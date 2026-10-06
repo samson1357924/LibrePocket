@@ -62,6 +62,13 @@ find_aapt() {
                 "$HOME/Android/Sdk/build-tools/35.0.0/aapt"; do
         if [ -x "$cand" ]; then printf '%s' "$cand"; return 0; fi
     done
+    # Fallback: newest installed build-tools (version-sorted, not hardcoded).
+    for sdk in "${ANDROID_HOME:-}" "$HOME/Android/Sdk"; do
+        if [ -n "$sdk" ]; then
+            latest=$(ls -d "$sdk"/build-tools/*/ 2>/dev/null | sort -V | tail -n 1)
+            if [ -x "${latest}aapt" ]; then printf '%s' "${latest}aapt"; return 0; fi
+        fi
+    done
     if command -v aapt >/dev/null 2>&1; then command -v aapt; return 0; fi
     return 1
 }
@@ -139,7 +146,11 @@ done
 # --- per-artifact checks -------------------------------------------------------
 AAPT=$(find_aapt || true)
 if [ -z "${AAPT:-}" ]; then
-    fail "aapt not found (set ANDROID_HOME)"
+    # Fail fast (not via fail()): without aapt every artifact check below
+    # would vacuously print OK on empty output.
+    printf 'FAIL: aapt not found (set ANDROID_HOME)\n'
+    printf 'play_policy_check (%s gate): FAILED\n' "$MODE"
+    exit 1
 fi
 BT_DIR=$(dirname -- "${AAPT:-/nonexistent}")
 if [ -x "$BT_DIR/dexdump" ]; then DEXDump="$BT_DIR/dexdump"; else DEXDump=""; fi
@@ -159,11 +170,10 @@ for ART in "$@"; do
         # 2. permission blacklist via aapt / bundle manifest scan
         case "$ART" in
             *.aab)
-                MANIFESTS=$(find "$TMP" -name "AndroidManifest.xml")
                 AAB_FAIL=0
-                if [ -n "$MANIFESTS" ]; then
+                if [ -n "$(find "$TMP" -name "AndroidManifest.xml" -print -quit)" ]; then
                     for p in $BLACKLIST_PERMS; do
-                        if grep -a -q "$p" $MANIFESTS 2>/dev/null; then
+                        if find "$TMP" -name "AndroidManifest.xml" -exec grep -a -q "$p" {} + 2>/dev/null; then
                             fail "$ART: blacklisted permission ($p) inside bundle manifest"
                             AAB_FAIL=1
                         fi
@@ -193,12 +203,9 @@ for ART in "$@"; do
         #    Uses dexdump class descriptors — precise and immune to const-string
         #    self-matches (e.g. the policy constants themselves).
         DEX_FAIL=0
-        DEX_FILES=$(find "$TMP" -type f -name "*.dex")
         if [ -n "${DEXDump:-}" ]; then
-            DUMP=$(for d in $DEX_FILES; do
-                [ -f "$d" ] || continue
-                "$DEXDump" "$d" 2>/dev/null | grep -E "Class descriptor|Superclass" || true
-            done)
+            # find -exec (not `for d in $(find)`) so paths with spaces are safe.
+            DUMP=$(find "$TMP" -type f -name "*.dex" -exec "$DEXDump" {} \; 2>/dev/null | grep -E "Class descriptor|Superclass" || true)
             for prefix in $BLACKLIST_CLASS_PREFIXES; do
                 if printf '%s\n' "$DUMP" | grep -F -q "$prefix"; then
                     fail "$ART dex defines self-install-only class ($prefix)"
@@ -233,9 +240,8 @@ for ART in "$@"; do
         # 4. manifest service assertion
         case "$ART" in
             *.aab)
-                MANIFESTS=$(find "$TMP" -name "AndroidManifest.xml")
-                if [ -n "$MANIFESTS" ]; then
-                    if grep -a -i -E "accessibilityservice|vpnservice" $MANIFESTS >/dev/null 2>&1; then
+                if [ -n "$(find "$TMP" -name "AndroidManifest.xml" -print -quit)" ]; then
+                    if find "$TMP" -name "AndroidManifest.xml" -exec grep -a -i -E "accessibilityservice|vpnservice" {} + >/dev/null 2>&1; then
                         fail "$ART bundle manifest registers an Accessibility/Vpn service"
                     else
                         log "  manifest-services(bundle-scan): OK"
@@ -244,7 +250,8 @@ for ART in "$@"; do
                 ;;
             *.apk)
                 XMLTREE=$("$AAPT" dump xmltree "$ART" AndroidManifest.xml 2>/dev/null || true)
-                if printf '%s\n' "$XMLTREE" | grep -i -q "accessibilityservice\|vpnservice"; then
+                # -E alternation (not BRE \|): portable to non-GNU grep.
+                if printf '%s\n' "$XMLTREE" | grep -i -E -q "accessibilityservice|vpnservice"; then
                     fail "$ART manifest registers an Accessibility/Vpn service"
                 else
                     log "  manifest-services: OK"
@@ -255,12 +262,9 @@ for ART in "$@"; do
         # --- foss gate per-artifact checks (mirror checkFossArtifact) ---
         # 2. dex proprietary-reference scan: Class descriptors only.
         DEX_FAIL=0
-        DEX_FILES=$(find "$TMP" -type f -name "*.dex")
         if [ -n "${DEXDump:-}" ]; then
-            DUMP=$(for d in $DEX_FILES; do
-                [ -f "$d" ] || continue
-                "$DEXDump" "$d" 2>/dev/null | grep "Class descriptor" || true
-            done)
+            # find -exec (not `for d in $(find)`) so paths with spaces are safe.
+            DUMP=$(find "$TMP" -type f -name "*.dex" -exec "$DEXDump" {} \; 2>/dev/null | grep "Class descriptor" || true)
             for prefix in $FOSS_DEX_PREFIXES; do
                 if printf '%s\n' "$DUMP" | grep -F -q "$prefix"; then
                     fail "$ART dex references proprietary ($prefix)"
@@ -284,11 +288,10 @@ for ART in "$@"; do
         # 3. manifest GMS-permission assertion
         case "$ART" in
             *.aab)
-                MANIFESTS=$(find "$TMP" -name "AndroidManifest.xml")
                 MAN_FAIL=0
-                if [ -n "$MANIFESTS" ]; then
+                if [ -n "$(find "$TMP" -name "AndroidManifest.xml" -print -quit)" ]; then
                     for needle in $FOSS_BLACKLIST; do
-                        if grep -a -i -q "$needle" $MANIFESTS 2>/dev/null; then
+                        if find "$TMP" -name "AndroidManifest.xml" -exec grep -a -i -q "$needle" {} + 2>/dev/null; then
                             fail "$ART bundle manifest references proprietary ($needle)"
                             MAN_FAIL=1
                         fi

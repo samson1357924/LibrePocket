@@ -84,6 +84,13 @@ object HardeningPolicy {
      * @param classDescriptors `Class descriptor` entries from `dexdump`.
      * @param superclasses `Superclass` entries from `dexdump`.
      * @param services manifest `<service>` android:name values.
+     *
+     * NOTE: the service check is deliberately fail-closed substring matching:
+     * any service whose name contains "accessibilityservice"/"vpnservice"
+     * (case-insensitive) is flagged, even at the cost of flagging benign
+     * helper names. A service named e.g. "VpnHelper" (no "service" suffix)
+     * passes; rename-for-evasion is out of scope (dex superclass scan covers
+     * the real services).
      */
     fun checkPlayArtifact(
         permissions: Collection<String>,

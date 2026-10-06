@@ -57,6 +57,11 @@ class DefaultProviderFactory(
  * Base-URL validation (SPEC §7.2 + §10.2 TLS row):
  * `https://` required; `http://` only for loopback / RFC1918 development
  * hosts, otherwise [IllegalArgumentException].
+ *
+ * Runtime note: release builds deny ALL cleartext via
+ * `res/xml/network_security_config.xml`, so even a validated http:// URL only
+ * connects in debug builds (whose overlay permits loopback +
+ * emulator-host cleartext) — LAN http:// stays refused at runtime by design.
  */
 fun validateBaseUrl(baseUrl: String) {
     val url = try {
@@ -67,7 +72,8 @@ fun validateBaseUrl(baseUrl: String) {
     val scheme = url.protocol.lowercase()
     if (scheme == "https") return
     if (scheme == "http") {
-        val host = url.host.lowercase()
+        // URL.getHost() returns bracketed IPv6 ("[::1]"): strip brackets.
+        val host = url.host.lowercase().trim('[', ']')
         val local = host == "localhost" ||
             host == "127.0.0.1" ||
             host == "::1" ||

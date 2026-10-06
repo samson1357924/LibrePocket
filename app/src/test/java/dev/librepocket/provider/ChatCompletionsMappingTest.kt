@@ -165,6 +165,7 @@ class ChatCompletionsMappingTest {
         validateBaseUrl("https://api.example.com/v1")
         validateBaseUrl("http://localhost:8080/v1")
         validateBaseUrl("http://127.0.0.1:8080/")
+        validateBaseUrl("http://[::1]:8080/")
         validateBaseUrl("http://192.168.1.20:8080/")
         validateBaseUrl("http://10.0.2.2:8080/")
         for (bad in listOf("http://api.example.com/v1", "ftp://x/", "not a url")) {

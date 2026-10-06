@@ -96,6 +96,21 @@ class HardeningPolicyTest {
         assertEquals(1, violations.size)
     }
 
+    @Test fun benignServiceNames_pass() {
+        // Fail-closed substring gate: names WITHOUT the full
+        // "accessibilityservice"/"vpnservice" token pass (precision boundary).
+        val violations = HardeningPolicy.checkPlayArtifact(
+            permissions = emptyList(),
+            classDescriptors = emptyList(),
+            superclasses = emptyList(),
+            services = listOf(
+                "dev.librepocket.agent.VpnHelper",
+                "com.example.AccessibilitySettings",
+            ),
+        )
+        assertTrue(violations.isEmpty())
+    }
+
     @Test fun cleartext_neverPermitted() {
         assertEquals(false, HardeningPolicy.CLEARTEXT_PERMITTED)
     }

@@ -2,8 +2,8 @@
 
 ## 1. JDK
 
-Android Gradle Plugin 8.x must run on **JDK 17 or 21** (this project
-uses JDK 21). Install one and export `JAVA_HOME`:
+Android Gradle Plugin 8.x must run on **JDK 17 or 21** (CI pins JDK 17;
+local builds may use 21). Install one and export `JAVA_HOME`:
 
 ```sh
 # Debian/Ubuntu

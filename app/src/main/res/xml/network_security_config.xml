@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  D07 hardening: never allow cleartext traffic.
+  D07 hardening: never allow cleartext traffic in release.
 
   Base config denies cleartext for all domains (including user-added CAs'
-  cleartext fallback). Loopback development exceptions, if ever needed,
-  must be added here explicitly with a TODO + expiry — never by flipping
-  the base value to true.
+  cleartext fallback). Debug builds overlay src/debug/res/xml/
+  network_security_config.xml, which additionally permits loopback +
+  emulator-host cleartext so LlmProvider.validateBaseUrl's http:// dev
+  allowlist can connect; LAN entries must never land here (use adb reverse).
+  Release artifacts always use THIS file (asserted by play_policy_check.sh).
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false">

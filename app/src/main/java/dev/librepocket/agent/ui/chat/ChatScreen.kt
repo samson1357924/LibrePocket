@@ -23,7 +23,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -32,6 +34,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -43,20 +46,27 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import dev.librepocket.chat.ChatStatus
+import dev.librepocket.chat.UiMessage
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ChatScreen(
     padding: PaddingValues,
     viewModel: ChatViewModel = viewModel(),
+    onOpenSettings: () -> Unit = {},
 ) {
-    val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val session by viewModel.sessionState.collectAsStateWithLifecycle()
+    val input by viewModel.input.collectAsStateWithLifecycle()
+    val notice by viewModel.notice.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
+    val visibleMessages = session.messages.filter { it.role == "user" || it.role == "assistant" }
+    val streaming = session.status == ChatStatus.STREAMING
 
-    LaunchedEffect(state.messages.size) {
-        if (state.messages.isNotEmpty()) {
+    LaunchedEffect(visibleMessages.size, visibleMessages.lastOrNull()?.text?.length, session.status) {
+        if (visibleMessages.isNotEmpty()) {
             try {
-                listState.scrollToItem(state.messages.size - 1)
+                listState.scrollToItem(visibleMessages.size - 1)
             } catch (_: IllegalArgumentException) {
                 // List not laid out yet; next recomposition will settle.
             }
@@ -69,7 +79,7 @@ fun ChatScreen(
             .padding(padding)
             .imePadding(),
     ) {
-        if (state.messages.isEmpty()) {
+        if (visibleMessages.isEmpty()) {
             // Gemini/ChatGPT-style empty state.
             Box(
                 modifier = Modifier
@@ -109,17 +119,17 @@ fun ChatScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                items(state.messages, key = { it.id }) { msg ->
+                items(visibleMessages, key = { it.id }) { msg ->
                     MessageBubble(msg)
                 }
-                if (state.isResponding) {
+                if (streaming) {
                     item {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .semantics {
                                     liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite
-                                    contentDescription = "正在思考"
+                                    contentDescription = "正在串流回覆"
                                 },
                             horizontalArrangement = Arrangement.Start,
                         ) {
@@ -137,13 +147,57 @@ fun ChatScreen(
                                         modifier = Modifier.padding(2.dp),
                                         strokeWidth = 2.dp,
                                     )
-                                    Text("思考中…")
+                                    Text("串流中…")
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+
+        if (session.pendingSteerCount > 0) {
+            Text(
+                text = "有 ${session.pendingSteerCount} 則指令排隊中",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+        }
+
+        session.error?.let { error ->
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp),
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        text = error,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (viewModel.canRetry) {
+                            Button(onClick = viewModel::retry) { Text("重試") }
+                        }
+                        TextButton(onClick = onOpenSettings) { Text("檢查設定") }
+                    }
+                }
+            }
+        }
+
+        notice?.let {
+            Text(
+                text = when (it) {
+                    "NO_ENDPOINT" -> "尚未設定端點，請先設定 API 金鑰。"
+                    else -> it
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
         }
 
         // Bottom input bar (ChatGPT/Gemini style).
@@ -159,48 +213,59 @@ fun ChatScreen(
                 Icon(Icons.Filled.Add, contentDescription = "新增附件")
             }
             OutlinedTextField(
-                value = state.input,
+                value = input,
                 onValueChange = viewModel::onInputChange,
                 modifier = Modifier.weight(1f),
                 placeholder = { Text("輸入訊息") },
                 shape = RoundedCornerShape(24.dp),
                 maxLines = 4,
             )
-            val canSend = state.input.isNotBlank() && !state.isResponding
-            IconButton(
-                onClick = { viewModel.send() },
-                enabled = canSend,
-            ) {
-                Icon(
-                    imageVector = if (canSend) Icons.AutoMirrored.Filled.Send else Icons.Filled.Mic,
-                    contentDescription = if (canSend) "傳送" else "語音輸入",
-                    tint = if (canSend) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                )
+            if (streaming) {
+                IconButton(onClick = viewModel::cancel) {
+                    Icon(
+                        imageVector = Icons.Filled.Stop,
+                        contentDescription = "停止",
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                }
+            } else {
+                val canSend = input.isNotBlank()
+                IconButton(
+                    onClick = viewModel::send,
+                    enabled = canSend,
+                ) {
+                    Icon(
+                        imageVector = if (canSend) Icons.AutoMirrored.Filled.Send else Icons.Filled.Mic,
+                        contentDescription = if (canSend) "傳送" else "語音輸入",
+                        tint = if (canSend) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                }
             }
         }
     }
 }
 
 @Composable
-private fun MessageBubble(msg: ChatMessage) {
+private fun MessageBubble(msg: UiMessage) {
+    val isUser = msg.role == "user"
     Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = if (msg.isUser) Arrangement.End else Arrangement.Start,
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
     ) {
         Card(
             modifier = Modifier.widthIn(max = 320.dp),
             shape = RoundedCornerShape(
                 topStart = 18.dp,
                 topEnd = 18.dp,
-                bottomStart = if (msg.isUser) 18.dp else 4.dp,
-                bottomEnd = if (msg.isUser) 4.dp else 18.dp,
+                bottomStart = if (isUser) 18.dp else 4.dp,
+                bottomEnd = if (isUser) 4.dp else 18.dp,
             ),
             colors = CardDefaults.cardColors(
-                containerColor = if (msg.isUser) {
+                containerColor = if (isUser) {
                     MaterialTheme.colorScheme.primaryContainer
                 } else {
                     MaterialTheme.colorScheme.surfaceContainerHighest
@@ -208,7 +273,7 @@ private fun MessageBubble(msg: ChatMessage) {
             ),
         ) {
             Text(
-                text = msg.text,
+                text = if (msg.isPartial) msg.text + " ▍" else msg.text,
                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
                 style = MaterialTheme.typography.bodyLarge,
             )

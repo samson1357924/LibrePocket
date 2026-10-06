@@ -30,6 +30,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
@@ -39,6 +40,7 @@ import androidx.navigation.compose.rememberNavController
 import dev.librepocket.agent.R
 import dev.librepocket.agent.ui.chat.ChatScreen
 import dev.librepocket.agent.ui.chat.ChatViewModel
+import dev.librepocket.agent.ui.chat.ChatViewModelFactory
 import dev.librepocket.agent.ui.settings.SettingsScreen
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.SetupScreen
@@ -60,7 +62,8 @@ fun MainScreen(
     val navController = rememberNavController()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
-    val chatViewModel: ChatViewModel = viewModel()
+    val app = LocalContext.current.applicationContext as android.app.Application
+    val chatViewModel: ChatViewModel = viewModel(factory = ChatViewModelFactory(app))
     val setupViewModel: SetupViewModel = viewModel()
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
@@ -178,7 +181,13 @@ fun MainScreen(
                     startDestination = Routes.CHAT,
                 ) {
                     composable(Routes.CHAT) {
-                        ChatScreen(padding = padding, viewModel = chatViewModel)
+                        ChatScreen(
+                            padding = padding,
+                            viewModel = chatViewModel,
+                            onOpenSettings = {
+                                navController.navigate(Routes.SETUP) { launchSingleTop = true }
+                            },
+                        )
                     }
                     composable(Routes.SETTINGS) {
                         SettingsScreen(

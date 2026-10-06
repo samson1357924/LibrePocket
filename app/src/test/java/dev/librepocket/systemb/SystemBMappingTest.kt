@@ -114,17 +114,19 @@ class SystemBMappingTest {
   // ---- 通知：預設關，標題優先 ----
 
   @Test
-  fun notification_defaultOff_deniedWithZeroRequest() {
+  fun notification_defaultOff_degradedTitleVisible() {
+    // MAJOR-1：缺 listener 即 DEGRADED/NO_PRIVILEGE（標題可見），與
+    // ToolRegistry `notification.read` 投影一致；不再是 UNAVAILABLE。
     val sink = RecordingSink()
     val c = NotificationTool.check(env(sink), emptyMap())
-    assertEquals(Availability.UNAVAILABLE, c.availability)
-    assertEquals(ReasonCode.USER_DISABLED, c.reason)
+    assertEquals(Availability.DEGRADED, c.availability)
+    assertEquals(ReasonCode.NO_PRIVILEGE, c.reason)
     val e = NotificationTool.execute(env(sink), emptyMap())
-    assertFalse(e.started)
-    assertNull(e.intent)
+    assertTrue(e.started)
+    assertEquals("title_only", e.intent!!.extras["mode"])
     assertTrue(sink.requests.isEmpty())
     val f = NotificationTool.fallback(c.reason, emptyMap())
-    assertTrue(f.userMessage.contains("USER_DISABLED"))
+    assertTrue(f.userMessage.contains("NO_PRIVILEGE"))
     assertTrue(f.manualSteps.isNotEmpty())
   }
 
@@ -213,11 +215,14 @@ class SystemBMappingTest {
   // ---- 註冊表 + 全組拒絕零請求 ----
 
   @Test
-  fun registry_containsAllSevenTools() {
+  fun registry_containsAllTenTools() {
     val names = SystemBRegistry.names()
     assertEquals(
       listOf(
+        "systemb.contact.get",
+        "systemb.contact.list",
         "systemb.contact.pick",
+        "systemb.contact.search",
         "systemb.email.compose",
         "systemb.location.foreground",
         "systemb.notification.titles",
@@ -238,7 +243,7 @@ class SystemBMappingTest {
       "systemb.email.compose" to emptyMap(),
       "systemb.phone.dial" to mapOf("directCall" to "true", "number" to "0912345678"),
       "systemb.sms.prefill" to emptyMap(),
-      "systemb.notification.titles" to emptyMap(),
+      // MAJOR-1：通知缺 listener 為 DEGRADED（標題可見），不在拒絕集合內，另測。
       "systemb.screenshot.capture" to emptyMap(),
       "systemb.location.foreground" to mapOf("background" to "true"),
     )

@@ -13,6 +13,10 @@ package dev.librepocket.tool
  *   permission; DIAL needs no CALL_PHONE permission).
  * @param degradedWithoutPermission when true, a missing permission yields
  *   [CapabilityLevel.DEGRADED] (partial scope) instead of UNAVAILABLE.
+ * @param foregroundOnly when true, the tool only works while the app is in
+ *   the foreground ([ProjectionContext.isForeground]). Background rounds
+ *   project [CapabilityLevel.UNAVAILABLE] + [DenyReason.NO_PRIVILEGE]
+ *   (e.g. clipboard access, blocked by the platform for background apps).
  */
 data class ToolAnnotations(
     val intentAction: String? = null,
@@ -22,6 +26,7 @@ data class ToolAnnotations(
     val switchDefault: Boolean = true,
     val requiresPermission: String? = null,
     val degradedWithoutPermission: Boolean = false,
+    val foregroundOnly: Boolean = false,
 )
 
 /**
@@ -41,6 +46,9 @@ data class ToolDef(
     val supportedFlavors: Set<Flavor> = setOf(Flavor.PLAY, Flavor.FOSS, Flavor.GITHUB),
 ) {
     fun project(ctx: ProjectionContext): Projection {
+        if (annotations.foregroundOnly && !ctx.isForeground) {
+            return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.NO_PRIVILEGE)
+        }
         if (ctx.flavor !in supportedFlavors) {
             return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.FLAVOR_BLOCKED)
         }

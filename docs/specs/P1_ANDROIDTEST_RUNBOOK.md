@@ -1,7 +1,7 @@
 # P1 instrumented 測試運行手冊（androidTest）
 
 > 範圍：`app/src/androidTest`（SPEC §10.1 [I] 層）。JVM 單測不受影響，
-> 照常用 `./gradlew :app:testPlayDebugUnitTest` 全綠。
+> 照常用 `./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` 全綠。
 
 ## 測試一覽
 
@@ -18,12 +18,14 @@ export JAVA_HOME=~/.gradle/jdks/eclipse_adoptium-25-amd64-linux.2
 export ANDROID_HOME=~/Android/Sdk
 # 列出可用設備
 $ANDROID_HOME/platform-tools/adb devices
-# Play flavor instrumented 全量
+# Play flavor instrumented 全量（foss/github 同理替換 flavor 名）
 ./gradlew :app:connectedPlayDebugAndroidTest
+# 三風味矩陣（CI nightly 與合併門檻，API 33 / 34 × Play / Foss / Github）
+./gradlew :app:connectedPlayDebugAndroidTest :app:connectedFossDebugAndroidTest :app:connectedGithubDebugAndroidTest
 ```
 
 ## 狀態
 
 - [x] `compilePlayDebugAndroidTestKotlin` 編譯通過（無設備可驗）。
-- [ ] `connectedPlayDebugAndroidTest` 待真機/模擬器實跑（本機 `adb devices`
-      為空時無法執行，見 SPEC §11.1 合併門檻，合併前須在 API 33 + 37 各跑一次）。
+- [ ] `connectedPlay/Foss/GithubDebugAndroidTest` 待真機/模擬器實跑（本機 `adb devices`
+      為空時無法執行，見 SPEC §11.1 合併門檻，合併前須在 API 33 + 37 各跑一次三風味矩陣）。

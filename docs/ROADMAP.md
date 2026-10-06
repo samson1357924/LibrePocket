@@ -3,13 +3,14 @@
 > 約定：P0 由另一組負責基建，本文件僅列介面依賴，不展開 P0 實作。
 > 每階段格式固定為：目標 / 範圍 / 非目標 / 驗收標準（可執行）/ 測試策略。
 > 驗收四件套縮寫：`UT` = 單元測試類名；`AAPT` = 權限斷言命令；`SMOKE` = 冒烟步驟（含 AndroidWorld 或手動）；`PLAY` = Play 政策檢查項。
+> 歷史注記：pre-1.0 文档中的 `full` 風味即現 `github` 風味（GitHub 直裝完整版，`dev.librepocket.agent.github`）；`foss` 為新增的 F-Droid 純開源風味。見 `docs/MIGRATION_FULL_TO_GITHUB.md`。
 
 ## P0 — 基建（另一組負責，本專案只消費介面）
 
 - 目標：提供可構建、可測、可發版的底座。
-- 範圍（P0 組交付）：Gradle 風味（`play/full`）、CI、簽名、版本號、基礎設計系統空殼。
-- 本專案依賴介面：`BuildConfig.FLAVOR`、風味原始碼集目錄劃分（`src/play / src/full`）、CI 產物（APK/AAB）。
-- 驗收（由 P0 組保證）：`./gradlew assemblePlayDebug assembleFullDebug` 雙風味一次通過。
+- 範圍（P0 組交付）：Gradle 風味（`play` / `foss` / `github`）、CI、簽名、版本號、基礎設計系統空殼。
+- 本專案依賴介面：`BuildConfig.FLAVOR`、風味原始碼集目錄劃分（`src/play` / `src/foss` / `src/github`）、CI 產物（APK/AAB）。
+- 驗收（由 P0 組保證）：`./gradlew assemblePlayDebug assembleFossDebug assembleGithubDebug` 三風味一次通過。
 
 ---
 
@@ -34,7 +35,7 @@
 ### 驗收標準（可執行）
 
 1. `UT`：`ProviderAdapterTest`（三協議映射：system/tools/stream/stopReason 全斷言）、`TranscriptRedactorTest`（给定語料含電話+郵件+經緯度+`sk-`樣式，斷言輸出不含原文）、`CapabilityProjectionTest`（play 風味下慢通道工具不可見）、`ChatBudgetTest`（超步數/超時即停）。
-2. `AAPT`：`aapt dump permissions app-play-debug.apk | grep -Ev 'SEND_SMS|RECEIVE_SMS|READ_SMS|MANAGE_EXTERNAL_STORAGE'` 必須零匹配；full 包亦在本階段不含 SMS/全存取權限。
+2. `AAPT`：`aapt dump permissions app-play-debug.apk | grep -Ev 'SEND_SMS|RECEIVE_SMS|READ_SMS|MANAGE_EXTERNAL_STORAGE'` 必須零匹配；foss / github 包亦在本階段不含 SMS/全存取權限。
 3. `SMOKE`（手動，3 台階）：① 填入無效金鑰 → 錯誤碼為認證類且可重試；② 切換 A→B 型供應商 → 歷史不丟；③ 殺進程重啟 → 上次 RUNNING 會話顯示 INTERRUPTED 且不自動重放。另用 AndroidWorld 錄製腳本跑「啟動→輸入→等待首字→停止」時序斷言（見測試策略）。
 4. `PLAY`：資料安全表單 v1（聲明網路+Keystore 用途）、無 SMS/全存取/VPN 權限、匯出轉錄預設為脫敏版。
 
@@ -78,7 +79,7 @@
 
 ---
 
-## P3 — 慢通道 GUI（full 版限定，可選）
+## P3 — 慢通道 GUI（foss / github 版限定，可選）
 
 ### 目標
 
@@ -88,7 +89,7 @@
 
 - SlowRouter：截圖→語義壓縮→單步提議→仲裁→執行→觀測迴圈；步數/時間雙預算；超限轉手動指引。
 - 仲裁器：越界檢測（支付/刪除/發送類需確認）、單步可觀測性檢查。
-- 審計表（座標/節點動作獨立統計）+ 風味開關（程式碼僅存於 `src/full`）。
+- 審計表（座標/節點動作獨立統計）+ 風味開關（程式碼僅存於 `src/github`，foss 鏡像見 `src/foss`）。
 - steering/cancel/pause 完整語義（步驟邊界暫停、取消不回滾已副作用但如實記錄）。
 
 ### 非目標
@@ -98,7 +99,7 @@
 ### 驗收標準（可執行）
 
 1. `UT`：`SlowBudgetTest`（超步數→指引）、`ArbitrationTest`（支付/發送類強制 CONFIRM）、`SteeringSemanticsTest`（插入新指示不搶占原子步驟）、`PauseResumeTest`（不斷點重放寫動作，冪等鍵去重）。
-2. `AAPT`：play 包斷言無 `BIND_ACCESSIBILITY_SERVICE` 且 `src/play` 無慢通道類；full 包列出該權限但功能預設關（設定頁開關初始值 `false` 的截圖/偏好 dump）。
+2. `AAPT`：play 包斷言無 `BIND_ACCESSIBILITY_SERVICE` 且 `src/play` 無慢通道類；foss / github 包列出該權限但功能預設關（設定頁開關初始值 `false` 的截圖/偏好 dump）。
 3. `SMOKE`：AndroidWorld 腳本 `slow_checkout_demo.py` 在 2 個基準 App 上跑通（含 1 次暫停恢復 + 1 次中途 steering）；超限場景驗證輸出為手動步驟指引而非無限重試。手動驗取消後轉錄含 `CANCELLED_AFTER_SIDE_EFFECT`（若有）或乾淨 `CANCELLED`。
 4. `PLAY`：play 上架包不含本階段能力（政策檢查：無障礙用途聲明不出現於 play 描述；若被問詢可出示風味源碼集差異）。
 
@@ -118,19 +119,19 @@
 
 ### 範圍
 
-- 受限 shell（白名單命令、超時、配額、輸出截斷）+ 提權子進程適配器介面（Shizuku/Root，full 版才實作）。
+- 受限 shell（白名單命令、超時、配額、輸出截斷）+ 提權子進程適配器介面（Shizuku/Root，foss / github 版才實作）。
 - 文件：私有域 + SAF + MediaStore；跨域讀寫經 Shizuku/Root 橋（需雙重確認）。
 - PRoot 發行版：下載式插件（控制 APK 體積）、使用者態運行、效能降級明示。
 - 審計：每次跨權限邊界呼叫記原因碼。
 
 ### 非目標
 
-- 不做 VPN/流量攔截（雙風味永不提供）；不做全存取權限申請；不把提權作為主流程。
+- 不做 VPN/流量攔截（三風味皆不提供；見 CAPABILITY_MATRIX §1-§2）；不做全存取權限申請；不把提權作為主流程。
 
 ### 驗收標準（可執行）
 
 1. `UT`：`ShellWhitelistTest`（黑名單命令拒絕、超時殺進程、輸出截斷）、`FileScopeTest`（play 風味拒絕跨域路徑）、`PrivilegeProbeTest`（探測失敗回落免 Root，不拋崩潰）。
-2. `AAPT`：`aapt dump permissions` 斷言雙風味皆無 `MANAGE_EXTERNAL_STORAGE`；full 包 Shizuku 權限僅為可選聲明且缺失時功能降級（卸載 Shizuku 後冒烟仍過）。
+2. `AAPT`：`aapt dump permissions` 斷言三風味皆無 `MANAGE_EXTERNAL_STORAGE`；foss / github 包 Shizuku 權限僅為可選聲明且缺失時功能降級（卸載 Shizuku 後冒烟仍過）。
 3. `SMOKE`：手動 5 步：受限命令成功、危險命令被拒、SAF 選檔讀寫、PRoot 啟動 hello-world、關閉提權開關後跨域入口消失。AndroidWorld 跑檔案命名參數化（中文/空格/長路徑）。
 4. `PLAY`：體積與下載政策（PRoot 為動態下載需走 Play 資產/外鏈合規）、無全存取、無 VPNService 子類（字串掃描零匹配）。
 
@@ -214,7 +215,7 @@
 
 - 加固：混淆/R8、Keystore 金鑰輪換、審計事件匯出（脫敏版）、明文匯出二次確認。
 - 備份：會話/偏好本地備份（金鑰預設不含），恢復時完整性校驗。
-- 上架：雙風味 AAB、資料安全表單終版、商店描述（含權限用途）、政策自查腳本（`scripts/play_policy_check.sh`）。
+- 上架：三風味 AAB/APK、資料安全表單終版、商店描述（含權限用途）、政策自查腳本（`scripts/play_policy_check.sh`，play 門 + `--foss` 門）。
 - 可觀測：崩潰上報（無敏感欄位）、ANR/卡頓基線。
 
 ### 非目標
@@ -224,12 +225,12 @@
 ### 驗收標準（可執行）
 
 1. `UT`：`BackupRoundTripTest`（備份→恢復一致；含金鑰預設排除）、`AuditExportTest`（匯出不含明文敏感）。
-2. `AAPT` + 腳本：`scripts/play_policy_check.sh app-play-release.aab` 一次通過，內容 = 權限黑名單斷言 + VPNService/Accessibility 自動化類掃描 + 資料安全表單一致性。該腳本納入 CI 必跑門禁。
+2. `AAPT` + 腳本：`scripts/play_policy_check.sh app-play-release.aab` 與 `scripts/play_policy_check.sh --foss <foss-apk/aab>` 各一次通過，內容 = 權限黑名單斷言 + VPNService/Accessibility 自動化類掃描（play 門）+ 專有字串掃描（foss 門）+ 資料安全表單一致性。兩門均納入 CI 必跑門禁。
 3. `SMOKE`：release 包手動全迴歸（P1→P6 冒烟子集 30 分鐘版）+ AndroidWorld 全量腳本綠；崩潰注入（kill -9）後轉錄可逐行恢復。
 4. `PLAY`：政策清單逐項勾選：目標 API 等級、64 位、資料安全表單、權限用途影片/說明（如需）、分級問卷、地區分發（簡訊/電話相關描述合規）。
 
 ### 測試策略
 
 - 發版門禁：UT 全綠 + `play_policy_check.sh` + release 冒烟三件套缺一不可。
-- 灰度：full 版先內測通道，play 版走封閉測試 → 公開。
+- 灰度：github 版先內測通道，play 版走封閉測試 → 公開；foss 版隨 F-Droid 構建發布。
 - 回滾：版本號/資料庫遷移腳本需雙向驗證（升→降不丟會話索引）。

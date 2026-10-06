@@ -1,15 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Full flavor overlay (F-Droid / direct download only, never Play).
+  GitHub flavor overlay (direct download only, never Play).
   Decision (locked): NO SMS, NO MANAGE_EXTERNAL_STORAGE, NO VPN in any
-  flavor. Full adds ONLY the accessibility automation service (default off,
+  flavor. GitHub adds ONLY the accessibility automation service (default off,
   two-step consent). See CAPABILITY_MATRIX §1-§2 + BACKLOG D15.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <application>
         <service
-            android:name=".full.FullAccessibilityService"
+            android:name=".github.GithubAccessibilityService"
             android:exported="false"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>

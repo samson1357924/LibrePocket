@@ -86,15 +86,17 @@ class FastRouterDecisionTest {
         assertTrue(d.fallbackMessage!!.contains("FLAVOR_BLOCKED"))
     }
 
-    @Test fun slowIntentOnFullWithAutomationGoesFast() {
-        val ctx = ProjectionContext(
-            flavor = Flavor.FULL,
-            automationEnabled = true,
-            grantedPermissions = setOf("android.permission.READ_CALENDAR"),
-        )
-        val d = decide("幫我自動點擊螢幕上的確定按鈕", ctx)
-        assertEquals(RouteKind.FAST, d.route)
-        assertEquals(ToolRegistry.SLOW_TOOL_NAME, d.toolCall!!.toolName)
+    @Test fun slowIntentOnSelfInstallWithAutomationGoesFast() {
+        for (flavor in listOf(Flavor.FOSS, Flavor.GITHUB)) {
+            val ctx = ProjectionContext(
+                flavor = flavor,
+                automationEnabled = true,
+                grantedPermissions = setOf("android.permission.READ_CALENDAR"),
+            )
+            val d = decide("幫我自動點擊螢幕上的確定按鈕", ctx)
+            assertEquals(RouteKind.FAST, d.route)
+            assertEquals(ToolRegistry.SLOW_TOOL_NAME, d.toolCall!!.toolName)
+        }
     }
 
     @Test fun unknownIntentDeniedWithGuidance() {

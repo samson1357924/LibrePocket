@@ -238,19 +238,21 @@ class ShellWhitelistTest {
         assertEquals(1, runner.calls)
     }
 
-    @Test fun fullBridgeCrossDomainStillDeniedForDirectExec() {
-        // full + 橋接已授權時 FileScope 回 needsBridge，但直接 exec 仍拒絕
+    @Test fun selfInstallBridgeCrossDomainStillDeniedForDirectExec() {
+        // foss/github + 橋接已授權時 FileScope 回 needsBridge，但直接 exec 仍拒絕
         // （需改走 D09 橋），不得放行子進程。
-        val runner = FakeRunner(ByteArray(0))
-        val shell = RestrictedShell(
-            runner = runner,
-            privateRoot = shellPrivateRoot,
-            flavor = Flavor.FULL,
-            bridgeGranted = true,
-        )
-        val result = shell.execute(listOf("cat", "/sdcard/Download/other/x.txt"))
-        assertTrue("expected Denied, got $result", result is ShellResult.Denied)
-        assertEquals(0, runner.calls)
+        for (flavor in listOf(Flavor.FOSS, Flavor.GITHUB)) {
+            val runner = FakeRunner(ByteArray(0))
+            val shell = RestrictedShell(
+                runner = runner,
+                privateRoot = shellPrivateRoot,
+                flavor = flavor,
+                bridgeGranted = true,
+            )
+            val result = shell.execute(listOf("cat", "/sdcard/Download/other/x.txt"))
+            assertTrue("expected Denied, got $result", result is ShellResult.Denied)
+            assertEquals(0, runner.calls)
+        }
     }
 
     @Test fun elevatedRunnerNeverSpawns() {

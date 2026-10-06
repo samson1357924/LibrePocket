@@ -7,7 +7,7 @@ package dev.librepocket.systema
  * [CheckResult]，攜帶 [Availability] + 原因碼，供模型生成降級話術：
  * `做不到 X（原因碼）→ 可替代 Y → 需要你做 Z`。
  */
-enum class Flavor { PLAY, FULL }
+enum class Flavor { PLAY, FOSS, GITHUB }
 
 enum class Availability { NATIVE, DEGRADED, UNAVAILABLE }
 

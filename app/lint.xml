@@ -3,8 +3,12 @@
     <!-- Ignore false positives caused by tools:node="remove" in play overlay manifest -->
     <issue id="ProtectedPermissions">
         <ignore path="src/play/AndroidManifest.xml" />
+        <ignore path="src/foss/AndroidManifest.xml" />
+        <ignore path="src/github/AndroidManifest.xml" />
     </issue>
     <issue id="PermissionImpliesUnsupportedChromeOsHardware">
         <ignore path="src/play/AndroidManifest.xml" />
+        <ignore path="src/foss/AndroidManifest.xml" />
+        <ignore path="src/github/AndroidManifest.xml" />
     </issue>
 </lint>

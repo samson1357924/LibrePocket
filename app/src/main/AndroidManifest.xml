@@ -2,7 +2,7 @@
 <!--
   Common manifest for all flavors. Only store-safe permissions live here.
   High-risk permissions (SMS, all-files access) and privileged services
-  (Accessibility, VPN) are declared exclusively in the src/full overlay,
+  (Accessibility, VPN) are declared exclusively in the src/github + src/foss overlays,
   so the play flavor can never inherit them.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">

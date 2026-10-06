@@ -26,6 +26,17 @@ testExtJunit = "1.2.1"
 espressoCore = "3.6.1"
 # Long-term key vault (P2; P1 keeps stub only)
 tink = "1.23.0"
+# Phase1 flavors: OCR / scan / on-device inference (foss+github = OSS, github-only = ML Kit)
+mlkitBarcodeScanning = "17.3.0"
+mlkitTextRecognition = "16.0.1"
+zxingCore = "3.5.4"
+tessTwo = "9.1.0"
+# NOTE: com.google.ai.edge.litert:litert (any 1.x/2.x) is unusable with AGP 9:
+# litert + litert-api AARs both declare package="com.google.ai.edge.litert",
+# tripping unique-namespace enforcement (verified 2.1.6/2.2.0). Phase1 pins the
+# API-compatible org.tensorflow:tensorflow-lite instead (LiteRT lineage); revisit
+# in Phase2 once Google fixes the upstream packaging.
+tensorflowLite = "2.17.0"
 
 [libraries]
 okhttp-sse = { group = "com.squareup.okhttp3", name = "okhttp-sse", version.ref = "okhttpSse" }
@@ -43,6 +54,11 @@ test-core = { group = "androidx.test", name = "core", version.ref = "testCore" }
 mockwebserver = { group = "com.squareup.okhttp3", name = "mockwebserver", version.ref = "mockwebserver" }
 test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "testExtJunit" }
 espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+mlkit-barcode-scanning = { group = "com.google.mlkit", name = "barcode-scanning", version.ref = "mlkitBarcodeScanning" }
+mlkit-text-recognition = { group = "com.google.mlkit", name = "text-recognition", version.ref = "mlkitTextRecognition" }
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
+tess-two = { group = "com.rmtheis", name = "tess-two", version.ref = "tessTwo" }
+litert = { group = "org.tensorflow", name = "tensorflow-lite", version.ref = "tensorflowLite" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

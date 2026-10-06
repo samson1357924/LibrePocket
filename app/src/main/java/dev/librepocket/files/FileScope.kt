@@ -11,7 +11,7 @@ import java.nio.file.Paths
  * - 自有域（App 私有目錄）：讀寫直行，READ/WRITE 授權面由呼叫方確認。
  * - 已授權 SAF 樹（使用者經系統 picker 授予）：以前綴白名單建模，
  *   實際 IO 由呼叫方經系統文件介面完成，本類只做路徑裁決（零 Android 依賴）。
- * - 跨域（私有域之外、SAF 授權之外）：play 一律拒絕；full 標記需提權橋
+ * - 跨域（私有域之外、SAF 授權之外）：play 一律拒絕；foss/github 標記需提權橋
  *   （Shizuku/Root，D09），未授權橋接前同樣拒絕。
  * - 全店合規：本包不申請、不引用全存取權限，跨域只能走使用者逐次授權的 SAF。
  */
@@ -33,11 +33,11 @@ data class SafGrant(val treePrefix: String) {
 data class ScopeDecision(
     val allowed: Boolean,
     val zone: FileZone,
-    /** 矩陣 §5 投影理由碼：跨域在 play 記風味阻擋，full 未授權橋接記缺權。 */
+    /** 矩陣 §5 投影理由碼：跨域在 play 記風味阻擋，foss/github 未授權橋接記缺權。 */
     val denyReason: DenyReason?,
     /** 機器可讀細碼：CROSS_DOMAIN / NEEDS_BRIDGE，寫審計用。 */
     val code: String?,
-    /** full 跨域且橋接已授權時為 true（呼叫方改走 D09 橋，仍需審計）。 */
+    /** foss/github 跨域且橋接已授權時為 true（呼叫方改走 D09 橋，仍需審計）。 */
     val needsBridge: Boolean,
 )
 
@@ -51,7 +51,7 @@ object FileScope {
      * @param path 待存取的絕對路徑（相對路徑視為非法，一律拒絕）。
      * @param privateRoot App 私有域根（絕對路徑）。
      * @param safRoots 已授權 SAF 樹前綴。
-     * @param bridgeGranted full 風味下使用者是否已授權提權橋（D09 開關）。
+     * @param bridgeGranted foss/github 風味下使用者是否已授權提權橋（D09 開關）。
      */
     fun decide(
         path: String,
@@ -76,10 +76,17 @@ object FileScope {
         if (flavor == Flavor.PLAY) {
             return deny(CODE_CROSS_DOMAIN, DenyReason.FLAVOR_BLOCKED)
         }
-        if (bridgeGranted) {
-            return ScopeDecision(true, FileZone.CROSS_DOMAIN, null, CODE_NEEDS_BRIDGE, true)
+        // Play 之外显式按风味分支：foss/github 双自装风味共享同一提权桥门禁。
+        return when (flavor) {
+            Flavor.FOSS, Flavor.GITHUB -> {
+                if (bridgeGranted) {
+                    ScopeDecision(true, FileZone.CROSS_DOMAIN, null, CODE_NEEDS_BRIDGE, true)
+                } else {
+                    deny(CODE_NEEDS_BRIDGE, DenyReason.NO_PRIVILEGE)
+                }
+            }
+            Flavor.PLAY -> deny(CODE_CROSS_DOMAIN, DenyReason.FLAVOR_BLOCKED)
         }
-        return deny(CODE_NEEDS_BRIDGE, DenyReason.NO_PRIVILEGE)
     }
 
     private fun deny(code: String, reason: DenyReason): ScopeDecision =

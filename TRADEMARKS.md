@@ -16,8 +16,16 @@ You may refer to them factually (e.g. "a fork of LibrePocket"), but:
 2. **No endorsement implied.** Do not present a derivative as the official
    LibrePocket app, and do not use the project's marks in a way that
    suggests sponsorship or affiliation.
-3. **Store listings.** The official Play listing and the official F-Droid
-   metadata are the only authorized distributions under the LibrePocket name.
+3. **Store listings.** Only three distributions are authorized under the
+   LibrePocket name, each bound to its own applicationId:
+   - Google Play listing → `play` flavor (`dev.librepocket.agent`);
+   - F-Droid metadata → `foss` flavor (`dev.librepocket.agent.foss`),
+     **and only an APK built by F-Droid itself counts as official**
+     (a locally built foss APK is functionally identical but unofficial —
+     do not present it as the official release);
+   - GitHub Releases → `github` flavor (`dev.librepocket.agent.github`)
+     **only** (direct download, never Play; the release workflow publishes
+     the github APK and nothing else).
 
 ## Why this exists
 

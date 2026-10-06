@@ -5,7 +5,7 @@ package dev.librepocket.slow
  *
  * This is an original, dependency-free description of one on-screen
  * element. It deliberately mirrors no Android framework type: the
- * full-flavor wiring (a separate workstream) translates platform
+ * flavor wiring (a separate workstream) translates platform
  * nodes into this shape before calling the core. Pixel data never
  * enters the core; screenshots are referenced by digest only.
  */

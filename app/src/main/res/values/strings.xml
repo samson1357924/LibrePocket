@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Default label; play pins "LibrePocket", foss overrides with "LibrePocket Foss". -->
     <string name="app_name">LibrePocket</string>
 </resources>

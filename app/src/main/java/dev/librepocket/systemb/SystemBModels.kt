@@ -1,5 +1,7 @@
 package dev.librepocket.systemb
 
+import dev.librepocket.tool.Flavor
+
 /**
  * P2 快通道 B 組共用模型（原創）。
  *
@@ -72,7 +74,7 @@ fun interface PermissionSink {
 
 /** B 組執行環境（呼叫方裝配，均為呼叫時快照）。 */
 data class SystemBEnv(
-  val flavorPlay: Boolean = true,
+  val flavor: Flavor = Flavor.PLAY,
   val notificationListenerEnabled: Boolean = false,
   val notificationFullTextConsented: Boolean = false,
   /** MediaProjection 每次授權：僅當次有效，呼叫方負責在調起系統授權頁後置 true。 */

@@ -35,11 +35,13 @@ jobs:
         with:
           cache-read-only: true
 
-      - name: Assemble Release Artifacts (APKs & AAB)
+      - name: Assemble Release Artifacts (APKs & AABs)
         run: |
           ./gradlew :app:assemblePlayRelease \
-                    :app:assembleFullRelease \
-                    :app:bundlePlayRelease
+                    :app:assembleFossRelease \
+                    :app:assembleGithubRelease \
+                    :app:bundlePlayRelease \
+                    :app:bundleGithubRelease
 
       - name: Configure Android SDK build-tools for aapt & dexdump
         run: |
@@ -59,6 +61,13 @@ jobs:
             app/build/outputs/bundle/playRelease/app-play-release.aab \
             "$PLAY_APK_TARGET"
 
+      - name: Verify Foss Release Policy Gate (ROADMAP D07)
+        run: |
+          chmod +x scripts/play_policy_check.sh
+          # 動態查找 foss release 的 apk 檔名（相容 signed 或 unsigned）
+          FOSS_APK_TARGET=$(find app/build/outputs/apk/foss/release -maxdepth 1 -name "*.apk" | head -n 1)
+          scripts/play_policy_check.sh --foss "$FOSS_APK_TARGET"
+
       - name: Sign Android Artifacts (if secret configured)
         if: env.KEYSTORE_PRESENT == 'true'
         uses: r0adkll/sign-android-release@v1
@@ -69,31 +78,39 @@ jobs:
           keyStorePassword: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.RELEASE_KEY_PASSWORD }}
 
+      - name: Generate SBOM for GitHub APK (CycloneDX, pinned)
+        uses: anchore/sbom-action@v0.17.2
+        with:
+          path: app/build/outputs/apk/github/release/
+          format: cyclonedx-json
+          output-file: sbom-github.cyclonedx.json
+
       - name: Prepare Release Artifacts with Checksums
         run: |
           mkdir -p release-artifacts
           VERSION_TAG="${{ github.ref_name }}"
           [ -z "$VERSION_TAG" ] && VERSION_TAG="snapshot"
 
-          # 優先收集已簽名 Full APK，次選 unsigned
-          FULL_APK=$(find app/build/outputs/apk/full/release -name "*signed.apk" | head -n 1)
-          [ -z "$FULL_APK" ] && FULL_APK=$(find app/build/outputs/apk/full/release -name "*.apk" | head -n 1)
-          [ -n "$FULL_APK" ] && cp "$FULL_APK" "release-artifacts/LibrePocket-${VERSION_TAG}-full.apk"
+          # 只發布已簽名 GitHub APK，次選 unsigned（Play AAB/APK 僅作政策自證、
+          # Foss unsigned 僅作政策校驗，均不進 release-artifacts）
+          GITHUB_APK=$(find app/build/outputs/apk/github/release -name "*signed.apk" | head -n 1)
+          [ -z "$GITHUB_APK" ] && GITHUB_APK=$(find app/build/outputs/apk/github/release -name "*.apk" | head -n 1)
+          [ -n "$GITHUB_APK" ] && cp "$GITHUB_APK" "release-artifacts/LibrePocket-${VERSION_TAG}-github.apk"
 
-          # 優先收集已簽名 Play APK，次選 unsigned
-          PLAY_APK=$(find app/build/outputs/apk/play/release -name "*signed.apk" | head -n 1)
-          [ -z "$PLAY_APK" ] && PLAY_APK=$(find app/build/outputs/apk/play/release -name "*.apk" | head -n 1)
-          [ -n "$PLAY_APK" ] && cp "$PLAY_APK" "release-artifacts/LibrePocket-${VERSION_TAG}-play.apk"
-
-          # 優先收集已簽名 Play AAB，次選原始 AAB
-          PLAY_AAB=$(find app/build/outputs/bundle/playRelease -name "*signed.aab" | head -n 1)
-          [ -z "$PLAY_AAB" ] && PLAY_AAB="app/build/outputs/bundle/playRelease/app-play-release.aab"
-          [ -f "$PLAY_AAB" ] && cp "$PLAY_AAB" "release-artifacts/LibrePocket-${VERSION_TAG}-play.aab"
+          # SBOM（GitHub APK 專屬）
+          [ -f sbom-github.cyclonedx.json ] && cp sbom-github.cyclonedx.json "release-artifacts/SBOM-github.cyclonedx.json"
 
           # 產生 SHA256 校驗碼清單
           cd release-artifacts
           sha256sum * > SHA256SUMS.txt
           cd ..
+
+      - name: Attest Play & Foss Artifacts (built & gated, not published)
+        run: |
+          ls -lh app/build/outputs/apk/play/release/ \
+                 app/build/outputs/bundle/playRelease/ \
+                 app/build/outputs/apk/foss/release/ \
+                 app/build/outputs/bundle/githubRelease/
 
       - name: Archive Release Artifacts to Workflow
         uses: actions/upload-artifact@v4

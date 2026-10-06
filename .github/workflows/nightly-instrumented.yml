@@ -17,13 +17,14 @@ permissions:
 jobs:
   instrumented-test:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-instrumented')
-    name: Instrumented Tests (API ${{ matrix.api-level }})
+    name: Instrumented Tests (${{ matrix.flavor }}, API ${{ matrix.api-level }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
         api-level: [33, 34]
+        flavor: [Play, Foss, Github]
         target: [google_apis]
         arch: [x86_64]
     steps:
@@ -56,12 +57,12 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio
-          script: ./gradlew :app:connectedPlayDebugAndroidTest --no-daemon -Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m"
+          script: ./gradlew :app:connected${{ matrix.flavor }}DebugAndroidTest --no-daemon -Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=512m"
 
       - name: Upload Instrumentation Test Reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: instrumented-reports-api-${{ matrix.api-level }}
+          name: instrumented-reports-${{ matrix.flavor }}-api-${{ matrix.api-level }}
           path: app/build/reports/androidTests/
           retention-days: 14

@@ -5,7 +5,7 @@
 > 非範圍：Agent Loop 工具執行、GUI Agent、終端、MCP、記憶、角色、雲端同步（皆為 P2+）
 > 沿用結論：HTTP 超時（連接 15s / 寫 30s / 讀 5min）、重試 3 次（2/4/8s backoff）
 > 目標 SDK：minSdk 33，compileSdk 37 / targetSdk 36（對齊骨架 `gradle/libs.versions.toml`）；行為差異覆蓋 API 33 / 36 / 37
-> 命名根：`dev.librepocket`（對齊骨架 `namespace = "dev.librepocket.agent"`、flavor 維度 `dist`（`full`/`play`）；Eta 既有 `AgentLoop` / `AgentProviderClient` / `AgentModelRetry` 僅為行為參考，不直接依賴）
+> 命名根：`dev.librepocket`（對齊骨架 `namespace = "dev.librepocket.agent"`、flavor 維度 `dist`（`play`/`foss`/`github`）；Eta 既有 `AgentLoop` / `AgentProviderClient` / `AgentModelRetry` 僅為行為參考，不直接依賴）
 
 ---
 
@@ -622,7 +622,7 @@ resource := wildcard 路徑，支援 "*"（單段）與 "**"（跨段），如�
 4. 預設 ruleset（首次啟動寫入）：
    ```text
    (0)  "*:*" → ASK              # 預設三態開關 = ASK（P1 保守預設）
-   (10) "key.read:*" → ASK       # 讀 Key 每次確認（play flavor 斷言見 §11.5）
+   (10) "key.read:*" → ASK       # 讀 Key 每次確認（三風味斷言見 §11.5）
    (10) "key.write:*" → ASK
    (10) "session.export:**" → ASK # 匯出必然彈確認
    (10) "chat.send:*" → ALLOW    # 純聊天預設放行（無工具調用）
@@ -715,7 +715,7 @@ resource := wildcard 路徑，支援 "*"（單段）與 "**"（跨段），如�
 | 測試類 | 層 | 斷言要點 |
 |--------|----|----------|
 | `PolicyStoreTest` | [J] | 無匹配→DENY；priority 大者勝；同 priority DENY 勝出；`*` action；非法 pattern 拋錯；未知 action→DENY；`evaluateFresh` 重載後決策更新（fake backing 換 ruleset）；預設 ruleset 快照（§9.2 六條） |
-| Play flavor 權限斷言 | [I]（見 §11.5） | `key.read` 在 play flavor 預設 ASK；`session.export` 觸發系統對話框（Espresso 斷言 dialog 出現） |
+| 三風味權限斷言 | [I]（見 §11.5） | `key.read:*` 三風味預設 ASK；`session.export` 觸發系統對話框（Espresso 斷言 dialog 出現）；foss/github 另斷言自動化開關預設關 |
 
 ### 10.4 Fixture 規範
 
@@ -730,12 +730,12 @@ resource := wildcard 路徑，支援 "*"（單段）與 "**"（跨段），如�
 ### 11.1 自動化門檻（必須全綠）
 
 ```bash
-./gradlew :app:testDebugUnitTest   # 全綠（含 Robolectric sdk=33/36/37 矩陣）
-./gradlew :app:connectedPlayDebugAndroidTest  # play flavor instrumented（Keystore 往返 + 權限斷言）
+./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest   # JVM + Robolectric 三風味矩陣（含 sdk=33/36/37）
+./gradlew :app:connectedPlayDebugAndroidTest :app:connectedFossDebugAndroidTest :app:connectedGithubDebugAndroidTest  # instrumented 三風味矩陣（Keystore 往返 + 權限斷言）
 ```
 
-- 上述兩條為合併門檻；任一紅即 P1 未通過。
-- 基建組負責 flavor 維度存在（`play` flavor 含 `key.read ASK` 預設，見 §9.2）；P1 規格組負責斷言語句正確。
+- 上述兩組為合併門檻；任一紅即 P1 未通過。
+- 基建組負責 flavor 維度存在（`play` / `foss` / `github` 三風味含 `key.read ASK` 預設，見 §9.2）；P1 規格組負責斷言語句正確。
 
 ### 11.2 SSE 解析單測
 
@@ -749,17 +749,18 @@ resource := wildcard 路徑，支援 "*"（單段）與 "**"（跨段），如�
 
 步驟：① 連 MockWebServer（chunk 間隔 500ms，連續 20 塊）；② 收到第 3 塊時點取消；③ 從點擊到 UI 狀態變 `CANCELLED` 且無新塊渲染，用 `adb shell screenrecord` / 慢動作計時（或 `SystemClock.elapsedRealtime()` 打點 log）。<200ms 通過。記錄設備型號 + API 級別存檔（`docs/specs/P1_ACCEPT.md`，P1 後補，不屬本規格）。
 
-### 11.5 Play flavor 權限斷言
+### 11.5 三風味權限斷言
 
 - `connectedPlayDebugAndroidTest` 內：① `PolicyStore` 預設 `key.read:*` = ASK；② 觸發 `key.read` 彈系統對話框（Espresso `onView(withText("允許"))` 存在性斷言）；③ 拒絕後 `evaluateFresh` = DENY 且 Provider 未發出任何請求（MockWebServer requestCount=0）。
+- `connectedFossDebugAndroidTest` / `connectedGithubDebugAndroidTest` 內：同上三斷言另加 ④ a11y 自動化類存在但開關預設關（`AutomationPolicy` 初始 `false` dump）。
 
 ### 11.6 驗收 Checklist（合併發布前逐項勾）
 
-- [ ] `:app:testDebugUnitTest` 全綠（含 sdk 33/36/37 Robolectric）
+- [ ] `:app:testPlay/Foss/GithubDebugUnitTest` 全綠（含 sdk 33/36/37 Robolectric）
 - [ ] SSE 四測試類全綠（真實 fixture）
 - [ ] `RedactorTest` 全綠（R1–R12 + redactError）
 - [ ] 手動取消 <200ms（記錄存檔）
-- [ ] `connectedPlayDebugAndroidTest` 全綠（Keystore 往返 + 權限三斷言）
+- [ ] `connectedPlay/Foss/GithubDebugAndroidTest` 全綠（Keystore 往返 + 三風味權限斷言）
 - [ ] `docs/specs/P1_SPEC.md` 與實現一致（Code Review 對照 §1 簽名）
 - [ ] 未動 `app/src` 業務碼與 gradle 配置之外的新增依賴已交基建組（§10.1 清單）
 - [ ] JSONL 匯出可用 `jq` 解析（抽查一 session）

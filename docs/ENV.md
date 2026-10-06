@@ -26,7 +26,7 @@ export ANDROID_HOME="$HOME/Android/Sdk"
 export PATH="$ANDROID_HOME/platform-tools:$PATH"
 ```
 
-Required SDK pieces (install once via `sdkmanager`, **no full reinstall**):
+Required SDK pieces (install once via `sdkmanager`, **no SDK reinstall needed**):
 
 ```sh
 sdkmanager "platforms;android-36" "platforms;android-37.0" "build-tools;36.0.0"
@@ -44,19 +44,42 @@ Verify:
 
 ```sh
 ls "$ANDROID_HOME/platforms"   # expect android-36 and android-37.0
-./gradlew :app:assemblePlayDebug :app:assembleFullDebug
+./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug
 ```
 
-## 3. Permission assertion (Play flavor)
+## 3. Permission assertion (three flavors)
 
-After building, confirm the Play APK carries no high-risk permissions:
+After building, confirm each APK carries no high-risk permissions
+(locked decision: no SMS / storage-manager / VPN permission in any
+flavor; foss/github each add ONLY the accessibility automation service,
+default off):
 
 ```sh
 AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
 $AAPT dump permissions app/build/outputs/apk/play/debug/app-play-debug.apk
 # must NOT list READ_SMS, RECEIVE_SMS, MANAGE_EXTERNAL_STORAGE,
 # BIND_ACCESSIBILITY_SERVICE, or BIND_VPN_SERVICE
-$AAPT dump permissions app/build/outputs/apk/full/debug/app-full-debug.apk
-# MUST also NOT list the above (decision locked: no SMS / full-storage / VPN
-# in any flavor; full adds ONLY the accessibility service, default off)
+$AAPT dump permissions app/build/outputs/apk/foss/debug/app-foss-debug.apk
+$AAPT dump permissions app/build/outputs/apk/github/debug/app-github-debug.apk
+# foss/github MUST also NOT list the above (a11y comes from the flavor
+# manifest overlay service, default off — see CAPABILITY_MATRIX §2)
 ```
+
+Or run both policy gates (mirrors `HardeningPolicy`):
+
+```sh
+scripts/play_policy_check.sh app/build/outputs/apk/play/debug/app-play-debug.apk
+scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
+```
+
+## 4. Flavors and signing
+
+| Flavor | `BuildConfig.FLAVOR` | applicationId | Ships via |
+|--------|----------------------|---------------|-----------|
+| `play` | `play` | `dev.librepocket.agent` | Google Play (AAB) |
+| `foss` | `foss` | `dev.librepocket.agent.foss` | F-Droid (F-Droid builds and signs; only that build is official) |
+| `github` | `github` | `dev.librepocket.agent.github` | GitHub Releases (developer release key, APK only) |
+
+- Read the flavor at runtime via `BuildConfig.FLAVOR` (`play` / `foss` / `github`); it maps 1:1 to the `Flavor` enum used by capability projection.
+- Signing keys are kept separate per channel: Play uses its upload key (Play App Signing holds the final key), F-Droid signs with its own key (hence only the F-Droid-built foss APK is official — a locally built foss APK is functionally identical but unofficial), GitHub APKs are signed with the developer release key (`RELEASE_KEYSTORE_*` secrets in `release.yml`). Never reuse the GitHub/local debug key for the Play upload.
+- Release flow publishes ONLY the `github` APK (+ SBOM + SHA256SUMS) to GitHub Releases; Play AAB/APK are built and policy-gated as self-proof, foss APK is policy-checked but distributed via F-Droid (see `.github/workflows/release.yml`, `TRADEMARKS.md`).

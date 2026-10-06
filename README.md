@@ -13,31 +13,42 @@ Licensed under the Apache License 2.0 (see `LICENSE`).
 ## Status — alpha (v0.1.0, debug only)
 
 Backbone + early extensions are implemented behind debug builds
-(P1 chat/BYOK, P2 fast-channel, P3 slow-channel full-only, D01–D07
-memory/MCP/Skills/shell/entry/hardening). No Play release, no stable API:
-upgrades may require reinstall, and instrumented tests still need real
+(P1 chat/BYOK, P2 fast-channel, P3 slow-channel foss/github-only default-off,
+D01–D07 memory/MCP/Skills/shell/entry/hardening). No Play release, no stable
+API: upgrades may require reinstall, and instrumented tests still need real
 devices (API 33/37).
 
-## Two distributions, distinct applicationIds (co-installable)
+## Three distributions, distinct applicationIds (co-installable)
 
-| Flavor | Channel | Permissions | Services |
-|--------|---------|-------------|----------|
-| `play` | Google Play | Store-safe only: INTERNET, ACCESS_NETWORK_STATE, POST_NOTIFICATIONS, FOREGROUND_SERVICE. High-risk permissions are additionally stripped via `tools:node="remove"` (see `app/src/play/AndroidManifest.xml`). | No AccessibilityService, no VpnService |
-| `full` | F-Droid / direct download (never Play) | Same as `play`: **never** requests `READ_SMS` / `RECEIVE_SMS` / `SEND_SMS`, `MANAGE_EXTERNAL_STORAGE`, or any VPN permission **in either flavor** (see `app/src/full/AndroidManifest.xml`, `docs/CAPABILITY_MATRIX.md` §1–§2, `docs/ROADMAP.md` P1–P4, `docs/BACKLOG.md` B8/D15). SMS goes only via the system composer pre-fill; files go only via SAF + MediaStore + private storage. | AccessibilityService only (default off, two-step consent); no VpnService |
+| Flavor | Channel | Permissions | Services | applicationId |
+|--------|---------|-------------|----------|---------------|
+| `play` | Google Play only | Store-safe only: INTERNET, ACCESS_NETWORK_STATE, POST_NOTIFICATIONS, FOREGROUND_SERVICE. High-risk permissions are additionally stripped via `tools:node="remove"` (see `app/src/play/AndroidManifest.xml`). | No AccessibilityService, no VpnService | `dev.librepocket.agent` (base ID, no suffix) |
+| `foss` | F-Droid (all-OSS; only a F-Droid-built APK counts as official — see `TRADEMARKS.md`) | Same as `play`: **never** requests `READ_SMS` / `RECEIVE_SMS` / `SEND_SMS`, `MANAGE_EXTERNAL_STORAGE`, or any VPN permission **in any flavor** (see `app/src/foss/AndroidManifest.xml`, `docs/CAPABILITY_MATRIX.md` §1–§2, `docs/ROADMAP.md` P1–P4, `docs/BACKLOG.md` B8/D15). SMS goes only via the system composer pre-fill; files go only via SAF + MediaStore + private storage. | AccessibilityService only (`FossAccessibilityService`, default off, two-step consent); no VpnService | `dev.librepocket.agent.foss` (`applicationIdSuffix = ".foss"`) |
+| `github` | GitHub Releases only (direct download, never Play) | Same as `play` (see `app/src/github/AndroidManifest.xml`). | AccessibilityService only (`GithubAccessibilityService`, default off, two-step consent); no VpnService | `dev.librepocket.agent.github` (`applicationIdSuffix = ".github"`) |
 
 Base `applicationId = dev.librepocket.agent`
-(**reverse-DNS, permanent — it can never be changed after publication**,
-and F-Droid indexes the app under it). The `full` flavor appends
-`applicationIdSuffix = ".full"`, i.e. `dev.librepocket.agent.full`, so
-Play and full builds are co-installable side by side. They differ only in
-manifest content (full adds solely the accessibility automation service),
-never in base identity.
+(**reverse-DNS, permanent — it can never be changed after publication**;
+Play owns the base ID and F-Droid indexes the foss build under the `.foss`
+suffix). The `foss` / `github` flavors append `".foss"` / `".github"`, so all
+three builds are co-installable side by side. They differ only in manifest
+content (foss/github each add solely the accessibility automation service)
+and in the vision stack (foss: ZXing/Tesseract/LiteRT pure OSS in
+`src/foss`; github: ML Kit in `src/github` plus the OSS stack; play has
+neither — see `docs/ARCHITECTURE.md` §9.4), never in base identity.
+
+> History note: pre-1.0 docs used the name `full` for what is now the
+> `github` flavor (`dev.librepocket.agent.github`). `foss` is new. See
+> `docs/MIGRATION_FULL_TO_GITHUB.md`.
 
 Build them with:
 
 ```sh
-./gradlew :app:assemblePlayDebug :app:assembleFullDebug
+./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug
 ```
+
+Only the `github` APK is published to GitHub Releases (Play AAB/APK are
+policy self-proof, foss APKs are policy-checked but distributed via
+F-Droid) — see `.github/workflows/release.yml`.
 
 ## Tech baseline
 

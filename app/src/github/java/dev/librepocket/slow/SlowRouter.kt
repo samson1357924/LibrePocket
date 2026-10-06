@@ -1,7 +1,7 @@
 package dev.librepocket.slow
 
 /**
- * Slow-loop state machine (ARCHITECTURE §7, full-only per MATRIX §1).
+ * Slow-loop state machine (ARCHITECTURE §7, self-install-only per MATRIX §1).
  *
  * ```text
  * IDLE → RUNNING ⇄ PAUSED → (resume→RUNNING)
@@ -38,7 +38,7 @@ data class StepResult(
     val sideEffect: Boolean = false,
 )
 
-/** Executor hook: performs one atomic step (full-flavor wiring provides this). */
+/** Executor hook: performs one atomic step (flavor wiring provides this). */
 fun interface StepExecutor {
     fun execute(proposal: StepProposal): StepResult
 }

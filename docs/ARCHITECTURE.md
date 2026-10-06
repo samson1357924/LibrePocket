@@ -13,7 +13,7 @@
 - 所有「會改變外部世界」的能力都經過結構校驗、能力投影與使用者授權三道閘門。
 - 操作分快慢兩條路徑：確定性系統操作走快通道；需要看懂螢幕、逐步試錯的走慢通道。
 - 敏感資料預設不落地、不上傳，在記憶與日誌層可證明已被遮蔽。
-- Play 上架版本與完整版本共用同一程式碼基線，僅以編譯風味（flavor）開關能力。
+- Play 上架版本、F-Droid 版本與 GitHub 直裝版本共用同一程式碼基線，僅以編譯風味（flavor：`play` / `foss` / `github`）開關能力。
 
 ### 1.2 非目標
 
@@ -137,11 +137,11 @@ UI 層只允許根據事件渲染，禁止解析模型原始字串來觸發系�
 
 ### 6.1 動機
 
-同一工具在不同裝置條件下可用性不同（有無 Root、有無 Shizuku、Play 版或完整版）。若把全部工具都暴露給模型，模型會規劃出執行不了的路徑。能力投影在每輪裝配提示前，根據當前裝置實際狀態計算「本輪可見工具子集」。
+同一工具在不同裝置條件下可用性不同（有無 Root、有無 Shizuku、play/foss/github三風味）。若把全部工具都暴露給模型，模型會規劃出執行不了的路徑。能力投影在每輪裝配提示前，根據當前裝置實際狀態計算「本輪可見工具子集」。
 
 ### 6.2 投影輸入
 
-- 編譯風味：`play` / `full`；
+- 編譯風味：`play` / `foss` / `github`（`BuildConfig.FLAVOR`；投影以 `Flavor` 枚舉取值）；
 - 執行期探測：Root 可用性、Shizuku 連通性、系統版本、授權狀態；
 - 使用者開關：高風險類別是否啟用。
 
@@ -221,13 +221,13 @@ INTERRUPTED → RUNNING (使用者明確恢復) / CANCELLED
 流程：
 
 ```text
-截圖/無障礙節點（full 版限定）→ 螢幕語義壓縮 → 單步動作提議 →
+截圖/無障礙節點（foss / github 版限定）→ 螢幕語義壓縮 → 單步動作提議 →
 仲裁（是否越界/是否需確認）→ 執行一步 → 觀測變化 → 迴圈或升級/放棄
 ```
 
 約束：
 
-- 慢通道僅在完整版且使用者明確授權自動化開關後可見（能力投影直接隱藏）。
+- 慢通道僅在 foss / github 版且使用者明確授權自動化開關後可見（能力投影直接隱藏）。
 - 每步動作需滿足「可觀測、可撤銷或可重試」三選一，否則要求確認。
 - 設定步數與時間上限；超限自動降級為「生成手動操作指引」而非無限重試。
 - 慢通道產生的座標/節點動作寫入獨立審計表，與快通道 Intent 調用區分統計。
@@ -242,6 +242,26 @@ INTERRUPTED → RUNNING (使用者明確恢復) / CANCELLED
 4. 其餘 → 預設 Fast，失敗一次後可升級 Slow（需授權）。
 
 決策與理由碼寫入轉錄頭部。
+
+### 9.4 風味原始碼集隔離與視覺棧（`OcrEngine`）
+
+特權能力按風味原始碼集物理隔離，不用執行期 `if` 殘留：
+
+```text
+app/src/main/                    共用基線（Runtime / 投影 / OcrEngine 介面）
+app/src/play/                    Play 疊加層（僅 tools:node="remove" 守衛）
+app/src/foss/                    agent.foss（a11y 服務 + ZXing/Tesseract/LiteRT）
+app/src/github/                  agent.github（a11y 服務 + ML Kit + OSS 棧）
+app/src/testFoss/ | testGithub   風味單測（play 斷言見 androidTest + 政策腳本）
+```
+
+| 能力 | `play` | `foss` | `github` | 隔離手段 |
+|---|---|---|---|---|
+| `gui.automate` 慢通道 | 整個類別隱藏（`UNAVAILABLE` + `FLAVOR_BLOCKED`） | 可選（預設關，三重同意） | 可選（預設關，三重同意） | `SlowRouter` 等僅存 `src/github`；`AutomationPolicy` 對 play 恆 `false`；play dex 斷言不含 `agent/github/`、`agent/foss/` 前綴 |
+| a11y 自動化服務 | 無 | `FossAccessibilityService`（`src/foss`） | `GithubAccessibilityService`（`src/github`） | manifest 疊加層各放一份；`BIND_ACCESSIBILITY_SERVICE` 在 play 黑名單 |
+| OCR/條碼（`OcrEngine` / `BarcodeScanner`，`dev.librepocket.vision`） | 物理缺失（調用方按識別失敗降級） | `ZxingBarcodeScanner` + `TessOcrEngine` + `LiteRtOcrEngine`（純 OSS） | `MlKitOcrEngine` + `MlKitBarcodeScanner`（專有，foss 黑名單反向自證） | 介面在 `main`（零第三方 import）；實作各放風味源集；foss dex 斷言不引用 `mlkit` / `gms` |
+
+`OcrEngine` 契約：輸入一律 `ByteArray`（已解碼圖像位元組，不碰 `android.graphics.*`，JVM 可測）；骨架預設回空結果，調用方降級。投影三值（`play` / `foss` / `github`）即 `Flavor` 枚舉，`BuildConfig.FLAVOR` 只是它的構建期字串來源（見 `docs/ENV.md` §4）。
 
 ## 10. MCP / Skills / 記憶三層
 

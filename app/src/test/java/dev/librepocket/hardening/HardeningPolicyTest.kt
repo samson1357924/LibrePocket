@@ -40,11 +40,50 @@ class HardeningPolicyTest {
     @Test fun fullClassAndForbiddenSuperclass_flagged() {
         val violations = HardeningPolicy.checkPlayArtifact(
             permissions = emptyList(),
-            classDescriptors = listOf("Ldev/librepocket/agent/full/FullAccessibilityService;"),
+            classDescriptors = listOf("Ldev/librepocket/agent/github/GithubAccessibilityService;"),
             superclasses = listOf("Landroid/accessibilityservice/AccessibilityService;"),
-            services = listOf(".full.FullAccessibilityService"),
+            services = listOf(".github.GithubAccessibilityService"),
         )
         assertEquals(3, violations.size)
+    }
+
+    @Test fun fossClass_flaggedInPlay() {
+        val violations = HardeningPolicy.checkPlayArtifact(
+            permissions = emptyList(),
+            classDescriptors = listOf("Ldev/librepocket/agent/foss/FossAccessibilityService;"),
+            superclasses = emptyList(),
+            services = emptyList(),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().check.contains("class-blacklist"))
+    }
+
+    @Test fun cleanFossArtifact_passes() {
+        val violations = HardeningPolicy.checkFossArtifact(
+            classDescriptors = listOf(
+                "Ldev/librepocket/hardening/HardeningPolicy;",
+                "Ldev/librepocket/vision/foss/ZxingBarcodeScanner;",
+                "Lcom/google/zxing/MultiFormatReader;",
+                "Lcom/googlecode/tesseract/android/TessBaseAPI;",
+                "Lorg/tensorflow/lite/Interpreter;",
+            ),
+        )
+        assertTrue(violations.isEmpty())
+    }
+
+    @Test fun mlkitReference_flaggedInFoss() {
+        val violations = HardeningPolicy.checkFossArtifact(
+            classDescriptors = listOf("Lcom/google/mlkit/vision/common/InputImage;"),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().detail.contains("InputImage"))
+    }
+
+    @Test fun gmsReference_flaggedInFoss() {
+        val violations = HardeningPolicy.checkFossArtifact(
+            classDescriptors = listOf("Lcom/google/android/gms/common/api/Status;"),
+        )
+        assertEquals(1, violations.size)
     }
 
     @Test fun vpnSubclass_flagged() {

@@ -3,6 +3,7 @@
   Play flavor overlay: defense in depth. The base manifest already excludes
   high-risk permissions, but these explicit removals guarantee the Play APK
   can never request them, even if the base manifest changes later.
+  (Privileged services live only in the src/github + src/foss overlays.)
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">

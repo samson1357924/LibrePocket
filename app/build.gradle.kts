@@ -27,24 +27,33 @@ android {
         // Store-safe build: must never request high-risk permissions or declare
         // AccessibilityService / VpnService. The src/play manifest additionally
         // strips them with tools:node="remove" as a guard.
+        // applicationId has no suffix: play owns the base ID (dev.librepocket.agent).
         create("play") {
             dimension = "dist"
         }
-        // Full build for F-Droid / direct download: all capabilities enabled.
-        // Extra permissions and services come from the src/full manifest overlay.
-        // Decision: co-installable via ".full" suffix (Play vs Full can coexist).
-        create("full") {
+        // F-Droid / fully open-source build: OSS-only capabilities (ZXing /
+        // Tesseract / LiteRT, no Play services). Co-installable via ".foss".
+        // The a11y service overlay lands in Phase2 with FossAccessibilityService.
+        create("foss") {
             dimension = "dist"
-            applicationIdSuffix = ".full"
-            versionNameSuffix = "-full"
+            applicationIdSuffix = ".foss"
+        }
+        // Direct-download build: all capabilities enabled (ML Kit + OSS stack).
+        // Extra permissions and services come from the src/github manifest overlay.
+        // Decision: co-installable via ".github" suffix (github succeeds the former full flavor).
+        create("github") {
+            dimension = "dist"
+            applicationIdSuffix = ".github"
         }
     }
 
     buildTypes {
         debug {
-            // Skeleton only; no shrink rules needed yet.
+            // Debug builds always carry "-debug" (release stays pure semver).
+            versionNameSuffix = "-debug"
         }
         release {
+            // Release versionName is pure semver (no flavor/build suffixes).
             // Kept unminified until the codebase has keep-rules to validate.
             isMinifyEnabled = false
         }
@@ -94,4 +103,14 @@ dependencies {
     androidTestImplementation(libs.test.core)
     androidTestImplementation(libs.room.testing)
     androidTestImplementation(libs.mockwebserver)
+    // Phase1 vision/OCR stack (unreferenced stubs; wired in Phase2).
+    // ML Kit is proprietary → github-only; OSS stack → foss + github.
+    "githubImplementation"(libs.mlkit.barcode.scanning)
+    "githubImplementation"(libs.mlkit.text.recognition)
+    "fossImplementation"(libs.zxing.core)
+    "githubImplementation"(libs.zxing.core)
+    "fossImplementation"(libs.tess.two)
+    "githubImplementation"(libs.tess.two)
+    "fossImplementation"(libs.litert)
+    "githubImplementation"(libs.litert)
 }

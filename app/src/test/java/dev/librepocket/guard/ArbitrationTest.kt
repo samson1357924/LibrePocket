@@ -132,7 +132,7 @@ class ArbitrationTest {
         assertEquals(red.size, intercepted)
     }
 
-    // ---- src/full 接线投影断言（B5/B8，只用 main 的纯函数，不引用 full 类） ----
+    // ---- src/github 接线投影断言（B5/B8，只用 main 的纯函数，不引用 github 类） ----
 
     @Test fun defaultAutomationIsOff() {
         assertEquals(false, AutomationPolicy.DEFAULT_ENABLED)
@@ -146,37 +146,71 @@ class ArbitrationTest {
         assertTrue(ToolRegistry.visibleTools(ctx).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
     }
 
-    @Test fun fullShowsSlowOnlyWhenEffectivelyAutomated() {
-        val off = ProjectionContext(flavor = Flavor.FULL, automationEnabled = false)
-        assertTrue(ToolRegistry.visibleTools(off).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
+    @Test fun selfInstallShowsSlowOnlyWhenEffectivelyAutomated() {
+        for (flavor in listOf(Flavor.FOSS, Flavor.GITHUB)) {
+            val off = ProjectionContext(flavor = flavor, automationEnabled = false)
+            assertTrue(ToolRegistry.visibleTools(off).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
 
-        val effective = AutomationPolicy.effectiveAutomation(
-            flavorIsFull = true,
-            switchOn = true,
-            serviceGranted = true,
-            userConfirmed = true,
-        )
-        assertTrue(effective)
-        val on = ProjectionContext(flavor = Flavor.FULL, automationEnabled = effective)
-        assertTrue(ToolRegistry.visibleTools(on).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
+            val effective = AutomationPolicy.effectiveAutomation(
+                flavor = flavor,
+                switchOn = true,
+                serviceGranted = true,
+                userConfirmed = true,
+            )
+            assertTrue(effective)
+            val on = ProjectionContext(flavor = flavor, automationEnabled = effective)
+            assertTrue(ToolRegistry.visibleTools(on).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
+        }
     }
 
     @Test fun effectiveAutomationNeedsAllThreeConsents() {
+        // Play 风味即使三同意齐全也永远关（商店合规）。
         assertEquals(
             false,
-            AutomationPolicy.effectiveAutomation(true, switchOn = false, serviceGranted = true, userConfirmed = true),
+            AutomationPolicy.effectiveAutomation(
+                Flavor.PLAY,
+                switchOn = true,
+                serviceGranted = true,
+                userConfirmed = true,
+            ),
         )
-        assertEquals(
-            false,
-            AutomationPolicy.effectiveAutomation(true, switchOn = true, serviceGranted = false, userConfirmed = true),
-        )
-        assertEquals(
-            false,
-            AutomationPolicy.effectiveAutomation(true, switchOn = true, serviceGranted = true, userConfirmed = false),
-        )
-        assertEquals(
-            false,
-            AutomationPolicy.effectiveAutomation(false, switchOn = true, serviceGranted = true, userConfirmed = true),
-        )
+        for (flavor in listOf(Flavor.FOSS, Flavor.GITHUB)) {
+            assertEquals(
+                false,
+                AutomationPolicy.effectiveAutomation(
+                    flavor,
+                    switchOn = false,
+                    serviceGranted = true,
+                    userConfirmed = true,
+                ),
+            )
+            assertEquals(
+                false,
+                AutomationPolicy.effectiveAutomation(
+                    flavor,
+                    switchOn = true,
+                    serviceGranted = false,
+                    userConfirmed = true,
+                ),
+            )
+            assertEquals(
+                false,
+                AutomationPolicy.effectiveAutomation(
+                    flavor,
+                    switchOn = true,
+                    serviceGranted = true,
+                    userConfirmed = false,
+                ),
+            )
+            assertEquals(
+                true,
+                AutomationPolicy.effectiveAutomation(
+                    flavor,
+                    switchOn = true,
+                    serviceGranted = true,
+                    userConfirmed = true,
+                ),
+            )
+        }
     }
 }

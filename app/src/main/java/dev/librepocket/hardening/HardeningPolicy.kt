@@ -28,8 +28,9 @@ object HardeningPolicy {
 
     /**
      * Permissions the play artifact must never declare (CAPABILITY_MATRIX §2).
-     * `BIND_ACCESSIBILITY_SERVICE` covers the automation-service guard; full-only
-     * a11y lives exclusively under `src/full` and is asserted absent from play.
+     * `BIND_ACCESSIBILITY_SERVICE` covers the automation-service guard; self-install
+     * a11y lives exclusively under `src/github` (foss mirror: `src/foss`, Phase2)
+     * and is asserted absent from play.
      */
     val PLAY_PERMISSION_BLACKLIST: List<String> = listOf(
         "android.permission.SEND_SMS",
@@ -42,10 +43,26 @@ object HardeningPolicy {
 
     /**
      * Class-descriptor prefixes that must never be DEFINED in the play dex
-     * (full-flavor code, e.g. `Ldev/librepocket/agent/full/FullAccessibilityService;`).
+     * (self-install flavor code, e.g. `Ldev/librepocket/agent/github/GithubAccessibilityService;`).
      */
     val PLAY_CLASS_BLACKLIST: List<String> = listOf(
-        "Ldev/librepocket/agent/full/",
+        "Ldev/librepocket/agent/github/",
+        "Ldev/librepocket/agent/foss/",
+    )
+
+    /**
+     * Proprietary needles that must never be REFERENCED by the foss dex
+     * (fully open-source build: no Play services, no ML Kit).
+     *
+     * Stored in dot form on purpose: [checkFossArtifact] only scans
+     * `Class descriptor` entries (Dalvik `L...;` form, e.g.
+     * `Lcom/google/mlkit/vision/common/InputImage;`), which these dot-form
+     * literals can never equal — so the artifact scanner stays silent on
+     * the policy class itself (same self-match avoidance as above).
+     */
+    val FOSS_STRING_BLACKLIST: List<String> = listOf(
+        "com.google.mlkit",
+        "com.google.android.gms",
     )
 
     /**
@@ -96,6 +113,30 @@ object HardeningPolicy {
                 "vpnservice" in service.lowercase()
             ) {
                 out += Violation("service-blacklist", "play manifest registers '$service'")
+            }
+        }
+        return out
+    }
+
+    /**
+     * Pure foss-compliance check over extracted artifact facts.
+     *
+     * The foss build is fully open-source: its dex must never reference
+     * proprietary Play-services / ML Kit code. [classDescriptors] are the
+     * `Class descriptor` entries from `dexdump`; each [FOSS_STRING_BLACKLIST]
+     * needle is matched in Dalvik form (`L` + slashes + `/`), so the
+     * dot-form literals stored above can never self-match.
+     */
+    fun checkFossArtifact(
+        classDescriptors: Collection<String>,
+    ): List<Violation> {
+        val out = mutableListOf<Violation>()
+        for (descriptor in classDescriptors) {
+            val hit = FOSS_STRING_BLACKLIST.firstOrNull { needle ->
+                descriptor.startsWith("L" + needle.replace('.', '/') + "/")
+            }
+            if (hit != null) {
+                out += Violation("foss-string-blacklist", "foss dex references proprietary '$descriptor'")
             }
         }
         return out

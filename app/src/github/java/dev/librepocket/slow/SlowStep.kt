@@ -3,7 +3,7 @@ package dev.librepocket.slow
 /**
  * Single GUI steps the slow loop may propose (ARCHITECTURE §9.2).
  * Coordinates are screen pixels captured at proposal time; the
- * full-flavor executor re-validates them before acting.
+ * flavor executor re-validates them before acting.
  */
 sealed interface SlowAction {
     data class Tap(val nodeId: String) : SlowAction
@@ -32,7 +32,7 @@ enum class SlowRisk {
  * Minimal in-core arbitration predicate: payment / deletion / outbound
  * submission steps always require explicit user confirmation before the
  * executor runs. Pure function, no platform dependencies; the confirm
- * UI itself is wired by the full-flavor workstream.
+ * UI itself is wired by the flavor workstreams.
  */
 object SlowArbitrator {
     private val SENSITIVE_HINTS = listOf(

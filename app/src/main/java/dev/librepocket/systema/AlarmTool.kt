@@ -6,7 +6,7 @@ package dev.librepocket.systema
  * 主路徑無需任何權限；降級「自有提醒」才需要精準鬧鐘申報
  * （`SCHEDULE_EXACT_ALARM`，API 31+；或 `USE_EXACT_ALARM`，
  * Play 需在 Data Safety + 商店描述中披露用途，見 [fallback] 的
- * requiresDeclaration）。兩風味皆允許。
+ * requiresDeclaration）。三風味皆允許。
  */
 object AlarmTool : SystemTool<AlarmTool.Params> {
 

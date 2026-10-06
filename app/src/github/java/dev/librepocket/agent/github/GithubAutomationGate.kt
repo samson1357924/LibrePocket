@@ -1,4 +1,4 @@
-package dev.librepocket.agent.full
+package dev.librepocket.agent.github
 
 import dev.librepocket.guard.AutomationPolicy
 import dev.librepocket.tool.Flavor
@@ -6,14 +6,14 @@ import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
 
 /**
- * Full 风味自动化接线（BACKLOG B5/B8，MATRIX §1/§2 原创实现）。
+ * GitHub 风味自动化接线（BACKLOG B5/B8，MATRIX §1/§2 原创实现）。
  *
- * - 本文件只存在于 `src/full`，play 构建物理缺失；
+ * - 本文件只存在于 `src/github`，play 构建物理缺失；
  * - 总开关默认关（[DEFAULT_ENABLED] = false，与 [AutomationPolicy] 同源）；
  * - 两步同意：App 内开关 + 系统无障碍授权 + 当轮二次确认；
  * - 可见性唯一经由 [ToolRegistry.projectAll] 计算，不手写白名单。
  */
-object FullAutomationGate {
+object GithubAutomationGate {
 
     const val SWITCH_KEY: String = AutomationPolicy.SWITCH_KEY
 
@@ -25,7 +25,7 @@ object FullAutomationGate {
         serviceGranted: Boolean = false,
         userConfirmed: Boolean = false,
     ): Boolean = AutomationPolicy.effectiveAutomation(
-        flavorIsFull = true,
+        flavor = Flavor.GITHUB,
         switchOn = switchOn,
         serviceGranted = serviceGranted,
         userConfirmed = userConfirmed,
@@ -38,7 +38,7 @@ object FullAutomationGate {
         grantedPermissions: Set<String> = emptySet(),
         userSwitches: Map<String, Boolean> = emptyMap(),
     ): ProjectionContext = ProjectionContext(
-        flavor = Flavor.FULL,
+        flavor = Flavor.GITHUB,
         automationEnabled = effectiveAutomation(switchOn, serviceGranted, userConfirmed),
         grantedPermissions = grantedPermissions,
         userSwitches = userSwitches,

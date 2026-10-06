@@ -231,7 +231,7 @@ object JevBudgets {
 Jev OK → Jev 快判
 Jev TIMEOUT/ABSTAIN → 本步降級：路由回規則引擎+大模型；grounding 回 VLM 看一次；風控回 Policy 預設（保守 ASK）
 Jev UNAVAILABLE/連續失敗熔斷 → 整輪降級：等價於「無 Jev 的 Eta」（現狀行為），功能不中斷
-Play 風味 → Jev 的 GUI 重排分支整包不存在（與 SlowRouter 同進退，`src/full` only）
+Play 風味 → Jev 的 GUI 重排分支整包不存在（與 SlowRouter 同進退，`src/foss` + `src/github` only）
 ```
 
 - `NoOpJevRouter` 語義：Choice 永遠 abstain；Score 對 WRITE 以上給 0.6（觸發確認）；Noul 對 PRIVILEGED 永遠 needConfirm。方向只收緊。
@@ -278,7 +278,7 @@ Play 風味 → Jev 的 GUI 重排分支整包不存在（與 SlowRouter 同進�
 | `JevCacheTest` | JVM | 同鍵命中零調用；投影變化失效；高風險不快取；快取僅記憶體（進程重啟消失） |
 | `JevLatencyTest` | Harness/真機 | AndroidWorld 腳本：簡單指令 p95 <300ms；Slow 單步 p95 <800ms；回退率 <5% |
 | `JevPrivacyTest` | JVM | 送 Jev 前過 Redactor（含 R1–R12）；傳輸體/日誌/轉錄三處掃描無原文；截圖位元組永不進 Jev 請求 |
-| Play 風味斷言 | Instrumented | play 包無 Slow/Jev-grounding 類（字串掃描 + `src/play` 無檔案） |
+| Play 風味斷言 | Instrumented | play 包無 Slow/Jev-grounding 類（字串掃描 + `src/play` 無檔案）；foss/github 包含實作但投影預設隱藏 |
 
 Fixture：`jev-route-cases.txt`（`input || expectedId || minConf`）、`jev-nodes-*.json`（錄製節點樹+真值 node）、`jev-risk-cases.txt`（越界指令集，紅隊）。
 

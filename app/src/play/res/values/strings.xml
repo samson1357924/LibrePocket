@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Play flavor label: pinned explicitly so store listing never inherits another flavor's name. -->
+    <string name="app_name">LibrePocket</string>
+</resources>

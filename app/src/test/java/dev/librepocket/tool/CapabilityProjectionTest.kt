@@ -13,8 +13,13 @@ import org.junit.Test
 class CapabilityProjectionTest {
 
     private val playBase = ProjectionContext(flavor = Flavor.PLAY)
-    private val fullAuto = ProjectionContext(
-        flavor = Flavor.FULL,
+    private val fossAuto = ProjectionContext(
+        flavor = Flavor.FOSS,
+        automationEnabled = true,
+        grantedPermissions = setOf("android.permission.READ_CALENDAR", "listener:notification"),
+    )
+    private val githubAuto = ProjectionContext(
+        flavor = Flavor.GITHUB,
         automationEnabled = true,
         grantedPermissions = setOf("android.permission.READ_CALENDAR", "listener:notification"),
     )
@@ -35,12 +40,23 @@ class CapabilityProjectionTest {
         assertTrue(ToolRegistry.visibleTools(playBase).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
     }
 
-    @Test fun fullWithAutomationShowsSlowChannel() {
-        assertTrue(ToolRegistry.visibleTools(fullAuto).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
+    @Test fun fossWithAutomationShowsSlowChannel() {
+        assertTrue(ToolRegistry.visibleTools(fossAuto).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
     }
 
-    @Test fun fullWithoutAutomationDeniesSlowAsUserDisabled() {
-        val ctx = ProjectionContext(flavor = Flavor.FULL, automationEnabled = false)
+    @Test fun githubWithAutomationShowsSlowChannel() {
+        assertTrue(ToolRegistry.visibleTools(githubAuto).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
+    }
+
+    @Test fun fossWithoutAutomationDeniesSlowAsUserDisabled() {
+        val ctx = ProjectionContext(flavor = Flavor.FOSS, automationEnabled = false)
+        val projected = ToolRegistry.projectAll(ctx)[ToolRegistry.SLOW_TOOL_NAME]!!
+        assertEquals(CapabilityLevel.UNAVAILABLE, projected.level)
+        assertEquals(DenyReason.USER_DISABLED, projected.reason)
+    }
+
+    @Test fun githubWithoutAutomationDeniesSlowAsUserDisabled() {
+        val ctx = ProjectionContext(flavor = Flavor.GITHUB, automationEnabled = false)
         val projected = ToolRegistry.projectAll(ctx)[ToolRegistry.SLOW_TOOL_NAME]!!
         assertEquals(CapabilityLevel.UNAVAILABLE, projected.level)
         assertEquals(DenyReason.USER_DISABLED, projected.reason)

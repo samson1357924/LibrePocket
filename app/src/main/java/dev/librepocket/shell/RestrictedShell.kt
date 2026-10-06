@@ -128,7 +128,7 @@ class ShellQuota(
  * 檔案域：[privateRoot] 為 App 私有域根（例 `context.filesDir.absolutePath`），
  * 檔案參數凡絕對路徑一律先過 `FileScope.decide`（見 [ShellPolicy.validate]）。
  * 未配置（null，預設）時任何絕對路徑一律拒絕（fail-closed）；play 跨域拒絕，
- * full 跨域即使橋接已授權，直接 exec 仍拒絕（需改走 D09 橋）。
+ * foss/github 跨域即使橋接已授權，直接 exec 仍拒絕（需改走 D09 橋）。
  */
 class RestrictedShell(
     private val quota: ShellQuota = ShellQuota(),

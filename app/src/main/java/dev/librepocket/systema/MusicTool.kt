@@ -1,7 +1,7 @@
 package dev.librepocket.systema
 
 /**
- * 音樂工具：媒體 Intent + MediaSession 前台（兩風味皆完整，矩陣 §1 列 10）。
+ * 音樂工具：媒體 Intent + MediaSession 前台（三風味皆完整，矩陣 §1 列 10）。
  *
  * - 點播：VIEW Intent 帶曲目/搜尋 URI，交給系統播放器。
  * - 控制（暫停/下一首等）：MEDIA_BUTTON 語義的 [ControlSpec]，

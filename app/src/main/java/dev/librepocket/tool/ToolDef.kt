@@ -38,7 +38,7 @@ data class ToolDef(
     val jsonSchema: String,
     val sideEffect: SideEffect,
     val annotations: ToolAnnotations = ToolAnnotations(),
-    val supportedFlavors: Set<Flavor> = setOf(Flavor.PLAY, Flavor.FULL),
+    val supportedFlavors: Set<Flavor> = setOf(Flavor.PLAY, Flavor.FOSS, Flavor.GITHUB),
 ) {
     fun project(ctx: ProjectionContext): Projection {
         if (ctx.flavor !in supportedFlavors) {

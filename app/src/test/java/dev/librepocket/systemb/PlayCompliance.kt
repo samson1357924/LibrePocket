@@ -4,7 +4,7 @@ package dev.librepocket.systemb
  * Play 合規審計常量（僅測試源集）。
  *
  * B8 要求 play dex 字串掃描零匹配，為避免 `android.permission.*` 字面被編入
- * main dex（雙風味共用），拒絕清單只保留在測試源集。此處邏輯與原 main 常量一致，
+ * main dex（三風味共用），拒絕清單只保留在測試源集。此處邏輯與原 main 常量一致，
  * 供 [SystemBMappingTest] 斷言「拒絕零請求」使用；生產碼永不申請此處列出的權限，
  * 且生產碼本身不引用本對象（見 main/SystemBModels.kt 註解）。
  */

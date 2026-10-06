@@ -6,7 +6,7 @@ package dev.librepocket.systema
  * - 建事件：優先 `ACTION_INSERT` 委託系統日曆 App（免 `WRITE_CALENDAR`，
  *   由系統 App 完成最後一步，符合 PRIVILEGED→系統接管語義）。
  * - 查事件：經 Calendar Provider，需 `READ_CALENDAR`（[checkQuery] 斷言）。
- * - 兩風味皆允許；Play 需申報日曆權限 + 用途披露（矩陣 §1 列 7）。
+ * - 三風味皆允許；Play 需申報日曆權限 + 用途披露（矩陣 §1 列 7）。
  */
 object CalendarTool : SystemTool<CalendarTool.EventParams> {
 

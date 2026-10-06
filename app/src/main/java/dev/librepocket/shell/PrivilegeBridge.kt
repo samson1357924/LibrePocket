@@ -7,7 +7,7 @@ import java.io.File
  *
  * - 本層只做「探測」，不實作任何提權執行：[ElevatedShellRunner] 沒有預設
  *   真實現，呼叫一律被 [DenyingElevatedRunner] 拒絕。
- * - Shizuku/Root 的真正橋接屬於 full 風味後續工作（D09），屆時在風味源集
+ * - Shizuku/Root 的真正橋接屬於 foss/github 風味後續工作（D09），屆時在風味源集
  *   另行提供實現；play 風味永遠不可見提權路徑。
  */
 enum class Privilege {
@@ -29,7 +29,7 @@ data class ElevatedRequest(
 
 /**
  * 提權執行器介面（僅介面）。D05 階段不提供真實現；
- * D09 在 full 源集落地前，呼叫方應使用 [DenyingElevatedRunner]。
+ * D09 在 foss/github 源集落地前，呼叫方應使用 [DenyingElevatedRunner]。
  */
 interface ElevatedShellRunner {
     fun run(request: ElevatedRequest, timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS): ShellResult
@@ -48,7 +48,7 @@ class DenyingElevatedRunner(
  *
  * - 預設 su 探測只做常見路徑存在性檢查，不執行任何二進位。
  * - Shizuku 預設探測固定回 false（真實 binder 檢查需 Android/Shizuku 依賴，
- *   由 full 風味的 D09 實現注入）；兩探測函數均可注入，便於單測。
+ *   由 foss/github 風味的 D09 實現注入）；兩探測函數均可注入，便於單測。
  */
 class PrivilegeProbe(
     private val shizukuProbe: () -> Boolean = { false },

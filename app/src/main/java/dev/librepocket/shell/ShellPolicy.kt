@@ -113,7 +113,7 @@ object ShellPolicy {
      * @param privateRoot App 私有域根；null 表示未配置作用域，
      *   此時任何絕對路徑參數一律拒絕（fail-closed）。
      * @param safRoots 已授權 SAF 樹前綴。
-     * @param flavor 風味：play 跨域一律拒絕；full 跨域即使橋接已授權，
+     * @param flavor 風味：play 跨域一律拒絕；foss/github 跨域即使橋接已授權，
      *   直接 exec 仍拒絕（需改走 D09 橋，[FileScope.decide] 回 needsBridge）。
      */
     fun validate(

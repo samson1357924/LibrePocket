@@ -33,8 +33,8 @@ jobs:
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
-      - name: Run Unit Tests (Play & Full Flavors)
-        run: ./gradlew :app:testPlayDebugUnitTest :app:testFullDebugUnitTest --continue
+      - name: Run Unit Tests (Play, Foss & GitHub Flavors)
+        run: ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --continue
 
       - name: Upload Test Reports
         if: failure()
@@ -63,8 +63,8 @@ jobs:
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
-      - name: Run Android Lint (Play & Full Flavors)
-        run: ./gradlew :app:lintPlayDebug :app:lintFullDebug
+      - name: Run Android Lint (Play, Foss & GitHub Flavors)
+        run: ./gradlew :app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug
 
       - name: Upload Lint Reports
         if: failure()
@@ -75,7 +75,7 @@ jobs:
           retention-days: 7
 
   build-and-policy-gate:
-    name: Build & Play Policy Gate
+    name: Build & Policy Gates
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -94,7 +94,7 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Assemble Debug APKs
-        run: ./gradlew :app:assemblePlayDebug :app:assembleFullDebug
+        run: ./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug
 
       - name: Configure Android SDK build-tools for aapt & dexdump
         run: |
@@ -109,6 +109,11 @@ jobs:
         run: |
           chmod +x scripts/play_policy_check.sh
           scripts/play_policy_check.sh app/build/outputs/apk/play/debug/app-play-debug.apk
+
+      - name: Run Foss Policy Check (ROADMAP D07)
+        run: |
+          chmod +x scripts/play_policy_check.sh
+          scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
 
       - name: Upload Debug APKs
         if: success()

@@ -65,7 +65,7 @@ jobs:
           languages: java-kotlin
 
       - name: Compile Kotlin & Java Sources
-        run: ./gradlew :app:compilePlayDebugSources :app:compileFullDebugSources
+        run: ./gradlew :app:compilePlayDebugSources :app:compileFossDebugSources :app:compileGithubDebugSources
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3

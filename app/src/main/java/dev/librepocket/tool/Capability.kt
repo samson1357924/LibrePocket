@@ -1,9 +1,11 @@
 package dev.librepocket.tool
 
-/** Build flavor: store-safe (`play`) vs full (`full`, self-installed). */
+/** Build flavor: store-safe (`play`) vs self-installed (`foss`, fully
+ * open-source; `github`, direct download with proprietary services). */
 enum class Flavor {
     PLAY,
-    FULL,
+    FOSS,
+    GITHUB,
 }
 
 /** Per-tool availability for this round (ARCHITECTURE §6.3). */
@@ -27,7 +29,7 @@ enum class DenyReason {
  * Inputs to the capability projection pure function (ARCHITECTURE §6.2).
  *
  * @param flavor compile flavor.
- * @param automationEnabled master switch for screen automation (full only).
+ * @param automationEnabled master switch for screen automation (foss/github only).
  * @param userSwitches per-category user toggles, e.g. "screenshot" to false.
  *   Missing keys fall back to each tool's declared default.
  * @param grantedPermissions runtime/system grants already held, e.g.

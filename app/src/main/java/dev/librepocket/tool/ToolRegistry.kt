@@ -3,7 +3,7 @@ package dev.librepocket.tool
 /**
  * Built-in tool registry: the 11 P2 fast-channel tools (BACKLOG B3,
  * CAPABILITY_MATRIX §1) plus the slow-channel descriptor used only for
- * projection (hidden on play, full-only, default off).
+ * projection (hidden on play, foss/github-only, default off).
  *
  * Compliance red lines (MATRIX §2), enforced here and asserted by tests:
  * - phone uses `ACTION_DIAL` prefill only, never `ACTION_CALL`;
@@ -190,7 +190,7 @@ object ToolRegistry {
     val SLOW_TOOLS: List<ToolDef> = listOf(
         ToolDef(
             name = SLOW_TOOL_NAME,
-            description = "Screen-understanding GUI automation (full flavor only, default off).",
+            description = "Screen-understanding GUI automation (foss/github only, default off).",
             jsonSchema = schema(
                 prop("goal", "string", "What to achieve on screen"),
                 required = "\"goal\"",
@@ -201,7 +201,7 @@ object ToolRegistry {
                 switchDefault = false,
                 fallbackHint = "follow the generated manual step-by-step guide",
             ),
-            supportedFlavors = setOf(Flavor.FULL),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
         ),
     )
 

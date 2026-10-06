@@ -73,27 +73,31 @@ class FileScopeTest {
         assertFalse(d.allowed)
     }
 
-    @Test fun fullCrossDomainNeedsBridgeWithoutGrant() {
-        val d = FileScope.decide(
-            "/sdcard/Download/other/x.txt",
-            privateRoot,
-            flavor = Flavor.FULL,
-            bridgeGranted = false,
-        )
-        assertFalse(d.allowed)
-        assertEquals(FileScope.CODE_NEEDS_BRIDGE, d.code)
-        assertEquals(DenyReason.NO_PRIVILEGE, d.denyReason)
+    @Test fun selfInstallCrossDomainNeedsBridgeWithoutGrant() {
+        for (flavor in listOf(Flavor.FOSS, Flavor.GITHUB)) {
+            val d = FileScope.decide(
+                "/sdcard/Download/other/x.txt",
+                privateRoot,
+                flavor = flavor,
+                bridgeGranted = false,
+            )
+            assertFalse(d.allowed)
+            assertEquals(FileScope.CODE_NEEDS_BRIDGE, d.code)
+            assertEquals(DenyReason.NO_PRIVILEGE, d.denyReason)
+        }
     }
 
-    @Test fun fullCrossDomainAllowedOnlyWithBridge() {
-        val d = FileScope.decide(
-            "/sdcard/Download/other/x.txt",
-            privateRoot,
-            flavor = Flavor.FULL,
-            bridgeGranted = true,
-        )
-        assertTrue(d.allowed)
-        assertTrue(d.needsBridge)
+    @Test fun selfInstallCrossDomainAllowedOnlyWithBridge() {
+        for (flavor in listOf(Flavor.FOSS, Flavor.GITHUB)) {
+            val d = FileScope.decide(
+                "/sdcard/Download/other/x.txt",
+                privateRoot,
+                flavor = flavor,
+                bridgeGranted = true,
+            )
+            assertTrue(d.allowed)
+            assertTrue(d.needsBridge)
+        }
     }
 
     // ---- 檔名衛生 ----

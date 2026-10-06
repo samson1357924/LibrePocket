@@ -5,7 +5,7 @@ import java.net.URLEncoder
 /**
  * 導航工具：geo Intent 優先，無地圖 App 時降級走網頁地圖。
  *
- * 兩風味皆完整（矩陣 §1 列 1）。不申請位置權限：導航本身免權限，
+ * 三風味皆完整（矩陣 §1 列 1）。不申請位置權限：導航本身免權限，
  * 只有「定位」才需前台定位授權，本工具不做定位。
  */
 object NavigationTool : SystemTool<NavigationTool.Params> {

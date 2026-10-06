@@ -47,6 +47,29 @@ android {
         }
     }
 
+    // Release signing (keystores/release-<flavor>.p12, gitignored).
+    // Secrets come from the environment so local (.env, Bitwarden) and CI
+    // (GitHub Actions Secrets) share one path:
+    //   <FLAVOR>_KEYSTORE_FILE      (optional, defaults to keystores/release-<flavor>.p12)
+    //   <FLAVOR>_KEYSTORE_PASSWORD  (storepass == keypass)
+    //   <FLAVOR>_KEY_ALIAS          (optional, defaults to librepocket-<flavor>)
+    // Unsigned release builds still work (AGP signs with the debug key and
+    // warns); flavors whose keystore/password is absent fail at signing time
+    // with a clear message — never silently.
+    signingConfigs {
+        listOf("play", "foss", "github").forEach { flavor ->
+            create(flavor) {
+                val prefix = flavor.uppercase()
+                val filePath = System.getenv("${prefix}_KEYSTORE_FILE")
+                    ?: "keystores/release-$flavor.p12"
+                storeFile = rootProject.file(filePath)
+                storePassword = System.getenv("${prefix}_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("${prefix}_KEY_ALIAS") ?: "librepocket-$flavor"
+                keyPassword = System.getenv("${prefix}_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         debug {
             // Debug builds always carry "-debug" (release stays pure semver).
@@ -56,6 +79,21 @@ android {
             // Release versionName is pure semver (no flavor/build suffixes).
             // Kept unminified until the codebase has keep-rules to validate.
             isMinifyEnabled = false
+        }
+    }
+
+    // Release-only signing: debug variants always keep the debug key, so local
+    // development never needs passwords. The blessed path is
+    // scripts/build_release.sh, which passes -PreleaseSigning=true; a direct
+    // `./gradlew bundleXxxRelease` without the flag yields an unsigned
+    // (debug-signed) artifact, exactly as before this change.
+    // (Assigned per-flavor here rather than via applicationVariants, which
+    // AGP 9 removed; a buildType-level assignment could not differ per flavor.)
+    if (providers.gradleProperty("releaseSigning").map { it.toBoolean() }.getOrElse(false)) {
+        listOf("play", "foss", "github").forEach { flavor ->
+            productFlavors.getByName(flavor) {
+                signingConfig = signingConfigs.getByName(flavor)
+            }
         }
     }
     compileOptions {

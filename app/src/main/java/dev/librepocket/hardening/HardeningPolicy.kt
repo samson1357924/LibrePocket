@@ -89,6 +89,25 @@ object HardeningPolicy {
         "Landroid/accessibilityservice/AccessibilityService;",
     )
 
+    /**
+     * S4 play gate: zip-entry substrings for on-device Linux payload.
+     *
+     * Matching is case-insensitive.
+     * It covers the PRoot binary (`proot`).
+     * It covers container paths (`rootfs`, `linux/image`).
+     * Rootfs is download-only in every flavor.
+     * No source set ships these payloads.
+     * Any such entry in the play APK/AAB is a packaging regression.
+     * The play gate fails the build on the first hit.
+     * Mirrored by `scripts/play_policy_check.sh` (S4 section).
+     * Note: this is a zip-entry scan, not a dex scan.
+     */
+    val PLAY_LINUX_ENTRY_BLACKLIST: List<String> = listOf(
+        "proot",
+        "rootfs",
+        "linux/image",
+    )
+
     /** Result of [checkPlayArtifact]; empty means compliant. */
     data class Violation(val check: String, val detail: String)
 
@@ -159,6 +178,30 @@ object HardeningPolicy {
             }
             if (hit != null) {
                 out += Violation("foss-string-blacklist", "foss dex references proprietary '$descriptor'")
+            }
+        }
+        return out
+    }
+
+    /**
+     * Pure S4 play-compliance check over zip entry names.
+     *
+     * Input is `unzip -l` of the APK/AAB.
+     * Any entry containing a [PLAY_LINUX_ENTRY_BLACKLIST] needle is a violation.
+     * Matching is case-insensitive.
+     * The PRoot binary must never ship inside the play artifact.
+     * Container image/rootfs must never ship inside the play artifact.
+     * Rootfs is download-only in all flavors.
+     */
+    fun checkPlayLinuxEntries(
+        entries: Collection<String>,
+    ): List<Violation> {
+        val out = mutableListOf<Violation>()
+        for (entry in entries) {
+            val lower = entry.lowercase()
+            val hit = PLAY_LINUX_ENTRY_BLACKLIST.firstOrNull { it in lower }
+            if (hit != null) {
+                out += Violation("linux-entry-blacklist", "play artifact embeds on-device Linux payload '$entry'")
             }
         }
         return out

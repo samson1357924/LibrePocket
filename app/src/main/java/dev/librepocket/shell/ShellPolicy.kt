@@ -110,6 +110,9 @@ object ShellPolicy {
      * → find 高危謂詞 → 檔案域（絕對路徑經 [FileScope.decide]）。
      * 呼叫方（[RestrictedShell]）必須先調此函數，拒絕時不得建子進程。
      *
+     * @param allowedBinaries 白名單集合（預設 [ALLOWED_BINARIES]；S4
+     *   `linux.exec` 傳聯集，黑名單/參數衛生/find 封堵/檔案域邏輯完全繼承，
+     *   僅白名單放寬）。
      * @param privateRoot App 私有域根；null 表示未配置作用域，
      *   此時任何絕對路徑參數一律拒絕（fail-closed）。
      * @param safRoots 已授權 SAF 樹前綴。
@@ -122,6 +125,7 @@ object ShellPolicy {
         safRoots: List<String> = emptyList(),
         flavor: Flavor = Flavor.PLAY,
         bridgeGranted: Boolean = false,
+        allowedBinaries: Set<String> = ALLOWED_BINARIES,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
@@ -152,7 +156,7 @@ object ShellPolicy {
                 return Validation.Denied(ShellDeny.BAD_ARGUMENT, "NUL byte denied")
             }
         }
-        if (base !in ALLOWED_BINARIES) {
+        if (base !in allowedBinaries) {
             return Validation.Denied(ShellDeny.NOT_WHITELISTED, "not whitelisted: $base")
         }
         // find 沙箱逃逸封堵：高危謂詞命中任一即拒絕（不建子進程）。

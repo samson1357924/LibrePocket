@@ -8,11 +8,18 @@
 
   File inventory (see EncryptedPrefsVault.PREFS_FILE):
   - sharedpref/librepocket_keys.xml ........... EncryptedSharedPreferences key file
-  - database/librepocket_vault* ............... future DataStore/Tink vault files
-  - files/librepocket_keyset_* ................ future Tink keyset files
+  - database/librepocket_vault ............... future DataStore/Tink vault DB
+  - database/librepocket_vault-wal/-shm ...... its SQLite WAL sidecars (separate files!)
+  - files/librepocket_keysets/ ............... future Tink keyset DIRECTORY
+      (backup `path` is an exact file-or-directory match, NOT a glob/prefix:
+      a whole directory must be excluded, never a filename prefix)
+
+  Contract: Tink keysets MUST be created under files/librepocket_keysets/.
 -->
 <full-backup-content>
     <exclude domain="sharedpref" path="librepocket_keys.xml" />
     <exclude domain="database" path="librepocket_vault" />
-    <exclude domain="file" path="librepocket_keyset_" />
+    <exclude domain="database" path="librepocket_vault-wal" />
+    <exclude domain="database" path="librepocket_vault-shm" />
+    <exclude domain="file" path="librepocket_keysets" />
 </full-backup-content>

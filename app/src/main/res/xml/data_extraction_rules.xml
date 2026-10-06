@@ -5,16 +5,23 @@
   Mirrors backup_rules.xml: the same key files are excluded from BOTH
   cloud backup and D2D transfer. After a device migration the user
   re-enters provider keys; sessions restore without them.
+
+  NOTE: backup `path` is exact-match (no globs): WAL sidecars are listed
+  explicitly and keysets live under the files/librepocket_keysets/ directory.
 -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="librepocket_keys.xml" />
         <exclude domain="database" path="librepocket_vault" />
-        <exclude domain="file" path="librepocket_keyset_" />
+        <exclude domain="database" path="librepocket_vault-wal" />
+        <exclude domain="database" path="librepocket_vault-shm" />
+        <exclude domain="file" path="librepocket_keysets" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="librepocket_keys.xml" />
         <exclude domain="database" path="librepocket_vault" />
-        <exclude domain="file" path="librepocket_keyset_" />
+        <exclude domain="database" path="librepocket_vault-wal" />
+        <exclude domain="database" path="librepocket_vault-shm" />
+        <exclude domain="file" path="librepocket_keysets" />
     </device-transfer>
 </data-extraction-rules>

@@ -23,11 +23,18 @@ object BackupPolicy {
     /**
      * Key-file inventory excluded from system backup (mirrors the two
      * `res/xml` rule files; see EncryptedPrefsVault.PREFS_FILE).
+     *
+     * NOTE: Android backup `path` is an exact file-or-directory match (no
+     * globs/prefixes), so keysets are isolated in their own directory and WAL
+     * sidecars are listed explicitly. Keyset files MUST be created under
+     * `files/librepocket_keysets/` for the exclusion to apply.
      */
     val KEY_FILES_EXCLUDED: List<String> = listOf(
         "sharedpref/librepocket_keys.xml",
         "database/librepocket_vault",
-        "file/librepocket_keyset_",
+        "database/librepocket_vault-wal",
+        "database/librepocket_vault-shm",
+        "file/librepocket_keysets",
     )
 
     /** Closed export mode: transcripts export redacted unless double-confirmed. */

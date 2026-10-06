@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Full flavor only. Shown on the system Accessibility settings screen. -->
+    <string name="accessibility_description">LibrePocket full-build helper (placeholder, no behavior yet).</string>
+</resources>

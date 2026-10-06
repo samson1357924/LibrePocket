@@ -1,0 +1,8 @@
+LibrePocket – Open Mobile AI Agent
+Copyright 2026 LibrePocket Contributors
+
+This product includes software developed by the LibrePocket project
+(https://github.com/librepocket — placeholder until the real home is chosen).
+
+Third-party components and their licenses are declared in the Gradle
+version catalog (gradle/libs.versions.toml) and their own NOTICE files.

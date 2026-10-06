@@ -3,7 +3,8 @@ package dev.librepocket.redact
 import kotlin.text.RegexOption.IGNORE_CASE
 
 /**
- * P1 redaction table (M5, spec §6).
+ * P1 redaction table (M5, spec §6: R1–R12) plus R13 GEO_COORD, a beyond-spec
+ * hardening addition (B3: coordinates must not reach transcript/audit/export).
  *
  * Pure functions; zero Android dependencies so plain JVM unit tests can run them.
  * Rules apply sequentially R1..R13; [RedactResult.hits] counts matches per rule
@@ -101,7 +102,12 @@ object Redactor {
     private const val CARD_RULE_ID = "CARD_16"
     private const val CARD_REPLACEMENT = "⟦REDACTED:CARD⟧"
 
-    /** Error-message subset (spec §6.5): keys/tokens/URLs + private IPs + GEO, then truncate. */
+    /**
+     * Error-message subset: spec §6.5 (keys/tokens/URLs + private IPs) PLUS
+     * GEO_COORD as beyond-spec hardening — error/log strings are a
+     * coordinate-leak path (e.g. NavigationTool failures), so coordinates
+     * are stripped here too. Truncated to [ERROR_MAX_CHARS] characters.
+     */
     private val ERROR_RULE_IDS = setOf(
         "API_KEY_VALUE",
         "BEARER_TOKEN",
@@ -114,7 +120,7 @@ object Redactor {
 
     const val ERROR_MAX_CHARS = 500
 
-    /** Full redaction: applies R1–R13 in order. */
+    /** Full redaction: applies R1–R13 in order (R13 GEO is beyond-spec; see class KDoc). */
     fun redact(input: String): RedactResult {
         var text = input
         val hits = LinkedHashMap<String, Int>()
@@ -135,8 +141,9 @@ object Redactor {
     }
 
     /**
-     * Stricter error-message redaction (spec §6.5): R1–R5 + R11 + GEO only,
-     * truncated to [ERROR_MAX_CHARS] characters.
+     * Stricter error-message redaction: spec §6.5 (R1–R5 + R11) plus GEO_COORD
+     * (beyond-spec, see [ERROR_RULE_IDS]), truncated to [ERROR_MAX_CHARS]
+     * characters.
      */
     fun redactError(input: String): String {
         var text = input

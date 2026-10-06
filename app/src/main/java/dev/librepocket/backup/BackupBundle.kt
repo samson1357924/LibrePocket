@@ -5,6 +5,7 @@ import java.security.MessageDigest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -36,6 +37,8 @@ data class BackupSession(
     val createdAt: Long,
     val updatedAt: Long,
     val events: List<BackupEvent>,
+    /** Mirrors SessionEntity.pinned (prune exemption); default false keeps old bundles decodable. */
+    val pinned: Boolean = false,
 )
 
 /**
@@ -46,8 +49,11 @@ data class BackupSession(
  * - [keys] is the staging field for key material: [BackupCodec.encode] drops
  *   it unless the caller passes `includeKeys = true`. The default path therefore
  *   cannot serialize a key even if the caller staged one by mistake.
- * - [integrity] is a SHA-256 over the canonical payload, verified on decode;
+ * - [integrity] is a SHA-256 over the payload serialization, verified on decode;
  *   a restored bundle with a mismatch is rejected before anything is applied.
+ *   NOTE: the serialization is insertion-ordered, not canonical JSON — the hash
+ *   is a same-library self-check against corruption, not a cross-platform
+ *   signature (an attacker who can rewrite the payload can recompute it).
  */
 data class BackupBundle(
     val version: Int = BUNDLE_VERSION,
@@ -75,6 +81,7 @@ object BackupCodec {
                         put("model", s.model)
                         put("createdAt", s.createdAt)
                         put("updatedAt", s.updatedAt)
+                        put("pinned", s.pinned)
                         put(
                             "events",
                             JsonArray(s.events.map { e ->
@@ -146,7 +153,7 @@ object BackupCodec {
                     )
                 } ?: fail("missing events")
                 val seqs = events.map { it.seq }
-                check(seqs == seqs.sorted() && seqs.toSet().size == seqs.size) { "event seqs not ordered/unique" }
+                if (seqs != seqs.sorted() || seqs.toSet().size != seqs.size) fail("event seqs not ordered/unique")
                 BackupSession(
                     sessionId = str("sessionId"),
                     title = str("title"),
@@ -154,6 +161,9 @@ object BackupCodec {
                     createdAt = so["createdAt"]?.jsonPrimitive?.longOrNull ?: fail("session.createdAt"),
                     updatedAt = so["updatedAt"]?.jsonPrimitive?.longOrNull ?: fail("session.updatedAt"),
                     events = events,
+                    pinned = so["pinned"]?.let {
+                        it.jsonPrimitive.booleanOrNull ?: fail("session.pinned")
+                    } ?: false,
                 )
             } ?: fail("missing sessions")
         } catch (e: IllegalArgumentException) {
@@ -162,10 +172,10 @@ object BackupCodec {
             fail("malformed sessions", e)
         }
         val prefs = payload["prefs"]?.jsonObject?.entries?.associate { (k, v) ->
-            k to (v.jsonPrimitive.content)
+            k to (v.jsonPrimitive.takeIf { it.isString }?.content ?: fail("prefs.$k not a string"))
         } ?: emptyMap()
         val keys = payload["keys"]?.jsonObject?.entries?.associate { (k, v) ->
-            k to (v.jsonPrimitive.content)
+            k to (v.jsonPrimitive.takeIf { it.isString }?.content ?: fail("keys.$k not a string"))
         } ?: emptyMap()
         return BackupBundle(
             version = BUNDLE_VERSION,

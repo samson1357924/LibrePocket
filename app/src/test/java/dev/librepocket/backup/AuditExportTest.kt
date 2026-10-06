@@ -84,6 +84,61 @@ class AuditExportTest {
         assertEquals(1, audit.countByType()[AuditType.PLAINTEXT_DENIED])
     }
 
+    @Test fun plaintext_withForgedToken_refused() {
+        val audit = AuditLog()
+        try {
+            TranscriptExport.confirmPlaintext("sess-1", sensitiveEvents(), "forged-token", true, audit)
+            fail("forged token must throw")
+        } catch (e: IllegalArgumentException) {
+            // expected
+        }
+        assertEquals(1, audit.countByType()[AuditType.PLAINTEXT_DENIED])
+    }
+
+    @Test fun plaintext_tokenSingleUse_replayRefused() {
+        val audit = AuditLog()
+        val token = TranscriptExport.requestPlaintext("sess-1", true, audit)
+        TranscriptExport.confirmPlaintext("sess-1", sensitiveEvents(), token, true, audit)
+        try {
+            TranscriptExport.confirmPlaintext("sess-1", sensitiveEvents(), token, true, audit)
+            fail("replayed token must throw")
+        } catch (e: IllegalArgumentException) {
+            // expected
+        }
+    }
+
+    @Test fun plaintext_tokenBoundToSession_crossSessionRefused() {
+        val audit = AuditLog()
+        val token = TranscriptExport.requestPlaintext("sess-1", true, audit)
+        try {
+            TranscriptExport.confirmPlaintext("sess-2", sensitiveEvents(), token, true, audit)
+            fail("cross-session token must throw")
+        } catch (e: IllegalArgumentException) {
+            // expected
+        }
+    }
+
+    @Test fun plaintext_expiredToken_refused() {
+        val audit = AuditLog()
+        val issuedAt = 1_700_000_000_000L
+        val token = TranscriptExport.requestPlaintext("sess-1", true, audit, atMs = issuedAt, nowMs = issuedAt)
+        try {
+            TranscriptExport.confirmPlaintext(
+                "sess-1",
+                sensitiveEvents(),
+                token,
+                true,
+                audit,
+                atMs = issuedAt + TranscriptExport.TOKEN_TTL_MS + 1,
+                nowMs = issuedAt + TranscriptExport.TOKEN_TTL_MS + 1,
+            )
+            fail("expired token must throw")
+        } catch (e: IllegalArgumentException) {
+            // expected
+        }
+        assertEquals(1, audit.countByType()[AuditType.PLAINTEXT_DENIED])
+    }
+
     @Test fun plaintext_doubleConfirmed_emitsPlaintextAndAudits() {
         val audit = AuditLog()
         val token = TranscriptExport.requestPlaintext("sess-1", true, audit)

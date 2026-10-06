@@ -31,11 +31,12 @@ data class AuditRecord(
 /**
  * In-memory audit log for backup/export flows.
  *
- * - [record] is the only write path; callers cannot smuggle bodies in because
- *   the signature takes no free-text content, only ids and counters.
- * - [exportJson] always runs [Redactor.redact] over the serialized rows, so the
- *   exported audit file cannot leak a secret even if a future caller puts an
- *   unusual string into [AuditRecord.detail].
+ * - [record] is the only write path; callers MUST pass machine strings only
+ *   (ids, counters, yes/no flags). The signature accepts a free-text [detail]
+ *   for forward-compat, so this is a convention, not a type-level guarantee.
+ * - [exportJson] runs [Redactor.redact] over the serialized rows as a
+ *   best-effort second pass; heuristic redaction cannot guarantee zero leakage
+ *   for unknown secret formats.
  */
 class AuditLog {
     private val records = mutableListOf<AuditRecord>()

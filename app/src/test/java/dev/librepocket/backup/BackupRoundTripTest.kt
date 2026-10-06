@@ -1,5 +1,12 @@
 package dev.librepocket.backup
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -52,6 +59,39 @@ class BackupRoundTripTest {
         )
         assertEquals(listOf(1L, 2L), s.events.map { it.seq })
         assertEquals(mapOf("theme" to "dark"), restored.prefs)
+    }
+
+    @Test fun roundTrip_preservesPinned() {
+        val base = sampleBundle()
+        val bundle = base.copy(
+            sessions = base.sessions.map { it.copy(pinned = true) },
+        )
+        val restored = BackupCodec.decode(BackupCodec.encode(bundle))
+        assertTrue(restored.sessions.single().pinned)
+    }
+
+    @Test fun decode_oldBundleWithoutPinned_defaultsFalse() {
+        // Simulate a pre-pinned bundle: strip "pinned" from the payload JSON
+        // then recompute integrity so the bundle stays valid.
+        val raw = BackupCodec.encode(sampleBundle())
+        val payload = Json.parseToJsonElement(raw).jsonObject.getValue("payload").jsonObject
+        val sessions = payload.getValue("sessions").jsonArray.map { se ->
+            val so = se.jsonObject.toMutableMap()
+            so.remove("pinned")
+            JsonObject(so)
+        }
+        val strippedPayload = JsonObject(payload.toMutableMap().also {
+            it["sessions"] = JsonArray(sessions)
+        })
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(strippedPayload.toString().toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        val stripped = buildJsonObject {
+            put("payload", strippedPayload)
+            put("integrity", digest)
+        }.toString()
+        val restored = BackupCodec.decode(stripped)
+        assertFalse(restored.sessions.single().pinned)
     }
 
     @Test fun keys_excludedByDefault() {

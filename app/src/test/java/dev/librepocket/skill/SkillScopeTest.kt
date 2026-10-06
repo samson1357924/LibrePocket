@@ -40,7 +40,7 @@ class SkillScopeTest {
 
     @Test fun enabledSkillConvergesVisibleTools() {
         val base = playVisible()
-        assertEquals(11, base.size)
+        assertEquals(21, base.size) // P2 11 + web.fetch (S1-B，預設開) + calendar.query/update/delete (S1-C) + clipboard/files 6 (S1-A，預設開)。
         val s = skill("meeting-prep", setOf("calendar.create", "alarm.create"))
         val converged = SkillScope.converge(base, listOf(s))
         assertEquals(setOf("calendar.create", "alarm.create"), converged.map { it.name }.toSet())

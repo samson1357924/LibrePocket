@@ -1,15 +1,26 @@
 package dev.librepocket.tool
 
+import dev.librepocket.clipboard.ClipboardTools
+import dev.librepocket.files.FileAttachTools
+import dev.librepocket.files.FileEditTools
+import dev.librepocket.files.FileSearchTools
+
 /**
- * Built-in tool registry: the 11 P2 fast-channel tools (BACKLOG B3,
- * CAPABILITY_MATRIX §1) plus the slow-channel descriptor used only for
- * projection (hidden on play, foss/github-only, default off).
+ * Built-in tool registry: the P2 fast-channel tools (BACKLOG B3,
+ * CAPABILITY_MATRIX §1) plus S1-C backfill (shell/calendar/contacts,
+ * in [FAST_TOOLS]) plus S1-B network/data tools (owned block
+ * [S1B_TOOLS] below, do not edit) plus the slow-channel descriptor
+ * used only for projection (hidden on play, foss/github-only,
+ * default off).
  *
  * Compliance red lines (MATRIX §2), enforced here and asserted by tests:
  * - phone uses `ACTION_DIAL` prefill only, never `ACTION_CALL`;
  * - SMS goes through the system editor prefill only; this registry requests
  *   no SMS permission ([ToolAnnotations.requiresPermission] is null for
  *   `sms.compose` and no schema mentions SEND_SMS / READ_SMS).
+ * - S1-C adds no blacklist permission literals (no RECORD_AUDIO, no a11y):
+ *   only READ_CALENDAR / WRITE_CALENDAR / READ_CONTACTS + pseudo-grant
+ *   `listener:notification` appear in the S1-C block.
  */
 object ToolRegistry {
 
@@ -162,6 +173,7 @@ object ToolRegistry {
             description = "Read notification titles (own app, or via listener with grant); full text needs confirmation.",
             jsonSchema = schema(
                 prop("limit", "integer", "Max items to return"),
+                prop("fullText", "boolean", "Read full body text; always needs explicit confirmation plus listener grant and second consent"),
             ),
             sideEffect = SideEffect.READ,
             annotations = ToolAnnotations(
@@ -184,7 +196,326 @@ object ToolRegistry {
                 fallbackHint = "take a screenshot manually with the hardware keys",
             ),
         ),
+        // ---- S1-C backfill: restricted shell (D05 restricted part) ----
+        ToolDef(
+            name = "shell.exec",
+            description = "Restricted shell exec (no privilege): argv direct to RestrictedShell, no sh -c; allowlist/denylist/quota/truncation apply. Elevated execution is never performed in this phase.",
+            jsonSchema = schema(
+                prop("argv", "array", "Argument vector; argv[0] is the binary basename, never a shell string"),
+                prop("timeoutMs", "integer", "Per-call timeout budget in milliseconds"),
+                prop("reason", "string", "Why this command is needed (audit)"),
+                required = "\"argv\"",
+            ),
+            sideEffect = SideEffect.PRIVILEGED,
+            annotations = ToolAnnotations(
+                requiresSwitch = "shell",
+                switchDefault = false,
+                timeoutMs = 10_000L,
+                fallbackHint = "run the command manually in a terminal app",
+            ),
+        ),
+        // ---- S1-C backfill: calendar query/update/delete ----
+        ToolDef(
+            name = "calendar.query",
+            description = "Query calendar events via Calendar Provider; requires READ_CALENDAR.",
+            jsonSchema = schema(
+                prop("start", "string", "ISO-8601 range start"),
+                prop("end", "string", "ISO-8601 range end"),
+                prop("query", "string", "Optional title/location keyword filter"),
+                prop("limit", "integer", "Max events to return"),
+                required = "\"start\", \"end\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "calendar",
+                requiresPermission = "android.permission.READ_CALENDAR",
+                fallbackHint = "open the calendar app manually and check the schedule",
+            ),
+        ),
+        ToolDef(
+            name = "calendar.update",
+            description = "Update a calendar event via system calendar EDIT delegation preferred; direct provider write needs WRITE_CALENDAR.",
+            jsonSchema = schema(
+                prop("eventId", "string", "Event row id"),
+                prop("title", "string", "New title, if changing"),
+                prop("start", "string", "ISO-8601 start, if changing"),
+                prop("end", "string", "ISO-8601 end, if changing"),
+                required = "\"eventId\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = "calendar",
+                requiresPermission = "android.permission.WRITE_CALENDAR",
+                degradedWithoutPermission = true,
+                fallbackHint = "open the calendar app manually and edit the event",
+            ),
+        ),
+        ToolDef(
+            name = "calendar.delete",
+            description = "Delete a calendar event via system calendar delegation preferred; direct provider delete needs WRITE_CALENDAR.",
+            jsonSchema = schema(
+                prop("eventId", "string", "Event row id"),
+                required = "\"eventId\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = "calendar",
+                requiresPermission = "android.permission.WRITE_CALENDAR",
+                degradedWithoutPermission = true,
+                fallbackHint = "open the calendar app manually and delete the event",
+            ),
+        ),
+        // ---- S1-C backfill: full contacts (foss/github only, default off) ----
+        ToolDef(
+            name = "contact.search",
+            description = "Search contacts by name/phone keyword (foss/github full access only, default off; pick delegation stays permission-free).",
+            jsonSchema = schema(
+                prop("query", "string", "Name or phone keyword"),
+                prop("limit", "integer", "Max results"),
+                required = "\"query\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "contacts_full",
+                switchDefault = false,
+                requiresPermission = "android.permission.READ_CONTACTS",
+                fallbackHint = "open the contacts app manually or use the system picker",
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = "contact.list",
+            description = "List contacts (foss/github full access only, default off; pick delegation stays permission-free).",
+            jsonSchema = schema(
+                prop("limit", "integer", "Max results"),
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "contacts_full",
+                switchDefault = false,
+                requiresPermission = "android.permission.READ_CONTACTS",
+                fallbackHint = "open the contacts app manually or use the system picker",
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = "contact.get",
+            description = "Get one contact by id (foss/github full access only, default off; pick delegation stays permission-free).",
+            jsonSchema = schema(
+                prop("contactId", "string", "Contact row id"),
+                required = "\"contactId\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "contacts_full",
+                switchDefault = false,
+                requiresPermission = "android.permission.READ_CONTACTS",
+                fallbackHint = "open the contacts app manually or use the system picker",
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
     )
+
+    // S1-B-ANCHOR-BEGIN: network + data tools owned by S1-B.
+    // S1-A / S1-C: append your own anchored blocks AFTER S1-B-ANCHOR-END;
+    // do not edit inside this block (merge-conflict avoidance).
+    val S1B_TOOLS: List<ToolDef> = listOf(
+        ToolDef(
+            name = WebFetch.TOOL_NAME,
+            description = "Fetch an https URL as text (http only for loopback); byte-capped, 15s timeout, transcode-downgraded.",
+            jsonSchema = schema(
+                prop("url", "string", "https URL to fetch (http only for localhost/loopback)"),
+                prop("maxBytes", "integer", "Byte cap, clamped to 1 MiB"),
+                required = "\"url\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                timeoutMs = WebFetch.TIMEOUT_MS,
+                requiresSwitch = WebFetch.SWITCH,
+                switchDefault = WebFetch.SWITCH_DEFAULT,
+                fallbackHint = WebFetch.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = WebSearchLocal.TOOL_NAME,
+            description = "Local web search {query, count} via a configured supplier; distinct from the server-side hosted web_search passthrough.",
+            jsonSchema = schema(
+                prop("query", "string", "Search keywords"),
+                prop("count", "integer", "Max results, 1-10"),
+                required = "\"query\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = WebSearchLocal.SWITCH,
+                switchDefault = WebSearchLocal.SWITCH_DEFAULT,
+                fallbackHint = WebSearchLocal.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = DbTools.QUERY_NAME,
+            description = "Read-only SELECT over the app database with a row cap; rejects non-SELECT and multi-statements.",
+            jsonSchema = schema(
+                prop("sql", "string", "Single SELECT/WITH statement"),
+                prop("limit", "integer", "Row cap, clamped to 200"),
+                required = "\"sql\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = DbTools.SWITCH,
+                switchDefault = DbTools.SWITCH_DEFAULT,
+                fallbackHint = DbTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = DbTools.EXEC_NAME,
+            description = "Write to the app database; needs confirmation and bans ATTACH/DROP.",
+            jsonSchema = schema(
+                prop("sql", "string", "Single write statement, no ATTACH/DROP"),
+                prop("confirmed", "boolean", "User confirmation for the write"),
+                required = "\"sql\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = DbTools.SWITCH,
+                switchDefault = DbTools.SWITCH_DEFAULT,
+                fallbackHint = DbTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = LspTools.SYMBOLS_NAME,
+            description = "Code symbol lookup via the local stub, or an MCP-backed LSP bridge when provided.",
+            jsonSchema = schema(
+                prop("query", "string", "Symbol name to look up"),
+                prop("pathPrefix", "string", "Optional path scope"),
+                prop("limit", "integer", "Max symbols, clamped to 200"),
+                required = "\"query\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = LspTools.SWITCH,
+                switchDefault = LspTools.SWITCH_DEFAULT,
+                fallbackHint = LspTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = LspTools.DIAGNOSTICS_NAME,
+            description = "File diagnostics via the local stub, or an MCP-backed LSP bridge when provided.",
+            jsonSchema = schema(
+                prop("path", "string", "File path to inspect"),
+                required = "\"path\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = LspTools.SWITCH,
+                switchDefault = LspTools.SWITCH_DEFAULT,
+                fallbackHint = LspTools.FALLBACK_HINT,
+            ),
+        ),
+    )
+    // S1-B-ANCHOR-END
+
+    // S1-A-ANCHOR-BEGIN: clipboard + files tools owned by S1-A.
+    // S1-B / S1-C: append your own anchored blocks elsewhere;
+    // do not edit inside this block (merge-conflict avoidance).
+    val S1A_TOOLS: List<ToolDef> = listOf(
+        ToolDef(
+            name = ClipboardTools.READ_NAME,
+            description = "Read text from the foreground clipboard via ClipboardManager; background reads are unavailable.",
+            jsonSchema = schema(),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = ClipboardTools.SWITCH,
+                switchDefault = ClipboardTools.SWITCH_DEFAULT,
+                foregroundOnly = true,
+                degradedWithoutPermission = false,
+                fallbackHint = ClipboardTools.FALLBACK_READ_HINT,
+            ),
+        ),
+        ToolDef(
+            name = ClipboardTools.WRITE_NAME,
+            description = "Write text to the foreground clipboard via ClipboardManager; background writes are unavailable.",
+            jsonSchema = schema(
+                prop("text", "string", "Text to copy to the clipboard"),
+                prop("label", "string", "Clip label shown by the system"),
+                required = "\"text\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = ClipboardTools.SWITCH,
+                switchDefault = ClipboardTools.SWITCH_DEFAULT,
+                foregroundOnly = true,
+                degradedWithoutPermission = false,
+                fallbackHint = ClipboardTools.FALLBACK_WRITE_HINT,
+            ),
+        ),
+        ToolDef(
+            name = FileEditTools.EDIT_NAME,
+            description = "Create or overwrite a file in the private domain (or a granted SAF tree) with full content; cross-domain paths are refused.",
+            jsonSchema = schema(
+                prop("path", "string", "Private-domain relative path or absolute path"),
+                prop("content", "string", "Full file content (UTF-8)"),
+                required = "\"path\", \"content\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = FileEditTools.SWITCH,
+                switchDefault = FileEditTools.SWITCH_DEFAULT,
+                degradedWithoutPermission = false,
+                fallbackHint = FileEditTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = FileEditTools.PATCH_NAME,
+            description = "Replace a unique text span inside a private-domain (or granted SAF) file; always keeps a .bak backup and writes atomically.",
+            jsonSchema = schema(
+                prop("path", "string", "Private-domain relative path or absolute path"),
+                prop("oldText", "string", "Text span to find (must be unique by default)"),
+                prop("newText", "string", "Replacement text"),
+                prop("singleMatch", "boolean", "Fail when the span matches more than once"),
+                required = "\"path\", \"oldText\", \"newText\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = FileEditTools.SWITCH,
+                switchDefault = FileEditTools.SWITCH_DEFAULT,
+                degradedWithoutPermission = false,
+                fallbackHint = FileEditTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = FileSearchTools.SEARCH_NAME,
+            description = "Search file names and text inside the private domain (or granted SAF trees); absolute roots pass the restricted-shell path gate.",
+            jsonSchema = schema(
+                prop("query", "string", "Single-line literal to search for"),
+                prop("root", "string", "Private relative prefix or absolute root; empty means the whole private domain"),
+                prop("maxHits", "integer", "Max hits to return"),
+                required = "\"query\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = FileSearchTools.SWITCH,
+                switchDefault = FileSearchTools.SWITCH_DEFAULT,
+                degradedWithoutPermission = false,
+                fallbackHint = FileSearchTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = FileAttachTools.ATTACH_NAME,
+            description = "Stage a Photo Picker / SAF-picked image or file into the private workspace for chat attachments (skeleton for the ChatScreen entry point).",
+            jsonSchema = schema(
+                prop("mimeTypes", "array", "Accepted MIME types, e.g. image/*"),
+                prop("maxSizeBytes", "integer", "Size cap in bytes"),
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = FileAttachTools.SWITCH,
+                switchDefault = FileAttachTools.SWITCH_DEFAULT,
+                degradedWithoutPermission = false,
+                fallbackHint = FileAttachTools.FALLBACK_HINT,
+            ),
+        ),
+    )
+    // S1-A-ANCHOR-END
 
     /** Slow-channel descriptor: projection-only, never executed by FastRouter. */
     val SLOW_TOOLS: List<ToolDef> = listOf(
@@ -205,7 +536,8 @@ object ToolRegistry {
         ),
     )
 
-    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS
+    // S1-B: ALL covers FAST + SLOW + S1B (S1-A appends S1A; S1-C extended FAST).
+    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS + S1B_TOOLS + S1A_TOOLS
 
     fun find(name: String): ToolDef? = ALL.firstOrNull { it.name == name }
 

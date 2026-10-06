@@ -42,6 +42,12 @@ interface SessionStore {
     /** Create a session; returns the sessionId. */
     suspend fun createSession(title: String, model: String): String
 
+    /** All sessions, most-recently-updated first (titles re-redacted on read). */
+    suspend fun listSessions(): List<SessionMeta>
+
+    /** One session header, or null (title re-redacted on read). */
+    suspend fun getSession(sessionId: String): SessionMeta?
+
     /** Append one event; returns the rowId. */
     suspend fun appendEvent(event: TranscriptEvent): Long
 

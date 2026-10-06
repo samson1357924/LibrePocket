@@ -210,12 +210,62 @@ class ChatWiringTest {
         )
         runBlocking {
             try {
-                factory.create(sampleEndpoint().copy(apiKeyRef = "sk-pasted-key-material"))
+                factory.create(sampleEndpoint().copy(apiKeyRef = "sk-pasted-key-material"), "hi")
                 error("expected PROVIDER_KEY_REF_MALFORMED")
             } catch (e: IllegalArgumentException) {
                 assertEquals("PROVIDER_KEY_REF_MALFORMED", e.message)
             }
         }
+    }
+
+    @Test
+    fun openSessionReplaysHistoryThenLiveAppends() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        runBlocking {
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "assistant", text = "a1", createdAt = 2L,
+                ),
+            )
+            // Non-rendered kinds stay in the store but hide from replay.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "system", text = "usage", createdAt = 3L,
+                ),
+            )
+        }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = ChatViewModel(store, factory)
+        vm.openSession(sid)
+        awaitTrue { vm.messages.value.size == 2 }
+        assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
+        vm.onInputChange("new")
+        vm.send()
+        awaitTrue { vm.messages.value.size == 4 }
+        assertEquals("ok", vm.messages.value.last().text)
+        // Live turn persisted into the same transcript session.
+        assertTrue(transcripts.events.count { it.kind == "user" } == 2)
     }
 
     @Test

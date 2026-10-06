@@ -24,8 +24,9 @@ class CapabilityProjectionTest {
         grantedPermissions = setOf("android.permission.READ_CALENDAR", "listener:notification"),
     )
 
-    @Test fun fastToolsCountIsEleven() {
-        assertEquals(11, ToolRegistry.FAST_TOOLS.size)
+    @Test fun fastToolsCountIsEighteen() {
+        // P2 11 + S1-C 7（shell.exec + calendar.query/update/delete + contact.search/list/get）。
+        assertEquals(18, ToolRegistry.FAST_TOOLS.size)
     }
 
     @Test fun toolNamesUnique() {
@@ -62,13 +63,27 @@ class CapabilityProjectionTest {
         assertEquals(DenyReason.USER_DISABLED, projected.reason)
     }
 
-    @Test fun playSeesAllElevenFastToolsByDefault() {
-        // Calendar needs a grant, notification degrades (still visible): 9 native + 1 degraded.
+    @Test fun playSeesFifteenToolsByDefault() {
+        // P2 11（calendar.create 已授權；notification 缺 listener 降級仍可見）
+        // + S1-B web.fetch（預設開；websearch/database/lsp 預設關）
+        // + S1-C calendar.query（已授權）/ update+delete（缺 WRITE_CALENDAR 時經 EDIT 委託降級，仍可見）；
+        // shell.exec（開關預設關）與全量聯繫人（play FLAVOR_BLOCKED）隱藏。
+        // + S1-A 6（clipboard.read/write 前台預設開；file.edit/patch/search/attach 開關 files 預設開）。
         val visible = ToolRegistry.visibleTools(
             playBase.copy(grantedPermissions = setOf("android.permission.READ_CALENDAR")),
         ).map { it.name }
-        assertEquals(11, visible.size)
-        assertTrue(visible.containsAll(ToolRegistry.FAST_TOOLS.map { it.name }))
+        assertEquals(21, visible.size)
+        assertTrue(
+            visible.containsAll(
+                ToolRegistry.FAST_TOOLS.map { it.name } -
+                    setOf("shell.exec", "contact.search", "contact.list", "contact.get"),
+            ),
+        )
+        assertTrue(visible.containsAll(listOf("calendar.query", "calendar.update", "calendar.delete")))
+        assertTrue(visible.contains(WebFetch.TOOL_NAME))
+        assertTrue(visible.containsAll(ToolRegistry.S1A_TOOLS.map { it.name }))
+        assertFalse(visible.contains("shell.exec"))
+        assertFalse(visible.contains("contact.search"))
     }
 
     @Test fun calendarWithoutGrantIsNoPrivilege() {

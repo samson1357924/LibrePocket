@@ -50,16 +50,14 @@ android {
     // Release signing (keystores/release-<flavor>.p12, gitignored).
     // Secrets come from the environment so local (.env, Bitwarden) and CI
     // (GitHub Actions Secrets) share one path:
-    //   <FLAVOR>_KEYSTORE_FILE      (optional, defaults to keystores/release-<flavor>.p12)
-    //   <FLAVOR>_KEYSTORE_PASSWORD  (storepass == keypass)
-    //   <FLAVOR>_KEY_ALIAS          (optional, defaults to librepocket-<flavor>)
-    // Unsigned release builds still work (AGP signs with the debug key and
-    // warns); flavors whose keystore/password is absent fail at signing time
-    // with a clear message — never silently.
+    //   <PREFIX>_KEYSTORE_FILE      (optional, defaults to keystores/release-<flavor>.p12)
+    //   <PREFIX>_KEYSTORE_PASSWORD  (storepass == keypass)
+    //   <PREFIX>_KEY_ALIAS          (optional, defaults to librepocket-<flavor>)
+    // Prefixes: PLAY_ / FOSS_ / DIRECT_ (the github flavor uses DIRECT_
+    // because GitHub reserves the GITHUB_ secret prefix).
     signingConfigs {
-        listOf("play", "foss", "github").forEach { flavor ->
+        mapOf("play" to "PLAY", "foss" to "FOSS", "github" to "DIRECT").forEach { (flavor, prefix) ->
             create(flavor) {
-                val prefix = flavor.uppercase()
                 val filePath = System.getenv("${prefix}_KEYSTORE_FILE")
                     ?: "keystores/release-$flavor.p12"
                 storeFile = rootProject.file(filePath)

@@ -11,7 +11,9 @@
 #        BW_ITEM_PLAY / BW_ITEM_FOSS / BW_ITEM_GITHUB
 #        (defaults: librepocket-play / librepocket-foss / librepocket-github)
 #   2. Pre-exported env vars (CI flow, e.g. GitHub Actions Secrets):
-#        PLAY_KEYSTORE_PASSWORD / FOSS_KEYSTORE_PASSWORD / GITHUB_KEYSTORE_PASSWORD
+#        PLAY_KEYSTORE_PASSWORD / FOSS_KEYSTORE_PASSWORD / DIRECT_KEYSTORE_PASSWORD
+#      (The github flavor uses DIRECT_ because GitHub reserves the GITHUB_
+#      secret prefix.)
 #
 # Keystores stay local: keystores/release-<flavor>.p12 (gitignored).
 # Override path per flavor with <FLAVOR>_KEYSTORE_FILE if needed.
@@ -60,7 +62,7 @@ for f in $FLAVORS; do
     case $f in
         play) prefix=PLAY ;;
         foss) prefix=FOSS ;;
-        github) prefix=GITHUB ;;
+        github) prefix=DIRECT ;;
     esac
     eval "pw=\${${prefix}_KEYSTORE_PASSWORD:-}"
     if [ -z "$pw" ]; then
@@ -77,7 +79,7 @@ if [ "$need_bw" -eq 1 ]; then
         case $f in
             play) prefix=PLAY; item=${BW_ITEM_PLAY:-librepocket-play} ;;
             foss) prefix=FOSS; item=${BW_ITEM_FOSS:-librepocket-foss} ;;
-            github) prefix=GITHUB; item=${BW_ITEM_GITHUB:-librepocket-github} ;;
+            github) prefix=DIRECT; item=${BW_ITEM_GITHUB:-librepocket-github} ;;
         esac
         eval "pw=\${${prefix}_KEYSTORE_PASSWORD:-}"
         if [ -z "$pw" ]; then

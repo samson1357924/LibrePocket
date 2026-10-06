@@ -90,7 +90,7 @@ object Redactor {
             // rules never emit digit-dot-comma shapes, and no earlier rule matches
             // inside a geo URI (R5 only knows api_key/token/secret keys).
             Regex(
-                """geo:-?\d+(?:\.\d+)?,\s*-?\d+(?:\.\d+)?(?:[?;][^\s]*)?|(?<![A-Za-z])(?:lat(?:itude)?|lng|lon(?:gitude)?|latlng|loc(?:ation)?|coordinates?|coords?|經緯度|座標|位置)\s*[:=：]?\s*-?\d+(?:\.\d+)?\s*[,，]\s*-?\d+(?:\.\d+)?|(?:lat(?:itude)?|lng|lon(?:gitude)?)\s*[:=：]\s*-?\d+(?:\.\d+)?|(?<!\d)-?\d{1,3}\.\d{2,}\s*[,，]\s*-?\d{1,3}\.\d{2,}(?!\d)""",
+                """(?<![A-Za-z])geo:-?\d+(?:\.\d+)?,\s*-?\d+(?:\.\d+)?(?:[?;][^\s,.;!?)]*)?|(?<![A-Za-z])(?:lat(?:itude)?|lng|lon(?:gitude)?|latlng|loc(?:ation)?|coordinates?|coords?|經緯度|座標|位置)\s*[:=：]?\s*-?\d+(?:\.\d+)?\s*[,，]\s*-?\d+(?:\.\d+)?|(?<![A-Za-z])(?:lat(?:itude)?|lng|lon(?:gitude)?)\s*[:=：]\s*-?\d+(?:\.\d+)?|(?<![A-Za-z0-9.])-?\d{1,3}\.\d{2,}\s*[,，]\s*-?\d{1,3}\.\d{2,}(?!\d)""",
                 IGNORE_CASE,
             ),
             "⟦REDACTED:GEO⟧",
@@ -101,7 +101,7 @@ object Redactor {
     private const val CARD_RULE_ID = "CARD_16"
     private const val CARD_REPLACEMENT = "⟦REDACTED:CARD⟧"
 
-    /** Error-message subset (spec §6.5): keys/tokens/URLs + private IPs, then truncate. */
+    /** Error-message subset (spec §6.5): keys/tokens/URLs + private IPs + GEO, then truncate. */
     private val ERROR_RULE_IDS = setOf(
         "API_KEY_VALUE",
         "BEARER_TOKEN",
@@ -109,6 +109,7 @@ object Redactor {
         "URL_CREDENTIAL",
         "URL_TOKEN_PARAM",
         "IPV4_PRIVATE",
+        "GEO_COORD",
     )
 
     const val ERROR_MAX_CHARS = 500
@@ -134,7 +135,7 @@ object Redactor {
     }
 
     /**
-     * Stricter error-message redaction (spec §6.5): R1–R5 + R11 only,
+     * Stricter error-message redaction (spec §6.5): R1–R5 + R11 + GEO only,
      * truncated to [ERROR_MAX_CHARS] characters.
      */
     fun redactError(input: String): String {

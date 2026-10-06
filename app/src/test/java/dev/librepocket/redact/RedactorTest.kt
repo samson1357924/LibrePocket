@@ -329,6 +329,31 @@ class RedactorTest {
         assertUnchanged("location unknown")
         assertUnchanged("date 2024-02-29 note")
         assertUnchanged("order 12345")
+        // B3 lookbehind: words ending in lat/lon/lng must not be truncated.
+        assertUnchanged("flat: 0")
+        assertUnchanged("colon: 5")
+        assertUnchanged("semicolon: 12")
+        assertUnchanged("slat: 3")
+        assertUnchanged("plant: 2")
+        assertUnchanged("plate: 2")
+        assertUnchanged("relocation: 1,2")
+        // geo: boundary + bare-pair prefix guard.
+        assertUnchanged("paleogeo:1,2")
+        assertUnchanged("v1.23, 4.56")
+    }
+
+    @Test fun r13_geoTrailingPunctuationPreserved() {
+        assertEquals(
+            "go ⟦REDACTED:GEO⟧, see docs",
+            Redactor.redact("go geo:25.0478,121.5170, see docs").text,
+        )
+    }
+
+    @Test fun r13_errorRedactsGeo() {
+        val out = Redactor.redactError("failed to open geo:25.0478,121.5170?q=xx")
+        assertTrue(out, !out.contains("25.0478"))
+        assertTrue(out, !out.contains("121.5170"))
+        assertTrue(out, out.contains("⟦REDACTED:GEO⟧"))
     }
 
     // ---- redact-cases.txt corpus (spec §10.3: 每行 RULEID || input || expected) ----

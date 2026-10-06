@@ -10,3 +10,9 @@ GEO_COORD || see https://www.openstreetmap.org/search?query=25.0478,121.517 ok |
 GEO_COORD || see geo maps here || see geo maps here
 GEO_COORD || version 1.2, 3.4 released || version 1.2, 3.4 released
 GEO_COORD || location unknown || location unknown
+GEO_COORD || flat: 0 || flat: 0
+GEO_COORD || colon: 5 || colon: 5
+GEO_COORD || semicolon: 12 || semicolon: 12
+GEO_COORD || paleogeo:1,2 || paleogeo:1,2
+GEO_COORD || v1.23, 4.56 || v1.23, 4.56
+GEO_COORD || go geo:25.0478,121.5170, see docs || go ⟦REDACTED:GEO⟧, see docs

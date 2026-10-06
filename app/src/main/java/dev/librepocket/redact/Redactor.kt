@@ -4,10 +4,12 @@ import kotlin.text.RegexOption.IGNORE_CASE
 
 /**
  * P1 redaction table (M5, spec §6: R1–R12) plus R13 GEO_COORD, a beyond-spec
- * hardening addition (B3: coordinates must not reach transcript/audit/export).
+ * hardening addition (B3: coordinates must not reach transcript/audit/export),
+ * plus R14 ANDROID_PATH (S4: absolute on-device paths must not reach
+ * transcript/audit/export, covering S4 container path echoes).
  *
  * Pure functions; zero Android dependencies so plain JVM unit tests can run them.
- * Rules apply sequentially R1..R13; [RedactResult.hits] counts matches per rule
+ * Rules apply sequentially R1..R14; [RedactResult.hits] counts matches per rule
  * in table order (rules with zero hits are included with count 0).
  */
 object Redactor {
@@ -44,7 +46,7 @@ object Redactor {
         ),
         Rule(
             "URL_CREDENTIAL",
-            Regex("""(https?://)[^/\s:@]+:[^/\s@]+@""", IGNORE_CASE),
+            Regex("""(https?://)[^/\s@]+@""", IGNORE_CASE),
             "\$1⟦REDACTED⟧@",
         ),
         Rule(
@@ -96,6 +98,17 @@ object Redactor {
             ),
             "⟦REDACTED:GEO⟧",
         ),
+        Rule(
+            "ANDROID_PATH",
+            // R14 (S4): absolute on-device paths must not reach transcript/audit/export.
+            // Covers the app private domain (/data/data|user|app/...), shared storage
+            // (/sdcard, /storage/emulated/...), and S4 container echoes. Runs after
+            // GEO_COORD: coordinates never contain slashes, paths never match geo.
+            // Fail-closed: trailing punctuation (.,;!?) is redacted as part of the
+            // path rather than left in place.
+            Regex("""/data/(?:data|user|app|media|misc)/\S+|/storage/emulated/\S+|/sdcard/\S+"""),
+            "⟦REDACTED:PATH⟧",
+        ),
     )
 
     private val CARD_CANDIDATE = Regex("""(?<!\d)(?:\d[ \-]?){15,16}(?!\d)""")
@@ -116,11 +129,15 @@ object Redactor {
         "URL_TOKEN_PARAM",
         "IPV4_PRIVATE",
         "GEO_COORD",
+        "ANDROID_PATH",
     )
 
     const val ERROR_MAX_CHARS = 500
 
-    /** Full redaction: applies R1–R13 in order (R13 GEO is beyond-spec; see class KDoc). */
+    /**
+     * Full redaction: applies R1–R14 in order (R13 GEO is beyond-spec; R14
+     * ANDROID_PATH is the S4 addition, see class KDoc).
+     */
     fun redact(input: String): RedactResult {
         var text = input
         val hits = LinkedHashMap<String, Int>()

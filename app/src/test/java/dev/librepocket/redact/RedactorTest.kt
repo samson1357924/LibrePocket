@@ -110,6 +110,12 @@ class RedactorTest {
         assertUnchanged("see https://example.com/@handle here")
     }
 
+    @Test fun r4_userOnlyUserinfo() {
+        val out = Redactor.redact("go https://alice@example.com/path now").text
+        assertTrue(out, out.contains("https://⟦REDACTED⟧@example.com/path"))
+        assertTrue(out, !out.contains("alice@"))
+    }
+
     // ---- R5 URL_TOKEN_PARAM ----
 
     @Test fun r5_apiKeyParam() {
@@ -383,7 +389,7 @@ class RedactorTest {
         assertEquals(1, result.hits["EMAIL"])
         assertEquals(1, result.hits["CARD_16"])
         assertEquals(0, result.hits["PHONE_GENERIC"])
-        assertEquals(13, result.hits.size)
+        assertEquals(14, result.hits.size)
     }
 
     @Test fun hits_tableOrder() {
@@ -392,7 +398,7 @@ class RedactorTest {
             listOf(
                 "API_KEY_VALUE", "BEARER_TOKEN", "JSON_KEY_FIELD", "URL_CREDENTIAL",
                 "URL_TOKEN_PARAM", "EMAIL", "PHONE_GENERIC", "PHONE_INTL", "ID_TW",
-                "CARD_16", "IPV4_PRIVATE", "ANDROID_ID_LIKE", "GEO_COORD",
+                "CARD_16", "IPV4_PRIVATE", "ANDROID_ID_LIKE", "GEO_COORD", "ANDROID_PATH",
             ),
             result.hits.keys.toList(),
         )
@@ -424,5 +430,33 @@ class RedactorTest {
         val out = Redactor.redactError("Bearer abcdef123456 from 192.168.0.7 denied")
         assertTrue(out, !out.contains("abcdef123456"))
         assertTrue(out, !out.contains("192.168.0.7"))
+    }
+
+    // ---- R14 ANDROID_PATH (S4) ----
+
+    @Test fun r14_privateAndSharedPaths() {
+        assertRedacted(
+            "open /data/data/dev.librepocket.agent/files/linux/x failed",
+            "/data/data/dev.librepocket.agent/files/linux/x",
+        )
+        assertRedacted("at /data/user/0/dev.librepocket.agent/y", "/data/user/0/dev.librepocket.agent/y")
+        assertRedacted("save to /sdcard/Download/a.apk done", "/sdcard/Download/a.apk")
+        assertRedacted("save to /storage/emulated/0/Download/a.apk done", "/storage/emulated/0/Download")
+    }
+
+    @Test fun r14_relativeAndWebPathsUnchanged() {
+        assertUnchanged("run ./gradlew build")
+        assertUnchanged("open https://example.com/a/b")
+    }
+
+    @Test fun r14_barePrefixUnchanged() {
+        // \S+ 要求段內容：裸前綴不得誤殺。
+        assertUnchanged("save to /sdcard")
+        assertUnchanged("save to /storage/emulated/")
+    }
+
+    @Test fun r14_errorSubsetStripsPaths() {
+        val out = Redactor.redactError("failed at /data/data/dev.librepocket.agent/files/x code 1")
+        assertTrue(out, !out.contains("/data/data/"))
     }
 }

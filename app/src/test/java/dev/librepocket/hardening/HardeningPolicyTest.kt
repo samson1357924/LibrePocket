@@ -166,4 +166,29 @@ class HardeningPolicyTest {
     @Test fun cleartext_neverPermitted() {
         assertEquals(false, HardeningPolicy.CLEARTEXT_PERMITTED)
     }
+
+    @Test fun linuxPayload_cleanEntriesPass() {
+        val violations = HardeningPolicy.checkPlayLinuxEntries(
+            entries = listOf(
+                "lib/arm64-v8a/libc++_shared.so",
+                "assets/app.js",
+                "res/layout/main.xml",
+            ),
+        )
+        assertTrue(violations.isEmpty())
+    }
+
+    @Test fun linuxPayload_prootAndRootfsFlagged() {
+        // S4：proot 二進位與 rootfs/image 條目一律不得進 play 產物
+        //（rootfs 全風味下載式，出現即打包迴歸）。
+        val violations = HardeningPolicy.checkPlayLinuxEntries(
+            entries = listOf(
+                "lib/arm64-v8a/libproot.so",
+                "assets/linux/image/alpine.tar.gz",
+                "assets/containers/x/rootfs/etc/hosts",
+            ),
+        )
+        assertEquals(3, violations.size)
+        assertTrue(violations.all { it.check.contains("linux-entry-blacklist") })
+    }
 }

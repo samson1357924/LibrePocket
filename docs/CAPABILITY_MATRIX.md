@@ -52,7 +52,7 @@ Play 版（`flavor == play`）**一律不包含 / 不申請**：
 
 雙黑名單（程式碼事實：`HardeningPolicy` + `scripts/play_policy_check.sh`）：
 
-- Play 黑名單（play 產物零容忍）：權限 `SEND_SMS / RECEIVE_SMS / READ_SMS / MANAGE_EXTERNAL_STORAGE / BIND_ACCESSIBILITY_SERVICE / BIND_VPN_SERVICE`；dex 定義前綴 `Ldev/librepocket/agent/github/`、`Ldev/librepocket/agent/foss/`；超類 `VpnService`、`AccessibilityService`；manifest service 含 accessibilityservice / vpnservice 字樣。
+- Play 黑名單（play 產物零容忍）：權限 `SEND_SMS / RECEIVE_SMS / READ_SMS / MANAGE_EXTERNAL_STORAGE / BIND_ACCESSIBILITY_SERVICE / BIND_VPN_SERVICE`；dex 定義前綴 `Ldev/librepocket/agent/github/`、`Ldev/librepocket/agent/foss/`；超類 `VpnService`、`AccessibilityService`；manifest service 含 accessibilityservice / vpnservice 字樣；zip 條目含 `proot` / `rootfs` / `linux/image`（S4 下載式 rootfs，全風味不內嵌，見 `HardeningPolicy.PLAY_LINUX_ENTRY_BLACKLIST`，此為 zip 掃描，非 dex 掃描）。
 - Foss 黑名單（foss 產物零容忍，純開源自證）：dex 不得引用 `com.google.mlkit` / `com.google.android.gms`（`FOSS_STRING_BLACKLIST`，`--foss` 門）；foss 視覺棧只用 ZXing / Tesseract / LiteRT。
 
 Play 版上架自查（每次發版必跑）：

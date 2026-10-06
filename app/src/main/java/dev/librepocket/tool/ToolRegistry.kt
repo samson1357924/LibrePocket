@@ -4,6 +4,12 @@ import dev.librepocket.clipboard.ClipboardTools
 import dev.librepocket.files.FileAttachTools
 import dev.librepocket.files.FileEditTools
 import dev.librepocket.files.FileSearchTools
+import dev.librepocket.linux.CompileBuild
+import dev.librepocket.linux.DecompileAnalyze
+import dev.librepocket.linux.LinuxBoot
+import dev.librepocket.linux.LinuxPkg
+import dev.librepocket.linux.LinuxTools
+import dev.librepocket.linux.ProotExec
 
 /**
  * Built-in tool registry: the P2 fast-channel tools (BACKLOG B3,
@@ -623,8 +629,129 @@ object ToolRegistry {
         ),
     )
 
-    // S1-B: ALL covers FAST + SLOW + S1B + S1A + VOICE (S1-A appends S1A; S1-C extended FAST; S2 appends VOICE).
-    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS + S1B_TOOLS + S1A_TOOLS + VOICE_TOOLS
+    // S4-ANCHOR-BEGIN: on-device Linux (PRoot) + compile + decompile, owned by S4.
+    // Do not edit inside this block from other workstreams (merge-conflict avoidance).
+    // - linux.boot / linux.exec / linux.pkg (WRITE, switch `linux` default off):
+    //   download式 rootfs (HTTPS+SHA256, OCI digest-pin 優先), PRoot 容器執行,
+    //   apt/dnf/apk 子集. Perf 見 LinuxTools.PERF_NOTICE（機內僅輕量任務）.
+    // - compile.build (WRITE, switch `compile` default off): make/cmake/gcc/
+    //   clang/python recipe; Gradle 機內不支援（CI 指引，見 CompileBuild.CI_GUIDANCE）.
+    // - decompile.analyze (WRITE) + decompile.repack (PRIVILEGED, 每次確認):
+    //   strings→smali→resources→java 漸進（apktool 3.0.1 / jadx 1.5.6 釘選）.
+    // - 三風味：foss/github only（play 投影 FLAVOR_BLOCKED 即隱藏）.
+    val LINUX_TOOLS: List<ToolDef> = listOf(
+        ToolDef(
+            name = LinuxBoot.NAME,
+            description = "Download/start/stop an on-device PRoot Linux container (self-install only; rootfs is downloaded over HTTPS with SHA256, never bundled). Perf-limited: light tasks only.",
+            jsonSchema = schema(
+                prop("action", "string", "download|start|stop"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                prop("url", "string", "https image URL (download only)"),
+                prop("sha256", "string", "64-hex SHA256 of the image (download only, required)"),
+                required = "\"action\", \"container\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = LinuxBoot.SWITCH,
+                switchDefault = LinuxBoot.SWITCH_DEFAULT,
+                fallbackHint = LinuxBoot.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = ProotExec.NAME,
+            description = "Execute a guest command inside a PRoot container (union allowlist, inherited denylist/quota/truncation; SAF trees are never bound, use inbox copy). Perf-limited: light tasks only.",
+            jsonSchema = schema(
+                prop("argv", "array", "Guest argument vector; argv[0] is the binary basename"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                prop("timeoutMs", "integer", "Per-call timeout budget in milliseconds"),
+                prop("reason", "string", "Why this command is needed (audit)"),
+                required = "\"argv\", \"container\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = LinuxBoot.SWITCH,
+                switchDefault = LinuxBoot.SWITCH_DEFAULT,
+                timeoutMs = 10_000L,
+                fallbackHint = ProotExec.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = LinuxPkg.NAME,
+            description = "Manage packages inside a PRoot container (apt/dnf/apk subset: update/install/remove/list/search/show only).",
+            jsonSchema = schema(
+                prop("argv", "array", "Package argv, e.g. [apt, install, pkg]; no option flags"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                required = "\"argv\", \"container\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = LinuxBoot.SWITCH,
+                switchDefault = LinuxBoot.SWITCH_DEFAULT,
+                fallbackHint = ProotExec.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = CompileBuild.NAME,
+            description = "Build from source inside a PRoot container (make/cmake/gcc/clang/python recipes; Gradle is unsupported on-device, use CI). Perf-limited: light tasks only.",
+            jsonSchema = schema(
+                prop("argv", "array", "Recipe argument vector, e.g. [make, -j4]"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                prop("timeoutMs", "integer", "Per-call timeout budget in milliseconds"),
+                required = "\"argv\", \"container\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = CompileBuild.SWITCH,
+                switchDefault = CompileBuild.SWITCH_DEFAULT,
+                timeoutMs = 10_000L,
+                fallbackHint = CompileBuild.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = DecompileAnalyze.NAME,
+            description = "Analyze an APK progressively inside a PRoot container (strings, smali, resources, java; apktool 3.0.1 / jadx 1.5.6 pinned). Output is redacted. Perf-limited: light tasks only.",
+            jsonSchema = schema(
+                prop("stage", "string", "strings|smali|resources|java (progressive, no skipping)"),
+                prop("apkPath", "string", "Inbox-staged APK path"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                required = "\"stage\", \"apkPath\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = DecompileAnalyze.SWITCH,
+                switchDefault = DecompileAnalyze.SWITCH_DEFAULT,
+                timeoutMs = 10_000L,
+                fallbackHint = DecompileAnalyze.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = DecompileAnalyze.REPACK_NAME,
+            description = "Repack/resign an APK inside a PRoot container; privileged and needs explicit confirmation on every call.",
+            jsonSchema = schema(
+                prop("apkPath", "string", "Inbox-staged APK path"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                prop("confirmed", "boolean", "User confirmation for this repack"),
+                required = "\"apkPath\", \"container\", \"confirmed\"",
+            ),
+            sideEffect = SideEffect.PRIVILEGED,
+            annotations = ToolAnnotations(
+                requiresSwitch = DecompileAnalyze.SWITCH,
+                switchDefault = DecompileAnalyze.SWITCH_DEFAULT,
+                timeoutMs = 10_000L,
+                fallbackHint = DecompileAnalyze.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+    )
+    // S4-ANCHOR-END
+
+    // S1-B: ALL covers FAST + SLOW + S1B + S1A + VOICE + LINUX (S1-A appends S1A; S1-C extended FAST; S2 appends VOICE; S4 appends LINUX).
+    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS + S1B_TOOLS + S1A_TOOLS + VOICE_TOOLS + LINUX_TOOLS
 
     fun find(name: String): ToolDef? = ALL.firstOrNull { it.name == name }
 

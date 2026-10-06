@@ -1,0 +1,35 @@
+package dev.librepocket.chat
+
+import kotlinx.coroutines.flow.StateFlow
+
+/**
+ * Single-turn chat controller: send / stream / cancel / steering.
+ *
+ * Invariants (P1 acceptance):
+ * 1. Only one in-flight turn; [send] while busy throws [IllegalStateException]
+ *    (also projected via [ChatUiState.error], never crashes).
+ * 2. [cancel] only flips state + closes the HTTP call + cancels the job.
+ *    No IO, no DB writes on that path (persistence is async elsewhere).
+ * 3. [steer] never cancels the current turn; the instruction is queued FIFO
+ *    and sent as the next user message after the current turn fully ends.
+ */
+interface ChatSession {
+  /** Messages for UI (collect; includes streaming placeholders). */
+  val uiState: StateFlow<ChatUiState>
+
+  /** Send one user message and stream the reply. One in-flight turn at a time. */
+  suspend fun send(text: String, images: List<ChatImageRef> = emptyList())
+
+  /** Cancel the in-flight turn; UI must stop updating within 200ms. */
+  fun cancel()
+
+  /**
+   * Steering: queue an instruction for the next round.
+   * Never cancels the current HTTP request or the current turn; the queued
+   * instruction is sent automatically once the current turn fully ends.
+   */
+  fun steer(text: String)
+
+  /** Release (close HTTP call, drop queue). */
+  fun close()
+}

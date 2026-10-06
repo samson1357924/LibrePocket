@@ -1,0 +1,17 @@
+: ping
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"今天台北"}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"天氣晴。","encrypted_reasoning":"OPAQUE-SECRET-XYZ"}
+
+data: {"type":"response.reasoning_summary_text.delta","output_index":1,"content_index":0,"delta":"先查天氣再回覆"}
+
+data: {"type":"response.output_item.added","output_index":2,"item_id":"item_wx8f","item":{"type":"function_call","id":"","call_id":"call_wx8fQ2zA","name":"get_weather"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":2,"item_id":"item_wx8f","delta":"{\"city\":"}
+
+data: {"type":"response.function_call_arguments.delta","output_index":2,"item_id":"item_wx8f","delta":"\"Taipei\"}"}
+
+data: {"type":"response.output_item.done","output_index":2,"item_id":"item_wx8f","item":{"type":"function_call","id":"item_wx8f","call_id":"call_wx8fQ2zA","name":"get_weather","arguments":"{\"city\":\"Taipei\"}"}}
+
+data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":128,"output_tokens":64}}}

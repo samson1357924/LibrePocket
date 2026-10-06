@@ -1,0 +1,20 @@
+: ping
+
+data: {"id":"chatcmpl-B3x1aBc9","object":"chat.completion.chunk","created":1728000000,"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"system_fingerprint":"fp_9d2c"}
+
+data: {"id":"chatcmpl-B3x1aBc9","object":"chat.completion.chunk","created":1728000000,"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"content":"我來幫你查一下"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-B3x1aBc9","object":"chat.completion.chunk","created":1728000000,"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"reasoning_content":"用戶要查天氣，先確認城"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-B3x1aBc9","object":"chat.completion.chunk","created":1728000000,"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"reasoning":"市。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-B3x1aBc9","object":"chat.completion.chunk","created":1728000000,"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_wx8fQ2zA","type":"function","function":{"name":"get_weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-B3x1aBc9","object":"chat.completion.chunk","created":1728000000,"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"","function":{"arguments":"\"Taipei\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-B3x1aBc9","object":"chat.completion.chunk","created":1728000000,"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"type":"function","function":{"name":"get_time","arguments":"{}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-B3x1aBc9","object":"chat.completion.chunk","created":1728000000,"model":"gpt-4o-mini-2024-07-18","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":128,"completion_tokens":64,"total_tokens":192}}
+
+data: [DONE]
+

@@ -1,11 +1,15 @@
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
 }
 
 android {
     namespace = "dev.librepocket.agent"
     compileSdk = 37
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        }
+    }
 
     defaultConfig {
         // WARNING: applicationId is permanent once published (Play + F-Droid share it).
@@ -15,6 +19,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     flavorDimensions += "dist"
@@ -27,8 +32,10 @@ android {
         }
         // Full build for F-Droid / direct download: all capabilities enabled.
         // Extra permissions and services come from the src/full manifest overlay.
+        // Decision: co-installable via ".full" suffix (Play vs Full can coexist).
         create("full") {
             dimension = "dist"
+            applicationIdSuffix = ".full"
             versionNameSuffix = "-full"
         }
     }
@@ -46,11 +53,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-}
-
-kotlin {
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+        }
     }
 }
 
@@ -64,4 +70,25 @@ dependencies {
     implementation(libs.datastore.preferences)
     // Encrypted key/value + file storage.
     implementation(libs.security.crypto)
+    // Long-term vault crypto type (P2 stub signature only; P1 ships EncryptedPrefsVault).
+    implementation(libs.tink.android)
+    // Session JSONL export/import codec.
+    implementation(libs.serialization.json)
+    // Chat/policy state + streaming (explicit; also pulled transitively by room/datastore).
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
+    // Unit tests (M3/M6).
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
+    // Unit tests (M2/M4/M5: Android-dependent vault/Room paths run under Robolectric).
+    testImplementation(libs.robolectric)
+    testImplementation(libs.room.testing)
+    testImplementation(libs.test.core)
+    // SSE replay transport for JVM unit tests (never hits the external network).
+    testImplementation(libs.mockwebserver)
+    // Instrumented tests (P1_SPEC §10.1 [I] layer; MockWebServer keeps them offline).
+    androidTestImplementation(libs.test.ext.junit)
+    androidTestImplementation(libs.espresso.core)
+    androidTestImplementation(libs.test.core)
+    androidTestImplementation(libs.room.testing)
+    androidTestImplementation(libs.mockwebserver)
 }

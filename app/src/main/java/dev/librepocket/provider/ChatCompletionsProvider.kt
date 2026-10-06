@@ -1,0 +1,305 @@
+package dev.librepocket.provider
+
+import java.util.UUID
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.FlowCollector
+import okhttp3.OkHttpClient
+
+/**
+ * Baseline adapter: OpenAI Chat Completions (SPEC §3.1–§3.2).
+ *
+ * - `POST {base}/chat/completions` with `"stream": true`.
+ * - `choices[].delta.content` -> [StreamEvent.TextDelta];
+ *   `delta.reasoning_content` (compat `reasoning` / `reasoning_details`
+ *   summary, first non-blank wins per chunk) -> [StreamEvent.ReasoningDelta].
+ * - `delta.tool_calls[]` aggregated by `index`; empty id chunks never
+ *   overwrite a valid id; missing/conflicting ids are repaired at the end
+ *   with response-scoped unique `call_<uuid8>`.
+ * - `finish_reason` + `[DONE]` -> [StreamEvent.Done]; missing either ->
+ *   `Failed(retryable=true)`.
+ */
+class ChatCompletionsProvider(
+    private val config: ProviderConfig,
+    private val apiKey: suspend () -> CharArray?,
+    client: OkHttpClient? = null,
+) : LlmProvider {
+    override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
+    private val httpClient: OkHttpClient by lazy { client ?: defaultOkHttpClient(config.http) }
+
+    override fun stream(request: ChatRequest): Flow<StreamEvent> = streamingFlow {
+        val key = apiKey() ?: throw ProviderFailure(false, "HTTP 401 missing_api_key")
+        try {
+            val body = buildBody(request)
+            val headers = linkedMapOf(
+                "Content-Type" to "application/json",
+                "Accept" to "text/event-stream",
+                "Authorization" to "Bearer ${String(key)}",
+            )
+            val url = endpoint(config.baseUrl)
+            runWithRetry(config.http) { _ ->
+                val mapper = ChatCompletionsMapper()
+                pumpSse(httpClient, postJson(url, headers, body)) { frame ->
+                    if (frame.isDone) {
+                        mapper.markDone()
+                    } else {
+                        for (e in mapper.mapPayload(frame.data)) emit(e)
+                    }
+                }
+                for (e in mapper.finish()) emit(e)
+            }
+        } finally {
+            key.fill('\u0000')
+        }
+    }
+
+    override suspend fun listModels(): List<String> {
+        val key = apiKey() ?: throw ProviderFailure(false, "HTTP 401 missing_api_key")
+        try {
+            val url = joinEndpoint(config.baseUrl, "/models")
+            val req = okhttp3.Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer ${String(key)}")
+                .get()
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    val kind = ProviderErrorClassifier.classify(resp.code, null, text)
+                    throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("HTTP ${resp.code}", text))
+                }
+                return extractModelIds(text)
+            }
+        } finally {
+            key.fill('\u0000')
+        }
+    }
+
+    internal fun endpoint(base: String): String = joinEndpoint(base, "/chat/completions")
+
+    /**
+     * Protocol request JSON. System messages collapse into a single leading
+     * `system` message (order preserved); images ride multimodal `content[]`
+     * parts; `>4` images are cut with the omission recorded in [BuiltBody].
+     */
+    internal fun buildBody(request: ChatRequest): String {
+        val sb = StringBuilder()
+        sb.append("{\"model\":${q(request.model)},\"stream\":true")
+        request.maxTokens?.let { sb.append(",\"max_tokens\":$it") }
+        request.temperature?.let { sb.append(",\"temperature\":$it") }
+        if (request.tools.isNotEmpty()) {
+            sb.append(",\"tools\":[")
+            request.tools.forEachIndexed { i, t ->
+                if (i > 0) sb.append(',')
+                sb.append("{\"type\":\"function\",\"function\":{\"name\":${q(t.name)},")
+                sb.append("\"description\":${q(t.description)},\"parameters\":${t.jsonSchema}}}")
+            }
+            sb.append(']')
+        }
+        sb.append(",\"messages\":[")
+        var first = true
+        val emitMsg = { role: String, contentJson: String ->
+            if (!first) sb.append(',')
+            first = false
+            sb.append("{\"role\":${q(role)},\"content\":$contentJson}")
+        }
+        val systems = ArrayList<String>()
+        if (request.systemPromptOverride != null) systems.add(request.systemPromptOverride)
+        for (m in request.messages) if (m.role == "system") systems.add(m.text)
+        if (systems.isNotEmpty()) emitMsg("system", q(systems.joinToString("\n")))
+        for (m in request.messages) {
+            if (m.role == "system") continue
+            when {
+                m.role == "tool" -> {
+                    if (!first) sb.append(',')
+                    first = false
+                    sb.append("{\"role\":\"tool\",\"tool_call_id\":${q(m.toolCallId.orEmpty())},")
+                    sb.append("\"content\":${q(m.text)}}")
+                }
+                m.images.isEmpty() && m.toolCalls.isEmpty() -> emitMsg(m.role, q(m.text))
+                else -> {
+                    if (!first) sb.append(',')
+                    first = false
+                    sb.append("{\"role\":${q(m.role)},\"content\":${contentParts(m)},")
+                    if (m.toolCalls.isNotEmpty()) {
+                        sb.append("\"tool_calls\":[")
+                        m.toolCalls.forEachIndexed { i, tc ->
+                            if (i > 0) sb.append(',')
+                            sb.append("{\"id\":${q(tc.id)},\"type\":\"function\",")
+                            sb.append("\"function\":{\"name\":${q(tc.name)},")
+                            sb.append("\"arguments\":${q(tc.argumentsJson)}}}")
+                        }
+                        sb.append("],")
+                    }
+                    sb.append("\"text\":${q(m.text)}}")
+                }
+            }
+        }
+        sb.append("]}")
+        return sb.toString()
+    }
+
+    /** Multimodal content parts; images beyond the policy cap are dropped (counted by caller). */
+    internal fun contentParts(m: ChatMessage): String {
+        val infos = m.images.map { ImageFallbackPolicy.fromChatImage(it) }
+        return when (val d = ImageFallbackPolicy.decide(infos, supportsImages = true)) {
+            is ImageFallbackPolicy.Decision.Reject ->
+                throw ProviderFailure(false, d.reason)
+            is ImageFallbackPolicy.Decision.StripAll ->
+                "[{\"type\":\"text\",\"text\":${q(m.text)}}]"
+            is ImageFallbackPolicy.Decision.Send -> {
+                val sb = StringBuilder("[{\"type\":\"text\",\"text\":${q(m.text)}}")
+                val encoder = java.util.Base64.getEncoder()
+                for (idx in d.indices) {
+                    val img = m.images[idx]
+                    val b64 = encoder.encodeToString(img.bytes)
+                    sb.append(",{\"type\":\"image_url\",\"image_url\":{\"url\":")
+                    sb.append(q("data:${img.mimeType};base64,$b64"))
+                    sb.append("}}")
+                }
+                sb.append(']')
+                sb.toString()
+            }
+        }
+    }
+}
+
+/** Pure payload->event projection; no I/O, JVM-testable. */
+internal class ChatCompletionsMapper(val round: Int = 0) {
+    private enum class Kind { TEXT, REASONING, TOOL }
+
+    private class AggCall(var id: String = "", var name: String = "", val args: StringBuilder = StringBuilder())
+
+    private var blockIndex = 0
+    private var lastKind: Kind? = null
+    private val tools = LinkedHashMap<Int, AggCall>()
+    private var finishReason: String? = null
+    private var usage: StreamEvent.Usage? = null
+    private var sawDone = false
+    private var failed: StreamEvent.Failed? = null
+
+    fun markDone() {
+        sawDone = true
+    }
+
+    fun mapPayload(payload: String): List<StreamEvent> {
+        if (failed != null) return emptyList()
+        val root = try {
+            MiniJson.parse(payload) as? MiniJson.JObj ?: return emptyList()
+        } catch (_: MiniJson.MiniJsonException) {
+            return emptyList() // sniffing rule §3.4: not our shape, ignore
+        }
+        val out = ArrayList<StreamEvent>()
+        val choices = root.arr("choices")?.items?.filterIsInstance<MiniJson.JObj>()
+        val choice = choices?.firstOrNull()
+        val delta = choice?.obj("delta")
+        if (delta != null) {
+            // Text (string or multimodal parts array).
+            val text = deltaText(delta)
+            if (!text.isNullOrEmpty()) {
+                switchTo(Kind.TEXT)
+                out.add(StreamEvent.TextDelta(round, blockIndex, text))
+            }
+            // Reasoning (first non-blank representation wins per chunk).
+            val reasoning = deltaReasoning(delta)
+            if (!reasoning.isNullOrEmpty()) {
+                switchTo(Kind.REASONING)
+                out.add(StreamEvent.ReasoningDelta(round, blockIndex, reasoning))
+            }
+            // Tool calls aggregated by index.
+            val toolCalls = delta.arr("tool_calls")?.items?.filterIsInstance<MiniJson.JObj>()
+            if (toolCalls != null) {
+                for (tc in toolCalls) {
+                    val index = tc.int("index") ?: 0
+                    val agg = tools.getOrPut(index) { AggCall() }
+                    switchTo(Kind.TOOL)
+                    val idChunk = tc.string("id")?.takeIf { it.isNotEmpty() }
+                    if (idChunk != null && agg.id.isEmpty()) agg.id = idChunk
+                    val fn = tc.obj("function")
+                    val nameChunk = fn?.string("name")?.takeIf { it.isNotEmpty() }
+                    if (nameChunk != null && agg.name.isEmpty()) agg.name = nameChunk
+                    val argsChunk = fn?.string("arguments").orEmpty()
+                    agg.args.append(argsChunk)
+                    out.add(StreamEvent.ToolDelta(index, idChunk, nameChunk, argsChunk))
+                }
+            }
+        }
+        choice?.string("finish_reason")?.let { if (it.isNotEmpty() && it != "null") finishReason = it }
+        root.obj("usage")?.let { u ->
+            val inp = u.int("prompt_tokens")
+            val outp = u.int("completion_tokens")
+            if (inp != null || outp != null) {
+                usage = StreamEvent.Usage(inp, outp)
+                out.add(usage!!)
+            }
+        }
+        return out
+    }
+
+    /** Terminal projection: ToolDones -> Usage? -> Done, else Failed(retryable). */
+    fun finish(): List<StreamEvent> {
+        failed?.let { return listOf(it) }
+        val out = ArrayList<StreamEvent>()
+        val usedIds = LinkedHashSet<String>()
+        for ((index, agg) in tools) {
+            var id = agg.id
+            if (id.isEmpty() || !usedIds.add(id)) {
+                do {
+                    id = "call_" + UUID.randomUUID().toString().take(8)
+                } while (!usedIds.add(id))
+            }
+            out.add(StreamEvent.ToolDone(index, id, agg.name, agg.args.toString()))
+        }
+        // Usage was already emitted inline when seen; keep terminal compact.
+        if (finishReason != null && sawDone) {
+            out.add(StreamEvent.Done(finishReason!!))
+        } else {
+            out.add(StreamEvent.Failed("SSE_TRUNCATED", retryable = true))
+        }
+        return out
+    }
+
+    private fun switchTo(kind: Kind) {
+        if (lastKind != null && lastKind != kind) blockIndex++
+        lastKind = kind
+    }
+
+    private fun deltaText(delta: MiniJson.JObj): String? {
+        delta.string("content")?.let { return it }
+        val parts = delta.arr("content")?.items?.filterIsInstance<MiniJson.JObj>() ?: return null
+        val sb = StringBuilder()
+        for (p in parts) {
+            val t = p.string("text")
+            if (!t.isNullOrEmpty()) sb.append(t)
+        }
+        return sb.toString().ifEmpty { null }
+    }
+
+    private fun deltaReasoning(delta: MiniJson.JObj): String? {
+        delta.string("reasoning_content")?.takeIf { it.isNotEmpty() }?.let { return it }
+        delta.string("reasoning")?.takeIf { it.isNotEmpty() }?.let { return it }
+        val details = delta.arr("reasoning_details")?.items?.filterIsInstance<MiniJson.JObj>()
+        if (details != null) {
+            for (d in details) {
+                d.string("summary")?.takeIf { it.isNotEmpty() }?.let { return it }
+                d.string("text")?.takeIf { it.isNotEmpty() }?.let { return it }
+            }
+        }
+        return null
+    }
+}
+
+/** Extract `data[].id` from a `GET /models` response (tolerates envelope variants). */
+internal fun extractModelIds(json: String): List<String> {
+    val root = try {
+        MiniJson.parse(json) as? MiniJson.JObj ?: return emptyList()
+    } catch (_: MiniJson.MiniJsonException) {
+        return emptyList()
+    }
+    val arr = root.arr("data")?.items?.filterIsInstance<MiniJson.JObj>() ?: return emptyList()
+    return arr.mapNotNull { it.string("id") }
+}
+
+/** Narrowing collector helper to keep provider bodies small. */
+internal suspend fun FlowCollector<StreamEvent>.emitAll(events: List<StreamEvent>) {
+    for (e in events) emit(e)
+}

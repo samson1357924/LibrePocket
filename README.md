@@ -1,16 +1,22 @@
 # LibrePocket – Open Mobile AI Agent
 
+> **ALPHA — not production ready.** APIs, schemas, and DB formats may change
+> without migration. Use debug builds for testing only; do not store
+> irreplaceable data or keys you cannot re-enter. See `docs/ROADMAP.md`.
+
 An international, open-source on-device AI agent for Android.
 Licensed under the Apache License 2.0 (see `LICENSE`).
 
 > **Not affiliated** with any device vendor, carrier, model provider, or
 > app store. LibrePocket is an independent community project.
 
-## Status
+## Status — alpha (v0.1.0, debug only)
 
-Infrastructure skeleton only (v0.1.0): build system, product flavors,
-permissions model, and project documents. There is **no agent loop and no
-tool implementations** yet — see "Next steps" below.
+Backbone + early extensions are implemented behind debug builds
+(P1 chat/BYOK, P2 fast-channel, P3 slow-channel full-only, D01–D07
+memory/MCP/Skills/shell/entry/hardening). No Play release, no stable API:
+upgrades may require reinstall, and instrumented tests still need real
+devices (API 33/37).
 
 ## Two distributions, distinct applicationIds (co-installable)
 

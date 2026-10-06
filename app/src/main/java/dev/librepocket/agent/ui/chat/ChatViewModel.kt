@@ -7,6 +7,8 @@ import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.ChatUiState
 import dev.librepocket.chat.UiMessage
+import dev.librepocket.policy.PolicyStore
+import dev.librepocket.policy.Verdict
 import dev.librepocket.session.SessionStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -41,6 +43,7 @@ private const val HISTORY_CAP = 2000
 class ChatViewModel(
     private val store: EndpointStore,
     private val sessions: ChatSessionFactory,
+    private val policy: PolicyStore,
 ) : ViewModel() {
 
     private val _input = MutableStateFlow("")
@@ -64,12 +67,17 @@ class ChatViewModel(
 
     private var currentSession: ChatSession? = null
     private var sessionEndpointId: String? = null
+    private var sessionModel: String? = null
     private var sessionCollectJob: Job? = null
     private var openJob: Job? = null
     private var lastUserText: String? = null
 
     val canRetry: Boolean
         get() = _sessionState.value.status == ChatStatus.ERROR && lastUserText != null
+
+    /** In-flight or follow-up pending: a new turn must steer, never send. */
+    private fun isBusy(status: ChatStatus): Boolean =
+        status == ChatStatus.STREAMING || status == ChatStatus.WAITING_STEERED
 
     fun onInputChange(value: String) {
         _input.value = value
@@ -87,8 +95,51 @@ class ChatViewModel(
     fun send() {
         val text = _input.value.trim()
         if (text.isEmpty()) return
-        if (_sessionState.value.status == ChatStatus.STREAMING) return
-        sendText(text)
+        _input.value = ""
+        if (isBusy(_sessionState.value.status)) {
+            steer(text)
+        } else {
+            sendText(text)
+        }
+    }
+
+    /** Entry path: normalized text goes straight out (no input box round-trip). */
+    fun sendDirect(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        if (isBusy(_sessionState.value.status)) {
+            steer(clean)
+            return
+        }
+        _input.value = ""
+        sendText(clean)
+    }
+
+    /** Queue an instruction for the next round; never preempts the live turn. */
+    fun steer(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        lastUserText = clean
+        viewModelScope.launch {
+            if (!keyReadAllowed()) {
+                _notice.value = "POLICY_DENIED"
+                return@launch
+            }
+            val session = try {
+                withContext(Dispatchers.IO) { ensureSession(clean) }
+            } catch (_: Exception) {
+                null
+            }
+            if (session == null) {
+                _notice.value = "NO_ENDPOINT"
+                return@launch
+            }
+            try {
+                session.session.steer(clean)
+            } catch (_: Exception) {
+                // Controller projects failures via sessionState; nothing to add.
+            }
+        }
     }
 
     fun retry() {
@@ -98,10 +149,13 @@ class ChatViewModel(
     }
 
     private fun sendText(text: String) {
-        _input.value = ""
         lastUserText = text
         _notice.value = null
         viewModelScope.launch {
+            if (!keyReadAllowed()) {
+                _notice.value = "POLICY_DENIED"
+                return@launch
+            }
             val created = try {
                 withContext(Dispatchers.IO) { ensureSession(text) }
             } catch (_: Exception) {
@@ -163,7 +217,7 @@ class ChatViewModel(
             }
             closeLive()
             _history.value = loaded
-            attach(created.session, created.sessionId, created.endpointId)
+            attach(created.session, created.sessionId, created.endpointId, created.model)
             _notice.value = null
         }
     }
@@ -171,23 +225,50 @@ class ChatViewModel(
     private suspend fun ensureSession(title: String): CreatedSession? {
         val config = store.observe().first() ?: return null
         val current = currentSession
-        if (current != null && sessionEndpointId == config.providerId) {
-            return CreatedSession(_currentSessionId.value, current, config.providerId)
+        if (current != null &&
+            sessionEndpointId == config.providerId &&
+            sessionModel == sessions.modelFor(config)
+        ) {
+            return CreatedSession(_currentSessionId.value, current, config.providerId, sessionModel.orEmpty())
         }
+        // Rebuild (endpoint/model switch): the old live messages only exist in
+        // the previous session's flow, so replay the previous transcript to
+        // avoid visibly dropping history. New turns land in a fresh session.
+        val prevId = _currentSessionId.value
         closeLive()
         val created = sessions.create(config, title)
-        attach(created.session, created.sessionId, created.endpointId)
+        if (prevId != null) {
+            try {
+                loadHistory(prevId)?.let { _history.value = it }
+            } catch (_: Exception) {
+            }
+        }
+        attach(created.session, created.sessionId, created.endpointId, created.model)
         return created
     }
 
-    private fun attach(session: ChatSession, transcriptId: String?, endpointId: String) {
+    private fun attach(session: ChatSession, transcriptId: String?, endpointId: String, model: String) {
         currentSession = session
         sessionEndpointId = endpointId
+        sessionModel = model
         _currentSessionId.value = transcriptId
         sessionCollectJob?.cancel()
         sessionCollectJob = viewModelScope.launch {
             session.uiState.collect { _sessionState.value = it }
         }
+    }
+
+    /**
+     * key.read is ASK-by-default (consented at setup); only a DENY rule blocks
+     * here (fail-closed, zero requests on deny). Shared by send and steer paths.
+     */
+    private suspend fun keyReadAllowed(): Boolean = try {
+        withContext(Dispatchers.IO) {
+            val endpointId = store.observe().first()?.providerId.orEmpty()
+            policy.evaluateFresh("key.read", endpointId).verdict != Verdict.DENY
+        }
+    } catch (_: Exception) {
+        false
     }
 
     private fun closeLive() {
@@ -199,6 +280,7 @@ class ChatViewModel(
         }
         currentSession = null
         sessionEndpointId = null
+        sessionModel = null
     }
 
     private suspend fun loadHistory(sessionId: String): List<UiMessage>? {

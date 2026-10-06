@@ -52,6 +52,10 @@ import dev.librepocket.agent.ui.settings.SettingsScreen
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.SetupScreen
 import dev.librepocket.agent.ui.setup.SetupViewModel
+import dev.librepocket.agent.ui.setup.SetupViewModelFactory
+import dev.librepocket.chat.ChatStatus
+import dev.librepocket.entry.EntryDispatch
+import dev.librepocket.entry.EntryRoute
 import kotlinx.coroutines.launch
 
 object Routes {
@@ -71,7 +75,7 @@ fun MainScreen(
     val scope = rememberCoroutineScope()
     val app = LocalContext.current.applicationContext as android.app.Application
     val chatViewModel: ChatViewModel = viewModel(factory = ChatViewModelFactory(app))
-    val setupViewModel: SetupViewModel = viewModel()
+    val setupViewModel: SetupViewModel = viewModel(factory = SetupViewModelFactory(app))
     val sessionListViewModel: SessionListViewModel = viewModel(factory = SessionListViewModelFactory(app))
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
@@ -82,10 +86,17 @@ fun MainScreen(
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
 
-    // Gate first, prefill later: stash shared text until an endpoint exists.
-    LaunchedEffect(sharedText, hasEndpoint) {
+    // Gate first, dispatch later: stash the normalized entry text until an
+    // endpoint exists, then send-now when idle or steer when busy.
+    val chatStatus by chatViewModel.sessionState.collectAsStateWithLifecycle()
+    LaunchedEffect(sharedText, hasEndpoint, chatStatus.status) {
         if (!sharedText.isNullOrBlank() && hasEndpoint) {
-            chatViewModel.prefill(sharedText)
+            val busy = chatStatus.status == ChatStatus.STREAMING ||
+                chatStatus.status == ChatStatus.WAITING_STEERED
+            when (EntryDispatch.route(isBusy = busy)) {
+                EntryRoute.SendNow -> chatViewModel.sendDirect(sharedText!!)
+                EntryRoute.QueueAsSteer -> chatViewModel.steer(sharedText!!)
+            }
             onSharedConsumed()
         }
     }
@@ -106,6 +117,14 @@ fun MainScreen(
         if (drawerState.currentValue == DrawerValue.Open) {
             sessionListViewModel.refresh()
         }
+    }
+
+    // Edit-entry helper: prefill the form with the live endpoint (key stays
+    // blank) so "edit" never shows another preset's defaults.
+    fun goSetupForEdit() {
+        val config = (gate as? EndpointGate.Ready)?.config
+        if (config != null) setupViewModel.prefillForEdit(config)
+        navController.navigate(Routes.SETUP) { launchSingleTop = true }
     }
 
     ModalNavigationDrawer(
@@ -170,7 +189,7 @@ fun MainScreen(
                     label = { Text("API 設定") },
                     selected = currentRoute == Routes.SETUP,
                     onClick = {
-                        navController.navigate(Routes.SETUP) { launchSingleTop = true }
+                        goSetupForEdit()
                         scope.launch { drawerState.close() }
                     },
                     icon = { Icon(Icons.Filled.Key, contentDescription = null) },
@@ -241,9 +260,7 @@ fun MainScreen(
                         ChatScreen(
                             padding = padding,
                             viewModel = chatViewModel,
-                            onOpenSettings = {
-                                navController.navigate(Routes.SETUP) { launchSingleTop = true }
-                            },
+                            onOpenSettings = { goSetupForEdit() },
                             onTurnFinished = { sessionListViewModel.refresh() },
                         )
                     }
@@ -251,10 +268,12 @@ fun MainScreen(
                         SettingsScreen(
                             padding = padding,
                             gate = gate,
-                            onEditEndpoint = {
-                                navController.navigate(Routes.SETUP) { launchSingleTop = true }
+                            onEditEndpoint = { goSetupForEdit() },
+                            onLogout = {
+                                setupViewModel.logout()
+                                chatViewModel.newChat()
+                                sessionListViewModel.refresh()
                             },
-                            onLogout = { setupViewModel.logout() },
                         )
                     }
                     composable(Routes.SETUP) {

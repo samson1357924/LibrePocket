@@ -38,9 +38,11 @@ private class FakeChatProvider(
 ) : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
     var streamCalls = 0
+    val seenRequests: MutableList<ChatRequest> = java.util.Collections.synchronizedList(mutableListOf())
 
     override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
         streamCalls++
+        seenRequests.add(request)
         emitAll(handler(request))
     }
 
@@ -98,7 +100,7 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        return ChatViewModel(store, factory)
+        return ChatViewModel(store, factory, InMemoryPolicyStore())
     }
 
     private fun awaitTrue(timeoutMs: Long = 8000, cond: () -> Boolean) {
@@ -130,7 +132,7 @@ class ChatWiringTest {
     }
 
     @Test
-    fun busySendIsIgnoredAndCancelWorks() {
+    fun busySendSteersAndCancelWorks() {
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
@@ -149,18 +151,22 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = ChatViewModel(store, factory)
-        vm.onInputChange("first")
-        vm.send()
-        awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
-        vm.onInputChange("second")
-        vm.send() // busy: ignored, no crash
-        Thread.sleep(50)
-        assertEquals(ChatStatus.STREAMING, vm.sessionState.value.status)
-        vm.cancel()
-        awaitTrue { vm.sessionState.value.status == ChatStatus.CANCELLED }
-        val partial = vm.sessionState.value.messages.first { it.role == "assistant" }
-        assertTrue(partial.isPartial)
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
+        try {
+            vm.onInputChange("first")
+            vm.send()
+            awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
+            vm.onInputChange("second")
+            vm.send() // busy: steered, never preempts; input consumed into the queue
+            awaitTrue { vm.sessionState.value.pendingSteerCount == 1 }
+            assertEquals(ChatStatus.STREAMING, vm.sessionState.value.status)
+            vm.cancel()
+            awaitTrue { vm.sessionState.value.status == ChatStatus.CANCELLED }
+            val partial = vm.sessionState.value.messages.first { it.role == "assistant" }
+            assertTrue(partial.isPartial)
+        } finally {
+            vm.newChat() // close session: drains the queued steer, no background leak
+        }
     }
 
     @Test
@@ -187,7 +193,7 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = ChatViewModel(store, factory)
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
         vm.onInputChange("hi")
         vm.send()
         awaitTrue { vm.sessionState.value.status == ChatStatus.ERROR }
@@ -256,7 +262,7 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = ChatViewModel(store, factory)
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
         vm.openSession(sid)
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
@@ -266,6 +272,155 @@ class ChatWiringTest {
         assertEquals("ok", vm.messages.value.last().text)
         // Live turn persisted into the same transcript session.
         assertTrue(transcripts.events.count { it.kind == "user" } == 2)
+    }
+
+    @Test
+    fun steerWhenIdleSends() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "steered"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val vm = newVm(store, fake)
+        vm.steer("go")
+        awaitTrue { vm.sessionState.value.messages.size == 2 }
+        assertEquals("go", vm.sessionState.value.messages.first { it.role == "user" }.text)
+    }
+
+    @Test
+    fun steerWhileBusyQueuesFollowUp() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "part"))
+                delay(300)
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val vm = newVm(store, fake)
+        vm.onInputChange("first")
+        vm.send()
+        awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
+        vm.steer("follow")
+        awaitTrue { vm.sessionState.value.pendingSteerCount == 1 || vm.messages.value.size == 4 }
+        awaitTrue(timeoutMs = 12000) { vm.messages.value.size == 4 }
+        assertEquals("follow", vm.messages.value[2].text)
+    }
+
+    @Test
+    fun policyDenyBlocksSendWithZeroRequests() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "must not send"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val deny = object : dev.librepocket.policy.PolicyStore {
+            override fun evaluate(action: String, resource: String) =
+                dev.librepocket.policy.PolicyDecision(
+                    dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
+                )
+
+            override suspend fun setRule(rule: dev.librepocket.policy.PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules() = emptyList<dev.librepocket.policy.PolicyRule>()
+            override suspend fun evaluateFresh(action: String, resource: String) =
+                dev.librepocket.policy.PolicyDecision(
+                    dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
+                )
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            buildProvider = { _, _ -> fake },
+        )
+        val vm = ChatViewModel(store, factory, deny)
+        vm.onInputChange("hi")
+        vm.send()
+        awaitTrue { vm.notice.value == "POLICY_DENIED" }
+        assertEquals(0, fake.streamCalls)
+        assertTrue(vm.sessionState.value.messages.isEmpty())
+    }
+
+    @Test
+    fun policyDenyBlocksSteerWithZeroRequests() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "must not send"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val deny = object : dev.librepocket.policy.PolicyStore {
+            override fun evaluate(action: String, resource: String) =
+                dev.librepocket.policy.PolicyDecision(
+                    dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
+                )
+
+            override suspend fun setRule(rule: dev.librepocket.policy.PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules() = emptyList<dev.librepocket.policy.PolicyRule>()
+            override suspend fun evaluateFresh(action: String, resource: String) =
+                dev.librepocket.policy.PolicyDecision(
+                    dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
+                )
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            buildProvider = { _, _ -> fake },
+        )
+        val vm = ChatViewModel(store, factory, deny)
+        vm.steer("queued-evil")
+        awaitTrue { vm.notice.value == "POLICY_DENIED" }
+        assertEquals(0, fake.streamCalls)
+    }
+
+    @Test
+    fun modelSwitchRecreatesLiveSession() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        var creates = 0
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            buildProvider = { _, _ ->
+                creates++
+                fake
+            },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
+        vm.onInputChange("one")
+        vm.send()
+        awaitTrue { vm.sessionState.value.messages.isNotEmpty() }
+        assertEquals(1, creates)
+        // The transcript sink persists asynchronously; wait for it before switching.
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+        // Same provider, different model -> live session must rebuild with the
+        // new model, and the previous transcript stays visible.
+        runBlocking { store.save(sampleEndpoint().copy(model = "gpt-4o")) }
+        vm.onInputChange("two")
+        vm.send()
+        awaitTrue { creates == 2 }
+        awaitTrue { vm.messages.value.size == 4 }
+        assertEquals(listOf("gpt-4o-mini", "gpt-4o"), fake.seenRequests.map { it.model })
     }
 
     @Test
@@ -292,7 +447,7 @@ class ChatWiringTest {
                 fake
             },
         )
-        val vm = ChatViewModel(store, factory)
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
         vm.onInputChange("one")
         vm.send()
         awaitTrue { vm.sessionState.value.messages.isNotEmpty() }

@@ -133,7 +133,7 @@ class EndpointStoreTest {
         runBlocking {
             try {
                 // Pasted key material must never land in the ref field.
-                store.save(sampleConfig().copy(apiKeyRef = "sk-abcdef1234567890"))
+                store.save(sampleConfig().copy(apiKeyRef = "sk-abcDEF1234567890"))
                 error("expected PROVIDER_KEY_REF_MALFORMED")
             } catch (e: IllegalArgumentException) {
                 assertEquals("PROVIDER_KEY_REF_MALFORMED", e.message)

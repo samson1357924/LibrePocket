@@ -1,0 +1,5 @@
+# False positive: synthetic fixture in saveRejectsMalformedRef, deliberately
+# key-looking to prove save() rejects pasted key material in the ref field.
+# Worktree copy already switched to an allowlisted fixture (b0effb9); this
+# entry silences the pre-fix commit (8a5bedf) under full-history scans.
+8a5bedfcddd7e8e83c3a8554444f80dd51d9cf06:app/src/test/java/dev/librepocket/agent/ui/setup/EndpointStoreTest.kt:generic-api-key:136

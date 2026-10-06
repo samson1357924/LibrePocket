@@ -58,6 +58,9 @@ android {
             isIncludeAndroidResources = true
         }
     }
+    lint {
+        lintConfig = file("lint.xml")
+    }
 }
 
 dependencies {

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!-- Ignore false positives caused by tools:node="remove" in play overlay manifest -->
+    <issue id="ProtectedPermissions">
+        <ignore path="src/play/AndroidManifest.xml" />
+    </issue>
+    <issue id="PermissionImpliesUnsupportedChromeOsHardware">
+        <ignore path="src/play/AndroidManifest.xml" />
+    </issue>
+</lint>

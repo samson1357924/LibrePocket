@@ -274,13 +274,19 @@ INTERRUPTED → RUNNING (使用者明確恢復) / CANCELLED
 
 ## 12. 競品思想借鑑（僅思想，不複製實作）
 
-| 方向 | 借鑑的思想 | 出處 |
+| 方向 | 借鑑的思想 | 出處與授權 |
 |---|---|---|
-| 轉錄可恢復性 | 以 JSONL 追加寫作為會話真相來源，崩潰可逐行重放 | pi 代理的會話轉錄思想（公開專案 pi） |
-| 可測 harness | 以錄製/回放裝置動作序列支撐 GUI 迴歸，而非每次真機重跑 | mobilerun 類 harness 思想（本機參照專案 mobilerun） |
-| 本地全文檢索 | 以 FTS 表支撐轉錄與記憶檢索，避免重型向量庫 | hermes 端側 FTS5 思想（本機參照專案 hermes-agent） |
-| 常駐閘道 | 以單一常駐服務匯聚多入口、統一鑑權與審計 | openclaw gateway 思想（本機參照專案 openclaw） |
+| 產品/架構願景 | 系統級 Agent、快慢雙通道、BYOK（僅思想，程式碼零複製） | Eta（PolyForm Noncommercial，不相容，clean-room） |
+| 轉錄可恢復性 | 以 JSONL 追加寫作為會話真相來源，崩潰可逐行重放 | pi 代理的會話轉錄思想（MIT，公開專案 pi） |
+| Steering 語義 | 每 turn 起點與 tool 間隙拉 steering、follow-up 下輪進入 | pi（MIT） |
+| 可測 harness | 以錄製/回放裝置動作序列支撐 GUI 迴歸，而非每次真機重跑 | mobilerun 類 harness 思想（MIT，本機參照專案 mobilerun） |
+| 本地全文檢索 | 以 FTS 表支撐轉錄與記憶檢索，避免重型向量庫 | hermes 端側 FTS5 思想（MIT，本機參照專案 hermes-agent） |
+| 常駐閘道 | 以單一常駐服務匯聚多入口、統一鑑權與審計 | openclaw gateway 思想（MIT，本機參照專案 openclaw） |
 | 模型目錄 | 以外部模型目錄解耦「模型列表更新」與 App 發版 | models.dev 模型目錄思想，見 https://models.dev |
+| 權限規則集 | ask/allow/deny × wildcard 三態規則 | opencode permission 思想（MIT） |
+| 判別加速頭 | Choice/Score/Noul 結構化判斷、可選 shadow 接入 | TypeSafe Jev（專有託管模型，預設關） |
+| GUI 動作空間 | tap/swipe/input 緊湊 JSON、規劃與 grounding 分離 | AgentCPM-GUI（Apache-2.0） |
+| 端側對標 | 功能清單黑盒對照（不抄碼，授權不相容） | OmniBot（AGPL，僅參考） |
 
 以上僅為思想層面參考，本文件所有結構定義均為原創表述。
 

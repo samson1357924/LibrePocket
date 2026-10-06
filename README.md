@@ -44,10 +44,34 @@ Build them with:
 Environment setup (JDK, `ANDROID_HOME`, SDK platforms) is documented in
 `docs/ENV.md`. Brand rules live in `TRADEMARKS.md`.
 
-## Next steps (not yet implemented)
+## Acknowledgments
 
-1. Agent loop + tool registry design doc.
-2. Network transport wrapper on okhttp-sse.
-3. Room schema v1 + DataStore settings keys.
-4. Encrypted credential storage via security-crypto.
-5. Release signing, versionCode policy, Play Data Safety form draft.
+LibrePocket is an original clean-room implementation. It learns ideas only
+from the projects below — no code is copied from non-compatible sources:
+
+- [Eta](https://github.com/Mangi-11/Eta) — product/architecture inspiration
+  (system-level agent, fast/slow paths, BYOK). Eta is PolyForm Noncommercial,
+  so LibrePocket reimplements ideas independently and ships under Apache-2.0.
+- [pi](https://github.com/earendil-works/pi) (MIT) — steering semantics,
+  JSONL session-truth idea.
+- [openclaw](https://github.com/openclaw/openclaw) (MIT) — gateway and
+  auth-profile ideas.
+- [opencode](https://github.com/sst/opencode) (MIT) — models.dev-driven
+  provider catalog and permission-ruleset ideas.
+- [hermes-agent](https://github.com/NousResearch/hermes-agent) (MIT) —
+  on-device FTS recall idea.
+- [mobilerun](https://github.com/droidrun/mobilerun) (MIT) — GUI harness and
+  app-card ideas.
+- [OmniBot](https://github.com/omnimind-ai/OmniBot) — closest on-device
+  peer, used as black-box functional reference only (AGPL, not compatible,
+  no code reuse).
+- [AgentCPM-GUI](https://github.com/OpenBMB/AgentCPM-GUI) (Apache-2.0) —
+  grounding action-space reference.
+- [models.dev](https://models.dev) — open model directory snapshot idea.
+- TypeSafe Jev (proprietary, via OpenRouter) — optional discrimination head
+  (Choice/Score/Noul), off by default, key user-supplied.
+
+## License
+
+Apache-2.0 (`LICENSE`). Brand rules in `TRADEMARKS.md` (code is free,
+brand is not). Third-party notices in `NOTICE`.

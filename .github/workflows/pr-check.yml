@@ -1,0 +1,111 @@
+name: PR Check
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  unit-tests:
+    name: Unit & Robolectric Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Run Unit Tests (Play & Full Flavors)
+        run: ./gradlew :app:testPlayDebugUnitTest :app:testFullDebugUnitTest --continue
+
+      - name: Upload Test Reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: app/build/reports/tests/
+
+  lint:
+    name: Android Lint Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Run Android Lint (Play & Full Flavors)
+        run: ./gradlew :app:lintPlayDebug :app:lintFullDebug
+
+      - name: Upload Lint Reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-reports
+          path: app/build/reports/lint-results-*
+
+  build-and-policy-gate:
+    name: Build & Play Policy Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Assemble Debug APKs
+        run: ./gradlew :app:assemblePlayDebug :app:assembleFullDebug
+
+      - name: Configure Android SDK build-tools for aapt & dexdump
+        run: |
+          if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/build-tools" ]; then
+            BT_DIR=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+            if [ -n "$BT_DIR" ] && [ -d "$BT_DIR" ]; then
+              echo "$BT_DIR" >> "$GITHUB_PATH"
+            fi
+          fi
+
+      - name: Run Play Policy Check (ROADMAP D07)
+        run: |
+          chmod +x scripts/play_policy_check.sh
+          scripts/play_policy_check.sh app/build/outputs/apk/play/debug/app-play-debug.apk
+
+      - name: Upload Debug APKs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apks
+          path: app/build/outputs/apk/**/*.apk
+          retention-days: 7

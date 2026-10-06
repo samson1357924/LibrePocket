@@ -6,3 +6,19 @@ This product includes software developed by the LibrePocket project
 
 Third-party components and their licenses are declared in the Gradle
 version catalog (gradle/libs.versions.toml) and their own NOTICE files.
+
+Key runtime dependencies (all Apache-2.0 unless noted):
+- OkHttp / okhttp-sse / MockWebServer (Square) — Apache-2.0
+- AndroidX Room / DataStore / Security-Crypto / Test — Apache-2.0
+- kotlinx-serialization-json (JetBrains) — Apache-2.0
+- Tink Android (Google) — Apache-2.0
+- Kotlin stdlib / coroutines — Apache-2.0
+- JUnit4 — EPL-1.0 (test only); Robolectric — MIT (test only)
+
+Idea-level references (no vendored code except where license-compatible):
+- Eta (PolyForm Noncommercial 1.0.0) — inspiration only, clean-room
+  reimplementation, no code reuse.
+- pi / openclaw / opencode / hermes-agent / mobilerun — MIT.
+- AgentCPM-GUI — Apache-2.0.
+- OmniBot — AGPL (reference only, no code reuse for license reasons).
+- TypeSafe Jev — proprietary hosted model, optional integration only.

@@ -8,6 +8,7 @@ import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.agent.ui.chat.toProviderConfig
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.models.ModelsDevSnapshot
 import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.provider.DefaultProviderFactory
 import dev.librepocket.provider.KeyProvider
@@ -41,6 +42,8 @@ data class SetupUiState(
     val saving: Boolean = false,
     val testing: Boolean = false,
     val testModels: Int? = null,
+    val modelOptions: List<String> = emptyList(),
+    val modelsLoading: Boolean = false,
     val errorCode: String? = null,
     val saved: Boolean = false,
 )
@@ -60,7 +63,14 @@ class SetupViewModel(
     private val vaultSource: VaultSource,
     private val buildProvider: (ProviderConfig, KeyProvider) -> LlmProvider =
         { cfg, keys -> DefaultProviderFactory(keys).create(cfg) },
+    private val fetchDirectory: (suspend (String) -> String)? = null,
 ) : ViewModel() {
+
+    private val directoryClient by lazy {
+        dev.librepocket.provider.defaultOkHttpClient(
+            dev.librepocket.provider.ProviderHttpConfig(),
+        )
+    }
 
     private suspend fun vault(): KeyVault = vaultSource.vault()
 
@@ -97,11 +107,12 @@ class SetupViewModel(
             model = ProviderCatalog.defaultModelFor(presetId),
             errorCode = null,
             testModels = null,
+            modelOptions = emptyList(),
         )
     }
 
     fun onBaseUrlChange(v: String) {
-        _form.value = _form.value.copy(baseUrl = v, errorCode = null, testModels = null)
+        _form.value = _form.value.copy(baseUrl = v, errorCode = null, testModels = null, modelOptions = emptyList())
     }
 
     fun onModelChange(v: String) {
@@ -123,7 +134,7 @@ class SetupViewModel(
     /** One-shot connectivity check (P1_SPEC listModels); persists nothing. */
     fun testConnection() {
         val cur = _form.value
-        if (cur.testing || cur.saving) return
+        if (cur.testing || cur.saving || cur.modelsLoading) return
         val effectiveBaseUrl = effectiveBaseUrlOf(cur)
         val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey)
         if (err != null) {
@@ -146,9 +157,44 @@ class SetupViewModel(
         }
     }
 
+    /** Refresh the model candidates: live listing first, snapshot fills the rest. */
+    fun refreshModels() {
+        val cur = _form.value
+        if (cur.modelsLoading || cur.testing || cur.saving) return
+        val effectiveBaseUrl = effectiveBaseUrlOf(cur)
+        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey)
+        if (err != null) {
+            _form.value = cur.copy(errorCode = err)
+            return
+        }
+        _form.value = cur.copy(modelsLoading = true, errorCode = null)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val config = providerConfigOf(cur, effectiveBaseUrl)
+                val typed = cur.apiKey.trim()
+                val keys = KeyProvider { typed.toCharArray() }
+                val live = try {
+                    buildProvider(config, keys).listModels()
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                val fetcher = fetchDirectory ?: { url: String ->
+                    ModelDirectory.fetchBody(directoryClient, url)
+                }
+                val snapshot = ModelsDevSnapshot.fetchSnapshot(fetcher = fetcher)
+                val options = ProviderCatalog.listedModels(cur.presetId, live, snapshot)
+                _form.value = _form.value.copy(modelsLoading = false, modelOptions = options)
+            } catch (_: Exception) {
+                // Validation passed but mapping failed (unknown preset race):
+                // keep the free-text model, clear the spinner.
+                _form.value = _form.value.copy(modelsLoading = false)
+            }
+        }
+    }
+
     fun save() {
         val cur = _form.value
-        if (cur.saving || cur.testing) return
+        if (cur.saving || cur.testing || cur.modelsLoading) return
         val effectiveBaseUrl = effectiveBaseUrlOf(cur)
         val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey)
         if (err != null) {

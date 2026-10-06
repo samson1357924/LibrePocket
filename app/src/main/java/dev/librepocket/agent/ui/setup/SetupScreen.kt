@@ -17,6 +17,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
@@ -41,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
@@ -163,13 +165,59 @@ fun SetupScreen(
             singleLine = true,
         )
 
-        OutlinedTextField(
-            value = state.model,
-            onValueChange = viewModel::onModelChange,
-            label = { Text("模型") },
+        var modelExpanded by remember { mutableStateOf(false) }
+        Row(
             modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-        )
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ExposedDropdownMenuBox(
+                expanded = modelExpanded,
+                onExpandedChange = { modelExpanded = !modelExpanded },
+                modifier = Modifier.weight(1f),
+            ) {
+                OutlinedTextField(
+                    value = state.model,
+                    onValueChange = viewModel::onModelChange,
+                    label = { Text("模型") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelExpanded) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .menuAnchor(MenuAnchorType.PrimaryEditable),
+                    singleLine = true,
+                )
+                ExposedDropdownMenu(
+                    expanded = modelExpanded,
+                    onDismissRequest = { modelExpanded = false },
+                ) {
+                    if (state.modelOptions.isEmpty()) {
+                        DropdownMenuItem(
+                            text = { Text("先按「更新」載入模型列表，也可直接輸入") },
+                            onClick = { modelExpanded = false },
+                        )
+                    } else {
+                        state.modelOptions.take(50).forEach { option ->
+                            DropdownMenuItem(
+                                text = { Text(option) },
+                                onClick = {
+                                    viewModel.onModelChange(option)
+                                    modelExpanded = false
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+            IconButton(
+                onClick = viewModel::refreshModels,
+                enabled = !state.modelsLoading && !state.testing && !state.saving,
+            ) {
+                if (state.modelsLoading) {
+                    CircularProgressIndicator(strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Filled.Refresh, contentDescription = "更新模型列表")
+                }
+            }
+        }
 
         OutlinedTextField(
             value = state.apiKey,

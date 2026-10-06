@@ -6,7 +6,7 @@ import kotlin.text.RegexOption.IGNORE_CASE
  * P1 redaction table (M5, spec §6).
  *
  * Pure functions; zero Android dependencies so plain JVM unit tests can run them.
- * Rules apply sequentially R1..R12; [RedactResult.hits] counts matches per rule
+ * Rules apply sequentially R1..R13; [RedactResult.hits] counts matches per rule
  * in table order (rules with zero hits are included with count 0).
  */
 object Redactor {
@@ -81,6 +81,20 @@ object Redactor {
             Regex("""(android[_-]?id|device[_-]?id|imei|serial)\s*[:=]\s*\S+""", IGNORE_CASE),
             "\$1=⟦REDACTED⟧",
         ),
+        Rule(
+            "GEO_COORD",
+            // R13 (B3 fix): coordinates must not reach transcript/audit/export.
+            // Covers systema/NavigationTool output ("geo:lat,lng[?q=..]") as well as
+            // bare "lat,lng" pairs (e.g. inside OSM/Google-Maps fallback URLs) and
+            // labelled forms ("lat=..&lng=..", "座標：..,.."). Runs last: earlier
+            // rules never emit digit-dot-comma shapes, and no earlier rule matches
+            // inside a geo URI (R5 only knows api_key/token/secret keys).
+            Regex(
+                """geo:-?\d+(?:\.\d+)?,\s*-?\d+(?:\.\d+)?(?:[?;][^\s]*)?|(?<![A-Za-z])(?:lat(?:itude)?|lng|lon(?:gitude)?|latlng|loc(?:ation)?|coordinates?|coords?|經緯度|座標|位置)\s*[:=：]?\s*-?\d+(?:\.\d+)?\s*[,，]\s*-?\d+(?:\.\d+)?|(?:lat(?:itude)?|lng|lon(?:gitude)?)\s*[:=：]\s*-?\d+(?:\.\d+)?|(?<!\d)-?\d{1,3}\.\d{2,}\s*[,，]\s*-?\d{1,3}\.\d{2,}(?!\d)""",
+                IGNORE_CASE,
+            ),
+            "⟦REDACTED:GEO⟧",
+        ),
     )
 
     private val CARD_CANDIDATE = Regex("""(?<!\d)(?:\d[ \-]?){15,16}(?!\d)""")
@@ -99,7 +113,7 @@ object Redactor {
 
     const val ERROR_MAX_CHARS = 500
 
-    /** Full redaction: applies R1–R12 in order. */
+    /** Full redaction: applies R1–R13 in order. */
     fun redact(input: String): RedactResult {
         var text = input
         val hits = LinkedHashMap<String, Int>()

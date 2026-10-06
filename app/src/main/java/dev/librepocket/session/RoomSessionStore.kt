@@ -101,7 +101,14 @@ class RoomSessionStore(
 
     override suspend fun exportJsonl(sessionId: String, destFile: File) {
         val lines = withContext(Dispatchers.IO) {
-            dao.allEvents(sessionId).map { JsonlCodec.encode(it.toEvent()) }
+            dao.allEvents(sessionId).map {
+                val event = it.toEvent()
+                // B1 defense-in-depth: legacy rows may predate write-time
+                // redaction, so re-redact at export time before touching disk.
+                // Mirrors TranscriptExport.exportRedacted semantics.
+                val redacted = Redactor.redact(event.text).text
+                JsonlCodec.encode(event.copy(text = redacted))
+            }
         }
         val bytes = lines.sumOf { it.toByteArray(Charsets.UTF_8).size + 1 }
         check(bytes <= EXPORT_MAX_BYTES) { "export too large" }

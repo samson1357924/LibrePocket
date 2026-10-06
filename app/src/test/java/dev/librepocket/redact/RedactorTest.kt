@@ -5,7 +5,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * M5 unit tests (spec §10.3 / §11.3): R1–R12, ≥3 positives + ≥2 negatives each,
+ * M5 unit tests (spec §10.3 / §11.3): R1–R13, ≥3 positives + ≥2 negatives each,
  * plus redactError, hit counts, and the Luhn gate for R10.
  *
  * Pure JVM: [Redactor] has zero Android dependencies.
@@ -274,6 +274,83 @@ class RedactorTest {
         assertUnchanged("device is ready")
     }
 
+    // ---- R13 GEO_COORD (B3: NavigationTool geo URIs + bare lat,lng pairs) ----
+
+    @Test fun r13_geoUri() {
+        assertRedacted("nav geo:25.0478,121.5170 go", "25.0478,121.5170")
+    }
+
+    @Test fun r13_geoUriWithQuery() {
+        // systema/NavigationTool shape: coords + ?q= label must vanish as a whole.
+        val out = Redactor.redact("open geo:25.0478,121.5170?q=北車 now").text
+        assertTrue(out, out.contains("⟦REDACTED:GEO⟧"))
+        assertTrue(out, !out.contains("25.0478"))
+        assertTrue(out, !out.contains("121.5170"))
+        assertTrue(out, !out.contains("北車"))
+    }
+
+    @Test fun r13_geoZeroPlaceholder() {
+        val out = Redactor.redact("pin geo:0,0?q=台北車站 ok").text
+        assertTrue(out, out.contains("⟦REDACTED:GEO⟧"))
+        assertTrue(out, !out.contains("台北車站"))
+    }
+
+    @Test fun r13_barePair() {
+        assertRedacted("meet at 25.0478,121.517 tomorrow", "25.0478,121.517")
+    }
+
+    @Test fun r13_barePairWithSpace() {
+        assertRedacted("at 25.0478, 121.5170 sharp", "25.0478", "121.5170")
+    }
+
+    @Test fun r13_labeledPair() {
+        assertRedacted("座標：25.0478,121.5170集合", "25.0478", "121.5170")
+    }
+
+    @Test fun r13_splitLatLngParams() {
+        // Web-fallback style "?lat=..&lng=..": each axis redacted on its own.
+        assertRedacted("go ?lat=25.0478&lng=121.517 end", "25.0478", "121.517")
+    }
+
+    @Test fun r13_insideMapUrl() {
+        // OSM web fallback (NavigationTool.buildWebIntent) must not leak coords.
+        val out = Redactor.redact(
+            "see https://www.openstreetmap.org/search?query=25.0478,121.517 ok",
+        ).text
+        assertEquals(
+            "see https://www.openstreetmap.org/search?query=⟦REDACTED:GEO⟧ ok",
+            out,
+        )
+    }
+
+    @Test fun r13_negatives() {
+        assertUnchanged("see geo maps here")
+        assertUnchanged("version 1.2, 3.4 released")
+        assertUnchanged("location unknown")
+        assertUnchanged("date 2024-02-29 note")
+        assertUnchanged("order 12345")
+    }
+
+    // ---- redact-cases.txt corpus (spec §10.3: 每行 RULEID || input || expected) ----
+
+    @Test fun corpus_redactCases() {
+        val stream = javaClass.getResourceAsStream("/redact-cases.txt")
+            ?: throw AssertionError("redact-cases.txt missing from test resources")
+        val lines = stream.bufferedReader(Charsets.UTF_8).readLines()
+        var count = 0
+        for ((index, raw) in lines.withIndex()) {
+            if (raw.isBlank() || raw.trimStart().startsWith("#")) continue
+            val parts = raw.split("||", limit = 3)
+            assertEquals("bad corpus line ${index + 1}: $raw", 3, parts.size)
+            val ruleId = parts[0].trim()
+            val input = parts[1].trim()
+            val expected = parts[2].trim()
+            assertEquals("corpus line ${index + 1} [$ruleId]", expected, Redactor.redact(input).text)
+            count++
+        }
+        assertTrue("corpus must not be empty", count > 0)
+    }
+
     // ---- hits ----
 
     @Test fun hits_countPerRule() {
@@ -281,7 +358,7 @@ class RedactorTest {
         assertEquals(1, result.hits["EMAIL"])
         assertEquals(1, result.hits["CARD_16"])
         assertEquals(0, result.hits["PHONE_GENERIC"])
-        assertEquals(12, result.hits.size)
+        assertEquals(13, result.hits.size)
     }
 
     @Test fun hits_tableOrder() {
@@ -290,7 +367,7 @@ class RedactorTest {
             listOf(
                 "API_KEY_VALUE", "BEARER_TOKEN", "JSON_KEY_FIELD", "URL_CREDENTIAL",
                 "URL_TOKEN_PARAM", "EMAIL", "PHONE_GENERIC", "PHONE_INTL", "ID_TW",
-                "CARD_16", "IPV4_PRIVATE", "ANDROID_ID_LIKE",
+                "CARD_16", "IPV4_PRIVATE", "ANDROID_ID_LIKE", "GEO_COORD",
             ),
             result.hits.keys.toList(),
         )

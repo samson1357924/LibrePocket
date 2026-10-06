@@ -12,17 +12,20 @@ Infrastructure skeleton only (v0.1.0): build system, product flavors,
 permissions model, and project documents. There is **no agent loop and no
 tool implementations** yet — see "Next steps" below.
 
-## Two distributions, one applicationId
+## Two distributions, distinct applicationIds (co-installable)
 
 | Flavor | Channel | Permissions | Services |
 |--------|---------|-------------|----------|
 | `play` | Google Play | Store-safe only: INTERNET, ACCESS_NETWORK_STATE, POST_NOTIFICATIONS, FOREGROUND_SERVICE. High-risk permissions are additionally stripped via `tools:node="remove"` (see `app/src/play/AndroidManifest.xml`). | No AccessibilityService, no VpnService |
-| `full` | F-Droid / direct download | Everything in `play`, plus READ_SMS, RECEIVE_SMS, MANAGE_EXTERNAL_STORAGE (see `app/src/full/AndroidManifest.xml`). | Placeholder AccessibilityService + VpnService declarations |
+| `full` | F-Droid / direct download (never Play) | Same as `play`: **never** requests `READ_SMS` / `RECEIVE_SMS` / `SEND_SMS`, `MANAGE_EXTERNAL_STORAGE`, or any VPN permission **in either flavor** (see `app/src/full/AndroidManifest.xml`, `docs/CAPABILITY_MATRIX.md` §1–§2, `docs/ROADMAP.md` P1–P4, `docs/BACKLOG.md` B8/D15). SMS goes only via the system composer pre-fill; files go only via SAF + MediaStore + private storage. | AccessibilityService only (default off, two-step consent); no VpnService |
 
-Both flavors share `applicationId = dev.librepocket.agent`
+Base `applicationId = dev.librepocket.agent`
 (**reverse-DNS, permanent — it can never be changed after publication**,
-and F-Droid indexes the app under it). They differ only in manifest
-content, never in identity.
+and F-Droid indexes the app under it). The `full` flavor appends
+`applicationIdSuffix = ".full"`, i.e. `dev.librepocket.agent.full`, so
+Play and full builds are co-installable side by side. They differ only in
+manifest content (full adds solely the accessibility automation service),
+never in base identity.
 
 Build them with:
 

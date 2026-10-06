@@ -277,6 +277,41 @@ class SessionStoreTest {
 
     // ---- concurrency ----
 
+    @Test fun export_redactsLegacyPlaintextRows(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        // Simulate a legacy DB row written before write-time redaction existed:
+        // bypass RoomSessionStore.appendEvent and insert plaintext via the DAO.
+        val secretEmail = "user@example.com"
+        val secretKey = "sk-abcDEF1234567890"
+        val secretPhone = "0912-345-678"
+        db.sessionDao().insertEvent(
+            TranscriptEventEntity(
+                0,
+                sid,
+                1,
+                "run-1",
+                "user",
+                "contact $secretEmail my key $secretKey call $secretPhone",
+                false,
+                0,
+                now,
+            ),
+        )
+
+        val dest = File(tmpDir, "legacy.jsonl")
+        store.exportJsonl(sid, dest)
+
+        val lines = dest.readLines(Charsets.UTF_8)
+        assertEquals(1, lines.size)
+        Json.parseToJsonElement(lines[0]) // still jq-parseable
+        val out = lines[0]
+        assertTrue(!out.contains(secretEmail))
+        assertTrue(!out.contains(secretKey))
+        assertTrue(!out.contains(secretPhone))
+        assertTrue(out.contains("⟦REDACTED"))
+    }
+
     @Test fun append_concurrentKeepsSeqDense(): Unit = runBlocking {
         setUp()
         val sid = store.createSession("t", "p/m")

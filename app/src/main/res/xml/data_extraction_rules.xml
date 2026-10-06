@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  D07 data-extraction rules (API 31+: cloud backup + device transfer).
+
+  Mirrors backup_rules.xml: the same key files are excluded from BOTH
+  cloud backup and D2D transfer. After a device migration the user
+  re-enters provider keys; sessions restore without them.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="librepocket_keys.xml" />
+        <exclude domain="database" path="librepocket_vault" />
+        <exclude domain="file" path="librepocket_keyset_" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="librepocket_keys.xml" />
+        <exclude domain="database" path="librepocket_vault" />
+        <exclude domain="file" path="librepocket_keyset_" />
+    </device-transfer>
+</data-extraction-rules>

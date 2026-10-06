@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  D07 hardening: never allow cleartext traffic.
+
+  Base config denies cleartext for all domains (including user-added CAs'
+  cleartext fallback). Loopback development exceptions, if ever needed,
+  must be added here explicitly with a TODO + expiry — never by flipping
+  the base value to true.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

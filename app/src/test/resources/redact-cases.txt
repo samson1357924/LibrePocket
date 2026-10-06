@@ -1,0 +1,12 @@
+# redact-cases.txt — 脫敏語料，每行 `RULEID || input || expected`，由 RedactorTest 逐行斷言。
+# B3 起始語料：R13 座標規則（經緯度 + geo: URI）。新增規則時往此檔追加正/反例即可。
+GEO_COORD || nav geo:25.0478,121.5170 go || nav ⟦REDACTED:GEO⟧ go
+GEO_COORD || open geo:25.0478,121.5170?q=北車 now || open ⟦REDACTED:GEO⟧ now
+GEO_COORD || pin geo:0,0?q=台北車站 ok || pin ⟦REDACTED:GEO⟧ ok
+GEO_COORD || meet at 25.0478,121.517 tomorrow || meet at ⟦REDACTED:GEO⟧ tomorrow
+GEO_COORD || 座標：25.0478,121.5170集合 || ⟦REDACTED:GEO⟧集合
+GEO_COORD || lat=25.0478&lng=121.517 || ⟦REDACTED:GEO⟧&⟦REDACTED:GEO⟧
+GEO_COORD || see https://www.openstreetmap.org/search?query=25.0478,121.517 ok || see https://www.openstreetmap.org/search?query=⟦REDACTED:GEO⟧ ok
+GEO_COORD || see geo maps here || see geo maps here
+GEO_COORD || version 1.2, 3.4 released || version 1.2, 3.4 released
+GEO_COORD || location unknown || location unknown

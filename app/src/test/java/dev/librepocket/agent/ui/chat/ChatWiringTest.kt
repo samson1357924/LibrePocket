@@ -38,9 +38,11 @@ private class FakeChatProvider(
 ) : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
     var streamCalls = 0
+    val seenRequests: MutableList<ChatRequest> = java.util.Collections.synchronizedList(mutableListOf())
 
     override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
         streamCalls++
+        seenRequests.add(request)
         emitAll(handler(request))
     }
 
@@ -379,6 +381,46 @@ class ChatWiringTest {
         vm.steer("queued-evil")
         awaitTrue { vm.notice.value == "POLICY_DENIED" }
         assertEquals(0, fake.streamCalls)
+    }
+
+    @Test
+    fun modelSwitchRecreatesLiveSession() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        var creates = 0
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            buildProvider = { _, _ ->
+                creates++
+                fake
+            },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
+        vm.onInputChange("one")
+        vm.send()
+        awaitTrue { vm.sessionState.value.messages.isNotEmpty() }
+        assertEquals(1, creates)
+        // The transcript sink persists asynchronously; wait for it before switching.
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+        // Same provider, different model -> live session must rebuild with the
+        // new model, and the previous transcript stays visible.
+        runBlocking { store.save(sampleEndpoint().copy(model = "gpt-4o")) }
+        vm.onInputChange("two")
+        vm.send()
+        awaitTrue { creates == 2 }
+        awaitTrue { vm.messages.value.size == 4 }
+        assertEquals(listOf("gpt-4o-mini", "gpt-4o"), fake.seenRequests.map { it.model })
     }
 
     @Test

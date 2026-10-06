@@ -133,6 +133,28 @@ class SetupViewModel(
         _form.value = _form.value.copy(showKey = !_form.value.showKey)
     }
 
+    /**
+     * Prefill the form from the live endpoint for "edit" entries. The key
+     * always stays blank (dots display "already set"; retype to rotate).
+     * Unknown presetIds fall back to custom with the stored URL editable.
+     */
+    fun prefillForEdit(config: EndpointConfig) {
+        val preset = ProviderCatalog.preset(config.presetId)
+        if (preset == null || config.presetId == ProviderCatalog.CUSTOM_ID) {
+            _form.value = SetupUiState(
+                presetId = ProviderCatalog.CUSTOM_ID,
+                baseUrl = config.baseUrl,
+                model = config.model,
+            )
+        } else {
+            _form.value = SetupUiState(
+                presetId = preset.id,
+                baseUrl = preset.baseUrl,
+                model = config.model.ifBlank { preset.defaultModel },
+            )
+        }
+    }
+
     fun consumeSaved() {
         _form.value = _form.value.copy(saved = false)
     }

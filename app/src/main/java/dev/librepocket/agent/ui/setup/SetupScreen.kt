@@ -276,7 +276,7 @@ fun SetupScreen(
         ) {
             OutlinedButton(
                 onClick = viewModel::testConnection,
-                enabled = !state.testing && !state.saving,
+                enabled = !state.testing && !state.saving && !state.modelsLoading,
                 modifier = Modifier.weight(1f),
             ) {
                 if (state.testing) {
@@ -289,7 +289,7 @@ fun SetupScreen(
             }
             Button(
                 onClick = viewModel::save,
-                enabled = !state.saving && !state.testing,
+                enabled = !state.saving && !state.testing && !state.modelsLoading,
                 modifier = Modifier.weight(1f),
             ) {
                 if (state.saving) {

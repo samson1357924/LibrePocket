@@ -119,6 +119,14 @@ fun MainScreen(
         }
     }
 
+    // Edit-entry helper: prefill the form with the live endpoint (key stays
+    // blank) so "edit" never shows another preset's defaults.
+    fun goSetupForEdit() {
+        val config = (gate as? EndpointGate.Ready)?.config
+        if (config != null) setupViewModel.prefillForEdit(config)
+        navController.navigate(Routes.SETUP) { launchSingleTop = true }
+    }
+
     ModalNavigationDrawer(
         drawerState = drawerState,
         gesturesEnabled = hasEndpoint,
@@ -181,7 +189,7 @@ fun MainScreen(
                     label = { Text("API 設定") },
                     selected = currentRoute == Routes.SETUP,
                     onClick = {
-                        navController.navigate(Routes.SETUP) { launchSingleTop = true }
+                        goSetupForEdit()
                         scope.launch { drawerState.close() }
                     },
                     icon = { Icon(Icons.Filled.Key, contentDescription = null) },
@@ -252,9 +260,7 @@ fun MainScreen(
                         ChatScreen(
                             padding = padding,
                             viewModel = chatViewModel,
-                            onOpenSettings = {
-                                navController.navigate(Routes.SETUP) { launchSingleTop = true }
-                            },
+                            onOpenSettings = { goSetupForEdit() },
                             onTurnFinished = { sessionListViewModel.refresh() },
                         )
                     }
@@ -262,10 +268,12 @@ fun MainScreen(
                         SettingsScreen(
                             padding = padding,
                             gate = gate,
-                            onEditEndpoint = {
-                                navController.navigate(Routes.SETUP) { launchSingleTop = true }
+                            onEditEndpoint = { goSetupForEdit() },
+                            onLogout = {
+                                setupViewModel.logout()
+                                chatViewModel.newChat()
+                                sessionListViewModel.refresh()
                             },
-                            onLogout = { setupViewModel.logout() },
                         )
                     }
                     composable(Routes.SETUP) {

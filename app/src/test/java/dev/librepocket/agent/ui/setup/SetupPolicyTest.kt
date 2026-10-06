@@ -158,6 +158,47 @@ class SetupPolicyTest {
     }
 
     @Test
+    fun prefillForEditPopulatesFormWithoutKey() {
+        val (vm, _, _) = newVm(VerdictPolicy(Verdict.ALLOW))
+        vm.prefillForEdit(
+            EndpointConfig(
+                providerId = "preset:anthropic",
+                presetId = "anthropic",
+                label = "Anthropic",
+                baseUrl = "https://api.anthropic.com",
+                protocol = dev.librepocket.provider.ProviderProtocol.ANTHROPIC,
+                model = "claude-x",
+                apiKeyRef = "provider_key/preset:anthropic",
+            ),
+        )
+        val form = vm.form.value
+        assertEquals("anthropic", form.presetId)
+        assertEquals("https://api.anthropic.com", form.baseUrl)
+        assertEquals("claude-x", form.model)
+        assertEquals("", form.apiKey)
+        assertNull(form.errorCode)
+    }
+
+    @Test
+    fun prefillForEditUnknownPresetFallsBackToCustom() {
+        val (vm, _, _) = newVm(VerdictPolicy(Verdict.ALLOW))
+        vm.prefillForEdit(
+            EndpointConfig(
+                providerId = "preset:ghost",
+                presetId = "ghost",
+                label = "Ghost",
+                baseUrl = "https://ghost.example.com/v1",
+                protocol = dev.librepocket.provider.ProviderProtocol.CHAT_COMPLETIONS,
+                model = "m",
+                apiKeyRef = "provider_key/preset:ghost",
+            ),
+        )
+        val form = vm.form.value
+        assertEquals("custom", form.presetId)
+        assertEquals("https://ghost.example.com/v1", form.baseUrl)
+    }
+
+    @Test
     fun keyEditInvalidatesConfirmation() {
         val (vm, _, _) = newVm(VerdictPolicy(Verdict.ASK))
         vm.onApiKeyChange("sk-test-key-123")

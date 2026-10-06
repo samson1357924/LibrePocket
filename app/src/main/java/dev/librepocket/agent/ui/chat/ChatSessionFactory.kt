@@ -52,6 +52,7 @@ data class CreatedSession(
     val sessionId: String?,
     val session: ChatSession,
     val endpointId: String,
+    val model: String,
 )
 
 /**
@@ -73,14 +74,15 @@ class ChatSessionFactory(
         val config = endpoint.toProviderConfig()
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         val store = sessionStores?.store()
-        val sessionId = store?.createSession(title.take(30), modelOf(endpoint))
+        val model = modelFor(endpoint)
+        val sessionId = store?.createSession(title.take(30), model)
         val transcript: TranscriptSink =
             if (store != null && sessionId != null) {
                 SessionTranscriptSink(store, sessionId)
             } else {
                 NoOpTranscriptSink()
             }
-        return CreatedSession(sessionId, buildSession(endpoint, config, transcript), endpoint.providerId)
+        return CreatedSession(sessionId, buildSession(endpoint, config, transcript), endpoint.providerId, model)
     }
 
     /** Binds a live session to an existing transcript session (resume, no re-create). */
@@ -89,10 +91,12 @@ class ChatSessionFactory(
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         val store = sessionStores?.store()
         require(store != null && store.getSession(sessionId) != null) { "UNKNOWN_SESSION" }
+        val model = modelFor(endpoint)
         return CreatedSession(
             sessionId,
             buildSession(endpoint, config, SessionTranscriptSink(store, sessionId)),
             endpoint.providerId,
+            model,
         )
     }
 
@@ -100,6 +104,15 @@ class ChatSessionFactory(
         sessionStores?.store()
     } catch (_: Exception) {
         null
+    }
+
+    /** Effective model id for an endpoint (user text, preset default, or "default"). */
+    fun modelFor(endpoint: EndpointConfig): String = endpoint.model.ifBlank {
+        if (endpoint.presetId == ProviderCatalog.CUSTOM_ID) {
+            TurnController.DEFAULT_MODEL
+        } else {
+            ProviderCatalog.defaultModelFor(endpoint.presetId)
+        }
     }
 
     private suspend fun buildSession(
@@ -110,16 +123,9 @@ class ChatSessionFactory(
         val vault = vaultSource.vault()
         val keys = KeyProvider { ref -> vault.getKey(ref.removePrefix("provider_key/")) }
         val provider = buildProvider(config, keys)
-        return ChatSessionImpl(provider, policy, transcript, model = modelOf(endpoint))
+        return ChatSessionImpl(provider, policy, transcript, model = modelFor(endpoint))
     }
 
-    private fun modelOf(endpoint: EndpointConfig): String = endpoint.model.ifBlank {
-        if (endpoint.presetId == ProviderCatalog.CUSTOM_ID) {
-            TurnController.DEFAULT_MODEL
-        } else {
-            ProviderCatalog.defaultModelFor(endpoint.presetId)
-        }
-    }
 }
 
 /** Production wiring for [ChatViewModel] (shares the process-singleton endpoint store). */

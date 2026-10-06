@@ -67,6 +67,7 @@ class ChatViewModel(
 
     private var currentSession: ChatSession? = null
     private var sessionEndpointId: String? = null
+    private var sessionModel: String? = null
     private var sessionCollectJob: Job? = null
     private var openJob: Job? = null
     private var lastUserText: String? = null
@@ -207,7 +208,7 @@ class ChatViewModel(
             }
             closeLive()
             _history.value = loaded
-            attach(created.session, created.sessionId, created.endpointId)
+            attach(created.session, created.sessionId, created.endpointId, created.model)
             _notice.value = null
         }
     }
@@ -215,18 +216,32 @@ class ChatViewModel(
     private suspend fun ensureSession(title: String): CreatedSession? {
         val config = store.observe().first() ?: return null
         val current = currentSession
-        if (current != null && sessionEndpointId == config.providerId) {
-            return CreatedSession(_currentSessionId.value, current, config.providerId)
+        if (current != null &&
+            sessionEndpointId == config.providerId &&
+            sessionModel == sessions.modelFor(config)
+        ) {
+            return CreatedSession(_currentSessionId.value, current, config.providerId, sessionModel.orEmpty())
         }
+        // Rebuild (endpoint/model switch): the old live messages only exist in
+        // the previous session's flow, so replay the previous transcript to
+        // avoid visibly dropping history. New turns land in a fresh session.
+        val prevId = _currentSessionId.value
         closeLive()
         val created = sessions.create(config, title)
-        attach(created.session, created.sessionId, created.endpointId)
+        if (prevId != null) {
+            try {
+                loadHistory(prevId)?.let { _history.value = it }
+            } catch (_: Exception) {
+            }
+        }
+        attach(created.session, created.sessionId, created.endpointId, created.model)
         return created
     }
 
-    private fun attach(session: ChatSession, transcriptId: String?, endpointId: String) {
+    private fun attach(session: ChatSession, transcriptId: String?, endpointId: String, model: String) {
         currentSession = session
         sessionEndpointId = endpointId
+        sessionModel = model
         _currentSessionId.value = transcriptId
         sessionCollectJob?.cancel()
         sessionCollectJob = viewModelScope.launch {
@@ -256,6 +271,7 @@ class ChatViewModel(
         }
         currentSession = null
         sessionEndpointId = null
+        sessionModel = null
     }
 
     private suspend fun loadHistory(sessionId: String): List<UiMessage>? {

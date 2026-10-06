@@ -89,19 +89,9 @@ interface SystemBTool {
   fun fallback(reason: ReasonCode, args: Map<String, String> = emptyMap()): Fallback
 }
 
-/** Play 合規審計常量：雙風味皆不可申請。 */
-object PlayCompliance {
-  const val SEND_SMS = "android.permission.SEND_SMS"
-  const val RECEIVE_SMS = "android.permission.RECEIVE_SMS"
-  const val READ_SMS = "android.permission.READ_SMS"
-  const val ACCESS_BACKGROUND_LOCATION = "android.permission.ACCESS_BACKGROUND_LOCATION"
-  const val MANAGE_EXTERNAL_STORAGE = "android.permission.MANAGE_EXTERNAL_STORAGE"
-
-  val FORBIDDEN_PERMISSIONS: Set<String> = setOf(
-    SEND_SMS,
-    RECEIVE_SMS,
-    READ_SMS,
-    ACCESS_BACKGROUND_LOCATION,
-    MANAGE_EXTERNAL_STORAGE,
-  )
-}
+/**
+ * Play 合規說明（B8）：本包生產碼不得包含高風險權限字面，拒絕清單僅保留在
+ * 測試源集 `dev.librepocket.systemb.PlayCompliance`（供單測斷言零請求用），
+ * 因此此處故意不定義任何 `android.permission.*` 常量，避免字面被編入 play dex。
+ * 生產合規靠「永不觸碰 permissionSink + 委託系統 App」實現，見各 Tool 註解。
+ */

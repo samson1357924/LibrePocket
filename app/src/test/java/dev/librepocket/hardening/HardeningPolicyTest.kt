@@ -58,6 +58,31 @@ class HardeningPolicyTest {
         assertTrue(violations.single().check.contains("class-blacklist"))
     }
 
+    @Test fun privilegeBridge_flaggedInPlay() {
+        // S3：提權橋（privilege/github）絕不進 play。
+        val violations = HardeningPolicy.checkPlayArtifact(
+            permissions = emptyList(),
+            classDescriptors = listOf("Ldev/librepocket/privilege/github/RootSuRunner;"),
+            superclasses = emptyList(),
+            services = emptyList(),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().check.contains("class-blacklist"))
+        assertTrue(HardeningPolicy.PLAY_CLASS_BLACKLIST.contains("Ldev/librepocket/privilege/github/"))
+    }
+
+    @Test fun shizukuTransport_flaggedInPlay() {
+        // S3：Shizuku 傳輸層（githubImplementation only）絕不進 play。
+        val violations = HardeningPolicy.checkPlayArtifact(
+            permissions = emptyList(),
+            classDescriptors = listOf("Lrikka/shizuku/Shizuku;"),
+            superclasses = emptyList(),
+            services = emptyList(),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().check.contains("class-blacklist"))
+    }
+
     @Test fun cleanFossArtifact_passes() {
         val violations = HardeningPolicy.checkFossArtifact(
             classDescriptors = listOf(
@@ -100,6 +125,17 @@ class HardeningPolicyTest {
         assertTrue(
             HardeningPolicy.FOSS_STRING_BLACKLIST.contains("com.microsoft.cognitiveservices.speech"),
         )
+    }
+
+    @Test fun shizukuReference_flaggedInFoss() {
+        // S3：Shizuku 僅 github 版；foss dex 引用即違規（dot-form 常量，
+        // Dalvik 形匹配，避免自匹配）。
+        val violations = HardeningPolicy.checkFossArtifact(
+            classDescriptors = listOf("Lrikka/shizuku/Shizuku;"),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().check.contains("foss-string-blacklist"))
+        assertTrue(HardeningPolicy.FOSS_STRING_BLACKLIST.contains("rikka.shizuku"))
     }
 
     @Test fun vpnSubclass_flagged() {

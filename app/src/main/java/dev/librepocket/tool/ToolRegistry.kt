@@ -594,7 +594,10 @@ object ToolRegistry {
                 prop("voice", "string", "Optional Azure voice name"),
                 required = "\"text\"",
             ),
-            sideEffect = SideEffect.WRITE,
+            sideEffect = SideEffect.WRITE, // Final-review acceptance: TTS is audio-only
+            // (mirrors music.control WRITE, one-time confirm memorable); github-only +
+            // dual-switch (azure_tts default false + voice_output) is sufficient, no
+            // per-call PRIVILEGED confirm required. Text is redacted before upload.
             annotations = ToolAnnotations(
                 requiresSwitch = "azure_tts",
                 switchDefault = false,

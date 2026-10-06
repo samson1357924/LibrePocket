@@ -52,6 +52,7 @@ import dev.librepocket.agent.ui.settings.SettingsScreen
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.SetupScreen
 import dev.librepocket.agent.ui.setup.SetupViewModel
+import dev.librepocket.agent.ui.setup.SetupViewModelFactory
 import kotlinx.coroutines.launch
 
 object Routes {
@@ -71,7 +72,7 @@ fun MainScreen(
     val scope = rememberCoroutineScope()
     val app = LocalContext.current.applicationContext as android.app.Application
     val chatViewModel: ChatViewModel = viewModel(factory = ChatViewModelFactory(app))
-    val setupViewModel: SetupViewModel = viewModel()
+    val setupViewModel: SetupViewModel = viewModel(factory = SetupViewModelFactory(app))
     val sessionListViewModel: SessionListViewModel = viewModel(factory = SessionListViewModelFactory(app))
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route

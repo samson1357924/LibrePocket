@@ -6,6 +6,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -30,6 +31,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -46,17 +48,18 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.librepocket.preset.ProviderCatalog
 
 private fun errorText(code: String): String = when (code) {
     "SETUP_UNKNOWN_PRESET" -> "未知的供應商，請重新選擇。"
     "SETUP_BASE_URL_BLANK" -> "請填寫伺服器位址。"
     "PROVIDER_BAD_URL" -> "位址格式不正確。"
-    "PROVIDER_URL_MUST_BE_HTTPS" -> "必須使用 https（本機測試僅允許 loopback）。非 https 在正式版會被系統擋下。"
+    "PROVIDER_URL_MUST_BE_HTTPS" -> "必須使用 https（本機/內網測試位址除外）。"
     "SETUP_KEY_TOO_SHORT" -> "金鑰太短（至少 8 字元），請檢查後重貼。"
     "PROVIDER_KEY_REF_BLANK", "PROVIDER_KEY_REF_MALFORMED" -> "內部參照異常，請重試。"
     "API key too short" -> "金鑰太短（至少 8 字元），請檢查後重貼。"
+    "TEST_UNAUTHORIZED" -> "金鑰無效（認證失敗），請檢查後重貼。"
+    "TEST_RETRYABLE" -> "伺服器忙碌或網路不穩，請稍後重試。"
     else -> "儲存失敗（$code），請重試。"
 }
 
@@ -66,7 +69,7 @@ fun SetupScreen(
     padding: PaddingValues,
     isFirstRun: Boolean,
     onSaved: () -> Unit,
-    viewModel: SetupViewModel = viewModel(),
+    viewModel: SetupViewModel,
 ) {
     val state by viewModel.form.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -202,17 +205,49 @@ fun SetupScreen(
             }
         }
 
-        Button(
-            onClick = viewModel::save,
-            enabled = !state.saving,
+        state.testModels?.let { count ->
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = "連線成功，找到 $count 個模型。",
+                    modifier = Modifier.padding(12.dp),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
+
+        Row(
             modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (state.saving) {
-                CircularProgressIndicator(strokeWidth = 2.dp)
-                Spacer(modifier = Modifier.padding(4.dp))
-                Text("儲存中…")
-            } else {
-                Text(if (isFirstRun) "儲存並開始聊天" else "儲存")
+            OutlinedButton(
+                onClick = viewModel::testConnection,
+                enabled = !state.testing && !state.saving,
+                modifier = Modifier.weight(1f),
+            ) {
+                if (state.testing) {
+                    CircularProgressIndicator(strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.padding(4.dp))
+                    Text("測試中…")
+                } else {
+                    Text("測試連線")
+                }
+            }
+            Button(
+                onClick = viewModel::save,
+                enabled = !state.saving && !state.testing,
+                modifier = Modifier.weight(1f),
+            ) {
+                if (state.saving) {
+                    CircularProgressIndicator(strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.padding(4.dp))
+                    Text("儲存中…")
+                } else {
+                    Text(if (isFirstRun) "儲存並開始聊天" else "儲存")
+                }
             }
         }
 

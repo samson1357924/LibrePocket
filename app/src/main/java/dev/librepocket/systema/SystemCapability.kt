@@ -33,6 +33,8 @@ object ReasonCodes {
  * @param hasAlarmApp 是否有處理 SET_ALARM 的系統鬧鐘 App。
  * @param hasCalendarApp 是否有處理日曆 INSERT 的系統日曆 App。
  * @param calendarReadGranted READ_CALENDAR 是否已授權（僅 Provider 直查需要）。
+ * @param calendarWriteGranted WRITE_CALENDAR 是否已授權（僅 Provider 直接寫需要；
+ *   有系統日曆 App 時更新/刪除優先 EDIT 委託，免寫權限）。
  * @param exactAlarmGranted 精準鬧鐘是否可用（自有提醒降級路徑）。
  * @param hasMusicApp 是否有可處理媒體 Intent 的播放器。
  */
@@ -44,6 +46,7 @@ data class SystemEnv(
   val hasAlarmApp: Boolean = true,
   val hasCalendarApp: Boolean = true,
   val calendarReadGranted: Boolean = false,
+  val calendarWriteGranted: Boolean = false,
   val exactAlarmGranted: Boolean = false,
   val hasMusicApp: Boolean = true,
 )

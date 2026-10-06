@@ -1,21 +1,26 @@
 package dev.librepocket.agent.ui
 
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -41,6 +46,8 @@ import dev.librepocket.agent.R
 import dev.librepocket.agent.ui.chat.ChatScreen
 import dev.librepocket.agent.ui.chat.ChatViewModel
 import dev.librepocket.agent.ui.chat.ChatViewModelFactory
+import dev.librepocket.agent.ui.chat.SessionListViewModel
+import dev.librepocket.agent.ui.chat.SessionListViewModelFactory
 import dev.librepocket.agent.ui.settings.SettingsScreen
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.SetupScreen
@@ -65,12 +72,15 @@ fun MainScreen(
     val app = LocalContext.current.applicationContext as android.app.Application
     val chatViewModel: ChatViewModel = viewModel(factory = ChatViewModelFactory(app))
     val setupViewModel: SetupViewModel = viewModel()
+    val sessionListViewModel: SessionListViewModel = viewModel(factory = SessionListViewModelFactory(app))
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     val appName = stringResource(R.string.app_name)
     val gate by setupViewModel.gate.collectAsStateWithLifecycle()
     val hasEndpoint = gate is EndpointGate.Ready
     val gateLoading = gate is EndpointGate.Loading
+    val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
+    val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
 
     // Gate first, prefill later: stash shared text until an endpoint exists.
     LaunchedEffect(sharedText, hasEndpoint) {
@@ -91,11 +101,19 @@ fun MainScreen(
         }
     }
 
+    // History list follows the drawer: refresh whenever it opens.
+    LaunchedEffect(drawerState.currentValue) {
+        if (drawerState.currentValue == DrawerValue.Open) {
+            sessionListViewModel.refresh()
+        }
+    }
+
     ModalNavigationDrawer(
         drawerState = drawerState,
         gesturesEnabled = hasEndpoint,
         drawerContent = {
             ModalDrawerSheet {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 Text(
                     text = appName,
                     modifier = Modifier.fillMaxWidth()
@@ -104,9 +122,10 @@ fun MainScreen(
                 )
                 NavigationDrawerItem(
                     label = { Text("新對話") },
-                    selected = currentRoute == Routes.CHAT,
+                    selected = currentRoute == Routes.CHAT && currentSessionId == null,
                     onClick = {
                         chatViewModel.newChat()
+                        sessionListViewModel.refresh()
                         navController.navigate(Routes.CHAT) {
                             popUpTo(Routes.CHAT) { inclusive = false }
                             launchSingleTop = true
@@ -115,6 +134,38 @@ fun MainScreen(
                     },
                     icon = { Icon(Icons.Filled.Add, contentDescription = null) },
                 )
+                if (sessions.isNotEmpty()) {
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                    Text(
+                        text = "歷史對話",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                    )
+                    sessions.take(20).forEach { meta ->
+                        NavigationDrawerItem(
+                            label = {
+                                Text(
+                                    text = meta.title.ifBlank { "(無標題)" },
+                                    maxLines = 1,
+                                )
+                            },
+                            selected = currentRoute == Routes.CHAT && currentSessionId == meta.sessionId,
+                            onClick = {
+                                scope.launch {
+                                    chatViewModel.openSession(meta.sessionId)
+                                    sessionListViewModel.refresh()
+                                    navController.navigate(Routes.CHAT) {
+                                        popUpTo(Routes.CHAT) { inclusive = false }
+                                        launchSingleTop = true
+                                    }
+                                    drawerState.close()
+                                }
+                            },
+                            icon = { Icon(Icons.Filled.ChatBubbleOutline, contentDescription = null) },
+                        )
+                    }
+                }
                 NavigationDrawerItem(
                     label = { Text("API 設定") },
                     selected = currentRoute == Routes.SETUP,
@@ -133,6 +184,7 @@ fun MainScreen(
                     },
                     icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
                 )
+                }
             }
         },
     ) {
@@ -158,7 +210,12 @@ fun MainScreen(
                     },
                     actions = {
                         if (currentRoute == Routes.CHAT) {
-                            IconButton(onClick = { chatViewModel.newChat() }) {
+                            IconButton(
+                                onClick = {
+                                    chatViewModel.newChat()
+                                    sessionListViewModel.refresh()
+                                },
+                            ) {
                                 Icon(Icons.Filled.Add, contentDescription = "新對話")
                             }
                         }
@@ -187,6 +244,7 @@ fun MainScreen(
                             onOpenSettings = {
                                 navController.navigate(Routes.SETUP) { launchSingleTop = true }
                             },
+                            onTurnFinished = { sessionListViewModel.refresh() },
                         )
                     }
                     composable(Routes.SETTINGS) {

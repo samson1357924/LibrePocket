@@ -79,6 +79,8 @@ data class SystemBEnv(
   val notificationFullTextConsented: Boolean = false,
   /** MediaProjection 每次授權：僅當次有效，呼叫方負責在調起系統授權頁後置 true。 */
   val screenshotFreshGrant: Boolean = false,
+  /** 全量聯繫人讀取授權（S1-C）：foss/github 的 READ_CONTACTS 結果映射；play 恆 false。 */
+  val contactsReadGranted: Boolean = false,
   val permissionSink: PermissionSink = PermissionSink { _ -> },
 )
 

@@ -143,7 +143,7 @@ object NotificationTool : SystemBTool {
 
   override fun check(env: SystemBEnv, args: Map<String, String>): CheckResult {
     if (!env.notificationListenerEnabled) {
-      return CheckResult(Availability.UNAVAILABLE, ReasonCode.USER_DISABLED, "通知監聽預設關閉，需使用者授權後可用")
+      return CheckResult(Availability.DEGRADED, ReasonCode.NO_PRIVILEGE, "未授權通知監聽，僅本 App 標題可見；全文需授權加二次同意")
     }
     return CheckResult(Availability.DEGRADED, ReasonCode.OK, "僅讀取通知標題；全文需二次同意")
   }
@@ -151,7 +151,8 @@ object NotificationTool : SystemBTool {
   override fun execute(env: SystemBEnv, args: Map<String, String>): ExecResult {
     val c = check(env, args)
     if (c.availability == Availability.UNAVAILABLE) return denied(c.reason, c.message)
-    val includeBody = args["fullText"] == "true" && env.notificationFullTextConsented
+    val includeBody = args["fullText"] == "true" && env.notificationListenerEnabled && env.notificationFullTextConsented
+    val limited = !env.notificationListenerEnabled
     return ExecResult(
       started = true,
       viaSystemApp = false,
@@ -160,7 +161,7 @@ object NotificationTool : SystemBTool {
         extras = mapOf("mode" to if (includeBody) "title_and_body" else "title_only"),
       ),
       reason = ReasonCode.OK,
-      note = if (includeBody) "已二次同意，全文讀取" else "最小化：僅標題",
+      note = if (includeBody) "已二次同意，全文讀取" else if (limited) "最小化：僅本 App 標題（未授權監聽）" else "最小化：僅標題",
     )
   }
 

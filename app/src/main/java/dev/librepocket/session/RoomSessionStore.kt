@@ -26,10 +26,8 @@ import kotlinx.coroutines.withContext
  * - seq gaps are legal (prune deletes old rows; import preserves file seqs);
  *   only strictly-increasing order + uniqueness are required.
  * - session titles are redacted on every current write path (create/import),
- *   but rows written before write-time redaction existed keep their original
- *   title: there is no store-level session-list API yet, so no read path
- *   exposes them today. When one is added, re-redact titles on read or run a
- *   one-time title migration — do not assume stored titles are clean.
+ *   and re-redacted on every list/get read, so rows written before write-time
+ *   redaction existed are still safe to display.
  */
 class RoomSessionStore(
     private val db: LibrePocketDb,
@@ -107,6 +105,15 @@ class RoomSessionStore(
         require(limit > 0) { "limit must be positive" }
         dao.eventsAfter(sessionId, afterSeq, limit).map { it.toEvent() }
     }
+
+    override suspend fun listSessions(): List<SessionMeta> = withContext(Dispatchers.IO) {
+        dao.allSessions().map { it.toMeta() }
+    }
+
+    override suspend fun getSession(sessionId: String): SessionMeta? =
+        withContext(Dispatchers.IO) {
+            dao.sessionById(sessionId)?.toMeta()
+        }
 
     override suspend fun exportJsonl(sessionId: String, destFile: File) {
         // Paged streaming export: memory stays O(page), not O(session).
@@ -264,6 +271,15 @@ class RoomSessionStore(
         text = text,
         imagesOmitted = imagesOmitted,
         createdAt = createdAt,
+    )
+
+    private fun SessionEntity.toMeta(): SessionMeta = SessionMeta(
+        sessionId = sessionId,
+        // Defense in depth: rows predating write-time redaction are cleaned here.
+        title = Redactor.redact(title).text,
+        model = model,
+        createdAt = createdAt,
+        updatedAt = updatedAt,
     )
 
     companion object {

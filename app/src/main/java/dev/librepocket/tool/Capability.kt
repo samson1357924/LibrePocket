@@ -35,12 +35,16 @@ enum class DenyReason {
  * @param grantedPermissions runtime/system grants already held, e.g.
  *   "android.permission.READ_CALENDAR" or the pseudo grant
  *   "listener:notification".
+ * @param isForeground whether the app is currently in the foreground.
+ *   Foreground-only tools (e.g. clipboard read/write, restricted by the
+ *   platform on Android 10+) project UNAVAILABLE when this is false.
  */
 data class ProjectionContext(
     val flavor: Flavor = Flavor.PLAY,
     val automationEnabled: Boolean = false,
     val userSwitches: Map<String, Boolean> = emptyMap(),
     val grantedPermissions: Set<String> = emptySet(),
+    val isForeground: Boolean = true,
 ) {
     fun switchOn(key: String, default: Boolean): Boolean =
         userSwitches.getOrDefault(key, default)

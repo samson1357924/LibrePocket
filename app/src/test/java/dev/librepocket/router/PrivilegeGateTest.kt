@@ -66,4 +66,13 @@ class PrivilegeGateTest {
         val projection = projectionOf(tool.name, CapabilityLevel.UNAVAILABLE, DenyReason.NO_PRIVILEGE)
         assertEquals(GateResult.Denied(DenyReason.NO_PRIVILEGE), PrivilegeGate.check(tool, true, projection))
     }
+
+    @Test fun fullTextJsonBoundaryRejectsPrefixNumbers() {
+        // MAJOR-7：`1` 不得為 `10`/`11` 的前綴誤判。
+        assertTrue(PrivilegeGate.isFullTextRequestJson("{\"limit\": 10, \"fullText\": true}"))
+        assertTrue(PrivilegeGate.isFullTextRequestJson("{\"fullText\": 1}"))
+        assertFalse(PrivilegeGate.isFullTextRequestJson("{\"fullText\": 10}"))
+        assertFalse(PrivilegeGate.isFullTextRequestJson("{\"fullText\": 11}"))
+        assertFalse(PrivilegeGate.isFullTextRequestJson("{\"limit\": 10}"))
+    }
 }

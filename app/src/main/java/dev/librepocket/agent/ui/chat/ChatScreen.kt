@@ -38,6 +38,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.contentDescription
@@ -55,21 +58,32 @@ fun ChatScreen(
     padding: PaddingValues,
     viewModel: ChatViewModel = viewModel(),
     onOpenSettings: () -> Unit = {},
+    onTurnFinished: () -> Unit = {},
 ) {
     val session by viewModel.sessionState.collectAsStateWithLifecycle()
+    val messages by viewModel.messages.collectAsStateWithLifecycle()
     val input by viewModel.input.collectAsStateWithLifecycle()
     val notice by viewModel.notice.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
-    val visibleMessages = session.messages.filter { it.role == "user" || it.role == "assistant" }
     val streaming = session.status == ChatStatus.STREAMING
+    var wasActive by remember { mutableStateOf(false) }
 
-    LaunchedEffect(visibleMessages.size, visibleMessages.lastOrNull()?.text?.length, session.status) {
-        if (visibleMessages.isNotEmpty()) {
+    LaunchedEffect(messages.size, messages.lastOrNull()?.text?.length, session.status) {
+        if (messages.isNotEmpty()) {
             try {
-                listState.scrollToItem(visibleMessages.size - 1)
+                listState.scrollToItem(messages.size - 1)
             } catch (_: IllegalArgumentException) {
                 // List not laid out yet; next recomposition will settle.
             }
+        }
+    }
+
+    LaunchedEffect(session.status) {
+        if (session.status == ChatStatus.STREAMING) {
+            wasActive = true
+        } else if (wasActive) {
+            wasActive = false
+            onTurnFinished()
         }
     }
 
@@ -79,7 +93,7 @@ fun ChatScreen(
             .padding(padding)
             .imePadding(),
     ) {
-        if (visibleMessages.isEmpty()) {
+        if (messages.isEmpty()) {
             // Gemini/ChatGPT-style empty state.
             Box(
                 modifier = Modifier
@@ -119,7 +133,7 @@ fun ChatScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                items(visibleMessages, key = { it.id }) { msg ->
+                items(messages, key = { it.id }) { msg ->
                     MessageBubble(msg)
                 }
                 if (streaming) {

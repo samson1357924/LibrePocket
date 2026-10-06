@@ -34,7 +34,10 @@ import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -56,6 +59,7 @@ import dev.librepocket.agent.ui.setup.SetupViewModelFactory
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
+import dev.librepocket.shell.PrivilegeBridgeState
 import kotlinx.coroutines.launch
 
 object Routes {
@@ -85,6 +89,11 @@ fun MainScreen(
     val gateLoading = gate is EndpointGate.Loading
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
+
+    // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
+    // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
+    val privilegeState = remember { PrivilegeBridgeState() }
+    var privilegeAuditCount by remember { mutableIntStateOf(privilegeState.auditCount()) }
 
     // Gate first, dispatch later: stash the normalized entry text until an
     // endpoint exists, then send-now when idle or steer when busy.
@@ -274,6 +283,11 @@ fun MainScreen(
                                 chatViewModel.newChat()
                                 sessionListViewModel.refresh()
                             },
+                            onRevokePrivilege = {
+                                privilegeState.revoke()
+                                privilegeAuditCount = privilegeState.auditCount()
+                            },
+                            privilegeAuditCount = privilegeAuditCount,
                         )
                     }
                     composable(Routes.SETUP) {

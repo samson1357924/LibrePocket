@@ -79,16 +79,24 @@ object SlowArbitrator {
     private val PAYMENT_HINTS = listOf(
         "转账", "转帐", "轉帳", "轉賬", "支付", "付款", "汇款", "匯款",
         "银行卡", "信用卡", "红包", "收付款", "提现", "提現",
+        // S3 镜像统一：以下为原 github 慢核（dev.librepocket.slow）独有、
+        // 现并入守卫以保证 foss/github 同语义。
+        "扣款", "下單", "下单", "結帳", "结账", "checkout",
         "pay", "transfer", "payment",
     )
     private val DELETE_HINTS = listOf(
         "删除", "刪除", "删掉", "刪掉", "删对话", "刪對話", "删除对话",
         "清空", "清除记录", "清除紀錄", "delete", "remove conversation",
         "clear history",
+        // S3 镜像统一：原慢核独有关鍵詞（破坏性操作）。
+        "移除帳號", "移除账号", "註銷", "注销", "remove account",
     )
     private val SEND_HINTS = listOf(
         "发送", "發送", "寄出", "送出", "分享", "发布", "發佈", "公开发布",
         "提交订单", "提交訂單", "提交", "订单", "訂單", "下单", "送出表单",
+        // S3 镜像统一：原慢核独有关鍵詞（繁体表單 + 显式 submit order，
+        // 后者虽已被 "submit" 子串覆盖，仍显式列出以文档化 parity）。
+        "送出表單", "submit order",
         "send", "share", "post", "submit",
     )
 

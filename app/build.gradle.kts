@@ -164,4 +164,9 @@ dependencies {
     "githubImplementation"(libs.tess.two)
     "fossImplementation"(libs.litert)
     "githubImplementation"(libs.litert)
+    // S3 privileged bridge (Shizuku remote process + provider) → github-only.
+    // Never `implementation(...)`: foss/play must physically lack Shizuku
+    // references (store compliance; play AAPT gate asserts this).
+    "githubImplementation"(libs.shizuku.api)
+    "githubImplementation"(libs.shizuku.provider)
 }

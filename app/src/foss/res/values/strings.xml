@@ -2,6 +2,6 @@
 <resources>
     <!-- Foss flavor label (co-installable alongside Play via .foss suffix). -->
     <string name="app_name">LibrePocket Foss</string>
-    <!-- Foss flavor only. Shown on the system Accessibility settings screen (Phase2 service). -->
-    <string name="accessibility_description">LibrePocket Foss-build helper (placeholder, no behavior yet).</string>
+    <!-- Foss flavor only. Shown on the system Accessibility settings screen. -->
+    <string name="accessibility_description">LibrePocket helper: on-screen step-by-step assistance (default off; payment/deletion/sending steps always ask first).</string>
 </resources>

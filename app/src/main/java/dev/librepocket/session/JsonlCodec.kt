@@ -70,6 +70,13 @@ object JsonlCodec {
             createdAt = createdAt,
         )
         if (parsed.kind !in VALID_KINDS) fail()
+        // Reject nonsensical fields early (spec §8.5): seqs start at 1 and the
+        // importer additionally requires strict increase; negative counters /
+        // timestamps would pollute ordering and prune math.
+        if (parsed.seq < 1) fail()
+        if (parsed.runId.isBlank()) fail()
+        if (parsed.imagesOmitted < 0) fail()
+        if (parsed.createdAt < 0) fail()
         return parsed
     }
 }

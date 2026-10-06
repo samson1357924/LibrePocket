@@ -312,6 +312,76 @@ class SessionStoreTest {
         assertTrue(out.contains("⟦REDACTED"))
     }
 
+    @Test fun import_rejectsBadFieldValues(): Unit = runBlocking {
+        setUp()
+        val cases = listOf(
+            // seq must be >= 1
+            "{\"seq\":0,\"runId\":\"r\",\"kind\":\"user\",\"text\":\"t\",\"imagesOmitted\":0,\"createdAt\":1}",
+            // runId must be non-blank
+            "{\"seq\":1,\"runId\":\"\",\"kind\":\"user\",\"text\":\"t\",\"imagesOmitted\":0,\"createdAt\":1}",
+            "{\"seq\":1,\"runId\":\"  \",\"kind\":\"user\",\"text\":\"t\",\"imagesOmitted\":0,\"createdAt\":1}",
+            // counters / timestamps must be non-negative
+            "{\"seq\":1,\"runId\":\"r\",\"kind\":\"user\",\"text\":\"t\",\"imagesOmitted\":-1,\"createdAt\":1}",
+            "{\"seq\":1,\"runId\":\"r\",\"kind\":\"user\",\"text\":\"t\",\"imagesOmitted\":0,\"createdAt\":-5}",
+        )
+        for ((i, line) in cases.withIndex()) {
+            val f = File(tmpDir, "badfield-$i.jsonl")
+            f.writeText(line + "\n", Charsets.UTF_8)
+            try {
+                store.importJsonl(f)
+                fail("case $i must throw")
+            } catch (e: IllegalArgumentException) {
+                // expected; message carries line number only, never content
+            }
+        }
+    }
+
+    @Test fun import_truncatesHugeTextWithFlag(): Unit = runBlocking {
+        setUp()
+        val big = "z".repeat(100_001)
+        val f = File(tmpDir, "big.jsonl")
+        f.writeText(
+            "{\"seq\":1,\"runId\":\"r\",\"kind\":\"user\",\"text\":\"$big\",\"imagesOmitted\":0,\"createdAt\":1}\n",
+            Charsets.UTF_8,
+        )
+        val imported = store.importJsonl(f)
+        val loaded = store.loadEvents(imported).single().text
+        assertEquals(RoomSessionStore.MAX_TEXT_CHARS, loaded.length)
+        assertTrue(db.sessionDao().allEvents(imported).single().isTruncated)
+    }
+
+    @Test fun import_tooLargeRefusedBeforeReading(): Unit = runBlocking {
+        setUp()
+        val before = db.sessionDao().allSessions().size
+        val f = File(tmpDir, "huge.jsonl")
+        // Just over the gate: mostly zeros, one valid line at the end.
+        f.writeText("0".repeat(RoomSessionStore.IMPORT_MAX_BYTES + 1), Charsets.UTF_8)
+        try {
+            store.importJsonl(f)
+            fail("oversize import must throw")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("too large"))
+        }
+        assertEquals(before, db.sessionDao().allSessions().size)
+    }
+
+    @Test fun export_failureLeavesNoPartialFile(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        store.appendEvent(event(sid, text = "hello"))
+        // Parent is an existing FILE, so no directory can be created there.
+        val blocker = File(tmpDir, "blocker")
+        blocker.writeText("x", Charsets.UTF_8)
+        val dest = File(blocker, "out.jsonl")
+        try {
+            store.exportJsonl(sid, dest)
+            fail("expected export failure")
+        } catch (e: Exception) {
+            // expected (IO or export-failed)
+        }
+        assertTrue(!dest.exists())
+    }
+
     @Test fun append_concurrentKeepsSeqDense(): Unit = runBlocking {
         setUp()
         val sid = store.createSession("t", "p/m")

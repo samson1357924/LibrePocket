@@ -12,6 +12,17 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
+    <!-- S2 系統語音辨識：委託系統 RecognizerIntent（無 RECORD_AUDIO 新權限）。
+         queries 僅宣告可見性，供 PackageManager 解析辨識服務；
+         action 必須是 RECOGNIZE_SPEECH（與 VoiceStt.ACTION 同字面值），
+         不可用 RecognitionService（服務類名，非 intent action，解析不到）；
+         無服務時 ChatScreen 降級手動輸入（NO_PRIVILEGE）。 -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+    </queries>
+
     <application
         android:name=".LibrePocketApp"
         android:label="@string/app_name"

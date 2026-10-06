@@ -25,14 +25,19 @@
 #
 # Foss gate (--foss) checks (any failure exits non-zero):
 #   1. source manifests (app/src/main + app/src/foss) contain no proprietary
-#      needle (com.google.mlkit / com.google.android.gms) — catches an
+#      needle (com.google.mlkit / com.google.android.gms /
+#      com.microsoft.cognitiveservices.speech) — catches an
 #      accidental proprietary dependency before the build;
 #   2. `dexdump` Class-descriptor scan: no class REFERENCED under a proprietary
-#      prefix (Lcom/google/mlkit/ or Lcom/google/android/gms/). Descriptor form
+#      prefix (Lcom/google/mlkit/ or Lcom/google/android/gms/ or
+#      Lcom/microsoft/cognitiveservices/speech/). Descriptor form
 #      (L + slashes + /) is used deliberately: the dot-form policy constants
 #      can never self-match it;
 #   3. manifest dump (APK via aapt, AAB via bundle-manifest scan) declares no
 #      proprietary (GMS) permission.
+#
+# S2: Azure Speech is github-flavor only (azure_tts default off); the foss
+# gate covers it alongside ML Kit / GMS.
 #
 # Mirrors HardeningPolicy (PLAY_PERMISSION_BLACKLIST / PLAY_CLASS_BLACKLIST /
 # PLAY_SUPERCLASS_BLACKLIST / FOSS_STRING_BLACKLIST + checkFossArtifact):
@@ -44,8 +49,8 @@ set -eu
 BLACKLIST_PERMS="SEND_SMS RECEIVE_SMS READ_SMS MANAGE_EXTERNAL_STORAGE BIND_ACCESSIBILITY_SERVICE BIND_VPN_SERVICE"
 BLACKLIST_CLASS_PREFIXES="Ldev/librepocket/agent/github/ Ldev/librepocket/agent/foss/"
 BLACKLIST_SUPERS="Landroid/net/VpnService; Landroid/accessibilityservice/AccessibilityService;"
-FOSS_BLACKLIST="com.google.mlkit com.google.android.gms"
-FOSS_DEX_PREFIXES="Lcom/google/mlkit/ Lcom/google/android/gms/"
+FOSS_BLACKLIST="com.google.mlkit com.google.android.gms com.microsoft.cognitiveservices.speech"
+FOSS_DEX_PREFIXES="Lcom/google/mlkit/ Lcom/google/android/gms/ Lcom/microsoft/cognitiveservices/speech/"
 FAIL=0
 
 log() { printf '%s\n' "$*"; }
@@ -105,7 +110,7 @@ if [ "$MODE" = "play" ]; then
 else
     log "== source manifests (foss gate) =="
     # Mirrors HardeningPolicy.FOSS_STRING_BLACKLIST: the foss overlay must not
-    # pull in proprietary Play-services / ML Kit references. Manifest-only
+    # pull in proprietary Play-services / ML Kit / Azure Speech references. Manifest-only
     # scan (the policy class itself legitimately names these in dot form, so
     # .kt sources are covered by the dex gate instead).
     for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/foss/AndroidManifest.xml"; do

@@ -14,8 +14,8 @@ import dev.librepocket.tool.Flavor
  *   本層只產出請求描述（[IntentSpec] 攜 action + extras），呼叫方在邊緣層
  *   翻譯為真正的 Provider 查詢；拒絕時 started=false + intent=null
  *   （拒絕零請求），且永不觸碰 [SystemBEnv.permissionSink]。
- * - Play 合規：本檔案不含任何黑名單權限字面（RECORD_AUDIO 留 S2，
- *   無障礙留 S3）；READ_CONTACTS 字面僅出現在 ToolRegistry 投影註解，
+ * - Play 合規：本檔案不含任何黑名單權限字面（S2 語音走系統
+ *   RecognizerIntent/TTS 委託、零 RECORD_AUDIO；無障礙留 S3）；READ_CONTACTS 字面僅出現在 ToolRegistry 投影註解，
  *   此處只讀布林快照。
  */
 

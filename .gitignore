@@ -20,3 +20,6 @@ local.properties
 *.jks
 *.p12
 *.keystore
+# Built artifacts (covered by /build/ too, belt and suspenders for strays).
+*.apk
+*.aab

@@ -1,14 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Full flavor overlay (F-Droid / direct download only, never Play).
-  Declares the high-risk permissions and privileged services that the
-  Play flavor must not contain.
+  Decision (locked): NO SMS, NO MANAGE_EXTERNAL_STORAGE, NO VPN in any
+  flavor. Full adds ONLY the accessibility automation service (default off,
+  two-step consent). See CAPABILITY_MATRIX §1-§2 + BACKLOG D15.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <uses-permission android:name="android.permission.READ_SMS" />
-    <uses-permission android:name="android.permission.RECEIVE_SMS" />
-    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application>
         <service
@@ -21,15 +18,6 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_config" />
-        </service>
-
-        <service
-            android:name=".full.FullVpnService"
-            android:exported="false"
-            android:permission="android.permission.BIND_VPN_SERVICE">
-            <intent-filter>
-                <action android:name="android.net.VpnService" />
-            </intent-filter>
         </service>
     </application>
 </manifest>

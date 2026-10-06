@@ -57,5 +57,6 @@ $AAPT dump permissions app/build/outputs/apk/play/debug/app-play-debug.apk
 # must NOT list READ_SMS, RECEIVE_SMS, MANAGE_EXTERNAL_STORAGE,
 # BIND_ACCESSIBILITY_SERVICE, or BIND_VPN_SERVICE
 $AAPT dump permissions app/build/outputs/apk/full/debug/app-full-debug.apk
-# MUST list READ_SMS and MANAGE_EXTERNAL_STORAGE
+# MUST also NOT list the above (decision locked: no SMS / full-storage / VPN
+# in any flavor; full adds ONLY the accessibility service, default off)
 ```

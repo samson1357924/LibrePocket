@@ -113,9 +113,16 @@ for ART in "$@"; do
             trap 'rm -rf "$TMPB"' EXIT INT TERM
             unzip -oq "$ART" -d "$TMPB"
             MANIFESTS=$(find "$TMPB" -name "AndroidManifest.xml")
-            if [ -n "$MANIFESTS" ] && grep -l "MANAGE_EXTERNAL_STORAGE\|READ_SMS\|RECEIVE_SMS\|SEND_SMS" $MANIFESTS 2>/dev/null | grep -q .; then
-                fail "$ART: blacklisted permission string inside bundle manifest"
-            else
+            AAB_FAIL=0
+            if [ -n "$MANIFESTS" ]; then
+                for p in $BLACKLIST_PERMS; do
+                    if grep -a -q "$p" $MANIFESTS 2>/dev/null; then
+                        fail "$ART: blacklisted permission ($p) inside bundle manifest"
+                        AAB_FAIL=1
+                    fi
+                done
+            fi
+            if [ "$AAB_FAIL" -eq 0 ]; then
                 log "  permissions(bundle-scan): OK"
             fi
             rm -rf "$TMPB"

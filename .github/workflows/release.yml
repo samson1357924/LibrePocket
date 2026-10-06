@@ -3,7 +3,7 @@ name: Release & Distribution
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
 
 permissions:
@@ -13,6 +13,9 @@ jobs:
   release:
     name: Build, Verify & Publish Release
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      KEYSTORE_PRESENT: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -44,20 +47,20 @@ jobs:
       - name: Verify Play Release Policy Gate (ROADMAP D07)
         run: |
           chmod +x scripts/play_policy_check.sh
-          # 嚴格驗證 Play Release AAB 產物完全符合 Play 隱私與服務規範
-          scripts/play_policy_check.sh app/build/outputs/bundle/playRelease/app-play-release.aab
+          # 驗證 Play Release AAB 與 APK，確保權限黑名單與服務宣告皆通過
+          scripts/play_policy_check.sh \
+            app/build/outputs/bundle/playRelease/app-play-release.aab \
+            app/build/outputs/apk/play/release/app-play-release-unsigned.apk
 
       - name: Sign Android Artifacts (if secret configured)
         if: env.KEYSTORE_PRESENT == 'true'
         uses: r0adkll/sign-android-release@v1
         with:
-          releaseDirectory: app/build/outputs/apk
+          releaseDirectory: app/build/outputs
           signingKeyBase64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
           alias: ${{ secrets.RELEASE_KEY_ALIAS }}
           keyStorePassword: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.RELEASE_KEY_PASSWORD }}
-        env:
-          KEYSTORE_PRESENT: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
 
       - name: Prepare Release Artifacts with Checksums
         run: |
@@ -65,23 +68,20 @@ jobs:
           VERSION_TAG="${{ github.ref_name }}"
           [ -z "$VERSION_TAG" ] && VERSION_TAG="snapshot"
 
-          # 收集 Full APK (F-Droid / Direct download)
-          FULL_APK=$(find app/build/outputs/apk/full/release -name "*.apk" | head -n 1)
-          if [ -n "$FULL_APK" ] && [ -f "$FULL_APK" ]; then
-            cp "$FULL_APK" "release-artifacts/LibrePocket-${VERSION_TAG}-full.apk"
-          fi
+          # 優先收集已簽名 Full APK，次選 unsigned
+          FULL_APK=$(find app/build/outputs/apk/full/release -name "*signed.apk" | head -n 1)
+          [ -z "$FULL_APK" ] && FULL_APK=$(find app/build/outputs/apk/full/release -name "*.apk" | head -n 1)
+          [ -n "$FULL_APK" ] && cp "$FULL_APK" "release-artifacts/LibrePocket-${VERSION_TAG}-full.apk"
 
-          # 收集 Play APK
-          PLAY_APK=$(find app/build/outputs/apk/play/release -name "*.apk" | head -n 1)
-          if [ -n "$PLAY_APK" ] && [ -f "$PLAY_APK" ]; then
-            cp "$PLAY_APK" "release-artifacts/LibrePocket-${VERSION_TAG}-play.apk"
-          fi
+          # 優先收集已簽名 Play APK，次選 unsigned
+          PLAY_APK=$(find app/build/outputs/apk/play/release -name "*signed.apk" | head -n 1)
+          [ -z "$PLAY_APK" ] && PLAY_APK=$(find app/build/outputs/apk/play/release -name "*.apk" | head -n 1)
+          [ -n "$PLAY_APK" ] && cp "$PLAY_APK" "release-artifacts/LibrePocket-${VERSION_TAG}-play.apk"
 
-          # 收集 Play AAB (Play Store publish bundle)
-          PLAY_AAB="app/build/outputs/bundle/playRelease/app-play-release.aab"
-          if [ -f "$PLAY_AAB" ]; then
-            cp "$PLAY_AAB" "release-artifacts/LibrePocket-${VERSION_TAG}-play.aab"
-          fi
+          # 優先收集已簽名 Play AAB，次選原始 AAB
+          PLAY_AAB=$(find app/build/outputs/bundle/playRelease -name "*signed.aab" | head -n 1)
+          [ -z "$PLAY_AAB" ] && PLAY_AAB="app/build/outputs/bundle/playRelease/app-play-release.aab"
+          [ -f "$PLAY_AAB" ] && cp "$PLAY_AAB" "release-artifacts/LibrePocket-${VERSION_TAG}-play.aab"
 
           # 產生 SHA256 校驗碼清單
           cd release-artifacts

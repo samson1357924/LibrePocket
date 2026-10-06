@@ -1,0 +1,30 @@
+package dev.librepocket.guard
+
+/**
+ * 自动化总开关策略（BACKLOG B8 + CAPABILITY_MATRIX §2，纯逻辑部分）。
+ *
+ * - 默认关闭（[DEFAULT_ENABLED] = false），与 full 风味的
+ *   `FullAutomationGate.DEFAULT_ENABLED` 同源， Dump/单测均可证明；
+ * - 两步同意：App 内开关 + 系统无障碍授权 + 当轮二次确认，三者缺一不可；
+ * - 本对象零 Android 依赖，供 `src/full` 的 Android 包装直接委托。
+ */
+object AutomationPolicy {
+    const val SWITCH_KEY = "automation"
+    const val DEFAULT_ENABLED = false
+
+    /**
+     * @param flavorIsFull 是否 full 风味（play 永远 false）。
+     * @param switchOn App 内自动化总开关。
+     * @param serviceGranted 系统无障碍服务是否已授权。
+     * @param userConfirmed 当轮是否已二次确认。
+     */
+    fun effectiveAutomation(
+        flavorIsFull: Boolean,
+        switchOn: Boolean = DEFAULT_ENABLED,
+        serviceGranted: Boolean = false,
+        userConfirmed: Boolean = false,
+    ): Boolean = flavorIsFull && switchOn && serviceGranted && userConfirmed
+
+    /** 模型可见性 = 投影侧 `automationEnabled` 的唯一输入。 */
+    fun slowVisibleToModel(effectiveAutomation: Boolean): Boolean = effectiveAutomation
+}

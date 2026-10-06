@@ -66,6 +66,7 @@ class HardeningPolicyTest {
                 "Lcom/google/zxing/MultiFormatReader;",
                 "Lcom/googlecode/tesseract/android/TessBaseAPI;",
                 "Lorg/tensorflow/lite/Interpreter;",
+                "Ldev/librepocket/voice/VoiceTts;",
             ),
         )
         assertTrue(violations.isEmpty())
@@ -84,6 +85,21 @@ class HardeningPolicyTest {
             classDescriptors = listOf("Lcom/google/android/gms/common/api/Status;"),
         )
         assertEquals(1, violations.size)
+    }
+
+    @Test fun azureReference_flaggedInFoss() {
+        // S2: Azure Speech 僅 github 版；foss dex 引用即違規。
+        val violations = HardeningPolicy.checkFossArtifact(
+            classDescriptors = listOf("Lcom/microsoft/cognitiveservices/speech/SpeechConfig;"),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().check.contains("foss-string-blacklist"))
+    }
+
+    @Test fun fossBlacklist_pinsAzureNeedle() {
+        assertTrue(
+            HardeningPolicy.FOSS_STRING_BLACKLIST.contains("com.microsoft.cognitiveservices.speech"),
+        )
     }
 
     @Test fun vpnSubclass_flagged() {

@@ -52,17 +52,22 @@ object HardeningPolicy {
 
     /**
      * Proprietary needles that must never be REFERENCED by the foss dex
-     * (fully open-source build: no Play services, no ML Kit).
+     * (fully open-source build: no Play services, no ML Kit, no Azure Speech).
      *
      * Stored in dot form on purpose: [checkFossArtifact] only scans
      * `Class descriptor` entries (Dalvik `L...;` form, e.g.
      * `Lcom/google/mlkit/vision/common/InputImage;`), which these dot-form
      * literals can never equal — so the artifact scanner stays silent on
      * the policy class itself (same self-match avoidance as above).
+     *
+     * S2: Azure Speech (`com.microsoft.cognitiveservices.speech`) is
+     * github-flavor only (with `azure_tts` default off); foss must never
+     * reference it. Mirrored by `scripts/play_policy_check.sh` foss gate.
      */
     val FOSS_STRING_BLACKLIST: List<String> = listOf(
         "com.google.mlkit",
         "com.google.android.gms",
+        "com.microsoft.cognitiveservices.speech",
     )
 
     /**

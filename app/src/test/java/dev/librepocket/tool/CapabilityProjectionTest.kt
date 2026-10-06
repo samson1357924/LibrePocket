@@ -69,10 +69,11 @@ class CapabilityProjectionTest {
         // + S1-C calendar.query（已授權）/ update+delete（缺 WRITE_CALENDAR 時經 EDIT 委託降級，仍可見）；
         // shell.exec（開關預設關）與全量聯繫人（play FLAVOR_BLOCKED）隱藏。
         // + S1-A 6（clipboard.read/write 前台預設開；file.edit/patch/search/attach 開關 files 預設開）。
+        // + S2 2（voice.transcribe / voice.speak 開關預設開；voice.speak.azure 僅 GITHUB，play 隱藏）。
         val visible = ToolRegistry.visibleTools(
             playBase.copy(grantedPermissions = setOf("android.permission.READ_CALENDAR")),
         ).map { it.name }
-        assertEquals(21, visible.size)
+        assertEquals(23, visible.size)
         assertTrue(
             visible.containsAll(
                 ToolRegistry.FAST_TOOLS.map { it.name } -

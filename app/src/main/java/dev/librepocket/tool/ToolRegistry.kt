@@ -21,6 +21,9 @@ import dev.librepocket.files.FileSearchTools
  * - S1-C adds no blacklist permission literals (no RECORD_AUDIO, no a11y):
  *   only READ_CALENDAR / WRITE_CALENDAR / READ_CONTACTS + pseudo-grant
  *   `listener:notification` appear in the S1-C block.
+ * - S2 voice adds no permission either: system STT walks `RecognizerIntent`
+ *   delegation and system TTS needs none (no RECORD_AUDIO literal anywhere;
+ *   Azure cloud voice is github-flavor code only).
  */
 object ToolRegistry {
 
@@ -517,6 +520,69 @@ object ToolRegistry {
     )
     // S1-A-ANCHOR-END
 
+    // S2-ANCHOR-BEGIN: voice tools owned by S2 (system STT/TTS first, Azure github-only).
+    // Do not edit inside this block from other workstreams (merge-conflict avoidance).
+    // - voice.transcribe (READ, switch voice_input default true): system RecognizerIntent
+    //   transcript entry; audio never touches disk; text is redacted before the store.
+    // - voice.speak (WRITE, switch voice_output default true): system TextToSpeech,
+    //   zero new permissions.
+    // - voice.speak.azure (WRITE, github-only, switch azure_tts default false):
+    //   Azure cloud fallback; additionally requires voice_output on (dual-switch,
+    //   enforced by AzureSpeechGate AND by the second switch below, so the
+    //   projection never diverges from the gate); text is redacted again before
+    //   the cloud call.
+    val VOICE_TOOLS: List<ToolDef> = listOf(
+        ToolDef(
+            name = "voice.transcribe",
+            description = "Transcribe speech via the system recognizer; audio is memory-only and the text is redacted before storage.",
+            jsonSchema = schema(
+                prop("locale", "string", "BCP-47 locale hint, e.g. zh-TW"),
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "voice_input",
+                switchDefault = true,
+                fallbackHint = "type the message manually in the input box",
+            ),
+        ),
+        ToolDef(
+            name = "voice.speak",
+            description = "Read text aloud via the system text-to-speech engine; no new permissions.",
+            jsonSchema = schema(
+                prop("text", "string", "Text to speak aloud"),
+                required = "\"text\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = "voice_output",
+                switchDefault = true,
+                fallbackHint = "read the message text on screen manually",
+            ),
+        ),
+        ToolDef(
+            name = "voice.speak.azure",
+            description = "Cloud voice fallback via Azure Speech (github flavor only); needs voice_output and azure_tts on, text redacted before upload.",
+            jsonSchema = schema(
+                prop("text", "string", "Text to synthesize via Azure"),
+                prop("voice", "string", "Optional Azure voice name"),
+                required = "\"text\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = "azure_tts",
+                switchDefault = false,
+                // M1 雙開關自訂投影：azure_tts 關閉或 voice_output 關閉，
+                // 任一即 UNAVAILABLE + USER_DISABLED（與 AzureSpeechGate 同語義；
+                // 預設值與 VoiceTools.SWITCH_AZURE_DEFAULT / SWITCH_OUTPUT_DEFAULT 同源）。
+                requiresSwitch2 = "voice_output",
+                switchDefault2 = true,
+                fallbackHint = "use the system voice output, or read the text on screen manually",
+            ),
+            supportedFlavors = setOf(Flavor.GITHUB),
+        ),
+    )
+    // S2-ANCHOR-END
+
     /** Slow-channel descriptor: projection-only, never executed by FastRouter. */
     val SLOW_TOOLS: List<ToolDef> = listOf(
         ToolDef(
@@ -536,8 +602,8 @@ object ToolRegistry {
         ),
     )
 
-    // S1-B: ALL covers FAST + SLOW + S1B (S1-A appends S1A; S1-C extended FAST).
-    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS + S1B_TOOLS + S1A_TOOLS
+    // S1-B: ALL covers FAST + SLOW + S1B + S1A + VOICE (S1-A appends S1A; S1-C extended FAST; S2 appends VOICE).
+    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS + S1B_TOOLS + S1A_TOOLS + VOICE_TOOLS
 
     fun find(name: String): ToolDef? = ALL.firstOrNull { it.name == name }
 

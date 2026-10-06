@@ -34,6 +34,9 @@ tink = "1.23.0"
 # Phase1 flavors: OCR / scan / on-device inference (foss+github = OSS, github-only = ML Kit)
 mlkitBarcodeScanning = "17.3.0"
 mlkitTextRecognition = "16.0.1"
+# S2 cloud voice fallback (github flavor only; foss/play must never reference it —
+# see HardeningPolicy.FOSS_STRING_BLACKLIST + scripts/play_policy_check.sh foss gate).
+azureSpeech = "1.52.0"
 zxingCore = "3.5.4"
 tessTwo = "9.1.0"
 # NOTE: com.google.ai.edge.litert:litert (any 1.x/2.x) is unusable with AGP 9:
@@ -61,6 +64,7 @@ test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "t
 espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
 mlkit-barcode-scanning = { group = "com.google.mlkit", name = "barcode-scanning", version.ref = "mlkitBarcodeScanning" }
 mlkit-text-recognition = { group = "com.google.mlkit", name = "text-recognition", version.ref = "mlkitTextRecognition" }
+azure-speech = { group = "com.microsoft.cognitiveservices.speech", name = "client-sdk", version.ref = "azureSpeech" }
 # Compose UI (MainScreen + Theme + NavHost; Gemini/ChatGPT-style chat layout)
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 compose-ui = { group = "androidx.compose.ui", name = "ui" }

@@ -71,6 +71,38 @@ fun SettingsScreen(
                 Button(onClick = onEditEndpoint, modifier = Modifier.fillMaxWidth()) {
                     Text("編輯端點")
                 }
+                Spacer(modifier = Modifier.height(12.dp))
+                // S2 語音揭露（明示）：系統 STT/TTS 優先、音檔不落地、送雲前再 redact。
+                // TODO(S2-voice, M3)：Azure key/region 設定入口 + 朗讀鏈路接線尚未落地。
+                // 落地形狀：key 進 KeyVault providerId "azure_speech"（僅 github 版讀寫，
+                // 見 AzureSpeechEngine.KEY_REF），region 為非密鑰字串另存設定；
+                // 朗讀時雙開關（voice_output 且 azure_tts）皆開且有 key 才走
+                // AzureSpeechEngine.synthesizeToSpeaker，否則維持系統 TTS。
+                // 在此之前 AzureSpeechEngine 無產品呼叫者（僅門禁/投影可見）。
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                    ),
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Text("語音", style = MaterialTheme.typography.titleMedium)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "語音輸入走系統辨識、語音輸出走系統朗讀，不新增任何權限；" +
+                                "麥克風音檔只駐留記憶體、不落地存檔；辨識正文寫入紀錄前會先遮罩敏感內容。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "雲端語音（Azure）僅直接下載版可用，需同時開啟「語音輸出」與「Azure 語音」" +
+                                "（後者預設關閉）；送雲前會再次遮罩敏感內容。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
                 Spacer(modifier = Modifier.height(8.dp))
                 if (!confirmLogout) {
                     OutlinedButton(

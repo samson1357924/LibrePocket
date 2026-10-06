@@ -8,6 +8,12 @@ package dev.librepocket.tool
  * @param fallbackHint manual alternative quoted in downgrade replies.
  * @param requiresSwitch user-toggle key guarding this tool, or null.
  * @param switchDefault value when the key is absent from [ProjectionContext].
+ * @param requiresSwitch2 second user-toggle key that must ALSO be on, or null
+ *   when the tool needs only one switch (S2 `voice.speak.azure` needs both
+ *   `azure_tts` and `voice_output`; either off yields UNAVAILABLE +
+ *   USER_DISABLED, mirroring `AzureSpeechGate`).
+ * @param switchDefault2 value when [requiresSwitch2] is absent from
+ *   [ProjectionContext].
  * @param requiresPermission runtime/system grant needed, or null when the
  *   tool needs none (e.g. SMS prefill deliberately requests no SMS
  *   permission; DIAL needs no CALL_PHONE permission).
@@ -24,6 +30,8 @@ data class ToolAnnotations(
     val fallbackHint: String = "",
     val requiresSwitch: String? = null,
     val switchDefault: Boolean = true,
+    val requiresSwitch2: String? = null,
+    val switchDefault2: Boolean = true,
     val requiresPermission: String? = null,
     val degradedWithoutPermission: Boolean = false,
     val foregroundOnly: Boolean = false,
@@ -58,6 +66,11 @@ data class ToolDef(
                 return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.USER_DISABLED)
             }
         } else if (switchKey != null && !ctx.switchOn(switchKey, annotations.switchDefault)) {
+            return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.USER_DISABLED)
+        }
+        // S2 雙開關（voice.speak.azure）：第二開關關閉同樣不可用（USER_DISABLED）。
+        val switchKey2 = annotations.requiresSwitch2
+        if (switchKey2 != null && !ctx.switchOn(switchKey2, annotations.switchDefault2)) {
             return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.USER_DISABLED)
         }
         val permission = annotations.requiresPermission

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Night variant: avoid white flash on dark-mode cold start. -->
+    <style name="Theme.LibrePocket" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@android:color/black</item>
+        <!-- TODO: replace with branded @mipmap/ic_launcher once adaptive icon lands. -->
+        <item name="windowSplashScreenAnimatedIcon">@android:mipmap/sym_def_app_icon</item>
+        <item name="postSplashScreenTheme">@android:style/Theme.Material.NoActionBar</item>
+    </style>
+</resources>

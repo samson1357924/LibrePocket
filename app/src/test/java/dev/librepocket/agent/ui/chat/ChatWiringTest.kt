@@ -98,7 +98,7 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        return ChatViewModel(store, factory)
+        return ChatViewModel(store, factory, InMemoryPolicyStore())
     }
 
     private fun awaitTrue(timeoutMs: Long = 8000, cond: () -> Boolean) {
@@ -149,7 +149,7 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = ChatViewModel(store, factory)
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
         try {
             vm.onInputChange("first")
             vm.send()
@@ -191,7 +191,7 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = ChatViewModel(store, factory)
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
         vm.onInputChange("hi")
         vm.send()
         awaitTrue { vm.sessionState.value.status == ChatStatus.ERROR }
@@ -260,7 +260,7 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = ChatViewModel(store, factory)
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
         vm.openSession(sid)
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
@@ -310,6 +310,78 @@ class ChatWiringTest {
     }
 
     @Test
+    fun policyDenyBlocksSendWithZeroRequests() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "must not send"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val deny = object : dev.librepocket.policy.PolicyStore {
+            override fun evaluate(action: String, resource: String) =
+                dev.librepocket.policy.PolicyDecision(
+                    dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
+                )
+
+            override suspend fun setRule(rule: dev.librepocket.policy.PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules() = emptyList<dev.librepocket.policy.PolicyRule>()
+            override suspend fun evaluateFresh(action: String, resource: String) =
+                dev.librepocket.policy.PolicyDecision(
+                    dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
+                )
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            buildProvider = { _, _ -> fake },
+        )
+        val vm = ChatViewModel(store, factory, deny)
+        vm.onInputChange("hi")
+        vm.send()
+        awaitTrue { vm.notice.value == "POLICY_DENIED" }
+        assertEquals(0, fake.streamCalls)
+        assertTrue(vm.sessionState.value.messages.isEmpty())
+    }
+
+    @Test
+    fun policyDenyBlocksSteerWithZeroRequests() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "must not send"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val deny = object : dev.librepocket.policy.PolicyStore {
+            override fun evaluate(action: String, resource: String) =
+                dev.librepocket.policy.PolicyDecision(
+                    dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
+                )
+
+            override suspend fun setRule(rule: dev.librepocket.policy.PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules() = emptyList<dev.librepocket.policy.PolicyRule>()
+            override suspend fun evaluateFresh(action: String, resource: String) =
+                dev.librepocket.policy.PolicyDecision(
+                    dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
+                )
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            buildProvider = { _, _ -> fake },
+        )
+        val vm = ChatViewModel(store, factory, deny)
+        vm.steer("queued-evil")
+        awaitTrue { vm.notice.value == "POLICY_DENIED" }
+        assertEquals(0, fake.streamCalls)
+    }
+
+    @Test
     fun endpointSwitchRecreatesSession() {
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())
@@ -333,7 +405,7 @@ class ChatWiringTest {
                 fake
             },
         )
-        val vm = ChatViewModel(store, factory)
+        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
         vm.onInputChange("one")
         vm.send()
         awaitTrue { vm.sessionState.value.messages.isNotEmpty() }

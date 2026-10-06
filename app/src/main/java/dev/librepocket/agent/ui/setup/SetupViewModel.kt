@@ -9,6 +9,9 @@ import dev.librepocket.agent.ui.chat.toProviderConfig
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.KeyVault
 import dev.librepocket.models.ModelsDevSnapshot
+import dev.librepocket.policy.DataStorePolicyStore
+import dev.librepocket.policy.PolicyStore
+import dev.librepocket.policy.Verdict
 import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.provider.DefaultProviderFactory
 import dev.librepocket.provider.KeyProvider
@@ -44,6 +47,8 @@ data class SetupUiState(
     val testModels: Int? = null,
     val modelOptions: List<String> = emptyList(),
     val modelsLoading: Boolean = false,
+    val confirmKeyWrite: Boolean = false,
+    val keyWriteConfirmed: Boolean = false,
     val errorCode: String? = null,
     val saved: Boolean = false,
 )
@@ -61,6 +66,7 @@ data class SetupUiState(
 class SetupViewModel(
     private val store: EndpointStore,
     private val vaultSource: VaultSource,
+    private val policy: PolicyStore,
     private val buildProvider: (ProviderConfig, KeyProvider) -> LlmProvider =
         { cfg, keys -> DefaultProviderFactory(keys).create(cfg) },
     private val fetchDirectory: (suspend (String) -> String)? = null,
@@ -120,7 +126,7 @@ class SetupViewModel(
     }
 
     fun onApiKeyChange(v: String) {
-        _form.value = _form.value.copy(apiKey = v, errorCode = null, testModels = null)
+        _form.value = _form.value.copy(apiKey = v, errorCode = null, testModels = null, keyWriteConfirmed = false)
     }
 
     fun toggleShowKey() {
@@ -205,6 +211,20 @@ class SetupViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val providerId = SetupValidation.deriveProviderId(cur.presetId)
+                // key.write defaults to ASK: one explicit confirmation per key.
+                if (!cur.keyWriteConfirmed) {
+                    when (policy.evaluateFresh("key.write", providerId).verdict) {
+                        Verdict.DENY -> {
+                            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                            return@launch
+                        }
+                        Verdict.ASK -> {
+                            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+                            return@launch
+                        }
+                        Verdict.ALLOW -> Unit
+                    }
+                }
                 val keyCopy = cur.apiKey.trim().toCharArray()
                 try {
                     vault().putKey(providerId, keyCopy)
@@ -219,6 +239,17 @@ class SetupViewModel(
                 _form.value = _form.value.copy(saving = false, errorCode = "SETUP_SAVE_FAILED")
             }
         }
+    }
+
+    /** Second tap of the key.write confirmation dialog: proceed with the save. */
+    fun confirmKeyWriteSave() {
+        if (!_form.value.confirmKeyWrite) return
+        _form.value = _form.value.copy(confirmKeyWrite = false, keyWriteConfirmed = true)
+        save()
+    }
+
+    fun dismissKeyWriteConfirm() {
+        _form.value = _form.value.copy(confirmKeyWrite = false)
     }
 
     /** Logout: delete the vault key, then clear metadata (order matters). */
@@ -288,6 +319,7 @@ class SetupViewModel(
 /** Production wiring (vault construction stays off the main thread). */
 class SetupViewModelFactory(app: Application) : ViewModelProvider.Factory {
     private val store = EndpointStore(app)
+    private val policy: PolicyStore = DataStorePolicyStore(app)
 
     @Volatile
     private var vault: KeyVault? = null
@@ -299,6 +331,6 @@ class SetupViewModelFactory(app: Application) : ViewModelProvider.Factory {
 
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
-        return SetupViewModel(store, vaultSource) as T
+        return SetupViewModel(store, vaultSource, policy) as T
     }
 }

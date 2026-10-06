@@ -20,6 +20,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -35,6 +36,7 @@ import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -62,6 +64,7 @@ private fun errorText(code: String): String = when (code) {
     "API key too short" -> "金鑰太短（至少 8 字元），請檢查後重貼。"
     "TEST_UNAUTHORIZED" -> "金鑰無效（認證失敗），請檢查後重貼。"
     "TEST_RETRYABLE" -> "伺服器忙碌或網路不穩，請稍後重試。"
+    "POLICY_DENIED_KEY_WRITE" -> "政策拒絕寫入金鑰（key.write DENY），請檢查權限設定。"
     else -> "儲存失敗（$code），請重試。"
 }
 
@@ -304,6 +307,22 @@ fun SetupScreen(
             text = "LibrePocket 為獨立社群專案，與上述供應商無任何關聯；此頁僅為你自填端點提供指名引用，不代表官方支援或認證。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+
+    if (state.confirmKeyWrite) {
+        AlertDialog(
+            onDismissRequest = viewModel::dismissKeyWriteConfirm,
+            title = { Text("寫入金鑰確認") },
+            text = {
+                Text("即將把此 API Key 存入本機加密儲存（key.write）。換機或還原後需重輸；金鑰永不離開本機。確定繼續嗎？")
+            },
+            confirmButton = {
+                TextButton(onClick = viewModel::confirmKeyWriteSave) { Text("確定寫入") }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::dismissKeyWriteConfirm) { Text("取消") }
+            },
         )
     }
 }

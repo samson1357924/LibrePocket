@@ -141,6 +141,6 @@ class ChatViewModelFactory(app: Application) : ViewModelProvider.Factory {
 
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
-        return ChatViewModel(store, sessions) as T
+        return ChatViewModel(store, sessions, policy) as T
     }
 }

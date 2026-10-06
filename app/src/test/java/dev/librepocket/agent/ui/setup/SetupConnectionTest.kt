@@ -4,6 +4,7 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
+import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderConfig
@@ -82,6 +83,7 @@ class SetupConnectionTest {
         val vm = SetupViewModel(
             store = store,
             vaultSource = VaultSource { vault },
+            policy = InMemoryPolicyStore(),
             buildProvider = { _, _ -> fake },
         )
         return vm to store

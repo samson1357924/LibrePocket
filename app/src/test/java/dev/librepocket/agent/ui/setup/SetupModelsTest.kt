@@ -4,6 +4,7 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
+import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -76,6 +77,7 @@ class SetupModelsTest {
         return SetupViewModel(
             store = store,
             vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            policy = InMemoryPolicyStore(),
             buildProvider = { _, _ -> fake },
             fetchDirectory = { directoryBody },
         )
@@ -116,6 +118,7 @@ class SetupModelsTest {
         val vm = SetupViewModel(
             store = store,
             vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            policy = InMemoryPolicyStore(),
             buildProvider = { _, _ -> FakeModelProvider(failure = java.io.IOException("offline")) },
             fetchDirectory = { throw java.io.IOException("offline") },
         )

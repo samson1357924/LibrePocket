@@ -7,6 +7,8 @@ import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.ChatUiState
 import dev.librepocket.chat.UiMessage
+import dev.librepocket.policy.PolicyStore
+import dev.librepocket.policy.Verdict
 import dev.librepocket.session.SessionStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -41,6 +43,7 @@ private const val HISTORY_CAP = 2000
 class ChatViewModel(
     private val store: EndpointStore,
     private val sessions: ChatSessionFactory,
+    private val policy: PolicyStore,
 ) : ViewModel() {
 
     private val _input = MutableStateFlow("")
@@ -108,6 +111,10 @@ class ChatViewModel(
         if (clean.isEmpty()) return
         lastUserText = clean
         viewModelScope.launch {
+            if (!keyReadAllowed()) {
+                _notice.value = "POLICY_DENIED"
+                return@launch
+            }
             val session = try {
                 withContext(Dispatchers.IO) { ensureSession(clean) }
             } catch (_: Exception) {
@@ -135,6 +142,10 @@ class ChatViewModel(
         lastUserText = text
         _notice.value = null
         viewModelScope.launch {
+            if (!keyReadAllowed()) {
+                _notice.value = "POLICY_DENIED"
+                return@launch
+            }
             val created = try {
                 withContext(Dispatchers.IO) { ensureSession(text) }
             } catch (_: Exception) {
@@ -221,6 +232,19 @@ class ChatViewModel(
         sessionCollectJob = viewModelScope.launch {
             session.uiState.collect { _sessionState.value = it }
         }
+    }
+
+    /**
+     * key.read is ASK-by-default (consented at setup); only a DENY rule blocks
+     * here (fail-closed, zero requests on deny). Shared by send and steer paths.
+     */
+    private suspend fun keyReadAllowed(): Boolean = try {
+        withContext(Dispatchers.IO) {
+            val endpointId = store.observe().first()?.providerId.orEmpty()
+            policy.evaluateFresh("key.read", endpointId).verdict != Verdict.DENY
+        }
+    } catch (_: Exception) {
+        false
     }
 
     private fun closeLive() {

@@ -19,10 +19,24 @@
         android:allowBackup="true">
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- D06 最小版系統入口（P6）：僅 intent-filter，無新增權限。
+                 ASSIST = 預設助手/助手手勢喚起；理由：同一 Runtime 續接會話。
+                 SEND(text/plain) = 系統分享接收；理由：分享正文歸一為 UserTurn。
+                 後台喚起一律經 EntryGate 需使用者手勢，無背景啟動濫用。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
     </application>

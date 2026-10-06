@@ -3,5 +3,5 @@
     <!-- GitHub flavor label (co-installable alongside Play via .github suffix). -->
     <string name="app_name">LibrePocket GitHub</string>
     <!-- GitHub flavor only. Shown on the system Accessibility settings screen. -->
-    <string name="accessibility_description">LibrePocket GitHub-build helper (placeholder, no behavior yet).</string>
+    <string name="accessibility_description">LibrePocket helper: on-screen step-by-step assistance (default off; payment/deletion/sending steps always ask first).</string>
 </resources>

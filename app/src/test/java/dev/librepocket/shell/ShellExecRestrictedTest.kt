@@ -145,23 +145,35 @@ class ShellExecRestrictedTest {
         }
     }
 
-    @Test fun elevatedAlwaysDeniedWithoutSpawn() {
+    @Test fun elevatedDeniedAndAuditedWithoutSpawn() {
+        // S3 D09：提權唯一路徑為審計版 executeElevated（無 audit 過載已刪除，
+        // 全路徑強制留痕；見 ElevatedDispatch）。
         val runner = FakeRunner(ByteArray(0))
-        // 預設 DenyingElevatedRunner。
-        val r = ShellExecTool.executeElevated(ElevatedRequest(listOf("id"), reasonCode = "TEST"))
+        val audit = PrivilegeAuditLog()
+        // 佔位 DenyingElevatedRunner：拒絕且不建子進程，同時寫 DENY 審計。
+        val r = ShellExecTool.executeElevated(
+            ElevatedRequest(listOf("id"), reasonCode = "TEST"),
+            DenyingElevatedRunner(),
+            audit,
+        )
         assertTrue("$r", r is ShellResult.Denied)
         // 顯式注入亦同（本階段無真實現）。
         val r2 = ShellExecTool.executeElevated(
             ElevatedRequest(listOf("id"), reasonCode = "TEST"),
             DenyingElevatedRunner(),
+            audit,
         )
         assertTrue("$r2", r2 is ShellResult.Denied)
         assertEquals(0, runner.calls)
+        assertEquals(2, audit.size())
     }
 
-    @Test fun elevatedNameReservedForS3() {
+    @Test fun elevatedNameRegisteredForS3() {
+        // S3（D09）：提權工具名已註冊（PRIVILEGED + 自裝風味 + 預設關），見 ShellElevatedTest。
         assertEquals("shell.elevated", ShellExecTool.ELEVATED_NAME)
-        // 本階段不註冊提權工具名。
-        assertEquals(null, ToolRegistry.find(ShellExecTool.ELEVATED_NAME))
+        val tool = ToolRegistry.find(ShellExecTool.ELEVATED_NAME)!!
+        assertEquals(SideEffect.PRIVILEGED, tool.sideEffect)
+        assertEquals("privilege_bridge", tool.annotations.requiresSwitch)
+        assertEquals(false, tool.annotations.switchDefault)
     }
 }

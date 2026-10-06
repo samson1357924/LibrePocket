@@ -12,8 +12,9 @@
 #      permission (SEND/RECEIVE/READ_SMS, MANAGE_EXTERNAL_STORAGE,
 #      BIND_ACCESSIBILITY_SERVICE, BIND_VPN_SERVICE);
 #   3. `dexdump` class scan: no class DEFINED under a self-install-only package
-#      (Ldev/librepocket/agent/github/ or Ldev/librepocket/agent/foss/) and no
-#      class EXTENDING a forbidden superclass (VpnService /
+#      (Ldev/librepocket/agent/github/, Ldev/librepocket/agent/foss/,
+#      Ldev/librepocket/privilege/github/, or the Shizuku transport
+#      Lrikka/shizuku/) and no class EXTENDING a forbidden superclass (VpnService /
 #      AccessibilityService). Descriptor form is used deliberately: plain-word
 #      grep would self-match the policy constants themselves;
 #   4. manifest service dump (APK via aapt xmltree) declares no
@@ -41,16 +42,18 @@
 #
 # Mirrors HardeningPolicy (PLAY_PERMISSION_BLACKLIST / PLAY_CLASS_BLACKLIST /
 # PLAY_SUPERCLASS_BLACKLIST / FOSS_STRING_BLACKLIST + checkFossArtifact):
-# play class prefixes cover both self-install flavors (github + foss); foss
-# dex needles are the Dalvik form (L + slashes + /) of the dot-form policy
-# constants, so the artifact scanner stays silent on the policy class itself.
+# play class prefixes cover both self-install flavors (github + foss a11y),
+# the S3 privilege bridge, and the Shizuku transport (githubImplementation
+# only); foss dex needles are the Dalvik form (L + slashes + /) of the
+# dot-form policy constants, so the artifact scanner stays silent on the
+# policy class itself.
 set -eu
 
 BLACKLIST_PERMS="SEND_SMS RECEIVE_SMS READ_SMS MANAGE_EXTERNAL_STORAGE BIND_ACCESSIBILITY_SERVICE BIND_VPN_SERVICE"
-BLACKLIST_CLASS_PREFIXES="Ldev/librepocket/agent/github/ Ldev/librepocket/agent/foss/"
+BLACKLIST_CLASS_PREFIXES="Ldev/librepocket/agent/github/ Ldev/librepocket/agent/foss/ Ldev/librepocket/privilege/github/ Lrikka/shizuku/"
 BLACKLIST_SUPERS="Landroid/net/VpnService; Landroid/accessibilityservice/AccessibilityService;"
-FOSS_BLACKLIST="com.google.mlkit com.google.android.gms com.microsoft.cognitiveservices.speech"
-FOSS_DEX_PREFIXES="Lcom/google/mlkit/ Lcom/google/android/gms/ Lcom/microsoft/cognitiveservices/speech/"
+FOSS_BLACKLIST="com.google.mlkit com.google.android.gms com.microsoft.cognitiveservices.speech rikka.shizuku"
+FOSS_DEX_PREFIXES="Lcom/google/mlkit/ Lcom/google/android/gms/ Lcom/microsoft/cognitiveservices/speech/ Lrikka/shizuku/"
 FAIL=0
 
 log() { printf '%s\n' "$*"; }
@@ -224,12 +227,15 @@ for ART in "$@"; do
                 fi
             done
         else
-            # Fallback without dexdump: descriptor-form binary grep (L-prefix + ';'
-            # suffix never matches plain-word const-strings). Mirrors HardeningPolicy
-            # PLAY_CLASS_BLACKLIST (github + foss prefixes, pinned on each flavor's
-            # AccessibilityService descriptor).
+            # Fallback without dexdump: descriptor-form binary grep (L-prefix +
+            # slashes never matches the dot-form policy constants). Mirrors HardeningPolicy
+            # PLAY_CLASS_BLACKLIST (github + foss a11y prefixes, the S3 privilege
+            # bridge prefix, and the Shizuku transport prefix, each pinned below
+            # on a concrete descriptor).
             for needle in "Ldev/librepocket/agent/github/GithubAccessibilityService;" \
                           "Ldev/librepocket/agent/foss/FossAccessibilityService;" \
+                          "Ldev/librepocket/privilege/github/" \
+                          "Lrikka/shizuku/" \
                           "Landroid/net/VpnService;" \
                           "Landroid/accessibilityservice/AccessibilityService;"; do
                 if grep -R -l -F "$needle" "$TMP" 2>/dev/null | grep -q .; then

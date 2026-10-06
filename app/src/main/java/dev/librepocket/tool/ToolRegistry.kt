@@ -217,6 +217,27 @@ object ToolRegistry {
                 fallbackHint = "run the command manually in a terminal app",
             ),
         ),
+        // ---- S3 提權橋：shell.elevated（D09，foss/github only，預設關） ----
+        // argv 向量直達提權通道（Shizuku/Root，僅 src/github 實作），不拼字串；
+        // Schema 只收 argv / reasonCode / timeoutMs 三鍵（無字串形式的執行鍵）。
+        ToolDef(
+            name = "shell.elevated",
+            description = "Elevated exec via the Shizuku/Root bridge (self-install only, default off): argv vector direct to the bridge, reasonCode required for audit.",
+            jsonSchema = schema(
+                prop("argv", "array", "Argument vector; argv[0] is the binary basename, never a single string"),
+                prop("reasonCode", "string", "Why elevated execution is needed (written to the audit log as a hash)"),
+                prop("timeoutMs", "integer", "Per-call timeout budget in milliseconds"),
+                required = "\"argv\", \"reasonCode\"",
+            ),
+            sideEffect = SideEffect.PRIVILEGED,
+            annotations = ToolAnnotations(
+                requiresSwitch = "privilege_bridge",
+                switchDefault = false,
+                timeoutMs = 10_000L,
+                fallbackHint = "run the steps manually in a terminal app",
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
         // ---- S1-C backfill: calendar query/update/delete ----
         ToolDef(
             name = "calendar.query",

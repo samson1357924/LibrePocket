@@ -33,12 +33,28 @@ object PrivilegeGate {
     /** Full-text gate covers both the ToolRegistry and SystemB notification names. */
     val NOTIFICATION_TOOLS: Set<String> = setOf(NOTIFICATION_TOOL, "systemb.notification.titles")
 
+    /**
+     * S3 提權工具名（BACKLOG D09，矩陣 §3/§4）。
+     * `shell.elevated` 永遠走提權通道（Shizuku/Root，僅自裝風味實作）：
+     * 三參 [check] 遇此工具一律 [NeedConfirm]（即使已確認，強制呼叫方
+     * 改走四參 args-aware 版）；四參版還要求 reasonCode 非空
+     * （見 args-aware [check]），空原因碼同樣只回 [NeedConfirm]，
+     * 絕不靜默放行。
+     */
+    const val ELEVATED_TOOL = "shell.elevated"
+
     fun check(tool: ToolDef, confirmed: Boolean, projection: Projection): GateResult {
         require(projection.toolName == tool.name) {
             "projection is for ${projection.toolName}, not ${tool.name}"
         }
         if (projection.level == CapabilityLevel.UNAVAILABLE) {
             return GateResult.Denied(projection.reason ?: DenyReason.USER_DISABLED)
+        }
+        // 提權分支（S3 D09）：三參版遇 ELEVATED_TOOL 一律 NeedConfirm，
+        // 無論 confirmed 為何 —— 呼叫方必須改走四參 args-aware 版並攜帶
+        // 非空 reasonCode，否則永遠拿不到 Allowed（防三參繞過原因碼門）。
+        if (tool.name == ELEVATED_TOOL) {
+            return GateResult.NeedConfirm(tool.name)
         }
         if (tool.sideEffect == SideEffect.PRIVILEGED && !confirmed) {
             return GateResult.NeedConfirm(tool.name)
@@ -65,11 +81,31 @@ object PrivilegeGate {
         if (projection.level == CapabilityLevel.UNAVAILABLE) {
             return GateResult.Denied(projection.reason ?: DenyReason.USER_DISABLED)
         }
+        // 提權分支（args-aware）：原因碼缺席/空白即使用戶已勾確認框也只回
+        // NeedConfirm（呼叫方必須補 reasonCode 再走一次確認）。
+        // 原因碼有效時落到當輪確認門禁 —— 不得經三參版（其遇提權一律
+        // NeedConfirm，防三參繞過原因碼門；此處顯式放行才是唯一的 Allowed 路）。
+        if (tool.name == ELEVATED_TOOL) {
+            if (!isElevatedRequest(args)) {
+                return GateResult.NeedConfirm(tool.name)
+            }
+            if (!confirmed) {
+                return GateResult.NeedConfirm(tool.name)
+            }
+            return GateResult.Allowed
+        }
         if (tool.name in NOTIFICATION_TOOLS && isFullTextRequest(args) && !confirmed) {
             return GateResult.NeedConfirm(tool.name)
         }
         return check(tool, confirmed, projection)
     }
+
+    /**
+     * 提權請求是否攜帶有效原因碼（矩陣 §3 審計要求：每次跨權限邊界呼叫
+     * 必須攜帶原因碼）。空白/缺席一律視為無效。
+     */
+    fun isElevatedRequest(args: Map<String, String>): Boolean =
+        !args["reasonCode"].isNullOrBlank()
 
     /** `fullText=true` (or `1`) requests the privileged body path. */
     fun isFullTextRequest(args: Map<String, String>): Boolean {

@@ -12,6 +12,8 @@ import org.junit.Test
 /**
  * PrivilegeGate tests (BACKLOG B4): PRIVILEGED tools never execute
  * without confirmation; unavailable tools are denied with reasons.
+ * S3: `shell.elevated` three-arg [check] always gates to [NeedConfirm]
+ * (callers must use the args-aware four-arg overload with reasonCode).
  */
 class PrivilegeGateTest {
 
@@ -65,6 +67,25 @@ class PrivilegeGateTest {
         val tool = ToolRegistry.find("calendar.create")!!
         val projection = projectionOf(tool.name, CapabilityLevel.UNAVAILABLE, DenyReason.NO_PRIVILEGE)
         assertEquals(GateResult.Denied(DenyReason.NO_PRIVILEGE), PrivilegeGate.check(tool, true, projection))
+    }
+
+    @Test fun elevatedThreeArgAlwaysNeedsConfirmEvenWhenConfirmed() {
+        // S3 D09：三參版遇 shell.elevated 一律 NeedConfirm（即使 confirmed=true），
+        // 強制呼叫方改走四參 args-aware 版攜 reasonCode，防原因碼門被繞過。
+        val tool = ToolRegistry.find("shell.elevated")!!
+        val native = projectionOf(tool.name, CapabilityLevel.NATIVE)
+        assertEquals(GateResult.NeedConfirm(tool.name), PrivilegeGate.check(tool, false, native))
+        assertEquals(GateResult.NeedConfirm(tool.name), PrivilegeGate.check(tool, true, native))
+        assertFalse(PrivilegeGate.canExecute(tool, true, native))
+        // 四參版：有 reasonCode + 已確認才放行。
+        assertEquals(
+            GateResult.Allowed,
+            PrivilegeGate.check(tool, true, native, mapOf("reasonCode" to "D09-T")),
+        )
+        assertEquals(
+            GateResult.NeedConfirm(tool.name),
+            PrivilegeGate.check(tool, true, native, mapOf("reasonCode" to " ")),
+        )
     }
 
     @Test fun fullTextJsonBoundaryRejectsPrefixNumbers() {

@@ -183,6 +183,84 @@ object ShellPolicy {
         return Validation.Allowed(base)
     }
 
+    /**
+     * 提權通道校驗（S3，BACKLOG D09，矩陣 §3）。
+     *
+     * 與 [validate] 的差異只有兩處，其餘（空命令 → 黑名單二進位/全文片段 →
+     * 參數衛生 → find 高危謂詞 → 檔案域）完全同序：
+     * - 跳過白名單門禁：白名單外的二進位僅允許走提權通道（Shizuku/Root），
+     *   直接 exec 仍拒（[validate] 維持原判）；
+     * - 檔案域改走提權語義：私有域 / 已授權 SAF 直行（呼叫方應優先走
+     *   SAF/私有域，見提權橋「SAF 優先」話術）；跨域且
+     *   [FileScope.decide] 回 needsBridge（橋接已授權）才放行，其餘跨域仍拒。
+     * 黑名單（`rm -rf /` 類）一律拒，不因提權放行。
+     *
+     * 預設 [flavor] 為 PLAY（fail-closed：未指明風味時跨域一律拒；
+     * 自裝風味呼叫方必須顯式傳 FOSS/GITHUB + bridgeGranted）。
+     */
+    fun validateElevated(
+        argv: List<String>,
+        privateRoot: String? = null,
+        safRoots: List<String> = emptyList(),
+        flavor: Flavor = Flavor.PLAY,
+        bridgeGranted: Boolean = false,
+    ): Validation {
+        if (argv.isEmpty() || argv.all { it.isBlank() }) {
+            return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
+        }
+        val base = basename(argv[0].trim())
+        if (base.isEmpty()) {
+            return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
+        }
+        if (base in DENIED_BINARIES) {
+            return Validation.Denied(ShellDeny.BLACKLISTED, "binary denied: $base")
+        }
+        val joined = argv.joinToString(" ")
+        for (snippet in DENIED_TEXT_SNIPPETS) {
+            if (joined.contains(snippet)) {
+                return Validation.Denied(ShellDeny.BLACKLISTED, "blocked pattern: $snippet")
+            }
+        }
+        for (arg in argv) {
+            for (ch in arg) {
+                if (ch in DENIED_ARG_CHARS) {
+                    return Validation.Denied(
+                        ShellDeny.BAD_ARGUMENT,
+                        "metachar denied: ${ch.code}",
+                    )
+                }
+            }
+            if (arg.contains('\u0000')) {
+                return Validation.Denied(ShellDeny.BAD_ARGUMENT, "NUL byte denied")
+            }
+        }
+        // find 沙箱逃逸封堵：提權通道同樣拒絕（與 validate 同策）。
+        if (base == "find") {
+            for (arg in argv.drop(1)) {
+                if (arg in FIND_DENIED_PREDICATES) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "find predicate denied: $arg",
+                    )
+                }
+            }
+        }
+        // 檔案域（提權語義）：needsBridge 且橋接已授權才放行跨域。
+        for (arg in argv.drop(1)) {
+            for (candidate in absoluteCandidates(arg)) {
+                val denial = checkFileScopeElevated(
+                    candidate,
+                    privateRoot,
+                    safRoots,
+                    flavor,
+                    bridgeGranted,
+                )
+                if (denial != null) return denial
+            }
+        }
+        return Validation.Allowed(base)
+    }
+
     /** 取參數中的絕對路徑候選：`/...` 或 `--opt=/...`（`=` 後綴）。 */
     private fun absoluteCandidates(arg: String): List<String> {
         if (arg.startsWith("/")) return listOf(arg)
@@ -215,6 +293,35 @@ object ShellPolicy {
             )
         }
         return null
+    }
+
+    /**
+     * 提權語義的檔案域檢查（S3，BACKLOG D09）。
+     *
+     * 先走 [FileScope.decide]：私有域 / 已授權 SAF 直行；跨域僅當回
+     * needsBridge 且已授權（[FileScope.decide] 內已按風味與
+     * bridgeGranted 裁決，`allowed == true` 即放行條件）才放行，
+     * 其餘跨域仍拒。無作用域（privateRoot == null）fail-closed。
+     */
+    private fun checkFileScopeElevated(
+        path: String,
+        privateRoot: String?,
+        safRoots: List<String>,
+        flavor: Flavor,
+        bridgeGranted: Boolean,
+    ): Validation.Denied? {
+        if (privateRoot == null) {
+            return Validation.Denied(
+                ShellDeny.BLACKLISTED,
+                "absolute path denied without scope: $path",
+            )
+        }
+        val decision = FileScope.decide(path, privateRoot, safRoots, flavor, bridgeGranted)
+        if (decision.allowed) return null
+        return Validation.Denied(
+            ShellDeny.BLACKLISTED,
+            "cross-domain denied: $path",
+        )
     }
 
     /** 對輸出做位元組級截斷（UTF-8 邊界安全由呼叫方解碼時處理）。 */

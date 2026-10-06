@@ -43,11 +43,16 @@ object HardeningPolicy {
 
     /**
      * Class-descriptor prefixes that must never be DEFINED in the play dex
-     * (self-install flavor code, e.g. `Ldev/librepocket/agent/github/GithubAccessibilityService;`).
+     * (self-install flavor code, e.g. `Ldev/librepocket/agent/github/GithubAccessibilityService;`,
+     * plus the S3 privilege bridge `Ldev/librepocket/privilege/github/` and its
+     * Shizuku transport `Lrikka/shizuku/` — Shizuku is `githubImplementation`
+     * only, so any play-dex occurrence is a dependency-scoping regression).
      */
     val PLAY_CLASS_BLACKLIST: List<String> = listOf(
         "Ldev/librepocket/agent/github/",
         "Ldev/librepocket/agent/foss/",
+        "Ldev/librepocket/privilege/github/",
+        "Lrikka/shizuku/",
     )
 
     /**
@@ -63,11 +68,16 @@ object HardeningPolicy {
      * S2: Azure Speech (`com.microsoft.cognitiveservices.speech`) is
      * github-flavor only (with `azure_tts` default off); foss must never
      * reference it. Mirrored by `scripts/play_policy_check.sh` foss gate.
+     *
+     * S3: Shizuku (`rikka.shizuku`, `githubImplementation` only) likewise
+     * never appears in foss; the play gate additionally pins its dex form
+     * (`Lrikka/shizuku/`, see [PLAY_CLASS_BLACKLIST]).
      */
     val FOSS_STRING_BLACKLIST: List<String> = listOf(
         "com.google.mlkit",
         "com.google.android.gms",
         "com.microsoft.cognitiveservices.speech",
+        "rikka.shizuku",
     )
 
     /**

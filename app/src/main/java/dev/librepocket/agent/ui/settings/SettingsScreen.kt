@@ -28,6 +28,10 @@ fun SettingsScreen(
     gate: EndpointGate = EndpointGate.Loading,
     onEditEndpoint: () -> Unit = {},
     onLogout: () -> Unit = {},
+    /** S3 提權橋一鍵收回（呼叫方清 [PrivilegeAuditLog] + 關 `privilege_bridge` 開關）。 */
+    onRevokePrivilege: () -> Unit = {},
+    /** 提權審計筆數（僅計數，不含明文；0 表示無待收回授權痕跡）。 */
+    privilegeAuditCount: Int = 0,
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
     Column(
@@ -101,6 +105,34 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                // S3 提權橋揭露 + 一鍵收回（矩陣 §3：每次跨權限邊界呼叫攜原因碼寫審計，
+                // 審計只記雜湊計數；此處一鍵清表並關閉提權橋開關）。
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                    ),
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Text("提權橋（Shizuku / Root，可選）", style = MaterialTheme.typography.titleMedium)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            "僅直接下載版可用，預設關閉；開啟後檔案跨域、提權子進程、截圖備選路徑" +
+                                "才會經系統授權的橋接執行，每次呼叫都記一筆審計（只記雜湊與計數，不記原文）。" +
+                                "目前審計筆數：$privilegeAuditCount",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = onRevokePrivilege,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("一鍵收回提權授權並清空審計")
+                        }
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))

@@ -71,28 +71,30 @@ class ChatViewModel(
     val canRetry: Boolean
         get() = _sessionState.value.status == ChatStatus.ERROR && lastUserText != null
 
+    /** In-flight or follow-up pending: a new turn must steer, never send. */
+    private fun isBusy(status: ChatStatus): Boolean =
+        status == ChatStatus.STREAMING || status == ChatStatus.WAITING_STEERED
+
     fun onInputChange(value: String) {
         _input.value = value
-    }
-
-    fun prefill(text: String) {
-        if (text.isBlank()) return
-        _input.value = text
     }
 
     fun send() {
         val text = _input.value.trim()
         if (text.isEmpty()) return
-        if (_sessionState.value.status == ChatStatus.STREAMING) return
         _input.value = ""
-        sendText(text)
+        if (isBusy(_sessionState.value.status)) {
+            steer(text)
+        } else {
+            sendText(text)
+        }
     }
 
     /** Entry path: normalized text goes straight out (no input box round-trip). */
     fun sendDirect(text: String) {
         val clean = text.trim()
         if (clean.isEmpty()) return
-        if (_sessionState.value.status == ChatStatus.STREAMING) {
+        if (isBusy(_sessionState.value.status)) {
             steer(clean)
             return
         }

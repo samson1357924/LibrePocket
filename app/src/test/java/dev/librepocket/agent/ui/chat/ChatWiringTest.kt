@@ -130,7 +130,7 @@ class ChatWiringTest {
     }
 
     @Test
-    fun busySendIsIgnoredAndCancelWorks() {
+    fun busySendSteersAndCancelWorks() {
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
@@ -150,17 +150,21 @@ class ChatWiringTest {
             buildProvider = { _, _ -> fake },
         )
         val vm = ChatViewModel(store, factory)
-        vm.onInputChange("first")
-        vm.send()
-        awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
-        vm.onInputChange("second")
-        vm.send() // busy: ignored, no crash
-        Thread.sleep(50)
-        assertEquals(ChatStatus.STREAMING, vm.sessionState.value.status)
-        vm.cancel()
-        awaitTrue { vm.sessionState.value.status == ChatStatus.CANCELLED }
-        val partial = vm.sessionState.value.messages.first { it.role == "assistant" }
-        assertTrue(partial.isPartial)
+        try {
+            vm.onInputChange("first")
+            vm.send()
+            awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
+            vm.onInputChange("second")
+            vm.send() // busy: steered, never preempts; input consumed into the queue
+            awaitTrue { vm.sessionState.value.pendingSteerCount == 1 }
+            assertEquals(ChatStatus.STREAMING, vm.sessionState.value.status)
+            vm.cancel()
+            awaitTrue { vm.sessionState.value.status == ChatStatus.CANCELLED }
+            val partial = vm.sessionState.value.messages.first { it.role == "assistant" }
+            assertTrue(partial.isPartial)
+        } finally {
+            vm.newChat() // close session: drains the queued steer, no background leak
+        }
     }
 
     @Test

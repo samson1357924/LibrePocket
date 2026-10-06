@@ -91,7 +91,9 @@ fun MainScreen(
     val chatStatus by chatViewModel.sessionState.collectAsStateWithLifecycle()
     LaunchedEffect(sharedText, hasEndpoint, chatStatus.status) {
         if (!sharedText.isNullOrBlank() && hasEndpoint) {
-            when (EntryDispatch.route(isBusy = chatStatus.status == ChatStatus.STREAMING)) {
+            val busy = chatStatus.status == ChatStatus.STREAMING ||
+                chatStatus.status == ChatStatus.WAITING_STEERED
+            when (EntryDispatch.route(isBusy = busy)) {
                 EntryRoute.SendNow -> chatViewModel.sendDirect(sharedText!!)
                 EntryRoute.QueueAsSteer -> chatViewModel.steer(sharedText!!)
             }

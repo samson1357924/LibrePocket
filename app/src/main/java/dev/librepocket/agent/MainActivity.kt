@@ -64,8 +64,9 @@ class MainActivity : ComponentActivity() {
                 kind = EntryKind.SHARE,
                 rawText = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString(),
                 shareTitle = intent.getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString(),
-                // No sender supplies sessionId yet; every share starts a new turn
-                // in the current session (SessionTarget.New).
+                // No sender supplies sessionId yet, so normalize() always yields
+                // SessionTarget.New (Resume is future work); the VM reuses the
+                // live session and only the normalized text travels downstream.
                 sessionId = null,
                 isForeground = true,
                 hasUserGesture = true,

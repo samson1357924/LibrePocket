@@ -105,14 +105,14 @@ for ART in "$@"; do
     fi
     log "== artifact: $ART =="
 
-    # 2. permission blacklist via aapt (APK; AAB has no runtime manifest per
-    #    se, so fall back to the base manifest inside the bundle).
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT INT TERM
+    unzip -oq "$ART" -d "$TMP"
+
+    # 2. permission blacklist via aapt / bundle manifest scan
     case "$ART" in
         *.aab)
-            TMPB=$(mktemp -d)
-            trap 'rm -rf "$TMPB"' EXIT INT TERM
-            unzip -oq "$ART" -d "$TMPB"
-            MANIFESTS=$(find "$TMPB" -name "AndroidManifest.xml")
+            MANIFESTS=$(find "$TMP" -name "AndroidManifest.xml")
             AAB_FAIL=0
             if [ -n "$MANIFESTS" ]; then
                 for p in $BLACKLIST_PERMS; do
@@ -125,29 +125,30 @@ for ART in "$@"; do
             if [ "$AAB_FAIL" -eq 0 ]; then
                 log "  permissions(bundle-scan): OK"
             fi
-            rm -rf "$TMPB"
-            trap - EXIT INT TERM
             ;;
         *)
             PERMS=$("$AAPT" dump permissions "$ART" 2>/dev/null || true)
+            XMLTREE=$("$AAPT" dump xmltree "$ART" AndroidManifest.xml 2>/dev/null || true)
+            APK_PERM_FAIL=0
             for p in $BLACKLIST_PERMS; do
-                if printf '%s\n' "$PERMS" | grep -q "$p"; then
+                if printf '%s\n' "$PERMS" | grep -q "$p" || printf '%s\n' "$XMLTREE" | grep -q "$p"; then
                     fail "$ART declares $p"
+                    APK_PERM_FAIL=1
                 fi
             done
-            log "  permissions(aapt): OK"
+            if [ "$APK_PERM_FAIL" -eq 0 ]; then
+                log "  permissions(aapt): OK"
+            fi
             ;;
     esac
 
     # 3. dex class scan (works for APK and AAB: both are zips with dex files).
     #    Uses dexdump class descriptors — precise and immune to const-string
     #    self-matches (e.g. the policy constants themselves).
-    TMP=$(mktemp -d)
-    trap 'rm -rf "$TMP"' EXIT INT TERM
-    unzip -oq "$ART" -d "$TMP"
     DEX_FAIL=0
+    DEX_FILES=$(find "$TMP" -type f -name "*.dex")
     if [ -n "${DEXDump:-}" ]; then
-        DUMP=$(for d in "$TMP"/classes*.dex "$TMP"/base/classes*.dex; do
+        DUMP=$(for d in $DEX_FILES; do
             [ -f "$d" ] || continue
             "$DEXDump" "$d" 2>/dev/null | grep -E "Class descriptor|Superclass" || true
         done)
@@ -177,9 +178,18 @@ for ART in "$@"; do
         log "  dex-classes: OK"
     fi
 
-    # 4. manifest service assertion (APK only; AAB services are covered by the
-    #    dex scan above since the class must be present to be registered).
+    # 4. manifest service assertion
     case "$ART" in
+        *.aab)
+            MANIFESTS=$(find "$TMP" -name "AndroidManifest.xml")
+            if [ -n "$MANIFESTS" ]; then
+                if grep -a -i -E "accessibilityservice|vpnservice" $MANIFESTS >/dev/null 2>&1; then
+                    fail "$ART bundle manifest registers an Accessibility/Vpn service"
+                else
+                    log "  manifest-services(bundle-scan): OK"
+                fi
+            fi
+            ;;
         *.apk)
             XMLTREE=$("$AAPT" dump xmltree "$ART" AndroidManifest.xml 2>/dev/null || true)
             if printf '%s\n' "$XMLTREE" | grep -i -q "accessibilityservice\|vpnservice"; then
@@ -189,6 +199,7 @@ for ART in "$@"; do
             fi
             ;;
     esac
+
     rm -rf "$TMP"
     trap - EXIT INT TERM
 done

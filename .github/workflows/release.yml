@@ -6,6 +6,10 @@ on:
       - 'v[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -28,6 +32,8 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
 
       - name: Assemble Release Artifacts (APKs & AAB)
         run: |
@@ -47,10 +53,11 @@ jobs:
       - name: Verify Play Release Policy Gate (ROADMAP D07)
         run: |
           chmod +x scripts/play_policy_check.sh
-          # 驗證 Play Release AAB 與 APK，確保權限黑名單與服務宣告皆通過
+          # 動態查找 play release 的 apk 檔名（相容 signed 或 unsigned）
+          PLAY_APK_TARGET=$(find app/build/outputs/apk/play/release -maxdepth 1 -name "*.apk" | head -n 1)
           scripts/play_policy_check.sh \
             app/build/outputs/bundle/playRelease/app-play-release.aab \
-            app/build/outputs/apk/play/release/app-play-release-unsigned.apk
+            "$PLAY_APK_TARGET"
 
       - name: Sign Android Artifacts (if secret configured)
         if: env.KEYSTORE_PRESENT == 'true'
@@ -87,6 +94,13 @@ jobs:
           cd release-artifacts
           sha256sum * > SHA256SUMS.txt
           cd ..
+
+      - name: Archive Release Artifacts to Workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist-binaries
+          path: release-artifacts/*
+          retention-days: 30
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

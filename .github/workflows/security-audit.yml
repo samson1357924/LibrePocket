@@ -20,6 +20,7 @@ jobs:
   gitleaks:
     name: Secret Leak Detection (Gitleaks)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: read
@@ -38,6 +39,7 @@ jobs:
   codeql:
     name: CodeQL SAST Analysis
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
@@ -54,6 +56,8 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: true
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -70,6 +74,7 @@ jobs:
     name: Dependency Vulnerability Review
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

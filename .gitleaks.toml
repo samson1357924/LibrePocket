@@ -4,7 +4,9 @@ title = "LibrePocket Gitleaks Config"
 [extend]
 useDefault = true
 
-[[allowlists]]
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
 description = "Allowlist test fixtures used for verifying sensitive data redaction and vault encryption"
 condition = "AND"
 paths = [

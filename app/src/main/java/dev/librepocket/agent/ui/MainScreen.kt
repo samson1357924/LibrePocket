@@ -53,6 +53,9 @@ import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.SetupScreen
 import dev.librepocket.agent.ui.setup.SetupViewModel
 import dev.librepocket.agent.ui.setup.SetupViewModelFactory
+import dev.librepocket.chat.ChatStatus
+import dev.librepocket.entry.EntryDispatch
+import dev.librepocket.entry.EntryRoute
 import kotlinx.coroutines.launch
 
 object Routes {
@@ -83,10 +86,15 @@ fun MainScreen(
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
 
-    // Gate first, prefill later: stash shared text until an endpoint exists.
-    LaunchedEffect(sharedText, hasEndpoint) {
+    // Gate first, dispatch later: stash the normalized entry text until an
+    // endpoint exists, then send-now when idle or steer when busy.
+    val chatStatus by chatViewModel.sessionState.collectAsStateWithLifecycle()
+    LaunchedEffect(sharedText, hasEndpoint, chatStatus.status) {
         if (!sharedText.isNullOrBlank() && hasEndpoint) {
-            chatViewModel.prefill(sharedText)
+            when (EntryDispatch.route(isBusy = chatStatus.status == ChatStatus.STREAMING)) {
+                EntryRoute.SendNow -> chatViewModel.sendDirect(sharedText!!)
+                EntryRoute.QueueAsSteer -> chatViewModel.steer(sharedText!!)
+            }
             onSharedConsumed()
         }
     }

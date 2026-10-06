@@ -269,6 +269,43 @@ class ChatWiringTest {
     }
 
     @Test
+    fun steerWhenIdleSends() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "steered"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val vm = newVm(store, fake)
+        vm.steer("go")
+        awaitTrue { vm.sessionState.value.messages.size == 2 }
+        assertEquals("go", vm.sessionState.value.messages.first { it.role == "user" }.text)
+    }
+
+    @Test
+    fun steerWhileBusyQueuesFollowUp() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "part"))
+                delay(300)
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val vm = newVm(store, fake)
+        vm.onInputChange("first")
+        vm.send()
+        awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
+        vm.steer("follow")
+        awaitTrue { vm.sessionState.value.pendingSteerCount == 1 || vm.messages.value.size == 4 }
+        awaitTrue(timeoutMs = 12000) { vm.messages.value.size == 4 }
+        assertEquals("follow", vm.messages.value[2].text)
+    }
+
+    @Test
     fun endpointSwitchRecreatesSession() {
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())

@@ -84,7 +84,43 @@ class ChatViewModel(
         val text = _input.value.trim()
         if (text.isEmpty()) return
         if (_sessionState.value.status == ChatStatus.STREAMING) return
+        _input.value = ""
         sendText(text)
+    }
+
+    /** Entry path: normalized text goes straight out (no input box round-trip). */
+    fun sendDirect(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        if (_sessionState.value.status == ChatStatus.STREAMING) {
+            steer(clean)
+            return
+        }
+        _input.value = ""
+        sendText(clean)
+    }
+
+    /** Queue an instruction for the next round; never preempts the live turn. */
+    fun steer(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        lastUserText = clean
+        viewModelScope.launch {
+            val session = try {
+                withContext(Dispatchers.IO) { ensureSession(clean) }
+            } catch (_: Exception) {
+                null
+            }
+            if (session == null) {
+                _notice.value = "NO_ENDPOINT"
+                return@launch
+            }
+            try {
+                session.session.steer(clean)
+            } catch (_: Exception) {
+                // Controller projects failures via sessionState; nothing to add.
+            }
+        }
     }
 
     fun retry() {
@@ -94,7 +130,6 @@ class ChatViewModel(
     }
 
     private fun sendText(text: String) {
-        _input.value = ""
         lastUserText = text
         _notice.value = null
         viewModelScope.launch {

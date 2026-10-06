@@ -128,6 +128,9 @@ class EndpointStore(
         require(config.providerId.isNotBlank()) { "PROVIDER_ID_BLANK" }
         require(config.baseUrl.isNotBlank()) { "BASE_URL_BLANK" }
         require(config.apiKeyRef.isNotBlank()) { "PROVIDER_KEY_REF_BLANK" }
+        // Boundary guard: the ref must be a vault alias, never pasted key material.
+        require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
+        require('\n' !in config.apiKeyRef && '\r' !in config.apiKeyRef) { "PROVIDER_KEY_REF_MALFORMED" }
         validateBaseUrl(config.baseUrl)
         withContext(ioDispatcher) {
             dataStore.edit { prefs ->

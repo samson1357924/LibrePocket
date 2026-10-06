@@ -128,6 +128,48 @@ class EndpointStoreTest {
     }
 
     @Test
+    fun saveRejectsMalformedRef() {
+        val store = newStore()
+        runBlocking {
+            try {
+                // Pasted key material must never land in the ref field.
+                store.save(sampleConfig().copy(apiKeyRef = "sk-abcdef1234567890"))
+                error("expected PROVIDER_KEY_REF_MALFORMED")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("PROVIDER_KEY_REF_MALFORMED", e.message)
+            }
+            try {
+                store.save(sampleConfig().copy(apiKeyRef = "other/x"))
+                error("expected PROVIDER_KEY_REF_MALFORMED")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("PROVIDER_KEY_REF_MALFORMED", e.message)
+            }
+            try {
+                store.save(sampleConfig().copy(apiKeyRef = "provider_key/a\nb"))
+                error("expected PROVIDER_KEY_REF_MALFORMED")
+            } catch (e: IllegalArgumentException) {
+                assertEquals("PROVIDER_KEY_REF_MALFORMED", e.message)
+            }
+            assertNull(store.observe().first())
+        }
+    }
+
+    @Test
+    fun dirtyBaseUrlReadsAsNotReady() = runBlocking {
+        val store = newStore()
+        // Bypass save() validation with a direct dirty write.
+        store.dataStore.edit { prefs ->
+            prefs[ENDPOINT_PROVIDER_ID_V1] = "preset:openai"
+            prefs[ENDPOINT_BASE_URL_V1] = "http://evil.example.com"
+            prefs[ENDPOINT_PROTOCOL_V1] = "CHAT_COMPLETIONS"
+            prefs[ENDPOINT_API_KEY_REF_V1] = "provider_key/preset:openai"
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        assertEquals(EndpointReadiness.INVALID_BASE_URL, store.readiness(vault))
+    }
+
+    @Test
     fun readinessRequiresMetadataUrlAndKey() = runBlocking {
         val store = newStore()
         val vault = EncryptedPrefsVault(InMemoryPrefs())

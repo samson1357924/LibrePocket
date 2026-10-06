@@ -14,3 +14,9 @@
 .externalNativeBuild
 .cxx
 local.properties
+# Release signing: keystores + passwords must NEVER be committed.
+.env
+/keystores/
+*.jks
+*.p12
+*.keystore

@@ -1,5 +1,6 @@
 package dev.librepocket.provider
 
+import dev.librepocket.redact.Redactor
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
@@ -82,16 +83,30 @@ class ResponsesProvider(
         sb.append("{\"model\":${q(request.model)},\"stream\":true,\"store\":false")
         request.maxTokens?.let { sb.append(",\"max_output_tokens\":$it") }
         request.temperature?.let { sb.append(",\"temperature\":$it") }
+        val webSearch = request.webSearchOrNull()
+        // 服务端搜索会把提示词送往厂商 hosted 检索：开启时先过 Redactor 脱敏；
+        // 关闭时保持原样（零行为变化）。
+        val serverSearch = webSearch != null
         val instructions = ArrayList<String>()
         if (request.systemPromptOverride != null) instructions.add(request.systemPromptOverride)
         for (m in request.messages) if (m.role == "system") instructions.add(m.text)
-        if (instructions.isNotEmpty()) sb.append(",\"instructions\":${q(instructions.joinToString("\n"))}")
-        if (request.tools.isNotEmpty()) {
+        if (instructions.isNotEmpty()) {
+            val joined = instructions.joinToString("\n")
+            val safe = if (serverSearch) Redactor.redact(joined).text else joined
+            sb.append(",\"instructions\":${q(safe)}")
+        }
+        if (request.tools.isNotEmpty() || webSearch != null) {
             sb.append(",\"tools\":[")
-            request.tools.forEachIndexed { i, t ->
-                if (i > 0) sb.append(',')
+            var ti = 0
+            request.tools.forEach { t ->
+                if (ti > 0) sb.append(',')
+                ti++
                 sb.append("{\"type\":\"function\",\"name\":${q(t.name)},")
                 sb.append("\"description\":${q(t.description)},\"parameters\":${t.jsonSchema}}}")
+            }
+            if (webSearch != null) {
+                if (ti > 0) sb.append(',')
+                sb.append(webSearchToolJson(webSearch.contextSize))
             }
             sb.append(']')
         }
@@ -101,8 +116,9 @@ class ResponsesProvider(
             if (m.role == "system") continue
             if (!first) sb.append(',')
             first = false
+            val safeText = if (serverSearch) Redactor.redact(m.text).text else m.text
             sb.append("{\"type\":\"message\",\"role\":${q(if (m.role == "tool") "user" else m.role)},")
-            sb.append("\"content\":[{\"type\":\"input_text\",\"text\":${q(m.text)}}")
+            sb.append("\"content\":[{\"type\":\"input_text\",\"text\":${q(safeText)}}")
             val infos = m.images.map { ImageFallbackPolicy.fromChatImage(it) }
             when (val d = ImageFallbackPolicy.decide(infos, supportsImages = true)) {
                 is ImageFallbackPolicy.Decision.Reject ->
@@ -149,6 +165,12 @@ internal class ResponsesMapper(val round: Int = 0) {
         }
         val type = root.string("type") ?: return emptyList()
         val out = ArrayList<StreamEvent>()
+        // 服务端搜索生命周期事件：固定走 TextDelta 标记，不进本地 Tool 聚合。
+        if (type.startsWith("response.web_search_call.")) {
+            val state = webSearchStateOf(type.substringAfterLast('.'))
+            out.add(StreamEvent.TextDelta(round, blockOf(root), ServerToolTranscript.webSearchMarker(state)))
+            return out
+        }
         when (type) {
             "response.output_text.delta" -> {
                 val delta = root.string("delta") ?: return emptyList()
@@ -162,6 +184,10 @@ internal class ResponsesMapper(val round: Int = 0) {
             }
             "response.output_item.added" -> {
                 val item = root.obj("item") ?: return emptyList()
+                if (item.string("type") == "web_search_call") {
+                    out.add(StreamEvent.TextDelta(round, blockOf(root), ServerToolTranscript.webSearchMarker("started")))
+                    return out
+                }
                 if (item.string("type") != "function_call") return emptyList()
                 val itemId = root.string("item_id") ?: item.string("id") ?: ("item_" + UUID.randomUUID().toString().take(8))
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
@@ -178,6 +204,10 @@ internal class ResponsesMapper(val round: Int = 0) {
             }
             "response.output_item.done" -> {
                 val item = root.obj("item") ?: return emptyList()
+                if (item.string("type") == "web_search_call") {
+                    out.add(StreamEvent.TextDelta(round, blockOf(root), ServerToolTranscript.webSearchMarker("completed")))
+                    return out
+                }
                 if (item.string("type") != "function_call") return emptyList()
                 val itemId = root.string("item_id") ?: item.string("id") ?: return emptyList()
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
@@ -257,4 +287,12 @@ internal class ResponsesMapper(val round: Int = 0) {
         val ci = root.int("content_index") ?: 0
         return oi * 1000 + ci
     }
+}
+
+/** 厂商事件后缀收敛为白名单状态，避免把厂商原文透传进转录。 */
+internal fun webSearchStateOf(suffix: String): String = when (suffix) {
+    "in_progress" -> "started"
+    "searching" -> "searching"
+    "completed" -> "completed"
+    else -> "update"
 }

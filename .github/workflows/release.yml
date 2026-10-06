@@ -1,0 +1,98 @@
+name: Release & Distribution
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, Verify & Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Assemble Release Artifacts (APKs & AAB)
+        run: |
+          ./gradlew :app:assemblePlayRelease \
+                    :app:assembleFullRelease \
+                    :app:bundlePlayRelease
+
+      - name: Configure Android SDK build-tools for aapt & dexdump
+        run: |
+          if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/build-tools" ]; then
+            BT_DIR=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+            if [ -n "$BT_DIR" ] && [ -d "$BT_DIR" ]; then
+              echo "$BT_DIR" >> "$GITHUB_PATH"
+            fi
+          fi
+
+      - name: Verify Play Release Policy Gate (ROADMAP D07)
+        run: |
+          chmod +x scripts/play_policy_check.sh
+          # 嚴格驗證 Play Release AAB 產物完全符合 Play 隱私與服務規範
+          scripts/play_policy_check.sh app/build/outputs/bundle/playRelease/app-play-release.aab
+
+      - name: Sign Android Artifacts (if secret configured)
+        if: env.KEYSTORE_PRESENT == 'true'
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: app/build/outputs/apk
+          signingKeyBase64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          alias: ${{ secrets.RELEASE_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        env:
+          KEYSTORE_PRESENT: ${{ secrets.RELEASE_KEYSTORE_BASE64 != '' }}
+
+      - name: Prepare Release Artifacts with Checksums
+        run: |
+          mkdir -p release-artifacts
+          VERSION_TAG="${{ github.ref_name }}"
+          [ -z "$VERSION_TAG" ] && VERSION_TAG="snapshot"
+
+          # 收集 Full APK (F-Droid / Direct download)
+          FULL_APK=$(find app/build/outputs/apk/full/release -name "*.apk" | head -n 1)
+          if [ -n "$FULL_APK" ] && [ -f "$FULL_APK" ]; then
+            cp "$FULL_APK" "release-artifacts/LibrePocket-${VERSION_TAG}-full.apk"
+          fi
+
+          # 收集 Play APK
+          PLAY_APK=$(find app/build/outputs/apk/play/release -name "*.apk" | head -n 1)
+          if [ -n "$PLAY_APK" ] && [ -f "$PLAY_APK" ]; then
+            cp "$PLAY_APK" "release-artifacts/LibrePocket-${VERSION_TAG}-play.apk"
+          fi
+
+          # 收集 Play AAB (Play Store publish bundle)
+          PLAY_AAB="app/build/outputs/bundle/playRelease/app-play-release.aab"
+          if [ -f "$PLAY_AAB" ]; then
+            cp "$PLAY_AAB" "release-artifacts/LibrePocket-${VERSION_TAG}-play.aab"
+          fi
+
+          # 產生 SHA256 校驗碼清單
+          cd release-artifacts
+          sha256sum * > SHA256SUMS.txt
+          cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

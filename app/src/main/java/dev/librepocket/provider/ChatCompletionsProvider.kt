@@ -1,5 +1,6 @@
 package dev.librepocket.provider
 
+import dev.librepocket.redact.Redactor
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.FlowCollector
@@ -86,6 +87,10 @@ class ChatCompletionsProvider(
         sb.append("{\"model\":${q(request.model)},\"stream\":true")
         request.maxTokens?.let { sb.append(",\"max_tokens\":$it") }
         request.temperature?.let { sb.append(",\"temperature\":$it") }
+        val webSearch = request.webSearchOrNull()
+        // 与 Responses 一致：服务端搜索外发提示词，开启时先脱敏；关闭时零变化。
+        val serverSearch = webSearch != null
+        fun safeText(raw: String): String = if (serverSearch) Redactor.redact(raw).text else raw
         if (request.tools.isNotEmpty()) {
             sb.append(",\"tools\":[")
             request.tools.forEachIndexed { i, t ->
@@ -94,6 +99,10 @@ class ChatCompletionsProvider(
                 sb.append("\"description\":${q(t.description)},\"parameters\":${t.jsonSchema}}}")
             }
             sb.append(']')
+        }
+        if (webSearch != null) {
+            // Additive：与 tools 并存；厂商不支持时由 HTTP 错误分类为 FATAL 上报。
+            sb.append(",${webSearchOptionsJson(webSearch.contextSize)}")
         }
         sb.append(",\"messages\":[")
         var first = true
@@ -105,21 +114,22 @@ class ChatCompletionsProvider(
         val systems = ArrayList<String>()
         if (request.systemPromptOverride != null) systems.add(request.systemPromptOverride)
         for (m in request.messages) if (m.role == "system") systems.add(m.text)
-        if (systems.isNotEmpty()) emitMsg("system", q(systems.joinToString("\n")))
+        if (systems.isNotEmpty()) emitMsg("system", q(safeText(systems.joinToString("\n"))))
         for (m in request.messages) {
             if (m.role == "system") continue
+            val safeM = if (serverSearch) m.copy(text = Redactor.redact(m.text).text) else m
             when {
                 m.role == "tool" -> {
                     if (!first) sb.append(',')
                     first = false
                     sb.append("{\"role\":\"tool\",\"tool_call_id\":${q(m.toolCallId.orEmpty())},")
-                    sb.append("\"content\":${q(m.text)}}")
+                    sb.append("\"content\":${q(safeM.text)}}")
                 }
-                m.images.isEmpty() && m.toolCalls.isEmpty() -> emitMsg(m.role, q(m.text))
+                m.images.isEmpty() && m.toolCalls.isEmpty() -> emitMsg(m.role, q(safeM.text))
                 else -> {
                     if (!first) sb.append(',')
                     first = false
-                    sb.append("{\"role\":${q(m.role)},\"content\":${contentParts(m)},")
+                    sb.append("{\"role\":${q(m.role)},\"content\":${contentParts(safeM)},")
                     if (m.toolCalls.isNotEmpty()) {
                         sb.append("\"tool_calls\":[")
                         m.toolCalls.forEachIndexed { i, tc ->
@@ -130,7 +140,7 @@ class ChatCompletionsProvider(
                         }
                         sb.append("],")
                     }
-                    sb.append("\"text\":${q(m.text)}}")
+                    sb.append("\"text\":${q(safeM.text)}}")
                 }
             }
         }
@@ -222,6 +232,12 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
                     out.add(StreamEvent.ToolDelta(index, idChunk, nameChunk, argsChunk))
                 }
             }
+            // 服务端搜索引用标注：之前直接忽略，现以 SERVER_TOOL 文本标记透出；
+            // 无标注时零行为变化，且永不产生 ToolDelta/ToolDone。
+            if (hasWebSearchCitation(delta)) {
+                switchTo(Kind.TEXT)
+                out.add(StreamEvent.TextDelta(round, blockIndex, ServerToolTranscript.webSearchMarker("completed")))
+            }
         }
         choice?.string("finish_reason")?.let { if (it.isNotEmpty() && it != "null") finishReason = it }
         root.obj("usage")?.let { u ->
@@ -286,6 +302,12 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
         }
         return null
     }
+}
+
+/** `delta.annotations[]` 中出现 `url_citation` 即视为服务端搜索引用（静态标记，不透传 URL）。 */
+internal fun hasWebSearchCitation(delta: MiniJson.JObj): Boolean {
+    val annotations = delta.arr("annotations")?.items?.filterIsInstance<MiniJson.JObj>() ?: return false
+    return annotations.any { it.string("type") == "url_citation" }
 }
 
 /** Extract `data[].id` from a `GET /models` response (tolerates envelope variants). */

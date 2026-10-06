@@ -57,6 +57,8 @@ data class ChatRequest(
     val maxTokens: Int? = null,
     val temperature: Float? = null,
     val systemPromptOverride: String? = null,
+    /** 服务端工具（默认空 = 关闭；开启后请求体会透传 hosted tool 字段）。 */
+    val serverTools: List<ServerTool> = emptyList(),
 )
 
 data class ToolSchema(val name: String, val description: String, val jsonSchema: String)

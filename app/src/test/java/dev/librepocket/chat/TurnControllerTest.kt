@@ -818,4 +818,60 @@ class TurnControllerTest {
     assertEquals(ChatStatus.ERROR, c.uiState.value.status)
     assertNotNull(c.uiState.value.error)
   }
+
+  // Q1: idle startOrEnqueue accepts exactly once (Started + join completes).
+  @Test fun startOrEnqueueIdleStartsOnce() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    val verdict = runBlocking { c.startOrEnqueue("hi") }
+    assertTrue(verdict is TurnStart.Started)
+    runBlocking { withTimeout(5000) { (verdict as TurnStart.Started).host.join() } }
+    assertEquals(listOf("hi"), usersOf(c))
+    assertEquals(1, provider.streamCalls)
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+  }
+
+  // Q1: busy startOrEnqueue queues exactly once (no throw, no extra provider
+  // call); the queued follow-up runs after the first turn completes.
+  @Test fun startOrEnqueueBusyQueuesOnceAndFollowUpRuns() {
+    val gate = CompletableDeferred<Unit>()
+    val provider = FakeLlmProvider { input ->
+      flow {
+        if (lastUserTextOf(input) == "first") {
+          emit(StreamEvent.TextDelta(0, 0, "A"))
+          gate.await()
+          emit(StreamEvent.Done("stop"))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "B-" + lastUserTextOf(input)))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { assistantsOf(c).any { it.text == "A" } }
+      val verdict = runBlocking { c.startOrEnqueue("second") }
+      assertTrue(verdict is TurnStart.Queued)
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertEquals(1, provider.streamCalls)
+      // fireTranscript delivers onSteerQueued asynchronously: await it.
+      awaitTrue { sink.steerQueued.toList() == listOf("second") }
+      gate.complete(Unit)
+      runBlocking { withTimeout(5000) { first.join() } }
+      awaitTrue { c.uiState.value.status == ChatStatus.IDLE && provider.streamCalls == 2 }
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      // The queued text is what ran as the follow-up turn.
+      awaitTrue { usersOf(c).contains("second") }
+    } finally {
+      outer.cancel()
+    }
+  }
 }

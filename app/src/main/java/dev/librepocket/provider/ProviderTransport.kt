@@ -20,14 +20,24 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
+import okhttp3.ResponseBody
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.BufferedSink
+import okio.Buffer
 
-/** Internal transport failure; [retryable] comes from [ProviderErrorClassifier]. */
+/** Internal transport failure; [retryable] comes from [ProviderErrorClassifier] unless a typed code applies. */
+internal enum class ProviderFailureCode { TOO_LARGE }
+
 internal class ProviderFailure(
     val retryable: Boolean,
     message: String,
     cause: Throwable? = null,
+    val code: ProviderFailureCode? = null,
 ) : IOException(message, cause)
+
+private const val MODEL_LIST_RESPONSE_MAX_BYTES = 1024 * 1024
+private const val HTTP_ERROR_BODY_MAX_BYTES = 16 * 1024
+private const val RESPONSE_READ_CHUNK_BYTES = 8 * 1024
 
 /**
  * OkHttp client per SPEC §5.1: 15s connect / 30s write / 5min read-idle,
@@ -122,6 +132,67 @@ internal fun redactedError(prefix: String, rawSnippet: String?): String =
 internal fun redactedError(message: String): String = Redactor.redactError(message)
 
 /**
+ * Read a successful finite provider body with a hard byte cap before decoding.
+ * The one-byte probe distinguishes an exact-cap EOF from an oversized body.
+ * The actual Call must be cancelled before response.close() can try to discard
+ * unread bytes from the network.
+ */
+internal fun readBoundedProviderBody(
+    body: ResponseBody,
+    cancelCall: () -> Unit,
+): String {
+    val limit = MODEL_LIST_RESPONSE_MAX_BYTES.toLong()
+    if (body.contentLength() > limit) {
+        cancelCall()
+        throw tooLargeProviderFailure()
+    }
+
+    val source = body.source()
+    val bytes = Buffer()
+    var remaining = limit
+    while (true) {
+        val requested = minOf(RESPONSE_READ_CHUNK_BYTES.toLong(), remaining + 1L)
+        val read = source.read(bytes, requested)
+        if (read == -1L) break
+        if (read > remaining) {
+            cancelCall()
+            throw tooLargeProviderFailure()
+        }
+        remaining -= read
+    }
+    return bytes.readByteArray().toResponseBody(body.contentType()).string()
+}
+
+/**
+ * Read and decode only the bounded prefix of an HTTP error body. Unlike a
+ * successful JSON body, a capped error remains classified by its HTTP status
+ * and markers present in this prefix. At the cap, cancel the actual Call so
+ * closing the response cannot spend time draining the remainder.
+ */
+internal fun readProviderErrorPrefix(
+    body: ResponseBody?,
+    cancelCall: () -> Unit,
+): String? {
+    if (body == null) return null
+    var remaining = HTTP_ERROR_BODY_MAX_BYTES.toLong()
+    val source = body.source()
+    val bytes = Buffer()
+    while (remaining > 0L) {
+        val read = source.read(bytes, minOf(RESPONSE_READ_CHUNK_BYTES.toLong(), remaining))
+        if (read == -1L) break
+        remaining -= read
+    }
+    if (remaining == 0L) cancelCall()
+    return bytes.readByteArray().toResponseBody(body.contentType()).string()
+}
+
+private fun tooLargeProviderFailure() = ProviderFailure(
+    retryable = false,
+    message = "TOO_LARGE provider model-list response",
+    code = ProviderFailureCode.TOO_LARGE,
+)
+
+/**
  * Execute a non-streaming provider request. The cancellation handler is active
  * from before execute() through complete body consumption and is disposed on
  * every exit path. Call.cancel() therefore interrupts blocking header/body IO
@@ -135,7 +206,7 @@ internal fun redactedError(message: String): String = Redactor.redactError(messa
 internal suspend fun <T> executeProviderRequest(
     client: OkHttpClient,
     request: Request,
-    consume: (Response) -> T,
+    consume: (response: Response, cancelCall: () -> Unit) -> T,
 ): T = withContext(Dispatchers.IO) {
     val call = client.newCall(request)
     val job = currentCoroutineContext()[Job]
@@ -144,7 +215,7 @@ internal suspend fun <T> executeProviderRequest(
     }
     try {
         currentCoroutineContext().ensureActive()
-        call.execute().use(consume)
+        call.execute().use { response -> consume(response) { call.cancel() } }
     } catch (e: IOException) {
         currentCoroutineContext().ensureActive()
         throw e
@@ -184,7 +255,7 @@ internal suspend fun pumpSse(
             response.use { response ->
                 if (!response.isSuccessful) {
                     val snippet = try {
-                        response.body?.string()?.take(2048)
+                        readProviderErrorPrefix(response.body) { call.cancel() }
                     } catch (e: IOException) {
                         currentCoroutineContext().ensureActive()
                         null

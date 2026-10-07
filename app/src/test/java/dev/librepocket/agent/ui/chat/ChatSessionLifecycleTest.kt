@@ -457,9 +457,17 @@ class ChatSessionLifecycleTest {
         }
     }
 
-    // F3 fresh-read-first: send started on old generation, endpoint B saved
-    // while authorize suspends. Must fail closed (zero sessions) but NOT
-    // silently drop user text: input restored + visible cancellation.
+    // F3 observer-first: send started on the old generation while authorize
+    // suspends in key.read; endpoint B is saved and the Flow observer
+    // invalidates before the policy gate is released. Must fail closed (zero
+    // sessions) but NOT silently drop user text: input restored + visible
+    // cancellation. (The gate stays closed until the observer has restored
+    // input/notice, so this covers the observer-wins ordering; the
+    // fresh-read-wins ordering leads to the same invalidate drain and is
+    // covered by the R1/R2 pre-accept cancellation tests below. A truly
+    // delayed-observer variant is not deterministically constructible with a
+    // real DataStore: the observer and the op's fresh read share the same
+    // store.observe() flow, so neither ordering can be forced.)
     // Before fix inputEmpty=true, notice=null (red); after fix restored (green).
     @Test
     fun sendRacingEndpointSaveIsNotSilentlyDropped() = runBlocking {

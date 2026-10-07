@@ -81,11 +81,12 @@ jobs:
     # INFRA: dependency-review-action 在 Dependency graph 未啟用時會直接 abort
     # ("Dependency review is not supported on this repository")，與依賴本身有無漏洞無關。
     # Owner 需至 Settings → Code security → Dependency graph → Enable（public repo 免費）。
-    # 在 graph 啟用前先設 continue-on-error 避免 infra 擋 PR；啟用並確認掃出具體 GHSA 後應 revert 此行。
-    continue-on-error: true
+    # 在 graph 啟用前先設 step-level continue-on-error 避免 infra 擋 PR；
+    # 注意必須放在 step 層（job 層仍會紅燈，見 actions/runner#2347），啟用並確認掃出具體 GHSA 後應 revert 此行。
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Run Dependency Review
         uses: actions/dependency-review-action@v4
+        continue-on-error: true

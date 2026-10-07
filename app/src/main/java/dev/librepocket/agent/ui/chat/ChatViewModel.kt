@@ -73,6 +73,33 @@ class ChatViewModel(
     private val _notice = MutableStateFlow<String?>(null)
     val notice: StateFlow<String?> = _notice.asStateFlow()
 
+    // Q3: observable outbox depth. Restoring/discarding through
+    // restoreNextRecovered()/discardNextRecovered() costs zero provider
+    // calls; the box is only ever filled when blank, never auto-sent.
+    private val _pendingRecoveryCount = MutableStateFlow(0)
+    val pendingRecoveryCount: StateFlow<Int> = _pendingRecoveryCount.asStateFlow()
+
+    /** Restore the oldest recoverable text into a blank box. Never overwrites, never sends. */
+    fun restoreNextRecovered(): Boolean {
+        if (_input.value.isNotBlank()) return false
+        val next = recoverableOps.removeFirstOrNull() ?: return false
+        setInput(next.text, next.opId, next.text)
+        syncRecoveryCount()
+        return true
+    }
+
+    /** Drop the oldest recoverable text. A denied intent dropped here is no longer retryable. */
+    fun discardNextRecovered(): Boolean {
+        val dropped = recoverableOps.removeFirstOrNull() ?: return false
+        if (retryableOp?.opId == dropped.opId) retryableOp = null
+        syncRecoveryCount()
+        return true
+    }
+
+    private fun syncRecoveryCount() {
+        _pendingRecoveryCount.value = recoverableOps.size
+    }
+
     // Lifecycle state is main-thread confined. The generation is also read by
     // the provider's suspending key callback, so it is volatile across IO.
     @Volatile
@@ -166,6 +193,7 @@ class ChatViewModel(
             if (draft != null && draft.revision == inputRevision && draft.text == raw) draft.opId else null
         if (adoptedId != null) recoverableOps.removeAll { it.opId == adoptedId }
         else retryableOp = null
+        syncRecoveryCount()
         setInput("")
         if (isBusy(_sessionState.value.status)) {
             steer(text, adoptedId)
@@ -298,6 +326,7 @@ class ChatViewModel(
             setInput("")
         }
         recoverableOps.removeAll { it.opId == op.opId }
+        syncRecoveryCount()
         lastUserText = op.text
         launchSendOp(op.opId, op.text, lifecycleGeneration)
     }
@@ -752,6 +781,7 @@ class ChatViewModel(
             lastUserText = null
             pendingOps.clear()
             recoverableOps.clear()
+            syncRecoveryCount()
             retryableOp = null
             setInput("")
             _notice.value = "NO_ENDPOINT"
@@ -763,8 +793,10 @@ class ChatViewModel(
             if (pendingOps.isNotEmpty()) {
                 for ((_, op) in pendingOps) recoverableOps.addLast(op)
                 pendingOps.clear()
+                syncRecoveryCount()
                 if (_input.value.isBlank()) {
                     recoverableOps.removeFirstOrNull()?.let { setInput(it.text, it.opId, it.text) }
+                    syncRecoveryCount()
                 }
                 _notice.value = "SEND_CANCELLED_ENDPOINT_CHANGED"
             } else {
@@ -787,6 +819,7 @@ class ChatViewModel(
             lastUserText = null
             pendingOps.clear()
             recoverableOps.clear()
+            syncRecoveryCount()
             retryableOp = null
             inputDraft = null
         }
@@ -841,6 +874,7 @@ class ChatViewModel(
         retryableOp = op
         if (_input.value.isNotBlank()) {
             recoverableOps.addLast(op)
+            syncRecoveryCount()
             return
         }
         setInput(op.text, op.opId, op.text)
@@ -854,6 +888,7 @@ class ChatViewModel(
     private fun drainNextRecoverableToInput() {
         if (_input.value.isNotBlank()) return
         val next = recoverableOps.removeFirstOrNull() ?: return
+        syncRecoveryCount()
         setInput(next.text, next.opId, next.text)
     }
 

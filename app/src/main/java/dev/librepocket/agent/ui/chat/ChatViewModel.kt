@@ -85,6 +85,11 @@ class ChatViewModel(
     private var sessionCollectJob: Job? = null
     private var openJob: Job? = null
     private var lastUserText: String? = null
+    // F3: unsent text retained until handed to a session. Cleared only on
+    // successful handoff or explicit newChat/logout/open; restored to input
+    // when an endpoint change cancels the send (never auto-sent to B).
+    private var pendingDraft: String? = null
+    private var pendingDraftGeneration: Long = -1L
     private var observedBinding: EndpointSessionBinding? = null
     private var hasObservedBinding = false
 
@@ -154,6 +159,8 @@ class ChatViewModel(
         if (clean.isEmpty()) return
         lastUserText = clean
         val startedAt = lifecycleGeneration
+        pendingDraft = clean
+        pendingDraftGeneration = startedAt
         lifecycleScope.launch {
             var operationGeneration = startedAt
             try {
@@ -163,16 +170,27 @@ class ChatViewModel(
                         val handle = ensureSession(access.endpoint, clean) ?: return@launch
                         operationGeneration = handle.generation
                         if (!isHandleCurrent(handle)) return@launch
+                        if (pendingDraft == clean) {
+                            pendingDraft = null
+                            pendingDraftGeneration = -1L
+                        }
                         handle.created.session.steer(clean)
                     }
-                    EndpointAccess.Denied -> setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
-                    EndpointAccess.Missing -> setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
+                    EndpointAccess.Denied -> {
+                        setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
+                        restoreDraftForFailedSend(operationGeneration, clean, "POLICY_DENIED")
+                    }
+                    EndpointAccess.Missing -> {
+                        setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
+                        restoreDraftForFailedSend(operationGeneration, clean, "NO_ENDPOINT")
+                    }
                     EndpointAccess.Stale -> Unit
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
                 setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
+                restoreDraftForFailedSend(operationGeneration, clean, "NO_ENDPOINT")
             }
         }
     }
@@ -187,6 +205,8 @@ class ChatViewModel(
         lastUserText = text
         _notice.value = null
         val startedAt = lifecycleGeneration
+        pendingDraft = text
+        pendingDraftGeneration = startedAt
         lifecycleScope.launch {
             var operationGeneration = startedAt
             try {
@@ -195,6 +215,10 @@ class ChatViewModel(
                         operationGeneration = access.endpoint.generation
                         val handle = ensureSession(access.endpoint, text)
                         if (handle == null || !isHandleCurrent(handle)) return@launch
+                        if (pendingDraft == text) {
+                            pendingDraft = null
+                            pendingDraftGeneration = -1L
+                        }
                         operationGeneration = handle.generation
                         try {
                             handle.created.session.send(text)
@@ -217,14 +241,21 @@ class ChatViewModel(
                             // Fresh chat policy deny is already projected by the controller.
                         }
                     }
-                    EndpointAccess.Denied -> setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
-                    EndpointAccess.Missing -> setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
+                    EndpointAccess.Denied -> {
+                        setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
+                        restoreDraftForFailedSend(operationGeneration, text, "POLICY_DENIED")
+                    }
+                    EndpointAccess.Missing -> {
+                        setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
+                        restoreDraftForFailedSend(operationGeneration, text, "NO_ENDPOINT")
+                    }
                     EndpointAccess.Stale -> Unit
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
                 setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
+                restoreDraftForFailedSend(operationGeneration, text, "NO_ENDPOINT")
             }
         }
     }
@@ -415,6 +446,8 @@ class ChatViewModel(
         if (currentSession != null) {
             lifecycleGeneration += 1
             generation = lifecycleGeneration
+            // F2: keep visible transcript when the transport is replaced.
+            snapshotLiveToHistory()
             closeLive()
             _sessionState.value = EMPTY_SESSION_STATE
         }
@@ -580,16 +613,29 @@ class ChatViewModel(
         cancelLifecycleOperations()
         openJob?.cancel()
         openJob = null
+        // F2: decouple transport invalidation from transcript display.
+        if (binding != null) snapshotLiveToHistory()
         closeLive()
         _sessionState.value = EMPTY_SESSION_STATE
         if (binding == null) {
             _history.value = emptyList()
             _currentSessionId.value = null
             lastUserText = null
+            pendingDraft = null
+            pendingDraftGeneration = -1L
             _input.value = ""
             _notice.value = "NO_ENDPOINT"
         } else {
-            _notice.value = null
+            // F3: fail-closed send keeps a restorable draft, never auto-sent to B.
+            val draft = pendingDraft
+            if (draft != null) {
+                if (_input.value.isBlank()) _input.value = draft
+                _notice.value = "SEND_CANCELLED_ENDPOINT_CHANGED"
+                pendingDraft = null
+                pendingDraftGeneration = -1L
+            } else {
+                _notice.value = null
+            }
         }
     }
 
@@ -605,6 +651,8 @@ class ChatViewModel(
             _history.value = emptyList()
             _currentSessionId.value = null
             lastUserText = null
+            pendingDraft = null
+            pendingDraftGeneration = -1L
         }
     }
 
@@ -625,6 +673,34 @@ class ChatViewModel(
 
     private fun setNoticeIfCurrent(generation: Long, value: String) {
         if (isGenerationCurrent(generation)) _notice.value = value
+    }
+
+    // F2: retain visible user/assistant messages before dropping live state,
+    // so a model/revision change never blanks the screen until the next send
+    // replays. Id-deduped; logout/newChat clearing is preserved elsewhere.
+    private fun snapshotLiveToHistory() {
+        val live = _sessionState.value.messages.filter { it.role == "user" || it.role == "assistant" }
+        if (live.isEmpty()) return
+        val existing = _history.value.map { it.id }.toSet()
+        val fresh = live.filter { it.id !in existing }
+        if (fresh.isNotEmpty()) _history.value = _history.value + fresh
+    }
+
+    // F3: restore an unconsumed draft only for its own operation generation
+    // and only when the input box is still empty, so later typing is never
+    // overwritten. Explicit newChat/logout/open already cleared the draft.
+    private fun restoreDraftForFailedSend(generation: Long, text: String, noticeValue: String) {
+        if (!isGenerationCurrent(generation)) return
+        if (pendingDraft != text || pendingDraftGeneration != generation) return
+        if (_input.value.isNotBlank()) {
+            pendingDraft = null
+            pendingDraftGeneration = -1L
+            return
+        }
+        _input.value = text
+        _notice.value = noticeValue
+        pendingDraft = null
+        pendingDraftGeneration = -1L
     }
 
     private fun closeLive() {

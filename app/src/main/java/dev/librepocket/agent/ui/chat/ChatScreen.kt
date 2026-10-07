@@ -66,6 +66,16 @@ import dev.librepocket.voice.VoiceStt
 import dev.librepocket.voice.VoiceSpeaker
 import dev.librepocket.voice.VoiceTools
 
+/** User-visible text for a chat notice code; unknown codes fall through raw. */
+internal fun chatNoticeText(code: String): String =
+    when (code) {
+        "NO_ENDPOINT" -> "尚未設定端點，請先設定 API 金鑰。"
+        "POLICY_DENIED" -> "政策拒絕讀取金鑰（key.read DENY），本次未發送任何請求。"
+        "UNKNOWN_SESSION" -> "找不到該會話，可能已被刪除。"
+        "SEND_CANCELLED_ENDPOINT_CHANGED" -> "端點已變更，本次未送出，請確認後重送。"
+        else -> code
+    }
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ChatScreen(
@@ -287,13 +297,7 @@ fun ChatScreen(
 
         notice?.let {
             Text(
-                text = when (it) {
-                    "NO_ENDPOINT" -> "尚未設定端點，請先設定 API 金鑰。"
-                    "POLICY_DENIED" -> "政策拒絕讀取金鑰（key.read DENY），本次未發送任何請求。"
-                    "UNKNOWN_SESSION" -> "找不到該會話，可能已被刪除。"
-                    "SEND_CANCELLED_ENDPOINT_CHANGED" -> "端點已變更，本次未送出，請確認後重送。"
-                    else -> it
-                },
+                text = chatNoticeText(it),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(horizontal = 16.dp),

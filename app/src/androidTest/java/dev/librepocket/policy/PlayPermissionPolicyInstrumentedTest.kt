@@ -9,6 +9,7 @@ import androidx.test.espresso.assertion.ViewAssertions.doesNotExist
 import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
 import androidx.test.espresso.matcher.ViewMatchers.withText
+import androidx.test.espresso.matcher.RootMatchers.isDialog
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.librepocket.agent.MainActivity
 import dev.librepocket.provider.ChatCompletionsProvider
@@ -69,8 +70,12 @@ class PlayPermissionPolicyInstrumentedTest {
                     .create()
                     .show()
             }
-            onView(allOf(withText("允許"))).check(matches(isDisplayed()))
-            onView(allOf(withText("拒絕"))).perform(click())
+            onView(allOf(withText("允許")))
+                .inRoot(isDialog())
+                .check(matches(isDisplayed()))
+            onView(allOf(withText("拒絕")))
+                .inRoot(isDialog())
+                .perform(click())
             onView(allOf(withText("允許"))).check(doesNotExist())
         }
     }

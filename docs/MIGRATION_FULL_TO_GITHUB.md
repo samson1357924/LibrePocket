@@ -1,72 +1,27 @@
-# `full` → `github` 遷移公告與跨包遷移指南（MIGRATION_FULL_TO_GITHUB）
+# 歷史 `full` → `github` 遷移說明 — **目前不可操作**
 
-> 適用對象：裝過 pre-1.0 `full` 風味調試包（`dev.librepocket.agent.full`）的測試者。
-> 結論先行：`full` 已截尾，不再構建/簽名/發布；接替者是 `github`（`dev.librepocket.agent.github`）。
-> applicationId 不同 = Android 視為不同應用，**必須卸載重裝**；會話經匯出/匯入搬運，**Key 一律不遷移**（見 §3–§4）。
+> **重要：不要依照舊版本文卸載 app、清除資料或假設可從 UI 匯出/匯入。** 本文原有的逐步遷移指南與現行程式不符，已撤回為警告說明。保留舊安裝與其資料，直到有經實機驗證、與來源版本匹配的遷移方案；本文件不提供卸載步驟。
 
-## 1. 截尾公告（§C）
+- **狀態：** Current warning / Historical naming note。依 `b3d8a818f37f8455a254a0670b512286e4deb750` 核對（2026-10-07）。
+- **Owner role：** app/release 維護者；未指派個人。
+- **Source of truth：** `app/build.gradle.kts`, `app/src/*/AndroidManifest.xml`, current UI/session composition.
+- **更新觸發：** 真的新增且實機驗證 user-facing migration/export/import 流程，或 flavors/application IDs 改變時。
 
-1. `full` 風味在此文檔落地後正式截尾：`src/full` 不再存在（已遷至 `src/github`，另有 `src/foss` 鏡像），`applicationIdSuffix ".full"` 不再被任何構建引用，CI 三包矩陣僅為 `play` / `foss` / `github`。
-2. 發布渠道同步截尾：GitHub Releases 只發 `github` APK（+ SBOM + SHA256SUMS）；Play AAB/APK 僅作政策自證；foss 經 F-Droid 構建發布。任何自稱 `full` 的後續產物皆為非官方。
-3. 為何不斷 `full` 而是改名：pre-1.0 尚無任何商店發布（v0.1.0 alpha，debug only），`.full` ID 從未進入 Play / F-Droid 索引；`github` 之名誠實表達「直裝完整版（含專有服務 ML Kit）」，與 `foss`（F-Droid 純開源版）對稱。早斷尾比晚斷尾便宜。
-4. 歷史注記：本倉 pre-1.0 文檔（ROADMAP / BACKLOG / CAPABILITY_MATRIX / ARCHITECTURE / specs）中出現的 `full`，一律理解為現 `github`；`foss` 為截尾同時新增的第三風味。
+## Current：名稱與包識別
 
-## 2. 先選對包：`github` 還是 `foss`
+此 commit 定義 `play` (`dev.librepocket.agent`)、`foss` (`dev.librepocket.agent.foss`) 與 `github` (`dev.librepocket.agent.github`) 三個 flavor；沒有 `full` flavor。不同 application ID 是不同 Android app。舊文件把歷史 `full` 映射到 `github` 的說法，不足以證明舊包能原地更新或資料能自動搬移；簽章、舊版實際 package ID、版本與裝置狀況都會影響結果。
 
-| 你是 | 裝哪個 | applicationId |
-|---|---|---|
-| 要最新直裝完整版（含 ML Kit OCR/條碼），接受專有服務 | `github`（GitHub Releases） | `dev.librepocket.agent.github` |
-| 要純開源版（ZXing / Tesseract / LiteRT），經 F-Droid 更新 | `foss`（F-Droid；只有 F-Droid 構建的才算官方） | `dev.librepocket.agent.foss` |
-| 只要商店合規版 | `play`（Google Play，尚未發布） | `dev.librepocket.agent` |
+## Current：資料匯出、匯入與備份的限制
 
-三包能力對照見 `docs/CAPABILITY_MATRIX.md` §1–§2；品牌規則見 `TRADEMARKS.md`。
+- Room 是目前 session transcript 的 production persistence。JSONL codec、Room store import/export 方法及 backup/export helper 有 library-level code，但目前 app UI 沒有本文曾承諾的完整 SAF 選檔、使用者確認、跨 flavor 匯出再匯入流程。
+- Android manifest 的 `allowBackup` 為 `true`。備份規則排除特定 key 檔案/目錄；它們不是 transcript、preferences 或 audit 的全面排除規則。Android/OEM/使用者備份行為不在本文保證範圍。
+- App-level backup bundle 預設不納入 keys，但程式介面可顯式指定包含 keys。不要把 key-only Android backup exclusions 說成所有匯出格式都絕不含 key。
+- Transcript 寫入 Room 時套用 redaction；這不是 provider request 的傳送前遮蔽保證。JSONL、備份檔與 provider request 均應視為可能含敏感內容，直至逐路徑驗證。
 
-## 3. 跨包遷移（卸載重裝 + 匯出匯入）
+## Target：安全的遷移文件必須等待
 
-原理：`dev.librepocket.agent.full` → `dev.librepocket.agent.github` 是**不同應用**，Android 不允許覆蓋安裝（簽名與 ID 雙雙對不上），系統備份也不會跨包還原。本指南用應用內匯出/匯入搬運資料。
+只有在來源與目標版本均可取得、完整 UI 工作流可用，且已驗證檔案格式、大小限制、失敗原子性、key 排除、簽章/application ID 及實機恢復結果後，才可以發布操作步驟。測試必須使用 synthetic data，並在新指南清楚區分 Android system backup 與 app-level export。
 
-步驟（在舊 `full` 包內操作）：
+在這之前：不要卸載來源 app、不要清除 app data，也不要把本地 JSONL helper 當成已提供的遷移介面。若已不慎移除舊 app，本文件不能承諾資料可恢復。
 
-```text
-1. 舊包 → 設定 → 匯出：會話 JSONL（`librepocket-<sessionId8>-<日期>.jsonl`，SAF 存到自選位置；
-   單 session 上限 20 MiB，超限先 prune）＋ 偏好/審計匯出（脫敏版）。
-   匯出預設為脫敏版；明文匯出需顯式開關並記審計事件。
-2. 核對匯出檔可用 `jq` 解析（`jq empty <file>.jsonl`），再備份到電腦。
-3. 卸載舊 `full` 包（系統設定 → 應用 → LibrePocket full → 解除安裝）。
-4. 安裝新包（GitHub Releases 的 `LibrePocket-<版本>-github.apk`，或 F-Droid 的 foss）。
-5. 新包 → 設定 → 匯入：逐個匯入 JSONL（壞行整批回滾，只報行號不貼內容；`sessionId` 重寫為新 ID）。
-6. 重新授權：日曆/通知監聽/錄屏、自動化開關（foss/github 預設關，需系統授權 + App 內二次確認）。
-```
-
-## 4. Key 不遷移（必須重輸）
-
-- BYOK 金鑰（各 Provider Key、MCP `keyId`）**預設永不進入任何備份**：`BackupPolicy.KEY_FILES_EXCLUDED` + `backup_rules.xml` / `data_extraction_rules.xml` 明確排除（`librepocket_keys.xml`、vault、Tink keyset）；`BackupBundle.DEFAULT_INCLUDE_KEYS = false`。
-- 因此第 3 步搬運的只是會話/偏好/審計，**不含金鑰**。換包（乃至換機還原）後請逐個重輸 Key；輪換即本機 `KeyVault.deleteKey + putKey`，無服務端可轉移（無帳號體系，P7 非目標）。
-- 切勿為省事開明文匯出傳 Key：明文匯出需二次確認且記審計，仍建議只在受控環境使用。
-
-## 5. 驗證你遷移成功了
-
-```sh
-# 新包三查：ID 對了、舊包沒了、會話回來了
-adb shell pm list packages | grep librepocket   # 應見 .github（或 .foss），不應再見 .full
-# 新包內：會話列表與匯出前一致；轉錄頭部含路由決策 + 投影快照；Key 頁顯示未填（預期）
-```
-
-## 6. 常見問題
-
-- **能不卸載直接裝嗎？** 不能。不同 applicationId，包管理器拒絕覆蓋安裝（`INSTALL_FAILED_CONFLICTING_PROVIDER` 類錯誤都算正常）。
-- **舊包已卸載但忘記匯出？** 資料隨舊包刪除，無法找回（alpha 階段無雲同步，P7 明確不做服務端託管）。
-- **`full` 包還能從哪下載？** 不能。release 工作流不再產生它；殘留的本地 `app-full-*.apk` 請刪除。
-- **foss 和 github 能共存嗎？** 能。三包 ID 兩兩不同，可並存；但同一會話不要雙開編輯後互導，會出現 `sessionId` 分叉（以最後一次匯入為準）。
-
-## 7. Obtainium 訂閱（只追 `github`）
-
-- URL：在 Obtainium 新增 App → 來源選 `GitHub Releases` → 指向本倉 Releases 頁（`https://github.com/<owner>/<repo>/releases`，`owner/repo` 換成本倉實際路徑）。
-  - 不要填 F-Droid / Play 地址：`foss` 走 F-Droid 構建、`play` 尚未發布，Obtainium 只應追 `github`。
-- APK 過濾正則（按正則篩選 APK）：
-  ```text
-  LibrePocket-.*-github\.apk
-  ```
-  - 作用：只命中 `LibrePocket-<版本>-github.apk`（見 `.github/workflows/release.yml`「Prepare Release Artifacts」；同目錄的 `SHA256SUMS.txt` / `SBOM-*.json` 不會被誤裝）。
-- 版本擷取：保持預設「從 Release tag 擷取」。tag 形如 `vX.Y.Z`，檔名中 `<版本>` 即該 tag（如 `LibrePocket-v0.2.0-github.apk`）；不要改成從檔名/APK `versionName` 擷取，避免附屬檔干擾。
-- 三包 ID 對照提醒：此條目裝到的永遠是 `dev.librepocket.agent.github`；它與 `dev.librepocket.agent`（`play`）/`dev.librepocket.agent.foss`（`foss`）是不同應用，可並存但不互通更新——`foss` 請走 F-Droid 更新，勿用此 Obtainium 條目去裝 `foss` / `play`。
+相關現況見 [Threat Model](THREAT_MODEL.md)、[Testing](TESTING.md) 與 [Release](RELEASE.md)。

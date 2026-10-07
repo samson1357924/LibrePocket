@@ -1,94 +1,52 @@
-# LibrePocket – Open Mobile AI Agent
+# LibrePocket — Open Mobile AI Agent
 
-> **ALPHA — not production ready.** APIs, schemas, and DB formats may change
-> without migration. Use debug builds for testing only; do not store
-> irreplaceable data or keys you cannot re-enter. See `docs/ROADMAP.md`.
+> **Alpha — not production ready.** This repository does not promise stable APIs, durable database compatibility, or a supported upgrade path. Do not rely on it as the only copy of important data or credentials.
 
-An international, open-source on-device AI agent for Android.
-Licensed under the Apache License 2.0 (see `LICENSE`).
+LibrePocket is an Android application for chatting with a user-configured model provider. Ordinary chat requests send message content to the configured provider without a global outbound redaction pass; selected hosted-search paths apply `Redactor`, but Room redaction does not protect the request already sent. “On device” describes the app, not necessarily model inference. See [Security](SECURITY.md) and the [threat model](docs/THREAT_MODEL.md) before using sensitive data.
 
-> **Not affiliated** with any device vendor, carrier, model provider, or
-> app store. LibrePocket is an independent community project.
+## Current status
 
-## Status — alpha (v0.1.0, debug only)
+Checked against `b3d8a818f37f8455a254a0670b512286e4deb750` on 2026-10-07. This is a source snapshot, not a release or device certification. Scope: public product status. Owner role: project maintainers. Source of truth: checked-in app/build/CI configuration and the cited commit. Update trigger: changes to current runtime, flavor, privacy, test, or release claims.
 
-Backbone + early extensions are implemented behind debug builds
-(P1 chat/BYOK, P2 fast-channel, P3 slow-channel foss/github-only default-off,
-D01–D07 memory/MCP/Skills/shell/entry/hardening). No Play release, no stable
-API: upgrades may require reinstall, and instrumented tests still need real
-devices (API 33/37).
+- The current app has three Android product flavors: `play`, `foss`, and `github`, each with a distinct application ID. Their source sets, dependencies, and manifests are not capability-equivalent.
+- The provider layer contains adapters for Chat Completions, Responses, and Anthropic Messages. Protocol support does not certify compatibility with every endpoint using those labels.
+- Chat transcripts are currently persisted through Room. JSONL codecs and export/import logic exist as library code; the current app UI has no user-facing export/import route wired. The proposed append-only JSONL source-of-truth design is not the current storage contract.
+- The built-in registry declares 41 tools, but none is marked `executionReady`; the current model-visible built-in tool list is therefore empty. A declaration, projection, or scaffold is not an executable feature.
+- Android `allowBackup` is enabled. The configured Android backup rules exclude key-related files; they do not establish that transcripts, preferences, or audit data are excluded. Do not treat Android backup as transcript privacy protection.
+- GitHub release automation exists, but there is no verified final-artifact gate that fails closed on signature/certificate, package, version, and debug state. Release readiness is not established.
 
-## Three distributions, distinct applicationIds (co-installable)
+## Build flavors
 
-| Flavor | Channel | Permissions | Services | applicationId |
-|--------|---------|-------------|----------|---------------|
-| `play` | Google Play only | Store-safe only: INTERNET, ACCESS_NETWORK_STATE, POST_NOTIFICATIONS, FOREGROUND_SERVICE. High-risk permissions are additionally stripped via `tools:node="remove"` (see `app/src/play/AndroidManifest.xml`). | No AccessibilityService, no VpnService | `dev.librepocket.agent` (base ID, no suffix) |
-| `foss` | F-Droid (all-OSS; only a F-Droid-built APK counts as official — see `TRADEMARKS.md`) | Same as `play`: **never** requests `READ_SMS` / `RECEIVE_SMS` / `SEND_SMS`, `MANAGE_EXTERNAL_STORAGE`, or any VPN permission **in any flavor** (see `app/src/foss/AndroidManifest.xml`, `docs/CAPABILITY_MATRIX.md` §1–§2, `docs/ROADMAP.md` P1–P4, `docs/BACKLOG.md` B8/D15). SMS goes only via the system composer pre-fill; files go only via SAF + MediaStore + private storage. | AccessibilityService only (`FossAccessibilityService`, default off, two-step consent); no VpnService | `dev.librepocket.agent.foss` (`applicationIdSuffix = ".foss"`) |
-| `github` | GitHub Releases only (direct download, never Play) | Same as `play` (see `app/src/github/AndroidManifest.xml`). | AccessibilityService only (`GithubAccessibilityService`, default off, two-step consent); no VpnService | `dev.librepocket.agent.github` (`applicationIdSuffix = ".github"`) |
+| Flavor | Application ID | Source / distribution boundary |
+|---|---|---|
+| `play` | `dev.librepocket.agent` | Play-oriented source set and manifest; no accessibility automation service. |
+| `foss` | `dev.librepocket.agent.foss` | FOSS source set; includes the accessibility service and OSS vision dependencies. |
+| `github` | `dev.librepocket.agent.github` | GitHub source set; includes the accessibility service and GitHub-only dependencies, including ML Kit, Azure Speech, and Shizuku. |
 
-Base `applicationId = dev.librepocket.agent`
-(**reverse-DNS, permanent — it can never be changed after publication**;
-Play owns the base ID and F-Droid indexes the foss build under the `.foss`
-suffix). The `foss` / `github` flavors append `".foss"` / `".github"`, so all
-three builds are co-installable side by side. They differ only in manifest
-content (foss/github each add solely the accessibility automation service)
-and in the vision stack (foss: ZXing/Tesseract/LiteRT pure OSS in
-`src/foss`; github: ML Kit in `src/github` plus the OSS stack; play has
-neither — see `docs/ARCHITECTURE.md` §9.4), never in base identity.
+These are build boundaries, not a promise that all features work in each flavor. See [the capability matrix](docs/CAPABILITY_MATRIX.md) and [architecture](docs/ARCHITECTURE.md). Historical references to a `full` flavor are not proof that a user-facing migration path exists: read the warning in [the migration note](docs/MIGRATION_FULL_TO_GITHUB.md) before uninstalling anything.
 
-> History note: pre-1.0 docs used the name `full` for what is now the
-> `github` flavor (`dev.librepocket.agent.github`). `foss` is new. See
-> `docs/MIGRATION_FULL_TO_GITHUB.md`.
+## Build and verification
 
-Build them with:
+The source of truth for toolchain versions is `gradle/libs.versions.toml`, `gradle/wrapper/gradle-wrapper.properties`, and `app/build.gradle.kts`. Setup is documented in [Build Environment](docs/ENV.md); current test scope and commands are in [Testing](docs/TESTING.md).
 
 ```sh
-./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug
+./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --max-workers=1 --no-daemon
 ```
 
-Only the `github` APK is published to GitHub Releases (Play AAB/APK are
-policy self-proof, foss APKs are policy-checked but distributed via
-F-Droid) — see `.github/workflows/release.yml`.
+A command listed in documentation is not evidence it was run. CI currently runs flavor unit/Robolectric tests, lint, debug assembly, and Play/Foss policy checks; it does not run the documented instrumented-device matrix on every pull request.
 
-## Tech baseline
+## Project documents
 
-- compileSdk 37 (Android 17), targetSdk 36 (Play's 2026-08-31 requirement),
-  minSdk 33 (Android 13)
-- Kotlin + Android Gradle Plugin, version catalog in `gradle/libs.versions.toml`
-- Planned building blocks (declared, not yet wired): okhttp-sse, Room,
-  DataStore, androidx.security-crypto
-
-Environment setup (JDK, `ANDROID_HOME`, SDK platforms) is documented in
-`docs/ENV.md`. Brand rules live in `TRADEMARKS.md`.
-
-## Acknowledgments
-
-LibrePocket is an original clean-room implementation. It learns ideas only
-from the projects below — no code is copied from non-compatible sources:
-
-- [Eta](https://github.com/Mangi-11/Eta) — product/architecture inspiration
-  (system-level agent, fast/slow paths, BYOK). Eta is PolyForm Noncommercial,
-  so LibrePocket reimplements ideas independently and ships under Apache-2.0.
-- [pi](https://github.com/earendil-works/pi) (MIT) — steering semantics,
-  JSONL session-truth idea.
-- [openclaw](https://github.com/openclaw/openclaw) (MIT) — gateway and
-  auth-profile ideas.
-- [opencode](https://github.com/sst/opencode) (MIT) — models.dev-driven
-  provider catalog and permission-ruleset ideas.
-- [hermes-agent](https://github.com/NousResearch/hermes-agent) (MIT) —
-  on-device FTS recall idea.
-- [mobilerun](https://github.com/droidrun/mobilerun) (MIT) — GUI harness and
-  app-card ideas.
-- [OmniBot](https://github.com/omnimind-ai/OmniBot) — closest on-device
-  peer, used as black-box functional reference only (AGPL, not compatible,
-  no code reuse).
-- [AgentCPM-GUI](https://github.com/OpenBMB/AgentCPM-GUI) (Apache-2.0) —
-  grounding action-space reference.
-- [models.dev](https://models.dev) — open model directory snapshot idea.
-- TypeSafe Jev (proprietary, via OpenRouter) — optional discrimination head
-  (Choice/Score/Noul), off by default, key user-supplied.
+- [Security reporting and handling](SECURITY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Threat model](docs/THREAT_MODEL.md)
+- [Testing](docs/TESTING.md)
+- [Release process and gaps](docs/RELEASE.md)
+- [Architecture: current, target, and proposed](docs/ARCHITECTURE.md)
+- [Capability status](docs/CAPABILITY_MATRIX.md)
+- [Roadmap](docs/ROADMAP.md) and [backlog](docs/BACKLOG.md)
+- [Historical full-to-GitHub migration note](docs/MIGRATION_FULL_TO_GITHUB.md)
 
 ## License
 
-Apache-2.0 (`LICENSE`). Brand rules in `TRADEMARKS.md` (code is free,
-brand is not). Third-party notices in `NOTICE`.
+Apache License 2.0; see `LICENSE`. LibrePocket is independent and is not affiliated with device vendors, carriers, model providers, or app stores.

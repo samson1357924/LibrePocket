@@ -1,85 +1,53 @@
 # Build Environment — LibrePocket
 
-## 1. JDK
+**Status:** Current checked-in build baseline, checked 2026-10-07 at `b3d8a818f37f8455a254a0670b512286e4deb750`.
 
-Android Gradle Plugin 8.x must run on **JDK 17 or 21** (CI pins JDK 17;
-local builds may use 21). Install one and export `JAVA_HOME`:
+- **Scope:** Local build prerequisites and checked-in Android toolchain values.
+- **Owner role:** Build/CI maintainer; no individual assigned.
+- **Source of truth:** `gradle/libs.versions.toml`, `gradle/wrapper/gradle-wrapper.properties`, `app/build.gradle.kts`, and `.github/workflows/pr-check.yml`.
+- **Update trigger:** Any SDK, AGP, Kotlin, Gradle, JDK, flavor, or CI image change.
+
+## JDK and Gradle
+
+CI uses JDK 17. Use JDK 17 for closest CI parity; JDK 21 may be used locally, but it is not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed.
 
 ```sh
-# Debian/Ubuntu
-sudo apt-get install -y openjdk-21-jdk-headless
-export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
-export PATH="$JAVA_HOME/bin:$PATH"
-java -version   # expect 21.x
+java -version
+./gradlew --version
 ```
 
-Gradle itself is bootstrapped through the checked-in wrapper (`gradlew`);
-no system Gradle install is required.
+## Android SDK
 
-## 2. Android SDK
-
-Point the build at your SDK (the wrapper reads `ANDROID_HOME`,
-falling back to `ANDROID_SDK_ROOT` and `local.properties`'s `sdk.dir`):
+Set `ANDROID_HOME` to the SDK installation on your machine (the value below is an example):
 
 ```sh
 export ANDROID_HOME="$HOME/Android/Sdk"
 export PATH="$ANDROID_HOME/platform-tools:$PATH"
 ```
 
-Required SDK pieces (install once via `sdkmanager`, **no SDK reinstall needed**):
+The checked-in app configuration currently uses:
 
-```sh
-sdkmanager "platforms;android-36" "platforms;android-37.0" "build-tools;36.0.0"
-```
+| Setting | Value |
+|---|---:|
+| `minSdk` | 33 |
+| `targetSdk` | 36 |
+| `compileSdk` | 37 |
+| Android Gradle Plugin | 9.4.1 |
+| Kotlin | 2.4.20 |
+| Gradle wrapper | 9.7.1 |
 
-Why these three:
+Install the matching Android platforms and build tools required by the wrapper/build. Do not infer installation paths or current Google Play policy deadlines from this table; the values above describe this source revision, not a store approval.
 
-| Piece | Reason |
-|-------|--------|
-| `platforms;android-37.0` | `compileSdk = 37` (Android 17) |
-| `platforms;android-36` | `targetSdk = 36` (Play 2026-08-31 minimum) |
-| `build-tools;36.0.0` | `aapt`/dexer used by AGP 8.13 |
+## Flavors and IDs
 
-Verify:
+| Flavor | Application ID | Source boundary |
+|---|---|---|
+| `play` | `dev.librepocket.agent` | base ID; Play overlay removes high-risk permissions/services |
+| `foss` | `dev.librepocket.agent.foss` | Foss source set and OSS-only dependency policy |
+| `github` | `dev.librepocket.agent.github` | GitHub source set and GitHub-only dependencies |
 
-```sh
-ls "$ANDROID_HOME/platforms"   # expect android-36 and android-37.0
-./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug
-```
+Do not treat a locally built APK as an official channel artifact. Distribution/signing status is described in [Release](RELEASE.md) and [TRADEMARKS](../TRADEMARKS.md).
 
-## 3. Permission assertion (three flavors)
+## Build commands
 
-After building, confirm each APK carries no high-risk permissions
-(locked decision: no SMS / storage-manager / VPN permission in any
-flavor; foss/github each add ONLY the accessibility automation service,
-default off):
-
-```sh
-AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
-$AAPT dump permissions app/build/outputs/apk/play/debug/app-play-debug.apk
-# must NOT list READ_SMS, RECEIVE_SMS, MANAGE_EXTERNAL_STORAGE,
-# BIND_ACCESSIBILITY_SERVICE, or BIND_VPN_SERVICE
-$AAPT dump permissions app/build/outputs/apk/foss/debug/app-foss-debug.apk
-$AAPT dump permissions app/build/outputs/apk/github/debug/app-github-debug.apk
-# foss/github MUST also NOT list the above (a11y comes from the flavor
-# manifest overlay service, default off — see CAPABILITY_MATRIX §2)
-```
-
-Or run both policy gates (mirrors `HardeningPolicy`):
-
-```sh
-scripts/play_policy_check.sh app/build/outputs/apk/play/debug/app-play-debug.apk
-scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
-```
-
-## 4. Flavors and signing
-
-| Flavor | `BuildConfig.FLAVOR` | applicationId | Ships via |
-|--------|----------------------|---------------|-----------|
-| `play` | `play` | `dev.librepocket.agent` | Google Play (AAB) |
-| `foss` | `foss` | `dev.librepocket.agent.foss` | F-Droid (F-Droid builds and signs; only that build is official) |
-| `github` | `github` | `dev.librepocket.agent.github` | GitHub Releases (developer release key, APK only) |
-
-- Read the flavor at runtime via `BuildConfig.FLAVOR` (`play` / `foss` / `github`); it maps 1:1 to the `Flavor` enum used by capability projection.
-- Signing keys are kept separate per channel: Play uses its upload key (Play App Signing holds the final key), F-Droid signs with its own key (hence only the F-Droid-built foss APK is official — a locally built foss APK is functionally identical but unofficial), GitHub APKs are signed with the developer release key (`RELEASE_KEYSTORE_*` secrets in `release.yml`). Never reuse the GitHub/local debug key for the Play upload.
-- Release flow publishes ONLY the `github` APK (+ SBOM + SHA256SUMS) to GitHub Releases; Play AAB/APK are built and policy-gated as self-proof, foss APK is policy-checked but distributed via F-Droid (see `.github/workflows/release.yml`, `TRADEMARKS.md`).
+Use the commands and evidence guidance in [Testing](TESTING.md). On constrained systems, serialize Gradle runs with `--max-workers=1 --no-daemon`; do not run multiple Gradle/test JVMs after an OOM.

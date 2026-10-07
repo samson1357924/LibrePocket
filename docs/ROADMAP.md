@@ -1,16 +1,19 @@
 # LibrePocket 分階段路線圖（ROADMAP）
 
-> 約定：P0 由另一組負責基建，本文件僅列介面依賴，不展開 P0 實作。
-> 每階段格式固定為：目標 / 範圍 / 非目標 / 驗收標準（可執行）/ 測試策略。
+> **狀態：Target roadmap / historical planning.** 本文件列出方向與原始驗收構想，不是 Current 功能表、團隊分工或已執行測試證據。Current 狀態請看 [README](../README.md)、[能力矩陣](CAPABILITY_MATRIX.md) 與各測試/發布文件。
+> - 範圍：未來階段的目標、非目標及候選驗收。
+> - Owner role：roadmap maintainer；未指派個人。
+> - Source of truth：實際程式與 CI；roadmap 只記錄目標。
+> - 更新觸發：階段目標、接受決策或驗收方式改變時。
 > 驗收四件套縮寫：`UT` = 單元測試類名；`AAPT` = 權限斷言命令；`SMOKE` = 冒烟步驟（含 AndroidWorld 或手動）；`PLAY` = Play 政策檢查項。
 > 歷史注記：pre-1.0 文档中的 `full` 風味即現 `github` 風味（GitHub 直裝完整版，`dev.librepocket.agent.github`）；`foss` 為新增的 F-Droid 純開源風味。見 `docs/MIGRATION_FULL_TO_GITHUB.md`。
 
-## P0 — 基建（另一組負責，本專案只消費介面）
+## P0 — 基建（歷史規劃項；非現行分組或完成狀態）
 
 - 目標：提供可構建、可測、可發版的底座。
-- 範圍（P0 組交付）：Gradle 風味（`play` / `foss` / `github`）、CI、簽名、版本號、基礎設計系統空殼。
+- 原規劃範圍：Gradle 風味（`play` / `foss` / `github`）、CI、簽名、版本號、基礎設計系統空殼；不表示有獨立 P0 團隊。
 - 本專案依賴介面：`BuildConfig.FLAVOR`、風味原始碼集目錄劃分（`src/play` / `src/foss` / `src/github`）、CI 產物（APK/AAB）。
-- 驗收（由 P0 組保證）：`./gradlew assemblePlayDebug assembleFossDebug assembleGithubDebug` 三風味一次通過。
+- 原規劃驗收目標：`./gradlew assemblePlayDebug assembleFossDebug assembleGithubDebug` 三風味一次通過；非現行測試證據。
 
 ---
 
@@ -220,7 +223,7 @@
 
 ### 非目標
 
-- 不做服務端託管、不做帳號體系；不同步聊天內容到任何雲。
+- 不規劃 app-managed 服務端託管、帳號體系或聊天同步。Android manifest 目前 `allowBackup=true`，僅排除 key-specific paths；不得據此宣稱聊天內容不會進入 Android backup。
 
 ### 驗收標準（可執行）
 

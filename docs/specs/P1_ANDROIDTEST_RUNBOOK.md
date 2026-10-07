@@ -1,31 +1,34 @@
-# P1 instrumented 測試運行手冊（androidTest）
+# P1 Android instrumented test notes
 
-> 範圍：`app/src/androidTest`（SPEC §10.1 [I] 層）。JVM 單測不受影響，
-> 照常用 `./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` 全綠。
+> **Status: Current inventory, not a CI merge gate.** Test source names and commands were checked against `b3d8a818f37f8455a254a0670b512286e4deb750` on 2026-10-07. This document does not claim a device run was performed for this revision.
+>
+> - **Scope:** Tests under `app/src/androidTest` only.
+> - **Owner role:** CI/test maintainer; no individual assigned.
+> - **Source of truth:** `app/src/androidTest`, `.github/workflows/pr-check.yml`, and run results tied to a commit/device.
+> - **Update trigger:** Instrumented test, CI device matrix, Android API coverage, or required merge-gate changes.
 
-## 測試一覽
+## Current instrumented test sources
 
-| 測試類 | 斷言 | 網路 |
-|--------|------|------|
-| `keystore.EncryptedPrefsVaultInstrumentedTest` | 真 Keystore put→get→delete 往返、`hasKey` 不洩露長度、vault 重建仍可讀、空白/過短 Key 拒收 | 無 |
-| `session.RoomSessionStoreConcurrencyInstrumentedTest` | in-memory Room，10 協程 × 50 append，`seq` 保持 1..500 稠密 | 無 |
-| `policy.PlayPermissionPolicyInstrumentedTest` | ① `key.read:*` 預設 ASK；② ASK 彈確認對話框（Espresso 斷言「允許」出現＋「拒絕」關閉）；③ 拒絕後 `evaluateFresh` = DENY 且 Provider 零請求（MockWebServer `requestCount == 0`） | 僅 MockWebServer 本機迴環，不連外網 |
+| Test | Source-level intent | Network |
+|---|---|---|
+| `EncryptedPrefsVaultInstrumentedTest` | Android Keystore-backed key vault behavior | None |
+| `RoomSessionStoreConcurrencyInstrumentedTest` | In-memory Room concurrent append behavior | None |
+| `PlayPermissionPolicyInstrumentedTest` | Policy/confirmation behavior and denial before a provider request | Local MockWebServer fixture |
 
-## 運行（需模擬器或真機，API 33 / 37 矩陣）
+Source presence is not evidence that a test passed on a physical device or emulator. Current pull-request CI runs unit/Robolectric, lint, debug assembly, and artifact policy scripts; it does not run this AndroidTest set.
 
-```bash
-export JAVA_HOME=~/.gradle/jdks/eclipse_adoptium-25-amd64-linux.2
-export ANDROID_HOME=~/Android/Sdk
-# 列出可用設備
-$ANDROID_HOME/platform-tools/adb devices
-# Play flavor instrumented 全量（foss/github 同理替換 flavor 名）
-./gradlew :app:connectedPlayDebugAndroidTest
-# 三風味矩陣（CI nightly 與合併門檻，API 33 / 34 × Play / Foss / Github）
-./gradlew :app:connectedPlayDebugAndroidTest :app:connectedFossDebugAndroidTest :app:connectedGithubDebugAndroidTest
+## Example execution
+
+Use JDK 17 for CI parity, set `ANDROID_HOME`, and confirm a device is connected. Run one Gradle/test process at a time.
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+"$ANDROID_HOME/platform-tools/adb" devices
+./gradlew :app:connectedPlayDebugAndroidTest --max-workers=1 --no-daemon
 ```
 
-## 狀態
+The app has `play`, `foss`, and `github` variants, but test source/variant coverage must be confirmed from Gradle configuration before claiming a three-flavor instrumented matrix. Do not infer `connectedFossDebugAndroidTest` or `connectedGithubDebugAndroidTest` is a required or passing gate merely from a planned command.
 
-- [x] `compilePlayDebugAndroidTestKotlin` 編譯通過（無設備可驗）。
-- [ ] `connectedPlay/Foss/GithubDebugAndroidTest` 待真機/模擬器實跑（本機 `adb devices`
-      為空時無法執行，見 SPEC §11.1 合併門檻，合併前須在 API 33 + 37 各跑一次三風味矩陣）。
+## Evidence required for a device claim
+
+Record the tested SHA, exact Gradle task, device/emulator model, Android API, JDK, result and report location. State which variants were not run. The historical API 33/34/36/37 matrix language elsewhere in the P1 design spec is a target proposal, not current CI configuration or proof of execution. See [Testing](../TESTING.md).

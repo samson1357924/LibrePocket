@@ -1,11 +1,15 @@
-# LibrePocket P1 核心階段 — 可執行詳細規格
+# LibrePocket P1 核心階段 — Historical Target Specification
 
-> 狀態：規格凍結待審（Spec only，不含業務程式碼）
-> 範圍：P1 = Provider BYOK 層 + 最小聊天閉環 + 會話存儲 + 權限模型 + 本機測試基建
-> 非範圍：Agent Loop 工具執行、GUI Agent、終端、MCP、記憶、角色、雲端同步（皆為 P2+）
-> 沿用結論：HTTP 超時（連接 15s / 寫 30s / 讀 5min）、重試 3 次（2/4/8s backoff）
-> 目標 SDK：minSdk 33，compileSdk 37 / targetSdk 36（對齊骨架 `gradle/libs.versions.toml`）；行為差異覆蓋 API 33 / 36 / 37
-> 命名根：`dev.librepocket`（對齊骨架 `namespace = "dev.librepocket.agent"`、flavor 維度 `dist`（`play`/`foss`/`github`）；Eta 既有 `AgentLoop` / `AgentProviderClient` / `AgentModelRetry` 僅為行為參考，不直接依賴）
+> **狀態：Historical target specification, not a frozen current implementation contract.** Reviewed against `b3d8a818f37f8455a254a0670b512286e4deb750` on 2026-10-07. This file preserves design and acceptance intent; some APIs, wiring, test gates, persistence behavior, and security assumptions diverge from current code. Do not use its checklists as evidence of completion.
+>
+> - **範圍：** P1 design for provider BYOK, chat, session persistence, policy, and tests.
+> - **Owner role：** app/runtime maintainers; no individual assigned.
+> - **Source of truth for Current：** production composition and source/configuration at the pinned commit. See [Architecture](../ARCHITECTURE.md), [Testing](../TESTING.md), and [Threat Model](../THREAT_MODEL.md).
+> - **Update trigger：** Accepted cross-layer design changes or implementation changes that invalidate the retained design/acceptance criteria.
+>
+> **Current facts that override stale examples below:** Room is the current transcript store; JSONL import/export exists as library code but is not a user-facing workflow; Android `allowBackup=true` with key-specific exclusions is configured; provider request text is not proven redacted before transmission; built-in tools are not execution-ready; CI does not run the proposed instrumented device matrix. The spec's JSONL-authority, UI, test matrix, and acceptance language is Target unless explicitly verified elsewhere.
+>
+> **Target scope:** provider BYOK, minimum chat loop, session persistence, policy model, and local tests. Agent tool execution, GUI, terminal, MCP, memory, and cloud sync were originally scoped as later work. “No app-managed cloud sync” does not mean Android Auto Backup is disabled.
 
 ---
 
@@ -467,7 +471,7 @@ object ProviderErrorClassifier {
 
 ### 7.1 威脅模型（P1 範圍）
 
-- 防：同設備其他 App 讀取、備份還原洩露（`allowBackup=false` 配合）、logcat/匯出洩露。
+- Target threat: reduce exposure to other apps, backup/restore, logs, and exported files. Current manifest sets `allowBackup=true`; backup XML excludes key-specific files, not transcripts or all app data. This is not a current backup-exclusion guarantee.
 - 不防：Root 後記憶體 dump、系統級鍵盤記錄（超出 P1 範圍，如實告知用戶）。
 
 ### 7.2 配置校验（寫入 Keystore 前）
@@ -588,7 +592,7 @@ ChatSessionImpl 產生 assistant 文本
 - `Retrying` 寫 `kind="retry"` 事件（attempt/max/delayMs 結構化，不寫模型正文）。
 - cancel 寫 `kind="system"`（`text="cancelled by user"` 固定字串）。
 
-### 8.5 JSONL 匯出 / 匯入
+### 8.5 JSONL 匯出 / 匯入（目標介面；非目前 UI 流程）
 
 - 匯出：一行一 JSON（`{"seq":N,"runId":"…","kind":"…","text":"…(已脫敏)","imagesOmitted":0,"createdAt":…}`）+ 檔頭註解行？**無檔頭**（純 JSONL，`jq` 可直接處理）。
 - 檔名：`librepocket-<sessionId8>-<yyyyMMddHHmm>.jsonl`；經 SAF 寫入用戶選位（P1 不自建 FileProvider 分享）。
@@ -725,16 +729,16 @@ resource := wildcard 路徑，支援 "*"（單段）與 "**"（跨段），如�
 
 ---
 
-## 11. P1 驗收標準
+## 11. P1 Target 驗收標準（待依現況重新核定）
 
-### 11.1 自動化門檻（必須全綠）
+### 11.1 原規劃自動化門檻（非目前 CI / merge gate）
 
 ```bash
 ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest   # JVM + Robolectric 三風味矩陣（含 sdk=33/36/37）
 ./gradlew :app:connectedPlayDebugAndroidTest :app:connectedFossDebugAndroidTest :app:connectedGithubDebugAndroidTest  # instrumented 三風味矩陣（Keystore 往返 + 權限斷言）
 ```
 
-- 上述兩組為合併門檻；任一紅即 P1 未通過。
+- 上述命令是原規劃的驗收目標，不代表目前 CI 合併門檻或已執行結果；以 [Testing](../TESTING.md) 的 Current 說明與該 SHA 的 CI/device 證據為準。
 - 基建組負責 flavor 維度存在（`play` / `foss` / `github` 三風味含 `key.read ASK` 預設，見 §9.2）；P1 規格組負責斷言語句正確。
 
 ### 11.2 SSE 解析單測

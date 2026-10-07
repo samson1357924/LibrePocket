@@ -31,7 +31,7 @@ class ProotExecTest {
         var calls: Int = 0
         var lastArgv: List<String>? = null
         var lastEnv: Map<String, String>? = null
-        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput {
+        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput {
             calls++
             lastArgv = argv
             lastEnv = env

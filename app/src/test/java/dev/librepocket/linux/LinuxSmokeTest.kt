@@ -29,7 +29,7 @@ class LinuxSmokeTest {
     private val filesDir = "/data/data/dev.librepocket.agent/files"
 
     private class EchoRunner : ProcessRunner {
-        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput {
+        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput {
             // 假跑道回顯 guest argv 尾段（模擬容器內 echo）。
             val guest = argv.dropWhile { it != "-0" }.drop(1)
             val text = if (guest.firstOrNull() == "echo") guest.drop(1).joinToString(" ") else ""

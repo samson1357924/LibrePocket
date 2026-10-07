@@ -18,7 +18,7 @@ class ShellWhitelistTest {
     ) : ProcessRunner {
         var calls: Int = 0
 
-        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput {
+        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput {
             calls++
             return RawOutput(stdout, stderr, 0, false)
         }

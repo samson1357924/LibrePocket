@@ -64,7 +64,7 @@ class CompileBuildTest {
     }
 
     private class OkRunner : ProcessRunner {
-        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput =
+        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput =
             RawOutput("ok".toByteArray(), ByteArray(0), 0, false)
     }
 

@@ -223,7 +223,7 @@ class LinuxInboxStagerTest {
             override fun run(
                 argv: List<String>,
                 timeoutMs: Long,
-                env: Map<String, String>? = null,
+                env: Map<String, String>?,
             ): dev.librepocket.shell.RawOutput {
                 spawned = argv
                 return dev.librepocket.shell.RawOutput("ok".toByteArray(), ByteArray(0), 0, false)

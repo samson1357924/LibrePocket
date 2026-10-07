@@ -49,7 +49,7 @@ class LinuxFileScopeTest {
                 override fun run(
                     argv: List<String>,
                     timeoutMs: Long,
-                    env: Map<String, String>? = null,
+                    env: Map<String, String>?,
                 ): dev.librepocket.shell.RawOutput = throw AssertionError("must not spawn")
             },
         )

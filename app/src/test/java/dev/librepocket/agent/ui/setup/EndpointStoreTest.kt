@@ -63,8 +63,21 @@ class EndpointStoreTest {
     fun saveObserveRoundTrip() = runBlocking {
         val store = newStore()
         store.save(sampleConfig())
-        assertEquals(sampleConfig(), store.observe().first())
+        assertEquals(sampleConfig().copy(configRevision = 1L), store.observe().first())
         assertTrue(store.hasMetadata())
+    }
+
+    @Test
+    fun saveAndClearAdvancePersistentConfigRevision() = runBlocking {
+        val store = newStore()
+        store.save(sampleConfig())
+        assertEquals(1L, store.observe().first()?.configRevision)
+        store.save(sampleConfig().copy(baseUrl = "https://example.test/v1"))
+        assertEquals(2L, store.observe().first()?.configRevision)
+        store.clear()
+        assertNull(store.observe().first())
+        store.save(sampleConfig())
+        assertEquals(4L, store.observe().first()?.configRevision)
     }
 
     @Test

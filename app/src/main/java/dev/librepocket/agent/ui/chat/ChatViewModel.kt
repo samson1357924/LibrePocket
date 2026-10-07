@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui.chat
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatStatus
@@ -10,16 +11,22 @@ import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.session.SessionStore
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private val EMPTY_SESSION_STATE = ChatUiState(
@@ -42,7 +49,7 @@ private const val HISTORY_CAP = 2000
  */
 class ChatViewModel(
     private val store: EndpointStore,
-    private val sessions: ChatSessionFactory,
+    private val sessions: ChatSessionProvider,
     private val policy: PolicyStore,
 ) : ViewModel() {
 
@@ -65,12 +72,38 @@ class ChatViewModel(
     private val _notice = MutableStateFlow<String?>(null)
     val notice: StateFlow<String?> = _notice.asStateFlow()
 
+    // Lifecycle state is main-thread confined. The generation is also read by
+    // the provider's suspending key callback, so it is volatile across IO.
+    @Volatile
+    private var lifecycleGeneration = 0L
+    private var lifecycleJob = SupervisorJob(viewModelScope.coroutineContext[Job])
+    private var lifecycleScope = CoroutineScope(viewModelScope.coroutineContext + lifecycleJob)
+    private val sessionMutex = Mutex()
     private var currentSession: ChatSession? = null
-    private var sessionEndpointId: String? = null
-    private var sessionModel: String? = null
+    private var currentBinding: EndpointSessionBinding? = null
+    private var currentSessionGeneration: Long? = null
     private var sessionCollectJob: Job? = null
     private var openJob: Job? = null
     private var lastUserText: String? = null
+    private var observedBinding: EndpointSessionBinding? = null
+    private var hasObservedBinding = false
+
+    init {
+        // MainScreen obtains this ViewModel above the NavHost, so it survives
+        // SetupScreen saves. Observe the shared DataStore rather than relying on
+        // a screen callback to invalidate an already-live transport.
+        viewModelScope.launch {
+            try {
+                store.observe().collect { config ->
+                    observeEndpoint(config)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                observeEndpoint(null)
+            }
+        }
+    }
 
     val canRetry: Boolean
         get() = _sessionState.value.status == ChatStatus.ERROR && lastUserText != null
@@ -120,24 +153,26 @@ class ChatViewModel(
         val clean = text.trim()
         if (clean.isEmpty()) return
         lastUserText = clean
-        viewModelScope.launch {
-            if (!keyReadAllowed()) {
-                _notice.value = "POLICY_DENIED"
-                return@launch
-            }
-            val session = try {
-                withContext(Dispatchers.IO) { ensureSession(clean) }
-            } catch (_: Exception) {
-                null
-            }
-            if (session == null) {
-                _notice.value = "NO_ENDPOINT"
-                return@launch
-            }
+        val startedAt = lifecycleGeneration
+        lifecycleScope.launch {
+            var operationGeneration = startedAt
             try {
-                session.session.steer(clean)
+                when (val access = authorizeEndpoint(startedAt)) {
+                    is EndpointAccess.Ready -> {
+                        operationGeneration = access.endpoint.generation
+                        val handle = ensureSession(access.endpoint, clean) ?: return@launch
+                        operationGeneration = handle.generation
+                        if (!isHandleCurrent(handle)) return@launch
+                        handle.created.session.steer(clean)
+                    }
+                    EndpointAccess.Denied -> setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
+                    EndpointAccess.Missing -> setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
+                    EndpointAccess.Stale -> Unit
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
-                // Controller projects failures via sessionState; nothing to add.
+                setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
             }
         }
     }
@@ -151,26 +186,45 @@ class ChatViewModel(
     private fun sendText(text: String) {
         lastUserText = text
         _notice.value = null
-        viewModelScope.launch {
-            if (!keyReadAllowed()) {
-                _notice.value = "POLICY_DENIED"
-                return@launch
-            }
-            val created = try {
-                withContext(Dispatchers.IO) { ensureSession(text) }
-            } catch (_: Exception) {
-                null
-            }
-            if (created == null) {
-                _notice.value = "NO_ENDPOINT"
-                return@launch
-            }
+        val startedAt = lifecycleGeneration
+        lifecycleScope.launch {
+            var operationGeneration = startedAt
             try {
-                created.session.send(text)
-            } catch (_: IllegalStateException) {
-                // Busy: already projected via sessionState.error by the controller.
-            } catch (_: SecurityException) {
-                // Policy deny: already projected via sessionState.error.
+                when (val access = authorizeEndpoint(startedAt)) {
+                    is EndpointAccess.Ready -> {
+                        operationGeneration = access.endpoint.generation
+                        val handle = ensureSession(access.endpoint, text)
+                        if (handle == null || !isHandleCurrent(handle)) return@launch
+                        operationGeneration = handle.generation
+                        try {
+                            handle.created.session.send(text)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: IllegalStateException) {
+                            // Two sends can race before STREAMING reaches the UI.
+                            // TurnController rejects the second start; steer it
+                            // into the FIFO instead of silently dropping input.
+                            if (isHandleCurrent(handle)) {
+                                try {
+                                    handle.created.session.steer(text)
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    // Closed/stale sessions are deliberately inert.
+                                }
+                            }
+                        } catch (_: SecurityException) {
+                            // Fresh chat policy deny is already projected by the controller.
+                        }
+                    }
+                    EndpointAccess.Denied -> setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
+                    EndpointAccess.Missing -> setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
+                    EndpointAccess.Stale -> Unit
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
             }
         }
     }
@@ -180,95 +234,385 @@ class ChatViewModel(
     }
 
     fun newChat() {
-        openJob?.cancel()
-        openJob = null
-        closeLive()
-        _history.value = emptyList()
-        _currentSessionId.value = null
-        lastUserText = null
-        _sessionState.value = EMPTY_SESSION_STATE
-        _notice.value = null
+        invalidateLifecycle(clearChat = true)
     }
 
     /** Resume an existing transcript session (history replay + live binding). */
     fun openSession(sessionId: String) {
-        openJob?.cancel()
-        openJob = viewModelScope.launch {
-            val loaded = try {
-                withContext(Dispatchers.IO) { loadHistory(sessionId) }
-            } catch (_: Exception) {
-                null
-            }
-            if (loaded == null) {
-                _notice.value = "UNKNOWN_SESSION"
-                return@launch
-            }
-            val created = try {
-                withContext(Dispatchers.IO) {
-                    val config = store.observe().first() ?: return@withContext null
-                    sessions.open(config, sessionId)
-                }
-            } catch (_: Exception) {
-                null
-            }
-            if (created == null) {
-                _notice.value = "NO_ENDPOINT"
-                return@launch
-            }
-            closeLive()
-            _history.value = loaded
-            attach(created.session, created.sessionId, created.endpointId, created.model)
-            _notice.value = null
-        }
-    }
-
-    private suspend fun ensureSession(title: String): CreatedSession? {
-        val config = store.observe().first() ?: return null
-        val current = currentSession
-        if (current != null &&
-            sessionEndpointId == config.providerId &&
-            sessionModel == sessions.modelFor(config)
-        ) {
-            return CreatedSession(_currentSessionId.value, current, config.providerId, sessionModel.orEmpty())
-        }
-        // Rebuild (endpoint/model switch): the old live messages only exist in
-        // the previous session's flow, so replay the previous transcript to
-        // avoid visibly dropping history. New turns land in a fresh session.
-        val prevId = _currentSessionId.value
-        closeLive()
-        val created = sessions.create(config, title)
-        if (prevId != null) {
+        invalidateLifecycle(clearChat = true)
+        val requestedGeneration = lifecycleGeneration
+        openJob = lifecycleScope.launch {
+            var candidate: CreatedSession? = null
+            var attached = false
+            var cancellation: CancellationException? = null
             try {
-                loadHistory(prevId)?.let { _history.value = it }
+                val loaded = try {
+                    withContext(Dispatchers.IO) { loadHistory(sessionId) }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
+                if (!isGenerationCurrent(requestedGeneration)) return@launch
+                if (loaded == null) {
+                    _notice.value = "UNKNOWN_SESSION"
+                    return@launch
+                }
+
+                val access = when (val result = authorizeEndpoint(requestedGeneration)) {
+                    is EndpointAccess.Ready -> result.endpoint
+                    EndpointAccess.Denied -> {
+                        setNoticeIfCurrent(requestedGeneration, "POLICY_DENIED")
+                        return@launch
+                    }
+                    EndpointAccess.Missing -> {
+                        setNoticeIfCurrent(requestedGeneration, "NO_ENDPOINT")
+                        return@launch
+                    }
+                    EndpointAccess.Stale -> return@launch
+                }
+                // Opening is tied to the endpoint selected when this operation
+                // started; a config transition must not move old context to B.
+                if (access.generation != requestedGeneration) return@launch
+
+                sessionMutex.withLock {
+                    if (!isGenerationCurrent(requestedGeneration)) return@withLock
+                    val latest = readEndpoint()
+                    if (!isGenerationCurrent(requestedGeneration)) return@withLock
+                    if (bindingOf(latest) != access.binding || latest == null) {
+                        reconcileReadBinding(bindingOf(latest))
+                        return@withLock
+                    }
+
+                    val creationGeneration = requestedGeneration
+                    withContext(Dispatchers.IO) {
+                        candidate = sessions.open(latest, sessionId) {
+                            isBindingCurrent(access.binding, creationGeneration)
+                        }
+                    }
+                    val created = candidate ?: return@withLock
+                    if (!isGenerationCurrent(creationGeneration)) return@withLock
+                    val afterCreate = readEndpoint()
+                    if (!isGenerationCurrent(creationGeneration)) return@withLock
+                    if (bindingOf(afterCreate) != access.binding || afterCreate == null) {
+                        reconcileReadBinding(bindingOf(afterCreate))
+                        return@withLock
+                    }
+
+                    _history.value = loaded
+                    attach(created, access.binding, creationGeneration)
+                    attached = true
+                    candidate = null
+                    _notice.value = null
+                }
+            } catch (cancelled: CancellationException) {
+                cancellation = cancelled
+                throw cancelled
             } catch (_: Exception) {
+                setNoticeIfCurrent(requestedGeneration, "NO_ENDPOINT")
+            } finally {
+                val unattached = candidate
+                if (!attached && unattached != null) {
+                    try {
+                        sessions.discardUnattached(unattached, deleteTranscriptRow = false)
+                    } catch (cleanupFailure: Throwable) {
+                        val originalCancellation = cancellation
+                        if (originalCancellation != null) {
+                            originalCancellation.addSuppressed(cleanupFailure)
+                        } else {
+                            throw cleanupFailure
+                        }
+                    }
+                }
             }
         }
-        attach(created.session, created.sessionId, created.endpointId, created.model)
-        return created
     }
 
-    private fun attach(session: ChatSession, transcriptId: String?, endpointId: String, model: String) {
-        currentSession = session
-        sessionEndpointId = endpointId
-        sessionModel = model
-        _currentSessionId.value = transcriptId
+    private suspend fun authorizeEndpoint(startedAt: Long): EndpointAccess {
+        if (!isGenerationCurrent(startedAt)) return EndpointAccess.Stale
+        val endpoint = try {
+            readEndpoint()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return EndpointAccess.Denied
+        }
+        if (!isGenerationCurrent(startedAt)) return EndpointAccess.Stale
+        if (endpoint == null) {
+            return if (reconcileReadBinding(null)) EndpointAccess.Stale else EndpointAccess.Missing
+        }
+        val binding = bindingOf(endpoint)
+        if (binding == null) {
+            return if (reconcileReadBinding(null)) EndpointAccess.Stale else EndpointAccess.Missing
+        }
+
+        // If the fresh snapshot differs from the observed binding, invalidation
+        // cancels this old-generation operation. Fail closed as Stale; do not
+        // adopt the new generation and continue an action that began on old data.
+        if (reconcileReadBinding(binding)) return EndpointAccess.Stale
+        if (!isGenerationCurrent(startedAt)) return EndpointAccess.Stale
+        val authorizedGeneration = startedAt
+
+        val decision = try {
+            withContext(Dispatchers.IO) {
+                policy.evaluateFresh("key.read", endpoint.providerId)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return EndpointAccess.Denied
+        }
+        if (!isGenerationCurrent(authorizedGeneration)) return EndpointAccess.Stale
+        // Preserve existing ASK semantics; only an explicit DENY blocks. No
+        // synthetic ALLOW is introduced here.
+        if (decision.verdict == Verdict.DENY) return EndpointAccess.Denied
+
+        // Fresh policy evaluation suspended. Re-read the complete connection
+        // identity so a save/logout racing that suspension fails closed.
+        val latest = try {
+            readEndpoint()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return EndpointAccess.Missing
+        }
+        if (!isGenerationCurrent(authorizedGeneration)) return EndpointAccess.Stale
+        if (bindingOf(latest) != binding || latest == null) {
+            reconcileReadBinding(bindingOf(latest))
+            return EndpointAccess.Stale
+        }
+        return EndpointAccess.Ready(AuthorizedEndpoint(latest, binding, authorizedGeneration))
+    }
+
+    /** Single-flight construction. All mutable ViewModel state stays on Main. */
+    private suspend fun ensureSession(
+        authorized: AuthorizedEndpoint,
+        title: String,
+    ): SessionHandle? = sessionMutex.withLock {
+        var generation = authorized.generation
+        if (!isGenerationCurrent(generation)) return@withLock null
+
+        val endpoint = readEndpoint()
+        if (!isGenerationCurrent(generation)) return@withLock null
+        if (endpoint == null || bindingOf(endpoint) != authorized.binding) {
+            reconcileReadBinding(bindingOf(endpoint))
+            return@withLock null
+        }
+
+        if (currentSession != null &&
+            currentBinding == authorized.binding &&
+            currentSessionGeneration == generation
+        ) {
+            return@withLock SessionHandle(
+                CreatedSession(_currentSessionId.value, currentSession!!, endpoint.providerId, authorized.binding.model),
+                authorized.binding,
+                generation,
+            )
+        }
+
+        // A mismatched live session is closed before any replacement work, so
+        // it cannot keep sending to the old host during endpoint migration.
+        if (currentSession != null) {
+            lifecycleGeneration += 1
+            generation = lifecycleGeneration
+            closeLive()
+            _sessionState.value = EMPTY_SESSION_STATE
+        }
+
+        val previousSessionId = _currentSessionId.value
+        if (previousSessionId != null) {
+            val replay = withContext(Dispatchers.IO) { loadHistory(previousSessionId) }
+            if (!isGenerationCurrent(generation)) return@withLock null
+            val afterHistory = readEndpoint()
+            if (!isGenerationCurrent(generation)) return@withLock null
+            if (afterHistory == null || bindingOf(afterHistory) != authorized.binding) {
+                reconcileReadBinding(bindingOf(afterHistory))
+                return@withLock null
+            }
+            if (replay != null) _history.value = replay
+        }
+
+        val creationGeneration = generation
+        var candidate: CreatedSession? = null
+        var attached = false
+        var failure: Throwable? = null
+        try {
+            withContext(Dispatchers.IO) {
+                candidate = sessions.create(endpoint, title) {
+                    isBindingCurrent(authorized.binding, creationGeneration)
+                }
+            }
+            val created = candidate ?: return@withLock null
+            if (!isGenerationCurrent(creationGeneration)) return@withLock null
+            val afterCreate = readEndpoint()
+            if (!isGenerationCurrent(creationGeneration)) return@withLock null
+            if (afterCreate == null || bindingOf(afterCreate) != authorized.binding) {
+                reconcileReadBinding(bindingOf(afterCreate))
+                return@withLock null
+            }
+            attach(created, authorized.binding, creationGeneration)
+            attached = true
+            candidate = null
+            SessionHandle(created, authorized.binding, creationGeneration)
+        } catch (thrown: Throwable) {
+            failure = thrown
+            throw thrown
+        } finally {
+            val unattached = candidate
+            if (!attached && unattached != null) {
+                try {
+                    sessions.discardUnattached(unattached, deleteTranscriptRow = true)
+                } catch (cleanupFailure: Throwable) {
+                    val originalFailure = failure
+                    if (originalFailure != null) {
+                        originalFailure.addSuppressed(cleanupFailure)
+                    } else {
+                        throw cleanupFailure
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun isBindingCurrent(
+        binding: EndpointSessionBinding,
+        generation: Long,
+    ): Boolean {
+        if (!isGenerationCurrent(generation)) return false
+        return try {
+            val latest = readEndpoint()
+            isGenerationCurrent(generation) && bindingOf(latest) == binding
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun attach(
+        created: CreatedSession,
+        binding: EndpointSessionBinding,
+        generation: Long,
+    ) {
+        currentSession = created.session
+        currentBinding = binding
+        currentSessionGeneration = generation
+        _currentSessionId.value = created.sessionId
         sessionCollectJob?.cancel()
         sessionCollectJob = viewModelScope.launch {
-            session.uiState.collect { _sessionState.value = it }
+            created.session.uiState.collect { state ->
+                if (isGenerationCurrent(generation) && currentSession === created.session) {
+                    _sessionState.value = state
+                }
+            }
         }
     }
 
     /**
      * key.read is ASK-by-default (consented at setup); only a DENY rule blocks
-     * here (fail-closed, zero requests on deny). Shared by send and steer paths.
+     * here. The endpoint revision/origin is revalidated immediately before a
+     * provider receives its session-frozen credential snapshot.
      */
-    private suspend fun keyReadAllowed(): Boolean = try {
-        withContext(Dispatchers.IO) {
-            val endpointId = store.observe().first()?.providerId.orEmpty()
-            policy.evaluateFresh("key.read", endpointId).verdict != Verdict.DENY
+    private suspend fun readEndpoint(): EndpointConfig? = withContext(Dispatchers.IO) {
+        store.observe().first()
+    }
+
+    private fun bindingOf(endpoint: EndpointConfig?): EndpointSessionBinding? {
+        val config = endpoint ?: return null
+        return try {
+            config.toSessionBinding(sessions.modelFor(config))
+        } catch (_: Exception) {
+            null
         }
-    } catch (_: Exception) {
-        false
+    }
+
+    /** Flow-side detection also covers SetupViewModel saves and logout. */
+    private fun observeEndpoint(endpoint: EndpointConfig?) {
+        val next = bindingOf(endpoint)
+        if (!hasObservedBinding) {
+            hasObservedBinding = true
+            observedBinding = next
+            if (currentSession != null && (next == null || currentBinding != next)) {
+                invalidateForEndpointChange(next)
+            }
+            return
+        }
+        if (next != observedBinding) {
+            invalidateForEndpointChange(next)
+        }
+    }
+
+    /**
+     * Reconcile a fresh read that beat the asynchronous Flow collector.
+     * Returns true when this read invalidated the operation's generation.
+     */
+    private fun reconcileReadBinding(binding: EndpointSessionBinding?): Boolean {
+        if (!hasObservedBinding) {
+            hasObservedBinding = true
+            observedBinding = binding
+            return false
+        }
+        if (binding == observedBinding) return false
+        invalidateForEndpointChange(binding)
+        return true
+    }
+
+    /**
+     * Endpoint change invalidates the entire old operation scope, including a
+     * caller that discovered the change by rereading DataStore. Such callers
+     * must immediately return Stale; subsequent user actions use the new scope.
+     */
+    private fun invalidateForEndpointChange(binding: EndpointSessionBinding?) {
+        observedBinding = binding
+        lifecycleGeneration += 1
+        cancelLifecycleOperations()
+        openJob?.cancel()
+        openJob = null
+        closeLive()
+        _sessionState.value = EMPTY_SESSION_STATE
+        if (binding == null) {
+            _history.value = emptyList()
+            _currentSessionId.value = null
+            lastUserText = null
+            _input.value = ""
+            _notice.value = "NO_ENDPOINT"
+        } else {
+            _notice.value = null
+        }
+    }
+
+    private fun invalidateLifecycle(clearChat: Boolean) {
+        lifecycleGeneration += 1
+        cancelLifecycleOperations()
+        openJob?.cancel()
+        openJob = null
+        closeLive()
+        _sessionState.value = EMPTY_SESSION_STATE
+        _notice.value = null
+        if (clearChat) {
+            _history.value = emptyList()
+            _currentSessionId.value = null
+            lastUserText = null
+        }
+    }
+
+    private fun isGenerationCurrent(generation: Long): Boolean =
+        lifecycleGeneration == generation
+
+    private fun cancelLifecycleOperations() {
+        lifecycleJob.cancel()
+        lifecycleJob = SupervisorJob(viewModelScope.coroutineContext[Job])
+        lifecycleScope = CoroutineScope(viewModelScope.coroutineContext + lifecycleJob)
+    }
+
+    private fun isHandleCurrent(handle: SessionHandle): Boolean =
+        isGenerationCurrent(handle.generation) &&
+            currentSession === handle.created.session &&
+            currentBinding == handle.binding &&
+            currentSessionGeneration == handle.generation
+
+    private fun setNoticeIfCurrent(generation: Long, value: String) {
+        if (isGenerationCurrent(generation)) _notice.value = value
     }
 
     private fun closeLive() {
@@ -279,8 +623,8 @@ class ChatViewModel(
         } catch (_: Exception) {
         }
         currentSession = null
-        sessionEndpointId = null
-        sessionModel = null
+        currentBinding = null
+        currentSessionGeneration = null
     }
 
     private suspend fun loadHistory(sessionId: String): List<UiMessage>? {
@@ -303,7 +647,29 @@ class ChatViewModel(
     }
 
     override fun onCleared() {
+        lifecycleGeneration += 1
+        lifecycleJob.cancel()
+        openJob?.cancel()
         closeLive()
         super.onCleared()
+    }
+
+    private data class AuthorizedEndpoint(
+        val config: EndpointConfig,
+        val binding: EndpointSessionBinding,
+        val generation: Long,
+    )
+
+    private data class SessionHandle(
+        val created: CreatedSession,
+        val binding: EndpointSessionBinding,
+        val generation: Long,
+    )
+
+    private sealed class EndpointAccess {
+        data class Ready(val endpoint: AuthorizedEndpoint) : EndpointAccess()
+        object Denied : EndpointAccess()
+        object Missing : EndpointAccess()
+        object Stale : EndpointAccess()
     }
 }

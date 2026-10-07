@@ -26,8 +26,14 @@ import dev.librepocket.session.SessionTranscriptSink
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+
+private const val TRANSCRIPT_CLEANUP_TIMEOUT_MS = 5_000L
+private const val TRANSCRIPT_CREATE_TIMEOUT_MS = 5_000L
 
 /** Lazily provides the product vault (Keystore I/O must stay off the main thread). */
 fun interface VaultSource {
@@ -62,6 +68,31 @@ data class CreatedSession(
 private fun Long.toInstantOrNull(): Instant? =
     if (this > 0) runCatching { Instant.ofEpochMilli(this) }.getOrNull() else null
 
+/** Injectable session-construction boundary used by the chat lifecycle tests. */
+interface ChatSessionProvider {
+    suspend fun create(
+        endpoint: EndpointConfig,
+        title: String,
+        keyIsCurrent: suspend () -> Boolean = { true },
+    ): CreatedSession
+
+    suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        keyIsCurrent: suspend () -> Boolean = { true },
+    ): CreatedSession
+
+    suspend fun storeOrNull(): SessionStore?
+
+    /** Release a result that was built but could not be attached to the live UI. */
+    @Suppress("UNUSED_PARAMETER")
+    suspend fun discardUnattached(created: CreatedSession, deleteTranscriptRow: Boolean) {
+        created.session.close()
+    }
+
+    fun modelFor(endpoint: EndpointConfig): String
+}
+
 /**
  * Builds a [ChatSession] from the persisted endpoint.
  *
@@ -79,69 +110,187 @@ class ChatSessionFactory(
     private val clock: Clock = Clock.systemDefaultZone(),
     private val userTimezone: String? = null,
     private val systemZone: () -> ZoneId = ZoneId::systemDefault,
-) {
-    suspend fun create(endpoint: EndpointConfig, title: String): CreatedSession {
+) : ChatSessionProvider {
+    override suspend fun create(
+        endpoint: EndpointConfig,
+        title: String,
+        keyIsCurrent: suspend () -> Boolean,
+    ): CreatedSession {
         val config = endpoint.toProviderConfig()
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
-        val store = sessionStores?.store()
         val model = modelFor(endpoint)
-        val sessionId = store?.createSession(title.take(30), model)
-        val transcript: TranscriptSink =
-            if (store != null && sessionId != null) {
-                SessionTranscriptSink(store, sessionId)
-            } else {
-                NoOpTranscriptSink()
+        val credential = captureCredential(endpoint)
+        var storeForCleanup: SessionStore? = null
+        var createdSessionId: String? = null
+        var session: ChatSession? = null
+        try {
+            requireCurrentBinding(keyIsCurrent)
+            val store = sessionStores?.store()
+            storeForCleanup = store
+            requireCurrentBinding(keyIsCurrent)
+            if (store != null) {
+                // Keep the bounded insert non-cancellable so a durable row's id
+                // is captured for rollback if the parent is cancelled mid-insert.
+                withContext(NonCancellable + Dispatchers.IO) {
+                    createdSessionId = withTimeout(TRANSCRIPT_CREATE_TIMEOUT_MS) {
+                        store.createSession(title.take(30), model)
+                    }
+                }
             }
-        // Room SessionMeta.createdAt is the source of truth for `Session started`.
-        // Storeless/sessionId null/unknown/invalid/exception → null (omit, never fake now).
-        val sessionStart: Instant? = try {
-            if (store != null && sessionId != null) {
-                store.getSession(sessionId)?.let { it.createdAt.toInstantOrNull() }
-            } else {
+            val sessionId = createdSessionId
+            requireCurrentBinding(keyIsCurrent)
+            val transcript: TranscriptSink =
+                if (store != null && sessionId != null) {
+                    SessionTranscriptSink(store, sessionId)
+                } else {
+                    NoOpTranscriptSink()
+                }
+            // Room SessionMeta.createdAt is the source of truth for `Session started`.
+            // Storeless/sessionId null/unknown/invalid/exception → null (omit, never fake now).
+            val sessionStart: Instant? = try {
+                if (store != null && sessionId != null) {
+                    store.getSession(sessionId)?.let { it.createdAt.toInstantOrNull() }
+                } else {
+                    null
+                }
+            } catch (_: Exception) {
                 null
             }
-        } catch (_: Exception) {
-            null
+            val createdSession = buildSession(
+                config,
+                model,
+                transcript,
+                credential,
+                keyIsCurrent,
+                clock,
+                userTimezone,
+                systemZone,
+                sessionStart,
+            )
+            session = createdSession
+            requireCurrentBinding(keyIsCurrent)
+            return CreatedSession(
+                sessionId,
+                createdSession,
+                endpoint.providerId,
+                model,
+            )
+        } catch (failure: Throwable) {
+            try {
+                session?.close()
+            } catch (closeFailure: Throwable) {
+                failure.addSuppressed(closeFailure)
+            }
+            credential.close()
+            val unusedStore = storeForCleanup
+            val unusedSessionId = createdSessionId
+            if (unusedStore != null && unusedSessionId != null) {
+                try {
+                    deleteUnusedTranscriptSession(unusedStore, unusedSessionId)
+                } catch (cleanupFailure: Throwable) {
+                    failure.addSuppressed(cleanupFailure)
+                }
+            }
+            throw failure
         }
-        return CreatedSession(
-            sessionId,
-            buildSession(endpoint, config, transcript, clock, userTimezone, systemZone, sessionStart),
-            endpoint.providerId,
-            model,
-        )
     }
 
     /** Binds a live session to an existing transcript session (resume, no re-create). */
-    suspend fun open(endpoint: EndpointConfig, sessionId: String): CreatedSession {
+    override suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        keyIsCurrent: suspend () -> Boolean,
+    ): CreatedSession {
         val config = endpoint.toProviderConfig()
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
-        val store = sessionStores?.store()
+        requireCurrentBinding(keyIsCurrent)
+        val store = requireNotNull(sessionStores?.store()) { "UNKNOWN_SESSION" }
+        requireCurrentBinding(keyIsCurrent)
         // Retain the meta so resume reuses the original createdAt (never re-stamps now).
         // getSession failure → null → UNKNOWN_SESSION (never masks unknown with now).
         val meta = try {
-            store?.getSession(sessionId)
+            store.getSession(sessionId)
         } catch (_: Exception) {
             null
         }
-        require(store != null && meta != null) { "UNKNOWN_SESSION" }
+        require(meta != null) { "UNKNOWN_SESSION" }
+        requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
-        val sessionStart = meta.createdAt.toInstantOrNull()
-        return CreatedSession(
-            sessionId,
-            buildSession(endpoint, config, SessionTranscriptSink(store, sessionId), clock, userTimezone, systemZone, sessionStart),
-            endpoint.providerId,
-            model,
-        )
+        val credential = captureCredential(endpoint)
+        var session: ChatSession? = null
+        try {
+            requireCurrentBinding(keyIsCurrent)
+            val sessionStart = meta.createdAt.toInstantOrNull()
+            val openedSession = buildSession(
+                config,
+                model,
+                SessionTranscriptSink(store, sessionId),
+                credential,
+                keyIsCurrent,
+                clock,
+                userTimezone,
+                systemZone,
+                sessionStart,
+            )
+            session = openedSession
+            requireCurrentBinding(keyIsCurrent)
+            return CreatedSession(
+                sessionId,
+                openedSession,
+                endpoint.providerId,
+                model,
+            )
+        } catch (failure: Throwable) {
+            try {
+                session?.close()
+            } catch (closeFailure: Throwable) {
+                failure.addSuppressed(closeFailure)
+            }
+            credential.close()
+            throw failure
+        }
     }
 
-    suspend fun storeOrNull(): SessionStore? = try {
+    override suspend fun discardUnattached(
+        created: CreatedSession,
+        deleteTranscriptRow: Boolean,
+    ) {
+        var failure: Throwable? = null
+        try {
+            created.session.close()
+        } catch (closeFailure: Throwable) {
+            failure = closeFailure
+        }
+
+        val sessionId = created.sessionId
+        val storeSource = sessionStores
+        if (deleteTranscriptRow && sessionId != null && storeSource != null) {
+            try {
+                // Cancellation must not strand an already-created row; keep this
+                // cleanup bounded so teardown cannot wait forever on Room.
+                withContext(NonCancellable + Dispatchers.IO) {
+                    withTimeout(TRANSCRIPT_CLEANUP_TIMEOUT_MS) {
+                        storeSource.store().deleteSession(sessionId)
+                    }
+                }
+            } catch (cleanupFailure: Throwable) {
+                val originalFailure = failure
+                if (originalFailure == null) failure = cleanupFailure else originalFailure.addSuppressed(cleanupFailure)
+            }
+        }
+        failure?.let { throw it }
+    }
+
+    override suspend fun storeOrNull(): SessionStore? = try {
         sessionStores?.store()
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (_: Exception) {
         null
     }
 
     /** Effective model id for an endpoint (user text, preset default, or "default"). */
-    fun modelFor(endpoint: EndpointConfig): String = endpoint.model.ifBlank {
+    override fun modelFor(endpoint: EndpointConfig): String = endpoint.model.ifBlank {
         if (endpoint.presetId == ProviderCatalog.CUSTOM_ID) {
             TurnController.DEFAULT_MODEL
         } else {
@@ -149,28 +298,87 @@ class ChatSessionFactory(
         }
     }
 
-    private suspend fun buildSession(
-        endpoint: EndpointConfig,
+    private suspend fun deleteUnusedTranscriptSession(store: SessionStore, sessionId: String) {
+        // A generation can be cancelled after Room inserted the row but before
+        // provider/session construction completes. Roll back that new row with
+        // a bounded non-cancellable cleanup, then rethrow the original failure.
+        withContext(NonCancellable + Dispatchers.IO) {
+            withTimeout(TRANSCRIPT_CLEANUP_TIMEOUT_MS) {
+                store.deleteSession(sessionId)
+            }
+        }
+    }
+
+    private suspend fun requireCurrentBinding(keyIsCurrent: suspend () -> Boolean) {
+        if (!keyIsCurrent()) throw CancellationException("ENDPOINT_BINDING_STALE")
+    }
+
+    private suspend fun captureCredential(endpoint: EndpointConfig): SessionCredential {
+        val alias = endpoint.apiKeyRef.removePrefix("provider_key/")
+        require(alias.isNotBlank() && alias != endpoint.apiKeyRef) { "PROVIDER_KEY_REF_MALFORMED" }
+        val vault = vaultSource.vault()
+        val key = vault.getKey(alias) ?: throw IllegalStateException("ENDPOINT_KEY_MISSING")
+        return SessionCredential(endpoint.apiKeyRef, key)
+    }
+
+    private fun buildSession(
         config: ProviderConfig,
+        model: String,
         transcript: TranscriptSink,
+        credential: SessionCredential,
+        keyIsCurrent: suspend () -> Boolean,
         clock: Clock = this.clock,
         userTimezone: String? = this.userTimezone,
         systemZone: () -> ZoneId = this.systemZone,
         sessionStart: Instant? = null,
     ): ChatSession {
-        val vault = vaultSource.vault()
-        val keys = KeyProvider { ref -> vault.getKey(ref.removePrefix("provider_key/")) }
+        val keys = KeyProvider { ref ->
+            if (keyIsCurrent()) credential.copyFor(ref) else null
+        }
         val provider = buildProvider(config, keys)
-        return ChatSessionImpl(
+        val session = ChatSessionImpl(
             provider,
             policy,
             transcript,
-            model = modelFor(endpoint),
+            model = model,
             clock = clock,
             userTimezone = userTimezone,
             sessionStart = sessionStart,
             systemZone = systemZone,
         )
+        return CredentialBoundChatSession(session, credential)
+    }
+
+    /** The live provider never rereads a mutable alias after this snapshot. */
+    private class SessionCredential(
+        private val apiKeyRef: String,
+        private val secret: CharArray,
+    ) {
+        private var closed = false
+
+        @Synchronized
+        fun copyFor(requestedRef: String): CharArray? =
+            if (closed || requestedRef != apiKeyRef) null else secret.copyOf()
+
+        @Synchronized
+        fun close() {
+            if (closed) return
+            closed = true
+            secret.fill('\u0000')
+        }
+    }
+
+    private class CredentialBoundChatSession(
+        private val delegate: ChatSession,
+        private val credential: SessionCredential,
+    ) : ChatSession by delegate {
+        override fun close() {
+            try {
+                delegate.close()
+            } finally {
+                credential.close()
+            }
+        }
     }
 
 }

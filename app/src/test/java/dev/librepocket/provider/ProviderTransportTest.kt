@@ -533,4 +533,102 @@ class ProviderTransportTest {
             server.shutdown()
         }
     }
+
+    private fun providerFor(protocol: ProviderProtocol, server: MockWebServer, client: OkHttpClient? = null): LlmProvider {
+        val base = server.url("/").toString().trimEnd('/')
+        val cfg = config(protocol, base)
+        return when (protocol) {
+            ProviderProtocol.ANTHROPIC -> AnthropicProvider(cfg, { fakeKey.toCharArray() }, client)
+            ProviderProtocol.CHAT_COMPLETIONS -> ChatCompletionsProvider(cfg, { fakeKey.toCharArray() }, client)
+            ProviderProtocol.RESPONSES -> ResponsesProvider(cfg, { fakeKey.toCharArray() }, client)
+        }
+    }
+
+    @Test
+    fun stream503WithRetryAfterZeroMakesOneRequestPerProtocol() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                repeat(2) {
+                    server.enqueue(
+                        MockResponse().setResponseCode(503).addHeader("Retry-After", "0")
+                            .setBody("temporarily unavailable"),
+                    )
+                }
+                val events = withTimeout(3_000) { providerFor(protocol, server).stream(request()).toList() }
+                assertEquals(
+                    "$protocol 503+Retry-After:0 is one retryable failure",
+                    StreamEvent.Failed("HTTP 503 temporarily unavailable", retryable = true),
+                    events.single(),
+                )
+                val received = withContext(Dispatchers.IO) { server.takeRequest(2, TimeUnit.SECONDS) }
+                assertNotNull("$protocol records the single POST", received)
+                assertEquals("no hidden OkHttp 503 follow-up for $protocol", 1, server.requestCount)
+                val second = withContext(Dispatchers.IO) { server.takeRequest(200, TimeUnit.MILLISECONDS) }
+                assertNull("no second $protocol request", second)
+                assertEquals(1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun listModels503WithRetryAfterZeroMakesOneRequestPerProtocol() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                repeat(2) {
+                    server.enqueue(
+                        MockResponse().setResponseCode(503).addHeader("Retry-After", "0")
+                            .setBody("temporarily unavailable"),
+                    )
+                }
+                try {
+                    providerFor(protocol, server).listModels()
+                    throw AssertionError("expected $protocol 503 to throw")
+                } catch (expected: ProviderFailure) {
+                    assertTrue("$protocol 503 stays retryable", expected.retryable)
+                    assertTrue(expected.message.orEmpty().contains("HTTP 503"))
+                }
+                val received = withContext(Dispatchers.IO) { server.takeRequest(2, TimeUnit.SECONDS) }
+                assertNotNull("$protocol records the single GET", received)
+                assertEquals("GET", received!!.method)
+                assertEquals("no hidden OkHttp 503 follow-up for $protocol GET", 1, server.requestCount)
+                val second = withContext(Dispatchers.IO) { server.takeRequest(200, TimeUnit.MILLISECONDS) }
+                assertNull("no second $protocol GET", second)
+                assertEquals(1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun injectedRetryEnabledClientStillMakesOneRequestOn503RetryAfterZero() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            repeat(2) {
+                server.enqueue(
+                    MockResponse().setResponseCode(503).addHeader("Retry-After", "0")
+                        .setBody("temporarily unavailable"),
+                )
+            }
+            val permissive = OkHttpClient.Builder()
+                .retryOnConnectionFailure(true)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build()
+            val events = withTimeout(3_000) {
+                providerFor(ProviderProtocol.CHAT_COMPLETIONS, server, permissive).stream(request()).toList()
+            }
+            assertEquals(1, events.size)
+            assertEquals("no hidden follow-up with injected retry-enabled client", 1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
 }

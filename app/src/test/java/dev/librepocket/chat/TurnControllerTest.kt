@@ -407,6 +407,52 @@ class TurnControllerTest {
     }
   }
 
+  @Test fun retryExhaustionWithRetryAfterZeroMakesExactlyFourActualHttpRequests() = runBlocking {
+    val server = MockWebServer()
+    server.start()
+    try {
+      repeat(8) {
+        // Without the transport fix each controller attempt resends once more
+        // (4 attempts -> 8 exchanges); with the fix the total stays 4.
+        server.enqueue(
+          MockResponse().setResponseCode(503).addHeader("Retry-After", "0")
+            .setBody("temporarily unavailable"),
+        )
+      }
+      val provider = ChatCompletionsProvider(
+        ProviderConfig(
+          id = "turn-retry-after-zero-test",
+          label = "local test",
+          baseUrl = server.url("/").toString().trimEnd('/'),
+          protocol = ProviderProtocol.CHAT_COMPLETIONS,
+          apiKeyRef = "fake-key-ref",
+          http = ProviderHttpConfig(maxRetries = 3, retryDelaysMs = listOf(0L)),
+        ),
+        { "stage5-fake-key".toCharArray() },
+      )
+      val controller = TurnController(
+        provider = provider,
+        policy = AllowPolicy(),
+        retryConfig = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+        sleeper = {},
+      )
+
+      controller.send("budget-retry-after-zero")
+
+      assertEquals("four controller attempts stay four wire requests", 4, server.requestCount)
+      repeat(4) {
+        val request = server.takeRequest(1, TimeUnit.SECONDS)
+        assertNotNull("request ${it + 1}", request)
+        assertEquals("POST", request!!.method)
+        assertEquals("Bearer stage5-fake-key", request.getHeader("Authorization"))
+        assertTrue(request.body.readUtf8().contains("budget-retry-after-zero"))
+      }
+      assertEquals(ChatStatus.ERROR, controller.uiState.value.status)
+    } finally {
+      server.shutdown()
+    }
+  }
+
   @Test fun actualProviderPartialIoFailureRetriesAsSeparateAssistantAttempt() = runBlocking {
     val server = MockWebServer()
     server.start()

@@ -18,8 +18,9 @@ import kotlinx.coroutines.flow.flowOn
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.Response
-import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
 
 /** Internal transport failure; [retryable] comes from [ProviderErrorClassifier]. */
 internal class ProviderFailure(
@@ -31,27 +32,49 @@ internal class ProviderFailure(
 /**
  * OkHttp client per SPEC §5.1: 15s connect / 30s write / 5min read-idle,
  * with redirects and connection-failure retries disabled.
+ *
+ * Single-request contract: OkHttp 5.5.0 retries 503 + Retry-After: 0 inside
+ * RetryAndFollowUpInterceptor without checking retryOnConnectionFailure.
+ * The network interceptor below strips that trigger so the raw 503 returns
+ * to TurnController (sole retry owner). Classifier/callers use code/body only.
  */
+private fun OkHttpClient.Builder.denyUnbudgetedResends() = apply {
+    followRedirects(false)
+    followSslRedirects(false)
+    retryOnConnectionFailure(false)
+    addNetworkInterceptor { chain ->
+        val response = chain.proceed(chain.request())
+        if (response.code == 503) response.newBuilder().removeHeader("Retry-After").build()
+        else response
+    }
+}
+
 fun defaultOkHttpClient(http: ProviderHttpConfig): OkHttpClient = OkHttpClient.Builder()
     .connectTimeout(http.connectTimeoutMs, TimeUnit.MILLISECONDS)
     .writeTimeout(http.writeTimeoutMs, TimeUnit.MILLISECONDS)
     .readTimeout(http.readTimeoutMs, TimeUnit.MILLISECONDS)
-    .followRedirects(false)
-    .followSslRedirects(false)
-    .retryOnConnectionFailure(false)
+    .denyUnbudgetedResends()
     .build()
 
 /** Enforce the provider redirect policy even when callers inject a client. */
 internal fun providerTransportClient(client: OkHttpClient): OkHttpClient = client.newBuilder()
-    .followRedirects(false)
-    .followSslRedirects(false)
-    .retryOnConnectionFailure(false)
+    .denyUnbudgetedResends()
     .build()
 
 /** A redirect is a terminal response: never replay credentials or request bodies. */
 internal enum class SsePumpDecision { CONTINUE, STOP }
 
 internal val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+/** POST bodies are one-shot so OkHttp never replays them outside the controller budget. */
+private class OneShotJsonBody(private val json: String) : RequestBody() {
+    override fun contentType() = JSON_MEDIA_TYPE
+    override fun contentLength(): Long = json.toByteArray(Charsets.UTF_8).size.toLong()
+    override fun isOneShot() = true
+    override fun writeTo(sink: BufferedSink) {
+        sink.writeUtf8(json)
+    }
+}
 
 /** Append [suffixPath] unless [base] already ends with it (path completion). */
 internal fun joinEndpoint(base: String, suffixPath: String): String {
@@ -224,9 +247,9 @@ internal suspend fun pumpSse(
     }
 }
 
-/** Build a POST request with a JSON body; [headers] iteration order preserved. */
+/** Build a POST request with a one-shot JSON body; [headers] iteration order preserved. */
 internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJson: String): Request {
-    val b = Request.Builder().url(url).post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
+    val b = Request.Builder().url(url).post(OneShotJsonBody(bodyJson))
     for ((k, v) in headers) b.header(k, v)
     return b.build()
 }

@@ -1,5 +1,11 @@
 # LibrePocket 骨幹優先計劃（BACKLOG）
 
+> **狀態：Target backlog / historical planning snapshot.** 本表不是目前 issue、PR、功能完成度或安全 finding 的權威狀態。逐項 Current 狀態請回到程式、[能力矩陣](CAPABILITY_MATRIX.md) 與 issue tracker；不要只因仍在此表就推定 open/未修，或因測試名存在就推定完成。
+> - 範圍：候選骨幹及未來工作排序。
+> - Owner role：backlog maintainer；未指派個人。
+> - Source of truth：main 的實際 code/CI 與 issue tracker。
+> - 更新觸發：優先序或驗收決策改變時。
+
 > 定位：骨幹先行，其餘全部進池排隊。本文只寫文檔建議，不涉及 `app/src` 實作。
 > 輸入：`ROADMAP.md`（P0–P7）、`CAPABILITY_MATRIX.md`、`ARCHITECTURE.md`、`ENV.md`。
 > 缺失輸入：無（`docs/specs/P1_SPEC.md`、`docs/specs/JEV_INTEGRATION_DRAFT.md` 均已補檔；Jev 相關需求見該草案 §3–§8，D01 已可定界）。
@@ -10,7 +16,7 @@
 
 ## 1. 骨幹定義：什麼叫「骨幹可用」
 
-骨幹 = P1 全量 + P2 全量 + P3 最小閉環 + 橫切（脫敏/權限/三 flavor）全綠。P0 視為外部依賴（另一組交付），只消費介面。
+骨幹 = P1 全量 + P2 全量 + P3 最小閉環 + 橫切（脫敏/權限/三 flavor）全綠。P0 原按基建前置條件描述；不是現行團隊分工或完成狀態。
 
 ### 1.1 骨幹清單（Must，缺一不可）
 
@@ -25,6 +31,8 @@
 | B7 | 能力投影 v1 | P1/ARCH §6 | 純函數投影：風味 + 使用者開關（本階段不含提權探測）；play 下慢通道工具不可見；投影快照寫轉錄頭部；`CapabilityProjectionTest` 綠 |
 | B8 | 三 flavor 綠 | P1–P3/P0 介面 | `./gradlew assemblePlayDebug assembleFossDebug assembleGithubDebug` 一次通過；`AAPT` play 包零匹配 `SEND_SMS/RECEIVE_SMS/READ_SMS/MANAGE_EXTERNAL_STORAGE`，且 play 無 `BIND_ACCESSIBILITY_SERVICE` 自動化子類、無 `VPNService` 子類（字串掃描零匹配）；foss / github 包列 a11y 但預設關（開關初始 `false` 可 dump 證明）；foss 門 `play_policy_check.sh --foss` 通過（dex 無 `mlkit` / `gms` 引用） |
 | B9 | 骨幹測試門禁 | P1–P3 測試策略 | `ProviderAdapterTest / TranscriptRedactorTest / CapabilityProjectionTest / ChatBudgetTest / FastRouterDecisionTest / SystemIntentMappingTest / PrivilegeGateTest / SlowBudgetTest / ArbitrationTest / SteeringSemanticsTest / PauseResumeTest` 全綠；AndroidWorld `smoke_chat_stop.py` + `slow_checkout_demo.py`（2 基準 App，含暫停恢復 + steering + 超限轉指引）通過 |
+
+> 註：上表 `ARCH §5/§6/§8/§9` 等編號指歷史 ARCH 草案章節（`ca5a666` 重寫前），現行 `docs/ARCHITECTURE.md` 已改為非編號 `Current/Target/Proposed` 節；對應目標語義以現行 `Target` 節與 `docs/specs/P1_SPEC.md` 為準。
 
 ### 1.2 骨幹非目標（明確不做）
 
@@ -61,7 +69,7 @@
 | D13 | MCP/Skills 市集（發現/評分/簽名審查） | Won't-now | D03/D04/D07 | 政策：第三方工具不繞投影+確認；市集包簽名/雜湊強制校驗（本期只留介面） |
 | D14 | Xposed/LSPosed 注入他 App | Won't-now | — | 三風味皆不內建；僅預留外部模組協議（矩陣 §1/§2 合規紅線） |
 | D15 | VPN/流量攔截 | Won't-ever | — | 三風味皆不提供（矩陣 §1 明確 `—`） |
-| D16 | 向量重型記憶庫 / 服務端同步/雲備份/帳號體系 | Won't-now | D02 | P5 非目標：先用 FTS + 輕量排序；不同步聊天內容到雲 |
+| D16 | 向量重型記憶庫 / 服務端同步/帳號體系 | Won't-now | D02 | P5 不規劃 app-managed chat sync；Android Auto Backup 目前為 allowBackup=true，見 Threat Model，不得宣稱無雲端/裝置備份 |
 
 **代辦 Top 10（執行序）：** D01 Jev 最小可用 → D02 記憶 FTS → D03 MCP 客戶端 → D04 Skills → D05 受限 shell+文件 → D06 系統入口/預設助手 → D07 加固備份上架 → D08 PRoot 插件 → D09 Shizuku/Root 增強 → D10 語音鏈。（D11 定時、D12 IM 緊隨；D13–D16 明確凍結。）
 

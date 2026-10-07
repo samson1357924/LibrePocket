@@ -14,7 +14,7 @@
 ## Current：資料匯出、匯入與備份的限制
 
 - Room 是目前 session transcript 的 production persistence。JSONL codec、Room store import/export 方法及 backup/export helper 有 library-level code，但目前 app UI 沒有本文曾承諾的完整 SAF 選檔、使用者確認、跨 flavor 匯出再匯入流程。
-- Android manifest 的 `allowBackup` 為 `true`。備份規則排除特定 key 檔案/目錄；它們不是 transcript、preferences 或 audit 的全面排除規則。Android/OEM/使用者備份行為不在本文保證範圍。
+- Android manifest 的 `allowBackup` 為 `true`。備份規則排除特定 key 檔案/目錄；它們不是 transcript、preferences 或 audit 的全面排除規則。Android/OEM/使用者備份行為不在本文保證範圍。本應用為本機優先架構，無帳號體系與專屬雲端同步服務；請勿將 Android 系統雲端備份混淆為 App 雲端同步。
 - App-level backup bundle 預設不納入 keys，但程式介面可顯式指定包含 keys。不要把 key-only Android backup exclusions 說成所有匯出格式都絕不含 key。
 - Transcript 寫入 Room 時套用 redaction；這不是 provider request 的傳送前遮蔽保證。JSONL、備份檔與 provider request 均應視為可能含敏感內容，直至逐路徑驗證。
 

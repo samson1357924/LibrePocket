@@ -613,6 +613,205 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // R2: same generation, two different texts, both suspended pre-accept.
+    // An endpoint change must keep BOTH recoverable (single-slot code only
+    // restored the second). The oldest fills the box; each explicit send
+    // surfaces the next; nothing is auto-sent to the new binding.
+    @Test
+    fun sameGenerationTwoPendingSendsBothRecoverableAfterEndpointSwitch() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val acceptArrived = AtomicInteger()
+        val releaseAccept = CompletableDeferred<Unit>()
+        sessions.acceptGate = {
+            acceptArrived.incrementAndGet()
+            releaseAccept.await()
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            chatMain.run { vm.sendDirect("second") }
+            withTimeout(5_000) {
+                while (acceptArrived.get() < 2) delay(1)
+            }
+            assertEquals(1, sessions.createCalls)
+
+            store.save(endpoint().copy(model = "other-model"))
+
+            withTimeout(5_000) { vm.input.first { it == "first" } }
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            val cancelled = sessions.awaitCreated(1)
+            assertTrue(cancelled.sent.isEmpty())
+
+            releaseAccept.complete(Unit)
+            withTimeout(5_000) { cancelled.closed.await() }
+            assertTrue(cancelled.sent.isEmpty())
+            assertEquals(1, sessions.createCalls)
+
+            chatMain.run { vm.send() }
+            val live = sessions.awaitCreated(2)
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("first"), live.sent.toList())
+            withTimeout(5_000) { vm.input.first { it == "second" } }
+            chatMain.run { vm.send() }
+            withTimeout(5_000) {
+                while (live.sent.size < 2) delay(1)
+            }
+            assertEquals(listOf("first", "second"), live.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            releaseAccept.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // R2: two identical texts must not cross-clear. The second op admits
+    // while the first is still gated; the switch then still recovers the
+    // first (single-slot code cleared it via string equality: silent loss).
+    @Test
+    fun identicalPendingSendsStayIndependentlyRecoverable() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val acceptArrived = AtomicInteger()
+        val releaseFirstAccept = CompletableDeferred<Unit>()
+        sessions.acceptGate = {
+            if (acceptArrived.incrementAndGet() == 1) releaseFirstAccept.await()
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("same") }
+            chatMain.run { vm.sendDirect("same") }
+            withTimeout(5_000) {
+                while (acceptArrived.get() < 2) delay(1)
+            }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) {
+                while (live.sent.isEmpty()) delay(1)
+            }
+            assertEquals(listOf("same"), live.sent.toList())
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { vm.input.first { it == "same" } }
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+
+            releaseFirstAccept.complete(Unit)
+            withTimeout(5_000) { live.closed.await() }
+            assertEquals(listOf("same"), live.sent.toList())
+
+            chatMain.run { vm.send() }
+            val resent = sessions.awaitCreated(2)
+            withTimeout(5_000) { resent.sendFinished.await() }
+            assertEquals(listOf("same"), resent.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            releaseFirstAccept.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // R2: typing during the wait wins the box, but the cancelled op is kept
+    // in the outbox instead of deleted (single-slot code dropped it while
+    // sparing the new input).
+    @Test
+    fun newInputDuringWaitIsPreservedWhileCancelledOpStaysRecoverable() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val acceptEntered = CompletableDeferred<Unit>()
+        val releaseAccept = CompletableDeferred<Unit>()
+        sessions.acceptGate = {
+            acceptEntered.complete(Unit)
+            releaseAccept.await()
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            withTimeout(5_000) { acceptEntered.await() }
+            chatMain.run { vm.onInputChange("typed-later") }
+
+            store.save(endpoint().copy(model = "other-model"))
+
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            assertEquals("typed-later", vm.input.value)
+            val cancelled = sessions.awaitCreated(1)
+            assertTrue(cancelled.sent.isEmpty())
+
+            releaseAccept.complete(Unit)
+            withTimeout(5_000) { cancelled.closed.await() }
+            assertTrue(cancelled.sent.isEmpty())
+            assertEquals("typed-later", vm.input.value)
+
+            chatMain.run { vm.send() }
+            val live = sessions.awaitCreated(2)
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("typed-later"), live.sent.toList())
+            withTimeout(5_000) { vm.input.first { it == "first" } }
+            chatMain.run { vm.send() }
+            withTimeout(5_000) {
+                while (live.sent.size < 2) delay(1)
+            }
+            assertEquals(listOf("typed-later", "first"), live.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            releaseAccept.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // R2 discard semantics: explicit newChat drops pending + recoverable ops;
+    // a later send starts clean with nothing draining back into the box.
+    @Test
+    fun newChatDiscardsPendingAndRecoverableOps() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val acceptArrived = AtomicInteger()
+        val releaseAccept = CompletableDeferred<Unit>()
+        sessions.acceptGate = {
+            acceptArrived.incrementAndGet()
+            releaseAccept.await()
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            chatMain.run { vm.sendDirect("second") }
+            withTimeout(5_000) {
+                while (acceptArrived.get() < 2) delay(1)
+            }
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { vm.input.first { it == "first" } }
+
+            // Explicit newChat drops the outbox (notice cleared). The input
+            // box itself is left untouched by newChat (pre-existing box
+            // semantics, out of R2 scope): clear it like a user would, then
+            // prove nothing drains back after a clean send.
+            chatMain.run { vm.newChat() }
+            assertNull(vm.notice.value)
+            assertEquals("first", vm.input.value)
+            chatMain.run { vm.onInputChange("") }
+
+            releaseAccept.complete(Unit)
+            assertEquals(1, sessions.createCalls)
+            chatMain.run { vm.sendDirect("fresh") }
+            val live = sessions.awaitCreated(2)
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("fresh"), live.sent.toList())
+            // sendFinished fires in the session completion handler BEFORE
+            // the VM op's host.join()->drain resumes, so assert emptiness
+            // over a quiet window: a missed newChat clear would repopulate
+            // the blank box via drain within milliseconds.
+            repeat(10) {
+                delay(50)
+                assertEquals("", vm.input.value)
+            }
+        } finally {
+            releaseAccept.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     private class GatedFirstAllowPolicy : PolicyStore {
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()

@@ -384,6 +384,127 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // F2: valid endpoint/model change must not blank visible transcript.
+    // Completes one turn, switches model, waits for invalidation WITHOUT
+    // another send. Before fix visibleMessages=0 (red); after fix 2 (green).
+    @Test
+    fun endpointChangeKeepsVisibleTranscriptWithoutAnotherSend() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("hello") }
+            val live = sessions.awaitCreated(1)
+            live.sendFinished.await()
+            withTimeout(5_000) { vm.messages.first { it.size == 2 } }
+            assertEquals("session-1", vm.currentSessionId.value)
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { live.closed.await() }
+            withTimeout(5_000) { vm.sessionState.first { it.messages.isEmpty() } }
+            // Allow combine(history+live) to propagate; snapshot keeps 2 visible.
+            delay(300)
+            assertEquals(2, vm.messages.value.size)
+            assertEquals(listOf("hello", "ok"), vm.messages.value.map { it.text })
+            assertEquals("session-1", vm.currentSessionId.value)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // F3 observer-first: send started AFTER the new binding was observed
+    // must succeed on the new binding (no silent drop, no stale restore).
+    @Test
+    fun sendAfterObservedEndpointChangeSucceedsOnNewBinding() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("one") }
+            val first = sessions.awaitCreated(1)
+            first.sendFinished.await()
+            withTimeout(5_000) { vm.messages.first { it.size == 2 } }
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { first.closed.await() }
+            withTimeout(5_000) { vm.sessionState.first { it.messages.isEmpty() } }
+            delay(300)
+            assertEquals(2, vm.messages.value.size)
+
+            chatMain.run { vm.sendDirect("two") }
+            val second = sessions.awaitCreated(2)
+            second.sendFinished.await()
+            assertEquals(listOf("two"), second.sent.toList())
+            assertEquals("session-2", vm.currentSessionId.value)
+            assertEquals("", vm.input.value)
+            assertNull(vm.notice.value)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // F3 fresh-read-first: send started on old generation, endpoint B saved
+    // while authorize suspends. Must fail closed (zero sessions) but NOT
+    // silently drop user text: input restored + visible cancellation.
+    // Before fix inputEmpty=true, notice=null (red); after fix restored (green).
+    @Test
+    fun sendRacingEndpointSaveIsNotSilentlyDropped() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val policy = GatedFirstAllowPolicy()
+        val vm = newViewModel(store, sessions, policy)
+        try {
+            chatMain.run {
+                vm.onInputChange("fresh text")
+                vm.send()
+            }
+            withTimeout(5_000) { policy.entered.await() }
+            withTimeout(5_000) { vm.input.first { it.isEmpty() } }
+
+            store.save(endpoint().copy(model = "other-model"))
+
+            withTimeout(5_000) { vm.input.first { it == "fresh text" } }
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            assertEquals(0, sessions.createCalls)
+            assertEquals(0, sessions.created.size)
+            assertEquals("fresh text", vm.input.value)
+
+            policy.release.complete(Unit)
+            chatMain.run { vm.send() }
+            val created = sessions.awaitCreated(1)
+            created.sendFinished.await()
+            assertEquals(listOf("fresh text"), created.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            policy.release.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    private class GatedFirstAllowPolicy : PolicyStore {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        private val count = AtomicInteger()
+        private val delegate = InMemoryPolicyStore()
+
+        override fun evaluate(action: String, resource: String): PolicyDecision =
+            delegate.evaluate(action, resource)
+
+        override suspend fun setRule(rule: PolicyRule) = delegate.setRule(rule)
+        override suspend fun removeRule(pattern: String) = delegate.removeRule(pattern)
+        override suspend fun listRules(): List<PolicyRule> = delegate.listRules()
+
+        override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+            if (count.incrementAndGet() != 1) return delegate.evaluateFresh(action, resource)
+            entered.complete(Unit)
+            release.await()
+            return delegate.evaluateFresh(action, resource)
+        }
+    }
+
     /** Blocks loadHistory() itself (the pre-mutex window), not sessions.open(). */
     private class GatedHistoryStore : SessionStore {
         val entered = CompletableDeferred<Unit>()

@@ -17,45 +17,49 @@ import dev.librepocket.provider.ProviderProtocol
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import java.util.concurrent.TimeUnit
 import org.hamcrest.CoreMatchers.allOf
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * Play-flavor permission assertions (SPEC §10.3 / §11.5 [I]).
+ * Play-flavor policy/transport contract checks (SPEC §10.3 / §11.5 [I]).
  *
- * ① Default `key.read:*` is ASK. ② An ASK verdict surfaces a confirmation
- * dialog (the skeleton shows the product-contract dialog — title, message,
- * 「允許」/「拒絕」 buttons — and Espresso asserts it appears and dismisses
- * on 拒絕; the settings-screen wiring is P1 UI work). ③ After denial,
- * `evaluateFresh` is DENY and the provider emits zero requests
- * ([MockWebServer] proves it, no external network).
+ * The policy decision tests use the actual single-segment endpoint provider id
+ * `preset:openai` (the colon is not a resource-path separator). The dialog
+ * test constructs a test-hosted fixture only; it does not exercise product ASK
+ * consent wiring. The test-only gate drives the real
+ * `listModels` HTTP request for its ALLOW positive control and proves that both
+ * DENY and ASK return before transport. Setup/dispatch ASK behavior (issue #13)
+ * remains outside this scope and is not claimed as fixed here.
  *
- * Requires a device or emulator (API 33/37 matrix); see
+ * The nightly workflow is configured for API 33/34 across Play, Foss, and
+ * Github. That configuration is not evidence of a device run; see
  * `docs/specs/P1_ANDROIDTEST_RUNBOOK.md`.
  */
 @RunWith(AndroidJUnit4::class)
 class PlayPermissionPolicyInstrumentedTest {
 
     @Test
-    fun keyRead_defaultsToAsk() = runBlocking {
-        val store = InMemoryPolicyStore()
-        val decision = store.evaluateFresh("key.read", "openai/provider-1")
+    fun keyRead_defaultsToAskForProviderPreset() = runBlocking {
+        val decision = InMemoryPolicyStore().evaluateFresh("key.read", PROVIDER_PRESET)
         assertEquals(Verdict.ASK, decision.verdict)
+        assertEquals(PolicyRule("key.read:*", Verdict.ASK, 10), decision.matchedRule)
     }
 
     @Test
-    fun askVerdict_surfacesConfirmationDialog() {
-        val verdict = runBlocking {
-            InMemoryPolicyStore().evaluateFresh("key.read", "openai/provider-1")
+    fun askVerdict_testHostedDialogFixtureCanBeDismissed() {
+        val decision = runBlocking {
+            InMemoryPolicyStore().evaluateFresh("key.read", PROVIDER_PRESET)
         }
-        assertEquals(Verdict.ASK, verdict)
+        assertEquals(Verdict.ASK, decision.verdict)
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             scenario.onActivity { activity ->
-                // Product dialog contract (SPEC §9.3): ASK always asks once,
-                // never remembers. The settings screen reuses this shape.
+                // This AlertDialog is created by the test, not by product UI.
                 AlertDialog.Builder(activity)
                     .setTitle("讀取 API Key？")
                     .setMessage("將讀取該 Provider 的 API Key 以發送本次請求。")
@@ -71,33 +75,87 @@ class PlayPermissionPolicyInstrumentedTest {
     }
 
     @Test
-    fun deniedProviderCall_sendsZeroRequests() {
+    fun deniedProviderCall_sendsZeroRequests() = runBlocking {
         val server = MockWebServer()
         server.start()
         try {
-            server.enqueue(
-                MockResponse().setBody("""{"models":[]}"""),
-            )
-            val verdict = runBlocking {
-                val store = InMemoryPolicyStore()
-                store.setRule(PolicyRule("provider.call:*", Verdict.DENY, 20))
-                store.evaluateFresh("provider.call", "openai/gpt-4o-mini")
-            }
-            assertEquals(Verdict.DENY, verdict)
+            server.enqueue(modelsResponse())
+            val store = InMemoryPolicyStore()
+            store.setRule(PolicyRule("provider.call:$PROVIDER_PRESET", Verdict.DENY, 20))
 
-            // Execution gate (SPEC §9.3): DENY never reaches the transport.
-            val config = ProviderConfig(
-                id = "00000000-0000-0000-0000-000000000009",
-                label = "test",
-                baseUrl = server.url("/v1").toString().removeSuffix("/"),
-                protocol = ProviderProtocol.CHAT_COMPLETIONS,
-                apiKeyRef = "provider_key/00000000-0000-0000-0000-000000000009",
+            val result = listModelsThroughTestOnlyPolicyGate(
+                policyStore = store,
+                resource = PROVIDER_PRESET,
+                provider = testProvider(server),
             )
-            if (verdict.verdict == Verdict.ALLOW) {
-                ChatCompletionsProvider(config, { "k".toCharArray() })
-            }
 
+            assertEquals(Verdict.DENY, result.decision.verdict)
+            assertEquals(
+                PolicyRule("provider.call:$PROVIDER_PRESET", Verdict.DENY, 20),
+                result.decision.matchedRule,
+            )
+            assertNull(result.modelIds)
             assertEquals(0, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun askProviderCall_sendsZeroRequests() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(modelsResponse())
+            val store = InMemoryPolicyStore()
+            store.setRule(PolicyRule("provider.call:$PROVIDER_PRESET", Verdict.ASK, 20))
+
+            val result = listModelsThroughTestOnlyPolicyGate(
+                policyStore = store,
+                resource = PROVIDER_PRESET,
+                provider = testProvider(server),
+            )
+
+            assertEquals(Verdict.ASK, result.decision.verdict)
+            assertEquals(
+                PolicyRule("provider.call:$PROVIDER_PRESET", Verdict.ASK, 20),
+                result.decision.matchedRule,
+            )
+            assertNull(result.modelIds)
+            assertEquals(0, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun allowedProviderCall_requestsAndParsesModelsEndpoint() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(modelsResponse())
+            val result = listModelsThroughTestOnlyPolicyGate(
+                policyStore = InMemoryPolicyStore(),
+                resource = PROVIDER_PRESET,
+                provider = testProvider(server),
+            )
+
+            assertEquals(Verdict.ALLOW, result.decision.verdict)
+            assertEquals(
+                PolicyRule("provider.call:*", Verdict.ALLOW, 10),
+                result.decision.matchedRule,
+            )
+            assertEquals(listOf("gpt-4o-mini", "gpt-4.1-mini"), result.modelIds)
+            assertEquals(1, server.requestCount)
+
+            val request = server.takeRequest(2, TimeUnit.SECONDS)
+            assertNotNull("expected one provider request within 2 seconds", request)
+            val receivedRequest = request ?: throw AssertionError(
+                "requestCount was 1 but MockWebServer returned no request within 2 seconds",
+            )
+            assertEquals("GET", receivedRequest.method)
+            assertEquals("/v1/models", receivedRequest.path)
+            assertEquals("Bearer local-test-key", receivedRequest.getHeader("Authorization"))
         } finally {
             server.shutdown()
         }
@@ -108,5 +166,24 @@ class PlayPermissionPolicyInstrumentedTest {
         ApplicationProvider.getApplicationContext<android.content.Context>()
         val decision = InMemoryPolicyStore().evaluateFresh("session.export", "abc123")
         assertEquals(Verdict.ASK, decision.verdict)
+        assertEquals(PolicyRule("session.export:**", Verdict.ASK, 10), decision.matchedRule)
+    }
+
+    private fun testProvider(server: MockWebServer) = ChatCompletionsProvider(
+        config = ProviderConfig(
+            id = PROVIDER_PRESET,
+            label = "local-test-provider",
+            baseUrl = server.url("/v1").toString().removeSuffix("/"),
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            apiKeyRef = "provider_key/$PROVIDER_PRESET",
+        ),
+        apiKey = { "local-test-key".toCharArray() },
+    )
+
+    private fun modelsResponse() = MockResponse()
+        .setBody("""{"data":[{"id":"gpt-4o-mini"},{"id":"gpt-4.1-mini"}]}""")
+
+    private companion object {
+        const val PROVIDER_PRESET = "preset:openai"
     }
 }

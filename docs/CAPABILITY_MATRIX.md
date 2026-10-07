@@ -35,6 +35,8 @@
 | 終端命令（受限 shell） | `N` App 內受限 shell（無提權、白名單命令） | `N` 可選提權子進程（顯式開關） | `N` 可選 su 子進程（顯式開關） | 無 | ✅（僅受限 shell） | ✅（受限 + 可選提權） | ✅（受限 + 可選提權） |
 | Linux 環境（PRoot 發行版） | `N` 使用者態 PRoot（無需 Root，效能降級明示） | 無增強 | 無增強 | 無 | ✅（若體積政策允許，否則改下載式插件） | ✅ | ✅ |
 | GUI 自動化（點/滑/填表） | `—` 不提供；改給手動步驟指引 | `—`（仍不提供點擊；僅輔助讀狀態） | `—` 原則不提供；僅 foss / github 版經無障礙節點有限支援 | 有限支援（模組僅作手勢輔助，需另行安裝） | ❌ 整個類別隱藏 | ⚠️ 可選（預設關，需無障礙授權+二次確認） | ⚠️ 可選（預設關，需無障礙授權+二次確認） |
+
+> **PR#1 SCAFFOLD 誠實註記（本 PR 範圍）**：上表 `N`/`✅` 為投影可見性（ToolRegistry `NATIVE` + `visibleTools`），不等於產品 Chat 已可執行。本 PR 為 core/scaffold：`shell.exec` / `shell.elevated` / `web.fetch` / `db.query` / `db.exec` / `gui.automate` / `linux.boot` / `voice.speak.azure` 8 項 description 已標 `SCAFFOLD: projection-only`（見 `ToolRegistry` 與 `CapabilityProjectionTest.scaffoldToolsHonestlyMarkedUntilWired`），`TurnController` 僅記錄 `ToolDone` 不執行工具（records-only），`LinuxBoot.download` 無生產 Downloader（test Fake only），`AutomationSettings` 無 DataStore/確認 Dialog/StepExecutor 接線。產品 dispatcher + 執行器 + E2E 在接線 PR 落地前，模型不得宣稱可代執行，降級話術按 §5（`USER_DISABLED` / `NO_PRIVILEGE`）誠實回覆。
 | VPN/流量攔截 | `—` 不提供 | `—` | `—` | `—` | ❌ | ❌（三風味皆不提供） | ❌（三風味皆不提供） |
 | Xposed 注入他 App | `—` 不提供 | `—` | `—` | 本 App 不內建注入，僅預留外部模組協議 | ❌ | ❌（不內建） | ❌（不內建） |
 

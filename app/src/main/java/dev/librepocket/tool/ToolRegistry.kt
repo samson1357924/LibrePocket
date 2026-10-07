@@ -208,7 +208,7 @@ object ToolRegistry {
         // ---- S1-C backfill: restricted shell (D05 restricted part) ----
         ToolDef(
             name = "shell.exec",
-            description = "Restricted shell exec (no privilege): argv direct to RestrictedShell, no sh -c; allowlist/denylist/quota/truncation apply. Elevated execution is never performed in this phase.",
+            description = "Restricted shell exec (no privilege): argv direct to RestrictedShell, no sh -c; allowlist/denylist/quota/truncation apply. Elevated execution is never performed in this phase. SCAFFOLD: projection-only in this PR, no product Chat dispatcher/executor wiring yet (see TurnController records-only); ShellExecTool.execute has no production caller yet, wiring lands in the wiring PR.",
             jsonSchema = schema(
                 prop("argv", "array", "Argument vector; argv[0] is the binary basename, never a shell string"),
                 prop("timeoutMs", "integer", "Per-call timeout budget in milliseconds"),

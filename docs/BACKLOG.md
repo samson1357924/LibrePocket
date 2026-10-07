@@ -32,6 +32,8 @@
 | B8 | 三 flavor 綠 | P1–P3/P0 介面 | `./gradlew assemblePlayDebug assembleFossDebug assembleGithubDebug` 一次通過；`AAPT` play 包零匹配 `SEND_SMS/RECEIVE_SMS/READ_SMS/MANAGE_EXTERNAL_STORAGE`，且 play 無 `BIND_ACCESSIBILITY_SERVICE` 自動化子類、無 `VPNService` 子類（字串掃描零匹配）；foss / github 包列 a11y 但預設關（開關初始 `false` 可 dump 證明）；foss 門 `play_policy_check.sh --foss` 通過（dex 無 `mlkit` / `gms` 引用） |
 | B9 | 骨幹測試門禁 | P1–P3 測試策略 | `ProviderAdapterTest / TranscriptRedactorTest / CapabilityProjectionTest / ChatBudgetTest / FastRouterDecisionTest / SystemIntentMappingTest / PrivilegeGateTest / SlowBudgetTest / ArbitrationTest / SteeringSemanticsTest / PauseResumeTest` 全綠；AndroidWorld `smoke_chat_stop.py` + `slow_checkout_demo.py`（2 基準 App，含暫停恢復 + steering + 超限轉指引）通過 |
 
+> 註：上表 `ARCH §5/§6/§8/§9` 等編號指歷史 ARCH 草案章節（`ca5a666` 重寫前），現行 `docs/ARCHITECTURE.md` 已改為非編號 `Current/Target/Proposed` 節；對應目標語義以現行 `Target` 節與 `docs/specs/P1_SPEC.md` 為準。
+
 ### 1.2 骨幹非目標（明確不做）
 
 - 不做終端/檔案跨域（P4）、MCP/Skills/記憶檢索（P5）、全量系統入口（P6，骨幹僅需 Launcher Activity 單入口可聊）、加固備份上架（P7，僅 debug 包門禁）。

@@ -14,8 +14,44 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      policy: ${{ steps.filter.outputs.policy }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        # Pinned to full commit SHA per supply-chain rule (see #20).
+        # dorny/paths-filter v3 (v3 tag resolves to this SHA).
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          filters: |
+            code:
+              - 'app/src/**'
+              - 'app/build.gradle.kts'
+              - 'app/lint.xml'
+              - 'gradle/**'
+              - 'settings.gradle.kts'
+              - 'build.gradle.kts'
+              - 'gradle.properties'
+              - '.github/workflows/pr-check.yml'
+            policy:
+              - 'scripts/play_policy_check.sh'
+
   unit-tests:
     name: Unit & Robolectric Tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # 三風味串行實測約 24-25 分鐘（編譯 3.5m + 每風味 ~7m），20m 必超時。
     timeout-minutes: 40
@@ -48,6 +84,8 @@ jobs:
 
   lint:
     name: Android Lint Check
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -78,6 +116,8 @@ jobs:
 
   build-and-policy-gate:
     name: Build & Policy Gates
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || needs.changes.outputs.policy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -124,3 +164,105 @@ jobs:
           name: debug-apks
           path: app/build/outputs/apk/**/*.apk
           retention-days: 7
+
+  docs-guard:
+    name: Docs Claim Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run docs claim check
+        run: |
+          chmod +x scripts/docs_claim_check.sh
+          scripts/docs_claim_check.sh
+
+  pr-gate:
+    name: PR Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, unit-tests, lint, build-and-policy-gate, docs-guard]
+    if: always()
+    steps:
+      - name: Evaluate gate
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          POLICY: ${{ needs.changes.outputs.policy }}
+          UNIT: ${{ needs.unit-tests.result }}
+          LINT: ${{ needs.lint.result }}
+          BUILD: ${{ needs.build-and-policy-gate.result }}
+          DOCS: ${{ needs.docs-guard.result }}
+        run: |
+          fail=0
+
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "pr-gate: changes job did not succeed (result=$CHANGES_RESULT)"
+            fail=1
+          fi
+
+          if [ "$DOCS" != "success" ]; then
+            echo "pr-gate: docs-guard did not succeed (result=$DOCS)"
+            fail=1
+          fi
+
+          case "$UNIT" in
+            success)
+              echo "pr-gate: unit-tests passed"
+              ;;
+            skipped)
+              if [ "$CODE" = "false" ]; then
+                echo "pr-gate: unit-tests skipped (no code changes) — pass"
+              else
+                echo "pr-gate: unit-tests skipped but code='$CODE' — fail"
+                fail=1
+              fi
+              ;;
+            *)
+              echo "pr-gate: unit-tests result=$UNIT — fail"
+              fail=1
+              ;;
+          esac
+
+          case "$LINT" in
+            success)
+              echo "pr-gate: lint passed"
+              ;;
+            skipped)
+              if [ "$CODE" = "false" ]; then
+                echo "pr-gate: lint skipped (no code changes) — pass"
+              else
+                echo "pr-gate: lint skipped but code='$CODE' — fail"
+                fail=1
+              fi
+              ;;
+            *)
+              echo "pr-gate: lint result=$LINT — fail"
+              fail=1
+              ;;
+          esac
+
+          case "$BUILD" in
+            success)
+              echo "pr-gate: build-and-policy-gate passed"
+              ;;
+            skipped)
+              if [ "$CODE" = "false" ] && [ "$POLICY" = "false" ]; then
+                echo "pr-gate: build-and-policy-gate skipped (no code/policy changes) — pass"
+              else
+                echo "pr-gate: build-and-policy-gate skipped but code='$CODE' policy='$POLICY' — fail"
+                fail=1
+              fi
+              ;;
+            *)
+              echo "pr-gate: build-and-policy-gate result=$BUILD — fail"
+              fail=1
+              ;;
+          esac
+
+          if [ "$fail" -ne 0 ]; then
+            echo "pr-gate: FAILED"
+            exit 1
+          fi
+          echo "pr-gate: PASSED"

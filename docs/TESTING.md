@@ -1,21 +1,50 @@
 # Testing and Verification
 
-**Status:** Current test inventory and repeatable command guide, checked 2026-10-07 at `b3d8a818f37f8455a254a0670b512286e4deb750`.
+**Status:** Current test inventory and repeatable command guide, checked 2026-10-07 at `d7449d8ccf8c38884f514f5c30db157ca89641e1`.
 
 - **Scope:** Repository CI, local JVM/Robolectric tests, static policy gates, and separately scheduled Android device tests.
 - **Owner role:** CI/build maintainer; no individual is assigned here.
-- **Source of truth:** `.github/workflows/pr-check.yml`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
+- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
 - **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes.
 
 ## Current CI scope
 
-The pull-request workflow uses JDK 17 and runs these stages independently:
+`pr-check.yml` is path-gated. A `changes` job classifies each pull request
+with `dorny/paths-filter` into `code` (`app/src/**`,
+`app/build.gradle.kts`, `app/lint.xml`, `gradle/**`,
+`settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
+`.github/workflows/pr-check.yml`) and `policy`
+(`scripts/play_policy_check.sh`) outputs. `docs-guard` always runs the
+static grep guard `scripts/docs_claim_check.sh` (no Gradle, no emulator);
+`pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
+stage as pass only when the corresponding `changes` output is explicitly
+`false`, and fails closed otherwise.
+
+When `code == true`, the workflow uses JDK 17 and runs these Gradle stages:
 
 1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets).
 2. `:app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug`.
-3. Assemble the three debug APKs and run `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss.
+3. `:app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug`, then `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss. This stage also runs when only `policy == true`.
 
-The workflow does **not** run an Android emulator/device matrix on every pull request. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+What runs by edit type:
+
+- Docs-only (neither `code` nor `policy`, e.g. `docs/**` or `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.
+- Policy-script-only (`scripts/play_policy_check.sh` edit, `code == false`): build/policy runs; unit tests and lint are skipped and resolved as pass by `pr-gate`.
+- Workflow-only edit to `pr-check.yml`: counts as `code`, so all Gradle stages run.
+- Mixed docs + code/policy edits: full Gradle stages plus `docs-guard` run.
+
+Static analysis lives outside `pr-check.yml`: CodeQL runs in
+`.github/workflows/codeql.yml`, which skips docs-only push/PR events via
+`paths-ignore` (`docs/**`, `**/*.md`, `LICENSE*`, `TRADEMARKS.md`,
+`NOTICE*`) while the weekly cron and `workflow_dispatch` runs stay
+unfiltered. Secret scanning (`gitleaks`) and `dependency-review` in
+`.github/workflows/security-audit.yml` still run on every pull request,
+including docs-only ones.
+
+No branch-protection required checks are configured on `main`; `pr-gate`
+and the checks above are informational until protection is configured.
+
+The workflows do **not** run an Android emulator/device matrix on every pull request. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 
 ## Local commands
 

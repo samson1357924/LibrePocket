@@ -71,53 +71,91 @@ class GithubGateTest {
 
     @Test fun oneShotConfirmationLifecycle() {
         // P1 lifecycle（PR#1 review blocker，判定層；perform 需真機）：
-        // NeedConfirm → 武裝三同意（effective）→ 消耗一次確認 → 重放被擋。
+        // NeedConfirm（攜指紋）→ 武裝三同意（effective）→ exact-match 消耗一次 → 重放被擋。
         val gate = GithubAccessibilityService.gateAction("幫我轉帳 500 元", A11yAction.Tap("n1"))
         assertTrue("$gate", gate is GateDecision.NeedConfirm)
+        val fp = (gate as GateDecision.NeedConfirm).fingerprint
+        assertTrue(fp.startsWith("a11y-v1:"))
 
         val prevSwitch = GithubA11yState.switchOn
         val prevGrant = GithubA11yState.serviceGranted
-        val prevConfirm = GithubA11yState.userConfirmed
         try {
-            // 未確認：effective false，連判定都過不了。
+            // 未確認：effective false，消耗失敗。
             GithubA11yState.switchOn = true
             GithubA11yState.serviceGranted = true
-            GithubA11yState.userConfirmed = false
+            GithubA11yState.clearConfirmation()
             assertFalse(GithubA11yState.effective())
-            assertFalse(GithubA11yState.consumeConfirmation())
+            assertFalse(GithubA11yState.consumeConfirmation(fp))
 
-            // 確認後：effective true，可消耗一次。
-            GithubA11yState.userConfirmed = true
+            // 確認後：effective true，可消耗一次（exact-match）。
+            GithubA11yState.grantConfirmation(fp)
             assertTrue(GithubA11yState.effective())
-            assertTrue(GithubA11yState.consumeConfirmation())
+            // 錯誤指紋不消耗且保留額度。
+            assertFalse(GithubA11yState.consumeConfirmation(fp + "00"))
+            assertTrue(GithubA11yState.effective())
+            assertTrue(GithubA11yState.consumeConfirmation(fp))
 
             // one-shot 已消耗：effective 回 false，重放再擋。
             assertFalse(GithubA11yState.userConfirmed)
             assertFalse(GithubA11yState.effective())
-            assertFalse(GithubA11yState.consumeConfirmation())
+            assertFalse(GithubA11yState.consumeConfirmation(fp))
         } finally {
             GithubA11yState.switchOn = prevSwitch
             GithubA11yState.serviceGranted = prevGrant
-            GithubA11yState.userConfirmed = prevConfirm
+            GithubA11yState.clearConfirmation()
+        }
+    }
+
+    @Test fun confirmationBoundToAction() {
+        // P1 re-review：TOCTOU 替換必須失敗（目標/金額/正文任一變更即指紋變更）。
+        val gateA = GithubAccessibilityService.gateAction("幫我轉帳 1 元", A11yAction.Tap("n1"))
+        val fpA = (gateA as GateDecision.NeedConfirm).fingerprint
+        val fpB = AutomationCore.fingerprintFor(A11yAction.Tap("n99"), "幫我轉帳 1 元")
+        val fpC = AutomationCore.fingerprintFor(A11yAction.Tap("n1"), "幫我轉帳 50000 元")
+        val fpD = AutomationCore.fingerprintFor(A11yAction.Input("n3", "hi"), "提交訂單")
+        val fpE = AutomationCore.fingerprintFor(A11yAction.Input("n3", "attacker"), "提交訂單")
+        assertTrue(fpA != fpB)
+        assertTrue(fpA != fpC)
+        assertTrue(fpD != fpE)
+        // 穩定性：同輸入同指紋；規範化（大小寫/空白）一致。
+        val fpNorm1 = AutomationCore.fingerprintFor(A11yAction.Tap("n1"), "  幫我轉帳 500 元 ")
+        val fpNorm2 = AutomationCore.fingerprintFor(A11yAction.Tap("n1"), "幫我轉帳 500 元")
+        assertTrue(fpNorm1 == fpNorm2)
+
+        val prevSwitch = GithubA11yState.switchOn
+        val prevGrant = GithubA11yState.serviceGranted
+        try {
+            GithubA11yState.switchOn = true
+            GithubA11yState.serviceGranted = true
+            GithubA11yState.grantConfirmation(fpA)
+            // 替換提案消耗失敗且額度保留。
+            assertFalse(GithubA11yState.consumeConfirmation(fpB))
+            assertTrue(GithubA11yState.effective())
+            assertTrue(GithubA11yState.consumeConfirmation(fpA))
+        } finally {
+            GithubA11yState.switchOn = prevSwitch
+            GithubA11yState.serviceGranted = prevGrant
+            GithubA11yState.clearConfirmation()
         }
     }
 
     @Test fun benignAllowDoesNotNeedConfirmation() {
-        // 良性 Allow 不吃確認額度：武裝後不消耗，userConfirmed 原樣保留。
+        // 良性 Allow 不吃確認額度：武裝後不消耗，指紋原樣保留。
         val prevSwitch = GithubA11yState.switchOn
         val prevGrant = GithubA11yState.serviceGranted
-        val prevConfirm = GithubA11yState.userConfirmed
         try {
             GithubA11yState.switchOn = true
             GithubA11yState.serviceGranted = true
-            GithubA11yState.userConfirmed = true
+            val gateFp = (GithubAccessibilityService.gateAction("幫我轉帳 1 元", A11yAction.Tap("n1")) as GateDecision.NeedConfirm).fingerprint
+            GithubA11yState.grantConfirmation(gateFp)
             val gate = GithubAccessibilityService.gateAction("點一下返回", A11yAction.Tap("n1"))
             assertEquals(GateDecision.Allow, gate)
             assertTrue(GithubA11yState.userConfirmed)
+            assertTrue(GithubA11yState.consumeConfirmation(gateFp))
         } finally {
             GithubA11yState.switchOn = prevSwitch
             GithubA11yState.serviceGranted = prevGrant
-            GithubA11yState.userConfirmed = prevConfirm
+            GithubA11yState.clearConfirmation()
         }
     }
 }

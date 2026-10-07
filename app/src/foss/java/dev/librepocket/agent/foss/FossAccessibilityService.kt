@@ -48,21 +48,24 @@ class FossAccessibilityService : AccessibilityService() {
      * 當輪確認後的唯一執行動作入口（P1 one-shot 確認，PR#1 review blocker，
      * 與 github 鏡像同語義）。
      *
-     * - [FossA11yState.effective] 為 false → 回 false；
-     * - 裁決 Allow → 直接 [perform]（不消耗確認）；
-     * - 裁決 NeedConfirm → 原子消耗一次當輪確認才 [perform]（防重放）；
-     * - 裁決 Deny（越界種類）→ 即使已確認仍回 false。
-     *
-     * 執行緒約束：必須在背景執行緒呼叫（手勢分派見 [dispatchSwipe]
-     * 的 ANR 防護，主執行緒呼叫一律回 false）。
+     * P1 re-review 綁定確認：必須透傳 UI 指紋並 exact-match 才消耗執行，
+     * 詳見 github 鏡像 [dev.librepocket.agent.github.GithubAccessibilityService.executeConfirmed]。
      */
-    fun executeConfirmed(action: A11yAction, goalText: String, targetText: String = ""): Boolean {
+    fun executeConfirmed(
+        action: A11yAction,
+        goalText: String,
+        targetText: String = "",
+        confirmedFingerprint: String = "",
+        allowedKinds: Set<SlowActionKind> = SlowArbitrator.DEFAULT_ALLOWED,
+    ): Boolean {
         if (!FossA11yState.effective()) return false
-        when (AutomationCore.verdictFor(action, goalText, targetText)) {
+        when (AutomationCore.verdictFor(action, goalText, targetText, allowedKinds)) {
             is ArbitrationVerdict.Allow -> return perform(action)
             is ArbitrationVerdict.Deny -> return false
             is ArbitrationVerdict.NeedConfirm -> {
-                if (!FossA11yState.consumeConfirmation()) return false
+                val recomputed = AutomationCore.fingerprintFor(action, goalText, targetText, allowedKinds)
+                if (confirmedFingerprint.isBlank() || recomputed != confirmedFingerprint) return false
+                if (!FossA11yState.consumeConfirmation(recomputed)) return false
                 return perform(action)
             }
         }
@@ -191,17 +194,20 @@ class FossAccessibilityService : AccessibilityService() {
         ): FossGateDecision {
             return when (val verdict = AutomationCore.verdictFor(action, goalText, targetText, allowedKinds)) {
                 is ArbitrationVerdict.Allow -> FossGateDecision.Allow
-                is ArbitrationVerdict.NeedConfirm -> FossGateDecision.NeedConfirm(verdict.codes)
+                is ArbitrationVerdict.NeedConfirm -> FossGateDecision.NeedConfirm(
+                    verdict.codes,
+                    AutomationCore.fingerprintFor(action, goalText, targetText, allowedKinds),
+                )
                 is ArbitrationVerdict.Deny -> FossGateDecision.Denied(verdict.codes)
             }
         }
     }
 }
 
-/** 仲裁前攔截結論：放行 / 需二次確認 / 拒絕（附理由碼，轉錄/審計用）。 */
+/** 仲裁前攔截結論：放行 / 需二次確認（含指紋） / 拒絕。 */
 sealed interface FossGateDecision {
     data object Allow : FossGateDecision
-    data class NeedConfirm(val codes: List<ArbitrationCode>) : FossGateDecision
+    data class NeedConfirm(val codes: List<ArbitrationCode>, val fingerprint: String) : FossGateDecision
     /** 越界種類：即使已確認亦不可執行（確認不可覆寫拒絕）。 */
     data class Denied(val codes: List<ArbitrationCode>) : FossGateDecision
 }
@@ -210,28 +216,47 @@ sealed interface FossGateDecision {
  * 服務側三同意狀態（記憶體態；App 內開關由設定頁寫入）。
  * effective = [FossAutomationGate.effectiveAutomation]
  *（App 開關 + 系統授權 + 當輪確認，play 側無此類故永遠缺席）。
+ *
+ * P1 re-review：與 github 鏡像同語義，確認綁定指紋（單槽 one-shot）。
  */
 object FossA11yState {
     @Volatile var switchOn: Boolean = FossAutomationGate.DEFAULT_ENABLED
     @Volatile var serviceGranted: Boolean = false
-    @Volatile var userConfirmed: Boolean = false
+    @Volatile private var confirmedFingerprint: String? = null
     @Volatile var lastCompressed: List<String> = emptyList()
+
+    var userConfirmed: Boolean
+        get() = confirmedFingerprint != null
+        set(value) {
+            if (!value) confirmedFingerprint = null
+        }
 
     fun effective(): Boolean = FossAutomationGate.effectiveAutomation(
         switchOn = switchOn,
         serviceGranted = serviceGranted,
-        userConfirmed = userConfirmed,
+        userConfirmed = confirmedFingerprint != null,
     )
 
-    /**
-     * 原子消耗一次當輪確認（P1 one-shot，PR#1 review blocker，
-     * 與 github 鏡像同語義）：已確認才回 true 並清零，防重放；
-     * 良性 Allow 路徑不呼叫此函數。
-     */
     @Synchronized
-    fun consumeConfirmation(): Boolean {
-        if (!userConfirmed) return false
-        userConfirmed = false
+    fun grantConfirmation(fingerprint: String) {
+        require(fingerprint.isNotBlank()) { "fingerprint must not be blank" }
+        confirmedFingerprint = fingerprint
+    }
+
+    @Synchronized
+    fun clearConfirmation() {
+        confirmedFingerprint = null
+    }
+
+    @Synchronized
+    fun consumeConfirmation(expected: String): Boolean {
+        val cur = confirmedFingerprint ?: return false
+        if (cur != expected) return false
+        confirmedFingerprint = null
         return true
     }
+
+    @Deprecated("必須傳 expected 指紋 exact-match，避免 ambient 確認", ReplaceWith("consumeConfirmation(expected)"))
+    @Synchronized
+    fun consumeConfirmation(): Boolean = false
 }

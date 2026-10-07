@@ -53,31 +53,53 @@ class FossA11yTest {
     }
 
     @Test fun oneShotConfirmationLifecycle() {       // P1 lifecycle（PR#1 review blocker，判定層；perform 需真機）：
-        // NeedConfirm → 武裝三同意（effective）→ 消耗一次確認 → 重放被擋。
+        // NeedConfirm（攜指紋）→ 武裝三同意（effective）→ exact-match 消耗一次 → 重放被擋。
         val gate = FossAccessibilityService.gateAction("幫我轉帳 500 元", A11yAction.Tap("n1"))
         assertTrue("$gate", gate is FossGateDecision.NeedConfirm)
+        val fp = (gate as FossGateDecision.NeedConfirm).fingerprint
+        assertTrue(fp.startsWith("a11y-v1:"))
 
         val prevSwitch = FossA11yState.switchOn
         val prevGrant = FossA11yState.serviceGranted
-        val prevConfirm = FossA11yState.userConfirmed
         try {
             FossA11yState.switchOn = true
             FossA11yState.serviceGranted = true
-            FossA11yState.userConfirmed = false
+            FossA11yState.clearConfirmation()
             assertFalse(FossA11yState.effective())
-            assertFalse(FossA11yState.consumeConfirmation())
+            assertFalse(FossA11yState.consumeConfirmation(fp))
 
-            FossA11yState.userConfirmed = true
+            FossA11yState.grantConfirmation(fp)
             assertTrue(FossA11yState.effective())
-            assertTrue(FossA11yState.consumeConfirmation())
+            assertFalse(FossA11yState.consumeConfirmation(fp + "00"))
+            assertTrue(FossA11yState.effective())
+            assertTrue(FossA11yState.consumeConfirmation(fp))
 
             assertFalse(FossA11yState.userConfirmed)
             assertFalse(FossA11yState.effective())
-            assertFalse(FossA11yState.consumeConfirmation())
+            assertFalse(FossA11yState.consumeConfirmation(fp))
         } finally {
             FossA11yState.switchOn = prevSwitch
             FossA11yState.serviceGranted = prevGrant
-            FossA11yState.userConfirmed = prevConfirm
+            FossA11yState.clearConfirmation()
+        }
+    }
+
+    @Test fun confirmationBoundToAction() {
+        val fpA = (FossAccessibilityService.gateAction("幫我轉帳 1 元", A11yAction.Tap("n1")) as FossGateDecision.NeedConfirm).fingerprint
+        val fpB = dev.librepocket.automation.AutomationCore.fingerprintFor(A11yAction.Tap("n99"), "幫我轉帳 1 元")
+        assertTrue(fpA != fpB)
+        val prevSwitch = FossA11yState.switchOn
+        val prevGrant = FossA11yState.serviceGranted
+        try {
+            FossA11yState.switchOn = true
+            FossA11yState.serviceGranted = true
+            FossA11yState.grantConfirmation(fpA)
+            assertFalse(FossA11yState.consumeConfirmation(fpB))
+            assertTrue(FossA11yState.consumeConfirmation(fpA))
+        } finally {
+            FossA11yState.switchOn = prevSwitch
+            FossA11yState.serviceGranted = prevGrant
+            FossA11yState.clearConfirmation()
         }
     }
 
@@ -85,18 +107,19 @@ class FossA11yTest {
         // 與 github 鏡像同語義：良性 Allow 不吃確認額度。
         val prevSwitch = FossA11yState.switchOn
         val prevGrant = FossA11yState.serviceGranted
-        val prevConfirm = FossA11yState.userConfirmed
         try {
             FossA11yState.switchOn = true
             FossA11yState.serviceGranted = true
-            FossA11yState.userConfirmed = true
+            val fp = (FossAccessibilityService.gateAction("幫我轉帳 1 元", A11yAction.Tap("n1")) as FossGateDecision.NeedConfirm).fingerprint
+            FossA11yState.grantConfirmation(fp)
             val gate = FossAccessibilityService.gateAction("點一下返回", A11yAction.Tap("n1"))
             assertEquals(FossGateDecision.Allow, gate)
             assertTrue(FossA11yState.userConfirmed)
+            assertTrue(FossA11yState.consumeConfirmation(fp))
         } finally {
             FossA11yState.switchOn = prevSwitch
             FossA11yState.serviceGranted = prevGrant
-            FossA11yState.userConfirmed = prevConfirm
+            FossA11yState.clearConfirmation()
         }
     }
 }

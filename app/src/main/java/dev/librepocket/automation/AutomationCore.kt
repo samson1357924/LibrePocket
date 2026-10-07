@@ -172,10 +172,51 @@ object AutomationCore {
         return verdictFor(action, goalText, targetText, allowedKinds).codes
     }
 
+    /**
+     * Proposal 指紋（P1 綁定確認，PR#1 re-review）：
+     * `a11y-v1:<sha256hex>`，覆蓋種類 + 動作全量（含 Input 全文、Swipe 全座標、
+     * Tap nodeId）+ goal/target 規範化（小寫+trim+空白摺疊，與仲裁 haystack
+     * 一致）+ allowedKinds 排序集。任一變更即指紋變更，確認必須 exact-match。
+     * 純 JVM（MessageDigest），零 Android 依賴。
+     */
+    fun fingerprintFor(
+        action: A11yAction,
+        goalText: String,
+        targetText: String = "",
+        allowedKinds: Set<SlowActionKind> = SlowArbitrator.DEFAULT_ALLOWED,
+    ): String {
+        val kind = when (action) {
+            is A11yAction.Tap -> SlowActionKind.TAP
+            is A11yAction.Swipe -> SlowActionKind.SCROLL
+            is A11yAction.Input -> SlowActionKind.INPUT
+            is A11yAction.Back -> SlowActionKind.BACK
+        }
+        val actionCanon = when (action) {
+            is A11yAction.Tap -> "tap:${action.nodeId}"
+            is A11yAction.Swipe -> "swipe:${action.fromX},${action.fromY},${action.toX},${action.toY}"
+            is A11yAction.Input -> "input:${action.nodeId}:${action.text}"
+            is A11yAction.Back -> "back"
+        }
+        fun norm(s: String): String = s.trim().lowercase().replace(Regex("\\s+"), " ")
+        val allowedSorted = allowedKinds.map { it.name }.sorted().joinToString(",")
+        val raw = "a11y-v1|${kind.name}|$actionCanon|${norm(goalText)}|${norm(targetText)}|$allowedSorted"
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        val hex = digest.digest(raw.toByteArray(Charsets.UTF_8)).joinToString("") {
+            "%02x".format(it)
+        }
+        return "a11y-v1:$hex"
+    }
+
     private fun A11yAction.key(): String = when (this) {
         is A11yAction.Tap -> "tap-$nodeId"
         is A11yAction.Swipe -> "swipe-$fromX-$fromY-$toX-$toY"
-        is A11yAction.Input -> "input-$nodeId"
+        // P1 修正：Input 納全文雜湊，避免同 node 不同 text 碰撞（見 fingerprintFor）。
+        is A11yAction.Input -> {
+            val h = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(text.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+                .take(12)
+            "input-$nodeId-$h"
+        }
         is A11yAction.Back -> "back"
     }
 

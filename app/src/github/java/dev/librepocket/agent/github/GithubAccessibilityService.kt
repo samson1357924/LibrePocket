@@ -51,24 +51,35 @@ class GithubAccessibilityService : AccessibilityService() {
     /**
      * 當輪確認後的唯一執行動作入口（P1 one-shot 確認，PR#1 review blocker）。
      *
-     * 舊語義在已確認後仍把同一 proposal 重新仲裁為 NeedConfirm 並拒絕，
-     * 敏感動作永遠到不了 [perform]（dead-end）。新語義：
+     * P1 re-review 綁定確認：呼叫方必須透傳 UI 展示給使用者的指紋
+     *（[gateAction] 回的 `NeedConfirm.fingerprint`，經 [AutomationCore.fingerprintFor]
+     * 重算交叉驗證），服務端重算當前 action/goal/target/allowedKinds 指紋，
+     * 三者 exact-match 才原子消耗（[GithubA11yState.consumeConfirmation]），
+     * 否則回 false 且不消耗額度（防掃描耗損與 TOCTOU 替換）。
+     *
      * - [GithubA11yState.effective] 為 false（一輪三同意缺一）→ 回 false；
      * - 裁決 Allow → 直接 [perform]（不消耗確認，良性動作不吃掉確認額度）；
-     * - 裁決 NeedConfirm → 必須原子消耗一次當輪確認（[GithubA11yState.consumeConfirmation]）
-     *   才 [perform]；消耗失敗（已被用過/重放）回 false；
+     * - 裁決 NeedConfirm → 指紋一致 + 原子消耗一次當輪確認才 [perform]；
      * - 裁決 Deny（越界種類）→ 即使已確認仍回 false（確認不可覆寫拒絕）。
      *
      * 執行緒約束：必須在背景執行緒呼叫（手勢分派見 [dispatchSwipe]
      * 的 ANR 防護，主執行緒呼叫一律回 false）。
      */
-    fun executeConfirmed(action: A11yAction, goalText: String, targetText: String = ""): Boolean {
+    fun executeConfirmed(
+        action: A11yAction,
+        goalText: String,
+        targetText: String = "",
+        confirmedFingerprint: String = "",
+        allowedKinds: Set<SlowActionKind> = SlowArbitrator.DEFAULT_ALLOWED,
+    ): Boolean {
         if (!GithubA11yState.effective()) return false
-        when (AutomationCore.verdictFor(action, goalText, targetText)) {
+        when (AutomationCore.verdictFor(action, goalText, targetText, allowedKinds)) {
             is ArbitrationVerdict.Allow -> return perform(action)
             is ArbitrationVerdict.Deny -> return false
             is ArbitrationVerdict.NeedConfirm -> {
-                if (!GithubA11yState.consumeConfirmation()) return false
+                val recomputed = AutomationCore.fingerprintFor(action, goalText, targetText, allowedKinds)
+                if (confirmedFingerprint.isBlank() || recomputed != confirmedFingerprint) return false
+                if (!GithubA11yState.consumeConfirmation(recomputed)) return false
                 return perform(action)
             }
         }
@@ -200,17 +211,20 @@ class GithubAccessibilityService : AccessibilityService() {
         ): GateDecision {
             return when (val verdict = AutomationCore.verdictFor(action, goalText, targetText, allowedKinds)) {
                 is ArbitrationVerdict.Allow -> GateDecision.Allow
-                is ArbitrationVerdict.NeedConfirm -> GateDecision.NeedConfirm(verdict.codes)
+                is ArbitrationVerdict.NeedConfirm -> GateDecision.NeedConfirm(
+                    verdict.codes,
+                    AutomationCore.fingerprintFor(action, goalText, targetText, allowedKinds),
+                )
                 is ArbitrationVerdict.Deny -> GateDecision.Denied(verdict.codes)
             }
         }
     }
 }
 
-/** 仲裁前攔截結論：放行 / 需二次確認 / 拒絕（附理由碼，轉錄/審計用）。 */
+/** 仲裁前攔截結論：放行 / 需二次確認（含指紋，UI 原樣回傳） / 拒絕。 */
 sealed interface GateDecision {
     data object Allow : GateDecision
-    data class NeedConfirm(val codes: List<ArbitrationCode>) : GateDecision
+    data class NeedConfirm(val codes: List<ArbitrationCode>, val fingerprint: String) : GateDecision
     /** 越界種類：即使已確認亦不可執行（確認不可覆寫拒絕）。 */
     data class Denied(val codes: List<ArbitrationCode>) : GateDecision
 }
@@ -219,28 +233,59 @@ sealed interface GateDecision {
  * 服務側三同意狀態（記憶體態；App 內開關由設定頁寫入）。
  * effective = [GithubAutomationGate.effectiveAutomation]
  *（App 開關 + 系統授權 + 當輪確認，play 側無此類故永遠缺席）。
+ *
+ * P1 re-review：確認即 capability，真相來源為 `confirmedFingerprint`
+ *（單槽 one-shot），`userConfirmed` 僅為相容派生視圖（只讀）。
  */
 object GithubA11yState {
     @Volatile var switchOn: Boolean = GithubAutomationGate.DEFAULT_ENABLED
     @Volatile var serviceGranted: Boolean = false
-    @Volatile var userConfirmed: Boolean = false
+    @Volatile private var confirmedFingerprint: String? = null
     @Volatile var lastCompressed: List<String> = emptyList()
+
+    /** 相容視圖：有未消耗指紋即視為已確認（只讀用途；寫入請走 grant）。 */
+    var userConfirmed: Boolean
+        get() = confirmedFingerprint != null
+        set(value) {
+            if (!value) confirmedFingerprint = null
+            // true 不直接賦值：必須經 grantConfirmation 綁定指紋，避免 ambient。
+        }
 
     fun effective(): Boolean = GithubAutomationGate.effectiveAutomation(
         switchOn = switchOn,
         serviceGranted = serviceGranted,
-        userConfirmed = userConfirmed,
+        userConfirmed = confirmedFingerprint != null,
     )
 
+    /** 授權一次確認：覆寫單槽（後授權覆蓋前者，需 UI 展示與指紋一致）。 */
+    @Synchronized
+    fun grantConfirmation(fingerprint: String) {
+        require(fingerprint.isNotBlank()) { "fingerprint must not be blank" }
+        confirmedFingerprint = fingerprint
+    }
+
+    /** 測試/設定頁相容：清空確認（等同拒絕/超時）。 */
+    @Synchronized
+    fun clearConfirmation() {
+        confirmedFingerprint = null
+    }
+
     /**
-     * 原子消耗一次當輪確認（P1 one-shot，PR#1 review blocker）：
-     * 已確認才回 true 並清零（一次確認只放行一步敏感動作，防重放）；
-     * 未確認回 false。良性 Allow 路徑不呼叫此函數，不吃掉確認額度。
+     * 原子消耗一次當輪確認（P1 one-shot + 指紋綁定）：
+     * 僅當 stored 非 null 且與 expected exact-match 才清零回 true；
+     * 否則不清除、回 false（防掃描耗損額度與 TOCTOU 替換）。
+     * 良性 Allow 路徑不呼叫此函數，不吃掉確認額度。
      */
     @Synchronized
-    fun consumeConfirmation(): Boolean {
-        if (!userConfirmed) return false
-        userConfirmed = false
+    fun consumeConfirmation(expected: String): Boolean {
+        val cur = confirmedFingerprint ?: return false
+        if (cur != expected) return false
+        confirmedFingerprint = null
         return true
     }
+
+    /** 舊無參過載：已廢止，一律回 false，避免 ambient 回退。 */
+    @Deprecated("必須傳 expected 指紋 exact-match，避免 ambient 確認", ReplaceWith("consumeConfirmation(expected)"))
+    @Synchronized
+    fun consumeConfirmation(): Boolean = false
 }

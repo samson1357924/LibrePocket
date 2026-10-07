@@ -229,30 +229,47 @@ class RoomSessionStore(
     }
 
     override suspend fun prune(policy: PrunePolicy): PruneResult =
+        pruneWithBeforeConditionalDelete(policy) {}
+
+    /**
+     * The callback is an internal test seam for deterministically exercising an update
+     * between the candidate snapshot and the conditional DELETE. The actual deletion
+     * always goes through Room's single-statement predicate, not this callback or a
+     * store-local mutex.
+     */
+    internal suspend fun pruneWithBeforeConditionalDelete(
+        policy: PrunePolicy,
+        beforeConditionalDelete: suspend (String) -> Unit,
+    ): PruneResult =
         withContext(Dispatchers.IO) {
             var deletedSessions = 0
             var deletedEvents = 0
             val cutoff = clock() - policy.maxAgeDays * MILLIS_PER_DAY
-            val stale = dao.staleSessionIds(cutoff).toSet()
+            // This is only a candidate snapshot. Every delete rechecks age and pin
+            // state atomically in SQL, so a committed append/touch or pin after this
+            // read cannot be lost to a stale in-memory decision.
+            val candidates = dao.allSessions()
             val survivors = ArrayList<String>()
-            for (session in dao.allSessions()) {
-                if (session.sessionId in stale) {
-                    if (policy.keepPinnedSessions && session.isPinned) {
-                        survivors.add(session.sessionId)
-                    } else {
-                        dao.deleteSession(session.sessionId) // CASCADE clears events
-                        deletedSessions++
-                    }
+            for (session in candidates) {
+                beforeConditionalDelete(session.sessionId)
+                val deleted = dao.deleteSessionIfStale(
+                    session.sessionId,
+                    cutoff,
+                    policy.keepPinnedSessions,
+                )
+                if (deleted > 0) {
+                    deletedSessions += deleted // CASCADE clears events atomically
                 } else {
                     survivors.add(session.sessionId)
                 }
             }
             for (sid in survivors) {
-                val count = dao.eventCount(sid)
-                if (count > policy.maxEventsPerSession) {
-                    val through = dao.maxSeq(sid) - policy.maxEventsPerSession
-                    deletedEvents += dao.deleteEventsThrough(sid, through)
-                }
+                // Imported seq values may be sparse. Keep N actual newest rows by
+                // ordering the current rows, rather than deriving a cutoff from MAX(seq).
+                deletedEvents += dao.deleteEventsBeyondLimit(
+                    sid,
+                    policy.maxEventsPerSession.coerceAtLeast(0),
+                )
             }
             PruneResult(deletedEvents = deletedEvents, deletedSessions = deletedSessions)
         }

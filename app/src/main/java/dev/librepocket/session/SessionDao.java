@@ -32,9 +32,6 @@ public interface SessionDao {
     @Query("SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_events WHERE sessionId = :sid")
     long nextSeq(String sid);
 
-    @Query("SELECT COALESCE(MAX(seq), 0) FROM transcript_events WHERE sessionId = :sid")
-    long maxSeq(String sid);
-
     @Insert
     long insertEvent(TranscriptEventEntity e);
 
@@ -49,12 +46,15 @@ public interface SessionDao {
     @Query("DELETE FROM sessions WHERE sessionId = :sid")
     void deleteSession(String sid); // CASCADE clears events
 
-    @Query("SELECT sessionId FROM sessions WHERE pinned = 0 AND updatedAt < :cutoff")
-    List<String> staleSessionIds(long cutoff);
-
-    @Query("DELETE FROM transcript_events WHERE sessionId = :sid AND seq <= :throughSeq")
-    int deleteEventsThrough(String sid, long throughSeq);
+    @Query("DELETE FROM sessions WHERE sessionId = :sid AND updatedAt < :cutoff "
+            + "AND (:keepPinned = 0 OR pinned = 0)")
+    int deleteSessionIfStale(String sid, long cutoff, boolean keepPinned);
 
     @Query("SELECT COUNT(*) FROM transcript_events WHERE sessionId = :sid")
     int eventCount(String sid);
+
+    @Query("DELETE FROM transcript_events WHERE sessionId = :sid AND rowId NOT IN "
+            + "(SELECT rowId FROM transcript_events WHERE sessionId = :sid "
+            + "ORDER BY seq DESC, rowId DESC LIMIT :keep)")
+    int deleteEventsBeyondLimit(String sid, int keep);
 }

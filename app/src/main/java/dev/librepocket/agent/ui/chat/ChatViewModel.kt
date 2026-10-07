@@ -85,11 +85,16 @@ class ChatViewModel(
     private var sessionCollectJob: Job? = null
     private var openJob: Job? = null
     private var lastUserText: String? = null
-    // F3: unsent text retained until handed to a session. Cleared only on
-    // successful handoff or explicit newChat/logout/open; restored to input
-    // when an endpoint change cancels the send (never auto-sent to B).
-    private var pendingDraft: String? = null
-    private var pendingDraftGeneration: Long = -1L
+    // R2: unsent texts are owned per send/steer operation, never by a single
+    // global String. Cleared only when the controller accepts that exact op
+    // (startTurn return / FIFO queue); pre-accept endpoint invalidation drains
+    // every entry into recoverableOps (never auto-sent to the new binding).
+    private data class PendingOp(val opId: Long, val generation: Long, val text: String)
+    private var nextOpId = 0L
+    private val pendingOps = LinkedHashMap<Long, PendingOp>()
+    // Endpoint-cancelled but never accepted: surfaced one-by-one through the
+    // input box after each explicit send; discarded by newChat/open/logout.
+    private val recoverableOps = ArrayDeque<PendingOp>()
     private var observedBinding: EndpointSessionBinding? = null
     private var hasObservedBinding = false
 
@@ -159,22 +164,29 @@ class ChatViewModel(
         if (clean.isEmpty()) return
         lastUserText = clean
         val startedAt = lifecycleGeneration
-        pendingDraft = clean
-        pendingDraftGeneration = startedAt
+        val opId = ++nextOpId
+        pendingOps[opId] = PendingOp(opId, startedAt, clean)
         lifecycleScope.launch {
             var operationGeneration = startedAt
             try {
                 when (val access = authorizeEndpoint(startedAt)) {
                     is EndpointAccess.Ready -> {
                         operationGeneration = access.endpoint.generation
-                        val handle = ensureSession(access.endpoint, clean) ?: return@launch
+                        val handle = ensureSession(access.endpoint, clean)
+                        if (handle == null || !isHandleCurrent(handle)) {
+                            // The generation is dead or the session was
+                            // replaced: endpoint invalidation (or explicit
+                            // discard) already owns this op's entry, so leave
+                            // it for the drain/clear path instead of dropping
+                            // or double-restoring here.
+                            return@launch
+                        }
                         operationGeneration = handle.generation
-                        if (!isHandleCurrent(handle)) return@launch
                         // ensureSession may replace a mismatched transport
-                        // under a bumped generation; re-root the draft so a
+                        // under a bumped generation; re-root the op so a
                         // chat.send deny still restores to input instead of
                         // stranding on the stale generation.
-                        if (pendingDraft == clean) pendingDraftGeneration = handle.generation
+                        pendingOps[opId] = PendingOp(opId, handle.generation, clean)
                         // R1: accept first, clear after. startTurn returns only
                         // once the controller owns the text; anything thrown
                         // before that leaves the draft for invalidate/restore.
@@ -184,7 +196,8 @@ class ChatViewModel(
                             throw cancelled
                         } catch (_: IllegalStateException) {
                             // Lost a busy race after the idle check: queue
-                            // into the FIFO (synchronous acceptance).
+                            // into the FIFO (synchronous acceptance). A stale
+                            // handle leaves the op for the invalidation drain.
                             if (!isHandleCurrent(handle)) return@launch
                             try {
                                 handle.created.session.steer(clean)
@@ -192,25 +205,19 @@ class ChatViewModel(
                                 throw cancelled
                             } catch (_: Exception) {
                                 // Closed/stale sessions are deliberately inert;
-                                // the retained draft is owned by invalidation.
+                                // the retained op is owned by invalidation.
                                 return@launch
                             }
-                            if (pendingDraft == clean) {
-                                pendingDraft = null
-                                pendingDraftGeneration = -1L
-                            }
+                            pendingOps.remove(opId)
                             return@launch
                         } catch (_: SecurityException) {
                             // Fresh chat.send deny is projected by the
                             // controller; keep the text recoverable.
                             setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
-                            restoreDraftForFailedSend(operationGeneration, clean, "POLICY_DENIED")
+                            restoreOpForFailedSend(opId, "POLICY_DENIED")
                             return@launch
                         }
-                        if (pendingDraft == clean) {
-                            pendingDraft = null
-                            pendingDraftGeneration = -1L
-                        }
+                        pendingOps.remove(opId)
                         try {
                             host.join()
                         } catch (cancelled: CancellationException) {
@@ -219,22 +226,23 @@ class ChatViewModel(
                             // Turn failed after acceptance: transcript keeps
                             // the user message; nothing to restore.
                         }
+                        drainNextRecoverableToInput()
                     }
                     EndpointAccess.Denied -> {
                         setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
-                        restoreDraftForFailedSend(operationGeneration, clean, "POLICY_DENIED")
+                        restoreOpForFailedSend(opId, "POLICY_DENIED")
                     }
                     EndpointAccess.Missing -> {
                         setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
-                        restoreDraftForFailedSend(operationGeneration, clean, "NO_ENDPOINT")
+                        restoreOpForFailedSend(opId, "NO_ENDPOINT")
                     }
-                    EndpointAccess.Stale -> Unit
+                    EndpointAccess.Stale -> pendingOps.remove(opId)
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
                 setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
-                restoreDraftForFailedSend(operationGeneration, clean, "NO_ENDPOINT")
+                restoreOpForFailedSend(opId, "NO_ENDPOINT")
             }
         }
     }
@@ -249,8 +257,8 @@ class ChatViewModel(
         lastUserText = text
         _notice.value = null
         val startedAt = lifecycleGeneration
-        pendingDraft = text
-        pendingDraftGeneration = startedAt
+        val opId = ++nextOpId
+        pendingOps[opId] = PendingOp(opId, startedAt, text)
         lifecycleScope.launch {
             var operationGeneration = startedAt
             try {
@@ -258,20 +266,25 @@ class ChatViewModel(
                     is EndpointAccess.Ready -> {
                         operationGeneration = access.endpoint.generation
                         val handle = ensureSession(access.endpoint, text)
-                        if (handle == null || !isHandleCurrent(handle)) return@launch
+                        if (handle == null || !isHandleCurrent(handle)) {
+                            // The generation is dead or the session was
+                            // replaced: endpoint invalidation (or explicit
+                            // discard) already owns this op's entry.
+                            return@launch
+                        }
                         operationGeneration = handle.generation
                         // ensureSession may replace a mismatched transport
-                        // under a bumped generation; re-root the draft so a
+                        // under a bumped generation; re-root the op so a
                         // chat.send deny still restores to input instead of
                         // stranding on the stale generation.
-                        if (pendingDraft == text) pendingDraftGeneration = handle.generation
-                        // R1: the draft is owned by the controller only after
+                        pendingOps[opId] = PendingOp(opId, handle.generation, text)
+                        // R1: the op is owned by the controller only after
                         // startTurn returns (fresh chat.send passed, user
                         // message appended). Clearing earlier loses text when
                         // an endpoint change cancels the gate suspension.
                         // Clearing after send() returns is equally wrong:
                         // send() joins the whole turn, so an accepted text
-                        // would be mistaken for an unsent draft.
+                        // would be mistaken for an unsent op.
                         val host: Job = try {
                             handle.created.session.startTurn(text)
                         } catch (cancelled: CancellationException) {
@@ -280,7 +293,7 @@ class ChatViewModel(
                             // Two sends can race before STREAMING reaches the
                             // UI. The controller rejects the second start;
                             // steer it into the FIFO instead of silently
-                            // dropping input. The draft stays until the steer
+                            // dropping input. The op stays until the steer
                             // is queued (accepted) below.
                             if (!isHandleCurrent(handle)) return@launch
                             try {
@@ -291,23 +304,17 @@ class ChatViewModel(
                                 // Closed/stale sessions are deliberately inert.
                                 return@launch
                             }
-                            if (pendingDraft == text) {
-                                pendingDraft = null
-                                pendingDraftGeneration = -1L
-                            }
+                            pendingOps.remove(opId)
                             return@launch
                         } catch (_: SecurityException) {
                             // Fresh chat.send deny is projected by the
                             // controller; keep the text recoverable instead of
                             // swallowing it with no notice.
                             setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
-                            restoreDraftForFailedSend(operationGeneration, text, "POLICY_DENIED")
+                            restoreOpForFailedSend(opId, "POLICY_DENIED")
                             return@launch
                         }
-                        if (pendingDraft == text) {
-                            pendingDraft = null
-                            pendingDraftGeneration = -1L
-                        }
+                        pendingOps.remove(opId)
                         try {
                             host.join()
                         } catch (cancelled: CancellationException) {
@@ -316,22 +323,23 @@ class ChatViewModel(
                             // Turn failed after acceptance: the transcript
                             // keeps the user message; nothing to restore.
                         }
+                        drainNextRecoverableToInput()
                     }
                     EndpointAccess.Denied -> {
                         setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
-                        restoreDraftForFailedSend(operationGeneration, text, "POLICY_DENIED")
+                        restoreOpForFailedSend(opId, "POLICY_DENIED")
                     }
                     EndpointAccess.Missing -> {
                         setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
-                        restoreDraftForFailedSend(operationGeneration, text, "NO_ENDPOINT")
+                        restoreOpForFailedSend(opId, "NO_ENDPOINT")
                     }
-                    EndpointAccess.Stale -> Unit
+                    EndpointAccess.Stale -> pendingOps.remove(opId)
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
                 setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
-                restoreDraftForFailedSend(operationGeneration, text, "NO_ENDPOINT")
+                restoreOpForFailedSend(opId, "NO_ENDPOINT")
             }
         }
     }
@@ -697,18 +705,22 @@ class ChatViewModel(
             _history.value = emptyList()
             _currentSessionId.value = null
             lastUserText = null
-            pendingDraft = null
-            pendingDraftGeneration = -1L
+            pendingOps.clear()
+            recoverableOps.clear()
             _input.value = ""
             _notice.value = "NO_ENDPOINT"
         } else {
-            // F3: fail-closed send keeps a restorable draft, never auto-sent to B.
-            val draft = pendingDraft
-            if (draft != null) {
-                if (_input.value.isBlank()) _input.value = draft
+            // R2: fail-closed sends keep EVERY unaccepted op recoverable,
+            // never auto-sent to the new binding. The oldest fills an empty
+            // box; newer typing is never overwritten; the rest wait in
+            // recoverableOps and surface one-by-one after each explicit send.
+            if (pendingOps.isNotEmpty()) {
+                for ((_, op) in pendingOps) recoverableOps.addLast(op)
+                pendingOps.clear()
+                if (_input.value.isBlank()) {
+                    recoverableOps.removeFirstOrNull()?.let { _input.value = it.text }
+                }
                 _notice.value = "SEND_CANCELLED_ENDPOINT_CHANGED"
-                pendingDraft = null
-                pendingDraftGeneration = -1L
             } else {
                 _notice.value = null
             }
@@ -727,8 +739,8 @@ class ChatViewModel(
             _history.value = emptyList()
             _currentSessionId.value = null
             lastUserText = null
-            pendingDraft = null
-            pendingDraftGeneration = -1L
+            pendingOps.clear()
+            recoverableOps.clear()
         }
     }
 
@@ -762,21 +774,29 @@ class ChatViewModel(
         if (fresh.isNotEmpty()) _history.value = _history.value + fresh
     }
 
-    // F3: restore an unconsumed draft only for its own operation generation
-    // and only when the input box is still empty, so later typing is never
-    // overwritten. Explicit newChat/logout/open already cleared the draft.
-    private fun restoreDraftForFailedSend(generation: Long, text: String, noticeValue: String) {
-        if (!isGenerationCurrent(generation)) return
-        if (pendingDraft != text || pendingDraftGeneration != generation) return
+    // R2: restore one op by identity, so two identical texts never
+    // cross-clear, and only when the input box is still empty, so later
+    // typing is never overwritten. A non-blank box keeps the user's text and
+    // the cancelled op waits in recoverableOps instead of being deleted.
+    // Explicit newChat/logout/open already discarded the op.
+    private fun restoreOpForFailedSend(opId: Long, noticeValue: String) {
+        val op = pendingOps.remove(opId) ?: return
+        if (!isGenerationCurrent(op.generation)) return
         if (_input.value.isNotBlank()) {
-            pendingDraft = null
-            pendingDraftGeneration = -1L
+            recoverableOps.addLast(op)
             return
         }
-        _input.value = text
+        _input.value = op.text
         _notice.value = noticeValue
-        pendingDraft = null
-        pendingDraftGeneration = -1L
+    }
+
+    // R2: surface the next endpoint-cancelled text after an explicit send
+    // completes, so every unaccepted op is recoverable through the input box
+    // without auto-sending anything to the new binding.
+    private fun drainNextRecoverableToInput() {
+        if (_input.value.isNotBlank()) return
+        val next = recoverableOps.removeFirstOrNull() ?: return
+        _input.value = next.text
     }
 
     private fun closeLive() {

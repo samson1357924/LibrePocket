@@ -242,4 +242,148 @@ class LinuxInboxStagerTest {
         assertEquals(listOf("cat", staged.guestPath), cmd.takeLast(2))
         assertTrue(cmd.none { it == "-b" || it == "--bind" })
     }
+
+    // ---- TOCTOU（PR#1 comment 6039436820 P1）：check-then-use 封閉 ----
+
+    @Test fun stageFile_symlinkSource_deniedWithoutCopy() {
+        // inbox 內 symlink 源直拒（不跟隨到 rootfs 外敏感檔）。
+        val outside = File(treeRoot, "stage-symlink-outside.txt").apply { writeText("host-secret") }
+        val inbox = File(LinuxEnv.inboxDir(filesDir)).apply { mkdirs() }
+        val link = File(inbox, "link.txt")
+        try {
+            link.delete()
+        } catch (_: Exception) {
+        }
+        Files.createSymbolicLink(link.toPath(), outside.toPath())
+        val r = LinuxInboxStager.stageFile(filesDir, "symlinksrc", link, id = "abcd1234")
+        assertTrue("expected Denied, got $r", r is LinuxInboxStager.StageOutcome.Denied)
+        assertEquals("NOT_A_FILE", (r as LinuxInboxStager.StageOutcome.Denied).code)
+        // 保證沒有把外部敏感內容拷入 rootfs。
+        val stagedCandidates = File(LinuxEnv.containerRootfs(filesDir, "symlinksrc") + "/inbox")
+            .listFiles()?.toList().orEmpty()
+        assertTrue("no exfil copy expected, got $stagedCandidates", stagedCandidates.none { it.readText() == "host-secret" })
+        assertTrue(!File(LinuxInboxStager.hostOutboxDir(filesDir), "link.txt").exists())
+    }
+
+    @Test fun collectFile_symlinkProduct_deniedWithoutCopy() {
+        // guest outbox 內 symlink 產物直拒（不跟隨讀宿主檔）。
+        val container = "symlinkcollect"
+        val outbox = LinuxInboxStager.guestOutboxDir(filesDir, container).apply { mkdirs() }
+        val outside = File(treeRoot, "collect-outside.txt").apply { writeText("collect-secret") }
+        val link = File(outbox, "evil.apk")
+        try {
+            link.delete()
+        } catch (_: Exception) {
+        }
+        Files.createSymbolicLink(link.toPath(), outside.toPath())
+        val r = LinuxInboxStager.collectFile(filesDir, container, "/outbox/evil.apk")
+        assertTrue("expected Denied, got $r", r is LinuxInboxStager.CollectOutcome.Denied)
+        assertEquals("NOT_A_FILE", (r as LinuxInboxStager.CollectOutcome.Denied).code)
+        assertTrue(!File(LinuxInboxStager.hostOutboxDir(filesDir), "evil.apk").exists())
+    }
+
+    @Test fun stageFile_destPreplantedSymlink_noOverwriteOutside() {
+        // 攻擊者預測 id，預植 rootfs/inbox/<id>-<name> symlink 到外部：
+        // stage 不得跟隨覆寫外部受害檔。
+        val container = "preplant"
+        val src = hostInboxFile("victim-src.txt", "good-payload".toByteArray())
+        val victimOutside = File(treeRoot, "preplant-victim.txt").apply { writeText("do-not-overwrite") }
+        val destDir = File(LinuxEnv.containerRootfs(filesDir, container) + "/inbox").apply { mkdirs() }
+        val predicted = File(destDir, "deadbeef-victim-src.txt")
+        try {
+            predicted.delete()
+        } catch (_: Exception) {
+        }
+        Files.createSymbolicLink(predicted.toPath(), victimOutside.toPath())
+        val out = LinuxInboxStager.stageFile(filesDir, container, src, id = "deadbeef")
+        // 允許成功（先刪 link 再建 regular file）或明確拒絕，但絕不能覆寫外部。
+        assertEquals("do-not-overwrite", victimOutside.readText())
+        if (out is LinuxInboxStager.StageOutcome.Staged) {
+            assertTrue(!Files.isSymbolicLink(out.hostFile.toPath()))
+            assertEquals("good-payload", out.hostFile.readText())
+        } else {
+            assertTrue(out is LinuxInboxStager.StageOutcome.Denied)
+        }
+    }
+
+    @Test fun containerLocks_serializeStageCollectAndExec() {
+        // 同容器 stage/collect/exec 共用同一鎖：併發跑不應拋、不應逃逸。
+        val container = "raceser"
+        val src = hostInboxFile("race.txt", "race-payload".toByteArray())
+        // 保證 outbox 為實目錄（隔離前序 symlink 污染）。
+        val outbox = LinuxInboxStager.guestOutboxDir(filesDir, container).apply { mkdirs() }
+        if (Files.isSymbolicLink(File(LinuxEnv.containerRootfs(filesDir, container), "outbox").toPath())) {
+            File(LinuxEnv.containerRootfs(filesDir, container), "outbox").deleteRecursively()
+            outbox.mkdirs()
+        }
+        File(outbox, "race.apk").writeBytes("race-artifact".toByteArray())
+        // 同 key 同實例，不同容器不同實例。
+        assertTrue(LinuxInboxStager.lockFor(filesDir, container) === LinuxInboxStager.lockFor(filesDir, container))
+        assertTrue(LinuxInboxStager.lockFor(filesDir, container) !== LinuxInboxStager.lockFor(filesDir, "other"))
+
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+        try {
+            val start = java.util.concurrent.CountDownLatch(1)
+            val done = java.util.concurrent.CountDownLatch(12)
+            val errors = java.util.concurrent.CopyOnWriteArrayList<Throwable>()
+            repeat(4) { i ->
+                pool.submit {
+                    try {
+                        start.await()
+                        val r = LinuxInboxStager.stageFile(filesDir, container, src, id = "race${i}abc")
+                        if (r !is LinuxInboxStager.StageOutcome.Staged && r !is LinuxInboxStager.StageOutcome.Denied) {
+                            error("unexpected $r")
+                        }
+                    } catch (t: Throwable) {
+                        errors.add(t)
+                    } finally {
+                        done.countDown()
+                    }
+                }
+                pool.submit {
+                    try {
+                        start.await()
+                        val r = LinuxInboxStager.collectFile(filesDir, container, "/outbox/race.apk")
+                        if (r !is LinuxInboxStager.CollectOutcome.Collected && r !is LinuxInboxStager.CollectOutcome.Denied) {
+                            error("unexpected $r")
+                        }
+                    } catch (t: Throwable) {
+                        errors.add(t)
+                    } finally {
+                        done.countDown()
+                    }
+                }
+                pool.submit {
+                    try {
+                        start.await()
+                        val runner = object : dev.librepocket.shell.ProcessRunner {
+                            override fun run(
+                                argv: List<String>,
+                                timeoutMs: Long,
+                                env: Map<String, String>?,
+                            ): dev.librepocket.shell.RawOutput {
+                                Thread.sleep(5)
+                                return dev.librepocket.shell.RawOutput("ok".toByteArray(), ByteArray(0), 0, false)
+                            }
+                        }
+                        val r = ProotExec.execute(
+                            listOf("echo", "hi"), filesDir, container, Flavor.GITHUB, true, runner,
+                        )
+                        if (r !is ShellResult.Ok && r !is ShellResult.Denied) {
+                            error("unexpected $r")
+                        }
+                    } catch (t: Throwable) {
+                        errors.add(t)
+                    } finally {
+                        done.countDown()
+                    }
+                }
+            }
+            start.countDown()
+            assertTrue(done.await(30, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue("concurrent errors: $errors", errors.isEmpty())
+        } finally {
+            pool.shutdownNow()
+        }
+    }
 }

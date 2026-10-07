@@ -2,6 +2,7 @@ package dev.librepocket.linux
 
 import dev.librepocket.redact.Redactor
 import dev.librepocket.shell.ProcessRunner
+import dev.librepocket.shell.RawOutput
 import dev.librepocket.shell.ShellDeny
 import dev.librepocket.shell.ShellPolicy
 import dev.librepocket.shell.ShellQuota
@@ -195,14 +196,25 @@ object ProotExec {
         if (!quota.tryAcquire()) {
             return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "linux.exec quota exceeded")
         }
-        val raw = try {
-            runner.run(
-                LinuxEnv.prootCmd(LinuxEnv.prootBin(filesDir), rootfs, guestArgv),
-                timeoutMs,
-                LinuxEnv.GUEST_ENV,
-            )
-        } catch (e: Exception) {
-            return ShellResult.Failed("spawn failed: ${e.message}")
+        // TOCTOU 序列化（PR#1 comment 6039436820 P1）：spawn 持同容器鎖，
+        // 與 LinuxInboxStager.stageFile/collectFile 同臨界，確保 staging/
+        // collect 的 check→copy 期間沒有 guest 進程併發改 rootfs 路徑。
+        // 純政策否決不持鎖；只有真正會觸及容器 FS 的 spawn 持鎖。
+        val containerLock = LinuxInboxStager.lockFor(filesDir, container)
+        val raw: RawOutput
+        containerLock.lock()
+        try {
+            raw = try {
+                runner.run(
+                    LinuxEnv.prootCmd(LinuxEnv.prootBin(filesDir), rootfs, guestArgv),
+                    timeoutMs,
+                    LinuxEnv.GUEST_ENV,
+                )
+            } catch (e: Exception) {
+                return ShellResult.Failed("spawn failed: ${e.message}")
+            }
+        } finally {
+            containerLock.unlock()
         }
         val out = ShellPolicy.truncate(raw.stdout)
         val err = ShellPolicy.truncate(raw.stderr)

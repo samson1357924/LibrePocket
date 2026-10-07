@@ -1134,6 +1134,147 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // Q3: a hidden outbox entry is unreachable until an explicit restore —
+    // no new provider request may be required to get it back. first/second/
+    // third are cancelled pre-accept; first fills the box, the rest wait.
+    // Resending first while typing temp skips the drain; clearing temp still
+    // leaves the outbox hidden; only restoreNextRecovered() surfaces it, with
+    // zero provider calls; discard drops the head without touching the box.
+    @Test
+    fun hiddenOutboxSurfacedViaExplicitRestoreWithoutNewRequest() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val acceptArrived = AtomicInteger()
+        val releaseAccept = CompletableDeferred<Unit>()
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.acceptGate = {
+            acceptArrived.incrementAndGet()
+            releaseAccept.await()
+        }
+        sessions.sendGate = { text ->
+            if (text == "first") releaseTurn.await()
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            chatMain.run { vm.sendDirect("second") }
+            chatMain.run { vm.sendDirect("third") }
+            withTimeout(5_000) {
+                while (acceptArrived.get() < 3) delay(1)
+            }
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { vm.input.first { it == "first" } }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 2 } }
+            val cancelled = sessions.awaitCreated(1)
+            releaseAccept.complete(Unit)
+            withTimeout(5_000) { cancelled.closed.await() }
+            assertTrue(cancelled.sent.isEmpty())
+
+            // Resend first; type temp during its turn; drain skips non-blank.
+            chatMain.run { vm.send() }
+            val live = sessions.awaitCreated(2)
+            chatMain.run { vm.onInputChange("temp") }
+            releaseTurn.complete(Unit)
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("first"), live.sent.toList())
+            assertEquals("temp", vm.input.value)
+            assertEquals(2, vm.pendingRecoveryCount.value)
+
+            // Clear temp: still idle with no entry — the outbox stays hidden.
+            chatMain.run { vm.onInputChange("") }
+            assertEquals("", vm.input.value)
+            assertEquals(2, vm.pendingRecoveryCount.value)
+            assertFalse(vm.canRetry)
+
+            // Explicit restore: oldest first, zero provider calls.
+            var restored = false
+            val callsBefore = sessions.createCalls
+            val sentBefore = live.sent.size
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertTrue(restored)
+            assertEquals("second", vm.input.value)
+            assertEquals(1, vm.pendingRecoveryCount.value)
+            assertEquals(callsBefore, sessions.createCalls)
+            assertEquals(sentBefore, live.sent.size)
+
+            // Non-blank restore never overwrites.
+            chatMain.run { vm.onInputChange("keep") }
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertFalse(restored)
+            assertEquals("keep", vm.input.value)
+            chatMain.run { vm.onInputChange("second") }
+
+            // Discard drops the head (third) without touching the box.
+            var discarded = false
+            chatMain.run { discarded = vm.discardNextRecovered() }
+            assertTrue(discarded)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals("second", vm.input.value)
+
+            // Send the restored text; nothing resurrects afterwards.
+            chatMain.run { vm.send() }
+            withTimeout(5_000) {
+                while (live.sent.size < 2) delay(1)
+            }
+            assertEquals(listOf("first", "second"), live.sent.toList())
+            assertEquals("", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+        } finally {
+            releaseAccept.complete(Unit)
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // Q3: a stashed op (cancelled while the box was occupied) is restorable
+    // after the box is cleared, with zero provider calls and zero sends.
+    @Test
+    fun stashedOpRestorableWithoutNetworkAfterBoxCleared() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val acceptEntered = CompletableDeferred<Unit>()
+        val releaseAccept = CompletableDeferred<Unit>()
+        sessions.acceptGate = {
+            acceptEntered.complete(Unit)
+            releaseAccept.await()
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            withTimeout(5_000) { acceptEntered.await() }
+            chatMain.run { vm.onInputChange("typed-later") }
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            assertEquals("typed-later", vm.input.value)
+            val cancelled = sessions.awaitCreated(1)
+            releaseAccept.complete(Unit)
+            withTimeout(5_000) { cancelled.closed.await() }
+            assertTrue(cancelled.sent.isEmpty())
+            val callsBefore = sessions.createCalls
+
+            // Occupied box: restore refuses without overwriting.
+            var restored = true
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertFalse(restored)
+            assertEquals("typed-later", vm.input.value)
+
+            // Clear and restore: the text comes back with no network effect.
+            chatMain.run { vm.onInputChange("") }
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertTrue(restored)
+            assertEquals("first", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(callsBefore, sessions.createCalls)
+            assertTrue(cancelled.sent.isEmpty())
+        } finally {
+            releaseAccept.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     private class GatedFirstAllowPolicy : PolicyStore {
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()

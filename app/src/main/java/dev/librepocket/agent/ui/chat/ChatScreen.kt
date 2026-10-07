@@ -93,6 +93,7 @@ fun ChatScreen(
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val input by viewModel.input.collectAsStateWithLifecycle()
     val notice by viewModel.notice.collectAsStateWithLifecycle()
+    val pendingRecoveryCount by viewModel.pendingRecoveryCount.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val streaming = session.status == ChatStatus.STREAMING
     var wasActive by remember { mutableStateOf(false) }
@@ -303,6 +304,27 @@ fun ChatScreen(
                 color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(horizontal = 16.dp),
             )
+        }
+
+        // Q3: outbox recovery entry. Restoring fills a blank box only and
+        // never sends; both actions cost zero provider calls.
+        if (pendingRecoveryCount > 0) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "有 $pendingRecoveryCount 則未送出的訊息可恢復",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = viewModel::restoreNextRecovered) { Text("恢復") }
+                TextButton(onClick = viewModel::discardNextRecovered) { Text("捨棄") }
+            }
         }
 
         voiceError?.let {

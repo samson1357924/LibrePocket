@@ -125,7 +125,7 @@ class DecompileAnalyzeTest {
     }
 
     private class OkRunner : ProcessRunner {
-        override fun run(argv: List<String>, timeoutMs: Long): RawOutput =
+        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput =
             RawOutput("ok".toByteArray(), ByteArray(0), 0, false)
     }
 

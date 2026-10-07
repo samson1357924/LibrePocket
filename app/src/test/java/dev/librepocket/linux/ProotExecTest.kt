@@ -1,5 +1,6 @@
 package dev.librepocket.linux
 
+import dev.librepocket.shell.DefaultProcessRunner
 import dev.librepocket.shell.ProcessRunner
 import dev.librepocket.shell.RawOutput
 import dev.librepocket.shell.ShellDeny
@@ -29,9 +30,11 @@ class ProotExecTest {
     ) : ProcessRunner {
         var calls: Int = 0
         var lastArgv: List<String>? = null
-        override fun run(argv: List<String>, timeoutMs: Long): RawOutput {
+        var lastEnv: Map<String, String>? = null
+        override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput {
             calls++
             lastArgv = argv
+            lastEnv = env
             return RawOutput(stdout, stderr, 0, timedOut)
         }
     }
@@ -50,7 +53,10 @@ class ProotExecTest {
     @Test fun union_allowsHostAndGuestBinaries() {
         for (argv in listOf(
             listOf("echo", "hi"),
-            listOf("ls", "/data/data/dev.librepocket.agent/files/linux/containers/alpine/rootfs/etc"),
+            // Guest 命名空間：容器內路徑用 guest 絕對路徑（/etc），
+            // host 側 `.../linux/containers/.../rootfs/...` 一律 fail-closed
+            //（見 hostAbsolutePaths_deniedWithoutSpawn），此處不再當正例。
+            listOf("ls", "/etc"),
             listOf("python3", "--version"),
             listOf("gcc", "--version"),
             listOf("make", "-j4"),
@@ -160,6 +166,74 @@ class ProotExecTest {
         assertEquals(listOf("-r", "$filesDir/linux/containers/alpine/rootfs"), spawned.subList(1, 3))
         assertTrue(spawned.none { it == "-b" || it == "--bind" })
         assertEquals(listOf("cat", "/inbox/1a2b3c4d-x.txt"), spawned.takeLast(2))
+    }
+
+    @Test fun hostAbsolutePaths_deniedWithoutSpawn() {
+        // PR#1 comment 6038761291 blocker 2：guest argv 一律 guest namespace；
+        // 任何指向 filesDir/linux 整樹的 host 絕對路徑在真實 proot -r 下只會
+        // ENOENT，故 fail-closed 且不建子進程（不只 tmp/inbox 一支）。
+        val cases = listOf(
+            listOf("ls", "$filesDir/linux/containers/alpine/rootfs/etc"),
+            listOf("ls", "$filesDir/linux/containers/other/rootfs/etc"),
+            listOf("cat", "$filesDir/linux/cache/x.bin"),
+            listOf("cat", "$filesDir/linux/tmp/outbox/x.bin"),
+            listOf("ls", "$filesDir/linux/bin/proot"),
+            listOf("cat", "$filesDir/linux/image/alpine.tar.gz"),
+            listOf("cat", "--file=$filesDir/linux/containers/alpine/rootfs/etc/passwd"),
+        )
+        for (argv in cases) {
+            val runner = FakeRunner()
+            val result = exec(argv, runner = runner)
+            assertTrue("expected Denied for $argv, got $result", result is ShellResult.Denied)
+            assertEquals("$argv", ShellDeny.BLACKLISTED, (result as ShellResult.Denied).reason)
+            assertEquals("$argv", 0, runner.calls)
+        }
+    }
+
+    @Test fun hostLinuxAbsoluteRef_normalizesVariants() {
+        val root = LinuxEnv.root(filesDir)
+        assertTrue(LinuxInboxStager.hostLinuxAbsoluteRef(listOf("cat", "$root/containers/alpine/rootfs/etc"), filesDir) != null)
+        assertTrue(LinuxInboxStager.hostLinuxAbsoluteRef(listOf("cat", "$root//containers/alpine/rootfs/etc"), filesDir) != null)
+        assertTrue(LinuxInboxStager.hostLinuxAbsoluteRef(listOf("cat", "--file=$root/cache/x"), filesDir) != null)
+        assertEquals(null, LinuxInboxStager.hostLinuxAbsoluteRef(listOf("cat", "/inbox/x.txt"), filesDir))
+        assertEquals(null, LinuxInboxStager.hostLinuxAbsoluteRef(listOf("cat", "/etc/passwd"), filesDir))
+        assertEquals(null, LinuxInboxStager.hostLinuxAbsoluteRef(listOf("echo", "hi"), filesDir))
+    }
+
+    @Test fun guestEnv_enforcedOnSpawn() {
+        // PR#1 comment 6038761291 blocker 3：乾淨 guest env 必須是執行不變量，
+        // 不只常量斷言。FakeRunner 必須收到 GUEST_ENV 全等表。
+        val runner = FakeRunner()
+        val result = exec(listOf("echo", "hi"), runner = runner)
+        assertTrue("expected Ok, got $result", result is ShellResult.Ok)
+        assertEquals(LinuxEnv.GUEST_ENV, runner.lastEnv)
+        // 拒絕路徑不建子進程、不洩 env。
+        val deniedRunner = FakeRunner()
+        val denied = exec(listOf("cat", "$filesDir/linux/containers/alpine/rootfs/etc"), runner = deniedRunner)
+        assertTrue(denied is ShellResult.Denied)
+        assertEquals(0, deniedRunner.calls)
+        assertEquals(null, deniedRunner.lastEnv)
+    }
+
+    @Test fun defaultRunner_clearsHostEnv() {
+        // 真實 DefaultProcessRunner：非 null env 即 clear()+putAll，不繼承宿主。
+        // 用 `env` 二進位回顯子進程環境（Linux CI 必備；缺失則跳過）。
+        val probe = try {
+            DefaultProcessRunner().run(listOf("env"), 5_000L, mapOf("ONLY_GUEST_VAR" to "guest123"))
+            true
+        } catch (_: Exception) {
+            false
+        }
+        if (!probe) return
+        val out = DefaultProcessRunner().run(listOf("env"), 5_000L, LinuxEnv.GUEST_ENV)
+        val text = String(out.stdout, Charsets.UTF_8)
+        val lines = text.lineSequence().map { it.substringBefore('=') }.toSet()
+        assertTrue("PATH missing", "PATH" in lines)
+        assertTrue(text.contains("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"))
+        assertTrue(text.contains("HOME=/root"))
+        assertTrue("LD_PRELOAD leaked", lines.none { it == "LD_PRELOAD" })
+        assertTrue("PROOT_* leaked", lines.none { it.startsWith("PROOT_") })
+        assertTrue("proxy leaked", lines.none { it.equals("http_proxy", ignoreCase = true) || it.equals("https_proxy", ignoreCase = true) })
     }
 
     // ---- 超時/配額/截斷沿用宿主同一套 ----

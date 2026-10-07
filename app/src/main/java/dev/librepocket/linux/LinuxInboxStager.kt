@@ -19,7 +19,7 @@ import java.util.UUID
  * - 出：[collectFile] 把 guest `/outbox/...` 產物反向 bounded copy 到
  *   host `linux/tmp/outbox/`（上限由呼叫方指定，預設 [LinuxEnv.INBOX_MAX_BYTES]）。
  * - [ProotExec.execute] 對未 stage 的 host inbox 路徑 fail-closed
- *  （見 [ProotExec.unstagedInboxVeto]），逼呼叫方先走本通道。
+ *  （見 [unstagedInboxRef]），逼呼叫方先走本通道。
  *
  * 本檔案零 Android 依賴，JVM 單測可用真實暫存目錄斷言。
  */
@@ -81,6 +81,40 @@ object LinuxInboxStager {
                 val norm = FileScope.normalize(candidate)
                 if (norm == inbox || norm.startsWith("$inbox/")) {
                     return "unstaged host inbox path denied (stage via LinuxInboxStager first): $arg"
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Guest argv 是否引用任何 host 側 Linux 樹絕對路徑（fail-closed 守衛，
+     * [ProotExec.execute] 在 validate 之前呼叫）。
+     *
+     * 背景：真實 PRoot 用 `proot -r <container/rootfs> -w /` 且無 bind，
+     * guest 命名空間只有 `/inbox/...`、`/outbox/...`、`/etc` 等容器內路徑；
+     * 任何指向 `filesDir/linux` 整樹的 host 絕對路徑在 guest 內都只會
+     * `ENOENT`（`unstagedInboxRef` 只擋其中 `tmp/inbox` 一支，同一
+     * namespace confusion 仍存在於 `containers/.../rootfs/...`、
+     * `cache/...`、`tmp/outbox/...`、`bin/proot` 等）。
+     *
+     * 故 guest argv 一律用 guest namespace：host↔guest 資料只經
+     * [stageFile]/[collectFile] 顯式映射；命中回否決訊息，否則 null。
+     * 比對口徑與 [unstagedInboxRef] 一致（含 `--opt=/...` 值抽取）。
+     */
+    fun hostLinuxAbsoluteRef(argv: List<String>, filesDir: String): String? {
+        if (filesDir.isEmpty()) return null
+        val root = FileScope.normalize(LinuxEnv.root(filesDir))
+        for (arg in argv) {
+            val candidates = mutableListOf(arg)
+            val eq = arg.indexOf('=')
+            if (eq >= 0 && eq + 1 < arg.length && arg[eq + 1] == '/') {
+                candidates.add(arg.substring(eq + 1))
+            }
+            for (candidate in candidates) {
+                val norm = FileScope.normalize(candidate)
+                if (norm == root || norm.startsWith("$root/")) {
+                    return "host linux path denied in guest argv (use /inbox/... guest paths via LinuxInboxStager): $arg"
                 }
             }
         }
@@ -190,13 +224,21 @@ object LinuxInboxStager {
      *
      * 門禁順序：容器/作用域 → guest 路徑必須是 `/outbox/` 下單段檔名
      * （`GUEST_PATH_REJECTED`，含 `/inbox` 輸入、巢狀、`..` 一律拒）→
-     * 來源存在且為普通檔 → 大小上限（`OUTPUT_TOO_LARGE`）→ 複製 → 覆核。
+     * outbox 根 canonical 必須嚴格等於 `rootfs/outbox`
+     * （`OUTBOX_ESCAPES_ROOTFS`，防 rootfs 內 `outbox -> <rootfs 外>` 目錄
+     * symlink 讓 canonical 塌縮後 `parent == outbox` 恆成立）→
+     * 來源存在且為普通檔 → 大小上限（`OUTPUT_TOO_LARGE`）→
+     * [LinuxEnv.quotaVeto] 總量/容器配額（`usedTotalBytes`/
+     * `usedContainerBytes`，collect 是複製故須計入，與 [stageFile] 同策）→
+     * 複製 → 覆核。
      */
     fun collectFile(
         filesDir: String,
         container: String,
         guestPath: String,
         maxBytes: Long = LinuxEnv.INBOX_MAX_BYTES,
+        usedTotalBytes: Long = 0L,
+        usedContainerBytes: Long = 0L,
     ): CollectOutcome {
         if (LinuxEnv.containerVeto(filesDir, container) != null) return CollectOutcome.Denied("BAD_CONTAINER_OR_SCOPE")
         if (maxBytes < 0) return CollectOutcome.Denied("NEGATIVE_SIZE")
@@ -207,6 +249,15 @@ object LinuxInboxStager {
             return CollectOutcome.Denied("GUEST_PATH_REJECTED")
         }
         if (!SAFE_NAME.matches(name)) return CollectOutcome.Denied("GUEST_PATH_REJECTED")
+        // 縱深：先把 rootfs canonical 化，再要求 outbox 根 canonical 嚴格等於
+        // `rootfs/outbox`（字串全等）。若 rootfs/outbox 本身是 symlink（指向
+        // rootfs 外或 rootfs 內他處），canonical 會塌縮到他處，此處即 fail-closed，
+        // 不會走到後續 `src.parent == outbox` 的恆真比較。
+        val rootfs = try {
+            File(LinuxEnv.containerRootfs(filesDir, container)).canonicalFile
+        } catch (_: Exception) {
+            return CollectOutcome.Denied("BAD_CONTAINER_OR_SCOPE")
+        }
         val src = File(guestOutboxDir(filesDir, container), name)
         val srcCanonical = try {
             src.canonicalFile
@@ -218,10 +269,14 @@ object LinuxInboxStager {
         } catch (_: Exception) {
             return CollectOutcome.Denied("BAD_CONTAINER_OR_SCOPE")
         }
+        val expectedOutbox = rootfs.path + File.separator + "outbox"
+        if (outboxRoot.path != expectedOutbox) return CollectOutcome.Denied("OUTBOX_ESCAPES_ROOTFS")
         if (srcCanonical.parent != outboxRoot.path) return CollectOutcome.Denied("GUEST_PATH_REJECTED")
         if (!srcCanonical.isFile) return CollectOutcome.Denied("NOT_A_FILE")
         val size = srcCanonical.length()
         if (size > maxBytes) return CollectOutcome.Denied("OUTPUT_TOO_LARGE")
+        val quotaVeto = LinuxEnv.quotaVeto(usedTotalBytes, usedContainerBytes, size)
+        if (quotaVeto != null) return CollectOutcome.Denied(quotaVeto)
         val destDir = hostOutboxDir(filesDir)
         if (!destDir.isDirectory && !destDir.mkdirs()) return CollectOutcome.Denied("COLLECT_MKDIRS_FAILED")
         val dest = File(destDir, safeName(name))

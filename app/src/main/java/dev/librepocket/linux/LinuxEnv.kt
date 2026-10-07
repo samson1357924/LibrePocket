@@ -63,6 +63,12 @@ object LinuxEnv {
     /**
      * 乾淨 guest 環境：固定最小集合，宿主環境變數一律不繼承
      * （阻斷 `LD_PRELOAD` / `PROOT_*` / 代理變數污染容器）。
+     *
+     * 執行不變量：[ProotExec.execute] 經 [dev.librepocket.shell.ProcessRunner]
+     * 的 `env` 參數傳入本表；[dev.librepocket.shell.DefaultProcessRunner]
+     * 遇非 null env 即 `clear()` 後全量替換，不繼承宿主 env
+     * （見 `ProotExecTest.guestEnv_enforcedOnSpawn` 與
+     * `ProotExecTest.defaultRunner_clearsHostEnv`）。
      */
     val GUEST_ENV: Map<String, String> = mapOf(
         "PATH" to "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

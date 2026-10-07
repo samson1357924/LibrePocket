@@ -18,11 +18,14 @@ import dev.librepocket.tool.Flavor
  *   同一程式碼路徑：黑名單二進位 → 全文片段 → 參數衛生 → find 高危謂詞，
  *   見 `allowedBinaries` 參數）。`git` 不在聯集內：取源一律經 inbox 進件，
  *   容器內不得直抓（`curl/wget` 同理不在聯集）。
- * - 檔案域：guest 絕對路徑以整個 `filesDir/linux` 樹（PRIVATE）為作用域
- *   （容器 rootfs 與 inbox 同屬該樹；guest 越界由 PRoot `-r` 在執行時約束，
- *   argv 層只擋樹外路徑）；SAF 樹路徑即使橋接已授權亦拒絕（禁 `--bind`，
- *   進出走 inbox 複製，見 [LinuxInboxStager]）。`bridgeGranted` 固定 false
- *   （fail-closed）。
+ * - 檔案域：guest argv 一律用 guest namespace（`/inbox/...`、`/outbox/...`、
+ *   `/etc` 等容器內路徑；host↔guest 資料只經 [LinuxInboxStager.stageFile] /
+ *   [LinuxInboxStager.collectFile] 顯式映射）。任何指向 `filesDir/linux`
+ *   整樹的 host 絕對路徑（`containers/.../rootfs/...`、`cache/...`、
+ *   `tmp/outbox/...`、`bin/proot` 等，不只 `tmp/inbox`）在真實
+ *   `proot -r` 下只會 `ENOENT`，故在 argv 層直接 fail-closed
+ *   （[LinuxInboxStager.hostLinuxAbsoluteRef]；SAF 樹路徑即使橋接已授權亦拒絕，
+ *   禁 `--bind`）。`bridgeGranted` 固定 false（fail-closed）。
  * - Host inbox 路徑（`filesDir/linux/tmp/inbox/...`）在 guest argv 內一律
  *   否決（[LinuxInboxStager.unstagedInboxRef]）：該路徑是 rootfs 的 sibling，
  *   真實 PRoot 下 guest 看不見（`-r` 無 bind 即 `ENOENT`）；呼叫方必須先經
@@ -96,7 +99,9 @@ object ProotExec {
      * 門禁順序（固定）：風味/開關（[denyReasonFor]）→ 容器/作用域 →
      * proot 權限（[LinuxEnv.prootBinModeVeto]）→ 落盤配額
      * （[LinuxEnv.quotaVeto]）→ bind 封堵 → 未 stage inbox 封堵
-     * （[LinuxInboxStager.unstagedInboxRef]）→ 白名單/黑名單/檔案域
+     * （[LinuxInboxStager.unstagedInboxRef]）→ host Linux 樹封堵
+     * （[LinuxInboxStager.hostLinuxAbsoluteRef]，guest argv 一律 guest
+     * namespace）→ 白名單/黑名單/檔案域
      * （[ShellPolicy.validate]）→ 速率配額 → spawn。
      *
      * @param filesDir App 私有域根（作用域為 `filesDir/linux` 整樹，
@@ -165,6 +170,13 @@ object ProotExec {
         if (inboxRef != null) {
             return ShellResult.Denied(ShellDeny.BLACKLISTED, inboxRef)
         }
+        // Host Linux 樹絕對路徑在 guest namespace 下無意義（真機 ENOENT）：
+        // 容器內只認 /inbox/...、/outbox/...、/etc 等 guest 路徑，
+        // host↔guest 只經 LinuxInboxStager 顯式映射。
+        val hostRef = LinuxInboxStager.hostLinuxAbsoluteRef(guestArgv, filesDir)
+        if (hostRef != null) {
+            return ShellResult.Denied(ShellDeny.BLACKLISTED, hostRef)
+        }
         val rootfs = LinuxEnv.containerRootfs(filesDir, container)
         when (
             val v = ShellPolicy.validate(
@@ -184,7 +196,11 @@ object ProotExec {
             return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "linux.exec quota exceeded")
         }
         val raw = try {
-            runner.run(LinuxEnv.prootCmd(LinuxEnv.prootBin(filesDir), rootfs, guestArgv), timeoutMs)
+            runner.run(
+                LinuxEnv.prootCmd(LinuxEnv.prootBin(filesDir), rootfs, guestArgv),
+                timeoutMs,
+                LinuxEnv.GUEST_ENV,
+            )
         } catch (e: Exception) {
             return ShellResult.Failed("spawn failed: ${e.message}")
         }

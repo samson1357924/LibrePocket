@@ -118,6 +118,66 @@ class LinuxInboxStagerTest {
         }
     }
 
+    @Test fun collectFile_outboxSymlinkEscape_denied() {
+        // PR#1 comment 6038761291 blocker 1：rootfs/outbox -> <rootfs 外> 目錄
+        // symlink 時，canonical 塌縮會讓舊 `parent == outbox` 恆成立；
+        // 新門禁要求 outbox 根 canonical 嚴格等於 rootfs/outbox。
+        val rootfs = File(LinuxEnv.containerRootfs(filesDir, "alpine")).apply { mkdirs() }
+        val outside = File(treeRoot, "outside-secret").apply { mkdirs() }
+        File(outside, "secret.txt").writeText("host-secret")
+        val outboxLink = File(rootfs, "outbox")
+        // 若已存在實目錄（前序測試建立），先清空再換成 symlink。
+        if (outboxLink.isDirectory && !java.nio.file.Files.isSymbolicLink(outboxLink.toPath())) {
+            outboxLink.deleteRecursively()
+        }
+        if (!outboxLink.exists()) {
+            java.nio.file.Files.createSymbolicLink(outboxLink.toPath(), outside.toPath())
+        } else if (!java.nio.file.Files.isSymbolicLink(outboxLink.toPath())) {
+            // 已是實目錄且非空：改用新容器名隔離此逃逸場景。
+            val altOutbox = LinuxInboxStager.guestOutboxDir(filesDir, "evil").apply { parentFile.mkdirs() }
+            altOutbox.parentFile.mkdirs()
+            File(LinuxEnv.containerRootfs(filesDir, "evil")).mkdirs()
+            val altLink = File(LinuxEnv.containerRootfs(filesDir, "evil"), "outbox")
+            if (altLink.exists()) altLink.deleteRecursively()
+            java.nio.file.Files.createSymbolicLink(altLink.toPath(), outside.toPath())
+            val r = LinuxInboxStager.collectFile(filesDir, "evil", "/outbox/secret.txt")
+            assertTrue("expected Denied, got $r", r is LinuxInboxStager.CollectOutcome.Denied)
+            assertEquals("OUTBOX_ESCAPES_ROOTFS", (r as LinuxInboxStager.CollectOutcome.Denied).code)
+            assertTrue(!File(LinuxInboxStager.hostOutboxDir(filesDir), "secret.txt").exists())
+            return
+        }
+        val r = LinuxInboxStager.collectFile(filesDir, "alpine", "/outbox/secret.txt")
+        assertTrue("expected Denied, got $r", r is LinuxInboxStager.CollectOutcome.Denied)
+        assertEquals("OUTBOX_ESCAPES_ROOTFS", (r as LinuxInboxStager.CollectOutcome.Denied).code)
+        assertTrue(!File(LinuxInboxStager.hostOutboxDir(filesDir), "secret.txt").exists())
+    }
+
+    @Test fun collectFile_deniedNearTotalQuota_noCopy() {
+        // PR#1 comment 6038761291 blocker 4：collect 是複製（rootfs/outbox ->
+        // linux/tmp/outbox，兩端同屬 linux 樹），必須納入 TOTAL/CONTAINER 配額。
+        val outbox = LinuxInboxStager.guestOutboxDir(filesDir, "quota").apply { mkdirs() }
+        // 若 outbox 曾被前一測試換成 symlink，先恢復成實目錄。
+        if (java.nio.file.Files.isSymbolicLink(File(LinuxEnv.containerRootfs(filesDir, "quota"), "outbox").toPath())) {
+            File(LinuxEnv.containerRootfs(filesDir, "quota"), "outbox").deleteRecursively()
+            outbox.mkdirs()
+        }
+        File(outbox, "victim.bin").writeBytes(ByteArray(8 * 1024) { 1 })
+        val nearTotal = LinuxInboxStager.collectFile(
+            filesDir, "quota", "/outbox/victim.bin",
+            usedTotalBytes = LinuxEnv.TOTAL_BYTES - 1024,
+        )
+        assertTrue("expected Denied, got $nearTotal", nearTotal is LinuxInboxStager.CollectOutcome.Denied)
+        assertEquals("TOTAL_QUOTA_4G", (nearTotal as LinuxInboxStager.CollectOutcome.Denied).code)
+        assertTrue(!File(LinuxInboxStager.hostOutboxDir(filesDir), "victim.bin").exists())
+        // 邊界：usedTotal + size == TOTAL 即放行（此容器用獨立檔名避免污染）。
+        File(outbox, "edge.bin").writeBytes(ByteArray(1024) { 2 })
+        val edge = LinuxInboxStager.collectFile(
+            filesDir, "quota", "/outbox/edge.bin",
+            usedTotalBytes = LinuxEnv.TOTAL_BYTES - 1024,
+        )
+        assertTrue("expected Collected, got $edge", edge is LinuxInboxStager.CollectOutcome.Collected)
+    }
+
     @Test fun unstagedInboxRef_normalizesVariants() {
         val inbox = LinuxEnv.inboxDir(filesDir)
         assertTrue(LinuxInboxStager.unstagedInboxRef(listOf("cat", "$inbox/x.txt"), filesDir) != null)
@@ -163,6 +223,7 @@ class LinuxInboxStagerTest {
             override fun run(
                 argv: List<String>,
                 timeoutMs: Long,
+                env: Map<String, String>? = null,
             ): dev.librepocket.shell.RawOutput {
                 spawned = argv
                 return dev.librepocket.shell.RawOutput("ok".toByteArray(), ByteArray(0), 0, false)

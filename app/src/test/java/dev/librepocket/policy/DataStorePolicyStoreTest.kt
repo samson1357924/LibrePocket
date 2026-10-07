@@ -7,6 +7,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -76,9 +77,11 @@ class DataStorePolicyStoreTest {
     fun setRulePersistsAcrossInstances() = runBlocking {
         val dir = Files.createTempDirectory("policy-persist").toFile()
         tmpDirs.add(dir)
+        val openedScopes = ArrayList<CoroutineScope>()
         fun open(): DataStorePolicyStore {
             val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
             scopes.add(scope)
+            openedScopes.add(scope)
             val dataStore = PreferenceDataStoreFactory.create(
                 scope = scope,
                 produceFile = { java.io.File(dir, "policy.preferences_pb") },
@@ -89,10 +92,14 @@ class DataStorePolicyStoreTest {
         val first = open()
         first.evaluateFresh("key.read", "x") // seed
         first.setRule(PolicyRule("key.read:*", Verdict.DENY, 10))
+        // 耐久屏障：等 DataStore 把本次寫入落盤後再模擬重啟。
+        // 舊碼在 setRule 後立刻 cancel scope，會競掉後台 IO（CI 單發 flake
+        // `DataStorePolicyStoreTest.setRulePersistsAcrossInstances` 即此）。
+        first.dataStore.data.first()
 
         // DataStore is single-instance-per-file per process: retire the first
         // instance's scope before opening the second (mirrors process restart).
-        scopes[0].cancel()
+        openedScopes[0].cancel()
 
         val second = open()
         // A fresh instance serves its in-memory snapshot until the first

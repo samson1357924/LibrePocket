@@ -8,9 +8,15 @@ import java.util.concurrent.TimeUnit
 /**
  * 子進程跑道抽象：預設走真實 [ProcessBuilder]，單測可注入假實現，
  * 讓「輸出截斷」等斷言不依賴宿主機二進位。
+ *
+ * @param env 子進程環境：非 null 時真實 runner 必須 `clear()` 後全量替換
+ * （不繼承宿主 env，阻斷 `LD_PRELOAD` / `PROOT_*` / 代理污染）；
+ * null 表示繼承宿主 env（僅宿主直接 shell 通道使用；PRoot guest 通道
+ * 必須傳 [dev.librepocket.linux.LinuxEnv.GUEST_ENV]，見
+ * [dev.librepocket.linux.ProotExec.execute]）。
  */
 interface ProcessRunner {
-    fun run(argv: List<String>, timeoutMs: Long): RawOutput
+    fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput
 }
 
 /** 子進程原始回執：輸出為位元組（截斷前），[timedOut] 表示超時已被殺。 */
@@ -25,11 +31,17 @@ data class RawOutput(
  * [dirRoot] 非 null 時把子進程 cwd 釘到該目錄（縱深防禦：bare filename
  * 相對解析目標固定；PR#1 P0 direct-cwd 封堵）。null 時維持系統預設 cwd
  *（政策層仍 fail-closed）。
+ * [run] 的 [env] 非 null 時先 `clear()` 再全量替換（guest 乾淨環境，
+ * 見 [dev.librepocket.linux.LinuxEnv.GUEST_ENV]）；null 時繼承宿主 env。
  */
 class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
-    override fun run(argv: List<String>, timeoutMs: Long): RawOutput {
+    override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput {
         val pb = ProcessBuilder(argv)
             .redirectInput(ProcessBuilder.Redirect.PIPE)
+        if (env != null) {
+            pb.environment().clear()
+            pb.environment().putAll(env)
+        }
         if (dirRoot != null) {
             val dir = java.io.File(dirRoot)
             // 釘死失敗即 fail-closed：不繼承不可控 cwd，直接拋給上層轉 Failed。

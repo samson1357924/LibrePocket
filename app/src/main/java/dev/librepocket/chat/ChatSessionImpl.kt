@@ -63,6 +63,8 @@ class ChatSessionImpl(
 
   override suspend fun send(text: String, images: List<ChatImageRef>) = controller.send(text, images)
 
+  override suspend fun startTurn(text: String, images: List<ChatImageRef>) = controller.startTurn(text, images)
+
   override fun cancel() = controller.cancel()
 
   override fun steer(text: String) = controller.steer(text)

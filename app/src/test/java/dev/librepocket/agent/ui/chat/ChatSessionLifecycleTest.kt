@@ -496,6 +496,123 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // R1: send suspends in the controller's fresh chat.send gate (AFTER the
+    // session handle is acquired, BEFORE the text is appended). An endpoint
+    // change in that window must fail closed (zero sends) but keep the
+    // unaccepted text recoverable with a visible notice. Before the fix the
+    // draft was cleared before session.send(), so this ended with
+    // inputEmpty=true, notice=null (red); after the fix the draft survives
+    // until startTurn returns (green).
+    @Test
+    fun sendSuspendedInChatSendGateThenEndpointSwitchRestoresDraft() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val acceptEntered = CompletableDeferred<Unit>()
+        val releaseAccept = CompletableDeferred<Unit>()
+        sessions.acceptGate = {
+            acceptEntered.complete(Unit)
+            releaseAccept.await()
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run {
+                vm.onInputChange("fresh text")
+                vm.send()
+            }
+            withTimeout(5_000) { acceptEntered.await() }
+            withTimeout(5_000) { vm.input.first { it.isEmpty() } }
+            assertEquals(1, sessions.createCalls)
+
+            store.save(endpoint().copy(model = "other-model"))
+
+            withTimeout(5_000) { vm.input.first { it == "fresh text" } }
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            val cancelled = sessions.awaitCreated(1)
+            assertTrue(cancelled.sent.isEmpty())
+            assertEquals("fresh text", vm.input.value)
+
+            // The cancelled op must never resume into the new endpoint, even
+            // once its gate is released: its session was closed, so startTurn
+            // fails closed on the closed check.
+            releaseAccept.complete(Unit)
+            withTimeout(5_000) { cancelled.closed.await() }
+            assertTrue(cancelled.sent.isEmpty())
+            assertEquals(1, sessions.createCalls)
+
+            // Explicit resend on the new binding succeeds exactly once.
+            chatMain.run { vm.send() }
+            val resent = sessions.awaitCreated(2)
+            withTimeout(5_000) { resent.sendFinished.await() }
+            assertEquals(listOf("fresh text"), resent.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            releaseAccept.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // R1 positive control (post-accept): the text was already appended when
+    // the endpoint changes, so the transcript snapshot keeps it and the draft
+    // must NOT be restored as unsent input.
+    @Test
+    fun endpointSwitchDuringRunningTurnKeepsAcceptedTextWithoutDraftRestore() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("accepted text") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.hostEntered.await() }
+            withTimeout(5_000) { vm.messages.first { list -> list.any { it.text == "accepted text" } } }
+
+            store.save(endpoint().copy(model = "other-model"))
+
+            withTimeout(5_000) { live.closed.await() }
+            assertEquals("", vm.input.value)
+            assertNull(vm.notice.value)
+            assertTrue(vm.messages.value.any { it.text == "accepted text" })
+            assertEquals(listOf("accepted text"), live.sent.toList())
+            assertEquals(1, sessions.createCalls)
+        } finally {
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // R1 deny control: fresh chat.send DENY is projected by the controller;
+    // the unaccepted text stays recoverable with POLICY_DENIED (previously it
+    // was swallowed with no notice because the draft was already cleared).
+    @Test
+    fun chatSendDenyKeepsTextRecoverableWithPolicyNotice() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        sessions.acceptGate = { throw SecurityException("chat.send denied by policy") }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run {
+                vm.onInputChange("denied text")
+                vm.send()
+            }
+            withTimeout(5_000) { vm.input.first { it == "denied text" } }
+            withTimeout(5_000) { vm.notice.first { it == "POLICY_DENIED" } }
+            // ERROR projection travels via the session collector; input/notice
+            // awaits alone give no happens-before edge for _sessionState.
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            assertEquals(1, sessions.createCalls)
+            val created = sessions.awaitCreated(1)
+            assertTrue(created.sent.isEmpty())
+            assertEquals("denied text", vm.input.value)
+            assertTrue(vm.canRetry)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     private class GatedFirstAllowPolicy : PolicyStore {
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
@@ -587,6 +704,10 @@ class ChatSessionLifecycleTest {
         var createGate: suspend (Int) -> Unit = {}
         var openGate: suspend (String, Int) -> Unit = { _, _ -> }
         var sendGate: suspend (String) -> Unit = {}
+        // R1: suspends/throws BEFORE the fake records the text (production
+        // chat.send gate order). Defaults to no-op so older tests keep the
+        // previous admit-then-suspend shape via sendGate.
+        var acceptGate: suspend (String) -> Unit = {}
         // F1: non-null only for tests that must block loadHistory() itself
         // (the pre-mutex window), rather than sessions.open() in the mutex.
         var backingStore: SessionStore? = null
@@ -602,7 +723,7 @@ class ChatSessionLifecycleTest {
             val sessionId = "session-$ordinal"
             createAttemptIds.add(sessionId)
             createGate(ordinal)
-            val session = RecordingSession(sessionId, sendGate)
+            val session = RecordingSession(sessionId, sendGate, acceptGate)
             created.add(session)
             return CreatedSession(sessionId, session, endpoint.providerId, modelFor(endpoint))
         }
@@ -614,7 +735,7 @@ class ChatSessionLifecycleTest {
         ): CreatedSession {
             val ordinal = openCounter.incrementAndGet()
             openGate(sessionId, ordinal)
-            val session = RecordingSession(sessionId, sendGate)
+            val session = RecordingSession(sessionId, sendGate, acceptGate)
             opened.add(session)
             return CreatedSession(sessionId, session, endpoint.providerId, modelFor(endpoint))
         }
@@ -636,6 +757,7 @@ class ChatSessionLifecycleTest {
     private class RecordingSession(
         val sessionId: String,
         private val sendGate: suspend (String) -> Unit,
+        private val acceptGate: suspend (String) -> Unit = {},
     ) : ChatSession {
         private val mutableState = MutableStateFlow(
             ChatUiState(emptyList(), ChatStatus.IDLE, 0, null),
@@ -662,7 +784,31 @@ class ChatSessionLifecycleTest {
         private var busy = false
         private var closedFlag = false
 
-        override suspend fun send(text: String, images: List<dev.librepocket.chat.ChatImageRef>) {
+        /**
+         * Production order (TurnController.startTurn): fresh chat.send gate
+         * BEFORE append. acceptGate suspends/throws before anything is
+         * recorded, so pre-accept cancellation denies are observable as zero
+         * sends; turn completion is driven by invokeOnCompletion so it fires
+         * even when the hosted block never dispatches.
+         */
+        override suspend fun startTurn(text: String, images: List<dev.librepocket.chat.ChatImageRef>): Job {
+            // Production pre-gate admission (TurnController.startTurn): a
+            // closed/busy session rejects before the chat.send gate.
+            synchronized(this) {
+                check(!closedFlag) { "closed" }
+                if (busy) throw IllegalStateException("already in flight")
+            }
+            try {
+                acceptGate(text)
+            } catch (denied: SecurityException) {
+                synchronized(this) {
+                    mutableState.value = mutableState.value.copy(
+                        status = ChatStatus.ERROR,
+                        error = "denied by policy",
+                    )
+                }
+                throw denied
+            }
             synchronized(this) {
                 check(!closedFlag) { "closed" }
                 if (busy) throw IllegalStateException("already in flight")
@@ -686,19 +832,14 @@ class ChatSessionLifecycleTest {
                 }
             }
             hosted = host
-            // Close() may win between firstSendEntered and launch when the
+            // Close() may win between admission and launch dispatch when the
             // scope is already cancelled: the block above never runs and its
-            // finally never clears the flag set before launch. Fail closed
-            // here so hostedTurnActive cannot leak true past close().
+            // finally never clears the flag set at admission.
             if (host.isCancelled) hostedTurnActive = false
-            try {
-                host.join()
-            } catch (cancelled: CancellationException) {
-                if (coroutineContext[Job]?.isCancelled == true) throw cancelled
-            } finally {
+            host.invokeOnCompletion {
                 synchronized(this) {
                     busy = false
-                    hosted = null
+                    if (hosted === host) hosted = null
                     if (!closedFlag) {
                         mutableState.value = ChatUiState(
                             messages = listOf(
@@ -712,6 +853,16 @@ class ChatSessionLifecycleTest {
                     }
                     sendFinished.complete(Unit)
                 }
+            }
+            return host
+        }
+
+        override suspend fun send(text: String, images: List<dev.librepocket.chat.ChatImageRef>) {
+            val host = startTurn(text, images)
+            try {
+                host.join()
+            } catch (cancelled: CancellationException) {
+                if (coroutineContext[Job]?.isCancelled == true) throw cancelled
             }
         }
 

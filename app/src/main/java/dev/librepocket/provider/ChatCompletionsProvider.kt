@@ -25,7 +25,7 @@ class ChatCompletionsProvider(
     client: OkHttpClient? = null,
 ) : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
-    private val httpClient: OkHttpClient by lazy { client ?: defaultOkHttpClient(config.http) }
+    private val httpClient: OkHttpClient by lazy { providerTransportClient(client ?: defaultOkHttpClient(config.http)) }
 
     override fun stream(request: ChatRequest): Flow<StreamEvent> = streamingFlow {
         val key = apiKey() ?: throw ProviderFailure(false, "HTTP 401 missing_api_key")
@@ -36,18 +36,17 @@ class ChatCompletionsProvider(
                 "Accept" to "text/event-stream",
                 "Authorization" to "Bearer ${String(key)}",
             )
-            val url = endpoint(config.baseUrl)
-            runWithRetry(config.http) { _ ->
-                val mapper = ChatCompletionsMapper()
-                pumpSse(httpClient, postJson(url, headers, body)) { frame ->
-                    if (frame.isDone) {
-                        mapper.markDone()
-                    } else {
-                        for (e in mapper.mapPayload(frame.data)) emit(e)
-                    }
+            val mapper = ChatCompletionsMapper()
+            pumpSse(httpClient, postJson(endpoint(config.baseUrl), headers, body)) { frame ->
+                if (frame.isDone) {
+                    mapper.markDone()
+                    SsePumpDecision.STOP
+                } else {
+                    for (e in mapper.mapPayload(frame.data)) emit(e)
+                    SsePumpDecision.CONTINUE
                 }
-                for (e in mapper.finish()) emit(e)
             }
+            for (e in mapper.finish()) emit(e)
         } finally {
             key.fill('\u0000')
         }
@@ -62,13 +61,13 @@ class ChatCompletionsProvider(
                 .header("Authorization", "Bearer ${String(key)}")
                 .get()
                 .build()
-            httpClient.newCall(req).execute().use { resp ->
+            return executeProviderRequest(httpClient, req) { resp ->
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     val kind = ProviderErrorClassifier.classify(resp.code, null, text)
                     throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("HTTP ${resp.code}", text))
                 }
-                return extractModelIds(text)
+                extractModelIds(text)
             }
         } finally {
             key.fill('\u0000')

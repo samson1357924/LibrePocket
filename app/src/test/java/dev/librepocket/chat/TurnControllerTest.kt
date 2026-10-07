@@ -6,6 +6,10 @@ import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ChatCompletionsProvider
+import dev.librepocket.provider.ProviderConfig
+import dev.librepocket.provider.ProviderHttpConfig
+import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.StreamEvent
 import kotlinx.coroutines.CancellationException
@@ -29,8 +33,12 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.SocketPolicy
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.TimeUnit
 
 private class FakeLlmProvider(
   var handler: (ChatRequest) -> Flow<StreamEvent> = { emptyFlow() },
@@ -145,6 +153,15 @@ class TurnControllerTest {
     val r = TurnRetryConfig()
     assertEquals(3, r.maxRetries)
     assertEquals(listOf(2_000L, 4_000L, 8_000L), r.retryDelaysMs)
+  }
+
+  @Test fun turnRetryConfigRejectsBudgetsAboveFourTotalAttempts() {
+    try {
+      TurnRetryConfig(maxRetries = 4)
+      fail("expected hard four-attempt cap")
+    } catch (_: IllegalArgumentException) {
+      // expected
+    }
   }
 
   @Test fun sendStreamsThenIdles() {
@@ -312,6 +329,221 @@ class TurnControllerTest {
     assertEquals("ok", assistants[2].text)
     assertFalse(assistants[2].isPartial)
     assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+  }
+
+  @Test fun partialOutputFromOneAttemptNeverCombinesWithTheNextAttempt() {
+    val calls = AtomicInteger(0)
+    val ids = AtomicInteger(0)
+    val provider = FakeLlmProvider {
+      flow {
+        if (calls.incrementAndGet() == 1) {
+          emit(StreamEvent.TextDelta(0, 0, "OLD-PARTIAL"))
+          emit(StreamEvent.Failed("connection lost", retryable = true))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "NEW-ANSWER"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    val c = TurnController(
+      provider = provider,
+      policy = AllowPolicy(),
+      retryConfig = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(0L)),
+      sleeper = {},
+      newId = { "attempt-${ids.incrementAndGet()}" },
+    )
+
+    runBlocking { c.send("hi") }
+
+    val assistants = assistantsOf(c)
+    assertEquals(2, calls.get())
+    assertEquals(listOf("OLD-PARTIAL", "NEW-ANSWER"), assistants.map { it.text })
+    assertEquals(2, assistants.map { it.id }.toSet().size)
+    assertTrue(assistants[0].isPartial)
+    assertFalse(assistants[1].isPartial)
+  }
+
+  @Test fun retryExhaustionMakesExactlyFourActualHttpRequests() = runBlocking {
+    val server = MockWebServer()
+    server.start()
+    try {
+      repeat(16) {
+        // Old provider-level and turn-level retries can consume up to 16 responses;
+        // keep the regression bounded while asserting the fixed four-request budget below.
+        server.enqueue(MockResponse().setResponseCode(503).setBody("temporarily unavailable"))
+      }
+      val provider = ChatCompletionsProvider(
+        ProviderConfig(
+          id = "turn-retry-test",
+          label = "local test",
+          baseUrl = server.url("/").toString().trimEnd('/'),
+          protocol = ProviderProtocol.CHAT_COMPLETIONS,
+          apiKeyRef = "fake-key-ref",
+          // Retained compatibility fields must not create a provider retry loop.
+          http = ProviderHttpConfig(maxRetries = 3, retryDelaysMs = listOf(0L)),
+        ),
+        { "stage5-fake-key".toCharArray() },
+      )
+      val controller = TurnController(
+        provider = provider,
+        policy = AllowPolicy(),
+        retryConfig = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+        sleeper = {},
+      )
+
+      controller.send("budget-test")
+
+      assertEquals(4, server.requestCount)
+      repeat(4) {
+        val request = server.takeRequest(1, TimeUnit.SECONDS)
+        assertNotNull("request ${it + 1}", request)
+        assertEquals("POST", request!!.method)
+        assertEquals("Bearer stage5-fake-key", request.getHeader("Authorization"))
+        assertTrue(request.body.readUtf8().contains("budget-test"))
+      }
+      assertEquals(ChatStatus.ERROR, controller.uiState.value.status)
+    } finally {
+      server.shutdown()
+    }
+  }
+
+  @Test fun retryExhaustionWithRetryAfterZeroMakesExactlyFourActualHttpRequests() = runBlocking {
+    val server = MockWebServer()
+    server.start()
+    try {
+      repeat(8) {
+        // Without the transport fix each controller attempt resends once more
+        // (4 attempts -> 8 exchanges); with the fix the total stays 4.
+        server.enqueue(
+          MockResponse().setResponseCode(503).addHeader("Retry-After", "0")
+            .setBody("temporarily unavailable"),
+        )
+      }
+      val provider = ChatCompletionsProvider(
+        ProviderConfig(
+          id = "turn-retry-after-zero-test",
+          label = "local test",
+          baseUrl = server.url("/").toString().trimEnd('/'),
+          protocol = ProviderProtocol.CHAT_COMPLETIONS,
+          apiKeyRef = "fake-key-ref",
+          http = ProviderHttpConfig(maxRetries = 3, retryDelaysMs = listOf(0L)),
+        ),
+        { "stage5-fake-key".toCharArray() },
+      )
+      val controller = TurnController(
+        provider = provider,
+        policy = AllowPolicy(),
+        retryConfig = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+        sleeper = {},
+      )
+
+      controller.send("budget-retry-after-zero")
+
+      assertEquals("four controller attempts stay four wire requests", 4, server.requestCount)
+      repeat(4) {
+        val request = server.takeRequest(1, TimeUnit.SECONDS)
+        assertNotNull("request ${it + 1}", request)
+        assertEquals("POST", request!!.method)
+        assertEquals("Bearer stage5-fake-key", request.getHeader("Authorization"))
+        assertTrue(request.body.readUtf8().contains("budget-retry-after-zero"))
+      }
+      assertEquals(ChatStatus.ERROR, controller.uiState.value.status)
+    } finally {
+      server.shutdown()
+    }
+  }
+
+  @Test fun actualProviderPartialIoFailureRetriesAsSeparateAssistantAttempt() = runBlocking {
+    val server = MockWebServer()
+    server.start()
+    try {
+      val oldFrame = "data: {\"choices\":[{\"delta\":{\"content\":\"OLD\"}}]}\n\n"
+      val truncatedBody = oldFrame + ":" + "padding-comment-".repeat(8_192)
+      server.enqueue(
+        MockResponse()
+          .setHeader("Content-Type", "text/event-stream")
+          .setBody(truncatedBody)
+          .setSocketPolicy(SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY),
+      )
+      server.enqueue(
+        MockResponse()
+          .setHeader("Content-Type", "text/event-stream")
+          .setBody(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"NEW\"}}]}\n\n" +
+              "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+              "data: [DONE]\n\n",
+          ),
+      )
+      val provider = ChatCompletionsProvider(
+        ProviderConfig(
+          id = "partial-io-retry-test",
+          label = "local test",
+          baseUrl = server.url("/").toString().trimEnd('/'),
+          protocol = ProviderProtocol.CHAT_COMPLETIONS,
+          apiKeyRef = "fake-key-ref",
+          // Legacy provider retries are deliberately immediate so the old nested
+          // retry owner fails by request count rather than sleeping or hanging.
+          http = ProviderHttpConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+        ),
+        { "stage5-fake-key".toCharArray() },
+      )
+      val controller = TurnController(
+        provider = provider,
+        policy = AllowPolicy(),
+        retryConfig = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(0L)),
+        sleeper = {},
+      )
+
+      withTimeout(10_000) { controller.send("partial-io-budget-test") }
+
+      assertEquals("one partial attempt plus one controller retry", 2, server.requestCount)
+      repeat(2) {
+        val recorded = server.takeRequest(1, TimeUnit.SECONDS)
+        assertNotNull("actual provider request ${it + 1}", recorded)
+        assertEquals("Bearer stage5-fake-key", recorded!!.getHeader("Authorization"))
+        assertTrue(recorded.body.readUtf8().contains("partial-io-budget-test"))
+      }
+      val assistants = assistantsOf(controller)
+      assertEquals(listOf("OLD", "NEW"), assistants.map { it.text })
+      assertEquals("each attempt has its own assistant block/run id", 2, assistants.map { it.id }.toSet().size)
+      assertTrue("truncated first attempt remains partial", assistants[0].isPartial)
+      assertFalse("second attempt completes", assistants[1].isPartial)
+      assertFalse("partial text is never combined with the retry", assistants.any { it.text.contains("OLDNEW") })
+      assertEquals(ChatStatus.IDLE, controller.uiState.value.status)
+    } finally {
+      server.shutdown()
+    }
+  }
+
+  @Test fun actualUnauthorizedProviderResponseDoesNotRetryTheTurn() = runBlocking {
+    val server = MockWebServer()
+    server.start()
+    try {
+      server.enqueue(MockResponse().setResponseCode(401).setBody("invalid_api_key"))
+      val provider = ChatCompletionsProvider(
+        ProviderConfig(
+          id = "turn-auth-test",
+          label = "local test",
+          baseUrl = server.url("/").toString().trimEnd('/'),
+          protocol = ProviderProtocol.CHAT_COMPLETIONS,
+          apiKeyRef = "fake-key-ref",
+        ),
+        { "stage5-fake-key".toCharArray() },
+      )
+      val controller = TurnController(
+        provider = provider,
+        policy = AllowPolicy(),
+        retryConfig = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+        sleeper = {},
+      )
+
+      controller.send("auth-test")
+
+      assertEquals(1, server.requestCount)
+      assertEquals(ChatStatus.ERROR, controller.uiState.value.status)
+    } finally {
+      server.shutdown()
+    }
   }
 
   @Test fun fatalFailureDoesNotRetry() {

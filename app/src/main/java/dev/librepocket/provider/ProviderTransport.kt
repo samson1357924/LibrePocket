@@ -5,18 +5,22 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.job
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody
+import okhttp3.Response
+import okio.BufferedSink
 
 /** Internal transport failure; [retryable] comes from [ProviderErrorClassifier]. */
 internal class ProviderFailure(
@@ -25,15 +29,52 @@ internal class ProviderFailure(
     cause: Throwable? = null,
 ) : IOException(message, cause)
 
-/** OkHttp client per SPEC §5.1: 15s connect / 30s write / 5min read-idle, no built-in retry. */
+/**
+ * OkHttp client per SPEC §5.1: 15s connect / 30s write / 5min read-idle,
+ * with redirects and connection-failure retries disabled.
+ *
+ * Single-request contract: OkHttp 5.5.0 retries 503 + Retry-After: 0 inside
+ * RetryAndFollowUpInterceptor without checking retryOnConnectionFailure.
+ * The network interceptor below strips that trigger so the raw 503 returns
+ * to TurnController (sole retry owner). Classifier/callers use code/body only.
+ */
+private fun OkHttpClient.Builder.denyUnbudgetedResends() = apply {
+    followRedirects(false)
+    followSslRedirects(false)
+    retryOnConnectionFailure(false)
+    addNetworkInterceptor { chain ->
+        val response = chain.proceed(chain.request())
+        if (response.code == 503) response.newBuilder().removeHeader("Retry-After").build()
+        else response
+    }
+}
+
 fun defaultOkHttpClient(http: ProviderHttpConfig): OkHttpClient = OkHttpClient.Builder()
     .connectTimeout(http.connectTimeoutMs, TimeUnit.MILLISECONDS)
     .writeTimeout(http.writeTimeoutMs, TimeUnit.MILLISECONDS)
     .readTimeout(http.readTimeoutMs, TimeUnit.MILLISECONDS)
-    .retryOnConnectionFailure(false)
+    .denyUnbudgetedResends()
     .build()
 
+/** Enforce the provider redirect policy even when callers inject a client. */
+internal fun providerTransportClient(client: OkHttpClient): OkHttpClient = client.newBuilder()
+    .denyUnbudgetedResends()
+    .build()
+
+/** A redirect is a terminal response: never replay credentials or request bodies. */
+internal enum class SsePumpDecision { CONTINUE, STOP }
+
 internal val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+/** POST bodies are one-shot so OkHttp never replays them outside the controller budget. */
+private class OneShotJsonBody(private val json: String) : RequestBody() {
+    override fun contentType() = JSON_MEDIA_TYPE
+    override fun contentLength(): Long = json.toByteArray(Charsets.UTF_8).size.toLong()
+    override fun isOneShot() = true
+    override fun writeTo(sink: BufferedSink) {
+        sink.writeUtf8(json)
+    }
+}
 
 /** Append [suffixPath] unless [base] already ends with it (path completion). */
 internal fun joinEndpoint(base: String, suffixPath: String): String {
@@ -81,118 +122,158 @@ internal fun redactedError(prefix: String, rawSnippet: String?): String =
 internal fun redactedError(message: String): String = Redactor.redactError(message)
 
 /**
- * Retry wrapper shared by all providers (SPEC §5.3):
- * - every attempt runs [block]; a [ProviderFailure] with `retryable=true`
- *   and remaining budget emits [StreamEvent.Retrying] and waits the fixed
- *   2s/4s/8s sequence (cancellable [delay]);
- * - fatal failures and exhausted budgets end in [StreamEvent.Failed];
- * - coroutine cancellation is never converted into [StreamEvent.Failed].
+ * Execute a non-streaming provider request. The cancellation handler is active
+ * from before execute() through complete body consumption and is disposed on
+ * every exit path. Call.cancel() therefore interrupts blocking header/body IO
+ * as soon as the Job enters cancelling, rather than waiting for completion.
+ *
+ * Cancellation is judged by the coroutine Job (ensureActive) only, never by
+ * Call.isCanceled(): OkHttp's own callTimeout self-cancels the call, and that
+ * timeout must stay a classifiable IOException, not a CancellationException.
  */
-internal suspend fun FlowCollector<StreamEvent>.runWithRetry(
-    http: ProviderHttpConfig,
-    block: suspend (attempt: Int) -> Unit,
-) {
-    var attempt = 0
-    while (true) {
-        try {
-            block(attempt)
-            return
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: ProviderFailure) {
-            currentCoroutineContext().ensureActive()
-            val exhausted = !e.retryable || attempt >= http.maxRetries
-            if (exhausted) {
-                emit(StreamEvent.Failed(redactedError(e.message ?: "PROVIDER_FAILED"), e.retryable))
-                return
-            }
-            val waitMs = http.retryDelaysMs.getOrElse(attempt) { http.retryDelaysMs.last() }
-            emit(StreamEvent.Retrying(attempt + 1, http.maxRetries, waitMs))
-            delay(waitMs)
-            attempt++
-        }
+@OptIn(InternalCoroutinesApi::class)
+internal suspend fun <T> executeProviderRequest(
+    client: OkHttpClient,
+    request: Request,
+    consume: (Response) -> T,
+): T = withContext(Dispatchers.IO) {
+    val call = client.newCall(request)
+    val job = currentCoroutineContext()[Job]
+    val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+        if (cause != null) call.cancel()
+    }
+    try {
+        currentCoroutineContext().ensureActive()
+        call.execute().use(consume)
+    } catch (e: IOException) {
+        currentCoroutineContext().ensureActive()
+        throw e
+    } finally {
+        cancellation?.dispose()
     }
 }
 
 /**
- * Execute [request] and pump SSE frames into [onFrame].
- * HTTP error codes are classified via [ProviderErrorClassifier]; transport
- * errors likewise. Throws [ProviderFailure] (or [CancellationException]).
+ * Execute [request] and pump SSE frames into [onFrame]. HTTP error codes and
+ * transport errors are classified as one provider attempt. [onFrame] returns
+ * [SsePumpDecision.STOP] when the protocol reaches a terminal frame; the
+ * response is then closed immediately without reading later bytes.
  */
+@OptIn(InternalCoroutinesApi::class)
 internal suspend fun pumpSse(
     client: OkHttpClient,
     request: Request,
-    onFrame: suspend (SseFrameParser.Frame) -> Unit,
+    onFrame: suspend (SseFrameParser.Frame) -> SsePumpDecision,
 ) {
     val call = client.newCall(request)
-    currentCoroutineContext().job?.invokeOnCompletion { call.cancel() }
+    val job = currentCoroutineContext()[Job]
+    val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+        if (cause != null) call.cancel()
+    }
     try {
-        call.execute().use { response ->
-            if (!response.isSuccessful) {
-                val snippet = try {
-                    response.body?.string()?.take(2048)
-                } catch (_: IOException) {
-                    null
+        currentCoroutineContext().ensureActive()
+        val response = try {
+            call.execute()
+        } catch (e: IOException) {
+            currentCoroutineContext().ensureActive()
+            val kind = ProviderErrorClassifier.classify(null, e, null)
+            throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
+        }
+        var protocolTerminalReached = false
+        try {
+            response.use { response ->
+                if (!response.isSuccessful) {
+                    val snippet = try {
+                        response.body?.string()?.take(2048)
+                    } catch (e: IOException) {
+                        currentCoroutineContext().ensureActive()
+                        null
+                    }
+                    val kind = ProviderErrorClassifier.classify(response.code, null, snippet)
+                    throw ProviderFailure(
+                        retryable = kind == FailureKind.RETRYABLE,
+                        message = redactedError("HTTP ${response.code}", snippet),
+                    )
                 }
-                val kind = ProviderErrorClassifier.classify(response.code, null, snippet)
-                throw ProviderFailure(
-                    retryable = kind == FailureKind.RETRYABLE,
-                    message = redactedError("HTTP ${response.code}", snippet),
-                )
-            }
-            val body = response.body
-                ?: throw ProviderFailure(true, "SSE_EMPTY_BODY")
-            val parser = SseFrameParser()
-            val source = body.source()
-            val buf = ByteArray(8192)
-            try {
-                while (true) {
+                val body = response.body
+                    ?: throw ProviderFailure(true, "SSE_EMPTY_BODY")
+                val parser = SseFrameParser()
+                val source = body.source()
+                val buf = ByteArray(8192)
+                var stopped = false
+                while (!stopped) {
                     currentCoroutineContext().ensureActive()
                     val read: Int = try {
                         source.read(buf, 0, buf.size)
                     } catch (e: IOException) {
-                        if (call.isCanceled()) throw CancellationException("cancelled", e)
-                        throw e
+                        currentCoroutineContext().ensureActive()
+                        val kind = ProviderErrorClassifier.classify(null, e, null)
+                        throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
                     }
-                    if (read == -1) break
-                    for (frame in parser.feed(buf, 0, read)) onFrame(frame)
-                    if (parser.lineTooLong) {
+                    if (read == -1) {
+                        for (frame in parser.flush()) {
+                            if (onFrame(frame) == SsePumpDecision.STOP) {
+                                protocolTerminalReached = true
+                                stopped = true
+                                break
+                            }
+                        }
+                        break
+                    }
+                    val frames = parser.feed(buf, 0, read)
+                    for (frame in frames) {
+                        if (onFrame(frame) == SsePumpDecision.STOP) {
+                            protocolTerminalReached = true
+                            stopped = true
+                            // Stop reading the body; Response.use closes it on exit.
+                            break
+                        }
+                    }
+                    if (parser.lineTooLong && !protocolTerminalReached) {
                         throw ProviderFailure(false, "SSE_LINE_TOO_LONG")
                     }
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: ProviderFailure) {
-                throw e
-            } catch (e: IOException) {
-                currentCoroutineContext().ensureActive()
-                val kind = ProviderErrorClassifier.classify(null, e, null)
-                throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
+                if (parser.lineTooLong && !protocolTerminalReached) {
+                    throw ProviderFailure(false, "SSE_LINE_TOO_LONG")
+                }
             }
-            if (parser.lineTooLong) throw ProviderFailure(false, "SSE_LINE_TOO_LONG")
-            for (frame in parser.flush()) onFrame(frame)
+        } catch (e: IOException) {
+            // A protocol terminal already emitted the authoritative Done/Failed.
+            // Do not append a second terminal event if close reports cleanup IO.
+            if (!protocolTerminalReached) throw e
         }
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: ProviderFailure) {
-        throw e
-    } catch (e: IOException) {
-        currentCoroutineContext().ensureActive()
-        if (call.isCanceled()) throw CancellationException("cancelled", e)
-        val kind = ProviderErrorClassifier.classify(null, e, null)
-        throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
-    } catch (e: IllegalArgumentException) {
-        // URL/protocol misconfiguration.
-        throw ProviderFailure(false, "PROVIDER_BAD_REQUEST", e)
+    } finally {
+        cancellation?.dispose()
     }
 }
 
-/** Build a POST request with a JSON body; [headers] iteration order preserved. */
+/** Build a POST request with a one-shot JSON body; [headers] iteration order preserved. */
 internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJson: String): Request {
-    val b = Request.Builder().url(url).post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
+    val b = Request.Builder().url(url).post(OneShotJsonBody(bodyJson))
     for ((k, v) in headers) b.header(k, v)
     return b.build()
 }
 
+/**
+ * Provider stream plumbing: exactly one attempt, with upstream failures
+ * classified into one terminal event. `catch` preserves Flow exception
+ * transparency for failures thrown by the downstream collector.
+ */
 internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit): Flow<StreamEvent> =
-    flow(block).flowOn(Dispatchers.IO)
+    flow(block)
+        .catch { e ->
+            currentCoroutineContext().ensureActive()
+            when (e) {
+                is CancellationException -> throw e
+                is ProviderFailure -> emit(StreamEvent.Failed(redactedError(e.message ?: "PROVIDER_FAILED"), e.retryable))
+                is IllegalArgumentException -> emit(
+                    StreamEvent.Failed(redactedError("PROVIDER_BAD_REQUEST", e.message), retryable = false),
+                )
+                is IOException -> {
+                    val kind = ProviderErrorClassifier.classify(null, e, null)
+                    emit(StreamEvent.Failed(redactedError("PROVIDER_TRANSPORT", e.message), kind == FailureKind.RETRYABLE))
+                }
+                else -> emit(StreamEvent.Failed(redactedError(e.message ?: "PROVIDER_FAILURE"), retryable = true))
+            }
+        }
+        .flowOn(Dispatchers.IO)

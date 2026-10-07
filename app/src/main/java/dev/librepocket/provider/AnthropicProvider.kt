@@ -24,7 +24,7 @@ class AnthropicProvider(
     client: OkHttpClient? = null,
 ) : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.ANTHROPIC
-    private val httpClient: OkHttpClient by lazy { client ?: defaultOkHttpClient(config.http) }
+    private val httpClient: OkHttpClient by lazy { providerTransportClient(client ?: defaultOkHttpClient(config.http)) }
 
     override fun stream(request: ChatRequest): Flow<StreamEvent> = streamingFlow {
         val key = apiKey() ?: throw ProviderFailure(false, "HTTP 401 missing_api_key")
@@ -36,15 +36,12 @@ class AnthropicProvider(
                 "anthropic-version" to ANTHROPIC_VERSION,
                 "x-api-key" to String(key),
             )
-            val url = endpoint(config.baseUrl)
-            runWithRetry(config.http) { _ ->
-                val mapper = AnthropicMapper()
-                pumpSse(httpClient, postJson(url, headers, body)) { frame ->
-                    emitAll(mapper.mapPayload(frame.data))
-                    if (mapper.terminalReached) return@pumpSse
-                }
-                emitAll(mapper.finish())
+            val mapper = AnthropicMapper()
+            pumpSse(httpClient, postJson(endpoint(config.baseUrl), headers, body)) { frame ->
+                emitAll(mapper.mapPayload(frame.data))
+                if (mapper.terminalReached) SsePumpDecision.STOP else SsePumpDecision.CONTINUE
             }
+            emitAll(mapper.finish())
         } finally {
             key.fill('\u0000')
         }
@@ -60,13 +57,13 @@ class AnthropicProvider(
                 .header("x-api-key", String(key))
                 .get()
                 .build()
-            httpClient.newCall(req).execute().use { resp ->
+            return executeProviderRequest(httpClient, req) { resp ->
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     val kind = ProviderErrorClassifier.classify(resp.code, null, text)
                     throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("HTTP ${resp.code}", text))
                 }
-                return extractModelIds(text)
+                extractModelIds(text)
             }
         } finally {
             key.fill('\u0000')

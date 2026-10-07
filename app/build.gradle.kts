@@ -142,6 +142,8 @@ dependencies {
     testImplementation(libs.robolectric)
     testImplementation(libs.room.testing)
     testImplementation(libs.test.core)
+    // Local HTTPS certificate fixtures for provider redirect security tests only.
+    testImplementation(libs.okhttp.tls)
     // SSE replay transport for JVM unit tests (never hits the external network).
     testImplementation(libs.mockwebserver)
     // Instrumented tests (P1_SPEC §10.1 [I] layer; MockWebServer keeps them offline).

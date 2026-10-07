@@ -6,6 +6,7 @@ import dev.librepocket.provider.ChatImage
 import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.redact.Redactor
 import kotlinx.coroutines.CancellationException
@@ -25,12 +26,19 @@ import kotlinx.coroutines.launch
 import java.util.UUID
 import kotlin.coroutines.coroutineContext
 
-/** Retry budget for one turn (P1 defaults: 3 retries, fixed 2s/4s/8s backoff). */
+/**
+ * The sole retry budget for one logical turn (at most 3 retries / 4 requests).
+ * Provider adapters make one classified attempt and never multiply this budget.
+ */
 data class TurnRetryConfig(
   val maxRetries: Int = 3,
   val retryDelaysMs: List<Long> = listOf(2_000L, 4_000L, 8_000L),
 ) {
-  /** 1-based retry index → delay. Extra retries reuse the last delay. */
+  init {
+    require(maxRetries in 0..3) { "a turn may make at most four provider attempts" }
+  }
+
+  /** 1-based retry index → delay. Extra retry indices reuse the last delay. */
   fun delayForRetry(retryIndex: Int): Long =
     retryDelaysMs.getOrElse(retryIndex - 1) { retryDelaysMs.lastOrNull() ?: 0L }
 }
@@ -46,9 +54,10 @@ private data class PendingSteer(val text: String, val images: List<ChatImageRef>
  * [StreamEvent.ReasoningDelta] extend the current assistant block,
  * [StreamEvent.ToolDelta]/[StreamEvent.ToolDone] are aggregated and recorded
  * (marker text + [TranscriptSink.onToolDone]) so tool calls are never dropped,
- * [StreamEvent.Usage] is recorded ([TranscriptSink.onUsage] + [lastUsage]),
- * and provider [StreamEvent.Retrying] notices are forwarded to
- * [TranscriptSink.onTurnRetried] while the turn stays alive.
+ * [StreamEvent.Usage] is recorded ([TranscriptSink.onUsage] + [lastUsage]).
+ * Retry ownership is here: each retryable terminal failure gets a new runId
+ * and isolated assistant/tool aggregation, with at most four provider attempts
+ * per logical turn.
  *
  * SCAFFOLD (PR#1 re-review, P1 scope): this PR records ToolDone only and never
  * executes tools — no ToolDispatcher/FastRouter/PrivilegeGate/ElevatedDispatch
@@ -314,6 +323,9 @@ class TurnController(
       try {
         provider.stream(request).collect { event ->
           coroutineContext.ensureActive()
+          // A provider terminal is authoritative; ignore buggy/legacy events
+          // that an implementation emits after Done or Failed.
+          if (done || failed != null) return@collect
           when (event) {
             is StreamEvent.TextDelta -> appendAssistantText(attemptRunId, event.delta)
             // Reasoning stays in the same assistant block: P1 keeps one visible
@@ -345,7 +357,8 @@ class TurnController(
             }
             is StreamEvent.Failed -> failed = event
             is StreamEvent.Retrying -> {
-              // Provider-internal retry notice: surface progress, keep the turn alive.
+              // Compatibility with legacy/custom providers. Built-in adapters
+              // do not retry; this controller owns retries from Failed events.
               fireTranscript { transcript.onTurnRetried(attemptRunId, event.attempt, event.maxAttempts, event.delayMs) }
             }
           }
@@ -356,6 +369,9 @@ class TurnController(
         }
       } catch (e: CancellationException) {
         throw e
+      } catch (e: ProviderFailure) {
+        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = e.retryable)
+        flushPendingTools()
       } catch (e: Exception) {
         failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
         flushPendingTools()

@@ -64,17 +64,23 @@ data class ChatRequest(
 data class ToolSchema(val name: String, val description: String, val jsonSchema: String)
 
 /**
- * Transport knobs (frozen per SPEC §5.1; global defaults, not overridable
- * per request in P1).
+ * HTTP transport knobs (global defaults, not overridable per request).
+ *
+ * Retries are owned by [dev.librepocket.chat.TurnRetryConfig]. The deprecated
+ * retry fields remain in the constructor for source/config compatibility but
+ * are intentionally ignored by providers; changing them does not change the
+ * number of requests in a logical turn.
  *
  * @param readTimeoutMs idle timeout waiting for the next SSE chunk,
- *   not a whole-turn deadline. Any valid inbound byte resets the timer.
+ *   not a whole-turn deadline. Cancellation closes the active call immediately.
  */
 data class ProviderHttpConfig(
     val connectTimeoutMs: Long = 15_000,
     val writeTimeoutMs: Long = 30_000,
     val readTimeoutMs: Long = 300_000,
+    @Deprecated("Provider retries are disabled; configure whole-turn retries in TurnRetryConfig.")
     val maxRetries: Int = 3,
+    @Deprecated("Provider retries are disabled; configure whole-turn retries in TurnRetryConfig.")
     val retryDelaysMs: List<Long> = listOf(2_000, 4_000, 8_000),
 )
 

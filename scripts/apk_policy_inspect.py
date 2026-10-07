@@ -20,6 +20,7 @@ are resource limits, not evidence that any real APK passed this scanner.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
 import os
 import re
@@ -48,7 +49,16 @@ MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_DEX_COUNT = 64
 MAX_SINGLE_DEX_BYTES = 128 * 1024 * 1024
 MAX_TOTAL_DEX_BYTES = 256 * 1024 * 1024
-MAX_TYPE_DESCRIPTOR_UTF16_UNITS = 1_000_000
+# Deliberate scanner limits, not DEX format maxima. Read-only inventory of the
+# current three debug APKs: max 125,703 string_ids, longest descriptor 182 UTF-16
+# units, max 1,116,929 descriptor units/shard, max 2,720,128 units/APK. These
+# limits leave headroom while bounding table allocations and decoded strings.
+MAX_STRING_IDS = 1_000_000
+MAX_TYPE_DESCRIPTOR_UTF16_UNITS = 4096
+MAX_DEX_DESCRIPTOR_UTF16_UNITS = 4 * 1024 * 1024
+MAX_DEX_DESCRIPTOR_ENCODED_BYTES = 12 * 1024 * 1024
+MAX_APK_DESCRIPTOR_UTF16_UNITS = 16 * 1024 * 1024
+MAX_APK_DESCRIPTOR_ENCODED_BYTES = 48 * 1024 * 1024
 MAX_AAPT_OUTPUT_BYTES = 8 * 1024 * 1024
 TOOL_TIMEOUT_SECONDS = 120.0
 
@@ -92,6 +102,22 @@ DEX_ROOT_NAME = re.compile(r"classes(?:[2-9]|[1-9][0-9]+)?\.dex\Z")
 
 class PolicyError(Exception):
     """Expected fail-closed artifact or tool error."""
+
+
+class DescriptorBudget:
+    """One APK's retained descriptor budget; reserve before string decoding."""
+
+    def __init__(self) -> None:
+        self.remaining_units = MAX_APK_DESCRIPTOR_UTF16_UNITS
+        self.remaining_bytes = MAX_APK_DESCRIPTOR_ENCODED_BYTES
+
+    def reserve(self, units: int, encoded_bytes: int) -> None:
+        if units > self.remaining_units:
+            raise PolicyError("APK cumulative descriptor UTF-16 units exceed scanner limit")
+        if encoded_bytes > self.remaining_bytes:
+            raise PolicyError("APK cumulative descriptor encoded bytes exceed scanner limit")
+        self.remaining_units -= units
+        self.remaining_bytes -= encoded_bytes
 
 
 class ParsedDex:
@@ -144,14 +170,18 @@ def _read_uleb128(data: bytes, offset: int, what: str) -> tuple[int, int]:
     raise PolicyError(f"DEX ULEB128 is longer than five bytes in {what}")
 
 
-def _decode_mutf8_string(data: bytes, offset: int) -> str:
+def _decode_mutf8_string(data: bytes, offset: int, *, end_offset: int | None = None) -> str:
     utf16_size, cursor = _read_uleb128(data, offset, "string_data_item length")
     if utf16_size > MAX_TYPE_DESCRIPTOR_UTF16_UNITS:
         raise PolicyError("DEX type descriptor exceeds the scanner's bounded string limit")
 
     utf16 = bytearray()
     max_encoded_bytes = 3 * utf16_size
-    end_limit = min(len(data), cursor + max_encoded_bytes + 1)
+    end_limit = min(
+        len(data),
+        cursor + max_encoded_bytes + 1,
+        len(data) if end_offset is None else end_offset,
+    )
     terminated = False
     while cursor < end_limit:
         first = data[cursor]
@@ -253,7 +283,7 @@ def _validate_map(
     return seen
 
 
-def parse_dex_type_tables(data: bytes) -> ParsedDex:
+def parse_dex_type_tables(data: bytes, *, descriptor_budget: DescriptorBudget | None = None) -> ParsedDex:
     """Parse bounded DEX type/class tables needed by policy checks only."""
     if len(data) < DEX_HEADER_SIZE or data[:4] != b"dex\n" or data[7] != 0:
         raise PolicyError("DEX magic/header is truncated or invalid")
@@ -288,6 +318,8 @@ def parse_dex_type_tables(data: bytes) -> ParsedDex:
     data_size = _u32(data, 104, "data_size")
     data_offset = _u32(data, 108, "data_off")
 
+    if string_count > MAX_STRING_IDS:
+        raise PolicyError("DEX string_ids_size exceeds scanner limit before offset table allocation")
     if type_count == 0:
         raise PolicyError("DEX has no type_ids to inspect")
     if type_count > 65_535:
@@ -319,17 +351,37 @@ def parse_dex_type_tables(data: bytes) -> ParsedDex:
         string_data_count, string_data_offset = map_items.get(0x2002, (0, 0))
         if string_data_count != string_count or not (data_offset <= string_data_offset < len(data)):
             raise PolicyError("DEX map_list string_data_item range disagrees with string_ids")
+    else:
+        raise PolicyError("DEX type_ids require a nonempty string_ids table")
+    string_data_end = min(
+        (offset for _count, offset in map_items.values() if offset > string_data_offset),
+        default=len(data),
+    )
 
-    string_offsets = [
+    # Sort only physical offsets, not type indices or values. The table-count
+    # limit is checked above before this bounded allocation. Lookup for a
+    # type's string_id stays in the original table; sorting cannot hide an
+    # unsorted descriptor_idx or skip a reference.
+    sorted_offsets = sorted(
         _u32(data, string_offset + 4 * index, f"string_ids[{index}]")
         for index in range(string_count)
-    ]
-    if any(offset < data_offset or offset >= len(data) for offset in string_offsets):
-        raise PolicyError("DEX string_id points outside data section")
-    if string_count and any(offset < string_data_offset for offset in string_offsets):
-        raise PolicyError("DEX string_id points before mapped string_data_item range")
+    )
+    previous_offset = -1
+    for offset in sorted_offsets:
+        if not (string_data_offset <= offset < string_data_end):
+            raise PolicyError("DEX string_id points outside mapped string_data_item range")
+        if offset == previous_offset:
+            raise PolicyError("DEX string_ids contains a duplicate string_data offset")
+        previous_offset = offset
 
-    type_descriptors: list[str] = []
+    # Preflight *all* referenced strings before allocating any decoded text.
+    # Searching raw NUL finds the MUTF-8 terminator without materializing a
+    # payload; the decoder still validates MUTF-8/UTF-16 lengths afterwards.
+    # The next physical string offset bounds each scan, rejecting aliasing
+    # intervals instead of repeatedly decoding overlapping long payloads.
+    descriptor_ranges: list[tuple[int, int]] = []
+    cumulative_units = 0
+    cumulative_bytes = 0
     previous_descriptor_index = -1
     for index in range(type_count):
         descriptor_index = _u32(data, type_offset + 4 * index, f"type_ids[{index}].descriptor_idx")
@@ -338,8 +390,36 @@ def parse_dex_type_tables(data: bytes) -> ParsedDex:
         if descriptor_index <= previous_descriptor_index:
             raise PolicyError("DEX type_ids are duplicated or not descriptor-sorted")
         previous_descriptor_index = descriptor_index
-        descriptor = _decode_mutf8_string(data, string_offsets[descriptor_index])
+        offset = _u32(data, string_offset + 4 * descriptor_index, "descriptor string_id")
+        utf16_size, start = _read_uleb128(data, offset, "descriptor length preflight")
+        if utf16_size > MAX_TYPE_DESCRIPTOR_UTF16_UNITS:
+            raise PolicyError("DEX type descriptor exceeds the scanner's bounded string limit")
+        cumulative_units += utf16_size
+        if cumulative_units > MAX_DEX_DESCRIPTOR_UTF16_UNITS:
+            raise PolicyError("DEX cumulative descriptor UTF-16 units exceed scanner limit")
+        next_index = bisect.bisect_right(sorted_offsets, offset)
+        next_offset = sorted_offsets[next_index] if next_index < string_count else string_data_end
+        end_limit = min(next_offset, start + 3 * utf16_size + 1)
+        terminator = data.find(b"\0", start, end_limit)
+        if terminator < 0:
+            raise PolicyError("DEX descriptor overlaps another string_data item or is unterminated")
+        end_offset = terminator + 1
+        cumulative_bytes += end_offset - offset  # includes ULEB128 and terminator
+        if cumulative_bytes > MAX_DEX_DESCRIPTOR_ENCODED_BYTES:
+            raise PolicyError("DEX cumulative descriptor encoded bytes exceed scanner limit")
+        descriptor_ranges.append((offset, end_offset))
+    del sorted_offsets
+    if descriptor_budget is not None:
+        descriptor_budget.reserve(cumulative_units, cumulative_bytes)
+
+    type_descriptors: list[str] = []
+    seen_descriptors: set[str] = set()
+    for offset, end_offset in descriptor_ranges:
+        descriptor = _decode_mutf8_string(data, offset, end_offset=end_offset)
         _validate_type_descriptor(descriptor)
+        if descriptor in seen_descriptors:
+            raise PolicyError("DEX type_ids contains a duplicate type descriptor value")
+        seen_descriptors.add(descriptor)
         type_descriptors.append(descriptor)
 
     defined_classes: set[str] = set()
@@ -633,13 +713,14 @@ def inspect_apk(apk: Path, mode: str, aapt: str, dexdump: str) -> None:
     infos, dex_infos = _validate_archive(apk)
     permissions, xmltree = _validate_aapt_output(aapt, apk)
     parsed_dexes: list[ParsedDex] = []
+    descriptor_budget = DescriptorBudget()
     with zipfile.ZipFile(apk, "r") as archive:
         for info in dex_infos:
             with archive.open(info, "r") as member:
                 dex_bytes = member.read(MAX_SINGLE_DEX_BYTES + 1)
             if len(dex_bytes) != info.file_size or len(dex_bytes) > MAX_SINGLE_DEX_BYTES:
                 raise PolicyError(f"APK DEX expanded size mismatch: {info.filename}")
-            parsed = parse_dex_type_tables(dex_bytes)
+            parsed = parse_dex_type_tables(dex_bytes, descriptor_budget=descriptor_budget)
             _validate_dexdump(dexdump, info.filename, dex_bytes)
             parsed_dexes.append(parsed)
 

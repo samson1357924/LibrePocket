@@ -692,5 +692,125 @@ class ApkPolicyHarness(unittest.TestCase):
                 self.assertNotIn(fragment, workflow)
 
 
+class DexDescriptorResourceHarness(unittest.TestCase):
+    """Small synthetic inputs; never reproduce the full memory-exhaustion case."""
+
+    def assert_rejected_before_decode(self, dex: bytes, message: str) -> None:
+        with mock.patch.object(
+            policy_inspect, "_decode_mutf8_string", wraps=policy_inspect._decode_mutf8_string
+        ) as decoder:
+            with self.assertRaisesRegex(policy_inspect.PolicyError, message):
+                policy_inspect.parse_dex_type_tables(dex)
+            decoder.assert_not_called()
+
+    def test_duplicate_string_offsets_reject_before_amplified_decoding(self) -> None:
+        # Reproduce the 128-type, one-long-string proof without a large payload.
+        # descriptor_idx remains increasing; only string_data offsets alias.
+        descriptors = ("LA" + "x" * 4096 + ";",) + tuple(
+            f"LB{index:03d};" for index in range(127)
+        )
+        dex = bytearray(minimal_dex(type_descriptors=descriptors))
+        string_ids_off = struct.unpack_from("<I", dex, 60)[0]
+        first_offset = struct.unpack_from("<I", dex, string_ids_off)[0]
+        for index in range(128):
+            struct.pack_into("<I", dex, string_ids_off + 4 * index, first_offset)
+        _update_dex_checksums(dex)
+        self.assert_rejected_before_decode(bytes(dex), "duplicate string_data offset")
+
+    def test_duplicate_type_values_at_distinct_offsets_reject(self) -> None:
+        dex = bytearray(minimal_dex(type_descriptors=("Lfixture/A;", "Lfixture/B;")))
+        string_ids_off = struct.unpack_from("<I", dex, 60)[0]
+        first, second = struct.unpack_from("<II", dex, string_ids_off)
+        # Same-length, physically disjoint string_data_items now name one type.
+        length, start = policy_inspect._read_uleb128(dex, first, "fixture length")
+        item_bytes = bytes(dex[first : start + length + 1])
+        dex[second : second + len(item_bytes)] = item_bytes
+        _update_dex_checksums(dex)
+        with self.assertRaisesRegex(policy_inspect.PolicyError, "duplicate type descriptor"):
+            policy_inspect.parse_dex_type_tables(bytes(dex))
+
+    def test_overlapping_distinct_string_offsets_reject_before_decode(self) -> None:
+        # ASCII B (66) is simultaneously a valid outer-name character and an
+        # inner ULEB128 length. Both descriptors would be valid in isolation,
+        # but the two distinct offsets point into overlapping encoded data.
+        outer = "LA" + "x" * 128 + "B" + "L" + "x" * 64 + ";"
+        dex = bytearray(minimal_dex(type_descriptors=(outer, "LB;")))
+        string_ids_off = struct.unpack_from("<I", dex, 60)[0]
+        first = struct.unpack_from("<I", dex, string_ids_off)[0]
+        _, start = policy_inspect._read_uleb128(dex, first, "fixture length")
+        struct.pack_into("<I", dex, string_ids_off + 4, start + 2 + 128)
+        _update_dex_checksums(dex)
+        self.assert_rejected_before_decode(bytes(dex), "overlaps|unterminated")
+
+    def test_string_ids_cap_precedes_offset_table_allocation(self) -> None:
+        dex = minimal_dex(type_descriptors=("Lfixture/A;", "Lfixture/B;"))
+        with mock.patch.object(policy_inspect, "MAX_STRING_IDS", 1, create=True):
+            with mock.patch.object(policy_inspect, "_u32", wraps=policy_inspect._u32) as fields:
+                self.assert_rejected_before_decode(dex, "string_ids.*scanner limit")
+                self.assertFalse(
+                    any("string_ids[" in call.args[2] for call in fields.call_args_list),
+                    "string_ids must be capped before reading/allocating its offset table",
+                )
+
+    def test_distinct_long_descriptors_have_predecode_cumulative_unit_cap(self) -> None:
+        dex = minimal_dex(type_descriptors=("LA" + "x" * 2048 + ";", "LB" + "x" * 2048 + ";"))
+        with mock.patch.object(policy_inspect, "MAX_DEX_DESCRIPTOR_UTF16_UNITS", 3000, create=True):
+            self.assert_rejected_before_decode(dex, "cumulative descriptor UTF-16")
+
+    def test_distinct_long_mutf8_descriptors_have_predecode_encoded_byte_cap(self) -> None:
+        dex = minimal_dex(type_descriptors=("LA" + "é" * 1000 + ";", "LB" + "é" * 1000 + ";"))
+        with mock.patch.object(policy_inspect, "MAX_DEX_DESCRIPTOR_ENCODED_BYTES", 3000, create=True):
+            self.assert_rejected_before_decode(dex, "cumulative descriptor encoded bytes")
+
+    def test_exact_cumulative_budget_boundary_preserves_valid_types(self) -> None:
+        descriptors = ("LAé;", "LBé;")
+        units = sum(_mutf8(value)[0] for value in descriptors)
+        encoded_bytes = sum(
+            len(_uleb128(_mutf8(value)[0])) + len(_mutf8(value)[1]) + 1
+            for value in descriptors
+        )
+        with mock.patch.object(policy_inspect, "MAX_DEX_DESCRIPTOR_UTF16_UNITS", units, create=True), mock.patch.object(
+            policy_inspect, "MAX_DEX_DESCRIPTOR_ENCODED_BYTES", encoded_bytes, create=True
+        ):
+            parsed = policy_inspect.parse_dex_type_tables(minimal_dex(type_descriptors=descriptors))
+        self.assertEqual(parsed.type_descriptors, descriptors)
+
+    def test_per_descriptor_limit_rejects_before_decode_and_accepts_boundary(self) -> None:
+        descriptor = "LAxx;"
+        with mock.patch.object(policy_inspect, "MAX_TYPE_DESCRIPTOR_UTF16_UNITS", len(descriptor)):
+            parsed = policy_inspect.parse_dex_type_tables(minimal_dex(type_descriptors=(descriptor,)))
+            self.assertEqual(parsed.type_descriptors, (descriptor,))
+            self.assert_rejected_before_decode(
+                minimal_dex(type_descriptors=("LAxxx;",)), "bounded string limit"
+            )
+
+    def test_apk_budget_bounds_retained_descriptors_across_shards_before_decode(self) -> None:
+        first = minimal_dex(type_descriptors=("LA;",))
+        second = minimal_dex(type_descriptors=("LB;",))
+        for limit, message in (
+            ("MAX_APK_DESCRIPTOR_UTF16_UNITS", "APK cumulative descriptor UTF-16"),
+            ("MAX_APK_DESCRIPTOR_ENCODED_BYTES", "APK cumulative descriptor encoded bytes"),
+        ):
+            with self.subTest(cap=limit), mock.patch.object(policy_inspect, limit, 5):
+                budget = policy_inspect.DescriptorBudget()
+                policy_inspect.parse_dex_type_tables(first, descriptor_budget=budget)
+                with mock.patch.object(
+                    policy_inspect, "_decode_mutf8_string", wraps=policy_inspect._decode_mutf8_string
+                ) as decoder:
+                    with self.assertRaisesRegex(policy_inspect.PolicyError, message):
+                        policy_inspect.parse_dex_type_tables(second, descriptor_budget=budget)
+                    decoder.assert_not_called()
+
+        # The same cross-shard budget accepts exactly six units / ten encoded
+        # bytes (length prefix and terminator included for each descriptor).
+        with mock.patch.object(policy_inspect, "MAX_APK_DESCRIPTOR_UTF16_UNITS", 6), mock.patch.object(
+            policy_inspect, "MAX_APK_DESCRIPTOR_ENCODED_BYTES", 10
+        ):
+            budget = policy_inspect.DescriptorBudget()
+            policy_inspect.parse_dex_type_tables(first, descriptor_budget=budget)
+            policy_inspect.parse_dex_type_tables(second, descriptor_budget=budget)
+            self.assertEqual((budget.remaining_units, budget.remaining_bytes), (0, 0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -96,6 +96,24 @@ class ChatViewModel(
     // Endpoint-cancelled but never accepted: surfaced one-by-one through the
     // input box after each explicit send; discarded by newChat/open/logout.
     private val recoverableOps = ArrayDeque<PendingOp>()
+    // Q2: every box value has an owner — user input (null tag) or the op
+    // that restored it. Retry adopts the failed intent and consumes the box
+    // only while it still holds that unmodified draft (opId + revision +
+    // text must all match: no string-equality ownership, no clobbering newer
+    // typing, identical independent texts stay separate).
+    private var inputRevision = 0L
+    private data class InputDraft(val opId: Long, val revision: Long, val text: String)
+    private var inputDraft: InputDraft? = null
+    // Latest denied-but-retryable intent (CHAT_SEND_DENIED path). A retry
+    // reuses its opId, so repeated deny→retry never grows the outbox.
+    private var retryableOp: PendingOp? = null
+
+    /** Single choke point for all `_input` writes: bumps the revision and (re)tags the owner. */
+    private fun setInput(value: String, draftOpId: Long? = null, draftText: String? = null) {
+        _input.value = value
+        inputRevision++
+        inputDraft = draftOpId?.let { InputDraft(it, inputRevision, draftText ?: value) }
+    }
     private var observedBinding: EndpointSessionBinding? = null
     private var hasObservedBinding = false
 
@@ -124,7 +142,7 @@ class ChatViewModel(
         status == ChatStatus.STREAMING || status == ChatStatus.WAITING_STEERED
 
     fun onInputChange(value: String) {
-        _input.value = value
+        setInput(value)
     }
 
     /**
@@ -133,17 +151,27 @@ class ChatViewModel(
      */
     fun prefill(text: String) {
         if (text.isBlank()) return
-        _input.value = text
+        setInput(text)
     }
 
     fun send() {
-        val text = _input.value.trim()
+        val raw = _input.value
+        val text = raw.trim()
         if (text.isEmpty()) return
-        _input.value = ""
+        // Q2: adopt the tagged draft when the box still holds that exact
+        // unmodified restore; otherwise this explicit send supersedes any
+        // retryable intent (abandoned by user action, never duplicated).
+        val draft = inputDraft
+        val adoptedId =
+            if (draft != null && draft.revision == inputRevision && draft.text == raw) draft.opId else null
+        if (adoptedId != null) recoverableOps.removeAll { it.opId == adoptedId }
+        else retryableOp = null
+        setInput("")
         if (isBusy(_sessionState.value.status)) {
-            steer(text)
+            steer(text, adoptedId)
         } else {
-            sendText(text)
+            if (adoptedId != null) launchSendOp(adoptedId, text, lifecycleGeneration)
+            else sendText(text)
         }
     }
 
@@ -155,17 +183,21 @@ class ChatViewModel(
             steer(clean)
             return
         }
-        _input.value = ""
+        retryableOp = null
+        setInput("")
         sendText(clean)
     }
 
     /** Queue an instruction for the next round; never preempts the live turn. */
-    fun steer(text: String) {
+    fun steer(text: String, adoptedOpId: Long? = null) {
         val clean = text.trim()
         if (clean.isEmpty()) return
         lastUserText = clean
         val startedAt = lifecycleGeneration
-        val opId = ++nextOpId
+        // Q2: a fresh steer mints a new op and supersedes any retryable
+        // intent; an adopted retry reuses its opId (no outbox growth).
+        val opId = adoptedOpId ?: ++nextOpId
+        if (adoptedOpId == null) retryableOp = null
         pendingOps[opId] = PendingOp(opId, startedAt, clean)
         lifecycleScope.launch {
             var operationGeneration = startedAt
@@ -206,12 +238,15 @@ class ChatViewModel(
                             return@launch
                         } catch (_: SecurityException) {
                             // Fresh chat.send deny is projected by the
-                            // controller; keep the text recoverable.
-                            setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
-                            restoreOpForFailedSend(opId, "POLICY_DENIED")
+                            // controller; keep the text recoverable. Distinct
+                            // code from key.read POLICY_DENIED: key.read
+                            // passed here.
+                            setNoticeIfCurrent(operationGeneration, "CHAT_SEND_DENIED")
+                            restoreOpForFailedSend(opId, "CHAT_SEND_DENIED")
                             return@launch
                         }
                         pendingOps.remove(opId)
+                        if (retryableOp?.opId == opId) retryableOp = null
                         val host = (started as? TurnStart.Started)?.host ?: return@launch
                         try {
                             host.join()
@@ -243,16 +278,42 @@ class ChatViewModel(
     }
 
     fun retry() {
-        val text = lastUserText ?: return
         if (_sessionState.value.status != ChatStatus.ERROR) return
-        sendText(text)
+        val op = retryableOp
+        if (op == null) {
+            // Post-accept failure (e.g. provider error mid-turn): no denied
+            // intent is tracked, so resend the last text as a fresh op.
+            val text = lastUserText ?: return
+            sendText(text)
+            return
+        }
+        // Q2: adopt the failed intent under its own opId. Consume the box
+        // only while it still holds that exact unmodified restore; newer
+        // typing is never touched. Repeated deny→retry reuses the opId, so
+        // the outbox cannot grow copies of one intent.
+        val draft = inputDraft
+        if (draft != null && draft.opId == op.opId && draft.revision == inputRevision &&
+            draft.text == _input.value
+        ) {
+            setInput("")
+        }
+        recoverableOps.removeAll { it.opId == op.opId }
+        lastUserText = op.text
+        launchSendOp(op.opId, op.text, lifecycleGeneration)
     }
 
     private fun sendText(text: String) {
         lastUserText = text
-        _notice.value = null
-        val startedAt = lifecycleGeneration
+        // A fresh explicit send supersedes any retryable intent.
+        retryableOp = null
         val opId = ++nextOpId
+        launchSendOp(opId, text, lifecycleGeneration)
+    }
+
+    /** Shared send coroutine: minters pass a fresh opId, retry passes the adopted one. */
+    private fun launchSendOp(opId: Long, text: String, startedAt: Long) {
+        lastUserText = text
+        _notice.value = null
         pendingOps[opId] = PendingOp(opId, startedAt, text)
         lifecycleScope.launch {
             var operationGeneration = startedAt
@@ -290,12 +351,14 @@ class ChatViewModel(
                         } catch (_: SecurityException) {
                             // Fresh chat.send deny is projected by the
                             // controller; keep the text recoverable instead of
-                            // swallowing it with no notice.
-                            setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
-                            restoreOpForFailedSend(opId, "POLICY_DENIED")
+                            // swallowing it with no notice. Distinct code from
+                            // key.read POLICY_DENIED: key.read passed here.
+                            setNoticeIfCurrent(operationGeneration, "CHAT_SEND_DENIED")
+                            restoreOpForFailedSend(opId, "CHAT_SEND_DENIED")
                             return@launch
                         }
                         pendingOps.remove(opId)
+                        if (retryableOp?.opId == opId) retryableOp = null
                         val host = (started as? TurnStart.Started)?.host ?: return@launch
                         try {
                             host.join()
@@ -689,7 +752,8 @@ class ChatViewModel(
             lastUserText = null
             pendingOps.clear()
             recoverableOps.clear()
-            _input.value = ""
+            retryableOp = null
+            setInput("")
             _notice.value = "NO_ENDPOINT"
         } else {
             // R2: fail-closed sends keep EVERY unaccepted op recoverable,
@@ -700,7 +764,7 @@ class ChatViewModel(
                 for ((_, op) in pendingOps) recoverableOps.addLast(op)
                 pendingOps.clear()
                 if (_input.value.isBlank()) {
-                    recoverableOps.removeFirstOrNull()?.let { _input.value = it.text }
+                    recoverableOps.removeFirstOrNull()?.let { setInput(it.text, it.opId, it.text) }
                 }
                 _notice.value = "SEND_CANCELLED_ENDPOINT_CHANGED"
             } else {
@@ -723,6 +787,8 @@ class ChatViewModel(
             lastUserText = null
             pendingOps.clear()
             recoverableOps.clear()
+            retryableOp = null
+            inputDraft = null
         }
     }
 
@@ -761,24 +827,34 @@ class ChatViewModel(
     // typing is never overwritten. A non-blank box keeps the user's text and
     // the cancelled op waits in recoverableOps instead of being deleted.
     // Explicit newChat/logout/open already discarded the op.
+    // Q2: idempotent per opId (a re-denied adopted retry re-arms the same
+    // entry instead of growing copies) and re-arms retryableOp; the restored
+    // box is tagged so retry() can adopt it.
     private fun restoreOpForFailedSend(opId: Long, noticeValue: String) {
+        if (recoverableOps.any { it.opId == opId } || inputDraft?.opId == opId) {
+            val stashed = recoverableOps.firstOrNull { it.opId == opId }
+            if (stashed != null && isGenerationCurrent(stashed.generation)) retryableOp = stashed
+            return
+        }
         val op = pendingOps.remove(opId) ?: return
         if (!isGenerationCurrent(op.generation)) return
+        retryableOp = op
         if (_input.value.isNotBlank()) {
             recoverableOps.addLast(op)
             return
         }
-        _input.value = op.text
+        setInput(op.text, op.opId, op.text)
         _notice.value = noticeValue
     }
 
     // R2: surface the next endpoint-cancelled text after an explicit send
     // completes, so every unaccepted op is recoverable through the input box
-    // without auto-sending anything to the new binding.
+    // without auto-sending anything to the new binding. The drained box is
+    // tagged for a possible retry adoption.
     private fun drainNextRecoverableToInput() {
         if (_input.value.isNotBlank()) return
         val next = recoverableOps.removeFirstOrNull() ?: return
-        _input.value = next.text
+        setInput(next.text, next.opId, next.text)
     }
 
     private fun closeLive() {

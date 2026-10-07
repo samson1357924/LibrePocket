@@ -40,6 +40,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -673,8 +674,8 @@ class ChatSessionLifecycleTest {
     }
 
     // R1 deny control: fresh chat.send DENY is projected by the controller;
-    // the unaccepted text stays recoverable with POLICY_DENIED (previously it
-    // was swallowed with no notice because the draft was already cleared).
+    // the unaccepted text stays recoverable with CHAT_SEND_DENIED (key.read
+    // passed, so POLICY_DENIED would misdiagnose).
     @Test
     fun chatSendDenyKeepsTextRecoverableWithPolicyNotice() = runBlocking {
         val store = newStore()
@@ -688,7 +689,7 @@ class ChatSessionLifecycleTest {
                 vm.send()
             }
             withTimeout(5_000) { vm.input.first { it == "denied text" } }
-            withTimeout(5_000) { vm.notice.first { it == "POLICY_DENIED" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
             // ERROR projection travels via the session collector; input/notice
             // awaits alone give no happens-before edge for _sessionState.
             withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
@@ -698,6 +699,238 @@ class ChatSessionLifecycleTest {
             assertEquals("denied text", vm.input.value)
             assertTrue(vm.canRetry)
         } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // Q2: DENY→retry adopts the failed intent. A successful retry consumes
+    // the restored box (no stale draft left); the old code left the sent
+    // text sitting in the input.
+    @Test
+    fun denyRetrySuccessLeavesNoStaleDraft() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val deny = java.util.concurrent.atomic.AtomicBoolean(true)
+        sessions.acceptGate = {
+            if (deny.get()) throw SecurityException("chat.send denied by policy")
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run {
+                vm.onInputChange("Q")
+                vm.send()
+            }
+            withTimeout(5_000) { vm.input.first { it == "Q" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            assertTrue(vm.canRetry)
+
+            deny.set(false)
+            chatMain.run { vm.retry() }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("Q"), live.sent.toList())
+            assertEquals("", vm.input.value)
+            assertEquals(1, sessions.createCalls)
+            // sendFinished fires before the session collector projects IDLE;
+            // canRetry needs the IDLE edge.
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            assertFalse(vm.canRetry)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // Q2: repeated DENY→retry reuses one opId, so one intent never grows
+    // outbox copies. Proved via public API: after allow+retry succeeds, an
+    // empty box over a quiet window means nothing drained back.
+    @Test
+    fun repeatedDenyRetryDoesNotGrowOutbox() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val deny = java.util.concurrent.atomic.AtomicBoolean(true)
+        sessions.acceptGate = {
+            if (deny.get()) throw SecurityException("chat.send denied by policy")
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run {
+                vm.onInputChange("Q")
+                vm.send()
+            }
+            withTimeout(5_000) { vm.input.first { it == "Q" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+
+            repeat(3) {
+                chatMain.run { vm.retry() }
+                withTimeout(5_000) { vm.input.first { it == "Q" } }
+            }
+            assertEquals("Q", vm.input.value)
+
+            deny.set(false)
+            chatMain.run { vm.retry() }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("Q"), live.sent.toList())
+            // sendFinished fires before the VM join→drain resumes: assert
+            // emptiness over a quiet window so a leaked copy would repopulate.
+            repeat(10) {
+                delay(50)
+                assertEquals("", vm.input.value)
+            }
+            assertEquals(1, sessions.createCalls)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // Q2: retry never clobbers newer typing, and a denied retry stashes the
+    // intent instead of deleting it. Denied Q is restored, the user types
+    // "newer", and a still-denied retry resends nothing and keeps "newer";
+    // the stash is then proved by a manual send whose completion drains Q.
+    @Test
+    fun retryWithNewerInputPreservesIt() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val deny = java.util.concurrent.atomic.AtomicBoolean(true)
+        val denyCalls = AtomicInteger()
+        sessions.acceptGate = {
+            denyCalls.incrementAndGet()
+            if (deny.get()) throw SecurityException("chat.send denied by policy")
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("Q") }
+            withTimeout(5_000) { vm.input.first { it == "Q" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            chatMain.run { vm.onInputChange("newer") }
+
+            // Still denied: retry resends nothing, stashes Q, keeps "newer".
+            // denyCalls proves the retry's op actually ran (not dropped).
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) {
+                while (denyCalls.get() < 2) delay(1)
+            }
+            val live = sessions.awaitCreated(1)
+            assertTrue(live.sent.isEmpty())
+            assertEquals("newer", vm.input.value)
+
+            // Allow and send "newer" manually: its completion drains the
+            // stashed Q into the box, proving the denied retry kept it.
+            deny.set(false)
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("newer"), live.sent.toList())
+            withTimeout(5_000) { vm.input.first { it == "Q" } }
+            // The drained box is adopted by an explicit send: both delivered.
+            chatMain.run { vm.send() }
+            withTimeout(5_000) {
+                while (live.sent.size < 2) delay(1)
+            }
+            assertEquals(listOf("newer", "Q"), live.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // Q2: an allowed retry sends the denied intent without touching newer
+    // typing. (Companion to the denied variant above.)
+    @Test
+    fun allowedRetrySendsWithoutTouchingNewerInput() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val deny = java.util.concurrent.atomic.AtomicBoolean(true)
+        sessions.acceptGate = {
+            if (deny.get()) throw SecurityException("chat.send denied by policy")
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("Q") }
+            withTimeout(5_000) { vm.input.first { it == "Q" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            chatMain.run { vm.onInputChange("newer") }
+
+            deny.set(false)
+            chatMain.run { vm.retry() }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) {
+                while (live.sent.isEmpty()) delay(1)
+            }
+            assertEquals(listOf("Q"), live.sent.toList())
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals("newer", vm.input.value)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // Q2: two independent identical texts stay separate through deny+retry.
+    // A string-equality ownership check would cross-consume the box; opIds
+    // keep each intent distinct.
+    @Test
+    fun identicalTextsStaySeparateThroughDenyRetry() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val calls = AtomicInteger()
+        val deny = java.util.concurrent.atomic.AtomicBoolean(true)
+        val firstArrived = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        sessions.acceptGate = {
+            if (calls.incrementAndGet() == 1) {
+                firstArrived.complete(Unit)
+                releaseFirst.await()
+            }
+            if (deny.get()) throw SecurityException("chat.send denied by policy")
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("same") }
+            withTimeout(5_000) { firstArrived.await() }
+            chatMain.run { vm.sendDirect("same") }
+            // Second op denies into the blank box; first still gated.
+            withTimeout(5_000) { vm.input.first { it == "same" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            releaseFirst.complete(Unit)
+            val live = sessions.awaitCreated(1)
+            // Flush Main: op1's deny→stash continuation was queued before
+            // this barrier, so after it the outbox deterministically holds
+            // op1 and retryableOp is op1 (not op2). The box await below would
+            // otherwise pass vacuously on op2's restore alone.
+            chatMain.run { }
+            // First op denies into the occupied box: stashed, not deleted.
+            withTimeout(5_000) { vm.input.first { it == "same" } }
+            assertTrue(live.sent.isEmpty())
+
+            deny.set(false)
+            // Retry sends one intent; the box keeps the other identical text.
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) {
+                while (live.sent.isEmpty()) delay(1)
+            }
+            assertEquals(listOf("same"), live.sent.toList())
+            assertEquals("same", vm.input.value)
+            withTimeout(5_000) { live.sendFinished.await() }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            // Explicit send delivers the remaining identical text (adopts the
+            // box tag by opId, never by string equality); nothing is lost,
+            // duplicated, or crossed. IDLE is required: a running turn would
+            // steer instead of sending.
+            chatMain.run { vm.send() }
+            withTimeout(5_000) {
+                while (live.sent.size < 2) delay(1)
+            }
+            assertEquals(listOf("same", "same"), live.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            releaseFirst.complete(Unit)
             chatMain.run { vm.newChat() }
         }
     }

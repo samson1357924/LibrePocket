@@ -13,19 +13,28 @@ import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ProviderProtocol
+import dev.librepocket.session.PrunePolicy
+import dev.librepocket.session.PruneResult
+import dev.librepocket.session.SessionMeta
 import dev.librepocket.session.SessionStore
+import dev.librepocket.session.TranscriptEvent
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -264,6 +273,150 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // F1: openSession() blocks in loadHistory() before taking sessionMutex.
+    // A send() in that window attaches a live same-generation session (N);
+    // mounting history must close N (hosted turn + binding), not orphan it.
+    // Without the attach-time close, N has closeCalls=0 and keeps its hosted
+    // turn running past cancel()/newChat()/clear.
+    @Test
+    fun openSessionClosesLiveSessionRacingHistoryLoadThenNewChatLeavesNothing() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val history = GatedHistoryStore()
+        sessions.backingStore = history
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.openSession("H") }
+            history.entered.await()
+            chatMain.run { vm.sendDirect("typed while history loads") }
+            val live = sessions.awaitCreated(1)
+            live.firstSendEntered.await()
+            assertTrue(live.hostedTurnActive)
+
+            history.release.complete(Unit)
+            val historySession = sessions.awaitOpened("H")
+            withTimeout(5_000) { vm.currentSessionId.first { it == "H" } }
+            withTimeout(5_000) { live.closed.await() }
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(1, live.closeCalls.get())
+            assertTrue(!live.hostedTurnActive)
+            assertEquals("H", vm.currentSessionId.value)
+
+            chatMain.run { vm.newChat() }
+            assertTrue(historySession.closed.isCompleted)
+            assertTrue(!historySession.hostedTurnActive)
+            assertTrue(!live.hostedTurnActive)
+        } finally {
+            history.release.complete(Unit)
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun cancelAfterRacingOpenLeavesNoHostedTurn() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val history = GatedHistoryStore()
+        sessions.backingStore = history
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.openSession("H") }
+            history.entered.await()
+            chatMain.run { vm.sendDirect("typed while history loads") }
+            val live = sessions.awaitCreated(1)
+            live.firstSendEntered.await()
+
+            history.release.complete(Unit)
+            val historySession = sessions.awaitOpened("H")
+            withTimeout(5_000) { vm.currentSessionId.first { it == "H" } }
+            withTimeout(5_000) { live.closed.await() }
+
+            chatMain.run { vm.cancel() }
+            assertEquals(1, historySession.cancelCalls.get())
+            assertEquals(1, live.closeCalls.get())
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertTrue(!live.hostedTurnActive)
+        } finally {
+            history.release.complete(Unit)
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun viewModelClearAfterRacingOpenLeavesNoHostedTurn() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val history = GatedHistoryStore()
+        sessions.backingStore = history
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.openSession("H") }
+            history.entered.await()
+            chatMain.run { vm.sendDirect("typed while history loads") }
+            val live = sessions.awaitCreated(1)
+            live.firstSendEntered.await()
+
+            history.release.complete(Unit)
+            val historySession = sessions.awaitOpened("H")
+            withTimeout(5_000) { vm.currentSessionId.first { it == "H" } }
+            withTimeout(5_000) { live.closed.await() }
+
+            chatMain.clearViewModels(chatViewModels)
+            assertTrue(live.closed.isCompleted)
+            assertTrue(historySession.closed.isCompleted)
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertTrue(!live.hostedTurnActive)
+            assertTrue(!historySession.hostedTurnActive)
+        } finally {
+            history.release.complete(Unit)
+            releaseTurn.complete(Unit)
+        }
+    }
+
+    /** Blocks loadHistory() itself (the pre-mutex window), not sessions.open(). */
+    private class GatedHistoryStore : SessionStore {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+
+        override suspend fun createSession(title: String, model: String): String = "gated-unused"
+
+        override suspend fun listSessions(): List<SessionMeta> = emptyList()
+
+        override suspend fun getSession(sessionId: String): SessionMeta? =
+            SessionMeta(sessionId, "history", 0L, 0L, "test-model")
+
+        override suspend fun appendEvent(event: TranscriptEvent): Long = 0L
+
+        override suspend fun loadEvents(
+            sessionId: String,
+            afterSeq: Long,
+            limit: Int,
+        ): List<TranscriptEvent> {
+            entered.complete(Unit)
+            release.await()
+            return emptyList()
+        }
+
+        override suspend fun exportJsonl(sessionId: String, destFile: File) = Unit
+
+        override suspend fun importJsonl(srcFile: File): String = "gated-imported"
+
+        override suspend fun prune(policy: PrunePolicy): PruneResult = PruneResult(0, 0)
+
+        override suspend fun deleteSession(sessionId: String) = Unit
+    }
+
     private class DelayedFirstDenyPolicy : PolicyStore {
         val firstEvaluationEntered = CompletableDeferred<Unit>()
         val releaseFirstEvaluation = CompletableDeferred<Unit>()
@@ -301,6 +454,9 @@ class ChatSessionLifecycleTest {
         var createGate: suspend (Int) -> Unit = {}
         var openGate: suspend (String, Int) -> Unit = { _, _ -> }
         var sendGate: suspend (String) -> Unit = {}
+        // F1: non-null only for tests that must block loadHistory() itself
+        // (the pre-mutex window), rather than sessions.open() in the mutex.
+        var backingStore: SessionStore? = null
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
@@ -330,7 +486,7 @@ class ChatSessionLifecycleTest {
             return CreatedSession(sessionId, session, endpoint.providerId, modelFor(endpoint))
         }
 
-        override suspend fun storeOrNull(): SessionStore? = null
+        override suspend fun storeOrNull(): SessionStore? = backingStore
 
         suspend fun awaitCreated(ordinal: Int): RecordingSession = withTimeout(5_000) {
             val expectedId = "session-$ordinal"
@@ -357,6 +513,18 @@ class ChatSessionLifecycleTest {
         val firstSendEntered = CompletableDeferred<Unit>()
         val sendFinished = CompletableDeferred<Unit>()
         val steerReceived = CompletableDeferred<String>()
+        val closeCalls = AtomicInteger()
+        val cancelCalls = AtomicInteger()
+        @Volatile
+        var hostedTurnActive = false
+            private set
+        // Mirrors production ownership (TurnController): the hosted turn runs
+        // in a session-owned scope while send() only joins it, so close() and
+        // cancel() must cancel the host; cancelling the join caller does not
+        // stop the turn, and close() also wipes the session binding.
+        private val sessionScope = CoroutineScope(SupervisorJob())
+        @Volatile
+        private var hosted: Job? = null
         private var busy = false
         private var closedFlag = false
 
@@ -367,6 +535,7 @@ class ChatSessionLifecycleTest {
                 busy = true
                 sent.add(text)
                 firstSendEntered.complete(Unit)
+                hostedTurnActive = true
                 mutableState.value = ChatUiState(
                     messages = listOf(UiMessage("u", "user", text, false)),
                     status = ChatStatus.STREAMING,
@@ -374,11 +543,22 @@ class ChatSessionLifecycleTest {
                     error = null,
                 )
             }
+            val host = sessionScope.launch {
+                try {
+                    sendGate(text)
+                } finally {
+                    hostedTurnActive = false
+                }
+            }
+            hosted = host
             try {
-                sendGate(text)
+                host.join()
+            } catch (cancelled: CancellationException) {
+                if (coroutineContext[Job]?.isCancelled == true) throw cancelled
             } finally {
                 synchronized(this) {
                     busy = false
+                    hosted = null
                     if (!closedFlag) {
                         mutableState.value = ChatUiState(
                             messages = listOf(
@@ -395,7 +575,10 @@ class ChatSessionLifecycleTest {
             }
         }
 
-        override fun cancel() = Unit
+        override fun cancel() {
+            cancelCalls.incrementAndGet()
+            hosted?.cancel()
+        }
 
         override fun steer(text: String) {
             steerReceived.complete(text)
@@ -405,8 +588,11 @@ class ChatSessionLifecycleTest {
             synchronized(this) {
                 if (closedFlag) return
                 closedFlag = true
+                closeCalls.incrementAndGet()
                 closed.complete(Unit)
             }
+            hosted?.cancel()
+            sessionScope.cancel()
         }
     }
 }

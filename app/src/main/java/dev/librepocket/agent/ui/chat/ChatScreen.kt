@@ -291,6 +291,7 @@ fun ChatScreen(
                     "NO_ENDPOINT" -> "尚未設定端點，請先設定 API 金鑰。"
                     "POLICY_DENIED" -> "政策拒絕讀取金鑰（key.read DENY），本次未發送任何請求。"
                     "UNKNOWN_SESSION" -> "找不到該會話，可能已被刪除。"
+                    "SEND_CANCELLED_ENDPOINT_CHANGED" -> "端點已變更，本次未送出，請確認後重送。"
                     else -> it
                 },
                 style = MaterialTheme.typography.bodySmall,

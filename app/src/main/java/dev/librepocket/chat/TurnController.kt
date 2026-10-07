@@ -125,6 +125,25 @@ class TurnController(
   }
 
   suspend fun send(text: String, images: List<ChatImageRef> = emptyList()) {
+    val host = startTurn(text, images)
+    try {
+      host.join()
+    } catch (e: CancellationException) {
+      // Our own turn was cancelled via cancel()/close(): state already flipped.
+      // Only propagate if the *caller* itself was cancelled.
+      if (coroutineContext[Job]?.isCancelled == true) throw e
+    }
+  }
+
+  /**
+   * Start a turn and return once the text is accepted (fresh `chat.send`
+   * policy passed, user message appended, STREAMING) without waiting for the
+   * hosted turn to finish. Callers that must retain an unsent draft across
+   * endpoint invalidation (R1) clear it only after this returns; a
+   * [CancellationException]/[SecurityException]/[IllegalStateException] before
+   * return means the text was NOT accepted and must stay recoverable.
+   */
+  suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): Job {
     require(text.isNotBlank()) { "text must not be blank" }
     synchronized(lock) {
       check(!closed) { "controller is closed" }
@@ -151,13 +170,7 @@ class TurnController(
       }
       job
     }
-    try {
-      host.join()
-    } catch (e: CancellationException) {
-      // Our own turn was cancelled via cancel()/close(): state already flipped.
-      // Only propagate if the *caller* itself was cancelled.
-      if (coroutineContext[Job]?.isCancelled == true) throw e
-    }
+    return host
   }
 
   fun cancel() {

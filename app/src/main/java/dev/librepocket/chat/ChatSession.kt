@@ -20,6 +20,15 @@ interface ChatSession {
   /** Send one user message and stream the reply. One in-flight turn at a time. */
   suspend fun send(text: String, images: List<ChatImageRef> = emptyList())
 
+  /**
+   * Start a turn and return once the text is accepted (fresh `chat.send`
+   * policy passed, user message appended, STREAMING) without waiting for the
+   * hosted turn to finish. A [CancellationException]/[SecurityException]/
+   * [IllegalStateException]/[IllegalArgumentException] before return means
+   * the text was NOT accepted.
+   */
+  suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): kotlinx.coroutines.Job
+
   /** Cancel the in-flight turn; UI must stop updating within 200ms. */
   fun cancel()
 

@@ -170,11 +170,55 @@ class ChatViewModel(
                         val handle = ensureSession(access.endpoint, clean) ?: return@launch
                         operationGeneration = handle.generation
                         if (!isHandleCurrent(handle)) return@launch
+                        // ensureSession may replace a mismatched transport
+                        // under a bumped generation; re-root the draft so a
+                        // chat.send deny still restores to input instead of
+                        // stranding on the stale generation.
+                        if (pendingDraft == clean) pendingDraftGeneration = handle.generation
+                        // R1: accept first, clear after. startTurn returns only
+                        // once the controller owns the text; anything thrown
+                        // before that leaves the draft for invalidate/restore.
+                        val host: Job = try {
+                            handle.created.session.startTurn(clean)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: IllegalStateException) {
+                            // Lost a busy race after the idle check: queue
+                            // into the FIFO (synchronous acceptance).
+                            if (!isHandleCurrent(handle)) return@launch
+                            try {
+                                handle.created.session.steer(clean)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                // Closed/stale sessions are deliberately inert;
+                                // the retained draft is owned by invalidation.
+                                return@launch
+                            }
+                            if (pendingDraft == clean) {
+                                pendingDraft = null
+                                pendingDraftGeneration = -1L
+                            }
+                            return@launch
+                        } catch (_: SecurityException) {
+                            // Fresh chat.send deny is projected by the
+                            // controller; keep the text recoverable.
+                            setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
+                            restoreDraftForFailedSend(operationGeneration, clean, "POLICY_DENIED")
+                            return@launch
+                        }
                         if (pendingDraft == clean) {
                             pendingDraft = null
                             pendingDraftGeneration = -1L
                         }
-                        handle.created.session.steer(clean)
+                        try {
+                            host.join()
+                        } catch (cancelled: CancellationException) {
+                            if (coroutineContext[Job]?.isCancelled == true) throw cancelled
+                        } catch (_: Exception) {
+                            // Turn failed after acceptance: transcript keeps
+                            // the user message; nothing to restore.
+                        }
                     }
                     EndpointAccess.Denied -> {
                         setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
@@ -215,30 +259,62 @@ class ChatViewModel(
                         operationGeneration = access.endpoint.generation
                         val handle = ensureSession(access.endpoint, text)
                         if (handle == null || !isHandleCurrent(handle)) return@launch
+                        operationGeneration = handle.generation
+                        // ensureSession may replace a mismatched transport
+                        // under a bumped generation; re-root the draft so a
+                        // chat.send deny still restores to input instead of
+                        // stranding on the stale generation.
+                        if (pendingDraft == text) pendingDraftGeneration = handle.generation
+                        // R1: the draft is owned by the controller only after
+                        // startTurn returns (fresh chat.send passed, user
+                        // message appended). Clearing earlier loses text when
+                        // an endpoint change cancels the gate suspension.
+                        // Clearing after send() returns is equally wrong:
+                        // send() joins the whole turn, so an accepted text
+                        // would be mistaken for an unsent draft.
+                        val host: Job = try {
+                            handle.created.session.startTurn(text)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: IllegalStateException) {
+                            // Two sends can race before STREAMING reaches the
+                            // UI. The controller rejects the second start;
+                            // steer it into the FIFO instead of silently
+                            // dropping input. The draft stays until the steer
+                            // is queued (accepted) below.
+                            if (!isHandleCurrent(handle)) return@launch
+                            try {
+                                handle.created.session.steer(text)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                // Closed/stale sessions are deliberately inert.
+                                return@launch
+                            }
+                            if (pendingDraft == text) {
+                                pendingDraft = null
+                                pendingDraftGeneration = -1L
+                            }
+                            return@launch
+                        } catch (_: SecurityException) {
+                            // Fresh chat.send deny is projected by the
+                            // controller; keep the text recoverable instead of
+                            // swallowing it with no notice.
+                            setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
+                            restoreDraftForFailedSend(operationGeneration, text, "POLICY_DENIED")
+                            return@launch
+                        }
                         if (pendingDraft == text) {
                             pendingDraft = null
                             pendingDraftGeneration = -1L
                         }
-                        operationGeneration = handle.generation
                         try {
-                            handle.created.session.send(text)
+                            host.join()
                         } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: IllegalStateException) {
-                            // Two sends can race before STREAMING reaches the UI.
-                            // TurnController rejects the second start; steer it
-                            // into the FIFO instead of silently dropping input.
-                            if (isHandleCurrent(handle)) {
-                                try {
-                                    handle.created.session.steer(text)
-                                } catch (cancelled: CancellationException) {
-                                    throw cancelled
-                                } catch (_: Exception) {
-                                    // Closed/stale sessions are deliberately inert.
-                                }
-                            }
-                        } catch (_: SecurityException) {
-                            // Fresh chat policy deny is already projected by the controller.
+                            if (coroutineContext[Job]?.isCancelled == true) throw cancelled
+                        } catch (_: Exception) {
+                            // Turn failed after acceptance: the transcript
+                            // keeps the user message; nothing to restore.
                         }
                     }
                     EndpointAccess.Denied -> {

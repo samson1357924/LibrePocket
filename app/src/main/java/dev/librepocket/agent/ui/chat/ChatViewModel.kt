@@ -494,6 +494,18 @@ class ChatViewModel(
         binding: EndpointSessionBinding,
         generation: Long,
     ) {
+        // F1: openSession() reads history before taking sessionMutex, so a
+        // send() in that window can attach a live same-generation session.
+        // Close the replaced incumbent (credential wipe + hosted-turn cancel)
+        // instead of orphaning it past cancel()/newChat()/onCleared() reach.
+        // Its transcript row is retained: it already received user input.
+        val incumbent = currentSession
+        if (incumbent != null && incumbent !== created.session) {
+            try {
+                incumbent.close()
+            } catch (_: Exception) {
+            }
+        }
         currentSession = created.session
         currentBinding = binding
         currentSessionGeneration = generation

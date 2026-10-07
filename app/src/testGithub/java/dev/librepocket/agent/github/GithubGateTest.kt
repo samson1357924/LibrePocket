@@ -75,7 +75,7 @@ class GithubGateTest {
         val gate = GithubAccessibilityService.gateAction("幫我轉帳 500 元", A11yAction.Tap("n1"))
         assertTrue("$gate", gate is GateDecision.NeedConfirm)
         val fp = (gate as GateDecision.NeedConfirm).fingerprint
-        assertTrue(fp.startsWith("a11y-v1:"))
+        assertTrue(fp.startsWith("a11y-v2:"))
 
         val prevSwitch = GithubA11yState.switchOn
         val prevGrant = GithubA11yState.serviceGranted
@@ -141,11 +141,16 @@ class GithubGateTest {
 
     @Test fun benignAllowDoesNotNeedConfirmation() {
         // 良性 Allow 不吃確認額度：武裝後不消耗，指紋原樣保留。
+        // PR#1 P1 round-vs-sensitive 分離：Allow 只需 isArmed，不需 effective。
         val prevSwitch = GithubA11yState.switchOn
         val prevGrant = GithubA11yState.serviceGranted
         try {
             GithubA11yState.switchOn = true
             GithubA11yState.serviceGranted = true
+            GithubA11yState.clearConfirmation()
+            // 無確認時仍 armed（快照/良性執行門），effective false。
+            assertTrue(GithubA11yState.isArmed())
+            assertFalse(GithubA11yState.effective())
             val gateFp = (GithubAccessibilityService.gateAction("幫我轉帳 1 元", A11yAction.Tap("n1")) as GateDecision.NeedConfirm).fingerprint
             GithubA11yState.grantConfirmation(gateFp)
             val gate = GithubAccessibilityService.gateAction("點一下返回", A11yAction.Tap("n1"))
@@ -155,6 +160,48 @@ class GithubGateTest {
         } finally {
             GithubA11yState.switchOn = prevSwitch
             GithubA11yState.serviceGranted = prevGrant
+            GithubA11yState.clearConfirmation()
+        }
+    }
+
+    @Test fun delimiterCollisionBoundedByLengthPrefix() {
+        // PR#1 P1 指紋分隔符注入：不同結構不得塌縮成同一指紋（v2 長度前綴）。
+        val fpA = AutomationCore.fingerprintFor(
+            A11yAction.Input("n1", "x|幫我轉帳"),
+            "幫我轉帳",
+        )
+        val fpB = AutomationCore.fingerprintFor(
+            A11yAction.Input("n1", "x"),
+            "幫我轉帳|幫我轉帳",
+        )
+        assertTrue("delimiter collision: $fpA vs $fpB", fpA != fpB)
+        val fpC = AutomationCore.fingerprintFor(A11yAction.Tap("n1"), "a|b", "c")
+        val fpD = AutomationCore.fingerprintFor(A11yAction.Tap("n1"), "a", "b|c")
+        assertTrue(fpC != fpD)
+    }
+
+    @Test fun confirmationExpiresAfterTtl() {
+        // PR#1 P1 TTL：超時自動失效，不可跨畫面消耗。
+        val prevSwitch = GithubA11yState.switchOn
+        val prevGrant = GithubA11yState.serviceGranted
+        val prevClock = GithubA11yState.clockMs
+        try {
+            var now = 1_000_000L
+            GithubA11yState.clockMs = { now }
+            GithubA11yState.switchOn = true
+            GithubA11yState.serviceGranted = true
+            GithubA11yState.clearConfirmation()
+            val fp = (GithubAccessibilityService.gateAction("幫我轉帳 1 元", A11yAction.Tap("n1")) as GateDecision.NeedConfirm).fingerprint
+            GithubA11yState.grantConfirmation(fp)
+            assertTrue(GithubA11yState.effective())
+            now += GithubA11yState.CONFIRM_TTL_MS + 1
+            assertFalse("expired confirmation must not be effective", GithubA11yState.effective())
+            assertFalse(GithubA11yState.consumeConfirmation(fp))
+            assertFalse(GithubA11yState.effective())
+        } finally {
+            GithubA11yState.switchOn = prevSwitch
+            GithubA11yState.serviceGranted = prevGrant
+            GithubA11yState.clockMs = prevClock
             GithubA11yState.clearConfirmation()
         }
     }

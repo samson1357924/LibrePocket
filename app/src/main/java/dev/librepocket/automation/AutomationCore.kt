@@ -173,11 +173,16 @@ object AutomationCore {
     }
 
     /**
-     * Proposal 指紋（P1 綁定確認，PR#1 re-review）：
-     * `a11y-v1:<sha256hex>`，覆蓋種類 + 動作全量（含 Input 全文、Swipe 全座標、
+     * Proposal 指紋（P1 綁定確認，PR#1 re-review + P0 delimiter 封堵）：
+     * `a11y-v2:<sha256hex>`，覆蓋種類 + 動作全量（含 Input 全文、Swipe 全座標、
      * Tap nodeId）+ goal/target 規範化（小寫+trim+空白摺疊，與仲裁 haystack
      * 一致）+ allowedKinds 排序集。任一變更即指紋變更，確認必須 exact-match。
      * 純 JVM（MessageDigest），零 Android 依賴。
+     *
+     * v2 封堵（PR#1 P1）：v1 用 `|` 直接串接，action text / goal / target 含
+     * `|` 時欄位邊界可塌縮碰撞（例 Input `x|幫我轉帳` + goal `幫我轉帳` vs
+     * Input `x` + goal `幫我轉帳|幫我轉帳` 同 raw）。v2 改長度前綴逐段綴接，
+     * 欄位邊界不再依賴分隔符轉義，SHA-256 前即 collision-free。
      */
     fun fingerprintFor(
         action: A11yAction,
@@ -199,12 +204,24 @@ object AutomationCore {
         }
         fun norm(s: String): String = s.trim().lowercase().replace(Regex("\\s+"), " ")
         val allowedSorted = allowedKinds.map { it.name }.sorted().joinToString(",")
-        val raw = "a11y-v1|${kind.name}|$actionCanon|${norm(goalText)}|${norm(targetText)}|$allowedSorted"
+        // 長度前綴：len(bytes)+":"+bytes，逐段綴接，避免分隔符注入塌縮。
+        fun field(s: String): String {
+            val b = s.toByteArray(Charsets.UTF_8)
+            return "${b.size}:$s;"
+        }
+        val raw = buildString {
+            append("a11y-v2;")
+            append(field(kind.name))
+            append(field(actionCanon))
+            append(field(norm(goalText)))
+            append(field(norm(targetText)))
+            append(field(allowedSorted))
+        }
         val digest = java.security.MessageDigest.getInstance("SHA-256")
         val hex = digest.digest(raw.toByteArray(Charsets.UTF_8)).joinToString("") {
             "%02x".format(it)
         }
-        return "a11y-v1:$hex"
+        return "a11y-v2:$hex"
     }
 
     private fun A11yAction.key(): String = when (this) {

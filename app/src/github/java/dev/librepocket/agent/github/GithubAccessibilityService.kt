@@ -19,8 +19,9 @@ import dev.librepocket.guard.SlowArbitrator
  *
  * - 本類只存在於 `src/github`（play 物理缺失；foss 鏡像見
  *   `src/foss …FossAccessibilityService`，純 OSS 同語義）；
- * - 三同意門禁（[GithubA11yState.effective] → [GithubAutomationGate]）：
- *   App 內開關 + 系統服務授權 + 當輪二次確認，三者缺一即
+ * - 門禁分層（[GithubA11yState.isArmed]/[GithubA11yState.effective]）：
+ *   快照與良性 Allow 只查 armed（App 開關 + 系統授權）；僅敏感
+ *   NeedConfirm 要求 effective（armed + 未過期確認指紋）。缺 armed 即
  *   [onAccessibilityEvent] 直接返回，不讀窗、不點擊；
  * - 管線：節點快照（[A11yWalker]）→ 脫敏語義壓縮
  *  （[AutomationCore.compressNodes]，郵箱/電話等先遮罩）→
@@ -52,7 +53,10 @@ class GithubAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (!GithubA11yState.effective()) return
+        // Round authorization 只查 armed（開關 + 系統授權）：已武裝即快照供
+        // 觀察，未確認時仍不自動點擊；敏感確認只在 executeConfirmed NeedConfirm
+        // 分支要求（見 executeConfirmed）。
+        if (!GithubA11yState.isArmed()) return
         // 已武裝時也只做快照 + 壓縮（供 SlowRouter 觀察用），絕不自動點擊；
         // 任何執行必須經 executeConfirmed（當輪二次確認後）。
         val nodes = A11yWalker.snapshot(rootInActiveWindow)
@@ -70,10 +74,22 @@ class GithubAccessibilityService : AccessibilityService() {
      * 三者 exact-match 才原子消耗（[GithubA11yState.consumeConfirmation]），
      * 否則回 false 且不消耗額度（防掃描耗損與 TOCTOU 替換）。
      *
-     * - [GithubA11yState.effective] 為 false（一輪三同意缺一）→ 回 false；
-     * - 裁決 Allow → 直接 [perform]（不消耗確認，良性動作不吃掉確認額度）；
-     * - 裁決 NeedConfirm → 指紋一致 + 原子消耗一次當輪確認才 [perform]；
+     * - Round authorization（[GithubA11yState.isArmed]：開關 + 系統授權）
+     *   缺一 → 回 false；
+     * - 裁決 Allow → 直接 [perform]（不要求確認指紋、不消耗額度；良性 tap/
+     *   swipe/input 即使無敏感確認亦可執行，敏感確認消耗後下一個 benign
+     *   step 不被擋）；
+     * - 裁決 NeedConfirm → 要求 [GithubA11yState.effective]（未過期指紋）
+     *   + exact-match + 原子消耗一次才 [perform]；
      * - 裁決 Deny（越界種類）→ 即使已確認仍回 false（確認不可覆寫拒絕）。
+     *
+     * TOCTOU 說明（PR#1 P1）：nodeId 為當次 BFS 序號，確認與執行間 UI 重排
+     * 可能移位；本層以指紋 exact-match + 60s TTL 縮小窗口，完整 window/
+     * bounds / snapshot-generation 綁定與 perform 前 revalidate 待
+     * StepExecutor 接線時補（屆時 grant 攜 snapshot id，perform 前重取比對
+     * text/bounds/window，不一致拒執行；見 AutomationSettings SCAFFOLD）。
+     * 目前 executeConfirmed 無生產 caller（SCAFFOLD），TOCTOU 不經產品路徑
+     * 可達。
      *
      * 執行緒約束：必須在背景執行緒呼叫（手勢分派見 [dispatchSwipe]
      * 的 ANR 防護，主執行緒呼叫一律回 false）。
@@ -85,11 +101,12 @@ class GithubAccessibilityService : AccessibilityService() {
         confirmedFingerprint: String = "",
         allowedKinds: Set<SlowActionKind> = SlowArbitrator.DEFAULT_ALLOWED,
     ): Boolean {
-        if (!GithubA11yState.effective()) return false
+        if (!GithubA11yState.isArmed()) return false
         when (AutomationCore.verdictFor(action, goalText, targetText, allowedKinds)) {
             is ArbitrationVerdict.Allow -> return perform(action)
             is ArbitrationVerdict.Deny -> return false
             is ArbitrationVerdict.NeedConfirm -> {
+                if (!GithubA11yState.effective()) return false
                 val recomputed = AutomationCore.fingerprintFor(action, goalText, targetText, allowedKinds)
                 if (confirmedFingerprint.isBlank() || recomputed != confirmedFingerprint) return false
                 if (!GithubA11yState.consumeConfirmation(recomputed)) return false
@@ -257,51 +274,88 @@ sealed interface GateDecision {
  *
  * P1 re-review：確認即 capability，真相來源為 `confirmedFingerprint`
  *（單槽 one-shot），`userConfirmed` 僅為相容派生視圖（只讀）。
+ *
+ * PR#1 P1 round-vs-sensitive 分離 + TTL：
+ * - [isArmed] = 開關 + 系統授權（round authorization，常駐；快照與良性
+ *   Allow 執行只查此門）；
+ * - [effective] = armed + 未過期確認指紋（sensitive вооружение，短時；
+ *   僅 NeedConfirm 分支要求）；
+ * - 確認單槽升級為 fp + grantedAtMs，TTL 內有效，超時自動失效
+ *   （防 stale 跨畫面消耗；完整 window/turn 綁定待 StepExecutor 接線時
+ *   補 snapshot generation id，見 executeConfirmed 註解）。
  */
 object GithubA11yState {
+    /** 當輪確認有效期：60 秒，超時自動失效（需重新走 gateAction → 使用者確認）。 */
+    const val CONFIRM_TTL_MS: Long = 60_000L
+
     @Volatile var switchOn: Boolean = GithubAutomationGate.DEFAULT_ENABLED
     @Volatile var serviceGranted: Boolean = false
     @Volatile private var confirmedFingerprint: String? = null
+    @Volatile private var grantedAtMs: Long = 0L
     @Volatile var lastCompressed: List<String> = emptyList()
 
-    /** 相容視圖：有未消耗指紋即視為已確認（只讀用途；寫入請走 grant）。 */
+    /** 測試可注入時鐘（預設系統時間；單測可改寫驗 TTL）。 */
+    @Volatile var clockMs: () -> Long = System::currentTimeMillis
+
+    /** Round authorization：開關 + 系統授權（常駐，不含當輪確認）。 */
+    fun isArmed(): Boolean = switchOn && serviceGranted
+
+    /** 相容視圖：有未過期指紋即視為已確認（只讀用途；寫入請走 grant）。 */
     var userConfirmed: Boolean
-        get() = confirmedFingerprint != null
+        get() = confirmedFingerprint != null && !isExpired()
         set(value) {
-            if (!value) confirmedFingerprint = null
+            if (!value) {
+                confirmedFingerprint = null
+                grantedAtMs = 0L
+            }
             // true 不直接賦值：必須經 grantConfirmation 綁定指紋，避免 ambient。
         }
 
     fun effective(): Boolean = GithubAutomationGate.effectiveAutomation(
         switchOn = switchOn,
         serviceGranted = serviceGranted,
-        userConfirmed = confirmedFingerprint != null,
+        userConfirmed = confirmedFingerprint != null && !isExpired(),
     )
+
+    private fun isExpired(now: Long = clockMs()): Boolean {
+        val fp = confirmedFingerprint ?: return true
+        if (fp.isBlank()) return true
+        return now - grantedAtMs > CONFIRM_TTL_MS
+    }
 
     /** 授權一次確認：覆寫單槽（後授權覆蓋前者，需 UI 展示與指紋一致）。 */
     @Synchronized
     fun grantConfirmation(fingerprint: String) {
         require(fingerprint.isNotBlank()) { "fingerprint must not be blank" }
         confirmedFingerprint = fingerprint
+        grantedAtMs = clockMs()
     }
 
     /** 測試/設定頁相容：清空確認（等同拒絕/超時）。 */
     @Synchronized
     fun clearConfirmation() {
         confirmedFingerprint = null
+        grantedAtMs = 0L
     }
 
     /**
-     * 原子消耗一次當輪確認（P1 one-shot + 指紋綁定）：
-     * 僅當 stored 非 null 且與 expected exact-match 才清零回 true；
-     * 否則不清除、回 false（防掃描耗損額度與 TOCTOU 替換）。
+     * 原子消耗一次當輪確認（P1 one-shot + 指紋綁定 + TTL）：
+     * 僅當 stored 非 null、未過期且與 expected exact-match 才清零回 true；
+     * 過期自動清零回 false；錯誤指紋不清除、回 false
+     *（防掃描耗損額度與 TOCTOU 替換）。
      * 良性 Allow 路徑不呼叫此函數，不吃掉確認額度。
      */
     @Synchronized
     fun consumeConfirmation(expected: String): Boolean {
         val cur = confirmedFingerprint ?: return false
+        if (isExpired()) {
+            confirmedFingerprint = null
+            grantedAtMs = 0L
+            return false
+        }
         if (cur != expected) return false
         confirmedFingerprint = null
+        grantedAtMs = 0L
         return true
     }
 

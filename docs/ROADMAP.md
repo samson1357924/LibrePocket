@@ -228,7 +228,9 @@
 ### 驗收標準（可執行）
 
 1. `UT`：`BackupRoundTripTest`（備份→恢復一致；含金鑰預設排除）、`AuditExportTest`（匯出不含明文敏感）。
-2. `AAPT` + 腳本：`scripts/play_policy_check.sh app-play-release.aab` 與 `scripts/play_policy_check.sh --foss <foss-apk/aab>` 各一次通過，內容 = 權限黑名單斷言 + VPNService/Accessibility 自動化類掃描（play 門）+ 專有字串掃描（foss 門）+ 資料安全表單一致性。兩門均納入 CI 必跑門禁。
+2. **Current（APK-only；未達成完整 D07 acceptance）：** `scripts/play_policy_check.sh <play.apk>` 與 `scripts/play_policy_check.sh --foss <foss.apk>` 執行權限／manifest、DEX policy 與包裝內容檢查；`.aab` 明確 fail closed。public release workflow 暫停，不代表此項可上架驗收。
+
+   **Target（bundle-aware；尚未實作／驗收）：** 保留原 AAB acceptance：`scripts/play_policy_check.sh app-play-release.aab` 與 `scripts/play_policy_check.sh --foss <foss-apk/aab>` 各一次通過，內容 = 權限黑名單斷言 + VPNService/Accessibility 自動化類掃描（play 門）+ 專有字串掃描（foss 門）+ 資料安全表單一致性；兩門均納入 CI 必跑門禁。上述 AAB 命令僅為 Target 示例，在 scanner 支援 bundle-aware 驗證前不可當作目前可執行命令或通過證據。
 3. `SMOKE`：release 包手動全迴歸（P1→P6 冒烟子集 30 分鐘版）+ AndroidWorld 全量腳本綠；崩潰注入（kill -9）後轉錄可逐行恢復。
 4. `PLAY`：政策清單逐項勾選：目標 API 等級、64 位、資料安全表單、權限用途影片/說明（如需）、分級問卷、地區分發（簡訊/電話相關描述合規）。
 

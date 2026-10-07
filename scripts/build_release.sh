@@ -19,11 +19,11 @@
 # Override path per flavor with <FLAVOR>_KEYSTORE_FILE if needed.
 #
 # Usage:
-#   sh scripts/build_release.sh [--apk] [play] [foss] [github]
+#   sh scripts/build_release.sh --apk [play] [foss] [github]
 # Examples:
-#   sh scripts/build_release.sh                 # AABs for all three flavors
-#   sh scripts/build_release.sh --apk github    # APK for direct download
-#   sh scripts/build_release.sh play foss       # AABs for two flavors
+#   sh scripts/build_release.sh --apk           # APKs for all three flavors
+#   sh scripts/build_release.sh --apk github    # GitHub-flavor APK
+# AAB output is explicitly unsupported by this APK-only policy path.
 #
 # After the build, the play artifact is verified with play_policy_check.sh.
 set -eu
@@ -54,6 +54,11 @@ for arg in "$@"; do
 done
 if [ -z "$FLAVORS" ]; then
     FLAVORS="play foss github"
+fi
+
+# Fail before Bitwarden, environment credential lookup, or Gradle invocation.
+if [ "$WANT_APK" -ne 1 ]; then
+    die "AAB is unsupported by the current APK-only release policy gate; pass --apk (public release remains disabled for Issue #12)"
 fi
 
 # --- resolve passwords (env wins, else Bitwarden) ------------------------------
@@ -102,11 +107,7 @@ for f in $FLAVORS; do
         foss) variant=Foss ;;
         github) variant=Github ;;
     esac
-    if [ "$WANT_APK" -eq 1 ]; then
-        TASKS="$TASKS :app:assemble${variant}Release"
-    else
-        TASKS="$TASKS :app:bundle${variant}Release"
-    fi
+    TASKS="$TASKS :app:assemble${variant}Release"
 done
 # -PreleaseSigning=true activates the per-flavor release signingConfigs in
 # app/build.gradle.kts. Without it AGP would silently debug-sign the release
@@ -116,11 +117,7 @@ done
 
 # --- report + gate ---------------------------------------------------------------
 for f in $FLAVORS; do
-    if [ "$WANT_APK" -eq 1 ]; then
-        art=$(ls "app/build/outputs/apk/$f/release/"*.apk 2>/dev/null | head -n 1 || true)
-    else
-        art=$(ls "app/build/outputs/bundle/${f}Release/"*.aab 2>/dev/null | head -n 1 || true)
-    fi
+    art=$(ls "app/build/outputs/apk/$f/release/"*.apk 2>/dev/null | head -n 1 || true)
     [ -n "$art" ] || die "expected artifact for flavor '$f' not found"
     log "built ($f): $art"
     case $f in
@@ -128,4 +125,4 @@ for f in $FLAVORS; do
         foss) sh scripts/play_policy_check.sh --foss "$art" ;;
     esac
 done
-log "build_release: DONE"
+log "build_release: APK policy scan completed; cryptographic signer/package/version/final-byte identity was not verified"

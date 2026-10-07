@@ -1,10 +1,10 @@
 # Testing and Verification
 
-**Status:** Current test inventory and repeatable command guide, checked 2026-10-07 at `d7449d8ccf8c38884f514f5c30db157ca89641e1`.
+**Status:** Current test inventory and repeatable command guide.
 
 - **Scope:** Repository CI, local JVM/Robolectric tests, static policy gates, and separately scheduled Android device tests.
 - **Owner role:** CI/build maintainer; no individual is assigned here.
-- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
+- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, `scripts/apk_policy_inspect.py`, `scripts/tests/test_apk_policy_check.py`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
 - **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes.
 
 ## Current CI scope
@@ -44,13 +44,16 @@ including docs-only ones.
 No branch-protection required checks are configured on `main`; `pr-gate`
 and the checks above are informational until protection is configured.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflows do **not** run an Android emulator/device matrix on every pull request. The new Python APK policy harness is a local stdlib regression harness and is not wired into the existing PR workflow by this change. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 
 ## Local commands
 
 Use one Gradle execution at a time on constrained machines. The repo's maintenance guidance requires `--max-workers=1 --no-daemon`; do not run a parallel flavor matrix after an OOM.
 
 ```sh
+# Synthetic APK/DEX policy regression harness (Python standard library only)
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py
+
 # Flavor unit/Robolectric tests
 ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --max-workers=1 --no-daemon
 
@@ -60,12 +63,13 @@ Use one Gradle execution at a time on constrained machines. The repo's maintenan
 # Debug assembly
 ./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug --max-workers=1 --no-daemon
 
-# Artifact policy checks after successful assembly
+# APK-only artifact policy checks after successful assembly; AAB is currently
+# unsupported and rejected before credentials/build by the release helper.
 scripts/play_policy_check.sh app/build/outputs/apk/play/debug/app-play-debug.apk
 scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
 ```
 
-These are instructions, not a claim that they were run for this documentation change. Version sources are listed in [Build Environment](ENV.md).
+The synthetic Python fixtures and fake `aapt`/`dexdump` commands test bounded parser and policy behavior; they do not represent a real APK or prove Android SDK native-tool compatibility. A release/build maintainer should run the APK policy/native-parser gates against fresh debug APKs for all three flavors and record their paths, SHA-256 values, SDK build-tools version, command output, and tested commit. Do not infer a pass from historical APK inventory. These are instructions, not a claim that they were run for this documentation change. Version sources are listed in [Build Environment](ENV.md).
 
 ## Android instrumented tests
 

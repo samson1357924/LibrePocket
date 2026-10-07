@@ -32,6 +32,19 @@ class FossAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         FossA11yState.serviceGranted = true
+        instance = this
+    }
+
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        FossA11yState.serviceGranted = false
+        if (instance === this) instance = null
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        FossA11yState.serviceGranted = false
+        if (instance === this) instance = null
+        super.onDestroy()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -179,6 +192,10 @@ class FossAccessibilityService : AccessibilityService() {
     companion object {
         /** 與總開關同源的預設關常量，供設定頁 dump 舉證。 */
         const val DEFAULT_ENABLED: Boolean = FossAutomationGate.DEFAULT_ENABLED
+
+        /** 服務實例持有（與 github 鏡像同語義，僅 foss 源集訪問）。 */
+        @Volatile var instance: FossAccessibilityService? = null
+            private set
 
         /**
          * 仲裁前攔截（純 OSS 路徑）：經 [AutomationCore.verdictFor]

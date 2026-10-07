@@ -36,6 +36,19 @@ class GithubAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         GithubA11yState.serviceGranted = true
+        instance = this
+    }
+
+    override fun onUnbind(intent: android.content.Intent?): Boolean {
+        GithubA11yState.serviceGranted = false
+        if (instance === this) instance = null
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        GithubA11yState.serviceGranted = false
+        if (instance === this) instance = null
+        super.onDestroy()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -193,6 +206,14 @@ class GithubAccessibilityService : AccessibilityService() {
     companion object {
         /** 與總開關同源的預設關常量，供設定頁 dump 舉證。 */
         const val DEFAULT_ENABLED: Boolean = GithubAutomationGate.DEFAULT_ENABLED
+
+        /**
+         * 服務實例持有（產品接線用，P1 inert 修正）：
+         * flavor 層 StepExecutor 經此拿到 service 執行 [executeConfirmed]，
+         * null 表示系統未授權/未綁定。僅 flavor 源集訪問，main 不直接引用。
+         */
+        @Volatile var instance: GithubAccessibilityService? = null
+            private set
 
         /**
          * 仲裁前攔截（與 foss 鏡像同語義的守衛路徑，S3 镜像统一）：

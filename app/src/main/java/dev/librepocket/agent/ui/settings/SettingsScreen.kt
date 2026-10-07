@@ -12,6 +12,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -21,6 +22,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.librepocket.agent.ui.setup.EndpointGate
+import dev.librepocket.automation.AutomationSettingsState
 
 @Composable
 fun SettingsScreen(
@@ -32,6 +34,15 @@ fun SettingsScreen(
     onRevokePrivilege: () -> Unit = {},
     /** 提權審計筆數（僅計數，不含明文；0 表示無待收回授權痕跡）。 */
     privilegeAuditCount: Int = 0,
+    /**
+     * S3 無障礙自動化設定（P1 inert 收斂，PR#1 re-review）：
+     * null（play 或未接線）時整卡隱藏；非 null（foss/github flavor wiring 傳入）
+     * 才顯示開關 + 系統授權狀態 + 跳轉。本 PR flavor 持久化/確認 Dialog 尚未落地
+     *（SCAFFOLD），先以契約就緒 + sticky-true 已修為邊界。
+     */
+    automation: AutomationSettingsState? = null,
+    onAutomationSwitch: (Boolean) -> Unit = {},
+    onOpenSystemA11y: () -> Unit = {},
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
     Column(
@@ -136,6 +147,43 @@ fun SettingsScreen(
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
+                // S3 無障礙自動化開關（P1 inert 收斂）：僅 flavor 傳入 automation 非 null
+                // 才顯示（play 永遠 null 即隱藏）。開關預設關，系統授權需至系統設定手動開啟，
+                // 當輪敏感動作另需二次確認（per-round Dialog，flavor 接線 PR 落地）。
+                if (automation != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                        ),
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Text("螢幕自動化（無障礙，可選）", style = MaterialTheme.typography.titleMedium)
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                "僅直接下載版可用，預設關閉；開啟後仍需至系統設定手動授予無障礙權限，" +
+                                    "支付/刪除/發送類動作每次執行前需當輪二次確認。目前系統授權：" +
+                                    (if (automation.serviceGranted) "已授予" else "未授予") +
+                                    "；是否生效：" + (if (automation.effective) "已武裝" else "未武裝") + "。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Switch(
+                                checked = automation.switchOn,
+                                onCheckedChange = onAutomationSwitch,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = onOpenSystemA11y,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("前往系統無障礙設定")
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
                 if (!confirmLogout) {
                     OutlinedButton(
                         onClick = { confirmLogout = true },

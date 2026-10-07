@@ -9,6 +9,10 @@ import dev.librepocket.redact.Redactor
  * - `voice.speak`（WRITE）：系統 TTS 朗讀入口，開關 `voice_output` 預設開。
  * - `voice.speak.azure`（WRITE，僅 GITHUB）：Azure 雲端語音次選，需同時開啟
  *   `voice_output` 且 `azure_tts`（後者預設關）。
+ *   SCAFFOLD（PR#1 review 收斂）：雲端分派接線（設定頁 key/region 入口 +
+ *   朗讀鏈路 fallback）尚未落地，[AzureSpeechEngine] 尚無產品呼叫者；
+ *   在此之前投影 NATIVE 僅表示開關語義，實際呼叫走系統語音降級
+ *   （見 ToolRegistry fallbackHint）。接線 PR 翻轉此註記並附端到端測試。
  *
  * 隱私不變量（S2 鎖定）：
  * - 語音正文寫入 [RoomSessionStore][dev.librepocket.session.RoomSessionStore]

@@ -110,4 +110,22 @@ class AutomationCoreTest {
         assertFalse(codes.isEmpty())
         assertFalse(codes.toString().contains("轉帳"))
     }
+
+    // ---- P1 one-shot 確認的判定基礎（PR#1 review blocker） ----
+
+    @Test fun verdictFor_distinguishesAllowConfirmDeny() {
+        val allow = AutomationCore.verdictFor(A11yAction.Tap("n1"), "點一下返回")
+        assertTrue("$allow", allow is dev.librepocket.guard.ArbitrationVerdict.Allow)
+
+        val confirm = AutomationCore.verdictFor(A11yAction.Tap("n1"), "幫我轉帳 500 元")
+        assertTrue("$confirm", confirm is dev.librepocket.guard.ArbitrationVerdict.NeedConfirm)
+
+        // 越界種類（BACK 不在允許集內）：Deny，與 NeedConfirm 不同態。
+        val deny = AutomationCore.verdictFor(
+            A11yAction.Back,
+            "點一下確定",
+            allowedKinds = setOf(SlowActionKind.TAP),
+        )
+        assertTrue("$deny", deny is dev.librepocket.guard.ArbitrationVerdict.Deny)
+    }
 }

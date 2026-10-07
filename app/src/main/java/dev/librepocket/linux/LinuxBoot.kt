@@ -23,7 +23,14 @@ import dev.librepocket.tool.Flavor
  *   單測斷言。
  *
  * 本檔案零 Android 依賴；實際下載/解包 IO 由呼叫方（Android 層）注入
- * [Downloader] 縫，單測用假實現。
+ * [Downloader] 縫，單測用假實現。本 PR 內尚無生產 Downloader/unpacker
+ * 與生產 [download] 呼叫方（SCAFFOLD，PR#1 review 收斂）：
+ * 投影 NATIVE 僅表示開關/風味語義，`download` 動作需接線 PR
+ *（streaming 下載 + 真 unpack + 膨脹後配額 + 端到端測試）才真正可用。
+ *
+ * 配額語義邊界：[download] 的兩次 [LinuxEnv.quotaVeto] 都以**壓縮檔位元組**
+ * 計（宣告 `sizeBytes` 與 `fetch` 實際位元組），不是解包後 rootfs 實際佔用；
+ * 生產 unpacker 必須補 expanded-byte 二次裁決（見上 [LinuxEnv.quotaVeto]）。
  */
 object LinuxBoot {
 

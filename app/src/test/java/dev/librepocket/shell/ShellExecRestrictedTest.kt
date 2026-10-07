@@ -145,6 +145,22 @@ class ShellExecRestrictedTest {
         }
     }
 
+    @Test fun relativePathDeniedForDirectExecWithoutSpawn() {
+        // P0 fail-closed（PR#1 review blocker）：直接通道相對路徑一律拒且不建子進程。
+        val runner = FakeRunner(ByteArray(0))
+        val shell = RestrictedShell(runner = runner, privateRoot = privateRoot)
+        for (argv in listOf(
+            listOf("cat", "../../etc/passwd"),
+            listOf("grep", "-r", "password", ".."),
+            listOf("cat", "--db=../secret.db"),
+            listOf("cat", "chat/x.txt"),
+        )) {
+            val r = ShellExecTool.execute(argv, shell, switchOn = true)
+            assertTrue("$argv -> $r", r is ShellResult.Denied)
+        }
+        assertEquals(0, runner.calls)
+    }
+
     @Test fun elevatedDeniedAndAuditedWithoutSpawn() {
         // S3 D09：提權唯一路徑為審計版 executeElevated（無 audit 過載已刪除，
         // 全路徑強制留痕；見 ElevatedDispatch）。

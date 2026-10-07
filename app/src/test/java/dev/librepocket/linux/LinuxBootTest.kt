@@ -150,8 +150,28 @@ class LinuxBootTest {
         assertEquals(null, dl.unpackedTo)
     }
 
-    @Test fun download_unknownSize_notCountedAsZero() {
-        // 未知大小（-1）預檢跳過，fetch 後按實際裁決：小檔放行，大檔拒絕。
+    @Test fun linuxBoot_descriptionMarksDownloadScaffold() {
+        // PR#1 review 收斂：生產 Downloader 接線前 description 誠實標註 SCAFFOLD。
+        val desc = ToolRegistry.find(LinuxBoot.NAME)!!.description
+        assertTrue("desc=$desc", desc.contains("SCAFFOLD"))
+    }
+
+    @Test fun quota_countsCompressedBytesNotExpandedRootfs() {
+        // PR#1 review 收斂（語義邊界鎖定）：現配額只看壓縮檔位元組。
+        // 小 archive 兩次 veto 全過即 unpack（不做解包後佔用核算）；
+        // 生產 unpacker 必須補 expanded-byte 二次裁決，接線時更新此測試。
+        val bytes = ByteArray(8) { 3 }
+        val spec = LinuxEnv.DownloadSpec("https://example.com/a.tar.gz", shaOf(bytes), bytes.size.toLong())
+        val dl = FakeDownloader(bytes)
+        val out = LinuxBoot.download(
+            spec, Flavor.GITHUB, true, LinuxBoot.BootState.NOT_INSTALLED,
+            filesDir, "alpine", 0, 0, dl,
+        )
+        assertTrue("expected Ok, got $out", out is LinuxBoot.BootOutcome.Ok)
+        assertEquals(LinuxEnv.containerRootfs(filesDir, "alpine"), dl.unpackedTo)
+    }
+
+    @Test fun download_unknownSize_notCountedAsZero() {       // 未知大小（-1）預檢跳過，fetch 後按實際裁決：小檔放行，大檔拒絕。
         val small = "tiny".toByteArray()
         val smallSpec = LinuxEnv.DownloadSpec("https://example.com/a.tar.gz", shaOf(small), -1L)
         val smallDl = FakeDownloader(small)

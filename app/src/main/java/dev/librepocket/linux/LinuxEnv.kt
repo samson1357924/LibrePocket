@@ -100,6 +100,12 @@ object LinuxEnv {
      * 配額裁決（純函數）：`usedContainer + incoming` 不得超單容器 2G，
      * `usedTotal + incoming` 不得超總量 4G。呼叫方在下載/解包前先算，
      * 下載後必須再以實際位元組數算一次（防宣告大小造假，見 [LinuxBoot.download]）。
+     *
+     * 語義邊界（PR#1 review 收斂）：此處 `incoming` 是**壓縮檔位元組**
+     * （`fetch` 回傳的 archive 大小），不是解包後 rootfs 實際佔用；
+     * 高壓縮比 archive 仍可能撐爆儲存。生產 unpacker 落地時必須做
+     * streaming extraction + per-entry 路徑安全 + expanded-byte 配額
+     * 二次裁決（超限 abort + 清理 rootfs），見 [LinuxBoot.download]。
      */
     fun quotaVeto(usedTotalBytes: Long, usedContainerBytes: Long, incomingBytes: Long): String? {
         if (incomingBytes < 0) return "NEGATIVE_SIZE"

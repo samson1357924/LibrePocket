@@ -10,6 +10,9 @@ import dev.librepocket.automation.A11yAction
 import dev.librepocket.automation.A11yWalker
 import dev.librepocket.automation.AutomationCore
 import dev.librepocket.guard.ArbitrationCode
+import dev.librepocket.guard.ArbitrationVerdict
+import dev.librepocket.guard.SlowActionKind
+import dev.librepocket.guard.SlowArbitrator
 
 /**
  * Foss 風味無障礙自動化真實現（S3，BACKLOG B5/B8，純 OSS）。
@@ -42,16 +45,27 @@ class FossAccessibilityService : AccessibilityService() {
     override fun onInterrupt() = Unit
 
     /**
-     * 當輪確認後的唯一執行動作入口。呼叫前必須已通過 [gateAction] 且
-     * 使用者已二次確認（[FossA11yState.userConfirmed]）；否則回 false。
+     * 當輪確認後的唯一執行動作入口（P1 one-shot 確認，PR#1 review blocker，
+     * 與 github 鏡像同語義）。
+     *
+     * - [FossA11yState.effective] 為 false → 回 false；
+     * - 裁決 Allow → 直接 [perform]（不消耗確認）；
+     * - 裁決 NeedConfirm → 原子消耗一次當輪確認才 [perform]（防重放）；
+     * - 裁決 Deny（越界種類）→ 即使已確認仍回 false。
      *
      * 執行緒約束：必須在背景執行緒呼叫（手勢分派見 [dispatchSwipe]
      * 的 ANR 防護，主執行緒呼叫一律回 false）。
      */
     fun executeConfirmed(action: A11yAction, goalText: String, targetText: String = ""): Boolean {
         if (!FossA11yState.effective()) return false
-        if (gateAction(goalText, action, targetText) !is FossGateDecision.Allow) return false
-        return perform(action)
+        when (AutomationCore.verdictFor(action, goalText, targetText)) {
+            is ArbitrationVerdict.Allow -> return perform(action)
+            is ArbitrationVerdict.Deny -> return false
+            is ArbitrationVerdict.NeedConfirm -> {
+                if (!FossA11yState.consumeConfirmation()) return false
+                return perform(action)
+            }
+        }
     }
 
     private fun perform(action: A11yAction): Boolean {
@@ -164,29 +178,32 @@ class FossAccessibilityService : AccessibilityService() {
         const val DEFAULT_ENABLED: Boolean = FossAutomationGate.DEFAULT_ENABLED
 
         /**
-         * 仲裁前攔截（純 OSS 路徑）：經 [AutomationCore.needsConfirm]
-         *（支付/刪除/發送關鍵詞或種類命中 → 強制 CONFIRM；越界種類拒絕，
-         * 同樣視為攔截）；只有放行回 [FossGateDecision.Allow]。
+         * 仲裁前攔截（純 OSS 路徑）：經 [AutomationCore.verdictFor]
+         * 三態映射 —— Allow → [FossGateDecision.Allow]；支付/刪除/發送
+         * 關鍵詞或種類命中 → [FossGateDecision.NeedConfirm]；越界種類拒絕 →
+         * [FossGateDecision.Denied]（確認不可覆寫）。
          */
         fun gateAction(
             goalText: String,
             action: A11yAction,
             targetText: String = "",
+            allowedKinds: Set<SlowActionKind> = SlowArbitrator.DEFAULT_ALLOWED,
         ): FossGateDecision {
-            if (AutomationCore.needsConfirm(action, goalText, targetText)) {
-                return FossGateDecision.NeedConfirm(
-                    AutomationCore.interceptCodes(action, goalText, targetText),
-                )
+            return when (val verdict = AutomationCore.verdictFor(action, goalText, targetText, allowedKinds)) {
+                is ArbitrationVerdict.Allow -> FossGateDecision.Allow
+                is ArbitrationVerdict.NeedConfirm -> FossGateDecision.NeedConfirm(verdict.codes)
+                is ArbitrationVerdict.Deny -> FossGateDecision.Denied(verdict.codes)
             }
-            return FossGateDecision.Allow
         }
     }
 }
 
-/** 仲裁前攔截結論：放行 / 需二次確認（附理由碼，轉錄/審計用）。 */
+/** 仲裁前攔截結論：放行 / 需二次確認 / 拒絕（附理由碼，轉錄/審計用）。 */
 sealed interface FossGateDecision {
     data object Allow : FossGateDecision
     data class NeedConfirm(val codes: List<ArbitrationCode>) : FossGateDecision
+    /** 越界種類：即使已確認亦不可執行（確認不可覆寫拒絕）。 */
+    data class Denied(val codes: List<ArbitrationCode>) : FossGateDecision
 }
 
 /**
@@ -205,4 +222,16 @@ object FossA11yState {
         serviceGranted = serviceGranted,
         userConfirmed = userConfirmed,
     )
+
+    /**
+     * 原子消耗一次當輪確認（P1 one-shot，PR#1 review blocker，
+     * 與 github 鏡像同語義）：已確認才回 true 並清零，防重放；
+     * 良性 Allow 路徑不呼叫此函數。
+     */
+    @Synchronized
+    fun consumeConfirmation(): Boolean {
+        if (!userConfirmed) return false
+        userConfirmed = false
+        return true
+    }
 }

@@ -1,6 +1,7 @@
 package dev.librepocket.automation
 
 import dev.librepocket.guard.ArbitrationCode
+import dev.librepocket.guard.ArbitrationVerdict
 import dev.librepocket.guard.SlowActionKind
 import dev.librepocket.guard.SlowArbitrator
 import dev.librepocket.guard.SlowProposal
@@ -19,8 +20,9 @@ import dev.librepocket.redact.Redactor
  *    （可操作/帶文本優先，布局容器丟棄，計數與字數設限）；
  * 2. [tapJson]/[swipeJson]/[inputJson]/[backJson]：執行動作的緊湊 JSON
  *    （無空白，供轉錄與執行器消費；input 正文同樣先脫敏）；
- * 3. [needsConfirm]：SlowRouter 仲裁前攔截 —— 支付/刪除/發送類
- *    （關鍵詞或種類命中）強制 CONFIRM，越界種類拒絕；只有 Allow 算放行。
+ * 3. [verdictFor]：SlowRouter 仲裁前攔截的正典三態裁決 —— 支付/刪除/發送類
+ *    （關鍵詞或種類命中）強制 CONFIRM，越界種類拒絕（Deny，確認不可覆寫）；
+ *    只有 Allow 算放行。[needsConfirm]/[interceptCodes] 皆由此衍生。
  */
 data class A11yNode(
     val id: String,
@@ -118,6 +120,35 @@ object AutomationCore {
     fun backJson(): String = "{\"back\":true}"
 
     /**
+     * 仲裁前攔截的完整裁決（P1 one-shot 確認的判定基礎，PR#1 review blocker）：
+     * 把一步動作映射為 [SlowProposal] 再經 [SlowArbitrator]，原樣回傳
+     * [ArbitrationVerdict]（Allow / NeedConfirm / Deny 三態，呼叫方可區分
+     * 「確認可放行」與「越界永拒」）。[needsConfirm]/[interceptCodes] 皆由此衍生。
+     */
+    fun verdictFor(
+        action: A11yAction,
+        goalText: String,
+        targetText: String = "",
+        allowedKinds: Set<SlowActionKind> = SlowArbitrator.DEFAULT_ALLOWED,
+    ): ArbitrationVerdict {
+        val kind = when (action) {
+            is A11yAction.Tap -> SlowActionKind.TAP
+            is A11yAction.Swipe -> SlowActionKind.SCROLL
+            is A11yAction.Input -> SlowActionKind.INPUT
+            is A11yAction.Back -> SlowActionKind.BACK
+        }
+        return SlowArbitrator.arbitrate(
+            SlowProposal(
+                id = "a11y-${action.key()}",
+                kind = kind,
+                goalText = goalText,
+                targetText = targetText,
+            ),
+            allowedKinds = allowedKinds,
+        )
+    }
+
+    /**
      * 仲裁前攔截：把一步動作映射為 [SlowProposal] 再經 [SlowArbitrator]。
      * 支付/刪除/發送類強制 CONFIRM（回 true）；越界種類拒絕（同樣回 true，
      * 呼叫方一律視為已攔截）；只有 Allow 回 false（可放行）。
@@ -128,22 +159,7 @@ object AutomationCore {
         targetText: String = "",
         allowedKinds: Set<SlowActionKind> = SlowArbitrator.DEFAULT_ALLOWED,
     ): Boolean {
-        val kind = when (action) {
-            is A11yAction.Tap -> SlowActionKind.TAP
-            is A11yAction.Swipe -> SlowActionKind.SCROLL
-            is A11yAction.Input -> SlowActionKind.INPUT
-            is A11yAction.Back -> SlowActionKind.BACK
-        }
-        val verdict = SlowArbitrator.arbitrate(
-            SlowProposal(
-                id = "a11y-${action.key()}",
-                kind = kind,
-                goalText = goalText,
-                targetText = targetText,
-            ),
-            allowedKinds = allowedKinds,
-        )
-        return SlowArbitrator.isIntercepted(verdict)
+        return SlowArbitrator.isIntercepted(verdictFor(action, goalText, targetText, allowedKinds))
     }
 
     /** 攔截理由碼（審計/轉錄用，不含敏感原文）。 */
@@ -153,16 +169,7 @@ object AutomationCore {
         targetText: String = "",
         allowedKinds: Set<SlowActionKind> = SlowArbitrator.DEFAULT_ALLOWED,
     ): List<ArbitrationCode> {
-        val kind = when (action) {
-            is A11yAction.Tap -> SlowActionKind.TAP
-            is A11yAction.Swipe -> SlowActionKind.SCROLL
-            is A11yAction.Input -> SlowActionKind.INPUT
-            is A11yAction.Back -> SlowActionKind.BACK
-        }
-        return SlowArbitrator.arbitrate(
-            SlowProposal("a11y-${action.key()}", kind, goalText, targetText),
-            allowedKinds,
-        ).codes
+        return verdictFor(action, goalText, targetText, allowedKinds).codes
     }
 
     private fun A11yAction.key(): String = when (this) {

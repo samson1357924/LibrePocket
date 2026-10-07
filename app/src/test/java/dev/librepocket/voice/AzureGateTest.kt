@@ -93,8 +93,13 @@ class AzureGateTest {
         assertEquals(CapabilityLevel.NATIVE, ToolRegistry.projectAll(on)[VoiceTools.AZURE_SPEAK_NAME]!!.level)
     }
 
-    @Test fun azure_voiceOutputOffIsUserDisabled() {
-        // M1：雙開關任一關即 UNAVAILABLE + USER_DISABLED（與 AzureSpeechGate 同語義）。
+    @Test fun azure_descriptionMarksScaffoldUntilWired() {
+        // PR#1 review 收斂：雲端分派接線落地前，模型可見的 description 必須誠實標註 SCAFFOLD。
+        val desc = ToolRegistry.find(VoiceTools.AZURE_SPEAK_NAME)!!.description
+        assertTrue("desc=$desc", desc.contains("SCAFFOLD"))
+    }
+
+    @Test fun azure_voiceOutputOffIsUserDisabled() {       // M1：雙開關任一關即 UNAVAILABLE + USER_DISABLED（與 AzureSpeechGate 同語義）。
         val outputOff = ProjectionContext(
             flavor = Flavor.GITHUB,
             userSwitches = mapOf(

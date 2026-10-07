@@ -113,6 +113,68 @@ class ShellElevatedTest {
         assertTrue("$allowed", allowed is Validation.Allowed)
     }
 
+    @Test fun elevatedRelativePathDeniedRegardlessOfBridge() {
+        // P0 fail-closed（PR#1 review blocker）：相對路徑不進 FileScope
+        // 即一律拒，bridge on/off 皆同，且不因提權放行。
+        val cases = listOf(
+            listOf("cat", "../../etc/passwd"),
+            listOf("cat", "../../../etc/passwd"),
+            listOf("grep", "-r", "password", ".."),
+            listOf("find", "..", "-maxdepth", "2", "-name", "*.db"),
+            listOf("cat", "--db=../secret.db"),
+            listOf("cat", "sub/../../etc/passwd"),
+            listOf("cat", ".."),
+            listOf("cat", "."),
+            // dash 開頭但含 `/`：合法 flag 不含斜線，一律擋。
+            listOf("cat", "-foo/bar"),
+            listOf("cat", "--foo/bar"),
+            // 域內相對路徑同樣 fail-closed：呼叫方需先轉絕對路徑。
+            listOf("cat", "chat/x.txt"),
+            listOf("cat", "./chat/x.txt"),
+        )
+        for (flavor in listOf(Flavor.PLAY, Flavor.FOSS, Flavor.GITHUB)) {
+            for (bridge in listOf(false, true)) {
+                for (argv in cases) {
+                    val v = ShellPolicy.validateElevated(argv, privateRoot, flavor = flavor, bridgeGranted = bridge)
+                    assertTrue("$flavor bridge=$bridge $argv -> $v", v is Validation.Denied)
+                    assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+                }
+            }
+        }
+    }
+
+    @Test fun directValidateRelativePathDenied() {
+        // 直接通道同洞同修：validate() 相對路徑亦一律拒。
+        for (argv in listOf(
+            listOf("cat", "../../etc/passwd"),
+            listOf("cat", "../../../etc/passwd"),
+            listOf("grep", "-r", "password", ".."),
+            listOf("find", "..", "-maxdepth", "2", "-name", "*.db"),
+            listOf("cat", "--db=../secret.db"),
+            listOf("cat", "sub/../../etc/passwd"),
+            listOf("cat", ".."),
+            listOf("cat", "."),
+            listOf("cat", "-foo/bar"),
+            listOf("cat", "chat/x.txt"),
+            listOf("cat", "./chat/x.txt"),
+        )) {
+            val v = ShellPolicy.validate(argv, privateRoot)
+            assertTrue("$argv -> $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        }
+    }
+
+    @Test fun barePatternWithoutSlashNotKilledByRelativeGate() {
+        // 避免誤殺：無 `/` 的 bare pattern（搜尋字串/flag 值）不視為路徑。
+        val v = ShellPolicy.validateElevated(
+            listOf("grep", "-r", "password"),
+            privateRoot,
+            flavor = Flavor.GITHUB,
+            bridgeGranted = true,
+        )
+        assertTrue("$v", v is Validation.Allowed)
+    }
+
     // ---- 門禁 elevated 分支 ----
 
     @Test fun gate_elevatedNeedsConfirmWithoutConfirm() {

@@ -40,4 +40,63 @@ class FossA11yTest {
         assertFalse(FossA11yState.effective())
         assertEquals(false, FossAccessibilityService.DEFAULT_ENABLED)
     }
+
+    @Test fun outOfScopeGateIsDeniedNotConfirmable() {
+        // 越界種類 → Denied（確認不可覆寫；executeConfirmed 遇 Denied 永拒）。
+        val verdict = FossAccessibilityService.gateAction(
+            "點一下確定",
+            A11yAction.Back,
+            allowedKinds = dev.librepocket.guard.SlowArbitrator.DEFAULT_ALLOWED
+                .filter { it != dev.librepocket.guard.SlowActionKind.BACK }.toSet(),
+        )
+        assertTrue("$verdict", verdict is FossGateDecision.Denied)
+    }
+
+    @Test fun oneShotConfirmationLifecycle() {       // P1 lifecycle（PR#1 review blocker，判定層；perform 需真機）：
+        // NeedConfirm → 武裝三同意（effective）→ 消耗一次確認 → 重放被擋。
+        val gate = FossAccessibilityService.gateAction("幫我轉帳 500 元", A11yAction.Tap("n1"))
+        assertTrue("$gate", gate is FossGateDecision.NeedConfirm)
+
+        val prevSwitch = FossA11yState.switchOn
+        val prevGrant = FossA11yState.serviceGranted
+        val prevConfirm = FossA11yState.userConfirmed
+        try {
+            FossA11yState.switchOn = true
+            FossA11yState.serviceGranted = true
+            FossA11yState.userConfirmed = false
+            assertFalse(FossA11yState.effective())
+            assertFalse(FossA11yState.consumeConfirmation())
+
+            FossA11yState.userConfirmed = true
+            assertTrue(FossA11yState.effective())
+            assertTrue(FossA11yState.consumeConfirmation())
+
+            assertFalse(FossA11yState.userConfirmed)
+            assertFalse(FossA11yState.effective())
+            assertFalse(FossA11yState.consumeConfirmation())
+        } finally {
+            FossA11yState.switchOn = prevSwitch
+            FossA11yState.serviceGranted = prevGrant
+            FossA11yState.userConfirmed = prevConfirm
+        }
+    }
+
+    @Test fun benignAllowDoesNotNeedConfirmation() {
+        // 與 github 鏡像同語義：良性 Allow 不吃確認額度。
+        val prevSwitch = FossA11yState.switchOn
+        val prevGrant = FossA11yState.serviceGranted
+        val prevConfirm = FossA11yState.userConfirmed
+        try {
+            FossA11yState.switchOn = true
+            FossA11yState.serviceGranted = true
+            FossA11yState.userConfirmed = true
+            val gate = FossAccessibilityService.gateAction("點一下返回", A11yAction.Tap("n1"))
+            assertEquals(FossGateDecision.Allow, gate)
+            assertTrue(FossA11yState.userConfirmed)
+        } finally {
+            FossA11yState.switchOn = prevSwitch
+            FossA11yState.serviceGranted = prevGrant
+            FossA11yState.userConfirmed = prevConfirm
+        }
+    }
 }

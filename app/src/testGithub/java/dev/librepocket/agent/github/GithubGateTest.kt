@@ -57,4 +57,67 @@ class GithubGateTest {
         assertEquals("{\"swipe\":[1,2,3,4]}", AutomationCore.swipeJson(1, 2, 3, 4))
         assertEquals("{\"back\":true}", AutomationCore.backJson())
     }
+
+    @Test fun outOfScopeGateIsDeniedNotConfirmable() {
+        // 越界種類 → Denied（確認不可覆寫；executeConfirmed 遇 Denied 永拒）。
+        val verdict = GithubAccessibilityService.gateAction(
+            "點一下確定",
+            A11yAction.Back,
+            allowedKinds = dev.librepocket.guard.SlowArbitrator.DEFAULT_ALLOWED
+                .filter { it != dev.librepocket.guard.SlowActionKind.BACK }.toSet(),
+        )
+        assertTrue("$verdict", verdict is GateDecision.Denied)
+    }
+
+    @Test fun oneShotConfirmationLifecycle() {
+        // P1 lifecycle（PR#1 review blocker，判定層；perform 需真機）：
+        // NeedConfirm → 武裝三同意（effective）→ 消耗一次確認 → 重放被擋。
+        val gate = GithubAccessibilityService.gateAction("幫我轉帳 500 元", A11yAction.Tap("n1"))
+        assertTrue("$gate", gate is GateDecision.NeedConfirm)
+
+        val prevSwitch = GithubA11yState.switchOn
+        val prevGrant = GithubA11yState.serviceGranted
+        val prevConfirm = GithubA11yState.userConfirmed
+        try {
+            // 未確認：effective false，連判定都過不了。
+            GithubA11yState.switchOn = true
+            GithubA11yState.serviceGranted = true
+            GithubA11yState.userConfirmed = false
+            assertFalse(GithubA11yState.effective())
+            assertFalse(GithubA11yState.consumeConfirmation())
+
+            // 確認後：effective true，可消耗一次。
+            GithubA11yState.userConfirmed = true
+            assertTrue(GithubA11yState.effective())
+            assertTrue(GithubA11yState.consumeConfirmation())
+
+            // one-shot 已消耗：effective 回 false，重放再擋。
+            assertFalse(GithubA11yState.userConfirmed)
+            assertFalse(GithubA11yState.effective())
+            assertFalse(GithubA11yState.consumeConfirmation())
+        } finally {
+            GithubA11yState.switchOn = prevSwitch
+            GithubA11yState.serviceGranted = prevGrant
+            GithubA11yState.userConfirmed = prevConfirm
+        }
+    }
+
+    @Test fun benignAllowDoesNotNeedConfirmation() {
+        // 良性 Allow 不吃確認額度：武裝後不消耗，userConfirmed 原樣保留。
+        val prevSwitch = GithubA11yState.switchOn
+        val prevGrant = GithubA11yState.serviceGranted
+        val prevConfirm = GithubA11yState.userConfirmed
+        try {
+            GithubA11yState.switchOn = true
+            GithubA11yState.serviceGranted = true
+            GithubA11yState.userConfirmed = true
+            val gate = GithubAccessibilityService.gateAction("點一下返回", A11yAction.Tap("n1"))
+            assertEquals(GateDecision.Allow, gate)
+            assertTrue(GithubA11yState.userConfirmed)
+        } finally {
+            GithubA11yState.switchOn = prevSwitch
+            GithubA11yState.serviceGranted = prevGrant
+            GithubA11yState.userConfirmed = prevConfirm
+        }
+    }
 }

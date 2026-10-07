@@ -172,6 +172,8 @@ object ShellPolicy {
         }
         // 白名單二進位讀任意路徑封堵：檔案參數凡絕對路徑先過 FileScope.decide。
         // argv[0] 是二進位本身（/bin/ls 類豁免），只查 drop(1)。
+        // P0 fail-closed：相對路徑（`../`、`..`、含 `/` 者）不進 FileScope
+        // 即一律拒，呼叫方需先轉絕對路徑（見 isRelativePathArg）。
         for (arg in argv.drop(1)) {
             for (candidate in absoluteCandidates(arg)) {
                 val denial = checkFileScope(
@@ -182,6 +184,12 @@ object ShellPolicy {
                     bridgeGranted,
                 )
                 if (denial != null) return denial
+            }
+            if (isRelativePathArg(arg)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "relative path denied (fail-closed, use absolute path): $arg",
+                )
             }
         }
         return Validation.Allowed(base)
@@ -250,6 +258,8 @@ object ShellPolicy {
             }
         }
         // 檔案域（提權語義）：needsBridge 且橋接已授權才放行跨域。
+        // P0 fail-closed：相對路徑同直接通道一律拒（見 isRelativePathArg），
+        // 提權 cwd 未釘死前不得放行任何相對路徑。
         for (arg in argv.drop(1)) {
             for (candidate in absoluteCandidates(arg)) {
                 val denial = checkFileScopeElevated(
@@ -260,6 +270,12 @@ object ShellPolicy {
                     bridgeGranted,
                 )
                 if (denial != null) return denial
+            }
+            if (isRelativePathArg(arg)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "relative path denied (fail-closed, use absolute path): $arg",
+                )
             }
         }
         return Validation.Allowed(base)
@@ -273,6 +289,40 @@ object ShellPolicy {
             return listOf(arg.substring(eq + 1))
         }
         return emptyList()
+    }
+
+    /**
+     * 相對路徑值是否像路徑（P0 fail-closed，PR#1 review blocker）：
+     * 含 `/` 或為 `.`/`..` 即視為路徑。
+     */
+    private fun isRelativePathValue(value: String): Boolean {
+        if (value == "." || value == "..") return true
+        if (value.contains('/')) return true
+        return false
+    }
+
+    /**
+     * argv 參數是否為相對路徑（P0 fail-closed）。
+     * - 絕對路徑（`/...`、`--opt=/...`）由 [absoluteCandidates] 處理，
+     *   此處回 false（其中 key 含 `/` 的畸形參數仍擋）；
+     * - `-flag` 純旗標：不含 `/` 即放行，含 `/`（如 `-foo/bar`）一律擋
+     *   （合法 flag 不含斜線）；
+     * - 非旗標 bare word 沒有 `/` 且不是 `.`/`..` 視為 pattern/檔名不擋
+     *  （避免 `grep -r password` 誤殺）；其餘含 `/` 或為 `.`/`..` 一律擋，
+     *   呼叫方需先轉絕對路徑再送 FileScope 裁決。
+     */
+    private fun isRelativePathArg(arg: String): Boolean {
+        if (arg.startsWith("-")) {
+            val eq = arg.indexOf('=')
+            if (eq < 0) return arg.contains('/')
+            val key = arg.substring(0, eq)
+            val v = arg.substring(eq + 1)
+            if (key.contains('/')) return true
+            if (v.startsWith("/")) return false
+            return isRelativePathValue(v)
+        }
+        if (arg.startsWith("/")) return false
+        return isRelativePathValue(arg)
     }
 
     /** 絕對路徑經 [FileScope.decide]；跨域 / 需橋接 / 無作用域一律拒絕。 */

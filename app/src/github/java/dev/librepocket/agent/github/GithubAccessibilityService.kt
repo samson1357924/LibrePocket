@@ -10,6 +10,9 @@ import dev.librepocket.automation.A11yAction
 import dev.librepocket.automation.A11yWalker
 import dev.librepocket.automation.AutomationCore
 import dev.librepocket.guard.ArbitrationCode
+import dev.librepocket.guard.ArbitrationVerdict
+import dev.librepocket.guard.SlowActionKind
+import dev.librepocket.guard.SlowArbitrator
 
 /**
  * GitHub 風味無障礙自動化真實現（S3，BACKLOG B5/B8，矩陣 §1/§2）。
@@ -21,9 +24,11 @@ import dev.librepocket.guard.ArbitrationCode
  *   [onAccessibilityEvent] 直接返回，不讀窗、不點擊；
  * - 管線：節點快照（[A11yWalker]）→ 脫敏語義壓縮
  *  （[AutomationCore.compressNodes]，郵箱/電話等先遮罩）→
- *   執行前經 [gateAction]（[AutomationCore.needsConfirm] 仲裁前攔截，
+ *   執行前經 [gateAction]（[AutomationCore.verdictFor] 仲裁前攔截，
  *   與 foss 鏡像同語義）：支付/刪除/發送類強制
- *   CONFIRM（[GateDecision.NeedConfirm]），未確認一律不執行；
+ *   CONFIRM（[GateDecision.NeedConfirm]），未確認不執行；
+ *   已確認消耗一次 one-shot 確認後執行（[executeConfirmed]），
+ *   越界種類（[GateDecision.Denied]）即使已確認亦不執行；
  * - 動作序列化為緊湊 JSON（[AutomationCore.tapJson]/[swipeJson]/
  *   [inputJson]/[backJson]，無空白），供轉錄與 SlowRouter 消費。
  */
@@ -44,16 +49,29 @@ class GithubAccessibilityService : AccessibilityService() {
     override fun onInterrupt() = Unit
 
     /**
-     * 當輪確認後的唯一執行動作入口。呼叫前必須已通過 [gateAction] 且
-     * 使用者已二次確認（[GithubA11yState.userConfirmed]）；否則回 false。
+     * 當輪確認後的唯一執行動作入口（P1 one-shot 確認，PR#1 review blocker）。
+     *
+     * 舊語義在已確認後仍把同一 proposal 重新仲裁為 NeedConfirm 並拒絕，
+     * 敏感動作永遠到不了 [perform]（dead-end）。新語義：
+     * - [GithubA11yState.effective] 為 false（一輪三同意缺一）→ 回 false；
+     * - 裁決 Allow → 直接 [perform]（不消耗確認，良性動作不吃掉確認額度）；
+     * - 裁決 NeedConfirm → 必須原子消耗一次當輪確認（[GithubA11yState.consumeConfirmation]）
+     *   才 [perform]；消耗失敗（已被用過/重放）回 false；
+     * - 裁決 Deny（越界種類）→ 即使已確認仍回 false（確認不可覆寫拒絕）。
      *
      * 執行緒約束：必須在背景執行緒呼叫（手勢分派見 [dispatchSwipe]
      * 的 ANR 防護，主執行緒呼叫一律回 false）。
      */
     fun executeConfirmed(action: A11yAction, goalText: String, targetText: String = ""): Boolean {
         if (!GithubA11yState.effective()) return false
-        if (gateAction(goalText, action, targetText) !is GateDecision.Allow) return false
-        return perform(action)
+        when (AutomationCore.verdictFor(action, goalText, targetText)) {
+            is ArbitrationVerdict.Allow -> return perform(action)
+            is ArbitrationVerdict.Deny -> return false
+            is ArbitrationVerdict.NeedConfirm -> {
+                if (!GithubA11yState.consumeConfirmation()) return false
+                return perform(action)
+            }
+        }
     }
 
     private fun perform(action: A11yAction): Boolean {
@@ -167,31 +185,34 @@ class GithubAccessibilityService : AccessibilityService() {
 
         /**
          * 仲裁前攔截（與 foss 鏡像同語義的守衛路徑，S3 镜像统一）：
-         * 只經 [AutomationCore.needsConfirm]（支付/刪除/發送關鍵詞或種類命中
-         * → 強制 CONFIRM；越界種類拒絕，同樣視為攔截）；只有放行回
-         * [GateDecision.Allow]。原 github 慢核（dev.librepocket.slow
-         * SlowArbitrator.assess）已移除，其獨有關鍵詞已併入守衛
-         * （見 dev.librepocket.guard.SlowArbitrator），避免雙風味分叉。
+         * 經 [AutomationCore.verdictFor] 三態映射 —— Allow → [GateDecision.Allow]；
+         * NeedConfirm（支付/刪除/發送關鍵詞或種類命中）→ [GateDecision.NeedConfirm]；
+         * Deny（越界種類）→ [GateDecision.Denied]（確認不可覆寫）。
+         * 原 github 慢核（dev.librepocket.slow SlowArbitrator.assess）已移除，
+         * 其獨有關鍵詞已併入守衛（見 dev.librepocket.guard.SlowArbitrator），
+         * 避免雙風味分叉。
          */
         fun gateAction(
             goalText: String,
             action: A11yAction,
             targetText: String = "",
+            allowedKinds: Set<SlowActionKind> = SlowArbitrator.DEFAULT_ALLOWED,
         ): GateDecision {
-            if (AutomationCore.needsConfirm(action, goalText, targetText)) {
-                return GateDecision.NeedConfirm(
-                    AutomationCore.interceptCodes(action, goalText, targetText),
-                )
+            return when (val verdict = AutomationCore.verdictFor(action, goalText, targetText, allowedKinds)) {
+                is ArbitrationVerdict.Allow -> GateDecision.Allow
+                is ArbitrationVerdict.NeedConfirm -> GateDecision.NeedConfirm(verdict.codes)
+                is ArbitrationVerdict.Deny -> GateDecision.Denied(verdict.codes)
             }
-            return GateDecision.Allow
         }
     }
 }
 
-/** 仲裁前攔截結論：放行 / 需二次確認（附理由碼，轉錄/審計用）。 */
+/** 仲裁前攔截結論：放行 / 需二次確認 / 拒絕（附理由碼，轉錄/審計用）。 */
 sealed interface GateDecision {
     data object Allow : GateDecision
     data class NeedConfirm(val codes: List<ArbitrationCode>) : GateDecision
+    /** 越界種類：即使已確認亦不可執行（確認不可覆寫拒絕）。 */
+    data class Denied(val codes: List<ArbitrationCode>) : GateDecision
 }
 
 /**
@@ -210,4 +231,16 @@ object GithubA11yState {
         serviceGranted = serviceGranted,
         userConfirmed = userConfirmed,
     )
+
+    /**
+     * 原子消耗一次當輪確認（P1 one-shot，PR#1 review blocker）：
+     * 已確認才回 true 並清零（一次確認只放行一步敏感動作，防重放）；
+     * 未確認回 false。良性 Allow 路徑不呼叫此函數，不吃掉確認額度。
+     */
+    @Synchronized
+    fun consumeConfirmation(): Boolean {
+        if (!userConfirmed) return false
+        userConfirmed = false
+        return true
+    }
 }

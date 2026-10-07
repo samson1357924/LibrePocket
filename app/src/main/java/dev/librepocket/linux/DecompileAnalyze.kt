@@ -141,10 +141,11 @@ object DecompileAnalyze {
     }
 
     /**
-     * 相容舊單參簽名（預設 foss + 開關開 + 測試容器，僅確認語義）。
-     * 正式鏈路一律用五參版本（含門禁）。
+     * 相容舊單參簽名（PR#1 review T2 收斂：僅測試可見）。
+     * 正式鏈路一律用五參版本（含門禁）；此 overload 只鎖確認語義，
+     * 生產碼不得呼叫。
      */
-    fun repack(confirmed: Boolean): RepackOutcome =
+    internal fun repack(confirmed: Boolean): RepackOutcome =
         if (!confirmed) RepackOutcome.NeedConfirm(REPACK_NAME)
         else RepackOutcome.Ok("repack confirmed (signing runs inside the container)")
 

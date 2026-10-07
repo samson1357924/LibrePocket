@@ -588,7 +588,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = "voice.speak.azure",
-            description = "Cloud voice fallback via Azure Speech (github flavor only); needs voice_output and azure_tts on, text redacted before upload.",
+            description = "Cloud voice fallback via Azure Speech (github flavor only); needs voice_output and azure_tts on, text redacted before upload. SCAFFOLD: cloud dispatch wiring (settings key/region +朗讀鏈路 fallback) lands later; until then calls fall back to the system voice.",
             jsonSchema = schema(
                 prop("text", "string", "Text to synthesize via Azure"),
                 prop("voice", "string", "Optional Azure voice name"),
@@ -645,7 +645,7 @@ object ToolRegistry {
     val LINUX_TOOLS: List<ToolDef> = listOf(
         ToolDef(
             name = LinuxBoot.NAME,
-            description = "Download/start/stop an on-device PRoot Linux container (self-install only; rootfs is downloaded over HTTPS with SHA256, never bundled). Perf-limited: light tasks only.",
+            description = "Download/start/stop an on-device PRoot Linux container (self-install only; rootfs is downloaded over HTTPS with SHA256, never bundled). Perf-limited: light tasks only. SCAFFOLD: download needs a production Downloader injected by the Android layer (test Fake only in this PR); quota below counts compressed bytes, not expanded rootfs (see LinuxBoot.download).",
             jsonSchema = schema(
                 prop("action", "string", "download|start|stop"),
                 prop("container", "string", "Container name, [A-Za-z0-9_-]+"),

@@ -34,8 +34,16 @@ tink = "1.23.0"
 # Phase1 flavors: OCR / scan / on-device inference (foss+github = OSS, github-only = ML Kit)
 mlkitBarcodeScanning = "17.3.0"
 mlkitTextRecognition = "16.0.1"
+# S2 cloud voice fallback (github flavor only; foss/play must never reference it —
+# see HardeningPolicy.FOSS_STRING_BLACKLIST + scripts/play_policy_check.sh foss gate).
+azureSpeech = "1.52.0"
 zxingCore = "3.5.4"
 tessTwo = "9.1.0"
+# S3 privileged bridge (github flavor only; foss/play must never reference it).
+# Shizuku remote-process + provider (13.x line). Only `githubImplementation`
+# may consume these (see app/build.gradle.kts); any `implementation(...)` leak
+# into foss/play breaks store compliance.
+shizuku = "13.1.5"
 # NOTE: com.google.ai.edge.litert:litert (any 1.x/2.x) is unusable with AGP 9:
 # litert + litert-api AARs both declare package="com.google.ai.edge.litert",
 # tripping unique-namespace enforcement (verified 2.1.6/2.2.0). Phase1 pins the
@@ -61,6 +69,7 @@ test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "t
 espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
 mlkit-barcode-scanning = { group = "com.google.mlkit", name = "barcode-scanning", version.ref = "mlkitBarcodeScanning" }
 mlkit-text-recognition = { group = "com.google.mlkit", name = "text-recognition", version.ref = "mlkitTextRecognition" }
+azure-speech = { group = "com.microsoft.cognitiveservices.speech", name = "client-sdk", version.ref = "azureSpeech" }
 # Compose UI (MainScreen + Theme + NavHost; Gemini/ChatGPT-style chat layout)
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 compose-ui = { group = "androidx.compose.ui", name = "ui" }
@@ -75,6 +84,10 @@ navigation-compose = { group = "androidx.navigation", name = "navigation-compose
 core-splashscreen = { group = "androidx.core", name = "core-splashscreen", version.ref = "coreSplashscreen" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
 tess-two = { group = "com.rmtheis", name = "tess-two", version.ref = "tessTwo" }
+# S3 Shizuku bridge (github-only). Keys use hyphen form so the accessors read
+# `libs.shizuku.api` / `libs.shizuku.provider`.
+shizuku-api = { group = "dev.rikka.shizuku", name = "api", version.ref = "shizuku" }
+shizuku-provider = { group = "dev.rikka.shizuku", name = "provider", version.ref = "shizuku" }
 litert = { group = "org.tensorflow", name = "tensorflow-lite", version.ref = "tensorflowLite" }
 
 [plugins]

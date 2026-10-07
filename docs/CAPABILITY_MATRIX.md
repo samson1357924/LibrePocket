@@ -35,6 +35,8 @@
 | 終端命令（受限 shell） | `N` App 內受限 shell（無提權、白名單命令） | `N` 可選提權子進程（顯式開關） | `N` 可選 su 子進程（顯式開關） | 無 | ✅（僅受限 shell） | ✅（受限 + 可選提權） | ✅（受限 + 可選提權） |
 | Linux 環境（PRoot 發行版） | `N` 使用者態 PRoot（無需 Root，效能降級明示） | 無增強 | 無增強 | 無 | ✅（若體積政策允許，否則改下載式插件） | ✅ | ✅ |
 | GUI 自動化（點/滑/填表） | `—` 不提供；改給手動步驟指引 | `—`（仍不提供點擊；僅輔助讀狀態） | `—` 原則不提供；僅 foss / github 版經無障礙節點有限支援 | 有限支援（模組僅作手勢輔助，需另行安裝） | ❌ 整個類別隱藏 | ⚠️ 可選（預設關，需無障礙授權+二次確認） | ⚠️ 可選（預設關，需無障礙授權+二次確認） |
+
+> **PR#1 SCAFFOLD 誠實註記（本 PR 範圍，code-level invariant）**：上表 `N`/`✅` 為投影可見性（`project()` 回 `NATIVE` + `projectedTools`），不等於模型可執行。本 PR 為 core/scaffold：`ToolRegistry.visibleTools()`（唯一可送模型的名單）要求投影通過 **且** `ToolDef.executionReady=true`；本 PR 41 項全為 `false`（接線 PR 逐工具翻 true，附 dispatcher/executor/E2E），故開關全開下 model 名單為空（見 `CapabilityProjectionTest.unwiredToolsNeverReachModelList`）。8 項（`shell.exec` / `shell.elevated` / `web.fetch` / `db.query` / `db.exec` / `gui.automate` / `linux.boot` / `voice.speak.azure`）description 另標 `SCAFFOLD: projection-only`；`TurnController` 僅記錄 `ToolDone` 不執行工具（records-only，`buildRequest` 不帶 tools 有意為之）；`LinuxBoot.download` 無生產 Downloader（test Fake only）；`AutomationSettings` 無 DataStore/確認 Dialog/StepExecutor 接線。模型不得宣稱可代執行，降級話術按 §5（`USER_DISABLED` / `NO_PRIVILEGE`）誠實回覆。
 | VPN/流量攔截 | `—` 不提供 | `—` | `—` | `—` | ❌ | ❌（三風味皆不提供） | ❌（三風味皆不提供） |
 | Xposed 注入他 App | `—` 不提供 | `—` | `—` | 本 App 不內建注入，僅預留外部模組協議 | ❌ | ❌（不內建） | ❌（不內建） |
 
@@ -52,7 +54,7 @@ Play 版（`flavor == play`）**一律不包含 / 不申請**：
 
 雙黑名單（程式碼事實：`HardeningPolicy` + `scripts/play_policy_check.sh`）：
 
-- Play 黑名單（play 產物零容忍）：權限 `SEND_SMS / RECEIVE_SMS / READ_SMS / MANAGE_EXTERNAL_STORAGE / BIND_ACCESSIBILITY_SERVICE / BIND_VPN_SERVICE`；dex 定義前綴 `Ldev/librepocket/agent/github/`、`Ldev/librepocket/agent/foss/`；超類 `VpnService`、`AccessibilityService`；manifest service 含 accessibilityservice / vpnservice 字樣。
+- Play 黑名單（play 產物零容忍）：權限 `SEND_SMS / RECEIVE_SMS / READ_SMS / MANAGE_EXTERNAL_STORAGE / BIND_ACCESSIBILITY_SERVICE / BIND_VPN_SERVICE`；dex 定義前綴 `Ldev/librepocket/agent/github/`、`Ldev/librepocket/agent/foss/`；超類 `VpnService`、`AccessibilityService`；manifest service 含 accessibilityservice / vpnservice 字樣；zip 條目含 `proot` / `rootfs` / `linux/image`（S4 下載式 rootfs，全風味不內嵌，見 `HardeningPolicy.PLAY_LINUX_ENTRY_BLACKLIST`，此為 zip 掃描，非 dex 掃描）。
 - Foss 黑名單（foss 產物零容忍，純開源自證）：dex 不得引用 `com.google.mlkit` / `com.google.android.gms`（`FOSS_STRING_BLACKLIST`，`--foss` 門）；foss 視覺棧只用 ZXing / Tesseract / LiteRT。
 
 Play 版上架自查（每次發版必跑）：

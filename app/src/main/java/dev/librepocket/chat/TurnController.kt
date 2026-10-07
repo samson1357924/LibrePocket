@@ -50,6 +50,15 @@ private data class PendingSteer(val text: String, val images: List<ChatImageRef>
  * and provider [StreamEvent.Retrying] notices are forwarded to
  * [TranscriptSink.onTurnRetried] while the turn stays alive.
  *
+ * SCAFFOLD (PR#1 re-review, P1 scope): this PR records ToolDone only and never
+ * executes tools — no ToolDispatcher/FastRouter/PrivilegeGate/ElevatedDispatch
+ * product wiring yet. Projection NATIVE means switch/flavor semantics only;
+ * model visibility additionally requires `ToolDef.executionReady` (see
+ * [ToolRegistry.visibleTools], the ONLY list that may be sent to the model),
+ * which is false for all 41 tools in this PR.
+ * The true product tool loop (dispatcher + grant/confirm + Android executors +
+ * E2E) lands in the wiring PR, which flips tools to ready one by one.
+ *
  * Execution-basis policy: every turn (including steered follow-ups) is gated
  * by [PolicyStore.evaluateFresh]. [PolicyStore.evaluate] is UI pre-display
  * only and is never used here.
@@ -225,7 +234,11 @@ class TurnController(
     try {
       runTurnLoop(text, images)
     } catch (e: CancellationException) {
-      fireTranscript { transcript.onTurnCancelled(latestAssistantId(), latestAssistantText()) }
+      // Snapshot before async hop: latest* reads uiState at execution time,
+      // which may have moved on by the time the launched block runs.
+      val cancelId = latestAssistantId()
+      val cancelText = latestAssistantText()
+      fireTranscript { transcript.onTurnCancelled(cancelId, cancelText) }
       throw e
     }
     // Normal completion only: hand off at most one queued steer as a detached
@@ -271,7 +284,9 @@ class TurnController(
   private suspend fun runTurnLoop(text: String, images: List<ChatImageRef>) {
     var attempt = 0
     var runId = newId()
-    fireTranscript { transcript.onTurnStarted(runId, text) }
+    // Snapshot: fireTranscript is scope.launch async; capturing the var
+    // directly would race with later `runId = newId()` reassignments.
+    runId.let { startedId -> fireTranscript { transcript.onTurnStarted(startedId, text) } }
     while (true) {
       val attemptRunId = runId
       appendAssistantPlaceholder(attemptRunId)
@@ -289,8 +304,10 @@ class TurnController(
           if (index !in toolDoneSeen) {
             val id = toolIdText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
             val name = toolNameText[index]?.toString().orEmpty().ifEmpty { "pending" }
-            appendAssistantText(attemptRunId, "\n[tool:$name $args]")
-            fireTranscript { transcript.onToolDone(attemptRunId, index, id, name, args.toString()) }
+            // Snapshot args string before async hop (StringBuilder keeps mutating).
+            val argsStr = args.toString()
+            appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
+            fireTranscript { transcript.onToolDone(attemptRunId, index, id, name, argsStr) }
           }
         }
       }
@@ -345,7 +362,9 @@ class TurnController(
       }
       val failure = failed
       if (failure == null) {
-        fireTranscript { transcript.onTurnSucceeded(attemptRunId, assistantTextOf(attemptRunId)) }
+        // Snapshot text: assistantTextOf reads uiState at execution time.
+        val successText = assistantTextOf(attemptRunId)
+        fireTranscript { transcript.onTurnSucceeded(attemptRunId, successText) }
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
@@ -358,14 +377,19 @@ class TurnController(
       }
       attempt += 1
       val waitMs = retryConfig.delayForRetry(attempt)
-      fireTranscript { transcript.onTurnRetried(attemptRunId, attempt, retryConfig.maxRetries, waitMs) }
+      // Snapshot mutable `attempt` before async hop: the launched block may
+      // run after the next iteration increments it (both retries read 2).
+      val firedAttempt = attempt
+      val firedRunId = attemptRunId
+      val firedMax = retryConfig.maxRetries
+      fireTranscript { transcript.onTurnRetried(firedRunId, firedAttempt, firedMax, waitMs) }
       try {
         sleeper(waitMs)
       } catch (e: CancellationException) {
         throw e
       }
       runId = newId()
-      fireTranscript { transcript.onTurnStarted(runId, text) }
+      runId.let { startedId -> fireTranscript { transcript.onTurnStarted(startedId, text) } }
     }
   }
 
@@ -389,6 +413,10 @@ class TurnController(
       }
     }
     return ChatRequest(model = model, messages = base)
+    // NOTE (PR#1 scope-down): tools deliberately NOT attached here.
+    // ChatRequest.tools may only carry ToolRegistry.visibleTools() output
+    // (projection + executionReady); all 41 tools are executionReady=false
+    // in this scaffold PR, so the request stays pure-chat by construction.
   }
 
   // ---- uiState helpers (StateFlow.update is atomic; no lock needed) ----

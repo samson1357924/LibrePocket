@@ -24,8 +24,10 @@ class CapabilityProjectionTest {
         grantedPermissions = setOf("android.permission.READ_CALENDAR", "listener:notification"),
     )
 
-    @Test fun fastToolsCountIsEleven() {
-        assertEquals(11, ToolRegistry.FAST_TOOLS.size)
+    @Test fun fastToolsCountIsEighteen() {
+        // P2 11 + S1-C 7（shell.exec + calendar.query/update/delete + contact.search/list/get）
+        // + S3 1（shell.elevated，自裝風味提權橋）。
+        assertEquals(19, ToolRegistry.FAST_TOOLS.size)
     }
 
     @Test fun toolNamesUnique() {
@@ -37,15 +39,15 @@ class CapabilityProjectionTest {
         val projected = ToolRegistry.projectAll(playBase)[ToolRegistry.SLOW_TOOL_NAME]!!
         assertEquals(CapabilityLevel.UNAVAILABLE, projected.level)
         assertEquals(DenyReason.FLAVOR_BLOCKED, projected.reason)
-        assertTrue(ToolRegistry.visibleTools(playBase).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
+        assertTrue(ToolRegistry.projectedTools(playBase).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
     }
 
     @Test fun fossWithAutomationShowsSlowChannel() {
-        assertTrue(ToolRegistry.visibleTools(fossAuto).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
+        assertTrue(ToolRegistry.projectedTools(fossAuto).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
     }
 
     @Test fun githubWithAutomationShowsSlowChannel() {
-        assertTrue(ToolRegistry.visibleTools(githubAuto).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
+        assertTrue(ToolRegistry.projectedTools(githubAuto).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
     }
 
     @Test fun fossWithoutAutomationDeniesSlowAsUserDisabled() {
@@ -62,13 +64,30 @@ class CapabilityProjectionTest {
         assertEquals(DenyReason.USER_DISABLED, projected.reason)
     }
 
-    @Test fun playSeesAllElevenFastToolsByDefault() {
-        // Calendar needs a grant, notification degrades (still visible): 9 native + 1 degraded.
-        val visible = ToolRegistry.visibleTools(
+    @Test fun playProjectsTwentyThreeToolsByDefault() {
+        // P2 11（calendar.create 已授權；notification 缺 listener 降級仍可見）
+        // + S1-B web.fetch（預設開；websearch/database/lsp 預設關）
+        // + S1-C calendar.query（已授權）/ update+delete（缺 WRITE_CALENDAR 時經 EDIT 委託降級，仍可見）；
+        // shell.exec（開關預設關）與全量聯繫人（play FLAVOR_BLOCKED）隱藏；
+        // S3 shell.elevated（自裝風味 + privilege_bridge 預設關）同樣隱藏。
+        // + S1-A 6（clipboard.read/write 前台預設開；file.edit/patch/search/attach 開關 files 預設開）。
+        // + S2 2（voice.transcribe / voice.speak 開關預設開；voice.speak.azure 僅 GITHUB，play 隱藏）。
+        val visible = ToolRegistry.projectedTools(
             playBase.copy(grantedPermissions = setOf("android.permission.READ_CALENDAR")),
         ).map { it.name }
-        assertEquals(11, visible.size)
-        assertTrue(visible.containsAll(ToolRegistry.FAST_TOOLS.map { it.name }))
+        assertEquals(23, visible.size)
+        assertTrue(
+            visible.containsAll(
+                ToolRegistry.FAST_TOOLS.map { it.name } -
+                    setOf("shell.exec", "shell.elevated", "contact.search", "contact.list", "contact.get"),
+            ),
+        )
+        assertTrue(visible.containsAll(listOf("calendar.query", "calendar.update", "calendar.delete")))
+        assertTrue(visible.contains(WebFetch.TOOL_NAME))
+        assertTrue(visible.containsAll(ToolRegistry.S1A_TOOLS.map { it.name }))
+        assertFalse(visible.contains("shell.exec"))
+        assertFalse(visible.contains("shell.elevated"))
+        assertFalse(visible.contains("contact.search"))
     }
 
     @Test fun calendarWithoutGrantIsNoPrivilege() {
@@ -86,7 +105,7 @@ class CapabilityProjectionTest {
     @Test fun notificationWithoutGrantDegradesInsteadOfVanishing() {
         val projected = ToolRegistry.projectAll(playBase)["notification.read"]!!
         assertEquals(CapabilityLevel.DEGRADED, projected.level)
-        assertTrue(ToolRegistry.visibleTools(playBase).any { it.name == "notification.read" })
+        assertTrue(ToolRegistry.projectedTools(playBase).any { it.name == "notification.read" })
     }
 
     @Test fun userSwitchOffYieldsUserDisabled() {
@@ -132,5 +151,85 @@ class CapabilityProjectionTest {
         assertEquals(SideEffect.PRIVILEGED, ToolRegistry.find("phone.dial")!!.sideEffect)
         assertEquals(SideEffect.PRIVILEGED, ToolRegistry.find("sms.compose")!!.sideEffect)
         assertEquals(SideEffect.PRIVILEGED, ToolRegistry.find("screenshot.capture")!!.sideEffect)
+    }
+
+    @Test fun scaffoldToolsHonestlyMarkedUntilWired() {
+        // PR#1 re-review P1 scope：無產品 dispatcher 接線的工具必須標 SCAFFOLD，
+        // 避免「模型看得到、App 做不到」。8 個：shell.exec/shell.elevated +
+        // web.fetch + db.query/exec + gui.automate + linux.boot + voice.azure。
+        for (name in listOf(
+            "shell.exec",
+            "shell.elevated",
+            WebFetch.TOOL_NAME,
+            DbTools.QUERY_NAME,
+            DbTools.EXEC_NAME,
+            ToolRegistry.SLOW_TOOL_NAME,
+            "linux.boot",
+            "voice.speak.azure",
+        )) {
+            val desc = ToolRegistry.find(name)!!.description
+            assertTrue("$name desc=$desc", desc.contains("SCAFFOLD"))
+        }
+    }
+
+    @Test fun unwiredToolsNeverReachModelList() {
+        // PR#1 re-review head 4e3a6c6 blocker 3：code-level invariant。
+        // executionReady=false 的工具即使投影通過（開關全開），也不得進
+        // visibleTools（唯一可送模型的名單）；投影（projectedTools）保持完整，
+        // 供 gates/headers/audit 使用。接線 PR 逐工具翻 true 時同步更新本測試。
+        val permissiveGithub = ProjectionContext(
+            flavor = Flavor.GITHUB,
+            automationEnabled = true,
+            grantedPermissions = setOf(
+                "android.permission.READ_CALENDAR",
+                "android.permission.WRITE_CALENDAR",
+                "android.permission.READ_CONTACTS",
+                "listener:notification",
+            ),
+            userSwitches = mapOf(
+                "shell" to true,
+                "privilege_bridge" to true,
+                "calendar" to true,
+                "contacts_full" to true,
+                "notification" to true,
+                "screenshot" to true,
+                "webfetch" to true,
+                "websearch" to true,
+                "database" to true,
+                "lsp" to true,
+                "clipboard" to true,
+                "files" to true,
+                "voice_input" to true,
+                "voice_output" to true,
+                "azure_tts" to true,
+                "linux" to true,
+                "compile" to true,
+                "decompile" to true,
+            ),
+        )
+        val scaffoldNames = setOf(
+            "shell.exec",
+            "shell.elevated",
+            WebFetch.TOOL_NAME,
+            DbTools.QUERY_NAME,
+            DbTools.EXEC_NAME,
+            ToolRegistry.SLOW_TOOL_NAME,
+            "linux.boot",
+            "voice.speak.azure",
+        )
+        for (name in scaffoldNames) {
+            assertFalse(
+                "$name must not be executionReady before wiring",
+                ToolRegistry.find(name)!!.executionReady,
+            )
+        }
+        val model = ToolRegistry.visibleTools(permissiveGithub).map { it.name }.toSet()
+        assertTrue("scaffold leaked to model: ${model intersect scaffoldNames}", (model intersect scaffoldNames).isEmpty())
+        // 投影本身不受 executionReady 影響（gates/headers/audit 照常用）。
+        val projected = ToolRegistry.projectedTools(permissiveGithub).map { it.name }.toSet()
+        assertTrue("projection lost scaffold: ${scaffoldNames - projected}", projected.containsAll(scaffoldNames))
+        // 本 PR 無任何工具完成接線：開關全開下 model 名單為空（與
+        // TurnController.buildRequest 不帶 tools 一致；接線 PR 翻 flag 時更新）。
+        assertTrue("expected empty model list in scaffold phase, got $model", model.isEmpty())
     }
 }

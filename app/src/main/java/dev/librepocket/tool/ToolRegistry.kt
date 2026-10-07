@@ -1,15 +1,35 @@
 package dev.librepocket.tool
 
+import dev.librepocket.clipboard.ClipboardTools
+import dev.librepocket.files.FileAttachTools
+import dev.librepocket.files.FileEditTools
+import dev.librepocket.files.FileSearchTools
+import dev.librepocket.linux.CompileBuild
+import dev.librepocket.linux.DecompileAnalyze
+import dev.librepocket.linux.LinuxBoot
+import dev.librepocket.linux.LinuxPkg
+import dev.librepocket.linux.LinuxTools
+import dev.librepocket.linux.ProotExec
+
 /**
- * Built-in tool registry: the 11 P2 fast-channel tools (BACKLOG B3,
- * CAPABILITY_MATRIX §1) plus the slow-channel descriptor used only for
- * projection (hidden on play, foss/github-only, default off).
+ * Built-in tool registry: the P2 fast-channel tools (BACKLOG B3,
+ * CAPABILITY_MATRIX §1) plus S1-C backfill (shell/calendar/contacts,
+ * in [FAST_TOOLS]) plus S1-B network/data tools (owned block
+ * [S1B_TOOLS] below, do not edit) plus the slow-channel descriptor
+ * used only for projection (hidden on play, foss/github-only,
+ * default off).
  *
  * Compliance red lines (MATRIX §2), enforced here and asserted by tests:
  * - phone uses `ACTION_DIAL` prefill only, never `ACTION_CALL`;
  * - SMS goes through the system editor prefill only; this registry requests
  *   no SMS permission ([ToolAnnotations.requiresPermission] is null for
  *   `sms.compose` and no schema mentions SEND_SMS / READ_SMS).
+ * - S1-C adds no blacklist permission literals (no RECORD_AUDIO, no a11y):
+ *   only READ_CALENDAR / WRITE_CALENDAR / READ_CONTACTS + pseudo-grant
+ *   `listener:notification` appear in the S1-C block.
+ * - S2 voice adds no permission either: system STT walks `RecognizerIntent`
+ *   delegation and system TTS needs none (no RECORD_AUDIO literal anywhere;
+ *   Azure cloud voice is github-flavor code only).
  */
 object ToolRegistry {
 
@@ -162,6 +182,7 @@ object ToolRegistry {
             description = "Read notification titles (own app, or via listener with grant); full text needs confirmation.",
             jsonSchema = schema(
                 prop("limit", "integer", "Max items to return"),
+                prop("fullText", "boolean", "Read full body text; always needs explicit confirmation plus listener grant and second consent"),
             ),
             sideEffect = SideEffect.READ,
             annotations = ToolAnnotations(
@@ -184,13 +205,419 @@ object ToolRegistry {
                 fallbackHint = "take a screenshot manually with the hardware keys",
             ),
         ),
+        // ---- S1-C backfill: restricted shell (D05 restricted part) ----
+        ToolDef(
+            name = "shell.exec",
+            description = "Restricted shell exec (no privilege): argv direct to RestrictedShell, no sh -c; allowlist/denylist/quota/truncation apply. Elevated execution is never performed in this phase. SCAFFOLD: projection-only in this PR, no product Chat dispatcher/executor wiring yet (see TurnController records-only); ShellExecTool.execute has no production caller yet, wiring lands in the wiring PR.",
+            jsonSchema = schema(
+                prop("argv", "array", "Argument vector; argv[0] is the binary basename, never a shell string"),
+                prop("timeoutMs", "integer", "Per-call timeout budget in milliseconds"),
+                prop("reason", "string", "Why this command is needed (audit)"),
+                required = "\"argv\"",
+            ),
+            sideEffect = SideEffect.PRIVILEGED,
+            annotations = ToolAnnotations(
+                requiresSwitch = "shell",
+                switchDefault = false,
+                timeoutMs = 10_000L,
+                fallbackHint = "run the command manually in a terminal app",
+            ),
+        ),
+        // ---- S3 提權橋：shell.elevated（D09，foss/github only，預設關） ----
+        // argv 向量直達提權通道（Shizuku/Root，僅 src/github 實作），不拼字串；
+        // Schema 只收 argv / reasonCode / timeoutMs 三鍵（無字串形式的執行鍵）。
+        ToolDef(
+            name = "shell.elevated",
+            description = "Elevated exec via the Shizuku/Root bridge (self-install only, default off): argv vector direct to the bridge, reasonCode required for audit. SCAFFOLD: projection-only in this PR, no product Chat dispatcher/executor wiring yet (see TurnController records-only); production runner + grant/confirm flow lands in the wiring PR.",
+            jsonSchema = schema(
+                prop("argv", "array", "Argument vector; argv[0] is the binary basename, never a single string"),
+                prop("reasonCode", "string", "Why elevated execution is needed (written to the audit log as a hash)"),
+                prop("timeoutMs", "integer", "Per-call timeout budget in milliseconds"),
+                required = "\"argv\", \"reasonCode\"",
+            ),
+            sideEffect = SideEffect.PRIVILEGED,
+            annotations = ToolAnnotations(
+                requiresSwitch = "privilege_bridge",
+                switchDefault = false,
+                timeoutMs = 10_000L,
+                fallbackHint = "run the steps manually in a terminal app",
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        // ---- S1-C backfill: calendar query/update/delete ----
+        ToolDef(
+            name = "calendar.query",
+            description = "Query calendar events via Calendar Provider; requires READ_CALENDAR.",
+            jsonSchema = schema(
+                prop("start", "string", "ISO-8601 range start"),
+                prop("end", "string", "ISO-8601 range end"),
+                prop("query", "string", "Optional title/location keyword filter"),
+                prop("limit", "integer", "Max events to return"),
+                required = "\"start\", \"end\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "calendar",
+                requiresPermission = "android.permission.READ_CALENDAR",
+                fallbackHint = "open the calendar app manually and check the schedule",
+            ),
+        ),
+        ToolDef(
+            name = "calendar.update",
+            description = "Update a calendar event via system calendar EDIT delegation preferred; direct provider write needs WRITE_CALENDAR.",
+            jsonSchema = schema(
+                prop("eventId", "string", "Event row id"),
+                prop("title", "string", "New title, if changing"),
+                prop("start", "string", "ISO-8601 start, if changing"),
+                prop("end", "string", "ISO-8601 end, if changing"),
+                required = "\"eventId\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = "calendar",
+                requiresPermission = "android.permission.WRITE_CALENDAR",
+                degradedWithoutPermission = true,
+                fallbackHint = "open the calendar app manually and edit the event",
+            ),
+        ),
+        ToolDef(
+            name = "calendar.delete",
+            description = "Delete a calendar event via system calendar delegation preferred; direct provider delete needs WRITE_CALENDAR.",
+            jsonSchema = schema(
+                prop("eventId", "string", "Event row id"),
+                required = "\"eventId\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = "calendar",
+                requiresPermission = "android.permission.WRITE_CALENDAR",
+                degradedWithoutPermission = true,
+                fallbackHint = "open the calendar app manually and delete the event",
+            ),
+        ),
+        // ---- S1-C backfill: full contacts (foss/github only, default off) ----
+        ToolDef(
+            name = "contact.search",
+            description = "Search contacts by name/phone keyword (foss/github full access only, default off; pick delegation stays permission-free).",
+            jsonSchema = schema(
+                prop("query", "string", "Name or phone keyword"),
+                prop("limit", "integer", "Max results"),
+                required = "\"query\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "contacts_full",
+                switchDefault = false,
+                requiresPermission = "android.permission.READ_CONTACTS",
+                fallbackHint = "open the contacts app manually or use the system picker",
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = "contact.list",
+            description = "List contacts (foss/github full access only, default off; pick delegation stays permission-free).",
+            jsonSchema = schema(
+                prop("limit", "integer", "Max results"),
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "contacts_full",
+                switchDefault = false,
+                requiresPermission = "android.permission.READ_CONTACTS",
+                fallbackHint = "open the contacts app manually or use the system picker",
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = "contact.get",
+            description = "Get one contact by id (foss/github full access only, default off; pick delegation stays permission-free).",
+            jsonSchema = schema(
+                prop("contactId", "string", "Contact row id"),
+                required = "\"contactId\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "contacts_full",
+                switchDefault = false,
+                requiresPermission = "android.permission.READ_CONTACTS",
+                fallbackHint = "open the contacts app manually or use the system picker",
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
     )
+
+    // S1-B-ANCHOR-BEGIN: network + data tools owned by S1-B.
+    // S1-A / S1-C: append your own anchored blocks AFTER S1-B-ANCHOR-END;
+    // do not edit inside this block (merge-conflict avoidance).
+    val S1B_TOOLS: List<ToolDef> = listOf(
+        ToolDef(
+            name = WebFetch.TOOL_NAME,
+            description = "Fetch an https URL as text (http only for loopback); byte-capped, 15s timeout, transcode-downgraded. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only).",
+            jsonSchema = schema(
+                prop("url", "string", "https URL to fetch (http only for localhost/loopback)"),
+                prop("maxBytes", "integer", "Byte cap, clamped to 1 MiB"),
+                required = "\"url\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                timeoutMs = WebFetch.TIMEOUT_MS,
+                requiresSwitch = WebFetch.SWITCH,
+                switchDefault = WebFetch.SWITCH_DEFAULT,
+                fallbackHint = WebFetch.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = WebSearchLocal.TOOL_NAME,
+            description = "Local web search {query, count} via a configured supplier; distinct from the server-side hosted web_search passthrough.",
+            jsonSchema = schema(
+                prop("query", "string", "Search keywords"),
+                prop("count", "integer", "Max results, 1-10"),
+                required = "\"query\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = WebSearchLocal.SWITCH,
+                switchDefault = WebSearchLocal.SWITCH_DEFAULT,
+                fallbackHint = WebSearchLocal.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = DbTools.QUERY_NAME,
+            description = "Read-only SELECT over the app database with a row cap; rejects non-SELECT and multi-statements. SCAFFOLD: projection-only in this PR, no product Chat dispatcher/Room wiring yet (test fake Connection only).",
+            jsonSchema = schema(
+                prop("sql", "string", "Single SELECT/WITH statement"),
+                prop("limit", "integer", "Row cap, clamped to 200"),
+                required = "\"sql\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = DbTools.SWITCH,
+                switchDefault = DbTools.SWITCH_DEFAULT,
+                fallbackHint = DbTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = DbTools.EXEC_NAME,
+            description = "Write to the app database; needs confirmation and bans ATTACH/DROP. SCAFFOLD: projection-only in this PR, no product Chat dispatcher/Room wiring yet.",
+            jsonSchema = schema(
+                prop("sql", "string", "Single write statement, no ATTACH/DROP"),
+                prop("confirmed", "boolean", "User confirmation for the write"),
+                required = "\"sql\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = DbTools.SWITCH,
+                switchDefault = DbTools.SWITCH_DEFAULT,
+                fallbackHint = DbTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = LspTools.SYMBOLS_NAME,
+            description = "Code symbol lookup via the local stub, or an MCP-backed LSP bridge when provided.",
+            jsonSchema = schema(
+                prop("query", "string", "Symbol name to look up"),
+                prop("pathPrefix", "string", "Optional path scope"),
+                prop("limit", "integer", "Max symbols, clamped to 200"),
+                required = "\"query\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = LspTools.SWITCH,
+                switchDefault = LspTools.SWITCH_DEFAULT,
+                fallbackHint = LspTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = LspTools.DIAGNOSTICS_NAME,
+            description = "File diagnostics via the local stub, or an MCP-backed LSP bridge when provided.",
+            jsonSchema = schema(
+                prop("path", "string", "File path to inspect"),
+                required = "\"path\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = LspTools.SWITCH,
+                switchDefault = LspTools.SWITCH_DEFAULT,
+                fallbackHint = LspTools.FALLBACK_HINT,
+            ),
+        ),
+    )
+    // S1-B-ANCHOR-END
+
+    // S1-A-ANCHOR-BEGIN: clipboard + files tools owned by S1-A.
+    // S1-B / S1-C: append your own anchored blocks elsewhere;
+    // do not edit inside this block (merge-conflict avoidance).
+    val S1A_TOOLS: List<ToolDef> = listOf(
+        ToolDef(
+            name = ClipboardTools.READ_NAME,
+            description = "Read text from the foreground clipboard via ClipboardManager; background reads are unavailable.",
+            jsonSchema = schema(),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = ClipboardTools.SWITCH,
+                switchDefault = ClipboardTools.SWITCH_DEFAULT,
+                foregroundOnly = true,
+                degradedWithoutPermission = false,
+                fallbackHint = ClipboardTools.FALLBACK_READ_HINT,
+            ),
+        ),
+        ToolDef(
+            name = ClipboardTools.WRITE_NAME,
+            description = "Write text to the foreground clipboard via ClipboardManager; background writes are unavailable.",
+            jsonSchema = schema(
+                prop("text", "string", "Text to copy to the clipboard"),
+                prop("label", "string", "Clip label shown by the system"),
+                required = "\"text\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = ClipboardTools.SWITCH,
+                switchDefault = ClipboardTools.SWITCH_DEFAULT,
+                foregroundOnly = true,
+                degradedWithoutPermission = false,
+                fallbackHint = ClipboardTools.FALLBACK_WRITE_HINT,
+            ),
+        ),
+        ToolDef(
+            name = FileEditTools.EDIT_NAME,
+            description = "Create or overwrite a file in the private domain (or a granted SAF tree) with full content; cross-domain paths are refused.",
+            jsonSchema = schema(
+                prop("path", "string", "Private-domain relative path or absolute path"),
+                prop("content", "string", "Full file content (UTF-8)"),
+                required = "\"path\", \"content\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = FileEditTools.SWITCH,
+                switchDefault = FileEditTools.SWITCH_DEFAULT,
+                degradedWithoutPermission = false,
+                fallbackHint = FileEditTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = FileEditTools.PATCH_NAME,
+            description = "Replace a unique text span inside a private-domain (or granted SAF) file; always keeps a .bak backup and writes atomically.",
+            jsonSchema = schema(
+                prop("path", "string", "Private-domain relative path or absolute path"),
+                prop("oldText", "string", "Text span to find (must be unique by default)"),
+                prop("newText", "string", "Replacement text"),
+                prop("singleMatch", "boolean", "Fail when the span matches more than once"),
+                required = "\"path\", \"oldText\", \"newText\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = FileEditTools.SWITCH,
+                switchDefault = FileEditTools.SWITCH_DEFAULT,
+                degradedWithoutPermission = false,
+                fallbackHint = FileEditTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = FileSearchTools.SEARCH_NAME,
+            description = "Search file names and text inside the private domain (or granted SAF trees); absolute roots pass the restricted-shell path gate.",
+            jsonSchema = schema(
+                prop("query", "string", "Single-line literal to search for"),
+                prop("root", "string", "Private relative prefix or absolute root; empty means the whole private domain"),
+                prop("maxHits", "integer", "Max hits to return"),
+                required = "\"query\"",
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = FileSearchTools.SWITCH,
+                switchDefault = FileSearchTools.SWITCH_DEFAULT,
+                degradedWithoutPermission = false,
+                fallbackHint = FileSearchTools.FALLBACK_HINT,
+            ),
+        ),
+        ToolDef(
+            name = FileAttachTools.ATTACH_NAME,
+            description = "Stage a Photo Picker / SAF-picked image or file into the private workspace for chat attachments (skeleton for the ChatScreen entry point).",
+            jsonSchema = schema(
+                prop("mimeTypes", "array", "Accepted MIME types, e.g. image/*"),
+                prop("maxSizeBytes", "integer", "Size cap in bytes"),
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = FileAttachTools.SWITCH,
+                switchDefault = FileAttachTools.SWITCH_DEFAULT,
+                degradedWithoutPermission = false,
+                fallbackHint = FileAttachTools.FALLBACK_HINT,
+            ),
+        ),
+    )
+    // S1-A-ANCHOR-END
+
+    // S2-ANCHOR-BEGIN: voice tools owned by S2 (system STT/TTS first, Azure github-only).
+    // Do not edit inside this block from other workstreams (merge-conflict avoidance).
+    // - voice.transcribe (READ, switch voice_input default true): system RecognizerIntent
+    //   transcript entry; audio never touches disk; text is redacted before the store.
+    // - voice.speak (WRITE, switch voice_output default true): system TextToSpeech,
+    //   zero new permissions.
+    // - voice.speak.azure (WRITE, github-only, switch azure_tts default false):
+    //   Azure cloud fallback; additionally requires voice_output on (dual-switch,
+    //   enforced by AzureSpeechGate AND by the second switch below, so the
+    //   projection never diverges from the gate); text is redacted again before
+    //   the cloud call.
+    val VOICE_TOOLS: List<ToolDef> = listOf(
+        ToolDef(
+            name = "voice.transcribe",
+            description = "Transcribe speech via the system recognizer; audio is memory-only and the text is redacted before storage.",
+            jsonSchema = schema(
+                prop("locale", "string", "BCP-47 locale hint, e.g. zh-TW"),
+            ),
+            sideEffect = SideEffect.READ,
+            annotations = ToolAnnotations(
+                requiresSwitch = "voice_input",
+                switchDefault = true,
+                fallbackHint = "type the message manually in the input box",
+            ),
+        ),
+        ToolDef(
+            name = "voice.speak",
+            description = "Read text aloud via the system text-to-speech engine; no new permissions.",
+            jsonSchema = schema(
+                prop("text", "string", "Text to speak aloud"),
+                required = "\"text\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = "voice_output",
+                switchDefault = true,
+                fallbackHint = "read the message text on screen manually",
+            ),
+        ),
+        ToolDef(
+            name = "voice.speak.azure",
+            description = "Cloud voice fallback via Azure Speech (github flavor only); needs voice_output and azure_tts on, text redacted before upload. SCAFFOLD: cloud dispatch wiring (settings key/region +朗讀鏈路 fallback) lands later; until then calls fall back to the system voice.",
+            jsonSchema = schema(
+                prop("text", "string", "Text to synthesize via Azure"),
+                prop("voice", "string", "Optional Azure voice name"),
+                required = "\"text\"",
+            ),
+            sideEffect = SideEffect.WRITE, // Final-review acceptance: TTS is audio-only
+            // (mirrors music.control WRITE, one-time confirm memorable); github-only +
+            // dual-switch (azure_tts default false + voice_output) is sufficient, no
+            // per-call PRIVILEGED confirm required. Text is redacted before upload.
+            annotations = ToolAnnotations(
+                requiresSwitch = "azure_tts",
+                switchDefault = false,
+                // M1 雙開關自訂投影：azure_tts 關閉或 voice_output 關閉，
+                // 任一即 UNAVAILABLE + USER_DISABLED（與 AzureSpeechGate 同語義；
+                // 預設值與 VoiceTools.SWITCH_AZURE_DEFAULT / SWITCH_OUTPUT_DEFAULT 同源）。
+                requiresSwitch2 = "voice_output",
+                switchDefault2 = true,
+                fallbackHint = "use the system voice output, or read the text on screen manually",
+            ),
+            supportedFlavors = setOf(Flavor.GITHUB),
+        ),
+    )
+    // S2-ANCHOR-END
 
     /** Slow-channel descriptor: projection-only, never executed by FastRouter. */
     val SLOW_TOOLS: List<ToolDef> = listOf(
         ToolDef(
             name = SLOW_TOOL_NAME,
-            description = "Screen-understanding GUI automation (foss/github only, default off).",
+            description = "Screen-understanding GUI automation (foss/github only, default off). SCAFFOLD: projection-only in this PR, no product Chat dispatcher/StepExecutor wiring yet; automation switch + confirm flow lands in the wiring PR.",
             jsonSchema = schema(
                 prop("goal", "string", "What to achieve on screen"),
                 required = "\"goal\"",
@@ -205,7 +632,129 @@ object ToolRegistry {
         ),
     )
 
-    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS
+    // S4-ANCHOR-BEGIN: on-device Linux (PRoot) + compile + decompile, owned by S4.
+    // Do not edit inside this block from other workstreams (merge-conflict avoidance).
+    // - linux.boot / linux.exec / linux.pkg (WRITE, switch `linux` default off):
+    //   download式 rootfs (HTTPS+SHA256, OCI digest-pin 優先), PRoot 容器執行,
+    //   apt/dnf/apk 子集. Perf 見 LinuxTools.PERF_NOTICE（機內僅輕量任務）.
+    // - compile.build (WRITE, switch `compile` default off): make/cmake/gcc/
+    //   clang/python recipe; Gradle 機內不支援（CI 指引，見 CompileBuild.CI_GUIDANCE）.
+    // - decompile.analyze (WRITE) + decompile.repack (PRIVILEGED, 每次確認):
+    //   strings→smali→resources→java 漸進（apktool 3.0.1 / jadx 1.5.6 釘選）.
+    // - 三風味：foss/github only（play 投影 FLAVOR_BLOCKED 即隱藏）.
+    val LINUX_TOOLS: List<ToolDef> = listOf(
+        ToolDef(
+            name = LinuxBoot.NAME,
+            description = "Download/start/stop an on-device PRoot Linux container (self-install only; rootfs is downloaded over HTTPS with SHA256, never bundled). Perf-limited: light tasks only. SCAFFOLD: download needs a production Downloader injected by the Android layer (test Fake only in this PR); quota below counts compressed bytes, not expanded rootfs (see LinuxBoot.download).",
+            jsonSchema = schema(
+                prop("action", "string", "download|start|stop"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                prop("url", "string", "https image URL (download only)"),
+                prop("sha256", "string", "64-hex SHA256 of the image (download only, required)"),
+                required = "\"action\", \"container\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = LinuxBoot.SWITCH,
+                switchDefault = LinuxBoot.SWITCH_DEFAULT,
+                fallbackHint = LinuxBoot.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = ProotExec.NAME,
+            description = "Execute a guest command inside a PRoot container (union allowlist, inherited denylist/quota/truncation; SAF trees are never bound, use inbox copy). Perf-limited: light tasks only. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only); host inbox paths must first be staged via LinuxInboxStager, guest argv uses /inbox/... paths.",
+            jsonSchema = schema(
+                prop("argv", "array", "Guest argument vector; argv[0] is the binary basename"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                prop("timeoutMs", "integer", "Per-call timeout budget in milliseconds"),
+                prop("reason", "string", "Why this command is needed (audit)"),
+                required = "\"argv\", \"container\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = LinuxBoot.SWITCH,
+                switchDefault = LinuxBoot.SWITCH_DEFAULT,
+                timeoutMs = 10_000L,
+                fallbackHint = ProotExec.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = LinuxPkg.NAME,
+            description = "Manage packages inside a PRoot container (apt/dnf/apk subset: update/install/remove/list/search/show only). SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only).",
+            jsonSchema = schema(
+                prop("argv", "array", "Package argv, e.g. [apt, install, pkg]; no option flags"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                required = "\"argv\", \"container\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = LinuxBoot.SWITCH,
+                switchDefault = LinuxBoot.SWITCH_DEFAULT,
+                fallbackHint = ProotExec.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = CompileBuild.NAME,
+            description = "Build from source inside a PRoot container (make/cmake/gcc/clang/python recipes; Gradle is unsupported on-device, use CI). Perf-limited: light tasks only. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only); source files must first be staged via LinuxInboxStager.",
+            jsonSchema = schema(
+                prop("argv", "array", "Recipe argument vector, e.g. [make, -j4]"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                prop("timeoutMs", "integer", "Per-call timeout budget in milliseconds"),
+                required = "\"argv\", \"container\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = CompileBuild.SWITCH,
+                switchDefault = CompileBuild.SWITCH_DEFAULT,
+                timeoutMs = 10_000L,
+                fallbackHint = CompileBuild.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = DecompileAnalyze.NAME,
+            description = "Analyze an APK progressively inside a PRoot container (strings, smali, resources, java; apktool 3.0.1 / jadx 1.5.6 pinned). Output is redacted. Perf-limited: light tasks only. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only).",
+            jsonSchema = schema(
+                prop("stage", "string", "strings|smali|resources|java (progressive, no skipping)"),
+                prop("apkPath", "string", "Inbox-staged APK path"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                required = "\"stage\", \"apkPath\"",
+            ),
+            sideEffect = SideEffect.WRITE,
+            annotations = ToolAnnotations(
+                requiresSwitch = DecompileAnalyze.SWITCH,
+                switchDefault = DecompileAnalyze.SWITCH_DEFAULT,
+                timeoutMs = 10_000L,
+                fallbackHint = DecompileAnalyze.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+        ToolDef(
+            name = DecompileAnalyze.REPACK_NAME,
+            description = "Repack/resign an APK inside a PRoot container; privileged and needs explicit confirmation on every call. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only).",
+            jsonSchema = schema(
+                prop("apkPath", "string", "Inbox-staged APK path"),
+                prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
+                prop("confirmed", "boolean", "User confirmation for this repack"),
+                required = "\"apkPath\", \"container\", \"confirmed\"",
+            ),
+            sideEffect = SideEffect.PRIVILEGED,
+            annotations = ToolAnnotations(
+                requiresSwitch = DecompileAnalyze.SWITCH,
+                switchDefault = DecompileAnalyze.SWITCH_DEFAULT,
+                timeoutMs = 10_000L,
+                fallbackHint = DecompileAnalyze.FALLBACK_HINT,
+            ),
+            supportedFlavors = setOf(Flavor.FOSS, Flavor.GITHUB),
+        ),
+    )
+    // S4-ANCHOR-END
+
+    // S1-B: ALL covers FAST + SLOW + S1B + S1A + VOICE + LINUX (S1-A appends S1A; S1-C extended FAST; S2 appends VOICE; S4 appends LINUX).
+    val ALL: List<ToolDef> = FAST_TOOLS + SLOW_TOOLS + S1B_TOOLS + S1A_TOOLS + VOICE_TOOLS + LINUX_TOOLS
 
     fun find(name: String): ToolDef? = ALL.firstOrNull { it.name == name }
 
@@ -213,7 +762,21 @@ object ToolRegistry {
     fun projectAll(ctx: ProjectionContext): Map<String, Projection> =
         ALL.associate { it.name to it.project(ctx) }
 
-    /** Tools visible to the model this round (excludes UNAVAILABLE). */
-    fun visibleTools(ctx: ProjectionContext): List<ToolDef> =
+    /**
+     * Projected tools (flavor/switch/permission): for gates, transcript
+     * headers and audit snapshots. NOT the model tool list: projection
+     * says a tool *could* be offered, not that it can execute this round.
+     */
+    fun projectedTools(ctx: ProjectionContext): List<ToolDef> =
         ALL.filter { it.project(ctx).level != CapabilityLevel.UNAVAILABLE }
+
+    /**
+     * Tools visible to the model this round (PR#1 re-review scope-down):
+     * projected AND [ToolDef.executionReady]. This is the ONLY list that
+     * may be sent to the model (see `ChatRequest.tools`); description text
+     * alone (e.g. `SCAFFOLD` markers) can never make a tool model-visible.
+     * Empty until the wiring PR flips tools to ready one by one.
+     */
+    fun visibleTools(ctx: ProjectionContext): List<ToolDef> =
+        ALL.filter { it.project(ctx).level != CapabilityLevel.UNAVAILABLE && it.executionReady }
 }

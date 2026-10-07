@@ -83,6 +83,15 @@ class ChatViewModel(
         _input.value = value
     }
 
+    /**
+     * S2 系統 STT 入口：辨識正文以 prefill 進入輸入框（不自動送出），
+     * 由使用者確認後送出；寫庫前經 Redactor（Room 寫路徑）。
+     */
+    fun prefill(text: String) {
+        if (text.isBlank()) return
+        _input.value = text
+    }
+
     fun send() {
         val text = _input.value.trim()
         if (text.isEmpty()) return

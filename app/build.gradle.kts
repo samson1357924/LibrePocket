@@ -154,10 +154,19 @@ dependencies {
     // ML Kit is proprietary → github-only; OSS stack → foss + github.
     "githubImplementation"(libs.mlkit.barcode.scanning)
     "githubImplementation"(libs.mlkit.text.recognition)
+    // S2 cloud voice fallback (Azure Speech) → github-only, default off.
+    // foss/play must never reference com.microsoft.cognitiveservices.speech
+    // (HardeningPolicy.FOSS_STRING_BLACKLIST + foss gate assert this).
+    "githubImplementation"(libs.azure.speech)
     "fossImplementation"(libs.zxing.core)
     "githubImplementation"(libs.zxing.core)
     "fossImplementation"(libs.tess.two)
     "githubImplementation"(libs.tess.two)
     "fossImplementation"(libs.litert)
     "githubImplementation"(libs.litert)
+    // S3 privileged bridge (Shizuku remote process + provider) → github-only.
+    // Never `implementation(...)`: foss/play must physically lack Shizuku
+    // references (store compliance; play AAPT gate asserts this).
+    "githubImplementation"(libs.shizuku.api)
+    "githubImplementation"(libs.shizuku.provider)
 }

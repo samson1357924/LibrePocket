@@ -12,10 +12,16 @@ import java.util.concurrent.atomic.AtomicLong
  * schema-checked [ToolCall]; a match whose projection is UNAVAILABLE is
  * denied with the projection reason code; anything else is DENIED as
  * no-match with manual guidance. Every outcome carries a [TranscriptHeader]
- * with the decision and the visible-tool snapshot.
+ * with the decision, the projection snapshot and the model-visible snapshot.
  *
- * Pure logic, no Android dependencies. Confirmation is NOT checked here;
- * [PrivilegeGate] owns the PRIVILEGED execution gate.
+ * Wiring gate (PR#1 re-review scope-down): a match whose tool is projected
+ * but NOT `executionReady` is denied as USER_DISABLED (capability not
+ * enabled for this round; the wiring PR flips tools to ready one by one).
+ * FAST therefore means *routable AND executable*, never projection-only.
+ * Confirmation is NOT checked here; [PrivilegeGate] owns the PRIVILEGED
+ * execution gate.
+ *
+ * Pure logic, no Android dependencies.
  */
 class FastRouter(
     private val registry: ToolRegistry = ToolRegistry,
@@ -29,9 +35,10 @@ class FastRouter(
         turnIndex: Int? = null,
     ): RouteDecision {
         val projections = registry.projectAll(ctx)
-        val visible = projections.values
-            .filter { it.level != CapabilityLevel.UNAVAILABLE }
-            .map { it.toolName }
+        // Canonical snapshots (PR#1 scope-down): projection for audit,
+        // model-visible list for "what the model saw". Never self-built.
+        val projected = registry.projectedTools(ctx).map { it.name }
+        val modelVisible = registry.visibleTools(ctx).map { it.name }
         fun header(route: RouteKind, toolName: String?, reason: dev.librepocket.tool.DenyReason?) =
             TranscriptHeader(
                 sessionId = sessionId,
@@ -39,7 +46,8 @@ class FastRouter(
                 route = route,
                 toolName = toolName,
                 reasonCode = reason?.name,
-                visibleTools = visible,
+                visibleTools = modelVisible,
+                projectedTools = projected,
             )
 
         val match = matchTemplate(intentText.trim())
@@ -62,6 +70,19 @@ class FastRouter(
         val projection = projections.getValue(tool.name)
         if (projection.level == CapabilityLevel.UNAVAILABLE) {
             val reason = projection.reason ?: dev.librepocket.tool.DenyReason.USER_DISABLED
+            return RouteDecision(
+                route = RouteKind.DENIED,
+                toolCall = null,
+                reasonCode = reason,
+                fallbackMessage = FallbackMessages.forTool(tool.name, reason, tool.annotations.fallbackHint),
+                header = header(RouteKind.DENIED, tool.name, reason),
+            )
+        }
+        // Wiring gate: projected but not executionReady ⇒ not enabled this
+        // round (USER_DISABLED + manual alternative; the wiring PR restores
+        // FAST per tool as flags flip with dispatcher/executor/E2E).
+        if (!tool.executionReady) {
+            val reason = dev.librepocket.tool.DenyReason.USER_DISABLED
             return RouteDecision(
                 route = RouteKind.DENIED,
                 toolCall = null,

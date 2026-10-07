@@ -1,7 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Accessibility configuration for the foss flavor placeholder service (Phase2). -->
+<!-- Accessibility configuration (S3 real implementation, least privilege, pure OSS):
+     only click/focus/window-change events (no typeAllMask), window content
+     readable for the redacted snapshot pipeline, 100ms event throttle.
+     canPerformGestures=true is required: dispatchSwipe uses dispatchGesture()
+     (see FossAccessibilityService.dispatchSwipe); without it the system
+     cancels every gesture and Swipe automation silently never works. -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityEventTypes="typeViewClicked|typeViewFocused|typeWindowStateChanged|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:canRetrieveWindowContent="false"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:notificationTimeout="100"
     android:description="@string/accessibility_description" />

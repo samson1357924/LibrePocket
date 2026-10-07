@@ -12,12 +12,16 @@
 #      permission (SEND/RECEIVE/READ_SMS, MANAGE_EXTERNAL_STORAGE,
 #      BIND_ACCESSIBILITY_SERVICE, BIND_VPN_SERVICE);
 #   3. `dexdump` class scan: no class DEFINED under a self-install-only package
-#      (Ldev/librepocket/agent/github/ or Ldev/librepocket/agent/foss/) and no
-#      class EXTENDING a forbidden superclass (VpnService /
+#      (Ldev/librepocket/agent/github/, Ldev/librepocket/agent/foss/,
+#      Ldev/librepocket/privilege/github/, or the Shizuku transport
+#      Lrikka/shizuku/) and no class EXTENDING a forbidden superclass (VpnService /
 #      AccessibilityService). Descriptor form is used deliberately: plain-word
 #      grep would self-match the policy constants themselves;
 #   4. manifest service dump (APK via aapt xmltree) declares no
 #      AccessibilityService / VpnService service.
+#   5. S4: unzipped entry scan declares no on-device Linux payload
+#      (`proot` binary / `rootfs` / `linux/image` — rootfs is download-only
+#      in every flavor, so any such entry is a packaging regression).
 #   Bundle (.aab) inputs are scanned from the unzipped bundle manifests, so the
 #   same gate covers both playRelease and githubRelease bundles (a
 #   githubRelease bundle is expected to FAIL the play gate — positive control
@@ -25,28 +29,40 @@
 #
 # Foss gate (--foss) checks (any failure exits non-zero):
 #   1. source manifests (app/src/main + app/src/foss) contain no proprietary
-#      needle (com.google.mlkit / com.google.android.gms) — catches an
+#      needle (com.google.mlkit / com.google.android.gms /
+#      com.microsoft.cognitiveservices.speech) — catches an
 #      accidental proprietary dependency before the build;
 #   2. `dexdump` Class-descriptor scan: no class REFERENCED under a proprietary
-#      prefix (Lcom/google/mlkit/ or Lcom/google/android/gms/). Descriptor form
+#      prefix (Lcom/google/mlkit/ or Lcom/google/android/gms/ or
+#      Lcom/microsoft/cognitiveservices/speech/). Descriptor form
 #      (L + slashes + /) is used deliberately: the dot-form policy constants
 #      can never self-match it;
 #   3. manifest dump (APK via aapt, AAB via bundle-manifest scan) declares no
 #      proprietary (GMS) permission.
 #
+# S2: Azure Speech is github-flavor only (azure_tts default off); the foss
+# gate covers it alongside ML Kit / GMS.
+#
 # Mirrors HardeningPolicy (PLAY_PERMISSION_BLACKLIST / PLAY_CLASS_BLACKLIST /
-# PLAY_SUPERCLASS_BLACKLIST / FOSS_STRING_BLACKLIST + checkFossArtifact):
-# play class prefixes cover both self-install flavors (github + foss); foss
-# dex needles are the Dalvik form (L + slashes + /) of the dot-form policy
-# constants, so the artifact scanner stays silent on the policy class itself.
+# PLAY_SUPERCLASS_BLACKLIST / PLAY_LINUX_ENTRY_BLACKLIST / FOSS_STRING_BLACKLIST
+# + checkFossArtifact):
+# play class prefixes cover both self-install flavors (github + foss a11y),
+# the S3 privilege bridge, and the Shizuku transport (githubImplementation
+# only); foss dex needles are the Dalvik form (L + slashes + /) of the
+# dot-form policy constants, so the artifact scanner stays silent on the
+# policy class itself.
 set -eu
+# Deterministic grep/sort byte semantics across locales.
+export LC_ALL=C
 
 BLACKLIST_PERMS="SEND_SMS RECEIVE_SMS READ_SMS MANAGE_EXTERNAL_STORAGE BIND_ACCESSIBILITY_SERVICE BIND_VPN_SERVICE"
-BLACKLIST_CLASS_PREFIXES="Ldev/librepocket/agent/github/ Ldev/librepocket/agent/foss/"
+BLACKLIST_CLASS_PREFIXES="Ldev/librepocket/agent/github/ Ldev/librepocket/agent/foss/ Ldev/librepocket/privilege/github/ Lrikka/shizuku/"
 BLACKLIST_SUPERS="Landroid/net/VpnService; Landroid/accessibilityservice/AccessibilityService;"
-FOSS_BLACKLIST="com.google.mlkit com.google.android.gms"
-FOSS_DEX_PREFIXES="Lcom/google/mlkit/ Lcom/google/android/gms/"
+FOSS_BLACKLIST="com.google.mlkit com.google.android.gms com.microsoft.cognitiveservices.speech rikka.shizuku"
+FOSS_DEX_PREFIXES="Lcom/google/mlkit/ Lcom/google/android/gms/ Lcom/microsoft/cognitiveservices/speech/ Lrikka/shizuku/"
 FAIL=0
+# Current per-artifact temp dir (single EXIT trap below cleans it on interrupt).
+TMP_CURRENT=""
 
 log() { printf '%s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*"; FAIL=1; }
@@ -105,7 +121,7 @@ if [ "$MODE" = "play" ]; then
 else
     log "== source manifests (foss gate) =="
     # Mirrors HardeningPolicy.FOSS_STRING_BLACKLIST: the foss overlay must not
-    # pull in proprietary Play-services / ML Kit references. Manifest-only
+    # pull in proprietary Play-services / ML Kit / Azure Speech references. Manifest-only
     # scan (the policy class itself legitimately names these in dot form, so
     # .kt sources are covered by the dex gate instead).
     for m in "$ROOT/app/src/main/AndroidManifest.xml" "$ROOT/app/src/foss/AndroidManifest.xml"; do
@@ -163,7 +179,11 @@ for ART in "$@"; do
     log "== artifact ($MODE gate): $ART =="
 
     TMP=$(mktemp -d)
-    trap 'rm -rf "$TMP"' EXIT INT TERM
+    TMP_CURRENT="$TMP"
+    # Single-shot cleanup for interrupt: expanded now (double quotes), so later
+    # iterations cannot clobber the trapped path (no late "$TMP" expansion).
+    # shellcheck disable=SC2064
+    trap "rm -rf \"$TMP\"" INT TERM
     unzip -oq "$ART" -d "$TMP"
 
     if [ "$MODE" = "play" ]; then
@@ -219,12 +239,15 @@ for ART in "$@"; do
                 fi
             done
         else
-            # Fallback without dexdump: descriptor-form binary grep (L-prefix + ';'
-            # suffix never matches plain-word const-strings). Mirrors HardeningPolicy
-            # PLAY_CLASS_BLACKLIST (github + foss prefixes, pinned on each flavor's
-            # AccessibilityService descriptor).
+            # Fallback without dexdump: descriptor-form binary grep (L-prefix +
+            # slashes never matches the dot-form policy constants). Mirrors HardeningPolicy
+            # PLAY_CLASS_BLACKLIST (github + foss a11y prefixes, the S3 privilege
+            # bridge prefix, and the Shizuku transport prefix, each pinned below
+            # on a concrete descriptor).
             for needle in "Ldev/librepocket/agent/github/GithubAccessibilityService;" \
                           "Ldev/librepocket/agent/foss/FossAccessibilityService;" \
+                          "Ldev/librepocket/privilege/github/" \
+                          "Lrikka/shizuku/" \
                           "Landroid/net/VpnService;" \
                           "Landroid/accessibilityservice/AccessibilityService;"; do
                 if grep -R -l -F "$needle" "$TMP" 2>/dev/null | grep -q .; then
@@ -258,6 +281,23 @@ for ART in "$@"; do
                 fi
                 ;;
         esac
+
+        # 5. S4 on-device Linux payload assertion (mirrors
+        #    HardeningPolicy.PLAY_LINUX_ENTRY_BLACKLIST + checkPlayLinuxEntries):
+        #    the PRoot binary and any container image/rootfs must never ship
+        #    inside the play artifact (rootfs is download-only in all flavors).
+        LINUX_FAIL=0
+        ENTRIES=$(cd "$TMP" && find . | sed 's|^\./||')
+        for needle in proot rootfs linux/image; do
+            HIT=$(printf '%s\n' "$ENTRIES" | grep -i -F "$needle" || true)
+            if [ -n "$HIT" ]; then
+                fail "$ART embeds on-device Linux payload ($needle): $(printf '%s' "$HIT" | head -n 3 | tr '\n' ' ')"
+                LINUX_FAIL=1
+            fi
+        done
+        if [ "$LINUX_FAIL" -eq 0 ]; then
+            log "  linux-payload: OK"
+        fi
     else
         # --- foss gate per-artifact checks (mirror checkFossArtifact) ---
         # 2. dex proprietary-reference scan: Class descriptors only.
@@ -319,8 +359,11 @@ for ART in "$@"; do
     fi
 
     rm -rf "$TMP"
-    trap - EXIT INT TERM
+    TMP_CURRENT=""
+    trap - INT TERM
 done
+# Final interrupt-trap cleanup (leftover TMP_CURRENT on early exit).
+if [ -n "${TMP_CURRENT:-}" ]; then rm -rf "$TMP_CURRENT"; fi
 
 if [ "$FAIL" -ne 0 ]; then
     log "play_policy_check ($MODE gate): FAILED"

@@ -8,9 +8,15 @@ import java.util.concurrent.TimeUnit
 /**
  * 子進程跑道抽象：預設走真實 [ProcessBuilder]，單測可注入假實現，
  * 讓「輸出截斷」等斷言不依賴宿主機二進位。
+ *
+ * @param env 子進程環境：非 null 時真實 runner 必須 `clear()` 後全量替換
+ * （不繼承宿主 env，阻斷 `LD_PRELOAD` / `PROOT_*` / 代理污染）；
+ * null 表示繼承宿主 env（僅宿主直接 shell 通道使用；PRoot guest 通道
+ * 必須傳 [dev.librepocket.linux.LinuxEnv.GUEST_ENV]，見
+ * [dev.librepocket.linux.ProotExec.execute]）。
  */
 interface ProcessRunner {
-    fun run(argv: List<String>, timeoutMs: Long): RawOutput
+    fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>? = null): RawOutput
 }
 
 /** 子進程原始回執：輸出為位元組（截斷前），[timedOut] 表示超時已被殺。 */
@@ -21,12 +27,30 @@ data class RawOutput(
     val timedOut: Boolean,
 )
 
-/** 真實子進程實現：argv 直達 exec（無 shell），超時 [destroyForcibly]。 */
-class DefaultProcessRunner : ProcessRunner {
-    override fun run(argv: List<String>, timeoutMs: Long): RawOutput {
-        val process = ProcessBuilder(argv)
+/** 真實子進程實現：argv 直達 exec（無 shell），超時 [destroyForcibly]。
+ * [dirRoot] 非 null 時把子進程 cwd 釘到該目錄（縱深防禦：bare filename
+ * 相對解析目標固定；PR#1 P0 direct-cwd 封堵）。null 時維持系統預設 cwd
+ *（政策層仍 fail-closed）。
+ * [run] 的 [env] 非 null 時先 `clear()` 再全量替換（guest 乾淨環境，
+ * 見 [dev.librepocket.linux.LinuxEnv.GUEST_ENV]）；null 時繼承宿主 env。
+ */
+class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
+    override fun run(argv: List<String>, timeoutMs: Long, env: Map<String, String>?): RawOutput {
+        val pb = ProcessBuilder(argv)
             .redirectInput(ProcessBuilder.Redirect.PIPE)
-            .start()
+        if (env != null) {
+            pb.environment().clear()
+            pb.environment().putAll(env)
+        }
+        if (dirRoot != null) {
+            val dir = java.io.File(dirRoot)
+            // 釘死失敗即 fail-closed：不繼承不可控 cwd，直接拋給上層轉 Failed。
+            if (!dir.isDirectory) {
+                throw IllegalStateException("pinned cwd not a directory: $dirRoot")
+            }
+            pb.directory(dir)
+        }
+        val process = pb.start()
         process.outputStream.close()
         val outReader = streamGobbler(process.inputStream)
         val errReader = streamGobbler(process.errorStream)
@@ -127,7 +151,8 @@ class ShellQuota(
  *
  * 檔案域：[privateRoot] 為 App 私有域根（例 `context.filesDir.absolutePath`），
  * 檔案參數凡絕對路徑一律先過 `FileScope.decide`（見 [ShellPolicy.validate]）。
- * 未配置（null，預設）時任何絕對路徑一律拒絕（fail-closed）；play 跨域拒絕，
+ * 未配置（null，預設）時任何絕對路徑一律拒絕，且隱式讀 cwd 的命令無明確
+ * 路徑時亦拒絕（fail-closed）；play 跨域拒絕，
  * foss/github 跨域即使橋接已授權，直接 exec 仍拒絕（需改走 D09 橋）。
  */
 class RestrictedShell(
@@ -148,8 +173,17 @@ class RestrictedShell(
         if (!quota.tryAcquire()) {
             return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "shell quota exceeded")
         }
+        // Direct 通道 cwd 縱深釘死：預設 runner 且 privateRoot 已知時，用釘死 cwd
+        // 的 runner 執行（與 Root/Shizuku 雙層釘死對齊；政策層已 fail-closed，
+        // 此處防 TOCTOU / cwd 預植）。
+        val effectiveRunner: ProcessRunner =
+            if (privateRoot != null && runner is DefaultProcessRunner) {
+                DefaultProcessRunner(privateRoot)
+            } else {
+                runner
+            }
         val raw: RawOutput = try {
-            runner.run(argv, timeoutMs)
+            effectiveRunner.run(argv, timeoutMs)
         } catch (e: Exception) {
             return ShellResult.Failed("spawn failed: ${e.message}")
         }

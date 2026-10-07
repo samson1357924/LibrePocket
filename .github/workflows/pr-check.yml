@@ -17,7 +17,8 @@ jobs:
   unit-tests:
     name: Unit & Robolectric Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 三風味串行實測約 24-25 分鐘（編譯 3.5m + 每風味 ~7m），20m 必超時。
+    timeout-minutes: 40
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,10 +35,11 @@ jobs:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
       - name: Run Unit Tests (Play, Foss & GitHub Flavors)
-        run: ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --continue
+        run: ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --continue --stacktrace
 
       - name: Upload Test Reports
-        if: failure()
+        # cancelled（超時被砍）時也要上傳，否則下次仍是盲修。
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: unit-test-reports

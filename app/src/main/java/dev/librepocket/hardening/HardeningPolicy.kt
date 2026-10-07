@@ -43,26 +43,41 @@ object HardeningPolicy {
 
     /**
      * Class-descriptor prefixes that must never be DEFINED in the play dex
-     * (self-install flavor code, e.g. `Ldev/librepocket/agent/github/GithubAccessibilityService;`).
+     * (self-install flavor code, e.g. `Ldev/librepocket/agent/github/GithubAccessibilityService;`,
+     * plus the S3 privilege bridge `Ldev/librepocket/privilege/github/` and its
+     * Shizuku transport `Lrikka/shizuku/` — Shizuku is `githubImplementation`
+     * only, so any play-dex occurrence is a dependency-scoping regression).
      */
     val PLAY_CLASS_BLACKLIST: List<String> = listOf(
         "Ldev/librepocket/agent/github/",
         "Ldev/librepocket/agent/foss/",
+        "Ldev/librepocket/privilege/github/",
+        "Lrikka/shizuku/",
     )
 
     /**
      * Proprietary needles that must never be REFERENCED by the foss dex
-     * (fully open-source build: no Play services, no ML Kit).
+     * (fully open-source build: no Play services, no ML Kit, no Azure Speech).
      *
      * Stored in dot form on purpose: [checkFossArtifact] only scans
      * `Class descriptor` entries (Dalvik `L...;` form, e.g.
      * `Lcom/google/mlkit/vision/common/InputImage;`), which these dot-form
      * literals can never equal — so the artifact scanner stays silent on
      * the policy class itself (same self-match avoidance as above).
+     *
+     * S2: Azure Speech (`com.microsoft.cognitiveservices.speech`) is
+     * github-flavor only (with `azure_tts` default off); foss must never
+     * reference it. Mirrored by `scripts/play_policy_check.sh` foss gate.
+     *
+     * S3: Shizuku (`rikka.shizuku`, `githubImplementation` only) likewise
+     * never appears in foss; the play gate additionally pins its dex form
+     * (`Lrikka/shizuku/`, see [PLAY_CLASS_BLACKLIST]).
      */
     val FOSS_STRING_BLACKLIST: List<String> = listOf(
         "com.google.mlkit",
         "com.google.android.gms",
+        "com.microsoft.cognitiveservices.speech",
+        "rikka.shizuku",
     )
 
     /**
@@ -72,6 +87,25 @@ object HardeningPolicy {
     val PLAY_SUPERCLASS_BLACKLIST: List<String> = listOf(
         "Landroid/net/VpnService;",
         "Landroid/accessibilityservice/AccessibilityService;",
+    )
+
+    /**
+     * S4 play gate: zip-entry substrings for on-device Linux payload.
+     *
+     * Matching is case-insensitive.
+     * It covers the PRoot binary (`proot`).
+     * It covers container paths (`rootfs`, `linux/image`).
+     * Rootfs is download-only in every flavor.
+     * No source set ships these payloads.
+     * Any such entry in the play APK/AAB is a packaging regression.
+     * The play gate fails the build on the first hit.
+     * Mirrored by `scripts/play_policy_check.sh` (S4 section).
+     * Note: this is a zip-entry scan, not a dex scan.
+     */
+    val PLAY_LINUX_ENTRY_BLACKLIST: List<String> = listOf(
+        "proot",
+        "rootfs",
+        "linux/image",
     )
 
     /** Result of [checkPlayArtifact]; empty means compliant. */
@@ -144,6 +178,30 @@ object HardeningPolicy {
             }
             if (hit != null) {
                 out += Violation("foss-string-blacklist", "foss dex references proprietary '$descriptor'")
+            }
+        }
+        return out
+    }
+
+    /**
+     * Pure S4 play-compliance check over zip entry names.
+     *
+     * Input is `unzip -l` of the APK/AAB.
+     * Any entry containing a [PLAY_LINUX_ENTRY_BLACKLIST] needle is a violation.
+     * Matching is case-insensitive.
+     * The PRoot binary must never ship inside the play artifact.
+     * Container image/rootfs must never ship inside the play artifact.
+     * Rootfs is download-only in all flavors.
+     */
+    fun checkPlayLinuxEntries(
+        entries: Collection<String>,
+    ): List<Violation> {
+        val out = mutableListOf<Violation>()
+        for (entry in entries) {
+            val lower = entry.lowercase()
+            val hit = PLAY_LINUX_ENTRY_BLACKLIST.firstOrNull { it in lower }
+            if (hit != null) {
+                out += Violation("linux-entry-blacklist", "play artifact embeds on-device Linux payload '$entry'")
             }
         }
         return out

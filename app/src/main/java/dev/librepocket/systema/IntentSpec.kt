@@ -46,6 +46,8 @@ object IntentActions {
   const val SEND = "android.intent.action.SEND"
   const val SET_ALARM = "android.intent.action.SET_ALARM"
   const val INSERT = "android.intent.action.INSERT"
+  const val EDIT = "android.intent.action.EDIT"
+  const val DELETE = "android.intent.action.DELETE"
   const val MEDIA_BUTTON = "android.intent.action.MEDIA_BUTTON"
   const val SOUND_SETTINGS = "android.settings.SOUND_SETTINGS"
 

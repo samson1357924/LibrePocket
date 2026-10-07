@@ -75,6 +75,11 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    # Dependency graph 已啟用（含 Automatic dependency submission），此 job 為嚴格門檻：
+    # 掃出具體 GHSA 即紅燈擋 PR，不再放行。
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

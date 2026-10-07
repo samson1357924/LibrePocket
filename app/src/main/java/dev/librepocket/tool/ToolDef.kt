@@ -8,11 +8,21 @@ package dev.librepocket.tool
  * @param fallbackHint manual alternative quoted in downgrade replies.
  * @param requiresSwitch user-toggle key guarding this tool, or null.
  * @param switchDefault value when the key is absent from [ProjectionContext].
+ * @param requiresSwitch2 second user-toggle key that must ALSO be on, or null
+ *   when the tool needs only one switch (S2 `voice.speak.azure` needs both
+ *   `azure_tts` and `voice_output`; either off yields UNAVAILABLE +
+ *   USER_DISABLED, mirroring `AzureSpeechGate`).
+ * @param switchDefault2 value when [requiresSwitch2] is absent from
+ *   [ProjectionContext].
  * @param requiresPermission runtime/system grant needed, or null when the
  *   tool needs none (e.g. SMS prefill deliberately requests no SMS
  *   permission; DIAL needs no CALL_PHONE permission).
  * @param degradedWithoutPermission when true, a missing permission yields
  *   [CapabilityLevel.DEGRADED] (partial scope) instead of UNAVAILABLE.
+ * @param foregroundOnly when true, the tool only works while the app is in
+ *   the foreground ([ProjectionContext.isForeground]). Background rounds
+ *   project [CapabilityLevel.UNAVAILABLE] + [DenyReason.NO_PRIVILEGE]
+ *   (e.g. clipboard access, blocked by the platform for background apps).
  */
 data class ToolAnnotations(
     val intentAction: String? = null,
@@ -20,8 +30,11 @@ data class ToolAnnotations(
     val fallbackHint: String = "",
     val requiresSwitch: String? = null,
     val switchDefault: Boolean = true,
+    val requiresSwitch2: String? = null,
+    val switchDefault2: Boolean = true,
     val requiresPermission: String? = null,
     val degradedWithoutPermission: Boolean = false,
+    val foregroundOnly: Boolean = false,
 )
 
 /**
@@ -30,6 +43,16 @@ data class ToolAnnotations(
  * The projection predicate ([project]) is a pure function of flavor,
  * user switches and granted permissions (ARCHITECTURE §6.3): identical
  * input always yields identical output.
+ *
+ * @param executionReady code-level wiring invariant (PR#1 re-review):
+ *   true only when the tool is executable end-to-end this round
+ *   (dispatcher + executor + confirmation/grant flow + E2E). Only
+ *   [ToolRegistry.visibleTools] (which additionally requires this flag)
+ *   may be sent to the model; [ToolRegistry.projectedTools] stays
+ *   available for gates/headers/audit regardless of this flag.
+ *   The wiring PR flips tools to true one by one as each loop lands;
+ *   until then new tools default to false (fail-closed: projection text
+ *   alone can never make a tool model-visible).
  */
 data class ToolDef(
     val name: String,
@@ -39,8 +62,12 @@ data class ToolDef(
     val sideEffect: SideEffect,
     val annotations: ToolAnnotations = ToolAnnotations(),
     val supportedFlavors: Set<Flavor> = setOf(Flavor.PLAY, Flavor.FOSS, Flavor.GITHUB),
+    val executionReady: Boolean = false,
 ) {
     fun project(ctx: ProjectionContext): Projection {
+        if (annotations.foregroundOnly && !ctx.isForeground) {
+            return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.NO_PRIVILEGE)
+        }
         if (ctx.flavor !in supportedFlavors) {
             return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.FLAVOR_BLOCKED)
         }
@@ -50,6 +77,11 @@ data class ToolDef(
                 return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.USER_DISABLED)
             }
         } else if (switchKey != null && !ctx.switchOn(switchKey, annotations.switchDefault)) {
+            return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.USER_DISABLED)
+        }
+        // S2 雙開關（voice.speak.azure）：第二開關關閉同樣不可用（USER_DISABLED）。
+        val switchKey2 = annotations.requiresSwitch2
+        if (switchKey2 != null && !ctx.switchOn(switchKey2, annotations.switchDefault2)) {
             return Projection(name, CapabilityLevel.UNAVAILABLE, DenyReason.USER_DISABLED)
         }
         val permission = annotations.requiresPermission

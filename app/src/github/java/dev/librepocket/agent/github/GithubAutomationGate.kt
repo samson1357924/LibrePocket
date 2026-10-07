@@ -44,13 +44,15 @@ object GithubAutomationGate {
         userSwitches = userSwitches,
     )
 
-    /** 慢通道 `gui.automate` 本轮是否对模型可见。 */
+    /** 慢通道 `gui.automate` 本輪投影是否通過門禁（投影語義；非 model 可執行集）。 */
     fun isSlowVisible(
         switchOn: Boolean = DEFAULT_ENABLED,
         serviceGranted: Boolean = false,
         userConfirmed: Boolean = false,
     ): Boolean {
         val ctx = projectionContext(switchOn, serviceGranted, userConfirmed)
-        return ToolRegistry.visibleTools(ctx).any { it.name == ToolRegistry.SLOW_TOOL_NAME }
+        // 門禁看投影（projectedTools），非 model 可執行集：gui.automate 尚無
+        // StepExecutor 接線（executionReady=false），故 isSlowVisible 為投影語義。
+        return ToolRegistry.projectedTools(ctx).any { it.name == ToolRegistry.SLOW_TOOL_NAME }
     }
 }

@@ -58,6 +58,31 @@ class HardeningPolicyTest {
         assertTrue(violations.single().check.contains("class-blacklist"))
     }
 
+    @Test fun privilegeBridge_flaggedInPlay() {
+        // S3：提權橋（privilege/github）絕不進 play。
+        val violations = HardeningPolicy.checkPlayArtifact(
+            permissions = emptyList(),
+            classDescriptors = listOf("Ldev/librepocket/privilege/github/RootSuRunner;"),
+            superclasses = emptyList(),
+            services = emptyList(),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().check.contains("class-blacklist"))
+        assertTrue(HardeningPolicy.PLAY_CLASS_BLACKLIST.contains("Ldev/librepocket/privilege/github/"))
+    }
+
+    @Test fun shizukuTransport_flaggedInPlay() {
+        // S3：Shizuku 傳輸層（githubImplementation only）絕不進 play。
+        val violations = HardeningPolicy.checkPlayArtifact(
+            permissions = emptyList(),
+            classDescriptors = listOf("Lrikka/shizuku/Shizuku;"),
+            superclasses = emptyList(),
+            services = emptyList(),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().check.contains("class-blacklist"))
+    }
+
     @Test fun cleanFossArtifact_passes() {
         val violations = HardeningPolicy.checkFossArtifact(
             classDescriptors = listOf(
@@ -66,6 +91,7 @@ class HardeningPolicyTest {
                 "Lcom/google/zxing/MultiFormatReader;",
                 "Lcom/googlecode/tesseract/android/TessBaseAPI;",
                 "Lorg/tensorflow/lite/Interpreter;",
+                "Ldev/librepocket/voice/VoiceTts;",
             ),
         )
         assertTrue(violations.isEmpty())
@@ -84,6 +110,32 @@ class HardeningPolicyTest {
             classDescriptors = listOf("Lcom/google/android/gms/common/api/Status;"),
         )
         assertEquals(1, violations.size)
+    }
+
+    @Test fun azureReference_flaggedInFoss() {
+        // S2: Azure Speech 僅 github 版；foss dex 引用即違規。
+        val violations = HardeningPolicy.checkFossArtifact(
+            classDescriptors = listOf("Lcom/microsoft/cognitiveservices/speech/SpeechConfig;"),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().check.contains("foss-string-blacklist"))
+    }
+
+    @Test fun fossBlacklist_pinsAzureNeedle() {
+        assertTrue(
+            HardeningPolicy.FOSS_STRING_BLACKLIST.contains("com.microsoft.cognitiveservices.speech"),
+        )
+    }
+
+    @Test fun shizukuReference_flaggedInFoss() {
+        // S3：Shizuku 僅 github 版；foss dex 引用即違規（dot-form 常量，
+        // Dalvik 形匹配，避免自匹配）。
+        val violations = HardeningPolicy.checkFossArtifact(
+            classDescriptors = listOf("Lrikka/shizuku/Shizuku;"),
+        )
+        assertEquals(1, violations.size)
+        assertTrue(violations.single().check.contains("foss-string-blacklist"))
+        assertTrue(HardeningPolicy.FOSS_STRING_BLACKLIST.contains("rikka.shizuku"))
     }
 
     @Test fun vpnSubclass_flagged() {
@@ -113,5 +165,30 @@ class HardeningPolicyTest {
 
     @Test fun cleartext_neverPermitted() {
         assertEquals(false, HardeningPolicy.CLEARTEXT_PERMITTED)
+    }
+
+    @Test fun linuxPayload_cleanEntriesPass() {
+        val violations = HardeningPolicy.checkPlayLinuxEntries(
+            entries = listOf(
+                "lib/arm64-v8a/libc++_shared.so",
+                "assets/app.js",
+                "res/layout/main.xml",
+            ),
+        )
+        assertTrue(violations.isEmpty())
+    }
+
+    @Test fun linuxPayload_prootAndRootfsFlagged() {
+        // S4：proot 二進位與 rootfs/image 條目一律不得進 play 產物
+        //（rootfs 全風味下載式，出現即打包迴歸）。
+        val violations = HardeningPolicy.checkPlayLinuxEntries(
+            entries = listOf(
+                "lib/arm64-v8a/libproot.so",
+                "assets/linux/image/alpine.tar.gz",
+                "assets/containers/x/rootfs/etc/hosts",
+            ),
+        )
+        assertEquals(3, violations.size)
+        assertTrue(violations.all { it.check.contains("linux-entry-blacklist") })
     }
 }

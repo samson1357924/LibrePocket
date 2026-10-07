@@ -3,6 +3,9 @@ package dev.librepocket.systemb
 /**
  * B 組工具註冊表（原創）。FastRouter 在裝配提示前查詢此表；
  * 能力投影按風味 + 使用者開關过滤後再暴露給模型。
+ *
+ * S1-C：全量聯繫人三工具（search/list/get，foss/github 限定）與
+ * 既有委託選人（pick，免權限）共存；play 下全量一律 FLAVOR_BLOCKED。
  */
 object SystemBRegistry {
   private val tools: Map<String, SystemBTool> = listOf(
@@ -12,6 +15,9 @@ object SystemBRegistry {
     NotificationTool,
     ScreenshotTool,
     ContactTool,
+    ContactSearchTool,
+    ContactListTool,
+    ContactGetTool,
     LocationTool,
   ).associateBy { it.name }
 

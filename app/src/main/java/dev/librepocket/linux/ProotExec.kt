@@ -1,0 +1,256 @@
+package dev.librepocket.linux
+
+import dev.librepocket.redact.Redactor
+import dev.librepocket.shell.ProcessRunner
+import dev.librepocket.shell.RawOutput
+import dev.librepocket.shell.ShellDeny
+import dev.librepocket.shell.ShellPolicy
+import dev.librepocket.shell.ShellQuota
+import dev.librepocket.shell.ShellResult
+import dev.librepocket.shell.Validation
+import dev.librepocket.tool.DenyReason
+import dev.librepocket.tool.Flavor
+
+/**
+ * S4 `linux.exec` 執行面（WRITE）：在指定容器內執行 guest 命令。
+ *
+ * - 白名單聯集：[GUEST_BINARIES] = [ShellPolicy.ALLOWED_BINARIES] ∪ 機內
+ *   工具鏈/分析二進位；黑名單完整繼承（[ShellPolicy.validate]
+ *   同一程式碼路徑：黑名單二進位 → 全文片段 → 參數衛生 → find 高危謂詞，
+ *   見 `allowedBinaries` 參數）。`git` 不在聯集內：取源一律經 inbox 進件，
+ *   容器內不得直抓（`curl/wget` 同理不在聯集）。
+ * - 檔案域：guest argv 一律用 guest namespace（`/inbox/...`、`/outbox/...`、
+ *   `/etc` 等容器內路徑；host↔guest 資料只經 [LinuxInboxStager.stageFile] /
+ *   [LinuxInboxStager.collectFile] 顯式映射）。任何指向 `filesDir/linux`
+ *   整樹的 host 絕對路徑（`containers/.../rootfs/...`、`cache/...`、
+ *   `tmp/outbox/...`、`bin/proot` 等，不只 `tmp/inbox`）在真實
+ *   `proot -r` 下只會 `ENOENT`，故在 argv 層直接 fail-closed
+ *   （[LinuxInboxStager.hostLinuxAbsoluteRef]；SAF 樹路徑即使橋接已授權亦拒絕，
+ *   禁 `--bind`）。`bridgeGranted` 固定 false（fail-closed）。
+ * - Host inbox 路徑（`filesDir/linux/tmp/inbox/...`）在 guest argv 內一律
+ *   否決（[LinuxInboxStager.unstagedInboxRef]）：該路徑是 rootfs 的 sibling，
+ *   真實 PRoot 下 guest 看不見（`-r` 無 bind 即 `ENOENT`）；呼叫方必須先經
+ *   [LinuxInboxStager.stageFile] 複製到 rootfs 內，再用 `/inbox/...`
+ *   guest 路徑組 argv。
+ * - 落盤配額：執行前先過 [LinuxEnv.quotaVeto]（`usedTotal/usedContainer +
+ *   estimatedWrite`），超限不建子進程（與 [LinuxBoot.download] 同策）。
+ * - proot 落盤權限：呼叫方傳入實際 mode，必須等於 [LinuxEnv.PROOT_BIN_MODE]
+ *   （`0700`），否則 fail-closed（見 [LinuxEnv.prootBinModeVeto]）。
+ * - 超時 / 配額 / 截斷沿用宿主 shell 同一套常數
+ *   （[ShellPolicy.DEFAULT_TIMEOUT_MS] / [ShellQuota] /
+ *   [ShellPolicy.truncate]），輸出再過 [Redactor.redact] 全量
+ *   （R1–R14，含 R13 GEO 與 R14 路徑）。
+ * - 風味：foss/github NATIVE；play FLAVOR_BLOCKED。門禁經 [denyReasonFor]
+ *   統一裁決（執行入口不得另寫風味/開關分支）。
+ * - 降級回覆尾必附 [FALLBACK_HINT] 與 [LinuxTools.PERF_NOTICE]，單測斷言。
+ *
+ * 本檔案零 Android 依賴；子進程縫沿用 [ProcessRunner]，單測可注入假實現。
+ */
+object ProotExec {
+
+    const val NAME = "linux.exec"
+    const val FALLBACK_HINT = "run the command in a terminal app or on a desktop machine"
+
+    /**
+     * Guest 白名單增量（聯集對象）：工具鏈（編譯）、套件/解包/分析二進位
+     * 與容器內常用查詢類。破壞性/提權/直譯器仍由黑名單擋下
+     * （`sh`/`bash`/`su`/`sudo`/`rm`/`dd` 照拒）。
+     * `git` 刻意不在聯集：取源一律經 inbox 進件（見 [LinuxEnv.inboxVeto]）。
+     */
+    val GUEST_EXTRA_BINARIES: Set<String> = setOf(
+        "python3",
+        "python",
+        "gcc",
+        "g++",
+        "clang",
+        "clang++",
+        "make",
+        "cmake",
+        "ninja",
+        "pkg-config",
+        "tar",
+        "unzip",
+        "xz",
+        "file",
+        "strings",
+        "readelf",
+        "objdump",
+        "apt",
+        "apt-get",
+        "dpkg",
+        "dnf",
+        "yum",
+        "apk",
+        "apktool",
+        "jadx",
+        "baksmali",
+        "smali",
+        "aapt2",
+        "aapt",
+        "zipalign",
+        "apksigner",
+    )
+
+    /** 白名單聯集（宿主白名單 ∪ guest 增量）。 */
+    val GUEST_BINARIES: Set<String> = ShellPolicy.ALLOWED_BINARIES + GUEST_EXTRA_BINARIES
+
+    /**
+     * Guest 執行入口。
+     *
+     * 門禁順序（固定）：風味/開關（[denyReasonFor]）→ 容器/作用域 →
+     * proot 權限（[LinuxEnv.prootBinModeVeto]）→ 落盤配額
+     * （[LinuxEnv.quotaVeto]）→ bind 封堵 → 未 stage inbox 封堵
+     * （[LinuxInboxStager.unstagedInboxRef]）→ host Linux 樹封堵
+     * （[LinuxInboxStager.hostLinuxAbsoluteRef]，guest argv 一律 guest
+     * namespace）→ 白名單/黑名單/檔案域
+     * （[ShellPolicy.validate]）→ 速率配額 → spawn。
+     *
+     * @param filesDir App 私有域根（作用域為 `filesDir/linux` 整樹，
+     *   容器 rootfs 與 inbox 皆在其中；SAF 等樹外路徑一律拒絕）。
+     * @param container 容器名（[LinuxEnv.isSafeContainerName]）。
+     * @param quota 滑動窗口配額（沿用 [ShellQuota]，呼叫方可與宿主 shell 共用或獨立）。
+     * @param usedTotalBytes linux 總量已用（落盤配額用）。
+     * @param usedContainerBytes 單容器已用（落盤配額用）。
+     * @param estimatedWriteBytes 本次預估落盤（未知按 0 計，但輸出截斷仍受
+     *   [ShellPolicy.MAX_OUTPUT_BYTES] 約束）。
+     * @param prootBinMode proot 落盤實際 mode（須等於 [LinuxEnv.PROOT_BIN_MODE]）。
+     */
+    fun execute(
+        guestArgv: List<String>,
+        filesDir: String,
+        container: String,
+        flavor: Flavor,
+        switchOn: Boolean,
+        runner: ProcessRunner,
+        quota: ShellQuota = ShellQuota(),
+        timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS,
+        usedTotalBytes: Long = 0L,
+        usedContainerBytes: Long = 0L,
+        estimatedWriteBytes: Long = 0L,
+        prootBinMode: String = LinuxEnv.PROOT_BIN_MODE,
+    ): ShellResult {
+        when (denyReasonFor(flavor, switchOn)) {
+            DenyReason.FLAVOR_BLOCKED ->
+                return ShellResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "linux.exec blocked on play (FLAVOR_BLOCKED)；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
+                )
+            DenyReason.USER_DISABLED ->
+                return ShellResult.Denied(
+                    ShellDeny.NOT_WHITELISTED,
+                    "linux switch off (${LinuxBoot.SWITCH}=false)；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
+                )
+            DenyReason.NO_PRIVILEGE ->
+                return ShellResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "linux.exec privilege denied；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
+                )
+            null -> Unit
+        }
+        if (LinuxEnv.containerVeto(filesDir, container) != null) {
+            return ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "bad container or scope；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
+            )
+        }
+        val modeVeto = LinuxEnv.prootBinModeVeto(prootBinMode)
+        if (modeVeto != null) {
+            return ShellResult.Denied(ShellDeny.BLACKLISTED, "proot mode veto: $modeVeto")
+        }
+        val diskVeto = LinuxEnv.quotaVeto(usedTotalBytes, usedContainerBytes, estimatedWriteBytes)
+        if (diskVeto != null) {
+            return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "disk quota veto: $diskVeto")
+        }
+        if (LinuxEnv.bindVeto(guestArgv) != null) {
+            return ShellResult.Denied(ShellDeny.BLACKLISTED, "bind forbidden inside guest argv")
+        }
+        // 未 stage 的 host inbox 路徑 fail-closed（PR#1 re-review blocker 2）：
+        // 該路徑在真實 PRoot 下 guest 不可見，呼叫方必須先經
+        // LinuxInboxStager.stageFile 再用 /inbox/... guest 路徑。
+        val inboxRef = LinuxInboxStager.unstagedInboxRef(guestArgv, filesDir)
+        if (inboxRef != null) {
+            return ShellResult.Denied(ShellDeny.BLACKLISTED, inboxRef)
+        }
+        // Host Linux 樹絕對路徑在 guest namespace 下無意義（真機 ENOENT）：
+        // 容器內只認 /inbox/...、/outbox/...、/etc 等 guest 路徑，
+        // host↔guest 只經 LinuxInboxStager 顯式映射。
+        val hostRef = LinuxInboxStager.hostLinuxAbsoluteRef(guestArgv, filesDir)
+        if (hostRef != null) {
+            return ShellResult.Denied(ShellDeny.BLACKLISTED, hostRef)
+        }
+        val rootfs = LinuxEnv.containerRootfs(filesDir, container)
+        when (
+            val v = ShellPolicy.validate(
+                argv = guestArgv,
+                privateRoot = LinuxEnv.root(filesDir),
+                safRoots = emptyList(),
+                flavor = flavor,
+                bridgeGranted = false,
+                allowedBinaries = GUEST_BINARIES,
+                isGuest = true,
+            )
+        ) {
+            is Validation.Denied -> return ShellResult.Denied(v.reason, v.message)
+            is Validation.Allowed -> Unit
+        }
+        if (!quota.tryAcquire()) {
+            return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "linux.exec quota exceeded")
+        }
+        // TOCTOU 序列化（PR#1 comment 6039436820 P1）：spawn 持同容器鎖，
+        // 與 LinuxInboxStager.stageFile/collectFile 同臨界，確保 staging/
+        // collect 的 check→copy 期間沒有 guest 進程併發改 rootfs 路徑。
+        // 純政策否決不持鎖；只有真正會觸及容器 FS 的 spawn 持鎖。
+        val containerLock = LinuxInboxStager.lockFor(filesDir, container)
+        val raw: RawOutput
+        containerLock.lock()
+        try {
+            raw = try {
+                runner.run(
+                    LinuxEnv.prootCmd(LinuxEnv.prootBin(filesDir), rootfs, guestArgv),
+                    timeoutMs,
+                    LinuxEnv.GUEST_ENV,
+                )
+            } catch (e: Exception) {
+                return ShellResult.Failed("spawn failed: ${e.message}")
+            }
+        } finally {
+            containerLock.unlock()
+        }
+        val out = ShellPolicy.truncate(raw.stdout)
+        val err = ShellPolicy.truncate(raw.stderr)
+        val truncated = out.truncated || err.truncated
+        if (raw.timedOut) {
+            return ShellResult.TimedOut(
+                partialStdout = redactGuest(out.bytes.toUtf8(), filesDir),
+                partialStderr = redactGuest(err.bytes.toUtf8(), filesDir),
+                timeoutMs = timeoutMs,
+                truncated = truncated,
+            )
+        }
+        return ShellResult.Ok(
+            stdout = redactGuest(out.bytes.toUtf8(), filesDir),
+            stderr = redactGuest(err.bytes.toUtf8(), filesDir),
+            exitCode = raw.exitCode,
+            truncated = truncated,
+        )
+    }
+
+    /**
+     * Guest 輸出脫敏：先把本次 [filesDir] 絕對前綴折成 `⟦PRIVATE⟧`
+     *（容器路徑回顯不外洩），再過 [Redactor.redact] 全量
+     * （R1–R14：金鑰/個資/座標/絕對路徑）。
+     */
+    fun redactGuest(text: String, filesDir: String): String {
+        val folded = if (filesDir.isNotEmpty()) text.replace(filesDir, "⟦PRIVATE⟧") else text
+        return Redactor.redact(folded).text
+    }
+
+    /** DenyReason 投影（矩陣 §5 話術用）：play 阻擋，其餘缺權/未開關。 */
+    fun denyReasonFor(flavor: Flavor, switchOn: Boolean): DenyReason? {
+        if (flavor == Flavor.PLAY) return DenyReason.FLAVOR_BLOCKED
+        if (!switchOn) return DenyReason.USER_DISABLED
+        return null
+    }
+
+    private fun ByteArray.toUtf8(): String = String(this, Charsets.UTF_8)
+}

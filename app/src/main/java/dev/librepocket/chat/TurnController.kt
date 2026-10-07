@@ -37,6 +37,15 @@ data class TurnRetryConfig(
 
 private data class PendingSteer(val text: String, val images: List<ChatImageRef>)
 
+/** Explicit acknowledgment for [TurnController.startOrEnqueue]. */
+sealed interface TurnStart {
+  /** The text was accepted: gate passed, appended, turn running. Join it. */
+  data class Started(val host: Job) : TurnStart
+
+  /** A turn was already in flight: the text is queued FIFO for next round. */
+  data object Queued : TurnStart
+}
+
 /**
  * Turn controller: per-turn [Flow] collection + retry orchestration +
  * single-flight guard + steer queue + cooperative cancel.
@@ -183,15 +192,56 @@ class TurnController(
     // No join, no IO: return immediately so the UI stops within 200ms.
   }
 
+  /**
+   * Atomic start-or-enqueue: the busy check and the FIFO insert happen under
+   * the same lock, so the decision is never stale. Returns [TurnStart.Started]
+   * once the text is accepted (fresh `chat.send` passed, user message
+   * appended) without waiting for the turn to finish, or [TurnStart.Queued]
+   * when a turn was already in flight (the text is queued FIFO and the
+   * transcript records it). A [CancellationException]/[SecurityException]/
+   * [IllegalStateException] before return means NOT accepted. Unlike
+   * [steer], the idle path never fire-and-forgets: callers always get an
+   * explicit acknowledgment.
+   */
+  suspend fun startOrEnqueue(text: String, images: List<ChatImageRef> = emptyList()): TurnStart {
+    require(text.isNotBlank()) { "text must not be blank" }
+    synchronized(lock) {
+      check(!closed) { "controller is closed" }
+      if (activeLocked() != null) {
+        enqueueLocked(text, images)
+        return TurnStart.Queued
+      }
+    }
+    gateOrThrow()
+    val host = synchronized(lock) {
+      check(!closed) { "controller is closed" }
+      if (activeLocked() != null) {
+        // Lost the race during the gate: queue instead of throwing, so the
+        // caller still gets an explicit acceptance signal.
+        enqueueLocked(text, images)
+        return TurnStart.Queued
+      }
+      appendUser(text)
+      _uiState.update { it.copy(status = ChatStatus.STREAMING, error = null) }
+      val job = scope.launch { hostedTurn(text, images) }
+      inFlight = job
+      job.invokeOnCompletion {
+        synchronized(lock) {
+          if (inFlight === job) inFlight = null
+        }
+      }
+      job
+    }
+    return TurnStart.Started(host)
+  }
+
   fun steer(text: String) {
     require(text.isNotBlank()) { "text must not be blank" }
     synchronized(lock) {
       check(!closed) { "controller is closed" }
       if (activeLocked() != null) {
         // Never cancel the current turn: queue for the next round (FIFO).
-        steerQueue.addLast(PendingSteer(text, emptyList()))
-        _uiState.update { it.copy(pendingSteerCount = steerQueue.size) }
-        fireTranscript { transcript.onSteerQueued(text) }
+        enqueueLocked(text, emptyList())
         return
       }
     }
@@ -223,6 +273,13 @@ class TurnController(
   }
 
   // ---- internals ----
+
+  /** Caller must hold [lock]. Enqueues a follow-up and projects the count. */
+  private fun enqueueLocked(text: String, images: List<ChatImageRef>) {
+    steerQueue.addLast(PendingSteer(text, images))
+    _uiState.update { it.copy(pendingSteerCount = steerQueue.size) }
+    fireTranscript { transcript.onSteerQueued(text) }
+  }
 
   private suspend fun gateOrThrow() {
     val decision = policy.evaluateFresh(POLICY_ACTION, POLICY_RESOURCE)

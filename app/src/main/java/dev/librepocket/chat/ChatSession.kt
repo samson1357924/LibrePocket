@@ -29,6 +29,14 @@ interface ChatSession {
    */
   suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): kotlinx.coroutines.Job
 
+  /**
+   * Atomic start-or-enqueue with an explicit [TurnStart] acknowledgment: the
+   * busy check and the FIFO insert share one lock, so the verdict is never
+   * stale. Prefer over start-then-steer fallback sequences, whose two checks
+   * can straddle a turn completing (Q1).
+   */
+  suspend fun startOrEnqueue(text: String, images: List<ChatImageRef> = emptyList()): TurnStart
+
   /** Cancel the in-flight turn; UI must stop updating within 200ms. */
   fun cancel()
 

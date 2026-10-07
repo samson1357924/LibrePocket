@@ -7,6 +7,7 @@ import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.ChatUiState
+import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
@@ -187,28 +188,21 @@ class ChatViewModel(
                         // chat.send deny still restores to input instead of
                         // stranding on the stale generation.
                         pendingOps[opId] = PendingOp(opId, handle.generation, clean)
-                        // R1: accept first, clear after. startTurn returns only
-                        // once the controller owns the text; anything thrown
-                        // before that leaves the draft for invalidate/restore.
-                        val host: Job = try {
-                            handle.created.session.startTurn(clean)
+                        // Q1: single atomic admission. startOrEnqueue decides
+                        // start-vs-queue under the controller's lock, so the
+                        // verdict is never stale: Started owns the text
+                        // (remove + join), Queued owns it in the FIFO
+                        // (remove + return). Anything thrown before either
+                        // verdict leaves the op for invalidate/restore.
+                        // Never treat a bare steer() return as acceptance:
+                        // its idle path is fire-and-forget pre-gate.
+                        val started = try {
+                            handle.created.session.startOrEnqueue(clean)
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (_: IllegalStateException) {
-                            // Lost a busy race after the idle check: queue
-                            // into the FIFO (synchronous acceptance). A stale
-                            // handle leaves the op for the invalidation drain.
-                            if (!isHandleCurrent(handle)) return@launch
-                            try {
-                                handle.created.session.steer(clean)
-                            } catch (cancelled: CancellationException) {
-                                throw cancelled
-                            } catch (_: Exception) {
-                                // Closed/stale sessions are deliberately inert;
-                                // the retained op is owned by invalidation.
-                                return@launch
-                            }
-                            pendingOps.remove(opId)
+                            // Closed session: the teardown path (invalidation
+                            // drain or explicit discard) owns this op.
                             return@launch
                         } catch (_: SecurityException) {
                             // Fresh chat.send deny is projected by the
@@ -218,6 +212,7 @@ class ChatViewModel(
                             return@launch
                         }
                         pendingOps.remove(opId)
+                        val host = (started as? TurnStart.Started)?.host ?: return@launch
                         try {
                             host.join()
                         } catch (cancelled: CancellationException) {
@@ -278,33 +273,19 @@ class ChatViewModel(
                         // chat.send deny still restores to input instead of
                         // stranding on the stale generation.
                         pendingOps[opId] = PendingOp(opId, handle.generation, text)
-                        // R1: the op is owned by the controller only after
-                        // startTurn returns (fresh chat.send passed, user
-                        // message appended). Clearing earlier loses text when
-                        // an endpoint change cancels the gate suspension.
-                        // Clearing after send() returns is equally wrong:
-                        // send() joins the whole turn, so an accepted text
-                        // would be mistaken for an unsent op.
-                        val host: Job = try {
-                            handle.created.session.startTurn(text)
+                        // Q1: single atomic admission (see steer() above).
+                        // Started owns the text (remove + join); Queued owns
+                        // it in the FIFO (remove + return). Anything thrown
+                        // before either verdict leaves the op for
+                        // invalidate/restore. Never treat a bare steer()
+                        // return as acceptance.
+                        val started = try {
+                            handle.created.session.startOrEnqueue(text)
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (_: IllegalStateException) {
-                            // Two sends can race before STREAMING reaches the
-                            // UI. The controller rejects the second start;
-                            // steer it into the FIFO instead of silently
-                            // dropping input. The op stays until the steer
-                            // is queued (accepted) below.
-                            if (!isHandleCurrent(handle)) return@launch
-                            try {
-                                handle.created.session.steer(text)
-                            } catch (cancelled: CancellationException) {
-                                throw cancelled
-                            } catch (_: Exception) {
-                                // Closed/stale sessions are deliberately inert.
-                                return@launch
-                            }
-                            pendingOps.remove(opId)
+                            // Closed session: the teardown path (invalidation
+                            // drain or explicit discard) owns this op.
                             return@launch
                         } catch (_: SecurityException) {
                             // Fresh chat.send deny is projected by the
@@ -315,6 +296,7 @@ class ChatViewModel(
                             return@launch
                         }
                         pendingOps.remove(opId)
+                        val host = (started as? TurnStart.Started)?.host ?: return@launch
                         try {
                             host.join()
                         } catch (cancelled: CancellationException) {

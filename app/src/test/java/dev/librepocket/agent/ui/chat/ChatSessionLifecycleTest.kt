@@ -211,6 +211,87 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // Q1: a second send while the first turn runs gets one atomic Queued
+    // verdict (never a stale idle fire-and-forget). The queued follow-up
+    // belongs to the live turn scope: an endpoint switch tears it down with
+    // the session instead of resurrecting it as unsent input.
+    @Test
+    fun busySecondSendQueuesOnceAndSwitchTearsDownWithoutRestore() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.hostEntered.await() }
+
+            chatMain.run { vm.sendDirect("second") }
+            withTimeout(5_000) { live.steerReceived.await() }
+            assertEquals(listOf("second"), live.steered.toList())
+            assertEquals(listOf("first"), live.sent.toList())
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { live.closed.await() }
+            assertEquals("", vm.input.value)
+            assertNull(vm.notice.value)
+            assertEquals(listOf("first"), live.sent.toList())
+            assertEquals(1, sessions.createCalls)
+        } finally {
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // Q1: the post-gate busy race queues instead of throwing. B passes the
+    // idle pre-check and suspends in the chat.send gate; C admits meanwhile;
+    // B resumes into a busy session and must get Queued (never a stale idle
+    // fire-and-forget, never lost).
+    @Test
+    fun postGateBusyRaceQueuesInsteadOfThrowing() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val bArrived = CompletableDeferred<Unit>()
+        val releaseB = CompletableDeferred<Unit>()
+        val releaseC = CompletableDeferred<Unit>()
+        sessions.acceptGate = { text ->
+            if (text == "B") {
+                bArrived.complete(Unit)
+                releaseB.await()
+            }
+        }
+        sessions.sendGate = { text ->
+            if (text == "C") releaseC.await()
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) { bArrived.await() }
+
+            chatMain.run { vm.sendDirect("C") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) {
+                while (live.sent.isEmpty()) delay(1)
+            }
+            assertEquals(listOf("C"), live.sent.toList())
+
+            releaseB.complete(Unit)
+            withTimeout(5_000) { live.steerReceived.await() }
+            assertEquals(listOf("B"), live.steered.toList())
+            assertEquals(listOf("C"), live.sent.toList())
+
+            releaseC.complete(Unit)
+            withTimeout(5_000) { live.sendFinished.await() }
+        } finally {
+            releaseB.complete(Unit)
+            releaseC.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     @Test
     fun endpointMetadataClearClosesAttachedSession() = runBlocking {
         val store = newStore()
@@ -971,6 +1052,7 @@ class ChatSessionLifecycleTest {
         )
         override val uiState = mutableState
         val sent = CopyOnWriteArrayList<String>()
+        val steered = CopyOnWriteArrayList<String>()
         val closed = CompletableDeferred<Unit>()
         val firstSendEntered = CompletableDeferred<Unit>()
         val hostEntered = CompletableDeferred<Unit>()
@@ -1005,6 +1087,42 @@ class ChatSessionLifecycleTest {
                 check(!closedFlag) { "closed" }
                 if (busy) throw IllegalStateException("already in flight")
             }
+            return admitAfterGate(text, images)
+        }
+
+        /**
+         * Mirrors TurnController.startOrEnqueue: the busy check and the FIFO
+         * record share one lock per check, and a post-gate busy race queues
+         * instead of throwing (never fire-and-forget).
+         */
+        override suspend fun startOrEnqueue(
+            text: String,
+            images: List<dev.librepocket.chat.ChatImageRef>,
+        ): dev.librepocket.chat.TurnStart {
+            synchronized(this) {
+                check(!closedFlag) { "closed" }
+                if (busy) {
+                    recordQueuedSteer(text)
+                    return dev.librepocket.chat.TurnStart.Queued
+                }
+            }
+            try {
+                return dev.librepocket.chat.TurnStart.Started(admitAfterGate(text, images))
+            } catch (_: IllegalStateException) {
+                synchronized(this) {
+                    check(!closedFlag) { "closed" }
+                    recordQueuedSteer(text)
+                    return dev.librepocket.chat.TurnStart.Queued
+                }
+            }
+        }
+
+        private fun recordQueuedSteer(text: String) {
+            steered.add(text)
+            steerReceived.complete(text)
+        }
+
+        private suspend fun admitAfterGate(text: String, images: List<dev.librepocket.chat.ChatImageRef>): Job {
             try {
                 acceptGate(text)
             } catch (denied: SecurityException) {
@@ -1078,6 +1196,9 @@ class ChatSessionLifecycleTest {
             hosted?.cancel()
         }
 
+        // Post-Q1 the VM never calls session.steer(): admission goes through
+        // startOrEnqueue only. Kept for the ChatSession interface; records
+        // receipt without modeling the controller FIFO.
         override fun steer(text: String) {
             steerReceived.complete(text)
         }

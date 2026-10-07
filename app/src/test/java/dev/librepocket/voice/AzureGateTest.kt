@@ -77,7 +77,7 @@ class AzureGateTest {
             assertEquals(CapabilityLevel.UNAVAILABLE, projected.level)
             assertEquals(DenyReason.FLAVOR_BLOCKED, projected.reason)
             assertFalse(
-                ToolRegistry.visibleTools(ctx).any { it.name == VoiceTools.AZURE_SPEAK_NAME },
+                ToolRegistry.projectedTools(ctx).any { it.name == VoiceTools.AZURE_SPEAK_NAME },
             )
         }
     }
@@ -111,7 +111,7 @@ class AzureGateTest {
         assertEquals(CapabilityLevel.UNAVAILABLE, projected.level)
         assertEquals(DenyReason.USER_DISABLED, projected.reason)
         assertFalse(
-            ToolRegistry.visibleTools(outputOff).any { it.name == VoiceTools.AZURE_SPEAK_NAME },
+            ToolRegistry.projectedTools(outputOff).any { it.name == VoiceTools.AZURE_SPEAK_NAME },
         )
         // 雙關齊開才可見。
         val bothOn = ProjectionContext(
@@ -123,7 +123,7 @@ class AzureGateTest {
         )
         assertEquals(CapabilityLevel.NATIVE, ToolRegistry.projectAll(bothOn)[VoiceTools.AZURE_SPEAK_NAME]!!.level)
         assertTrue(
-            ToolRegistry.visibleTools(bothOn).any { it.name == VoiceTools.AZURE_SPEAK_NAME },
+            ToolRegistry.projectedTools(bothOn).any { it.name == VoiceTools.AZURE_SPEAK_NAME },
         )
     }
 

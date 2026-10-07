@@ -43,6 +43,16 @@ data class ToolAnnotations(
  * The projection predicate ([project]) is a pure function of flavor,
  * user switches and granted permissions (ARCHITECTURE §6.3): identical
  * input always yields identical output.
+ *
+ * @param executionReady code-level wiring invariant (PR#1 re-review):
+ *   true only when the tool is executable end-to-end this round
+ *   (dispatcher + executor + confirmation/grant flow + E2E). Only
+ *   [ToolRegistry.visibleTools] (which additionally requires this flag)
+ *   may be sent to the model; [ToolRegistry.projectedTools] stays
+ *   available for gates/headers/audit regardless of this flag.
+ *   The wiring PR flips tools to true one by one as each loop lands;
+ *   until then new tools default to false (fail-closed: projection text
+ *   alone can never make a tool model-visible).
  */
 data class ToolDef(
     val name: String,
@@ -52,6 +62,7 @@ data class ToolDef(
     val sideEffect: SideEffect,
     val annotations: ToolAnnotations = ToolAnnotations(),
     val supportedFlavors: Set<Flavor> = setOf(Flavor.PLAY, Flavor.FOSS, Flavor.GITHUB),
+    val executionReady: Boolean = false,
 ) {
     fun project(ctx: ProjectionContext): Projection {
         if (annotations.foregroundOnly && !ctx.isForeground) {

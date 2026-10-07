@@ -29,6 +29,8 @@ import dev.librepocket.tool.Flavor
  *   見 [inputVeto] 與 [LinuxEnv.apkSegmentsFor]；分段進件，每段獨立
  *   checksum，全量合併後再驗 SHA256），不走一般檔 inbox 通道
  *  （[LinuxEnv.inboxVeto] 10 MiB，兩通道分開計算）。
+ * - guest argv 一律用容器內路徑（如經 [LinuxInboxStager.stageFile]
+ *   後的 `/inbox/...`）；host inbox 路徑直傳會被 [ProotExec] 否決。
  * - 降級回覆尾必附 [FALLBACK_HINT] 與 [LinuxTools.PERF_NOTICE]，單測斷言。
  *
  * 本檔案零 Android 依賴，JVM 單測可直接斷言。

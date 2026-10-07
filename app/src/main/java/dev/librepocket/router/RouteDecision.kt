@@ -17,8 +17,17 @@ data class ToolCall(
 
 /**
  * Transcript header for this turn (ARCHITECTURE §8.1 / §9.3): route
- * decision plus the capability-projection snapshot, so audits can prove
- * what the model saw. [reasonCode] is the [DenyReason] name or null.
+ * decision plus capability snapshots for audit.
+ *
+ * - [projectedTools]: projection snapshot (flavor/switch/permission passed,
+ *   i.e. `ToolRegistry.projectedTools` names). Audit-only; a projected tool
+ *   is NOT necessarily executable this round.
+ * - [visibleTools]: the model-visible list (`ToolRegistry.visibleTools`
+ *   names: projected AND `executionReady`). This is the ONLY list that may
+ *   be sent to the model; empty until the wiring PR lands. Audits prove
+ *   "what the model saw" from THIS field, not from [projectedTools].
+ *
+ * [reasonCode] is the [DenyReason] name or null.
  */
 data class TranscriptHeader(
     val sessionId: String?,
@@ -27,6 +36,7 @@ data class TranscriptHeader(
     val toolName: String?,
     val reasonCode: String?,
     val visibleTools: List<String>,
+    val projectedTools: List<String> = emptyList(),
 )
 
 /** Fast-lane outcome: either a [ToolCall] or a denial with fallback text. */

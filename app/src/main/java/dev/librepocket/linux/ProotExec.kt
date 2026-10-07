@@ -21,7 +21,13 @@ import dev.librepocket.tool.Flavor
  * - 檔案域：guest 絕對路徑以整個 `filesDir/linux` 樹（PRIVATE）為作用域
  *   （容器 rootfs 與 inbox 同屬該樹；guest 越界由 PRoot `-r` 在執行時約束，
  *   argv 層只擋樹外路徑）；SAF 樹路徑即使橋接已授權亦拒絕（禁 `--bind`，
- *   進出走 inbox 複製）。`bridgeGranted` 固定 false（fail-closed）。
+ *   進出走 inbox 複製，見 [LinuxInboxStager]）。`bridgeGranted` 固定 false
+ *   （fail-closed）。
+ * - Host inbox 路徑（`filesDir/linux/tmp/inbox/...`）在 guest argv 內一律
+ *   否決（[LinuxInboxStager.unstagedInboxRef]）：該路徑是 rootfs 的 sibling，
+ *   真實 PRoot 下 guest 看不見（`-r` 無 bind 即 `ENOENT`）；呼叫方必須先經
+ *   [LinuxInboxStager.stageFile] 複製到 rootfs 內，再用 `/inbox/...`
+ *   guest 路徑組 argv。
  * - 落盤配額：執行前先過 [LinuxEnv.quotaVeto]（`usedTotal/usedContainer +
  *   estimatedWrite`），超限不建子進程（與 [LinuxBoot.download] 同策）。
  * - proot 落盤權限：呼叫方傳入實際 mode，必須等於 [LinuxEnv.PROOT_BIN_MODE]
@@ -89,7 +95,8 @@ object ProotExec {
      *
      * 門禁順序（固定）：風味/開關（[denyReasonFor]）→ 容器/作用域 →
      * proot 權限（[LinuxEnv.prootBinModeVeto]）→ 落盤配額
-     * （[LinuxEnv.quotaVeto]）→ bind 封堵 → 白名單/黑名單/檔案域
+     * （[LinuxEnv.quotaVeto]）→ bind 封堵 → 未 stage inbox 封堵
+     * （[LinuxInboxStager.unstagedInboxRef]）→ 白名單/黑名單/檔案域
      * （[ShellPolicy.validate]）→ 速率配額 → spawn。
      *
      * @param filesDir App 私有域根（作用域為 `filesDir/linux` 整樹，
@@ -150,6 +157,13 @@ object ProotExec {
         }
         if (LinuxEnv.bindVeto(guestArgv) != null) {
             return ShellResult.Denied(ShellDeny.BLACKLISTED, "bind forbidden inside guest argv")
+        }
+        // 未 stage 的 host inbox 路徑 fail-closed（PR#1 re-review blocker 2）：
+        // 該路徑在真實 PRoot 下 guest 不可見，呼叫方必須先經
+        // LinuxInboxStager.stageFile 再用 /inbox/... guest 路徑。
+        val inboxRef = LinuxInboxStager.unstagedInboxRef(guestArgv, filesDir)
+        if (inboxRef != null) {
+            return ShellResult.Denied(ShellDeny.BLACKLISTED, inboxRef)
         }
         val rootfs = LinuxEnv.containerRootfs(filesDir, container)
         when (

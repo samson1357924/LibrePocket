@@ -143,13 +143,13 @@ class ArbitrationTest {
         val projected = ToolRegistry.projectAll(ctx)[ToolRegistry.SLOW_TOOL_NAME]!!
         assertEquals(CapabilityLevel.UNAVAILABLE, projected.level)
         assertEquals(DenyReason.FLAVOR_BLOCKED, projected.reason)
-        assertTrue(ToolRegistry.visibleTools(ctx).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
+        assertTrue(ToolRegistry.projectedTools(ctx).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
     }
 
     @Test fun selfInstallShowsSlowOnlyWhenEffectivelyAutomated() {
         for (flavor in listOf(Flavor.FOSS, Flavor.GITHUB)) {
             val off = ProjectionContext(flavor = flavor, automationEnabled = false)
-            assertTrue(ToolRegistry.visibleTools(off).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
+            assertTrue(ToolRegistry.projectedTools(off).none { it.name == ToolRegistry.SLOW_TOOL_NAME })
 
             val effective = AutomationPolicy.effectiveAutomation(
                 flavor = flavor,
@@ -159,7 +159,7 @@ class ArbitrationTest {
             )
             assertTrue(effective)
             val on = ProjectionContext(flavor = flavor, automationEnabled = effective)
-            assertTrue(ToolRegistry.visibleTools(on).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
+            assertTrue(ToolRegistry.projectedTools(on).any { it.name == ToolRegistry.SLOW_TOOL_NAME })
         }
     }
 

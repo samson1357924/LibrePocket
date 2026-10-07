@@ -376,7 +376,7 @@ class LinuxBootTest {
             assertEquals("$name foss", CapabilityLevel.NATIVE, foss[name]!!.level)
             assertEquals("$name github", CapabilityLevel.NATIVE, github[name]!!.level)
         }
-        val playVisible = ToolRegistry.visibleTools(ProjectionContext(flavor = Flavor.PLAY)).map { it.name }
+        val playVisible = ToolRegistry.projectedTools(ProjectionContext(flavor = Flavor.PLAY)).map { it.name }
         assertTrue(playVisible.none { it in LinuxTools.ALL_NAMES })
         // 開關預設關：不開即 USER_DISABLED（六工具全列）。
         val off = ToolRegistry.projectAll(ProjectionContext(flavor = Flavor.GITHUB))

@@ -17,6 +17,8 @@ import dev.librepocket.tool.Flavor
  *   （Android 構建請走 CI 指引，機內 JVM/Android SDK 不完整且耗資源）。
  * - 其餘二進位走 [ProotExec.GUEST_BINARIES] 聯集判定（`curl/wget/git`
  *   不在聯集故不可直抓——原始碼一律經 inbox 進件，見 [LinuxEnv.inboxVeto]）。
+ * - 來源檔必須先經 [LinuxInboxStager.stageFile] 進件再用 `/inbox/...`
+ *   guest 路徑組 argv（host inbox 路徑直傳會被 [ProotExec] 否決）。
  * - 降級回覆尾必附 [FALLBACK_HINT] 與 [LinuxTools.PERF_NOTICE]，單測斷言。
  *
  * 本檔案零 Android 依賴，JVM 單測可直接斷言 [recipeVeto] 與 [execute]。

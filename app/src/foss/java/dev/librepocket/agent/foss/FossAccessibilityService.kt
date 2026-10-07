@@ -15,7 +15,9 @@ import dev.librepocket.guard.SlowActionKind
 import dev.librepocket.guard.SlowArbitrator
 
 /**
- * Foss 風味無障礙自動化真實現（S3，BACKLOG B5/B8，純 OSS）。
+ * Foss 風味無障礙自動化真實現（S3，BACKLOG B5/B8，純 OSS；
+ * SCAFFOLD：service/仲裁/確認指紋執行面已實作，但 StepExecutor 接線、
+ * 產品開關/DataStore/Dialog 尚未落地，`executeConfirmed` 目前無生產 caller）。
  *
  * 與 `src/github …GithubAccessibilityService` 同語義的鏡像，差異僅在
  * 接線對象（[FossAutomationGate]/[FossA11yState]）：

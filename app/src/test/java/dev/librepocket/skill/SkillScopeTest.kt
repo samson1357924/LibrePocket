@@ -14,7 +14,7 @@ import java.io.File
  */
 class SkillScopeTest {
 
-    private fun playVisible() = ToolRegistry.visibleTools(
+    private fun playVisible() = ToolRegistry.projectedTools(
         ProjectionContext(
             flavor = Flavor.PLAY,
             grantedPermissions = setOf("android.permission.READ_CALENDAR"),
@@ -80,7 +80,7 @@ class SkillScopeTest {
 
     @Test fun convergenceRespectsProjectionBase() {
         // calendar.create 在無授權時已不可見：即使 Skill 允許，也不會憑空出現。
-        val base = ToolRegistry.visibleTools(ProjectionContext(flavor = Flavor.PLAY))
+        val base = ToolRegistry.projectedTools(ProjectionContext(flavor = Flavor.PLAY))
         assertTrue(base.none { it.name == "calendar.create" })
         val s = skill("meeting-prep", setOf("calendar.create", "navigate"))
         val converged = SkillScope.converge(base, listOf(s))

@@ -59,7 +59,7 @@ class CalendarFullTest {
         for (name in listOf("calendar.update", "calendar.delete")) {
             val p = ToolRegistry.projectAll(ctx)[name]!!
             assertEquals(name, CapabilityLevel.DEGRADED, p.level)
-            assertTrue(ToolRegistry.visibleTools(ctx).any { it.name == name })
+            assertTrue(ToolRegistry.projectedTools(ctx).any { it.name == name })
         }
         val granted = ProjectionContext(
             flavor = Flavor.PLAY,

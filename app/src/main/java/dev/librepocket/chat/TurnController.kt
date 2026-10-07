@@ -53,8 +53,11 @@ private data class PendingSteer(val text: String, val images: List<ChatImageRef>
  * SCAFFOLD (PR#1 re-review, P1 scope): this PR records ToolDone only and never
  * executes tools — no ToolDispatcher/FastRouter/PrivilegeGate/ElevatedDispatch
  * product wiring yet. Projection NATIVE means switch/flavor semantics only;
- * the true product tool loop (dispatcher + grant/confirm + Android executors +
- * E2E) lands in the wiring PR.
+ * model visibility additionally requires `ToolDef.executionReady` (see
+ * [ToolRegistry.visibleTools], the ONLY list that may be sent to the model),
+ * which is false for all 41 tools in this PR.
+ * The true product tool loop (dispatcher + grant/confirm + Android executors +
+ * E2E) lands in the wiring PR, which flips tools to ready one by one.
  *
  * Execution-basis policy: every turn (including steered follow-ups) is gated
  * by [PolicyStore.evaluateFresh]. [PolicyStore.evaluate] is UI pre-display
@@ -395,6 +398,10 @@ class TurnController(
       }
     }
     return ChatRequest(model = model, messages = base)
+    // NOTE (PR#1 scope-down): tools deliberately NOT attached here.
+    // ChatRequest.tools may only carry ToolRegistry.visibleTools() output
+    // (projection + executionReady); all 41 tools are executionReady=false
+    // in this scaffold PR, so the request stays pure-chat by construction.
   }
 
   // ---- uiState helpers (StateFlow.update is atomic; no lock needed) ----

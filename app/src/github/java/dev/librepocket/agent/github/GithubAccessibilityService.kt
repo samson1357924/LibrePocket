@@ -15,7 +15,9 @@ import dev.librepocket.guard.SlowActionKind
 import dev.librepocket.guard.SlowArbitrator
 
 /**
- * GitHub 風味無障礙自動化真實現（S3，BACKLOG B5/B8，矩陣 §1/§2）。
+ * GitHub 風味無障礙自動化真實現（S3，BACKLOG B5/B8，矩陣 §1/§2；
+ * SCAFFOLD：service/仲裁/確認指紋執行面已實作，但 StepExecutor 接線、
+ * 產品開關/DataStore/Dialog 尚未落地，`executeConfirmed` 目前無生產 caller）。
  *
  * - 本類只存在於 `src/github`（play 物理缺失；foss 鏡像見
  *   `src/foss …FossAccessibilityService`，純 OSS 同語義）；

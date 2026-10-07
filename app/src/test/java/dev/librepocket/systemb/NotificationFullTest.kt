@@ -100,7 +100,7 @@ class NotificationFullTest {
     @Test fun projection_playListenerOffDegrades() {
         val p = ToolRegistry.projectAll(ProjectionContext(flavor = Flavor.PLAY))["notification.read"]!!
         assertEquals(CapabilityLevel.DEGRADED, p.level)
-        assertTrue(ToolRegistry.visibleTools(ProjectionContext(flavor = Flavor.PLAY)).any { it.name == "notification.read" })
+        assertTrue(ToolRegistry.projectedTools(ProjectionContext(flavor = Flavor.PLAY)).any { it.name == "notification.read" })
     }
 
     @Test fun missingListener_bothLayersDegradedTitleVisible() {

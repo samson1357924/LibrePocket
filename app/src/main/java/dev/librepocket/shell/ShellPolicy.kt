@@ -125,7 +125,9 @@ object ShellPolicy {
     /**
      * 明確不把 bare word 當路徑的二進位（無檔案操作數）：
      * echo 印字、pwd/uname/id/date/whoami/printenv 查系統、sleep 等時長、
-     * getprop 取屬性名（含點但非路徑）。這些 bare 放行不影響 FileScope。
+     * getprop 取屬性名（含點但非路徑）。這些 bare 不進檔案域；
+     * 但 pwd（及 ls/du/df/find）的零路徑隱式 cwd 語義另由尾守衛在
+     * privateRoot==null 時 fail-closed（見 checkPathArgs）。
      */
     private val NO_FILE_BINARIES: Set<String> = setOf(
         "echo",
@@ -164,6 +166,25 @@ object ShellPolicy {
         "--regexp", "--include", "--exclude", "--exclude-dir",
     )
 
+    /**
+     * 會隱式讀取 cwd 的二進位（PR#1 re-review head 4e3a6c6 blocker 1）：
+     * 無明確路徑參數時語義即操作 `.`（ls/du 無 operand 列 `.`、
+     * find 無 path 預設 `.`、df 無 operand 洩露掛載表、pwd 直接洩露 cwd）。
+     * privateRoot==null 且無明確絕對路徑時必須 fail-closed（見 checkPathArgs 尾守衛）。
+     */
+    private val IMPLICIT_CWD_BINARIES: Set<String> = setOf(
+        "ls",
+        "du",
+        "df",
+        "find",
+        "pwd",
+    )
+
+    /** grep 遞迴旗標：有此旗標且無檔案參數時語義為遞迴 `.`。 */
+    private fun isGrepRecursiveFlag(arg: String): Boolean =
+        arg == "-r" || arg == "-R" || arg == "--recursive" ||
+            (arg.startsWith("-") && !arg.startsWith("--") && 'r' in arg.drop(1) && !arg.contains('='))
+
     /** 純值形態保留（文件用）：數字/布林/stdin/格式/glob 僅在值槽
      *（VALUE_TAKING_FLAGS 下一位 / grep pattern 槽 / NON_PATH_OPT_KEYS）
      * 才豁免；FILE_OPERAND 普通 positional 不得以形態豁免（見上）。 */
@@ -186,7 +207,8 @@ object ShellPolicy {
      *   `linux.exec` 傳聯集，黑名單/參數衛生/find 封堵/檔案域邏輯完全繼承，
      *   僅白名單放寬）。
      * @param privateRoot App 私有域根；null 表示未配置作用域，
-     *   此時任何絕對路徑參數一律拒絕（fail-closed）。
+     *   此時任何絕對路徑參數一律拒絕，且隱式讀 cwd 的命令（ls/du/df/find/pwd
+     *   無明確路徑時，grep -r 無檔案參數時）亦一律拒絕（fail-closed）。
      * @param safRoots 已授權 SAF 樹前綴。
      * @param flavor 風味：play 跨域一律拒絕；foss/github 跨域即使橋接已授權，
      *   直接 exec 仍拒絕（需改走 D09 橋，[FileScope.decide] 回 needsBridge）。
@@ -350,6 +372,39 @@ object ShellPolicy {
         return Validation.Allowed(base)
     }
 
+    /**
+     * 宿主外掛點前綴（guest 容器內路徑豁免的例外，縱深保留拒絕）：
+     * 即使容器內存在同名路徑，`/sdcard` 等在宿主語義下是外部儲存，
+     * 為避免語義混淆與 proot 呼叫形態漂移時的逃逸，guest 內仍一律拒絕。
+     */
+    private val GUEST_EXTERNAL_PREFIXES: Set<String> = setOf(
+        "/sdcard",
+        "/storage",
+        "/mnt",
+        "/external_sd",
+        "/Removable",
+        "/otg",
+    )
+
+    /**
+     * Guest 容器內路徑判定（PR#1 re-review head 4e3a6c6 blocker 2）：
+     * isGuest 且作用域已知時，宿主樹外的絕對路徑視為容器內路徑
+     * （`proot -r rootfs` 將其約束在 rootfs 內，無 bind 即無法觸及宿主；
+     * host inbox 前綴另由 [dev.librepocket.linux.LinuxInboxStager.unstagedInboxRef]
+     * 在執行入口擋下）。
+     * 宿主樹內路徑回 false（仍走 FileScope）；宿主外掛點回 false（縱深拒絕）。
+     */
+    private fun isContainerInternalPath(candidate: String, privateRoot: String): Boolean {
+        val norm = FileScope.normalize(candidate)
+        if (!norm.startsWith("/")) return false
+        val priv = FileScope.normalize(privateRoot)
+        if (norm == priv || norm.startsWith("$priv/")) return false
+        for (prefix in GUEST_EXTERNAL_PREFIXES) {
+            if (norm == prefix || norm.startsWith("$prefix/")) return false
+        }
+        return true
+    }
+
     /** 取參數中的絕對路徑候選：`/...` 或 `--opt=/...`（`=` 後綴）。 */
     private fun absoluteCandidates(arg: String): List<String> {
         if (arg.startsWith("/")) return listOf(arg)
@@ -404,7 +459,10 @@ object ShellPolicy {
      * NON_PATH_OPT_KEYS 的 --opt 值），FILE_OPERAND 的普通 positional 一律
      * 當路徑（`cat 123` / `ls 123` / `stat %s` 亦拒）。Guest 模式（proot 容器
      * 內，cwd 已釘到 `-w /` + `-r rootfs`）的無 `/` bare 視為容器內子命令/
-     * 相對路徑，放行（絕對宿主路徑仍走 FileScope，含 `/` 相對仍擋）。
+     * 相對路徑，放行；宿主樹外的 guest 絕對路徑（如 stage 後的 `/inbox/...`、
+     * 容器內 `/etc`）同樣視為容器內路徑放行（[isContainerInternalPath]，
+     * 宿主樹內仍走 FileScope，null 作用域一律拒，外掛點保留拒絕；
+     * 含 `/` 相對仍擋）。
      */
     private fun checkPathArgs(
         base: String,
@@ -434,6 +492,9 @@ object ShellPolicy {
         }
         var endOfOptions = false
         var prevArg: String? = null
+        // grep 遞迴旗標是否出現在真正的選項位（-- 之後 / 取值旗標值 / pattern 槽不算，
+        // 如 `grep -- -r` 的 -r 是 pattern 而非遞迴）。
+        var sawGrepRecursiveFlag = false
         for (arg in args) {
             // bind 封堵縱深（與 LinuxEnv.bindVeto 雙層）：guest 包裝層 argv 內
             // 出現 --bind 即否決，不因 guest 放行（黑名單不因通道放行）。
@@ -444,6 +505,12 @@ object ShellPolicy {
                 )
             }
             for (candidate in absoluteCandidates(arg)) {
+                // Guest 容器內路徑（PR#1 blocker 2）：isGuest 且作用域已知時，
+                // 宿主樹外的絕對路徑是容器內路徑，直接放行（proot -r 約束；
+                // host inbox 前綴另由執行入口擋，外掛點由下式保留拒絕）。
+                if (isGuest && privateRoot != null && isContainerInternalPath(candidate, privateRoot)) {
+                    continue
+                }
                 val denial = if (isElevated) {
                     checkFileScopeElevated(candidate, privateRoot, safRoots, flavor, bridgeGranted)
                 } else {
@@ -463,6 +530,12 @@ object ShellPolicy {
                 )
             }
             val isPositional = endOfOptions || !arg.startsWith("-") || arg == "-"
+            // grep 遞迴旗標只認選項位的（見 sawGrepRecursiveFlag 註解）。
+            if (base == "grep" && !endOfOptions && prevArg !in VALUE_TAKING_FLAGS &&
+                isGrepRecursiveFlag(arg)
+            ) {
+                sawGrepRecursiveFlag = true
+            }
             // 取值旗標的下一位是值而非路徑（如 -n 20、-c %s、-name *.db、-e pattern）。
             if (isPositional && prevArg != null && prevArg in VALUE_TAKING_FLAGS) {
                 prevArg = arg
@@ -486,6 +559,30 @@ object ShellPolicy {
             )
             if (bareDenial != null) return bareDenial
             prevArg = arg
+        }
+        // Implicit-cwd fail-closed（PR#1 re-review head 4e3a6c6 blocker 1）：
+        // ls/du/df/find/pwd 無明確絕對路徑時語義即隱式操作 cwd（ls/du 列 `.`、
+        // find 預設 `.`、df 洩露掛載表、pwd 洩露 cwd 字串），grep -r 無檔案參數時
+        // 遞迴 `.`。privateRoot==null 時 ambient cwd 不可控，必須 Denied
+        // （guest 通道同理：生產 guest 恆帶非 null 私有域 + proot -r/-w 釘死，
+        // 故此守衛不影響生產 guest，只封 guest+null 的 API 級旁路）。
+        // privateRoot!=null 時 cwd 已釘死（RestrictedShell/Root/Shizuku），維持放行。
+        if (privateRoot == null) {
+            val hasExplicitAbsolute = args.any { absoluteCandidates(it).isNotEmpty() }
+            if (!hasExplicitAbsolute) {
+                if (base in IMPLICIT_CWD_BINARIES) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "implicit cwd denied without scope (fail-closed): $base",
+                    )
+                }
+                if (base == "grep" && sawGrepRecursiveFlag) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "implicit cwd denied without scope (fail-closed): $base",
+                    )
+                }
+            }
         }
         return null
     }

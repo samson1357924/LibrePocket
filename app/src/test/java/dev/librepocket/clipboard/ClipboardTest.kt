@@ -69,7 +69,7 @@ class ClipboardTest {
                 assertEquals(name, DenyReason.NO_PRIVILEGE, projected[name]!!.reason)
             }
         }
-        assertTrue(ToolRegistry.visibleTools(background).none { it.name.startsWith("clipboard.") })
+        assertTrue(ToolRegistry.projectedTools(background).none { it.name.startsWith("clipboard.") })
     }
 
     @Test fun switchOffYieldsUserDisabled() {

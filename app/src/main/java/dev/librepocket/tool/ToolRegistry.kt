@@ -663,7 +663,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = ProotExec.NAME,
-            description = "Execute a guest command inside a PRoot container (union allowlist, inherited denylist/quota/truncation; SAF trees are never bound, use inbox copy). Perf-limited: light tasks only.",
+            description = "Execute a guest command inside a PRoot container (union allowlist, inherited denylist/quota/truncation; SAF trees are never bound, use inbox copy). Perf-limited: light tasks only. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only); host inbox paths must first be staged via LinuxInboxStager, guest argv uses /inbox/... paths.",
             jsonSchema = schema(
                 prop("argv", "array", "Guest argument vector; argv[0] is the binary basename"),
                 prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
@@ -682,7 +682,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = LinuxPkg.NAME,
-            description = "Manage packages inside a PRoot container (apt/dnf/apk subset: update/install/remove/list/search/show only).",
+            description = "Manage packages inside a PRoot container (apt/dnf/apk subset: update/install/remove/list/search/show only). SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only).",
             jsonSchema = schema(
                 prop("argv", "array", "Package argv, e.g. [apt, install, pkg]; no option flags"),
                 prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
@@ -698,7 +698,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = CompileBuild.NAME,
-            description = "Build from source inside a PRoot container (make/cmake/gcc/clang/python recipes; Gradle is unsupported on-device, use CI). Perf-limited: light tasks only.",
+            description = "Build from source inside a PRoot container (make/cmake/gcc/clang/python recipes; Gradle is unsupported on-device, use CI). Perf-limited: light tasks only. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only); source files must first be staged via LinuxInboxStager.",
             jsonSchema = schema(
                 prop("argv", "array", "Recipe argument vector, e.g. [make, -j4]"),
                 prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
@@ -716,7 +716,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = DecompileAnalyze.NAME,
-            description = "Analyze an APK progressively inside a PRoot container (strings, smali, resources, java; apktool 3.0.1 / jadx 1.5.6 pinned). Output is redacted. Perf-limited: light tasks only.",
+            description = "Analyze an APK progressively inside a PRoot container (strings, smali, resources, java; apktool 3.0.1 / jadx 1.5.6 pinned). Output is redacted. Perf-limited: light tasks only. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only).",
             jsonSchema = schema(
                 prop("stage", "string", "strings|smali|resources|java (progressive, no skipping)"),
                 prop("apkPath", "string", "Inbox-staged APK path"),
@@ -734,7 +734,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = DecompileAnalyze.REPACK_NAME,
-            description = "Repack/resign an APK inside a PRoot container; privileged and needs explicit confirmation on every call.",
+            description = "Repack/resign an APK inside a PRoot container; privileged and needs explicit confirmation on every call. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only).",
             jsonSchema = schema(
                 prop("apkPath", "string", "Inbox-staged APK path"),
                 prop("container", "string", "Container name, [A-Za-z0-9_-]+"),
@@ -762,7 +762,21 @@ object ToolRegistry {
     fun projectAll(ctx: ProjectionContext): Map<String, Projection> =
         ALL.associate { it.name to it.project(ctx) }
 
-    /** Tools visible to the model this round (excludes UNAVAILABLE). */
-    fun visibleTools(ctx: ProjectionContext): List<ToolDef> =
+    /**
+     * Projected tools (flavor/switch/permission): for gates, transcript
+     * headers and audit snapshots. NOT the model tool list: projection
+     * says a tool *could* be offered, not that it can execute this round.
+     */
+    fun projectedTools(ctx: ProjectionContext): List<ToolDef> =
         ALL.filter { it.project(ctx).level != CapabilityLevel.UNAVAILABLE }
+
+    /**
+     * Tools visible to the model this round (PR#1 re-review scope-down):
+     * projected AND [ToolDef.executionReady]. This is the ONLY list that
+     * may be sent to the model (see `ChatRequest.tools`); description text
+     * alone (e.g. `SCAFFOLD` markers) can never make a tool model-visible.
+     * Empty until the wiring PR flips tools to ready one by one.
+     */
+    fun visibleTools(ctx: ProjectionContext): List<ToolDef> =
+        ALL.filter { it.project(ctx).level != CapabilityLevel.UNAVAILABLE && it.executionReady }
 }

@@ -217,6 +217,53 @@ class ShellWhitelistTest {
         assertEquals(0, runner.calls)
     }
 
+    @Test fun implicitCwdDeniedWithoutScopeWithoutSpawn() {
+        // PR#1 re-review head 4e3a6c6 blocker 1：privateRoot==null 且無明確
+        // 絕對路徑時，隱式讀 cwd 的命令必須 fail-closed 且不建子進程。
+        val nullScopeArgvs = listOf(
+            listOf("ls"),
+            listOf("ls", "-l"),
+            listOf("du"),
+            listOf("du", "-s"),
+            listOf("df"),
+            listOf("pwd"),
+            listOf("find"),
+            listOf("find", "-maxdepth", "1"),
+            listOf("find", "-name", "x.txt"),
+            listOf("grep", "-r", "password"),
+            listOf("df", "-h"),
+            listOf("pwd", "-L"),
+            listOf("ls", "--color=auto"),
+            listOf("grep", "--recursive", "password"),
+            listOf("grep", "-rn", "password"),
+        )
+        for (argv in nullScopeArgvs) {
+            val direct = ShellPolicy.validate(argv, privateRoot = null)
+            assertTrue("expected direct Denied for $argv, got $direct", direct is Validation.Denied)
+            val elevated = ShellPolicy.validateElevated(argv, privateRoot = null)
+            assertTrue("expected elevated Denied for $argv, got $elevated", elevated is Validation.Denied)
+            // guest+null 同樣 fail-closed（生產 guest 恆帶非 null 私有域，不受影響）。
+            val guest = ShellPolicy.validate(argv, privateRoot = null, isGuest = true)
+            assertTrue("expected guest Denied for $argv, got $guest", guest is Validation.Denied)
+            val runner = FakeRunner(ByteArray(0))
+            val shell = RestrictedShell(runner = runner)
+            val result = shell.execute(argv)
+            assertTrue("expected shell Denied for $argv, got $result", result is ShellResult.Denied)
+            assertEquals(0, runner.calls)
+        }
+        // -r 在 pattern 槽 / 取值槽時不是遞迴（讀 stdin），維持放行。
+        assertTrue(ShellPolicy.validate(listOf("grep", "--", "-r"), privateRoot = null) is Validation.Allowed)
+        assertTrue(ShellPolicy.validate(listOf("grep", "-e", "-r"), privateRoot = null) is Validation.Allowed)
+        // 非遞迴 grep 無檔案參數讀 stdin（EOF），無 cwd 洩露，維持放行。
+        assertTrue(ShellPolicy.validate(listOf("grep", "password"), privateRoot = null) is Validation.Allowed)
+        // 無 cwd 語義的命令不受影響。
+        assertTrue(ShellPolicy.validate(listOf("echo", "hi"), privateRoot = null) is Validation.Allowed)
+        // privateRoot!=null 時 cwd 已釘死，ls 裸跑維持放行（靠執行層 pin 保證域內）。
+        assertTrue(
+            ShellPolicy.validate(listOf("ls"), privateRoot = shellPrivateRoot) is Validation.Allowed,
+        )
+    }
+
     @Test fun privateAbsoluteAllowedWithScope() {
         val runner = FakeRunner("ok".toByteArray())
         val shell = RestrictedShell(runner = runner, privateRoot = shellPrivateRoot)

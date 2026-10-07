@@ -137,16 +137,29 @@ class ProotExecTest {
         assertEquals(0, runner.calls)
     }
 
-    @Test fun inboxCopy_allowed() {
+    @Test fun unstagedHostInboxPath_deniedWithoutSpawn() {
+        // PR#1 re-review head 4e3a6c6 blocker 2：host inbox 路徑是 rootfs 的
+        // sibling，真實 PRoot 下 guest 不可見；未經 LinuxInboxStager.stageFile
+        // 的直傳必須 fail-closed 且不建子進程。
         val runner = FakeRunner()
         val inboxFile = "$filesDir/linux/tmp/inbox/x.txt"
         val result = exec(listOf("cat", inboxFile), runner = runner)
+        assertTrue("expected Denied, got $result", result is ShellResult.Denied)
+        assertEquals(ShellDeny.BLACKLISTED, (result as ShellResult.Denied).reason)
+        assertEquals(0, runner.calls)
+    }
+
+    @Test fun stagedGuestPath_allowed() {
+        // 經 stage 後的 guest 路徑（/inbox/...）才是 guest 真正看得到的形狀。
+        val runner = FakeRunner()
+        val result = exec(listOf("cat", "/inbox/1a2b3c4d-x.txt"), runner = runner)
         assertTrue("expected Ok, got $result", result is ShellResult.Ok)
         // 實際 spawn 的是 proot 包裝 argv（--get-proot-cmd 可觀測）。
         val spawned = runner.lastArgv!!
         assertEquals(LinuxEnv.prootBin(filesDir), spawned[0])
         assertEquals(listOf("-r", "$filesDir/linux/containers/alpine/rootfs"), spawned.subList(1, 3))
         assertTrue(spawned.none { it == "-b" || it == "--bind" })
+        assertEquals(listOf("cat", "/inbox/1a2b3c4d-x.txt"), spawned.takeLast(2))
     }
 
     // ---- 超時/配額/截斷沿用宿主同一套 ----
@@ -176,7 +189,7 @@ class ProotExecTest {
 
     @Test fun output_redactsSecretsAndPaths() {
         val leak = "token=SECRETVALUE123 at $filesDir/linux/containers/alpine/rootfs/x".toByteArray()
-        val result = exec(listOf("cat", "$filesDir/linux/tmp/inbox/x.txt"), runner = FakeRunner(stdout = leak))
+        val result = exec(listOf("cat", "/inbox/x.txt"), runner = FakeRunner(stdout = leak))
         assertTrue(result is ShellResult.Ok)
         val out = (result as ShellResult.Ok).stdout
         assertTrue("secret leaked: $out", "SECRETVALUE123" !in out)

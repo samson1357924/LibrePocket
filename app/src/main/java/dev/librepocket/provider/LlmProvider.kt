@@ -5,20 +5,27 @@ import kotlinx.coroutines.flow.Flow
 /**
  * Provider client facade (SPEC §1.2).
  *
- * Cancellation is cooperative via the collecting coroutine's [kotlinx.coroutines.Job]:
- * cancelling collection must cancel the underlying HTTP call promptly.
+ * Each [stream] collection performs at most one provider HTTP attempt.
+ * Providers classify a failure into one terminal [StreamEvent.Failed]; they
+ * never retry internally. Turn-level retries and the total attempt budget are
+ * owned by TurnController.
+ *
+ * Cancellation is bound to the whole blocking HTTP call, including response
+ * body reads: cancelling collection calls OkHttp Call.cancel() immediately.
+ * Protocol terminal frames close the response and stop reading even if the
+ * peer leaves the stream open.
  */
 interface LlmProvider {
     val protocol: ProviderProtocol
 
     /**
-     * Stream a turn. Failures are classified (SPEC §5.2); retryable ones are
-     * retried inside with [StreamEvent.Retrying] notices before the terminal
-     * [StreamEvent.Done] / [StreamEvent.Failed].
+     * Stream one provider attempt. Failures are classified (SPEC §5.2) and
+     * surfaced as one terminal [StreamEvent.Failed]. Retryable failures are
+     * retried only by the logical-turn owner, not inside this flow.
      */
     fun stream(request: ChatRequest): Flow<StreamEvent>
 
-    /** One-shot model listing (settings "test connection"); never SSE. */
+    /** One-shot model listing (settings "test connection"); never SSE. Redirects fail closed. */
     suspend fun listModels(): List<String>
 }
 

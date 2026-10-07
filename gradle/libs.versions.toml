@@ -13,6 +13,7 @@ targetSdk = "36"
 minSdk = "33"
 # Networking (streaming HTTP, e.g. SSE)
 okhttpSse = "5.5.0"
+okhttpTls = "5.5.0"
 # Local persistence
 room = "2.8.5"
 datastore = "1.2.1"
@@ -53,6 +54,7 @@ tensorflowLite = "2.17.0"
 
 [libraries]
 okhttp-sse = { group = "com.squareup.okhttp3", name = "okhttp-sse", version.ref = "okhttpSse" }
+okhttp-tls = { group = "com.squareup.okhttp3", name = "okhttp-tls", version.ref = "okhttpTls" }
 room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
 room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
 room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }

@@ -11,6 +11,7 @@ import kotlinx.serialization.json.Json
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -135,7 +136,75 @@ class SessionStoreTest {
 
         val remaining = db.sessionDao().allSessions().map { it.sessionId }.toSet()
         assertEquals(setOf(pinned, fresh), remaining)
+        // The stale, unpinned session deletion must execute its FK cascade.
+        assertEquals(0, db.sessionDao().eventCount(old))
         assertEquals(1, store.loadEvents(pinned).size)
+    }
+
+    @Test fun prune_preservesAppendCommittedAfterCandidateSnapshot(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("old", "p/m")
+        store.appendEvent(event(sid, text = "before"))
+        db.sessionDao().touchSession(sid, now - 31L * 86_400_000L)
+
+        // A second store has its own mutex, so this specifically verifies that the
+        // conditional SQL DELETE (not the pruning store's mutex) protects the row.
+        val appendingStore = RoomSessionStore(db) { now }
+        var interleaved = false
+        val result = store.pruneWithBeforeConditionalDelete(
+            PrunePolicy(maxAgeDays = 30),
+        ) { candidate ->
+            if (candidate == sid && !interleaved) {
+                interleaved = true
+                appendingStore.appendEvent(event(sid, text = "committed after snapshot"))
+            }
+        }
+
+        assertTrue(interleaved)
+        assertEquals(0, result.deletedSessions)
+        assertEquals(2, db.sessionDao().eventCount(sid))
+        assertEquals(
+            listOf("before", "committed after snapshot"),
+            store.loadEvents(sid).map { it.text },
+        )
+    }
+
+    @Test fun prune_preservesPinCommittedAfterCandidateSnapshotWhenConfigured(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("old", "p/m")
+        store.appendEvent(event(sid))
+        db.sessionDao().touchSession(sid, now - 31L * 86_400_000L)
+
+        var interleaved = false
+        val result = store.pruneWithBeforeConditionalDelete(
+            PrunePolicy(maxAgeDays = 30, keepPinnedSessions = true),
+        ) { candidate ->
+            if (candidate == sid && !interleaved) {
+                interleaved = true
+                db.sessionDao().setPinned(sid, true)
+            }
+        }
+
+        assertTrue(interleaved)
+        assertEquals(0, result.deletedSessions)
+        assertTrue(db.sessionDao().sessionById(sid).isPinned)
+        assertEquals(1, db.sessionDao().eventCount(sid))
+    }
+
+    @Test fun prune_keepPinnedFalseDeletesExpiredPinnedSessionAndCascades(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("old pinned", "p/m")
+        store.appendEvent(event(sid))
+        db.sessionDao().touchSession(sid, now - 31L * 86_400_000L)
+        db.sessionDao().setPinned(sid, true)
+
+        val result = store.prune(
+            PrunePolicy(maxAgeDays = 30, keepPinnedSessions = false),
+        )
+
+        assertEquals(1, result.deletedSessions)
+        assertNull(db.sessionDao().sessionById(sid))
+        assertEquals(0, db.sessionDao().eventCount(sid))
     }
 
     @Test fun prune_capKeepsNewest(): Unit = runBlocking {
@@ -150,6 +219,34 @@ class SessionStoreTest {
         val kept = store.loadEvents(sid)
         assertEquals(listOf(4L, 5L, 6L, 7L, 8L), kept.map { it.seq })
         assertEquals(listOf("m3", "m4", "m5", "m6", "m7"), kept.map { it.text })
+    }
+
+    @Test fun prune_capRetainsNewestActualEventsForSparseImportedSeqs(): Unit = runBlocking {
+        setUp()
+        val source = File(tmpDir, "sparse.jsonl")
+        val sparseSeqs = listOf(1L, 10L, 1_000L, 1_000_000L)
+        source.writeText(
+            sparseSeqs.joinToString("\n") { seq ->
+                JsonlCodec.encode(
+                    TranscriptEvent(
+                        seq = seq,
+                        sessionId = "ignored-on-import",
+                        runId = "imported-$seq",
+                        kind = "user",
+                        text = "event-$seq",
+                        createdAt = now,
+                    ),
+                )
+            } + "\n",
+            Charsets.UTF_8,
+        )
+        val sid = store.importJsonl(source)
+
+        val result = store.prune(PrunePolicy(maxAgeDays = 365, maxEventsPerSession = 2))
+
+        assertEquals(0, result.deletedSessions)
+        assertEquals(2, result.deletedEvents)
+        assertEquals(listOf(1_000L, 1_000_000L), store.loadEvents(sid).map { it.seq })
     }
 
     // ---- JSONL ----

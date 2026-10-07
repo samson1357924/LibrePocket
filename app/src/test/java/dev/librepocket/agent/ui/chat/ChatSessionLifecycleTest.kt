@@ -294,6 +294,11 @@ class ChatSessionLifecycleTest {
             chatMain.run { vm.sendDirect("typed while history loads") }
             val live = sessions.awaitCreated(1)
             live.firstSendEntered.await()
+            // Wait for the hosted block itself (not just admission): without
+            // this, attach()->close() can win before launch runs, the
+            // cancelled launch never clears hostedTurnActive, and the later
+            // !hostedTurnActive assertion flakes under load (Github-only CI).
+            withTimeout(5_000) { live.hostEntered.await() }
             assertTrue(live.hostedTurnActive)
 
             history.release.complete(Unit)
@@ -332,6 +337,10 @@ class ChatSessionLifecycleTest {
             chatMain.run { vm.sendDirect("typed while history loads") }
             val live = sessions.awaitCreated(1)
             live.firstSendEntered.await()
+            // Same hosted-block barrier as above: close() is fenced after
+            // hostEntered, so the cancelled-never-started launch cannot leak
+            // hostedTurnActive past close().
+            withTimeout(5_000) { live.hostEntered.await() }
 
             history.release.complete(Unit)
             val historySession = sessions.awaitOpened("H")
@@ -366,6 +375,9 @@ class ChatSessionLifecycleTest {
             chatMain.run { vm.sendDirect("typed while history loads") }
             val live = sessions.awaitCreated(1)
             live.firstSendEntered.await()
+            // Same hosted-block barrier: ViewModel clear closes the live
+            // session, so fence close after the hosted block has started.
+            withTimeout(5_000) { live.hostEntered.await() }
 
             history.release.complete(Unit)
             val historySession = sessions.awaitOpened("H")
@@ -632,6 +644,7 @@ class ChatSessionLifecycleTest {
         val sent = CopyOnWriteArrayList<String>()
         val closed = CompletableDeferred<Unit>()
         val firstSendEntered = CompletableDeferred<Unit>()
+        val hostEntered = CompletableDeferred<Unit>()
         val sendFinished = CompletableDeferred<Unit>()
         val steerReceived = CompletableDeferred<String>()
         val closeCalls = AtomicInteger()
@@ -665,6 +678,7 @@ class ChatSessionLifecycleTest {
                 )
             }
             val host = sessionScope.launch {
+                hostEntered.complete(Unit)
                 try {
                     sendGate(text)
                 } finally {
@@ -672,6 +686,11 @@ class ChatSessionLifecycleTest {
                 }
             }
             hosted = host
+            // Close() may win between firstSendEntered and launch when the
+            // scope is already cancelled: the block above never runs and its
+            // finally never clears the flag set before launch. Fail closed
+            // here so hostedTurnActive cannot leak true past close().
+            if (host.isCancelled) hostedTurnActive = false
             try {
                 host.join()
             } catch (cancelled: CancellationException) {
@@ -714,6 +733,11 @@ class ChatSessionLifecycleTest {
             }
             hosted?.cancel()
             sessionScope.cancel()
+            // Close means the turn is dead: the flag must read false even if
+            // close() lands after hosted assignment but before the hosted
+            // block dispatches (its finally then never runs). Idempotent with
+            // the hosted finally; no live turn survives scope.cancel().
+            hostedTurnActive = false
         }
     }
 }

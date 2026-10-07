@@ -6,6 +6,10 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -29,9 +33,11 @@ internal val RULES_KEY = stringPreferencesKey("rules_v1")
  *   pre-display only, never an execution basis).
  * - [evaluateFresh] re-reads the DataStore snapshot first (TOCTOU guard) and
  *   stamps [PolicyDecision.recheckedAt]; it is the ONLY execution basis.
- * - An empty DataStore is seeded from [DefaultPolicyRuleset] on first
- *   [evaluateFresh]; malformed persisted lines are skipped (fail closed to
- *   the remaining rules, never to open).
+ * - Only a missing rules key is seeded from [DefaultPolicyRuleset]. An explicit
+ *   empty ruleset stays empty; unreadable or malformed data never uses defaults
+ *   or a previously permissive snapshot. Decode is all-or-nothing.
+ * - Mutations decode the current rules inside the DataStore transaction and
+ *   publish a snapshot only after persistence succeeds. Cancellation propagates.
  */
 class DataStorePolicyStore(
   internal val dataStore: DataStore<Preferences>,
@@ -57,61 +63,77 @@ class DataStorePolicyStore(
 
   override suspend fun setRule(rule: PolicyRule) {
     parseRulePattern(rule.pattern)
-    withContext(ioDispatcher) {
-      mutex.withLock {
-        snapshot = snapshot.filterNot { it.pattern == rule.pattern } + rule
-        persistLocked(snapshot)
-      }
-    }
+    mutateRules { rules -> rules.filterNot { it.pattern == rule.pattern } + rule }
   }
 
   override suspend fun removeRule(pattern: String) {
+    mutateRules { rules -> rules.filterNot { it.pattern == pattern } }
+  }
+
+  private suspend fun mutateRules(transform: (List<PolicyRule>) -> List<PolicyRule>) {
     withContext(ioDispatcher) {
       mutex.withLock {
-        snapshot = snapshot.filterNot { it.pattern == pattern }
-        persistLocked(snapshot)
+        refreshSnapshotLocked {
+          // Each wrapper has its own mutex. Only the DataStore transaction
+          // serializes read/decode/mutate/encode across all wrappers.
+          val persisted = dataStore.edit { prefs ->
+            val current = prefs[RULES_KEY]?.let(::decodeRules) ?: DefaultPolicyRuleset.rules
+            prefs[RULES_KEY] = encodeRules(transform(current))
+          }
+          decodeRules(checkNotNull(persisted[RULES_KEY]))
+        }
       }
     }
   }
 
   override suspend fun listRules(): List<PolicyRule> =
     withContext(ioDispatcher) {
-      mutex.withLock { snapshot.toList() }
+      mutex.withLock { refreshSnapshotLocked { readPersistedOrSeedLocked() }.toList() }
     }
 
   override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
-    val fresh = withContext(ioDispatcher) {
-      mutex.withLock {
-        snapshot = readPersistedOrSeedLocked()
-        snapshot.toList()
+    val fresh = try {
+      withContext(ioDispatcher) {
+        mutex.withLock { refreshSnapshotLocked { readPersistedOrSeedLocked() }.toList() }
       }
+    } catch (cancelled: CancellationException) {
+      throw cancelled
+    } catch (_: Exception) {
+      // No rule can authorize execution when this fresh check failed. The
+      // snapshot is also invalidated by refreshSnapshotLocked, never reused.
+      emptyList()
     }
     return evaluateSnapshot(action.trim(), resource.trim(), fresh, System.currentTimeMillis())
   }
 
-  private suspend fun persistLocked(rules: List<PolicyRule>) {
-    dataStore.edit { prefs -> prefs[RULES_KEY] = encodeRules(rules) }
+  /** Caller holds the wrapper mutex; never publish an uncommitted candidate. */
+  private suspend fun refreshSnapshotLocked(read: suspend () -> List<PolicyRule>): List<PolicyRule> {
+    try {
+      val persisted = read().toList()
+      snapshot = persisted
+      return persisted
+    } catch (cancelled: CancellationException) {
+      throw cancelled
+    } catch (failure: Exception) {
+      snapshot = emptyList()
+      throw failure
+    }
   }
 
   private suspend fun readPersistedOrSeedLocked(): List<PolicyRule> {
-    val raw: String? = try {
-      dataStore.data.map { prefs -> prefs[RULES_KEY] }.first()
-    } catch (_: Exception) {
-      // Corrupt/unreadable store: keep the in-memory snapshot (fail closed
-      // to whatever was last known good, never to an empty open ruleset).
-      return snapshot
-    }
-    if (raw == null) {
-      val seeded = DefaultPolicyRuleset.rules
-      try {
-        dataStore.edit { prefs -> prefs[RULES_KEY] = encodeRules(seeded) }
-      } catch (_: Exception) {
-        // Seeding is best-effort; the in-memory snapshot still serves reads.
+    val raw = dataStore.data.map { prefs -> prefs[RULES_KEY] }.first()
+    if (raw != null) return decodeRules(raw)
+
+    // Missing means first boot, not corrupt/unavailable. Recheck inside edit:
+    // a different wrapper may have written restrictions since the read above.
+    val persisted = dataStore.edit { prefs ->
+      if (prefs[RULES_KEY] == null) {
+        prefs[RULES_KEY] = encodeRules(DefaultPolicyRuleset.rules)
+      } else {
+        decodeRules(checkNotNull(prefs[RULES_KEY]))
       }
-      return seeded
     }
-    val decoded = decodeRules(raw)
-    return decoded
+    return decodeRules(checkNotNull(persisted[RULES_KEY]))
   }
 
   companion object {
@@ -127,33 +149,28 @@ class DataStorePolicyStore(
       }
     }
 
+    /** Reject the entire ruleset if any row is invalid, including a lost DENY. */
     internal fun decodeRules(raw: String): List<PolicyRule> {
-      if (raw.isBlank()) return emptyList()
+      // encodeRules(emptyList()) is exactly "". Whitespace/blank rows are not
+      // emitted by this format and must not silently erase a damaged rule.
+      if (raw.isEmpty()) return emptyList()
       val decoder = java.util.Base64.getUrlDecoder()
-      val out = ArrayList<PolicyRule>()
-      for (line in raw.lineSequence()) {
-        if (line.isBlank()) continue
+      val utf8 = Charsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+      return raw.lineSequence().map { line ->
         val parts = line.split('|')
-        if (parts.size != 3) continue
+        require(parts.size == 3) { "Invalid persisted policy row" }
         val pattern = try {
-          String(decoder.decode(parts[0]), Charsets.UTF_8)
-        } catch (_: IllegalArgumentException) {
-          continue
+          utf8.decode(ByteBuffer.wrap(decoder.decode(parts[0]))).toString()
+        } catch (failure: CharacterCodingException) {
+          throw IllegalArgumentException("Invalid policy pattern encoding", failure)
         }
-        val verdict = try {
-          Verdict.valueOf(parts[1])
-        } catch (_: IllegalArgumentException) {
-          continue
-        }
-        val priority = parts[2].toIntOrNull() ?: continue
-        try {
-          parseRulePattern(pattern)
-        } catch (_: IllegalArgumentException) {
-          continue
-        }
-        out.add(PolicyRule(pattern, verdict, priority))
-      }
-      return out
+        val verdict = Verdict.valueOf(parts[1])
+        val priority = requireNotNull(parts[2].toIntOrNull()) { "Invalid policy priority" }
+        parseRulePattern(pattern)
+        PolicyRule(pattern, verdict, priority)
+      }.toList()
     }
   }
 }

@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -21,7 +22,7 @@ import org.junit.Test
  * - `evaluateFresh` re-reads the persisted snapshot (TOCTOU guard): an
  *   out-of-band DataStore edit is visible to `evaluateFresh` immediately.
  * - Rules survive across store instances (real persistence, temp file).
- * - Malformed persisted lines are skipped, never fatal.
+ * - Malformed persisted data rejects the whole ruleset, never retaining ALLOW.
  */
 class DataStorePolicyStoreTest {
 
@@ -109,11 +110,12 @@ class DataStorePolicyStoreTest {
     }
 
     @Test
-    fun malformedLinesAreSkipped() {
+    fun malformedLinesRejectWholeRuleset() {
         val raw = DataStorePolicyStore.encodeRules(
             listOf(PolicyRule("chat.send:*", Verdict.ALLOW, 10)),
         ) + "\nnot-a-rule\n|||also-bad"
-        val decoded = DataStorePolicyStore.decodeRules(raw)
-        assertEquals(listOf(PolicyRule("chat.send:*", Verdict.ALLOW, 10)), decoded)
+        assertThrows(IllegalArgumentException::class.java) {
+            DataStorePolicyStore.decodeRules(raw)
+        }
     }
 }

@@ -160,6 +160,7 @@ object ProotExec {
                 flavor = flavor,
                 bridgeGranted = false,
                 allowedBinaries = GUEST_BINARIES,
+                isGuest = true,
             )
         ) {
             is Validation.Denied -> return ShellResult.Denied(v.reason, v.message)

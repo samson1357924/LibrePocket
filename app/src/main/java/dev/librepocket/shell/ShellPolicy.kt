@@ -164,7 +164,10 @@ object ShellPolicy {
         "--regexp", "--include", "--exclude", "--exclude-dir",
     )
 
-    /** 純值形態（數字/布林/stdin/格式/glob），非路徑，誤殺豁免用。 */
+    /** 純值形態保留（文件用）：數字/布林/stdin/格式/glob 僅在值槽
+     *（VALUE_TAKING_FLAGS 下一位 / grep pattern 槽 / NON_PATH_OPT_KEYS）
+     * 才豁免；FILE_OPERAND 普通 positional 不得以形態豁免（見上）。 */
+    @Suppress("unused")
     private fun isBenignValue(v: String): Boolean {
         if (v == "-") return true
         if (v.equals("true", ignoreCase = true) || v.equals("false", ignoreCase = true)) return true
@@ -195,6 +198,7 @@ object ShellPolicy {
         flavor: Flavor = Flavor.PLAY,
         bridgeGranted: Boolean = false,
         allowedBinaries: Set<String> = ALLOWED_BINARIES,
+        isGuest: Boolean = false,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
@@ -257,6 +261,7 @@ object ShellPolicy {
             bridgeGranted = bridgeGranted,
             isElevated = false,
             allowedBinaries = allowedBinaries,
+            isGuest = isGuest,
         )
         if (pathDenial != null) return pathDenial
         return Validation.Allowed(base)
@@ -283,6 +288,7 @@ object ShellPolicy {
         safRoots: List<String> = emptyList(),
         flavor: Flavor = Flavor.PLAY,
         bridgeGranted: Boolean = false,
+        isGuest: Boolean = false,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
@@ -338,6 +344,7 @@ object ShellPolicy {
             bridgeGranted = bridgeGranted,
             isElevated = true,
             allowedBinaries = ALLOWED_BINARIES,
+            isGuest = isGuest,
         )
         if (pathDenialElevated != null) return pathDenialElevated
         return Validation.Allowed(base)
@@ -388,10 +395,16 @@ object ShellPolicy {
     }
 
     /**
-     * 共用路徑審查（P0 re-review fix→review 循環後）：
+     * 共用路徑審查（P0 re-review fix→review 循環後 + PR#1 P0 value-shaped 封堵）：
      * 絕對路徑先過 FileScope → 相對含 `/` 擋 → grep `--` 終止符與 pattern 槽 →
-     * 取值旗標值豁免 → 純值豁免 → binary-aware bare 封堵。
+     * 取值旗標值豁免 → binary-aware bare 封堵。
      * 直接/提權共用，避免雙寫漂移。
+     *
+     * 純值豁免僅限值槽（VALUE_TAKING_FLAGS 下一位 / grep pattern 槽 /
+     * NON_PATH_OPT_KEYS 的 --opt 值），FILE_OPERAND 的普通 positional 一律
+     * 當路徑（`cat 123` / `ls 123` / `stat %s` 亦拒）。Guest 模式（proot 容器
+     * 內，cwd 已釘到 `-w /` + `-r rootfs`）的無 `/` bare 視為容器內子命令/
+     * 相對路徑，放行（絕對宿主路徑仍走 FileScope，含 `/` 相對仍擋）。
      */
     private fun checkPathArgs(
         base: String,
@@ -402,6 +415,7 @@ object ShellPolicy {
         bridgeGranted: Boolean,
         isElevated: Boolean,
         allowedBinaries: Set<String>,
+        isGuest: Boolean = false,
     ): Validation.Denied? {
         // grep 顯式 pattern 旗標預掃：-e/--regexp/-f 存在時無 positional pattern 槽。
         var grepPatternSeen = (base != "grep")
@@ -421,6 +435,14 @@ object ShellPolicy {
         var endOfOptions = false
         var prevArg: String? = null
         for (arg in args) {
+            // bind 封堵縱深（與 LinuxEnv.bindVeto 雙層）：guest 包裝層 argv 內
+            // 出現 --bind 即否決，不因 guest 放行（黑名單不因通道放行）。
+            if (arg == "--bind" || arg.startsWith("--bind=")) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "bind forbidden inside guest argv",
+                )
+            }
             for (candidate in absoluteCandidates(arg)) {
                 val denial = if (isElevated) {
                     checkFileScopeElevated(candidate, privateRoot, safRoots, flavor, bridgeGranted)
@@ -454,17 +476,13 @@ object ShellPolicy {
                 prevArg = arg
                 continue
             }
-            // 純值豁免（數字/布林/stdin/格式/glob），避免 head/find/stat 誤殺。
-            if (isPositional && isBenignValue(arg)) {
-                prevArg = arg
-                continue
-            }
             val bareDenial = checkBareFileOperand(
                 base = base,
                 arg = arg,
                 privateRoot = privateRoot,
                 isElevated = isElevated,
                 allowedBinaries = allowedBinaries,
+                isGuest = isGuest,
             )
             if (bareDenial != null) return bareDenial
             prevArg = arg
@@ -473,15 +491,20 @@ object ShellPolicy {
     }
 
     /**
-     * Bare filename 封堵（P0 re-review，binary-aware fail-closed）。
+     * Bare filename 封堵（P0 re-review，binary-aware fail-closed +
+     * PR#1 P0 value-shaped 封堵）。
      *
      * - 絕對路徑與含 `/`/`.`/`..` 已由 [isRelativePathArg] 擋，此處只處理
-     *   不含 `/` 的 bare word（如 `init.rc`、`chat`、`secret.db`）；
+     *   不含 `/` 的 bare word（如 `init.rc`、`chat`、`secret.db`、`123`、`%s`、`*`）；
      * - [FILE_OPERAND_BINARIES] 或 S4 擴展白名單新 binary：一律拒（呼叫方已豁免
-     *   pattern 槽/取值旗標值/純值，此處不再豁免）；
+     *   pattern 槽/取值旗標值，此處不再豁免純值形態 —— `cat 123` / `ls 123` /
+     *   `stat %s` 亦視為相對路徑）；
      * - `--opt=bare`：鍵在 [NON_PATH_OPT_KEYS]（color/sort/format 等）放行；
-     *   否則 FILE_OPERAND 中純值放行，其餘視為潛在路徑拒；
+     *   否則 FILE_OPERAND 即使值像數字/格式/glob 仍拒（`--db=123` 視為潛在路徑）；
      * - [NO_FILE_BINARIES]：bare 永遠放行；
+     * - Guest 模式（proot 容器內）：無 `/` bare 一律放行（子命令如 `version` /
+     *   `update` / `sign` 與容器內相對路徑如 `x.apk`；cwd 已釘 `-w /` + `-r`，
+     *   不會逃逸宿主；含 `/` 相對已由上層擋，宿主絕對路徑仍走 FileScope）；
      * - 未知二進位（提權通道如 dumpsys）：privateRoot==null 時任何 positional
      *   bare 一律拒（fail-closed）；非 null 時靠 cwd 釘死保證域內，放行無 `/`
      *   bare（`activity` 子命令與 `com.example.pkg` 包名兼顧），含 `/` 已由上層擋。
@@ -492,7 +515,14 @@ object ShellPolicy {
         privateRoot: String?,
         isElevated: Boolean,
         allowedBinaries: Set<String>,
+        isGuest: Boolean = false,
     ): Validation.Denied? {
+        // Guest 容器內：privateRoot 非 null 且無 `/` bare 不視為宿主相對路徑
+        // 逃逸，放行。含 `/` 的相對已由 isRelativePathArg 擋，宿主絕對路徑仍
+        // 走 FileScope；privateRoot==null 時落回 fail-closed（與 direct 同策）。
+        if (isGuest && privateRoot != null && !arg.contains('/')) {
+            return null
+        }
         if (arg.startsWith("-")) {
             val eq = arg.indexOf('=')
             if (eq < 0) return null
@@ -504,7 +534,6 @@ object ShellPolicy {
             val isFileOperand = base in FILE_OPERAND_BINARIES ||
                 (!isElevated && base in allowedBinaries && base !in NO_FILE_BINARIES)
             if (isFileOperand) {
-                if (isBenignValue(v)) return null
                 return Validation.Denied(
                     ShellDeny.BLACKLISTED,
                     "relative path denied (fail-closed, use absolute path): $arg",
@@ -520,11 +549,22 @@ object ShellPolicy {
             return null
         }
         if (arg.startsWith("/")) return null
-        if (arg.isEmpty() || arg.isBlank()) return null
+        if (arg.isEmpty()) return null
         if (arg == "-") return null
         if (base in NO_FILE_BINARIES) return null
         val isFileOperand = base in FILE_OPERAND_BINARIES ||
             (!isElevated && base in allowedBinaries && base !in NO_FILE_BINARIES)
+        // 空白檔名（" " 等）對 FILE_OPERAND 視為相對路徑，一併拒；
+        // 非 FILE_OPERAND（echo 等）維持放行（無檔案語義）。
+        if (arg.isBlank()) {
+            if (isFileOperand) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "relative path denied (fail-closed, use absolute path): $arg",
+                )
+            }
+            return null
+        }
         if (isFileOperand) {
             return Validation.Denied(
                 ShellDeny.BLACKLISTED,

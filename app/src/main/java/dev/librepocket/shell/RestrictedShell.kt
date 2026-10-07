@@ -21,12 +21,24 @@ data class RawOutput(
     val timedOut: Boolean,
 )
 
-/** 真實子進程實現：argv 直達 exec（無 shell），超時 [destroyForcibly]。 */
-class DefaultProcessRunner : ProcessRunner {
+/** 真實子進程實現：argv 直達 exec（無 shell），超時 [destroyForcibly]。
+ * [dirRoot] 非 null 時把子進程 cwd 釘到該目錄（縱深防禦：bare filename
+ * 相對解析目標固定；PR#1 P0 direct-cwd 封堵）。null 時維持系統預設 cwd
+ *（政策層仍 fail-closed）。
+ */
+class DefaultProcessRunner(val dirRoot: String? = null) : ProcessRunner {
     override fun run(argv: List<String>, timeoutMs: Long): RawOutput {
-        val process = ProcessBuilder(argv)
+        val pb = ProcessBuilder(argv)
             .redirectInput(ProcessBuilder.Redirect.PIPE)
-            .start()
+        if (dirRoot != null) {
+            val dir = java.io.File(dirRoot)
+            // 釘死失敗即 fail-closed：不繼承不可控 cwd，直接拋給上層轉 Failed。
+            if (!dir.isDirectory) {
+                throw IllegalStateException("pinned cwd not a directory: $dirRoot")
+            }
+            pb.directory(dir)
+        }
+        val process = pb.start()
         process.outputStream.close()
         val outReader = streamGobbler(process.inputStream)
         val errReader = streamGobbler(process.errorStream)
@@ -148,8 +160,17 @@ class RestrictedShell(
         if (!quota.tryAcquire()) {
             return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "shell quota exceeded")
         }
+        // Direct 通道 cwd 縱深釘死：預設 runner 且 privateRoot 已知時，用釘死 cwd
+        // 的 runner 執行（與 Root/Shizuku 雙層釘死對齊；政策層已 fail-closed，
+        // 此處防 TOCTOU / cwd 預植）。
+        val effectiveRunner: ProcessRunner =
+            if (privateRoot != null && runner is DefaultProcessRunner) {
+                DefaultProcessRunner(privateRoot)
+            } else {
+                runner
+            }
         val raw: RawOutput = try {
-            runner.run(argv, timeoutMs)
+            effectiveRunner.run(argv, timeoutMs)
         } catch (e: Exception) {
             return ShellResult.Failed("spawn failed: ${e.message}")
         }

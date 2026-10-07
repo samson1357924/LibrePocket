@@ -34,7 +34,7 @@ class RootSuRunner(
     private val quota: ShellQuota = ShellQuota(),
     private val bridgeGranted: Boolean = false,
     private val flavor: Flavor = Flavor.GITHUB,
-    private val spawn: (List<String>) -> Process = { argv -> ProcessBuilder(argv).start() },
+    private val spawn: ((List<String>) -> Process)? = null,
 ) : ElevatedShellRunner {
 
     override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
@@ -59,9 +59,19 @@ class RootSuRunner(
         // su -c 傳送層：內層 argv 已校驗，此處 joinToString 拼成單一
         // `-c` 字串（裝置側 `su` 必經一次字串解析，非 argv 直達；
         // 參數衛生已先拒絕串接/重定向字元，此處再經 quoteArg 包覆縱深防禦）。
-        val wrapped = listOf("su", "-c", request.argv.joinToString(" ") { quoteArg(it) })
+        // P0 cwd 釘死：外層 ProcessBuilder 目錄釘到 privateRoot（見 pinnedSpawn），
+        // 內層再 `cd <root> && exec ...` 雙保險，避免裝置側 su 重置 cwd 後
+        // 相對路徑解析到不可控目錄。
+        val inner = request.argv.joinToString(" ") { quoteArg(it) }
+        val root = privateRoot
+        val shellScript = if (root != null) {
+            "cd ${quoteArg(root)} && exec $inner"
+        } else {
+            inner
+        }
+        val wrapped = listOf("su", "-c", shellScript)
         val process: Process = try {
-            spawn(wrapped)
+            (spawn ?: ::pinnedSpawn)(wrapped)
         } catch (e: Exception) {
             return ShellResult.Failed("su spawn failed: ${e.message}")
         }
@@ -86,6 +96,20 @@ class RootSuRunner(
     }
 
     private fun ByteArray.toUtf8Lossy(): String = String(this, Charsets.UTF_8)
+
+    /**
+     * P0 cwd 釘死：真實建子進程時把工作目錄釘到 privateRoot。
+     * privateRoot 為 null（未配置作用域）時維持預設 cwd，但政策層已對
+     * 任何 path-like bare（含 `.`）fail-closed，殘餘僅非路徑子命令。
+     */
+    private fun pinnedSpawn(argv: List<String>): Process {
+        val pb = ProcessBuilder(argv)
+        val root = privateRoot
+        if (root != null) {
+            runCatching { pb.directory(java.io.File(root)) }
+        }
+        return pb.start()
+    }
 
     companion object {
         /**

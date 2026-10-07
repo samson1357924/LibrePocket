@@ -131,6 +131,19 @@ class ShellElevatedTest {
             // 域內相對路徑同樣 fail-closed：呼叫方需先轉絕對路徑。
             listOf("cat", "chat/x.txt"),
             listOf("cat", "./chat/x.txt"),
+            // P0 re-review：bare filename（無 `/`）對 FILE_OPERAND 二進位
+            // 同樣是相對路徑，必須拒（cwd 未釘死前可繞 FileScope）。
+            listOf("cat", "init.rc"),
+            listOf("cat", "secret.db"),
+            listOf("cat", "chat"),
+            listOf("head", "init.rc"),
+            listOf("tail", "x"),
+            listOf("stat", "build.prop"),
+            listOf("du", "foo"),
+            listOf("ls", "chat"),
+            listOf("cat", "--db=secret.db"),
+            listOf("grep", "-r", "pw", "secrets"),
+            listOf("find", "chat", "-print"),
         )
         for (flavor in listOf(Flavor.PLAY, Flavor.FOSS, Flavor.GITHUB)) {
             for (bridge in listOf(false, true)) {
@@ -157,6 +170,10 @@ class ShellElevatedTest {
             listOf("cat", "-foo/bar"),
             listOf("cat", "chat/x.txt"),
             listOf("cat", "./chat/x.txt"),
+            listOf("cat", "init.rc"),
+            listOf("cat", "secret.db"),
+            listOf("ls", "chat"),
+            listOf("cat", "--db=secret.db"),
         )) {
             val v = ShellPolicy.validate(argv, privateRoot)
             assertTrue("$argv -> $v", v is Validation.Denied)
@@ -173,6 +190,52 @@ class ShellElevatedTest {
             bridgeGranted = true,
         )
         assertTrue("$v", v is Validation.Allowed)
+    }
+
+    @Test fun grepDashDashTerminatorStillDeniesFile() {
+        // FAIL-2 回歸：`--` 後首個 bare（含 `-` 開頭）是 pattern，次個仍是檔案。
+        for (argv in listOf(
+            listOf("grep", "-r", "--", "-pw", "secrets"),
+            listOf("grep", "-r", "--", "password", "secrets"),
+        )) {
+            val v = ShellPolicy.validateElevated(argv, privateRoot, flavor = Flavor.GITHUB, bridgeGranted = true)
+            assertTrue("$argv -> $v", v is Validation.Denied)
+        }
+    }
+
+    @Test fun benignValuesNotKilled() {
+        // WARN-4 回歸：取值旗標值與純值（數字/格式/glob/非路徑 --opt）放行。
+        val absFile = "$privateRoot/x.txt"
+        for (argv in listOf(
+            listOf("head", "-n", "20", absFile),
+            listOf("stat", "-c", "%s", absFile),
+            listOf("ls", "--color=auto", absFile),
+            listOf("grep", "--color=auto", "password", absFile),
+            listOf("grep", "-e", "foo", absFile),
+        )) {
+            val v = ShellPolicy.validateElevated(argv, privateRoot, flavor = Flavor.GITHUB, bridgeGranted = true)
+            assertTrue("$argv -> $v", v is Validation.Allowed)
+        }
+    }
+
+    @Test fun elevatedNullScopeFailClosedForBare() {
+        // FAIL-3 回歸：privateRoot==null 時未知二進位 bare 亦一律拒。
+        for (argv in listOf(
+            listOf("dumpsys", "chat"),
+            listOf("dumpsys", "activity"),
+            listOf("mycmd", "--opt=chat"),
+        )) {
+            val v = ShellPolicy.validateElevated(argv, null, flavor = Flavor.GITHUB, bridgeGranted = true)
+            assertTrue("$argv -> $v", v is Validation.Denied)
+        }
+        // 非 null 釘死時未知子命令放行（cwd 保證域內，包名/子命令兼顧）。
+        val ok = ShellPolicy.validateElevated(
+            listOf("dumpsys", "activity"),
+            privateRoot,
+            flavor = Flavor.GITHUB,
+            bridgeGranted = true,
+        )
+        assertTrue("$ok", ok is Validation.Allowed)
     }
 
     // ---- 門禁 elevated 分支 ----

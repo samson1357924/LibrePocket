@@ -109,7 +109,7 @@ class ShizukuShellRunner(
     private val bridgeGranted: Boolean = false,
     private val flavor: Flavor = Flavor.GITHUB,
     private val pingBinder: () -> Boolean = { ShizukuProbe.ping() },
-    private val spawn: (List<String>) -> Process = defaultSpawn,
+    private val spawn: ((List<String>) -> Process)? = null,
 ) : ElevatedShellRunner {
 
     override fun run(request: ElevatedRequest, timeoutMs: Long): ShellResult {
@@ -137,7 +137,7 @@ class ShizukuShellRunner(
             return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "elevated shell quota exceeded")
         }
         val process: Process = try {
-            spawn(request.argv)
+            (spawn ?: ::pinnedSpawn)(request.argv)
         } catch (e: Exception) {
             return ShellResult.Failed("shizuku spawn failed: ${e.message}")
         }
@@ -177,12 +177,27 @@ class ShizukuShellRunner(
 
     private fun ByteArray.toUtf8Lossy(): String = String(this, Charsets.UTF_8)
 
+    /**
+     * P0 cwd 釘死：遠端建子進程時把 `dir` 釘到 privateRoot（原 `null` 會落在
+     * system_server 預設 cwd，不可控）。privateRoot 為 null 時維持 null，
+     * 但政策層已 fail-closed，殘餘僅非路徑子命令。
+     */
+    private fun pinnedSpawn(argv: List<String>): Process = defaultSpawnWithDir(argv, privateRoot)
+
     companion object {
         /**
          * 預設遠端建子進程：Shizuku 13.x 的 `newProcess` 為 private，
          * 此處反射呼叫（argv 直達，不經 `sh -c`，不拼字串）。
+         * P0 修正：`dir` 傳 privateRoot（非 null），不再傳 null。
          */
+        @Deprecated(
+            "僅測試/舊碼相容，產品碼禁用：未釘死 cwd（dir=null）。產品一律走實例 pinnedSpawn。",
+        )
         val defaultSpawn: (List<String>) -> Process = { argv ->
+            defaultSpawnWithDir(argv, null)
+        }
+
+        fun defaultSpawnWithDir(argv: List<String>, dir: String?): Process {
             val method = Shizuku::class.java.getDeclaredMethod(
                 "newProcess",
                 Array<String>::class.java,
@@ -191,7 +206,7 @@ class ShizukuShellRunner(
             )
             method.isAccessible = true
             @Suppress("UNCHECKED_CAST")
-            (method.invoke(null, argv.toTypedArray(), null, null) as Process)
+            return (method.invoke(null, argv.toTypedArray(), null, dir) as Process)
         }
     }
 }

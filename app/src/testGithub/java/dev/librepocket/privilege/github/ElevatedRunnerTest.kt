@@ -79,9 +79,12 @@ class ElevatedRunnerTest {
             assertTrue("$r", r is ShellResult.Ok)
         }
         val spawn = SpawnCounter()
-        // Root 走 su -c 傳送層：內層 argv 原樣包覆。
+        // Root 走 su -c 傳送層：內層 argv 原樣包覆，外層 cwd 釘死（cd + exec 雙保險）。
         rootRunner(spawn).run(ElevatedRequest(listOf("dumpsys", "activity"), reasonCode = "D09-T"))
-        assertEquals(listOf("su", "-c", "dumpsys activity"), spawn.lastArgv)
+        assertEquals(
+            listOf("su", "-c", "cd $privateRoot && exec dumpsys activity"),
+            spawn.lastArgv,
+        )
     }
 
     @Test fun blacklistDeniedWithoutSpawnOnBothRunners() {

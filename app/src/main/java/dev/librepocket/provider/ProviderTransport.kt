@@ -126,6 +126,10 @@ internal fun redactedError(message: String): String = Redactor.redactError(messa
  * from before execute() through complete body consumption and is disposed on
  * every exit path. Call.cancel() therefore interrupts blocking header/body IO
  * as soon as the Job enters cancelling, rather than waiting for completion.
+ *
+ * Cancellation is judged by the coroutine Job (ensureActive) only, never by
+ * Call.isCanceled(): OkHttp's own callTimeout self-cancels the call, and that
+ * timeout must stay a classifiable IOException, not a CancellationException.
  */
 @OptIn(InternalCoroutinesApi::class)
 internal suspend fun <T> executeProviderRequest(
@@ -143,7 +147,6 @@ internal suspend fun <T> executeProviderRequest(
         call.execute().use(consume)
     } catch (e: IOException) {
         currentCoroutineContext().ensureActive()
-        if (call.isCanceled()) throw CancellationException("provider request cancelled", e)
         throw e
     } finally {
         cancellation?.dispose()
@@ -173,7 +176,6 @@ internal suspend fun pumpSse(
             call.execute()
         } catch (e: IOException) {
             currentCoroutineContext().ensureActive()
-            if (call.isCanceled()) throw CancellationException("provider request cancelled", e)
             val kind = ProviderErrorClassifier.classify(null, e, null)
             throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
         }
@@ -185,7 +187,6 @@ internal suspend fun pumpSse(
                         response.body?.string()?.take(2048)
                     } catch (e: IOException) {
                         currentCoroutineContext().ensureActive()
-                        if (call.isCanceled()) throw CancellationException("provider request cancelled", e)
                         null
                     }
                     val kind = ProviderErrorClassifier.classify(response.code, null, snippet)
@@ -206,7 +207,6 @@ internal suspend fun pumpSse(
                         source.read(buf, 0, buf.size)
                     } catch (e: IOException) {
                         currentCoroutineContext().ensureActive()
-                        if (call.isCanceled()) throw CancellationException("provider request cancelled", e)
                         val kind = ProviderErrorClassifier.classify(null, e, null)
                         throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("SSE_TRANSPORT", e.message), e)
                     }

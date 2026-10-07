@@ -1,5 +1,6 @@
 package dev.librepocket.provider
 
+import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -627,6 +628,111 @@ class ProviderTransportTest {
             }
             assertEquals(1, events.size)
             assertEquals("no hidden follow-up with injected retry-enabled client", 1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun modelListCallTimeoutWaitingForHeadersIsNetworkFailureNotCancellation() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+            val client = OkHttpClient.Builder()
+                .callTimeout(300, TimeUnit.MILLISECONDS)
+                .readTimeout(5, TimeUnit.MINUTES)
+                .build()
+            try {
+                withTimeout(5_000) { anthropic(server, client).listModels() }
+                throw AssertionError("expected callTimeout to fail the model list")
+            } catch (e: CancellationException) {
+                throw AssertionError("OkHttp callTimeout must not surface as CancellationException", e)
+            } catch (e: IOException) {
+                assertEquals(
+                    "callTimeout stays a retryable network failure",
+                    FailureKind.RETRYABLE,
+                    ProviderErrorClassifier.classify(null, e, e.message),
+                )
+            }
+            val received = withContext(Dispatchers.IO) { server.takeRequest(2, TimeUnit.SECONDS) }
+            assertNotNull("timed-out model request still reaches the server", received)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun modelListCallTimeoutWhileReadingBodyIsNetworkFailureNotCancellation() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(
+                MockResponse()
+                    .setBody("{\"data\":[]}")
+                    .setBodyDelay(5, TimeUnit.SECONDS),
+            )
+            val client = OkHttpClient.Builder()
+                .callTimeout(300, TimeUnit.MILLISECONDS)
+                .readTimeout(5, TimeUnit.MINUTES)
+                .build()
+            try {
+                withTimeout(5_000) { anthropic(server, client).listModels() }
+                throw AssertionError("expected callTimeout to fail the model list")
+            } catch (e: CancellationException) {
+                throw AssertionError("OkHttp callTimeout must not surface as CancellationException", e)
+            } catch (e: IOException) {
+                assertEquals(
+                    "callTimeout stays a retryable network failure",
+                    FailureKind.RETRYABLE,
+                    ProviderErrorClassifier.classify(null, e, e.message),
+                )
+            }
+            val received = withContext(Dispatchers.IO) { server.takeRequest(2, TimeUnit.SECONDS) }
+            assertNotNull("timed-out model request still reaches the server", received)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun sseCallTimeoutWaitingForHeadersIsRetryableFailureNotCancellation() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+            val client = OkHttpClient.Builder()
+                .callTimeout(300, TimeUnit.MILLISECONDS)
+                .readTimeout(5, TimeUnit.MINUTES)
+                .build()
+            // A CancellationException here (not a Failed event) is the regression:
+            // streamingFlow rethrows cancellation instead of emitting a failure.
+            val events = withTimeout(5_000) { anthropic(server, client).stream(request()).toList() }
+            val failure = events.single() as StreamEvent.Failed
+            assertTrue("callTimeout surfaces as a retryable transport failure", failure.retryable)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun sseCallTimeoutWhileReadingBodyIsRetryableFailureNotCancellation() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody("data: body-never-arrives\n\n")
+                    .setBodyDelay(5, TimeUnit.SECONDS),
+            )
+            val client = OkHttpClient.Builder()
+                .callTimeout(300, TimeUnit.MILLISECONDS)
+                .readTimeout(5, TimeUnit.MINUTES)
+                .build()
+            val events = withTimeout(5_000) { anthropic(server, client).stream(request()).toList() }
+            val failure = events.single() as StreamEvent.Failed
+            assertTrue("callTimeout surfaces as a retryable transport failure", failure.retryable)
         } finally {
             server.shutdown()
         }

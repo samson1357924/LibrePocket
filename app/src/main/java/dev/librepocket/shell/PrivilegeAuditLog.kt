@@ -51,7 +51,7 @@ class PrivilegeAuditLog {
             records += row
             // 有界審計表：超過上限丟棄最舊（seqId 單調遞增保證轉錄側可察覺空洞，
             // 見 MAX_RECORDS）。
-            while (records.size > MAX_RECORDS) records.removeFirst()
+            while (records.size > MAX_RECORDS) records.removeAt(0)
         }
         return row
     }

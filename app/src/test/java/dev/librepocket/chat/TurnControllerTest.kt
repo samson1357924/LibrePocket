@@ -557,9 +557,11 @@ class TurnControllerTest {
     val c = controller(provider, delays = delays, transcript = sink)
     runBlocking { c.send("hi") }
     assertEquals(listOf(2_000L, 4_000L), delays)
-    awaitTrue { sink.retried.size >= 2 }
-    assertEquals(listOf(1, 2), sink.retried.map { it.attempt })
-    assertEquals(listOf(2_000L, 4_000L), sink.retried.map { it.delayMs })
+    // fireTranscript 是 scope.launch 異步投遞，抵達順序不保證：等齊 2 筆後按 attempt 排序再斷言。
+    awaitTrue { sink.retried.size == 2 }
+    val byAttempt = sink.retried.sortedBy { it.attempt }
+    assertEquals(listOf(1, 2), byAttempt.map { it.attempt })
+    assertEquals(listOf(2_000L, 4_000L), byAttempt.map { it.delayMs })
   }
 
   @Test fun truncatedStreamIsTreatedAsRetryable() {

@@ -75,6 +75,14 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    # INFRA: dependency-review-action 在 Dependency graph 未啟用時會直接 abort
+    # ("Dependency review is not supported on this repository")，與依賴本身有無漏洞無關。
+    # Owner 需至 Settings → Code security → Dependency graph → Enable（public repo 免費）。
+    # 在 graph 啟用前先設 continue-on-error 避免 infra 擋 PR；啟用並確認掃出具體 GHSA 後應 revert 此行。
+    continue-on-error: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

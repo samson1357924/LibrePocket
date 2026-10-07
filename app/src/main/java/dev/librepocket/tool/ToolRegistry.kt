@@ -228,7 +228,7 @@ object ToolRegistry {
         // Schema 只收 argv / reasonCode / timeoutMs 三鍵（無字串形式的執行鍵）。
         ToolDef(
             name = "shell.elevated",
-            description = "Elevated exec via the Shizuku/Root bridge (self-install only, default off): argv vector direct to the bridge, reasonCode required for audit.",
+            description = "Elevated exec via the Shizuku/Root bridge (self-install only, default off): argv vector direct to the bridge, reasonCode required for audit. SCAFFOLD: projection-only in this PR, no product Chat dispatcher/executor wiring yet (see TurnController records-only); production runner + grant/confirm flow lands in the wiring PR.",
             jsonSchema = schema(
                 prop("argv", "array", "Argument vector; argv[0] is the binary basename, never a single string"),
                 prop("reasonCode", "string", "Why elevated execution is needed (written to the audit log as a hash)"),
@@ -352,7 +352,7 @@ object ToolRegistry {
     val S1B_TOOLS: List<ToolDef> = listOf(
         ToolDef(
             name = WebFetch.TOOL_NAME,
-            description = "Fetch an https URL as text (http only for loopback); byte-capped, 15s timeout, transcode-downgraded.",
+            description = "Fetch an https URL as text (http only for loopback); byte-capped, 15s timeout, transcode-downgraded. SCAFFOLD: projection-only in this PR, no product Chat dispatcher wiring yet (TurnController records ToolDone only).",
             jsonSchema = schema(
                 prop("url", "string", "https URL to fetch (http only for localhost/loopback)"),
                 prop("maxBytes", "integer", "Byte cap, clamped to 1 MiB"),
@@ -383,7 +383,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = DbTools.QUERY_NAME,
-            description = "Read-only SELECT over the app database with a row cap; rejects non-SELECT and multi-statements.",
+            description = "Read-only SELECT over the app database with a row cap; rejects non-SELECT and multi-statements. SCAFFOLD: projection-only in this PR, no product Chat dispatcher/Room wiring yet (test fake Connection only).",
             jsonSchema = schema(
                 prop("sql", "string", "Single SELECT/WITH statement"),
                 prop("limit", "integer", "Row cap, clamped to 200"),
@@ -398,7 +398,7 @@ object ToolRegistry {
         ),
         ToolDef(
             name = DbTools.EXEC_NAME,
-            description = "Write to the app database; needs confirmation and bans ATTACH/DROP.",
+            description = "Write to the app database; needs confirmation and bans ATTACH/DROP. SCAFFOLD: projection-only in this PR, no product Chat dispatcher/Room wiring yet.",
             jsonSchema = schema(
                 prop("sql", "string", "Single write statement, no ATTACH/DROP"),
                 prop("confirmed", "boolean", "User confirmation for the write"),
@@ -617,7 +617,7 @@ object ToolRegistry {
     val SLOW_TOOLS: List<ToolDef> = listOf(
         ToolDef(
             name = SLOW_TOOL_NAME,
-            description = "Screen-understanding GUI automation (foss/github only, default off).",
+            description = "Screen-understanding GUI automation (foss/github only, default off). SCAFFOLD: projection-only in this PR, no product Chat dispatcher/StepExecutor wiring yet; automation switch + confirm flow lands in the wiring PR.",
             jsonSchema = schema(
                 prop("goal", "string", "What to achieve on screen"),
                 required = "\"goal\"",

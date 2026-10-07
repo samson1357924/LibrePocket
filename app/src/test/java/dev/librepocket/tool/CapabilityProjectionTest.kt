@@ -152,4 +152,19 @@ class CapabilityProjectionTest {
         assertEquals(SideEffect.PRIVILEGED, ToolRegistry.find("sms.compose")!!.sideEffect)
         assertEquals(SideEffect.PRIVILEGED, ToolRegistry.find("screenshot.capture")!!.sideEffect)
     }
+
+    @Test fun scaffoldToolsHonestlyMarkedUntilWired() {
+        // PR#1 re-review P1 scope：無產品 dispatcher 接線的工具必須標 SCAFFOLD，
+        // 避免「模型看得到、App 做不到」。已標：voice.speak.azure、linux.boot。
+        for (name in listOf(
+            "shell.elevated",
+            WebFetch.TOOL_NAME,
+            DbTools.QUERY_NAME,
+            DbTools.EXEC_NAME,
+            ToolRegistry.SLOW_TOOL_NAME,
+        )) {
+            val desc = ToolRegistry.find(name)!!.description
+            assertTrue("$name desc=$desc", desc.contains("SCAFFOLD"))
+        }
+    }
 }

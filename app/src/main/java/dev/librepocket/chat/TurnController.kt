@@ -50,6 +50,12 @@ private data class PendingSteer(val text: String, val images: List<ChatImageRef>
  * and provider [StreamEvent.Retrying] notices are forwarded to
  * [TranscriptSink.onTurnRetried] while the turn stays alive.
  *
+ * SCAFFOLD (PR#1 re-review, P1 scope): this PR records ToolDone only and never
+ * executes tools — no ToolDispatcher/FastRouter/PrivilegeGate/ElevatedDispatch
+ * product wiring yet. Projection NATIVE means switch/flavor semantics only;
+ * the true product tool loop (dispatcher + grant/confirm + Android executors +
+ * E2E) lands in the wiring PR.
+ *
  * Execution-basis policy: every turn (including steered follow-ups) is gated
  * by [PolicyStore.evaluateFresh]. [PolicyStore.evaluate] is UI pre-display
  * only and is never used here.

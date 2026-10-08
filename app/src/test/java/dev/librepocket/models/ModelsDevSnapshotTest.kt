@@ -26,15 +26,98 @@ class ModelsDevSnapshotTest {
         javaClass.classLoader!!.getResourceAsStream("models-snapshot-min.json")!!.readBytes()
             .toString(Charsets.UTF_8)
 
+    private fun nestedDirectoryFixtureBody(): String =
+        javaClass.classLoader!!.getResourceAsStream("models-dev-directory-2providers.json")!!.readBytes()
+            .toString(Charsets.UTF_8)
+
     @Test
     fun fixtureParsesToThreeCandidates() {
         val snapshot = ModelsDevSnapshot.parse(fixtureBody(), nowMs = 1_700_000_000_000L)
         assertEquals(3, snapshot.models.size)
-        assertEquals("openai/gpt-4o-mini", snapshot.models[0].id)
+        assertEquals("openai", snapshot.models[0].providerId)
+        assertEquals("gpt-4o-mini", snapshot.models[0].wireId)
         assertEquals(false, snapshot.models[0].reasoning)
-        assertEquals("anthropic/claude-haiku-4-5", snapshot.models[1].id)
+        assertEquals(true, snapshot.models[0].toolCalls)
+        assertEquals("anthropic", snapshot.models[1].providerId)
+        assertEquals("claude-haiku-4-5", snapshot.models[1].wireId)
         assertEquals(true, snapshot.models[1].reasoning)
-        assertEquals("google/gemini-2-flash", snapshot.models[2].id)
+        assertEquals("google", snapshot.models[2].providerId)
+        assertEquals("gemini-2-flash", snapshot.models[2].wireId)
+        assertEquals(true, snapshot.models[2].toolCalls)
+    }
+
+    @Test
+    fun nestedProviderModelDictionariesParseWithSingularToolCallCapabilities() {
+        val snapshot = ModelsDevSnapshot.parse(nestedDirectoryFixtureBody(), nowMs = 1_700_000_000_000L)
+
+        assertEquals(
+            listOf(
+                ModelsDevSnapshot.ModelEntry("openai", "wire-openai-a", reasoning = false, toolCalls = true),
+                ModelsDevSnapshot.ModelEntry("openai", "wire-openai-b", reasoning = true, toolCalls = false),
+                ModelsDevSnapshot.ModelEntry("anthropic", "wire-anthropic-a", reasoning = true, toolCalls = false),
+                ModelsDevSnapshot.ModelEntry("anthropic", "wire-anthropic-b", reasoning = false, toolCalls = true),
+            ),
+            snapshot.models,
+        )
+    }
+
+    @Test
+    fun nestedWireIdIsTakenVerbatimFromDictionaryKey() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"openai":{"models":{"vendor/model":{"id":"ignored-metadata-id","tool_call":true}}}}""",
+            nowMs = 1_700_000_000_000L,
+        )
+
+        assertEquals(
+            ModelsDevSnapshot.ModelEntry("openai", "vendor/model", toolCalls = true),
+            snapshot.models.single(),
+        )
+    }
+
+    @Test
+    fun singularToolCallAliasSetsCapability() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"models":[{"id":"openai/singular-tool","reasoning":true,"tool_call":true}]}""",
+            nowMs = 1_700_000_000_000L,
+        )
+
+        assertEquals(
+            ModelsDevSnapshot.ModelEntry("openai", "singular-tool", reasoning = true, toolCalls = true),
+            snapshot.models.single(),
+        )
+    }
+
+    @Test
+    fun singularFalseTakesPrecedenceOverPluralToolCallAliases() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"models":[{"id":"openai/contradictory","tool_call":false,"tool_calls":true,"tools":true}]}""",
+            nowMs = 1_700_000_000_000L,
+        )
+
+        assertEquals(false, snapshot.models.single().toolCalls)
+    }
+
+    @Test
+    fun legacyQualifiedIdsSplitOnlyAtFirstSlashAndUnqualifiedIdsStayUnscoped() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"models":[
+                |{"id":"openrouter/vendor/model","tools":true},
+                |{"id":"freeform-model","tool_calls":true}
+                |]}""".trimMargin(),
+            nowMs = 1_700_000_000_000L,
+        )
+
+        assertEquals(
+            listOf(
+                ModelsDevSnapshot.ModelEntry("openrouter", "vendor/model", toolCalls = true),
+                ModelsDevSnapshot.ModelEntry(null, "freeform-model", toolCalls = true),
+            ),
+            snapshot.models,
+        )
+        assertEquals(
+            listOf("vendor/model"),
+            ModelsDevSnapshot.mergeForProvider(emptyList(), snapshot, "openrouter"),
+        )
     }
 
     @Test
@@ -115,17 +198,16 @@ class ModelsDevSnapshotTest {
     }
 
     @Test
-    fun mergeUnionsLiveAndSnapshot() {
+    fun mergeForProviderAddsOnlyMatchingWireIds() {
         val snapshot = ModelsDevSnapshot.parse(fixtureBody(), nowMs = 1_700_000_000_000L)
-        val merged = ModelsDevSnapshot.merge(listOf("custom/local"), snapshot)
+        val merged = ModelsDevSnapshot.mergeForProvider(listOf("live-model"), snapshot, "openai")
         assertEquals(
-            listOf(
-                "custom/local",
-                "openai/gpt-4o-mini",
-                "anthropic/claude-haiku-4-5",
-                "google/gemini-2-flash",
-            ),
+            listOf("live-model", "gpt-4o-mini"),
             merged,
+        )
+        assertEquals(
+            listOf("live-model"),
+            ModelsDevSnapshot.mergeForProvider(listOf("live-model"), snapshot, null),
         )
     }
 }

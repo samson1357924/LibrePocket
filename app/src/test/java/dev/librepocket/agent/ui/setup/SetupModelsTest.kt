@@ -62,7 +62,7 @@ class SetupModelsTest {
 
     private fun newVm(
         fake: FakeModelProvider = FakeModelProvider(),
-        directoryBody: String = """{"models": [{"id": "snap-a", "reasoning": false, "tool_calls": true}]}""",
+        directoryBody: String = """{"openai":{"models":{"snap-a":{"reasoning":false,"tool_call":true}}}}""",
     ): SetupViewModel {
         val dir = Files.createTempDirectory("setup-models-test").toFile()
         tmpDirs.add(dir)
@@ -127,7 +127,7 @@ class SetupModelsTest {
         awaitModelsIdle(vm)
         val options = vm.form.value.modelOptions
         assertEquals("gpt-4o-mini", options.first())
-        assertTrue(options.contains("anthropic/claude-haiku-4-5"))
+        assertEquals(listOf("gpt-4o-mini"), options)
     }
 
     @Test

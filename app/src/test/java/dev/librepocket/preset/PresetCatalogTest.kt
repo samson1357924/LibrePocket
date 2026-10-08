@@ -172,50 +172,129 @@ class PresetCatalogTest {
     }
 
     @Test
-    fun snapshotMergeKeepsDefaultModelLiveFirst() {
-        val snapshot = ModelsDevSnapshot.parse(
-            """{"models":[
-                |{"id":"openai/gpt-4o-mini","reasoning":false,"tools":true},
-                |{"id":"anthropic/claude-haiku-4-5","reasoning":false,"tools":true},
-                |{"id":"google/gemini-2-flash","reasoning":true,"tools":true}
-                |]}""".trimMargin(),
-            nowMs = 1_700_000_000_000L,
-        )
-        // openai 預設模型置首，live 其次，快照補齊且不重複。
+    fun snapshotProjectionKeepsDefaultAndLiveFirstWithBareWireIds() {
+        val snapshot = fourProviderCandidatesSnapshot()
         val merged = ProviderCatalog.listedModels(
             presetId = ProviderCatalog.OPENAI_ID,
             liveModelIds = listOf("my-live-model"),
             snapshot = snapshot,
         )
-        assertEquals("gpt-4o-mini", merged[0])
-        assertEquals("my-live-model", merged[1])
-        assertTrue(merged.contains("openai/gpt-4o-mini"))
-        assertTrue(merged.contains("anthropic/claude-haiku-4-5"))
-        assertTrue(merged.contains("google/gemini-2-flash"))
+        assertEquals(
+            listOf("gpt-4o-mini", "my-live-model", "wire-openai-a", "wire-openai-b"),
+            merged,
+        )
         assertEquals(merged.size, merged.distinct().size)
 
-        // live 已含預設模型時不重複置首。
+        // A live default is not duplicated or moved behind another live ID.
         val merged2 = ProviderCatalog.listedModels(
             presetId = ProviderCatalog.OPENAI_ID,
             liveModelIds = listOf("gpt-4o-mini", "my-live-model"),
             snapshot = snapshot,
         )
         assertEquals(listOf("gpt-4o-mini", "my-live-model"), merged2.take(2))
+    }
 
-        // custom 無預設模型：直接複用快照合併語義。
-        val mergedCustom = ProviderCatalog.listedModels(
-            presetId = ProviderCatalog.CUSTOM_ID,
-            liveModelIds = listOf("custom/local"),
-            snapshot = snapshot,
+    private fun fourProviderCandidatesSnapshot(): ModelsDevSnapshot.Snapshot = ModelsDevSnapshot.parse(
+        """{"models":[
+            |{"id":"openai/wire-openai-a","reasoning":false,"tool_calls":true},
+            |{"id":"openai/wire-openai-b","reasoning":true,"tool_calls":false},
+            |{"id":"anthropic/wire-anthropic-a","reasoning":true,"tool_calls":false},
+            |{"id":"anthropic/wire-anthropic-b","reasoning":false,"tool_calls":true}
+            |]}""".trimMargin(),
+        nowMs = 1_700_000_000_000L,
+    )
+
+    @Test
+    fun openAiProjectionUsesBareWireIdsAndExcludesOtherProviders() {
+        val models = ProviderCatalog.listedModels(
+            presetId = ProviderCatalog.OPENAI_ID,
+            liveModelIds = listOf("openai-live"),
+            snapshot = fourProviderCandidatesSnapshot(),
         )
+
+        assertEquals(
+            listOf("gpt-4o-mini", "openai-live", "wire-openai-a", "wire-openai-b"),
+            models,
+        )
+    }
+
+    @Test
+    fun anthropicProjectionUsesBareWireIdsAndExcludesOtherProviders() {
+        val models = ProviderCatalog.listedModels(
+            presetId = ProviderCatalog.ANTHROPIC_ID,
+            liveModelIds = listOf("anthropic-live"),
+            snapshot = fourProviderCandidatesSnapshot(),
+        )
+
         assertEquals(
             listOf(
-                "custom/local",
-                "openai/gpt-4o-mini",
-                "anthropic/claude-haiku-4-5",
-                "google/gemini-2-flash",
+                "claude-haiku-4-5",
+                "anthropic-live",
+                "wire-anthropic-a",
+                "wire-anthropic-b",
             ),
-            mergedCustom,
+            models,
         )
+    }
+
+    @Test
+    fun customProjectionKeepsOnlyLiveModels() {
+        val models = ProviderCatalog.listedModels(
+            presetId = ProviderCatalog.CUSTOM_ID,
+            liveModelIds = listOf("custom-live"),
+            snapshot = fourProviderCandidatesSnapshot(),
+        )
+
+        assertEquals(listOf("custom-live"), models)
+    }
+
+    @Test
+    fun onlyExplicitlyMappedPresetsProjectDirectoryCandidates() {
+        assertEquals("openai", ProviderCatalog.requirePreset(ProviderCatalog.OPENAI_ID).modelsDevProviderId)
+        assertEquals("anthropic", ProviderCatalog.requirePreset(ProviderCatalog.ANTHROPIC_ID).modelsDevProviderId)
+        assertEquals("google", ProviderCatalog.requirePreset(ProviderCatalog.GEMINI_ID).modelsDevProviderId)
+        assertNull(ProviderCatalog.requirePreset(ProviderCatalog.XAI_ID).modelsDevProviderId)
+        assertNull(ProviderCatalog.requirePreset(ProviderCatalog.OPENROUTER_ID).modelsDevProviderId)
+        assertNull(ProviderCatalog.requirePreset(ProviderCatalog.CUSTOM_ID).modelsDevProviderId)
+    }
+
+    @Test
+    fun geminiMapsToGoogleAndNestedWireIdsWithSlashesStayVerbatim() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"google":{"models":{"vendor/model":{"id":"ignored","tool_call":true}}}}""",
+            nowMs = 1_700_000_000_000L,
+        )
+
+        val models = ProviderCatalog.listedModels(
+            presetId = ProviderCatalog.GEMINI_ID,
+            liveModelIds = listOf("gemini-live"),
+            snapshot = snapshot,
+        )
+
+        assertEquals(listOf("gemini-2.0-flash", "gemini-live", "vendor/model"), models)
+    }
+
+    @Test
+    fun unmappedPresetKeepsDefaultAndLiveWithoutDirectoryProjection() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"models":[
+                |{"id":"openrouter/vendor/model","tool_calls":true},
+                |{"id":"xai/grok-4","tool_calls":true}
+                |]}""".trimMargin(),
+            nowMs = 1_700_000_000_000L,
+        )
+        val models = ProviderCatalog.listedModels(
+            presetId = ProviderCatalog.OPENROUTER_ID,
+            liveModelIds = listOf("openrouter-live"),
+            snapshot = snapshot,
+        )
+        val xaiModels = ProviderCatalog.listedModels(
+            presetId = ProviderCatalog.XAI_ID,
+            liveModelIds = listOf("xai-live"),
+            snapshot = snapshot,
+        )
+
+        assertEquals(listOf("openrouter/auto", "openrouter-live"), models)
+        assertEquals(listOf("grok-3-mini", "xai-live"), xaiModels)
     }
 }

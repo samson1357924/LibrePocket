@@ -3,6 +3,7 @@ package dev.librepocket.models
 import dev.librepocket.provider.MiniJson
 import dev.librepocket.provider.arr
 import dev.librepocket.provider.bool
+import dev.librepocket.provider.obj
 import dev.librepocket.provider.string
 import dev.librepocket.provider.validateBaseUrl
 
@@ -14,7 +15,8 @@ import dev.librepocket.provider.validateBaseUrl
  *   injectable [fetcher] (no Android, no OkHttp dependency here; the caller
  *   supplies transport). Non-https URLs, oversize bodies and parse failures
  *   all fall back to [bundledSnapshot].
- * - [merge] unions a live provider listing with snapshot candidates.
+ * - [mergeForProvider] adds only candidates belonging to an explicit directory
+ *   provider identity, and exposes their wire IDs unchanged.
  *
  * The fetcher must not send any Authorization header (SPEC §10.3: reading the
  * directory carries no key); see [fetchSnapshot] docs for the assertion hook.
@@ -25,7 +27,8 @@ object ModelsDevSnapshot {
     const val CACHE_TTL_MS = 24L * 60 * 60 * 1000
 
     data class ModelEntry(
-        val id: String, // "provider/model"
+        val providerId: String?,
+        val wireId: String,
         val reasoning: Boolean = false,
         val toolCalls: Boolean = false,
     )
@@ -36,16 +39,18 @@ object ModelsDevSnapshot {
     fun bundledSnapshot(nowMs: Long = System.currentTimeMillis()): Snapshot = Snapshot(
         fetchedAt = nowMs,
         models = listOf(
-            ModelEntry("openai/gpt-4o-mini", reasoning = false, toolCalls = true),
-            ModelEntry("anthropic/claude-haiku-4-5", reasoning = false, toolCalls = true),
-            ModelEntry("google/gemini-2-flash", reasoning = true, toolCalls = true),
+            ModelEntry("openai", "gpt-4o-mini", reasoning = false, toolCalls = true),
+            ModelEntry("anthropic", "claude-haiku-4-5", reasoning = false, toolCalls = true),
+            ModelEntry("google", "gemini-2-flash", reasoning = true, toolCalls = true),
         ),
     )
 
     /**
-     * Parse a models.dev directory body. Accepts the upstream shape
-     * `{ "models": [ {"id": "...", "reasoning": bool, ...} ] }` plus a flat
-     * array fallback. Malformed entries are skipped, never fatal.
+     * Parse either the nested provider/model dictionary or the legacy flat
+     * `{ "models": [ {"id": "provider/model", ...} ] }` / array forms.
+     * For nested dictionaries, the model dictionary key is the verbatim wire
+     * ID, even when it contains `/`. For legacy IDs only, the first slash
+     * separates provider identity from wire ID. Malformed entries are skipped.
      */
     fun parse(body: String, nowMs: Long = System.currentTimeMillis()): Snapshot {
         val root = try {
@@ -53,25 +58,62 @@ object ModelsDevSnapshot {
         } catch (e: MiniJson.MiniJsonException) {
             throw SnapshotException("MODELS_SNAPSHOT_PARSE", e)
         }
-        val items: List<MiniJson.J> = when (root) {
-            is MiniJson.JObj -> root.arr("models")?.items ?: throw SnapshotException("MODELS_SNAPSHOT_SHAPE")
-            is MiniJson.JArr -> root.items
+
+        val entries = when (root) {
+            is MiniJson.JArr -> parseLegacyEntries(root.items)
+            is MiniJson.JObj -> {
+                val legacyItems = root.arr("models")
+                if (legacyItems != null) {
+                    parseLegacyEntries(legacyItems.items)
+                } else {
+                    parseProviderDirectory(root)
+                }
+            }
             else -> throw SnapshotException("MODELS_SNAPSHOT_SHAPE")
-        }
-        val entries = ArrayList<ModelEntry>()
-        for (item in items) {
-            val obj = item as? MiniJson.JObj ?: continue
-            val id = obj.string("id") ?: continue
-            entries.add(
-                ModelEntry(
-                    id = id,
-                    reasoning = obj.bool("reasoning") == true,
-                    toolCalls = obj.bool("tool_calls") == true || obj.bool("tools") == true,
-                ),
-            )
         }
         return Snapshot(nowMs, entries)
     }
+
+    private fun parseLegacyEntries(items: List<MiniJson.J>): List<ModelEntry> {
+        val entries = ArrayList<ModelEntry>()
+        for (item in items) {
+            val obj = item as? MiniJson.JObj ?: continue
+            val id = obj.string("id")?.takeIf { it.isNotBlank() } ?: continue
+            val slash = id.indexOf('/')
+            val isQualified = slash > 0 && slash < id.lastIndex
+            val providerId = if (isQualified) id.substring(0, slash) else null
+            val wireId = if (isQualified) id.substring(slash + 1) else id
+            entries.add(modelEntry(providerId, wireId, obj))
+        }
+        return entries
+    }
+
+    private fun parseProviderDirectory(root: MiniJson.JObj): List<ModelEntry> {
+        val entries = ArrayList<ModelEntry>()
+        var hasProviderModelsObject = false
+        for ((providerId, providerValue) in root.map) {
+            val provider = providerValue as? MiniJson.JObj ?: continue
+            val models = provider.obj("models") ?: continue
+            hasProviderModelsObject = true
+            for ((wireId, modelValue) in models.map) {
+                val model = modelValue as? MiniJson.JObj ?: continue
+                if (providerId.isBlank() || wireId.isBlank()) continue
+                // Nested dictionary keys are already wire IDs; do not split or
+                // infer them from metadata, including when they contain '/'.
+                entries.add(modelEntry(providerId, wireId, model))
+            }
+        }
+        if (!hasProviderModelsObject) throw SnapshotException("MODELS_SNAPSHOT_SHAPE")
+        return entries
+    }
+
+    private fun modelEntry(providerId: String?, wireId: String, obj: MiniJson.JObj): ModelEntry = ModelEntry(
+        providerId = providerId,
+        wireId = wireId,
+        reasoning = obj.bool("reasoning") == true,
+        toolCalls = obj.bool("tool_call")
+            ?: (obj.bool("tool_calls") == true || obj.bool("tools") == true),
+    )
 
     /**
      * Fetch with fallback. [fetcher] performs `GET(url)` and returns the body;
@@ -97,11 +139,16 @@ object ModelsDevSnapshot {
         }
     }
 
-    /** Union live ids with snapshot candidates (live first, snapshot order kept). */
-    fun merge(liveModelIds: List<String>, snapshot: Snapshot): List<String> {
+    /** Add matching provider wire IDs after live IDs, preserving stable order. */
+    fun mergeForProvider(
+        liveModelIds: List<String>,
+        snapshot: Snapshot,
+        providerId: String?,
+    ): List<String> {
         val out = ArrayList<String>(liveModelIds)
+        if (providerId == null) return out
         for (entry in snapshot.models) {
-            if (!out.contains(entry.id)) out.add(entry.id)
+            if (entry.providerId == providerId && entry.wireId !in out) out.add(entry.wireId)
         }
         return out
     }

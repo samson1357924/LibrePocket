@@ -46,7 +46,7 @@ data class TurnRetryConfig(
     retryDelaysMs.getOrElse(retryIndex - 1) { retryDelaysMs.lastOrNull() ?: 0L }
 }
 
-private data class PendingSteer(val text: String, val images: List<ChatImageRef>)
+private data class PendingSteer(val opId: Long?, val text: String, val images: List<ChatImageRef>)
 
 /** Explicit acknowledgment for [TurnController.startOrEnqueue]. */
 sealed interface TurnStart {
@@ -236,13 +236,23 @@ class TurnController(
    * [IllegalStateException] before return means NOT accepted. Unlike
    * [steer], the idle path never fire-and-forgets: callers always get an
    * explicit acknowledgment.
+   *
+   * N1 ownership: [TurnStart.Queued] is NOT acceptance (no gate, no append).
+   * The caller keeps owning the text — pass [opId] so endpoint teardown can
+   * reclaim it via [drainQueued] instead of losing it in [close]. Queued
+   * intents are never auto-resent to a new endpoint; draining only surfaces
+   * them for explicit user recovery.
    */
-  suspend fun startOrEnqueue(text: String, images: List<ChatImageRef> = emptyList()): TurnStart {
+  suspend fun startOrEnqueue(
+    text: String,
+    images: List<ChatImageRef> = emptyList(),
+    opId: Long? = null,
+  ): TurnStart {
     require(text.isNotBlank()) { "text must not be blank" }
     synchronized(lock) {
       check(!closed) { "controller is closed" }
       if (activeLocked() != null) {
-        enqueueLocked(text, images)
+        enqueueLocked(opId, text, images)
         return TurnStart.Queued
       }
     }
@@ -252,7 +262,7 @@ class TurnController(
       if (activeLocked() != null) {
         // Lost the race during the gate: queue instead of throwing, so the
         // caller still gets an explicit acceptance signal.
-        enqueueLocked(text, images)
+        enqueueLocked(opId, text, images)
         return TurnStart.Queued
       }
       appendUser(text)
@@ -275,7 +285,7 @@ class TurnController(
       check(!closed) { "controller is closed" }
       if (activeLocked() != null) {
         // Never cancel the current turn: queue for the next round (FIFO).
-        enqueueLocked(text, emptyList())
+        enqueueLocked(null, text, emptyList())
         return
       }
     }
@@ -290,6 +300,10 @@ class TurnController(
   }
 
   fun close() {
+    // Drop the FIFO under the same lock that seals the controller, so no
+    // admission can slip in between reclaim and seal. Callers that must keep
+    // unstarted work (endpoint-switch recovery) drain it explicitly via
+    // drainQueued() BEFORE close().
     synchronized(lock) {
       if (closed) return
       closed = true
@@ -309,10 +323,26 @@ class TurnController(
   // ---- internals ----
 
   /** Caller must hold [lock]. Enqueues a follow-up and projects the count. */
-  private fun enqueueLocked(text: String, images: List<ChatImageRef>) {
-    steerQueue.addLast(PendingSteer(text, images))
+  private fun enqueueLocked(opId: Long?, text: String, images: List<ChatImageRef>) {
+    steerQueue.addLast(PendingSteer(opId, text, images))
     _uiState.update { it.copy(pendingSteerCount = steerQueue.size) }
     fireTranscript { transcript.onSteerQueued(text) }
+  }
+
+  /**
+   * Reclaim queued-but-unstarted intents FIFO (N1). Returns the intents in
+   * queue order and clears the FIFO without starting anything. The caller
+   * owns them afterwards: surface for explicit user recovery, never
+   * auto-resend. Safe to call on a closed controller (drains the remainder).
+   */
+  fun drainQueued(): List<QueuedIntent> {
+    synchronized(lock) {
+      if (steerQueue.isEmpty()) return emptyList()
+      val out = steerQueue.map { QueuedIntent(it.opId, it.text) }
+      steerQueue.clear()
+      _uiState.update { it.copy(pendingSteerCount = 0) }
+      return out
+    }
   }
 
   private suspend fun gateOrThrow() {

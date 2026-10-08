@@ -34,8 +34,23 @@ interface ChatSession {
    * busy check and the FIFO insert share one lock, so the verdict is never
    * stale. Prefer over start-then-steer fallback sequences, whose two checks
    * can straddle a turn completing (Q1).
+   *
+   * N1 ownership: pass the caller's operation id as [opId] so a [TurnStart.Queued]
+   * verdict stays reclaimable via [drainQueued]. Queued is NOT acceptance.
    */
-  suspend fun startOrEnqueue(text: String, images: List<ChatImageRef> = emptyList()): TurnStart
+  suspend fun startOrEnqueue(
+    text: String,
+    images: List<ChatImageRef> = emptyList(),
+    opId: Long? = null,
+  ): TurnStart
+
+  /**
+   * Reclaim queued-but-unstarted intents FIFO without starting anything (N1).
+   * Endpoint teardown drains this BEFORE [close] so queued text stays
+   * recoverable; explicit discards (newChat/open/logout) skip the drain and
+   * let [close] drop the FIFO.
+   */
+  fun drainQueued(): List<QueuedIntent>
 
   /** Cancel the in-flight turn; UI must stop updating within 200ms. */
   fun cancel()

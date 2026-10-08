@@ -212,12 +212,13 @@ class ChatSessionLifecycleTest {
         }
     }
 
-    // Q1: a second send while the first turn runs gets one atomic Queued
-    // verdict (never a stale idle fire-and-forget). The queued follow-up
-    // belongs to the live turn scope: an endpoint switch tears it down with
-    // the session instead of resurrecting it as unsent input.
+    // N1: a second send while the first turn runs gets one atomic Queued
+    // verdict (never a stale idle fire-and-forget). Queued is NOT acceptance,
+    // so an endpoint switch reclaims the queued text into the recoverable
+    // outbox instead of dropping it with the session FIFO (never auto-sent
+    // to the new endpoint).
     @Test
-    fun busySecondSendQueuesOnceAndSwitchTearsDownWithoutRestore() = runBlocking {
+    fun busySecondSendQueuedTextIsRecoverableAfterEndpointSwitch() = runBlocking {
         val store = newStore()
         store.save(endpoint())
         val sessions = ControlledSessions()
@@ -236,10 +237,160 @@ class ChatSessionLifecycleTest {
 
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { live.closed.await() }
-            assertEquals("", vm.input.value)
-            assertNull(vm.notice.value)
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            // Queued-but-unstarted "second" never ran and never reached the
+            // new endpoint: it fills the blank box for explicit recovery.
+            assertEquals("second", vm.input.value)
             assertEquals(listOf("first"), live.sent.toList())
             assertEquals(1, sessions.createCalls)
+        } finally {
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // N1 negative control: newer typing is never overwritten by reclaimed
+    // queued text; the queued intent waits in the outbox instead.
+    @Test
+    fun queuedTextReclaimedToOutboxWhenInputBusyAfterEndpointSwitch() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.hostEntered.await() }
+
+            chatMain.run { vm.sendDirect("second") }
+            withTimeout(5_000) { live.steerReceived.await() }
+            chatMain.run { vm.onInputChange("new typing") }
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { live.closed.await() }
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            assertEquals("new typing", vm.input.value)
+            assertEquals(1, vm.pendingRecoveryCount.value)
+            // Explicit restore path still returns the queued text untouched.
+            chatMain.run { vm.onInputChange("") }
+            var restored = false
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertTrue(restored)
+            assertEquals("second", vm.input.value)
+            assertEquals(listOf("first"), live.sent.toList())
+        } finally {
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // N1 opId isolation: two queued sends with identical text stay two
+    // distinct recoverable entries (no string-equality merge, no cross-clear);
+    // nothing is auto-sent to the new endpoint.
+    @Test
+    fun multipleQueuedSameTextStayIsolatedAfterSwitch() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.hostEntered.await() }
+
+            chatMain.run { vm.sendDirect("same") }
+            chatMain.run { vm.sendDirect("same") }
+            // steerReceived is single-shot; poll the FIFO record for both.
+            withTimeout(5_000) { while (live.steered.size < 2) delay(1) }
+            assertEquals(listOf("same", "same"), live.steered.toList())
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { live.closed.await() }
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            assertEquals("same", vm.input.value)
+            assertEquals(1, vm.pendingRecoveryCount.value)
+            // The second identical text surfaces next: two opIds, not one.
+            chatMain.run { vm.onInputChange("") }
+            var restored = false
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertTrue(restored)
+            assertEquals("same", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(listOf("first"), live.sent.toList())
+            assertEquals(1, sessions.createCalls)
+        } finally {
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // N1 FIFO order: distinct queued texts surface in queue order after the
+    // switch (oldest fills the box, the rest wait in the outbox).
+    @Test
+    fun multipleQueuedTextsSurfaceInQueueOrderAfterSwitch() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.hostEntered.await() }
+
+            chatMain.run { vm.sendDirect("second") }
+            chatMain.run { vm.sendDirect("third") }
+            withTimeout(5_000) { while (live.steered.size < 2) delay(1) }
+            assertEquals(listOf("second", "third"), live.steered.toList())
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { live.closed.await() }
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            assertEquals("second", vm.input.value)
+            assertEquals(1, vm.pendingRecoveryCount.value)
+            chatMain.run { vm.onInputChange("") }
+            var restored = false
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertTrue(restored)
+            assertEquals("third", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(listOf("first"), live.sent.toList())
+            assertEquals(1, sessions.createCalls)
+        } finally {
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // N1 explicit-discard control: newChat (no endpoint switch) drops the
+    // queued FIFO with the session instead of reclaiming it.
+    @Test
+    fun queuedTextDroppedOnExplicitNewChat() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.hostEntered.await() }
+
+            chatMain.run { vm.sendDirect("second") }
+            withTimeout(5_000) { live.steerReceived.await() }
+
+            chatMain.run { vm.newChat() }
+            withTimeout(5_000) { live.closed.await() }
+            assertEquals("", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertNull(vm.notice.value)
+            assertEquals(listOf("first"), live.sent.toList())
         } finally {
             releaseTurn.complete(Unit)
             chatMain.run { vm.newChat() }
@@ -1467,15 +1618,19 @@ class ChatSessionLifecycleTest {
         /**
          * Mirrors TurnController.startOrEnqueue: the busy check and the FIFO
          * record share one lock per check, and a post-gate busy race queues
-         * instead of throwing (never fire-and-forget).
+         * instead of throwing (never fire-and-forget). N1: the FIFO keeps the
+         * caller opId so endpoint teardown can reclaim queued text via
+         * drainQueued(); close() drops the remainder like production.
          */
         override suspend fun startOrEnqueue(
             text: String,
             images: List<dev.librepocket.chat.ChatImageRef>,
+            opId: Long?,
         ): dev.librepocket.chat.TurnStart {
             synchronized(this) {
                 check(!closedFlag) { "closed" }
                 if (busy) {
+                    fakeQueue.addLast(FakeQueued(opId, text))
                     recordQueuedSteer(text)
                     return dev.librepocket.chat.TurnStart.Queued
                 }
@@ -1485,11 +1640,21 @@ class ChatSessionLifecycleTest {
             } catch (_: IllegalStateException) {
                 synchronized(this) {
                     check(!closedFlag) { "closed" }
+                    fakeQueue.addLast(FakeQueued(opId, text))
                     recordQueuedSteer(text)
                     return dev.librepocket.chat.TurnStart.Queued
                 }
             }
         }
+
+        override fun drainQueued(): List<dev.librepocket.chat.QueuedIntent> = synchronized(this) {
+            val out = fakeQueue.map { dev.librepocket.chat.QueuedIntent(it.opId, it.text) }
+            fakeQueue.clear()
+            out
+        }
+
+        private data class FakeQueued(val opId: Long?, val text: String)
+        private val fakeQueue = ArrayDeque<FakeQueued>()
 
         private fun recordQueuedSteer(text: String) {
             steered.add(text)
@@ -1582,6 +1747,7 @@ class ChatSessionLifecycleTest {
                 if (closedFlag) return
                 closedFlag = true
                 closeCalls.incrementAndGet()
+                fakeQueue.clear()
                 closed.complete(Unit)
             }
             hosted?.cancel()

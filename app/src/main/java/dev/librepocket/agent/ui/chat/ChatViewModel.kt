@@ -252,13 +252,15 @@ class ChatViewModel(
                         // Q1: single atomic admission. startOrEnqueue decides
                         // start-vs-queue under the controller's lock, so the
                         // verdict is never stale: Started owns the text
-                        // (remove + join), Queued owns it in the FIFO
-                        // (remove + return). Anything thrown before either
-                        // verdict leaves the op for invalidate/restore.
+                        // (remove + join), Queued stays owned by the caller
+                        // (remove + return, reclaimable via drainQueued on
+                        // endpoint teardown — see invalidateForEndpointChange).
+                        // Anything thrown before either verdict leaves the op
+                        // for invalidate/restore.
                         // Never treat a bare steer() return as acceptance:
                         // its idle path is fire-and-forget pre-gate.
                         val started = try {
-                            handle.created.session.startOrEnqueue(clean)
+                            handle.created.session.startOrEnqueue(clean, opId = opId)
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (_: IllegalStateException) {
@@ -365,13 +367,14 @@ class ChatViewModel(
                         // stranding on the stale generation.
                         pendingOps[opId] = PendingOp(opId, handle.generation, text)
                         // Q1: single atomic admission (see steer() above).
-                        // Started owns the text (remove + join); Queued owns
-                        // it in the FIFO (remove + return). Anything thrown
-                        // before either verdict leaves the op for
+                        // Started owns the text (remove + join); Queued stays
+                        // owned by the caller (remove + return, reclaimable
+                        // via drainQueued on endpoint teardown). Anything
+                        // thrown before either verdict leaves the op for
                         // invalidate/restore. Never treat a bare steer()
                         // return as acceptance.
                         val started = try {
-                            handle.created.session.startOrEnqueue(text)
+                            handle.created.session.startOrEnqueue(text, opId = opId)
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (_: IllegalStateException) {
@@ -602,13 +605,22 @@ class ChatViewModel(
 
         // A mismatched live session is closed before any replacement work, so
         // it cannot keep sending to the old host during endpoint migration.
+        // N1: reclaim its queued-but-unstarted FIFO first (same ownership as
+        // the invalidate path); the current op stays in pendingOps and is
+        // never touched here.
         if (currentSession != null) {
+            val queuedBeforeReplace: List<dev.librepocket.chat.QueuedIntent> = try {
+                currentSession?.drainQueued() ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
             lifecycleGeneration += 1
             generation = lifecycleGeneration
             // F2: keep visible transcript when the transport is replaced.
             snapshotLiveToHistory()
             closeLive()
             _sessionState.value = EMPTY_SESSION_STATE
+            absorbDrainedQueued(queuedBeforeReplace, fillInput = false, includePending = false)
         }
 
         val previousSessionId = _currentSessionId.value
@@ -768,6 +780,16 @@ class ChatViewModel(
      */
     private fun invalidateForEndpointChange(binding: EndpointSessionBinding?) {
         observedBinding = binding
+        // N1: reclaim queued-but-unstarted intents BEFORE close() drops the
+        // FIFO. Queued is not acceptance, so the caller still owns the text:
+        // it joins the recoverable outbox below (never auto-resent).
+        // Drained before the generation bump so a racing admission cannot
+        // slip in unnoticed between reclaim and close on this thread.
+        val queuedFromSession: List<dev.librepocket.chat.QueuedIntent> = try {
+            currentSession?.drainQueued() ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
         lifecycleGeneration += 1
         cancelLifecycleOperations()
         openJob?.cancel()
@@ -791,19 +813,64 @@ class ChatViewModel(
             // never auto-sent to the new binding. The oldest fills an empty
             // box; newer typing is never overwritten; the rest wait in
             // recoverableOps and surface one-by-one after each explicit send.
-            if (pendingOps.isNotEmpty()) {
-                for ((_, op) in pendingOps) recoverableOps.addLast(op)
-                pendingOps.clear()
-                syncRecoveryCount()
-                if (_input.value.isBlank()) {
-                    recoverableOps.removeFirstOrNull()?.let { setInput(it.text, it.opId, it.text) }
-                    syncRecoveryCount()
-                }
-                _notice.value = "SEND_CANCELLED_ENDPOINT_CHANGED"
-            } else {
+            // N1: queued-but-unstarted intents reclaimed above join the same
+            // outbox via absorbDrainedQueued (canonical FIFO = opId creation
+            // order; never auto-sent).
+            val hadUnaccepted = pendingOps.isNotEmpty() || queuedFromSession.isNotEmpty()
+            if (!hadUnaccepted) {
                 _notice.value = null
+            } else {
+                absorbDrainedQueued(queuedFromSession, fillInput = true)
+                _notice.value = "SEND_CANCELLED_ENDPOINT_CHANGED"
             }
         }
+    }
+
+    /**
+     * Merge reclaimed queued intents plus still-pending pre-accept ops into
+     * [recoverableOps] FIFO (N1/R2). Canonical order is opId creation order:
+     * both [pendingOps] insertion order and per-op incrementing ids agree on
+     * it, so a post-gate admission race cannot reorder the outbox. Returns
+     * true when anything became recoverable. Idempotent per opId within and
+     * across calls (never duplicates entries already in [recoverableOps] or
+     * the tagged input box; stale pending entries shadowed by those are
+     * dropped). Moved entries are re-stamped to the current generation so a
+     * later idempotent re-arm still sees them as current. When [fillInput] is
+     * false the box is left untouched for the caller to surface later
+     * (transport replacement mid-send); the badge count still reflects the
+     * outbox. When [includePending] is false only the drained queue moves and
+     * [pendingOps] is never touched (the transport-replace path, whose
+     * triggering op is still alive in [pendingOps]).
+     */
+    private fun absorbDrainedQueued(
+        drained: List<dev.librepocket.chat.QueuedIntent>,
+        fillInput: Boolean,
+        includePending: Boolean = true,
+    ): Boolean {
+        val seen = HashSet<Long>(recoverableOps.size + drained.size + 1)
+        for (existing in recoverableOps) seen.add(existing.opId)
+        inputDraft?.let { seen.add(it.opId) }
+        val reclaimed = ArrayList<PendingOp>(drained.size)
+        for (queued in drained) {
+            val id = queued.opId ?: ++nextOpId
+            if (!seen.add(id)) continue
+            reclaimed.add(PendingOp(id, lifecycleGeneration, queued.text))
+        }
+        val movedPending = if (includePending) {
+            pendingOps.values.filter { seen.add(it.opId) }
+                .map { if (it.generation == lifecycleGeneration) it else it.copy(generation = lifecycleGeneration) }
+        } else {
+            emptyList()
+        }
+        if (includePending) pendingOps.clear()
+        val merged = (movedPending + reclaimed).sortedBy { it.opId }
+        for (op in merged) recoverableOps.addLast(op)
+        syncRecoveryCount()
+        if (fillInput && merged.isNotEmpty() && _input.value.isBlank()) {
+            recoverableOps.removeFirstOrNull()?.let { setInput(it.text, it.opId, it.text) }
+            syncRecoveryCount()
+        }
+        return merged.isNotEmpty()
     }
 
     private fun invalidateLifecycle(clearChat: Boolean) {

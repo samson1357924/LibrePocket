@@ -15,7 +15,8 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
 `.github/workflows/pr-check.yml`) and `policy`
 (`scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
-`scripts/tests/test_apk_policy_check.py`) outputs. `docs-guard` always runs the
+`scripts/tests/test_apk_policy_check.py`,
+`.github/workflows/pr-check.yml`) outputs. `docs-guard` always runs the
 static grep guard `scripts/docs_claim_check.sh` (no Gradle, no emulator);
 `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
 stage as pass only when the corresponding `changes` output is explicitly
@@ -31,7 +32,7 @@ What runs by edit type:
 
 - Docs-only (neither `code` nor `policy`, e.g. `docs/**` or `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.
 - Policy-script-only (any `policy` path edit, `code == false`): build/policy and the stdlib Python policy harness run; unit tests and lint are skipped and resolved as pass by `pr-gate`. A scanner-only diff (`scripts/apk_policy_inspect.py` or `scripts/tests/test_apk_policy_check.py`) therefore cannot pass with all policy validation skipped.
-- Workflow-only edit to `pr-check.yml`: counts as `code`, so all Gradle stages run.
+- Workflow-only edit to `pr-check.yml`: counts as both `code` and `policy`, so all Gradle stages plus the Python policy harness run. The harness pin tests therefore execute exactly when the wiring they validate changes.
 - Mixed docs + code/policy edits: full Gradle stages plus `docs-guard` run.
 
 Static analysis lives outside `pr-check.yml`: CodeQL runs in

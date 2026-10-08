@@ -49,6 +49,10 @@ jobs:
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
               - 'scripts/tests/test_apk_policy_check.py'
+              # The PR workflow itself: wiring changes must run the harness
+              # tests that pin the workflow wiring (defense in depth; a
+              # workflow edit already counts as code, so Gradle stages run).
+              - '.github/workflows/pr-check.yml'
 
   unit-tests:
     name: Unit & Robolectric Tests

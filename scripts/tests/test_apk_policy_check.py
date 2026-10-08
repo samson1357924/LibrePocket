@@ -962,6 +962,7 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/play_policy_check.sh",
             "scripts/apk_policy_inspect.py",
             "scripts/tests/test_apk_policy_check.py",
+            ".github/workflows/pr-check.yml",
         ):
             with self.subTest(path=required):
                 self.assertIn(required, patterns)
@@ -972,6 +973,7 @@ class PolicyCiGateControl(unittest.TestCase):
             ["scripts/apk_policy_inspect.py"],
             ["scripts/tests/test_apk_policy_check.py"],
             ["scripts/apk_policy_inspect.py", "scripts/tests/test_apk_policy_check.py"],
+            [".github/workflows/pr-check.yml"],
         ):
             with self.subTest(diff=tuple(diff)):
                 matched = any(

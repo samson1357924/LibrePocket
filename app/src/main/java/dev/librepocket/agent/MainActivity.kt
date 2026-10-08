@@ -17,26 +17,46 @@ import dev.librepocket.entry.EntryInput
 import dev.librepocket.entry.EntryKind
 import dev.librepocket.entry.EntryNormalize
 
-class MainActivity : ComponentActivity() {
-    private var sharedText by mutableStateOf<String?>(null)
+open class MainActivity : ComponentActivity() {
+    private val entryState = mutableStateOf(EntryConsumptionState())
+    private var entryConsumptionState by entryState
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
-        sharedText = extractSharedTurnText(intent)
+        entryConsumptionState = EntryConsumptionState.restore(
+            savedInstanceState = savedInstanceState,
+            launchText = extractSharedTurnText(intent),
+        )
         enableEdgeToEdge()
+        installMainScreenContent(
+            sharedText = { entryConsumptionState.pendingText },
+            onSharedConsumed = { entryConsumptionState = entryConsumptionState.consume() },
+        )
+    }
+
+    /** Installs the production screen; overridable so lifecycle tests can fake dispatch. */
+    protected open fun installMainScreenContent(
+        sharedText: () -> String?,
+        onSharedConsumed: () -> Unit,
+    ) {
         setContent {
             LibrePocketTheme {
-                MainScreen(sharedText = sharedText, onSharedConsumed = { sharedText = null })
+                MainScreen(sharedText = sharedText(), onSharedConsumed = onSharedConsumed)
             }
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        entryConsumptionState.saveTo(outState)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         extractSharedTurnText(intent)?.let { text ->
-            sharedText = text
+            entryConsumptionState = entryConsumptionState.accept(text)
         }
     }
 

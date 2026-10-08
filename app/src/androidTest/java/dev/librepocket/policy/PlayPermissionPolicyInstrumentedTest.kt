@@ -3,13 +3,6 @@ package dev.librepocket.policy
 import android.app.AlertDialog
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
-import androidx.test.espresso.Espresso.onView
-import androidx.test.espresso.action.ViewActions.click
-import androidx.test.espresso.assertion.ViewAssertions.doesNotExist
-import androidx.test.espresso.assertion.ViewAssertions.matches
-import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
-import androidx.test.espresso.matcher.ViewMatchers.withText
-import androidx.test.espresso.matcher.RootMatchers.isDialog
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.librepocket.agent.MainActivity
 import dev.librepocket.provider.ChatCompletionsProvider
@@ -19,10 +12,11 @@ import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import java.util.concurrent.TimeUnit
-import org.hamcrest.CoreMatchers.allOf
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -60,23 +54,46 @@ class PlayPermissionPolicyInstrumentedTest {
         assertEquals(Verdict.ASK, decision.verdict)
 
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            scenario.onActivity { activity ->
-                // This AlertDialog is created by the test, not by product UI.
-                AlertDialog.Builder(activity)
-                    .setTitle("讀取 API Key？")
-                    .setMessage("將讀取該 Provider 的 API Key 以發送本次請求。")
-                    .setPositiveButton("允許", null)
-                    .setNegativeButton("拒絕", null)
-                    .create()
-                    .show()
+            // No Espresso: this fixture is designed to avoid requiring window focus.
+            // Hold the dialog reference and assert everything synchronously on
+            // the UI thread inside onActivity.
+            var dialog: AlertDialog? = null
+            try {
+                scenario.onActivity { activity ->
+                    // This AlertDialog is created by the test, not by product UI.
+                    val created = AlertDialog.Builder(activity)
+                        .setTitle("讀取 API Key？")
+                        .setMessage("將讀取該 Provider 的 API Key 以發送本次請求。")
+                        .setPositiveButton("允許", null)
+                        .setNegativeButton("拒絕", null)
+                        .create()
+                    dialog = created
+                    created.show()
+                    assertTrue(created.isShowing)
+                    assertEquals(
+                        "允許",
+                        created.getButton(AlertDialog.BUTTON_POSITIVE).text.toString(),
+                    )
+                    assertEquals(
+                        "拒絕",
+                        created.getButton(AlertDialog.BUTTON_NEGATIVE).text.toString(),
+                    )
+                    // A button click is assumed to post dismiss to the main Looper
+                    // (AlertController ButtonHandler); the dismissed state is
+                    // therefore asserted in the NEXT onActivity block, assumed
+                    // to run after the queued dismiss (same-Looper FIFO).
+                    // Assumption only — device-run pending on API 33/34.
+                    created.getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
+                }
+                scenario.onActivity {
+                    val shown = requireNotNull(dialog) { "dialog was not created" }
+                    assertFalse(shown.isShowing)
+                }
+            } finally {
+                scenario.onActivity {
+                    if (dialog?.isShowing == true) dialog?.dismiss()
+                }
             }
-            onView(allOf(withText("允許")))
-                .inRoot(isDialog())
-                .check(matches(isDisplayed()))
-            onView(allOf(withText("拒絕")))
-                .inRoot(isDialog())
-                .perform(click())
-            onView(allOf(withText("允許"))).check(doesNotExist())
         }
     }
 

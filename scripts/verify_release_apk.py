@@ -21,6 +21,7 @@ MAX_APK_BYTES = 2 * 1024 * 1024 * 1024
 MAX_TOOL_OUTPUT_BYTES = 1024 * 1024
 DEFAULT_TOOL_TIMEOUT_SECONDS = 120
 MAX_TOOL_TIMEOUT_SECONDS = 300
+_ACTIVE_TOOL_PROCESS: subprocess.Popen[bytes] | None = None
 APK_NAME = "release.apk"
 CHECKSUM_NAME = "SHA256SUMS"
 IDENTITY_NAME = "artifact-identity.json"
@@ -197,6 +198,8 @@ def _copy_candidate_snapshot(source_fd: int, stage_fd: int) -> tuple[str, os.sta
         os.fchmod(destination_fd, 0o444)
         os.fsync(destination_fd)
         staged_info = os.fstat(destination_fd)
+        if stat.S_IMODE(staged_info.st_mode) != 0o444:
+            _fail("staging filesystem did not preserve required 0444 mode for the APK")
         return digest.hexdigest(), staged_info
     finally:
         os.close(destination_fd)
@@ -223,7 +226,21 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
+def terminate_active_tool() -> None:
+    """Kill and reap the active SDK tool group when the owning pipeline stops."""
+    process = _ACTIVE_TOOL_PROCESS
+    if process is None:
+        return
+    _kill_process_group(process)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def _run_bounded(command: list[str], *, timeout_seconds: int) -> tuple[bytes, bytes]:
+    global _ACTIVE_TOOL_PROCESS
     try:
         process = subprocess.Popen(
             command,
@@ -237,6 +254,8 @@ def _run_bounded(command: list[str], *, timeout_seconds: int) -> tuple[bytes, by
         )
     except (OSError, ValueError) as exc:
         _fail(f"cannot start required tool {Path(command[0]).name}: {exc}")
+    _ACTIVE_TOOL_PROCESS = process
+    completed = False
     assert process.stdout is not None and process.stderr is not None
     selector = selectors.DefaultSelector()
     stdout = bytearray()
@@ -275,12 +294,22 @@ def _run_bounded(command: list[str], *, timeout_seconds: int) -> tuple[bytes, by
         returncode = process.wait(timeout=max(0.1, deadline - time.monotonic()))
         if returncode != 0:
             _fail(f"required tool {Path(command[0]).name} exited with status {returncode}")
+        completed = True
         return bytes(stdout), bytes(stderr)
     except subprocess.TimeoutExpired:
         _kill_process_group(process)
         process.wait()
         _fail(f"required tool timed out after {timeout_seconds} seconds")
     finally:
+        if not completed:
+            _kill_process_group(process)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if _ACTIVE_TOOL_PROCESS is process:
+            _ACTIVE_TOOL_PROCESS = None
         selector.close()
         for stream in (process.stdout, process.stderr):
             if not stream.closed:
@@ -458,6 +487,8 @@ def _write_exclusive(stage_fd: int, name: str, data: bytes) -> None:
         os.fsync(fd)
         os.fchmod(fd, 0o444)
         os.fsync(fd)
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o444:
+            _fail(f"staging filesystem did not preserve required 0444 mode for {name}")
     finally:
         os.close(fd)
 
@@ -536,6 +567,8 @@ def verify_and_stage(args: argparse.Namespace) -> dict[str, object]:
         )
         os.fchmod(stage_fd, 0o700)
         stage_info = os.fstat(stage_fd)
+        if stat.S_IMODE(stage_info.st_mode) != 0o700:
+            _fail("staging filesystem did not preserve required 0700 working-directory mode")
         snapshot_digest, apk_info = _copy_candidate_snapshot(source_fd, stage_fd)
         candidate_directory_after = os.fstat(candidate_dir_fd)
         if not _same_directory_snapshot(candidate_directory_before, candidate_directory_after):
@@ -584,6 +617,8 @@ def verify_and_stage(args: argparse.Namespace) -> dict[str, object]:
         # the integrity binding; the staged bytes are never re-copied from input.
         os.fchmod(stage_fd, 0o500)
         os.fsync(stage_fd)
+        if stat.S_IMODE(os.fstat(stage_fd).st_mode) != 0o500:
+            _fail("staging filesystem did not preserve required 0500 published-directory mode")
         return {**manifest, "stagedPath": str(staged_path)}
     except VerificationError:
         if stage_fd >= 0 and stage_info is not None:

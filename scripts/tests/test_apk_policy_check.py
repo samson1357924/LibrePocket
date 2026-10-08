@@ -996,8 +996,15 @@ class PolicyCiGateControl(unittest.TestCase):
         self.assertIn("needs: [changes, unit-tests, lint, build-and-policy-gate, policy-harness, docs-guard]", workflow)
         self.assertIn("needs.policy-harness.result", workflow)
         self.assertIn("policy-harness skipped but policy=", workflow)
+        for test_path in (
+            "scripts/tests/test_apk_policy_check.py",
+            "scripts/tests/test_release_artifact_verifier.py",
+            "scripts/tests/test_build_release_identity.py",
+        ):
+            with self.subTest(test_path=test_path):
+                self.assertIn(test_path, workflow)
         self.assertIn(
-            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py",
+            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py",
             workflow,
         )
 

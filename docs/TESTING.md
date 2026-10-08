@@ -46,15 +46,18 @@ including docs-only ones.
 No branch-protection required checks are configured on `main`; `pr-gate`
 and the checks above are informational until protection is configured.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy harness (`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py`, standard library only) runs in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 
 ## Local commands
 
 Use one Gradle execution at a time on constrained machines. The repo's maintenance guidance requires `--max-workers=1 --no-daemon`; do not run a parallel flavor matrix after an OOM.
 
 ```sh
-# Synthetic APK/DEX policy regression harness (Python standard library only)
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py
+# Synthetic APK/DEX policy and final-artifact identity harnesses (Python stdlib only)
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+  scripts/tests/test_apk_policy_check.py \
+  scripts/tests/test_release_artifact_verifier.py \
+  scripts/tests/test_build_release_identity.py
 
 # Flavor unit/Robolectric tests
 ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --max-workers=1 --no-daemon
@@ -65,13 +68,15 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_chec
 # Debug assembly
 ./gradlew :app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug --max-workers=1 --no-daemon
 
-# APK-only artifact policy checks after successful assembly; AAB is currently
-# unsupported and rejected before credentials/build by the release helper.
+# APK-only artifact policy checks after successful assembly; AAB is unsupported
+# and rejected before credentials/build by the local release builder.
 scripts/play_policy_check.sh app/build/outputs/apk/play/debug/app-play-debug.apk
 scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
 ```
 
-The synthetic Python fixtures and fake `aapt`/`dexdump` commands test bounded parser and policy behavior; they do not represent a real APK or prove Android SDK native-tool compatibility. A release/build maintainer should run the APK policy/native-parser gates against fresh debug APKs for all three flavors and record their paths, SHA-256 values, SDK build-tools version, command output, and tested commit. Do not infer a pass from historical APK inventory. These are instructions, not a claim that they were run for this documentation change. Version sources are listed in [Build Environment](ENV.md).
+The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. It remains a local staging/verification path only, not a publishing workflow or release-readiness claim.
+
+The synthetic Python fixtures and fake `aapt`/`dexdump`/`apksigner`/Gradle/policy commands test bounded parser, policy, identity, transaction, failure-cleanup, and process-cancellation behavior; they do not represent a real APK or prove Android SDK native-tool compatibility. A release/build maintainer should run the APK policy/native-parser gates against fresh debug APKs for all three flavors and record their paths, SHA-256 values, SDK build-tools version, command output, and tested commit. The separate signed-release verifier requires fresh controlled test fixtures/native-tool evidence and explicit trusted identity values; its synthetic harness alone does not establish that validation. Do not infer a pass from historical APK inventory. These are instructions, not a claim that they were run for this documentation change. Version sources are listed in [Build Environment](ENV.md).
 
 ## Android instrumented tests
 

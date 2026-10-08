@@ -49,6 +49,11 @@ jobs:
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
               - 'scripts/tests/test_apk_policy_check.py'
+              - 'scripts/build_release.sh'
+              - 'scripts/verify_release_apk.py'
+              - 'scripts/release_artifact_stage.py'
+              - 'scripts/tests/test_release_artifact_verifier.py'
+              - 'scripts/tests/test_build_release_identity.py'
               # The PR workflow itself: wiring changes must run the harness
               # tests that pin the workflow wiring (defense in depth; a
               # workflow edit already counts as code, so Gradle stages run).
@@ -130,8 +135,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run APK policy regression harness (stdlib only)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py
+      - name: Run APK policy and release-identity harnesses (stdlib only)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py
 
   build-and-policy-gate:
     name: Build & Policy Gates

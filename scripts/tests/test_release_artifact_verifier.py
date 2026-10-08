@@ -10,6 +10,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+
+from scripts import verify_release_apk as verifier
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -101,6 +104,7 @@ class ReleaseArtifactVerifierTest(unittest.TestCase):
         script = f'''#!{sys.executable}
 import os
 import pathlib
+import subprocess
 import sys
 import time
 
@@ -121,6 +125,10 @@ if BEHAVIOR == "timeout":
 elif BEHAVIOR == "output-flood":
     sys.stdout.buffer.write(b"X" * (2 * 1024 * 1024))
     sys.exit(0)
+elif BEHAVIOR.startswith("timeout-child:"):
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    pathlib.Path(BEHAVIOR.split(":", 1)[1]).write_text(str(child.pid), encoding="ascii")
+    time.sleep(120)
 elif BEHAVIOR == "mutate-staged":
     apk = pathlib.Path(args[-1])
     apk.chmod(0o644)
@@ -227,6 +235,22 @@ sys.exit({exit_code})
         if message:
             self.assertIn(message, result.stdout)
         self.assertFalse((stage or self.stage).exists(), "failed verification must not leave staged outputs")
+
+    def test_snapshot_rejects_filesystem_that_does_not_enforce_read_only_mode(self) -> None:
+        candidate = self.add_apk()
+        stage = self.tmp / "mode-check-stage"
+        stage.mkdir(mode=0o700)
+        source_fd = os.open(candidate, os.O_RDONLY)
+        stage_fd = os.open(stage, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            with mock.patch.object(verifier.os, "fchmod", return_value=None):
+                with self.assertRaisesRegex(
+                    verifier.VerificationError, "filesystem did not preserve required 0444 mode"
+                ):
+                    verifier._copy_candidate_snapshot(source_fd, stage_fd)
+        finally:
+            os.close(source_fd)
+            os.close(stage_fd)
 
     def test_valid_single_synthetic_candidate_is_verified_staged_and_checksummed(self) -> None:
         self.add_apk()
@@ -426,6 +450,34 @@ sys.exit({exit_code})
 
         self._write_apksigner(behavior="timeout")
         self.assert_rejected(self.run_verifier(timeout=1), "timed out")
+
+    def test_tool_timeout_kills_and_reaps_descendant_process_group(self) -> None:
+        self.add_apk()
+        child_pid_file = self.tmp / "timeout-child.pid"
+        self._write_apksigner(behavior=f"timeout-child:{child_pid_file}")
+
+        result = self.run_verifier(timeout=1)
+
+        self.assert_rejected(result, "timed out")
+        self.assertTrue(child_pid_file.is_file())
+        self.assert_pid_not_running(int(child_pid_file.read_text(encoding="ascii")))
+
+    @staticmethod
+    def assert_pid_not_running(pid: int) -> None:
+        import time
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            proc_stat = Path(f"/proc/{pid}/stat")
+            if not proc_stat.exists():
+                return
+            try:
+                state = proc_stat.read_text().split()[2]
+            except (FileNotFoundError, IndexError):
+                return
+            if state == "Z":
+                return
+            time.sleep(0.05)
+        raise AssertionError(f"fake tool descendant {pid} is still running")
 
     def test_expected_fingerprint_must_be_explicitly_valid(self) -> None:
         self.add_apk()

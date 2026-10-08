@@ -19,6 +19,7 @@ export const REPO_ALLOWED_LABELS = new Set<string>([
   'area:policy',
   'area:delivery',
   'area:docs',
+  // `status:needs-decision`, `security`, and `performance` require maintainer creation before go-live (README).
   'status:needs-decision',
   'security',
   'performance',
@@ -32,6 +33,9 @@ export const REPO_ALLOWED_LABELS = new Set<string>([
   'status:verified-main',
   'status:partial',
   'status:latent',
+  // Human-only labels: the bot never emits or manages these.
+  'accessibility',
+  'run-instrumented',
   'bug',
   'enhancement',
   'documentation',
@@ -42,6 +46,8 @@ export const REPO_ALLOWED_LABELS = new Set<string>([
   'question',
   'wontfix',
 ]);
+
+const HUMAN_ONLY_LABELS = new Set(['accessibility', 'run-instrumented']);
 
 export const LABEL_SYNONYMS: Readonly<Record<string, string>> = Object.freeze({
   policy: 'area:policy',
@@ -61,6 +67,7 @@ export function normalizeLabelName(candidate: string): string | undefined {
   if (!candidate || typeof candidate !== 'string') return undefined;
   const trimmed = candidate.trim().replace(/^[`"']+|[`"']+$/g, '').toLowerCase();
   if (!trimmed) return undefined;
+  if (HUMAN_ONLY_LABELS.has(trimmed)) return undefined;
   const synonym = Object.hasOwn(LABEL_SYNONYMS, trimmed) ? LABEL_SYNONYMS[trimmed] : undefined;
   if (synonym && REPO_ALLOWED_LABELS.has(synonym)) {
     return synonym;
@@ -117,6 +124,8 @@ const PACKAGE_AREA_PREFIXES: ReadonlyArray<readonly [string, string]> = [
   ['clipboard', 'area:platform'],
   ['agent/foss', 'area:platform'],
   ['agent/github', 'area:platform'],
+  ['agent', 'area:runtime'],
+  ['ui', 'area:runtime'],
   ['slow', 'area:platform'],
   ['policy', 'area:policy'],
   ['guard', 'area:policy'],
@@ -152,7 +161,7 @@ function resolveMainPathArea(normalizedPath: string): string | undefined {
     normalizedPath === 'settings.gradle.kts' ||
     normalizedPath === 'build.gradle.kts' ||
     normalizedPath === 'gradle.properties' ||
-    normalizedPath === '.github/workflows/release.yml'
+    normalizedPath.startsWith('.github/workflows/')
   ) {
     return 'area:delivery';
   }
@@ -593,6 +602,8 @@ export function isManagedByBot(labelName: string, scope?: ReconcileScope): boole
   if (
     lower === 'security' ||
     lower === 'performance' ||
+    lower === 'accessibility' ||
+    lower === 'run-instrumented' ||
     lower === 'type:tracking' ||
     lower.startsWith('priority:') ||
     lower.startsWith('gate:') ||

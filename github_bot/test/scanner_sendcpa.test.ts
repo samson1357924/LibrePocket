@@ -10,9 +10,13 @@ import {
 } from '../src/send_cpa';
 import {
   coverageSummary,
+  filterReviewDiffFiles,
+  MAX_DIFF_LENGTH,
   prioritizeFiles,
   truncateDiff,
 } from '../src/review_diff';
+import { buildReviewDiff } from '../src/github_runner';
+import { orchestrateReview } from '../src/orchestrator';
 
 const FAKE_CPA_BASE_URL = ['https:', '', 'pocketguard-cpa.test', 'v1'].join('/');
 const FAKE_ALLOWED_ORIGINS = [new URL(FAKE_CPA_BASE_URL).origin];
@@ -69,6 +73,19 @@ export async function runScannerSendCpaTests(): Promise<void> {
     assert.equal(result.violations[0]?.severity, 'BLOCK', declaration);
   }
 
+  for (const attributeOnly of [
+    'android:permission="android.permission.BIND_VPN_SERVICE"',
+    'android:name="android.permission.SEND_SMS"',
+  ]) {
+    const result = DeterministicScanner.scan(
+      ['app/src/main/AndroidManifest.xml'],
+      diffFor('app/src/main/AndroidManifest.xml', [attributeOnly]),
+    );
+    assert.equal(result.hasBlockers, true, attributeOnly);
+    assert.equal(result.violations[0]?.ruleId, 'SEC-MANIFEST-CAPABILITY', attributeOnly);
+    assert.equal(result.violations[0]?.severity, 'BLOCK', attributeOnly);
+  }
+
   const quotedManifestDiff = diffFor('app/src/main/AndroidManifest.xml', [
     '<uses-permission android:name="android.permission.SEND_SMS" />',
   ]).replace('+++ b/app/src/main/AndroidManifest.xml', '+++ "b/app/src/main/AndroidManifest.xml"');
@@ -103,8 +120,43 @@ export async function runScannerSendCpaTests(): Promise<void> {
   const truncation = truncateDiff('0123456789', 5);
   assert.equal(truncation.truncated, true);
   assert.equal(truncation.originalLength, 10);
-  assert.ok(truncation.diff.startsWith('01234'));
-  assert.ok(truncation.diff.includes('PocketGuard diff truncated: total 10 chars exceeded budget 5'));
+  assert.ok(truncation.diff.length <= 5);
+  const noticedTruncation = truncateDiff('0123456789'.repeat(20), 100);
+  assert.ok(noticedTruncation.diff.length <= 100);
+  assert.ok(noticedTruncation.diff.includes('PocketGuard diff truncated'));
+
+  const filteredFiles = filterReviewDiffFiles([
+    'app/src/main/res/drawable/screenshot.png',
+    'app/src/main/AndroidManifest.xml',
+    'app/build.gradle.kts',
+    'app/build/proguard-rules.pro',
+    'app/build/proguard/rules.png',
+    'app/src/main/res/permission-map.map',
+    '.github/workflows/ci.yml',
+    'app/src/test/assets/screenshot.png',
+    'app/src/test/java/example/SampleTest.kt',
+  ]);
+  assert.deepEqual(filteredFiles, [
+    'app/src/main/AndroidManifest.xml',
+    'app/build.gradle.kts',
+    'app/build/proguard-rules.pro',
+    'app/build/proguard/rules.png',
+    'app/src/main/res/permission-map.map',
+    '.github/workflows/ci.yml',
+    'app/src/test/assets/screenshot.png',
+    'app/src/test/java/example/SampleTest.kt',
+  ]);
+
+  const boundaryDiffs: Record<string, string> = {
+    'app/src/main/java/example/First.kt': 'A'.repeat(119850),
+    'app/src/main/java/example/Second.kt': 'B'.repeat(1000),
+  };
+  const assembled = buildReviewDiff({
+    runGit: (args) => boundaryDiffs[args[args.length - 1]] ?? '',
+  }, 'a'.repeat(40), 'b'.repeat(40), Object.keys(boundaryDiffs));
+  assert.equal(assembled.diff.length, MAX_DIFF_LENGTH);
+  assert.ok(assembled.diff.includes('PocketGuard diff truncated'));
+  assert.deepEqual(assembled.coverage.truncatedFiles, ['app/src/main/java/example/Second.kt']);
 
   assert.deepEqual(prioritizeFiles([
     'docs/guide.md',
@@ -211,6 +263,92 @@ export async function runScannerSendCpaTests(): Promise<void> {
       }),
       /CPA response empty/,
     );
+
+    const orchestratorEnv = {
+      ...cpaEnvironment,
+      POCKETGUARD_MODEL_CHIEF: FAKE_MODEL_ID,
+      POCKETGUARD_MODEL_ANDROID_SEC: FAKE_MODEL_ID,
+      POCKETGUARD_MODEL_ANDROID_CODE: FAKE_MODEL_ID,
+    };
+    async function runOrchestratorResponse(content: string, coverage = {
+      complete: true,
+      omittedFiles: [] as string[],
+      truncatedFiles: [] as string[],
+      originalLength: 20,
+    }) {
+      const previous = globalThis.fetch;
+      const requests: Array<Record<string, unknown>> = [];
+      globalThis.fetch = (async (_input, init) => {
+        requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({
+          output: [{ content: [{ type: 'output_text', text: content }] }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }) as typeof fetch;
+      try {
+        const review = await orchestrateReview({
+          changedFiles: ['app/src/main/AndroidManifest.xml'],
+          diff: '+synthetic test diff',
+          coverage,
+          deterministicViolations: [],
+          env: orchestratorEnv,
+          allowedOrigins: FAKE_ALLOWED_ORIGINS,
+        });
+        assert.equal(requests.length, 3);
+        for (const request of requests) {
+          assert.equal(Array.isArray(request.input), true);
+          assert.equal((request.input as unknown[]).length, 2);
+          assert.equal(Object.hasOwn(request, 'tools'), false);
+          assert.equal(Object.hasOwn(request, 'previous_response_id'), false);
+        }
+        return review;
+      } finally {
+        globalThis.fetch = previous;
+      }
+    }
+
+    const blockingRole = await runOrchestratorResponse(JSON.stringify({
+      verdict: 'APPROVE',
+      findings: [{ severity: 'BLOCK', issue: 'Synthetic blocking finding.' }],
+    }));
+    assert.equal(blockingRole.verdict, 'NEEDS_CHANGES');
+
+    const omittedCritical = await runOrchestratorResponse(JSON.stringify({ verdict: 'APPROVE', findings: [] }), {
+      complete: false,
+      omittedFiles: ['app/src/main/AndroidManifest.xml'],
+      truncatedFiles: [],
+      originalLength: 20,
+    });
+    assert.equal(omittedCritical.verdict, 'INCONCLUSIVE');
+
+    for (const omittedFile of [
+      'app/src/main/AndroidManifest.xml',
+      'app/build.gradle.kts',
+      '.github/workflows/ci.yml',
+    ]) {
+      const completeWithOmission = await runOrchestratorResponse(JSON.stringify({ verdict: 'APPROVE', findings: [] }), {
+        complete: true,
+        omittedFiles: [omittedFile],
+        truncatedFiles: [],
+        originalLength: 20,
+      });
+      assert.equal(completeWithOmission.coverage.complete, true, omittedFile);
+      assert.equal(completeWithOmission.verdict, 'INCONCLUSIVE', omittedFile);
+    }
+
+    const unknownFindingField = await runOrchestratorResponse(JSON.stringify({
+      verdict: 'APPROVE',
+      findings: [{ severity: 'WARN', issue: 'Synthetic finding.', unexpected: true }],
+    }));
+    assert.equal(unknownFindingField.verdict, 'INCONCLUSIVE');
+    assert.equal(unknownFindingField.roles.every((role) => role.findings.length === 0), true);
+
+    const unknownTopLevelField = await runOrchestratorResponse(JSON.stringify({
+      verdict: 'APPROVE',
+      findings: [],
+      unexpected: true,
+    }));
+    assert.equal(unknownTopLevelField.verdict, 'INCONCLUSIVE');
+    assert.equal(unknownTopLevelField.roles.every((role) => role.verdict === 'INCONCLUSIVE'), true);
   } finally {
     globalThis.fetch = originalFetch;
   }

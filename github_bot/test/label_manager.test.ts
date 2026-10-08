@@ -81,7 +81,8 @@ export async function runLabelManagerTests(): Promise<void> {
     'area:runtime', 'area:platform', 'area:policy', 'area:delivery', 'area:docs',
     'status:needs-decision', 'security', 'performance', 'type:tracking', 'priority:P1', 'priority:P2',
     'gate:live', 'gate:release', 'gate:activation', 'gate:docs', 'status:verified-main',
-    'status:partial', 'status:latent', 'bug', 'enhancement', 'documentation', 'duplicate',
+    'status:partial', 'status:latent', 'accessibility', 'run-instrumented',
+    'bug', 'enhancement', 'documentation', 'duplicate',
     'good first issue', 'help wanted', 'invalid', 'question', 'wontfix',
   ]);
   assert.equal(normalizeLabelName(' POLICY '), 'area:policy');
@@ -93,17 +94,23 @@ export async function runLabelManagerTests(): Promise<void> {
   assert.equal(normalizeLabelName('needs-decision'), 'status:needs-decision');
   assert.equal(normalizeLabelName('priority:p1'), 'priority:P1');
   assert.equal(normalizeLabelName('TYPE:BUG'), undefined);
+  assert.equal(normalizeLabelName('accessibility'), undefined);
+  assert.equal(normalizeLabelName('run-instrumented'), undefined);
   assert.equal(normalizeLabelName('unknown-label'), undefined);
   assert.deepEqual(sanitizeLabels(['sec', 'security', 'policy', 'alien']), ['area:policy', 'security']);
+  assert.deepEqual(sanitizeLabels(['accessibility', 'run-instrumented']), []);
   assert.equal(BOT_MENTION, '@pocketguard');
   assert.ok(Object.values(COMMENT_MARKERS).every((marker) => marker.includes('PocketGuard')));
 
   // Specific package mappings precede delivery/docs fallbacks; unknown paths stay unmapped.
   assert.deepEqual(resolveAreaLabelsFromPaths([]), []);
   assert.deepEqual(resolveAreaLabelsFromPaths(['random/file.kt']), []);
+  assert.deepEqual(resolveAreaLabelsFromPaths(['src/unknown/package/File.kt']), []);
   assert.deepEqual(resolveAreaLabelsFromPaths([
     'app/src/main/java/dev/librepocket/chat/Chat.kt',
     'app/src/main/java/dev/librepocket/agent/github/Runner.kt',
+    'app/src/main/java/dev/librepocket/agent/ui/AgentUi.kt',
+    'app/src/main/java/dev/librepocket/ui/Screen.kt',
     'app/src/main/java/dev/librepocket/guard/Guard.kt',
   ]), ['area:platform', 'area:policy', 'area:runtime']);
   assert.deepEqual(resolveAreaLabelsFromPaths([
@@ -119,6 +126,8 @@ export async function runLabelManagerTests(): Promise<void> {
     'gradle.properties',
     'scripts/check.sh',
     '.github/workflows/release.yml',
+    '.github/workflows/ci.yml',
+    '.github/workflows/reusable/checks.yml',
   ]), ['area:delivery']);
   assert.deepEqual(resolveAreaLabelsFromPaths([
     'docs/specs/design.md',
@@ -203,7 +212,8 @@ ${reportWith('A security flaw remains.')}`);
   assert.deepEqual(DEFAULT_PR_RECONCILE_SCOPE.managedExactLabels, ['status:needs-decision']);
   for (const protectedLabel of [
     'security', 'performance', 'type:tracking', 'priority:P1', 'gate:release', 'status:verified-main',
-    'status:partial', 'status:latent', 'bug', 'enhancement', 'documentation', 'duplicate',
+    'status:partial', 'status:latent', 'accessibility', 'run-instrumented',
+    'bug', 'enhancement', 'documentation', 'duplicate',
     'good first issue', 'help wanted', 'invalid', 'question', 'wontfix',
   ]) {
     assert.equal(isManagedByBot(protectedLabel, DEFAULT_PR_RECONCILE_SCOPE), false, protectedLabel);

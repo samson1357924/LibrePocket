@@ -13,12 +13,21 @@ import { DeterministicScanner, type ScanViolation } from './deterministic_scanne
 import {
   DEFAULT_PR_RECONCILE_SCOPE,
   reconcileBotLabelsSafely,
+  resolveAreaLabelsFromPaths,
   resolveLabelsFromTitle,
   resolveReviewLabels,
   sanitizeLabels,
   type GitHubLabelClient,
+  type ReconcileScope,
 } from './label_manager';
-import { MAX_DIFF_LENGTH, prioritizeFiles, truncateDiff, type ReviewCoverage } from './review_diff';
+import {
+  coverageSummary,
+  filterReviewDiffFiles,
+  MAX_DIFF_LENGTH,
+  prioritizeFiles,
+  truncateDiff,
+  type ReviewCoverage,
+} from './review_diff';
 
 const REVIEW_MARKER = '<!-- PocketGuard-review -->';
 const ROLE_NAMES = ['chief', 'android_sec', 'android_code'] as const;
@@ -94,6 +103,9 @@ interface ReviewTarget {
 
 export interface TagResult {
   labels: string[];
+  areaLabels: string[];
+  changedFiles: string[];
+  changedFilesComplete: boolean;
   target: CommentTarget | 'none';
   command: CommentCommand;
   needsDiff: boolean;
@@ -117,6 +129,9 @@ export interface RunnerReviewOutput {
   }>;
   coverage: ReviewCoverage;
   deterministicViolations: ScanViolation[];
+  areaLabels: string[];
+  changedFiles: string[];
+  changedFilesComplete: boolean;
 }
 
 function stdout(context: RunnerContext, text: string): void {
@@ -254,9 +269,18 @@ function appendWorkflowOutputs(env: NodeJS.ProcessEnv, values: Record<string, st
 export async function runTagMode(context: RunnerContext = {}): Promise<TagResult> {
   const env = context.env ?? process.env;
   const target = await inspectTarget(context);
-  const labels = sanitizeLabels(resolveLabelsFromTitle(target.title));
+  const changed = target.safeReview && target.pullRequest
+    ? collectChangedPaths(context, target.pullRequest)
+    : { changedFiles: [], complete: false };
+  const areaLabels = target.safeReview && target.pullRequest
+    ? resolveAreaLabelsFromPaths(changed.changedFiles, changed.complete)
+    : [];
+  const labels = sanitizeLabels([...resolveLabelsFromTitle(target.title), ...areaLabels]);
   const result: TagResult = {
     labels,
+    areaLabels,
+    changedFiles: changed.changedFiles,
+    changedFilesComplete: changed.complete,
     target: target.target,
     command: target.command,
     needsDiff: target.needsDiff,
@@ -265,6 +289,9 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
   };
   appendWorkflowOutputs(env, {
     labels: JSON.stringify(result.labels),
+    area_labels: JSON.stringify(result.areaLabels),
+    changed_files: JSON.stringify(result.changedFiles),
+    changed_files_complete: String(result.changedFilesComplete),
     target: result.target,
     command: result.command,
     needs_diff: String(result.needsDiff),
@@ -290,7 +317,23 @@ function getChangedPaths(context: RunnerContext, baseSha: string, headSha: strin
     .filter(Boolean);
 }
 
-function buildReviewDiff(
+function collectChangedPaths(
+  context: RunnerContext,
+  pullRequest: PullRequestData,
+): { changedFiles: string[]; complete: boolean } {
+  try {
+    const runGit = context.runGit ?? defaultGit;
+    runGit(['fetch', '--no-tags', '--depth=1', 'origin', pullRequest.base.sha, pullRequest.head.sha]);
+    return {
+      changedFiles: getChangedPaths(context, pullRequest.base.sha, pullRequest.head.sha),
+      complete: true,
+    };
+  } catch {
+    return { changedFiles: [], complete: false };
+  }
+}
+
+export function buildReviewDiff(
   context: RunnerContext,
   baseSha: string,
   headSha: string,
@@ -298,14 +341,19 @@ function buildReviewDiff(
 ): { diff: string; coverage: ReviewCoverage; fullDiff: string } {
   const runGit = context.runGit ?? defaultGit;
   const diffs = new Map<string, string>();
+  const reviewFiles = new Set(filterReviewDiffFiles(changedFiles));
   let originalLength = 0;
+  let includedDiffCount = 0;
   for (const file of changedFiles) {
     const fileDiff = runGit(['diff', '--no-ext-diff', '--no-color', '--unified=3', baseSha, headSha, '--', file]);
     diffs.set(file, fileDiff);
-    originalLength += fileDiff.length;
+    if (reviewFiles.has(file)) {
+      originalLength += fileDiff.length + (includedDiffCount > 0 ? 1 : 0);
+      includedDiffCount += 1;
+    }
   }
 
-  const sortedFiles = prioritizeFiles(changedFiles);
+  const sortedFiles = prioritizeFiles(changedFiles.filter((file) => reviewFiles.has(file)));
   const visible: string[] = [];
   const omittedFiles: string[] = [];
   const truncatedFiles: string[] = [];
@@ -313,24 +361,36 @@ function buildReviewDiff(
   for (const file of sortedFiles) {
     const fileDiff = diffs.get(file) ?? '';
     if (!fileDiff) continue;
-    const remaining = Math.max(0, MAX_DIFF_LENGTH - visibleLength);
+    const separatorLength = visible.length > 0 ? 1 : 0;
+    const remaining = Math.max(0, MAX_DIFF_LENGTH - visibleLength - separatorLength);
     if (fileDiff.length <= remaining) {
       visible.push(fileDiff);
-      visibleLength += fileDiff.length;
+      visibleLength += separatorLength + fileDiff.length;
       continue;
     }
     if (remaining > 0) {
-      visible.push(truncateDiff(fileDiff, remaining).diff.slice(0, remaining));
-      visibleLength = MAX_DIFF_LENGTH;
-      truncatedFiles.push(file);
+      const truncated = truncateDiff(fileDiff, remaining);
+      if (truncated.diff.length > remaining) throw new Error('assembled review diff exceeded budget');
+      if (truncated.diff.includes('PocketGuard diff truncated')) {
+        visible.push(truncated.diff);
+        visibleLength += separatorLength + truncated.diff.length;
+        truncatedFiles.push(file);
+      } else {
+        omittedFiles.push(file);
+      }
     } else {
       omittedFiles.push(file);
     }
   }
 
   const fullDiff = Array.from(diffs.values()).join('\n');
+  const diff = visible.join('\n');
+  if (diff.length > MAX_DIFF_LENGTH) throw new Error('assembled review diff exceeded budget');
+  if (truncatedFiles.length > 0 && !diff.includes('PocketGuard diff truncated')) {
+    throw new Error('truncated review diff is missing its notice');
+  }
   return {
-    diff: visible.join('\n'),
+    diff,
     fullDiff,
     coverage: {
       complete: omittedFiles.length === 0 && truncatedFiles.length === 0,
@@ -360,6 +420,9 @@ function genericReviewOutput(): RunnerReviewOutput {
     roles: ROLE_NAMES.map((role) => ({ role, modelUsed: 'not-run', verdict: 'INCONCLUSIVE', findings: [] })),
     coverage: { complete: false, omittedFiles: [], truncatedFiles: [], originalLength: 0 },
     deterministicViolations: [],
+    areaLabels: [],
+    changedFiles: [],
+    changedFilesComplete: false,
   };
 }
 
@@ -404,6 +467,8 @@ function installCpaStub(env: NodeJS.ProcessEnv): () => void {
 export async function runReviewMode(context: RunnerContext = {}): Promise<RunnerReviewOutput> {
   const env = context.env ?? process.env;
   let output = genericReviewOutput();
+  let changedFiles: string[] = [];
+  let changedFilesComplete = false;
   try {
     const target = await inspectTarget(context);
     const forcedUnsafe = env.POCKETGUARD_SAFE_REVIEW === 'false';
@@ -420,13 +485,14 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
     const runGit = context.runGit ?? defaultGit;
     try {
       runGit(['fetch', '--no-tags', '--depth=1', 'origin', baseSha, headSha]);
-      const changedFiles = getChangedPaths(context, baseSha, headSha);
+      changedFiles = getChangedPaths(context, baseSha, headSha);
+      changedFilesComplete = true;
       const reviewDiff = buildReviewDiff(context, baseSha, headSha, changedFiles);
       const scan = DeterministicScanner.scan(changedFiles, reviewDiff.fullDiff);
       const { orchestrateReview } = await import('./orchestrator');
       const restoreFetch = installCpaStub(env);
       try {
-        output = await orchestrateReview({
+        const orchestrated = await orchestrateReview({
           changedFiles,
           diff: redactForModel(reviewDiff.diff),
           coverage: reviewDiff.coverage,
@@ -434,6 +500,12 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
           env,
           allowedOrigins: parseAllowedOrigins(env),
         });
+        output = {
+          ...orchestrated,
+          areaLabels: resolveAreaLabelsFromPaths(changedFiles),
+          changedFiles,
+          changedFilesComplete,
+        };
       } finally {
         restoreFetch();
       }
@@ -443,6 +515,12 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
   } catch {
     output = genericReviewOutput();
   }
+  output = {
+    ...output,
+    areaLabels: resolveAreaLabelsFromPaths(changedFiles, changedFilesComplete),
+    changedFiles,
+    changedFilesComplete,
+  };
   saveReviewOutput(output, context);
   return output;
 }
@@ -468,9 +546,15 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
   const raw = value as Record<string, unknown>;
   const verdicts = new Set(['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE']);
   if (
-    Object.keys(raw).some((key) => !['verdict', 'roles', 'coverage', 'deterministicViolations'].includes(key)) ||
+    Object.keys(raw).some((key) => ![
+      'verdict', 'roles', 'coverage', 'deterministicViolations', 'areaLabels', 'changedFiles', 'changedFilesComplete',
+    ].includes(key)) ||
     !verdicts.has(String(raw.verdict)) || !Array.isArray(raw.roles) || raw.roles.length !== ROLE_NAMES.length ||
-    !Array.isArray(raw.deterministicViolations)
+    !Array.isArray(raw.deterministicViolations) ||
+    (raw.areaLabels !== undefined && (!Array.isArray(raw.areaLabels) || !raw.areaLabels.every((label) => typeof label === 'string'))) ||
+    (raw.changedFiles !== undefined && (!Array.isArray(raw.changedFiles) || !raw.changedFiles.every((file) => typeof file === 'string'))) ||
+    (raw.changedFilesComplete !== undefined && typeof raw.changedFilesComplete !== 'boolean') ||
+    (raw.changedFilesComplete === true && !Array.isArray(raw.changedFiles))
   ) return undefined;
   const rawCoverage = raw.coverage;
   if (!rawCoverage || typeof rawCoverage !== 'object' || Array.isArray(rawCoverage)) return undefined;
@@ -576,6 +660,13 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
       originalLength: Number.isSafeInteger(coverage.originalLength) ? Number(coverage.originalLength) : 0,
     },
     deterministicViolations,
+    areaLabels: sanitizeLabels(Array.isArray(raw.areaLabels)
+      ? raw.areaLabels.filter((label): label is string => typeof label === 'string')
+      : []),
+    changedFiles: Array.isArray(raw.changedFiles)
+      ? raw.changedFiles.filter((file): file is string => typeof file === 'string').map((file) => safeString(file))
+      : [],
+    changedFilesComplete: raw.changedFilesComplete === true,
   };
 }
 
@@ -593,7 +684,13 @@ function reviewComment(output: RunnerReviewOutput): string {
     '## PocketGuard 審查',
     '',
     `**判定：${output.verdict}**`,
-    `覆蓋：${output.coverage.complete ? '完整' : '不完整'}；省略 ${output.coverage.omittedFiles.length} 個檔案；截斷 ${output.coverage.truncatedFiles.length} 個檔案。`,
+    coverageSummary(output.coverage),
+    `省略檔案：${output.coverage.omittedFiles.length > 0
+      ? output.coverage.omittedFiles.map((file) => escapeMarkdown(file)).join('、')
+      : '無'}`,
+    `截斷檔案：${output.coverage.truncatedFiles.length > 0
+      ? output.coverage.truncatedFiles.map((file) => escapeMarkdown(file)).join('、')
+      : '無'}`,
     '',
   ];
   for (const role of output.roles) {
@@ -682,7 +779,13 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
 
   const body = reviewComment(output);
   try {
-    const identity = await client.rest.users.getAuthenticated();
+    let botLogin = 'github-actions[bot]';
+    try {
+      const identity = await client.rest.users.getAuthenticated();
+      if (typeof identity.data.login === 'string' && identity.data.login) botLogin = identity.data.login;
+    } catch {
+      // The fallback still permits safe marker matching when this endpoint is forbidden.
+    }
     let existing: GithubComment | undefined;
     for (let page = 1; ; page += 1) {
       const comments = await client.rest.issues.listComments({
@@ -693,7 +796,8 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
         page,
       });
       existing = comments.data.find((comment) =>
-        comment.user?.login === identity.data.login && typeof comment.body === 'string' && comment.body.includes(REVIEW_MARKER));
+        (comment.user?.login === botLogin || comment.user?.type === 'Bot') &&
+        typeof comment.body === 'string' && comment.body.includes(REVIEW_MARKER));
       if (existing || comments.data.length < 100) break;
     }
     if (existing) {
@@ -717,6 +821,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       output.roles.some((role) => role.role === 'android_sec' && role.findings.some((finding) => finding.severity === 'BLOCK'));
     const labels = sanitizeLabels([
       ...configuredTagLabels(env),
+      ...(output.changedFilesComplete ? output.areaLabels : []),
       ...resolveReviewLabels({
         verdict: output.verdict,
         hasSecurityFinding: hasSecurityBlock,
@@ -728,8 +833,10 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       repo: repository.repo,
       issueNumber: target.issueNumber,
       desiredLabels: labels,
-      scope: DEFAULT_PR_RECONCILE_SCOPE,
-      coverageComplete: output.coverage.complete,
+      scope: output.changedFilesComplete
+        ? DEFAULT_PR_RECONCILE_SCOPE
+        : { managedExactLabels: ['status:needs-decision'] } satisfies ReconcileScope,
+      coverageComplete: output.coverage.complete && output.changedFilesComplete,
     });
   } catch {
     return;

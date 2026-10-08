@@ -39,6 +39,12 @@ Configure the following GitHub Actions variables:
 - Deterministic secret and forbidden-manifest checks run against the full available diff. Secret-like text is redacted before model submission and generated output is sanitized before publication.
 - Review artifacts are retained for seven days. The workflow's actions are pinned to full commit SHAs; update pins intentionally and keep the adjacent version comments accurate.
 
+## Labels
+
+- The bot allowlist includes `accessibility` and `run-instrumented` only to preserve existing repository labels; they are human-only and the bot never emits or manages them.
+- The bot may emit `security`, `performance`, and `status:needs-decision`. Maintainers must create these labels before go-live; allowlisting them does not create them in the repository.
+- `area:*` labels are derived from the full changed-path list. If that list is unavailable, publication preserves existing area labels and only reconciles `status:needs-decision`.
+
 ## Local verification
 
 Use `npm test` and `npm run build`. The runner tests use fake CPA configuration and a fetch stub; they do not call external services. Never use production credentials or private review content in local tests.

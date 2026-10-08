@@ -33,13 +33,70 @@ export function truncateDiff(raw: string, maxLen: number): TruncatedDiff {
   const budget = Math.max(0, Math.floor(Number.isFinite(maxLen) ? maxLen : 0));
   if (raw.length <= budget) return { diff: raw, truncated: false, originalLength: raw.length };
 
-  const visible = raw.slice(0, budget);
-  const notice = `... [PocketGuard diff truncated: total ${raw.length} chars exceeded budget ${budget}. Showing first ${visible.length} chars.] ...`;
-  return { diff: `${visible}\n${notice}`, truncated: true, originalLength: raw.length };
+  const fullNotice = `\n... [PocketGuard diff truncated: total ${raw.length} chars exceeded budget ${budget}.] ...`;
+  const compactNotice = '\n...[truncated]...';
+  const notice = fullNotice.length <= budget
+    ? fullNotice
+    : compactNotice.length <= budget
+      ? compactNotice
+      : compactNotice.slice(0, budget);
+  const visibleBudget = Math.max(0, budget - notice.length);
+  const diff = `${raw.slice(0, visibleBudget)}${notice}`;
+  if (diff.length > budget) throw new Error('truncated diff exceeded budget');
+  return { diff, truncated: true, originalLength: raw.length };
 }
 
 function normalizePath(path: string): string {
   return path.replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+function globToRegExp(glob: string): RegExp {
+  let expression = glob.includes('/') ? '^' : '(?:^|.*/)';
+  for (let index = 0; index < glob.length; index += 1) {
+    const character = glob[index];
+    if (character === '*') {
+      if (glob[index + 1] === '*') {
+        index += 1;
+        if (glob[index + 1] === '/') {
+          index += 1;
+          expression += '(?:.*/)?';
+        } else {
+          expression += '.*';
+        }
+      } else {
+        expression += '[^/]*';
+      }
+    } else if (character === '?') {
+      expression += '[^/]';
+    } else {
+      expression += character.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+    }
+  }
+  return new RegExp(`${expression}$`, 'i');
+}
+
+const EXCLUDE_PATTERNS = DEFAULT_GIT_DIFF_EXCLUDES.map(globToRegExp);
+
+function isMustIncludeReviewFile(file: string): boolean {
+  const normalized = normalizePath(file).toLowerCase();
+  const basename = normalized.slice(normalized.lastIndexOf('/') + 1);
+  return basename === 'androidmanifest.xml' ||
+    normalized.includes('permission') ||
+    normalized.endsWith('.gradle.kts') ||
+    normalized.includes('proguard') ||
+    normalized.startsWith('.github/workflows/') ||
+    /(^|\/)(?:test|tests|androidtest)(\/|$)/.test(normalized) ||
+    /(?:^|\/)[^/]*(?:test|tests|spec)\.(?:kt|java)$/.test(normalized);
+}
+
+/** Filter only model-visible diff files; callers must retain all paths for scanning and area mapping. */
+export function filterReviewDiffFiles(changedFiles: string[]): string[] {
+  return changedFiles.filter((rawPath) => {
+    if (!rawPath || typeof rawPath !== 'string') return false;
+    const file = normalizePath(rawPath);
+    if (isMustIncludeReviewFile(file)) return true;
+    return !EXCLUDE_PATTERNS.some((pattern) => pattern.test(file));
+  });
 }
 
 function reviewTier(path: string): number {

@@ -57,10 +57,18 @@ export async function runCommentRunnerTests(): Promise<void> {
         GITHUB_REPOSITORY: 'sample/repository',
       } as NodeJS.ProcessEnv,
       writeStdout: (value) => { tagStdout += value; },
+      runGit: (args: string[]) => {
+        if (args[0] === 'fetch') return '';
+        if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/AndroidManifest.xml\0';
+        throw new Error('unexpected tag-mode git call');
+      },
     });
     assert.equal(tagged.safeReview, true);
-    assert.deepEqual(tagged.labels, ['security']);
-    assert.deepEqual(JSON.parse(tagStdout).labels, ['security']);
+    assert.deepEqual(tagged.areaLabels, ['area:delivery']);
+    assert.deepEqual(tagged.changedFiles, ['app/src/main/AndroidManifest.xml']);
+    assert.equal(tagged.changedFilesComplete, true);
+    assert.deepEqual(tagged.labels, ['area:delivery', 'security']);
+    assert.deepEqual(JSON.parse(tagStdout).labels, ['area:delivery', 'security']);
 
     const forkEvent = JSON.parse(JSON.stringify(pullRequestEvent())) as {
       pull_request: { head: { repo: { full_name: string } } };
@@ -100,6 +108,11 @@ export async function runCommentRunnerTests(): Promise<void> {
         },
       },
       writeStdout: () => undefined,
+      runGit: (args: string[]) => {
+        if (args[0] === 'fetch') return '';
+        if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/AndroidManifest.xml\0';
+        throw new Error('unexpected mention-mode git call');
+      },
     } as unknown as RunnerContext;
     const mentioned = await runTagMode(mentionContext);
     assert.equal(mentioned.command, 'review');
@@ -153,7 +166,19 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.equal(reviewed.verdict, 'APPROVE');
       assert.equal(reviewed.roles.length, 3);
       assert.equal(reviewed.coverage.complete, true);
-      assert.equal(JSON.parse(fs.readFileSync(outputPath, 'utf8')).verdict, 'APPROVE');
+      const persistedReview = JSON.parse(fs.readFileSync(outputPath, 'utf8')) as {
+        verdict: string;
+        areaLabels: string[];
+        changedFiles: string[];
+        changedFilesComplete: boolean;
+      };
+      assert.equal(persistedReview.verdict, 'APPROVE');
+      assert.deepEqual(persistedReview.areaLabels, ['area:delivery']);
+      assert.deepEqual(persistedReview.changedFiles, [
+        'app/src/main/AndroidManifest.xml',
+        'app/src/main/java/demo/Safe.kt',
+      ]);
+      assert.equal(persistedReview.changedFilesComplete, true);
 
       let unsafeGitCalls = 0;
       const genericPath = path.join(tempDirectory, 'fork-review-output.json');
@@ -213,8 +238,9 @@ export async function runCommentRunnerTests(): Promise<void> {
         }],
         created: 0,
         updated: 0,
+        identityFails: false,
         labels: [] as string[][],
-        existingLabels: ['status:needs-decision'],
+        existingLabels: ['area:docs', 'status:needs-decision'],
       };
       const publishClient = {
         rest: {
@@ -225,7 +251,10 @@ export async function runCommentRunnerTests(): Promise<void> {
               head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
             } }),
           },
-          users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+          users: { getAuthenticated: async () => {
+            if (fakeClientState.identityFails) throw new Error('authenticated-user endpoint unavailable');
+            return { data: { login: 'pocketguard[bot]' } };
+          } },
           issues: {
             listLabelsOnIssue: async () => ({
               data: fakeClientState.existingLabels.map((name) => ({ name })),
@@ -240,7 +269,12 @@ export async function runCommentRunnerTests(): Promise<void> {
               });
               return {};
             },
-            updateComment: async () => { fakeClientState.updated += 1; return {}; },
+            updateComment: async (params: { comment_id: number; body: string }) => {
+              fakeClientState.updated += 1;
+              const comment = fakeClientState.comments.find((candidate) => candidate.id === params.comment_id);
+              if (comment) comment.body = params.body;
+              return {};
+            },
             addLabels: async (params: { labels: string[] }) => {
               fakeClientState.labels.push(params.labels);
               for (const label of params.labels) {
@@ -269,14 +303,42 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.equal(fakeClientState.created, 1);
       assert.equal(fakeClientState.updated, 0);
       assert.ok(fakeClientState.labels.some((labels) => labels.includes('security')));
+      assert.deepEqual(fakeClientState.existingLabels.filter((label) => label.startsWith('area:')).sort(), ['area:delivery']);
 
       await runPublishMode(publishContext);
       assert.equal(fakeClientState.created, 1);
       assert.equal(fakeClientState.updated, 1);
 
       fs.writeFileSync(outputPath, JSON.stringify(reviewed));
+      fakeClientState.identityFails = true;
       await runPublishMode(publishContext);
+      assert.equal(fakeClientState.updated, 2, 'Bot marker comment is updated if getAuthenticated is forbidden');
       assert.equal(fakeClientState.existingLabels.includes('status:needs-decision'), false);
+      assert.deepEqual(fakeClientState.existingLabels.filter((label) => label.startsWith('area:')).sort(), ['area:delivery']);
+
+      const partialCoverage = {
+        ...reviewed,
+        verdict: 'INCONCLUSIVE',
+        coverage: {
+          complete: false,
+          omittedFiles: ['app/src/main/java/private/Omitted.kt'],
+          truncatedFiles: ['app/src/main/java/private/Truncated.kt'],
+          originalLength: 654321,
+        },
+        areaLabels: [],
+        changedFiles: [],
+        changedFilesComplete: false,
+      };
+      fs.writeFileSync(outputPath, JSON.stringify(partialCoverage));
+      await runPublishMode(publishContext);
+      assert.equal(fakeClientState.updated, 3);
+      assert.deepEqual(fakeClientState.existingLabels.filter((label) => label.startsWith('area:')).sort(), ['area:delivery']);
+      const partialComment = fakeClientState.comments.filter((comment) =>
+        comment.user?.type === 'Bot' && comment.body?.includes('PocketGuard-review')).pop()?.body ?? '';
+      assert.ok(partialComment.includes(String.raw`app/src/main/java/private/Omitted\.kt`));
+      assert.ok(partialComment.includes(String.raw`app/src/main/java/private/Truncated\.kt`));
+      assert.ok(partialComment.includes('654321 original diff chars'));
+      assert.equal(partialComment.includes('+<manifest />'), false, 'coverage detail does not publish diff content');
     } finally {
       fs.rmSync(tempDirectory, { recursive: true, force: true });
     }

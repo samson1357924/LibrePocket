@@ -124,7 +124,7 @@ function isManifest(path: string): boolean {
 
 function scanManifestCapabilities(rows: AddedLine[], file: string, violations: ScanViolation[]): void {
   const additions = rows.map((row) => row.text).join('\n');
-  const permissionPattern = /(?:<uses-permission(?:-sdk-\d+)?\b[^>]*?\bandroid:name|<service\b[^>]*?\bandroid:permission)\s*=\s*["']android\.permission\.([A-Z0-9_]+)["'][^>]*>/gi;
+  const permissionPattern = /\bandroid:(?:name|permission)\s*=\s*["'](?:android\.permission\.)?([A-Z0-9_]+)["']/gi;
   let match: RegExpExecArray | null;
   while ((match = permissionPattern.exec(additions)) !== null) {
     const permission = match[1].toUpperCase();

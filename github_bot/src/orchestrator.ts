@@ -124,7 +124,11 @@ function parseRoleResponse(role: CpaModelRole, modelUsed: string, content: strin
   const sanitizedModel = redactSensitiveText(modelUsed);
   const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [] };
   const parsed = parseJsonObject(content);
-  if (!parsed || !VERDICTS.has(parsed.verdict as ReviewVerdict)) return fallback;
+  if (
+    !parsed ||
+    Object.keys(parsed).some((key) => !['verdict', 'summary', 'findings'].includes(key)) ||
+    !VERDICTS.has(parsed.verdict as ReviewVerdict)
+  ) return fallback;
   const findings = parseFindings(parsed.findings);
   if (!findings) return fallback;
   return { role, modelUsed: sanitizedModel, verdict: parsed.verdict as ReviewVerdict, findings };

@@ -17,6 +17,10 @@ import kotlinx.coroutines.flow.StateFlow
  * The controller consumes the unified M1 [dev.librepocket.provider.StreamEvent]
  * union via [LlmProvider] directly; [model] selects the ChatRequest model and
  * [imageLoader] maps [ChatImageRef] paths to [ChatImage] bytes.
+ *
+ * Ephemeral time context is passed through to [TurnController]. Prefer passing
+ * `sessionStart = clock.instant()` captured at session creation (defaults to
+ * null, which omits the `Session started` line, for call compatibility).
  */
 class ChatSessionImpl(
   provider: LlmProvider,
@@ -28,6 +32,9 @@ class ChatSessionImpl(
   newId: () -> String = { java.util.UUID.randomUUID().toString() },
   model: String = TurnController.DEFAULT_MODEL,
   imageLoader: (List<ChatImageRef>) -> List<ChatImage> = ::defaultChatImageLoader,
+  clock: java.time.Clock = java.time.Clock.systemDefaultZone(),
+  userTimezone: String? = null,
+  sessionStart: java.time.Instant? = null,
 ) : ChatSession {
   private val controller = TurnController(
     provider = provider,
@@ -39,6 +46,9 @@ class ChatSessionImpl(
     newId = newId,
     model = model,
     imageLoader = imageLoader,
+    clock = clock,
+    userTimezone = userTimezone,
+    sessionStart = sessionStart,
   )
 
   @Suppress("unused")

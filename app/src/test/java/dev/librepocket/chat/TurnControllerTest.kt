@@ -183,7 +183,11 @@ class TurnControllerTest {
     assertEquals(null, c.uiState.value.error)
     assertEquals(1, provider.streamCalls)
     // Request carries the user history through the unified ChatRequest.
-    assertEquals("hi", lastUserTextOf(provider.seenRequests.single()))
+    // Phase 2 appends an ephemeral time block to a copy of the last user
+    // message: raw text stays first, time block follows.
+    val sent = lastUserTextOf(provider.seenRequests.single())
+    assertTrue(sent!!.startsWith("hi\n\n"))
+    assertTrue(sent.contains("Runtime time context:"))
   }
 
   @Test fun doubleSendThrowsAndFirstTurnSurvives() {
@@ -224,12 +228,14 @@ class TurnControllerTest {
     val gate = CompletableDeferred<Unit>()
     val provider = FakeLlmProvider { input ->
       flow {
-        if (lastUserTextOf(input) == "first") {
+        // Phase 2 appends an ephemeral time block; branch on the raw text.
+        val rawUserText = lastUserTextOf(input)?.substringBefore("\n\n")
+        if (rawUserText == "first") {
           emit(StreamEvent.TextDelta(0, 0, "A"))
           gate.await()
           emit(StreamEvent.Done("stop"))
         } else {
-          emit(StreamEvent.TextDelta(0, 0, "B-" + lastUserTextOf(input)))
+          emit(StreamEvent.TextDelta(0, 0, "B-$rawUserText"))
           emit(StreamEvent.Done("stop"))
         }
       }

@@ -23,6 +23,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.time.Clock
+import java.time.Instant
 import java.util.UUID
 import kotlin.coroutines.coroutineContext
 
@@ -80,6 +82,20 @@ private data class PendingSteer(val text: String, val images: List<ChatImageRef>
  * Retry: each attempt gets a fresh runId; failed partial output is kept with
  * `isPartial=true` and the next attempt starts a new assistant block instead
  * of backfilling the old one.
+ *
+ * Ephemeral runtime time context (Phase 2): every outgoing [ChatRequest]
+ * carries a [buildRuntimeTimeContext] block appended to a **copy** of the last
+ * user message. The block never touches [_uiState] (no [UiMessage] residue)
+ * and never flows through [TranscriptSink] (transcript keeps the raw user
+ * text). Unknown time is still sent as `(time unknown)` so the model knows
+ * the clock is unavailable instead of hallucinating one; fallback/unknown
+ * only emits `Log.w` and never blocks the turn.
+ *
+ * @param clock clock used to stamp the ephemeral time block.
+ * @param userTimezone IANA id preferred for the time block; blank/invalid
+ *   falls back to the system zone (fail-closed, never throws).
+ * @param sessionStart session creation instant for the `Session started`
+ *   line; null omits the line. Callers should pass the session creation time.
  */
 class TurnController(
   private val provider: LlmProvider,
@@ -91,6 +107,9 @@ class TurnController(
   private val newId: () -> String = { UUID.randomUUID().toString() },
   private val model: String = DEFAULT_MODEL,
   private val imageLoader: (List<ChatImageRef>) -> List<ChatImage> = ::defaultChatImageLoader,
+  private val clock: Clock = Clock.systemDefaultZone(),
+  private val userTimezone: String? = null,
+  private val sessionStart: Instant? = null,
 ) {
   companion object {
     const val POLICY_ACTION = "chat.send"
@@ -413,6 +432,11 @@ class TurnController(
    * Maps the current (settled) UI history plus this turn's images to one
    * [ChatRequest]. The current user message is already in [uiState] (appended
    * by [send] before the turn starts), so images attach to the last user line.
+   *
+   * Ephemeral time context: a [buildRuntimeTimeContext] block is appended to a
+   * copy of the last user message only. No user message means no injection
+   * (never fabricates a message for the clock). UI state and transcript keep
+   * the raw user text.
    */
   private fun buildRequest(images: List<ChatImageRef>): ChatRequest {
     val base = _uiState.value.messages
@@ -428,11 +452,38 @@ class TurnController(
         base.add(ChatMessage(role = "user", text = "", images = loaded))
       }
     }
+    val lastUser = base.indexOfLast { it.role == "user" }
+    if (lastUser >= 0) {
+      val block = buildRuntimeTimeContext(clock, userTimezone, sessionStart)
+      warnOnTimeContextDegraded(block)
+      base[lastUser] = base[lastUser].copy(text = base[lastUser].text + "\n\n" + block)
+    }
     return ChatRequest(model = model, messages = base)
     // NOTE (PR#1 scope-down): tools deliberately NOT attached here.
     // ChatRequest.tools may only carry ToolRegistry.visibleTools() output
     // (projection + executionReady); all 41 tools are executionReady=false
     // in this scaffold PR, so the request stays pure-chat by construction.
+  }
+
+  /**
+   * Observability for the ephemeral time block: `Log.w` only, never blocks
+   * the turn. Fires when the block renders `(time unknown)` or when a
+   * non-blank [userTimezone] did not resolve verbatim (fallback to system
+   * zone). `runCatching` keeps JVM unit tests (no mocked `android.util.Log`)
+   * green.
+   */
+  private fun warnOnTimeContextDegraded(block: String) {
+    val requested = userTimezone
+    val fellBack = !requested.isNullOrBlank() &&
+      runCatching { resolveZone(requested).id != requested.trim() }.getOrDefault(false)
+    if (!block.contains("(time unknown)") && !fellBack) return
+    val used = runCatching { resolveZone(userTimezone).id }.getOrDefault("?")
+    runCatching {
+      android.util.Log.w(
+        "TurnController",
+        "runtime time context degraded: requested=$userTimezone used=$used unknown=${block.contains("(time unknown)")}",
+      )
+    }
   }
 
   // ---- uiState helpers (StateFlow.update is atomic; no lock needed) ----

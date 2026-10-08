@@ -14,6 +14,8 @@ data class UiMessage(
   val role: String,
   val text: String,
   val isPartial: Boolean,
+  /** In-memory admission identity; not persisted or sent to the provider. */
+  val operationId: Long? = null,
 )
 
 data class ChatUiState(
@@ -21,6 +23,8 @@ data class ChatUiState(
   val status: ChatStatus,
   val pendingSteerCount: Int,
   val error: String? = null,
+  /** True when a non-empty FIFO is retained for explicit recovery (policy failure or cancellation). */
+  val queuedRecoveryRequired: Boolean = false,
 )
 
 /**
@@ -28,17 +32,22 @@ data class ChatUiState(
  *
  * [TurnController.startOrEnqueue] returns [TurnStart.Queued] for text that is
  * only sitting in the FIFO: no `chat.send` gate has passed and no user message
- * was appended. Unlike [TurnStart.Started], Queued is NOT acceptance — the
- * intent must stay recoverable across endpoint teardown instead of vanishing
- * with `close()`. The nullable [opId] is the caller's operation identity (null
- * only for legacy callers that never provided one).
+ * was appended. [TurnStart.NeedsRecovery] atomically transfers intents left by
+ * a previous promotion whose fresh policy check denied or failed to the
+ * caller; the current admission is not
+ * accepted. If recovery is discovered under the second admission lock, the
+ * current admission may already have passed one fresh policy gate, so retrying
+ * after recovery evaluates policy again. Neither result accepts the returned/
+ * queued work — it must stay recoverable across endpoint teardown instead of
+ * vanishing with `close()`. The nullable [opId] is the caller's operation
+ * identity (null only for legacy callers that never provided one).
  *
- * Images are intentionally not carried: every current admission path queues
- * text only (`emptyList()` images), so image turns never sit in the FIFO and
- * there is nothing to reclaim. Happy-path promotion still delivers queued
- * images; only teardown reclaim is text-only. If image queueing is ever
- * introduced, this type must grow before teardown can claim to preserve
- * queued work.
+ * Images are intentionally not carried. [TurnController.startOrEnqueue]
+ * rejects a non-empty image list with [IllegalStateException] if a turn is
+ * already active, including the post-policy-gate race; it never accepts an
+ * image-bearing intent into the FIFO. The caller retains both text and images
+ * after that exception. Idle image turns remain supported. If image queueing is
+ * introduced later, this type must grow before the controller can accept it.
  */
 data class QueuedIntent(
   val opId: Long?,

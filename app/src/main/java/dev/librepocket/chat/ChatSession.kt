@@ -10,8 +10,9 @@ import kotlinx.coroutines.flow.StateFlow
  *    (also projected via [ChatUiState.error], never crashes).
  * 2. [cancel] only flips state + closes the HTTP call + cancels the job.
  *    No IO, no DB writes on that path (persistence is async elsewhere).
- * 3. [steer] never cancels the current turn; the instruction is queued FIFO
- *    and sent as the next user message after the current turn fully ends.
+ * 3. [steer] never cancels the current turn; queued work normally auto-promotes
+ *    FIFO after an accepted turn ends. A denied/cancelled turn or failed
+ *    recovery gate keeps the queue for explicit recovery instead.
  */
 interface ChatSession {
   /** Messages for UI (collect; includes streaming placeholders). */
@@ -35,8 +36,16 @@ interface ChatSession {
    * stale. Prefer over start-then-steer fallback sequences, whose two checks
    * can straddle a turn completing (Q1).
    *
-   * N1 ownership: pass the caller's operation id as [opId] so a [TurnStart.Queued]
-   * verdict stays reclaimable via [drainQueued]. Queued is NOT acceptance.
+   * N1 ownership: pass the caller's operation id as [opId]. [TurnStart.Queued]
+   * is not acceptance and stays reclaimable via [drainQueued].
+   * [TurnStart.NeedsRecovery] atomically returns a FIFO retained after a
+   * denied or failed promotion policy check for recovery; the caller must
+   * preserve it according to lifecycle semantics
+   * (including handing it to a replacement endpoint when appropriate) before
+   * retrying the current admission. The current admission is not accepted;
+   * when recovery is discovered under the second admission lock, it may
+   * already have passed one fresh policy gate, and retrying evaluates policy
+   * again. Neither result accepts the returned FIFO.
    */
   suspend fun startOrEnqueue(
     text: String,
@@ -58,7 +67,12 @@ interface ChatSession {
   /**
    * Steering: queue an instruction for the next round.
    * Never cancels the current HTTP request or the current turn; the queued
-   * instruction is sent automatically once the current turn fully ends.
+   * instruction is sent automatically once the current turn fully ends. When
+   * idle, retained recovery work causes a synchronous
+   * [RecoveryRequiredException] instead of allowing this instruction to
+   * overtake it; the new text is retained behind that FIFO. If recovery wins
+   * after the idle check, the text is retained for explicit recovery and
+   * surfaced in [uiState].
    */
   fun steer(text: String)
 

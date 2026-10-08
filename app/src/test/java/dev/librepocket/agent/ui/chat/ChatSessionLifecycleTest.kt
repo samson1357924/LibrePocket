@@ -3,9 +3,14 @@ package dev.librepocket.agent.ui.chat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.chat.ChatImageRef
 import dev.librepocket.chat.ChatSession
+import dev.librepocket.chat.ChatSessionImpl
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.ChatUiState
+import dev.librepocket.chat.NoOpTranscriptSink
+import dev.librepocket.chat.TranscriptSink
+import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyDecision
@@ -13,6 +18,9 @@ import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ProviderProtocol
+import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.StreamEvent
 import dev.librepocket.session.PrunePolicy
 import dev.librepocket.session.PruneResult
 import dev.librepocket.session.SessionMeta
@@ -21,8 +29,11 @@ import dev.librepocket.session.TranscriptEvent
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.coroutineContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -36,6 +47,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -101,7 +113,7 @@ class ChatSessionLifecycleTest {
 
     private fun newViewModel(
         store: EndpointStore,
-        sessions: ControlledSessions,
+        sessions: ChatSessionProvider,
         policy: PolicyStore = InMemoryPolicyStore(),
     ): ChatViewModel = chatViewModels.own(ChatViewModel(store, sessions, policy))
 
@@ -395,6 +407,81 @@ class ChatSessionLifecycleTest {
             assertEquals(listOf("first"), live.sent.toList())
         } finally {
             releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun staleNeedsRecoveryBatchHandsOffAcrossNonNullEndpointSwitch() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = BarrierNeedsRecoverySessions()
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("current") }
+            sessions.returnBarrierEntered.await()
+
+            // The controller already drained "queued" into its return value,
+            // so endpoint invalidation cannot see it in drainQueued(). It can
+            // still reclaim the independent current admission from pendingOps.
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { sessions.oldClosed.await() }
+            sessions.releaseReturn.complete(Unit)
+
+            withTimeout(5_000) {
+                while (vm.input.value != "current" || vm.pendingRecoveryCount.value != 1) delay(1)
+            }
+            assertEquals("current", vm.input.value)
+
+            chatMain.run { vm.send() }
+            val replacement = sessions.awaitReplacement()
+            withTimeout(5_000) { replacement.sendFinished.await() }
+            assertEquals(listOf("current"), replacement.sent.toList())
+            withTimeout(5_000) {
+                while (vm.input.value != "queued" || vm.pendingRecoveryCount.value != 0) delay(1)
+            }
+            assertEquals("queued", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { replacement.sendFinished.await() }
+            withTimeout(5_000) { while (replacement.sent.size != 2) delay(1) }
+            assertEquals(
+                "returned batch and current op are each delivered once",
+                listOf("current", "queued"),
+                replacement.sent.toList(),
+            )
+            assertEquals(0, vm.pendingRecoveryCount.value)
+        } finally {
+            sessions.releaseReturn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun freshSendDenyDoesNotReclaimQueueOrStealRetryOwner() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = FreshDenyQueuedSessions()
+        val vm = newViewModel(store, sessions, PromotionPolicy(denyChecks = emptySet()))
+        try {
+            chatMain.run { vm.sendDirect("fresh") }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            withTimeout(5_000) { vm.input.first { it == "fresh" } }
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(0, sessions.session.drainCalls.get())
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { while (sessions.session.admitted.size != 1) delay(1) }
+            assertEquals(
+                "Retry remains owned by the fresh denied op",
+                listOf("fresh"),
+                sessions.session.admitted.toList(),
+            )
+            assertEquals(0, sessions.session.drainCalls.get())
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(listOf(dev.librepocket.chat.QueuedIntent(77L, "queued")), sessions.session.drainQueued())
+        } finally {
             chatMain.run { vm.newChat() }
         }
     }
@@ -1206,6 +1293,745 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    @Test
+    fun retryWhilePolicyGateIsBlockedAdmitsTheRetryTargetOnlyOnce() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val retryGateEntered = CompletableDeferred<Unit>()
+        val releaseRetryGate = CompletableDeferred<Unit>()
+        val chatSendChecks = AtomicInteger()
+        val policy = object : PolicyStore {
+            override fun evaluate(action: String, resource: String) =
+                PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+
+            override suspend fun setRule(rule: PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules(): List<PolicyRule> = emptyList()
+
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+                if (action != "chat.send") return PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+                return when (chatSendChecks.incrementAndGet()) {
+                    1 -> PolicyDecision(Verdict.DENY, null, System.currentTimeMillis())
+                    2 -> {
+                        retryGateEntered.complete(Unit)
+                        releaseRetryGate.await()
+                        PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+                    }
+                    else -> PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+                }
+            }
+        }
+        val provider = PromotionProvider()
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            chatMain.run { vm.sendDirect("retry target") }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            withTimeout(5_000) { vm.input.first { it == "retry target" } }
+            assertTrue(vm.canRetry)
+            assertTrue(provider.sent.isEmpty())
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { retryGateEntered.await() }
+            // ERROR remains projected while fresh policy is suspended. A
+            // second click must not launch another attempt with the same opId.
+            chatMain.run { vm.retry() }
+            releaseRetryGate.complete(Unit)
+
+            withTimeout(5_000) { provider.sentCount.first { it == 1 } }
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.IDLE && it.pendingSteerCount == 0 }
+            }
+            delay(100)
+            assertEquals(listOf("retry target"), provider.sent.toList())
+            assertEquals("only the initial denial and one retry reach chat.send", 2, chatSendChecks.get())
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(0, vm.sessionState.value.pendingSteerCount)
+            assertFalse(vm.sessionState.value.queuedRecoveryRequired)
+            assertEquals("", vm.input.value)
+        } finally {
+            releaseRetryGate.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun queuedRetryGuardSurvivesStaleErrorProjectionAndPromotionDrain() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val projectionHeld = CompletableDeferred<Unit>()
+        val releaseProjection = CompletableDeferred<Unit>()
+        val retryQueued = CompletableDeferred<Unit>()
+        val provider = PromotionProvider(blockedText = "active")
+        val policy = PromotionPolicy(denyChecks = setOf(1, 3))
+        val sessions = ProductionControllerSessions(
+            provider = provider,
+            policy = policy,
+            onQueued = { text -> if (text == "retry target") retryQueued.complete(Unit) },
+            wrapSession = { session -> HoldFirstStreamingProjection(session, projectionHeld, releaseProjection) },
+        )
+        val vm = newViewModel(store, sessions, policy)
+        try {
+            chatMain.run { vm.sendDirect("retry target") }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.input.first { it == "retry target" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            assertTrue(vm.canRetry)
+
+            val session = withTimeout(5_000) { sessions.createdSessions.first() }
+            val controllerSession = sessions.controllerSessions.first()
+            val active = session.startOrEnqueue("active", opId = 900)
+            assertTrue(active is dev.librepocket.chat.TurnStart.Started)
+            withTimeout(5_000) { projectionHeld.await() }
+            withTimeout(5_000) { provider.blockedCall.await() }
+            assertEquals("collector remains on the prior ERROR while controller is streaming", ChatStatus.ERROR, vm.sessionState.value.status)
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { retryQueued.await() }
+            assertEquals(1, controllerSession.uiState.value.pendingSteerCount)
+            // The stale ERROR is still visible. A second Retry must not create
+            // another queued copy while the first queued retry owns the guard.
+            chatMain.run { vm.retry() }
+            assertEquals(1, controllerSession.uiState.value.pendingSteerCount)
+
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) {
+                controllerSession.uiState.first { it.queuedRecoveryRequired && it.pendingSteerCount == 1 }
+            }
+            assertEquals(1, controllerSession.uiState.value.pendingSteerCount)
+            assertEquals(listOf("active"), provider.sent.toList())
+
+            releaseProjection.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.ERROR && it.pendingSteerCount == 0 &&
+                        it.messages.any { message -> message.role == "user" && message.text == "active" }
+                }
+            }
+            withTimeout(5_000) { vm.input.first { it == "retry target" } }
+            assertTrue("the drained queued retry must be retryable again", vm.canRetry)
+
+            // Check #3 denied the queued promotion; this explicit retry is #4
+            // and is accepted once under the same operation identity.
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { provider.sentCount.first { it == 2 } }
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.IDLE && it.pendingSteerCount == 0 }
+            }
+            assertEquals(listOf("active", "retry target"), provider.sent.toList())
+            assertEquals(4, policy.chatSendCheckCount)
+            assertEquals(0, controllerSession.uiState.value.pendingSteerCount)
+            val promotedRetry = vm.sessionState.value.messages.single {
+                it.role == "user" && it.text == "retry target"
+            }
+            assertTrue("promoted retry carries its exact admission id", promotedRetry.operationId != null)
+        } finally {
+            releaseProjection.complete(Unit)
+            provider.releaseBlocked.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun promotionDenyMovesQueuedOpToRecoveryAndRetryReusesItOnce() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider()
+        val policy = PromotionPolicy(denyChecks = setOf(2))
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            provider.blockedCall.await()
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) {
+                vm.sessionState.first { it.pendingSteerCount == 1 }
+            }
+
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.ERROR && it.pendingSteerCount == 0 }
+            }
+            assertEquals("B", vm.input.value)
+            assertEquals("CHAT_SEND_DENIED", vm.notice.value)
+            assertTrue(vm.canRetry)
+            assertEquals(listOf("A"), provider.sent.toList())
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            assertEquals(listOf("A", "B"), provider.sent.toList())
+            assertEquals("", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            delay(100)
+            assertEquals("B must not remain queued for a duplicate promotion", listOf("A", "B"), provider.sent.toList())
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun fallbackRetryAdoptsExactQueuedRecoveryAfterEarlierRetryTargetIsDiscarded() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider(blockedText = "X")
+        val policy = PromotionPolicy(denyChecks = setOf(2))
+        val queuedA = CompletableDeferred<Unit>()
+        val queuedB = CompletableDeferred<Unit>()
+        val originalQueuedBOpId = CompletableDeferred<Long>()
+        val sessions = ProductionControllerSessions(
+            provider = provider,
+            policy = policy,
+            wrapSession = { delegate ->
+                object : ChatSession by delegate {
+                    override suspend fun startOrEnqueue(
+                        text: String,
+                        images: List<ChatImageRef>,
+                        opId: Long?,
+                    ): TurnStart {
+                        val verdict = delegate.startOrEnqueue(text, images, opId)
+                        if (text == "B" && verdict is TurnStart.Queued) {
+                            originalQueuedBOpId.complete(requireNotNull(opId))
+                        }
+                        return verdict
+                    }
+                }
+            },
+            onQueued = { text ->
+                when (text) {
+                    "A" -> queuedA.complete(Unit)
+                    "B" -> queuedB.complete(Unit)
+                }
+            },
+        )
+        val vm = newViewModel(store, sessions, policy)
+        try {
+            chatMain.run { vm.sendDirect("X") }
+            withTimeout(5_000) { provider.blockedCall.await() }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.STREAMING } }
+
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { queuedA.await() }
+            chatMain.run {
+                vm.sendDirect("B")
+                vm.onInputChange("keep")
+            }
+            withTimeout(5_000) { queuedB.await() }
+            val queuedBOpId = withTimeout(5_000) { originalQueuedBOpId.await() }
+
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.ERROR && it.pendingSteerCount == 0 }
+            }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 2 } }
+            assertEquals("keep", vm.input.value)
+            assertEquals(listOf("X"), provider.sent.toList())
+            assertTrue(vm.canRetry)
+
+            // Promotion denial makes A the explicit retryable target, while B
+            // remains the accepted-fallback target. Discard A, then keep the
+            // unrelated non-empty draft while Retry adopts B by its exact id.
+            var discarded = false
+            chatMain.run { discarded = vm.discardNextRecovered() }
+            assertTrue(discarded)
+            assertEquals(1, vm.pendingRecoveryCount.value)
+            assertEquals("keep", vm.input.value)
+            assertTrue("B remains a valid fallback after discarding A", vm.canRetry)
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { provider.sentCount.first { it == 2 } }
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.IDLE && it.messages.any { message ->
+                        message.role == "user" && message.text == "B"
+                    }
+                }
+            }
+
+            val retriedB = vm.sessionState.value.messages.single {
+                it.role == "user" && it.text == "B"
+            }
+            assertEquals(queuedBOpId, retriedB.operationId)
+            assertEquals(listOf("X", "B"), provider.sent.toList())
+            assertEquals(1, provider.sent.count { it == "B" })
+            assertEquals("keep", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            chatMain.run { vm.onInputChange("") }
+            var restored = true
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertFalse("retried B must no longer be restorable", restored)
+            assertEquals("", vm.input.value)
+            assertEquals(listOf("X", "B"), provider.sent.toList())
+        } finally {
+            provider.releaseBlocked.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun discardingQueuedRecoveryCannotFallbackRetryItButSameTextNewOpCanRetry() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider(blockedText = "active", failedText = "same")
+        val policy = PromotionPolicy(denyChecks = setOf(2))
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            chatMain.run { vm.sendDirect("active") }
+            withTimeout(5_000) { provider.blockedCall.await() }
+            chatMain.run { vm.sendDirect("same") }
+            chatMain.run { vm.onInputChange("keep") }
+
+            // The queued turn's promotion gate fails. The occupied box keeps
+            // that exact op hidden in the recovery outbox while ERROR remains.
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.ERROR && it.pendingSteerCount == 0 }
+            }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            assertEquals("keep", vm.input.value)
+            assertEquals(listOf("active"), provider.sent.toList())
+            assertTrue(vm.canRetry)
+
+            var discarded = false
+            chatMain.run { discarded = vm.discardNextRecovered() }
+            assertTrue(discarded)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertFalse("discarded queued op must not be revived by text fallback", vm.canRetry)
+            chatMain.run { vm.retry() }
+            delay(100)
+            assertEquals("Retry after discard must not reach the provider", listOf("active"), provider.sent.toList())
+
+            // A distinct accepted operation with identical text gets its own
+            // retry target; discard is keyed by opId, never String equality.
+            chatMain.run { vm.sendDirect("same") }
+            withTimeout(5_000) { provider.sentCount.first { it == 2 } }
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.ERROR && it.messages.any { message ->
+                        message.role == "user" && message.text == "same" && message.operationId != null
+                    }
+                }
+            }
+            assertTrue("independent same-text failed turn remains retryable", vm.canRetry)
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { provider.sentCount.first { it == 3 } }
+            assertEquals(listOf("active", "same", "same"), provider.sent.toList())
+        } finally {
+            provider.releaseBlocked.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun promotionPolicyFailureShowsUnavailableAndRetrySendsQueuedOpExactlyOnce() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider()
+        // A's admission is allowed; promotion of queued B fails; Retry then
+        // gets a fresh successful policy evaluation.
+        val policy = PromotionPolicy(denyChecks = emptySet(), failureChecks = setOf(2))
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            provider.blockedCall.await()
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) {
+                vm.sessionState.first { it.pendingSteerCount == 1 }
+            }
+
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.ERROR && it.error == "policy evaluation failed" &&
+                        it.pendingSteerCount == 0
+                }
+            }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_POLICY_UNAVAILABLE" } }
+            assertEquals("CHAT_POLICY_UNAVAILABLE", vm.notice.value)
+            assertEquals("B", vm.input.value)
+            assertTrue(vm.canRetry)
+            assertEquals("Promotion failure must not send B", listOf("A"), provider.sent.toList())
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.IDLE && it.pendingSteerCount == 0 }
+            }
+            assertEquals(listOf("A", "B"), provider.sent.toList())
+            assertEquals("", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            delay(100)
+            assertEquals("Retry sends B exactly once", listOf("A", "B"), provider.sent.toList())
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun freshPolicyEvaluationFailureFailsClosedAndRestoresSend() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider()
+        val failedChatChecks = AtomicInteger()
+        val fallbackChecks = AtomicInteger()
+        val policy = object : PolicyStore {
+            override fun evaluate(action: String, resource: String): PolicyDecision {
+                fallbackChecks.incrementAndGet()
+                return PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+            }
+
+            override suspend fun setRule(rule: PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules(): List<PolicyRule> = emptyList()
+
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+                if (action == "chat.send") {
+                    if (failedChatChecks.incrementAndGet() == 1) {
+                        throw IllegalStateException("synthetic policy storage failure")
+                    }
+                }
+                return PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+            }
+        }
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            chatMain.run { vm.sendDirect("must remain recoverable") }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_POLICY_UNAVAILABLE" } }
+            withTimeout(5_000) { vm.input.first { it == "must remain recoverable" } }
+
+            assertEquals("CHAT_POLICY_UNAVAILABLE", vm.notice.value)
+            assertTrue(vm.notice.value != "NO_ENDPOINT")
+            assertEquals(ChatStatus.ERROR, vm.sessionState.value.status)
+            assertTrue("failed admission remains retryable", vm.canRetry)
+            assertEquals("must remain recoverable", vm.input.value)
+            assertEquals(0, provider.sent.size)
+            assertEquals(1, failedChatChecks.get())
+            assertEquals("no stale evaluate() ALLOW fallback", 0, fallbackChecks.get())
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.IDLE }
+            }
+            assertEquals(2, failedChatChecks.get())
+            assertEquals(listOf("must remain recoverable"), provider.sent.toList())
+            assertEquals("", vm.input.value)
+            delay(100)
+            assertEquals("Retry re-gates and sends exactly once", listOf("must remain recoverable"), provider.sent.toList())
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun initialAskDoesNotSendAndRestoresInputWithApprovalRequiredNotice() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider()
+        val policy = PromotionPolicy(denyChecks = emptySet(), askChecks = setOf(1))
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            chatMain.run { vm.sendDirect("needs approval") }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_APPROVAL_REQUIRED" } }
+            withTimeout(5_000) { vm.input.first { it == "needs approval" } }
+
+            assertEquals("CHAT_APPROVAL_REQUIRED", vm.notice.value)
+            assertEquals("needs approval", vm.input.value)
+            assertEquals(0, provider.sent.size)
+            assertFalse(vm.sessionState.value.messages.any { it.role == "user" })
+            assertTrue(vm.canRetry)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun followUpAskKeepsQueueRecoverableUntilExplicitRetryIsAllowed() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider()
+        val policy = PromotionPolicy(denyChecks = emptySet(), askChecks = setOf(2))
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            provider.blockedCall.await()
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) { vm.sessionState.first { it.pendingSteerCount == 1 } }
+
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.ERROR && it.error == "approval required" &&
+                        it.pendingSteerCount == 0
+                }
+            }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_APPROVAL_REQUIRED" } }
+            assertEquals("CHAT_APPROVAL_REQUIRED", vm.notice.value)
+            assertEquals("B", vm.input.value)
+            assertTrue(vm.canRetry)
+            assertEquals("ASK must not append or call provider", listOf("A"), provider.sent.toList())
+            assertFalse(vm.sessionState.value.messages.any { it.role == "user" && it.text == "B" })
+
+            // Retry is an explicit re-admission; check #3 returns ALLOW.
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.IDLE && it.pendingSteerCount == 0 }
+            }
+            assertEquals(listOf("A", "B"), provider.sent.toList())
+            assertEquals("", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            delay(100)
+            assertEquals("Explicit retry sends B exactly once", listOf("A", "B"), provider.sent.toList())
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun sendQueuedBehindCancelledHostIsRecoveredOnceWithoutAutoSend() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = CancelWindowProvider()
+        val policy = PromotionPolicy(denyChecks = emptySet())
+        val queuedB = CompletableDeferred<Unit>()
+        val sessions = ProductionControllerSessions(provider, policy) { text ->
+            if (text == "B") queuedB.complete(Unit)
+        }
+        val vm = newViewModel(store, sessions, policy)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { provider.requestEntered.await() }
+
+            chatMain.run { vm.cancel() }
+            withTimeout(5_000) { provider.cancellationCleanupEntered.await() }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.CANCELLED } }
+
+            // The cancelled host is still cleaning up and remains the active
+            // single-flight job. B queues after cancel() has already run.
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) { queuedB.await() }
+            provider.releaseCancellationCleanup.complete(Unit)
+
+            withTimeout(5_000) { vm.input.first { it == "B" } }
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.CANCELLED && it.pendingSteerCount == 0 &&
+                        !it.queuedRecoveryRequired
+                }
+            }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_CANCELLED_RECOVERY" } }
+            assertEquals("B", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(listOf("A"), provider.sent.toList())
+            assertFalse(vm.sessionState.value.messages.any { it.role == "user" && it.text == "B" })
+            delay(100)
+            assertEquals("retained work is never auto-sent", listOf("A"), provider.sent.toList())
+
+            // Recovery is explicit: the retained input can be sent once by
+            // the user after cancellation has fully completed.
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            assertEquals(listOf("A", "B"), provider.sent.toList())
+            assertEquals("", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            delay(100)
+            assertEquals("explicit recovery sends B exactly once", listOf("A", "B"), provider.sent.toList())
+        } finally {
+            provider.releaseCancellationCleanup.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun staleFreshDenyCannotStealRetryFromNewerReclaimedPromotionQueue() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val candidateGateEntered = CompletableDeferred<Unit>()
+        val releaseCandidateGate = CompletableDeferred<Unit>()
+        val checks = AtomicInteger()
+        val policy = object : PolicyStore {
+            override fun evaluate(action: String, resource: String) =
+                PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+
+            override suspend fun setRule(rule: PolicyRule) = Unit
+            override suspend fun removeRule(pattern: String) = Unit
+            override suspend fun listRules(): List<PolicyRule> = emptyList()
+
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+                if (action != "chat.send") return PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+                return when (checks.incrementAndGet()) {
+                    1 -> {
+                        candidateGateEntered.complete(Unit)
+                        releaseCandidateGate.await()
+                        PolicyDecision(Verdict.DENY, null, System.currentTimeMillis())
+                    }
+                    3 -> PolicyDecision(Verdict.DENY, null, System.currentTimeMillis())
+                    else -> PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+                }
+            }
+        }
+        val provider = PromotionProvider()
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            // Candidate's fresh gate remains in flight while a later turn is
+            // admitted and its queued follow-up fails promotion.
+            chatMain.run { vm.sendDirect("older candidate") }
+            withTimeout(5_000) { candidateGateEntered.await() }
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { provider.blockedCall.await() }
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) { vm.sessionState.first { it.pendingSteerCount == 1 } }
+
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.ERROR && it.pendingSteerCount == 0 }
+            }
+            withTimeout(5_000) { vm.input.first { it == "B" } }
+            assertTrue(vm.canRetry)
+            assertEquals(listOf("A"), provider.sent.toList())
+
+            // Older candidate now returns DENY. It remains recoverable but may
+            // not replace B as the most recent, explicitly retriable queue item.
+            releaseCandidateGate.complete(Unit)
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            assertEquals("B", vm.input.value)
+            assertTrue(vm.canRetry)
+            assertEquals(listOf("A"), provider.sent.toList())
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { provider.sentCount.first { it >= 2 } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            assertEquals(listOf("A", "B"), provider.sent.toList())
+            // B's successful Retry surfaces the older denied candidate in the
+            // input draft; it does not auto-send it or lose it from recovery.
+            assertEquals("older candidate", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals("older candidate must remain explicit recovery, never auto-send", listOf("A", "B"), provider.sent.toList())
+
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { provider.sentCount.first { it >= 3 } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            assertEquals(listOf("A", "B", "older candidate"), provider.sent.toList())
+        } finally {
+            releaseCandidateGate.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun legacyNullOpIdRecoveryKeepsQueuedRetryTargetAcrossCurrentAdmission() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = LegacyNullRecoverySessions()
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("current") }
+
+            withTimeout(5_000) {
+                while (sessions.session.admitted.size < 1 || vm.input.value != "queued legacy") delay(1)
+            }
+            // The current admission succeeded once, but it did not replace the
+            // legacy queued text now held as the exact tagged Retry target.
+            assertEquals(listOf("current"), sessions.session.admitted.toList())
+            assertEquals("queued legacy", vm.input.value)
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            assertTrue(vm.canRetry)
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { while (sessions.session.admitted.size < 2) delay(1) }
+            assertEquals(listOf("current", "queued legacy"), sessions.session.admitted.toList())
+            assertEquals("", vm.input.value)
+            delay(100)
+            assertEquals("each admission is delivered once", listOf("current", "queued legacy"), sessions.session.admitted.toList())
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun promotionDenyThenFreshSendKeepsDeniedOpRecoverableWithoutPromotion() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider()
+        val policy = PromotionPolicy(denyChecks = setOf(2))
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            provider.blockedCall.await()
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) { vm.sessionState.first { it.pendingSteerCount == 1 } }
+
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.ERROR && it.pendingSteerCount == 0 }
+            }
+            assertEquals("B", vm.input.value)
+
+            chatMain.run { vm.sendDirect("C") }
+            withTimeout(5_000) { provider.sentCount.first { it >= 2 } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            assertEquals(listOf("A", "C"), provider.sent.toList())
+            // C was an explicit new send. B remains visible for explicit
+            // recovery/send; it was neither silently promoted nor discarded.
+            withTimeout(5_000) { vm.input.first { it == "B" } }
+            assertEquals("B", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(listOf("A", "C"), provider.sent.toList())
+
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { provider.sentCount.first { it >= 3 } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            assertEquals(listOf("A", "C", "B"), provider.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
+    fun newerPromotionDenyOwnsRetryWhileOlderDeniedOpRemainsRecoverable() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider(blockedText = "X")
+        // A's initial gate denies; X is admitted; B's follow-up promotion denies.
+        val policy = PromotionPolicy(denyChecks = setOf(1, 3))
+        val vm = newViewModel(store, ProductionControllerSessions(provider, policy), policy)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.ERROR && it.error == "denied by policy" }
+            }
+            assertEquals("A", vm.input.value)
+
+            // Explicit X stashes denied A and starts a real controller turn.
+            chatMain.run { vm.sendDirect("X") }
+            provider.blockedCall.await()
+            assertEquals(listOf("X"), provider.sent.toList())
+
+            // B queues behind X. Its promotion denial must become the Retry target.
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) { vm.sessionState.first { it.pendingSteerCount == 1 } }
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first { it.status == ChatStatus.ERROR && it.pendingSteerCount == 0 }
+            }
+            withTimeout(5_000) { while (vm.input.value != "A") delay(1) }
+            assertTrue(vm.canRetry)
+            assertEquals(listOf("X"), provider.sent.toList())
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            assertEquals(listOf("X", "B"), provider.sent.toList())
+            assertEquals("A", vm.input.value)
+            delay(100)
+            assertEquals("B is sent once and older denied A is not auto-sent", listOf("X", "B"), provider.sent.toList())
+
+            // A remains an explicitly recoverable tagged draft after retrying B.
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { while (provider.sent.size < 3) delay(1) }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.IDLE } }
+            assertEquals(listOf("X", "B", "A"), provider.sent.toList())
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     // Q2: retry never clobbers newer typing, and a denied retry stashes the
     // intent instead of deleting it. Denied Q is restored, the user types
     // "newer", and a still-denied retry resends nothing and keeps "newer";
@@ -1774,6 +2600,317 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    /** Real ChatSessionImpl/TurnController behind the ChatViewModel lifecycle tests. */
+    private class ProductionControllerSessions(
+        private val provider: LlmProvider,
+        private val policy: PolicyStore,
+        private val wrapSession: (ChatSession) -> ChatSession = { it },
+        private val onQueued: suspend (String) -> Unit = {},
+    ) : ChatSessionProvider {
+        private val created = AtomicInteger()
+        val createdSessions = CopyOnWriteArrayList<ChatSession>()
+        val controllerSessions = CopyOnWriteArrayList<ChatSession>()
+
+        override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession {
+            val id = "controller-session-${created.incrementAndGet()}"
+            val transcript = object : TranscriptSink by NoOpTranscriptSink() {
+                override suspend fun onSteerQueued(text: String) = onQueued(text)
+            }
+            val session = ChatSessionImpl(
+                provider = provider,
+                policy = policy,
+                transcript = transcript,
+                model = endpoint.model,
+            )
+            controllerSessions.add(session)
+            val exposed = wrapSession(session)
+            createdSessions.add(exposed)
+            return CreatedSession(id, exposed, endpoint.providerId, endpoint.model)
+        }
+
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = error("open is not used by this test")
+
+        override suspend fun storeOrNull(): SessionStore? = null
+    }
+
+    private class PromotionProvider(
+        private val blockedText: String = "A",
+        private val failedText: String? = null,
+    ) : LlmProvider {
+        override val protocol = ProviderProtocol.CHAT_COMPLETIONS
+        val sent = CopyOnWriteArrayList<String>()
+        val sentCount = MutableStateFlow(0)
+        val blockedCall = CompletableDeferred<Unit>()
+        val releaseBlocked = CompletableDeferred<Unit>()
+
+        override fun stream(request: ChatRequest) = flow {
+            val text = request.messages.last { it.role == "user" }.text
+            sent.add(text)
+            sentCount.value = sent.size
+            if (text == blockedText) {
+                blockedCall.complete(Unit)
+                releaseBlocked.await()
+            }
+            if (text == failedText) {
+                emit(StreamEvent.Failed("synthetic context error", retryable = false))
+                return@flow
+            }
+            emit(StreamEvent.Done("stop"))
+        }
+
+        override suspend fun listModels(): List<String> = emptyList()
+    }
+
+    /** Holds cancellation cleanup so a new send can queue behind the cancelled host. */
+    private class CancelWindowProvider : LlmProvider {
+        override val protocol = ProviderProtocol.CHAT_COMPLETIONS
+        val sent = CopyOnWriteArrayList<String>()
+        val requestEntered = CompletableDeferred<Unit>()
+        val cancellationCleanupEntered = CompletableDeferred<Unit>()
+        val releaseCancellationCleanup = CompletableDeferred<Unit>()
+
+        override fun stream(request: ChatRequest) = flow {
+            val text = request.messages.last { it.role == "user" }.text
+            sent.add(text)
+            if (text == "A") {
+                requestEntered.complete(Unit)
+                try {
+                    CompletableDeferred<Unit>().await()
+                } finally {
+                    withContext(NonCancellable) {
+                        cancellationCleanupEntered.complete(Unit)
+                        releaseCancellationCleanup.await()
+                    }
+                }
+            }
+            emit(StreamEvent.Done("stop"))
+        }
+
+        override suspend fun listModels(): List<String> = emptyList()
+    }
+
+    /** Deny selected chat.send policy check ordinals; allow every other check. */
+    private class PromotionPolicy(
+        private val denyChecks: Set<Int>,
+        private val failureChecks: Set<Int> = emptySet(),
+        private val askChecks: Set<Int> = emptySet(),
+    ) : PolicyStore {
+        private val delegate = InMemoryPolicyStore()
+        private val chatSendChecks = AtomicInteger()
+        val chatSendCheckCount: Int get() = chatSendChecks.get()
+
+        override fun evaluate(action: String, resource: String): PolicyDecision =
+            delegate.evaluate(action, resource)
+
+        override suspend fun setRule(rule: PolicyRule) = delegate.setRule(rule)
+        override suspend fun removeRule(pattern: String) = delegate.removeRule(pattern)
+        override suspend fun listRules(): List<PolicyRule> = delegate.listRules()
+
+        override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+            if (action == "chat.send") {
+                val check = chatSendChecks.incrementAndGet()
+                if (check in failureChecks) throw IllegalStateException("synthetic policy evaluation failure")
+                if (check in denyChecks) {
+                    return PolicyDecision(Verdict.DENY, null, System.currentTimeMillis())
+                }
+                if (check in askChecks) {
+                    return PolicyDecision(Verdict.ASK, null, System.currentTimeMillis())
+                }
+            }
+            return PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+        }
+    }
+
+    /** Returns a drained NeedsRecovery batch only after endpoint invalidation has run. */
+    private class BarrierNeedsRecoverySessions : ChatSessionProvider {
+        private val createCount = AtomicInteger()
+        val returnBarrierEntered = CompletableDeferred<Unit>()
+        val releaseReturn = CompletableDeferred<Unit>()
+        val oldClosed = CompletableDeferred<Unit>()
+        private val replacements = CopyOnWriteArrayList<RecordingSession>()
+
+        override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession {
+            if (createCount.incrementAndGet() == 1) {
+                val delegate = RecordingSession("old", { })
+                val session = object : ChatSession by delegate {
+                    override suspend fun startOrEnqueue(
+                        text: String,
+                        images: List<dev.librepocket.chat.ChatImageRef>,
+                        opId: Long?,
+                    ): dev.librepocket.chat.TurnStart {
+                        return suspendCoroutine { continuation ->
+                            returnBarrierEntered.complete(Unit)
+                            releaseReturn.invokeOnCompletion {
+                                continuation.resume(
+                                    dev.librepocket.chat.TurnStart.NeedsRecovery(
+                                        listOf(dev.librepocket.chat.QueuedIntent(9001L, "queued")),
+                                    ),
+                                )
+                            }
+                        }
+                    }
+
+                    override fun close() {
+                        delegate.close()
+                        oldClosed.complete(Unit)
+                    }
+                }
+                return CreatedSession("old", session, endpoint.providerId, modelFor(endpoint))
+            }
+
+            val replacement = RecordingSession("replacement", { })
+            replacements.add(replacement)
+            return CreatedSession("replacement-${createCount.get()}", replacement, endpoint.providerId, modelFor(endpoint))
+        }
+
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = error("open is not used by this test")
+
+        override suspend fun storeOrNull(): SessionStore? = null
+
+        suspend fun awaitReplacement(): RecordingSession = withTimeout(5_000) {
+            while (replacements.isEmpty()) delay(1)
+            replacements.first()
+        }
+    }
+
+    /** Fresh denial deliberately resembles the old string/count promotion signal. */
+    private class FreshDenyQueuedSessions : ChatSessionProvider {
+        val session = FreshDenyQueuedSession()
+        override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ) = CreatedSession("fresh-deny", session, endpoint.providerId, modelFor(endpoint))
+
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = error("open is not used by this test")
+
+        override suspend fun storeOrNull(): SessionStore? = null
+    }
+
+    private class FreshDenyQueuedSession : ChatSession {
+        private val mutableState = MutableStateFlow(
+            ChatUiState(emptyList(), ChatStatus.IDLE, 1, null),
+        )
+        override val uiState: StateFlow<ChatUiState> = mutableState
+        val drainCalls = AtomicInteger()
+        val admitted = CopyOnWriteArrayList<String>()
+        private var firstAdmission = true
+        private var queued = true
+
+        override suspend fun send(text: String, images: List<dev.librepocket.chat.ChatImageRef>) = Unit
+        override suspend fun startTurn(text: String, images: List<dev.librepocket.chat.ChatImageRef>): Job = Job().apply { complete() }
+
+        override suspend fun startOrEnqueue(
+            text: String,
+            images: List<dev.librepocket.chat.ChatImageRef>,
+            opId: Long?,
+        ): dev.librepocket.chat.TurnStart {
+            if (firstAdmission) {
+                firstAdmission = false
+                mutableState.value = mutableState.value.copy(
+                    status = ChatStatus.ERROR,
+                    error = "denied by policy",
+                    pendingSteerCount = 1,
+                    queuedRecoveryRequired = false,
+                )
+                throw SecurityException("chat.send denied by policy")
+            }
+            admitted.add(text)
+            mutableState.value = mutableState.value.copy(status = ChatStatus.IDLE, error = null)
+            return dev.librepocket.chat.TurnStart.Started(Job().apply { complete() })
+        }
+
+        override fun drainQueued(): List<dev.librepocket.chat.QueuedIntent> {
+            drainCalls.incrementAndGet()
+            if (!queued) return emptyList()
+            queued = false
+            return listOf(dev.librepocket.chat.QueuedIntent(77L, "queued"))
+        }
+
+        override fun cancel() = Unit
+        override fun steer(text: String) = Unit
+        override fun close() = Unit
+    }
+
+    /** Legacy steer-compatible fake that transfers one null-opId recovery batch. */
+    private class LegacyNullRecoverySessions : ChatSessionProvider {
+        val session = LegacyNullRecoverySession()
+
+        override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ) = CreatedSession("legacy-null-recovery", session, endpoint.providerId, modelFor(endpoint))
+
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = error("open is not used by this test")
+
+        override suspend fun storeOrNull(): SessionStore? = null
+    }
+
+    private class LegacyNullRecoverySession : ChatSession {
+        private val mutableState = MutableStateFlow(ChatUiState(emptyList(), ChatStatus.IDLE, 0, null))
+        override val uiState: StateFlow<ChatUiState> = mutableState
+        private var returnRecovery = true
+        val admitted = CopyOnWriteArrayList<String>()
+
+        override suspend fun send(text: String, images: List<dev.librepocket.chat.ChatImageRef>) = Unit
+        override suspend fun startTurn(text: String, images: List<dev.librepocket.chat.ChatImageRef>): Job =
+            Job().apply { complete() }
+
+        override suspend fun startOrEnqueue(
+            text: String,
+            images: List<dev.librepocket.chat.ChatImageRef>,
+            opId: Long?,
+        ): dev.librepocket.chat.TurnStart {
+            if (returnRecovery) {
+                returnRecovery = false
+                mutableState.value = mutableState.value.copy(status = ChatStatus.ERROR, error = "denied by policy")
+                return dev.librepocket.chat.TurnStart.NeedsRecovery(
+                    listOf(dev.librepocket.chat.QueuedIntent(opId = null, text = "queued legacy")),
+                )
+            }
+            admitted.add(text)
+            return dev.librepocket.chat.TurnStart.Started(Job().apply { complete() })
+        }
+
+        override fun drainQueued(): List<dev.librepocket.chat.QueuedIntent> = emptyList()
+        override fun cancel() = Unit
+        override fun steer(text: String) = Unit
+        override fun close() = Unit
+    }
+
     private class ControlledSessions : ChatSessionProvider {
         val created = CopyOnWriteArrayList<RecordingSession>()
         val opened = CopyOnWriteArrayList<RecordingSession>()
@@ -1865,6 +3002,34 @@ class ChatSessionLifecycleTest {
         gate: CompletableDeferred<Unit>,
     ) : ChatSession by delegate {
         override val uiState: StateFlow<ChatUiState> = GateableStateFlow(delegate.uiState, gate)
+    }
+
+    /** Holds the first STREAMING projection while the controller StateFlow keeps advancing. */
+    @OptIn(kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi::class)
+    private class HoldFirstStreamingProjection(
+        delegate: ChatSession,
+        private val held: CompletableDeferred<Unit>,
+        private val release: CompletableDeferred<Unit>,
+    ) : ChatSession by delegate {
+        private val source = delegate.uiState
+        override val uiState: StateFlow<ChatUiState> = object : StateFlow<ChatUiState> {
+            override val value: ChatUiState get() = source.value
+            override val replayCache: List<ChatUiState> get() = source.replayCache
+
+            override suspend fun collect(collector: FlowCollector<ChatUiState>): Nothing {
+                var paused = false
+                source.collect(object : FlowCollector<ChatUiState> {
+                    override suspend fun emit(value: ChatUiState) {
+                        if (!paused && value.status == ChatStatus.STREAMING) {
+                            paused = true
+                            held.complete(Unit)
+                            release.await()
+                        }
+                        collector.emit(value)
+                    }
+                })
+            }
+        }
     }
 
     private class RecordingSession(

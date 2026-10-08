@@ -654,6 +654,50 @@ class ApkPolicyHarness(unittest.TestCase):
         self.dexdump_path.unlink()
         self.assert_rejected(complete_apk(self.tmp / "missing-dexdump.apk"))
 
+    def test_falls_back_to_older_complete_build_tools(self) -> None:
+        older = self.sdk / "build-tools" / "35.0.0"
+        older.mkdir(parents=True)
+        aapt_text = (self.build_tools / "aapt").read_text(encoding="utf-8")
+        dexdump_text = self.dexdump_path.read_text(encoding="utf-8")
+        (older / "aapt").write_text(aapt_text, encoding="utf-8")
+        (older / "dexdump").write_text(dexdump_text, encoding="utf-8")
+        (older / "aapt").chmod(0o755)
+        (older / "dexdump").chmod(0o755)
+        # The newest directory is incomplete; the gate must use the older
+        # complete pair instead of reporting tools missing.
+        self.dexdump_path.unlink()
+        result = self.run_policy(complete_apk(self.tmp / "fallback-sdk.apk"))
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_split_tool_pair_across_versions_fails_closed(self) -> None:
+        older = self.sdk / "build-tools" / "35.0.0"
+        older.mkdir(parents=True)
+        dexdump_text = self.dexdump_path.read_text(encoding="utf-8")
+        (older / "dexdump").write_text(dexdump_text, encoding="utf-8")
+        (older / "dexdump").chmod(0o755)
+        # 36.0.0 has aapt only and 35.0.0 has dexdump only: no single
+        # directory holds both executables, so the gate must fail closed
+        # rather than mix versions.
+        self.dexdump_path.unlink()
+        self.assert_rejected(complete_apk(self.tmp / "split-sdk.apk"))
+
+    def test_sdk_path_with_space_resolves_tool_pair(self) -> None:
+        spaced_sdk = self.tmp / "sdk with space"
+        tools_dir = spaced_sdk / "build-tools" / "36.0.0"
+        tools_dir.mkdir(parents=True)
+        (tools_dir / "aapt").write_text(
+            (self.build_tools / "aapt").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (tools_dir / "dexdump").write_text(
+            self.dexdump_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (tools_dir / "aapt").chmod(0o755)
+        (tools_dir / "dexdump").chmod(0o755)
+        result = self.run_policy(
+            complete_apk(self.tmp / "spaced-sdk.apk"), sdk=spaced_sdk
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_dexdump_stdout_is_not_forwarded_or_used_as_policy_data(self) -> None:
         # Native stdout must be DEVNULL or otherwise bounded, never captured as
         # a full dump. This control checks output/data flow, not peak memory;

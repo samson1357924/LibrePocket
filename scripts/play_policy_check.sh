@@ -87,12 +87,27 @@ find_tool_pair() {
     for sdk in "${ANDROID_HOME:-}" "$HOME/Android/Sdk"; do
         [ -n "$sdk" ] || continue
         if [ -d "$sdk/build-tools" ]; then
-            latest=$(ls -d "$sdk"/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)
-            if [ -n "$latest" ] && [ -x "$latest/aapt" ] && [ -x "$latest/dexdump" ]; then
-                AAPT="$latest/aapt"
-                DEXDUMP="$latest/dexdump"
-                return 0
-            fi
+            # Take the newest directory that contains BOTH executables; a
+            # newer incomplete directory must not shadow an older complete
+            # pair.
+            candidates=$(ls -d "$sdk"/build-tools/* 2>/dev/null | sort -V -r || true)
+            # Split on newlines only (version dirs are one per line) and
+            # disable globbing so SDK paths with spaces still resolve.
+            _old_ifs=$IFS
+            IFS='
+'
+            set -f
+            for candidate in $candidates; do
+                if [ -x "$candidate/aapt" ] && [ -x "$candidate/dexdump" ]; then
+                    AAPT="$candidate/aapt"
+                    DEXDUMP="$candidate/dexdump"
+                    IFS=$_old_ifs
+                    set +f
+                    return 0
+                fi
+            done
+            IFS=$_old_ifs
+            set +f
         fi
     done
     if command -v aapt >/dev/null 2>&1 && command -v dexdump >/dev/null 2>&1; then

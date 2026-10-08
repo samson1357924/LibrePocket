@@ -157,6 +157,12 @@ class TurnController(
   private val steerQueue: ArrayDeque<PendingSteer> = ArrayDeque()
   private var closed = false
 
+  /** Test seam for pausing after follow-up policy approval, before handoff. */
+  internal var afterFollowUpGateForTest: (() -> Unit)? = null
+
+  /** Test seam for arranging a queue admission immediately before completion checks it. */
+  internal var beforeCompletionQueueCheckForTest: (() -> Unit)? = null
+
   /** Returns the live in-flight job, dropping (and clearing) completed ones. */
   private fun activeLocked(): Job? {
     val current = inFlight ?: return null
@@ -380,11 +386,12 @@ class TurnController(
     // Normal completion only: hand off at most one queued steer as a detached
     // follow-up turn, so send() returns after its own turn. The follow-up
     // gate runs BEFORE dequeue, so a deny leaves the queue intact (still
-    // reclaimable via drainQueued) instead of dropping the head, and no
-    // suspension sits between dequeue and append.
-    val hasQueued = synchronized(lock) { steerQueue.isNotEmpty() }
-    if (!hasQueued) {
-      synchronized(lock) {
+    // reclaimable via drainQueued). The dequeue and complete follow-up handoff
+    // then share the teardown lock, so the intent is either drained or fully
+    // accepted; it cannot be stranded between the queue and transcript.
+    beforeCompletionQueueCheckForTest?.invoke()
+    val hasQueued = synchronized(lock) {
+      if (steerQueue.isEmpty()) {
         if (inFlight === self) inFlight = null
         _uiState.update { s ->
           if (s.status == ChatStatus.STREAMING || s.status == ChatStatus.WAITING_STEERED) {
@@ -393,10 +400,15 @@ class TurnController(
             s
           }
         }
+        false
+      } else {
+        _uiState.update { it.copy(pendingSteerCount = steerQueue.size, status = ChatStatus.WAITING_STEERED) }
+        true
       }
+    }
+    if (!hasQueued) {
       return
     }
-    _uiState.update { it.copy(pendingSteerCount = queueSize(), status = ChatStatus.WAITING_STEERED) }
     val decision = policy.evaluateFresh(POLICY_ACTION, POLICY_RESOURCE)
     if (decision.verdict == Verdict.DENY) {
       _uiState.update { it.copy(status = ChatStatus.ERROR, error = "denied by policy") }
@@ -405,13 +417,16 @@ class TurnController(
       }
       return
     }
-    val next = synchronized(lock) { steerQueue.removeFirstOrNull() }
-    if (next == null) {
-      // Lost a race with close()/drainQueued(): nothing left to promote.
-      // Mirror the empty-queue status transition (the WAITING update above
-      // already fired); the STREAMING/WAITING-only gate preserves a racing
-      // close()'s CANCELLED.
-      synchronized(lock) {
+    afterFollowUpGateForTest?.invoke()
+    synchronized(lock) {
+      if (closed) {
+        if (inFlight === self) inFlight = null
+        return
+      }
+      val next = steerQueue.removeFirstOrNull()
+      if (next == null) {
+        // drainQueued() won after the fresh gate. Mirror the empty-queue
+        // transition while preserving a racing close()'s CANCELLED state.
         if (inFlight === self) inFlight = null
         _uiState.update { s ->
           if (s.status == ChatStatus.STREAMING || s.status == ChatStatus.WAITING_STEERED) {
@@ -420,17 +435,6 @@ class TurnController(
             s
           }
         }
-      }
-      return
-    }
-    synchronized(lock) {
-      if (closed) {
-        // Teardown won the race after dequeue: hand the intent (with its
-        // opId) back for any later drainQueued() instead of starting work on
-        // a dead scope.
-        if (inFlight === self) inFlight = null
-        steerQueue.addFirst(next)
-        _uiState.update { it.copy(pendingSteerCount = steerQueue.size) }
         return
       }
       appendUser(next.text)
@@ -444,8 +448,6 @@ class TurnController(
       }
     }
   }
-
-  private fun queueSize(): Int = synchronized(lock) { steerQueue.size }
 
   private suspend fun runTurnLoop(text: String, images: List<ChatImageRef>) {
     var attempt = 0

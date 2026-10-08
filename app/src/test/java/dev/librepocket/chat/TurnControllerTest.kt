@@ -37,6 +37,8 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
 import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.TimeUnit
 
@@ -875,6 +877,35 @@ class TurnControllerTest {
     }
   }
 
+  @Test fun queueAdmissionAtCompletionIsPromotedInsteadOfStranded() {
+    val completionCheck = CountDownLatch(1)
+    val resumeCompletion = CountDownLatch(1)
+    val provider = FakeLlmProvider {
+      flow { emit(StreamEvent.Done("stop")) }
+    }
+    val c = controller(provider)
+    c.beforeCompletionQueueCheckForTest = {
+      c.beforeCompletionQueueCheckForTest = null
+      completionCheck.countDown()
+      check(resumeCompletion.await(30, TimeUnit.SECONDS))
+    }
+
+    try {
+      val started = runBlocking { c.startOrEnqueue("first") } as TurnStart.Started
+      assertTrue("completion did not reach queue check", completionCheck.await(5, TimeUnit.SECONDS))
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow-up") })
+      resumeCompletion.countDown()
+      runBlocking { withTimeout(5000) { started.host.join() } }
+
+      awaitTrue { provider.streamCalls == 2 && c.uiState.value.status == ChatStatus.IDLE }
+      assertEquals(listOf("first", "follow-up"), usersOf(c))
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+    } finally {
+      resumeCompletion.countDown()
+      c.close()
+    }
+  }
+
   // N1 handoff: the follow-up gate runs BEFORE dequeue, so a deny at
   // promotion leaves the queued text in the FIFO (still reclaimable via
   // drainQueued) instead of dropping it, and the denied text is never
@@ -925,4 +956,60 @@ class TurnControllerTest {
       outer.cancel()
     }
   }
+
+  @Test fun teardownAfterFollowUpGateDrainsIntentBeforeAtomicHandoff() {
+    val firstTurnGate = CompletableDeferred<Unit>()
+    val gatePassed = CountDownLatch(1)
+    val releaseHandoff = CountDownLatch(1)
+    val provider = FakeLlmProvider { input ->
+      flow {
+        if (lastUserTextOf(input) == "first") {
+          firstTurnGate.await()
+        } else {
+          awaitCancellation()
+        }
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = TurnController(
+      provider = provider,
+      policy = AllowPolicy(),
+      dispatcher = Dispatchers.Default,
+    )
+    c.afterFollowUpGateForTest = {
+      // Pause after ALLOW but before the atomic queue→transcript handoff.
+      // Teardown must still be able to reclaim the original queued operation.
+      gatePassed.countDown()
+      check(releaseHandoff.await(30, TimeUnit.SECONDS))
+    }
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    var closer: Thread? = null
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow-up", opId = 73) })
+      firstTurnGate.complete(Unit)
+      assertTrue("follow-up gate did not pass", gatePassed.await(5, TimeUnit.SECONDS))
+
+      // The head is still in the queue until the handoff lock is acquired.
+      assertEquals(listOf(QueuedIntent(73L, "follow-up")), c.drainQueued())
+      closer = Thread { c.close() }.also { it.start() }
+      closer.join(5000)
+      assertFalse("close() did not finish", closer.isAlive)
+      releaseHandoff.countDown()
+      runBlocking { withTimeout(5000) { first.join() } }
+
+      // Teardown won: the intent has exactly one owner (the drain result), not
+      // a transcript append or a follow-up provider call.
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      assertTrue(c.drainQueued().isEmpty())
+    } finally {
+      releaseHandoff.countDown()
+      closer?.join(5000)
+      outer.cancel()
+      c.close()
+    }
+  }
+
 }

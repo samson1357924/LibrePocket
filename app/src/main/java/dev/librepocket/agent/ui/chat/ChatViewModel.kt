@@ -115,8 +115,9 @@ class ChatViewModel(
     private var lastUserText: String? = null
     // R2: unsent texts are owned per send/steer operation, never by a single
     // global String. Cleared only when the controller accepts that exact op
-    // (startTurn return / FIFO queue); pre-accept endpoint invalidation drains
-    // every entry into recoverableOps (never auto-sent to the new binding).
+    // (startOrEnqueue Started/Queued verdict); pre-accept endpoint
+    // invalidation drains every entry into recoverableOps (never auto-sent
+    // to the new binding).
     private data class PendingOp(val opId: Long, val generation: Long, val text: String)
     private var nextOpId = 0L
     private val pendingOps = LinkedHashMap<Long, PendingOp>()

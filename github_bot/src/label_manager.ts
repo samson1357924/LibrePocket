@@ -485,8 +485,8 @@ export async function ensureNeedsDecision(options: EnsureNeedsDecisionOptions): 
       labels: ['status:needs-decision'],
     });
     return true;
-  } catch (err: any) {
-    console.warn(`[PocketGuard Warning] Could not add status:needs-decision to #${options.issueNumber}: ${err?.message || err}`);
+  } catch {
+    console.warn('[PocketGuard Warning] Could not add status:needs-decision label.');
     return false;
   }
 }
@@ -590,7 +590,9 @@ export interface ReconcileResult {
   added: string[];
   removed: string[];
   skipped: string[];
-  failedRemovals?: string[];
+  failedRemovals: string[];
+  /** True when existing labels could not be listed, so stale-label reconciliation was not possible. */
+  failedToList: boolean;
 }
 
 /**
@@ -635,6 +637,7 @@ export async function reconcileBotLabelsSafely(
   const coverageComplete = options.coverageComplete !== false;
   const requestedLabels = coverageComplete ? desiredLabels : [...desiredLabels, 'status:needs-decision'];
   const validDesired = sanitizeLabels(requestedLabels);
+  let failedToList = false;
 
   try {
     let existingLabels: string[] = [];
@@ -648,26 +651,32 @@ export async function reconcileBotLabelsSafely(
           per_page: 100,
         });
         existingLabels = response.data.map((l) => l.name);
-      } catch (listErr: any) {
-        console.warn(
-          `[LabelManager Warning] Could not list existing labels for #${issueNumber}: ${listErr.message}`
-        );
-        // Fail-safe: if we cannot list labels, DO NOT attempt to remove anything to avoid accidental data loss.
-        if (validDesired.length > 0) {
-          try {
-            await client.rest.issues.addLabels({
-              owner,
-              repo,
-              issue_number: issueNumber,
-              labels: validDesired,
-            });
-            return { added: validDesired, removed: [], skipped: [] };
-          } catch (addErr: any) {
-            console.warn(`[LabelManager Warning] Fallback addLabels failed for #${issueNumber}: ${addErr.message}`);
-          }
-        }
-        return { added: [], removed: [], skipped: [] };
+      } catch {
+        failedToList = true;
+        console.warn('[LabelManager Warning] Could not list existing labels; stale-label reconciliation was skipped.');
       }
+    } else {
+      failedToList = true;
+      console.warn('[LabelManager Warning] Could not list existing labels; stale-label reconciliation was skipped.');
+    }
+
+    if (failedToList) {
+      // Without a listing, only append desired labels; never remove anything.
+      const added: string[] = [];
+      if (validDesired.length > 0) {
+        try {
+          await client.rest.issues.addLabels({
+            owner,
+            repo,
+            issue_number: issueNumber,
+            labels: validDesired,
+          });
+          added.push(...validDesired);
+        } catch {
+          console.warn('[LabelManager Warning] Could not add desired labels after listing failed.');
+        }
+      }
+      return { added, removed: [], skipped: [], failedRemovals: [], failedToList };
     }
 
     const existingLowerMap = new Map<string, string>();
@@ -711,13 +720,14 @@ export async function reconcileBotLabelsSafely(
           if (removeErr?.status === 404 || /not\s*found/i.test(removeErr?.message || '')) {
             removed.push(labelName);
           } else {
-            console.warn(
-              `[LabelManager Warning] Failed to remove label '${labelName}' from #${issueNumber}: ${removeErr?.message || removeErr}`
-            );
+            console.warn('[LabelManager Warning] Could not remove a stale managed label.');
             failedRemovals.push(labelName);
           }
         }
       }
+    } else if (toRemove.length > 0) {
+      failedRemovals.push(...toRemove);
+      console.warn('[LabelManager Warning] Could not remove stale managed labels.');
     }
 
     // 2. Add newly desired labels
@@ -734,15 +744,15 @@ export async function reconcileBotLabelsSafely(
         console.log(
           `[LabelManager] Successfully added labels to ${owner}/${repo} #${issueNumber}: [${toAdd.join(', ')}]`
         );
-      } catch (addErr: any) {
-        console.warn(`[LabelManager Warning] Failed to add labels to #${issueNumber}: ${addErr.message}`);
+      } catch {
+        console.warn('[LabelManager Warning] Could not add desired labels.');
       }
     }
 
-    return { added, removed, skipped, failedRemovals };
-  } catch (err: any) {
-    console.warn(`[LabelManager Warning] Reconciliation error on #${issueNumber}: ${err.message}`);
-    return { added: [], removed: [], skipped: [] };
+    return { added, removed, skipped, failedRemovals, failedToList };
+  } catch {
+    console.warn('[LabelManager Warning] Label reconciliation could not be completed.');
+    return { added: [], removed: [], skipped: [], failedRemovals: [], failedToList };
   }
 }
 
@@ -763,9 +773,17 @@ export interface ApplyLabelsOptions {
  * - If scope is undefined, maintains backward-compatible append-only behavior.
  * - Never throws on API errors (fails safely with warning log).
  */
-export async function applyLabelsSafely(
-  options: ApplyLabelsOptions
-): Promise<{ added: string[]; skipped: string[]; removed?: string[] }> {
+export interface ApplyLabelsResult {
+  added: string[];
+  skipped: string[];
+  removed?: string[];
+  /** Present for scoped reconciliation; omitted for legacy append-only calls. */
+  failedToList?: boolean;
+  /** Present for scoped reconciliation; omitted for legacy append-only calls. */
+  failedRemovals?: string[];
+}
+
+export async function applyLabelsSafely(options: ApplyLabelsOptions): Promise<ApplyLabelsResult> {
   if (options.scope) {
     const res = await reconcileBotLabelsSafely({
       client: options.client,
@@ -776,7 +794,13 @@ export async function applyLabelsSafely(
       scope: options.scope,
       coverageComplete: options.coverageComplete,
     });
-    return { added: res.added, skipped: res.skipped, removed: res.removed };
+    return {
+      added: res.added,
+      skipped: res.skipped,
+      removed: res.removed,
+      failedToList: res.failedToList,
+      failedRemovals: res.failedRemovals,
+    };
   }
 
   const { client, owner, repo, issueNumber, labels } = options;
@@ -799,8 +823,8 @@ export async function applyLabelsSafely(
           per_page: 100,
         });
         existingLabels = new Set(response.data.map((l) => l.name.toLowerCase()));
-      } catch (listErr: any) {
-        console.warn(`[LabelManager Warning] Could not list existing labels for #${issueNumber}: ${listErr.message}`);
+      } catch {
+        console.warn('[LabelManager Warning] Could not list existing labels.');
       }
     }
 
@@ -821,8 +845,8 @@ export async function applyLabelsSafely(
 
     console.log(`[LabelManager] Successfully added labels to ${owner}/${repo} #${issueNumber}: [${toAdd.join(', ')}]`);
     return { added: toAdd, skipped, removed: [] };
-  } catch (err: any) {
-    console.warn(`[LabelManager Warning] Failed to apply labels to #${issueNumber}: ${err.message}`);
+  } catch {
+    console.warn('[LabelManager Warning] Could not apply labels.');
     return { added: [], skipped: [], removed: [] };
   }
 }
@@ -833,6 +857,10 @@ export interface ApplyBotLabelsOptions {
   coverageComplete?: boolean;
 }
 
+export type ApplyBotLabelsResult =
+  | { added: string[]; removed: string[]; skipped: string[]; failedToList?: never; failedRemovals?: never }
+  | ReconcileResult;
+
 /**
  * High-level helper to apply labels safely using environment variables and GitHub context.
  * In local/offline runs, it logs candidates and returns safely without network calls.
@@ -840,7 +868,7 @@ export interface ApplyBotLabelsOptions {
 export async function applyBotLabels(
   labels: string[],
   optionsOrClient?: GitHubLabelClient | ApplyBotLabelsOptions
-): Promise<{ added: string[]; removed: string[]; skipped: string[] } | void> {
+): Promise<ApplyBotLabelsResult | void> {
   const token = process.env.GITHUB_TOKEN;
   const eventPath = process.env.GITHUB_EVENT_PATH;
   const repository = process.env.GITHUB_REPOSITORY;
@@ -897,7 +925,7 @@ export async function applyBotLabels(
       coverageComplete,
     });
     return { added: res.added, removed: res.removed || [], skipped: res.skipped };
-  } catch (err: any) {
-    console.warn(`[PocketGuard Warning] Label application error: ${err.message}`);
+  } catch {
+    console.warn('[PocketGuard Warning] Label application could not be completed.');
   }
 }

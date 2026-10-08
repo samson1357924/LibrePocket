@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   BOT_MENTION,
   COMMENT_MARKERS,
   DEFAULT_PR_RECONCILE_SCOPE,
   REPO_ALLOWED_LABELS,
+  applyBotLabels,
   applyLabelsSafely,
   ensureNeedsDecision,
   extractLabelsFromTriageText,
@@ -73,6 +77,43 @@ ${body}
 ---
 **\`FINAL_VERDICT=${verdict}\`**
 `;
+}
+
+interface CapturedConsoleCall {
+  level: 'warn' | 'error' | 'log';
+  args: unknown[];
+}
+
+async function captureConsoleCalls<T>(action: () => Promise<T>): Promise<{ result: T; calls: CapturedConsoleCall[] }> {
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  const originalLog = console.log;
+  const calls: CapturedConsoleCall[] = [];
+  console.warn = (...args: unknown[]) => calls.push({ level: 'warn', args });
+  console.error = (...args: unknown[]) => calls.push({ level: 'error', args });
+  console.log = (...args: unknown[]) => calls.push({ level: 'log', args });
+  try {
+    return { result: await action(), calls };
+  } finally {
+    console.warn = originalWarn;
+    console.error = originalError;
+    console.log = originalLog;
+  }
+}
+
+function containsMarker(value: unknown, marker: string, seen = new Set<object>()): boolean {
+  if (typeof value === 'string') return value.includes(marker);
+  if (value instanceof Error) {
+    return value.message.includes(marker) || (value.stack?.includes(marker) ?? false) || containsMarker(value.cause, marker, seen);
+  }
+  if (value === null || typeof value !== 'object' || seen.has(value)) return false;
+  seen.add(value);
+  return Object.entries(value).some(([key, child]) => key.includes(marker) || containsMarker(child, marker, seen));
+}
+
+function assertNoSensitiveConsoleOutput(calls: CapturedConsoleCall[], marker: string, context: string): void {
+  const leaked = calls.some((call) => call.args.some((arg) => containsMarker(arg, marker)));
+  assert.equal(leaked, false, `${context}: raw API error data must not be logged`);
 }
 
 export async function runLabelManagerTests(): Promise<void> {
@@ -252,6 +293,239 @@ ${reportWith('A security flaw remains.')}`);
   assert.deepEqual(incompleteResult.removed, []);
   assert.deepEqual(incompleteResult.added.sort(), ['area:docs', 'status:needs-decision']);
   assert.deepEqual(incompleteMock.getLabels(2), ['area:docs', 'area:platform', 'area:runtime', 'status:needs-decision']);
+
+  const missingRemoveClient = {
+    rest: { issues: {
+      listLabelsOnIssue: async () => ({ data: [{ name: 'area:docs' }, { name: 'area:runtime' }] }),
+      addLabels: async () => ({}),
+    } },
+  } as unknown as GitHubLabelClient;
+  const missingRemove = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+    client: missingRemoveClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 13,
+    desiredLabels: [],
+    scope: DEFAULT_PR_RECONCILE_SCOPE,
+  }));
+  assert.deepEqual(missingRemove.result.failedRemovals, ['area:docs', 'area:runtime']);
+  assert.deepEqual(missingRemove.result.removed, []);
+  assert.ok(missingRemove.calls.some((call) => call.level === 'warn'));
+
+  const notFoundRemoveClient = {
+    rest: { issues: {
+      listLabelsOnIssue: async () => ({ data: [{ name: 'area:docs' }] }),
+      addLabels: async () => ({}),
+      removeLabel: async () => { throw Object.assign(new Error('Not Found'), { status: 404 }); },
+    } },
+  } as unknown as GitHubLabelClient;
+  const notFoundRemove = await reconcileBotLabelsSafely({
+    client: notFoundRemoveClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 14,
+    desiredLabels: [],
+    scope: DEFAULT_PR_RECONCILE_SCOPE,
+  });
+  assert.deepEqual(notFoundRemove.removed, ['area:docs'], 'a 404 removal is idempotent success');
+  assert.deepEqual(notFoundRemove.failedRemovals, []);
+
+  const apiErrorMarker = 'synthetic raw label API error marker';
+  const listFailureClient = {
+    rest: { issues: {
+      listLabelsOnIssue: async () => { throw new Error(apiErrorMarker); },
+      addLabels: async () => ({}),
+      removeLabel: async () => ({}),
+    } },
+  } as unknown as GitHubLabelClient;
+  const listFailure = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+    client: listFailureClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 5,
+    desiredLabels: ['status:needs-decision'],
+    scope: { managedExactLabels: ['status:needs-decision'] },
+    coverageComplete: false,
+  }));
+  assert.equal(listFailure.result.failedToList, true);
+  assert.deepEqual(listFailure.result.added, ['status:needs-decision'],
+    'an unavailable listing still permits the append-only decision-label fallback');
+  assert.ok(listFailure.calls.some((call) => call.level === 'warn'));
+  assertNoSensitiveConsoleOutput(listFailure.calls, apiErrorMarker, 'list failure');
+
+  const fallbackAddFailureClient = {
+    rest: { issues: {
+      listLabelsOnIssue: async () => { throw new Error(apiErrorMarker); },
+      addLabels: async () => { throw { detail: apiErrorMarker }; },
+      removeLabel: async () => ({}),
+    } },
+  } as unknown as GitHubLabelClient;
+  const fallbackAddFailure = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+    client: fallbackAddFailureClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 10,
+    desiredLabels: ['status:needs-decision'],
+    scope: { managedExactLabels: ['status:needs-decision'] },
+    coverageComplete: false,
+  }));
+  assert.equal(fallbackAddFailure.result.failedToList, true);
+  assert.deepEqual(fallbackAddFailure.result.added, [], 'a failed fallback add is not reported as successful');
+  assertNoSensitiveConsoleOutput(fallbackAddFailure.calls, apiErrorMarker, 'fallback add failure');
+
+  const unavailableListCalls: string[][] = [];
+  const unavailableListClient = {
+    rest: { issues: {
+      addLabels: async (params: { labels: string[] }) => { unavailableListCalls.push(params.labels); return {}; },
+    } },
+  } as unknown as GitHubLabelClient;
+  const unavailableList = await reconcileBotLabelsSafely({
+    client: unavailableListClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 6,
+    desiredLabels: ['status:needs-decision'],
+    scope: DEFAULT_PR_RECONCILE_SCOPE,
+  });
+  assert.equal(unavailableList.failedToList, true, 'a missing listing operation is not complete reconciliation');
+  assert.deepEqual(unavailableListCalls, [['status:needs-decision']]);
+
+  const addFailureClient = {
+    rest: { issues: {
+      listLabelsOnIssue: async () => ({ data: [] }),
+      addLabels: async () => { throw new Error(apiErrorMarker); },
+      removeLabel: async () => ({}),
+    } },
+  } as unknown as GitHubLabelClient;
+  const addFailure = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+    client: addFailureClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 7,
+    desiredLabels: ['area:policy'],
+  }));
+  assert.deepEqual(addFailure.result.added, []);
+  assertNoSensitiveConsoleOutput(addFailure.calls, apiErrorMarker, 'add failure');
+
+  const removeFailureClient = {
+    rest: { issues: {
+      listLabelsOnIssue: async () => ({ data: [{ name: 'area:docs' }] }),
+      addLabels: async () => ({}),
+      removeLabel: async () => { throw { status: 500, detail: apiErrorMarker }; },
+    } },
+  } as unknown as GitHubLabelClient;
+  const removeFailure = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+    client: removeFailureClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 8,
+    desiredLabels: [],
+    scope: DEFAULT_PR_RECONCILE_SCOPE,
+  }));
+  assert.deepEqual(removeFailure.result.failedRemovals, ['area:docs']);
+  assertNoSensitiveConsoleOutput(removeFailure.calls, apiErrorMarker, 'remove failure');
+
+  const scopedListFailure = await applyLabelsSafely({
+    client: listFailureClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 15,
+    labels: ['status:needs-decision'],
+    scope: { managedExactLabels: ['status:needs-decision'] },
+  });
+  assert.equal(scopedListFailure.failedToList, true, 'scoped applyLabelsSafely preserves list failure metadata');
+  assert.deepEqual(scopedListFailure.failedRemovals, []);
+
+  const scopedRemoveFailure = await applyLabelsSafely({
+    client: removeFailureClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 16,
+    labels: [],
+    scope: DEFAULT_PR_RECONCILE_SCOPE,
+  });
+  assert.equal(scopedRemoveFailure.failedToList, false);
+  assert.deepEqual(scopedRemoveFailure.failedRemovals, ['area:docs'],
+    'scoped applyLabelsSafely preserves removal failure metadata');
+
+  const originalEventPath = process.env.GITHUB_EVENT_PATH;
+  const originalRepository = process.env.GITHUB_REPOSITORY;
+  const temporaryEventDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-label-test-'));
+  const temporaryEventPath = path.join(temporaryEventDirectory, 'event.json');
+  try {
+    fs.writeFileSync(temporaryEventPath, JSON.stringify({ pull_request: { number: 17 } }));
+    process.env.GITHUB_EVENT_PATH = temporaryEventPath;
+    process.env.GITHUB_REPOSITORY = 'owner/repo';
+
+    const botListFailure = await captureConsoleCalls(() => applyBotLabels(
+      ['status:needs-decision'],
+      { customClient: listFailureClient, scope: { managedExactLabels: ['status:needs-decision'] } },
+    ));
+    assert.equal(botListFailure.result?.failedToList, true,
+      'scoped applyBotLabels preserves list failure metadata');
+    assert.deepEqual(botListFailure.result?.failedRemovals, []);
+    assertNoSensitiveConsoleOutput(botListFailure.calls, apiErrorMarker, 'scoped applyBotLabels list failure');
+
+    const botRemoveFailure = await captureConsoleCalls(() => applyBotLabels(
+      [],
+      { customClient: removeFailureClient, scope: DEFAULT_PR_RECONCILE_SCOPE },
+    ));
+    assert.equal(botRemoveFailure.result?.failedToList, false);
+    assert.deepEqual(botRemoveFailure.result?.failedRemovals, ['area:docs'],
+      'scoped applyBotLabels preserves removal failure metadata');
+    assertNoSensitiveConsoleOutput(botRemoveFailure.calls, apiErrorMarker, 'scoped applyBotLabels remove failure');
+  } finally {
+    if (originalEventPath === undefined) delete process.env.GITHUB_EVENT_PATH;
+    else process.env.GITHUB_EVENT_PATH = originalEventPath;
+    if (originalRepository === undefined) delete process.env.GITHUB_REPOSITORY;
+    else process.env.GITHUB_REPOSITORY = originalRepository;
+    fs.rmSync(temporaryEventDirectory, { recursive: true, force: true });
+  }
+
+  const ensureFailure = await captureConsoleCalls(() => ensureNeedsDecision({
+    client: {
+      rest: { issues: {
+        addLabels: async () => { throw new Error(apiErrorMarker); },
+      } },
+    } as unknown as GitHubLabelClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 9,
+  }));
+  assert.equal(ensureFailure.result, false);
+  assertNoSensitiveConsoleOutput(ensureFailure.calls, apiErrorMarker, 'decision-label add failure');
+
+  const appendOnlyListFailureClient = {
+    rest: { issues: {
+      listLabelsOnIssue: async () => { throw new Error(apiErrorMarker); },
+      addLabels: async () => ({}),
+    } },
+  } as unknown as GitHubLabelClient;
+  const appendOnlyListFailure = await captureConsoleCalls(() => applyLabelsSafely({
+    client: appendOnlyListFailureClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 11,
+    labels: ['area:runtime'],
+  }));
+  assert.deepEqual(appendOnlyListFailure.result.added, ['area:runtime']);
+  assertNoSensitiveConsoleOutput(appendOnlyListFailure.calls, apiErrorMarker, 'append-only list failure');
+
+  const appendOnlyAddFailureClient = {
+    rest: { issues: {
+      listLabelsOnIssue: async () => ({ data: [] }),
+      addLabels: async () => { throw new Error(apiErrorMarker); },
+    } },
+  } as unknown as GitHubLabelClient;
+  const appendOnlyAddFailure = await captureConsoleCalls(() => applyLabelsSafely({
+    client: appendOnlyAddFailureClient,
+    owner: 'owner',
+    repo: 'repo',
+    issueNumber: 12,
+    labels: ['area:runtime'],
+  }));
+  assert.deepEqual(appendOnlyAddFailure.result.added, []);
+  assertNoSensitiveConsoleOutput(appendOnlyAddFailure.calls, apiErrorMarker, 'append-only add failure');
 
   // ensureNeedsDecision uses only the add-labels endpoint; it never lists or removes labels.
   const ensureMock = new StatefulMockLabelClient();

@@ -168,11 +168,23 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.equal(reviewed.coverage.complete, true);
       const persistedReview = JSON.parse(fs.readFileSync(outputPath, 'utf8')) as {
         verdict: string;
+        pullRequestNumber: number;
+        baseSha: string;
+        headSha: string;
+        headRepository: string;
         areaLabels: string[];
         changedFiles: string[];
         changedFilesComplete: boolean;
       };
+      assert.equal(reviewed.pullRequestNumber, 41);
+      assert.equal(reviewed.baseSha, BASE_SHA);
+      assert.equal(reviewed.headSha, HEAD_SHA);
+      assert.equal(reviewed.headRepository, 'sample/repository');
       assert.equal(persistedReview.verdict, 'APPROVE');
+      assert.equal(persistedReview.pullRequestNumber, 41);
+      assert.equal(persistedReview.baseSha, BASE_SHA);
+      assert.equal(persistedReview.headSha, HEAD_SHA);
+      assert.equal(persistedReview.headRepository, 'sample/repository');
       assert.deepEqual(persistedReview.areaLabels, ['area:delivery']);
       assert.deepEqual(persistedReview.changedFiles, [
         'app/src/main/AndroidManifest.xml',
@@ -219,126 +231,603 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.equal(truncatedReview.verdict, 'INCONCLUSIVE');
       assert.deepEqual(truncatedReview.coverage.truncatedFiles, ['app/src/main/AndroidManifest.xml']);
 
-      fs.writeFileSync(outputPath, JSON.stringify({
-        ...reviewed,
-        verdict: 'NEEDS_CHANGES',
-        deterministicViolations: [{
-          ruleId: 'SEC-TEST',
-          severity: 'BLOCK',
-          category: 'security',
-          message: 'A deterministic security check blocked this change.',
-        }],
-      }));
-
-      const fakeClientState = {
-        comments: [{
-          id: 7,
-          body: '<!-- PocketGuard-review --> user-authored marker',
-          user: { login: 'contributor', type: 'User' },
-        }],
-        created: 0,
-        updated: 0,
-        identityFails: false,
-        labels: [] as string[][],
-        existingLabels: ['area:docs', 'status:needs-decision'],
-      };
-      const publishClient = {
-        rest: {
-          pulls: {
-            get: async () => ({ data: {
-              number: 41,
-              base: { sha: BASE_SHA },
-              head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
-            } }),
+      type TestComment = { id: number; body: string; user: { login: string; type: string } };
+      const humanMarkerBody = '<!-- PocketGuard-review --> human-authored marker';
+      const priorApproveBody = '<!-- PocketGuard-review -->\n\n## PocketGuard 審查\n\n**判定：APPROVE**\nold result';
+      const makePublishHarness = (options: {
+        outputPath: string;
+        jobResult?: string;
+        pullRequest?: unknown;
+        getFails?: boolean;
+        identityFails?: boolean;
+        commentFailure?: 'list' | 'update' | 'create';
+        listLabelsFails?: boolean;
+        omitBotComment?: boolean;
+        addLabelsFails?: boolean;
+        removeLabelsFails?: boolean;
+        existingLabels?: string[];
+        changePullRequestDuringCommentLookup?: unknown;
+        changePullRequestAfterCommentUpdate?: unknown;
+        event?: Record<string, unknown>;
+      }) => {
+        const state = {
+          comments: [
+            ...(!options.omitBotComment
+              ? [{ id: 7, body: priorApproveBody, user: { login: 'pocketguard[bot]', type: 'Bot' } }]
+              : []),
+            { id: 8, body: humanMarkerBody, user: { login: 'contributor', type: 'User' } },
+          ] as TestComment[],
+          created: 0,
+          updated: 0,
+          labels: [] as string[][],
+          commentWrites: [] as string[],
+          existingLabels: options.existingLabels ?? ['area:docs', 'area:policy', 'security', 'performance'],
+          operations: [] as string[],
+          currentPullRequest: options.pullRequest ?? {
+            number: 41,
+            base: { sha: BASE_SHA },
+            head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
           },
-          users: { getAuthenticated: async () => {
-            if (fakeClientState.identityFails) throw new Error('authenticated-user endpoint unavailable');
-            return { data: { login: 'pocketguard[bot]' } };
-          } },
-          issues: {
-            listLabelsOnIssue: async () => ({
-              data: fakeClientState.existingLabels.map((name) => ({ name })),
-            }),
-            listComments: async () => ({ data: fakeClientState.comments }),
-            createComment: async (params: { body: string }) => {
-              fakeClientState.created += 1;
-              fakeClientState.comments.push({
-                id: 8,
-                body: params.body,
-                user: { login: 'pocketguard[bot]', type: 'Bot' },
-              });
-              return {};
+          lookupChangedPullRequest: false,
+        };
+        const publishClient = {
+          rest: {
+            pulls: {
+              get: async () => {
+                state.operations.push('fresh-get');
+                if (options.getFails) throw new Error('GitHub unavailable');
+                return { data: state.currentPullRequest };
+              },
             },
-            updateComment: async (params: { comment_id: number; body: string }) => {
-              fakeClientState.updated += 1;
-              const comment = fakeClientState.comments.find((candidate) => candidate.id === params.comment_id);
-              if (comment) comment.body = params.body;
-              return {};
-            },
-            addLabels: async (params: { labels: string[] }) => {
-              fakeClientState.labels.push(params.labels);
-              for (const label of params.labels) {
-                if (!fakeClientState.existingLabels.includes(label)) fakeClientState.existingLabels.push(label);
-              }
-              return {};
-            },
-            removeLabel: async (params: { name: string }) => {
-              fakeClientState.existingLabels = fakeClientState.existingLabels.filter((label) => label !== params.name);
-              return {};
+            users: { getAuthenticated: async () => {
+              state.operations.push('authenticated-user');
+              if (options.identityFails) throw new Error('sensitive identity detail');
+              return { data: { login: 'pocketguard[bot]' } };
+            } },
+            issues: {
+              listLabelsOnIssue: async () => {
+                state.operations.push('list-labels');
+                if (options.listLabelsFails) throw new Error('synthetic label listing failure');
+                return { data: state.existingLabels.map((name) => ({ name })) };
+              },
+              listComments: async () => {
+                state.operations.push('list-comments');
+                if (options.commentFailure === 'list') throw new Error('synthetic list failure');
+                if (options.changePullRequestDuringCommentLookup && !state.lookupChangedPullRequest) {
+                  state.currentPullRequest = options.changePullRequestDuringCommentLookup;
+                  state.lookupChangedPullRequest = true;
+                }
+                return { data: state.comments };
+              },
+              createComment: async (params: { body: string }) => {
+                state.operations.push('create-comment');
+                if (options.commentFailure === 'create') throw new Error('synthetic create failure');
+                state.commentWrites.push(params.body);
+                state.created += 1;
+                state.comments.push({
+                  id: 9,
+                  body: params.body,
+                  user: { login: 'pocketguard[bot]', type: 'Bot' },
+                });
+                return {};
+              },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.operations.push('update-comment');
+                if (options.commentFailure === 'update') throw new Error('synthetic update failure');
+                state.commentWrites.push(params.body);
+                state.updated += 1;
+                const comment = state.comments.find((candidate) => candidate.id === params.comment_id);
+                if (comment) comment.body = params.body;
+                if (state.updated === 1 && options.changePullRequestAfterCommentUpdate) {
+                  state.currentPullRequest = options.changePullRequestAfterCommentUpdate;
+                }
+                return {};
+              },
+              addLabels: async (params: { labels: string[] }) => {
+                state.operations.push('add-labels');
+                if (options.addLabelsFails) throw new Error('synthetic label failure');
+                state.labels.push(params.labels);
+                for (const label of params.labels) {
+                  if (!state.existingLabels.includes(label)) state.existingLabels.push(label);
+                }
+                return {};
+              },
+              removeLabel: async (params: { name: string }) => {
+                state.operations.push('remove-label');
+                if (options.removeLabelsFails) throw new Error('sensitive removal failure detail');
+                state.existingLabels = state.existingLabels.filter((label) => label !== params.name);
+                return {};
+              },
             },
           },
-        },
+        };
+        const context: RunnerContext = {
+          event: options.event ?? pullRequestEvent(),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: 'sample/repository',
+            GITHUB_TOKEN: 'fake-publish-token',
+            POCKETGUARD_OUTPUT: options.outputPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: options.jobResult ?? 'success',
+          } as NodeJS.ProcessEnv,
+          githubClient: publishClient as unknown as NonNullable<RunnerContext['githubClient']>,
+        };
+        return { state, context };
       };
-      const publishContext: RunnerContext = {
-        event: pullRequestEvent(),
-        env: {
-          GITHUB_EVENT_NAME: 'pull_request_target',
-          GITHUB_REPOSITORY: 'sample/repository',
-          GITHUB_TOKEN: 'fake-publish-token',
-          POCKETGUARD_OUTPUT: outputPath,
-        } as NodeJS.ProcessEnv,
-        githubClient: publishClient as unknown as NonNullable<RunnerContext['githubClient']>,
-      };
-      await runPublishMode(publishContext);
-      assert.equal(fakeClientState.created, 1);
-      assert.equal(fakeClientState.updated, 0);
-      assert.ok(fakeClientState.labels.some((labels) => labels.includes('security')));
-      assert.deepEqual(fakeClientState.existingLabels.filter((label) => label.startsWith('area:')).sort(), ['area:delivery']);
-
-      await runPublishMode(publishContext);
-      assert.equal(fakeClientState.created, 1);
-      assert.equal(fakeClientState.updated, 1);
 
       fs.writeFileSync(outputPath, JSON.stringify(reviewed));
-      fakeClientState.identityFails = true;
-      await runPublishMode(publishContext);
-      assert.equal(fakeClientState.updated, 2, 'Bot marker comment is updated if getAuthenticated is forbidden');
-      assert.equal(fakeClientState.existingLabels.includes('status:needs-decision'), false);
-      assert.deepEqual(fakeClientState.existingLabels.filter((label) => label.startsWith('area:')).sort(), ['area:delivery']);
+      const successHarness = makePublishHarness({ outputPath });
+      await runPublishMode(successHarness.context);
+      assert.equal(successHarness.state.created, 0);
+      assert.equal(successHarness.state.updated, 1, 'the existing bot sticky comment is updated');
+      const successfulBody = successHarness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+      assert.ok(successfulBody.includes('判定：APPROVE'));
+      assert.ok(successfulBody.includes(`審查的 head SHA：\`${HEAD_SHA}\``));
+      assert.equal(successHarness.state.comments.find((comment) => comment.id === 8)?.body, humanMarkerBody);
+      assert.equal(successHarness.state.existingLabels.includes('status:needs-decision'), false);
+      assert.deepEqual(successHarness.state.existingLabels.filter((label) => label.startsWith('area:')).sort(), ['area:delivery']);
+      assert.ok(successHarness.state.existingLabels.includes('security'), 'security is outside the reconciliation scope');
+      assert.ok(successHarness.state.existingLabels.includes('performance'), 'performance is outside the reconciliation scope');
+      assert.equal(successHarness.state.operations[0], 'fresh-get', 'fresh PR state is checked before writes');
 
-      const partialCoverage = {
+      const incompleteOutputPath = path.join(tempDirectory, 'incomplete-review-output.json');
+      fs.writeFileSync(incompleteOutputPath, JSON.stringify({
         ...reviewed,
         verdict: 'INCONCLUSIVE',
         coverage: {
           complete: false,
-          omittedFiles: ['app/src/main/java/private/Omitted.kt'],
-          truncatedFiles: ['app/src/main/java/private/Truncated.kt'],
-          originalLength: 654321,
+          omittedFiles: ['app/src/main/java/demo/Skipped.kt'],
+          truncatedFiles: [],
+          originalLength: 123,
         },
         areaLabels: [],
         changedFiles: [],
         changedFilesComplete: false,
+      }));
+      const incompleteCoverageHarness = makePublishHarness({ outputPath: incompleteOutputPath });
+      await runPublishMode(incompleteCoverageHarness.context);
+      assert.ok(incompleteCoverageHarness.state.existingLabels.includes('status:needs-decision'),
+        'incomplete coverage must reconcile the implicit maintainer-decision label');
+      assert.deepEqual(incompleteCoverageHarness.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
+        ['area:docs', 'area:policy'], 'incomplete coverage must preserve existing area labels');
+
+      for (const contradictoryCoverage of [
+        {
+          name: 'omitted-files-marked-complete',
+          coverage: {
+            complete: true,
+            omittedFiles: ['app/src/main/java/demo/Skipped.kt'],
+            truncatedFiles: [],
+            originalLength: 123,
+          },
+        },
+        {
+          name: 'truncated-files-marked-complete',
+          coverage: {
+            complete: true,
+            omittedFiles: [],
+            truncatedFiles: ['app/src/main/java/demo/Truncated.kt'],
+            originalLength: 123,
+          },
+        },
+      ]) {
+        const contradictoryOutputPath = path.join(tempDirectory, `${contradictoryCoverage.name}.json`);
+        fs.writeFileSync(contradictoryOutputPath, JSON.stringify({
+          ...reviewed,
+          verdict: 'INCONCLUSIVE',
+          coverage: contradictoryCoverage.coverage,
+          changedFilesComplete: true,
+        }));
+        const contradictoryHarness = makePublishHarness({ outputPath: contradictoryOutputPath });
+        await runPublishMode(contradictoryHarness.context);
+        const contradictoryBody = contradictoryHarness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+        assert.ok(contradictoryBody.includes('判定：INCONCLUSIVE'),
+          `${contradictoryCoverage.name}: contradictory metadata must fall back to INCONCLUSIVE`);
+        assert.ok(contradictoryBody.includes('schema or contents are invalid'),
+          `${contradictoryCoverage.name}: reject contradictory coverage metadata`);
+        assert.deepEqual(contradictoryHarness.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
+          ['area:docs', 'area:policy'], `${contradictoryCoverage.name}: preserve existing area labels`);
+        assert.deepEqual(contradictoryHarness.state.labels, [['status:needs-decision']],
+          `${contradictoryCoverage.name}: apply only the fallback decision label`);
+        assert.equal(contradictoryHarness.state.operations.includes('remove-label'), false,
+          `${contradictoryCoverage.name}: never remove labels based on contradictory coverage`);
+      }
+
+      const identityFallbackHarness = makePublishHarness({ outputPath, identityFails: true });
+      await runPublishMode(identityFallbackHarness.context);
+      assert.equal(identityFallbackHarness.state.updated, 1,
+        'identity lookup failure still updates the bot-authored marker comment');
+      assert.ok(identityFallbackHarness.state.comments.find((comment) => comment.id === 7)?.body.includes('判定：APPROVE'));
+      assert.equal(identityFallbackHarness.state.comments.find((comment) => comment.id === 8)?.body, humanMarkerBody,
+        'identity fallback must not mutate a human-authored marker comment');
+
+      const assertFailClosed = async (
+        name: string,
+        options: {
+          artifact?: unknown;
+          rawText?: string;
+          missingArtifact?: boolean;
+          jobResult?: string;
+          pullRequest?: unknown;
+          getFails?: boolean;
+          addLabelsFails?: boolean;
+          reason: string;
+        },
+      ) => {
+        const casePath = path.join(tempDirectory, `${name}-review-output.json`);
+        if (!options.missingArtifact) {
+          const text = options.rawText ?? JSON.stringify(options.artifact ?? reviewed);
+          fs.writeFileSync(casePath, text);
+        }
+        const harness = makePublishHarness({
+          outputPath: casePath,
+          jobResult: options.jobResult,
+          pullRequest: options.pullRequest,
+          getFails: options.getFails,
+          addLabelsFails: options.addLabelsFails,
+        });
+        await runPublishMode(harness.context);
+        assert.equal(harness.state.updated, 1, `${name}: update only the existing bot sticky comment`);
+        assert.equal(harness.state.created, 0, `${name}: do not create a duplicate bot comment`);
+        const botBody = harness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+        assert.ok(botBody.includes('判定：INCONCLUSIVE'), `${name}: explicitly show INCONCLUSIVE`);
+        assert.ok(botBody.includes(options.reason), `${name}: explain why the result is unavailable`);
+        assert.equal(botBody.includes('判定：APPROVE'), false, `${name}: never retain/publish the old approval`);
+        assert.equal(harness.state.comments.find((comment) => comment.id === 8)?.body, humanMarkerBody,
+          `${name}: preserve the human-authored marker comment`);
+        assert.ok(harness.state.existingLabels.includes('status:needs-decision'), `${name}: require maintainer decision`);
+        assert.deepEqual(harness.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
+          ['area:docs', 'area:policy'], `${name}: preserve existing area labels`);
+        assert.ok(harness.state.existingLabels.includes('security'), `${name}: preserve security label`);
+        assert.ok(harness.state.existingLabels.includes('performance'), `${name}: preserve performance label`);
+        assert.equal(harness.state.operations[0], 'fresh-get', `${name}: fresh GET must precede all writes`);
+        return harness.state;
       };
-      fs.writeFileSync(outputPath, JSON.stringify(partialCoverage));
-      await runPublishMode(publishContext);
-      assert.equal(fakeClientState.updated, 3);
-      assert.deepEqual(fakeClientState.existingLabels.filter((label) => label.startsWith('area:')).sort(), ['area:delivery']);
-      const partialComment = fakeClientState.comments.filter((comment) =>
-        comment.user?.type === 'Bot' && comment.body?.includes('PocketGuard-review')).pop()?.body ?? '';
-      assert.ok(partialComment.includes(String.raw`app/src/main/java/private/Omitted\.kt`));
-      assert.ok(partialComment.includes(String.raw`app/src/main/java/private/Truncated\.kt`));
-      assert.ok(partialComment.includes('654321 original diff chars'));
-      assert.equal(partialComment.includes('+<manifest />'), false, 'coverage detail does not publish diff content');
+
+      await assertFailClosed('stale-head', {
+        artifact: { ...reviewed, headSha: 'c'.repeat(40) },
+        reason: 'stale',
+      });
+      await assertFailClosed('stale-base', {
+        artifact: { ...reviewed, baseSha: 'c'.repeat(40) },
+        reason: 'stale',
+      });
+      await assertFailClosed('stale-pr-number', {
+        artifact: { ...reviewed, pullRequestNumber: 42 },
+        reason: 'stale',
+      });
+      await assertFailClosed('stale-head-repository', {
+        artifact: { ...reviewed, headRepository: 'untrusted/fork' },
+        reason: 'stale',
+      });
+      await assertFailClosed('missing', {
+        missingArtifact: true,
+        reason: 'missing or unreadable',
+      });
+      await assertFailClosed('malformed-json', {
+        rawText: '{not json',
+        reason: 'JSON is malformed',
+      });
+      await assertFailClosed('invalid-schema', {
+        artifact: { ...reviewed, roles: [] },
+        reason: 'schema or contents are invalid',
+      });
+      await assertFailClosed('missing-area-labels', {
+        artifact: { ...reviewed, areaLabels: undefined },
+        reason: 'schema or contents are invalid',
+      });
+      await assertFailClosed('incomplete-approval', {
+        artifact: { ...reviewed, changedFilesComplete: false },
+        reason: 'schema or contents are invalid',
+      });
+      await assertFailClosed('missing-completeness', {
+        artifact: { ...reviewed, changedFilesComplete: undefined },
+        reason: 'schema or contents are invalid',
+      });
+      await assertFailClosed('failed-review-job', {
+        jobResult: 'failure',
+        reason: 'did not complete successfully',
+      });
+      await assertFailClosed('cancelled-review-job', {
+        jobResult: 'cancelled',
+        reason: 'did not complete successfully',
+      });
+      await assertFailClosed('fresh-get-failure', {
+        getFails: true,
+        reason: 'could not be fetched from GitHub',
+      });
+
+      const changedPullRequest = {
+        number: 41,
+        base: { sha: BASE_SHA },
+        head: { sha: 'c'.repeat(40), repo: { full_name: 'sample/repository' } },
+      };
+      const changedDuringLookup = makePublishHarness({
+        outputPath,
+        changePullRequestDuringCommentLookup: changedPullRequest,
+      });
+      await runPublishMode(changedDuringLookup.context);
+      const lookupFallbackBody = changedDuringLookup.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+      assert.equal(changedDuringLookup.state.commentWrites.length, 1);
+      assert.equal(changedDuringLookup.state.commentWrites.some((body) => body.includes('判定：APPROVE')), false,
+        'a PR change during sticky-comment lookup must prevent publishing the old approval');
+      assert.ok(lookupFallbackBody.includes('判定：INCONCLUSIVE'));
+      assert.ok(lookupFallbackBody.includes('changed after review'));
+      assert.deepEqual(changedDuringLookup.state.labels, [['status:needs-decision']],
+        'a stale review during comment lookup may reconcile only the fallback status label');
+      assert.deepEqual(changedDuringLookup.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
+        ['area:docs', 'area:policy']);
+      assert.equal(changedDuringLookup.state.operations.includes('remove-label'), false);
+
+      const changedAfterCommentUpdate = makePublishHarness({
+        outputPath,
+        changePullRequestAfterCommentUpdate: changedPullRequest,
+      });
+      await runPublishMode(changedAfterCommentUpdate.context);
+      const postUpdateFallbackBody = changedAfterCommentUpdate.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+      assert.equal(changedAfterCommentUpdate.state.updated, 2,
+        'a PR change before normal label reconciliation overwrites the just-published approval');
+      assert.ok(changedAfterCommentUpdate.state.commentWrites[0].includes('判定：APPROVE'));
+      assert.ok(changedAfterCommentUpdate.state.commentWrites[1].includes('判定：INCONCLUSIVE'));
+      assert.ok(postUpdateFallbackBody.includes('判定：INCONCLUSIVE'));
+      assert.deepEqual(changedAfterCommentUpdate.state.labels, [['status:needs-decision']],
+        'a stale review before label reconciliation may reconcile only fallback status');
+      assert.deepEqual(changedAfterCommentUpdate.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
+        ['area:docs', 'area:policy']);
+      assert.equal(changedAfterCommentUpdate.state.operations.includes('remove-label'), false);
+
+      const existingDecisionLabel = makePublishHarness({
+        outputPath: path.join(tempDirectory, 'missing-existing-decision-review-output.json'),
+        existingLabels: ['area:docs', 'area:policy', 'security', 'performance', 'status:needs-decision'],
+      });
+      await runPublishMode(existingDecisionLabel.context);
+      const existingDecisionBody = existingDecisionLabel.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+      assert.ok(existingDecisionBody.includes('判定：INCONCLUSIVE'));
+      assert.ok(existingDecisionLabel.state.existingLabels.includes('status:needs-decision'));
+      assert.equal(existingDecisionLabel.state.operations.includes('list-labels'), true,
+        'fallback reconciliation checks whether the decision label is already present');
+      assert.equal(existingDecisionLabel.state.operations.includes('add-labels'), false,
+        'an existing decision label is recognized as skipped rather than added again');
+
+      for (const failure of ['list', 'update', 'create'] as const) {
+        const publishFailure = makePublishHarness({
+          outputPath,
+          commentFailure: failure,
+          omitBotComment: failure === 'create',
+        });
+        await assert.rejects(
+          runPublishMode(publishFailure.context),
+          (error: unknown) => error instanceof Error &&
+            error.message === 'PocketGuard: failed to publish review comment.',
+          `${failure} comment API failure must fail with generic text`,
+        );
+        assert.equal(publishFailure.state.operations.includes('list-labels'), false,
+          `${failure} comment API failure must prevent label reconciliation`);
+        assert.equal(publishFailure.state.operations.includes('add-labels'), false);
+        assert.equal(publishFailure.state.operations.includes('remove-label'), false);
+        assert.equal(publishFailure.state.comments.find((comment) => comment.id === 8)?.body, humanMarkerBody,
+          `${failure} comment API failure must not mutate the human-authored marker`);
+      }
+
+      const failedDecisionLabel = makePublishHarness({
+        outputPath: path.join(tempDirectory, 'missing-fallback-review-output.json'),
+        addLabelsFails: true,
+      });
+      await assert.rejects(
+        runPublishMode(failedDecisionLabel.context),
+        (error: unknown) => error instanceof Error &&
+          error.message === 'PocketGuard: failed to ensure maintainer decision label.',
+        'a failed fallback label add must fail visibly with generic text',
+      );
+      const failedDecisionBody = failedDecisionLabel.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+      assert.ok(failedDecisionBody.includes('判定：INCONCLUSIVE'),
+        'publish the inconclusive sticky comment before attempting the fallback label');
+      assert.equal(failedDecisionBody.includes('判定：APPROVE'), false);
+      assert.equal(failedDecisionLabel.state.existingLabels.includes('status:needs-decision'), false);
+      assert.deepEqual(failedDecisionLabel.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
+        ['area:docs', 'area:policy'], 'fallback label failure must not remove area labels');
+      assert.ok(failedDecisionLabel.state.existingLabels.includes('security'));
+      assert.ok(failedDecisionLabel.state.existingLabels.includes('performance'));
+      assert.equal(failedDecisionLabel.state.operations.includes('remove-label'), false,
+        'fallback status reconciliation must not remove any area labels');
+
+      const failedReviewLabel = makePublishHarness({ outputPath, addLabelsFails: true });
+      await assert.rejects(
+        runPublishMode(failedReviewLabel.context),
+        (error: unknown) => error instanceof Error &&
+          error.message === 'PocketGuard: failed to reconcile review labels.' &&
+          !error.message.includes('synthetic'),
+        'a valid review must fail generically when a desired label cannot be added',
+      );
+      assert.equal(failedReviewLabel.state.updated, 1, 'publish the valid review comment before label reconciliation');
+      assert.ok(failedReviewLabel.state.comments.find((comment) => comment.id === 7)?.body.includes('判定：APPROVE'));
+      assert.equal(failedReviewLabel.state.existingLabels.includes('area:delivery'), false,
+        'the failed label must not be represented as successfully applied');
+
+      const failedReviewRemoval = makePublishHarness({ outputPath, removeLabelsFails: true });
+      await assert.rejects(
+        runPublishMode(failedReviewRemoval.context),
+        (error: unknown) => error instanceof Error &&
+          error.message === 'PocketGuard: failed to reconcile review labels.' &&
+          !error.message.includes('sensitive removal failure detail'),
+        'a normal reconciliation removal failure must fail generically',
+      );
+      assert.ok(failedReviewRemoval.state.operations.includes('remove-label'),
+        'normal reconciliation attempts stale managed-label removal');
+
+      const failedReviewListing = makePublishHarness({ outputPath, listLabelsFails: true });
+      await assert.rejects(
+        runPublishMode(failedReviewListing.context),
+        (error: unknown) => error instanceof Error &&
+          error.message === 'PocketGuard: failed to reconcile review labels.' &&
+          !error.message.includes('synthetic'),
+        'a valid review must fail generically when existing labels cannot be listed');
+      assert.equal(failedReviewListing.state.updated, 1, 'publish the review comment before label reconciliation');
+      assert.ok(failedReviewListing.state.existingLabels.includes('area:delivery'),
+        'successful append after a failed listing does not prove complete reconciliation');
+      assert.deepEqual(failedReviewListing.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
+        ['area:delivery', 'area:docs', 'area:policy'], 'failed listing must not claim stale area labels were removed');
+      assert.equal(failedReviewListing.state.operations.includes('remove-label'), false,
+        'failed listing must never try to remove labels it could not inspect');
+
+      const emptyLabelsOutputPath = path.join(tempDirectory, 'empty-labels-review-output.json');
+      fs.writeFileSync(emptyLabelsOutputPath, JSON.stringify({ ...reviewed, areaLabels: [] }));
+      const failedEmptyLabelsListing = makePublishHarness({
+        outputPath: emptyLabelsOutputPath,
+        listLabelsFails: true,
+      });
+      await assert.rejects(
+        runPublishMode(failedEmptyLabelsListing.context),
+        (error: unknown) => error instanceof Error &&
+          error.message === 'PocketGuard: failed to reconcile review labels.',
+        'a failed listing must reject even when the review has no desired labels');
+      assert.deepEqual(failedEmptyLabelsListing.state.labels, [],
+        'an empty desired-label set does not trigger an unnecessary add');
+
+      const fallbackListFailure = makePublishHarness({
+        outputPath: path.join(tempDirectory, 'missing-list-fallback-review-output.json'),
+        listLabelsFails: true,
+      });
+      await runPublishMode(fallbackListFailure.context);
+      const fallbackListFailureBody = fallbackListFailure.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+      assert.ok(fallbackListFailureBody.includes('判定：INCONCLUSIVE'));
+      assert.ok(fallbackListFailure.state.existingLabels.includes('status:needs-decision'),
+        'fallback succeeds if the decision-label append succeeds despite a failed listing');
+      assert.deepEqual(fallbackListFailure.state.labels, [['status:needs-decision']],
+        'fallback adds only the maintainer decision label');
+      assert.deepEqual(fallbackListFailure.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
+        ['area:docs', 'area:policy'], 'fallback listing failure preserves existing area labels');
+      assert.equal(fallbackListFailure.state.operations.includes('remove-label'), false);
+
+      const failedFallbackListAndAdd = makePublishHarness({
+        outputPath: path.join(tempDirectory, 'missing-list-and-add-fallback-review-output.json'),
+        listLabelsFails: true,
+        addLabelsFails: true,
+      });
+      await assert.rejects(
+        runPublishMode(failedFallbackListAndAdd.context),
+        (error: unknown) => error instanceof Error &&
+          error.message === 'PocketGuard: failed to ensure maintainer decision label.' &&
+          !error.message.includes('synthetic'),
+        'a failed listing and decision-label append must fail generically');
+      assert.deepEqual(failedFallbackListAndAdd.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
+        ['area:docs', 'area:policy'], 'a failed fallback must preserve existing area labels');
+      assert.equal(failedFallbackListAndAdd.state.operations.includes('remove-label'), false);
+
+      const issueLabelFailure = makePublishHarness({
+        outputPath,
+        addLabelsFails: true,
+        event: {
+          action: 'opened',
+          repository: { full_name: 'sample/repository' },
+          issue: { number: 41, title: 'security: issue label regression' },
+        },
+      });
+      issueLabelFailure.context.env = {
+        ...issueLabelFailure.context.env,
+        GITHUB_EVENT_NAME: 'issues',
+      } as NodeJS.ProcessEnv;
+      await assert.rejects(
+        runPublishMode(issueLabelFailure.context),
+        (error: unknown) => error instanceof Error &&
+          error.message === 'PocketGuard: failed to apply issue labels.' &&
+          !error.message.includes('synthetic'),
+        'issues-event label API failures must reject with generic text',
+      );
+      assert.ok(issueLabelFailure.state.operations.includes('add-labels'));
+
+      const triageHarness = makePublishHarness({
+        outputPath,
+        event: {
+          action: 'created',
+          repository: { full_name: 'sample/repository' },
+          issue: { number: 41, pull_request: { url: 'unused' } },
+          comment: { body: '/triage' },
+        },
+      });
+      triageHarness.context.env = {
+        ...triageHarness.context.env,
+        GITHUB_EVENT_NAME: 'issue_comment',
+      } as NodeJS.ProcessEnv;
+      await runPublishMode(triageHarness.context);
+      assert.equal(triageHarness.state.updated, 0, 'non-review comment commands remain a legitimate skip');
+      assert.equal(triageHarness.state.created, 0);
+      assert.equal(triageHarness.state.operations.includes('update-comment'), false);
+      assert.equal(triageHarness.state.operations.includes('create-comment'), false);
+      assert.equal(triageHarness.state.operations.includes('add-labels'), false);
+      assert.equal(triageHarness.state.operations.includes('remove-label'), false);
+
+      const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');
+      const jobsStart = workflow.indexOf('jobs:');
+      const prepareTag = workflow.slice(workflow.indexOf('  prepare-tag:'), workflow.indexOf('  review-send:'));
+      const reviewJob = workflow.slice(workflow.indexOf('  review-send:'), workflow.indexOf('  publish:'));
+      const publishJob = workflow.slice(workflow.indexOf('  publish:'));
+      const publishCondition = publishJob.slice(0, publishJob.indexOf('    steps:'));
+      const workflowStep = (job: string, name: string): string => {
+        const marker = `      - name: ${name}`;
+        const start = job.indexOf(marker);
+        assert.notEqual(start, -1, `workflow step exists: ${name}`);
+        const contentsStart = start + marker.length;
+        const remainder = job.slice(contentsStart);
+        const nextStep = remainder.search(/^      - name:/m);
+        return remainder.slice(0, nextStep < 0 ? undefined : nextStep);
+      };
+      const nestedMapping = (step: string, key: 'env' | 'with'): string => {
+        const lines = step.split('\n');
+        const start = lines.findIndex((line) => new RegExp(`^\\s{8}${key}:\\s*$`).test(line));
+        if (start < 0) return '';
+        const values: string[] = [];
+        for (let index = start + 1; index < lines.length; index += 1) {
+          const line = lines[index];
+          if (line.trim() && !/^\s{10}\S/.test(line)) break;
+          values.push(line);
+        }
+        return values.join('\n');
+      };
+      const withValue = (step: string, key: string): string | undefined => {
+        const withBlock = nestedMapping(step, 'with');
+        const match = withBlock.match(new RegExp(`^\\s{10}${key}:\\s*(.*?)\\s*$`, 'm'));
+        return match?.[1].replace(/^['"]|['"]$/g, '');
+      };
+      const uploadStep = workflowStep(reviewJob, 'Upload review result');
+      const downloadStep = workflowStep(publishJob, 'Download review result');
+      const publishStep = workflowStep(publishJob, 'Publish sticky result and labels');
+      assert.match(downloadStep, /continue-on-error:\s*true/,
+        'artifact download failure must not block fallback publishing');
+      const conditionLine = publishCondition.match(/^\s{4}if:\s*(.*)$/m);
+      assert.ok(conditionLine, 'publish job declares an if condition');
+      const conditionLines = publishCondition.split('\n');
+      const conditionIndex = conditionLines.findIndex((line) => /^\s{4}if:/.test(line));
+      const conditionParts = [conditionLine?.[1] ?? ''];
+      for (let index = conditionIndex + 1; index < conditionLines.length; index += 1) {
+        const line = conditionLines[index];
+        if (!/^\s{6}\S/.test(line)) break;
+        conditionParts.push(line.trim());
+      }
+      const normalizedCondition = conditionParts.join(' ').replace(/\s+/g, ' ').trim();
+      assert.match(normalizedCondition, /\balways\(\)/,
+        'publish runs even when review-send fails or is skipped');
+      assert.match(normalizedCondition, /needs\.prepare-tag\.result\s*==\s*'success'/,
+        'publish requires successful deterministic tagging');
+      assert.doesNotMatch(normalizedCondition, /needs\.review-send\.result/,
+        'review-send failure or cancellation must not skip publish');
+      const uploadedArtifactName = withValue(uploadStep, 'name');
+      const downloadedArtifactName = withValue(downloadStep, 'name');
+      assert.ok(uploadedArtifactName, 'review job declares an uploaded artifact name');
+      assert.ok(downloadedArtifactName, 'publish job declares a downloaded artifact name');
+      assert.equal(uploadedArtifactName, downloadedArtifactName, 'upload and download artifact names match');
+      assert.equal(withValue(uploadStep, 'path'), 'github_bot/review-output.json');
+      assert.equal(withValue(downloadStep, 'path'), 'github_bot');
+      const publishEnv = nestedMapping(publishStep, 'env');
+      assert.match(publishEnv, /^\s{10}POCKETGUARD_OUTPUT:\s*['"]?review-output\.json['"]?\s*$/m,
+        'download destination contains the file expected by the publisher');
+      assert.match(reviewJob, /CPA_API_KEY:/);
+      assert.match(reviewJob, /CPA_BASE_URL:/);
+      const cpaSecretKeys = /CPA_API_KEY|CPA_BASE_URL/;
+      assert.doesNotMatch(workflow.slice(0, jobsStart), cpaSecretKeys,
+        'CPA secrets stay out of workflow-level configuration');
+      assert.doesNotMatch(prepareTag, cpaSecretKeys, 'CPA secrets stay out of prepare-tag');
+      assert.doesNotMatch(publishJob, cpaSecretKeys, 'CPA secrets stay out of publish');
     } finally {
       fs.rmSync(tempDirectory, { recursive: true, force: true });
     }

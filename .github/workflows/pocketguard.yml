@@ -123,8 +123,7 @@ jobs:
     name: Publish review and labels
     needs: [prepare-tag, review-send]
     if: >-
-      always() && needs.prepare-tag.result == 'success' &&
-      (needs.review-send.result == 'success' || needs.review-send.result == 'skipped')
+      always() && needs.prepare-tag.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -150,6 +149,7 @@ jobs:
 
       - name: Download review result
         if: needs.review-send.result == 'success'
+        continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pocketguard-review-output
@@ -160,5 +160,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           POCKETGUARD_OUTPUT: review-output.json
+          POCKETGUARD_REVIEW_JOB_RESULT: ${{ needs.review-send.result }}
           POCKETGUARD_TAG_LABELS: ${{ needs.prepare-tag.outputs.labels }}
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=publish

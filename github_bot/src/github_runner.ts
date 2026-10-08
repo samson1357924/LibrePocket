@@ -115,6 +115,10 @@ export interface TagResult {
 
 export interface RunnerReviewOutput {
   verdict: RunnerVerdict;
+  pullRequestNumber?: number;
+  baseSha?: string;
+  headSha?: string;
+  headRepository?: string;
   roles: Array<{
     role: ReviewRoleName;
     modelUsed: string;
@@ -169,8 +173,25 @@ function sameRepository(left: string | null | undefined, right: string): boolean
   return typeof left === 'string' && left.toLowerCase() === right.toLowerCase();
 }
 
+function safeRepositoryName(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value);
+}
+
 function safeSha(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
+}
+
+function validPullRequestData(value: unknown): value is PullRequestData {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const pullRequest = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(pullRequest.number) || Number(pullRequest.number) < 1) return false;
+  if (!pullRequest.base || typeof pullRequest.base !== 'object' || Array.isArray(pullRequest.base)) return false;
+  if (!pullRequest.head || typeof pullRequest.head !== 'object' || Array.isArray(pullRequest.head)) return false;
+  const base = pullRequest.base as Record<string, unknown>;
+  const head = pullRequest.head as Record<string, unknown>;
+  if (!head.repo || typeof head.repo !== 'object' || Array.isArray(head.repo)) return false;
+  const headRepo = head.repo as Record<string, unknown>;
+  return safeSha(base.sha) && safeSha(head.sha) && safeRepositoryName(headRepo.full_name);
 }
 
 async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
@@ -502,6 +523,10 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
         });
         output = {
           ...orchestrated,
+          pullRequestNumber: target.pullRequest.number,
+          baseSha,
+          headSha,
+          headRepository: target.pullRequest.head.repo?.full_name ?? '',
           areaLabels: resolveAreaLabelsFromPaths(changedFiles),
           changedFiles,
           changedFilesComplete,
@@ -547,14 +572,16 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
   const verdicts = new Set(['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE']);
   if (
     Object.keys(raw).some((key) => ![
-      'verdict', 'roles', 'coverage', 'deterministicViolations', 'areaLabels', 'changedFiles', 'changedFilesComplete',
+      'verdict', 'pullRequestNumber', 'baseSha', 'headSha', 'headRepository', 'roles', 'coverage',
+      'deterministicViolations', 'areaLabels', 'changedFiles', 'changedFilesComplete',
     ].includes(key)) ||
+    !Number.isSafeInteger(raw.pullRequestNumber) || Number(raw.pullRequestNumber) < 1 ||
+    !safeSha(raw.baseSha) || !safeSha(raw.headSha) || !safeRepositoryName(raw.headRepository) ||
     !verdicts.has(String(raw.verdict)) || !Array.isArray(raw.roles) || raw.roles.length !== ROLE_NAMES.length ||
     !Array.isArray(raw.deterministicViolations) ||
-    (raw.areaLabels !== undefined && (!Array.isArray(raw.areaLabels) || !raw.areaLabels.every((label) => typeof label === 'string'))) ||
-    (raw.changedFiles !== undefined && (!Array.isArray(raw.changedFiles) || !raw.changedFiles.every((file) => typeof file === 'string'))) ||
-    (raw.changedFilesComplete !== undefined && typeof raw.changedFilesComplete !== 'boolean') ||
-    (raw.changedFilesComplete === true && !Array.isArray(raw.changedFiles))
+    !Array.isArray(raw.areaLabels) || !raw.areaLabels.every((label) => typeof label === 'string') ||
+    !Array.isArray(raw.changedFiles) || !raw.changedFiles.every((file) => typeof file === 'string') ||
+    typeof raw.changedFilesComplete !== 'boolean'
   ) return undefined;
   const rawCoverage = raw.coverage;
   if (!rawCoverage || typeof rawCoverage !== 'object' || Array.isArray(rawCoverage)) return undefined;
@@ -565,6 +592,10 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
     !coverage.omittedFiles.every((file) => typeof file === 'string') || !Array.isArray(coverage.truncatedFiles) ||
     !coverage.truncatedFiles.every((file) => typeof file === 'string') ||
     !Number.isSafeInteger(coverage.originalLength) || Number(coverage.originalLength) < 0
+  ) return undefined;
+  if (
+    coverage.complete === true &&
+    ((coverage.omittedFiles as string[]).length > 0 || (coverage.truncatedFiles as string[]).length > 0)
   ) return undefined;
 
   const roles: RunnerReviewOutput['roles'] = [];
@@ -643,15 +674,21 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
     return normalized.startsWith('.github/workflows/') || normalized.includes('/.github/workflows/');
   });
   const unanimousApproval = roles.length === ROLE_NAMES.length && roles.every((role) => role.verdict === 'APPROVE');
+  const completeFileCoverage = raw.changedFilesComplete === true && coverage.complete === true &&
+    (coverage.omittedFiles as string[]).length === 0 && (coverage.truncatedFiles as string[]).length === 0;
   const calculatedVerdict: RunnerVerdict = hasBlockingFinding || hasDeterministicBlock
     ? 'NEEDS_CHANGES'
-    : unanimousApproval && coverage.complete && (coverage.truncatedFiles as string[]).length === 0 && !hasCriticalOmission
+    : unanimousApproval && completeFileCoverage && !hasCriticalOmission
       ? 'APPROVE'
       : 'INCONCLUSIVE';
   if (raw.verdict !== calculatedVerdict) return undefined;
 
   return {
     verdict: calculatedVerdict,
+    pullRequestNumber: Number(raw.pullRequestNumber),
+    baseSha: raw.baseSha,
+    headSha: raw.headSha,
+    headRepository: raw.headRepository,
     roles,
     coverage: {
       complete: coverage.complete,
@@ -675,15 +712,13 @@ function escapeMarkdown(value: string): string {
 }
 
 function reviewComment(output: RunnerReviewOutput): string {
-  if (output.roles.length > 0 && output.roles.every((role) => role.modelUsed === 'not-run')) {
-    return `${REVIEW_MARKER}\n\n## PocketGuard 審查\n\n${SAFE_MESSAGE}\n`;
-  }
   const lines = [
     REVIEW_MARKER,
     '',
     '## PocketGuard 審查',
     '',
     `**判定：${output.verdict}**`,
+    `審查的 head SHA：\`${output.headSha}\``,
     coverageSummary(output.coverage),
     `省略檔案：${output.coverage.omittedFiles.length > 0
       ? output.coverage.omittedFiles.map((file) => escapeMarkdown(file)).join('、')
@@ -713,6 +748,19 @@ function reviewComment(output: RunnerReviewOutput): string {
   return `${lines.join('\n')}\n`;
 }
 
+function inconclusiveComment(reason: string): string {
+  return [
+    REVIEW_MARKER,
+    '',
+    '## PocketGuard 審查',
+    '',
+    '**判定：INCONCLUSIVE**',
+    `**審查結果不可用：${safeString(reason)}**`,
+    SAFE_MESSAGE,
+    '',
+  ].join('\n');
+}
+
 function eventCommentAllowed(target: ReviewTarget, eventName: string): boolean {
   if (eventName === 'pull_request_target') return target.target === 'pull-request';
   return target.target === 'pull-request' && isCommentCommandAllowed(target.command, 'pull-request');
@@ -726,6 +774,118 @@ function configuredTagLabels(env: NodeJS.ProcessEnv): string[] {
       : [];
   } catch {
     return [];
+  }
+}
+
+async function publishStickyComment(
+  client: RunnerGitHubClient,
+  repository: { owner: string; repo: string },
+  issueNumber: number,
+  body: string,
+  bodyBeforeWrite?: () => Promise<string>,
+): Promise<void> {
+  let botLogin: string | undefined;
+  try {
+    const identity = await client.rest.users.getAuthenticated();
+    if (typeof identity.data.login === 'string' && identity.data.login.trim()) {
+      botLogin = identity.data.login;
+    }
+  } catch {
+    // The marker plus GitHub's bot author metadata provides a safe fallback.
+  }
+
+  try {
+    let existing: GithubComment | undefined;
+    for (let page = 1; ; page += 1) {
+      const comments = await client.rest.issues.listComments({
+        owner: repository.owner,
+        repo: repository.repo,
+        issue_number: issueNumber,
+        per_page: 100,
+        page,
+      });
+      existing = comments.data.find((comment) =>
+        (botLogin
+          ? comment.user?.login === botLogin
+          : comment.user?.login === 'github-actions[bot]' || comment.user?.type === 'Bot') &&
+        typeof comment.body === 'string' && comment.body.includes(REVIEW_MARKER));
+      if (existing || comments.data.length < 100) break;
+    }
+    // Revalidate only after locating the sticky comment and immediately before
+    // the write. GitHub offers no compare-and-swap, so this narrows but cannot
+    // eliminate the race with a concurrent PR update.
+    const currentBody = bodyBeforeWrite ? await bodyBeforeWrite() : body;
+    if (existing) {
+      await client.rest.issues.updateComment({
+        owner: repository.owner,
+        repo: repository.repo,
+        comment_id: existing.id,
+        body: currentBody,
+      });
+    } else {
+      await client.rest.issues.createComment({
+        owner: repository.owner,
+        repo: repository.repo,
+        issue_number: issueNumber,
+        body: currentBody,
+      });
+    }
+  } catch {
+    // Do not leak API details, and do not let labels advertise an unpublished result.
+    throw new Error('PocketGuard: failed to publish review comment.');
+  }
+}
+
+function sameReviewIdentity(output: RunnerReviewOutput, pullRequest: PullRequestData): boolean {
+  return output.pullRequestNumber === pullRequest.number &&
+    typeof output.baseSha === 'string' && output.baseSha.toLowerCase() === pullRequest.base.sha.toLowerCase() &&
+    typeof output.headSha === 'string' && output.headSha.toLowerCase() === pullRequest.head.sha.toLowerCase() &&
+    typeof output.headRepository === 'string' && sameRepository(output.headRepository, pullRequest.head.repo?.full_name ?? '');
+}
+
+async function currentReviewProblem(
+  client: RunnerGitHubClient,
+  repository: { owner: string; repo: string },
+  issueNumber: number,
+  output: RunnerReviewOutput,
+): Promise<string | undefined> {
+  try {
+    const response = await client.rest.pulls.get({
+      owner: repository.owner,
+      repo: repository.repo,
+      pull_number: issueNumber,
+    });
+    if (!validPullRequestData(response?.data) || response.data.number !== issueNumber) {
+      return 'the current pull request state is unavailable; review freshness could not be verified.';
+    }
+    if (!sameReviewIdentity(output, response.data)) {
+      return 'the pull request changed after review; the result is stale.';
+    }
+    return undefined;
+  } catch {
+    return 'the current pull request state is unavailable; review freshness could not be verified.';
+  }
+}
+
+async function reconcileNeedsDecisionOnly(
+  client: RunnerGitHubClient,
+  repository: { owner: string; repo: string },
+  issueNumber: number,
+): Promise<void> {
+  const reconciliation = await reconcileBotLabelsSafely({
+    client,
+    owner: repository.owner,
+    repo: repository.repo,
+    issueNumber,
+    desiredLabels: ['status:needs-decision'],
+    scope: { managedExactLabels: ['status:needs-decision'] } satisfies ReconcileScope,
+    coverageComplete: false,
+  });
+  if (
+    !reconciliation.added.includes('status:needs-decision') &&
+    !reconciliation.skipped.includes('status:needs-decision')
+  ) {
+    throw new Error('PocketGuard: failed to ensure maintainer decision label.');
   }
 }
 
@@ -761,85 +921,130 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
           labels,
         });
       } catch {
-        return;
+        throw new Error('PocketGuard: failed to apply issue labels.');
       }
     }
     return;
   }
 
   if (!eventCommentAllowed(target, eventName)) return;
-  const outputPath = env.POCKETGUARD_OUTPUT ?? 'review-output.json';
-  let output: RunnerReviewOutput | undefined;
-  try {
-    output = validateReviewOutput(JSON.parse(fs.readFileSync(outputPath, 'utf8')) as unknown);
-  } catch {
-    output = undefined;
-  }
-  if (!output) return;
 
-  const body = reviewComment(output);
+  let fallbackReason: string | undefined;
+  let freshPullRequest: PullRequestData | undefined;
   try {
-    let botLogin = 'github-actions[bot]';
-    try {
-      const identity = await client.rest.users.getAuthenticated();
-      if (typeof identity.data.login === 'string' && identity.data.login) botLogin = identity.data.login;
-    } catch {
-      // The fallback still permits safe marker matching when this endpoint is forbidden.
-    }
-    let existing: GithubComment | undefined;
-    for (let page = 1; ; page += 1) {
-      const comments = await client.rest.issues.listComments({
-        owner: repository.owner,
-        repo: repository.repo,
-        issue_number: target.issueNumber,
-        per_page: 100,
-        page,
-      });
-      existing = comments.data.find((comment) =>
-        (comment.user?.login === botLogin || comment.user?.type === 'Bot') &&
-        typeof comment.body === 'string' && comment.body.includes(REVIEW_MARKER));
-      if (existing || comments.data.length < 100) break;
-    }
-    if (existing) {
-      await client.rest.issues.updateComment({
-        owner: repository.owner,
-        repo: repository.repo,
-        comment_id: existing.id,
-        body,
-      });
-    } else {
-      await client.rest.issues.createComment({
-        owner: repository.owner,
-        repo: repository.repo,
-        issue_number: target.issueNumber,
-        body,
-      });
-    }
-
-    const hasSecurityBlock = output.deterministicViolations.some((violation) =>
-      violation.severity === 'BLOCK' && (violation.category === 'security' || violation.ruleId.startsWith('SEC-'))) ||
-      output.roles.some((role) => role.role === 'android_sec' && role.findings.some((finding) => finding.severity === 'BLOCK'));
-    const labels = sanitizeLabels([
-      ...configuredTagLabels(env),
-      ...(output.changedFilesComplete ? output.areaLabels : []),
-      ...resolveReviewLabels({
-        verdict: output.verdict,
-        hasSecurityFinding: hasSecurityBlock,
-      }),
-    ]);
-    await reconcileBotLabelsSafely({
-      client,
+    const response = await client.rest.pulls.get({
       owner: repository.owner,
       repo: repository.repo,
-      issueNumber: target.issueNumber,
-      desiredLabels: labels,
-      scope: output.changedFilesComplete
-        ? DEFAULT_PR_RECONCILE_SCOPE
-        : { managedExactLabels: ['status:needs-decision'] } satisfies ReconcileScope,
-      coverageComplete: output.coverage.complete && output.changedFilesComplete,
+      pull_number: target.issueNumber,
     });
+    if (!validPullRequestData(response?.data) || response.data.number !== target.issueNumber) {
+      fallbackReason = 'GitHub returned an invalid current pull request identity; review freshness could not be verified.';
+    } else {
+      freshPullRequest = response.data;
+    }
   } catch {
+    fallbackReason = 'the current pull request state could not be fetched from GitHub.';
+  }
+
+  const outputPath = env.POCKETGUARD_OUTPUT ?? 'review-output.json';
+  let output: RunnerReviewOutput | undefined;
+  if (!fallbackReason) {
+    const reviewJobResult = env.POCKETGUARD_REVIEW_JOB_RESULT ?? 'unavailable';
+    if (reviewJobResult !== 'success') {
+      fallbackReason = `the review job did not complete successfully (result: ${safeString(reviewJobResult, 100)}).`;
+    } else {
+      let artifactText: string;
+      try {
+        artifactText = fs.readFileSync(outputPath, 'utf8');
+      } catch {
+        fallbackReason = 'the review output artifact is missing or unreadable.';
+        artifactText = '';
+      }
+      if (!fallbackReason) {
+        let artifactValue: unknown;
+        try {
+          artifactValue = JSON.parse(artifactText) as unknown;
+        } catch {
+          fallbackReason = 'the review output JSON is malformed.';
+        }
+        if (!fallbackReason) {
+          output = validateReviewOutput(artifactValue);
+          if (!output) fallbackReason = 'the review output schema or contents are invalid.';
+        }
+      }
+      if (!fallbackReason && output && freshPullRequest && !sameReviewIdentity(output, freshPullRequest)) {
+        fallbackReason = 'the review output is stale: its PR number, base SHA, head SHA, or head repository no longer matches GitHub.';
+      }
+    }
+  }
+
+  if (fallbackReason || !output) {
+    await publishStickyComment(
+      client,
+      repository,
+      target.issueNumber,
+      inconclusiveComment(fallbackReason ?? 'a valid review result was unavailable.'),
+    );
+    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
+  }
+
+  let publishFallbackReason: string | undefined;
+  await publishStickyComment(client, repository, target.issueNumber, reviewComment(output), async () => {
+    publishFallbackReason = await currentReviewProblem(client, repository, target.issueNumber!, output!);
+    return publishFallbackReason ? inconclusiveComment(publishFallbackReason) : reviewComment(output!);
+  });
+  if (publishFallbackReason) {
+    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    return;
+  }
+
+  const hasSecurityBlock = output.deterministicViolations.some((violation) =>
+    violation.severity === 'BLOCK' && (violation.category === 'security' || violation.ruleId.startsWith('SEC-'))) ||
+    output.roles.some((role) => role.role === 'android_sec' && role.findings.some((finding) => finding.severity === 'BLOCK'));
+  const labels = sanitizeLabels([
+    ...configuredTagLabels(env),
+    ...(output.changedFilesComplete ? output.areaLabels : []),
+    ...resolveReviewLabels({
+      verdict: output.verdict,
+      hasSecurityFinding: hasSecurityBlock,
+    }),
+  ]);
+  const coverageComplete = output.coverage.complete && output.changedFilesComplete;
+  const labelFallbackReason = await currentReviewProblem(client, repository, target.issueNumber, output);
+  if (labelFallbackReason) {
+    await publishStickyComment(
+      client,
+      repository,
+      target.issueNumber,
+      inconclusiveComment(labelFallbackReason),
+    );
+    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    return;
+  }
+
+  const reconciliation = await reconcileBotLabelsSafely({
+    client,
+    owner: repository.owner,
+    repo: repository.repo,
+    issueNumber: target.issueNumber,
+    desiredLabels: labels,
+    scope: output.changedFilesComplete
+      ? DEFAULT_PR_RECONCILE_SCOPE
+      : { managedExactLabels: ['status:needs-decision'] } satisfies ReconcileScope,
+    coverageComplete,
+  });
+  const expectedLabels = sanitizeLabels([
+    ...labels,
+    ...(coverageComplete ? [] : ['status:needs-decision']),
+  ]);
+  const reconciledLabels = new Set([...reconciliation.added, ...reconciliation.skipped]);
+  if (
+    reconciliation.failedToList ||
+    expectedLabels.some((label) => !reconciledLabels.has(label)) ||
+    (reconciliation.failedRemovals?.length ?? 0) > 0
+  ) {
+    throw new Error('PocketGuard: failed to reconcile review labels.');
   }
 }
 

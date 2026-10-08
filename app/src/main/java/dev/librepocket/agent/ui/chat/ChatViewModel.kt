@@ -931,8 +931,29 @@ class ChatViewModel(
     // F2: retain visible user/assistant messages before dropping live state,
     // so a model/revision change never blanks the screen until the next send
     // replays. Id-deduped; logout/newChat clearing is preserved elsewhere.
+    // Timing note: the VM projection (_sessionState) trails the controller by
+    // one collector dispatch. A text already accepted (appended) but not yet
+    // projected must still survive: also read the live session truth
+    // (synchronous StateFlow value) before closeLive() nulls it. Accepted
+    // text belongs here in _history, never in the unsent outbox.
     private fun snapshotLiveToHistory() {
-        val live = _sessionState.value.messages.filter { it.role == "user" || it.role == "assistant" }
+        val projected = _sessionState.value.messages.filter { it.role == "user" || it.role == "assistant" }
+        // Accepted-but-unprojected tail: already appended by startOrEnqueue,
+        // collector not yet dispatched. Read before closeLive(); exceptions
+        // (closed session) mean nothing to add, never fail the switch.
+        val direct = try {
+            currentSession?.uiState?.value?.messages?.filter { it.role == "user" || it.role == "assistant" }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        } ?: emptyList()
+        // Direct is strictly newer than projected (same ids evolve in place:
+        // placeholder → deltas → finalized), so it wins on conflict.
+        val merged = LinkedHashMap<String, UiMessage>(projected.size + direct.size)
+        for (m in projected) merged[m.id] = m
+        for (m in direct) merged[m.id] = m
+        val live = merged.values.toList()
         if (live.isEmpty()) return
         val existing = _history.value.map { it.id }.toSet()
         val fresh = live.filter { it.id !in existing }

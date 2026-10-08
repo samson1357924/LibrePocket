@@ -5,7 +5,7 @@ on:
     - cron: '0 20 * * *'
   workflow_dispatch:
   pull_request:
-    types: [ labeled ]
+    types: [ labeled, synchronize, opened, reopened ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

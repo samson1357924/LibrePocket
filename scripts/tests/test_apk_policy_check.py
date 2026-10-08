@@ -480,6 +480,77 @@ class ApkPolicyHarness(unittest.TestCase):
         self.assert_rejected(apk)
         self.assertFalse((self.tmp / "outside.txt").exists())
 
+    def _write_nul_member_apk(self, path: Path, raw_name: bytes) -> Path:
+        # CPython's ZipFile.writestr normalizes NUL out of written names, so
+        # build a same-length placeholder entry and patch both the local and
+        # central filename bytes to the raw NUL name. Same length keeps all
+        # ZIP offsets valid.
+        placeholder = "classes.dexQQQ"
+        if len(raw_name) != len(placeholder):
+            raise ValueError("NUL fixture raw name must match placeholder length")
+        members = {
+            "AndroidManifest.xml": b"synthetic compiled manifest fixture",
+            placeholder: minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        }
+        write_apk(path, members)
+        raw = bytearray(path.read_bytes())
+        self.assertEqual(raw.count(placeholder.encode("ascii")), 2)
+        path.write_bytes(raw.replace(placeholder.encode("ascii"), raw_name))
+        return path
+
+    def test_rejects_nul_byte_archive_member_name(self) -> None:
+        # Regression for CPython ZipInfo NUL truncation: info.filename is
+        # "classes.dex" while info.orig_filename keeps "classes.dex\x00ab".
+        # The archive validator must fail closed on the original bytes,
+        # independently of fake aapt/dexdump results.
+        apk = self._write_nul_member_apk(
+            self.tmp / "nul-dex-name.apk", b"classes.dex\x00ab"
+        )
+        with zipfile.ZipFile(apk, "r") as archive:
+            matches = [
+                info
+                for info in archive.infolist()
+                if info.orig_filename == "classes.dex\x00ab"
+            ]
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0].filename, "classes.dex")
+        with self.assertRaisesRegex(policy_inspect.PolicyError, r"NUL"):
+            policy_inspect._validate_archive(apk)
+        self.assert_rejected(apk)
+
+    def test_rejects_nul_byte_manifest_member_name(self) -> None:
+        members = {
+            "AndroidManifest.xmlPLACE": b"synthetic compiled manifest fixture",
+            "classes.dex": minimal_dex(type_descriptors=("Ljava/lang/Object;",)),
+        }
+        apk = self.tmp / "nul-manifest-name.apk"
+        write_apk(apk, members)
+        placeholder = b"AndroidManifest.xmlPLACE"
+        raw_name = b"AndroidManifest.xml\x00LACE"
+        self.assertEqual(len(placeholder), len(raw_name))
+        raw = bytearray(apk.read_bytes())
+        self.assertEqual(raw.count(placeholder), 2)
+        apk.write_bytes(raw.replace(placeholder, raw_name))
+        with self.assertRaisesRegex(policy_inspect.PolicyError, r"NUL"):
+            policy_inspect._validate_archive(apk)
+        self.assert_rejected(apk)
+
+    def test_rejects_directory_entry_satisfying_root_dex_name(self) -> None:
+        # A "classes.dex/" directory entry must not satisfy the root
+        # classes.dex requirement.
+        apk = self.tmp / "dir-dex-name.apk"
+        with zipfile.ZipFile(apk, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("AndroidManifest.xml", b"synthetic manifest")
+            archive.writestr("classes.dex/", b"")
+            archive.writestr(
+                "classes2.dex", minimal_dex(type_descriptors=("Ljava/lang/Object;",))
+            )
+        with self.assertRaisesRegex(
+            policy_inspect.PolicyError, r"must contain root classes\.dex"
+        ):
+            policy_inspect._validate_archive(apk)
+        self.assert_rejected(apk)
+
     def test_rejects_invalid_dex_type_table(self) -> None:
         malformed_dex = bytearray(minimal_dex(type_descriptors=("Ljava/lang/Object;",)))
         # Point type_ids outside the DEX byte range. A parser error must not turn

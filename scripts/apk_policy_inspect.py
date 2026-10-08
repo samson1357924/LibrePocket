@@ -478,6 +478,18 @@ def _validate_archive(apk: Path) -> tuple[list[zipfile.ZipInfo], list[zipfile.Zi
             dex_infos: list[zipfile.ZipInfo] = []
             manifest_count = 0
             for info in infos:
+                # CPython's zipfile truncates ZipInfo.filename at the first NUL
+                # while keeping the unmodified bytes in orig_filename. Validate
+                # the original representation so a raw "classes.dex\x00ab" entry
+                # is never treated as canonical root classes.dex.
+                raw_name = info.orig_filename
+                if "\x00" in raw_name:
+                    raise PolicyError(f"APK ZIP contains NUL in member name: {raw_name!r}")
+                if raw_name != info.filename:
+                    raise PolicyError(
+                        "APK ZIP member name was normalized by zipfile: "
+                        f"{raw_name!r} != {info.filename!r}"
+                    )
                 canonical = _canonical_member_name(info.filename)
                 if canonical in names:
                     raise PolicyError(f"APK ZIP has duplicate normalized member: {canonical!r}")
@@ -503,6 +515,9 @@ def _validate_archive(apk: Path) -> tuple[list[zipfile.ZipInfo], list[zipfile.Zi
 
             if manifest_count != 1:
                 raise PolicyError("APK must contain exactly one root AndroidManifest.xml")
+            # Use the validated dex entries (non-directory members that passed the
+            # orig_filename/canonical checks above). Checking the plain names
+            # set would also match a "classes.dex/" directory entry.
             if not any(info.filename == "classes.dex" for info in dex_infos):
                 raise PolicyError("APK must contain root classes.dex")
             if not dex_infos or len(dex_infos) > MAX_DEX_COUNT:

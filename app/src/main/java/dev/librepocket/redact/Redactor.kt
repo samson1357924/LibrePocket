@@ -44,12 +44,15 @@ object Redactor {
         ),
         Rule(
             "JSON_KEY_FIELD",
-            // Quoted JSON values are handled by the linear scanner before any
-            // rule runs. This legacy rule remains for unquoted key=value fields;
-            // keep URL query delimiters in R5's domain and don't re-count an
-            // already-redacted JSON value on a second pass.
+            // Quoted JSON values are handled by the linear scanner at the R3
+            // position (after R1/R2, see redact()). This legacy rule remains
+            // for unquoted key=value fields; keep URL query delimiters in R5's
+            // domain. Idempotence only skips an already-redacted marker when it
+            // is the entire value (marker followed by closing quote, value
+            // boundary, or end); a marker-prefixed live secret must still be
+            // redacted.
             Regex(
-                """("?(api[_-]?key|secret|token|password|passwd|auth)"?\s*[:=]\s*"?)(?!⟦REDACTED⟧)[^",\s}&?]{4,}""",
+                """("?(api[_-]?key|secret|token|password|passwd|auth)"?\s*[:=]\s*"?)(?!⟦REDACTED⟧(["\s,}?&]|$))[^",\s}&?]{4,}""",
                 IGNORE_CASE,
             ),
             "\$1$JSON_REDACTED_VALUE",
@@ -149,12 +152,22 @@ object Redactor {
      * ANDROID_PATH is the S4 addition, see class KDoc).
      */
     fun redact(input: String): RedactResult {
-        // Protect whole quoted values before API-key/bearer and other generic
-        // rules can replace only a prefix within the value.
-        val (prepared, quotedJsonHits) = redactQuotedJsonSecretValues(input)
-        var text = prepared
+        // Table order is load-bearing: R1/R2 observe the original text first so
+        // overlapping key shapes (e.g. sk-... inside a "password" value) are
+        // counted before whole-field normalization. The quoted-JSON scanner runs
+        // at the R3 position; its hits are attributed to JSON_KEY_FIELD.
+        var text = input
         val hits = LinkedHashMap<String, Int>()
-        for (rule in RULES) {
+        for (rule in RULES.subList(0, 2)) {
+            val count = rule.pattern.findAll(text).count()
+            if (count > 0) {
+                text = rule.pattern.replace(text, rule.replacement)
+            }
+            hits[rule.id] = count
+        }
+        val (prepared, quotedJsonHits) = redactQuotedJsonSecretValues(text)
+        text = prepared
+        for (rule in RULES.subList(2, RULES.size)) {
             val count = rule.pattern.findAll(text).count()
             if (count > 0) {
                 text = rule.pattern.replace(text, rule.replacement)
@@ -176,8 +189,17 @@ object Redactor {
      * characters.
      */
     fun redactError(input: String): String {
-        var text = redactQuotedJsonSecretValues(input).first
-        for (rule in RULES) {
+        // Keep the same R1/R2-then-scanner ordering as redact() so the final
+        // whole-value marker choice stays consistent (scanner overwrites any
+        // partial R1/R2 marker inside a quoted secret value).
+        var text = input
+        for (rule in RULES.subList(0, 2)) {
+            if (rule.id in ERROR_RULE_IDS) {
+                text = rule.pattern.replace(text, rule.replacement)
+            }
+        }
+        text = redactQuotedJsonSecretValues(text).first
+        for (rule in RULES.subList(2, RULES.size)) {
             if (rule.id in ERROR_RULE_IDS) {
                 text = rule.pattern.replace(text, rule.replacement)
             }

@@ -195,4 +195,75 @@ class SecretValueRedactionRegressionTest {
         assertTrue("legacy JSON redaction marker changed: $once", once.contains("⟦REDACTED⟧"))
         assertEquals(once, twice)
     }
+
+    @Test
+    fun exactMarkerValuesAreIdempotentInBothModes() {
+        val cases = listOf(
+            "password=⟦REDACTED⟧" to "password=⟦REDACTED⟧",
+            "password:⟦REDACTED⟧" to "password:⟦REDACTED⟧",
+            "\"password\"=\"⟦REDACTED⟧\"" to "\"password\"=\"⟦REDACTED⟧\"",
+            "{\"password\":\"⟦REDACTED⟧\"}" to "{\"password\":\"⟦REDACTED⟧\"}",
+        )
+        for ((input, expected) in cases) {
+            val full = Redactor.redact(input)
+            assertEquals("full redaction changed exact marker: $input", expected, full.text)
+            assertEquals("exact marker must not add hits: $input", 0, full.hits["JSON_KEY_FIELD"])
+            assertEquals("second pass changed exact marker: $input", expected, Redactor.redact(full.text).text)
+
+            val error = Redactor.redactError(input)
+            assertEquals("error redaction changed exact marker: $input", expected, error)
+            assertEquals("error second pass changed exact marker: $input", expected, Redactor.redactError(error))
+        }
+    }
+
+    @Test
+    fun markerPrefixedLegacyValuesHaveSuffixRemovedInBothModes() {
+        val cases = listOf(
+            "password=⟦REDACTED⟧still-secret" to "password=⟦REDACTED⟧",
+            "password:⟦REDACTED⟧still-secret" to "password:⟦REDACTED⟧",
+            "\"password\"=\"⟦REDACTED⟧still-secret\"" to "\"password\"=\"⟦REDACTED⟧\"",
+            "\"password\":⟦REDACTED⟧still-secret" to "\"password\":⟦REDACTED⟧",
+        )
+        for ((input, expected) in cases) {
+            val full = Redactor.redact(input)
+            assertEquals("full redaction missed marker-prefixed suffix: $input", expected, full.text)
+            assertFalse("suffix leaked in full redaction: ${full.text}", full.text.contains("still-secret"))
+            assertEquals("second pass unstable: $input", expected, Redactor.redact(full.text).text)
+
+            val error = Redactor.redactError(input)
+            assertEquals("error redaction missed marker-prefixed suffix: $input", expected, error)
+            assertFalse("suffix leaked in error redaction: $error", error.contains("still-secret"))
+            assertEquals("error second pass unstable: $input", expected, Redactor.redactError(error))
+        }
+    }
+
+    @Test
+    fun overlappingKeyShapesPreservePerRuleHits() {
+        val apiInput = "{\"password\":\"sk-abcdefgh12345678\"}"
+        val apiResult = Redactor.redact(apiInput)
+        assertEquals("{\"password\":\"⟦REDACTED⟧\"}", apiResult.text)
+        assertEquals(1, apiResult.hits["API_KEY_VALUE"])
+        assertEquals(1, apiResult.hits["JSON_KEY_FIELD"])
+        assertEquals(0, apiResult.hits["BEARER_TOKEN"])
+        assertFalse(apiResult.text.contains("sk-abcdefgh12345678"))
+
+        val bearerInput = "{\"secret\":\"Bearer abcdef123456\"}"
+        val bearerResult = Redactor.redact(bearerInput)
+        assertEquals("{\"secret\":\"⟦REDACTED⟧\"}", bearerResult.text)
+        assertEquals(1, bearerResult.hits["BEARER_TOKEN"])
+        assertEquals(1, bearerResult.hits["JSON_KEY_FIELD"])
+        assertEquals(0, bearerResult.hits["API_KEY_VALUE"])
+        assertFalse(bearerResult.text.contains("abcdef123456"))
+
+        // Non-overlapping control: plain secret counts only for JSON_KEY_FIELD.
+        val plainResult = Redactor.redact("{\"password\":\"plain secret value\"}")
+        assertEquals("{\"password\":\"⟦REDACTED⟧\"}", plainResult.text)
+        assertEquals(0, plainResult.hits["API_KEY_VALUE"])
+        assertEquals(0, plainResult.hits["BEARER_TOKEN"])
+        assertEquals(1, plainResult.hits["JSON_KEY_FIELD"])
+
+        // Error mode keeps the whole-value marker for overlapping shapes.
+        assertEquals("{\"password\":\"⟦REDACTED⟧\"}", Redactor.redactError(apiInput))
+        assertEquals("{\"secret\":\"⟦REDACTED⟧\"}", Redactor.redactError(bearerInput))
+    }
 }

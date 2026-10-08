@@ -125,8 +125,14 @@ class ChatViewModel(
     // (startOrEnqueue Started/Queued verdict); pre-accept endpoint
     // invalidation drains every entry into recoverableOps (never auto-sent
     // to the new binding).
-    private data class PendingOp(val opId: Long, val generation: Long, val text: String)
+    private data class PendingOp(
+        val opId: Long,
+        val generation: Long,
+        val text: String,
+        val retryTargetEpoch: Long = 0L,
+    )
     private var nextOpId = 0L
+    private var nextRetryTargetEpoch = 0L
     private val pendingOps = LinkedHashMap<Long, PendingOp>()
     // Endpoint-cancelled but never accepted: surfaced one-by-one through the
     // input box after each explicit send; discarded by newChat/open/logout.
@@ -140,8 +146,11 @@ class ChatViewModel(
     private data class InputDraft(val opId: Long, val revision: Long, val text: String)
     private var inputDraft: InputDraft? = null
     // Latest denied-but-retryable intent (CHAT_SEND_DENIED path). A retry
-    // reuses its opId, so repeated deny→retry never grows the outbox.
+    // reuses its opId, while retryTargetEpoch distinguishes later attempts.
     private var retryableOp: PendingOp? = null
+    // Only controller Started admissions advance this marker. Queued stays
+    // caller-owned and must not make an older, still-running gate stale.
+    private var latestAcceptedStartedTarget: PendingOp? = null
     // Fallback for post-accept turn errors. This is operation-scoped rather
     // than a String fallback: discarding a recovered op must not revive it via
     // last-user-text equality, while an independent identical send stays valid.
@@ -235,20 +244,12 @@ class ChatViewModel(
         }
         // N2: a tagged recoverable draft in the box (deny/endpoint-cancel
         // restore) is owned recovery state, not abandoned typing: stash it to
-        // the outbox before clearing, instead of losing it silently. B still
-        // goes out as a fresh op; A is never auto-sent. Clearing the box
-        // around a recovery draft is not an explicit discard, so a divergent
-        // retryableOp is preserved exactly like the steer() path.
-        val hadTaggedDraft = isBoxHoldingTaggedDraft()
+        // the outbox before clearing, instead of losing it silently. This
+        // explicit direct-send is newer than that recovery and replaces its
+        // Retry target, but never auto-sends or discards the stashed draft.
         stashInputDraftToRecoverable()
-        if (!hadTaggedDraft) retryableOp = null
-        // sendText() supersedes retryable state for its fresh op; restore the
-        // preserved link around it so retry() keeps working for the stashed
-        // denied intent.
-        val keepRetryable = retryableOp
         setInput("")
         sendText(clean)
-        if (keepRetryable != null && retryableOp == null) retryableOp = keepRetryable
     }
 
     /** Queue an instruction for the next round; never preempts the live turn. */
@@ -262,9 +263,9 @@ class ChatViewModel(
         // draft — a visible restored draft stays retryable while the fresh
         // steer goes out alongside it.
         val opId = adoptedOpId ?: ++nextOpId
-        beginRetryTargetCandidate(opId, clean)
+        val pending = beginRetryTargetCandidate(opId, clean)
         if (adoptedOpId == null && !isBoxHoldingTaggedDraft()) retryableOp = null
-        pendingOps[opId] = PendingOp(opId, startedAt, clean)
+        pendingOps[opId] = pending.copy(generation = startedAt)
         lifecycleScope.launch {
             var operationGeneration = startedAt
             try {
@@ -285,7 +286,7 @@ class ChatViewModel(
                         // under a bumped generation; re-root the op so a
                         // chat.send deny still restores to input instead of
                         // stranding on the stale generation.
-                        pendingOps[opId] = PendingOp(opId, handle.generation, clean)
+                        pendingOps[opId] = checkNotNull(pendingOps[opId]).copy(generation = handle.generation)
                         // Q1: single atomic admission. startOrEnqueue decides
                         // start-vs-queue under the controller's lock, so the
                         // verdict is never stale: Started owns the text
@@ -326,7 +327,11 @@ class ChatViewModel(
                                 return@launch
                             }
                             if (verdict !is TurnStart.NeedsRecovery) {
-                                recordAcceptedRetryTarget(opId, clean)
+                                if (verdict is TurnStart.Started) {
+                                    recordStartedRetryTarget(opId, clean)
+                                } else {
+                                    recordAcceptedRetryTarget(opId, clean)
+                                }
                                 started = verdict
                                 continue
                             }
@@ -408,10 +413,10 @@ class ChatViewModel(
         try {
             if (op == null) {
                 // Post-accept failure (e.g. provider error mid-turn): no denied
-                // intent is tracked, so resend the exact accepted fallback
-                // target as a fresh op. The denied/recovery slot takes
-                // precedence: after a stashed-A + failed-B sequence Retry
-                // still targets A until it is explicitly discarded.
+                // intent is tracked for this send, so resend the exact accepted
+                // fallback target as a fresh op. A newer explicit direct-send
+                // already supersedes any older retryable intent; stashed work
+                // stays recoverable without taking this Retry slot.
                 sendText(retryText, retryAttempt = attempt, opId = retryOpId)
                 return
             }
@@ -448,9 +453,9 @@ class ChatViewModel(
         startedAt: Long,
         retryAttempt: RetryAttempt? = null,
     ) {
-        beginRetryTargetCandidate(opId, text)
+        val pending = beginRetryTargetCandidate(opId, text)
         _notice.value = null
-        pendingOps[opId] = PendingOp(opId, startedAt, text)
+        pendingOps[opId] = pending.copy(generation = startedAt)
         lifecycleScope.launch {
             var operationGeneration = startedAt
             try {
@@ -469,7 +474,7 @@ class ChatViewModel(
                         // under a bumped generation; re-root the op so a
                         // chat.send deny still restores to input instead of
                         // stranding on the stale generation.
-                        pendingOps[opId] = PendingOp(opId, handle.generation, text)
+                        pendingOps[opId] = checkNotNull(pendingOps[opId]).copy(generation = handle.generation)
                         // Q1: single atomic admission (see steer() above).
                         // Started owns the text (remove + join); Queued stays
                         // owned by the caller (remove + return, reclaimable
@@ -509,7 +514,11 @@ class ChatViewModel(
                                 if (verdict is TurnStart.Queued) {
                                     retryAttempt?.let { markRetryQueued(it, handle.created.session) }
                                 }
-                                recordAcceptedRetryTarget(opId, text)
+                                if (verdict is TurnStart.Started) {
+                                    recordStartedRetryTarget(opId, text)
+                                } else {
+                                    recordAcceptedRetryTarget(opId, text)
+                                }
                                 started = verdict
                                 continue
                             }
@@ -598,7 +607,7 @@ class ChatViewModel(
             PendingOp(it.opId, lifecycleGeneration, it.text)
         } ?: recoverableOps.firstOrNull { it.opId == attempt.opId }
             ?: PendingOp(attempt.opId, lifecycleGeneration, queued.text)
-        setRetryableIfNewer(recovered)
+        promoteQueuedRetryTarget(recovered)
         finishRetryAttempt(attempt)
     }
 
@@ -965,7 +974,7 @@ class ChatViewModel(
         }
         // A queue recovery is the latest failed operation and owns Retry,
         // even when another failed operation remains recoverable.
-        if (op != null) retryableOp = op
+        val retryTarget = op?.let(::promoteQueuedRetryTarget)
         val recoveryState = session.uiState.value
         val noticeCode = when {
             recoveryState.status == ChatStatus.CANCELLED -> "CHAT_CANCELLED_RECOVERY"
@@ -975,7 +984,7 @@ class ChatViewModel(
             else -> "CHAT_QUEUE_RECOVERY_REQUIRED"
         }
         setNoticeIfCurrent(generation, noticeCode)
-        return op
+        return retryTarget
     }
 
     /**
@@ -1070,6 +1079,7 @@ class ChatViewModel(
         else endpointReplacementEpoch += 1
         retryFallbackTarget = null
         retryTargetCandidate = null
+        latestAcceptedStartedTarget = null
         cancelLifecycleOperations()
         openJob?.cancel()
         openJob = null
@@ -1086,6 +1096,7 @@ class ChatViewModel(
             retryableOp = null
             retryFallbackTarget = null
             retryTargetCandidate = null
+            latestAcceptedStartedTarget = null
             setInput("")
             _notice.value = "NO_ENDPOINT"
         } else {
@@ -1134,7 +1145,11 @@ class ChatViewModel(
         for (queued in drained) {
             val id = queued.opId ?: ++nextOpId
             if (!seen.add(id)) continue
-            reclaimed.add(PendingOp(id, lifecycleGeneration, queued.text))
+            val pending = pendingOps[id]?.takeIf { it.text == queued.text }
+            reclaimed.add(
+                pending?.copy(generation = lifecycleGeneration)
+                    ?: PendingOp(id, lifecycleGeneration, queued.text),
+            )
         }
         val movedPending = if (includePending) {
             pendingOps.values.filter { seen.add(it.opId) }
@@ -1172,6 +1187,7 @@ class ChatViewModel(
             retryableOp = null
             retryFallbackTarget = null
             retryTargetCandidate = null
+            latestAcceptedStartedTarget = null
             inputDraft = null
         }
     }
@@ -1259,23 +1275,54 @@ class ChatViewModel(
         _notice.value = noticeValue
     }
 
-    /** opIds are minted monotonically by this VM and retained across retries/recovery. */
+    /** A stale gate restore cannot outrank a newer Started target or later retry attempt. */
     private fun setRetryableIfNewer(op: PendingOp) {
+        val accepted = latestAcceptedStartedTarget
+        if (accepted != null && op.retryTargetEpoch < accepted.retryTargetEpoch) return
         val current = retryableOp
-        if (current == null || op.opId >= current.opId) retryableOp = op
+        if (current == null || op.retryTargetEpoch > current.retryTargetEpoch ||
+            (op.retryTargetEpoch == current.retryTargetEpoch && op.opId >= current.opId)
+        ) {
+            retryableOp = op
+        }
     }
 
-    /** A new user action invalidates any older post-accept fallback candidate. */
-    private fun beginRetryTargetCandidate(opId: Long, text: String) {
-        retryTargetCandidate = PendingOp(opId, lifecycleGeneration, text)
+    /** A reclaimed queue entry keeps its established priority over the admission that exposed it. */
+    private fun promoteQueuedRetryTarget(op: PendingOp): PendingOp {
+        val target = op.copy(retryTargetEpoch = ++nextRetryTargetEpoch)
+        retryableOp = target
+        return target
+    }
+
+    /** A new retry-target attempt invalidates any older post-accept fallback candidate. */
+    private fun beginRetryTargetCandidate(opId: Long, text: String): PendingOp {
+        val candidate = PendingOp(opId, lifecycleGeneration, text, ++nextRetryTargetEpoch)
+        retryTargetCandidate = candidate
         retryFallbackTarget = null
+        return candidate
     }
 
-    /** Only an explicitly accepted Started/Queued operation can back fallback Retry. */
+    /** Started/Queued may back fallback Retry under the queue contract; only Started advances the marker. */
     private fun recordAcceptedRetryTarget(opId: Long, text: String) {
         val candidate = retryTargetCandidate
         if (candidate?.opId == opId && candidate.text == text) {
             retryFallbackTarget = candidate.copy(generation = lifecycleGeneration)
+        }
+    }
+
+    /** Started, unlike Queued, proves this target crossed the controller admission gate. */
+    private fun recordStartedRetryTarget(opId: Long, text: String) {
+        recordAcceptedRetryTarget(opId, text)
+        val started = pendingOps[opId]?.takeIf { it.text == text } ?: return
+        val current = latestAcceptedStartedTarget
+        if (current == null || started.retryTargetEpoch > current.retryTargetEpoch) {
+            latestAcceptedStartedTarget = started
+            if (retryableOp?.let {
+                    it.retryTargetEpoch < started.retryTargetEpoch || it.opId == opId
+                } == true
+            ) {
+                retryableOp = null
+            }
         }
     }
 

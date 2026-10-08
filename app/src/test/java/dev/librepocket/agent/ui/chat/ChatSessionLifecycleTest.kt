@@ -1022,20 +1022,32 @@ class ChatSessionLifecycleTest {
         }
     }
 
-    // N2 retry link: after stashing A and a failed direct send B, retry()
-    // still resends the denied A (newer typing untouched) instead of
-    // fresh-resending the failed B.
+    // N2/M3: stashing denied A preserves it for explicit recovery, but newer
+    // direct-send B owns Retry after a post-accept provider failure. Retrying B
+    // must not send A; the tagged A draft remains available for explicit send.
     @Test
-    fun stashedDeniedDraftRetriedAfterFailedDirectSend() = runBlocking {
+    fun newerDirectSendOwnsRetryWhileDeniedDraftRemainsRecoverable() = runBlocking {
         val store = newStore()
         store.save(endpoint())
         val sessions = ControlledSessions()
         val denyA = java.util.concurrent.atomic.AtomicBoolean(true)
+        val bAttempts = AtomicInteger()
+        val retryBEntered = CompletableDeferred<Unit>()
+        val releaseRetryB = CompletableDeferred<Unit>()
+        val aEntered = CompletableDeferred<Unit>()
         sessions.acceptGate = { text ->
             if (text == "A" && denyA.get()) throw SecurityException("chat.send denied by policy")
         }
         sessions.sendGate = { text ->
-            if (text == "B") throw RuntimeException("boom")
+            when (text) {
+                "B" -> if (bAttempts.incrementAndGet() == 1) {
+                    throw RuntimeException("first B attempt fails")
+                } else {
+                    retryBEntered.complete(Unit)
+                    releaseRetryB.await()
+                }
+                "A" -> aEntered.complete(Unit)
+            }
         }
         val vm = newViewModel(store, sessions)
         try {
@@ -1045,23 +1057,160 @@ class ChatSessionLifecycleTest {
             withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
 
             // B goes out fresh; A waits stashed. B fails post-accept, so A
-            // refills the box via the completion drain.
+            // refills the box via the completion drain while B owns fallback Retry.
             chatMain.run { vm.sendDirect("B") }
             val live = sessions.awaitCreated(1)
             withTimeout(5_000) { live.sendFinished.await() }
             withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
             assertEquals(listOf("B"), live.sent.toList())
             withTimeout(5_000) { vm.input.first { it == "A" } }
+            assertEquals(0, vm.pendingRecoveryCount.value)
 
-            // Newer typing never blocks the retry link — and is never touched.
+            // Retry re-sends B, while the visible tagged A remains untouched.
             denyA.set(false)
-            chatMain.run { vm.onInputChange("C") }
             chatMain.run { vm.retry() }
-            withTimeout(5_000) { while (live.sent.size < 2) delay(1) }
-            assertEquals(listOf("B", "A"), live.sent.toList())
-            assertEquals("C", vm.input.value)
+            withTimeout(5_000) { retryBEntered.await() }
+            assertEquals(listOf("B", "B"), live.sent.toList())
+            assertEquals("A", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+
+            releaseRetryB.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.IDLE && it.messages.any { message ->
+                        message.role == "user" && message.text == "B"
+                    }
+                }
+            }
+            assertEquals("A", vm.input.value)
+            assertEquals(listOf("B", "B"), live.sent.toList())
+
+            // A reaches the provider only after explicitly sending the tagged
+            // recovered draft; it was never part of either B attempt.
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { aEntered.await() }
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.IDLE && it.messages.any { message ->
+                        message.role == "user" && message.text == "A"
+                    }
+                }
+            }
+            assertEquals(listOf("B", "B", "A"), live.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            releaseRetryB.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // M3 race: an older denied A retry can be paused before controller
+    // admission while newer B is accepted and fails. Releasing A's denial
+    // must restore A without stealing B's Retry target.
+    @Test
+    fun delayedOlderDenialCannotReplaceNewerAcceptedRetryTarget() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val aAdmissions = AtomicInteger()
+        val bAttempts = AtomicInteger()
+        val aRetryGateEntered = CompletableDeferred<Unit>()
+        val releaseARetryGate = CompletableDeferred<Unit>()
+        val retryBEntered = CompletableDeferred<Unit>()
+        val releaseRetryB = CompletableDeferred<Unit>()
+        val aProviderEntered = CompletableDeferred<Unit>()
+        sessions.acceptGate = { text ->
+            if (text == "A") {
+                when (aAdmissions.incrementAndGet()) {
+                    1 -> throw SecurityException("initial A denied by policy")
+                    2 -> {
+                        aRetryGateEntered.complete(Unit)
+                        releaseARetryGate.await()
+                        throw SecurityException("retried A denied by policy")
+                    }
+                }
+            }
+        }
+        sessions.sendGate = { text ->
+            when (text) {
+                "B" -> if (bAttempts.incrementAndGet() == 1) {
+                    throw RuntimeException("first B attempt fails")
+                } else {
+                    retryBEntered.complete(Unit)
+                    releaseRetryB.await()
+                }
+                "A" -> aProviderEntered.complete(Unit)
+            }
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+
+            // The retry is now suspended inside A's second preaccept gate.
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { aRetryGateEntered.await() }
+
+            // B must be admitted despite the initial ERROR projection, then
+            // fail in the provider. Match B's message as well as ERROR so the
+            // old A error cannot satisfy the await (StateFlow may conflate the
+            // brief STREAMING projection).
+            chatMain.run { vm.sendDirect("B") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.firstSendEntered.await() }
+            withTimeout(5_000) { live.sendFinished.await() }
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.ERROR && it.messages.any { message ->
+                        message.role == "user" && message.text == "B"
+                    }
+                }
+            }
+            assertEquals(listOf("B"), live.sent.toList())
+
+            // A's delayed gate now denies. It must be restored but cannot
+            // replace the fallback created by B's newer Started admission.
+            releaseARetryGate.complete(Unit)
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertTrue(vm.canRetry)
+
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { retryBEntered.await() }
+            assertEquals(listOf("B", "B"), live.sent.toList())
+            assertEquals("A", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+
+            releaseRetryB.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.IDLE && it.messages.any { message ->
+                        message.role == "user" && message.text == "B"
+                    }
+                }
+            }
+            assertEquals("A", vm.input.value)
+            assertEquals(listOf("B", "B"), live.sent.toList())
+
+            // A was not part of either B attempt; it remains available for an
+            // explicit send after B's Retry completes.
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { aProviderEntered.await() }
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.IDLE && it.messages.any { message ->
+                        message.role == "user" && message.text == "A"
+                    }
+                }
+            }
+            assertEquals(listOf("B", "B", "A"), live.sent.toList())
+            assertEquals("", vm.input.value)
             assertEquals(0, vm.pendingRecoveryCount.value)
         } finally {
+            releaseARetryGate.complete(Unit)
+            releaseRetryB.complete(Unit)
             chatMain.run { vm.newChat() }
         }
     }
@@ -1157,15 +1306,16 @@ class ChatSessionLifecycleTest {
         }
     }
 
-    // N2 steer path: a fresh steer must not sever the retry link of a visible
-    // restored draft. After the steered turn fails, retry() still resends the
-    // denied A (adopted, box consumed) instead of fresh-resending the failed Q.
+    // M3 Started admission: accepted Q owns Retry after its provider failure,
+    // while the tagged denied A remains available for explicit recovery.
     @Test
-    fun deniedDraftRetrySurvivesFreshSteerAndFailedTurn() = runBlocking {
+    fun acceptedFreshSteerOwnsRetryWhileDeniedDraftRemainsRecoverable() = runBlocking {
         val store = newStore()
         store.save(endpoint())
         val sessions = ControlledSessions()
         val denyCount = AtomicInteger()
+        val qAttempts = AtomicInteger()
+        val retryQEntered = CompletableDeferred<Unit>()
         sessions.acceptGate = { text ->
             if (text == "A") {
                 denyCount.incrementAndGet()
@@ -1173,7 +1323,10 @@ class ChatSessionLifecycleTest {
             }
         }
         sessions.sendGate = { text ->
-            if (text == "Q") throw RuntimeException("boom")
+            if (text == "Q") {
+                if (qAttempts.incrementAndGet() == 1) throw RuntimeException("first Q attempt fails")
+                retryQEntered.complete(Unit)
+            }
         }
         val vm = newViewModel(store, sessions)
         try {
@@ -1188,22 +1341,34 @@ class ChatSessionLifecycleTest {
             withTimeout(5_000) { while (live.sent.isEmpty()) delay(1) }
             // Q's host ends (failed); its completion also frees the fake.
             withTimeout(5_000) { live.sendFinished.await() }
-            assertEquals(listOf("Q"), live.sent.toList())
-            assertEquals("A", vm.input.value)
-
-            // Retry resends the preserved denied intent A (denied again —
-            // still unaccepted, still recoverable), never a fresh Q.
-            // Poll: retry() no-ops until the ERROR projection lands.
             withTimeout(5_000) {
-                while (denyCount.get() < 2) {
-                    chatMain.run { vm.retry() }
-                    delay(10)
+                vm.sessionState.first {
+                    it.status == ChatStatus.ERROR && it.messages.any { message ->
+                        message.role == "user" && message.text == "Q"
+                    }
                 }
             }
             assertEquals(listOf("Q"), live.sent.toList())
-            withTimeout(5_000) { vm.input.first { it == "A" } }
+            assertEquals("A", vm.input.value)
+
+            // Q crossed Started after A's denial, so Retry resends Q. A stays
+            // tagged in the box and is not sent by Retry.
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) {
+                retryQEntered.await()
+            }
+            assertEquals(listOf("Q", "Q"), live.sent.toList())
+            assertEquals("A", vm.input.value)
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.IDLE && it.messages.any { message ->
+                        message.role == "user" && message.text == "Q"
+                    }
+                }
+            }
             assertEquals("A", vm.input.value)
             assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(1, denyCount.get())
         } finally {
             chatMain.run { vm.newChat() }
         }

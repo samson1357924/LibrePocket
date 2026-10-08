@@ -854,6 +854,232 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // N2: sendDirect(B) must not wipe a restored denied draft A. A is stashed
+    // to the outbox before the box is cleared; B goes out as a fresh op and
+    // B's completion surfaces A back into the box (never auto-sent).
+    @Test
+    fun deniedDraftSurvivesDirectSendOfNewText() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val denyA = java.util.concurrent.atomic.AtomicBoolean(true)
+        sessions.acceptGate = { text ->
+            if (text == "A" && denyA.get()) throw SecurityException("chat.send denied by policy")
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+
+            chatMain.run { vm.sendDirect("B") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("B"), live.sent.toList())
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            assertEquals("A", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+
+            // A is still a live intent: adopting the box sends it exactly once.
+            denyA.set(false)
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { while (live.sent.size < 2) delay(1) }
+            assertEquals(listOf("B", "A"), live.sent.toList())
+            assertEquals("", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // N2 retry link: after stashing A and a failed direct send B, retry()
+    // still resends the denied A (newer typing untouched) instead of
+    // fresh-resending the failed B.
+    @Test
+    fun stashedDeniedDraftRetriedAfterFailedDirectSend() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val denyA = java.util.concurrent.atomic.AtomicBoolean(true)
+        sessions.acceptGate = { text ->
+            if (text == "A" && denyA.get()) throw SecurityException("chat.send denied by policy")
+        }
+        sessions.sendGate = { text ->
+            if (text == "B") throw RuntimeException("boom")
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+
+            // B goes out fresh; A waits stashed. B fails post-accept, so A
+            // refills the box via the completion drain.
+            chatMain.run { vm.sendDirect("B") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.sendFinished.await() }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            assertEquals(listOf("B"), live.sent.toList())
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+
+            // Newer typing never blocks the retry link — and is never touched.
+            denyA.set(false)
+            chatMain.run { vm.onInputChange("C") }
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) { while (live.sent.size < 2) delay(1) }
+            assertEquals(listOf("B", "A"), live.sent.toList())
+            assertEquals("C", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // N2: an endpoint-cancelled draft restored to the box also survives a
+    // direct send on the new binding (same stash path, different restore
+    // origin). A is never sent to either endpoint without explicit action.
+    @Test
+    fun endpointCancelledDraftSurvivesDirectSendOnNewBinding() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val acceptEntered = CompletableDeferred<Unit>()
+        val releaseAccept = CompletableDeferred<Unit>()
+        sessions.acceptGate = { text ->
+            if (text == "A") {
+                acceptEntered.complete(Unit)
+                releaseAccept.await()
+            }
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { acceptEntered.await() }
+            assertEquals(1, sessions.createCalls)
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            val old = sessions.awaitCreated(1)
+            withTimeout(5_000) { old.closed.await() }
+
+            chatMain.run { vm.sendDirect("B") }
+            val live = sessions.awaitCreated(2)
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("B"), live.sent.toList())
+            assertTrue(old.sent.isEmpty())
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            assertEquals("A", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(2, sessions.createCalls)
+        } finally {
+            releaseAccept.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // N2 opId isolation: a denied "same" and a later direct "same" are two
+    // intents. While B runs, A waits as its own outbox entry (count 1, blank
+    // box — not merged into B, not lost); B's completion restores A.
+    @Test
+    fun deniedDraftWithSameTextSurvivesDirectSend() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val admissions = AtomicInteger()
+        val releaseB = CompletableDeferred<Unit>()
+        sessions.sendGate = {
+            if (admissions.incrementAndGet() == 1) releaseB.await()
+        }
+        val denySame = java.util.concurrent.atomic.AtomicBoolean(true)
+        sessions.acceptGate = { text ->
+            if (text == "same" && denySame.get()) throw SecurityException("chat.send denied by policy")
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("same") }
+            withTimeout(5_000) { vm.input.first { it == "same" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+
+            denySame.set(false)
+            chatMain.run { vm.sendDirect("same") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.hostEntered.await() }
+            assertEquals("", vm.input.value)
+            assertEquals(1, vm.pendingRecoveryCount.value)
+
+            releaseB.complete(Unit)
+            withTimeout(5_000) { live.sendFinished.await() }
+            withTimeout(5_000) { vm.input.first { it == "same" } }
+            assertEquals(listOf("same"), live.sent.toList())
+            assertEquals(0, vm.pendingRecoveryCount.value)
+
+            // The box holds A (never sent); adopting it sends exactly once.
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { while (live.sent.size < 2) delay(1) }
+            assertEquals(listOf("same", "same"), live.sent.toList())
+            assertEquals("", vm.input.value)
+        } finally {
+            releaseB.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // N2 steer path: a fresh steer must not sever the retry link of a visible
+    // restored draft. After the steered turn fails, retry() still resends the
+    // denied A (adopted, box consumed) instead of fresh-resending the failed Q.
+    @Test
+    fun deniedDraftRetrySurvivesFreshSteerAndFailedTurn() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val denyCount = AtomicInteger()
+        sessions.acceptGate = { text ->
+            if (text == "A") {
+                denyCount.incrementAndGet()
+                throw SecurityException("chat.send denied by policy")
+            }
+        }
+        sessions.sendGate = { text ->
+            if (text == "Q") throw RuntimeException("boom")
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            assertEquals(1, denyCount.get())
+
+            chatMain.run { vm.steer("Q") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { while (live.sent.isEmpty()) delay(1) }
+            // Q's host ends (failed); its completion also frees the fake.
+            withTimeout(5_000) { live.sendFinished.await() }
+            assertEquals(listOf("Q"), live.sent.toList())
+            assertEquals("A", vm.input.value)
+
+            // Retry resends the preserved denied intent A (denied again —
+            // still unaccepted, still recoverable), never a fresh Q.
+            // Poll: retry() no-ops until the ERROR projection lands.
+            withTimeout(5_000) {
+                while (denyCount.get() < 2) {
+                    chatMain.run { vm.retry() }
+                    delay(10)
+                }
+            }
+            assertEquals(listOf("Q"), live.sent.toList())
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            assertEquals("A", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     // Q2: DENY→retry adopts the failed intent. A successful retry consumes
     // the restored box (no stale draft left); the old code left the sent
     // text sitting in the input.
@@ -1687,10 +1913,24 @@ class ChatSessionLifecycleTest {
                     error = null,
                 )
             }
+            val failed = java.util.concurrent.atomic.AtomicBoolean(false)
             val host = sessionScope.launch {
                 hostEntered.complete(Unit)
                 try {
                     sendGate(text)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // N2: mirror production provider failure (TurnController
+                    // maps a failed turn to ERROR, never silent IDLE): the
+                    // completion handler below must not overwrite this.
+                    failed.set(true)
+                    synchronized(this@RecordingSession) {
+                        mutableState.value = mutableState.value.copy(
+                            status = ChatStatus.ERROR,
+                            error = "provider error",
+                        )
+                    }
                 } finally {
                     hostedTurnActive = false
                 }
@@ -1704,7 +1944,7 @@ class ChatSessionLifecycleTest {
                 synchronized(this) {
                     busy = false
                     if (hosted === host) hosted = null
-                    if (!closedFlag) {
+                    if (!closedFlag && !failed.get()) {
                         mutableState.value = ChatUiState(
                             messages = listOf(
                                 UiMessage("u", "user", text, false),

@@ -212,9 +212,22 @@ class ChatViewModel(
             steer(clean)
             return
         }
-        retryableOp = null
+        // N2: a tagged recoverable draft in the box (deny/endpoint-cancel
+        // restore) is owned recovery state, not abandoned typing: stash it to
+        // the outbox before clearing, instead of losing it silently. B still
+        // goes out as a fresh op; A is never auto-sent. Clearing the box
+        // around a recovery draft is not an explicit discard, so a divergent
+        // retryableOp is preserved exactly like the steer() path.
+        val hadTaggedDraft = isBoxHoldingTaggedDraft()
+        stashInputDraftToRecoverable()
+        if (!hadTaggedDraft) retryableOp = null
+        // sendText() supersedes retryable state for its fresh op; restore the
+        // preserved link around it so retry() keeps working for the stashed
+        // denied intent.
+        val keepRetryable = retryableOp
         setInput("")
         sendText(clean)
+        if (keepRetryable != null && retryableOp == null) retryableOp = keepRetryable
     }
 
     /** Queue an instruction for the next round; never preempts the live turn. */
@@ -225,8 +238,11 @@ class ChatViewModel(
         val startedAt = lifecycleGeneration
         // Q2: a fresh steer mints a new op and supersedes any retryable
         // intent; an adopted retry reuses its opId (no outbox growth).
+        // N2: supersede only applies when the box holds no live tagged
+        // draft — a visible restored draft stays retryable while the fresh
+        // steer goes out alongside it.
         val opId = adoptedOpId ?: ++nextOpId
-        if (adoptedOpId == null) retryableOp = null
+        if (adoptedOpId == null && !isBoxHoldingTaggedDraft()) retryableOp = null
         pendingOps[opId] = PendingOp(opId, startedAt, clean)
         lifecycleScope.launch {
             var operationGeneration = startedAt
@@ -958,6 +974,35 @@ class ChatViewModel(
         val next = recoverableOps.removeFirstOrNull() ?: return
         syncRecoveryCount()
         setInput(next.text, next.opId, next.text)
+    }
+
+    // N2: true only while the box still holds an unmodified tagged restore
+    // (deny/endpoint-cancel recovery owned by that opId). Any user edit goes
+    // through setInput() and untags, so this never mistakes fresh typing for
+    // recovery state.
+    private fun isBoxHoldingTaggedDraft(): Boolean {
+        val draft = inputDraft ?: return false
+        return draft.revision == inputRevision && _input.value == draft.text
+    }
+
+    /**
+     * N2: move a tagged recoverable draft from the box into the outbox before
+     * a direct send clears it (sendDirect never adopts the box, unlike
+     * send()). Only explicit user overwrite (untagged via onInputChange),
+     * explicit discard, or newChat/open/logout may drop it unstashed.
+     * Idempotent per opId; the stashed entry is always stamped with the
+     * current generation (same contract as absorbDrainedQueued). Never
+     * auto-sends. Returns the stashed entry, or null when the box held no
+     * tagged draft. Ownership of [retryableOp] is decided by the caller.
+     */
+    private fun stashInputDraftToRecoverable(): PendingOp? {
+        val draft = inputDraft ?: return null
+        if (draft.revision != inputRevision || _input.value != draft.text) return null
+        recoverableOps.firstOrNull { it.opId == draft.opId }?.let { return it }
+        val op = PendingOp(draft.opId, lifecycleGeneration, draft.text)
+        recoverableOps.addLast(op)
+        syncRecoveryCount()
+        return op
     }
 
     private fun closeLive() {

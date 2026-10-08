@@ -301,9 +301,11 @@ class TurnController(
 
   fun close() {
     // Drop the FIFO under the same lock that seals the controller, so no
-    // admission can slip in between reclaim and seal. Callers that must keep
-    // unstarted work (endpoint-switch recovery) drain it explicitly via
-    // drainQueued() BEFORE close().
+    // admission can slip in after the seal. Reclaim-then-seal ordering across
+    // threads is the caller's job: the ViewModel drains-then-closes with no
+    // suspension on its Main-confined path, so nothing slips between them
+    // there. Callers that must keep unstarted work (endpoint-switch recovery)
+    // drain it explicitly via drainQueued() BEFORE close().
     synchronized(lock) {
       if (closed) return
       closed = true
@@ -376,9 +378,12 @@ class TurnController(
       throw e
     }
     // Normal completion only: hand off at most one queued steer as a detached
-    // follow-up turn, so send() returns after its own turn.
-    val next = synchronized(lock) { steerQueue.removeFirstOrNull() }
-    if (next == null) {
+    // follow-up turn, so send() returns after its own turn. The follow-up
+    // gate runs BEFORE dequeue, so a deny leaves the queue intact (still
+    // reclaimable via drainQueued) instead of dropping the head, and no
+    // suspension sits between dequeue and append.
+    val hasQueued = synchronized(lock) { steerQueue.isNotEmpty() }
+    if (!hasQueued) {
       synchronized(lock) {
         if (inFlight === self) inFlight = null
         _uiState.update { s ->
@@ -400,9 +405,36 @@ class TurnController(
       }
       return
     }
+    val next = synchronized(lock) { steerQueue.removeFirstOrNull() }
+    if (next == null) {
+      // Lost a race with close()/drainQueued(): nothing left to promote.
+      // Mirror the empty-queue status transition (the WAITING update above
+      // already fired); the STREAMING/WAITING-only gate preserves a racing
+      // close()'s CANCELLED.
+      synchronized(lock) {
+        if (inFlight === self) inFlight = null
+        _uiState.update { s ->
+          if (s.status == ChatStatus.STREAMING || s.status == ChatStatus.WAITING_STEERED) {
+            s.copy(status = ChatStatus.IDLE)
+          } else {
+            s
+          }
+        }
+      }
+      return
+    }
     synchronized(lock) {
+      if (closed) {
+        // Teardown won the race after dequeue: hand the intent (with its
+        // opId) back for any later drainQueued() instead of starting work on
+        // a dead scope.
+        if (inFlight === self) inFlight = null
+        steerQueue.addFirst(next)
+        _uiState.update { it.copy(pendingSteerCount = steerQueue.size) }
+        return
+      }
       appendUser(next.text)
-      _uiState.update { it.copy(status = ChatStatus.STREAMING, error = null) }
+      _uiState.update { it.copy(status = ChatStatus.STREAMING, error = null, pendingSteerCount = steerQueue.size) }
       val follow = scope.launch { hostedTurn(next.text, next.images) }
       inFlight = follow
       follow.invokeOnCompletion {

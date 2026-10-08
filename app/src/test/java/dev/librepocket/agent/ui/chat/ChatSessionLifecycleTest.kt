@@ -33,6 +33,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -819,6 +821,46 @@ class ChatSessionLifecycleTest {
             assertEquals(listOf("accepted text"), live.sent.toList())
             assertEquals(1, sessions.createCalls)
         } finally {
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // Timing barrier: the controller accepted the text (appended, admission
+    // done) but the VM collector has not projected it yet when the endpoint
+    // switches. The accepted text must survive via the session-truth read in
+    // _history — and must NOT regress into the unsent-input path.
+    @Test
+    fun acceptedTextSurvivesSwitchBeforeCollectorProjects() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val collectGate = CompletableDeferred<Unit>()
+        sessions.collectGate = collectGate
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("accepted text") }
+            val live = sessions.awaitCreated(1)
+            // Admitted in the controller (user message appended synchronously
+            // at admission) while the VM projection is still gated.
+            withTimeout(5_000) { live.firstSendEntered.await() }
+            assertTrue(vm.sessionState.value.messages.isEmpty())
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { live.closed.await() }
+            // Accepted text is transcript, not an unsent draft: no input, no
+            // notice, nothing waiting in the outbox.
+            assertEquals("", vm.input.value)
+            assertNull(vm.notice.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            withTimeout(5_000) { vm.messages.first { list -> list.any { it.text == "accepted text" } } }
+            assertTrue(vm.messages.value.any { it.text == "accepted text" })
+            assertEquals(listOf("accepted text"), live.sent.toList())
+            assertEquals(1, sessions.createCalls)
+        } finally {
+            collectGate.complete(Unit)
             releaseTurn.complete(Unit)
             chatMain.run { vm.newChat() }
         }
@@ -1750,6 +1792,11 @@ class ChatSessionLifecycleTest {
         // F1: non-null only for tests that must block loadHistory() itself
         // (the pre-mutex window), rather than sessions.open() in the mutex.
         var backingStore: SessionStore? = null
+        // Timing barrier: when non-null, exposed sessions project their
+        // uiState through a gate that withholds COLLECTION (the VM collector
+        // stays blind) while `.value` still reflects admitted truth — the
+        // exact "controller accepted, VM not yet projected" window.
+        var collectGate: CompletableDeferred<Unit>? = null
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
@@ -1764,7 +1811,8 @@ class ChatSessionLifecycleTest {
             createGate(ordinal)
             val session = RecordingSession(sessionId, sendGate, acceptGate)
             created.add(session)
-            return CreatedSession(sessionId, session, endpoint.providerId, modelFor(endpoint))
+            val exposed: ChatSession = collectGate?.let { GatedSession(session, it) } ?: session
+            return CreatedSession(sessionId, exposed, endpoint.providerId, modelFor(endpoint))
         }
 
         override suspend fun open(
@@ -1791,6 +1839,32 @@ class ChatSessionLifecycleTest {
             while (opened.count { it.sessionId == sessionId } < ordinal) delay(1)
             opened.filter { it.sessionId == sessionId }[ordinal - 1]
         }
+    }
+
+    /**
+     * Timing-barrier uiState: withholds COLLECTION until [gate] completes
+     * (the VM collector stays blind) while [value] always reflects the
+     * source truth. Lets a test pin the "controller accepted, VM collector
+     * not yet dispatched" window deterministically.
+     */
+    private class GateableStateFlow<T>(
+        private val source: StateFlow<T>,
+        private val gate: CompletableDeferred<Unit>,
+    ) : StateFlow<T> {
+        override val value: T get() = source.value
+        override val replayCache: List<T> get() = source.replayCache
+        override suspend fun collect(collector: FlowCollector<T>): Nothing {
+            gate.await()
+            source.collect(collector)
+        }
+    }
+
+    /** RecordingSession with a gated uiState projection (delegation intact). */
+    private class GatedSession(
+        delegate: RecordingSession,
+        gate: CompletableDeferred<Unit>,
+    ) : ChatSession by delegate {
+        override val uiState: StateFlow<ChatUiState> = GateableStateFlow(delegate.uiState, gate)
     }
 
     private class RecordingSession(
@@ -1904,7 +1978,6 @@ class ChatSessionLifecycleTest {
                 if (busy) throw IllegalStateException("already in flight")
                 busy = true
                 sent.add(text)
-                firstSendEntered.complete(Unit)
                 hostedTurnActive = true
                 mutableState.value = ChatUiState(
                     messages = listOf(UiMessage("u", "user", text, false)),
@@ -1912,6 +1985,9 @@ class ChatSessionLifecycleTest {
                     pendingSteerCount = 0,
                     error = null,
                 )
+                // Signal admission only after the admitted state is visible,
+                // so awaiters can rely on uiState.value, not just sent.
+                firstSendEntered.complete(Unit)
             }
             val failed = java.util.concurrent.atomic.AtomicBoolean(false)
             val host = sessionScope.launch {

@@ -47,6 +47,8 @@ jobs:
               - '.github/workflows/pr-check.yml'
             policy:
               - 'scripts/play_policy_check.sh'
+              - 'scripts/apk_policy_inspect.py'
+              - 'scripts/tests/test_apk_policy_check.py'
 
   unit-tests:
     name: Unit & Robolectric Tests
@@ -113,6 +115,19 @@ jobs:
           name: lint-reports
           path: app/build/reports/lint-results-*
           retention-days: 7
+
+  policy-harness:
+    name: Python Policy Harness
+    needs: changes
+    if: needs.changes.outputs.policy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run APK policy regression harness (stdlib only)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py
 
   build-and-policy-gate:
     name: Build & Policy Gates
@@ -182,7 +197,7 @@ jobs:
     name: PR Gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [changes, unit-tests, lint, build-and-policy-gate, docs-guard]
+    needs: [changes, unit-tests, lint, build-and-policy-gate, policy-harness, docs-guard]
     if: always()
     steps:
       - name: Evaluate gate
@@ -193,6 +208,7 @@ jobs:
           UNIT: ${{ needs.unit-tests.result }}
           LINT: ${{ needs.lint.result }}
           BUILD: ${{ needs.build-and-policy-gate.result }}
+          HARNESS: ${{ needs.policy-harness.result }}
           DOCS: ${{ needs.docs-guard.result }}
         run: |
           fail=0
@@ -257,6 +273,24 @@ jobs:
               ;;
             *)
               echo "pr-gate: build-and-policy-gate result=$BUILD — fail"
+              fail=1
+              ;;
+          esac
+
+          case "$HARNESS" in
+            success)
+              echo "pr-gate: policy-harness passed"
+              ;;
+            skipped)
+              if [ "$POLICY" = "false" ]; then
+                echo "pr-gate: policy-harness skipped (no policy changes) — pass"
+              else
+                echo "pr-gate: policy-harness skipped but policy='$POLICY' — fail"
+                fail=1
+              fi
+              ;;
+            *)
+              echo "pr-gate: policy-harness result=$HARNESS — fail"
               fail=1
               ;;
           esac

@@ -14,7 +14,8 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `app/build.gradle.kts`, `app/lint.xml`, `gradle/**`,
 `settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
 `.github/workflows/pr-check.yml`) and `policy`
-(`scripts/play_policy_check.sh`) outputs. `docs-guard` always runs the
+(`scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
+`scripts/tests/test_apk_policy_check.py`) outputs. `docs-guard` always runs the
 static grep guard `scripts/docs_claim_check.sh` (no Gradle, no emulator);
 `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
 stage as pass only when the corresponding `changes` output is explicitly
@@ -29,7 +30,7 @@ When `code == true`, the workflow uses JDK 17 and runs these Gradle stages:
 What runs by edit type:
 
 - Docs-only (neither `code` nor `policy`, e.g. `docs/**` or `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.
-- Policy-script-only (`scripts/play_policy_check.sh` edit, `code == false`): build/policy runs; unit tests and lint are skipped and resolved as pass by `pr-gate`.
+- Policy-script-only (any `policy` path edit, `code == false`): build/policy and the stdlib Python policy harness run; unit tests and lint are skipped and resolved as pass by `pr-gate`. A scanner-only diff (`scripts/apk_policy_inspect.py` or `scripts/tests/test_apk_policy_check.py`) therefore cannot pass with all policy validation skipped.
 - Workflow-only edit to `pr-check.yml`: counts as `code`, so all Gradle stages run.
 - Mixed docs + code/policy edits: full Gradle stages plus `docs-guard` run.
 
@@ -44,7 +45,7 @@ including docs-only ones.
 No branch-protection required checks are configured on `main`; `pr-gate`
 and the checks above are informational until protection is configured.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. The new Python APK policy harness is a local stdlib regression harness and is not wired into the existing PR workflow by this change. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy harness (`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py`, standard library only) runs in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 
 ## Local commands
 

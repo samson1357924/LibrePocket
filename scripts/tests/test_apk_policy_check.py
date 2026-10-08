@@ -23,6 +23,7 @@ import unittest
 import warnings
 import zipfile
 import zlib
+from fnmatch import fnmatchcase
 from pathlib import Path
 from unittest import mock
 
@@ -32,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[2]
 POLICY_CHECK = ROOT / "scripts" / "play_policy_check.sh"
 BUILD_RELEASE = ROOT / "scripts" / "build_release.sh"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+PR_CHECK_WORKFLOW = ROOT / ".github" / "workflows" / "pr-check.yml"
 
 _FORBIDDEN_FOSS_TYPE = "Lcom/google/mlkit/Recognizer;"
 _SUPPORTED_DEX_VERSIONS = ("035", "037", "038", "039", "040")
@@ -881,6 +883,77 @@ class DexDescriptorResourceHarness(unittest.TestCase):
             policy_inspect.parse_dex_type_tables(first, descriptor_budget=budget)
             policy_inspect.parse_dex_type_tables(second, descriptor_budget=budget)
             self.assertEqual((budget.remaining_units, budget.remaining_bytes), (0, 0))
+
+
+def _pr_check_policy_patterns() -> list[str]:
+    """Extract the `policy:` paths-filter patterns from pr-check.yml.
+
+    The workflow file is parsed as text (stdlib only): lines under the
+    `policy:` key of the form `- 'pattern'` are collected until the next
+    top-level filter key or job.
+    """
+    text = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
+    patterns: list[str] = []
+    in_policy = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "policy:":
+            in_policy = True
+            continue
+        if in_policy:
+            if stripped.startswith("- '") and stripped.endswith("'"):
+                patterns.append(stripped[3:-1])
+                continue
+            if stripped in ("code:", "policy:") or stripped.endswith(":") and not stripped.startswith("-"):
+                break
+    return patterns
+
+
+class PolicyCiGateControl(unittest.TestCase):
+    """Pin the CI wiring so a scanner-only diff cannot skip validation."""
+
+    def test_policy_filter_covers_scanner_and_tests(self) -> None:
+        patterns = _pr_check_policy_patterns()
+        for required in (
+            "scripts/play_policy_check.sh",
+            "scripts/apk_policy_inspect.py",
+            "scripts/tests/test_apk_policy_check.py",
+        ):
+            with self.subTest(path=required):
+                self.assertIn(required, patterns)
+
+    def test_scanner_only_diff_triggers_policy_gate(self) -> None:
+        patterns = _pr_check_policy_patterns()
+        for diff in (
+            ["scripts/apk_policy_inspect.py"],
+            ["scripts/tests/test_apk_policy_check.py"],
+            ["scripts/apk_policy_inspect.py", "scripts/tests/test_apk_policy_check.py"],
+        ):
+            with self.subTest(diff=tuple(diff)):
+                matched = any(
+                    fnmatchcase(path, pattern)
+                    for path in diff
+                    for pattern in patterns
+                )
+                self.assertTrue(matched, f"scanner-only diff {diff} must set policy=true")
+
+    def test_docs_only_diff_does_not_trigger_policy_gate(self) -> None:
+        patterns = _pr_check_policy_patterns()
+        matched = any(
+            fnmatchcase("docs/TESTING.md", pattern) for pattern in patterns
+        )
+        self.assertFalse(matched, "docs-only diff must leave policy=false")
+
+    def test_pr_gate_requires_policy_harness(self) -> None:
+        workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("policy-harness", workflow)
+        self.assertIn("needs: [changes, unit-tests, lint, build-and-policy-gate, policy-harness, docs-guard]", workflow)
+        self.assertIn("needs.policy-harness.result", workflow)
+        self.assertIn("policy-harness skipped but policy=", workflow)
+        self.assertIn(
+            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py",
+            workflow,
+        )
 
 
 if __name__ == "__main__":

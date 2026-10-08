@@ -219,9 +219,13 @@ export async function runScannerSendCpaTests(): Promise<void> {
     CPA_API_KEY: 'fake-api-key',
   };
   try {
-    globalThis.fetch = (async () => new Response(JSON.stringify({
-      output: [{ content: [{ type: 'output_text', text: 'review result' }] }],
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
+    let ordinaryRedirectMode: RequestInit['redirect'] | undefined;
+    globalThis.fetch = (async (_input, init) => {
+      ordinaryRedirectMode = init?.redirect;
+      return new Response(JSON.stringify({
+        output: [{ content: [{ type: 'output_text', text: 'review result' }] }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
     const result = await sendCpaSingleTurn({
       modelId: FAKE_MODEL_ID,
       systemPrompt: 'fake system prompt',
@@ -231,6 +235,62 @@ export async function runScannerSendCpaTests(): Promise<void> {
       timeoutMs: 1000,
     });
     assert.deepEqual(result, { content: 'review result', modelId: FAKE_MODEL_ID });
+    assert.equal(ordinaryRedirectMode, 'error');
+
+    const redirectTarget = 'https://redirect-target.test/receive';
+    for (const status of [307, 308]) {
+      let targetRequests = 0;
+      const forwardedBodies: string[] = [];
+      const initialBodies: string[] = [];
+      const invalidRedirectModes: unknown[] = [];
+      const unexpectedTargets: string[] = [];
+      globalThis.fetch = (async (input, init) => {
+        const url = new URL(String(input));
+        if (url.origin === new URL(FAKE_CPA_BASE_URL).origin) {
+          initialBodies.push(typeof init?.body === 'string' ? init.body : '<missing body>');
+          const redirectResponse = new Response(null, {
+            status,
+            headers: { Location: redirectTarget },
+          });
+          if (init?.redirect === 'error') throw new TypeError('redirect rejected');
+          if (init?.redirect === undefined || init.redirect === 'follow') {
+            return globalThis.fetch(redirectResponse.headers.get('Location')!, init);
+          }
+          invalidRedirectModes.push(init.redirect);
+          return redirectResponse;
+        }
+
+        if (url.href === redirectTarget) {
+          targetRequests += 1;
+          if (typeof init?.body === 'string') forwardedBodies.push(init.body);
+          return new Response(JSON.stringify({
+            output: [{ content: [{ type: 'output_text', text: 'redirected response' }] }],
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        unexpectedTargets.push(url.href);
+        return new Response('unexpected target', { status: 500 });
+      }) as typeof fetch;
+
+      await assert.rejects(
+        sendCpaSingleTurn({
+          modelId: FAKE_MODEL_ID,
+          systemPrompt: 'fake system prompt',
+          userPrompt: 'fake user prompt',
+          allowedOrigins: FAKE_ALLOWED_ORIGINS,
+          env: cpaEnvironment,
+          timeoutMs: 1000,
+        }),
+        /CPA request failed/,
+        `${status} redirect should be rejected`,
+      );
+      assert.equal(initialBodies.length, 1, `${status} initial request count`);
+      assert.ok(initialBodies[0]?.includes('fake user prompt'), `${status} request body should reach the configured endpoint`);
+      assert.equal(targetRequests, 0, `${status} redirect target request count`);
+      assert.deepEqual(forwardedBodies, [], `${status} request body must not be forwarded`);
+      assert.deepEqual(invalidRedirectModes, [], `${status} should use a supported redirect mode`);
+      assert.deepEqual(unexpectedTargets, [], `${status} should not reach an unexpected target`);
+    }
 
     globalThis.fetch = (async () => new Response('FAKE_RESPONSE_BODY_SECRET', { status: 503 })) as typeof fetch;
     await assert.rejects(

@@ -115,6 +115,7 @@ export async function sendCpaSingleTurn(options: SendCpaSingleTurnOptions): Prom
     try {
       response = await fetch(endpoint, {
         method: 'POST',
+        redirect: 'error',
         headers: {
           Authorization: `Bearer ${config.apiKey}`,
           'Content-Type': 'application/json',

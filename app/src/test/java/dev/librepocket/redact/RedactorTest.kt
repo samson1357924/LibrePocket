@@ -86,7 +86,9 @@ class RedactorTest {
     }
 
     @Test fun r3_negatives() {
-        assertUnchanged("\"api_key\": \"ab\"")
+        // Short unquoted values retain the legacy minimum-length behavior.
+        // Quoted JSON credentials are covered separately and redact at any length.
+        assertUnchanged("api_key=ab")
         assertUnchanged("the monkey ate a banana")
     }
 

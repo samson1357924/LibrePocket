@@ -165,6 +165,8 @@ export async function runCommentRunnerTests(): Promise<void> {
       const reviewed = await runReviewMode(reviewContext);
       assert.equal(reviewed.verdict, 'APPROVE');
       assert.equal(reviewed.roles.length, 3);
+      assert.equal(reviewed.roles.every((role) => role.verdict === 'APPROVE'), true,
+        'a no-blocker review still reaches the CPA stub');
       assert.equal(reviewed.coverage.complete, true);
       const persistedReview = JSON.parse(fs.readFileSync(outputPath, 'utf8')) as {
         verdict: string;
@@ -191,6 +193,63 @@ export async function runCommentRunnerTests(): Promise<void> {
         'app/src/main/java/demo/Safe.kt',
       ]);
       assert.equal(persistedReview.changedFilesComplete, true);
+
+      const blockerOutputPath = path.join(tempDirectory, 'deterministic-block-review-output.json');
+      const blockerEnv = {
+        ...reviewContext.env,
+        POCKETGUARD_OUTPUT: blockerOutputPath,
+      } as NodeJS.ProcessEnv;
+      delete blockerEnv.POCKETGUARD_CPA_STUB;
+      const fakeSplitSecretParts = ['const fakeSecret = "ghp_', `${'A'.repeat(20)}";`];
+      let cpaRequestCount = 0;
+      const fetchBeforeBlockerReview = globalThis.fetch;
+      globalThis.fetch = (async () => {
+        cpaRequestCount += 1;
+        throw new Error('unexpected CPA request for deterministic blocker');
+      }) as typeof fetch;
+      const blockedReview = await (async () => {
+        try {
+          return await runReviewMode({
+            ...reviewContext,
+            env: blockerEnv,
+            runGit: (args) => {
+              if (args[0] === 'fetch') return '';
+              if (args[0] === 'diff' && args[1] === '--name-only') {
+                return 'app/src/main/java/demo/Secret.kt\0';
+              }
+              return [
+                'diff --git a/app/src/main/java/demo/Secret.kt b/app/src/main/java/demo/Secret.kt',
+                '--- a/app/src/main/java/demo/Secret.kt',
+                '+++ b/app/src/main/java/demo/Secret.kt',
+                '@@ -1,0 +1,2 @@',
+                `+${fakeSplitSecretParts[0]}`,
+                `+${fakeSplitSecretParts[1]}`,
+              ].join('\n');
+            },
+          });
+        } finally {
+          globalThis.fetch = fetchBeforeBlockerReview;
+        }
+      })();
+      assert.equal(cpaRequestCount, 0, 'deterministic BLOCK must prevent every CPA request');
+      assert.equal(blockedReview.verdict, 'NEEDS_CHANGES');
+      assert.ok(blockedReview.deterministicViolations.some((violation) =>
+        violation.ruleId === 'SEC-PRIVATE-KEY' && violation.severity === 'BLOCK'));
+      assert.equal(blockedReview.roles.every((role) =>
+        role.modelUsed === 'not-run' && role.verdict === 'INCONCLUSIVE'), true);
+      const persistedBlockerReview = JSON.parse(fs.readFileSync(blockerOutputPath, 'utf8')) as typeof blockedReview;
+      assert.equal(persistedBlockerReview.verdict, 'NEEDS_CHANGES');
+      assert.equal(persistedBlockerReview.pullRequestNumber, 41);
+      assert.equal(persistedBlockerReview.baseSha, BASE_SHA);
+      assert.equal(persistedBlockerReview.headSha, HEAD_SHA);
+      assert.equal(persistedBlockerReview.headRepository, 'sample/repository');
+      assert.deepEqual(persistedBlockerReview.changedFiles, ['app/src/main/java/demo/Secret.kt']);
+      assert.equal(persistedBlockerReview.changedFilesComplete, true);
+      assert.equal(persistedBlockerReview.coverage.complete, true);
+      assert.ok(persistedBlockerReview.deterministicViolations.some((violation) =>
+        violation.ruleId === 'SEC-PRIVATE-KEY' && violation.severity === 'BLOCK'));
+      assert.equal(persistedBlockerReview.roles.every((role) =>
+        role.modelUsed === 'not-run' && role.verdict === 'INCONCLUSIVE'), true);
 
       let unsafeGitCalls = 0;
       const genericPath = path.join(tempDirectory, 'fork-review-output.json');
@@ -356,6 +415,13 @@ export async function runCommentRunnerTests(): Promise<void> {
       };
 
       fs.writeFileSync(outputPath, JSON.stringify(reviewed));
+      const blockerPublishHarness = makePublishHarness({ outputPath: blockerOutputPath });
+      await runPublishMode(blockerPublishHarness.context);
+      const blockerPublishedBody = blockerPublishHarness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+      assert.ok(blockerPublishedBody.includes('判定：NEEDS_CHANGES'),
+        'the deterministic blocker artifact must pass strict publish validation');
+      assert.equal(blockerPublishedBody.includes('schema or contents are invalid'), false);
+
       const successHarness = makePublishHarness({ outputPath });
       await runPublishMode(successHarness.context);
       assert.equal(successHarness.state.created, 0);

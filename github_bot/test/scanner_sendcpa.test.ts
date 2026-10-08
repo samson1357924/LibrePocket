@@ -52,6 +52,81 @@ export async function runScannerSendCpaTests(): Promise<void> {
   const extractedSecret = DeterministicScanner.extractAddedContent(addedSecret);
   assert.equal(DeterministicScanner.scan(['app/src/main/res/values/strings.xml'], extractedSecret).hasBlockers, true);
 
+  const credentialFile = 'app/src/main/res/values/strings.xml';
+  const splitCredentialParts = [
+    "const credential = 'sk-",
+    'test-FAKE-not-',
+    "a-real-key';",
+  ];
+  const sameHunkSplitCredential = DeterministicScanner.scan(
+    [credentialFile],
+    [
+      `diff --git a/${credentialFile} b/${credentialFile}`,
+      `--- a/${credentialFile}`,
+      `+++ b/${credentialFile}`,
+      '@@ -1 +1,4 @@',
+      ' context before the new credential',
+      ...splitCredentialParts.map((line) => `+${line}`),
+    ].join('\n'),
+  );
+  assert.equal(sameHunkSplitCredential.hasBlockers, true);
+  const splitCredentialViolation = sameHunkSplitCredential.violations.find((violation) =>
+    violation.ruleId === 'SEC-PRIVATE-KEY');
+  assert.equal(splitCredentialViolation?.severity, 'BLOCK');
+  assert.equal(splitCredentialViolation?.file, credentialFile);
+  assert.equal(splitCredentialViolation?.line, 2, 'a multiline match reports its first added line after context');
+
+  const splitAcrossHunks = [
+    `diff --git a/${credentialFile} b/${credentialFile}`,
+    `--- a/${credentialFile}`,
+    `+++ b/${credentialFile}`,
+    '@@ -1,0 +1 @@',
+    `+${splitCredentialParts[0]}`,
+    '@@ -5,0 +2,2 @@',
+    `+${splitCredentialParts[1]}`,
+    `+${splitCredentialParts[2]}`,
+  ].join('\n');
+  assert.equal(DeterministicScanner.scan([credentialFile], splitAcrossHunks).hasBlockers, false);
+
+  const splitAcrossContextGap = [
+    `diff --git a/${credentialFile} b/${credentialFile}`,
+    `--- a/${credentialFile}`,
+    `+++ b/${credentialFile}`,
+    '@@ -1 +1,4 @@',
+    `+${splitCredentialParts[0]}`,
+    ' unchanged context line',
+    `+${splitCredentialParts[1]}`,
+    `+${splitCredentialParts[2]}`,
+  ].join('\n');
+  assert.equal(DeterministicScanner.scan([credentialFile], splitAcrossContextGap).hasBlockers, false);
+
+  const otherCredentialFile = 'app/src/main/res/values/other.xml';
+  const splitAcrossFiles = [
+    `diff --git a/${credentialFile} b/${credentialFile}`,
+    `--- a/${credentialFile}`,
+    `+++ b/${credentialFile}`,
+    '@@ -1,0 +1 @@',
+    `+${splitCredentialParts[0]}`,
+    `diff --git a/${otherCredentialFile} b/${otherCredentialFile}`,
+    `--- a/${otherCredentialFile}`,
+    `+++ b/${otherCredentialFile}`,
+    '@@ -1,0 +1,2 @@',
+    `+${splitCredentialParts[1]}`,
+    `+${splitCredentialParts[2]}`,
+  ].join('\n');
+  assert.equal(
+    DeterministicScanner.scan([credentialFile, otherCredentialFile], splitAcrossFiles).hasBlockers,
+    false,
+  );
+
+  const fourLineCredential = diffFor(credentialFile, [
+    's',
+    'k-test-',
+    'FAKE',
+    '-not-a-real-key',
+  ]);
+  assert.equal(DeterministicScanner.scan([credentialFile], fourLineCredential).hasBlockers, false);
+
   const smsDiff = diffFor('app/src/main/AndroidManifest.xml', [
     '<uses-permission android:name="android.permission.SEND_SMS" />',
   ]);

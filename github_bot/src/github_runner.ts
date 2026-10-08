@@ -510,29 +510,45 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
       changedFilesComplete = true;
       const reviewDiff = buildReviewDiff(context, baseSha, headSha, changedFiles);
       const scan = DeterministicScanner.scan(changedFiles, reviewDiff.fullDiff);
-      const { orchestrateReview } = await import('./orchestrator');
-      const restoreFetch = installCpaStub(env);
-      try {
-        const orchestrated = await orchestrateReview({
-          changedFiles,
-          diff: redactForModel(reviewDiff.diff),
-          coverage: reviewDiff.coverage,
-          deterministicViolations: scan.violations,
-          env,
-          allowedOrigins: parseAllowedOrigins(env),
-        });
+      if (scan.hasBlockers) {
         output = {
-          ...orchestrated,
+          ...genericReviewOutput(),
+          verdict: 'NEEDS_CHANGES',
           pullRequestNumber: target.pullRequest.number,
           baseSha,
           headSha,
           headRepository: target.pullRequest.head.repo?.full_name ?? '',
+          coverage: reviewDiff.coverage,
+          deterministicViolations: scan.violations,
           areaLabels: resolveAreaLabelsFromPaths(changedFiles),
           changedFiles,
           changedFilesComplete,
         };
-      } finally {
-        restoreFetch();
+      } else {
+        const { orchestrateReview } = await import('./orchestrator');
+        const restoreFetch = installCpaStub(env);
+        try {
+          const orchestrated = await orchestrateReview({
+            changedFiles,
+            diff: redactForModel(reviewDiff.diff),
+            coverage: reviewDiff.coverage,
+            deterministicViolations: scan.violations,
+            env,
+            allowedOrigins: parseAllowedOrigins(env),
+          });
+          output = {
+            ...orchestrated,
+            pullRequestNumber: target.pullRequest.number,
+            baseSha,
+            headSha,
+            headRepository: target.pullRequest.head.repo?.full_name ?? '',
+            areaLabels: resolveAreaLabelsFromPaths(changedFiles),
+            changedFiles,
+            changedFilesComplete,
+          };
+        } finally {
+          restoreFetch();
+        }
       }
     } catch {
       output = genericReviewOutput();

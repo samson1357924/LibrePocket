@@ -19,6 +19,7 @@ export interface DeterministicScanResult {
 interface AddedLine {
   file?: string;
   line?: number;
+  hunk?: number;
   text: string;
 }
 
@@ -64,18 +65,23 @@ function addedLinesFromDiff(gitDiff: string, changedFiles: string[]): AddedLine[
   const rows: AddedLine[] = [];
   let currentFile: string | undefined;
   let newLineNumber: number | undefined;
+  let currentHunk: number | undefined;
+  let nextHunk = 0;
 
   for (const line of gitDiff.split(/\r?\n/)) {
     if (line.startsWith('+++ ')) {
       const path = line.slice(4).split('\t', 1)[0];
       currentFile = path === '/dev/null' ? undefined : normalizePath(unquoteDiffPath(path));
       newLineNumber = undefined;
+      currentHunk = undefined;
       continue;
     }
 
     const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
     if (hunk) {
       newLineNumber = Number(hunk[1]);
+      currentHunk = nextHunk;
+      nextHunk += 1;
       continue;
     }
 
@@ -83,6 +89,7 @@ function addedLinesFromDiff(gitDiff: string, changedFiles: string[]): AddedLine[
       rows.push({
         file: currentFile ?? fallbackFile,
         line: newLineNumber,
+        hunk: currentHunk,
         text: line.slice(1),
       });
       if (newLineNumber !== undefined) newLineNumber += 1;
@@ -116,6 +123,81 @@ function rowAtOffset(rows: AddedLine[], offset: number): AddedLine | undefined {
     currentOffset += row.text.length + 1;
   }
   return rows[rows.length - 1];
+}
+
+function rowAtJoinedOffset(rows: AddedLine[], offset: number): AddedLine | undefined {
+  let currentOffset = 0;
+  for (const row of rows) {
+    if (offset < currentOffset + row.text.length) return row;
+    currentOffset += row.text.length;
+  }
+  return rows[rows.length - 1];
+}
+
+/**
+ * Bounded credential heuristic: join only 2–3 adjacent added lines from the
+ * same known file and diff hunk when their new-line numbers are contiguous.
+ * This intentionally does not attempt arbitrary multiline/source reconstruction.
+ */
+function scanMultilineSecrets(rows: AddedLine[], violations: ScanViolation[]): void {
+  const reportedLocations = new Set<string>();
+
+  for (let startIndex = 0; startIndex < rows.length; startIndex += 1) {
+    const first = rows[startIndex];
+    if (!first?.file || first.line === undefined || first.hunk === undefined) continue;
+
+    const windowRows = [first];
+    let joinedText = first.text;
+    for (
+      let nextIndex = startIndex + 1;
+      nextIndex < rows.length && windowRows.length < 3;
+      nextIndex += 1
+    ) {
+      const previous = windowRows[windowRows.length - 1];
+      const next = rows[nextIndex];
+      if (
+        !next ||
+        next.file !== first.file ||
+        next.hunk !== first.hunk ||
+        next.line === undefined ||
+        previous.line === undefined ||
+        next.line !== previous.line + 1
+      ) {
+        break;
+      }
+
+      windowRows.push(next);
+      joinedText += next.text;
+      for (const pattern of secretPatterns) {
+        const match = pattern.exec(joinedText);
+        if (!match) continue;
+
+        const matchRow = rowAtJoinedOffset(windowRows, match.index);
+        if (!matchRow?.file || matchRow.line === undefined) continue;
+        let matchRowOffset = 0;
+        for (const row of windowRows) {
+          if (row === matchRow) break;
+          matchRowOffset += row.text.length;
+        }
+        const offsetInRow = match.index - matchRowOffset;
+        // Single-line matches were already reported by the original scan above.
+        if (offsetInRow + match[0].length <= matchRow.text.length) continue;
+
+        const locationKey = `${matchRow.file}\0${matchRow.line}\0${offsetInRow}`;
+        if (reportedLocations.has(locationKey)) continue;
+        reportedLocations.add(locationKey);
+        addViolation(
+          violations,
+          'SEC-PRIVATE-KEY',
+          'BLOCK',
+          'security',
+          'Added content contains a value matching a private-key or credential pattern.',
+          matchRow.file,
+          matchRow.line,
+        );
+      }
+    }
+  }
 }
 
 function isManifest(path: string): boolean {
@@ -236,6 +318,7 @@ export class DeterministicScanner {
         }
       }
     }
+    scanMultilineSecrets(rows, violations);
 
     const rowsByFile = new Map<string, AddedLine[]>();
     for (const row of rows) {

@@ -330,6 +330,10 @@ class ChatViewModel(
         if (op == null) {
             // Post-accept failure (e.g. provider error mid-turn): no denied
             // intent is tracked, so resend the last text as a fresh op.
+            // N2 contract note: the slot keeps the latest DENIED intent, so
+            // after a stashed-A + failed-B sequence retry() resends A, not B.
+            // B's post-accept failure never claims the slot; resend B
+            // explicitly instead.
             val text = lastUserText ?: return
             sendText(text)
             return
@@ -799,8 +803,9 @@ class ChatViewModel(
         // N1: reclaim queued-but-unstarted intents BEFORE close() drops the
         // FIFO. Queued is not acceptance, so the caller still owns the text:
         // it joins the recoverable outbox below (never auto-resent).
-        // Drained before the generation bump so a racing admission cannot
-        // slip in unnoticed between reclaim and close on this thread.
+        // Reclaim and closeLive() run back-to-back with no suspension on
+        // this Main-confined path, so no admission slips between them; the
+        // generation bump below only fences generations.
         val queuedFromSession: List<dev.librepocket.chat.QueuedIntent> = try {
             currentSession?.drainQueued() ?: emptyList()
         } catch (_: Exception) {

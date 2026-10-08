@@ -35,8 +35,10 @@ data class ChatUiState(
  *
  * Images are intentionally not carried: every current admission path queues
  * text only (`emptyList()` images), so image turns never sit in the FIFO and
- * there is nothing to reclaim. If image queueing is ever introduced, this
- * type must grow before teardown can claim to preserve queued work.
+ * there is nothing to reclaim. Happy-path promotion still delivers queued
+ * images; only teardown reclaim is text-only. If image queueing is ever
+ * introduced, this type must grow before teardown can claim to preserve
+ * queued work.
  */
 data class QueuedIntent(
   val opId: Long?,

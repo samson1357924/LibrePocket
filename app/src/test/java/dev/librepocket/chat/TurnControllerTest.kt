@@ -636,4 +636,55 @@ class TurnControllerTest {
       outer.cancel()
     }
   }
+
+  // N1 handoff: the follow-up gate runs BEFORE dequeue, so a deny at
+  // promotion leaves the queued text in the FIFO (still reclaimable via
+  // drainQueued) instead of dropping it, and the denied text is never
+  // appended or started.
+  @Test fun denyAtPromotionKeepsQueueReclaimable() {
+    val gate = CompletableDeferred<Unit>()
+    val provider = FakeLlmProvider { input ->
+      flow {
+        if (lastUserTextOf(input) == "first") {
+          emit(StreamEvent.TextDelta(0, 0, "A"))
+          gate.await()
+          emit(StreamEvent.Done("stop"))
+        } else {
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    val evals = AtomicInteger(0)
+    val policy = object : PolicyStore {
+      override fun evaluate(action: String, resource: String) =
+        PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+      override suspend fun setRule(rule: PolicyRule) = Unit
+      override suspend fun removeRule(pattern: String) = Unit
+      override suspend fun listRules(): List<PolicyRule> = emptyList()
+      override suspend fun evaluateFresh(action: String, resource: String) =
+        if (evals.incrementAndGet() == 2) {
+          PolicyDecision(Verdict.DENY, null, System.currentTimeMillis())
+        } else {
+          PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+        }
+    }
+    val c = controller(provider, policy = policy)
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { assistantsOf(c).any { it.text == "A" } }
+      val verdict = runBlocking { c.startOrEnqueue("second") }
+      assertTrue(verdict is TurnStart.Queued)
+      gate.complete(Unit)
+      runBlocking { withTimeout(5000) { first.join() } }
+      awaitTrue { c.uiState.value.status == ChatStatus.ERROR }
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(1, provider.streamCalls)
+      val drained = c.drainQueued()
+      assertEquals(listOf("second"), drained.map { it.text })
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+    } finally {
+      outer.cancel()
+    }
+  }
 }

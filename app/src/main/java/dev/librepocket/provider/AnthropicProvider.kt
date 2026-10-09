@@ -13,8 +13,11 @@ import okhttp3.OkHttpClient
  *   native `content_block.index` as `blockIndex` (§3.5).
  * - `thinking_delta` -> [StreamEvent.ReasoningDelta]; signature/encrypted
  *   blocks are never displayed and never persisted (simply not emitted).
- * - `tool_use` blocks are recorded only (P1 executes nothing); a later turn
- *   never auto-returns `tool_result` (`toolResultPending` is a P2 concern).
+ * - Phase 2 history: assistant-carried calls ride `tool_use` blocks;
+ *   tool turns ride `user` messages carrying `tool_result` blocks paired by
+ *   `tool_use_id`. Every request self-contains the full pairing (stateless);
+ *   illegal pairings fail closed. P1 executed nothing; P2 still executes
+ *   nothing (no dispatcher — #19 vertical slice scope).
  * - Missing `message_stop` or unclosed visible/tool blocks ->
  *   `Failed(retryable=true)`.
  */
@@ -95,17 +98,16 @@ class AnthropicProvider(
         }
         sb.append(",\"messages\":[")
         var first = true
+        val knownToolIds = collectAssistantToolIds(request.messages)
         for (m in request.messages) {
             if (m.role == "system") continue
             if (!first) sb.append(',')
             first = false
             if (m.role == "tool") {
-                // P1 records tool_use without executing; a tool turn is kept
-                // as a user turn carrying the result text (no auto tool_result
-                // round-trip until P2).
-                sb.append("{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",")
-                sb.append("\"tool_use_id\":${q(m.toolCallId.orEmpty())},")
-                sb.append("\"content\":${q(m.text)}}]}")
+                // Phase 2: tool turns are user-carried tool_result blocks paired
+                // with the assistant tool_use id. Illegal pairings fail closed.
+                val toolUseId = requireToolOutputId(m.toolCallId, knownToolIds)
+                sb.append("{\"role\":\"user\",\"content\":[${anthropicToolResultJson(toolUseId, m.text)}]}")
                 continue
             }
             val blocks = StringBuilder("[{\"type\":\"text\",\"text\":${q(m.text)}}")
@@ -126,8 +128,7 @@ class AnthropicProvider(
             }
             if (m.toolCalls.isNotEmpty()) {
                 for (tc in m.toolCalls) {
-                    blocks.append(",{\"type\":\"tool_use\",\"id\":${q(tc.id)},")
-                    blocks.append("\"name\":${q(tc.name)},\"input\":${tc.argumentsJson.ifEmpty { "{}" }}}")
+                    blocks.append(",${anthropicToolUseJson(tc)}")
                 }
             }
             blocks.append(']')

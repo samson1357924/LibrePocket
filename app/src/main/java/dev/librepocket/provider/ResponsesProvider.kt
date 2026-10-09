@@ -11,6 +11,12 @@ import okhttp3.OkHttpClient
  *
  * - `POST {base}/responses` with `"stream": true, "store": false`;
  *   never sends `previous_response_id`.
+ * - Phase 2 history (stateless): every request self-contains the full
+ *   pairing — user/assistant `{"type":"message"}` items, assistant-carried
+ *   calls as `{"type":"function_call"}` (`call_id`/`name`/`arguments`),
+ *   tool turns as `{"type":"function_call_output"}` (`call_id`/`output`).
+ *   Nothing is read back from a server store (`store=false`), so a truncated
+ *   history without its call side fails closed instead of being sent.
  * - `response.output_text.delta` -> [StreamEvent.TextDelta] with
  *   `blockIndex = output_index * 1000 + content_index` (§3.5 mapping).
  * - `reasoning_summary_text.delta` / `reasoning_text.delta` ->
@@ -112,28 +118,57 @@ class ResponsesProvider(
         }
         sb.append(",\"input\":[")
         var first = true
-        for (m in request.messages) {
-            if (m.role == "system") continue
+        fun emit(fragment: String) {
             if (!first) sb.append(',')
             first = false
+            sb.append(fragment)
+        }
+        val knownToolIds = collectAssistantToolIds(request.messages)
+        for (m in request.messages) {
+            if (m.role == "system") continue
+            if (m.role == "tool") {
+                // Phase 2: tool turns are function_call_output paired by call_id,
+                // never rewritten to user. Illegal pairings fail closed.
+                val callId = requireToolOutputId(m.toolCallId, knownToolIds)
+                val safeText = if (serverSearch) Redactor.redact(m.text).text else m.text
+                emit(responsesFunctionCallOutputJson(callId, safeText))
+                continue
+            }
+            if (m.role == "assistant" && m.toolCalls.isNotEmpty()) {
+                val safeText = if (serverSearch) Redactor.redact(m.text).text else m.text
+                if (safeText.isNotEmpty() || m.images.isNotEmpty()) {
+                    emit(responsesMessageItem("assistant", safeText, m.images))
+                }
+                for (tc in m.toolCalls) {
+                    emit(responsesFunctionCallJson(tc))
+                }
+                continue
+            }
             val safeText = if (serverSearch) Redactor.redact(m.text).text else m.text
-            sb.append("{\"type\":\"message\",\"role\":${q(if (m.role == "tool") "user" else m.role)},")
-            sb.append("\"content\":[{\"type\":\"input_text\",\"text\":${q(safeText)}}")
-            val infos = m.images.map { ImageFallbackPolicy.fromChatImage(it) }
-            when (val d = ImageFallbackPolicy.decide(infos, supportsImages = true)) {
-                is ImageFallbackPolicy.Decision.Reject ->
-                    throw ProviderFailure(false, d.reason)
-                is ImageFallbackPolicy.Decision.StripAll -> Unit
-                is ImageFallbackPolicy.Decision.Send -> {
-                    val encoder = java.util.Base64.getEncoder()
-                    for (idx in d.indices) {
-                        sb.append(",{\"type\":\"input_image\",\"image_url\":")
-                        sb.append(q("data:${m.images[idx].mimeType};base64,${encoder.encodeToString(m.images[idx].bytes)}"))
-                        sb.append('}')
-                    }
+            emit(responsesMessageItem(if (m.role == "assistant") "assistant" else m.role, safeText, m.images))
+        }
+        sb.append("]}")
+        return sb.toString()
+    }
+
+    /** `{"type":"message",…}` item with optional `input_image` parts. */
+    internal fun responsesMessageItem(role: String, text: String, images: List<ChatImage>): String {
+        val sb = StringBuilder()
+        sb.append("{\"type\":\"message\",\"role\":${q(role)},")
+        sb.append("\"content\":[{\"type\":\"input_text\",\"text\":${q(text)}}")
+        val infos = images.map { ImageFallbackPolicy.fromChatImage(it) }
+        when (val d = ImageFallbackPolicy.decide(infos, supportsImages = true)) {
+            is ImageFallbackPolicy.Decision.Reject ->
+                throw ProviderFailure(false, d.reason)
+            is ImageFallbackPolicy.Decision.StripAll -> Unit
+            is ImageFallbackPolicy.Decision.Send -> {
+                val encoder = java.util.Base64.getEncoder()
+                for (idx in d.indices) {
+                    sb.append(",{\"type\":\"input_image\",\"image_url\":")
+                    sb.append(q("data:${images[idx].mimeType};base64,${encoder.encodeToString(images[idx].bytes)}"))
+                    sb.append('}')
                 }
             }
-            sb.append("]}")
         }
         sb.append("]}")
         return sb.toString()

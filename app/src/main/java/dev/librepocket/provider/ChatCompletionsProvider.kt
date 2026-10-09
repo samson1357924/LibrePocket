@@ -16,6 +16,10 @@ import okhttp3.OkHttpClient
  * - `delta.tool_calls[]` aggregated by `index`; empty id chunks never
  *   overwrite a valid id; missing/conflicting ids are repaired at the end
  *   with response-scoped unique `call_<uuid8>`.
+ * - Phase 2 history: assistant-carried `tool_calls[]` paired with `tool`
+ *   messages by `tool_call_id`. A stored id is verified; a missing id is
+ *   filled only for the single-call case (otherwise fail-closed, no request).
+ *   Every request self-contains the full pairing (stateless).
  * - `finish_reason` + `[DONE]` -> [StreamEvent.Done]; missing either ->
  *   `Failed(retryable=true)`.
  */
@@ -117,14 +121,18 @@ class ChatCompletionsProvider(
         if (request.systemPromptOverride != null) systems.add(request.systemPromptOverride)
         for (m in request.messages) if (m.role == "system") systems.add(m.text)
         if (systems.isNotEmpty()) emitMsg("system", q(safeText(systems.joinToString("\n"))))
+        val knownToolIds = collectAssistantToolIds(request.messages)
         for (m in request.messages) {
             if (m.role == "system") continue
             val safeM = if (serverSearch) m.copy(text = Redactor.redact(m.text).text) else m
             when {
                 m.role == "tool" -> {
+                    // Phase 2: stored tool_call_id is verified; a missing id is
+                    // filled only for the single-call case, otherwise fail-closed.
+                    val resolved = resolveChatToolOutputId(m.toolCallId, knownToolIds)
                     if (!first) sb.append(',')
                     first = false
-                    sb.append("{\"role\":\"tool\",\"tool_call_id\":${q(m.toolCallId.orEmpty())},")
+                    sb.append("{\"role\":\"tool\",\"tool_call_id\":${q(resolved)},")
                     sb.append("\"content\":${q(safeM.text)}}")
                 }
                 m.images.isEmpty() && m.toolCalls.isEmpty() -> emitMsg(m.role, q(safeM.text))

@@ -12,6 +12,7 @@ import dev.librepocket.chat.NoOpTranscriptSink
 import dev.librepocket.chat.TranscriptSink
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
+import dev.librepocket.chat.stripTimeBlock
 import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyDecision
 import dev.librepocket.policy.PolicyRule
@@ -3910,10 +3911,14 @@ class ChatSessionLifecycleTest {
 }
 
 /**
- * Strips the ephemeral TurnController time suffix (`"\n\n" + runtime time
- * block`) from a provider-request user text, returning the admitted base
+ * Strips the ephemeral TurnController time suffix (a trailing sentinel-led
+ * block) from a provider-request user text, returning the admitted base
  * text. Test-only tolerance: production time injection semantics are
  * untouched; LlmProvider fakes use this so exact gate matching and `sent`
  * assertions observe stable base text.
+ *
+ * The sentinel (not a bare blank line) is used so multi-paragraph user
+ * input keeps its own blank lines. Delegates to the shared
+ * [dev.librepocket.chat.stripTimeBlock] so all fakes strip identically.
  */
-private fun baseTextOf(text: String): String = text.substringBefore("\n\n")
+private fun baseTextOf(text: String): String = stripTimeBlock(text)

@@ -44,6 +44,21 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
+/** Sentinel prefix of the ephemeral runtime time block appended by TurnController.buildRequest. */
+private const val TIME_BLOCK_SENTINEL = "\n\nRuntime time context:"
+
+/**
+ * Strips the trailing sentinel-led time block from a provider-request user
+ * text, returning the admitted base text. The sentinel (not a bare blank
+ * line) is used so multi-paragraph user input keeps its own blank lines.
+ * The block is always appended as a suffix, so cut at its last occurrence
+ * to preserve a literal sentinel inside user text.
+ */
+internal fun stripTimeBlock(text: String): String {
+  val idx = text.lastIndexOf(TIME_BLOCK_SENTINEL)
+  return if (idx >= 0) text.substring(0, idx) else text
+}
+
 private class FakeLlmProvider(
   var handler: (ChatRequest) -> Flow<StreamEvent> = { emptyFlow() },
 ) : LlmProvider {
@@ -63,8 +78,8 @@ private class FakeLlmProvider(
   override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
     streamCalls.incrementAndGet()
     seenRequests.add(request)
-    request.messages.lastOrNull { it.role == "user" }?.text?.substringBefore("\n\n")?.let { userText ->
-      requestEntrySignals[userText]?.countDown()
+    request.messages.lastOrNull { it.role == "user" }?.text?.let { userText ->
+      requestEntrySignals[stripTimeBlock(userText)]?.countDown()
     }
     try {
       emitAll(handler(request))
@@ -167,10 +182,20 @@ class TurnControllerTest {
   private fun lastUserTextOf(req: ChatRequest): String? =
     req.messages.lastOrNull { it.role == "user" }?.text
 
-  // Phase 2 appends an ephemeral "\n\n<time block>" to the last user message
-  // in the provider request. Branch on the raw text, not the time suffix.
+  // Phase 2 appends an ephemeral time block (sentinel-led trailing suffix)
+  // to the last user message in the provider request. Branch on the raw
+  // text, not the time suffix.
   private fun baseUserTextOf(req: ChatRequest): String? =
-    lastUserTextOf(req)?.substringBefore("\n\n")
+    lastUserTextOf(req)?.let(::stripTimeBlock)
+
+  @Test fun stripTimeBlockKeepsMultiParagraphInput() {
+    assertEquals(
+      "para1\n\npara2",
+      stripTimeBlock("para1\n\npara2\n\nRuntime time context:\n- Current time: x"),
+    )
+    assertEquals("para1\n\npara2", stripTimeBlock("para1\n\npara2"))
+    assertEquals("", stripTimeBlock("\n\nRuntime time context: (time unknown)"))
+  }
 
   @Test fun retryDefaultsMatchSpec() {
     val r = TurnRetryConfig()

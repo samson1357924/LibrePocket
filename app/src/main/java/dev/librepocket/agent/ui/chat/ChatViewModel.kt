@@ -104,7 +104,7 @@ class ChatViewModel(
         _pendingRecoveryCount.value = recoverableOps.size
     }
 
-    /** Give first-time recovery work a stable FIFO position; carried positions never change. */
+    /** Assign a FIFO position once; explicit NeedsRecovery rebasing is handled separately. */
     private fun withRecoverySequence(op: PendingOp): PendingOp {
         val existing = op.recoverySequence
         if (existing != null) {
@@ -398,6 +398,7 @@ class ChatViewModel(
                                 handle.generation,
                             )
                             if (!isHandleCurrent(handle)) return@launch
+                            rebasePendingAdmissionAfterRecovery(opId, clean, handle.generation)
                             if (recoveredAdmissionRace) {
                                 // A second independent promotion deny raced the
                                 // retry. Preserve this send without unbounded
@@ -592,6 +593,7 @@ class ChatViewModel(
                                 handle.generation,
                             )
                             if (!isHandleCurrent(handle)) return@launch
+                            rebasePendingAdmissionAfterRecovery(opId, text, handle.generation)
                             if (recoveredAdmissionRace) {
                                 restoreOpForFailedSend(opId, "CHAT_SEND_DENIED")
                                 if (retryTarget != null) retryableOp = retryTarget
@@ -1392,6 +1394,20 @@ class ChatViewModel(
         val candidate = retryTargetCandidate
         if (candidate?.opId == opId && candidate.text == text) {
             retryFallbackTarget = candidate.copy(generation = lifecycleGeneration)
+        }
+    }
+
+    /** Keep the still-unaccepted admission behind the FIFO batch it just exposed. */
+    private fun rebasePendingAdmissionAfterRecovery(opId: Long, text: String, generation: Long) {
+        if (!isGenerationCurrent(generation)) return
+        val pending = pendingOps[opId]?.takeIf {
+            it.text == text && it.generation == generation
+        } ?: return
+        val tailSequence = ++nextRecoverySequence
+        pendingOps[opId] = pending.copy(recoverySequence = tailSequence)
+        val candidate = retryTargetCandidate
+        if (candidate?.opId == opId && candidate.text == text) {
+            retryTargetCandidate = candidate.copy(recoverySequence = tailSequence)
         }
     }
 

@@ -486,6 +486,63 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    @Test
+    fun needsRecoveryRebasesCurrentAdmissionBehindBatchBeforeFreshDeny() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = NeedsRecoveryThenFreshDenySessions()
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("C") }
+            sessions.session.firstAdmissionEntered.await()
+
+            // Keep the returned batch in the outbox while C's first admission
+            // is suspended; this input must not be overwritten or auto-sent.
+            chatMain.run { vm.onInputChange("control") }
+            sessions.session.releaseFirstAdmission.complete(Unit)
+
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 2 } }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            assertEquals("control", vm.input.value)
+            assertEquals(listOf("C", "C"), sessions.session.attempts.map { it.text })
+            assertEquals(
+                "the NeedsRecovery retry is the same still-unaccepted operation",
+                sessions.session.attempts[0].opId,
+                sessions.session.attempts[1].opId,
+            )
+            assertTrue("neither the queue nor denied C is auto-sent", sessions.session.accepted.isEmpty())
+
+            // Explicitly send the preserved input. Only after that accepted
+            // send finishes may B surface, ahead of denied C in the outbox.
+            chatMain.run { vm.send() }
+            sessions.session.controlAccepted.await()
+            withTimeout(5_000) { vm.input.first { it == "B" } }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            assertEquals(listOf("control"), sessions.session.accepted.toList())
+
+            chatMain.run { vm.send() }
+            sessions.session.bAccepted.await()
+            withTimeout(5_000) { vm.input.first { it == "C" } }
+            assertEquals(listOf("control", "B"), sessions.session.accepted.toList())
+            assertEquals(0, vm.pendingRecoveryCount.value)
+
+            chatMain.run { vm.send() }
+            sessions.session.retriedCAccepted.await()
+            assertEquals(listOf("control", "B", "C"), sessions.session.accepted.toList())
+            assertEquals(
+                listOf("C", "C", "control", "B", "C"),
+                sessions.session.attempts.map { it.text },
+            )
+            assertEquals(9001L, sessions.session.attempts[3].opId)
+            assertEquals(sessions.session.attempts[0].opId, sessions.session.attempts[4].opId)
+            assertEquals("", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+        } finally {
+            sessions.session.releaseFirstAdmission.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     // Q1: the post-gate busy race queues instead of throwing. B passes the
     // idle pre-check and suspends in the chat.send gate; C admits meanwhile;
     // B resumes into a busy session and must get Queued (never a stale idle
@@ -3284,6 +3341,95 @@ class ChatSessionLifecycleTest {
             return listOf(dev.librepocket.chat.QueuedIntent(77L, "queued"))
         }
 
+        override fun cancel() = Unit
+        override fun steer(text: String) = Unit
+        override fun close() = Unit
+    }
+
+    /** Returns a real NeedsRecovery handoff, then freshly denies its pending admission. */
+    private class NeedsRecoveryThenFreshDenySessions : ChatSessionProvider {
+        val session = NeedsRecoveryThenFreshDenySession()
+
+        override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ) = CreatedSession("needs-recovery", session, endpoint.providerId, modelFor(endpoint))
+
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = error("open is not used by this test")
+
+        override suspend fun storeOrNull(): SessionStore? = null
+    }
+
+    private class NeedsRecoveryThenFreshDenySession : ChatSession {
+        data class Attempt(val text: String, val opId: Long?)
+
+        private val mutableState = MutableStateFlow(
+            ChatUiState(emptyList(), ChatStatus.IDLE, 0, null),
+        )
+        override val uiState: StateFlow<ChatUiState> = mutableState
+        private val cAdmissions = AtomicInteger()
+        val attempts = CopyOnWriteArrayList<Attempt>()
+        val accepted = CopyOnWriteArrayList<String>()
+        val firstAdmissionEntered = CompletableDeferred<Unit>()
+        val releaseFirstAdmission = CompletableDeferred<Unit>()
+        val controlAccepted = CompletableDeferred<Unit>()
+        val bAccepted = CompletableDeferred<Unit>()
+        val retriedCAccepted = CompletableDeferred<Unit>()
+
+        override suspend fun send(text: String, images: List<ChatImageRef>) = Unit
+
+        override suspend fun startTurn(text: String, images: List<ChatImageRef>): Job =
+            Job().apply { complete() }
+
+        override suspend fun startOrEnqueue(
+            text: String,
+            images: List<ChatImageRef>,
+            opId: Long?,
+        ): TurnStart {
+            attempts.add(Attempt(text, opId))
+            val cAdmission = if (text == "C") cAdmissions.incrementAndGet() else 0
+            if (cAdmission == 1) {
+                firstAdmissionEntered.complete(Unit)
+                releaseFirstAdmission.await()
+                mutableState.value = mutableState.value.copy(
+                    status = ChatStatus.ERROR,
+                    error = "denied by policy",
+                )
+                return TurnStart.NeedsRecovery(
+                    listOf(dev.librepocket.chat.QueuedIntent(9001L, "B")),
+                )
+            }
+            if (cAdmission == 2) {
+                mutableState.value = mutableState.value.copy(
+                    status = ChatStatus.ERROR,
+                    error = "denied by policy",
+                )
+                throw SecurityException("fresh chat.send denied by policy")
+            }
+
+            accepted.add(text)
+            mutableState.value = mutableState.value.copy(
+                status = ChatStatus.IDLE,
+                pendingSteerCount = 0,
+                error = null,
+                queuedRecoveryRequired = false,
+            )
+            when (text) {
+                "control" -> controlAccepted.complete(Unit)
+                "B" -> bAccepted.complete(Unit)
+                "C" -> retriedCAccepted.complete(Unit)
+            }
+            return TurnStart.Started(Job().apply { complete() })
+        }
+
+        override fun drainQueued(): List<dev.librepocket.chat.QueuedIntent> = emptyList()
         override fun cancel() = Unit
         override fun steer(text: String) = Unit
         override fun close() = Unit

@@ -407,9 +407,11 @@ export async function runStickyLabelTests(): Promise<void> {
       }
     }
 
-    // P2 #4 PR convergence: AI priority/gate/bug in a PR publish are
-    // discarded (issue-triage-only) and force INCONCLUSIVE, never APPROVE,
-    // never written — even though the same labels are allowlisted for issues.
+    // P2 #4 PR convergence (Owner decision Phase 4, Owner B): priority/gate
+    // stay issue-triage-only — a PR AI suggestion carrying them is discarded
+    // and forces INCONCLUSIVE, never APPROVE, never written. bug (with
+    // enhancement/documentation) is restored to PR AI: a PR suggestion
+    // carrying it is kept and publishes normally.
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p2-pr-priority-'));
       try {
@@ -429,7 +431,7 @@ export async function runStickyLabelTests(): Promise<void> {
         } finally {
           restore();
         }
-        for (const issueOnly of ['priority:P1', 'gate:release', 'bug']) {
+        for (const issueOnly of ['priority:P1', 'gate:release']) {
           const tampered = { ...(goodArtifact as Record<string, unknown>), suggestedLabels: [issueOnly, 'area:runtime'] };
           const tamperedPath = path.join(tempDir, `tampered-${issueOnly.replace(/[^A-Za-z0-9]+/g, '-')}.json`);
           fs.writeFileSync(tamperedPath, JSON.stringify(tampered));
@@ -456,6 +458,34 @@ export async function runStickyLabelTests(): Promise<void> {
           assert.ok(!publishState.existingLabels.includes('priority:P1'), `${issueOnly}: priority never written from PR AI`);
           assert.ok(!publishState.existingLabels.includes('gate:release'), `${issueOnly}: gate never written from PR AI`);
           assert.ok(publishState.existingLabels.includes('bug'), `${issueOnly}: pre-existing manual bug preserved`);
+        }
+        // Restored PR semantic type: bug publishes normally (kept, APPROVE
+        // preserved) instead of forcing INCONCLUSIVE.
+        {
+          const tampered = { ...(goodArtifact as Record<string, unknown>), suggestedLabels: ['bug', 'area:runtime'] };
+          const tamperedPath = path.join(tempDir, 'tampered-bug.json');
+          fs.writeFileSync(tamperedPath, JSON.stringify(tampered));
+          const publishState = makeState({
+            existingLabels: ['area:docs'],
+            comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          });
+          await runPublishMode({
+            event: prOpenedEvent(),
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: tamperedPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(publishState),
+          });
+          assert.equal(publishState.created, 0, 'bug: creates no second comment');
+          assert.equal(publishState.updated, 1, 'bug: updates the same sticky');
+          assert.ok(publishState.comments[0].body.includes('判定：APPROVE'), 'bug: restored PR type keeps APPROVE');
+          assert.ok(publishState.existingLabels.includes('bug'), 'bug: written from PR AI after restore');
+          assert.ok(publishState.existingLabels.includes('area:runtime'), 'bug: sibling area label written');
         }
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });

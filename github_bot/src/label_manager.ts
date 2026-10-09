@@ -576,13 +576,15 @@ export const DEFAULT_PR_RECONCILE_SCOPE: Readonly<ReconcileScope> = Object.freez
   managedExactLabels: Object.freeze(['status:needs-decision']) as readonly string[],
 });
 
-// P2 #4 mutual-exclusion groups (human-owned taxonomy; the bot never writes
-// or auto-removes these — coexistence only warns). At least:
+// P2 #4 mutual-exclusion groups (human-owned taxonomy; coexistence only
+// warns unless the removal is a bot-owned transition, see
+// isBotOwnedTransitionRemoval). At least:
 // - priority:{P1,P2} (exactly one should apply; P1+P2 coexistence warns)
 // - gate:* (release/activation/live/docs gates are human release decisions)
 // - status:verified-main/partial/latent (human verification outcomes)
-// - bug/enhancement/documentation (issue-triage tradeoff; PR publish never
-//   writes these — they are issue-triage-only).
+// - bug/enhancement/documentation (issue triage plus — per Owner B decision
+//   restored to PR AI as well; PR publish writes them, priority/gate stay
+//   issue-triage-only).
 export const MUTEX_LABEL_GROUPS: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
   Object.freeze(['priority:P1', 'priority:P2']),
   Object.freeze(['gate:live', 'gate:release', 'gate:activation', 'gate:docs']),
@@ -591,16 +593,21 @@ export const MUTEX_LABEL_GROUPS: ReadonlyArray<ReadonlyArray<string>> = Object.f
 ]);
 
 // PR publish AI convergence allowlist: AI suggestions on PRs are limited to
-// area:*/security/performance/status:needs-decision (+ type:tracking for
-// backward compatibility with the existing deterministic title path).
-// priority:*/gate:* /bug/enhancement/documentation (and the verified statuses)
-// are issue-triage-only: a PR AI suggestion carrying them is discarded and
-// forces INCONCLUSIVE (never APPROVE, never written).
+// area:*/security/performance/status:needs-decision/bug/enhancement/
+// documentation (+ type:tracking for backward compatibility with the existing
+// deterministic title path). Owner decision (Phase 4, P2 #4, Owner B): PR AI
+// semantic classification restores bug/enhancement/documentation; priority:* /
+// gate:* (and the verified statuses) stay issue-triage-only and are NOT
+// widened — a PR AI suggestion carrying them is discarded and forces
+// INCONCLUSIVE (never APPROVE, never written).
 const PR_AI_ALLOWED_EXACT_LABELS: ReadonlySet<string> = new Set([
   'security',
   'performance',
   'status:needs-decision',
   'type:tracking',
+  'bug',
+  'enhancement',
+  'documentation',
 ]);
 
 /** True when the canonical label belongs to a human-owned mutex group. */
@@ -635,9 +642,10 @@ export function isPrAiSuggestibleLabel(canonicalLabel: string): boolean {
 /**
  * Filters raw PR AI suggestions through the convergence allowlist.
  * Returns kept (PR-writable canonical) plus discarded count. Unknown labels
- * and issue-triage-only labels (priority/gate/bug/enhancement/documentation/
- * verified statuses) are discarded; callers must force non-APPROVE when
- * discarded > 0. Raw values are never logged (prompt-injection safe).
+ * and issue-triage-only labels (priority/gate/verified statuses) are
+ * discarded; callers must force non-APPROVE when discarded > 0. Raw values
+ * are never logged (prompt-injection safe). bug/enhancement/documentation are
+ * PR-writable per the Owner B restore decision.
  */
 export function sanitizePrAiSuggestions(candidates: string[]): { kept: string[]; discardedCount: number } {
   const kept = new Set<string>();
@@ -655,6 +663,45 @@ export function sanitizePrAiSuggestions(candidates: string[]): { kept: string[];
     kept.add(canonical);
   }
   return { kept: Array.from(kept).sort(), discardedCount };
+}
+
+// P2 #4 bot-owned transition groups (Owner decision, Phase 4): within these
+// mutex groups the bot may move its own prior write (P1→P2,
+// bug→enhancement) when the desired set carries a different peer of the same
+// group. A human-owned label (existing member with no desired peer in the
+// group) is warn-only and preserved. gate:* and verified statuses are NOT
+// transitionable — human release/verification decisions are never moved.
+export const BOT_TRANSITIONABLE_GROUPS: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
+  Object.freeze(['priority:P1', 'priority:P2']),
+  Object.freeze(['bug', 'enhancement', 'documentation']),
+]);
+
+/**
+ * True when removing existingLabel is a bot-owned transition: the existing
+ * label sits in a BOT_TRANSITIONABLE_GROUPS group and desiredLabels carries a
+ * different peer of the same group (bot intent to move P1→P2 or
+ * bug→enhancement). Desired without any peer means human-owned → false
+ * (warn-only, preserve). Case-insensitive; desired values need not be
+ * pre-sanitized.
+ */
+export function isBotOwnedTransitionRemoval(existingLabel: string, desiredLabels: readonly string[]): boolean {
+  if (!existingLabel || typeof existingLabel !== 'string') return false;
+  const lower = existingLabel.trim().toLowerCase();
+  if (!lower) return false;
+  const desiredLower = new Set(
+    desiredLabels
+      .filter((entry): entry is string => typeof entry === 'string')
+      .map((entry) => entry.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  for (const group of BOT_TRANSITIONABLE_GROUPS) {
+    const lowerGroup = group.map((member) => member.toLowerCase());
+    if (!lowerGroup.includes(lower)) continue;
+    const desiredPeers = lowerGroup.filter((member) => desiredLower.has(member));
+    if (desiredPeers.length > 0 && !desiredLower.has(lower)) return true;
+    return false;
+  }
+  return false;
 }
 
 /**
@@ -707,13 +754,20 @@ export interface ReconcileResult {
 
 /**
  * Checks whether a given label name belongs to the bot-managed scope.
- * Provenance contract (P2 #4): the bot owns only area:* plus
- * status:needs-decision. Mutex/human labels (priority:*, gate:*, verified
- * statuses, bug/enhancement/documentation, type:tracking, security,
- * performance, accessibility/run-instrumented, and all other human labels)
- * are never managed: coexistence only warns (see warnOnMutexCoexistence),
- * never auto-removes. For area:*, an incomplete-coverage run preserves
- * existing area labels (human lock priority) instead of removing them.
+ * Provenance contract (P2 #4, Phase 4 Owner decision): the bot owns area:*
+ * plus status:needs-decision outright. Mutex/human labels (priority:*,
+ * gate:*, verified statuses, type:tracking, security, performance,
+ * accessibility/run-instrumented, and all other human labels) are never
+ * blanket-managed: coexistence only warns (see warnOnMutexCoexistence),
+ * never auto-removes — EXCEPT a bot-owned transition (see
+ * isBotOwnedTransitionRemoval): when the desired set carries a different peer
+ * of the same transitionable group (P1→P2, bug→enhancement),
+ * reconcileBotLabelsSafely may remove the superseded bot-written label. A
+ * human label with no desired peer is warn-only and preserved. bug /
+ * enhancement / documentation are PR-AI-writable per the Owner B restore but
+ * still reconcile only via the transition rule, never via blanket scope. For
+ * area:*, an incomplete-coverage run preserves existing area labels (human
+ * lock priority) instead of removing them.
  */
 export function isManagedByBot(labelName: string, scope?: ReconcileScope): boolean {
   if (!scope || !labelName || typeof labelName !== 'string') return false;
@@ -749,8 +803,11 @@ export function isManagedByBot(labelName: string, scope?: ReconcileScope): boole
  * - Surgically removes obsolete bot-managed labels (e.g. stale status:needs-decision or obsolete area:* labels).
  * - NEVER deletes unmanaged/human labels (e.g. good first issue, help wanted, custom tags).
  * - Mutex coexistence (P1+P2, multiple gates, verified statuses,
- *   bug/enhancement/documentation) only warns via warnOnMutexCoexistence;
- *   the bot never auto-removes a mutex member.
+ *   bug/enhancement/documentation) only warns via warnOnMutexCoexistence,
+ *   except a bot-owned transition (desired carries a different peer of the
+ *   same transitionable group: P1→P2, bug→enhancement), which removes the
+ *   superseded bot-written label; a human label with no desired peer is
+ *   preserved warn-only.
  * - Provenance: the bot only deletes labels inside its managed scope
  *   (area:* + status:needs-decision). Incomplete coverage preserves existing
  *   area:* labels (human lock priority) instead of removing them.
@@ -818,12 +875,17 @@ export async function reconcileBotLabelsSafely(
     const toAdd = validDesired.filter((l) => !existingLowerMap.has(l.toLowerCase()));
     const skipped = validDesired.filter((l) => existingLowerMap.has(l.toLowerCase()));
 
-    // Compute removals strictly within the managed scope
+    // Compute removals strictly within the managed scope, plus bot-owned
+    // transitions (desired carries a different peer of the same
+    // transitionable group, e.g. P1→P2 or bug→enhancement). Human-owned
+    // mutex members with no desired peer are preserved warn-only.
     const toRemove: string[] = [];
     if (scope) {
       for (const [lowerName, originalName] of existingLowerMap.entries()) {
         const isIncompleteCoverageArea = !coverageComplete && lowerName.startsWith('area:');
-        if (isManagedByBot(originalName, scope) && !validDesiredLower.has(lowerName) && !isIncompleteCoverageArea) {
+        const managed = isManagedByBot(originalName, scope);
+        const transition = isBotOwnedTransitionRemoval(originalName, validDesired);
+        if ((managed || transition) && !validDesiredLower.has(lowerName) && !isIncompleteCoverageArea) {
           toRemove.push(originalName);
         }
       }

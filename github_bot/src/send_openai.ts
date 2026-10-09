@@ -32,10 +32,11 @@ export function resolveDefaultReasoningEffort(env: OpenAIEnvironment): string {
 
 /**
  * Whether reasoning effort 'none' is supported for this model. Only the
- * gpt-5 family is verified to accept the omission path used here (see
- * sendOpenAISingleTurn). Other reasoning families (e.g. o-series) reject or
- * ignore it, so resolveModelProfile returns undefined for model+none
- * (fail-closed, zero fetch before send).
+ * gpt-5 family (including 5.5, matched by prefix) is verified to accept the
+ * explicit reasoning:{effort:'none'} wire body used here (see
+ * sendOpenAISingleTurn). Other reasoning families (e.g. o-series) reject it,
+ * so resolveModelProfile returns undefined for model+none (fail-closed, zero
+ * fetch before send) and the send path double-guards with a throw.
  */
 export function isReasoningNoneSupported(modelId: string): boolean {
   const lower = modelId.trim().toLowerCase();
@@ -248,7 +249,8 @@ function isChatFamily(modelId: string): boolean {
 // without an explicit profile returns undefined so callers fail closed
 // without sending a guessed body. A reasoning+none profile for a model that
 // does not support none (see isReasoningNoneSupported) likewise returns
-// undefined so sendOpenAISingleTurn fails closed with zero fetch.
+// undefined so sendOpenAISingleTurn fails closed with zero fetch; a
+// supporting model sends reasoning:{effort:'none'} explicitly on the wire.
 export function resolveModelProfile(modelId: string, env: OpenAIEnvironment): ModelProfile | undefined {
   const trimmedId = modelId.trim();
   if (!trimmedId || containsPlaceholder(trimmedId)) return undefined;
@@ -384,21 +386,33 @@ export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions)
     stream: false,
   };
   const effort = (profile.effort ?? '').trim();
-  const reasoningActive = profile.kind === 'reasoning' && effort.toLowerCase() !== 'none';
-  if (reasoningActive) {
-    // GPT-5-class reasoning with effort != none rejects temperature/top_p.
-    body.reasoning = { effort: effort || resolveDefaultReasoningEffort(env) };
-  } else {
-    // P2 #5 Responses API semantics (pinned): effort 'none' OMITS the
-    // reasoning key entirely (never sends reasoning:{effort:'none'}).
-    // Rationale: omitting reasoning selects the model default non-reasoning
-    // path, while an explicit {effort:'none'} is rejected with 400 on models
-    // that do not support none (see isReasoningNoneSupported, which fails
-    // closed before any fetch). Reference:
+  const effortLower = effort.toLowerCase();
+  if (profile.kind === 'reasoning') {
+    // P2 #3 Responses API semantics (pinned): effort 'none' is sent
+    // explicitly as reasoning:{effort:'none'} on supporting models (gpt-5
+    // family including 5.5). Unsupported models never reach here (gateNone in
+    // resolveModelProfile returns undefined → fail-closed before any fetch);
+    // the double-guard below keeps it fail-closed even if such a profile
+    // slips through — never silently omit. Reference:
     // https://platform.openai.com/docs/api-reference/responses/create
-    // (reasoning.effort; omitted reasoning == default behavior).
-    // Non-reasoning (or reasoning with effort none): never send reasoning.
-    // Temperature/top_p are opt-in only, so the default body stays minimal.
+    // (reasoning.effort). GPT-5-class reasoning (including explicit none)
+    // rejects temperature/top_p, so any reasoning effort is mutually
+    // exclusive with them and throws instead of silently dropping intent.
+    if (effortLower === 'none') {
+      if (!isReasoningNoneSupported(options.modelId)) throw new Error('reasoning effort none not supported');
+      if (options.temperature !== undefined || options.topP !== undefined) {
+        throw new Error('reasoning effort none excludes temperature/top_p');
+      }
+      body.reasoning = { effort: 'none' };
+    } else {
+      if (options.temperature !== undefined || options.topP !== undefined) {
+        throw new Error('reasoning effort excludes temperature/top_p');
+      }
+      body.reasoning = { effort: effort || resolveDefaultReasoningEffort(env) };
+    }
+  } else {
+    // Non-reasoning: never send reasoning. Temperature/top_p are opt-in
+    // only, so the default body stays minimal.
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.topP !== undefined) body.top_p = options.topP;
   }

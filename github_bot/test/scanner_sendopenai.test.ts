@@ -595,8 +595,9 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     assert.equal(chatExplicitBody.temperature, 0.2);
     assert.equal(chatExplicitBody.top_p, 0.9);
 
-    // Reasoning with effort none sends no reasoning key (and still omits
-    // temperature/top_p by default).
+    // Reasoning with effort none sends reasoning:{effort:'none'} explicitly
+    // (P2 #3; never omitted) and stays mutually exclusive with
+    // temperature/top_p.
     const noneEnv = {
       ...openaiEnvironment,
       POCKETGUARD_MODEL_CHIEF: 'gpt-5.2',
@@ -604,18 +605,74 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     };
     assert.deepEqual(resolveModelProfile('gpt-5.2', noneEnv), { kind: 'reasoning', effort: 'none' });
     const noneBody = await captureSingleTurnBody('gpt-5.2', noneEnv);
-    assert.equal(Object.hasOwn(noneBody, 'reasoning'), false);
+    assert.deepEqual(noneBody.reasoning, { effort: 'none' });
     assert.equal(Object.hasOwn(noneBody, 'temperature'), false);
     assert.equal(Object.hasOwn(noneBody, 'top_p'), false);
 
-    // P2 #5 none two-choice: omission (not explicit reasoning:{effort:none}).
-    // The pinned Responses API semantics omit the key entirely; an explicit
-    // none object must never appear on the wire.
+    // P2 #3 explicit-none wire contract: the reasoning key is present with
+    // effort none (never omitted).
     {
-      assert.equal(JSON.stringify(noneBody).includes('"effort":"none"'), false, 'none omits, never explicit');
-      assert.equal(JSON.stringify(noneBody).includes('"reasoning"'), false, 'none carries no reasoning key');
+      assert.equal(JSON.stringify(noneBody).includes('"effort":"none"'), true, 'none is explicit on the wire');
+      assert.equal(JSON.stringify(noneBody).includes('"reasoning"'), true, 'none carries the reasoning key');
       assert.equal(isReasoningNoneSupported('gpt-5.2'), true, 'gpt-5 supports none');
+      assert.equal(isReasoningNoneSupported('gpt-5.5'), true, 'gpt-5.5 supports none');
       assert.equal(isReasoningNoneSupported('o3-mini'), false, 'o-series does not support none');
+    }
+
+    // P2 #3 gpt-5.5 none is explicit on the wire.
+    {
+      const none55Env = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_CHIEF: 'gpt-5.5',
+        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+      };
+      assert.deepEqual(resolveModelProfile('gpt-5.5', none55Env), { kind: 'reasoning', effort: 'none' });
+      const none55Body = await captureSingleTurnBody('gpt-5.5', none55Env);
+      assert.deepEqual(none55Body.reasoning, { effort: 'none' });
+      assert.equal(Object.hasOwn(none55Body, 'temperature'), false);
+      assert.equal(Object.hasOwn(none55Body, 'top_p'), false);
+    }
+
+    // P2 #3 temperature/top_p are mutually exclusive with reasoning
+    // (including explicit none): carrying both throws before any fetch.
+    {
+      const previous = globalThis.fetch;
+      let fetchCount = 0;
+      globalThis.fetch = (async () => {
+        fetchCount += 1;
+        return new Response(JSON.stringify({
+          output: [{ content: [{ type: 'output_text', text: 'must not be called' }] }],
+        }), { status: 200 });
+      }) as typeof fetch;
+      try {
+        await assert.rejects(
+          sendOpenAISingleTurn({
+            modelId: 'gpt-5.2',
+            systemPrompt: 'fake system prompt',
+            userPrompt: 'fake user prompt',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: noneEnv,
+            timeoutMs: 1000,
+            temperature: 0.2,
+          }),
+          /temperature\/top_p/,
+        );
+        await assert.rejects(
+          sendOpenAISingleTurn({
+            modelId: 'gpt-5.2',
+            systemPrompt: 'fake system prompt',
+            userPrompt: 'fake user prompt',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: openaiEnvironment,
+            timeoutMs: 1000,
+            temperature: 0.2,
+          }),
+          /temperature\/top_p/,
+        );
+        assert.equal(fetchCount, 0, 'mutually exclusive params make zero fetch calls');
+      } finally {
+        globalThis.fetch = previous;
+      }
     }
 
     // P2 #5 unsupported none fails closed with zero fetch (before any send).
@@ -647,6 +704,40 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           /model profile not configured/,
         );
         assert.equal(fetchCount, 0, 'unsupported none makes zero fetch calls');
+      } finally {
+        globalThis.fetch = previous;
+      }
+    }
+
+    // P2 #3 unsupported none on a chat-family model also fails closed.
+    {
+      const chatNoneEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_CHIEF: 'gpt-4o',
+        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+      };
+      assert.equal(resolveModelProfile('gpt-4o', chatNoneEnv), undefined, 'gpt-4o + none is undefined');
+      const previous = globalThis.fetch;
+      let fetchCount = 0;
+      globalThis.fetch = (async () => {
+        fetchCount += 1;
+        return new Response(JSON.stringify({
+          output: [{ content: [{ type: 'output_text', text: 'must not be called' }] }],
+        }), { status: 200 });
+      }) as typeof fetch;
+      try {
+        await assert.rejects(
+          sendOpenAISingleTurn({
+            modelId: 'gpt-4o',
+            systemPrompt: 'fake system prompt',
+            userPrompt: 'fake user prompt',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chatNoneEnv,
+            timeoutMs: 1000,
+          }),
+          /model profile not configured/,
+        );
+        assert.equal(fetchCount, 0, 'chat-family none makes zero fetch calls');
       } finally {
         globalThis.fetch = previous;
       }

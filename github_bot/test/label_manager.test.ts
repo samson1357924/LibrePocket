@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   BOT_MENTION,
+  BOT_TRANSITIONABLE_GROUPS,
   COMMENT_MARKERS,
   DEFAULT_PR_RECONCILE_SCOPE,
   MUTEX_LABEL_GROUPS,
@@ -12,6 +13,7 @@ import {
   applyLabelsSafely,
   ensureNeedsDecision,
   extractLabelsFromTriageText,
+  isBotOwnedTransitionRemoval,
   isManagedByBot,
   isMutexLabel,
   isPrAiSuggestibleLabel,
@@ -285,25 +287,31 @@ ${reportWith('A security flaw remains.')}`);
   assert.ok(managedMock.getLabels(1).includes('priority:P1'));
 
   // P2 #4 mutex groups: priority, gate:*, verified statuses, bug/enhancement/documentation.
+  // Owner decision (Phase 4, Owner B): bug/enhancement/documentation are
+  // restored to PR AI; priority/gate/verified stay issue-triage-only.
   assert.ok(MUTEX_LABEL_GROUPS.some((group) => group.includes('priority:P1') && group.includes('priority:P2')));
   assert.ok(MUTEX_LABEL_GROUPS.some((group) => group.includes('gate:live') && group.includes('gate:release')));
   assert.ok(MUTEX_LABEL_GROUPS.some((group) => group.includes('status:verified-main')));
   assert.ok(MUTEX_LABEL_GROUPS.some((group) => group.includes('bug') && group.includes('enhancement')));
   for (const mutex of ['priority:P1', 'priority:P2', 'gate:live', 'gate:release', 'status:verified-main', 'status:partial', 'status:latent', 'bug', 'enhancement', 'documentation']) {
     assert.equal(isMutexLabel(mutex), true, mutex);
-    assert.equal(isManagedByBot(mutex, DEFAULT_PR_RECONCILE_SCOPE), false, `${mutex} never managed`);
-    assert.equal(isPrAiSuggestibleLabel(mutex), false, `${mutex} never PR-AI-suggestible`);
+    assert.equal(isManagedByBot(mutex, DEFAULT_PR_RECONCILE_SCOPE), false, `${mutex} never blanket-managed`);
   }
-  for (const prAllowed of ['area:runtime', 'area:docs', 'security', 'performance', 'status:needs-decision']) {
+  for (const stillIssueOnly of ['priority:P1', 'priority:P2', 'gate:live', 'gate:release', 'status:verified-main', 'status:partial', 'status:latent']) {
+    assert.equal(isPrAiSuggestibleLabel(stillIssueOnly), false, `${stillIssueOnly} stays issue-triage-only`);
+  }
+  for (const prAllowed of ['area:runtime', 'area:docs', 'security', 'performance', 'status:needs-decision', 'bug', 'enhancement', 'documentation']) {
     assert.equal(isPrAiSuggestibleLabel(prAllowed), true, prAllowed);
-    assert.equal(isMutexLabel(prAllowed), false, prAllowed);
   }
-  // PR convergence: priority/gate/bug/enhancement are discarded even though
-  // they are allowlisted for issue triage.
+  for (const prAllowedNonMutex of ['area:runtime', 'area:docs', 'security', 'performance', 'status:needs-decision']) {
+    assert.equal(isMutexLabel(prAllowedNonMutex), false, prAllowedNonMutex);
+  }
+  // PR convergence: priority/gate stay discarded (issue-triage-only) while
+  // restored bug/enhancement/documentation are kept.
   {
     const prFiltered = sanitizePrAiSuggestions(['area:runtime', 'security', 'priority:P1', 'gate:release', 'bug', 'alien-label']);
-    assert.deepEqual(prFiltered.kept, ['area:runtime', 'security']);
-    assert.equal(prFiltered.discardedCount, 4, 'priority/gate/bug/alien all discarded for PR');
+    assert.deepEqual(prFiltered.kept, ['area:runtime', 'bug', 'security']);
+    assert.equal(prFiltered.discardedCount, 3, 'priority/gate/alien discarded for PR; bug kept');
   }
   // P1+P2 coexistence: both survive, only a warning, never auto-removal.
   {
@@ -326,8 +334,9 @@ ${reportWith('A security flaw remains.')}`);
   }
   // Bot never writes priority/gate on PRs: PR AI suggestions are filtered
   // through the convergence allowlist before reconcile, so a PR desired
-  // never carries mutex members (issue triage is the only writer of
-  // priority/gate/bug/enhancement).
+  // never carries priority/gate (issue triage is the only writer of
+  // priority/gate; bug/enhancement/documentation are writable from both issue
+  // triage and PR AI per the Owner B restore).
   {
     const rawAi = ['priority:P1', 'gate:release', 'area:runtime'];
     const filtered = sanitizePrAiSuggestions(rawAi);
@@ -349,6 +358,75 @@ ${reportWith('A security flaw remains.')}`);
     assert.ok(!prResult.removed.includes('gate:release'));
     assert.equal(isManagedByBot('priority:P1', DEFAULT_PR_RECONCILE_SCOPE), false);
     assert.equal(isManagedByBot('gate:release', DEFAULT_PR_RECONCILE_SCOPE), false);
+  }
+  // P2 #4 bot-owned vs human-owned: a bot transition (desired carries a
+  // different peer of the same transitionable group) removes the superseded
+  // bot-written label; a human label with no desired peer is warn-only kept.
+  {
+    assert.ok(BOT_TRANSITIONABLE_GROUPS.some((group) => group.includes('priority:P1') && group.includes('priority:P2')));
+    assert.ok(BOT_TRANSITIONABLE_GROUPS.some((group) => group.includes('bug') && group.includes('enhancement')));
+    assert.equal(isBotOwnedTransitionRemoval('priority:P1', ['priority:P2']), true, 'P1→P2 is a bot transition');
+    assert.equal(isBotOwnedTransitionRemoval('bug', ['enhancement']), true, 'bug→enhancement is a bot transition');
+    assert.equal(isBotOwnedTransitionRemoval('priority:P1', ['area:runtime']), false, 'human P1 without desired peer stays');
+    assert.equal(isBotOwnedTransitionRemoval('bug', ['area:runtime']), false, 'human bug without desired peer stays');
+    assert.equal(isBotOwnedTransitionRemoval('gate:release', ['gate:live']), false, 'gate never transitions');
+    assert.equal(isBotOwnedTransitionRemoval('area:runtime', ['area:docs']), false, 'area is scope-managed, not transition-managed');
+
+    // Issue P1→P2 bot-owned: desired P2 adds P2 and removes superseded P1.
+    const p1ToP2Mock = new StatefulMockLabelClient({ 30: ['priority:P1', 'area:runtime'] });
+    const p1ToP2 = await reconcileBotLabelsSafely({
+      client: p1ToP2Mock,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 30,
+      desiredLabels: ['priority:P2', 'area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+    });
+    assert.ok(p1ToP2.added.includes('priority:P2'), 'bot-owned P2 is added');
+    assert.ok(p1ToP2.removed.includes('priority:P1'), 'superseded bot-owned P1 is removed');
+    assert.ok(!p1ToP2Mock.getLabels(30).includes('priority:P1'));
+    assert.ok(p1ToP2Mock.getLabels(30).includes('priority:P2'));
+
+    // Issue human-owned P1: desired without a priority peer preserves it.
+    const humanP1Mock = new StatefulMockLabelClient({ 31: ['priority:P1', 'area:runtime'] });
+    const humanP1 = await reconcileBotLabelsSafely({
+      client: humanP1Mock,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 31,
+      desiredLabels: ['area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+    });
+    assert.deepEqual(humanP1.removed, [], 'human-owned P1 is never auto-removed');
+    assert.ok(humanP1Mock.getLabels(31).includes('priority:P1'), 'human-owned P1 preserved');
+
+    // Issue bug→enhancement bot-owned: desired enhancement swaps the type.
+    const bugToEnhMock = new StatefulMockLabelClient({ 32: ['bug', 'area:runtime'] });
+    const bugToEnh = await reconcileBotLabelsSafely({
+      client: bugToEnhMock,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 32,
+      desiredLabels: ['enhancement', 'area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+    });
+    assert.ok(bugToEnh.added.includes('enhancement'), 'bot-owned enhancement is added');
+    assert.ok(bugToEnh.removed.includes('bug'), 'superseded bot-owned bug is removed');
+    assert.ok(!bugToEnhMock.getLabels(32).includes('bug'));
+    assert.ok(bugToEnhMock.getLabels(32).includes('enhancement'));
+
+    // Issue human-owned bug: desired without a type peer preserves it.
+    const humanBugMock = new StatefulMockLabelClient({ 33: ['bug', 'area:runtime'] });
+    const humanBug = await reconcileBotLabelsSafely({
+      client: humanBugMock,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 33,
+      desiredLabels: ['area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+    });
+    assert.deepEqual(humanBug.removed, [], 'human-owned bug is never auto-removed');
+    assert.ok(humanBugMock.getLabels(33).includes('bug'), 'human-owned bug preserved');
   }
   // Human area: retention — incomplete coverage preserves a human-added area
   // label (human lock priority) instead of replacing it.

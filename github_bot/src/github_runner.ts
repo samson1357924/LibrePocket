@@ -1481,8 +1481,10 @@ export interface RunnerIssueOutput {
   tags: string[];
   summary: string;
   // S5: raw AI label suggestions (strict string array, allowlisted at
-  // publish) plus a revision fingerprint over title/body/comments so publish
-  // can verify freshness and update the same sticky on mismatch.
+  // publish) plus a revision fingerprint over the FULL issue content
+  // (title/body/comments before any safeString or budget cut) so publish
+  // can verify freshness and update the same sticky on mismatch. Tail edits
+  // past any truncation cap still change the hash (no tail collision).
   // P1 #2: comments completeness over the live listComments read. Review
   // never APPROVEs when false; publish requires true on both the artifact
   // and the fresh re-read plus fingerprint equality, otherwise it falls back
@@ -1497,7 +1499,10 @@ function issueRulesTags(title: string): string[] {
 }
 
 // S5 content fingerprint for issues: SHA-256 over the normalized review
-// context (title, body, human comments). PR freshness reuses the existing
+// context (title, body, human comments). Callers must pass the FULL
+// redacted-but-unsliced content (see buildIssueContext fullFingerprint):
+// hashing truncated copies would collide on tail edits past any cap, so
+// review and publish compare full values. PR freshness reuses the existing
 // head/base SHA identity (sameReviewIdentity); issues hash their mutable
 // text content instead. Publish recomputes from the current context and
 // falls back to INCONCLUSIVE on the same sticky when the fingerprint
@@ -1623,21 +1628,27 @@ export async function fetchFreshIssueFields(
 // to MAX_ISSUE_CONTEXT_LENGTH. P1 #2 fail-closed completeness: commentsComplete
 // is true only when every comment page was read successfully (client,
 // repository, and listComments present, every response.data an array of
-// objects, no throw) and no fetched comment was dropped by the length budget.
-// Any other outcome — missing API, throw, non-array, non-object entry, or
-// truncation that discards a comment — yields commentsComplete false (the
-// caller must not APPROVE). A webhook issue_comment body may be merged as a
-// minimal input after the same bot filter, but the result stays incomplete and
-// never lifts the APPROVE ban. `truncated` distinguishes active budget
-// truncation from transport incompleteness.
+// objects, no throw), no fetched comment was dropped by the length budget,
+// and no single field was cut by its safeString cap (comment 2000, title
+// 2000, body 8000, or the MAX_ISSUE_CONTEXT_LENGTH body slice). Any other
+// outcome yields commentsComplete false (the caller must not APPROVE).
+// The returned title/body/comments stay truncated for the model, while
+// fullFingerprint is hashed over the full redacted-but-unsliced content so a
+// tail change past any cap still alters the fingerprint (no tail collision).
+// Only the hash is persisted; full text never leaves the model input path.
+// A webhook issue_comment body may be merged as a minimal input after the
+// same bot filter, but the result stays incomplete and never lifts the
+// APPROVE ban. `truncated` distinguishes active budget truncation from
+// transport incompleteness.
 async function buildIssueContext(
   context: RunnerContext,
   repository: { owner: string; repo: string } | undefined,
   issueNumber: number,
   title: string,
   body: string,
-): Promise<{ title: string; body: string; comments: string[]; commentsComplete: boolean; truncated: boolean }> {
+): Promise<{ title: string; body: string; comments: string[]; commentsComplete: boolean; truncated: boolean; fullFingerprint: string }> {
   const comments: string[] = [];
+  const fullComments: string[] = [];
   let commentsComplete = true;
   let truncated = false;
   const client = apiClient(context, (context.env ?? process.env).GITHUB_TOKEN ?? '');
@@ -1678,7 +1689,15 @@ async function buildIssueContext(
           const login = typeof entry.user?.login === 'string' && entry.user.login.trim()
             ? entry.user.login.trim()
             : 'unknown';
-          comments.push(`${login}：${safeString(entry.body)}`);
+          // P1 #1: a comment cut by the 2000-char safeString cap is a
+          // fail-closed truncation (tail change must not hash equal).
+          const cleanedComment = cleanForModel(entry.body);
+          if (cleanedComment.length > 2000) {
+            truncated = true;
+            commentsComplete = false;
+          }
+          comments.push(`${login}：${cleanedComment.slice(0, 2000)}`);
+          fullComments.push(`${login}：${cleanedComment}`);
         }
         if (entries.length < 100) {
           finished = true;
@@ -1700,16 +1719,36 @@ async function buildIssueContext(
         const rawLogin = webhookEvent.comment?.user?.login ?? webhookEvent.sender?.login;
         if (!(typeof rawLogin === 'string' && isBotLogin(rawLogin))) {
           const login = typeof rawLogin === 'string' && rawLogin.trim() ? rawLogin.trim() : 'unknown';
-          const merged = `${login}：${safeString(webhookBody)}`;
-          if (!comments.includes(merged)) comments.push(merged);
+          // Same single-field cap as fetched comments; the merged result
+          // stays incomplete regardless (never lifts the APPROVE ban).
+          const cleanedWebhook = cleanForModel(webhookBody);
+          if (cleanedWebhook.length > 2000) {
+            truncated = true;
+            commentsComplete = false;
+          }
+          const merged = `${login}：${cleanedWebhook.slice(0, 2000)}`;
+          if (!comments.includes(merged)) {
+            comments.push(merged);
+            fullComments.push(`${login}：${cleanedWebhook}`);
+          }
         }
       }
     } catch {
       // No webhook input available; stay incomplete with fetched comments only.
     }
   }
-  const safeTitle = safeString(title);
-  let safeBody = safeString(body, 8000);
+  // Full redacted-but-unsliced content for the fingerprint. Any cut by the
+  // single-field caps (title 2000, body 8000) is fail-closed: the model still
+  // sees the truncated copy, but completeness is lost so review and publish
+  // must not APPROVE.
+  const fullTitle = cleanForModel(title);
+  const fullBody = cleanForModel(body);
+  if (fullTitle.length > 2000 || fullBody.length > 8000) {
+    truncated = true;
+    commentsComplete = false;
+  }
+  const safeTitle = fullTitle.slice(0, 2000);
+  let safeBody = fullBody.slice(0, 8000);
   const kept = [...comments];
   const assembledLength = (): number =>
     safeTitle.length + safeBody.length + kept.reduce((total, comment) => total + comment.length, 0);
@@ -1722,8 +1761,14 @@ async function buildIssueContext(
   if (assembledLength() > MAX_ISSUE_CONTEXT_LENGTH) {
     safeBody = safeBody.slice(0, Math.max(0, MAX_ISSUE_CONTEXT_LENGTH - safeTitle.length));
     truncated = true;
+    // P1 #1: the body slice discards reviewed content, so the read is
+    // incomplete even though no comment row was dropped.
+    commentsComplete = false;
   }
-  return { title: safeTitle, body: safeBody, comments: kept, commentsComplete, truncated };
+  // Fingerprint over the FULL content (including comments later dropped from
+  // the model copy by the budget) so tail edits past any cap change the hash.
+  const fullFingerprint = issueContentFingerprint(fullTitle, fullBody, fullComments);
+  return { title: safeTitle, body: safeBody, comments: kept, commentsComplete, truncated, fullFingerprint };
 }
 
 // S5 issue execution (never counted): issues opened/edited/reopened and
@@ -1785,7 +1830,9 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
     try {
       const builtForPrint = await buildIssueContext(context, repository, issueNumber, title, body);
       return {
-        fingerprint: issueContentFingerprint(builtForPrint.title, builtForPrint.body, builtForPrint.comments),
+        // P1 #1: fingerprint over the full original content (pre-cut) so a
+        // tail edit past any cap changes the hash.
+        fingerprint: builtForPrint.fullFingerprint,
         commentsComplete: builtForPrint.commentsComplete,
       };
     } catch {
@@ -1818,7 +1865,9 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
     return output;
   }
   const built = await buildIssueContext(context, repository, issueNumber, title, body);
-  const fingerprint = issueContentFingerprint(built.title, built.body, built.comments);
+  // P1 #1: full-content fingerprint (pre-cut); truncated-context hashes would
+  // collide on tail edits past any cap.
+  const fingerprint = built.fullFingerprint;
   // P1 #2: never APPROVE on an incomplete comment set. Downgrade before any
   // OpenAI call (zero model traffic) so a fail-open read cannot approve.
   if (!built.commentsComplete) {
@@ -2051,11 +2100,14 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
   return output;
 }
 
-function safeString(value: unknown, maxLength = 2000): string {
+function cleanForModel(value: unknown): string {
   if (typeof value !== 'string') return '';
   return redactForModel(value)
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .slice(0, maxLength);
+    .replace(/[\u0000-\u001f\u007f]/g, ' ');
+}
+
+function safeString(value: unknown, maxLength = 2000): string {
+  return cleanForModel(value).slice(0, maxLength);
 }
 
 function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
@@ -2494,7 +2546,9 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     let currentCommentsComplete = false;
     try {
       const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody);
-      currentFingerprint = issueContentFingerprint(builtCurrent.title, builtCurrent.body, builtCurrent.comments);
+      // P1 #1: compare full-content fingerprints (pre-cut) on both sides so
+      // a tail edit past any cap is detected as stale.
+      currentFingerprint = builtCurrent.fullFingerprint;
       currentCommentsComplete = builtCurrent.commentsComplete;
     } catch {
       currentFingerprint = '0'.repeat(64);

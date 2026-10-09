@@ -922,6 +922,233 @@ export async function runStage4P2Tests(): Promise<void> {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
     }
+
+    // P1 #1: single-field truncation is fail-closed with a full-content
+    // fingerprint (no tail collision). Body 8001: tail X vs Y both yield
+    // INCONCLUSIVE with zero OpenAI calls, yet hash differently.
+    {
+      const bodyX = `${'a'.repeat(8000)}X`;
+      const bodyY = `${'a'.repeat(8000)}Y`;
+      const seen: Array<Awaited<ReturnType<typeof runIssueReviewMode>>> = [];
+      for (const body of [bodyX, bodyY]) {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1t-bodycap-'));
+        try {
+          const counter = { count: 0 };
+          const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] });
+          try {
+            const client = {
+              rest: {
+                users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+                issues: { listComments: async () => ({ data: [] }) },
+              },
+            } as unknown as NonNullable<RunnerContext['githubClient']>;
+            const reviewed = await runIssueReviewMode({
+              event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body } },
+              env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+              githubClient: client,
+              writeStdout: () => undefined,
+            });
+            assert.equal(reviewed.verdict, 'INCONCLUSIVE', '8001-char body never approves');
+            assert.equal(reviewed.commentsComplete, false, 'body-cap cut is incomplete');
+            assert.equal(counter.count, 0, 'body-cap cut makes zero OpenAI calls');
+            seen.push(reviewed);
+          } finally {
+            restore();
+          }
+        } finally {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
+      assert.notEqual(seen[0].fingerprint, seen[1].fingerprint, 'body tail change alters the full fingerprint');
+      assert.equal(seen[0].fingerprint, issueContentFingerprint('t', bodyX, []), 'fingerprint covers the full body');
+      assert.equal(seen[1].fingerprint, issueContentFingerprint('t', bodyY, []));
+    }
+
+    // P1 #1: comment 2001 chars — tail X vs Y both INCONCLUSIVE, zero AI,
+    // distinct full fingerprints.
+    {
+      const commentX = `${'b'.repeat(2000)}X`;
+      const commentY = `${'b'.repeat(2000)}Y`;
+      const seen: Array<Awaited<ReturnType<typeof runIssueReviewMode>>> = [];
+      for (const commentBody of [commentX, commentY]) {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1t-commentcap-'));
+        try {
+          const counter = { count: 0 };
+          const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] });
+          try {
+            const client = {
+              rest: {
+                users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+                issues: {
+                  listComments: async () => ({
+                    data: [{ id: 31, body: commentBody, user: { login: 'human', type: 'User' } }],
+                  }),
+                },
+              },
+            } as unknown as NonNullable<RunnerContext['githubClient']>;
+            const reviewed = await runIssueReviewMode({
+              event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+              env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+              githubClient: client,
+              writeStdout: () => undefined,
+            });
+            assert.equal(reviewed.verdict, 'INCONCLUSIVE', '2001-char comment never approves');
+            assert.equal(reviewed.commentsComplete, false, 'comment-cap cut is incomplete');
+            assert.equal(counter.count, 0, 'comment-cap cut makes zero OpenAI calls');
+            seen.push(reviewed);
+          } finally {
+            restore();
+          }
+        } finally {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
+      assert.notEqual(seen[0].fingerprint, seen[1].fingerprint, 'comment tail change alters the full fingerprint');
+      assert.equal(seen[0].fingerprint, issueContentFingerprint('t', 'b', [`human：${commentX}`]));
+      assert.equal(seen[1].fingerprint, issueContentFingerprint('t', 'b', [`human：${commentY}`]));
+    }
+
+    // P1 #1: title 2001 chars — tail X vs Y both INCONCLUSIVE, zero AI,
+    // distinct full fingerprints.
+    {
+      const titleX = `${'t'.repeat(2000)}X`;
+      const titleY = `${'t'.repeat(2000)}Y`;
+      const seen: Array<Awaited<ReturnType<typeof runIssueReviewMode>>> = [];
+      for (const title of [titleX, titleY]) {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1t-titlecap-'));
+        try {
+          const counter = { count: 0 };
+          const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] });
+          try {
+            const client = {
+              rest: {
+                users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+                issues: { listComments: async () => ({ data: [] }) },
+              },
+            } as unknown as NonNullable<RunnerContext['githubClient']>;
+            const reviewed = await runIssueReviewMode({
+              event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title, body: 'b' } },
+              env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+              githubClient: client,
+              writeStdout: () => undefined,
+            });
+            assert.equal(reviewed.verdict, 'INCONCLUSIVE', '2001-char title never approves');
+            assert.equal(reviewed.commentsComplete, false, 'title-cap cut is incomplete');
+            assert.equal(counter.count, 0, 'title-cap cut makes zero OpenAI calls');
+            seen.push(reviewed);
+          } finally {
+            restore();
+          }
+        } finally {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
+      assert.notEqual(seen[0].fingerprint, seen[1].fingerprint, 'title tail change alters the full fingerprint');
+      assert.equal(seen[0].fingerprint, issueContentFingerprint(titleX, 'b', []));
+      assert.equal(seen[1].fingerprint, issueContentFingerprint(titleY, 'b', []));
+    }
+
+    // P1 #1: total context past MAX_ISSUE_CONTEXT_LENGTH drops comments and
+    // is fail-closed (INCONCLUSIVE, zero OpenAI). Each comment is exactly at
+    // its single-field cap so only the shared budget triggers.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1t-budget-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] });
+        try {
+          const many = Array.from({ length: 7 }, (_, i) => ({
+            id: 3000 + i,
+            body: 'd'.repeat(2000),
+            user: { login: 'human', type: 'User' },
+          }));
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: { listComments: async () => ({ data: many }) },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'c'.repeat(8000) } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.commentsComplete, false, 'budget truncation is incomplete');
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'budget truncation never approves');
+          assert.equal(counter.count, 0, 'budget truncation makes zero OpenAI calls');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #1: publish-side tail collision still falls back on the same sticky.
+    // A pre-fix artifact hashed the truncated body (X and Y share it); the
+    // live issue now carries the Y tail, so the full fingerprint mismatches
+    // and publish must not APPROVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1t-pubtail-'));
+      try {
+        const liveY = `${'a'.repeat(8000)}Y`;
+        const collidingFp = issueContentFingerprint('t', 'a'.repeat(8000), []);
+        const artifactPath = path.join(tempDir, 'colliding.json');
+        fs.writeFileSync(artifactPath, JSON.stringify({
+          verdict: 'APPROVE',
+          issueNumber: 7,
+          title: 't',
+          tags: [],
+          summary: 'pre-fix colliding review',
+          suggestedLabels: [],
+          fingerprint: collidingFp,
+          commentsComplete: true,
+        }));
+        const state = {
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const client = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: 't', body: liveY } }),
+              listComments: async () => ({ data: state.comments }),
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const found = state.comments.find((c) => c.id === params.comment_id);
+                if (found) found.body = params.body;
+                return {};
+              },
+              addLabels: async () => ({}),
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'stale-webhook' } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as NodeJS.ProcessEnv,
+          githubClient: client,
+        });
+        assert.equal(state.created, 0, 'tail collision creates no second comment');
+        assert.equal(state.updated, 1, 'tail collision updates the same sticky');
+        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'tail collision falls back');
+        assert.ok(!state.comments[0].body.includes('判定：APPROVE'), 'tail collision never approves');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
   } finally {
     globalThis.fetch = previousFetch;
   }

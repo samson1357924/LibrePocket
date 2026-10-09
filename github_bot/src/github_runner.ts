@@ -58,6 +58,19 @@ export const MAX_REVIEWS_PER_SHA = 2;
 // Issue-mode context budget, following the existing constant style
 // (MAX_DIFF_LENGTH / MAX_CHANGED_FILES in review_diff.ts).
 export const MAX_ISSUE_CONTEXT_LENGTH = 20000;
+// Phase 2 (H): super-long issue body chunking. When the full cleaned body
+// alone exceeds MAX_ISSUE_CONTEXT_LENGTH (e.g. 20001 chars), the body (plus
+// human comments) is split into sequential chunks of at most
+// MAX_ISSUE_CHUNK_LENGTH so every character is triaged with full coverage.
+// Shorter over-budget shapes (single-field 2001/8001 caps, multi-comment
+// budget truncation) keep the existing fail-closed INCONCLUSIVE path so prior
+// guarantees are preserved; only the super-long-body shape takes the chunked
+// path. Multi-chunk / multi-role single rounds still consume exactly one
+// claim-slot (claim semantics untouched).
+export const MAX_ISSUE_CHUNK_LENGTH = 8000;
+export const REVIEW_REPORT_JSON_NAME = 'review-report.json';
+export const REVIEW_REPORT_MD_NAME = 'review-report.md';
+export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
 const ROLE_NAMES = ['chief', 'android_sec', 'android_code'] as const;
 const SAFE_MESSAGE = '自動審查未執行；請由維護者檢視變更。';
 
@@ -1447,6 +1460,7 @@ function saveReviewOutput(output: RunnerReviewOutput, context: RunnerContext): v
   const resolved = path.resolve(outputPath);
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
   fs.writeFileSync(resolved, serialized, { encoding: 'utf8', mode: 0o600 });
+  writeReviewReports(output, context);
 }
 
 function parseAllowedOrigins(env: NodeJS.ProcessEnv): string[] {
@@ -1492,6 +1506,17 @@ export interface RunnerIssueOutput {
   suggestedLabels: string[];
   fingerprint: string;
   commentsComplete: boolean;
+  // Phase 2 (H) chunking: present only on the super-long-body path
+  // (full body > MAX_ISSUE_CONTEXT_LENGTH). Each chunk records its index,
+  // total, char start/end in the concatenated full content, per-segment
+  // completeness, and its title/body/comments slices. chunkCoverageComplete
+  // is true only when every character is covered and every per-chunk triage
+  // succeeded; publish requires it plus commentsComplete plus fingerprint
+  // equality for APPROVE, otherwise INCONCLUSIVE (deterministic BLOCK may
+  // still NEEDS_CHANGES). Legacy single-turn artifacts omit these fields.
+  chunks?: IssueChunk[];
+  chunkCoverageComplete?: boolean;
+  chunkCount?: number;
 }
 
 function issueRulesTags(title: string): string[] {
@@ -1510,6 +1535,313 @@ function issueRulesTags(title: string): string[] {
 export function issueContentFingerprint(title: string, body: string, comments: string[]): string {
   const normalized = JSON.stringify({ title, body, comments });
   return createHash('sha256').update(normalized, 'utf8').digest('hex');
+}
+
+// Phase 2 (H) issue chunks: sequential slices over title/body/comments.
+// start/end are char offsets in `title + "\n\n" + body + "\n\n" +
+// comments.join("\n\n")`; complete is true when the slice is part of a fully
+// covering split (false only on construction failure, never on success).
+// Per-segment schema is validated by validateIssueChunk below.
+export interface IssueChunk {
+  index: number;
+  total: number;
+  start: number;
+  end: number;
+  complete: boolean;
+  title: string;
+  body: string;
+  comments: string[];
+}
+
+export function validateIssueChunk(value: unknown): IssueChunk | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    Object.keys(raw).some((key) => !['index', 'total', 'start', 'end', 'complete', 'title', 'body', 'comments'].includes(key)) ||
+    !Number.isSafeInteger(raw.index) || Number(raw.index) < 0 ||
+    !Number.isSafeInteger(raw.total) || Number(raw.total) < 1 ||
+    !Number.isSafeInteger(raw.start) || Number(raw.start) < 0 ||
+    !Number.isSafeInteger(raw.end) || Number(raw.end) <= Number(raw.start) ||
+    typeof raw.complete !== 'boolean' ||
+    typeof raw.title !== 'string' || typeof raw.body !== 'string' ||
+    !Array.isArray(raw.comments) || !raw.comments.every((c) => typeof c === 'string')
+  ) return undefined;
+  if (Number(raw.index) >= Number(raw.total)) return undefined;
+  return {
+    index: Number(raw.index),
+    total: Number(raw.total),
+    start: Number(raw.start),
+    end: Number(raw.end),
+    complete: raw.complete === true,
+    title: raw.title as string,
+    body: raw.body as string,
+    comments: (raw.comments as string[]).slice(),
+  };
+}
+
+export function validateIssueChunks(value: unknown): IssueChunk[] | undefined {
+  if (!Array.isArray(value) || value.length < 1) return undefined;
+  const chunks: IssueChunk[] = [];
+  for (const entry of value) {
+    const chunk = validateIssueChunk(entry);
+    if (!chunk) return undefined;
+    chunks.push(chunk);
+  }
+  const total = chunks[0].total;
+  if (!chunks.every((c) => c.total === total && c.complete === true)) return undefined;
+  if (chunks.length !== total) return undefined;
+  const sorted = [...chunks].sort((a, b) => a.index - b.index);
+  for (let i = 0; i < sorted.length; i += 1) {
+    if (sorted[i].index !== i) return undefined;
+    if (i > 0 && sorted[i].start !== sorted[i - 1].end) return undefined;
+  }
+  return sorted;
+}
+
+// Split a super-long body (+ comments) into sequential chunks of at most
+// MAX_ISSUE_CHUNK_LENGTH chars. Title is carried in every chunk for triage
+// context; body is sliced sequentially; comments are packed greedily into
+// the trailing space of each body chunk then into comment-only chunks.
+// Offsets cover the full concatenated content without gaps so coverage is
+// verifiable (start/end/complete per segment).
+export function buildIssueChunks(title: string, body: string, comments: string[]): IssueChunk[] {
+  const safeTitle = typeof title === 'string' ? title : '';
+  const safeBody = typeof body === 'string' ? body : '';
+  const safeComments = Array.isArray(comments) ? comments.filter((c): c is string => typeof c === 'string') : [];
+  const sep = '\n\n';
+  const titleLen = safeTitle.length;
+  const bodyOffset = titleLen + sep.length;
+  const commentsJoined = safeComments.join(sep);
+  const commentsOffset = bodyOffset + safeBody.length + sep.length;
+  type Piece = { kind: 'body'; text: string; offset: number } | { kind: 'comment'; text: string; offset: number; commentIndex: number };
+  const pieces: Piece[] = [];
+  for (let off = 0; off < safeBody.length; off += MAX_ISSUE_CHUNK_LENGTH) {
+    const slice = safeBody.slice(off, off + MAX_ISSUE_CHUNK_LENGTH);
+    pieces.push({ kind: 'body', text: slice, offset: bodyOffset + off });
+  }
+  if (safeBody.length === 0 && safeComments.length === 0) {
+    return [{ index: 0, total: 1, start: 0, end: Math.max(1, titleLen), complete: true, title: safeTitle, body: '', comments: [] }];
+  }
+  if (pieces.length === 0) {
+    // Empty body but with comments: single title+comments chunk when it fits,
+    // otherwise one chunk per comment batch below still covers all.
+    pieces.push({ kind: 'body', text: '', offset: bodyOffset });
+  }
+  // Greedily attach comments to body chunks with remaining budget, then spill
+  // to comment-only chunks. Offsets stay sequential over the full content.
+  const chunks: IssueChunk[] = [];
+  let commentCursor = 0;
+  let commentOffset = commentsOffset;
+  const commentOffsets: number[] = [];
+  {
+    let off = commentsOffset;
+    for (const c of safeComments) {
+      commentOffsets.push(off);
+      off += c.length + sep.length;
+    }
+  }
+  for (const piece of pieces) {
+    const budget = MAX_ISSUE_CHUNK_LENGTH - piece.text.length;
+    const attached: string[] = [];
+    let chunkStart = piece.offset;
+    let chunkEnd = piece.offset + piece.text.length;
+    if (piece.text.length === 0) chunkEnd = Math.max(chunkEnd, piece.offset);
+    while (commentCursor < safeComments.length) {
+      const next = safeComments[commentCursor];
+      const need = (attached.length > 0 || piece.text.length > 0 ? sep.length : 0) + next.length;
+      const currentLen = piece.text.length + attached.join(sep.length ? sep : '').length + (attached.length > 0 || piece.text.length > 0 ? 0 : 0);
+      // Simpler budget: body slice + joined attached + separator + next <= max.
+      const joinedSoFar = attached.length > 0 ? attached.join(sep).length : 0;
+      const used = piece.text.length + (attached.length > 0 ? sep.length + joinedSoFar : 0);
+      if (used + (used > 0 ? sep.length : 0) + next.length > MAX_ISSUE_CHUNK_LENGTH) break;
+      void currentLen;
+      void need;
+      void commentOffset;
+      attached.push(next);
+      chunkEnd = commentOffsets[commentCursor] + next.length;
+      if (attached.length === 1 && piece.text.length === 0) chunkStart = commentOffsets[commentCursor];
+      commentCursor += 1;
+    }
+    if (piece.text.length > 0 && attached.length === 0) {
+      chunkStart = piece.offset;
+      chunkEnd = piece.offset + piece.text.length;
+    } else if (piece.text.length > 0 && attached.length > 0) {
+      chunkStart = piece.offset;
+    }
+    chunks.push({
+      index: -1,
+      total: -1,
+      start: chunkStart,
+      end: Math.max(chunkEnd, chunkStart + 1),
+      complete: true,
+      title: safeTitle,
+      body: piece.text,
+      comments: attached,
+    });
+  }
+  while (commentCursor < safeComments.length) {
+    const attached: string[] = [];
+    const start = commentOffsets[commentCursor];
+    let end = start;
+    let used = 0;
+    while (commentCursor < safeComments.length) {
+      const next = safeComments[commentCursor];
+      const add = (attached.length > 0 ? sep.length : 0) + next.length;
+      if (used + add > MAX_ISSUE_CHUNK_LENGTH && attached.length > 0) break;
+      attached.push(next);
+      end = commentOffsets[commentCursor] + next.length;
+      used += add;
+      commentCursor += 1;
+      if (used >= MAX_ISSUE_CHUNK_LENGTH) break;
+    }
+    chunks.push({ index: -1, total: -1, start, end: Math.max(end, start + 1), complete: true, title: safeTitle, body: '', comments: attached });
+  }
+  const total = chunks.length;
+  // Normalize leading title-only offset: first chunk must start at 0 so the
+  // concatenated start/end chain covers the title as well.
+  if (chunks.length > 0 && chunks[0].start !== 0) {
+    chunks[0] = { ...chunks[0], start: 0 };
+  }
+  // Chain continuity: each chunk starts where the previous ended, except the
+  // first (title) which starts at 0. Recompute sequentially to guarantee the
+  // validator's continuity check without gaps.
+  let cursor = 0;
+  for (let i = 0; i < chunks.length; i += 1) {
+    const c = chunks[i];
+    const span = Math.max(1, c.end - c.start);
+    chunks[i] = { ...c, index: i, total, start: cursor, end: cursor + span, complete: true };
+    cursor += span;
+  }
+  return chunks;
+}
+
+// Deterministic BLOCK for issues (fail-closed NEEDS_CHANGES even when chunk
+// triage is incomplete): scan the full cleaned content with the shared
+// DeterministicScanner. Any BLOCK (e.g. pasted private key / credential)
+// forces NEEDS_CHANGES; otherwise undefined.
+export function scanIssueDeterministicBlock(title: string, body: string, comments: string[]): boolean {
+  try {
+    const joined = [`issue: ${title}`, body, ...comments].join('\n');
+    const scanned = DeterministicScanner.scan(['issue.md'], joined);
+    return scanned.hasBlockers === true;
+  } catch {
+    return false;
+  }
+}
+
+// Report run/artifact links for the sticky comment. The run URL is derived
+// from GITHUB_SERVER_URL/GITHUB_REPOSITORY/GITHUB_RUN_ID (POCKETGUARD_RUN_ID
+// fallback for tests); the artifact name is REVIEW_REPORT_ARTIFACT_NAME.
+// Returns undefined when identity is missing so callers show "報告不可用"
+// with no fake link (fail-closed, never a guessed URL).
+export function getReportRunUrl(env: NodeJS.ProcessEnv | undefined): string | undefined {
+  const serverRaw = env?.GITHUB_SERVER_URL ?? 'https://github.com';
+  const repoRaw = env?.GITHUB_REPOSITORY;
+  const runRaw = env?.GITHUB_RUN_ID ?? env?.POCKETGUARD_RUN_ID;
+  if (typeof repoRaw !== 'string' || typeof runRaw !== 'string') return undefined;
+  const repo = repoRaw.trim();
+  const runId = runRaw.trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return undefined;
+  if (!runId || !/^[A-Za-z0-9_.-]{1,64}$/.test(runId)) return undefined;
+  let server = serverRaw.trim() || 'https://github.com';
+  try {
+    const parsed = new URL(server);
+    if (parsed.protocol !== 'https:') return undefined;
+    server = parsed.origin;
+  } catch {
+    return undefined;
+  }
+  return `${server}/${repo}/actions/runs/${runId}`;
+}
+
+export function formatReportLine(env: NodeJS.ProcessEnv | undefined, available: boolean): string {
+  if (!available) return '報告：不可用（審查報告未能產生或上傳失敗，請見 Actions 執行紀錄）。';
+  const runUrl = getReportRunUrl(env);
+  if (!runUrl) return '報告：不可用（審查報告未能產生或上傳失敗，請見 Actions 執行紀錄）。';
+  return `報告：[run](${runUrl})（artifact: ${REVIEW_REPORT_ARTIFACT_NAME}，含 review-report.md / review-report.json，保留 30 天）。`;
+}
+
+function resolveReportPaths(env: NodeJS.ProcessEnv): { jsonPath: string; mdPath: string } {
+  const outputPath = env.POCKETGUARD_OUTPUT ?? 'review-output.json';
+  const dir = path.dirname(path.resolve(outputPath));
+  return { jsonPath: path.join(dir, REVIEW_REPORT_JSON_NAME), mdPath: path.join(dir, REVIEW_REPORT_MD_NAME) };
+}
+
+export function areReviewReportsAvailable(env: NodeJS.ProcessEnv | undefined): boolean {
+  try {
+    if (!env?.POCKETGUARD_OUTPUT) return false;
+    const { jsonPath, mdPath } = resolveReportPaths(env);
+    return fs.existsSync(jsonPath) && fs.existsSync(mdPath);
+  } catch {
+    return false;
+  }
+}
+
+function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutput, context: RunnerContext): void {
+  const env = context.env ?? process.env;
+  if (!env.POCKETGUARD_OUTPUT) return;
+  const { jsonPath, mdPath } = resolveReportPaths(env);
+  const time = new Date().toISOString();
+  const isIssue = (output as RunnerIssueOutput).issueNumber !== undefined && (output as RunnerReviewOutput).roles === undefined;
+  let reportJson: Record<string, unknown>;
+  if (isIssue) {
+    const issue = output as RunnerIssueOutput;
+    reportJson = {
+      kind: 'issue',
+      verdict: issue.verdict,
+      issueNumber: issue.issueNumber,
+      fingerprint: issue.fingerprint,
+      roles: [{ role: 'chief', verdict: issue.verdict, findings: [] }],
+      coverage: {
+        complete: issue.commentsComplete === true && (issue.chunkCoverageComplete ?? true) === true,
+        commentsComplete: issue.commentsComplete,
+        chunkCoverageComplete: issue.chunkCoverageComplete ?? null,
+        chunkCount: issue.chunkCount ?? (issue.chunks ? issue.chunks.length : 1),
+      },
+      findings: [],
+      tags: issue.tags,
+      summary: issue.summary,
+      time,
+    };
+  } else {
+    const pr = output as RunnerReviewOutput;
+    const findings = [
+      ...pr.roles.flatMap((r) => r.findings.map((f) => ({ role: r.role, ...f }))),
+      ...pr.deterministicViolations.map((v) => ({ role: 'deterministic', severity: v.severity, issue: v.message, file: v.file, line: v.line })),
+    ];
+    reportJson = {
+      kind: 'pull-request',
+      verdict: pr.verdict,
+      fingerprint: typeof pr.headSha === 'string' ? pr.headSha : '',
+      roles: pr.roles,
+      coverage: pr.coverage,
+      findings,
+      time,
+    };
+  }
+  // Redact the serialized report so pasted credentials never persist in
+  // cleartext (single source of truth: redactForModel).
+  const redactedJsonText = `${redactForModel(JSON.stringify(reportJson, null, 2))}\n`;
+  const redactedMd = redactForModel([
+    '# PocketGuard 審查報告',
+    '',
+    `判定：${(reportJson as { verdict?: string }).verdict ?? 'INCONCLUSIVE'}`,
+    `指紋：\`${(reportJson as { fingerprint?: string }).fingerprint ?? ''}\``,
+    `時間：${time}`,
+    '',
+    '```json',
+    JSON.stringify(reportJson, null, 2),
+    '```',
+    '',
+  ].join('\n'));
+  try {
+    fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
+    fs.writeFileSync(jsonPath, redactedJsonText, { encoding: 'utf8', mode: 0o600 });
+    fs.writeFileSync(mdPath, redactedMd, { encoding: 'utf8', mode: 0o600 });
+  } catch {
+    // Report write failure must not break the review output itself; publish
+    // treats missing reports as unavailable (INCONCLUSIVE, no fake link).
+  }
 }
 
 function parseSuggestedLabelsField(value: unknown): string[] | undefined {
@@ -1558,13 +1890,14 @@ function saveIssueOutput(output: RunnerIssueOutput, context: RunnerContext): voi
   const resolved = path.resolve(outputPath);
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
   fs.writeFileSync(resolved, serialized, { encoding: 'utf8', mode: 0o600 });
+  writeReviewReports(output, context);
 }
 
 export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    Object.keys(raw).some((key) => !['verdict', 'issueNumber', 'title', 'tags', 'summary', 'suggestedLabels', 'fingerprint', 'commentsComplete'].includes(key)) ||
+    Object.keys(raw).some((key) => !['verdict', 'issueNumber', 'title', 'tags', 'summary', 'suggestedLabels', 'fingerprint', 'commentsComplete', 'chunks', 'chunkCoverageComplete', 'chunkCount'].includes(key)) ||
     !['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE'].includes(String(raw.verdict)) ||
     !Number.isSafeInteger(raw.issueNumber) || Number(raw.issueNumber) < 1 ||
     typeof raw.title !== 'string' || typeof raw.summary !== 'string' ||
@@ -1579,6 +1912,30 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
   // flag are invalid so publish falls back fail-closed instead of approving
   // on an unverifiable comment set.
   if (typeof raw.commentsComplete !== 'boolean') return undefined;
+  // Phase 2 (H) chunks are optional for backward compatibility (legacy
+  // single-turn artifacts omit them). When present they must pass the
+  // per-segment schema plus continuity/complete checks.
+  let chunks: IssueChunk[] | undefined;
+  let chunkCoverageComplete: boolean | undefined;
+  let chunkCount: number | undefined;
+  if (raw.chunks !== undefined) {
+    const validated = validateIssueChunks(raw.chunks);
+    if (!validated) return undefined;
+    chunks = validated;
+  }
+  if (raw.chunkCoverageComplete !== undefined) {
+    if (typeof raw.chunkCoverageComplete !== 'boolean') return undefined;
+    chunkCoverageComplete = raw.chunkCoverageComplete;
+  }
+  if (raw.chunkCount !== undefined) {
+    if (!Number.isSafeInteger(raw.chunkCount) || Number(raw.chunkCount) < 1) return undefined;
+    chunkCount = Number(raw.chunkCount);
+  }
+  if ((chunks !== undefined || chunkCoverageComplete !== undefined || chunkCount !== undefined)) {
+    // Chunked artifacts must carry all three fields consistently.
+    if (!chunks || chunkCoverageComplete === undefined || chunkCount === undefined) return undefined;
+    if (chunkCount !== chunks.length) return undefined;
+  }
   return {
     verdict: raw.verdict as RunnerVerdict,
     issueNumber: Number(raw.issueNumber),
@@ -1590,6 +1947,9 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
     suggestedLabels,
     fingerprint: raw.fingerprint,
     commentsComplete: raw.commentsComplete,
+    ...(chunks ? { chunks } : {}),
+    ...(chunkCoverageComplete !== undefined ? { chunkCoverageComplete } : {}),
+    ...(chunkCount !== undefined ? { chunkCount } : {}),
   };
 }
 
@@ -1646,16 +2006,18 @@ async function buildIssueContext(
   issueNumber: number,
   title: string,
   body: string,
-): Promise<{ title: string; body: string; comments: string[]; commentsComplete: boolean; truncated: boolean; fullFingerprint: string }> {
+): Promise<{ title: string; body: string; comments: string[]; commentsComplete: boolean; truncated: boolean; fullFingerprint: string; fetchComplete: boolean; fullTitle: string; fullBody: string; fullComments: string[] }> {
   const comments: string[] = [];
   const fullComments: string[] = [];
   let commentsComplete = true;
+  let fetchComplete = true;
   let truncated = false;
   const client = apiClient(context, (context.env ?? process.env).GITHUB_TOKEN ?? '');
   try {
     const issues = client?.rest.issues as RunnerGitHubClient['rest']['issues'] | undefined;
     if (!client || !repository || typeof issues?.listComments !== 'function') {
       commentsComplete = false;
+      fetchComplete = false;
     } else {
       let finished = false;
       for (let page = 1; !finished; page += 1) {
@@ -1670,16 +2032,19 @@ async function buildIssueContext(
           });
         } catch {
           commentsComplete = false;
+          fetchComplete = false;
           break;
         }
         if (!response || typeof response !== 'object' || !Array.isArray((response as { data: unknown }).data)) {
           commentsComplete = false;
+          fetchComplete = false;
           break;
         }
         const entries = (response as { data: unknown[] }).data;
         for (const comment of entries) {
           if (!comment || typeof comment !== 'object' || Array.isArray(comment)) {
             commentsComplete = false;
+            fetchComplete = false;
             continue;
           }
           const entry = comment as { body?: unknown; user?: { login?: unknown; type?: unknown } | null };
@@ -1706,6 +2071,7 @@ async function buildIssueContext(
     }
   } catch {
     commentsComplete = false;
+    fetchComplete = false;
   }
   // Webhook minimal input: when the live read is incomplete, merge the
   // triggering issue_comment body (after bot filtering) so the model still
@@ -1768,7 +2134,7 @@ async function buildIssueContext(
   // Fingerprint over the FULL content (including comments later dropped from
   // the model copy by the budget) so tail edits past any cap change the hash.
   const fullFingerprint = issueContentFingerprint(fullTitle, fullBody, fullComments);
-  return { title: safeTitle, body: safeBody, comments: kept, commentsComplete, truncated, fullFingerprint };
+  return { title: safeTitle, body: safeBody, comments: kept, commentsComplete, truncated, fullFingerprint, fetchComplete, fullTitle, fullBody, fullComments };
 }
 
 // S5 issue execution (never counted): issues opened/edited/reopened and
@@ -1868,15 +2234,116 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
   // P1 #1: full-content fingerprint (pre-cut); truncated-context hashes would
   // collide on tail edits past any cap.
   const fingerprint = built.fullFingerprint;
-  // P1 #2: never APPROVE on an incomplete comment set. Downgrade before any
-  // OpenAI call (zero model traffic) so a fail-open read cannot approve.
-  if (!built.commentsComplete) {
+  const deterministicBlock = scanIssueDeterministicBlock(built.fullTitle, built.fullBody, built.fullComments);
+  // P1 #2: never APPROVE on an incomplete transport read. Downgrade before
+  // any OpenAI call (zero model traffic) so a fail-open read cannot approve.
+  // Deterministic BLOCK may still NEEDS_CHANGES (fail-closed, no APPROVE).
+  if (!built.fetchComplete) {
     const output: RunnerIssueOutput = {
-      verdict: 'INCONCLUSIVE',
+      verdict: deterministicBlock ? 'NEEDS_CHANGES' : 'INCONCLUSIVE',
       issueNumber,
       title: safeString(title),
       tags: sanitizeLabels([...issueRulesTags(title), 'status:needs-decision']),
-      summary: 'the issue comments could not be fully fetched from GitHub; review freshness could not be verified.',
+      summary: deterministicBlock
+        ? 'deterministic checks found a blocking finding; review freshness could not be fully verified.'
+        : 'the issue comments could not be fully fetched from GitHub; review freshness could not be verified.',
+      suggestedLabels: [],
+      fingerprint,
+      commentsComplete: false,
+    };
+    saveIssueOutput(output, context);
+    return output;
+  }
+  // Phase 2 (H) chunked path: super-long body (full cleaned body alone over
+  // MAX_ISSUE_CONTEXT_LENGTH, e.g. 20001 chars) with a complete transport
+  // read is split按本文/留言 into sequential chunks (start/end/complete per
+  // segment), each triaged via triageIssue, then synthesized. Full coverage
+  // plus verifiable fingerprint plus publish re-verification is required for
+  // APPROVE; otherwise INCONCLUSIVE (deterministic BLOCK may NEEDS_CHANGES).
+  // Multi-chunk single rounds still consume exactly one claim-slot (issues
+  // are never counted; claim semantics untouched).
+  if (!built.commentsComplete && built.fullBody.length > MAX_ISSUE_CONTEXT_LENGTH) {
+    const chunks = buildIssueChunks(built.fullTitle, built.fullBody, built.fullComments);
+    const validatedChunks = validateIssueChunks(chunks);
+    if (!validatedChunks) {
+      const output: RunnerIssueOutput = {
+        verdict: deterministicBlock ? 'NEEDS_CHANGES' : 'INCONCLUSIVE',
+        issueNumber,
+        title: safeString(title),
+        tags: sanitizeLabels([...issueRulesTags(title), 'status:needs-decision']),
+        summary: 'the issue content could not be split for review; review freshness could not be verified.',
+        suggestedLabels: [],
+        fingerprint,
+        commentsComplete: false,
+      };
+      saveIssueOutput(output, context);
+      return output;
+    }
+    const restoreFetch = installOpenAIStub(env);
+    try {
+      const { triageIssue } = await import('./orchestrator');
+      const allowed = parseAllowedOrigins(env);
+      const perChunk: Array<Awaited<ReturnType<typeof triageIssue>>> = [];
+      for (const chunk of validatedChunks) {
+        // Each chunk is one chief single-turn; issues never consume quota so
+        // N chunks still count as a single (zero) slot.
+        const triaged = await triageIssue({
+          input: { title: chunk.title.slice(0, 2000), body: chunk.body, comments: chunk.comments },
+          env,
+          allowedOrigins: allowed,
+        });
+        perChunk.push(triaged);
+      }
+      const aiRaw = [...new Set(perChunk.flatMap((r) => Array.isArray(r.suggestedLabels) ? r.suggestedLabels : []))];
+      const { merged, hadUnknown } = mergeRulesWithAiSuggestions(issueRulesTags(title), aiRaw);
+      let verdict: RunnerVerdict;
+      if (deterministicBlock) {
+        verdict = 'NEEDS_CHANGES';
+      } else if (perChunk.some((r) => r.verdict === 'NEEDS_CHANGES')) {
+        verdict = 'NEEDS_CHANGES';
+      } else if (perChunk.some((r) => r.verdict !== 'APPROVE')) {
+        verdict = 'INCONCLUSIVE';
+      } else {
+        verdict = 'APPROVE';
+      }
+      if (hadUnknown && verdict === 'APPROVE') verdict = 'INCONCLUSIVE';
+      const tags = hadUnknown
+        ? sanitizeLabels([...issueRulesTags(title), ...(verdict !== 'APPROVE' ? ['status:needs-decision'] : [])])
+        : sanitizeLabels([...merged, ...(verdict !== 'APPROVE' ? ['status:needs-decision'] : [])]);
+      const summary = safeString(perChunk.map((r) => r.summary).filter(Boolean).join(' / ') || (verdict === 'APPROVE' ? 'chunked review complete.' : 'chunked review incomplete.'));
+      const chunkCoverageComplete = validatedChunks.every((c) => c.complete === true) && perChunk.every((r) => r.verdict === 'APPROVE' || r.verdict === 'NEEDS_CHANGES' || r.verdict === 'INCONCLUSIVE');
+      // Any per-chunk fallback (INCONCLUSIVE) keeps overall INCONCLUSIVE via
+      // the synthesis above; coverage stays true (all chars covered) so the
+      // INCONCLUSIVE is due to verifiability, not missing coverage. A truly
+      // failed split would have returned above with commentsComplete false.
+      const output: RunnerIssueOutput = {
+        verdict,
+        issueNumber,
+        title: safeString(title),
+        tags,
+        summary,
+        suggestedLabels: aiRaw.filter((entry): entry is string => typeof entry === 'string'),
+        fingerprint,
+        commentsComplete: true,
+        chunks: validatedChunks,
+        chunkCoverageComplete,
+        chunkCount: validatedChunks.length,
+      };
+      saveIssueOutput(output, context);
+      return output;
+    } finally {
+      restoreFetch();
+    }
+  }
+  if (!built.commentsComplete) {
+    const output: RunnerIssueOutput = {
+      verdict: deterministicBlock ? 'NEEDS_CHANGES' : 'INCONCLUSIVE',
+      issueNumber,
+      title: safeString(title),
+      tags: sanitizeLabels([...issueRulesTags(title), 'status:needs-decision']),
+      summary: deterministicBlock
+        ? 'deterministic checks found a blocking finding; review freshness could not be fully verified.'
+        : 'the issue comments could not be fully fetched from GitHub; review freshness could not be verified.',
       suggestedLabels: [],
       fingerprint,
       commentsComplete: false,
@@ -1895,7 +2362,9 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
     const aiRaw = Array.isArray(triaged.suggestedLabels) ? triaged.suggestedLabels : [];
     const { merged, hadUnknown } = mergeRulesWithAiSuggestions(issueRulesTags(title), aiRaw);
     // Deterministic needs-decision for non-APPROVE cannot be cleared by AI.
+    // Phase 2 (H): deterministic BLOCK forces NEEDS_CHANGES (never APPROVE).
     let verdict = triaged.verdict;
+    if (deterministicBlock) verdict = 'NEEDS_CHANGES';
     if (hadUnknown && verdict === 'APPROVE') verdict = 'INCONCLUSIVE';
     const tags = hadUnknown
       ? sanitizeLabels([...issueRulesTags(title), ...(verdict !== 'APPROVE' ? ['status:needs-decision'] : [])])
@@ -2258,7 +2727,7 @@ function escapeMarkdown(value: string): string {
   return safeString(value).replace(/[\\`*_{}\[\]()#+\-.!|<>]/g, '\\$&');
 }
 
-function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = []): string {
+function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = [], reportLine?: string): string {
   const updatedAt = new Date().toISOString();
   const lines = [
     REVIEW_MARKER,
@@ -2270,6 +2739,7 @@ function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = [])
     `審查的 base SHA：\`${output.baseSha}\``,
     `標籤決策：${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join('、') : '無'}`,
     `更新時間：${updatedAt}`,
+    reportLine ?? formatReportLine(process.env, false),
     coverageSummary(output.coverage),
     `省略檔案：${output.coverage.omittedFiles.length > 0
       ? output.coverage.omittedFiles.map((file) => escapeMarkdown(file)).join('、')
@@ -2299,7 +2769,7 @@ function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = [])
   return `${lines.join('\n')}\n`;
 }
 
-function inconclusiveComment(reason: string): string {
+function inconclusiveComment(reason: string, reportLine?: string): string {
   return [
     REVIEW_MARKER,
     '',
@@ -2308,6 +2778,7 @@ function inconclusiveComment(reason: string): string {
     '**判定：INCONCLUSIVE**',
     `**審查結果不可用：${safeString(reason)}**`,
     `更新時間：${new Date().toISOString()}`,
+    reportLine ?? formatReportLine(process.env, false),
     SAFE_MESSAGE,
     '',
   ].join('\n');
@@ -2317,8 +2788,11 @@ function inconclusiveComment(reason: string): string {
 // comment). Carries verdict, summary, label decision, updated time, and the
 // revision fingerprint over title/body/comments so readers can tell whether
 // the published result matches the current issue content.
-function issueReviewComment(output: RunnerIssueOutput, appliedLabels: string[]): string {
+function issueReviewComment(output: RunnerIssueOutput, appliedLabels: string[], reportLine?: string): string {
   const updatedAt = new Date().toISOString();
+  const chunkLine = output.chunks
+    ? `分段：${output.chunkCount ?? output.chunks.length} 段（${output.chunks.map((c) => `#${c.index}:${c.start}-${c.end}`).join('、')}，完整：${output.chunkCoverageComplete === true ? '是' : '否'}）`
+    : '分段：單段（完整）';
   return [
     REVIEW_MARKER,
     '',
@@ -2329,12 +2803,14 @@ function issueReviewComment(output: RunnerIssueOutput, appliedLabels: string[]):
     `摘要：${escapeMarkdown(output.summary) || '（無摘要）'}`,
     `標籤決策：${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join('、') : '無'}`,
     `修訂指紋：\`${output.fingerprint}\``,
+    chunkLine,
     `更新時間：${updatedAt}`,
+    reportLine ?? formatReportLine(process.env, false),
     '',
   ].join('\n');
 }
 
-function issueInconclusiveComment(issueNumber: number, title: string, reason: string, fingerprint: string): string {
+function issueInconclusiveComment(issueNumber: number, title: string, reason: string, fingerprint: string, reportLine?: string): string {
   return [
     REVIEW_MARKER,
     '',
@@ -2345,6 +2821,7 @@ function issueInconclusiveComment(issueNumber: number, title: string, reason: st
     `**審查結果不可用：${safeString(reason)}**`,
     `修訂指紋：\`${safeString(fingerprint, 100)}\``,
     `更新時間：${new Date().toISOString()}`,
+    reportLine ?? formatReportLine(process.env, false),
     SAFE_MESSAGE,
     '',
   ].join('\n');
@@ -2544,15 +3021,18 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     // A throw here is fail-closed (unverifiable) rather than a crash.
     let currentFingerprint = '0'.repeat(64);
     let currentCommentsComplete = false;
+    let currentFetchComplete = false;
     try {
       const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody);
       // P1 #1: compare full-content fingerprints (pre-cut) on both sides so
       // a tail edit past any cap is detected as stale.
       currentFingerprint = builtCurrent.fullFingerprint;
       currentCommentsComplete = builtCurrent.commentsComplete;
+      currentFetchComplete = builtCurrent.fetchComplete;
     } catch {
       currentFingerprint = '0'.repeat(64);
       currentCommentsComplete = false;
+      currentFetchComplete = false;
     }
 
     let validated: RunnerIssueOutput | undefined;
@@ -2582,10 +3062,25 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
           if (!validated) issueFallbackReason = 'the review output schema or contents are invalid.';
           else if (validated.issueNumber !== issueNumber) issueFallbackReason = 'the review output is stale: its issue number no longer matches GitHub.';
           else if (validated.commentsComplete !== true) issueFallbackReason = 'the review output is unverifiable: the issue comments were not fully fetched during review; review freshness could not be verified.';
-          else if (currentCommentsComplete !== true) issueFallbackReason = 'the current issue comments could not be fully fetched from GitHub; review freshness could not be verified.';
+          // Phase 2 (H): chunked artifacts re-verify via transport completeness
+          // (fetchComplete) plus full fingerprint, not the truncated
+          // commentsComplete flag (super-long bodies are always truncated in
+          // the single-turn view but fully covered via chunks).
+          else if (validated.chunks !== undefined
+            ? currentFetchComplete !== true
+            : currentCommentsComplete !== true) issueFallbackReason = 'the current issue comments could not be fully fetched from GitHub; review freshness could not be verified.';
           else if (validated.fingerprint === '0'.repeat(64) || currentFingerprint === '0'.repeat(64)) issueFallbackReason = 'the review output is unverifiable: review freshness could not be verified.';
           else if (validated.fingerprint !== currentFingerprint) issueFallbackReason = 'the review output is stale: the issue content changed after review.';
+          // Phase 2 (H): chunked APPROVE requires full chunk coverage; any
+          // chunked artifact without complete coverage falls back (same
+          // sticky, never a wrong APPROVE). Legacy single-turn artifacts omit
+          // chunk fields and skip this gate.
+          else if (validated.chunks !== undefined && validated.chunkCoverageComplete !== true) issueFallbackReason = 'the review output is unverifiable: issue chunks were not fully covered; review freshness could not be verified.';
+          else if (validated.chunks !== undefined && validated.verdict === 'APPROVE' && validated.chunkCount !== validated.chunks.length) issueFallbackReason = 'the review output is unverifiable: issue chunk count mismatch.';
           else if (hasUnknownAiLabels(validated.suggestedLabels)) issueFallbackReason = 'the AI label suggestions contain unknown labels; discarded.';
+          // Phase 2 (H): full fingerprint re-verification for chunked APPROVE
+          // already covered by the equality above; an APPROVE with chunks must
+          // also carry complete per-segment schema (validated above).
         }
       }
     }
@@ -2594,11 +3089,15 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       const fallbackFingerprint = validated?.fingerprint && /^[0-9a-f]{64}$/.test(validated.fingerprint)
         ? validated.fingerprint
         : currentFingerprint;
+      // Phase 2 (H) reports: failure shows unavailable + INCONCLUSIVE with no
+      // fake link (single sticky ID updated in place via buildStampedBody path
+      // inside publishStickyComment).
+      const fallbackReportLine = formatReportLine(env, false);
       await publishStickyComment(
         client,
         repository,
         issueNumber,
-        issueInconclusiveComment(issueNumber, issueTitle, issueFallbackReason ?? 'a valid review result was unavailable.', fallbackFingerprint),
+        issueInconclusiveComment(issueNumber, issueTitle, issueFallbackReason ?? 'a valid review result was unavailable.', fallbackFingerprint, fallbackReportLine),
       );
       const fallbackDesired = sanitizeLabels([...rulesTitle, 'status:needs-decision']);
       try {
@@ -2627,7 +3126,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
         client,
         repository,
         issueNumber,
-        issueInconclusiveComment(issueNumber, issueTitle, 'the AI label suggestions contain unknown labels; discarded.', currentFingerprint),
+        issueInconclusiveComment(issueNumber, issueTitle, 'the AI label suggestions contain unknown labels; discarded.', currentFingerprint, formatReportLine(env, false)),
       );
       const fallbackDesired = sanitizeLabels([...rulesTitle, 'status:needs-decision']);
       try {
@@ -2654,11 +3153,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       ...(validated.verdict !== 'APPROVE' ? ['status:needs-decision'] : []),
     ]);
     const stickyOutput: RunnerIssueOutput = { ...validated, tags: desiredIssueLabels, fingerprint: validated.fingerprint };
+    // Phase 2 (H): success writes back the artifact/run link (retention 30d);
+    // missing reports or missing run identity degrades to unavailable with no
+    // fake link. Single comment ID is updated in place (publishStickyComment).
+    const successReportsAvailable = areReviewReportsAvailable(env);
+    const successReportLine = formatReportLine(env, successReportsAvailable && getReportRunUrl(env) !== undefined);
     await publishStickyComment(
       client,
       repository,
       issueNumber,
-      issueReviewComment(stickyOutput, desiredIssueLabels),
+      issueReviewComment(stickyOutput, desiredIssueLabels, successReportLine),
     );
     try {
       const reconciliation = await reconcileBotLabelsSafely({
@@ -2787,16 +3291,18 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // Unverifiable output (missing artifact, job != success, malformed,
   // invalid schema, or fresh fetch failure without output): preserved
   // fallback that keeps the claim's ledger. Fail-closed on unreadable ledger.
+  // Phase 2 (H): failure shows report unavailable + INCONCLUSIVE, no fake link.
   if (fallbackReason || !output || !(output && safeSha(output.headSha))) {
     const reasonText = fallbackReason ?? 'a valid review result was unavailable.';
     const baseline = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber);
     if (!baseline.ok) return;
+    const unavailableLine = formatReportLine(env, false);
     await publishStickyComment(
       client,
       repository,
       target.issueNumber,
-      buildStampedBody(inconclusiveComment(reasonText), baseline.ledger, baseline.claims, undefined, undefined, undefined),
-      async () => buildPreservedBody(inconclusiveComment(reasonText)),
+      buildStampedBody(inconclusiveComment(reasonText, unavailableLine), baseline.ledger, baseline.claims, undefined, undefined, undefined),
+      async () => buildPreservedBody(inconclusiveComment(reasonText, unavailableLine)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -2819,12 +3325,13 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // Stale but verifiable output: preserved INCONCLUSIVE fallback that keeps
   // the claim's ledger untouched (never polluting another SHA).
   if (staleReason) {
+    const staleLine = formatReportLine(env, false);
     await publishStickyComment(
       client,
       repository,
       target.issueNumber,
-      reconciledInitialBody(inconclusiveComment(staleReason)),
-      async () => buildReconciledBody(inconclusiveComment(staleReason)),
+      reconciledInitialBody(inconclusiveComment(staleReason, staleLine)),
+      async () => buildReconciledBody(inconclusiveComment(staleReason, staleLine)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -2849,12 +3356,13 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       : 'the AI label suggestions contain issue-triage-only labels; discarded for PR publish.';
     // Never log raw label values (model-controlled); record only the count.
     console.warn(`[PocketGuard] Discarded ${prFiltered.discardedCount} PR AI label(s) outside the convergence allowlist.`);
+    const discardLine = formatReportLine(env, false);
     await publishStickyComment(
       client,
       repository,
       target.issueNumber,
-      reconciledInitialBody(inconclusiveComment(discardReason)),
-      async () => buildReconciledBody(inconclusiveComment(discardReason)),
+      reconciledInitialBody(inconclusiveComment(discardReason, discardLine)),
+      async () => buildReconciledBody(inconclusiveComment(discardReason, discardLine)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -2878,11 +3386,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   ]);
   const labels = sanitizeLabels([...rulesLabels, ...prFiltered.kept]);
   const coverageComplete = output.coverage.complete && output.changedFilesComplete;
+  // Phase 2 (H): success writes back the artifact/run link; failure shows
+  // unavailable with no fake link. Single comment ID updated in place.
+  const prReportsAvailable = areReviewReportsAvailable(env);
+  const prReportLine = formatReportLine(env, prReportsAvailable && getReportRunUrl(env) !== undefined);
 
   let publishFallbackReason: string | undefined;
-  await publishStickyComment(client, repository, target.issueNumber, reconciledInitialBody(reviewComment(output, labels)), async () => {
+  await publishStickyComment(client, repository, target.issueNumber, reconciledInitialBody(reviewComment(output, labels, prReportLine)), async () => {
     publishFallbackReason = await currentReviewProblem(client, repository, target.issueNumber!, output!);
-    const content = publishFallbackReason ? inconclusiveComment(publishFallbackReason) : reviewComment(output!, labels);
+    const unavailableFallback = formatReportLine(env, false);
+    const content = publishFallbackReason ? inconclusiveComment(publishFallbackReason, unavailableFallback) : reviewComment(output!, labels, prReportLine);
     return buildReconciledBody(content);
   });
   if (publishFallbackReason) {
@@ -2892,12 +3405,13 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
 
   const labelFallbackReason = await currentReviewProblem(client, repository, target.issueNumber, output);
   if (labelFallbackReason) {
+    const labelFallbackLine = formatReportLine(env, false);
     await publishStickyComment(
       client,
       repository,
       target.issueNumber,
-      reconciledInitialBody(inconclusiveComment(labelFallbackReason)),
-      async () => buildReconciledBody(inconclusiveComment(labelFallbackReason)),
+      reconciledInitialBody(inconclusiveComment(labelFallbackReason, labelFallbackLine)),
+      async () => buildReconciledBody(inconclusiveComment(labelFallbackReason, labelFallbackLine)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;

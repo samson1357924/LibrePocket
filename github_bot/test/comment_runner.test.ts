@@ -1001,7 +1001,11 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.ok(uploadedArtifactName, 'review job declares an uploaded artifact name');
       assert.ok(downloadedArtifactName, 'publish job declares a downloaded artifact name');
       assert.equal(uploadedArtifactName, downloadedArtifactName, 'upload and download artifact names match');
-      assert.equal(withValue(uploadStep, 'path'), 'github_bot/review-output.json');
+      assert.equal(uploadedArtifactName, 'pocketguard-review-report', 'Phase 2 (H): artifact carries review reports');
+      assert.ok(uploadStep.includes('github_bot/review-output.json'), 'upload includes review output');
+      assert.ok(uploadStep.includes('github_bot/review-report.md'), 'upload includes markdown report');
+      assert.ok(uploadStep.includes('github_bot/review-report.json'), 'upload includes JSON report');
+      assert.match(uploadStep, /retention-days:\s*30/, 'Phase 2 (H): retention 30 days');
       assert.equal(withValue(downloadStep, 'path'), 'github_bot');
       const publishEnv = nestedMapping(publishStep, 'env');
       assert.match(publishEnv, /^\s{10}POCKETGUARD_OUTPUT:\s*['"]?review-output\.json['"]?\s*$/m,

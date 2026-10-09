@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import {
   hasUnknownAiLabels,
   issueContentFingerprint,
+  runClaimMode,
   runIssueReviewMode,
   runPublishMode,
   runReviewMode,
@@ -242,7 +243,10 @@ export async function runStickyLabelTests(): Promise<void> {
         const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', findings: [], suggestedLabels: ['performance'] });
         try {
           const outputPath = path.join(tempDir, 'review.json');
+          let passIndex = 0;
           const runFullPass = async () => {
+            passIndex += 1;
+            const runId = `sticky-s5-${passIndex}`;
             const tagEnv = openAiEnv({ GITHUB_EVENT_NAME: 'issue_comment' });
             const tagged = await runTagMode({
               event: prCommentEvent('/review', 'maintainer'),
@@ -251,10 +255,25 @@ export async function runStickyLabelTests(): Promise<void> {
               writeStdout: () => undefined,
               runGit: safeGitStub(),
             });
+            const claimed = await runClaimMode({
+              event: prCommentEvent('/review', 'maintainer'),
+              env: {
+                GITHUB_EVENT_NAME: 'issue_comment',
+                GITHUB_REPOSITORY: REPO,
+                GITHUB_TOKEN: 'fake-token',
+                POCKETGUARD_RUN_ID: runId,
+                ...(tagged.quotaHeadSha ? { POCKETGUARD_QUOTA_SHA: tagged.quotaHeadSha } : {}),
+              } as NodeJS.ProcessEnv,
+              githubClient: makeClient(state),
+              writeStdout: () => undefined,
+            });
+            if (tagged.reviewGate !== 'none') {
+              assert.equal(claimed.claimed, true, 'open gate claims a slot');
+            }
             const before = counter.count;
             const reviewed = await runReviewMode({
               event: prCommentEvent('/review', 'maintainer'),
-              env: openAiEnv({ GITHUB_EVENT_NAME: 'issue_comment', POCKETGUARD_OUTPUT: outputPath }),
+              env: openAiEnv({ GITHUB_EVENT_NAME: 'issue_comment', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: runId }),
               githubClient: makeClient(state),
               writeStdout: () => undefined,
               runGit: safeGitStub(),
@@ -268,6 +287,7 @@ export async function runStickyLabelTests(): Promise<void> {
                 POCKETGUARD_OUTPUT: outputPath,
                 POCKETGUARD_REVIEW_JOB_RESULT: 'success',
                 POCKETGUARD_TAG_LABELS: JSON.stringify(tagged.labels),
+                POCKETGUARD_RUN_ID: runId,
               } as NodeJS.ProcessEnv,
               githubClient: makeClient(state),
             });
@@ -276,7 +296,7 @@ export async function runStickyLabelTests(): Promise<void> {
           const first = await runFullPass();
           assert.ok(first.made > 0);
           assert.equal(state.created, 1, 'first PR review creates the sticky');
-          assert.equal(state.updated, 0);
+          assert.equal(state.updated, 1, 'first claim plus publish write the sticky');
           const stickyId = state.comments[0].id;
           assert.ok(state.comments[0].body.includes('<!-- PocketGuard-review -->'));
           assert.ok(state.comments[0].body.includes('判定：APPROVE'));
@@ -288,14 +308,14 @@ export async function runStickyLabelTests(): Promise<void> {
           const second = await runFullPass();
           assert.ok(second.made > 0);
           assert.equal(state.created, 1, 'second PR review does not create');
-          assert.equal(state.updated, 1, 'second PR review updates the same sticky');
+          assert.equal(state.updated, 3, 'second claim plus publish update the same sticky');
           assert.equal(state.comments[0].id, stickyId, 'same comment ID');
 
           const third = await runFullPass();
           assert.equal(third.made, 0, 'third review on the same SHA makes zero AI calls');
           assert.equal(third.tagged.reviewGate, 'none');
           assert.equal(state.created, 1);
-          assert.equal(state.updated, 1, 'quota-exhausted publish touches nothing');
+          assert.equal(state.updated, 3, 'quota-exhausted claim and publish touch nothing');
           assert.equal(state.comments[0].id, stickyId);
 
           state.pullRequest = defaultPullRequest(HEAD_SHA_NEW);

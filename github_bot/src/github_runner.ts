@@ -38,14 +38,21 @@ const REVIEW_COUNT_MARKER_PREFIX = '<!-- PocketGuard-reviews:';
 const REVIEW_CLAIM_MARKER_PREFIX = '<!-- PocketGuard-review-claim:';
 // S4 execution matrix: at most two AI reviews per PR+head SHA (the first
 // review plus one re-review); a new head SHA resets the budget. Issues are
-// never counted. The per-PR workflow concurrency group (cancel-in-progress:
-// false) serializes runs as the primary mutex; GitHub offers no
-// compare-and-swap on comments, so a residual race remains if two runs for
-// the same PR ever overlap (see readStickyReviewCount). The sticky comment
-// carries a multi-marker ledger (one `PocketGuard-reviews:<sha>:<n>` line per
-// head SHA, merged with max() so A→B→A never loses history) plus optional
-// per-run claim markers `PocketGuard-review-claim:<sha>:<runId>:<attempt>`
-// for retry idempotency (a retry that finds its own claim never +1+1).
+// never counted. Stage 5 (P1 #1): the budget is consumed by an independent
+// minimal-write claim-slot job that runs after prepare-tag and before
+// review-send (one +1 per (repo,PR,full head SHA) plus a per-run claim
+// marker); review-send only runs AI when its own claim is present, and
+// publish only reconciles (never +1). A started-but-failed run (transport /
+// artifact / publish failure after the claim) never refunds. The per-PR
+// workflow concurrency group (cancel-in-progress: false) serializes runs as
+// the primary mutex; GitHub offers no compare-and-swap on comments, so a
+// residual race remains if two runs for the same PR ever overlap (see
+// readStickyReviewCount and runClaimMode). The sticky comment carries a
+// multi-marker ledger (one `PocketGuard-reviews:<sha>:<n>` line per head SHA,
+// merged with max() so A→B→A never loses history) plus per-run claim markers
+// `PocketGuard-review-claim:<sha>:<runId>:<attempt>` for retry idempotency (a
+// retry that finds its own claim never +1+1; a new run with a new key
+// consumes normally).
 export const MAX_REVIEWS_PER_SHA = 2;
 // Issue-mode context budget, following the existing constant style
 // (MAX_DIFF_LENGTH / MAX_CHANGED_FILES in review_diff.ts).
@@ -168,6 +175,11 @@ export interface TagResult {
   routeKind: RouteKind;
   reviewGate: ReviewGate;
   reviewsUsed: number;
+  // Stage 5 claim input: the full head SHA whose budget tag checked (event
+  // payload for pull_request_target, fresh pulls.get for issue_comment).
+  // Forwarded as `quota_head_sha` so the claim-slot job can pin it against a
+  // trusted pulls.get read before pre-occupying the slot.
+  quotaHeadSha?: string;
   isOwner: boolean;
   actor?: string;
   repoOwner?: string;
@@ -687,12 +699,13 @@ export async function readStickyReviewCount(
   }
 }
 
-// Full-ledger re-read for publish (P1 #2): returns every per-SHA count plus
-// every claim marker from the current sticky (or an empty ledger when no
-// sticky exists yet). Any unreadable state reports unknown so publish stays
-// fail-closed with zero writes.
+// Full-ledger re-read for publish and claim (P1 #2, Stage 5): returns every
+// per-SHA count plus every claim marker plus the sticky body text from the
+// current sticky (or an empty ledger and empty body when no sticky exists
+// yet). Any unreadable state reports unknown so callers stay fail-closed
+// with zero writes.
 export type StickyLedgerRead =
-  | { ok: true; ledger: Map<string, number>; claims: Set<string> }
+  | { ok: true; ledger: Map<string, number>; claims: Set<string>; body: string }
   | { ok: false };
 export async function readStickyLedger(
   client: RunnerGitHubClient | undefined,
@@ -733,9 +746,10 @@ export async function readStickyLedger(
           ok: true,
           ledger: parseReviewCountLedger(sticky.body),
           claims: parseReviewClaimSet(sticky.body),
+          body: typeof sticky.body === 'string' ? sticky.body : '',
         };
       }
-      if (comments.data.length < 100) return { ok: true, ledger: new Map(), claims: new Set() };
+      if (comments.data.length < 100) return { ok: true, ledger: new Map(), claims: new Set(), body: '' };
     }
   } catch {
     return { ok: false };
@@ -914,10 +928,11 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
   const repoOwner = resolveRouteRepoOwner(env, event);
   const isOwner = isRepositoryOwner(actor, repoOwner);
   const action = typeof event.action === 'string' ? event.action : '';
-  // S4 quota: an open PR gate closes when this PR+head SHA already consumed
-  // its budget, or when the counter is unreadable (fail-closed). Only started
-  // reviews count (routing/authorization denials never reach a sticky write),
-  // and a new SHA restarts. Issue targets never open a PR gate and never
+  // S4 quota (Stage 5: consumed by the claim-slot job): an open PR gate
+  // closes when this PR+head SHA already consumed its budget, or when the
+  // counter is unreadable (fail-closed). Only claimed reviews consume
+  // (routing/authorization denials never reach a sticky write), and a new SHA
+  // restarts. Issue targets never open a PR gate and never consume quota:
   // consume quota: they are forced to none here and scheduled via the explicit
   // issue-auto route (routeKind first-review/issue-update plus should_review)
   // with no auth/quota gate by owner decision (this phase: no budget/rate
@@ -979,6 +994,7 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     routeKind: route.kind,
     reviewGate,
     reviewsUsed,
+    ...(quotaSha && safeSha(quotaSha) ? { quotaHeadSha: quotaSha.toLowerCase() } : {}),
     isOwner,
     ...(actor ? { actor } : {}),
     ...(repoOwner ? { repoOwner } : {}),
@@ -1003,6 +1019,7 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     route_kind: result.routeKind,
     review_gate: result.reviewGate,
     reviews_used: String(result.reviewsUsed),
+    ...(result.quotaHeadSha ? { quota_head_sha: result.quotaHeadSha } : {}),
     is_owner: String(result.isOwner),
     ...(result.actor ? { actor: result.actor } : {}),
     ...(result.repoOwner ? { repo_owner: result.repoOwner } : {}),
@@ -1011,6 +1028,149 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
   });
   stdout(context, `${JSON.stringify(result)}\n`);
   return result;
+}
+
+// Stage 5 claim-slot mode (P1 #1, scheme A): pre-occupies one per-SHA review
+// slot before any AI work. Runs in its own minimal-write workflow job after
+// prepare-tag and before review-send, with only issues:write (no OpenAI
+// secrets, no fork checkout, no git). Inputs reuse the tag scheduling
+// (route/authorized/review_gate) plus a trusted fresh pulls.get SHA pin; an
+// optional POCKETGUARD_QUOTA_SHA (the tag `quota_head_sha` output) must match
+// the fresh head when present, otherwise fail-closed with no write.
+//
+// Semantics: claim = (repo,PR,full head SHA) first +1 plus a per-run
+// (sha,run_id,attempt) marker. review-send only runs AI when its own claim
+// marker is present; publish only reconciles and never +1. Routing,
+// authorization, or quota blocks (unstarted) write nothing and count zero; a
+// reserved slot whose later transport/artifact/publish fails is never
+// refunded. Same-PR workflow concurrency serializes runs as the primary
+// mutex; the claim re-reads the ledger immediately before writing, the same
+// (sha,run_id,attempt) re-entry never re-adds, and a new run with a new key
+// consumes normally. GitHub offers no compare-and-swap on comments, so a
+// residual race remains if two runs for the same PR ever overlap.
+export interface ClaimResult {
+  claimed: boolean;
+  claimSha?: string;
+  reviewsUsed: number;
+  reason: string;
+  issueNumber?: number;
+}
+
+const CLAIM_PLACEHOLDER_BODY = `${REVIEW_MARKER}\n\n## PocketGuard 審查\n\n**判定：INCONCLUSIVE**\n**審查預佔名額已保留，等待審查結果。**\n`;
+
+export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimResult> {
+  const env = context.env ?? process.env;
+  const emit = (result: ClaimResult): ClaimResult => {
+    appendWorkflowOutputs(env, {
+      claimed: String(result.claimed),
+      ...(result.claimSha ? { claim_sha: result.claimSha } : {}),
+      reviews_used: String(result.reviewsUsed),
+      ...(result.issueNumber ? { issue_number: String(result.issueNumber) } : {}),
+      claim_reason: result.reason,
+    });
+    stdout(context, `${JSON.stringify(result)}\n`);
+    return result;
+  };
+  let event: GithubEvent;
+  try {
+    event = eventFrom(context);
+  } catch {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'claim-unknown: event unavailable' });
+  }
+  const repository = repositoryParts(env, event);
+  const eventName = env.GITHUB_EVENT_NAME ?? '';
+  if (!repository) {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'quota-unknown: repository identity unavailable' });
+  }
+  const target = await inspectTarget(context);
+  if (!target.issueNumber) {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'unstarted: no issue number' });
+  }
+  const issueNumber = target.issueNumber;
+  // Issues are never counted: no-op success so the issue-auto review still runs.
+  if (target.target === 'issue') {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'issue: never counted', issueNumber });
+  }
+  // Routed-ignore (non-owner synchronize, chatter, unsubscribed actions, bot)
+  // never starts: zero count, no write.
+  const claimRoute = routeEvent(event, env);
+  if (claimRoute.kind === 'ignore') {
+    return emit({ claimed: false, reviewsUsed: 0, reason: `unstarted: ${claimRoute.reason}`, issueNumber });
+  }
+  if (isBotEventActor(event)) {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'unstarted: bot actor', issueNumber });
+  }
+  if (!eventCommentAllowed(target, eventName)) {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'unstarted: event not reviewable', issueNumber });
+  }
+  // Defense in depth for the workflow claim gate: an issue_comment without an
+  // explicit authorized verdict claims nothing.
+  if (eventName === 'issue_comment' && target.authorized !== true) {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'unstarted: unauthorized', issueNumber });
+  }
+  const client = apiClient(context, env.GITHUB_TOKEN ?? '');
+  if (!client) {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'quota-unknown: client unavailable', issueNumber });
+  }
+  // Trusted fresh SHA pin: the counting SHA is always the live pulls.get head,
+  // never the webhook snapshot alone. An optional POCKETGUARD_QUOTA_SHA (tag
+  // `quota_head_sha`) must match the fresh head when present; any mismatch or
+  // fetch failure fails closed with no write.
+  let freshPullRequest: PullRequestData | undefined;
+  try {
+    const response = await client.rest.pulls.get({
+      owner: repository.owner,
+      repo: repository.repo,
+      pull_number: issueNumber,
+    });
+    if (!validPullRequestData(response?.data) || response.data.number !== issueNumber) {
+      return emit({ claimed: false, reviewsUsed: 0, reason: 'quota-unknown: invalid pull request identity', issueNumber });
+    }
+    freshPullRequest = response.data;
+  } catch {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'quota-unknown: pull request fetch failed', issueNumber });
+  }
+  if (!freshPullRequest || !safeSha(freshPullRequest.head.sha)) {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'quota-unknown: invalid head SHA', issueNumber });
+  }
+  const rawExpected = env.POCKETGUARD_QUOTA_SHA;
+  if (typeof rawExpected === 'string' && rawExpected.trim() !== '') {
+    const expectedSha = rawExpected.trim().toLowerCase();
+    if (!safeSha(expectedSha) || expectedSha !== freshPullRequest.head.sha.toLowerCase()) {
+      return emit({ claimed: false, reviewsUsed: 0, reason: 'quota-unknown: head SHA mismatch', issueNumber });
+    }
+  }
+  const claimSha = freshPullRequest.head.sha.toLowerCase();
+  // Read-then-write: an unreadable ledger fails closed with no write.
+  const baseline = await readStickyLedger(client, repository.owner, repository.repo, issueNumber);
+  if (!baseline.ok) {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'quota-unknown: sticky ledger unreadable', issueNumber });
+  }
+  const existing = baseline.ledger.get(claimSha) ?? 0;
+  if (existing >= MAX_REVIEWS_PER_SHA) {
+    return emit({ claimed: false, reviewsUsed: existing, reason: `quota-exhausted: head ${claimSha} already at ${existing}`, issueNumber, claimSha });
+  }
+  const claimKey = resolveCountClaimKey(env);
+  const claimPresent = claimKey ? baseline.claims.has(`${claimSha}:${claimKey}`) : false;
+  const expected = claimPresent ? existing : existing + 1;
+  const baseText = baseline.body.includes(REVIEW_MARKER) ? baseline.body : CLAIM_PLACEHOLDER_BODY;
+  const cleanText = stripReviewClaimMarkers(baseText);
+  const initialBody = buildStampedBody(cleanText, baseline.ledger, baseline.claims, claimSha, expected, claimKey);
+  const buildFreshBody = async (): Promise<string> => {
+    const fresh = await readStickyLedger(client, repository.owner, repository.repo, issueNumber);
+    if (!fresh.ok) throw new Error('PocketGuard: failed to claim review slot.');
+    const freshExisting = fresh.ledger.get(claimSha) ?? 0;
+    const freshPresent = claimKey ? fresh.claims.has(`${claimSha}:${claimKey}`) : false;
+    const freshExpected = freshPresent ? freshExisting : freshExisting + 1;
+    const freshBase = fresh.body.includes(REVIEW_MARKER) ? fresh.body : CLAIM_PLACEHOLDER_BODY;
+    return buildStampedBody(stripReviewClaimMarkers(freshBase), fresh.ledger, fresh.claims, claimSha, freshExpected, claimKey);
+  };
+  try {
+    await publishStickyComment(client, repository, issueNumber, initialBody, buildFreshBody);
+  } catch {
+    throw new Error('PocketGuard: failed to claim review slot.');
+  }
+  return emit({ claimed: true, reviewsUsed: expected, reason: `claimed: head ${claimSha} now at ${expected}`, issueNumber, claimSha });
 }
 
 function defaultGit(args: string[]): string {
@@ -1637,13 +1797,18 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
       return output;
     }
 
-    // S4 execution matrix: routed-ignore events (non-owner synchronize,
-    // ordinary chatter, unsubscribed actions, bot events) never reach AI, and
-    // review mode re-reads the sticky counter immediately before any git or
-    // OpenAI work as defense in depth against concurrent runs that both
-    // passed tag mode. A quota denial or an unreadable counter (fail-closed)
-    // returns the generic output with zero OpenAI calls and — like every
-    // routing or authorization denial — is never counted.
+    // Stage 5 execution matrix (P1 #1, scheme A): routed-ignore events
+    // (non-owner synchronize, ordinary chatter, unsubscribed actions, bot
+    // events) never reach AI, and review mode re-reads the sticky ledger
+    // immediately before any git or OpenAI work as defense in depth against
+    // concurrent runs. Quota is consumed by the claim-slot job before review:
+    // when a run id is available the review proceeds only when its own
+    // (sha,run_id,attempt) claim marker is present (an approved claim owns
+    // its slot even at the limit); without its own claim — claim skipped,
+    // failed, or exhausted — it returns the generic output with zero OpenAI
+    // calls. Runs without a run id (local) fall back to the count check.
+    // Like every routing or authorization denial, a blocked review is never
+    // counted (counting happens only in the claim job).
     const reviewEvent = eventFrom(context);
     const reviewRoute = routeEvent(reviewEvent, env);
     if (reviewRoute.kind === 'ignore') {
@@ -1657,16 +1822,35 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
     }
     {
       const quotaClient = apiClient(context, env.GITHUB_TOKEN ?? '');
-      const quota = await readStickyReviewCount(
-        quotaClient,
-        reviewRepository.owner,
-        reviewRepository.repo,
-        target.issueNumber,
-        target.pullRequest.head.sha,
-      );
-      if (!quota.ok || quota.used >= MAX_REVIEWS_PER_SHA) {
-        saveReviewOutput(output, context);
-        return output;
+      const reviewClaimKey = resolveCountClaimKey(env);
+      if (reviewClaimKey) {
+        const ledger = await readStickyLedger(
+          quotaClient,
+          reviewRepository.owner,
+          reviewRepository.repo,
+          target.issueNumber,
+        );
+        if (!ledger.ok) {
+          saveReviewOutput(output, context);
+          return output;
+        }
+        const reviewSha = target.pullRequest.head.sha.toLowerCase();
+        if (!ledger.claims.has(`${reviewSha}:${reviewClaimKey}`)) {
+          saveReviewOutput(output, context);
+          return output;
+        }
+      } else {
+        const quota = await readStickyReviewCount(
+          quotaClient,
+          reviewRepository.owner,
+          reviewRepository.repo,
+          target.issueNumber,
+          target.pullRequest.head.sha,
+        );
+        if (!quota.ok || quota.used >= MAX_REVIEWS_PER_SHA) {
+          saveReviewOutput(output, context);
+          return output;
+        }
       }
     }
 
@@ -2346,30 +2530,38 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     fallbackReason = 'the current pull request state could not be fetched from GitHub.';
   }
 
-  // S4 quota (P1 #2 ledger): an exhausted budget — or an unreadable counter
-  // (fail-closed) — publishes nothing — the sticky comment and labels keep
-  // the previous review untouched. This early check covers the fresh head SHA
-  // so quota-exhausted/unknown runs never touch the sticky; the per-SHA
-  // counting-SHA check after artifact validation covers stale artifacts (the
-  // count always follows artifact output.headSha, never freshHead). Counting
-  // happens only for started reviews with verifiable output (including
-  // INCONCLUSIVE fallbacks and illegal-label downgrades, which still ran AI);
-  // every write in one publish run shares a single expected stamp plus the
-  // (headSHA,run_id/run_attempt) claim, so the label-fallback overwrite
-  // cannot double-count. Without verifiable output the write preserves the
-  // existing ledger with no new marker (degraded, uncounted) rather than a
-  // wrong one. Only started reviews count: routing/authorization denials
-  // return above with zero writes, and quota-exhausted returns here.
+  // Stage 5 quota (claim-slot counts, publish reconciles): an exhausted
+  // budget — or an unreadable counter (fail-closed) — publishes nothing — the
+  // sticky comment and labels keep the previous review untouched. This early
+  // check covers the fresh head SHA so quota-exhausted/unknown runs never
+  // touch the sticky. Counting happens only in the claim-slot job before AI
+  // (including its hold for runs whose later transport/artifact/publish
+  // fails, which is never refunded); every publish write below preserves the
+  // ledger and claim set with no new marker. A run that owns its
+  // (freshSHA,run_id/run_attempt) claim always reconciles (even at the
+  // limit — it owns the slot); without its own claim an exhausted budget — or
+  // an unreadable counter (fail-closed) — publishes nothing. Only claimed
+  // reviews consume: routing/authorization denials return above with zero
+  // writes, and quota-exhausted without a claim returns here.
   if (freshPullRequest && safeSha(freshPullRequest.head.sha)) {
-    const quota = await readStickyReviewCount(
-      client,
-      repository.owner,
-      repository.repo,
-      target.issueNumber,
-      freshPullRequest.head.sha,
-    );
-    if (!quota.ok) return;
-    if (quota.used >= MAX_REVIEWS_PER_SHA) return;
+    const freshLower = freshPullRequest.head.sha.toLowerCase();
+    const publishClaimKey = resolveCountClaimKey(env);
+    if (publishClaimKey) {
+      const ledger = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber);
+      if (!ledger.ok) return;
+      const used = ledger.ledger.get(freshLower) ?? 0;
+      if (!ledger.claims.has(`${freshLower}:${publishClaimKey}`) && used >= MAX_REVIEWS_PER_SHA) return;
+    } else {
+      const quota = await readStickyReviewCount(
+        client,
+        repository.owner,
+        repository.repo,
+        target.issueNumber,
+        freshPullRequest.head.sha,
+      );
+      if (!quota.ok) return;
+      if (quota.used >= MAX_REVIEWS_PER_SHA) return;
+    }
   }
 
   const outputPath = env.POCKETGUARD_OUTPUT ?? 'review-output.json';
@@ -2405,13 +2597,13 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     }
   }
 
-  // P1 #2 attribution: the counting SHA is always the verified artifact
-  // output.headSha, never freshHead. A stale artifact still counts (AI did
-  // run) but toward output.headSha so current B stays untouched. Without
-  // verifiable output there is nothing to attribute: the review never started,
-  // so the fallback preserves the ledger with no new marker and no count.
-  const countingSha = output && safeSha(output.headSha) ? output.headSha.toLowerCase() : undefined;
-  const claimKey = resolveCountClaimKey(env);
+  // Stage 5 attribution (P1 #1, scheme A): counting happens only in the
+  // claim-slot job before AI, never here. Every sticky write below preserves
+  // the ledger and claim set unchanged (no new marker, no increment) and only
+  // reconciles content: a stale artifact still publishes its INCONCLUSIVE
+  // fallback toward the preserved ledger, and without verifiable output the
+  // fallback likewise preserves. Started-but-failed runs keep the claim's
+  // count (never refunded); unstarted runs (no claim) keep zero.
   const buildPreservedBody = async (freshContent: string): Promise<string> => {
     const fresh = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber!);
     if (!fresh.ok) throw new Error('PocketGuard: failed to publish review comment.');
@@ -2419,9 +2611,9 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   };
 
   // Unverifiable output (missing artifact, job != success, malformed,
-  // invalid schema, or fresh fetch failure without output): uncounted
-  // fallback that preserves the ledger. Fail-closed on unreadable ledger.
-  if (fallbackReason || !output || !countingSha) {
+  // invalid schema, or fresh fetch failure without output): preserved
+  // fallback that keeps the claim's ledger. Fail-closed on unreadable ledger.
+  if (fallbackReason || !output || !(output && safeSha(output.headSha))) {
     const reasonText = fallbackReason ?? 'a valid review result was unavailable.';
     const baseline = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber);
     if (!baseline.ok) return;
@@ -2436,37 +2628,29 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     return;
   }
 
-  // From here output and countingSha are verified and fallbackReason is
-  // undefined. Re-read the ledger after artifact validation and before any
-  // write; every counted write below merges with max(existing,expected) plus
-  // the run claim so retries never +1+1 and other SHAs are preserved.
-  const baselineCounted = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber);
-  if (!baselineCounted.ok) return;
-  const existingForCount = baselineCounted.ledger.get(countingSha) ?? 0;
-  if (existingForCount >= MAX_REVIEWS_PER_SHA) return;
-  if (freshPullRequest && safeSha(freshPullRequest.head.sha)) {
-    const freshLower = freshPullRequest.head.sha.toLowerCase();
-    if (freshLower !== countingSha && (baselineCounted.ledger.get(freshLower) ?? 0) >= MAX_REVIEWS_PER_SHA) return;
-  }
-  const claimPresentBaseline = claimKey ? baselineCounted.claims.has(`${countingSha}:${claimKey}`) : false;
-  const expectedBaseline = claimPresentBaseline ? existingForCount : existingForCount + 1;
-  const buildCountedBody = async (freshContent: string): Promise<string> => {
+  // From here output is verified and fallbackReason is undefined. Re-read
+  // the ledger after artifact validation and before any write; every write
+  // below preserves the ledger and claim set (reconciliation only) so
+  // retries never +1+1 and other SHAs are preserved.
+  const baselineReconciled = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber);
+  if (!baselineReconciled.ok) return;
+  const buildReconciledBody = async (freshContent: string): Promise<string> => {
     const fresh = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber!);
     if (!fresh.ok) throw new Error('PocketGuard: failed to publish review comment.');
-    return buildStampedBody(freshContent, fresh.ledger, fresh.claims, countingSha, expectedBaseline, claimKey);
+    return buildStampedBody(freshContent, fresh.ledger, fresh.claims, undefined, undefined, undefined);
   };
-  const countedInitialBody = (freshContent: string): string =>
-    buildStampedBody(freshContent, baselineCounted.ledger, baselineCounted.claims, countingSha, expectedBaseline, claimKey);
+  const reconciledInitialBody = (freshContent: string): string =>
+    buildStampedBody(freshContent, baselineReconciled.ledger, baselineReconciled.claims, undefined, undefined, undefined);
 
-  // Stale but verifiable output: counted INCONCLUSIVE toward output.headSha,
-  // never polluting the current freshHead.
+  // Stale but verifiable output: preserved INCONCLUSIVE fallback that keeps
+  // the claim's ledger untouched (never polluting another SHA).
   if (staleReason) {
     await publishStickyComment(
       client,
       repository,
       target.issueNumber,
-      countedInitialBody(inconclusiveComment(staleReason)),
-      async () => buildCountedBody(inconclusiveComment(staleReason)),
+      reconciledInitialBody(inconclusiveComment(staleReason)),
+      async () => buildReconciledBody(inconclusiveComment(staleReason)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -2476,8 +2660,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // entries are discarded with a log and force INCONCLUSIVE on the same
   // sticky (never a wrong APPROVE, never writing illegal labels). Manual
   // labels outside the bot scope are always preserved by reconciliation.
-  // An illegal-label downgrade still ran AI, so it counts once toward the
-  // same counting SHA.
+  // The ledger stays as the claim left it (reconciliation only).
   const aiRaw = Array.isArray(output.suggestedLabels) ? output.suggestedLabels : [];
   const { sanitizedAi, hadUnknown } = mergeRulesWithAiSuggestions([], aiRaw);
   if (hadUnknown) {
@@ -2485,8 +2668,8 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       client,
       repository,
       target.issueNumber,
-      countedInitialBody(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
-      async () => buildCountedBody(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
+      reconciledInitialBody(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
+      async () => buildReconciledBody(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -2512,10 +2695,10 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   const coverageComplete = output.coverage.complete && output.changedFilesComplete;
 
   let publishFallbackReason: string | undefined;
-  await publishStickyComment(client, repository, target.issueNumber, countedInitialBody(reviewComment(output, labels)), async () => {
+  await publishStickyComment(client, repository, target.issueNumber, reconciledInitialBody(reviewComment(output, labels)), async () => {
     publishFallbackReason = await currentReviewProblem(client, repository, target.issueNumber!, output!);
     const content = publishFallbackReason ? inconclusiveComment(publishFallbackReason) : reviewComment(output!, labels);
-    return buildCountedBody(content);
+    return buildReconciledBody(content);
   });
   if (publishFallbackReason) {
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
@@ -2528,8 +2711,8 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       client,
       repository,
       target.issueNumber,
-      countedInitialBody(inconclusiveComment(labelFallbackReason)),
-      async () => buildCountedBody(inconclusiveComment(labelFallbackReason)),
+      reconciledInitialBody(inconclusiveComment(labelFallbackReason)),
+      async () => buildReconciledBody(inconclusiveComment(labelFallbackReason)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -2560,23 +2743,24 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   }
 }
 
-function modeFromArgs(args: string[]): 'tag' | 'review' | 'publish' | undefined {
+function modeFromArgs(args: string[]): 'tag' | 'review' | 'publish' | 'claim' | undefined {
   const inline = args.find((arg) => arg.startsWith('--mode='))?.slice('--mode='.length);
   const index = args.indexOf('--mode');
   const mode = inline ?? (index >= 0 ? args[index + 1] : undefined);
-  return mode === 'tag' || mode === 'review' || mode === 'publish' ? mode : undefined;
+  return mode === 'tag' || mode === 'review' || mode === 'publish' || mode === 'claim' ? mode : undefined;
 }
 
 async function main(): Promise<void> {
   const mode = modeFromArgs(process.argv.slice(2));
   if (!mode) {
-    process.stderr.write('PocketGuard: specify --mode=tag, --mode=review, or --mode=publish.\n');
+    process.stderr.write('PocketGuard: specify --mode=tag, --mode=review, --mode=claim, or --mode=publish.\n');
     process.exitCode = 2;
     return;
   }
   try {
     if (mode === 'tag') await runTagMode();
     if (mode === 'review') await runReviewEntryMode();
+    if (mode === 'claim') await runClaimMode();
     if (mode === 'publish') await runPublishMode();
   } catch {
     process.stderr.write('PocketGuard: operation failed.\n');

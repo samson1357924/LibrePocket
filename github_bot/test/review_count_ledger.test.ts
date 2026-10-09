@@ -12,6 +12,7 @@ import {
   parseReviewCountMarker,
   readStickyLedger,
   resolveCountClaimKey,
+  runClaimMode,
   runPublishMode,
   runReviewMode,
   runTagMode,
@@ -39,6 +40,7 @@ interface FakeState {
   pullRequest: Record<string, unknown>;
   nextId: number;
   updateThrows?: boolean;
+  permission?: string;
 }
 
 function defaultPullRequest(headSha: string): Record<string, unknown> {
@@ -81,7 +83,7 @@ function makeClient(state: FakeState): NonNullable<RunnerContext['githubClient']
       repos: {
         getCollaboratorPermissionLevel: async () => {
           state.operations.push('permission-check');
-          return { data: { permission: 'write' } };
+          return { data: { permission: state.permission ?? 'write' } };
         },
       },
       issues: {
@@ -195,7 +197,39 @@ function ledgerOf(body: string): Map<string, number> {
   return parseReviewCountLedger(body);
 }
 
-/** One full tag → review → publish pass for the given head SHA and run id. */
+function prCommentEventFor(body: string, login: string): Record<string, unknown> {
+  return {
+    action: 'created',
+    repository: { full_name: REPO },
+    issue: { number: 41, pull_request: { url: 'unused' }, title: 'topic' },
+    comment: { body, user: { login, type: 'User' } },
+  };
+}
+
+/** Stage 5 claim step for the given head SHA and run id (mirrors the claim-slot job). */
+async function runClaimPass(
+  state: FakeState,
+  headSha: string,
+  runId: string,
+  quotaSha?: string,
+): Promise<{ claimed: boolean; used: number }> {
+  state.pullRequest = defaultPullRequest(headSha);
+  const claimed = await runClaimMode({
+    event: prOpenedEvent(headSha),
+    env: {
+      GITHUB_EVENT_NAME: 'pull_request_target',
+      GITHUB_REPOSITORY: REPO,
+      GITHUB_TOKEN: 'fake-token',
+      POCKETGUARD_RUN_ID: runId,
+      ...(quotaSha ? { POCKETGUARD_QUOTA_SHA: quotaSha } : {}),
+    } as NodeJS.ProcessEnv,
+    githubClient: makeClient(state),
+    writeStdout: () => undefined,
+  });
+  return { claimed: claimed.claimed, used: claimed.reviewsUsed };
+}
+
+/** One full tag → claim → review → publish pass for the given head SHA and run id. */
 async function runFullPass(
   state: FakeState,
   headSha: string,
@@ -213,10 +247,24 @@ async function runFullPass(
     writeStdout: () => undefined,
     runGit: safeGitStub(),
   });
+  const claimEnv = {
+    GITHUB_EVENT_NAME: 'pull_request_target',
+    GITHUB_REPOSITORY: REPO,
+    GITHUB_TOKEN: 'fake-token',
+    POCKETGUARD_RUN_ID: runId,
+    ...(tagged.quotaHeadSha ? { POCKETGUARD_QUOTA_SHA: tagged.quotaHeadSha } : {}),
+  } as NodeJS.ProcessEnv;
+  const claimed = await runClaimMode({
+    event,
+    env: claimEnv,
+    githubClient: makeClient(state),
+    writeStdout: () => undefined,
+  });
+  assert.equal(claimed.claimed, true, `claim pre-occupies the slot for ${runId}`);
   const before = counter.count;
   await runReviewMode({
     event,
-    env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath }),
+    env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: runId }),
     githubClient: makeClient(state),
     writeStdout: () => undefined,
     runGit: safeGitStub(),
@@ -318,10 +366,25 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           });
           assert.equal(tagged.reviewsUsed, 2);
           assert.equal(tagged.reviewGate, 'none');
+          const claimBlocked = await runClaimMode({
+            event,
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_RUN_ID: 'run-a3-blocked',
+              ...(tagged.quotaHeadSha ? { POCKETGUARD_QUOTA_SHA: tagged.quotaHeadSha } : {}),
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+          });
+          assert.equal(claimBlocked.claimed, false, 'quota-exhausted claim writes nothing');
+          const createdBefore = state.created;
+          assert.equal(state.created, createdBefore, 'quota-exhausted claim creates nothing');
           const before = counter.count;
           const reviewed = await runReviewMode({
             event,
-            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath }),
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: 'run-a3-blocked' }),
             githubClient: makeClient(state),
             writeStdout: () => undefined,
             runGit: safeGitStub(),
@@ -353,7 +416,10 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       }
     }
 
-    // --- Test 2: stale A artifact while B is current counts toward A only. ---
+    // --- Test 2: stale A artifact while B is current never pollutes B. ---
+    // Stage 5: counting happens only in the claim (here for the current head
+    // B); publish only reconciles, so the stale A artifact publishes its
+    // INCONCLUSIVE fallback while the ledger keeps the claim's B:1 and A:0.
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-stale-'));
       try {
@@ -373,6 +439,9 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           restore();
         }
         const state = makeState({ pullRequest: defaultPullRequest(SHA_B) });
+        const claimedB = await runClaimPass(state, SHA_B, 'run-stale-1');
+        assert.equal(claimedB.claimed, true, 'claim reserves the current head B');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_B), 1);
         await runPublishMode({
           event: prOpenedEvent(SHA_B),
           env: {
@@ -386,20 +455,26 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           } as NodeJS.ProcessEnv,
           githubClient: makeClient(state),
         });
-        assert.equal(state.created, 1);
+        assert.equal(state.created, 1, 'claim created the single sticky; publish reuses it');
         assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'stale publishes a fallback');
-        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'stale counts toward artifact SHA');
-        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_B), 0, 'current SHA is not polluted');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_B), 1, 'current SHA keeps the claim');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 0, 'stale artifact SHA is not counted by publish');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
     }
 
-    // --- Test 3: send-failure after AI started counts exactly once. ---
-    // --- Test 7 (part 1): three roles together count as one publish. ---
+    // --- Test 3: send-failure after AI started keeps the claim (exactly once). ---
+    // --- Test 7 (part 1): three roles together consume one claimed slot. ---
+    // Stage 5: the claim pre-occupies the slot; the later transport failure
+    // never refunds, and publish only reconciles (stays at 1).
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-sendfail-'));
       try {
+        const state = makeState();
+        const claimed = await runClaimPass(state, SHA_A, 'run-sendfail-1');
+        assert.equal(claimed.claimed, true, 'claim reserves the slot before AI');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1);
         const counter = { count: 0 };
         const throwingFetch = globalThis.fetch;
         globalThis.fetch = (async () => {
@@ -408,11 +483,10 @@ export async function runReviewCountLedgerTests(): Promise<void> {
         }) as typeof fetch;
         const outputPath = path.join(tempDir, 'review.json');
         try {
-          const buildState = makeState();
           const reviewed = await runReviewMode({
             event: prOpenedEvent(SHA_A),
-            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath }),
-            githubClient: makeClient(buildState),
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: 'run-sendfail-1' }),
+            githubClient: makeClient(state),
             writeStdout: () => undefined,
             runGit: safeGitStub(),
           });
@@ -422,7 +496,6 @@ export async function runReviewCountLedgerTests(): Promise<void> {
         } finally {
           globalThis.fetch = throwingFetch;
         }
-        const state = makeState();
         await runPublishMode({
           event: prOpenedEvent(SHA_A),
           env: {
@@ -436,7 +509,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           } as NodeJS.ProcessEnv,
           githubClient: makeClient(state),
         });
-        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'started review counts once despite 3 role attempts');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'started review keeps its single claimed slot despite 3 role attempts');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -453,7 +526,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           const outputPath = path.join(tempDir, 'review.json');
           const { made } = await runFullPass(state, SHA_A, 'run-roles-1', outputPath, counter);
           assert.ok(made >= 3, `three roles ran (got ${made})`);
-          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'one publish counts +1 total');
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'one claimed run holds +1 total');
         } finally {
           restore();
         }
@@ -462,7 +535,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       }
     }
 
-    // --- Test 4: missing artifact / failed job without output: zero count, no marker. ---
+    // --- Test 4a: truly unstarted (no claim) publish preserves zero, no marker. ---
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-unstarted-'));
       try {
@@ -528,29 +601,171 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       }
     }
 
-    // --- Test 5: publish write failure throws, writes no labels, retry is idempotent. ---
+    // --- Test 4b (Stage 5 rewrite): claimed-but-unverifiable keeps the claim (never refunded). ---
+    // The old zero-count expectation was the P1 #1 bug: AI had already been
+    // paid for once the claim reserved the slot, so a later missing artifact
+    // or failed job must not zero the ledger. Publish only reconciles content.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-claimed-missing-'));
+      try {
+        const missingPath = path.join(tempDir, 'absent.json');
+        const state = makeState();
+        const claimed = await runClaimPass(state, SHA_A, 'run-claimed-missing-1');
+        assert.equal(claimed.claimed, true);
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'claim pre-occupies the slot');
+        await runPublishMode({
+          event: prOpenedEvent(SHA_A),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: missingPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+            POCKETGUARD_RUN_ID: 'run-claimed-missing-1',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+        });
+        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'missing artifact still publishes a fallback');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'missing artifact after claim keeps the slot');
+
+        // Failed job result after a claim: same, the slot is never refunded.
+        const state2 = makeState();
+        await runClaimPass(state2, SHA_A, 'run-claimed-failed-1');
+        await runPublishMode({
+          event: prOpenedEvent(SHA_A),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: missingPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'failure',
+            POCKETGUARD_TAG_LABELS: '[]',
+            POCKETGUARD_RUN_ID: 'run-claimed-failed-1',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state2),
+        });
+        assert.equal(parseReviewCountMarker(state2.comments[0].body, SHA_A), 1, 'failed job after claim keeps the slot');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // --- Test 4c (Stage 5): four unstarted claim paths stay at zero with no writes. ---
+    {
+      // (1) route ignore: pull_request_target edited is not routed.
+      {
+        const state = makeState();
+        const ignored = await runClaimMode({
+          event: { ...prOpenedEvent(SHA_A), action: 'edited' },
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'run-ignore-1',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+        });
+        assert.equal(ignored.claimed, false);
+        assert.equal(state.created, 0, 'route-ignore claim creates nothing');
+        assert.equal(state.updated, 0, 'route-ignore claim updates nothing');
+      }
+      // (2) unauthorized: read-only outsider /review on a PR.
+      {
+        const state = makeState({ permission: 'read' });
+        const denied = await runClaimMode({
+          event: prCommentEventFor('/review', 'outsider'),
+          env: {
+            GITHUB_EVENT_NAME: 'issue_comment',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'run-unauth-1',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+        });
+        assert.equal(denied.claimed, false);
+        assert.equal(state.created, 0, 'unauthorized claim creates nothing');
+        assert.equal(state.updated, 0, 'unauthorized claim updates nothing');
+      }
+      // (3) quota-exhausted: pre-seeded A:2 stays untouched.
+      {
+        const sticky = stickyBodyFor(new Map([[SHA_A, 2]]));
+        const state = makeState({
+          comments: [{ id: 7, body: sticky, user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        const exhausted = await runClaimMode({
+          event: prOpenedEvent(SHA_A),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'run-exhausted-1',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+        });
+        assert.equal(exhausted.claimed, false);
+        assert.equal(state.created, 0, 'quota-exhausted claim creates nothing');
+        assert.equal(state.updated, 0, 'quota-exhausted claim updates nothing');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2);
+      }
+      // (4) quota-unknown: unreadable ledger fails closed with no writes.
+      {
+        const broken = {
+          rest: {
+            pulls: { get: async () => ({ data: defaultPullRequest(SHA_A) }) },
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              listComments: async () => { throw new Error('synthetic list failure'); },
+              createComment: async () => { throw new Error('must not write on quota-unknown'); },
+              updateComment: async () => { throw new Error('must not write on quota-unknown'); },
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        const unknown = await runClaimMode({
+          event: prOpenedEvent(SHA_A),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'run-unknown-1',
+          } as NodeJS.ProcessEnv,
+          githubClient: broken,
+          writeStdout: () => undefined,
+        });
+        assert.equal(unknown.claimed, false, 'quota-unknown claim writes nothing');
+      }
+    }
+
+    // --- Test 5 (Stage 5): publish write failure keeps the claim; same-key retry is idempotent. ---
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-retry-'));
       try {
         const counter = { count: 0 };
         const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', findings: [] });
         const outputPath = path.join(tempDir, 'review.json');
+        const state = makeState({
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
         try {
-          const buildState = makeState();
+          const claimed = await runClaimPass(state, SHA_A, 'run-retry-1');
+          assert.equal(claimed.claimed, true, 'claim pre-occupies the slot before AI');
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1);
           await runReviewMode({
             event: prOpenedEvent(SHA_A),
-            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath }),
-            githubClient: makeClient(buildState),
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: 'run-retry-1' }),
+            githubClient: makeClient(state),
             writeStdout: () => undefined,
             runGit: safeGitStub(),
           });
         } finally {
           restore();
         }
-        const state = makeState({
-          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
-          updateThrows: true,
-        });
+        // Publish fails on the sticky write; the claim's quota is already
+        // consumed and labels are blocked.
+        state.updateThrows = true;
         const publishEnv = {
           GITHUB_EVENT_NAME: 'pull_request_target',
           GITHUB_REPOSITORY: REPO,
@@ -565,9 +780,9 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           /failed to publish review comment/,
         );
         assert.ok(!state.operations.includes('add-labels') && !state.operations.includes('list-labels'), 'failed write blocks labels');
-        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 0, 'failed write counts zero');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'failed publish keeps the claimed slot');
 
-        // Retry with the same run id succeeds exactly once.
+        // Retry with the same run id succeeds without inflating.
         state.updateThrows = false;
         await runPublishMode({ event: prOpenedEvent(SHA_A), env: publishEnv, githubClient: makeClient(state) });
         assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1);
@@ -580,7 +795,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       }
     }
 
-    // --- Test 6: same-SHA sequential publishes merge to the correct total. ---
+    // --- Test 6 (Stage 5): same-SHA sequential claims merge; publish never re-counts. ---
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-concur-'));
       try {
@@ -600,27 +815,35 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           restore();
         }
         const state = makeState();
-        const publishFor = (runId: string) =>
-          runPublishMode({
-            event: prOpenedEvent(SHA_A),
-            env: {
-              GITHUB_EVENT_NAME: 'pull_request_target',
-              GITHUB_REPOSITORY: REPO,
-              GITHUB_TOKEN: 'fake-token',
-              POCKETGUARD_OUTPUT: outputPath,
-              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
-              POCKETGUARD_TAG_LABELS: '[]',
-              POCKETGUARD_RUN_ID: runId,
-            } as NodeJS.ProcessEnv,
-            githubClient: makeClient(state),
-          });
-        await publishFor('run-c1');
+        const claimFor = (runId: string) => runClaimPass(state, SHA_A, runId);
+        await claimFor('run-c1');
         assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1);
-        await publishFor('run-c2');
-        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2, 'second sequential publish merges to 2');
+        await claimFor('run-c2');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2, 'second sequential claim merges to 2');
         assert.equal(state.comments.length, 1, 'single sticky throughout');
 
-        // Other-SHA entries survive a counted write.
+        // Same-key claim re-entry never re-adds.
+        await claimFor('run-c2');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2, 'same-key claim re-entry is idempotent');
+
+        // Publish with a valid artifact reconciles only (never a third count).
+        await runPublishMode({
+          event: prOpenedEvent(SHA_A),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: outputPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+            POCKETGUARD_RUN_ID: 'run-c2',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+        });
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2, 'publish never re-counts');
+        assert.equal(state.comments.length, 1, 'single sticky throughout');
+
+        // Other-SHA entries survive a claimed write.
         state.pullRequest = defaultPullRequest(SHA_B);
         const counter2 = { count: 0 };
         const restore2 = installCountingOpenAI(counter2, { verdict: 'APPROVE', summary: 'ok', findings: [] });
@@ -633,6 +856,8 @@ export async function runReviewCountLedgerTests(): Promise<void> {
             writeStdout: () => undefined,
             runGit: safeGitStub(),
           });
+          const claimedB = await runClaimPass(state, SHA_B, 'run-c3-b');
+          assert.equal(claimedB.claimed, true, 'new SHA claims its own slot');
           await runPublishMode({
             event: prOpenedEvent(SHA_B),
             env: {
@@ -654,6 +879,158 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
+    }
+
+    // --- Test 8 (Stage 5 core): started-but-failed consumes; third same SHA makes zero OpenAI. ---
+    // A:1, then a second run whose AI starts (fetch > 0) but whose artifact is
+    // deleted before publish, then a third run on the same SHA that must see
+    // tag gate none, make zero OpenAI calls, and whose publish touches nothing.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-started-failed-'));
+      try {
+        const state = makeState();
+        const counter = { count: 0 };
+        const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', findings: [] });
+        try {
+          const outputPath = path.join(tempDir, 'review.json');
+          await runFullPass(state, SHA_A, 'run-q1', outputPath, counter);
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1);
+
+          // Second run: claim reserves the last slot, AI starts, artifact lost.
+          state.pullRequest = defaultPullRequest(SHA_A);
+          const secondEvent = prOpenedEvent(SHA_A);
+          const secondTag = await runTagMode({
+            event: secondEvent,
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          assert.equal(secondTag.reviewGate, 'auto', 'second run still scheduled');
+          const secondClaim = await runClaimMode({
+            event: secondEvent,
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_RUN_ID: 'run-q2',
+              ...(secondTag.quotaHeadSha ? { POCKETGUARD_QUOTA_SHA: secondTag.quotaHeadSha } : {}),
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+          });
+          assert.equal(secondClaim.claimed, true);
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2);
+          const beforeSecond = counter.count;
+          await runReviewMode({
+            event: secondEvent,
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: 'run-q2' }),
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          assert.ok(counter.count - beforeSecond > 0, 'second run AI started before the failure');
+          fs.rmSync(outputPath, { force: true });
+          await runPublishMode({
+            event: secondEvent,
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: outputPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: JSON.stringify(secondTag.labels),
+              POCKETGUARD_RUN_ID: 'run-q2',
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(state),
+          });
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2, 'lost artifact after claim keeps the slot');
+
+          // Third run on the same SHA: gated everywhere, touches nothing.
+          state.pullRequest = defaultPullRequest(SHA_A);
+          const thirdEvent = prOpenedEvent(SHA_A);
+          const thirdTag = await runTagMode({
+            event: thirdEvent,
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          assert.equal(thirdTag.reviewsUsed, 2);
+          assert.equal(thirdTag.reviewGate, 'none', 'tag gate none after two claimed slots');
+          const beforeThird = counter.count;
+          const thirdReview = await runReviewMode({
+            event: thirdEvent,
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: 'run-q3' }),
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          assert.equal(thirdReview.verdict, 'INCONCLUSIVE');
+          assert.equal(counter.count - beforeThird, 0, 'third run makes zero OpenAI calls');
+          const updatedBefore = state.updated;
+          const createdBefore = state.created;
+          await runPublishMode({
+            event: thirdEvent,
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: outputPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+              POCKETGUARD_RUN_ID: 'run-q3',
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(state),
+          });
+          assert.equal(state.updated, updatedBefore, 'third publish updates nothing');
+          assert.equal(state.created, createdBefore, 'third publish creates nothing');
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2);
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // --- Test 9 (Stage 5): workflow wiring for the claim-slot job. ---
+    {
+      const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');
+      const claimIdx = workflow.indexOf('  claim-slot:');
+      const reviewIdx = workflow.indexOf('  review-send:');
+      const publishIdx = workflow.indexOf('  publish:');
+      const prepareIdx = workflow.indexOf('  prepare-tag:');
+      assert.ok(prepareIdx !== -1 && claimIdx !== -1 && reviewIdx !== -1 && publishIdx !== -1, 'all jobs exist');
+      assert.ok(prepareIdx < claimIdx && claimIdx < reviewIdx && reviewIdx < publishIdx, 'claim-slot sits between prepare-tag and review-send');
+      const claimJob = workflow.slice(claimIdx, reviewIdx);
+      const reviewJob = workflow.slice(reviewIdx, publishIdx);
+      const publishJob = workflow.slice(publishIdx);
+      const prepareJob = workflow.slice(prepareIdx, claimIdx);
+      const squashed = (text: string): string => text.replace(/\s+/g, ' ').trim();
+      // Claim scheduling mirrors review-send PR scheduling plus the issue-auto route.
+      assert.match(squashed(claimJob), /review_gate\s*==\s*'auto'/, 'claim schedules PR auto reviews');
+      assert.match(squashed(claimJob), /review_gate\s*==\s*'manual'.*authorized\s*==\s*'true'/, 'claim gates manual reviews on authorization');
+      assert.match(squashed(claimJob), /route_kind\s*==\s*'first-review'/, 'claim covers the issue-auto route');
+      // Minimal write: issues:write only in claim-slot and publish.
+      assert.match(claimJob.slice(0, claimJob.indexOf('    steps:')), /issues:\s*write/, 'claim-slot holds issues:write');
+      assert.match(publishJob.slice(0, publishJob.indexOf('    steps:')), /issues:\s*write/, 'publish holds issues:write');
+      assert.doesNotMatch(prepareJob.slice(0, prepareJob.indexOf('    steps:')), /issues:\s*write/, 'prepare-tag stays read-only');
+      assert.doesNotMatch(reviewJob.slice(0, reviewJob.indexOf('    steps:')), /:\s*write/, 'review-send holds no write permission');
+      // No OpenAI secrets and no fork checkout in the claim job.
+      assert.doesNotMatch(claimJob, /OPENAI_API_KEY/, 'claim takes no OpenAI secrets');
+      assert.doesNotMatch(claimJob, /OPENAI_BASE_URL/, 'claim takes no OpenAI endpoint');
+      assert.doesNotMatch(claimJob, /refs\/pull/, 'claim never fetches fork refs');
+      assert.match(claimJob, /--mode=claim/, 'claim runs the claim mode');
+      assert.match(claimJob, /POCKETGUARD_QUOTA_SHA/, 'claim pins the tag head SHA');
+      // Tag forwards the claim input; review-send requires the approved claim for PRs.
+      assert.match(prepareJob, /quota_head_sha/, 'prepare-tag forwards quota_head_sha');
+      assert.match(reviewJob, /needs:\s*\[prepare-tag,\s*claim-slot\]/, 'review-send waits for the claim');
+      assert.match(squashed(reviewJob), /needs\.claim-slot\.outputs\.claimed\s*==\s*'true'/, 'review-send requires the approved claim for PRs');
+      // Concurrency still serializes per PR/issue without weakening.
+      const concurrencyBlock = workflow.slice(workflow.indexOf('concurrency:'), prepareIdx);
+      assert.match(concurrencyBlock, /cancel-in-progress:\s*false/, 'concurrency never cancels');
+      assert.match(concurrencyBlock, /claim/, 'concurrency documents the claim mutex without CAS');
     }
 
     // --- Ledger read helper: unknown stays fail-closed. ---

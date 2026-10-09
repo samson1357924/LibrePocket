@@ -12,6 +12,7 @@ import {
   parseReviewCountMarker,
   readStickyReviewCount,
   resolveReviewGate,
+  runClaimMode,
   runIssueReviewMode,
   runPublishMode,
   runReviewEntryMode,
@@ -840,9 +841,26 @@ export async function runExecutionMatrixTests(): Promise<void> {
               writeStdout: () => undefined,
               runGit: safeGitStub(),
             });
+            const runId = `matrix-${label}`;
+            const claimed = await runClaimMode({
+              event: prCommentEvent('/review', 'maintainer'),
+              env: {
+                GITHUB_EVENT_NAME: 'issue_comment',
+                GITHUB_REPOSITORY: REPO,
+                GITHUB_TOKEN: 'fake-token',
+                POCKETGUARD_RUN_ID: runId,
+                ...(tagged.quotaHeadSha ? { POCKETGUARD_QUOTA_SHA: tagged.quotaHeadSha } : {}),
+              } as NodeJS.ProcessEnv,
+              githubClient: makeClient(state),
+              writeStdout: () => undefined,
+            });
+            if (tagged.reviewGate !== 'none') {
+              assert.equal(claimed.claimed, true, `${label}: open gate claims a slot`);
+            }
             const reviewEnv = openAiEnv({
               GITHUB_EVENT_NAME: 'issue_comment',
               POCKETGUARD_OUTPUT: outputPath,
+              POCKETGUARD_RUN_ID: runId,
             });
             const before = openAiCounter.count;
             const reviewed = await runReviewMode({
@@ -859,6 +877,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
               POCKETGUARD_OUTPUT: outputPath,
               POCKETGUARD_REVIEW_JOB_RESULT: 'success',
               POCKETGUARD_TAG_LABELS: JSON.stringify(tagged.labels),
+              POCKETGUARD_RUN_ID: runId,
             } as NodeJS.ProcessEnv;
             const opsBefore = state.operations.length;
             await runPublishMode({
@@ -882,10 +901,10 @@ export async function runExecutionMatrixTests(): Promise<void> {
           const second = await runFullPass('second');
           assert.equal(second.tagged.reviewsUsed, 1);
           assert.equal(second.reviewed.verdict, 'APPROVE');
-          assert.equal(state.updated, 1, 'second review updates the sticky comment');
+          assert.equal(state.updated, 3, 'second claim plus publish update the sticky comment');
           assert.ok(
             state.comments[0].body.includes(formatReviewCountMarker(HEAD_SHA, 2)),
-            'second sticky write counts two reviews',
+            'second claim holds two reviews',
           );
 
           const stickyBefore = state.comments[0].body;
@@ -894,8 +913,8 @@ export async function runExecutionMatrixTests(): Promise<void> {
           assert.equal(third.tagged.reviewGate, 'none');
           assert.equal(third.reviewed.verdict, 'INCONCLUSIVE');
           assert.equal(third.made, 0, 'the third review on the same SHA makes zero OpenAI calls');
-          assert.equal(state.created, 1, 'quota-exhausted publish creates nothing');
-          assert.equal(state.updated, 1, 'quota-exhausted publish updates nothing');
+          assert.equal(state.created, 1, 'quota-exhausted run creates nothing');
+          assert.equal(state.updated, 3, 'quota-exhausted claim and publish update nothing');
           assert.equal(state.comments[0].body, stickyBefore, 'quota-exhausted publish leaves the sticky untouched');
           assert.deepEqual(
             state.operations.slice(third.opsBefore).filter((op) => op !== 'list-comments' && op !== 'pulls-get' && op !== 'permission-check' && op !== 'authenticated-user'),
@@ -1315,10 +1334,11 @@ export async function runExecutionMatrixTests(): Promise<void> {
       const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');
       const jobsStart = workflow.indexOf('jobs:');
       assert.notEqual(jobsStart, -1);
-      const prepareTag = workflow.slice(workflow.indexOf('  prepare-tag:'), workflow.indexOf('  review-send:'));
+      const prepareTag = workflow.slice(workflow.indexOf('  prepare-tag:'), workflow.indexOf('  claim-slot:'));
+      const claimJob = workflow.slice(workflow.indexOf('  claim-slot:'), workflow.indexOf('  review-send:'));
       const reviewJob = workflow.slice(workflow.indexOf('  review-send:'), workflow.indexOf('  publish:'));
       const publishJob = workflow.slice(workflow.indexOf('  publish:'));
-      for (const output of ['should_review', 'should_tag', 'route_kind', 'review_gate', 'reviews_used', 'diff_safe']) {
+      for (const output of ['should_review', 'should_tag', 'route_kind', 'review_gate', 'reviews_used', 'diff_safe', 'quota_head_sha']) {
         assert.match(
           prepareTag,
           new RegExp(`${output}:\\s*\\$\\{\\{\\s*steps\\.tag\\.outputs\\.${output}\\s*\\}\\}`),
@@ -1376,9 +1396,21 @@ export async function runExecutionMatrixTests(): Promise<void> {
       );
       const concurrencyBlock = workflow.slice(workflow.indexOf('concurrency:'), workflow.indexOf('  prepare-tag:'));
       assert.match(concurrencyBlock, /quota/, 'concurrency documents the quota mutex without CAS');
+      assert.match(concurrencyBlock, /claim/, 'concurrency documents the claim pre-occupation');
       assert.match(prepareTag, /issues:\s*read/, 'prepare-tag holds read-only issue metadata scope');
       assert.match(reviewJob.slice(0, reviewJob.indexOf('    steps:')), /issues:\s*read/,
         'review-send holds read-only issue metadata scope');
+      assert.doesNotMatch(reviewJob.slice(0, reviewJob.indexOf('    steps:')), /:\s*write/,
+        'review-send holds no write permission');
+      assert.match(claimJob.slice(0, claimJob.indexOf('    steps:')), /issues:\s*write/,
+        'claim-slot holds the minimal sticky write scope');
+      assert.doesNotMatch(claimJob, /OPENAI_API_KEY/, 'claim-slot takes no OpenAI secrets');
+      assert.match(reviewJob, /needs:\s*\[prepare-tag,\s*claim-slot\]/, 'review-send waits for the claim');
+      assert.match(
+        squashed(reviewJob.slice(0, reviewJob.indexOf('    steps:'))),
+        /needs\.claim-slot\.outputs\.claimed\s*==\s*'true'/,
+        'review-send requires the approved claim for pull-request reviews',
+      );
       assert.equal(MAX_REVIEWS_PER_SHA, 2, 'budget constant matches the specified two reviews per SHA');
     }
   } finally {

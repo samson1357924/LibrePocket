@@ -364,7 +364,7 @@ export async function runMergeBaseTests(): Promise<void> {
     const workflow = fs.readFileSync(
       path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');
     assert.doesNotMatch(workflow, /fetch-depth:\s*1/, 'no shallow checkout remains');
-    assert.equal(workflow.match(/fetch-depth:\s*0/g)?.length, 3, 'tag, review, and publish check out full history');
+    assert.equal(workflow.match(/fetch-depth:\s*0/g)?.length, 4, 'tag, claim, review, and publish check out full history');
     assert.match(workflow, /ref:\s*\$\{\{\s*github\.event\.repository\.default_branch\s*\}\}/,
       'checkouts stay on the default branch');
     assert.doesNotMatch(workflow, /ref:\s*.*refs\/pull/, 'never check out PR head refs');

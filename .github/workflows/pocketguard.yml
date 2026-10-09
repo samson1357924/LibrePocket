@@ -10,11 +10,12 @@ on:
 
 concurrency:
   # Per-PR/issue serialization is the primary mutex for the S4 per-SHA review
-  # quota (at most 2 AI reviews per PR+head SHA, counted in the sticky
-  # comment). GitHub offers no compare-and-swap on comments, so a residual
-  # race remains if overlapping runs for the same PR ever escape this group;
-  # review mode re-reads the counter immediately before any OpenAI call as
-  # defense in depth.
+  # quota (at most 2 AI reviews per PR+head SHA, pre-occupied by the claim-slot
+  # job before any AI work). GitHub offers no compare-and-swap on comments, so
+  # a residual race remains if overlapping runs for the same PR ever escape
+  # this group; the claim re-reads the ledger immediately before writing and
+  # review mode requires its own claim marker immediately before any OpenAI
+  # call as defense in depth.
   group: pocketguard-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
   cancel-in-progress: false
 
@@ -46,6 +47,7 @@ jobs:
       route_kind: ${{ steps.tag.outputs.route_kind }}
       review_gate: ${{ steps.tag.outputs.review_gate }}
       reviews_used: ${{ steps.tag.outputs.reviews_used }}
+      quota_head_sha: ${{ steps.tag.outputs.quota_head_sha }}
     steps:
       - name: Checkout default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,9 +81,77 @@ jobs:
           POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
 
+  claim-slot:
+    name: Claim review slot (quota pre-occupation)
+    needs: prepare-tag
+    # Stage 5 (P1 #1, scheme A): pre-occupies one per-SHA review slot before
+    # any AI work. Scheduling is identical to review-send below: an open PR
+    # gate (auto, or manual with authorization) or the explicit issue-auto
+    # route. Issues are a no-op success (never counted) so issue-auto review
+    # still runs. Routing/authorization/quota blocks claim nothing and count
+    # zero; a reserved slot whose later transport/artifact/publish fails is
+    # never refunded. This job holds no OpenAI secrets and never checks out
+    # fork code: the checkout stays on the default branch for the bot code
+    # only, and the head SHA is pinned via a trusted pulls.get read.
+    if: >-
+      (needs.prepare-tag.outputs.target == 'pull-request' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.review_gate == 'auto') ||
+      (needs.prepare-tag.outputs.target == 'pull-request' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.review_gate == 'manual' &&
+      needs.prepare-tag.outputs.authorized == 'true') ||
+      (needs.prepare-tag.outputs.target == 'issue' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      (needs.prepare-tag.outputs.route_kind == 'first-review' ||
+      needs.prepare-tag.outputs.route_kind == 'issue-update'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      # Minimal write: the sticky quota ledger only. No OpenAI secrets here.
+      issues: write
+    outputs:
+      claimed: ${{ steps.claim.outputs.claimed }}
+      claim_sha: ${{ steps.claim.outputs.claim_sha }}
+      reviews_used: ${{ steps.claim.outputs.reviews_used }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          # Full history kept consistent with the tag/review/publish jobs. The
+          # claim itself runs no git commands (no diff, no merge-base, no fork
+          # fetch) — only GitHub API reads plus one sticky write. Fork code is
+          # never checked out or executed.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies
+        working-directory: github_bot
+        run: npm ci --ignore-scripts
+
+      - name: Pre-occupy review slot
+        id: claim
+        working-directory: github_bot
+        # No OpenAI secrets in this job. POCKETGUARD_QUOTA_SHA pins the claim
+        # to the tag-observed head SHA; the claim verifies it against a fresh
+        # pulls.get and fails closed on any mismatch.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
+          POCKETGUARD_QUOTA_SHA: ${{ needs.prepare-tag.outputs.quota_head_sha }}
+        run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=claim
+
   review-send:
     name: Review with isolated OpenAI credentials
-    needs: prepare-tag
+    needs: [prepare-tag, claim-slot]
     # Route-driven scheduling (S4): a pull-request review is scheduled only
     # with should_review and an open review_gate. The auto gate (first review,
     # owner commit) needs no commenter gate; the manual gate (/review-style
@@ -94,15 +164,21 @@ jobs:
     # Owner decision: issue auto-review carries no auth/quota gate in this
     # phase (no budget/rate limit; only bot exclusion in routing plus
     # per-issue concurrency serialization), so the trusted step below admits
-    # the issue-auto route to the OpenAI secrets.
+    # the issue-auto route to the OpenAI secrets. Stage 5: pull-request
+    # reviews additionally require the claim-slot reservation
+    # (needs.claim-slot.outputs.claimed == 'true'); without its own approved
+    # claim the run makes zero OpenAI calls. The claim-slot job is a no-op
+    # success for issues, so the issue-auto route needs no claimed check.
     if: >-
       (needs.prepare-tag.outputs.target == 'pull-request' &&
       needs.prepare-tag.outputs.should_review == 'true' &&
-      needs.prepare-tag.outputs.review_gate == 'auto') ||
+      needs.prepare-tag.outputs.review_gate == 'auto' &&
+      needs.claim-slot.outputs.claimed == 'true') ||
       (needs.prepare-tag.outputs.target == 'pull-request' &&
       needs.prepare-tag.outputs.should_review == 'true' &&
       needs.prepare-tag.outputs.review_gate == 'manual' &&
-      needs.prepare-tag.outputs.authorized == 'true') ||
+      needs.prepare-tag.outputs.authorized == 'true' &&
+      needs.claim-slot.outputs.claimed == 'true') ||
       (needs.prepare-tag.outputs.target == 'issue' &&
       needs.prepare-tag.outputs.should_review == 'true' &&
       (needs.prepare-tag.outputs.route_kind == 'first-review' ||
@@ -218,6 +294,8 @@ jobs:
     # non-ignore route, covering issue_comment on issues). Unauthorized
     # comments, quota-exhausted runs (review_gate none), and bot-routed
     # ignores skip publish without touching the sticky comment or labels.
+    # Stage 5: counting happens only in the claim-slot job before AI; publish
+    # only reconciles content and never increments the ledger.
     if: >-
       always() && needs.prepare-tag.result == 'success' &&
       (github.event_name != 'issue_comment' ||

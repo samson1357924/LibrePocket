@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.time.Clock
 import java.time.Instant
+import java.time.ZoneId
 import java.util.UUID
 import kotlin.coroutines.coroutineContext
 
@@ -468,14 +469,13 @@ class TurnController(
   /**
    * Observability for the ephemeral time block: `Log.w` only, never blocks
    * the turn. Fires when the block renders `(time unknown)` or when a
-   * non-blank [userTimezone] did not resolve verbatim (fallback to system
-   * zone). `runCatching` keeps JVM unit tests (no mocked `android.util.Log`)
-   * green.
+   * non-blank [userTimezone] failed to parse (fell back to system zone).
+   * A successful parse never warns, even when the resolved id is normalized
+   * (e.g. `UTC+8` → `UTC+08:00`). `runCatching` keeps JVM unit tests (no
+   * mocked `android.util.Log`) green.
    */
   private fun warnOnTimeContextDegraded(block: String) {
-    val requested = userTimezone
-    val fellBack = !requested.isNullOrBlank() &&
-      runCatching { resolveZone(requested).id != requested.trim() }.getOrDefault(false)
+    val fellBack = isTimezoneFallback(userTimezone)
     if (!block.contains("(time unknown)") && !fellBack) return
     val used = runCatching { resolveZone(userTimezone).id }.getOrDefault("?")
     runCatching {
@@ -529,6 +529,20 @@ class TurnController(
 
   private fun latestAssistantText(): String =
     _uiState.value.messages.lastOrNull { it.role == "assistant" }?.text.orEmpty()
+}
+
+/**
+ * Pure fallback detector for the warn path: true only when a non-blank
+ * [requested] timezone fails to parse (so [resolveZone] falls back to the
+ * system zone). Successful parses — including normalized ids such as
+ * `UTC+8` → `UTC+08:00` — return false; null/blank returns false (nothing
+ * was requested). Never throws; JVM-pure (no `android.util.Log`) so it is
+ * directly unit-testable. Fail-closed: any parse failure counts as
+ * fallback so the caller warns.
+ */
+internal fun isTimezoneFallback(requested: String?): Boolean {
+  if (requested.isNullOrBlank()) return false
+  return runCatching { ZoneId.of(requested.trim()) }.isFailure
 }
 
 /**

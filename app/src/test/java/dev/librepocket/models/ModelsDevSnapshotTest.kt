@@ -7,6 +7,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -208,6 +209,88 @@ class ModelsDevSnapshotTest {
         assertEquals(
             listOf("live-model"),
             ModelsDevSnapshot.mergeForProvider(listOf("live-model"), snapshot, null),
+        )
+    }
+
+    private fun assertSnapshotShape(body: String) {
+        val e = assertThrows(ModelsDevSnapshot.SnapshotException::class.java) {
+            ModelsDevSnapshot.parse(body, nowMs = 1_700_000_000_000L)
+        }
+        assertEquals("MODELS_SNAPSHOT_SHAPE", e.message)
+    }
+
+    @Test
+    fun mistypedRootModelsKeyThrowsShapeInsteadOfProviderReinterpret() {
+        assertSnapshotShape("""{"models":"x"}""")
+        assertSnapshotShape("""{"models":42}""")
+        assertSnapshotShape("""{"models":{"models":{"m":{}}}}""")
+        assertSnapshotShape("""{"models":true}""")
+        assertSnapshotShape("""{"models":null}""")
+    }
+
+    @Test
+    fun mistypedRootModelsKeyWithSiblingDirectoryStillThrowsShape() {
+        assertSnapshotShape("""{"models":"x","openai":{"models":{"m":{}}}}""")
+    }
+
+    @Test
+    fun allInvalidProviderEntriesThrowShape() {
+        // Provider value not an object.
+        assertSnapshotShape("""{"openai":"x"}""")
+        // Provider object without a models dictionary.
+        assertSnapshotShape("""{"openai":{}}""")
+        // Models value not an object.
+        assertSnapshotShape("""{"openai":{"models":"x"}}""")
+        assertSnapshotShape("""{"openai":{"models":[]}}""")
+        // Every entry invalid in a different way.
+        assertSnapshotShape("""{"a":"x","b":{},"c":{"models":"x"}}""")
+    }
+
+    @Test
+    fun mixedValidAndInvalidProviderEntriesParsePartial() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"openai":{"models":{"good":{}}},"bad":"x","empty":{},"badmodels":{"models":[]}}""",
+            nowMs = 1_700_000_000_000L,
+        )
+        assertEquals(
+            listOf(ModelsDevSnapshot.ModelEntry("openai", "good")),
+            snapshot.models,
+        )
+    }
+
+    @Test
+    fun nonObjectModelValuesAreSkipped() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"openai":{"models":{"a":"x","b":null,"c":[],"d":{}}}}""",
+            nowMs = 1_700_000_000_000L,
+        )
+        assertEquals(
+            listOf(ModelsDevSnapshot.ModelEntry("openai", "d")),
+            snapshot.models,
+        )
+    }
+
+    @Test
+    fun emptyShapeSemantics() {
+        assertSnapshotShape("{}")
+        assertSnapshotShape("""{"openai":{}}""")
+        assertEquals(
+            0,
+            ModelsDevSnapshot.parse(
+                """{"openai":{"models":{}}}""",
+                nowMs = 1_700_000_000_000L,
+            ).models.size,
+        )
+        assertEquals(
+            0,
+            ModelsDevSnapshot.parse(
+                """{"models":[]}""",
+                nowMs = 1_700_000_000_000L,
+            ).models.size,
+        )
+        assertEquals(
+            0,
+            ModelsDevSnapshot.parse("[]", nowMs = 1_700_000_000_000L).models.size,
         )
     }
 }

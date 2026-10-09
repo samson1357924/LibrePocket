@@ -62,6 +62,13 @@ object ModelsDevSnapshot {
         val entries = when (root) {
             is MiniJson.JArr -> parseLegacyEntries(root.items)
             is MiniJson.JObj -> {
+                // "models" present but not an array is a shape error, not a
+                // provider directory (arr() alone cannot tell missing from
+                // mistyped, which previously reinterpreted e.g.
+                // {"models":{"models":{...}}} as provider "models").
+                if ("models" in root.map && root.map["models"] !is MiniJson.JArr) {
+                    throw SnapshotException("MODELS_SNAPSHOT_SHAPE")
+                }
                 val legacyItems = root.arr("models")
                 if (legacyItems != null) {
                     parseLegacyEntries(legacyItems.items)

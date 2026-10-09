@@ -254,7 +254,11 @@ class PresetCatalogTest {
         assertEquals("anthropic", ProviderCatalog.requirePreset(ProviderCatalog.ANTHROPIC_ID).modelsDevProviderId)
         assertEquals("google", ProviderCatalog.requirePreset(ProviderCatalog.GEMINI_ID).modelsDevProviderId)
         assertNull(ProviderCatalog.requirePreset(ProviderCatalog.XAI_ID).modelsDevProviderId)
+        assertNull(ProviderCatalog.requirePreset(ProviderCatalog.DEEPSEEK_ID).modelsDevProviderId)
         assertNull(ProviderCatalog.requirePreset(ProviderCatalog.OPENROUTER_ID).modelsDevProviderId)
+        assertNull(ProviderCatalog.requirePreset(ProviderCatalog.SILICONFLOW_ID).modelsDevProviderId)
+        assertNull(ProviderCatalog.requirePreset(ProviderCatalog.ALIBABA_ID).modelsDevProviderId)
+        assertNull(ProviderCatalog.requirePreset(ProviderCatalog.MOONSHOT_ID).modelsDevProviderId)
         assertNull(ProviderCatalog.requirePreset(ProviderCatalog.CUSTOM_ID).modelsDevProviderId)
     }
 
@@ -296,5 +300,23 @@ class PresetCatalogTest {
 
         assertEquals(listOf("openrouter/auto", "openrouter-live"), models)
         assertEquals(listOf("grok-3-mini", "xai-live"), xaiModels)
+    }
+
+    @Test
+    fun deepseekWithoutMappingIgnoresDirectoryEntryWithSamePrefix() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"models":[
+                |{"id":"deepseek/deepseek-chat","tool_calls":true},
+                |{"id":"openai/wire-openai-a","tool_calls":true}
+                |]}""".trimMargin(),
+            nowMs = 1_700_000_000_000L,
+        )
+        val models = ProviderCatalog.listedModels(
+            presetId = ProviderCatalog.DEEPSEEK_ID,
+            liveModelIds = listOf("deepseek-live"),
+            snapshot = snapshot,
+        )
+
+        assertEquals(listOf("deepseek-chat", "deepseek-live"), models)
     }
 }

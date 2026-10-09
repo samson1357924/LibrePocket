@@ -63,7 +63,7 @@ private class FakeLlmProvider(
   override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
     streamCalls.incrementAndGet()
     seenRequests.add(request)
-    request.messages.lastOrNull { it.role == "user" }?.text?.let { userText ->
+    request.messages.lastOrNull { it.role == "user" }?.text?.substringBefore("\n\n")?.let { userText ->
       requestEntrySignals[userText]?.countDown()
     }
     try {
@@ -167,6 +167,11 @@ class TurnControllerTest {
   private fun lastUserTextOf(req: ChatRequest): String? =
     req.messages.lastOrNull { it.role == "user" }?.text
 
+  // Phase 2 appends an ephemeral "\n\n<time block>" to the last user message
+  // in the provider request. Branch on the raw text, not the time suffix.
+  private fun baseUserTextOf(req: ChatRequest): String? =
+    lastUserTextOf(req)?.substringBefore("\n\n")
+
   @Test fun retryDefaultsMatchSpec() {
     val r = TurnRetryConfig()
     assertEquals(3, r.maxRetries)
@@ -246,7 +251,7 @@ class TurnControllerTest {
     val firstTurnGate = CompletableDeferred<Unit>()
     val provider = FakeLlmProvider { request ->
       flow {
-        if (lastUserTextOf(request) == "A") firstTurnGate.await()
+        if (baseUserTextOf(request) == "A") firstTurnGate.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -272,7 +277,7 @@ class TurnControllerTest {
           provider.streamCalls.get() == 2
       }
       assertEquals(listOf("A", "B"), usersOf(c))
-      assertEquals(listOf("A", "B"), provider.seenRequests.mapNotNull(::lastUserTextOf))
+      assertEquals(listOf("A", "B"), provider.seenRequests.mapNotNull(::baseUserTextOf))
       assertEquals(0, c.uiState.value.pendingSteerCount)
       assertFalse(c.uiState.value.queuedRecoveryRequired)
       assertTrue(c.drainQueued().isEmpty())
@@ -344,7 +349,7 @@ class TurnControllerTest {
     val releaseSteer = CountDownLatch(1)
     val provider = FakeLlmProvider { request ->
       flow {
-        if (lastUserTextOf(request) == "first") firstTurnGate.await()
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -471,7 +476,7 @@ class TurnControllerTest {
     }
     val provider = FakeLlmProvider { request ->
       flow {
-        if (lastUserTextOf(request) == "first") firstTurnGate.await()
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -539,7 +544,7 @@ class TurnControllerTest {
     }
     val provider = FakeLlmProvider { request ->
       flow {
-        if (lastUserTextOf(request) == "active only") activeTurnGate.await()
+        if (baseUserTextOf(request) == "active only") activeTurnGate.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -1141,12 +1146,12 @@ class TurnControllerTest {
     val gate = CompletableDeferred<Unit>()
     val provider = FakeLlmProvider { input ->
       flow {
-        if (lastUserTextOf(input) == "first") {
+        if (baseUserTextOf(input) == "first") {
           emit(StreamEvent.TextDelta(0, 0, "A"))
           gate.await()
           emit(StreamEvent.Done("stop"))
         } else {
-          emit(StreamEvent.TextDelta(0, 0, "B-" + lastUserTextOf(input)))
+          emit(StreamEvent.TextDelta(0, 0, "B-" + baseUserTextOf(input)))
           emit(StreamEvent.Done("stop"))
         }
       }
@@ -1178,7 +1183,7 @@ class TurnControllerTest {
     val releaseFirst = CompletableDeferred<Unit>()
     val provider = FakeLlmProvider { request ->
       flow {
-        if (lastUserTextOf(request) == "first") releaseFirst.await()
+        if (baseUserTextOf(request) == "first") releaseFirst.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -1411,7 +1416,7 @@ class TurnControllerTest {
       }
       val provider = FakeLlmProvider { request ->
         flow {
-          if (lastUserTextOf(request) == "A") activeTurnGate.await()
+          if (baseUserTextOf(request) == "A") activeTurnGate.await()
           emit(StreamEvent.Done("stop"))
         }
       }
@@ -1522,7 +1527,7 @@ class TurnControllerTest {
     val gate = CompletableDeferred<Unit>()
     val provider = FakeLlmProvider { input ->
       flow {
-        if (lastUserTextOf(input) == "first") {
+        if (baseUserTextOf(input) == "first") {
           emit(StreamEvent.TextDelta(0, 0, "A"))
           gate.await()
           emit(StreamEvent.Done("stop"))
@@ -1587,7 +1592,7 @@ class TurnControllerTest {
     val releaseDeny = CountDownLatch(1)
     val provider = FakeLlmProvider { input ->
       flow {
-        if (lastUserTextOf(input) == "A") firstTurnGate.await()
+        if (baseUserTextOf(input) == "A") firstTurnGate.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -1654,7 +1659,7 @@ class TurnControllerTest {
     }
     val provider = FakeLlmProvider { request ->
       flow {
-        if (lastUserTextOf(request) == "first") firstTurnGate.await()
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -1726,7 +1731,7 @@ class TurnControllerTest {
     }
     val provider = FakeLlmProvider { request ->
       flow {
-        if (lastUserTextOf(request) == "first") firstTurnGate.await()
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -1794,7 +1799,7 @@ class TurnControllerTest {
     }
     val provider = FakeLlmProvider { request ->
       flow {
-        if (lastUserTextOf(request) == "first") firstTurnGate.await()
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -1958,7 +1963,7 @@ class TurnControllerTest {
     val releaseHandoff = CountDownLatch(1)
     val provider = FakeLlmProvider { input ->
       flow {
-        if (lastUserTextOf(input) == "first") {
+        if (baseUserTextOf(input) == "first") {
           firstTurnGate.await()
         } else {
           awaitCancellation()
@@ -2013,7 +2018,7 @@ class TurnControllerTest {
     val releaseHandoff = CountDownLatch(1)
     val provider = FakeLlmProvider { input ->
       flow {
-        if (lastUserTextOf(input) == "first") firstTurnGate.await()
+        if (baseUserTextOf(input) == "first") firstTurnGate.await()
         emit(StreamEvent.Done("stop"))
       }
     }
@@ -2060,7 +2065,7 @@ class TurnControllerTest {
     val releaseHandoff = CountDownLatch(1)
     val provider = FakeLlmProvider { input ->
       flow {
-        if (lastUserTextOf(input) == "A") {
+        if (baseUserTextOf(input) == "A") {
           firstTurnGate.await()
         } else {
           awaitCancellation()

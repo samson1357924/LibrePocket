@@ -11,7 +11,9 @@
 
 `.github/workflows/release.yml` keeps the version-tag and manual triggers only to fail closed with `contents: read`. It does not check out source, build, sign, upload workflow artifacts, or create a public release. There is no alternate publishing branch in this workflow. Do not treat a successful workflow invocation as a release or artifact verification.
 
-The local `scripts/build_release.sh` supports APK builds only when explicitly passed `--apk`; without it, it rejects the default AAB request before Bitwarden/credential lookup or Gradle. Its Play/Foss policy scan is a local policy gate, not authorization to publish. AAB is explicitly unsupported by the current scanner and must not be passed to it.
+The local `scripts/build_release.sh` supports APK builds only when explicitly passed `--apk`; without it, it rejects the default AAB request before Bitwarden/credential lookup or Gradle. Its Play/Foss policy scan is a local policy gate, not authorization to publish. AAB is explicitly unsupported and is not a fallback.
+
+The local `scripts/build_release.sh` provides an APK identity verification and staging path: callers must supply each selected flavor's expected package, version code, version name, and signer-certificate SHA-256, plus explicit SDK tool paths. The builder retains its existing environment-first/Bitwarden keystore-password resolver before Gradle; this change does not alter that flow. After Gradle completes, it requires exactly one APK candidate per selected flavor, snapshots the candidate into a unique private transaction, verifies signature/metadata/debug state on those staged snapshot bytes, and runs the existing Play/Foss policy checks against them. It rechecks each staged checksum after policy and before reporting the complete set. The post-build verifier/stager does not perform credential lookup or choose/approve production signing policy. Output files/directories are assigned and checked for POSIX read-only/private mode bits as an accidental-overwrite guard; filesystems that do not report the required modes fail closed before a ready result. This is not an OS sandbox or protection from a same-user process that deliberately changes permissions. On failure it attempts to remove only the transaction it created; cleanup is best-effort, not an absolute guarantee under filesystem errors or abrupt termination. The helper's SDK/policy process output and runtime are bounded, and normal signal handling stops its active process group, but this is not a general process sandbox. This local path does not publish, upload, support AAB, or establish release readiness; the public workflow below remains disabled.
 
 ## Current APK policy scanner boundary
 
@@ -23,17 +25,11 @@ Resource limits are deliberate scanner restrictions, not DEX format maxima. Each
 
 The stdlib tests use synthetic ZIP/DEX fixtures and fake native-tool commands. They are useful regression controls, not evidence that a production APK or Android SDK native parser passed. Before relying on this APK-only gate, the release/build maintainer should run the scanner and native tools against fresh debug APKs for all three flavors and retain results tied to the tested commit. That rehearsal does not establish release signing or public-release readiness.
 
-## Release blocker: final-byte verification is not implemented
+## Local release identity and staging gate
 
-**Do not describe the current workflow or local policy scan as a verified secure-release gate.** Before enabling or relying on public release automation, add a fail-closed check against the exact bytes to be distributed. It must independently verify at minimum:
+The local builder implements the identity checks above for staged APK bytes via `scripts/verify_release_apk.py` and `scripts/release_artifact_stage.py`. The standard-library synthetic tests are unit and regression controls, not evidence that a production release APK passed on physical devices or across every SDK toolchain. The verifier uses `apksigner verify --verbose --print-certs -Werr` and `aapt dump badging`, compares against trusted caller-supplied per-flavor identity values (never inferred from the candidate), and rejects missing/ambiguous candidates, identity mismatch, invalid signature, debug signer, or debuggable APK. A unique transaction contains staged APKs, per-artifact identity/checksum records, and an aggregate checksum list; Play/Foss policy checks run on the staged bytes and checksums are rechecked before the one complete transaction is reported.
 
-- cryptographic APK signature validity and expected signer certificate/fingerprint;
-- package/application ID and flavor;
-- version code and version name against the intended release;
-- release/debug state (debuggable must be false);
-- the checked artifact is exactly the one subsequently checksummed and uploaded.
-
-Missing, ambiguous, unsigned, unexpected, or unverifiable output must fail before publication. A filename, checksum generated from an unverified file, or policy scan that passes is not a substitute. Record the verifier's version and results with the release artifact. None of these final-byte identity checks is claimed by the current APK scanner; this remains a separate release blocker and Issue #12 stays open.
+The local builder's existing environment-first/Bitwarden keystore-password resolution is unchanged. The verifier/stager performs no credential lookup and does not select or approve production signing policy; this work does not establish production-key custody/provenance or a trusted signer-pin registry, wire a public release workflow, prove correctness of every SDK/toolchain combination, publish, or establish release readiness. The existing Play/Foss policy gate remains in addition to signature/identity verification, not replaced by it. A filename, checksum alone, or policy scan is not a substitute for final-byte verification. Issue #12 remains open until all scoped requirements, native verification, and required release evidence are complete; see [Testing](TESTING.md).
 
 ## Target release sequence
 

@@ -18,6 +18,7 @@ import dev.librepocket.provider.KeyProvider
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderFailure
+import dev.librepocket.provider.ProviderFailureCode
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -411,6 +412,7 @@ class SetupViewModel(
     }
 
     private fun classifyTestError(e: ProviderFailure): String {
+        if (e.code == ProviderFailureCode.TOO_LARGE) return "TEST_TOO_LARGE"
         val msg = e.message.orEmpty()
         val lower = msg.lowercase()
         if (!e.retryable &&

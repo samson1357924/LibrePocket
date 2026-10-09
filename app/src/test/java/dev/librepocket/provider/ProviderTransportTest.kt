@@ -1,11 +1,15 @@
 package dev.librepocket.provider
 
+import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.zip.GZIPOutputStream
 import okhttp3.Call
 import okhttp3.EventListener
+import okhttp3.Interceptor
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -21,6 +25,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
 import okhttp3.tls.HandshakeCertificates
 import okhttp3.tls.HeldCertificate
+import okio.ForwardingSource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -37,6 +42,10 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.toList
+
+private const val MODEL_LIST_BODY_LIMIT_BYTES = 1024 * 1024
+private const val HTTP_ERROR_BODY_LIMIT_BYTES = 16 * 1024
+private const val SOURCE_READ_AHEAD_ALLOWANCE_BYTES = 2 * 8 * 1024
 
 /** Regression coverage for authenticated redirects, cancellation, and SSE terminal reads. */
 class ProviderTransportTest {
@@ -251,6 +260,88 @@ class ProviderTransportTest {
                 cancelled.countDown()
             }
         }
+    }
+
+    /** Counts bytes consumed at the client ResponseBody source boundary, not bytes the server queued. */
+    private class ResponseBodyReadSignals {
+        val consumedBytes = AtomicLong()
+        val readEntered = CountDownLatch(1)
+        val calls = CallSignals()
+
+        private val countingInterceptor = object : Interceptor {
+            override fun intercept(chain: Interceptor.Chain): Response {
+                val response = chain.proceed(chain.request())
+                val delegate = response.body ?: return response
+                val counted = object : ResponseBody() {
+                    private val countedSource: BufferedSource = object : ForwardingSource(delegate.source()) {
+                        override fun read(sink: Buffer, byteCount: Long): Long {
+                            // Entry latch: count down before the blocking delegate read so
+                            // cancellation tests can prove the Job was inside source.read().
+                            readEntered.countDown()
+                            val read = super.read(sink, byteCount)
+                            if (read > 0L) consumedBytes.addAndGet(read)
+                            return read
+                        }
+                    }.buffer()
+
+                    override fun contentType(): MediaType? = delegate.contentType()
+                    override fun contentLength(): Long = delegate.contentLength()
+                    override fun source(): BufferedSource = countedSource
+                }
+                return response.newBuilder().body(counted).build()
+            }
+        }
+
+        fun client(): OkHttpClient = OkHttpClient.Builder()
+            .addInterceptor(countingInterceptor)
+            .eventListener(calls.listener)
+            .readTimeout(5, TimeUnit.MINUTES)
+            .build()
+    }
+
+    private fun modelListJsonWithExactBytes(size: Int): String {
+        val prefix = "{\"data\":[{\"id\":\"budget-model\"}],\"padding\":\""
+        val suffix = "\"}"
+        val paddingBytes = size - prefix.toByteArray(Charsets.UTF_8).size - suffix.toByteArray(Charsets.UTF_8).size
+        require(paddingBytes >= 0)
+        return prefix + "x".repeat(paddingBytes) + suffix
+    }
+
+    private fun gzipBody(body: String): Buffer = gzipBytes(body.toByteArray(Charsets.UTF_8))
+
+    private fun gzipBytes(raw: ByteArray): Buffer {
+        val compressed = ByteArrayOutputStream().use { output ->
+            GZIPOutputStream(output).use { gzip -> gzip.write(raw) }
+            output.toByteArray()
+        }
+        return Buffer().write(compressed)
+    }
+
+    private suspend fun expectTooLarge(provider: LlmProvider, context: String): ProviderFailure {
+        val failure = try {
+            provider.listModels()
+            throw AssertionError("$context should reject an oversized model-list response")
+        } catch (expected: ProviderFailure) {
+            expected
+        }
+        assertFalse("$context TOO_LARGE is non-retryable", failure.retryable)
+        assertTrue("$context has a stable TOO_LARGE message", failure.message.orEmpty().contains("TOO_LARGE"))
+        return failure
+    }
+
+    private fun assertReadWithinBudget(signals: ResponseBodyReadSignals, budget: Int, context: String) {
+        val consumed = signals.consumedBytes.get()
+        assertTrue(
+            "$context client-source bytes $consumed <= $budget + sentinel + read-ahead allowance",
+            consumed <= budget.toLong() + 1L + SOURCE_READ_AHEAD_ALLOWANCE_BYTES,
+        )
+    }
+
+    private suspend fun assertCallCancelled(signals: ResponseBodyReadSignals, context: String) {
+        assertTrue(
+            "$context cancels the actual OkHttp Call",
+            withContext(Dispatchers.IO) { signals.calls.cancelled.await(1, TimeUnit.SECONDS) },
+        )
     }
 
     @Test
@@ -546,6 +637,243 @@ class ProviderTransportTest {
     }
 
     @Test
+    fun modelListAtExactlyOneMiBAcceptsValidJsonForEveryProtocol() = runBlocking {
+        val body = modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES)
+        assertEquals(MODEL_LIST_BODY_LIMIT_BYTES, body.toByteArray(Charsets.UTF_8).size)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                server.enqueue(MockResponse().setBody(body))
+                assertEquals(listOf("budget-model"), providerFor(protocol, server).listModels())
+                assertEquals("$protocol uses one model-list request", 1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun modelListChunkedAtExactlyOneMiBAcceptsValidJsonForEveryProtocol() = runBlocking {
+        // Unknown-length twin of the exact-cap success: the same 1MiB JSON over
+        // chunked encoding must pass via the one-byte sentinel EOF probe.
+        val body = modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES)
+        assertEquals(MODEL_LIST_BODY_LIMIT_BYTES, body.toByteArray(Charsets.UTF_8).size)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                server.enqueue(MockResponse().setChunkedBody(body, 1024))
+                assertEquals(listOf("budget-model"), providerFor(protocol, server).listModels())
+                assertEquals("$protocol chunked exact-cap uses one model-list request", 1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    // Added after baseline-red: the pristine test suite cannot reference this new typed API.
+    @Test
+    fun modelListOverflowCarriesTypedTooLargeCode() = runBlocking {
+        val server = MockWebServer()
+        val signals = ResponseBodyReadSignals()
+        server.start()
+        try {
+            server.enqueue(
+                MockResponse().setBody(
+                    modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES + 1),
+                ),
+            )
+            val failure = expectTooLarge(
+                providerFor(ProviderProtocol.CHAT_COMPLETIONS, server, signals.client()),
+                "typed model-list overflow",
+            )
+            assertEquals(ProviderFailureCode.TOO_LARGE, failure.code)
+            assertCallCancelled(signals, "typed model-list overflow")
+            assertEquals(1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun modelListKnownAndChunkedUnknownBodiesOverOneMiBFailAndStopReading() = runBlocking {
+        val oversized = modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES + 64 * 1024)
+        for (protocol in ProviderProtocol.values()) {
+            for (unknownLength in listOf(false, true)) {
+                val server = MockWebServer()
+                val signals = ResponseBodyReadSignals()
+                server.start()
+                try {
+                    val response = if (unknownLength) {
+                        MockResponse().setChunkedBody(oversized, 1024)
+                    } else {
+                        MockResponse().setBody(oversized)
+                    }
+                    server.enqueue(response)
+                    val kind = if (unknownLength) "chunked" else "known-length"
+                    val overflow = expectTooLarge(
+                        providerFor(protocol, server, signals.client()),
+                        "$protocol $kind model list",
+                    )
+                    assertEquals("$protocol $kind overflow carries typed code", ProviderFailureCode.TOO_LARGE, overflow.code)
+                    assertCallCancelled(signals, "$protocol $kind model-list overflow")
+                    assertReadWithinBudget(signals, MODEL_LIST_BODY_LIMIT_BYTES, "$protocol $kind model list")
+                    if (unknownLength) {
+                        assertTrue(
+                        "$protocol unknown-length path reads through the cap before rejecting",
+                            signals.consumedBytes.get() >= MODEL_LIST_BODY_LIMIT_BYTES.toLong(),
+                        )
+                    }
+                    assertEquals("$protocol $kind overflow remains one request", 1, server.requestCount)
+                } finally {
+                    server.shutdown()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun gzipModelListBudgetCountsDecodedBytes() = runBlocking {
+        val server = MockWebServer()
+        val signals = ResponseBodyReadSignals()
+        server.start()
+        try {
+            val small = modelListJsonWithExactBytes(512)
+            val oversized = modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES + 64 * 1024)
+            val compressedSmall = gzipBody(small)
+            val compressedOversized = gzipBody(oversized)
+            assertTrue("compressed fixture is below the decoded-byte budget", compressedOversized.size < MODEL_LIST_BODY_LIMIT_BYTES.toLong())
+            server.enqueue(
+                MockResponse()
+                    .addHeader("Content-Encoding", "gzip")
+                    .setBody(compressedSmall),
+            )
+            server.enqueue(
+                MockResponse()
+                    .addHeader("Content-Encoding", "gzip")
+                    .setBody(compressedOversized),
+            )
+            val provider = providerFor(ProviderProtocol.CHAT_COMPLETIONS, server, signals.client())
+            assertEquals(listOf("budget-model"), provider.listModels())
+            signals.consumedBytes.set(0L)
+            expectTooLarge(provider, "gzip model list counted after decoding")
+            assertCallCancelled(signals, "gzip model-list overflow")
+            assertReadWithinBudget(signals, MODEL_LIST_BODY_LIMIT_BYTES, "gzip model list")
+            assertEquals("gzip cases use one request each", 2, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun modelListErrorPrefixIsBoundedAndStillClassifiesLaterFatalMarker() = runBlocking {
+        val marker = "insufficient_quota"
+        val markerOffset = 4096
+        val errorBody = "x".repeat(markerOffset) + marker + "y".repeat(64 * 1024)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = ResponseBodyReadSignals()
+            server.start()
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setResponseCode(503)
+                        .addHeader("Retry-After", "0")
+                        .setChunkedBody(errorBody, 1024),
+                )
+                val failure = try {
+                    providerFor(protocol, server, signals.client()).listModels()
+                    throw AssertionError("$protocol large HTTP error should fail")
+                } catch (expected: ProviderFailure) {
+                    expected
+                }
+                assertFalse("$protocol marker within the bounded prefix keeps fatal precedence", failure.retryable)
+                assertTrue("$protocol preserves HTTP status in the error", failure.message.orEmpty().contains("HTTP 503"))
+                assertTrue(
+                    "$protocol reads far enough to observe a marker after the display snippet",
+                    signals.consumedBytes.get() >= (markerOffset + marker.length).toLong(),
+                )
+                assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, "$protocol marked HTTP error")
+                assertCallCancelled(signals, "$protocol HTTP error-prefix cap")
+                assertEquals("$protocol error body does not cause a follow-up", 1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun fatalMarkerBeyondErrorPrefixFallsBackToHttpStatusClassification() = runBlocking {
+        val errorBody = "x".repeat(
+            HTTP_ERROR_BODY_LIMIT_BYTES + SOURCE_READ_AHEAD_ALLOWANCE_BYTES + 4096,
+        ) + "insufficient_quota" + "y".repeat(32 * 1024)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = ResponseBodyReadSignals()
+            server.start()
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setResponseCode(503)
+                        .addHeader("Retry-After", "0")
+                        .setChunkedBody(errorBody, 1024),
+                )
+                val failure = try {
+                    providerFor(protocol, server, signals.client()).listModels()
+                    throw AssertionError("$protocol large HTTP error should fail")
+                } catch (expected: ProviderFailure) {
+                    expected
+                }
+                assertTrue("$protocol marker outside the bounded prefix is not observed; 503 fallback remains retryable", failure.retryable)
+                assertTrue("$protocol preserves HTTP status in the error", failure.message.orEmpty().contains("HTTP 503"))
+                assertTrue(
+                    "$protocol consumes the bounded prefix before status fallback",
+                    signals.consumedBytes.get() >= HTTP_ERROR_BODY_LIMIT_BYTES.toLong(),
+                )
+                assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, "$protocol status-fallback error")
+                assertCallCancelled(signals, "$protocol status-fallback error cap")
+                assertEquals("$protocol status fallback remains one request", 1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun sseHttpErrorPrefixIsBoundedAnd503RemainsSingleRetryableAttempt() = runBlocking {
+        val errorBody = "temporarily unavailable" + "x".repeat(64 * 1024)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = ResponseBodyReadSignals()
+            server.start()
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setResponseCode(503)
+                        .addHeader("Retry-After", "0")
+                        .setChunkedBody(errorBody, 1024),
+                )
+                val events = withTimeout(5_000) {
+                    providerFor(protocol, server, signals.client()).stream(request()).toList()
+                }
+                val failure = events.single() as StreamEvent.Failed
+                assertTrue("$protocol large error body preserves retryable HTTP 503", failure.retryable)
+                assertTrue("$protocol retains the HTTP status", failure.message.contains("HTTP 503"))
+                assertTrue(
+                    "$protocol reads the error prefix for classifier markers",
+                    signals.consumedBytes.get() >= HTTP_ERROR_BODY_LIMIT_BYTES.toLong(),
+                )
+                assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, "$protocol SSE HTTP error")
+                assertCallCancelled(signals, "$protocol SSE HTTP error-prefix cap")
+                assertEquals("$protocol 503 remains one provider attempt", 1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
     fun stream503WithRetryAfterZeroMakesOneRequestPerProtocol() = runBlocking {
         for (protocol in ProviderProtocol.values()) {
             val server = MockWebServer()
@@ -735,6 +1063,350 @@ class ProviderTransportTest {
             assertTrue("callTimeout surfaces as a retryable transport failure", failure.retryable)
         } finally {
             server.shutdown()
+        }
+    }
+
+    @Test
+    fun modelListChunkedLimitPlusOneCarriesTypedTooLargeCode() = runBlocking {
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = ResponseBodyReadSignals()
+            server.start()
+            try {
+                server.enqueue(
+                    MockResponse().setChunkedBody(
+                        modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES + 1),
+                        1024,
+                    ),
+                )
+                val failure = expectTooLarge(
+                    providerFor(protocol, server, signals.client()),
+                    "$protocol chunked LIMIT+1 model list",
+                )
+                assertEquals("$protocol chunked LIMIT+1 carries typed code", ProviderFailureCode.TOO_LARGE, failure.code)
+                assertCallCancelled(signals, "$protocol chunked LIMIT+1 overflow")
+                assertReadWithinBudget(signals, MODEL_LIST_BODY_LIMIT_BYTES, "$protocol chunked LIMIT+1 model list")
+                assertEquals("$protocol chunked LIMIT+1 remains one request", 1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun errorPrefixCapBoundariesListModelsFailsWithStatusFallback() = runBlocking {
+        // No fatal marker: bare 503 falls back to retryable status classification.
+        // Expected client-source bytes: under-cap sizes are read fully, over-cap
+        // sizes stop at the 16KiB prefix. Per current code the exact-cap size
+        // (remaining == 0) also calls cancelCall, even though no overflow byte
+        // exists; only the under-cap size leaves the Call uncancelled.
+        for (protocol in ProviderProtocol.values()) {
+            for (size in listOf(16383, 16384, 16385)) {
+                for (unknownLength in listOf(false, true)) {
+                    val server = MockWebServer()
+                    val signals = ResponseBodyReadSignals()
+                    server.start()
+                    try {
+                        val errorBody = "e".repeat(size)
+                        val response = MockResponse().setResponseCode(503)
+                        if (unknownLength) response.setChunkedBody(errorBody, 1024) else response.setBody(errorBody)
+                        server.enqueue(response)
+                        val kind = if (unknownLength) "chunked" else "known-length"
+                        val context = "$protocol $kind error $size"
+                        val failure = try {
+                            providerFor(protocol, server, signals.client()).listModels()
+                            throw AssertionError("$context should fail")
+                        } catch (expected: ProviderFailure) {
+                            expected
+                        }
+                        assertTrue("$context preserves HTTP status", failure.message.orEmpty().contains("HTTP 503"))
+                        assertTrue("$context bare 503 falls back to retryable", failure.retryable)
+                        val expectedConsumed = if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) size.toLong() else HTTP_ERROR_BODY_LIMIT_BYTES.toLong()
+                        assertEquals("$context consumed exact client-source bytes", expectedConsumed, signals.consumedBytes.get())
+                        if (size < HTTP_ERROR_BODY_LIMIT_BYTES) {
+                            assertFalse(
+                                "$context under-cap prefix leaves the Call uncancelled",
+                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(300, TimeUnit.MILLISECONDS) },
+                            )
+                        } else {
+                            // Exact-cap also cancels per current code (remaining == 0 path).
+                            assertCallCancelled(signals, context)
+                        }
+                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
+                        assertEquals("$context remains one request", 1, server.requestCount)
+                    } finally {
+                        server.shutdown()
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun errorPrefixCapBoundariesStreamFailsWithStatusFallback() = runBlocking {
+        // Stream twin of the listModels cap-boundary matrix: same bodies, same
+        // exact-consumed/cancel expectations, surfaced as one Failed event.
+        for (protocol in ProviderProtocol.values()) {
+            for (size in listOf(16383, 16384, 16385)) {
+                for (unknownLength in listOf(false, true)) {
+                    val server = MockWebServer()
+                    val signals = ResponseBodyReadSignals()
+                    server.start()
+                    try {
+                        val errorBody = "e".repeat(size)
+                        val response = MockResponse().setResponseCode(503)
+                        if (unknownLength) response.setChunkedBody(errorBody, 1024) else response.setBody(errorBody)
+                        server.enqueue(response)
+                        val kind = if (unknownLength) "chunked" else "known-length"
+                        val context = "$protocol $kind SSE error $size"
+                        val events = withTimeout(5_000) {
+                            providerFor(protocol, server, signals.client()).stream(request()).toList()
+                        }
+                        val failure = events.single() as StreamEvent.Failed
+                        assertTrue("$context preserves HTTP status", failure.message.contains("HTTP 503"))
+                        assertTrue("$context bare 503 stays retryable", failure.retryable)
+                        val expectedConsumed = if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) size.toLong() else HTTP_ERROR_BODY_LIMIT_BYTES.toLong()
+                        assertEquals("$context consumed exact client-source bytes", expectedConsumed, signals.consumedBytes.get())
+                        if (size < HTTP_ERROR_BODY_LIMIT_BYTES) {
+                            assertFalse(
+                                "$context under-cap prefix leaves the Call uncancelled",
+                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(300, TimeUnit.MILLISECONDS) },
+                            )
+                        } else {
+                            // Exact-cap also cancels per current code (remaining == 0 path).
+                            assertCallCancelled(signals, context)
+                        }
+                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
+                        assertEquals("$context remains one provider attempt", 1, server.requestCount)
+                    } finally {
+                        server.shutdown()
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    fun cancellationInsideErrorPrefixListModelsStaysCancellation() = runBlocking {
+        // Slow peer: headers arrive at once, the 503 error body stalls 10s, so
+        // the Job is cancelled while blocked inside the error-prefix read.
+        val hugeBody = "e".repeat(64 * 1024)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = ResponseBodyReadSignals()
+            server.start()
+            var job: Job? = null
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setResponseCode(503)
+                        .setChunkedBody(hugeBody, 1024)
+                        .setBodyDelay(10, TimeUnit.SECONDS),
+                )
+                var thrown: Throwable? = null
+                val active = launch(Dispatchers.IO) {
+                    try {
+                        providerFor(protocol, server, signals.client()).listModels()
+                    } catch (e: Throwable) {
+                        thrown = e
+                    }
+                }
+                job = active
+                assertTrue(
+                    "$protocol error headers arrive before body delay",
+                    withContext(Dispatchers.IO) { signals.calls.headers.await(3, TimeUnit.SECONDS) },
+                )
+                assertTrue(
+                    "$protocol error-prefix read entered before cancel",
+                    withContext(Dispatchers.IO) { signals.readEntered.await(3, TimeUnit.SECONDS) },
+                )
+                withTimeout(1_500) { active.cancelAndJoin() }
+                assertCallCancelled(signals, "$protocol error-prefix cancellation")
+                withTimeoutOrNull(1_500) { active.join() }
+                assertTrue("$protocol error-prefix cancellation stays CancellationException, got $thrown", thrown is CancellationException)
+                assertFalse("$protocol cancellation is not converted to ProviderFailure", thrown is ProviderFailure)
+                assertEquals("$protocol cancelled error prefix remains one request", 1, server.requestCount)
+            } finally {
+                job?.cancel()
+                server.shutdown()
+                job?.let { active -> withTimeoutOrNull(1_500) { active.join() } }
+            }
+        }
+    }
+
+    @Test
+    fun cancellationInsideErrorPrefixStreamEmitsNoFailure() = runBlocking {
+        // Stream twin: cancelling inside the 503 error-prefix read must surface
+        // as CancellationException with no Failed event, not a failure.
+        val hugeBody = "e".repeat(64 * 1024)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = ResponseBodyReadSignals()
+            server.start()
+            var job: Job? = null
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setResponseCode(503)
+                        .setChunkedBody(hugeBody, 1024)
+                        .setBodyDelay(10, TimeUnit.SECONDS),
+                )
+                val events = mutableListOf<StreamEvent>()
+                var thrown: Throwable? = null
+                val active = launch(Dispatchers.IO) {
+                    try {
+                        events.addAll(providerFor(protocol, server, signals.client()).stream(request()).toList())
+                    } catch (e: Throwable) {
+                        thrown = e
+                    }
+                }
+                job = active
+                assertTrue(
+                    "$protocol SSE error headers arrive before body delay",
+                    withContext(Dispatchers.IO) { signals.calls.headers.await(3, TimeUnit.SECONDS) },
+                )
+                assertTrue(
+                    "$protocol SSE error-prefix read entered before cancel",
+                    withContext(Dispatchers.IO) { signals.readEntered.await(3, TimeUnit.SECONDS) },
+                )
+                withTimeout(1_500) { active.cancelAndJoin() }
+                assertCallCancelled(signals, "$protocol SSE error-prefix cancellation")
+                withTimeoutOrNull(1_500) { active.join() }
+                assertTrue("$protocol SSE error-prefix cancellation stays CancellationException, got $thrown", thrown is CancellationException)
+                assertTrue("$protocol SSE cancellation emits no Failed event", events.none { it is StreamEvent.Failed })
+                assertEquals("$protocol cancelled SSE error prefix remains one request", 1, server.requestCount)
+            } finally {
+                job?.cancel()
+                server.shutdown()
+                job?.let { active -> withTimeoutOrNull(1_500) { active.join() } }
+            }
+        }
+    }
+
+    @Test
+    fun gzipErrorPrefixDecodingBoundariesDoNotCrash() = runBlocking {
+        // Budget counts DECODED bytes: the counting interceptor sits at the
+        // application layer, after OkHttp transparently inflates gzip.
+        val marker = "insufficient_quota"
+        val justInside = "x".repeat(HTTP_ERROR_BODY_LIMIT_BYTES - marker.length - 1) + marker + "y".repeat(32 * 1024)
+        val justOutside = "x".repeat(HTTP_ERROR_BODY_LIMIT_BYTES - 5) + marker + "y".repeat(32 * 1024)
+        // Marker straddles the 8KiB provider read chunk (8190..8207 crosses
+        // 8192) and the 16KiB cap lands mid-あ (8208 + 8176 = 16384).
+        val splitMarkerMultibyte = "x".repeat(8190) + marker + "あ".repeat(3000) + "z".repeat(20 * 1024)
+        val illegalPrefix = "err ".toByteArray(Charsets.UTF_8) +
+            byteArrayOf(0xFF.toByte(), 0xFE.toByte()) +
+            marker.toByteArray(Charsets.UTF_8) +
+            "x".repeat(32 * 1024).toByteArray(Charsets.UTF_8)
+        for (protocol in ProviderProtocol.values()) {
+            // (i) marker just inside vs just outside the 16KiB decoded prefix.
+            for ((label, body, expectRetryable) in listOf(
+                Triple("marker-just-inside", justInside, false),
+                Triple("marker-just-outside", justOutside, true),
+            )) {
+                val server = MockWebServer()
+                val signals = ResponseBodyReadSignals()
+                server.start()
+                try {
+                    server.enqueue(
+                        MockResponse()
+                            .setResponseCode(503)
+                            .addHeader("Content-Encoding", "gzip")
+                            .setBody(gzipBody(body)),
+                    )
+                    val failure = try {
+                        providerFor(protocol, server, signals.client()).listModels()
+                        throw AssertionError("$protocol gzip $label should fail")
+                    } catch (expected: ProviderFailure) {
+                        expected
+                    }
+                    assertTrue("$protocol gzip $label preserves HTTP status", failure.message.orEmpty().contains("HTTP 503"))
+                    assertEquals("$protocol gzip $label retryable follows marker visibility", expectRetryable, failure.retryable)
+                    assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, "$protocol gzip $label")
+                    assertCallCancelled(signals, "$protocol gzip $label cap")
+                    assertEquals("$protocol gzip $label remains one request", 1, server.requestCount)
+                } finally {
+                    server.shutdown()
+                }
+            }
+            // (ii) multi-byte split + marker split across the 8KiB read chunk.
+            run {
+                val server = MockWebServer()
+                val signals = ResponseBodyReadSignals()
+                server.start()
+                try {
+                    server.enqueue(
+                        MockResponse()
+                            .setResponseCode(503)
+                            .addHeader("Content-Encoding", "gzip")
+                            .setBody(gzipBody(splitMarkerMultibyte)),
+                    )
+                    val failure = try {
+                        providerFor(protocol, server, signals.client()).listModels()
+                        throw AssertionError("$protocol gzip split-marker-multibyte should fail without crashing")
+                    } catch (expected: ProviderFailure) {
+                        expected
+                    }
+                    assertTrue("$protocol gzip split marker preserves HTTP status", failure.message.orEmpty().contains("HTTP 503"))
+                    assertFalse("$protocol gzip split marker across 8KiB chunk stays visible/fatal", failure.retryable)
+                    assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, "$protocol gzip split-marker-multibyte")
+                    assertCallCancelled(signals, "$protocol gzip split-marker-multibyte cap")
+                    assertEquals("$protocol gzip split case remains one request", 1, server.requestCount)
+                } finally {
+                    server.shutdown()
+                }
+            }
+            // (iii) illegal UTF-8 sequence preserved via raw gzip bytes.
+            run {
+                val server = MockWebServer()
+                val signals = ResponseBodyReadSignals()
+                server.start()
+                try {
+                    server.enqueue(
+                        MockResponse()
+                            .setResponseCode(503)
+                            .addHeader("Content-Encoding", "gzip")
+                            .setBody(gzipBytes(illegalPrefix)),
+                    )
+                    val failure = try {
+                        providerFor(protocol, server, signals.client()).listModels()
+                        throw AssertionError("$protocol gzip illegal-sequence should fail without crashing")
+                    } catch (expected: ProviderFailure) {
+                        expected
+                    }
+                    assertTrue("$protocol gzip illegal bytes preserve HTTP status", failure.message.orEmpty().contains("HTTP 503"))
+                    assertFalse("$protocol gzip ASCII marker survives illegal bytes (fatal)", failure.retryable)
+                    assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, "$protocol gzip illegal-sequence")
+                    assertCallCancelled(signals, "$protocol gzip illegal-sequence cap")
+                    assertEquals("$protocol gzip illegal case remains one request", 1, server.requestCount)
+                } finally {
+                    server.shutdown()
+                }
+            }
+            // Gzip stream twin: one decoded-over-cap case must also surface as Failed.
+            run {
+                val server = MockWebServer()
+                val signals = ResponseBodyReadSignals()
+                server.start()
+                try {
+                    server.enqueue(
+                        MockResponse()
+                            .setResponseCode(503)
+                            .addHeader("Content-Encoding", "gzip")
+                            .setBody(gzipBody(justOutside)),
+                    )
+                    val events = withTimeout(5_000) {
+                        providerFor(protocol, server, signals.client()).stream(request()).toList()
+                    }
+                    val failure = events.single() as StreamEvent.Failed
+                    assertTrue("$protocol gzip SSE preserves HTTP status", failure.message.contains("HTTP 503"))
+                    assertTrue("$protocol gzip SSE outside-marker stays retryable", failure.retryable)
+                    assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, "$protocol gzip SSE")
+                    assertCallCancelled(signals, "$protocol gzip SSE cap")
+                    assertEquals("$protocol gzip SSE remains one attempt", 1, server.requestCount)
+                } finally {
+                    server.shutdown()
+                }
+            }
         }
     }
 }

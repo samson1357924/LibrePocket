@@ -10,6 +10,7 @@ import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.KeyProvider
 import dev.librepocket.provider.ProviderFailure
+import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
 import java.nio.file.Files
@@ -132,6 +133,35 @@ class SetupConnectionTest {
     @Test
     fun fatalUnknownMapsToFailed() {
         val fake = FakeListProvider(failure = ProviderFailure(false, "weird"))
+        val (vm, _) = newVm(fake)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.testConnection()
+        awaitIdle(vm)
+        assertEquals("TEST_FAILED", vm.form.value.errorCode)
+    }
+
+    @Test
+    fun tooLargeMapsToTooLarge() {
+        val fake = FakeListProvider(
+            failure = ProviderFailure(
+                false,
+                "response truncated",
+                code = ProviderFailureCode.TOO_LARGE,
+            ),
+        )
+        val (vm, _) = newVm(fake)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.testConnection()
+        awaitIdle(vm)
+        assertEquals("TEST_TOO_LARGE", vm.form.value.errorCode)
+        assertNull(vm.form.value.testModels)
+    }
+
+    @Test
+    fun tooLargeMessageWithoutCodeStillFails() {
+        val fake = FakeListProvider(
+            failure = ProviderFailure(false, "TOO_LARGE provider model-list response"),
+        )
         val (vm, _) = newVm(fake)
         vm.onApiKeyChange("sk-test-key-123")
         vm.testConnection()

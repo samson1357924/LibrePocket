@@ -61,12 +61,16 @@ class ChatCompletionsProvider(
                 .header("Authorization", "Bearer ${String(key)}")
                 .get()
                 .build()
-            return executeProviderRequest(httpClient, req) { resp ->
-                val text = resp.body?.string().orEmpty()
+            return executeProviderRequest(httpClient, req) { resp, cancelCall ->
                 if (!resp.isSuccessful) {
-                    val kind = ProviderErrorClassifier.classify(resp.code, null, text)
-                    throw ProviderFailure(kind == FailureKind.RETRYABLE, redactedError("HTTP ${resp.code}", text))
+                    val errorPrefix = readProviderErrorPrefix(resp.body, cancelCall).orEmpty()
+                    val kind = ProviderErrorClassifier.classify(resp.code, null, errorPrefix)
+                    throw ProviderFailure(
+                        kind == FailureKind.RETRYABLE,
+                        redactedError("HTTP ${resp.code}", errorPrefix),
+                    )
                 }
+                val text = resp.body?.let { readBoundedProviderBody(it, cancelCall) }.orEmpty()
                 extractModelIds(text)
             }
         } finally {

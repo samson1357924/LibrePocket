@@ -34,6 +34,24 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/**
+ * One-shot key.write consent minted when [PolicyStore.evaluateFresh] returns ASK.
+ *
+ * In-memory only: never persisted, never placed in SavedState, and carries no
+ * key material (identity snapshot + nonce only). Bound to the immutable
+ * endpoint snapshot observed at mint time; consumed (nulled) on the first
+ * confirm or abandon tap, so it can never be replayed or reused. Any
+ * endpoint-identity edit discards it before use.
+ */
+private data class KeyWriteConsent(
+    val action: String,
+    val resource: String,
+    val providerId: String,
+    val baseUrl: String,
+    val configRevision: Long,
+    val nonce: Long,
+)
+
 /** Gate state for startup navigation. Loading and NoEndpoint are distinct (no FOUC). */
 sealed interface EndpointGate {
     data object Loading : EndpointGate
@@ -62,7 +80,6 @@ data class SetupUiState(
     // Transient model-refresh CAS epoch only; not endpoint/configuration revision.
     internal val modelRefreshRevision: Long = 0L,
     val confirmKeyWrite: Boolean = false,
-    val keyWriteConfirmed: Boolean = false,
     val errorCode: String? = null,
     val saved: Boolean = false,
 )
@@ -99,6 +116,13 @@ class SetupViewModel(
     private val modelRefreshGeneration = AtomicLong(0L)
     private var modelRefreshJob: Job? = null
 
+    // One-shot key.write consent (ASK path). Main-thread edits and the IO save
+    // coroutine touch it from different threads; all access goes through
+    // [consentLock]. Never persisted, never leaves this ViewModel.
+    private val consentLock = Any()
+    private var pendingConsent: KeyWriteConsent? = null
+    private val consentNonces = AtomicLong(0L)
+
     val gate: StateFlow<EndpointGate> = store.observe()
         .map { config ->
             if (config == null) {
@@ -123,6 +147,7 @@ class SetupViewModel(
 
     fun selectPreset(presetId: String) {
         val preset = ProviderCatalog.preset(presetId) ?: return
+        invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
@@ -140,6 +165,7 @@ class SetupViewModel(
     }
 
     fun onBaseUrlChange(v: String) {
+        invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
@@ -159,6 +185,7 @@ class SetupViewModel(
     }
 
     fun onApiKeyChange(v: String) {
+        invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
@@ -167,7 +194,6 @@ class SetupViewModel(
             modelRefreshRevision = revision,
             errorCode = null,
             testModels = null,
-            keyWriteConfirmed = false,
             modelOptions = emptyList(),
             modelsLoading = false,
             modelDirectoryStatus = ModelDirectoryStatus.NotLoaded,
@@ -184,6 +210,7 @@ class SetupViewModel(
      * Unknown presetIds fall back to custom with the stored URL editable.
      */
     fun prefillForEdit(config: EndpointConfig) {
+        invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
@@ -304,6 +331,17 @@ class SetupViewModel(
     }
 
     fun save() {
+        saveWithConsent(null)
+    }
+
+    /**
+     * Shared save path. [consent] is non-null only for the dialog confirm tap,
+     * which carries the one-shot consent minted by the earlier ASK evaluation.
+     * Every side effect below ([KeyVault.putKey] + [EndpointStore.save]) is
+     * preceded by a fresh policy evaluation; DENY always wins, even when a
+     * consent was minted earlier.
+     */
+    private fun saveWithConsent(consent: KeyWriteConsent?) {
         val cur = _form.value
         if (cur.saving || cur.testing || cur.modelsLoading) return
         val effectiveBaseUrl = effectiveBaseUrlOf(cur)
@@ -315,29 +353,7 @@ class SetupViewModel(
         _form.value = cur.copy(saving = true, errorCode = null)
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val providerId = SetupValidation.deriveProviderId(cur.presetId)
-                // key.write defaults to ASK: one explicit confirmation per key.
-                if (!cur.keyWriteConfirmed) {
-                    when (policy.evaluateFresh("key.write", providerId).verdict) {
-                        Verdict.DENY -> {
-                            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                            return@launch
-                        }
-                        Verdict.ASK -> {
-                            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
-                            return@launch
-                        }
-                        Verdict.ALLOW -> Unit
-                    }
-                }
-                val keyCopy = cur.apiKey.trim().toCharArray()
-                try {
-                    vault().putKey(providerId, keyCopy)
-                } finally {
-                    keyCopy.fill('\u0000')
-                }
-                store.save(endpointConfigOf(cur, effectiveBaseUrl, providerId))
-                _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                executeKeyWrite(cur, effectiveBaseUrl, consent)
             } catch (e: IllegalArgumentException) {
                 _form.value = _form.value.copy(saving = false, errorCode = e.message ?: "SETUP_SAVE_FAILED")
             } catch (_: Exception) {
@@ -346,19 +362,113 @@ class SetupViewModel(
         }
     }
 
-    /** Second tap of the key.write confirmation dialog: proceed with the save. */
+    private suspend fun executeKeyWrite(
+        form: SetupUiState,
+        effectiveBaseUrl: String,
+        consent: KeyWriteConsent?,
+    ) {
+        val providerId = SetupValidation.deriveProviderId(form.presetId)
+        // Fresh evaluation immediately before ANY side effect (TOCTOU guard).
+        val verdict = policy.evaluateFresh("key.write", providerId).verdict
+        if (verdict == Verdict.DENY) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        if (consent != null) {
+            // The carried consent covers exactly one ASK. It must still match
+            // the endpoint snapshot; a changed identity fails closed.
+            if (!consentMatchesSnapshot(consent, form, effectiveBaseUrl)) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+        } else if (verdict == Verdict.ASK) {
+            // key.write defaults to ASK: one explicit confirmation per key.
+            mintKeyWriteConsent(providerId, effectiveBaseUrl)
+            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+            return
+        }
+        val keyCopy = form.apiKey.trim().toCharArray()
+        try {
+            vault().putKey(providerId, keyCopy)
+        } finally {
+            keyCopy.fill('\u0000')
+        }
+        store.save(endpointConfigOf(form, effectiveBaseUrl, providerId))
+        _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+    }
+
+    /** Second tap of the key.write confirmation dialog: single-use, snapshot-bound. */
     fun confirmKeyWriteSave() {
         if (!_form.value.confirmKeyWrite) return
-        _form.value = _form.value.copy(confirmKeyWrite = false, keyWriteConfirmed = true)
-        save()
+        // Consume-once: this tap burns the consent even if the write below is refused.
+        val consent = takePendingConsent()
+        _form.value = _form.value.copy(confirmKeyWrite = false)
+        if (consent == null) {
+            // Stale or replayed confirm (identity edited mid-dialog, double tap
+            // racing the save, or programmatic misuse): fail closed, touch nothing.
+            _form.value = _form.value.copy(errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        saveWithConsent(consent)
     }
 
     fun dismissKeyWriteConfirm() {
+        // Abandon the minted consent: a later save() must re-evaluate fresh.
+        takePendingConsent()
         _form.value = _form.value.copy(confirmKeyWrite = false)
     }
 
+    /** Discard any unconsumed consent and hide the confirm dialog. */
+    private fun invalidateKeyWriteConsent() {
+        takePendingConsent()
+        if (_form.value.confirmKeyWrite) {
+            _form.value = _form.value.copy(confirmKeyWrite = false)
+        }
+    }
+
+    /** Consume-once take: the returned consent (if any) can never be used again. */
+    private fun takePendingConsent(): KeyWriteConsent? =
+        synchronized(consentLock) {
+            val consent = pendingConsent
+            pendingConsent = null
+            consent
+        }
+
+    /** Mint a consent bound to the endpoint identity + stored revision observed now. */
+    private suspend fun mintKeyWriteConsent(providerId: String, baseUrl: String) {
+        val consent = KeyWriteConsent(
+            action = "key.write",
+            resource = providerId,
+            providerId = providerId,
+            baseUrl = baseUrl,
+            configRevision = readConfigRevision(),
+            nonce = consentNonces.incrementAndGet(),
+        )
+        synchronized(consentLock) { pendingConsent = consent }
+    }
+
+    private suspend fun consentMatchesSnapshot(
+        consent: KeyWriteConsent,
+        form: SetupUiState,
+        effectiveBaseUrl: String,
+    ): Boolean {
+        if (consent.action != "key.write") return false
+        if (consent.resource != consent.providerId) return false
+        if (consent.providerId != SetupValidation.deriveProviderId(form.presetId)) return false
+        if (consent.baseUrl != effectiveBaseUrl) return false
+        return consent.configRevision == readConfigRevision()
+    }
+
+    private suspend fun readConfigRevision(): Long =
+        try {
+            store.observe().first()?.configRevision ?: 0L
+        } catch (_: Exception) {
+            -1L
+        }
+
     /** Logout: delete the vault key, then clear metadata (order matters). */
     fun logout(onDone: () -> Unit = {}) {
+        invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         modelRefreshGeneration.incrementAndGet()

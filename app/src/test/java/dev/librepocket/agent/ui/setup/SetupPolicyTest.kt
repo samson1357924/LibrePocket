@@ -4,6 +4,7 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
+import dev.librepocket.keystore.KeyVault
 import dev.librepocket.policy.PolicyDecision
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.PolicyStore
@@ -45,6 +46,46 @@ class VerdictPolicy(private val verdict: Verdict) : PolicyStore {
     }
 }
 
+/** PolicyStore stub with a mutable verdict (policy-flip regression tests). */
+class MutablePolicy(var verdict: Verdict) : PolicyStore {
+    var freshCalls = 0
+    var lastAction: String? = null
+        private set
+    var lastResource: String? = null
+        private set
+
+    override fun evaluate(action: String, resource: String) =
+        PolicyDecision(verdict, null, System.currentTimeMillis())
+
+    override suspend fun setRule(rule: PolicyRule) = Unit
+    override suspend fun removeRule(pattern: String) = Unit
+    override suspend fun listRules(): List<PolicyRule> = emptyList()
+
+    override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+        freshCalls++
+        lastAction = action
+        lastResource = resource
+        return PolicyDecision(verdict, null, System.currentTimeMillis())
+    }
+}
+
+/** KeyVault decorator counting putKey calls (single-write / replay assertions). */
+class CountingVault(
+    private val delegate: KeyVault = EncryptedPrefsVault(InMemoryPrefs()),
+) : KeyVault {
+    var putKeys = 0
+        private set
+
+    override suspend fun putKey(providerId: String, apiKey: CharArray) {
+        putKeys++
+        delegate.putKey(providerId, apiKey)
+    }
+
+    override suspend fun getKey(providerId: String): CharArray? = delegate.getKey(providerId)
+    override suspend fun deleteKey(providerId: String) = delegate.deleteKey(providerId)
+    override suspend fun hasKey(providerId: String): Boolean = delegate.hasKey(providerId)
+}
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class SetupPolicyTest {
 
@@ -63,7 +104,10 @@ class SetupPolicyTest {
         tmpDirs.forEach { it.deleteRecursively() }
     }
 
-    private fun newVm(policy: PolicyStore): Triple<SetupViewModel, EncryptedPrefsVault, EndpointStore> {
+    private fun newVm(
+        policy: PolicyStore,
+        vault: KeyVault = EncryptedPrefsVault(InMemoryPrefs()),
+    ): Triple<SetupViewModel, KeyVault, EndpointStore> {
         val dir = Files.createTempDirectory("setup-policy-test").toFile()
         tmpDirs.add(dir)
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -74,7 +118,6 @@ class SetupPolicyTest {
                 produceFile = { java.io.File(dir, "policy.preferences_pb") },
             ),
         )
-        val vault = EncryptedPrefsVault(InMemoryPrefs())
         val vm = SetupViewModel(
             store = store,
             vaultSource = VaultSource { vault },
@@ -124,8 +167,8 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertFalse(vm.form.value.confirmKeyWrite)
         assertTrue(vm.form.value.saved)
-        // Policy checked once; the confirmation bypasses the second check.
-        assertEquals(1, policy.freshCalls)
+        // Policy checked twice: once before the dialog, once fresh before the write.
+        assertEquals(2, policy.freshCalls)
         runBlocking {
             assertTrue(vault.hasKey("preset:openai"))
             assertTrue(store.hasMetadata())
@@ -214,5 +257,117 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
         assertNull(vm.form.value.errorCode)
+    }
+
+    @Test
+    fun askThenDenyBlocksConfirmWithZeroWrites() {
+        val policy = MutablePolicy(Verdict.ASK)
+        val vault = CountingVault()
+        val (vm, _, store) = newVm(policy, vault)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.confirmKeyWrite)
+        assertEquals(1, policy.freshCalls)
+        // Policy flips to DENY after the dialog was shown: DENY always wins.
+        policy.verdict = Verdict.DENY
+        vm.confirmKeyWriteSave()
+        awaitSettled(vm)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        // The confirm path re-evaluated fresh against key.write for this provider.
+        assertEquals(2, policy.freshCalls)
+        assertEquals("key.write", policy.lastAction)
+        assertEquals("preset:openai", policy.lastResource)
+        assertEquals(0, vault.putKeys)
+        runBlocking {
+            assertFalse(vault.hasKey("preset:openai"))
+            assertFalse(store.hasMetadata())
+        }
+    }
+
+    @Test
+    fun presetChangeInvalidatesUnconsumedConsent() {
+        val policy = MutablePolicy(Verdict.ASK)
+        val vault = CountingVault()
+        val (vm, _, store) = newVm(policy, vault)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.confirmKeyWrite)
+        // Switching endpoint identity discards the minted consent and the dialog.
+        vm.selectPreset("anthropic")
+        assertFalse(vm.form.value.confirmKeyWrite)
+        vm.confirmKeyWriteSave()
+        assertNull(vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertEquals(1, policy.freshCalls)
+        assertEquals(0, vault.putKeys)
+        // A fresh save re-evaluates and mints a new consent for the new identity.
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.confirmKeyWrite)
+        assertEquals(2, policy.freshCalls)
+        vm.confirmKeyWriteSave()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.saved)
+        assertEquals(3, policy.freshCalls)
+        assertEquals(1, vault.putKeys)
+        runBlocking {
+            assertTrue(vault.hasKey("preset:anthropic"))
+            assertFalse(vault.hasKey("preset:openai"))
+            assertEquals("preset:anthropic", store.observe().first()?.providerId)
+        }
+    }
+
+    @Test
+    fun baseUrlChangeInvalidatesUnconsumedConsent() {
+        val policy = MutablePolicy(Verdict.ASK)
+        val vault = CountingVault()
+        val (vm, _, store) = newVm(policy, vault)
+        vm.selectPreset("custom")
+        vm.onBaseUrlChange("https://custom-a.example.com/v1")
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.confirmKeyWrite)
+        vm.onBaseUrlChange("https://custom-b.example.com/v1")
+        assertFalse(vm.form.value.confirmKeyWrite)
+        vm.confirmKeyWriteSave()
+        assertFalse(vm.form.value.saved)
+        assertEquals(1, policy.freshCalls)
+        assertEquals(0, vault.putKeys)
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.confirmKeyWrite)
+        vm.confirmKeyWriteSave()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.saved)
+        assertEquals(1, vault.putKeys)
+        runBlocking {
+            assertEquals("https://custom-b.example.com/v1", store.observe().first()?.baseUrl)
+        }
+    }
+
+    @Test
+    fun confirmReplayIsRefusedWithSingleWrite() {
+        val policy = MutablePolicy(Verdict.ASK)
+        val vault = CountingVault()
+        val (vm, _, _) = newVm(policy, vault)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.save()
+        awaitSettled(vm)
+        vm.confirmKeyWriteSave()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.saved)
+        assertEquals(1, vault.putKeys)
+        assertEquals(2, policy.freshCalls)
+        // The consent was consumed by the first confirm: replaying does nothing,
+        // not even a policy re-evaluation.
+        vm.confirmKeyWriteSave()
+        assertTrue(vm.form.value.saved)
+        assertEquals(1, vault.putKeys)
+        assertEquals(2, policy.freshCalls)
     }
 }

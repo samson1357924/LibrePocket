@@ -20,7 +20,7 @@ data class SessionMeta(
 data class TranscriptEvent(
     val seq: Long = 0, // DB-assigned; ignored on write
     val sessionId: String,
-    val runId: String, // one turn shares a runId; a retry starts a new runId
+    val runId: String, // one logical turn owns one user row id; each attempt uses a fresh runId for its assistant/tool/usage rows, retry notices bind to the logical id
     val kind: String, // "user" | "assistant" | "tool" | "steer" | "retry" | "system"
     val text: String, // redacted before write
     val imagesOmitted: Int = 0, // stripped image-body count (bytes never stored)

@@ -14,8 +14,10 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,6 +25,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
@@ -109,6 +113,13 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  * if the transport close blocks briefly, then the in-flight job is cancelled,
  * which cancels the underlying HTTP call promptly. No IO on this path.
  *
+ * Transcript durability: every transcript event goes through the
+ * session-owned [OrderedTranscriptSink] (bounded channel, single writer, core
+ * events durably acked). The writer runs outside the turn scope, so
+ * cancelling the network never discards an admitted event; [close] settles
+ * the doomed host and drains with a bounded timeout instead of cancelling the
+ * scope out from under pending writes.
+ *
  * Retry: each attempt gets a fresh runId; failed partial output is kept with
  * `isPartial=true` and the next attempt starts a new assistant block instead
  * of backfilling the old one.
@@ -164,6 +175,16 @@ class TurnController(
 
   private val lock = Any()
   private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+  /**
+   * Session-owned serialized transcript writer. All [TranscriptSink] calls
+   * below go through it (never directly to [transcript]), so persistence
+   * order matches admission order and core events are durably acked. Its
+   * scope is independent of [scope], so turn cancellation cannot strand an
+   * admitted event.
+   */
+  private val orderedTranscript = OrderedTranscriptSink(transcript, dispatcher)
+  /** Background settle+drain+seal launched by [close]; awaited by [flushTranscript]. Guarded by [lock]. */
+  private var shutdownJob: Job? = null
   private val _uiState = MutableStateFlow(
     ChatUiState(messages = emptyList(), status = ChatStatus.IDLE, pendingSteerCount = 0, error = null),
   )
@@ -416,19 +437,21 @@ class TurnController(
     }
   }
 
-  fun close() {
+  fun close(drainTimeoutMs: Long = OrderedTranscriptSink.DEFAULT_DRAIN_TIMEOUT_MS) {
     // Drop the FIFO under the same lock that seals the controller, so no
     // admission can slip in after the seal. Reclaim-then-seal ordering across
     // threads is the caller's job: the ViewModel drains-then-closes with no
     // suspension on its Main-confined path, so nothing slips between them
     // there. Callers that must keep unstarted work (endpoint-switch recovery)
     // drain it explicitly via drainQueued() BEFORE close().
+    val doomed: Job?
     synchronized(lock) {
       if (closed) return
       closed = true
       activityRevision++
       steerQueue.clear()
       val current = activeLocked()
+      doomed = current
       _uiState.update {
         it.copy(
           pendingSteerCount = 0,
@@ -439,7 +462,59 @@ class TurnController(
       current?.cancel()
     }
     scope.cancel()
+    // Bounded ledger drain on the session-owned writer (independent of
+    // [scope], so it survives the cancel above): settle the doomed host first
+    // so its non-cancellable terminal record is admitted ahead of the flush
+    // barrier, then drain, then seal. Core runIds still unacked afterwards are
+    // exposed via [interruptedTranscriptRunIds], never silently dropped. The
+    // synchronous part only launches this work, so close() stays fast even
+    // when the store stalls; await it via [flushTranscript]. The job is
+    // published under [lock] so a concurrent [flushTranscript] observes it.
+    val shutdown = orderedTranscript.shutdown(drainTimeoutMs) {
+      try {
+        doomed?.join()
+      } catch (_: CancellationException) {
+        // Hosts rethrow cancellation after persisting the terminal record.
+      }
+    }
+    synchronized(lock) { shutdownJob = shutdown }
   }
+
+  /**
+   * Suspends until the session ledger is fully settled, bounded by
+   * [timeoutMs] (true = drained, false = timed out): first the background
+   * [close] drain (doomed-host settle + admitted drain + seal, all bounded),
+   * then every event admitted so far. Send returning already implies
+   * durability for the terminal record (core writes are acked inline); use
+   * this after [close]/[cancel] to await the asynchronous terminal record.
+   * Cancellation of the caller still propagates.
+   *
+   * Concurrency: [shutdownJob] is read under the same [lock] that [close]
+   * publishes it with, so a concurrent [flushTranscript] either observes the
+   * drain job or — if it raced ahead of [close] — only flushes admitted
+   * events; call again after [close] returns to await the full drain.
+   */
+  suspend fun flushTranscript(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
+    val shutdown = synchronized(lock) { shutdownJob }
+    try {
+      if (shutdown != null && withTimeoutOrNull(timeoutMs) { shutdown.join() } == null) return false
+    } catch (e: CancellationException) {
+      throw e
+    } catch (_: Exception) {
+      // Best effort: the drain below still waits for what was admitted.
+    }
+    return orderedTranscript.flush(timeoutMs)
+  }
+
+  /**
+   * Core runIds admitted but never acked (drain timeout / seal race).
+   * Explicit INTERRUPTED marks for Phase 2/3 recovery; no Room schema change
+   * in Phase 1.
+   */
+  fun interruptedTranscriptRunIds(): List<String> = orderedTranscript.interruptedRunIds()
+
+  /** Core runIds admitted and still awaiting the session writer. */
+  fun pendingTranscriptRunIds(): List<String> = orderedTranscript.pendingRunIds()
 
   // ---- internals ----
 
@@ -498,7 +573,9 @@ class TurnController(
         queuedRecoveryRequired = it.queuedRecoveryRequired || it.status == ChatStatus.CANCELLED,
       )
     }
-    fireTranscript { transcript.onSteerQueued(text) }
+    // Session-ordered (never fire-and-forget): the writer admits this behind
+    // the caller's lock ordering, so queue order matches transcript order.
+    orderedTranscript.offerSteer(text)
   }
 
   /** Caller must hold [lock]; idle residual FIFO is transferred atomically. */
@@ -570,26 +647,19 @@ class TurnController(
     }
   }
 
-  private fun fireTranscript(block: suspend () -> Unit) {
-    scope.launch {
-      try {
-        block()
-      } catch (_: Exception) {
-        // Best effort: persistence must never break the chat loop.
-      }
-    }
-  }
-
   private suspend fun hostedTurn(text: String, images: List<ChatImageRef>) {
     val self = coroutineContext[Job]
     try {
       runTurnLoop(text, images)
     } catch (e: CancellationException) {
-      // Snapshot before async hop: latest* reads uiState at execution time,
-      // which may have moved on by the time the launched block runs.
+      // Snapshot before the write: latest* reads uiState at execution time,
+      // and the ordered write below suspends until admitted.
       val cancelId = latestAssistantId()
       val cancelText = latestAssistantText()
-      fireTranscript { transcript.onTurnCancelled(cancelId, cancelText) }
+      // Durable and non-cancellable: the host is cancelled but the session
+      // writer is independent, so this record still drains on close (or is
+      // explicitly marked INTERRUPTED instead of silently dropped).
+      withContext(NonCancellable) { orderedTranscript.onTurnCancelled(cancelId, cancelText) }
       throw e
     }
     // Normal completion only: hand off at most one queued steer as a detached
@@ -721,14 +791,34 @@ class TurnController(
     }
   }
 
+  /**
+   * Best-effort ordered notice (tool / usage / retry): the sink throws
+   * [ClosedSendChannelException] on the post-[close] seal race instead of
+   * succeeding silently, and that race is owned here — the notice is dropped
+   * explicitly (tool/usage notices have no drainQueued recovery path, and
+   * `close()` clears the FIFO). Cancellation of the caller still propagates.
+   */
+  private suspend fun writeNotice(block: suspend () -> Unit) {
+    try {
+      block()
+    } catch (e: CancellationException) {
+      throw e
+    } catch (_: ClosedSendChannelException) {
+      // Sealed after close(): explicit drop, no recovery path.
+    }
+  }
+
   private suspend fun runTurnLoop(text: String, images: List<ChatImageRef>) {
+    // One logical turn owns exactly one user row (logicalTurnId), durably
+    // acked before the first provider attempt. Retries add attempt records
+    // bound to that id and start a new assistant block each; they never emit
+    // another user row. Direct suspend calls (no fire-and-forget hop), so no
+    // snapshot copies are needed: each write completes in call order.
+    val logicalTurnId = newId()
+    orderedTranscript.onTurnStarted(logicalTurnId, text)
     var attempt = 0
-    var runId = newId()
-    // Snapshot: fireTranscript is scope.launch async; capturing the var
-    // directly would race with later `runId = newId()` reassignments.
-    runId.let { startedId -> fireTranscript { transcript.onTurnStarted(startedId, text) } }
+    var attemptRunId = logicalTurnId
     while (true) {
-      val attemptRunId = runId
       appendAssistantPlaceholder(attemptRunId)
       val request = buildRequest(images)
       var failed: StreamEvent.Failed? = null
@@ -739,15 +829,14 @@ class TurnController(
       val toolIdText = mutableMapOf<Int, StringBuilder>()
       val toolNameText = mutableMapOf<Int, StringBuilder>()
       val toolDoneSeen = mutableSetOf<Int>()
-      fun flushPendingTools() {
+      suspend fun flushPendingTools() {
         for ((index, args) in toolArgText) {
           if (index !in toolDoneSeen) {
             val id = toolIdText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
             val name = toolNameText[index]?.toString().orEmpty().ifEmpty { "pending" }
-            // Snapshot args string before async hop (StringBuilder keeps mutating).
             val argsStr = args.toString()
             appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
-            fireTranscript { transcript.onToolDone(attemptRunId, index, id, name, argsStr) }
+            writeNotice { orderedTranscript.onToolDone(attemptRunId, index, id, name, argsStr) }
           }
         }
       }
@@ -774,13 +863,13 @@ class TurnController(
             is StreamEvent.ToolDone -> {
               toolDoneSeen.add(event.toolIndex)
               appendAssistantText(attemptRunId, "\n[tool:${event.name} ${event.argumentsJson}]")
-              fireTranscript {
-                transcript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
+              writeNotice {
+                orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
               }
             }
             is StreamEvent.Usage -> {
               lastUsage = event
-              fireTranscript { transcript.onUsage(attemptRunId, event.inputTokens, event.outputTokens) }
+              writeNotice { orderedTranscript.onUsage(attemptRunId, event.inputTokens, event.outputTokens) }
             }
             is StreamEvent.Done -> {
               finalizeAssistant(attemptRunId)
@@ -790,7 +879,8 @@ class TurnController(
             is StreamEvent.Retrying -> {
               // Compatibility with legacy/custom providers. Built-in adapters
               // do not retry; this controller owns retries from Failed events.
-              fireTranscript { transcript.onTurnRetried(attemptRunId, event.attempt, event.maxAttempts, event.delayMs) }
+              // A per-attempt provider notice keeps the attempt id.
+              writeNotice { orderedTranscript.onTurnRetried(attemptRunId, event.attempt, event.maxAttempts, event.delayMs) }
             }
           }
         }
@@ -809,9 +899,7 @@ class TurnController(
       }
       val failure = failed
       if (failure == null) {
-        // Snapshot text: assistantTextOf reads uiState at execution time.
-        val successText = assistantTextOf(attemptRunId)
-        fireTranscript { transcript.onTurnSucceeded(attemptRunId, successText) }
+        orderedTranscript.onTurnSucceeded(attemptRunId, assistantTextOf(attemptRunId))
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
@@ -822,24 +910,20 @@ class TurnController(
           activityRevision++
           _uiState.update { it.copy(status = ChatStatus.ERROR, error = clean) }
         }
-        fireTranscript { transcript.onTurnFailed(attemptRunId, clean) }
+        orderedTranscript.onTurnFailed(attemptRunId, clean)
         return
       }
       attempt += 1
       val waitMs = retryConfig.delayForRetry(attempt)
-      // Snapshot mutable `attempt` before async hop: the launched block may
-      // run after the next iteration increments it (both retries read 2).
-      val firedAttempt = attempt
-      val firedRunId = attemptRunId
-      val firedMax = retryConfig.maxRetries
-      fireTranscript { transcript.onTurnRetried(firedRunId, firedAttempt, firedMax, waitMs) }
+      // Bound to the logical turn (single user row), not to the failed
+      // attempt: retries never re-emit onTurnStarted.
+      writeNotice { orderedTranscript.onTurnRetried(logicalTurnId, attempt, retryConfig.maxRetries, waitMs) }
       try {
         sleeper(waitMs)
       } catch (e: CancellationException) {
         throw e
       }
-      runId = newId()
-      runId.let { startedId -> fireTranscript { transcript.onTurnStarted(startedId, text) } }
+      attemptRunId = newId()
     }
   }
 

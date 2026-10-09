@@ -2,6 +2,7 @@ package dev.librepocket.session
 
 import dev.librepocket.chat.TranscriptSink
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 
 /**
  * [TranscriptSink] that persists turns into a [SessionStore] session.
@@ -12,9 +13,14 @@ import java.util.UUID
  * `retry` event, steer queued -> `steer` event, tool done -> `tool` event,
  * usage -> `system` event (accounting, P1 records only).
  *
- * The controller already calls these fire-and-forget with its own try/catch;
- * failures here must still never propagate, so every call guards its store
- * access as well. Text is redacted again by [RoomSessionStore] on write.
+ * The controller routes every call through its session-owned
+ * [dev.librepocket.chat.OrderedTranscriptSink] (single session writer:
+ * admission order is preserved, core events are durably acked before the
+ * turn proceeds, and one logical turn owns exactly one `user` row with
+ * retry notices bound to that same id). Implementations therefore observe
+ * calls in order and must still stay best-effort themselves: failures here
+ * must never propagate, so every call guards its store access as well.
+ * Text is redacted again by [RoomSessionStore] on write.
  */
 class SessionTranscriptSink(
     private val store: SessionStore,
@@ -33,6 +39,10 @@ class SessionTranscriptSink(
                     createdAt = clock(),
                 ),
             )
+        } catch (e: CancellationException) {
+            // Writer teardown: the session writer owns cancellation, so
+            // propagate instead of swallowing it as a store failure.
+            throw e
         } catch (_: Exception) {
             // Best effort: persistence must never break the chat loop.
         }

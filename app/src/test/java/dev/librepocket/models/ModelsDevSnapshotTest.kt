@@ -293,4 +293,68 @@ class ModelsDevSnapshotTest {
             ModelsDevSnapshot.parse("[]", nowMs = 1_700_000_000_000L).models.size,
         )
     }
+
+    @Test
+    fun nonObjectModelNumberAndBooleanValuesAreSkipped() {
+        // Complements nonObjectModelValuesAreSkipped (string/null/array):
+        // numbers and booleans are skipped the same way.
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"openai":{"models":{"n":42,"b":true,"ok":{}}}}""",
+            nowMs = 1_700_000_000_000L,
+        )
+        assertEquals(
+            listOf(ModelsDevSnapshot.ModelEntry("openai", "ok")),
+            snapshot.models,
+        )
+    }
+
+    @Test
+    fun extraTopLevelKeyWithModelsObjectIsTreatedAsProvider() {
+        // Known tolerance (characterization, not a contract): any top-level
+        // object with a "models" dictionary is read as a provider directory,
+        // so a non-provider metadata key with that shape is not ignored.
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"openai":{"models":{"m":{}}},"meta":{"models":{"e":{}}}}""",
+            nowMs = 1_700_000_000_000L,
+        )
+        assertEquals(
+            listOf(
+                ModelsDevSnapshot.ModelEntry("openai", "m"),
+                ModelsDevSnapshot.ModelEntry("meta", "e"),
+            ),
+            snapshot.models,
+        )
+    }
+
+    @Test
+    fun legacyModelsArrayTakesPrecedenceOverProviderDirectory() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"models":[{"id":"openai/legacy","tool_call":true}],""" +
+                """"openai":{"models":{"nested":{"tool_call":true}}}}""",
+            nowMs = 1_700_000_000_000L,
+        )
+        assertEquals(
+            listOf(ModelsDevSnapshot.ModelEntry("openai", "legacy", toolCalls = true)),
+            snapshot.models,
+        )
+    }
+
+    @Test
+    fun nonBooleanCapabilityValuesAreReadAsFalse() {
+        val snapshot = ModelsDevSnapshot.parse(
+            """{"openai":{"models":{""" +
+                """"o":{"tool_call":{}},"s":{"tool_call":"yes"},"n":{"tool_call":1},""" +
+                """"r":{"reasoning":"yes","tool_call":true}}}}""",
+            nowMs = 1_700_000_000_000L,
+        )
+        assertEquals(
+            listOf(
+                ModelsDevSnapshot.ModelEntry("openai", "o"),
+                ModelsDevSnapshot.ModelEntry("openai", "s"),
+                ModelsDevSnapshot.ModelEntry("openai", "n"),
+                ModelsDevSnapshot.ModelEntry("openai", "r", toolCalls = true),
+            ),
+            snapshot.models,
+        )
+    }
 }

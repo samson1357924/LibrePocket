@@ -28,7 +28,11 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * Durable ack: [onTurnStarted], [onTurnSucceeded], [onTurnCancelled] and
  * [onTurnFailed] suspend until the writer has run the delegate (the row is
- * durable, or swallowed best-effort by the delegate itself). Retry / tool /
+ * durable, or swallowed best-effort by the delegate itself). A writer
+ * teardown mid-entry fails the ack explicitly (never a false durable ack);
+ * the waiter converts that into an INTERRUPTED mark via [interruptedRunIds].
+ *
+ * Retry / tool /
  * usage / steer notices only suspend until admitted to the channel, so a slow
  * store back-pressures the turn through the bounded channel instead of
  * silently reordering it. Notices admitted after [shutdown] seals the channel
@@ -74,17 +78,24 @@ class OrderedTranscriptSink(
 
   private val writer: Job = writerScope.launch {
     for (entry in channel) {
+      var cancelled: CancellationException? = null
       try {
         entry.block()
       } catch (e: CancellationException) {
-        // Writer teardown (shutdown scope cancel): still run the finally
-        // below so the waiter unblocks, then propagate so the writer ends.
+        // Writer teardown (shutdown scope cancel): remember the failure so
+        // the finally below fails the ack explicitly instead of reporting a
+        // false durable ack, then propagate so the writer ends.
+        cancelled = e
         throw e
       } catch (_: Exception) {
         // Best effort preserved: persistence must never break the chat loop.
       } finally {
         entry.runId?.let { pendingCore.remove(it) }
-        entry.ack?.complete(Unit)
+        val ack = entry.ack
+        if (ack != null && !ack.isCompleted) {
+          val failure = cancelled
+          if (failure != null) ack.completeExceptionally(failure) else ack.complete(Unit)
+        }
       }
     }
   }
@@ -121,6 +132,14 @@ class OrderedTranscriptSink(
   /** Core event: suspends until the single writer has run the delegate. */
   private suspend fun writeCore(runId: String, block: suspend () -> Unit) {
     val ack = CompletableDeferred<Unit>()
+    // Writer-side failure (teardown mid-entry) completes this ack
+    // exceptionally; convert that into an explicit INTERRUPTED mark instead
+    // of a false durable ack. A merely-abandoned wait (caller cancelled while
+    // the ack is still pending) does NOT mark: the independent writer still
+    // persists the queued entry.
+    ack.invokeOnCompletion { cause ->
+      if (cause != null) markInterrupted(runId)
+    }
     pendingCore.add(runId)
     try {
       channel.send(Entry(runId, block, ack))
@@ -137,8 +156,10 @@ class OrderedTranscriptSink(
     try {
       ack.await()
     } catch (e: CancellationException) {
-      // Only the wait is abandoned: the entry stays queued and the
-      // independent writer still persists it, so this is not a loss.
+      // The handler above already marked INTERRUPTED when the writer failed
+      // the ack (teardown: the row may never have persisted). Otherwise only
+      // the wait was abandoned and the queued entry is still persisted by the
+      // independent writer. Either way propagate.
       throw e
     }
   }
@@ -243,7 +264,10 @@ class OrderedTranscriptSink(
         try {
           withTimeoutOrNull(drainTimeoutMs) { settle() }
         } catch (_: Exception) {
-          // Bounded: fall through to the drain attempt below.
+          // Bounded: fall through to the drain attempt below. This also
+          // catches CancellationException from a cancelled settle (the
+          // NonCancellable context above makes that a settle bug, never an
+          // outer-scope cancel): the drain below still bounds the teardown.
         }
         if (!flush(drainTimeoutMs)) {
           pendingCore.toList().forEach(::markInterrupted)

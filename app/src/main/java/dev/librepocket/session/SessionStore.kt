@@ -16,6 +16,17 @@ data class SessionMeta(
  *
  * [text] must already be redacted when it reaches the store; [RoomSessionStore]
  * enforces this by running [dev.librepocket.redact.Redactor] on every write.
+ *
+ * Phase 3 Target (no Room schema change in Phase 2): `isPartial` for
+ * cancelled / failed assistant rows (they keep their partial text with the
+ * flag set) and `failureReason` for failed rows (sanitized error kept next to
+ * that partial text), as `INTEGER NOT NULL DEFAULT 0` / nullable `TEXT`
+ * columns via a backward-compatible Migration 1→2. Until then partial-ness
+ * lives only in UI memory ([dev.librepocket.chat.UiMessage.isPartial]) and in
+ * the in-memory INTERRUPTED marks ([dev.librepocket.chat.TurnController.interruptedTranscriptRunIds]):
+ * cancelled ledger rows keep the partial text unstructured, failed ledger rows
+ * keep the reason only. See also [SessionTranscriptSink] and
+ * `TranscriptEventEntity`.
  */
 data class TranscriptEvent(
     val seq: Long = 0, // DB-assigned; ignored on write

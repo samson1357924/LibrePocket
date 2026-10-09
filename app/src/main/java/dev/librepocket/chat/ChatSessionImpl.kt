@@ -75,6 +75,8 @@ class ChatSessionImpl(
 
   override fun cancel() = controller.cancel()
 
+  override suspend fun flush(timeoutMs: Long): Boolean = controller.flushTranscript(timeoutMs)
+
   override fun steer(text: String) = controller.steer(text)
 
   override fun close() {

@@ -65,6 +65,20 @@ interface ChatSession {
   fun cancel()
 
   /**
+   * Bounded ledger drain: suspends until every transcript event admitted so
+   * far is persisted (true = drained, false = timed out). Two sequential
+   * per-call budgets of [timeoutMs] — the [close] shutdown-join first
+   * (doomed-host settle + admitted drain + seal), then the admitted-event
+   * drain — so a flush after [close] waits up to ~2x[timeoutMs], while a
+   * flush before/without [close] only runs the second phase (~1x[timeoutMs]).
+   * Caller cancellation still propagates. The ViewModel awaits this
+   * (bounded) before [close] on newChat / openSession / endpoint-switch so
+   * admitted notices are not lost with the session, without ever blocking
+   * the UI unboundedly.
+   */
+  suspend fun flush(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean
+
+  /**
    * Steering: queue an instruction for the next round.
    * Never cancels the current HTTP request or the current turn; the queued
    * instruction is sent automatically once the current turn fully ends. When

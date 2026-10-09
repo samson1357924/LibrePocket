@@ -380,8 +380,11 @@ class TurnControllerTimeContextTest {
     assertTrue(second.contains("- User timezone: America/New_York"))
     // 2026-01-15 is EST (-05:00).
     assertTrue(second.contains("(UTC-05:00)"))
-    // Transcript keeps the raw text across the retry, no time residue.
-    awaitTrue { sink.started.size >= 2 }
+    // Transcript keeps the raw text across the retry, no time residue. One
+    // logical turn owns exactly one user row; the retry only adds an attempt
+    // record bound to that id (see TurnControllerLedgerTest).
+    awaitTrue { sink.started.isNotEmpty() }
+    assertEquals(1, sink.started.size)
     for ((_, text) in sink.started) {
       assertEquals("hi", text)
       assertFalse(text.contains("Runtime time context"))

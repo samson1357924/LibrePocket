@@ -1,9 +1,14 @@
 package dev.librepocket.chat
 
 /**
- * Minimal persistence port (M4 stub). All calls are fire-and-forget from the
- * chat loop and must never run on the [ChatSession.cancel] path — cancel only
- * flips in-memory state, while these callbacks run asynchronously afterwards.
+ * Minimal persistence port. [TurnController] routes every call through its
+ * session-owned [OrderedTranscriptSink] (bounded channel, single writer, core
+ * events durably acked), so implementations observe admission order and must
+ * only stay best-effort themselves (never throw into the chat loop).
+ *
+ * [onTurnCancelled] still runs off the [dev.librepocket.chat.ChatSession.cancel]
+ * fast path: cancel only flips in-memory state, while this callback is
+ * written non-cancellably through the session writer afterwards.
  *
  * Tool and usage events come from the unified M1 [dev.librepocket.provider.StreamEvent]
  * union, which [TurnController] consumes directly: every `ToolDelta`/`ToolDone`

@@ -695,6 +695,53 @@ export async function runScannerSendOpenAITests(): Promise<void> {
       }
     }
 
+    // Issue triage redaction: raw credentials never reach the model, while
+    // the deterministic scanner still flags the ORIGINAL content. Order
+    // contract: scan original first, send only the redacted copy to AI.
+    {
+      const fakeToken = ['s', 'k-test-FAKE-REDACT-12345678'].join('');
+      const beginMarker = ['-----BEGIN', 'PRIVATE KEY-----'].join(' ');
+      const endMarker = ['-----END', 'PRIVATE KEY-----'].join(' ');
+      const fakeKeyBody = 'FAKE-BODY-12345678';
+      const fakeKeyBlock = `${beginMarker}\n${fakeKeyBody}\n${endMarker}`;
+      const rawTitle = `help with pasted token ${fakeToken}`;
+      const rawBody = `pasted key block:\n${fakeKeyBlock}`;
+      const rawComments = [`follow-up still shows ${fakeToken}`];
+      const originalText = [rawTitle, rawBody, ...rawComments].join('\n');
+      const scanOriginal = DeterministicScanner.scan(['issue.txt'], originalText);
+      assert.equal(scanOriginal.hasBlockers, true, 'scanner flags the original issue credentials');
+      assert.ok(scanOriginal.violations.some((violation) => violation.ruleId === 'SEC-PRIVATE-KEY'));
+
+      const previous = globalThis.fetch;
+      let fetchCount = 0;
+      let capturedUserPrompt = '';
+      globalThis.fetch = (async (_input, init) => {
+        fetchCount += 1;
+        const body = JSON.parse(String(init?.body)) as { input: Array<{ role: string; content: string }> };
+        capturedUserPrompt = body.input.find((entry) => entry.role === 'user')?.content ?? '';
+        return new Response(JSON.stringify({
+          output: [{ content: [{ type: 'output_text', text: JSON.stringify({ verdict: 'INCONCLUSIVE', summary: 'ok', suggestedLabels: [] }) }] }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }) as typeof fetch;
+      try {
+        const triaged = await triageIssue({
+          input: { title: rawTitle, body: rawBody, comments: rawComments },
+          env: orchestratorEnv,
+          allowedOrigins: FAKE_ALLOWED_ORIGINS,
+        });
+        assert.equal(fetchCount, 1, 'triage stays single-turn');
+        assert.equal(triaged.verdict, 'INCONCLUSIVE');
+        assert.ok(!capturedUserPrompt.includes(fakeToken), 'raw token must not reach the model');
+        assert.ok(!capturedUserPrompt.includes(fakeKeyBody), 'raw key body must not reach the model');
+        assert.ok(!capturedUserPrompt.includes(beginMarker), 'raw key marker must not reach the model');
+        assert.ok(capturedUserPrompt.includes('[REDACTED'), 'redacted marker reaches the model instead');
+        const scanRedacted = DeterministicScanner.scan(['issue.txt'], capturedUserPrompt);
+        assert.equal(scanRedacted.hasBlockers, false, 'redacted prompt carries no detectable secret (scan the original)');
+      } finally {
+        globalThis.fetch = previous;
+      }
+    }
+
     // Unknown profile fail-closed: no request is sent.
     {
       const previous = globalThis.fetch;

@@ -31,6 +31,7 @@ import {
   truncateDiff,
   type ReviewCoverage,
 } from './review_diff';
+import { redactForModel } from './redact';
 
 const REVIEW_MARKER = '<!-- PocketGuard-review -->';
 const REVIEW_COUNT_MARKER_PREFIX = '<!-- PocketGuard-reviews:';
@@ -1248,18 +1249,9 @@ export function buildReviewDiff(
   };
 }
 
-function redactForModel(value: string): string {
-  return value
-    .replace(/-----BEGIN\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY-----/gi, '[REDACTED PRIVATE KEY]')
-    .replace(/\bAIZA[A-Z0-9_-]{35}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bgh[pousr]_[A-Z0-9]{20,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bgithub_pat_[A-Z0-9_]{20,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bsk-(?:live|test)-[A-Z0-9_-]{8,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bAKIA[0-9A-Z]{16}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bxox(?:[aboprs]|b)-[A-Z0-9-]{10,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\b(Bearer|Basic)\s+[A-Z0-9._~+/-]+=*/gi, '$1 [REDACTED CREDENTIAL]')
-    .replace(/\b(api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["']?[^\s,;"'`]+/gi, '$1=[REDACTED CREDENTIAL]');
-}
+// redactForModel is shared via ./redact (single source of truth with
+// orchestrator triage). PR order stays: scan(fullDiff) first, then
+// redact(diff) for the model (see runReviewMode).
 
 function genericReviewOutput(): RunnerReviewOutput {
   return {
@@ -1770,16 +1762,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
 
 function safeString(value: unknown, maxLength = 2000): string {
   if (typeof value !== 'string') return '';
-  return value
-    .replace(/-----BEGIN\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY-----/gi, '[REDACTED PRIVATE KEY]')
-    .replace(/\bAIZA[A-Z0-9_-]{35}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bgh[pousr]_[A-Z0-9]{20,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bgithub_pat_[A-Z0-9_]{20,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bsk-(?:live|test)-[A-Z0-9_-]{8,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bAKIA[0-9A-Z]{16}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bxox(?:[aboprs]|b)-[A-Z0-9-]{10,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\b(Bearer|Basic)\s+[A-Z0-9._~+/-]+=*/gi, '$1 [REDACTED CREDENTIAL]')
-    .replace(/\b(api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["']?[^\s,;"'`]+/gi, '$1=[REDACTED CREDENTIAL]')
+  return redactForModel(value)
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .slice(0, maxLength);
 }

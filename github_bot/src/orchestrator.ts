@@ -6,6 +6,7 @@ import {
   type OpenAIEnvironment,
   type OpenAIModelRole,
 } from './send_openai';
+import { redactForModel } from './redact';
 import type { ReviewCoverage } from './review_diff';
 import type { ScanViolation } from './deterministic_scanner';
 
@@ -73,16 +74,7 @@ function reviewTier(filePath: string): number {
 }
 
 function redactSensitiveText(value: string): string {
-  return value
-    .replace(/-----BEGIN\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY-----[\s\S]*?-----END\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY-----/gi, '[REDACTED PRIVATE KEY]')
-    .replace(/\bAIZA[A-Z0-9_-]{35}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bgh[pousr]_[A-Z0-9]{20,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bgithub_pat_[A-Z0-9_]{20,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bsk-(?:live|test)-[A-Z0-9_-]{8,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bAKIA[0-9A-Z]{16}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\bxox(?:[aboprs]|b)-[A-Z0-9-]{10,}\b/gi, '[REDACTED CREDENTIAL]')
-    .replace(/\b(Bearer|Basic)\s+[A-Z0-9._~+/-]+=*/gi, '$1 [REDACTED CREDENTIAL]')
-    .replace(/\b(api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*["']?[^\s,;"'`]+/gi, '$1=[REDACTED CREDENTIAL]')
+  return redactForModel(value)
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ')
     .slice(0, MAX_TEXT_LENGTH);
 }
@@ -227,10 +219,15 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
     const promptDirectory = options.promptDirectory ?? path.resolve(__dirname, '../prompts');
     const modelUsed = resolveRoleModel('chief', env);
     const systemPrompt = fs.readFileSync(path.join(promptDirectory, 'issue_triage.md'), 'utf8');
+    // Issue triage carries human-supplied title/body/comments with no
+    // authorization gate (issue-auto). Redact the AI-bound copy with the same
+    // deterministic patterns as the PR diff path so pasted credentials never
+    // leave the runner in cleartext. Callers needing detection must scan the
+    // ORIGINAL input before this call; scanning the redacted copy misses.
     const userPrompt = [
-      `標題：${options.input.title}`,
-      `內文：${options.input.body}`,
-      ...options.input.comments.map((comment) => `留言：${comment}`),
+      `標題：${redactForModel(options.input.title)}`,
+      `內文：${redactForModel(options.input.body)}`,
+      ...options.input.comments.map((comment) => `留言：${redactForModel(comment)}`),
     ].join('\n\n');
     const result = await sendOpenAISingleTurn({
       modelId: modelUsed,

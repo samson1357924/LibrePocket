@@ -791,7 +791,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
       }
     }
 
-    // Zero-CPA locks: ordinary chatter, unsubscribed PR actions, and bot commands.
+    // Zero-OpenAI locks: ordinary chatter, unsubscribed PR actions, and bot commands.
     {
       const zeroCounter = { count: 0 };
       const restore = installCountingOpenAI(zeroCounter, { verdict: 'APPROVE', summary: 'ok', findings: [] });

@@ -34,11 +34,17 @@ import {
 
 const REVIEW_MARKER = '<!-- PocketGuard-review -->';
 const REVIEW_COUNT_MARKER_PREFIX = '<!-- PocketGuard-reviews:';
+const REVIEW_CLAIM_MARKER_PREFIX = '<!-- PocketGuard-review-claim:';
 // S4 execution matrix: at most two AI reviews per PR+head SHA (the first
 // review plus one re-review); a new head SHA resets the budget. Issues are
-// never counted. The per-PR workflow concurrency group serializes runs as the
-// primary mutex; GitHub offers no compare-and-swap on comments, so a residual
-// race remains if two runs for the same PR ever overlap (see readStickyReviewCount).
+// never counted. The per-PR workflow concurrency group (cancel-in-progress:
+// false) serializes runs as the primary mutex; GitHub offers no
+// compare-and-swap on comments, so a residual race remains if two runs for
+// the same PR ever overlap (see readStickyReviewCount). The sticky comment
+// carries a multi-marker ledger (one `PocketGuard-reviews:<sha>:<n>` line per
+// head SHA, merged with max() so A→B→A never loses history) plus optional
+// per-run claim markers `PocketGuard-review-claim:<sha>:<runId>:<attempt>`
+// for retry idempotency (a retry that finds its own claim never +1+1).
 export const MAX_REVIEWS_PER_SHA = 2;
 // Issue-mode context budget, following the existing constant style
 // (MAX_DIFF_LENGTH / MAX_CHANGED_FILES in review_diff.ts).
@@ -458,25 +464,164 @@ export function formatReviewCountMarker(sha: string, count: number): string {
   return `${REVIEW_COUNT_MARKER_PREFIX}${sha.toLowerCase()}:${Math.max(0, Math.floor(count))} -->`;
 }
 
-export function parseReviewCountMarker(body: unknown, sha: string): number {
-  if (typeof body !== 'string' || !safeSha(sha)) return 0;
-  const wanted = sha.toLowerCase();
+// Multi-marker ledger (P1 #2): the sticky body may carry one count marker per
+// head SHA on its own line. Parsing collects every marker (case-insensitive
+// SHA, last/max wins per SHA); stamping merges instead of overwriting so
+// A→B→A keeps A:2 while adding B:1.
+export function parseReviewCountLedger(body: unknown): Map<string, number> {
+  const ledger = new Map<string, number>();
+  if (typeof body !== 'string') return ledger;
   const pattern = new RegExp(
     `${REVIEW_COUNT_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([0-9a-f]{40}):(\\d+)\\s*-->`,
     'gi',
   );
-  let count = 0;
   for (const match of body.matchAll(pattern)) {
-    if (match[1].toLowerCase() === wanted) {
-      const parsed = Number.parseInt(match[2], 10);
-      if (Number.isSafeInteger(parsed) && parsed >= 0) count = parsed;
-    }
+    const sha = match[1].toLowerCase();
+    const parsed = Number.parseInt(match[2], 10);
+    if (!safeSha(sha) || !Number.isSafeInteger(parsed) || parsed < 0) continue;
+    const prev = ledger.get(sha) ?? 0;
+    ledger.set(sha, Math.max(prev, parsed));
   }
-  return count;
+  return ledger;
+}
+
+export function parseReviewCountMarker(body: unknown, sha: string): number {
+  if (!safeSha(sha)) return 0;
+  return parseReviewCountLedger(body).get(sha.toLowerCase()) ?? 0;
+}
+
+export function stripReviewCountMarkers(body: string): string {
+  const pattern = new RegExp(
+    `${REVIEW_COUNT_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[0-9a-f]{40}:\\d+\\s*-->`,
+    'gi',
+  );
+  return body.replace(pattern, '');
 }
 
 export function withReviewCountMarker(body: string, sha: string, count: number): string {
-  return `${body}${formatReviewCountMarker(sha, count)}\n`;
+  if (!safeSha(sha)) return body;
+  const target = sha.toLowerCase();
+  const normalized = Math.max(0, Math.floor(count));
+  const ledger = parseReviewCountLedger(body);
+  ledger.set(target, Math.max(ledger.get(target) ?? 0, normalized));
+  const stripped = stripReviewCountMarkers(body);
+  const base = stripped.length === 0 || stripped.endsWith('\n') ? stripped : `${stripped}\n`;
+  const sorted = [...ledger.entries()].sort((left, right) => left[0].localeCompare(right[0]));
+  if (sorted.length === 0) return base;
+  return `${base}${sorted.map(([entrySha, entryCount]) => formatReviewCountMarker(entrySha, entryCount)).join('\n')}\n`;
+}
+
+// Retry-dedup claim markers (P1 #2): `<!-- PocketGuard-review-claim:<sha>:
+// <runId>:<attempt> -->`. A publish that finds its own (sha,runId,attempt)
+// claim in the freshly re-read sticky never increments again, so a retry
+// after a successful write (or the second write of the same run) stays
+// idempotent. Without a run id (local runs) there is no claim and the writer
+// falls back to max(existing,expected) sharing a single stamp per run.
+export function formatReviewClaimMarker(sha: string, runId: string, attempt: string): string {
+  return `${REVIEW_CLAIM_MARKER_PREFIX}${sha.toLowerCase()}:${runId}:${attempt} -->`;
+}
+
+export function parseReviewClaimSet(body: unknown): Set<string> {
+  const claims = new Set<string>();
+  if (typeof body !== 'string') return claims;
+  const pattern = new RegExp(
+    `${REVIEW_CLAIM_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([0-9a-f]{40}):([A-Za-z0-9_.-]{1,64}):([A-Za-z0-9_.-]{1,64})\\s*-->`,
+    'gi',
+  );
+  for (const match of body.matchAll(pattern)) {
+    const sha = match[1].toLowerCase();
+    if (!safeSha(sha)) continue;
+    claims.add(`${sha}:${match[2]}:${match[3]}`);
+  }
+  return claims;
+}
+
+export function stripReviewClaimMarkers(body: string): string {
+  const pattern = new RegExp(
+    `${REVIEW_CLAIM_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[0-9a-f]{40}:[A-Za-z0-9_.-]{1,64}:[A-Za-z0-9_.-]{1,64}\\s*-->`,
+    'gi',
+  );
+  return body.replace(pattern, '');
+}
+
+export function withReviewClaimMarker(body: string, sha: string, runId: string, attempt: string): string {
+  if (!safeSha(sha)) return body;
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(runId) || !/^[A-Za-z0-9_.-]{1,64}$/.test(attempt)) return body;
+  const id = `${sha.toLowerCase()}:${runId}:${attempt}`;
+  if (parseReviewClaimSet(body).has(id)) return body;
+  const base = body.length === 0 || body.endsWith('\n') ? body : `${body}\n`;
+  return `${base}${formatReviewClaimMarker(sha.toLowerCase(), runId, attempt)}\n`;
+}
+
+// Dedup key for the current publish run: (run_id, run_attempt). Prefers the
+// GitHub Actions defaults (GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT, always present
+// in the workflow) with POCKETGUARD_* overrides for tests. Returns undefined
+// when no run id is available (local runs without ids): callers then share a
+// single max() stamp per run instead of claim dedup.
+export function resolveCountClaimKey(env: NodeJS.ProcessEnv | undefined): string | undefined {
+  const runId = env?.GITHUB_RUN_ID ?? env?.POCKETGUARD_RUN_ID;
+  const attempt = env?.GITHUB_RUN_ATTEMPT ?? env?.POCKETGUARD_RUN_ATTEMPT ?? '1';
+  if (typeof runId !== 'string' || !runId.trim()) return undefined;
+  if (typeof attempt !== 'string' || !attempt.trim()) return undefined;
+  const cleanRun = runId.trim();
+  const cleanAttempt = attempt.trim();
+  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(cleanRun) || !/^[A-Za-z0-9_.-]{1,64}$/.test(cleanAttempt)) return undefined;
+  return `${cleanRun}:${cleanAttempt}`;
+}
+
+// Merge a fresh review body with the freshly re-read sticky ledger: preserve
+// every other SHA, set target to the merged count, and carry (plus add) claim
+// markers. When target/expected are undefined the ledger is preserved
+// unchanged (uncounted fallback: no new marker, no increment).
+export function buildStampedBody(
+  freshContent: string,
+  freshLedger: Map<string, number>,
+  freshClaims: Set<string>,
+  targetSha: string | undefined,
+  expectedCount: number | undefined,
+  claimKey: string | undefined,
+): string {
+  const mergedLedger = new Map(freshLedger);
+  const mergedClaims = new Set(freshClaims);
+  if (targetSha && safeSha(targetSha) && typeof expectedCount === 'number') {
+    const target = targetSha.toLowerCase();
+    const freshExisting = mergedLedger.get(target) ?? 0;
+    let mergedCount: number;
+    if (!claimKey) {
+      mergedCount = Math.max(freshExisting, Math.max(0, Math.floor(expectedCount)));
+    } else {
+      const claimId = `${target}:${claimKey}`;
+      if (mergedClaims.has(claimId)) {
+        mergedCount = Math.max(freshExisting, Math.max(0, Math.floor(expectedCount)));
+      } else if (freshExisting >= MAX_REVIEWS_PER_SHA) {
+        mergedCount = freshExisting;
+        mergedClaims.add(claimId);
+      } else {
+        mergedCount = Math.max(freshExisting + 1, Math.max(0, Math.floor(expectedCount)));
+        mergedClaims.add(claimId);
+      }
+    }
+    mergedLedger.set(target, mergedCount);
+  }
+  const stripped = stripReviewCountMarkers(freshContent);
+  const base = stripped.length === 0 || stripped.endsWith('\n') ? stripped : `${stripped}\n`;
+  const ledgerPart = [...mergedLedger.entries()]
+    .sort((left, right) => left[0].localeCompare(right[0]))
+    .map(([entrySha, entryCount]) => formatReviewCountMarker(entrySha, entryCount))
+    .join('\n');
+  const claimMarkers = [...mergedClaims]
+    .sort()
+    .map((id) => {
+      const parts = id.split(':');
+      if (parts.length !== 3 || !safeSha(parts[0])) return undefined;
+      return formatReviewClaimMarker(parts[0], parts[1], parts[2]);
+    })
+    .filter((marker): marker is string => typeof marker === 'string')
+    .join('\n');
+  let result = base;
+  if (ledgerPart) result += `${ledgerPart}\n`;
+  if (claimMarkers) result += `${claimMarkers}\n`;
+  return result;
 }
 
 function isStickyReviewComment(comment: GithubComment, botLogin: string | undefined): boolean {
@@ -534,6 +679,61 @@ export async function readStickyReviewCount(
       const sticky = comments.data.find((comment) => isStickyReviewComment(comment, botLogin));
       if (sticky) return { ok: true, used: parseReviewCountMarker(sticky.body, headSha) };
       if (comments.data.length < 100) return { ok: true, used: 0 };
+    }
+  } catch {
+    return { ok: false };
+  }
+}
+
+// Full-ledger re-read for publish (P1 #2): returns every per-SHA count plus
+// every claim marker from the current sticky (or an empty ledger when no
+// sticky exists yet). Any unreadable state reports unknown so publish stays
+// fail-closed with zero writes.
+export type StickyLedgerRead =
+  | { ok: true; ledger: Map<string, number>; claims: Set<string> }
+  | { ok: false };
+export async function readStickyLedger(
+  client: RunnerGitHubClient | undefined,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+): Promise<StickyLedgerRead> {
+  if (!client || !Number.isSafeInteger(issueNumber) || issueNumber < 1) return { ok: false };
+  try {
+    const issues = client.rest.issues as RunnerGitHubClient['rest']['issues'] | undefined;
+    if (!issues || typeof issues.listComments !== 'function') return { ok: false };
+    let botLogin: string | undefined;
+    try {
+      const identity = await client.rest.users.getAuthenticated();
+      if (typeof identity?.data?.login === 'string' && identity.data.login.trim()) {
+        botLogin = identity.data.login;
+      }
+    } catch {
+      // Fall through to the marker plus GitHub bot-author metadata fallback.
+    }
+    for (let page = 1; ; page += 1) {
+      let comments: { data: GithubComment[] };
+      try {
+        comments = await issues.listComments({
+          owner,
+          repo,
+          issue_number: issueNumber,
+          per_page: 100,
+          page,
+        });
+      } catch {
+        return { ok: false };
+      }
+      if (!comments || !Array.isArray(comments.data)) return { ok: false };
+      const sticky = comments.data.find((comment) => isStickyReviewComment(comment, botLogin));
+      if (sticky) {
+        return {
+          ok: true,
+          ledger: parseReviewCountLedger(sticky.body),
+          claims: parseReviewClaimSet(sticky.body),
+        };
+      }
+      if (comments.data.length < 100) return { ok: true, ledger: new Map(), claims: new Set() };
     }
   } catch {
     return { ok: false };
@@ -2073,14 +2273,20 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     fallbackReason = 'the current pull request state could not be fetched from GitHub.';
   }
 
-  // S4 quota: an exhausted budget — or an unreadable counter (fail-closed) —
-  // publishes nothing — the sticky comment and labels keep the previous
-  // review untouched. Counting happens only on the sticky writes below
-  // (started reviews, including INCONCLUSIVE fallbacks); every write in this
-  // run shares one stamp, so the label-fallback overwrite cannot double-count.
-  // Without a fresh head SHA the write carries no marker (degraded, uncounted)
-  // rather than a wrong one.
-  let reviewsUsed = 0;
+  // S4 quota (P1 #2 ledger): an exhausted budget — or an unreadable counter
+  // (fail-closed) — publishes nothing — the sticky comment and labels keep
+  // the previous review untouched. This early check covers the fresh head SHA
+  // so quota-exhausted/unknown runs never touch the sticky; the per-SHA
+  // counting-SHA check after artifact validation covers stale artifacts (the
+  // count always follows artifact output.headSha, never freshHead). Counting
+  // happens only for started reviews with verifiable output (including
+  // INCONCLUSIVE fallbacks and illegal-label downgrades, which still ran AI);
+  // every write in one publish run shares a single expected stamp plus the
+  // (headSHA,run_id/run_attempt) claim, so the label-fallback overwrite
+  // cannot double-count. Without verifiable output the write preserves the
+  // existing ledger with no new marker (degraded, uncounted) rather than a
+  // wrong one. Only started reviews count: routing/authorization denials
+  // return above with zero writes, and quota-exhausted returns here.
   if (freshPullRequest && safeSha(freshPullRequest.head.sha)) {
     const quota = await readStickyReviewCount(
       client,
@@ -2091,15 +2297,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     );
     if (!quota.ok) return;
     if (quota.used >= MAX_REVIEWS_PER_SHA) return;
-    reviewsUsed = quota.used;
   }
-  const stampSticky = (body: string): string =>
-    freshPullRequest && safeSha(freshPullRequest.head.sha)
-      ? withReviewCountMarker(body, freshPullRequest.head.sha, reviewsUsed + 1)
-      : body;
 
   const outputPath = env.POCKETGUARD_OUTPUT ?? 'review-output.json';
   let output: RunnerReviewOutput | undefined;
+  let staleReason: string | undefined;
   if (!fallbackReason) {
     const reviewJobResult = env.POCKETGUARD_REVIEW_JOB_RESULT ?? 'unavailable';
     if (reviewJobResult !== 'success') {
@@ -2125,17 +2327,73 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
         }
       }
       if (!fallbackReason && output && freshPullRequest && !sameReviewIdentity(output, freshPullRequest)) {
-        fallbackReason = 'the review output is stale: its PR number, base SHA, head SHA, or head repository no longer matches GitHub.';
+        staleReason = 'the review output is stale: its PR number, base SHA, head SHA, or head repository no longer matches GitHub.';
       }
     }
   }
 
-  if (fallbackReason || !output) {
+  // P1 #2 attribution: the counting SHA is always the verified artifact
+  // output.headSha, never freshHead. A stale artifact still counts (AI did
+  // run) but toward output.headSha so current B stays untouched. Without
+  // verifiable output there is nothing to attribute: the review never started,
+  // so the fallback preserves the ledger with no new marker and no count.
+  const countingSha = output && safeSha(output.headSha) ? output.headSha.toLowerCase() : undefined;
+  const claimKey = resolveCountClaimKey(env);
+  const buildPreservedBody = async (freshContent: string): Promise<string> => {
+    const fresh = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber!);
+    if (!fresh.ok) throw new Error('PocketGuard: failed to publish review comment.');
+    return buildStampedBody(freshContent, fresh.ledger, fresh.claims, undefined, undefined, undefined);
+  };
+
+  // Unverifiable output (missing artifact, job != success, malformed,
+  // invalid schema, or fresh fetch failure without output): uncounted
+  // fallback that preserves the ledger. Fail-closed on unreadable ledger.
+  if (fallbackReason || !output || !countingSha) {
+    const reasonText = fallbackReason ?? 'a valid review result was unavailable.';
+    const baseline = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber);
+    if (!baseline.ok) return;
     await publishStickyComment(
       client,
       repository,
       target.issueNumber,
-      stampSticky(inconclusiveComment(fallbackReason ?? 'a valid review result was unavailable.')),
+      buildStampedBody(inconclusiveComment(reasonText), baseline.ledger, baseline.claims, undefined, undefined, undefined),
+      async () => buildPreservedBody(inconclusiveComment(reasonText)),
+    );
+    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    return;
+  }
+
+  // From here output and countingSha are verified and fallbackReason is
+  // undefined. Re-read the ledger after artifact validation and before any
+  // write; every counted write below merges with max(existing,expected) plus
+  // the run claim so retries never +1+1 and other SHAs are preserved.
+  const baselineCounted = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber);
+  if (!baselineCounted.ok) return;
+  const existingForCount = baselineCounted.ledger.get(countingSha) ?? 0;
+  if (existingForCount >= MAX_REVIEWS_PER_SHA) return;
+  if (freshPullRequest && safeSha(freshPullRequest.head.sha)) {
+    const freshLower = freshPullRequest.head.sha.toLowerCase();
+    if (freshLower !== countingSha && (baselineCounted.ledger.get(freshLower) ?? 0) >= MAX_REVIEWS_PER_SHA) return;
+  }
+  const claimPresentBaseline = claimKey ? baselineCounted.claims.has(`${countingSha}:${claimKey}`) : false;
+  const expectedBaseline = claimPresentBaseline ? existingForCount : existingForCount + 1;
+  const buildCountedBody = async (freshContent: string): Promise<string> => {
+    const fresh = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber!);
+    if (!fresh.ok) throw new Error('PocketGuard: failed to publish review comment.');
+    return buildStampedBody(freshContent, fresh.ledger, fresh.claims, countingSha, expectedBaseline, claimKey);
+  };
+  const countedInitialBody = (freshContent: string): string =>
+    buildStampedBody(freshContent, baselineCounted.ledger, baselineCounted.claims, countingSha, expectedBaseline, claimKey);
+
+  // Stale but verifiable output: counted INCONCLUSIVE toward output.headSha,
+  // never polluting the current freshHead.
+  if (staleReason) {
+    await publishStickyComment(
+      client,
+      repository,
+      target.issueNumber,
+      countedInitialBody(inconclusiveComment(staleReason)),
+      async () => buildCountedBody(inconclusiveComment(staleReason)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -2145,6 +2403,8 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // entries are discarded with a log and force INCONCLUSIVE on the same
   // sticky (never a wrong APPROVE, never writing illegal labels). Manual
   // labels outside the bot scope are always preserved by reconciliation.
+  // An illegal-label downgrade still ran AI, so it counts once toward the
+  // same counting SHA.
   const aiRaw = Array.isArray(output.suggestedLabels) ? output.suggestedLabels : [];
   const { sanitizedAi, hadUnknown } = mergeRulesWithAiSuggestions([], aiRaw);
   if (hadUnknown) {
@@ -2152,7 +2412,8 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       client,
       repository,
       target.issueNumber,
-      stampSticky(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
+      countedInitialBody(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
+      async () => buildCountedBody(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -2178,9 +2439,10 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   const coverageComplete = output.coverage.complete && output.changedFilesComplete;
 
   let publishFallbackReason: string | undefined;
-  await publishStickyComment(client, repository, target.issueNumber, stampSticky(reviewComment(output, labels)), async () => {
+  await publishStickyComment(client, repository, target.issueNumber, countedInitialBody(reviewComment(output, labels)), async () => {
     publishFallbackReason = await currentReviewProblem(client, repository, target.issueNumber!, output!);
-    return publishFallbackReason ? stampSticky(inconclusiveComment(publishFallbackReason)) : stampSticky(reviewComment(output!, labels));
+    const content = publishFallbackReason ? inconclusiveComment(publishFallbackReason) : reviewComment(output!, labels);
+    return buildCountedBody(content);
   });
   if (publishFallbackReason) {
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
@@ -2193,7 +2455,8 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       client,
       repository,
       target.issueNumber,
-      stampSticky(inconclusiveComment(labelFallbackReason)),
+      countedInitialBody(inconclusiveComment(labelFallbackReason)),
+      async () => buildCountedBody(inconclusiveComment(labelFallbackReason)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;

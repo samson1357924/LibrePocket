@@ -949,7 +949,8 @@ export async function runExecutionMatrixTests(): Promise<void> {
       );
     }
 
-    // A failed review job still counts: the INCONCLUSIVE fallback stamps the marker.
+    // P1 #2: a failed review job without verifiable output never started, so
+    // the INCONCLUSIVE fallback preserves the ledger with no new marker.
     {
       const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-matrix-fallback-'));
       try {
@@ -970,9 +971,10 @@ export async function runExecutionMatrixTests(): Promise<void> {
         assert.equal(state.created, 1, 'a failed review still publishes the INCONCLUSIVE fallback');
         assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'));
         assert.ok(
-          state.comments[0].body.includes(formatReviewCountMarker(HEAD_SHA, 1)),
-          'started reviews count even when the review job fails',
+          !state.comments[0].body.includes(formatReviewCountMarker(HEAD_SHA, 1)),
+          'unstarted reviews never consume the per-SHA budget',
         );
+        assert.equal(parseReviewCountMarker(state.comments[0].body, HEAD_SHA), 0);
       } finally {
         fs.rmSync(tempDirectory, { recursive: true, force: true });
       }

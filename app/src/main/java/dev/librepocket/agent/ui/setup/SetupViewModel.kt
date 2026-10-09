@@ -18,7 +18,10 @@ import dev.librepocket.provider.KeyProvider
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderFailure
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -26,6 +29,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -34,6 +38,12 @@ sealed interface EndpointGate {
     data object Loading : EndpointGate
     data object NoEndpoint : EndpointGate
     data class Ready(val config: EndpointConfig) : EndpointGate
+}
+
+sealed interface ModelDirectoryStatus {
+    data object NotLoaded : ModelDirectoryStatus
+    data object Remote : ModelDirectoryStatus
+    data class Bundled(val reason: ModelsDevSnapshot.SnapshotFallbackReason) : ModelDirectoryStatus
 }
 
 data class SetupUiState(
@@ -47,6 +57,9 @@ data class SetupUiState(
     val testModels: Int? = null,
     val modelOptions: List<String> = emptyList(),
     val modelsLoading: Boolean = false,
+    val modelDirectoryStatus: ModelDirectoryStatus = ModelDirectoryStatus.NotLoaded,
+    // Transient model-refresh CAS epoch only; not endpoint/configuration revision.
+    internal val modelRefreshRevision: Long = 0L,
     val confirmKeyWrite: Boolean = false,
     val keyWriteConfirmed: Boolean = false,
     val errorCode: String? = null,
@@ -82,6 +95,8 @@ class SetupViewModel(
 
     private val _form = MutableStateFlow(SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID)))
     val form: StateFlow<SetupUiState> = _form
+    private val modelRefreshGeneration = AtomicLong(0L)
+    private var modelRefreshJob: Job? = null
 
     val gate: StateFlow<EndpointGate> = store.observe()
         .map { config ->
@@ -107,18 +122,35 @@ class SetupViewModel(
 
     fun selectPreset(presetId: String) {
         val preset = ProviderCatalog.preset(presetId) ?: return
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
+        val revision = modelRefreshGeneration.incrementAndGet()
         _form.value = _form.value.copy(
             presetId = presetId,
+            modelRefreshRevision = revision,
             baseUrl = preset.baseUrl,
             model = ProviderCatalog.defaultModelFor(presetId),
             errorCode = null,
             testModels = null,
             modelOptions = emptyList(),
+            modelsLoading = false,
+            modelDirectoryStatus = ModelDirectoryStatus.NotLoaded,
         )
     }
 
     fun onBaseUrlChange(v: String) {
-        _form.value = _form.value.copy(baseUrl = v, errorCode = null, testModels = null, modelOptions = emptyList())
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
+        val revision = modelRefreshGeneration.incrementAndGet()
+        _form.value = _form.value.copy(
+            baseUrl = v,
+            modelRefreshRevision = revision,
+            errorCode = null,
+            testModels = null,
+            modelOptions = emptyList(),
+            modelsLoading = false,
+            modelDirectoryStatus = ModelDirectoryStatus.NotLoaded,
+        )
     }
 
     fun onModelChange(v: String) {
@@ -126,7 +158,19 @@ class SetupViewModel(
     }
 
     fun onApiKeyChange(v: String) {
-        _form.value = _form.value.copy(apiKey = v, errorCode = null, testModels = null, keyWriteConfirmed = false)
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
+        val revision = modelRefreshGeneration.incrementAndGet()
+        _form.value = _form.value.copy(
+            apiKey = v,
+            modelRefreshRevision = revision,
+            errorCode = null,
+            testModels = null,
+            keyWriteConfirmed = false,
+            modelOptions = emptyList(),
+            modelsLoading = false,
+            modelDirectoryStatus = ModelDirectoryStatus.NotLoaded,
+        )
     }
 
     fun toggleShowKey() {
@@ -139,18 +183,23 @@ class SetupViewModel(
      * Unknown presetIds fall back to custom with the stored URL editable.
      */
     fun prefillForEdit(config: EndpointConfig) {
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
+        val revision = modelRefreshGeneration.incrementAndGet()
         val preset = ProviderCatalog.preset(config.presetId)
         if (preset == null || config.presetId == ProviderCatalog.CUSTOM_ID) {
             _form.value = SetupUiState(
                 presetId = ProviderCatalog.CUSTOM_ID,
                 baseUrl = config.baseUrl,
                 model = config.model,
+                modelRefreshRevision = revision,
             )
         } else {
             _form.value = SetupUiState(
                 presetId = preset.id,
                 baseUrl = preset.baseUrl,
                 model = config.model.ifBlank { preset.defaultModel },
+                modelRefreshRevision = revision,
             )
         }
     }
@@ -195,27 +244,60 @@ class SetupViewModel(
             _form.value = cur.copy(errorCode = err)
             return
         }
-        _form.value = cur.copy(modelsLoading = true, errorCode = null)
-        viewModelScope.launch(Dispatchers.IO) {
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
+        val generation = modelRefreshGeneration.incrementAndGet()
+        _form.value = cur.copy(
+            modelsLoading = true,
+            errorCode = null,
+            modelDirectoryStatus = ModelDirectoryStatus.NotLoaded,
+            modelRefreshRevision = generation,
+        )
+        modelRefreshJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 val config = providerConfigOf(cur, effectiveBaseUrl)
                 val typed = cur.apiKey.trim()
                 val keys = KeyProvider { typed.toCharArray() }
                 val live = try {
                     buildProvider(config, keys).listModels()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (_: Exception) {
                     emptyList()
                 }
                 val fetcher = fetchDirectory ?: { url: String ->
                     ModelDirectory.fetchBody(directoryClient, url)
                 }
-                val snapshot = ModelsDevSnapshot.fetchSnapshot(fetcher = fetcher)
-                val options = ProviderCatalog.listedModels(cur.presetId, live, snapshot)
-                _form.value = _form.value.copy(modelsLoading = false, modelOptions = options)
+                val outcome = ModelsDevSnapshot.fetchSnapshotOutcome(fetcher = fetcher)
+                val options = ProviderCatalog.listedModels(cur.presetId, live, outcome.snapshot)
+                _form.update { current ->
+                    if (generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
+                        current.copy(
+                            modelsLoading = false,
+                            modelOptions = options,
+                            modelDirectoryStatus = when (outcome.source) {
+                                ModelsDevSnapshot.SnapshotSource.REMOTE_DIRECTORY -> ModelDirectoryStatus.Remote
+                                ModelsDevSnapshot.SnapshotSource.BUNDLED -> ModelDirectoryStatus.Bundled(
+                                    checkNotNull(outcome.fallbackReason),
+                                )
+                            },
+                        )
+                    } else {
+                        current
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 // Validation passed but mapping failed (unknown preset race):
                 // keep the free-text model, clear the spinner.
-                _form.value = _form.value.copy(modelsLoading = false)
+                _form.update { current ->
+                    if (generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
+                        current.copy(modelsLoading = false)
+                    } else {
+                        current
+                    }
+                }
             }
         }
     }
@@ -276,6 +358,9 @@ class SetupViewModel(
 
     /** Logout: delete the vault key, then clear metadata (order matters). */
     fun logout(onDone: () -> Unit = {}) {
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
+        modelRefreshGeneration.incrementAndGet()
         viewModelScope.launch(Dispatchers.IO) {
             val config = try {
                 store.observe().first()
@@ -335,6 +420,11 @@ class SetupViewModel(
         }
         if (e.retryable) return "TEST_RETRYABLE"
         return "TEST_FAILED"
+    }
+
+    override fun onCleared() {
+        modelRefreshJob?.cancel()
+        super.onCleared()
     }
 }
 

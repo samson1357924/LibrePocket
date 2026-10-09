@@ -121,15 +121,15 @@ class ChatCompletionsProvider(
         if (request.systemPromptOverride != null) systems.add(request.systemPromptOverride)
         for (m in request.messages) if (m.role == "system") systems.add(m.text)
         if (systems.isNotEmpty()) emitMsg("system", q(safeText(systems.joinToString("\n"))))
-        val knownToolIds = collectAssistantToolIds(request.messages)
-        for (m in request.messages) {
+        val resolvedIds = validateToolPairing(request.messages, true)
+        for ((i, m) in request.messages.withIndex()) {
             if (m.role == "system") continue
             val safeM = if (serverSearch) m.copy(text = Redactor.redact(m.text).text) else m
             when {
                 m.role == "tool" -> {
                     // Phase 2: stored tool_call_id is verified; a missing id is
-                    // filled only for the single-call case, otherwise fail-closed.
-                    val resolved = resolveChatToolOutputId(m.toolCallId, knownToolIds)
+                    // filled only for the single-pending case, otherwise fail-closed.
+                    val resolved = resolvedIds[i]!!
                     if (!first) sb.append(',')
                     first = false
                     sb.append("{\"role\":\"tool\",\"tool_call_id\":${q(resolved)},")

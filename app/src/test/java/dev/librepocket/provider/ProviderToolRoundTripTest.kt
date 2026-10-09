@@ -492,4 +492,200 @@ class ProviderToolRoundTripTest {
         assertEquals(tc.id, resultBlock["tool_use_id"]!!.jsonPrimitive.content)
         assertEquals(fakeOutput, resultBlock["content"]!!.jsonPrimitive.content)
     }
+
+    // ---- Exactly-once chronological pairing (P1: Codex + review finding 2) ----
+
+    private fun chatBodyOf(messages: List<ChatMessage>) =
+        ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+            ChatRequest(model = "m", messages = messages, tools = advTools()),
+        )
+
+    private fun responsesBodyOf(messages: List<ChatMessage>) =
+        ResponsesProvider(responsesConfig(), { null }).buildBody(
+            ChatRequest(model = "m", messages = messages, tools = advTools()),
+        )
+
+    private fun anthropicBodyOf(messages: List<ChatMessage>) =
+        AnthropicProvider(anthropicConfig(), { null }).buildBody(
+            ChatRequest(model = "m", messages = messages, tools = advTools()),
+        )
+
+    private fun expectFailWithCode(code: String, block: () -> String) {
+        try {
+            block()
+            fail("expected $code")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals(code, e.message)
+        }
+    }
+
+    private fun toolCall(id: String) = ToolCall(id, "t", "{}")
+
+    @Test
+    fun forwardRefFailsClosedOnAllAdapters() {
+        val history = listOf(
+            ChatMessage("tool", "early", toolCallId = "call_b"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_b"))),
+        )
+        expectFailWithCode("TOOL_OUTPUT_ORPHAN_ID") { chatBodyOf(history) }
+        expectFailWithCode("TOOL_OUTPUT_ORPHAN_ID") { responsesBodyOf(history) }
+        expectFailWithCode("TOOL_OUTPUT_ORPHAN_ID") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun duplicateOutputFailsClosedOnAllAdapters() {
+        val history = listOf(
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_a"))),
+            ChatMessage("tool", "one", toolCallId = "call_a"),
+            ChatMessage("tool", "two", toolCallId = "call_a"),
+        )
+        expectFailWithCode("TOOL_OUTPUT_DUPLICATE_ID") { chatBodyOf(history) }
+        expectFailWithCode("TOOL_OUTPUT_DUPLICATE_ID") { responsesBodyOf(history) }
+        expectFailWithCode("TOOL_OUTPUT_DUPLICATE_ID") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun missingSecondOutputAtEndFailsUnresolvedOnAllAdapters() {
+        val history = listOf(
+            ChatMessage("user", "hi"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_a"), toolCall("call_b"))),
+            ChatMessage("tool", "out-a", toolCallId = "call_a"),
+        )
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { chatBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { responsesBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun missingSecondOutputBeforeUserFailsUnresolvedOnAllAdapters() {
+        val history = listOf(
+            ChatMessage("user", "hi"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_a"), toolCall("call_b"))),
+            ChatMessage("tool", "out-a", toolCallId = "call_a"),
+            ChatMessage("user", "next"),
+        )
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { chatBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { responsesBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun interleavedNewCallTurnFailsUnresolvedOnAllAdapters() {
+        val history = listOf(
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_a"), toolCall("call_b"))),
+            ChatMessage("tool", "out-a", toolCallId = "call_a"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_c"))),
+        )
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { chatBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { responsesBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun interleavedPlainAssistantFailsUnresolvedOnAllAdapters() {
+        val history = listOf(
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_a"), toolCall("call_b"))),
+            ChatMessage("tool", "out-a", toolCallId = "call_a"),
+            ChatMessage("assistant", "thinking"),
+        )
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { chatBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { responsesBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun responsesTruncatedPairingFailsClosed() {
+        // Same stateless shape as responsesStatelessHistorySelfContainsPairing,
+        // but the second call never gets its output: validation must fail
+        // closed instead of emitting a half-drained turn.
+        val history = listOf(
+            ChatMessage("user", "weather?"),
+            ChatMessage(
+                "assistant",
+                "",
+                toolCalls = listOf(
+                    ToolCall("call_wx8fQ2zA", "get_weather", """{"city":"Taipei"}"""),
+                    ToolCall("call_tomorrow", "get_weather", """{"city":"Taichung"}"""),
+                ),
+            ),
+            ChatMessage("tool", """{"temp":25}""", toolCallId = "call_wx8fQ2zA"),
+            ChatMessage("user", "and tomorrow?"),
+        )
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { responsesBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { chatBodyOf(history) }
+        expectFailWithCode("TOOL_CALLS_UNRESOLVED") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun chatRepeatedBlankBackfillsFirstThenFailsSecond() {
+        val prefix = listOf(
+            ChatMessage("user", "hi"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_single"))),
+            ChatMessage("tool", "out", toolCallId = null),
+        )
+        // First blank backfills from the single pending call.
+        val toolMsg = strictObj(chatBodyOf(prefix))["messages"]!!.jsonArray.map { it.jsonObject }
+            .first { it["role"]!!.jsonPrimitive.content == "tool" }
+        assertEquals("call_single", toolMsg["tool_call_id"]!!.jsonPrimitive.content)
+        // Repeating the blank output has nothing pending to fill from.
+        expectFailWithCode("TOOL_OUTPUT_MISSING_ID") {
+            chatBodyOf(prefix + ChatMessage("tool", "again", toolCallId = null))
+        }
+    }
+
+    @Test
+    fun blankOutputFailsMissingIdOnResponsesAndAnthropic() {
+        val single = listOf(
+            ChatMessage("user", "hi"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_a"))),
+            ChatMessage("tool", "out", toolCallId = null),
+        )
+        expectFailWithCode("TOOL_OUTPUT_MISSING_ID") { responsesBodyOf(single) }
+        expectFailWithCode("TOOL_OUTPUT_MISSING_ID") { anthropicBodyOf(single) }
+        val repeated = single + ChatMessage("tool", "again", toolCallId = null)
+        expectFailWithCode("TOOL_OUTPUT_MISSING_ID") { responsesBodyOf(repeated) }
+        expectFailWithCode("TOOL_OUTPUT_MISSING_ID") { anthropicBodyOf(repeated) }
+    }
+
+    @Test
+    fun validTwoRoundsPassOnAllAdapters() {
+        val history = listOf(
+            ChatMessage("user", "q1"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_c1"))),
+            ChatMessage("tool", "r1", toolCallId = "call_c1"),
+            ChatMessage("user", "q2"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_c2"))),
+            ChatMessage("tool", "r2", toolCallId = "call_c2"),
+        )
+        val chatToolIds = strictObj(chatBodyOf(history))["messages"]!!.jsonArray.map { it.jsonObject }
+            .filter { it["role"]!!.jsonPrimitive.content == "tool" }
+            .map { it["tool_call_id"]!!.jsonPrimitive.content }
+        assertEquals(listOf("call_c1", "call_c2"), chatToolIds)
+        val respOutIds = strictObj(responsesBodyOf(history))["input"]!!.jsonArray.map { it.jsonObject }
+            .filter { it["type"]!!.jsonPrimitive.content == "function_call_output" }
+            .map { it["call_id"]!!.jsonPrimitive.content }
+        assertEquals(listOf("call_c1", "call_c2"), respOutIds)
+        val anthResultIds = strictObj(anthropicBodyOf(history))["messages"]!!.jsonArray.map { it.jsonObject }
+            .flatMap { it["content"]!!.jsonArray.map { b -> b.jsonObject } }
+            .filter { it["type"]!!.jsonPrimitive.content == "tool_result" }
+            .map { it["tool_use_id"]!!.jsonPrimitive.content }
+        assertEquals(listOf("call_c1", "call_c2"), anthResultIds)
+    }
+
+    @Test
+    fun chatSecondRoundBlankBackfillsCurrentPending() {
+        val history = listOf(
+            ChatMessage("user", "q1"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_c1"))),
+            ChatMessage("tool", "r1", toolCallId = "call_c1"),
+            ChatMessage("user", "q2"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_c2"))),
+            ChatMessage("tool", "r2", toolCallId = null),
+        )
+        val chatToolIds = strictObj(chatBodyOf(history))["messages"]!!.jsonArray.map { it.jsonObject }
+            .filter { it["role"]!!.jsonPrimitive.content == "tool" }
+            .map { it["tool_call_id"]!!.jsonPrimitive.content }
+        assertEquals(listOf("call_c1", "call_c2"), chatToolIds)
+    }
 }

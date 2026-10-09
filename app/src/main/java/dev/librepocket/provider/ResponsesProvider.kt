@@ -123,13 +123,13 @@ class ResponsesProvider(
             first = false
             sb.append(fragment)
         }
-        val knownToolIds = collectAssistantToolIds(request.messages)
-        for (m in request.messages) {
+        val resolved = validateToolPairing(request.messages, false)
+        for ((i, m) in request.messages.withIndex()) {
             if (m.role == "system") continue
             if (m.role == "tool") {
                 // Phase 2: tool turns are function_call_output paired by call_id,
                 // never rewritten to user. Illegal pairings fail closed.
-                val callId = requireToolOutputId(m.toolCallId, knownToolIds)
+                val callId = resolved[i]!!
                 val safeText = if (serverSearch) Redactor.redact(m.text).text else m.text
                 emit(responsesFunctionCallOutputJson(callId, safeText))
                 continue

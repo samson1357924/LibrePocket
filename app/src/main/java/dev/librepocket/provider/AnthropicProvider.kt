@@ -98,15 +98,15 @@ class AnthropicProvider(
         }
         sb.append(",\"messages\":[")
         var first = true
-        val knownToolIds = collectAssistantToolIds(request.messages)
-        for (m in request.messages) {
+        val resolved = validateToolPairing(request.messages, false)
+        for ((i, m) in request.messages.withIndex()) {
             if (m.role == "system") continue
             if (!first) sb.append(',')
             first = false
             if (m.role == "tool") {
                 // Phase 2: tool turns are user-carried tool_result blocks paired
                 // with the assistant tool_use id. Illegal pairings fail closed.
-                val toolUseId = requireToolOutputId(m.toolCallId, knownToolIds)
+                val toolUseId = resolved[i]!!
                 sb.append("{\"role\":\"user\",\"content\":[${anthropicToolResultJson(toolUseId, m.text)}]}")
                 continue
             }

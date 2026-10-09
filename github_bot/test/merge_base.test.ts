@@ -168,6 +168,12 @@ export async function runMergeBaseTests(): Promise<void> {
           POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
           POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
         } as NodeJS.ProcessEnv,
+        githubClient: {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: { listComments: async () => ({ data: [] }) },
+          },
+        } as unknown as RunnerContext['githubClient'],
         writeStdout: () => undefined,
         runGit,
       });

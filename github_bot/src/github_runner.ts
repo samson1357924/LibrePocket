@@ -31,6 +31,16 @@ import {
 } from './review_diff';
 
 const REVIEW_MARKER = '<!-- PocketGuard-review -->';
+const REVIEW_COUNT_MARKER_PREFIX = '<!-- PocketGuard-reviews:';
+// S4 execution matrix: at most two AI reviews per PR+head SHA (the first
+// review plus one re-review); a new head SHA resets the budget. Issues are
+// never counted. The per-PR workflow concurrency group serializes runs as the
+// primary mutex; GitHub offers no compare-and-swap on comments, so a residual
+// race remains if two runs for the same PR ever overlap (see readStickyReviewCount).
+export const MAX_REVIEWS_PER_SHA = 2;
+// Issue-mode context budget, following the existing constant style
+// (MAX_DIFF_LENGTH / MAX_CHANGED_FILES in review_diff.ts).
+export const MAX_ISSUE_CONTEXT_LENGTH = 20000;
 const ROLE_NAMES = ['chief', 'android_sec', 'android_code'] as const;
 const SAFE_MESSAGE = '自動審查未執行；請由維護者檢視變更。';
 
@@ -53,7 +63,7 @@ interface GithubEvent {
   action?: string;
   repository?: EventRepository;
   pull_request?: PullRequestPayload;
-  issue?: { number?: number; title?: string; pull_request?: unknown };
+  issue?: { number?: number; title?: string; body?: string; pull_request?: unknown };
   comment?: { body?: string; user?: { login?: string; type?: string }; author_association?: string };
   sender?: { login?: string; type?: string };
 }
@@ -62,6 +72,10 @@ interface PullRequestData {
   number: number;
   base: { sha: string };
   head: { sha: string; repo?: { full_name?: string | null } | null };
+  // Author identity for the manual-review self-approval path (S4): a comment
+  // author whose login matches the PR author may re-review their own PR
+  // without maintainer write permission. Absent author identity denies.
+  user?: { login?: string | null } | null;
 }
 
 interface GithubComment {
@@ -103,7 +117,17 @@ interface ReviewTarget {
   issueNumber?: number;
   pullRequest?: PullRequestData;
   title: string;
+  // Head SHA observed for the per-SHA review budget (S4), independent of the
+  // same-repo origin gate: the event payload for pull_request_target, or the
+  // fresh pulls.get result for issue_comment. Fork runs share the budget.
+  quotaHeadSha?: string;
 }
+
+// S4 review gate consumed by the workflow job conditions: auto needs no
+// commenter gate (first review and owner commits still pass the origin/SHA
+// checks in review mode), manual additionally requires authorized == true,
+// and none schedules nothing and publishes nothing.
+export type ReviewGate = 'auto' | 'manual' | 'none';
 
 export interface TagResult {
   labels: string[];
@@ -120,6 +144,8 @@ export interface TagResult {
   shouldTag: boolean;
   reason: string;
   routeKind: RouteKind;
+  reviewGate: ReviewGate;
+  reviewsUsed: number;
   isOwner: boolean;
   actor?: string;
   repoOwner?: string;
@@ -382,14 +408,115 @@ export function routeEvent(event: GithubEvent, env?: NodeJS.ProcessEnv): RouteRe
 
 export function routeReviewFlags(kind: RouteKind, eventName: string, event?: GithubEvent): { shouldReview: boolean; shouldTag: boolean } {
   if (kind === 'ignore') return { shouldReview: false, shouldTag: false };
-  if (kind === 'issue-update') return { shouldReview: false, shouldTag: true };
   if (kind === 'manual-pr-review' || kind === 'owner-commit') return { shouldReview: true, shouldTag: true };
-  // first-review: pull-request opens request review; issue opens request
-  // tagging context only (no PR to review).
-  const isPullRequest = eventName === 'pull_request_target' || Boolean(event?.pull_request);
-  return isPullRequest
-    ? { shouldReview: true, shouldTag: true }
-    : { shouldReview: false, shouldTag: true };
+  if (kind === 'issue-update') return { shouldReview: true, shouldTag: true };
+  // first-review: both pull-request opens and human issue opens request
+  // review. PR execution is a gated diff review (origin/auth/quota checks in
+  // review mode); issue execution is a single chief triage turn with no
+  // auth/quota gate by owner decision (bot senders already routed to ignore,
+  // per-issue serialization via the workflow concurrency group).
+  // should_tag stays true so publish can complete deterministic tagging.
+  void eventName;
+  void event;
+  return { shouldReview: true, shouldTag: true };
+}
+
+// S4 review gate for pull-request execution: manual-pr-review always needs
+// the commenter authorization verdict; first-review and owner-commit proceed
+// without it when they carry a review request (shouldReview). Issue targets
+// never open a PR review gate (runTagMode forces none; issue scheduling uses
+// the explicit issue-auto route instead — routeKind first-review/issue-update
+// plus should_review — with no auth/quota gate by owner decision).
+export function resolveReviewGate(kind: RouteKind, shouldReview: boolean): ReviewGate {
+  if (kind === 'manual-pr-review') return 'manual';
+  if (shouldReview && (kind === 'first-review' || kind === 'owner-commit')) return 'auto';
+  return 'none';
+}
+
+export function formatReviewCountMarker(sha: string, count: number): string {
+  return `${REVIEW_COUNT_MARKER_PREFIX}${sha.toLowerCase()}:${Math.max(0, Math.floor(count))} -->`;
+}
+
+export function parseReviewCountMarker(body: unknown, sha: string): number {
+  if (typeof body !== 'string' || !safeSha(sha)) return 0;
+  const wanted = sha.toLowerCase();
+  const pattern = new RegExp(
+    `${REVIEW_COUNT_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([0-9a-f]{40}):(\\d+)\\s*-->`,
+    'gi',
+  );
+  let count = 0;
+  for (const match of body.matchAll(pattern)) {
+    if (match[1].toLowerCase() === wanted) {
+      const parsed = Number.parseInt(match[2], 10);
+      if (Number.isSafeInteger(parsed) && parsed >= 0) count = parsed;
+    }
+  }
+  return count;
+}
+
+export function withReviewCountMarker(body: string, sha: string, count: number): string {
+  return `${body}${formatReviewCountMarker(sha, count)}\n`;
+}
+
+function isStickyReviewComment(comment: GithubComment, botLogin: string | undefined): boolean {
+  const authorMatches = botLogin
+    ? comment.user?.login === botLogin
+    : comment.user?.login === 'github-actions[bot]' || comment.user?.type === 'Bot';
+  return Boolean(authorMatches) &&
+    typeof comment.body === 'string' && comment.body.includes(REVIEW_MARKER);
+}
+
+// Cross-run review budget read (S4, fail-closed): scans the sticky bot comment
+// for the per-SHA counter marker. Distinguishes a successful read with no
+// marker (first review → ok/0) from an unreadable state (unknown): missing
+// client/APIs, invalid identity, any listComments throw, or malformed payloads
+// all report unknown and must close the gate (tag → review_gate none with a
+// quota-unknown reason; review → generic INCONCLUSIVE with zero OpenAI;
+// publish → no sticky write, no count). A new SHA restarts the budget; the
+// per-PR concurrency group serializes the normal case (no compare-and-swap on
+// comments, so review mode re-checks immediately before any OpenAI call).
+export type StickyReviewCount = { ok: true; used: number } | { ok: false };
+export async function readStickyReviewCount(
+  client: RunnerGitHubClient | undefined,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+  headSha: string,
+): Promise<StickyReviewCount> {
+  if (!client || !safeSha(headSha) || !Number.isSafeInteger(issueNumber) || issueNumber < 1) return { ok: false };
+  try {
+    const issues = client.rest.issues as RunnerGitHubClient['rest']['issues'] | undefined;
+    if (!issues || typeof issues.listComments !== 'function') return { ok: false };
+    let botLogin: string | undefined;
+    try {
+      const identity = await client.rest.users.getAuthenticated();
+      if (typeof identity?.data?.login === 'string' && identity.data.login.trim()) {
+        botLogin = identity.data.login;
+      }
+    } catch {
+      // Fall through to the marker plus GitHub bot-author metadata fallback.
+    }
+    for (let page = 1; ; page += 1) {
+      let comments: { data: GithubComment[] };
+      try {
+        comments = await issues.listComments({
+          owner,
+          repo,
+          issue_number: issueNumber,
+          per_page: 100,
+          page,
+        });
+      } catch {
+        return { ok: false };
+      }
+      if (!comments || !Array.isArray(comments.data)) return { ok: false };
+      const sticky = comments.data.find((comment) => isStickyReviewComment(comment, botLogin));
+      if (sticky) return { ok: true, used: parseReviewCountMarker(sticky.body, headSha) };
+      if (comments.data.length < 100) return { ok: true, used: 0 };
+    }
+  } catch {
+    return { ok: false };
+  }
 }
 
 async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
@@ -424,6 +551,9 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
           head: { sha: headSha, repo: { full_name: headRepository } },
         },
       } : {}),
+      // Budget identity comes from the webhook payload so fork runs share the
+      // same per-SHA limit even though their origin check denies review.
+      ...(safeSha(headSha) ? { quotaHeadSha: headSha } : {}),
       title: typeof pull.title === 'string' ? pull.title : '',
     };
   }
@@ -447,15 +577,17 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
     let pullRequest: PullRequestData | undefined;
     if (isPullRequest && repository && Number.isSafeInteger(issueNumber) && issueNumber > 0) {
       const client = apiClient(context, env.GITHUB_TOKEN ?? '');
-      authorized = await checkCommenterPermission(
+      const username = extractCommentUsername(event);
+      const hasWrite = await checkCommenterPermission(
         client,
         repository.owner,
         repository.repo,
-        extractCommentUsername(event),
+        username,
       );
-      if (!authorized) {
-        return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
-      }
+      // S4 author self-review: the PR author may re-review their own PR
+      // without maintainer write permission. The fresh pulls.get below is the
+      // identity source; a missing author login denies. pulls.get runs for
+      // every non-bot commenter now (not only writers) to resolve authorship.
       if (client) {
         try {
           const response = await client.rest.pulls.get({
@@ -468,6 +600,14 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
           pullRequest = undefined;
         }
       }
+      const authorLogin = pullRequest?.user?.login;
+      const isAuthor = typeof authorLogin === 'string' && authorLogin.trim() !== '' &&
+        typeof username === 'string' && username.trim() !== '' &&
+        authorLogin.trim().toLowerCase() === username.trim().toLowerCase();
+      authorized = hasWrite || isAuthor;
+      if (!authorized) {
+        return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
+      }
     } else {
       return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
     }
@@ -476,6 +616,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
       sameRepository(pullRequest.head.repo?.full_name, repository.fullName) &&
       safeSha(pullRequest.base.sha) && safeSha(pullRequest.head.sha),
     );
+    const quotaHeadSha = pullRequest && safeSha(pullRequest.head.sha) ? pullRequest.head.sha : undefined;
     return {
       target,
       command,
@@ -484,6 +625,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
       authorized,
       ...(Number.isSafeInteger(issueNumber) && issueNumber > 0 ? { issueNumber } : {}),
       ...(safeReview ? { pullRequest } : {}),
+      ...(quotaHeadSha ? { quotaHeadSha } : {}),
       title,
     };
   }
@@ -530,6 +672,52 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
   const repoOwner = resolveRouteRepoOwner(env, event);
   const isOwner = isRepositoryOwner(actor, repoOwner);
   const action = typeof event.action === 'string' ? event.action : '';
+  // S4 quota: an open PR gate closes when this PR+head SHA already consumed
+  // its budget, or when the counter is unreadable (fail-closed). Only started
+  // reviews count (routing/authorization denials never reach a sticky write),
+  // and a new SHA restarts. Issue targets never open a PR gate and never
+  // consume quota: they are forced to none here and scheduled via the explicit
+  // issue-auto route (routeKind first-review/issue-update plus should_review)
+  // with no auth/quota gate by owner decision (this phase: no budget/rate
+  // limit, only bot exclusion in routing plus per-issue concurrency
+  // serialization).
+  let reviewGate = resolveReviewGate(route.kind, flags.shouldReview);
+  let shouldReview = flags.shouldReview;
+  let reason = route.reason;
+  let reviewsUsed = 0;
+  if (target.target === 'issue') {
+    reviewGate = 'none';
+  }
+  const quotaSha = target.quotaHeadSha ?? target.pullRequest?.head.sha;
+  if ((reviewGate === 'auto' || reviewGate === 'manual') && quotaSha && safeSha(quotaSha) && target.issueNumber) {
+    const repository = repositoryParts(env, event);
+    if (!repository) {
+      reviewGate = 'none';
+      shouldReview = false;
+      reason = 'quota-unknown: repository identity unavailable; review budget could not be verified';
+    } else {
+      const client = apiClient(context, env.GITHUB_TOKEN ?? '');
+      const quota = await readStickyReviewCount(
+        client,
+        repository.owner,
+        repository.repo,
+        target.issueNumber,
+        quotaSha,
+      );
+      if (!quota.ok) {
+        reviewGate = 'none';
+        shouldReview = false;
+        reason = 'quota-unknown: sticky review counter unreadable; fail-closed without scheduling AI';
+      } else {
+        reviewsUsed = quota.used;
+        if (reviewsUsed >= MAX_REVIEWS_PER_SHA) {
+          reviewGate = 'none';
+          shouldReview = false;
+          reason = `quota-exhausted: head ${quotaSha.toLowerCase()} already reviewed ${reviewsUsed} times (limit ${MAX_REVIEWS_PER_SHA}); a new head SHA restarts the budget`;
+        }
+      }
+    }
+  }
   const result: TagResult = {
     labels,
     areaLabels,
@@ -542,10 +730,12 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     // Fail-closed: only an explicit true counts as authorized.
     authorized: target.authorized === true,
     ...(target.issueNumber ? { issueNumber: target.issueNumber } : {}),
-    shouldReview: flags.shouldReview,
+    shouldReview,
     shouldTag: flags.shouldTag,
-    reason: route.reason,
+    reason,
     routeKind: route.kind,
+    reviewGate,
+    reviewsUsed,
     isOwner,
     ...(actor ? { actor } : {}),
     ...(repoOwner ? { repoOwner } : {}),
@@ -567,6 +757,8 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     should_tag: String(result.shouldTag),
     reason: result.reason,
     route_kind: result.routeKind,
+    review_gate: result.reviewGate,
+    reviews_used: String(result.reviewsUsed),
     is_owner: String(result.isOwner),
     ...(result.actor ? { actor: result.actor } : {}),
     ...(result.repoOwner ? { repo_owner: result.repoOwner } : {}),
@@ -794,6 +986,172 @@ function installOpenAIStub(env: NodeJS.ProcessEnv): () => void {
   return () => { globalThis.fetch = previousFetch; };
 }
 
+export interface RunnerIssueOutput {
+  verdict: RunnerVerdict;
+  issueNumber: number;
+  title: string;
+  tags: string[];
+  summary: string;
+}
+
+function issueRulesTags(title: string): string[] {
+  return sanitizeLabels(resolveLabelsFromTitle(title));
+}
+
+function saveIssueOutput(output: RunnerIssueOutput, context: RunnerContext): void {
+  const env = context.env ?? process.env;
+  const serialized = `${JSON.stringify(output, null, 2)}\n`;
+  const outputPath = env.POCKETGUARD_OUTPUT;
+  if (!outputPath) {
+    stdout(context, serialized);
+    return;
+  }
+  const resolved = path.resolve(outputPath);
+  fs.mkdirSync(path.dirname(resolved), { recursive: true });
+  fs.writeFileSync(resolved, serialized, { encoding: 'utf8', mode: 0o600 });
+}
+
+export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    Object.keys(raw).some((key) => !['verdict', 'issueNumber', 'title', 'tags', 'summary'].includes(key)) ||
+    !['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE'].includes(String(raw.verdict)) ||
+    !Number.isSafeInteger(raw.issueNumber) || Number(raw.issueNumber) < 1 ||
+    typeof raw.title !== 'string' || typeof raw.summary !== 'string' ||
+    !Array.isArray(raw.tags) || !raw.tags.every((tag) => typeof tag === 'string')
+  ) return undefined;
+  return {
+    verdict: raw.verdict as RunnerVerdict,
+    issueNumber: Number(raw.issueNumber),
+    title: safeString(raw.title),
+    tags: sanitizeLabels(
+      (raw.tags as string[]).filter((tag): tag is string => typeof tag === 'string'),
+    ),
+    summary: safeString(raw.summary),
+  };
+}
+
+// S4 issue context: title plus body plus human comments (bot authors and bot
+// senders excluded by the same loop-protection rules as routing), truncated
+// to MAX_ISSUE_CONTEXT_LENGTH. Comment reads are best-effort: any API failure
+// yields title plus body only, never a throw.
+async function buildIssueContext(
+  context: RunnerContext,
+  repository: { owner: string; repo: string } | undefined,
+  issueNumber: number,
+  title: string,
+  body: string,
+): Promise<{ title: string; body: string; comments: string[] }> {
+  const comments: string[] = [];
+  const client = apiClient(context, (context.env ?? process.env).GITHUB_TOKEN ?? '');
+  try {
+    const issues = client?.rest.issues as RunnerGitHubClient['rest']['issues'] | undefined;
+    if (client && repository && typeof issues?.listComments === 'function') {
+      for (let page = 1; ; page += 1) {
+        const response = await issues.listComments({
+          owner: repository.owner,
+          repo: repository.repo,
+          issue_number: issueNumber,
+          per_page: 100,
+          page,
+        });
+        if (!Array.isArray(response.data)) break;
+        for (const comment of response.data) {
+          if (typeof comment?.body !== 'string' || !comment.body.trim()) continue;
+          if (comment.user?.type?.toLowerCase() === 'bot') continue;
+          if (typeof comment.user?.login === 'string' && isBotLogin(comment.user.login)) continue;
+          const login = typeof comment.user?.login === 'string' && comment.user.login.trim()
+            ? comment.user.login.trim()
+            : 'unknown';
+          comments.push(`${login}：${safeString(comment.body)}`);
+        }
+        if (response.data.length < 100) break;
+      }
+    }
+  } catch {
+    // Best-effort: fall through with title plus body only.
+  }
+  const safeTitle = safeString(title);
+  let safeBody = safeString(body, 8000);
+  const kept = [...comments];
+  const assembledLength = (): number =>
+    safeTitle.length + safeBody.length + kept.reduce((total, comment) => total + comment.length, 0);
+  while (kept.length > 0 && assembledLength() > MAX_ISSUE_CONTEXT_LENGTH) kept.pop();
+  if (assembledLength() > MAX_ISSUE_CONTEXT_LENGTH) {
+    safeBody = safeBody.slice(0, Math.max(0, MAX_ISSUE_CONTEXT_LENGTH - safeTitle.length));
+  }
+  return { title: safeTitle, body: safeBody, comments: kept };
+}
+
+// S4 issue execution (minimal, never counted): issues opened/edited/reopened
+// and human issue comments each take one chief single-turn over the issue
+// context and record verdict plus rules-only tags (AI label schema stays in
+// S5). Routing or AI failures fall back to rules-only INCONCLUSIVE.
+export async function runIssueReviewMode(context: RunnerContext = {}): Promise<RunnerIssueOutput> {
+  const env = context.env ?? process.env;
+  let event: GithubEvent;
+  try {
+    event = eventFrom(context);
+  } catch {
+    const output: RunnerIssueOutput = { verdict: 'INCONCLUSIVE', issueNumber: 0, title: '', tags: [], summary: '' };
+    saveIssueOutput(output, context);
+    return output;
+  }
+  const target = await inspectTarget(context);
+  const title = target.title;
+  const body = typeof event.issue?.body === 'string' ? event.issue.body : '';
+  const issueNumber = target.issueNumber ?? 0;
+  const rulesOnly = (summary: string): RunnerIssueOutput => ({
+    verdict: 'INCONCLUSIVE',
+    issueNumber,
+    title: safeString(title),
+    tags: issueRulesTags(title),
+    summary: safeString(summary),
+  });
+  const route = routeEvent(event, env);
+  if (target.target !== 'issue' || !issueNumber || (route.kind !== 'first-review' && route.kind !== 'issue-update')) {
+    const output = rulesOnly(`no issue review: ${route.reason}`);
+    saveIssueOutput(output, context);
+    return output;
+  }
+  const repository = repositoryParts(env, event);
+  const built = await buildIssueContext(context, repository, issueNumber, title, body);
+  const restoreFetch = installOpenAIStub(env);
+  try {
+    const { triageIssue } = await import('./orchestrator');
+    const triaged = await triageIssue({
+      input: { title: built.title, body: built.body, comments: built.comments },
+      env,
+      allowedOrigins: parseAllowedOrigins(env),
+    });
+    const output: RunnerIssueOutput = {
+      verdict: triaged.verdict,
+      issueNumber,
+      title: safeString(title),
+      tags: issueRulesTags(title),
+      summary: triaged.summary,
+    };
+    saveIssueOutput(output, context);
+    return output;
+  } finally {
+    restoreFetch();
+  }
+}
+
+// --mode=review entry: issues take the single-turn triage path (which ignores
+// the SAFE_REVIEW gate — there is no diff or code checkout), pull requests
+// take the gated diff review.
+export async function runReviewEntryMode(context: RunnerContext = {}): Promise<RunnerReviewOutput | RunnerIssueOutput> {
+  try {
+    const target = await inspectTarget(context);
+    if (target.target === 'issue') return runIssueReviewMode(context);
+  } catch {
+    // Fall through to runReviewMode, which fails closed to generic output.
+  }
+  return runReviewMode(context);
+}
+
 export async function runReviewMode(context: RunnerContext = {}): Promise<RunnerReviewOutput> {
   const env = context.env ?? process.env;
   let output = genericReviewOutput();
@@ -812,6 +1170,39 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
     ) {
       saveReviewOutput(output, context);
       return output;
+    }
+
+    // S4 execution matrix: routed-ignore events (non-owner synchronize,
+    // ordinary chatter, unsubscribed actions, bot events) never reach AI, and
+    // review mode re-reads the sticky counter immediately before any git or
+    // OpenAI work as defense in depth against concurrent runs that both
+    // passed tag mode. A quota denial or an unreadable counter (fail-closed)
+    // returns the generic output with zero OpenAI calls and — like every
+    // routing or authorization denial — is never counted.
+    const reviewEvent = eventFrom(context);
+    const reviewRoute = routeEvent(reviewEvent, env);
+    if (reviewRoute.kind === 'ignore') {
+      saveReviewOutput(output, context);
+      return output;
+    }
+    const reviewRepository = repositoryParts(env, reviewEvent);
+    if (!reviewRepository) {
+      saveReviewOutput(output, context);
+      return output;
+    }
+    {
+      const quotaClient = apiClient(context, env.GITHUB_TOKEN ?? '');
+      const quota = await readStickyReviewCount(
+        quotaClient,
+        reviewRepository.owner,
+        reviewRepository.repo,
+        target.issueNumber,
+        target.pullRequest.head.sha,
+      );
+      if (!quota.ok || quota.used >= MAX_REVIEWS_PER_SHA) {
+        saveReviewOutput(output, context);
+        return output;
+      }
     }
 
     const baseSha = target.pullRequest.base.sha;
@@ -1240,11 +1631,31 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   const eventName = env.GITHUB_EVENT_NAME ?? '';
   if (!target.issueNumber) return;
 
+  // S4 execution matrix: routed-ignore events (non-owner synchronize, ordinary
+  // chatter, unsubscribed actions, bot events) publish nothing — no sticky
+  // write, no label changes.
+  const publishRoute = routeEvent(event, env);
+  if (publishRoute.kind === 'ignore') return;
+
   if (eventName === 'issues' && target.target === 'issue') {
-    const labels = sanitizeLabels([
+    const titleLabels = sanitizeLabels([
       ...configuredTagLabels(env),
       ...resolveLabelsFromTitle(target.title),
     ]);
+    // S4 issue execution: apply the reviewed issue's rules-only tags when a
+    // matching valid artifact exists (AI label schema stays in S5); any
+    // missing or invalid artifact falls back to title labels only.
+    let issueTags: string[] = [];
+    if ((env.POCKETGUARD_REVIEW_JOB_RESULT ?? 'unavailable') === 'success') {
+      try {
+        const artifactText = fs.readFileSync(env.POCKETGUARD_OUTPUT ?? 'review-output.json', 'utf8');
+        const validated = validateIssueOutput(JSON.parse(artifactText) as unknown);
+        if (validated && validated.issueNumber === target.issueNumber) issueTags = validated.tags;
+      } catch {
+        // Best-effort: fall back to title labels only.
+      }
+    }
+    const labels = sanitizeLabels([...titleLabels, ...issueTags]);
     if (labels.length > 0) {
       try {
         await client.rest.issues.addLabels({
@@ -1261,6 +1672,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   }
 
   if (!eventCommentAllowed(target, eventName)) return;
+  // Defense in depth for the workflow publish gate: an issue_comment without
+  // an explicit authorized verdict publishes nothing — no artifact read, no
+  // sticky write, no label changes — so an unauthorized /review can never
+  // touch a prior approval even if the job condition is bypassed in tests.
+  if (eventName === 'issue_comment' && target.authorized !== true) return;
 
   let fallbackReason: string | undefined;
   let freshPullRequest: PullRequestData | undefined;
@@ -1278,6 +1694,31 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   } catch {
     fallbackReason = 'the current pull request state could not be fetched from GitHub.';
   }
+
+  // S4 quota: an exhausted budget — or an unreadable counter (fail-closed) —
+  // publishes nothing — the sticky comment and labels keep the previous
+  // review untouched. Counting happens only on the sticky writes below
+  // (started reviews, including INCONCLUSIVE fallbacks); every write in this
+  // run shares one stamp, so the label-fallback overwrite cannot double-count.
+  // Without a fresh head SHA the write carries no marker (degraded, uncounted)
+  // rather than a wrong one.
+  let reviewsUsed = 0;
+  if (freshPullRequest && safeSha(freshPullRequest.head.sha)) {
+    const quota = await readStickyReviewCount(
+      client,
+      repository.owner,
+      repository.repo,
+      target.issueNumber,
+      freshPullRequest.head.sha,
+    );
+    if (!quota.ok) return;
+    if (quota.used >= MAX_REVIEWS_PER_SHA) return;
+    reviewsUsed = quota.used;
+  }
+  const stampSticky = (body: string): string =>
+    freshPullRequest && safeSha(freshPullRequest.head.sha)
+      ? withReviewCountMarker(body, freshPullRequest.head.sha, reviewsUsed + 1)
+      : body;
 
   const outputPath = env.POCKETGUARD_OUTPUT ?? 'review-output.json';
   let output: RunnerReviewOutput | undefined;
@@ -1316,16 +1757,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       client,
       repository,
       target.issueNumber,
-      inconclusiveComment(fallbackReason ?? 'a valid review result was unavailable.'),
+      stampSticky(inconclusiveComment(fallbackReason ?? 'a valid review result was unavailable.')),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }
 
   let publishFallbackReason: string | undefined;
-  await publishStickyComment(client, repository, target.issueNumber, reviewComment(output), async () => {
+  await publishStickyComment(client, repository, target.issueNumber, stampSticky(reviewComment(output)), async () => {
     publishFallbackReason = await currentReviewProblem(client, repository, target.issueNumber!, output!);
-    return publishFallbackReason ? inconclusiveComment(publishFallbackReason) : reviewComment(output!);
+    return publishFallbackReason ? stampSticky(inconclusiveComment(publishFallbackReason)) : stampSticky(reviewComment(output!));
   });
   if (publishFallbackReason) {
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
@@ -1350,7 +1791,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       client,
       repository,
       target.issueNumber,
-      inconclusiveComment(labelFallbackReason),
+      stampSticky(inconclusiveComment(labelFallbackReason)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -1397,7 +1838,7 @@ async function main(): Promise<void> {
   }
   try {
     if (mode === 'tag') await runTagMode();
-    if (mode === 'review') await runReviewMode();
+    if (mode === 'review') await runReviewEntryMode();
     if (mode === 'publish') await runPublishMode();
   } catch {
     process.stderr.write('PocketGuard: operation failed.\n');

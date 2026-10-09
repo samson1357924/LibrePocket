@@ -9,6 +9,12 @@ on:
     types: [created, edited]
 
 concurrency:
+  # Per-PR/issue serialization is the primary mutex for the S4 per-SHA review
+  # quota (at most 2 AI reviews per PR+head SHA, counted in the sticky
+  # comment). GitHub offers no compare-and-swap on comments, so a residual
+  # race remains if overlapping runs for the same PR ever escape this group;
+  # review mode re-reads the counter immediately before any OpenAI call as
+  # defense in depth.
   group: pocketguard-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
   cancel-in-progress: false
 
@@ -23,6 +29,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # Read-only issue metadata for the S4 per-SHA quota read (sticky
+      # comment) and issue context assembly. No writes, no OpenAI secrets.
+      issues: read
     outputs:
       labels: ${{ steps.tag.outputs.labels }}
       target: ${{ steps.tag.outputs.target }}
@@ -31,6 +40,11 @@ jobs:
       safe_review: ${{ steps.tag.outputs.safe_review }}
       authorized: ${{ steps.tag.outputs.authorized }}
       issue_number: ${{ steps.tag.outputs.issue_number }}
+      should_review: ${{ steps.tag.outputs.should_review }}
+      should_tag: ${{ steps.tag.outputs.should_tag }}
+      route_kind: ${{ steps.tag.outputs.route_kind }}
+      review_gate: ${{ steps.tag.outputs.review_gate }}
+      reviews_used: ${{ steps.tag.outputs.reviews_used }}
     steps:
       - name: Checkout default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,17 +78,39 @@ jobs:
   review-send:
     name: Review with isolated OpenAI credentials
     needs: prepare-tag
-    # Read-only gate first: unauthorized issue_comment never schedules this
-    # secrets-bearing runner, so OpenAI secrets stay unreachable.
+    # Route-driven scheduling (S4): a pull-request review is scheduled only
+    # with should_review and an open review_gate. The auto gate (first review,
+    # owner commit) needs no commenter gate; the manual gate (/review-style
+    # commands) additionally requires authorized, which covers maintainer
+    # write+ and the PR author reviewing their own PR. Quota-exhausted or
+    # quota-unknown runs report review_gate none and schedule nothing. Issue
+    # execution is scheduled only by the explicit issue-auto route (target
+    # issue with should_review and route_kind first-review/issue-update);
+    # should_tag is a deterministic publish signal, never a scheduling reason.
+    # Owner decision: issue auto-review carries no auth/quota gate in this
+    # phase (no budget/rate limit; only bot exclusion in routing plus
+    # per-issue concurrency serialization), so the trusted step below admits
+    # the issue-auto route to the OpenAI secrets.
     if: >-
-      needs.prepare-tag.outputs.target == 'pull-request' &&
-      (github.event_name != 'issue_comment' || needs.prepare-tag.outputs.needs_diff == 'true') &&
-      (github.event_name != 'issue_comment' || needs.prepare-tag.outputs.authorized == 'true')
+      (needs.prepare-tag.outputs.target == 'pull-request' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.review_gate == 'auto') ||
+      (needs.prepare-tag.outputs.target == 'pull-request' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.review_gate == 'manual' &&
+      needs.prepare-tag.outputs.authorized == 'true') ||
+      (needs.prepare-tag.outputs.target == 'issue' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      (needs.prepare-tag.outputs.route_kind == 'first-review' ||
+      needs.prepare-tag.outputs.route_kind == 'issue-update'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
+      # Read-only issue metadata for the S4 quota re-check and issue context
+      # assembly. OpenAI secrets stay confined to the trusted review step.
+      issues: read
     steps:
       - name: Checkout default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -104,7 +140,15 @@ jobs:
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
 
       - name: Run trusted single-turn review
-        if: steps.gate.outputs.safe_review == 'true' && steps.gate.outputs.authorized == 'true'
+        # Trusted admission: same-repo pull requests with an explicit
+        # authorization verdict, plus the intentional issue-auto route (target
+        # issue with should_review and route_kind first-review/issue-update),
+        # which carries no auth/quota gate by owner decision. Only this step
+        # receives OpenAI secrets.
+        if: >-
+          (steps.gate.outputs.safe_review == 'true' && steps.gate.outputs.authorized == 'true') ||
+          (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
+          (steps.gate.outputs.route_kind == 'first-review' || steps.gate.outputs.route_kind == 'issue-update'))
         working-directory: github_bot
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -120,9 +164,13 @@ jobs:
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=review
 
       - name: Write generic result for untrusted pull request
-        # Fail-closed complement of the trusted step: missing/empty/non-'true'
-        # authorized lands here and runs the generic INCONCLUSIVE path only.
-        if: steps.gate.outputs.safe_review != 'true' || steps.gate.outputs.authorized != 'true'
+        # Fail-closed complement of the trusted step: anything not admitted
+        # above — including missing/empty/non-'true' authorized and non-issue
+        # routes — runs the generic INCONCLUSIVE path with no OpenAI secrets.
+        if: >-
+          !((steps.gate.outputs.safe_review == 'true' && steps.gate.outputs.authorized == 'true') ||
+          (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
+          (steps.gate.outputs.route_kind == 'first-review' || steps.gate.outputs.route_kind == 'issue-update')))
         working-directory: github_bot
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -143,11 +191,15 @@ jobs:
   publish:
     name: Publish review and labels
     needs: [prepare-tag, review-send]
-    # Unauthorized issue_comment skips publish entirely: no artifact read, no
-    # sticky write, no label changes, so an existing approval is never touched.
+    # Quota/authorization skip (S4): an issue_comment publishes only an
+    # authorized manual pull-request review with an open gate. Unauthorized
+    # comments and quota-exhausted runs (review_gate none) skip publish
+    # without touching the sticky comment or labels.
     if: >-
       always() && needs.prepare-tag.result == 'success' &&
-      (github.event_name != 'issue_comment' || needs.prepare-tag.outputs.authorized == 'true')
+      (github.event_name != 'issue_comment' ||
+      (needs.prepare-tag.outputs.authorized == 'true' &&
+      needs.prepare-tag.outputs.review_gate != 'none'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

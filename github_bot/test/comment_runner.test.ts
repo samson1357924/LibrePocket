@@ -65,6 +65,12 @@ export async function runCommentRunnerTests(): Promise<void> {
         GITHUB_EVENT_NAME: 'pull_request_target',
         GITHUB_REPOSITORY: 'sample/repository',
       } as NodeJS.ProcessEnv,
+      githubClient: {
+        rest: {
+          users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+          issues: { listComments: async () => ({ data: [] }) },
+        },
+      } as unknown as RunnerContext['githubClient'],
       writeStdout: (value) => { tagStdout += value; },
       runGit: (args: string[]) => {
         if (args[0] === 'fetch') return '';
@@ -126,6 +132,12 @@ export async function runCommentRunnerTests(): Promise<void> {
               head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
             } }),
           },
+          users: {
+            getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }),
+          },
+          issues: {
+            listComments: async () => ({ data: [] }),
+          },
           repos: {
             getCollaboratorPermissionLevel: async () => ({ data: { permission: 'write' } }),
           },
@@ -183,6 +195,12 @@ export async function runCommentRunnerTests(): Promise<void> {
           POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
           POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
         } as NodeJS.ProcessEnv,
+        githubClient: {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: { listComments: async () => ({ data: [] }) },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>,
         writeStdout: () => undefined,
         runGit: (args) => {
           if (args[0] === 'fetch') return '';
@@ -258,6 +276,14 @@ export async function runCommentRunnerTests(): Promise<void> {
         try {
           return await runReviewMode({
             ...reviewContext,
+            // Quota reads must not touch the network-counted fetch stub; an
+            // empty sticky list reports zero prior reviews.
+            githubClient: {
+              rest: {
+                users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+                issues: { listComments: async () => ({ data: [] }) },
+              },
+            } as unknown as NonNullable<RunnerContext['githubClient']>,
             env: blockerEnv,
             runGit: (args) => {
               if (args[0] === 'fetch') return '';
@@ -704,7 +730,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.equal(existingDecisionLabel.state.operations.includes('add-labels'), false,
         'an existing decision label is recognized as skipped rather than added again');
 
-      for (const failure of ['list', 'update', 'create'] as const) {
+      for (const failure of ['update', 'create'] as const) {
         const publishFailure = makePublishHarness({
           outputPath,
           commentFailure: failure,
@@ -722,6 +748,23 @@ export async function runCommentRunnerTests(): Promise<void> {
         assert.equal(publishFailure.state.operations.includes('remove-label'), false);
         assert.equal(publishFailure.state.comments.find((comment) => comment.id === 8)?.body, humanMarkerBody,
           `${failure} comment API failure must not mutate the human-authored marker`);
+      }
+
+      // A list failure during the fail-closed quota re-check publishes
+      // nothing (no throw, no sticky write, no labels) and leaves the prior
+      // sticky untouched.
+      {
+        const listFailure = makePublishHarness({ outputPath, commentFailure: 'list' });
+        const stickyBefore = listFailure.state.comments.find((comment) => comment.id === 7)?.body;
+        await runPublishMode(listFailure.context);
+        assert.equal(listFailure.state.operations.includes('list-labels'), false,
+          'list comment API failure must prevent label reconciliation');
+        assert.equal(listFailure.state.operations.includes('add-labels'), false);
+        assert.equal(listFailure.state.operations.includes('remove-label'), false);
+        assert.equal(listFailure.state.comments.find((comment) => comment.id === 7)?.body, stickyBefore,
+          'list comment API failure must leave the sticky untouched (quota-unknown fail-closed)');
+        assert.equal(listFailure.state.comments.find((comment) => comment.id === 8)?.body, humanMarkerBody,
+          'list comment API failure must not mutate the human-authored marker');
       }
 
       const failedDecisionLabel = makePublishHarness({
@@ -936,14 +979,22 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.match(prepareTag, /authorized:\s*\$\{\{\s*steps\.tag\.outputs\.authorized\s*\}\}/,
         'prepare-tag forwards the authorization verdict');
       const reviewCondition = reviewJob.slice(0, reviewJob.indexOf('    steps:'));
-      assert.match(reviewCondition, /needs\.prepare-tag\.outputs\.authorized\s*==\s*'true'/,
+      const squashedReviewCondition = reviewCondition.replace(/\s+/g, ' ');
+      assert.match(squashedReviewCondition, /needs\.prepare-tag\.outputs\.authorized\s*==\s*'true'/,
         'unauthorized issue_comment never schedules the secrets-bearing review job');
+      assert.doesNotMatch(squashedReviewCondition, /should_tag\s*==\s*'true'/,
+        'should_tag is never a review-job scheduling reason');
+      assert.match(squashedReviewCondition, /target\s*==\s*'issue'.*route_kind/,
+        'review-send schedules issue-auto execution by explicit route');
       const trustedStep = workflowStep(reviewJob, 'Run trusted single-turn review');
-      assert.match(trustedStep, /steps\.gate\.outputs\.safe_review\s*==\s*'true'\s*&&\s*steps\.gate\.outputs\.authorized\s*==\s*'true'/,
+      const squashedTrusted = trustedStep.replace(/\s+/g, ' ');
+      assert.match(squashedTrusted, /steps\.gate\.outputs\.safe_review\s*==\s*'true'\s*&&\s*steps\.gate\.outputs\.authorized\s*==\s*'true'/,
         'OpenAI credentials are injected only when origin and authorization both pass');
+      assert.match(squashedTrusted, /steps\.gate\.outputs\.target\s*==\s*'issue'.*should_review\s*==\s*'true'.*route_kind/,
+        'trusted step admits the intentional issue-auto route to secrets');
       const genericStep = workflowStep(reviewJob, 'Write generic result for untrusted pull request');
-      assert.match(genericStep, /steps\.gate\.outputs\.authorized\s*!=\s*'true'/,
-        'missing authorization falls through to the generic INCONCLUSIVE path');
+      assert.match(genericStep.replace(/\s+/g, ' '), /steps\.gate\.outputs\.target\s*==\s*'issue'/,
+        'generic complement excludes the issue-auto route from the no-secrets path');
       const uploadedArtifactName = withValue(uploadStep, 'name');
       const downloadedArtifactName = withValue(downloadStep, 'name');
       assert.ok(uploadedArtifactName, 'review job declares an uploaded artifact name');
@@ -1028,6 +1079,12 @@ export async function runCommentAuthTests(): Promise<void> {
                 head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
               } };
             },
+          },
+          users: {
+            getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }),
+          },
+          issues: {
+            listComments: async () => ({ data: [] }),
           },
           ...(options.omitRepos ? {} : {
             repos: {
@@ -1123,20 +1180,20 @@ export async function runCommentAuthTests(): Promise<void> {
         { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 2, 'outsider-read: tag and review each verify');
       assert.equal(harness.state.permissionCalls[0].username, 'outsider', 'outsider-read: username forwarded');
-      assert.equal(harness.state.pullsGetCalls, 0, 'outsider-read: no pulls.get call');
+      assert.equal(harness.state.pullsGetCalls, 2, 'outsider-read: tag and review each fetch the PR for the author check');
     }
 
     // d. collaborator without access, and a 404-style API failure, both deny.
     {
       const { harness } = await runAuthCase('outsider-none', { permission: 'none' },
         { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
-      assert.equal(harness.state.pullsGetCalls, 0, 'outsider-none: no pulls.get call');
+      assert.equal(harness.state.pullsGetCalls, 2, 'outsider-none: tag and review each fetch the PR for the author check');
     }
     {
       const { harness } = await runAuthCase('permission-404',
         { permissionThrows: 'synthetic permission lookup failure' },
         { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
-      assert.equal(harness.state.pullsGetCalls, 0, 'permission-404: no pulls.get call');
+      assert.equal(harness.state.pullsGetCalls, 2, 'permission-404: the author check still runs after a permission failure');
     }
 
     // e. FIRST_TIME_CONTRIBUTOR without write access is denied.
@@ -1170,7 +1227,7 @@ export async function runCommentAuthTests(): Promise<void> {
       const { harness } = await runAuthCase('spoofed-association',
         { permission: 'read', authorAssociation: 'COLLABORATOR' },
         { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
-      assert.equal(harness.state.pullsGetCalls, 0, 'spoofed-association: no pulls.get call');
+      assert.equal(harness.state.pullsGetCalls, 2, 'spoofed-association: tag and review each fetch the PR for the author check');
     }
 
     // i. missing usernames deny without touching the permission API.
@@ -1243,14 +1300,14 @@ export async function runCommentAuthTests(): Promise<void> {
       const { harness } = await runAuthCase('outsider-deny-safe-review-false',
         { permission: 'read', commentUser: { login: 'outsider', type: 'User' }, safeReviewEnv: 'false' },
         { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
-      assert.equal(harness.state.pullsGetCalls, 0, 'outsider-deny-safe-review-false: no pulls.get call');
+      assert.equal(harness.state.pullsGetCalls, 2, 'outsider-deny-safe-review-false: author check runs, bypass stays denied');
     }
 
     // A missing repos API on the client denies fail-closed.
     {
       const { harness } = await runAuthCase('missing-repos-api', { omitRepos: true },
         { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
-      assert.equal(harness.state.pullsGetCalls, 0, 'missing-repos-api: no pulls.get call');
+      assert.equal(harness.state.pullsGetCalls, 2, 'missing-repos-api: the author check still runs without a repos API');
     }
 
     // An authorized maintainer sending an unsupported command is authorized
@@ -1355,9 +1412,10 @@ export async function runRouteEventTests(): Promise<void> {
     ({ GITHUB_EVENT_NAME: 'issues', GITHUB_REPOSITORY: 'sample/repository' } as NodeJS.ProcessEnv);
   assert.equal(routeEvent({ action: 'opened', issue: { number: 7 } }, issuesEnv()).kind, 'first-review');
   const issueOpenedFlags = routeReviewFlags('first-review', 'issues', { issue: { number: 7 } });
-  assert.deepEqual(issueOpenedFlags, { shouldReview: false, shouldTag: true });
+  assert.deepEqual(issueOpenedFlags, { shouldReview: true, shouldTag: true });
   assert.equal(routeEvent({ action: 'edited', issue: { number: 7 } }, issuesEnv()).kind, 'issue-update');
   assert.equal(routeEvent({ action: 'reopened', issue: { number: 7 } }, issuesEnv()).kind, 'issue-update');
+  assert.deepEqual(routeReviewFlags('issue-update', 'issues', { issue: { number: 7 } }), { shouldReview: true, shouldTag: true });
   assert.equal(routeEvent(
     { action: 'opened', issue: { number: 7 }, sender: { login: 'bot[bot]', type: 'User' } },
     issuesEnv()).kind, 'ignore');
@@ -1426,6 +1484,12 @@ export async function runRouteEventTests(): Promise<void> {
         GITHUB_ACTOR: 'sample',
         POCKETGUARD_REPO_OWNER: 'sample',
       } as NodeJS.ProcessEnv,
+      githubClient: {
+        rest: {
+          users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+          issues: { listComments: async () => ({ data: [] }) },
+        },
+      } as unknown as RunnerContext['githubClient'],
       writeStdout: () => undefined,
       runGit: () => { throw new Error('no git needed for routing outputs'); },
     });

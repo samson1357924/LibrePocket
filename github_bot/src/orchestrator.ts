@@ -171,6 +171,68 @@ function roleUserPrompt(role: OpenAIModelRole, changedFiles: string[], diff: str
   ].join('\n\n');
 }
 
+export interface IssueTriageInput {
+  title: string;
+  body: string;
+  comments: string[];
+}
+
+export interface IssueTriageResult {
+  verdict: ReviewVerdict;
+  summary: string;
+}
+
+export interface TriageIssueOptions {
+  input: IssueTriageInput;
+  env?: OpenAIEnvironment;
+  promptDirectory?: string;
+  allowedOrigins?: string[];
+}
+
+// S4 issue execution (minimal): a single chief-role turn over the issue
+// title, body, and human comments. Decision record: a dedicated
+// issue_triage.md prompt with one role call is the smallest viable path —
+// reusing orchestrateReview would force diff/coverage concepts onto issues,
+// and AI-emitted labels stay out of scope until S5 (tags are rules-only
+// here). Any failure (missing config, transport, or schema) falls back to
+// INCONCLUSIVE with an empty summary; callers pair it with rules-only tags.
+export async function triageIssue(options: TriageIssueOptions): Promise<IssueTriageResult> {
+  const fallback: IssueTriageResult = { verdict: 'INCONCLUSIVE', summary: '' };
+  try {
+    const env = options.env ?? process.env;
+    const promptDirectory = options.promptDirectory ?? path.resolve(__dirname, '../prompts');
+    const modelUsed = resolveRoleModel('chief', env);
+    const systemPrompt = fs.readFileSync(path.join(promptDirectory, 'issue_triage.md'), 'utf8');
+    const userPrompt = [
+      `標題：${options.input.title}`,
+      `內文：${options.input.body}`,
+      ...options.input.comments.map((comment) => `留言：${comment}`),
+    ].join('\n\n');
+    const result = await sendOpenAISingleTurn({
+      modelId: modelUsed,
+      systemPrompt,
+      userPrompt,
+      temperature: 0.2,
+      maxOutputTokens: 1024,
+      allowedOrigins: options.allowedOrigins,
+      env,
+    });
+    const parsed = parseJsonObject(result.content);
+    if (
+      !parsed ||
+      Object.keys(parsed).some((key) => !['verdict', 'summary'].includes(key)) ||
+      !VERDICTS.has(parsed.verdict as ReviewVerdict) ||
+      typeof parsed.summary !== 'string'
+    ) return fallback;
+    return {
+      verdict: parsed.verdict as ReviewVerdict,
+      summary: redactSensitiveText(parsed.summary).slice(0, MAX_TEXT_LENGTH),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 export async function orchestrateReview(options: OrchestratorOptions): Promise<OrchestratedReview> {
   const coverage = safeCoverage(options.coverage);
   const deterministicViolations = safeViolations(options.deterministicViolations);

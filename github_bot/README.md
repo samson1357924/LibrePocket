@@ -87,15 +87,16 @@ Request bodies are built per model profile with a minimal default
 `reasoning` unless the profile requires it): reasoning models with
 `effort != none` send `reasoning: { effort }` and omit `temperature`/`top_p`
 (GPT-5-class reasoning rejects `temperature` with 400); reasoning with
-`effort == none` omits the `reasoning` key entirely (never sends
-`reasoning: { effort: 'none' }`; see
-https://platform.openai.com/docs/api-reference/responses/create — omitted
-`reasoning` selects the default non-reasoning path, while an explicit
-`none` is rejected with 400 on models without none support, so
-`resolveModelProfile` returns `undefined` for model+`none` when unsupported
-and the send fails closed with zero fetch); non-reasoning models
-never send `reasoning`, and `temperature`/`top_p` are sent only when the
-caller explicitly sets them. Builtin defaults cover `gpt-5*` as reasoning and
+`effort == none` explicitly sends `reasoning: { effort: 'none' }` on models
+with none support (e.g. `gpt-5*` including `gpt-5.5`; see
+https://developers.openai.com/api/docs/guides/reasoning — omission selects
+the model default such as `medium`, not `none`). Models without none support
+never send an omitted-key fallback: `resolveModelProfile` returns `undefined`
+for model+`none` when unsupported and the send fails closed with zero fetch;
+non-reasoning models never send `reasoning`, and `temperature`/`top_p` are
+sent only when the caller explicitly sets them (reasoning, including explicit
+none, is mutually exclusive with `temperature`/`top_p` and throws
+fail-closed). Builtin defaults cover `gpt-5*` as reasoning and
 `gpt-4o*`/`gpt-4.1*` as chat; any other model without an explicit profile
 fails closed (`model profile not configured`, no request sent) and the
 orchestrator converges to `INCONCLUSIVE` without retry, downgrade, or labels.
@@ -121,8 +122,8 @@ official OpenAI defaults.
 - The bot allowlist includes `accessibility` and `run-instrumented` only to preserve existing repository labels; they are human-only and the bot never emits or manages them.
 - The bot may emit `security`, `performance`, `type:tracking`, and `status:needs-decision`. Maintainers must create these labels before go-live; allowlisting them does not create them in the repository.
 - `area:*` labels are derived from the full changed-path list. If that list is unavailable, publication preserves existing area labels and only reconciles `status:needs-decision`.
-- Mutual exclusion (P2 #4): `priority:{P1,P2}`, `gate:*`, `status:verified-main/partial/latent`, and `bug/enhancement/documentation` are human-owned mutex groups. The bot never writes or auto-removes a mutex member (excluded from the managed scope); coexistence (e.g. `P1`+`P2`) only warns for a maintainer to resolve. Provenance: the bot only deletes inside `area:*` + `status:needs-decision`, and incomplete coverage preserves existing `area:*` (human lock priority).
-- PR convergence: PR publish AI suggestions are limited to `area:*`/`security`/`performance`/`status:needs-decision` (+ `type:tracking`); `priority:*`/`gate:*`/`bug`/`enhancement`/`documentation` (and verified statuses) are issue-triage-only. A PR AI suggestion carrying an issue-only or unknown label is discarded and forces `INCONCLUSIVE` (never `APPROVE`, never written).
+- Mutual exclusion (P2 #4): `priority:{P1,P2}`, `gate:*`, `status:verified-main/partial/latent`, and `bug/enhancement/documentation` are mutex groups. Human-only members (`gate:*`, verified statuses) are never written or auto-removed by the bot. `priority` stays issue-triage-only. PR AI restores semantic `bug`/`enhancement`/`documentation` per Owner B; bot-owned transitions (`priority:P1->P2`, `bug->enhancement` when desired carries a same-group peer) may reconcile, otherwise coexistence only warns for a maintainer to resolve. Provenance: the bot only deletes inside `area:*` + `status:needs-decision` plus bot-owned transitions, and incomplete coverage preserves existing `area:*` (human lock priority).
+- PR convergence: PR publish AI suggestions are limited to `area:*`/`security`/`performance`/`status:needs-decision` (+ `type:tracking` + semantic `bug`/`enhancement`/`documentation`); `priority:*`/`gate:*` (and verified statuses) are issue-triage-only. A PR AI suggestion carrying an issue-only or unknown label is discarded and forces `INCONCLUSIVE` (never `APPROVE`, never written).
 
 ## Maintainer go-live gate — NOT YET LOCALLY OR HOSTED-VERIFIED
 

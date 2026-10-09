@@ -3419,12 +3419,13 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // S5 AI label gate + P2 #4 convergence: raw suggestions are allowlisted at
   // publish. Unknown entries are discarded with a log and force INCONCLUSIVE
   // on the same sticky (never a wrong APPROVE, never writing illegal labels).
-  // PR convergence: only area:*/security/performance/status:needs-decision
-  // (+ type:tracking) may be written from PR AI; priority:*/gate:* /
-  // bug/enhancement/documentation (and verified statuses) are
+  // PR convergence: area:*/security/performance/status:needs-decision
+  // (+ type:tracking + semantic bug/enhancement/documentation) may be written
+  // from PR AI; priority:*/gate:* (and verified statuses) are
   // issue-triage-only, so a PR suggestion carrying them is likewise discarded
   // and forces INCONCLUSIVE. Manual labels outside the bot scope are always
-  // preserved by reconciliation. The ledger stays as the claim left it
+  // preserved by reconciliation (bot-owned P1->P2 / bug->enhancement
+  // transitions excepted). The ledger stays as the claim left it
   // (reconciliation only).
   const aiRaw = Array.isArray(output.suggestedLabels) ? output.suggestedLabels : [];
   const { hadUnknown } = mergeRulesWithAiSuggestions([], aiRaw);

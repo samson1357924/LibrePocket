@@ -15,6 +15,7 @@ import {
   runPublishMode,
   runReviewMode,
   runTagMode,
+  validateIssueOutput,
   type RunnerContext,
 } from '../src/github_runner';
 
@@ -470,6 +471,452 @@ export async function runStage4P2Tests(): Promise<void> {
         } finally {
           restore();
           console.warn = originalWarn;
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2: incomplete issue comments never APPROVE (fail-closed).
+    // First-page throw with an APPROVE-happy model still yields INCONCLUSIVE
+    // with zero OpenAI calls.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1c-throw-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'should not approve', suggestedLabels: [] });
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: { listComments: async () => { throw new Error('403'); } },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'first-page throw never approves');
+          assert.equal(reviewed.commentsComplete, false, 'throw marks incomplete');
+          assert.equal(counter.count, 0, 'incomplete review makes zero OpenAI calls');
+          assert.ok(reviewed.summary.includes('could not be fully fetched') || reviewed.summary.includes('freshness'), 'summary names incomplete comments');
+          const persisted = validateIssueOutput(JSON.parse(fs.readFileSync(path.join(tempDir, 'r.json'), 'utf8')) as unknown);
+          assert.ok(persisted && persisted.commentsComplete === false, 'artifact persists incomplete flag');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2: non-array comment payload is incomplete, never APPROVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1c-nonarray-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] });
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: { listComments: async () => ({ data: null }) },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'non-array payload never approves');
+          assert.equal(reviewed.commentsComplete, false);
+          assert.equal(counter.count, 0, 'non-array makes zero OpenAI calls');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2: non-object entries mark the read incomplete.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1c-nonobject-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] });
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: { listComments: async () => ({ data: [null, 'oops', 123] }) },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'non-object entries never approve');
+          assert.equal(reviewed.commentsComplete, false);
+          assert.equal(counter.count, 0);
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2: missing listComments API is incomplete (no client path).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1c-noapi-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] });
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {},
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'missing listComments never approves');
+          assert.equal(reviewed.commentsComplete, false);
+          assert.equal(counter.count, 0);
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2: page 1 ok but page 2 403 is incomplete, never APPROVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1c-page2-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] });
+        try {
+          const page1 = Array.from({ length: 100 }, (_, i) => ({
+            id: 1000 + i,
+            body: `human note ${i}`,
+            user: { login: 'human', type: 'User' },
+          }));
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                listComments: async (params: { page: number }) => {
+                  if (params.page === 1) return { data: page1 };
+                  throw new Error('403 on page 2');
+                },
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'page-2 failure never approves');
+          assert.equal(reviewed.commentsComplete, false);
+          assert.equal(counter.count, 0, 'page-2 failure makes zero OpenAI calls');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2: bot-only noise still counts as complete and may APPROVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1c-botfilter-'));
+      try {
+        let captured = '';
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(
+          counter,
+          { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [] },
+          (bodyText) => { captured = bodyText; },
+        );
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                listComments: async () => ({
+                  data: [
+                    { id: 1, body: 'human insight', user: { login: 'human', type: 'User' } },
+                    { id: 2, body: 'bot noise', user: { login: 'pocketguard[bot]', type: 'Bot' } },
+                    { id: 3, body: 'other bot', user: { login: 'helper[bot]', type: 'User' } },
+                    { id: 4, body: 'bot type', user: { login: 'human2', type: 'Bot' } },
+                    { id: 5, body: '   ', user: { login: 'human', type: 'User' } },
+                  ],
+                }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'APPROVE', 'bot filtering keeps completeness and may approve');
+          assert.equal(reviewed.commentsComplete, true, 'bot filtering stays complete');
+          assert.equal(counter.count, 1);
+          assert.ok(captured.includes('human insight'), 'human comment reaches the model');
+          assert.ok(!captured.includes('bot noise'), 'bot comments stay excluded');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2: review and publish with the same missing comments compute the
+    // same fingerprint yet must share one INCONCLUSIVE sticky, never APPROVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1c-samemissing-'));
+      try {
+        const artifactPath = path.join(tempDir, 'r.json');
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'should not approve', suggestedLabels: [] });
+        const publishState = {
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const reviewClient = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              listComments: async () => { throw new Error('403'); },
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        // Publish fingerprint read throws once, then the sticky lookup
+        // succeeds so the fallback can update the same comment in place.
+        let publishListCalls = 0;
+        const publishClient = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              listComments: async () => {
+                publishListCalls += 1;
+                if (publishListCalls === 1) throw new Error('403');
+                return { data: publishState.comments };
+              },
+              createComment: async () => ({}),
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                const found = publishState.comments.find((c) => c.id === params.comment_id);
+                if (found) found.body = params.body;
+                publishState.updated += 1;
+                return {};
+              },
+              addLabels: async () => ({}),
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        const issueCommentEvent = {
+          action: 'created',
+          repository: { full_name: REPO },
+          issue: { number: 7, title: 't', body: 'b' },
+          comment: { body: 'human follow-up', user: { login: 'human', type: 'User' } },
+        };
+        let reviewed: Awaited<ReturnType<typeof runIssueReviewMode>>;
+        try {
+          reviewed = await runIssueReviewMode({
+            event: issueCommentEvent,
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issue_comment' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: reviewClient,
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed!.verdict, 'INCONCLUSIVE');
+        assert.equal(reviewed!.commentsComplete, false);
+        assert.equal(counter.count, 0);
+        // The same missing input yields the same fingerprint on both sides,
+        // yet publish must still fall back because completeness is false.
+        const reviewFp = reviewed!.fingerprint;
+        assert.match(reviewFp, /^[0-9a-f]{64}$/);
+        await runPublishMode({
+          event: issueCommentEvent,
+          env: {
+            GITHUB_EVENT_NAME: 'issue_comment',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as NodeJS.ProcessEnv,
+          githubClient: publishClient,
+        });
+        assert.equal(publishState.created, 0, 'same-missing publish creates no second comment');
+        assert.equal(publishState.updated, 1, 'same-missing publish updates the same sticky');
+        assert.ok(publishState.comments[0].body.includes('判定：INCONCLUSIVE'), 'same missing falls back');
+        assert.ok(!publishState.comments[0].body.includes('判定：APPROVE'), 'same missing never approves');
+        assert.ok(
+          publishState.comments[0].body.includes('freshness') || publishState.comments[0].body.includes('could not be fully fetched'),
+          'fallback names unverifiable freshness',
+        );
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2: complete artifact but failing publish re-read falls back.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1c-pubfail-'));
+      try {
+        const artifactPath = path.join(tempDir, 'good.json');
+        const goodCounter = { count: 0 };
+        const goodRestore = installOpenAIStub(goodCounter, { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [] });
+        const goodClient = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: { listComments: async () => ({ data: [] }) },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        let good: Awaited<ReturnType<typeof runIssueReviewMode>>;
+        try {
+          good = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: goodClient,
+            writeStdout: () => undefined,
+          });
+        } finally {
+          goodRestore();
+        }
+        assert.equal(good!.verdict, 'APPROVE');
+        assert.equal(good!.commentsComplete, true);
+        const state = {
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        // Publish fingerprint read fails once, then the sticky lookup
+        // succeeds so the fallback updates the same comment.
+        let failingListCalls = 0;
+        const failingClient = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              listComments: async () => {
+                failingListCalls += 1;
+                if (failingListCalls === 1) throw new Error('403 at publish');
+                return { data: state.comments };
+              },
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const found = state.comments.find((c) => c.id === params.comment_id);
+                if (found) found.body = params.body;
+                return {};
+              },
+              addLabels: async () => ({}),
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as NodeJS.ProcessEnv,
+          githubClient: failingClient,
+        });
+        assert.equal(state.created, 0, 'publish failure creates no second comment');
+        assert.equal(state.updated, 1, 'publish failure updates the same sticky');
+        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'));
+        assert.ok(!state.comments[0].body.includes('判定：APPROVE'));
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2: fingerprint equality lock — the same missing input hashes equal,
+    // old artifacts without the flag are invalid, and truncation is incomplete.
+    {
+      assert.equal(
+        issueContentFingerprint('t', 'b', []),
+        issueContentFingerprint('t', 'b', []),
+        'same missing comments hash equal (the collision publish must still reject)',
+      );
+      assert.notEqual(
+        issueContentFingerprint('t', 'b', []),
+        issueContentFingerprint('t', 'b', ['human：hi']),
+        'present comments hash different',
+      );
+      assert.equal(
+        validateIssueOutput({ verdict: 'APPROVE', issueNumber: 7, title: 't', tags: [], summary: 's', suggestedLabels: [], fingerprint: 'a'.repeat(64) }),
+        undefined,
+        'pre-fix artifact without commentsComplete is invalid (fail-closed)',
+      );
+      assert.ok(
+        validateIssueOutput({ verdict: 'APPROVE', issueNumber: 7, title: 't', tags: [], summary: 's', suggestedLabels: [], fingerprint: 'a'.repeat(64), commentsComplete: true }),
+        'artifact with commentsComplete validates',
+      );
+      assert.equal(
+        validateIssueOutput({ verdict: 'APPROVE', issueNumber: 7, title: 't', tags: [], summary: 's', suggestedLabels: [], fingerprint: 'a'.repeat(64), commentsComplete: 'yes' }),
+        undefined,
+        'non-boolean completeness rejects',
+      );
+      // Truncation that discards a comment is incomplete and never approves.
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1c-truncate-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] });
+        try {
+          const big = `x`.repeat(6000);
+          const many = Array.from({ length: 10 }, (_, i) => ({
+            id: 2000 + i,
+            body: `${big}-${i}`,
+            user: { login: 'human', type: 'User' },
+          }));
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: { listComments: async () => ({ data: many }) },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.commentsComplete, false, 'truncation discarding comments is incomplete');
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'truncated comments never approve');
+          assert.equal(counter.count, 0, 'truncated comments make zero OpenAI calls');
+        } finally {
+          restore();
         }
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });

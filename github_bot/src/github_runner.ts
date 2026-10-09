@@ -1473,8 +1473,13 @@ export interface RunnerIssueOutput {
   // S5: raw AI label suggestions (strict string array, allowlisted at
   // publish) plus a revision fingerprint over title/body/comments so publish
   // can verify freshness and update the same sticky on mismatch.
+  // P1 #2: comments completeness over the live listComments read. Review
+  // never APPROVEs when false; publish requires true on both the artifact
+  // and the fresh re-read plus fingerprint equality, otherwise it falls back
+  // to INCONCLUSIVE (same sticky, never a wrong APPROVE).
   suggestedLabels: string[];
   fingerprint: string;
+  commentsComplete: boolean;
 }
 
 function issueRulesTags(title: string): string[] {
@@ -1544,7 +1549,7 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    Object.keys(raw).some((key) => !['verdict', 'issueNumber', 'title', 'tags', 'summary', 'suggestedLabels', 'fingerprint'].includes(key)) ||
+    Object.keys(raw).some((key) => !['verdict', 'issueNumber', 'title', 'tags', 'summary', 'suggestedLabels', 'fingerprint', 'commentsComplete'].includes(key)) ||
     !['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE'].includes(String(raw.verdict)) ||
     !Number.isSafeInteger(raw.issueNumber) || Number(raw.issueNumber) < 1 ||
     typeof raw.title !== 'string' || typeof raw.summary !== 'string' ||
@@ -1555,6 +1560,10 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
   // Fingerprint is required on S5 artifacts (hex SHA-256). Pre-S5 artifacts
   // without it are treated as invalid so publish falls back fail-closed.
   if (typeof raw.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(raw.fingerprint)) return undefined;
+  // P1 #2: comments completeness is required. Pre-fix artifacts without the
+  // flag are invalid so publish falls back fail-closed instead of approving
+  // on an unverifiable comment set.
+  if (typeof raw.commentsComplete !== 'boolean') return undefined;
   return {
     verdict: raw.verdict as RunnerVerdict,
     issueNumber: Number(raw.issueNumber),
@@ -1565,6 +1574,7 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
     summary: safeString(raw.summary),
     suggestedLabels,
     fingerprint: raw.fingerprint,
+    commentsComplete: raw.commentsComplete,
   };
 }
 
@@ -1600,54 +1610,110 @@ export async function fetchFreshIssueFields(
 
 // S4 issue context: title plus body plus human comments (bot authors and bot
 // senders excluded by the same loop-protection rules as routing), truncated
-// to MAX_ISSUE_CONTEXT_LENGTH. Comment reads are best-effort: any API failure
-// yields title plus body only, never a throw.
+// to MAX_ISSUE_CONTEXT_LENGTH. P1 #2 fail-closed completeness: commentsComplete
+// is true only when every comment page was read successfully (client,
+// repository, and listComments present, every response.data an array of
+// objects, no throw) and no fetched comment was dropped by the length budget.
+// Any other outcome — missing API, throw, non-array, non-object entry, or
+// truncation that discards a comment — yields commentsComplete false (the
+// caller must not APPROVE). A webhook issue_comment body may be merged as a
+// minimal input after the same bot filter, but the result stays incomplete and
+// never lifts the APPROVE ban. `truncated` distinguishes active budget
+// truncation from transport incompleteness.
 async function buildIssueContext(
   context: RunnerContext,
   repository: { owner: string; repo: string } | undefined,
   issueNumber: number,
   title: string,
   body: string,
-): Promise<{ title: string; body: string; comments: string[] }> {
+): Promise<{ title: string; body: string; comments: string[]; commentsComplete: boolean; truncated: boolean }> {
   const comments: string[] = [];
+  let commentsComplete = true;
+  let truncated = false;
   const client = apiClient(context, (context.env ?? process.env).GITHUB_TOKEN ?? '');
   try {
     const issues = client?.rest.issues as RunnerGitHubClient['rest']['issues'] | undefined;
-    if (client && repository && typeof issues?.listComments === 'function') {
-      for (let page = 1; ; page += 1) {
-        const response = await issues.listComments({
-          owner: repository.owner,
-          repo: repository.repo,
-          issue_number: issueNumber,
-          per_page: 100,
-          page,
-        });
-        if (!Array.isArray(response.data)) break;
-        for (const comment of response.data) {
-          if (typeof comment?.body !== 'string' || !comment.body.trim()) continue;
-          if (comment.user?.type?.toLowerCase() === 'bot') continue;
-          if (typeof comment.user?.login === 'string' && isBotLogin(comment.user.login)) continue;
-          const login = typeof comment.user?.login === 'string' && comment.user.login.trim()
-            ? comment.user.login.trim()
-            : 'unknown';
-          comments.push(`${login}：${safeString(comment.body)}`);
+    if (!client || !repository || typeof issues?.listComments !== 'function') {
+      commentsComplete = false;
+    } else {
+      let finished = false;
+      for (let page = 1; !finished; page += 1) {
+        let response: { data: unknown };
+        try {
+          response = await issues.listComments({
+            owner: repository.owner,
+            repo: repository.repo,
+            issue_number: issueNumber,
+            per_page: 100,
+            page,
+          });
+        } catch {
+          commentsComplete = false;
+          break;
         }
-        if (response.data.length < 100) break;
+        if (!response || typeof response !== 'object' || !Array.isArray((response as { data: unknown }).data)) {
+          commentsComplete = false;
+          break;
+        }
+        const entries = (response as { data: unknown[] }).data;
+        for (const comment of entries) {
+          if (!comment || typeof comment !== 'object' || Array.isArray(comment)) {
+            commentsComplete = false;
+            continue;
+          }
+          const entry = comment as { body?: unknown; user?: { login?: unknown; type?: unknown } | null };
+          if (typeof entry.body !== 'string' || !entry.body.trim()) continue;
+          if (typeof entry.user?.type === 'string' && entry.user.type.toLowerCase() === 'bot') continue;
+          if (typeof entry.user?.login === 'string' && isBotLogin(entry.user.login)) continue;
+          const login = typeof entry.user?.login === 'string' && entry.user.login.trim()
+            ? entry.user.login.trim()
+            : 'unknown';
+          comments.push(`${login}：${safeString(entry.body)}`);
+        }
+        if (entries.length < 100) {
+          finished = true;
+        }
       }
     }
   } catch {
-    // Best-effort: fall through with title plus body only.
+    commentsComplete = false;
+  }
+  // Webhook minimal input: when the live read is incomplete, merge the
+  // triggering issue_comment body (after bot filtering) so the model still
+  // sees the immediate human input. The result stays incomplete and never
+  // lifts the APPROVE ban.
+  if (!commentsComplete) {
+    try {
+      const webhookEvent: GithubEvent = context.event ?? eventFrom(context);
+      const webhookBody = webhookEvent.comment?.body;
+      if (typeof webhookBody === 'string' && webhookBody.trim() && !isBotEventActor(webhookEvent)) {
+        const rawLogin = webhookEvent.comment?.user?.login ?? webhookEvent.sender?.login;
+        if (!(typeof rawLogin === 'string' && isBotLogin(rawLogin))) {
+          const login = typeof rawLogin === 'string' && rawLogin.trim() ? rawLogin.trim() : 'unknown';
+          const merged = `${login}：${safeString(webhookBody)}`;
+          if (!comments.includes(merged)) comments.push(merged);
+        }
+      }
+    } catch {
+      // No webhook input available; stay incomplete with fetched comments only.
+    }
   }
   const safeTitle = safeString(title);
   let safeBody = safeString(body, 8000);
   const kept = [...comments];
   const assembledLength = (): number =>
     safeTitle.length + safeBody.length + kept.reduce((total, comment) => total + comment.length, 0);
+  const beforeTruncate = kept.length;
   while (kept.length > 0 && assembledLength() > MAX_ISSUE_CONTEXT_LENGTH) kept.pop();
+  if (kept.length < beforeTruncate) {
+    truncated = true;
+    commentsComplete = false;
+  }
   if (assembledLength() > MAX_ISSUE_CONTEXT_LENGTH) {
     safeBody = safeBody.slice(0, Math.max(0, MAX_ISSUE_CONTEXT_LENGTH - safeTitle.length));
+    truncated = true;
   }
-  return { title: safeTitle, body: safeBody, comments: kept };
+  return { title: safeTitle, body: safeBody, comments: kept, commentsComplete, truncated };
 }
 
 // S5 issue execution (never counted): issues opened/edited/reopened and
@@ -1663,7 +1729,7 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
   try {
     event = eventFrom(context);
   } catch {
-    const output: RunnerIssueOutput = { verdict: 'INCONCLUSIVE', issueNumber: 0, title: '', tags: [], summary: '', suggestedLabels: [], fingerprint: '0'.repeat(64) };
+    const output: RunnerIssueOutput = { verdict: 'INCONCLUSIVE', issueNumber: 0, title: '', tags: [], summary: '', suggestedLabels: [], fingerprint: '0'.repeat(64), commentsComplete: false };
     saveIssueOutput(output, context);
     return output;
   }
@@ -1699,28 +1765,42 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
         summary: 'the current issue state could not be fetched from GitHub; review freshness could not be verified.',
         suggestedLabels: [],
         fingerprint: '0'.repeat(64),
+        commentsComplete: false,
       };
       saveIssueOutput(output, context);
       return output;
     }
   }
-  const fingerprintFor = async (): Promise<string> => {
+  const fingerprintFor = async (): Promise<{ fingerprint: string; commentsComplete: boolean }> => {
     try {
       const builtForPrint = await buildIssueContext(context, repository, issueNumber, title, body);
-      return issueContentFingerprint(builtForPrint.title, builtForPrint.body, builtForPrint.comments);
+      return {
+        fingerprint: issueContentFingerprint(builtForPrint.title, builtForPrint.body, builtForPrint.comments),
+        commentsComplete: builtForPrint.commentsComplete,
+      };
     } catch {
-      return '0'.repeat(64);
+      return { fingerprint: '0'.repeat(64), commentsComplete: false };
     }
   };
-  const rulesOnly = async (summary: string): Promise<RunnerIssueOutput> => ({
-    verdict: 'INCONCLUSIVE',
-    issueNumber,
-    title: safeString(title),
-    tags: issueRulesTags(title),
-    summary: safeString(summary),
-    suggestedLabels: [],
-    fingerprint: issueNumber ? await fingerprintFor() : '0'.repeat(64),
-  });
+  const rulesOnly = async (summary: string): Promise<RunnerIssueOutput> => {
+    let fingerprint = '0'.repeat(64);
+    let commentsComplete = false;
+    if (issueNumber) {
+      const printed = await fingerprintFor();
+      fingerprint = printed.fingerprint;
+      commentsComplete = printed.commentsComplete;
+    }
+    return {
+      verdict: 'INCONCLUSIVE',
+      issueNumber,
+      title: safeString(title),
+      tags: issueRulesTags(title),
+      summary: safeString(summary),
+      suggestedLabels: [],
+      fingerprint,
+      commentsComplete,
+    };
+  };
   const route = routeEvent(event, env);
   if (target.target !== 'issue' || !issueNumber || (route.kind !== 'first-review' && route.kind !== 'issue-update')) {
     const output = await rulesOnly(`no issue review: ${route.reason}`);
@@ -1729,6 +1809,22 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
   }
   const built = await buildIssueContext(context, repository, issueNumber, title, body);
   const fingerprint = issueContentFingerprint(built.title, built.body, built.comments);
+  // P1 #2: never APPROVE on an incomplete comment set. Downgrade before any
+  // OpenAI call (zero model traffic) so a fail-open read cannot approve.
+  if (!built.commentsComplete) {
+    const output: RunnerIssueOutput = {
+      verdict: 'INCONCLUSIVE',
+      issueNumber,
+      title: safeString(title),
+      tags: sanitizeLabels([...issueRulesTags(title), 'status:needs-decision']),
+      summary: 'the issue comments could not be fully fetched from GitHub; review freshness could not be verified.',
+      suggestedLabels: [],
+      fingerprint,
+      commentsComplete: false,
+    };
+    saveIssueOutput(output, context);
+    return output;
+  }
   const restoreFetch = installOpenAIStub(env);
   try {
     const { triageIssue } = await import('./orchestrator');
@@ -1753,6 +1849,7 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       summary: triaged.summary,
       suggestedLabels: aiRaw.filter((entry): entry is string => typeof entry === 'string'),
       fingerprint,
+      commentsComplete: built.commentsComplete,
     };
     saveIssueOutput(output, context);
     return output;
@@ -2381,8 +2478,18 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       ...configuredTagLabels(env),
       ...resolveLabelsFromTitle(issueTitle),
     ]);
-    const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody);
-    const currentFingerprint = issueContentFingerprint(builtCurrent.title, builtCurrent.body, builtCurrent.comments);
+    // P1 #2: the fresh comment re-read carries its own completeness flag.
+    // A throw here is fail-closed (unverifiable) rather than a crash.
+    let currentFingerprint = '0'.repeat(64);
+    let currentCommentsComplete = false;
+    try {
+      const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody);
+      currentFingerprint = issueContentFingerprint(builtCurrent.title, builtCurrent.body, builtCurrent.comments);
+      currentCommentsComplete = builtCurrent.commentsComplete;
+    } catch {
+      currentFingerprint = '0'.repeat(64);
+      currentCommentsComplete = false;
+    }
 
     let validated: RunnerIssueOutput | undefined;
     let issueFallbackReason: string | undefined;
@@ -2410,6 +2517,9 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
           validated = validateIssueOutput(artifactValue);
           if (!validated) issueFallbackReason = 'the review output schema or contents are invalid.';
           else if (validated.issueNumber !== issueNumber) issueFallbackReason = 'the review output is stale: its issue number no longer matches GitHub.';
+          else if (validated.commentsComplete !== true) issueFallbackReason = 'the review output is unverifiable: the issue comments were not fully fetched during review; review freshness could not be verified.';
+          else if (currentCommentsComplete !== true) issueFallbackReason = 'the current issue comments could not be fully fetched from GitHub; review freshness could not be verified.';
+          else if (validated.fingerprint === '0'.repeat(64) || currentFingerprint === '0'.repeat(64)) issueFallbackReason = 'the review output is unverifiable: review freshness could not be verified.';
           else if (validated.fingerprint !== currentFingerprint) issueFallbackReason = 'the review output is stale: the issue content changed after review.';
           else if (hasUnknownAiLabels(validated.suggestedLabels)) issueFallbackReason = 'the AI label suggestions contain unknown labels; discarded.';
         }

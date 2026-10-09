@@ -19,8 +19,9 @@ import kotlinx.coroutines.flow.StateFlow
  * [imageLoader] maps [ChatImageRef] paths to [ChatImage] bytes.
  *
  * Ephemeral time context is passed through to [TurnController]. Prefer passing
- * `sessionStart = clock.instant()` captured at session creation (defaults to
- * null, which omits the `Session started` line, for call compatibility).
+ * `sessionStart` from the persisted `SessionMeta.createdAt` (see `ChatSessionFactory`,
+ * which reuses the original creation instant on resume; defaults to null, which omits
+ * the `Session started` line, for call compatibility).
  * [systemZone] is re-read every turn when no explicit timezone is set, so a
  * mid-session system timezone change is picked up on the next turn.
  */

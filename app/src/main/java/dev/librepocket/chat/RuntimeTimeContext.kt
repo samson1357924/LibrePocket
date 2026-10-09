@@ -20,10 +20,10 @@ private const val UNKNOWN_BLOCK = "Runtime time context: (time unknown)"
  *
  * Observability: this helper stays JVM-pure (no `android.util.Log`) so it can be unit-tested on
  * the JVM. Fallback/unknown 時 caller（Phase 2 TurnController）必須 Log.w。Caller
- * detectability: this function is `internal` so Phase 2 TurnController (same module) can compare
- * requested vs used — e.g. `val used = resolveZone(requested)` and
- * `val fellBack = !requested.isNullOrBlank() &&
- *   runCatching { ZoneId.of(requested.trim()) }.getOrNull() != used`; when [fellBack] is true (or
+ * detectability: this function is `internal` so Phase 2 TurnController (same module) can
+ * detect fallback via `isTimezoneFallback(requested)` — true only when a non-blank id
+ * fails `ZoneId.of(requested.trim())` (a successful parse, even a normalized one such as
+ * `UTC+8` → `UTC+08:00`, is not a fallback); when fallback is true (or
  * the block renders as `(time unknown)`), TurnController must emit `Log.w` with the requested id
  * and the zone actually used.
  */

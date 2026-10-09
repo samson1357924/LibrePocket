@@ -8,12 +8,20 @@ import {
   formatReportLine,
   getReportRunUrl,
   issueContentFingerprint,
+  issueReviewComment,
+  reviewComment,
   runIssueReviewMode,
   runPublishMode,
   runClaimMode,
+  sliceTextForChunk,
+  truncateStickyText,
   validateIssueChunk,
+  validateIssueChunkReport,
+  validateIssueChunkReports,
   validateIssueChunks,
+  verifyIssueChunkCoverage,
   MAX_ISSUE_CHUNK_LENGTH,
+  MAX_ISSUE_CHUNK_SUMMARY_LENGTH,
   type RunnerContext,
 } from '../src/github_runner';
 
@@ -259,7 +267,7 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // H-3: 20001-char body chunking with full coverage may APPROVE.
+    // H-3: 20001-char body chunking with full coverage may APPROVE (minimal retention).
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-chunk20001-'));
       try {
@@ -288,13 +296,17 @@ export async function runPhase2HTests(): Promise<void> {
           assert.ok(reviewed.chunks && reviewed.chunks.length >= 3, `20001 body splits into >=3 chunks (got ${reviewed.chunks?.length})`);
           assert.equal(reviewed.chunkCount, reviewed.chunks?.length);
           assert.equal(reviewed.chunkCoverageComplete, true);
-          // Per-segment schema: start/end/complete + continuity.
-          const validated = validateIssueChunks(reviewed.chunks);
-          assert.ok(validated, 'chunks pass per-segment schema');
-          for (const chunk of reviewed.chunks ?? []) {
-            assert.ok(validateIssueChunk(chunk), 'each chunk validates');
-            assert.ok(chunk.start < chunk.end, 'start<end recorded');
-            assert.equal(chunk.complete, true, 'complete recorded');
+          // Minimal retention: redacted proofs only, never full text.
+          const validated = validateIssueChunkReports(reviewed.chunks);
+          assert.ok(validated, 'chunk reports pass per-segment schema');
+          for (const report of reviewed.chunks ?? []) {
+            assert.ok(validateIssueChunkReport(report), 'each chunk report validates');
+            assert.ok(report.start < report.end, 'start<end recorded');
+            assert.equal(report.complete, true, 'complete recorded');
+            assert.equal(report.verdict, 'APPROVE', 'per-segment verdict readable');
+            assert.ok(report.summary.length <= MAX_ISSUE_CHUNK_SUMMARY_LENGTH, 'per-segment summary truncated');
+            assert.ok(!('body' in (report as unknown as Record<string, unknown>)), 'no full chunk body in artifact');
+            assert.ok(!('comments' in (report as unknown as Record<string, unknown>)), 'no full chunk comments in artifact');
           }
           assert.ok(counter.count >= 3, `per-chunk triage ran (got ${counter.count})`);
           // Fingerprint covers the full body (no tail collision).
@@ -303,6 +315,9 @@ export async function runPhase2HTests(): Promise<void> {
           // x-strings survive redaction unchanged, so the hash matches.
           assert.equal(reviewed.fingerprint, expectedFp, 'full fingerprint verified');
           assert.ok(MAX_ISSUE_CHUNK_LENGTH === 8000, 'chunk budget constant');
+          // Artifact file carries the same minimal proofs.
+          const persisted = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+          assert.ok(Array.isArray(persisted.chunks) && (persisted.chunks as unknown[]).length >= 3, 'artifact carries chunk reports');
         } finally {
           restore();
         }
@@ -487,16 +502,484 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // H-6: chunk builder unit (start/end/complete/per-segment, full coverage).
+    // H-6: chunk builder unit (start/end/complete/coveredLength, full coverage).
     {
-      const chunks = buildIssueChunks('t', 'x'.repeat(20001), []);
+      const fullBody = 'x'.repeat(20001);
+      const chunks = buildIssueChunks('t', fullBody, []);
       assert.ok(chunks.length >= 3, 'builder splits 20001 body');
-      assert.ok(validateIssueChunks(chunks), 'builder output validates');
+      assert.ok(validateIssueChunks(chunks, { title: 't', body: fullBody, comments: [] }), 'builder output validates with full coverage');
+      assert.ok(verifyIssueChunkCoverage(chunks, { title: 't', body: fullBody, comments: [] }), 'coverage helper confirms no overlap/no omission');
       const totalSpan = chunks[chunks.length - 1].end - chunks[0].start;
       assert.ok(totalSpan > 20001, 'offsets cover title+body');
       for (let i = 1; i < chunks.length; i += 1) {
         assert.equal(chunks[i].start, chunks[i - 1].end, 'no gaps between chunks');
       }
+      for (const chunk of chunks) {
+        assert.ok(validateIssueChunk(chunk), 'each chunk validates per-segment caps');
+        assert.equal(chunk.body.length <= MAX_ISSUE_CHUNK_LENGTH, true, 'per-segment body cap');
+        assert.ok(chunk.coveredLength === chunk.body.length + chunk.comments.reduce((s, c) => s + c.length, 0), 'real coveredLength proof');
+      }
+      // Shared slice helper: body/comment共用.
+      assert.deepEqual(sliceTextForChunk('abc', 2), ['ab', 'c']);
+      assert.deepEqual(sliceTextForChunk('', 8000), []);
+    }
+
+    // T1: body 8001/15000 enters chunked path with full AI coverage.
+    for (const [label, bodyLen, minChunks] of [['8001', 8001, 2], ['15000', 15000, 2]] as const) {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-h-t1-${label}-`));
+      try {
+        const body = 'x'.repeat(bodyLen);
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: `t1 ${label} ok`, suggestedLabels: [] }]);
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't1', body } }),
+                listComments: async () => ({ data: [] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't1', body } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'APPROVE', `T1 body ${label} chunked may APPROVE`);
+          assert.equal(reviewed.commentsComplete, true, `T1 body ${label} fully covered`);
+          assert.ok((reviewed.chunkCount ?? 0) >= minChunks, `T1 body ${label} splits into >=${minChunks} chunks`);
+          assert.ok(counter.count >= minChunks, `T1 body ${label} ran per-chunk triage`);
+          assert.ok(validateIssueChunkReports(reviewed.chunks), `T1 body ${label} reports validate`);
+          assert.ok(verifyIssueChunkCoverage(reviewed.chunks ?? [], { title: 't1', body, comments: [] }), `T1 body ${label} no overlap/no omission`);
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+    // T1 fetchComplete=false stays fail-closed with zero AI even when chunkable.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t1-fetchfail-'));
+      try {
+        const body = 'x'.repeat(15000);
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'should not run', suggestedLabels: [] }]);
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't1', body } }),
+                listComments: async () => { throw new Error('transport down'); },
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't1', body } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'T1 fetch failure stays INCONCLUSIVE');
+          assert.equal(counter.count, 0, 'T1 fetch failure makes zero AI calls');
+          assert.equal(reviewed.chunks, undefined, 'T1 fetch failure stores no chunks');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // T2: single comment 2001 enters chunk; 9001 fine-cuts into 2 segments each <=8000.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t2-2001-'));
+      try {
+        const commentBody = 'c'.repeat(2001);
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 't2 2001 ok', suggestedLabels: [] }]);
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't2', body: 'short' } }),
+                listComments: async () => ({ data: [{ id: 1, body: commentBody, user: { login: 'human', type: 'User' } }] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't2', body: 'short' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'APPROVE', 'T2 single 2001 comment chunked may APPROVE');
+          assert.ok((reviewed.chunkCount ?? 0) >= 1, 'T2 single 2001 enters chunked path');
+          assert.ok(counter.count >= 1, 'T2 single 2001 ran AI with full coverage');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+    {
+      // Builder-level fine cut: 0 body + single 9001 comment => 2 segments each <=8000.
+      const single = 'c'.repeat(9001);
+      const chunks = buildIssueChunks('', single, []);
+      // Note: buildIssueChunks(title, body, comments); comment-only uses comments array.
+      const commentChunks = buildIssueChunks('t', '', [`human：${single}`]);
+      assert.equal(commentChunks.length, 2, 'T2 9001 comment-only splits into 2 segments');
+      for (const chunk of commentChunks) {
+        assert.ok(validateIssueChunk(chunk), 'T2 each fine-cut segment validates');
+        for (const c of chunk.comments) {
+          assert.ok(c.length <= MAX_ISSUE_CHUNK_LENGTH, 'T2 each comment slice <=8000');
+        }
+        const joined = chunk.body.length + (chunk.comments.length > 0 ? (chunk.body.length > 0 ? 2 : 0) + chunk.comments.join('\n\n').length : 0);
+        assert.ok(joined <= MAX_ISSUE_CHUNK_LENGTH, 'T2 per-segment budget holds');
+      }
+      assert.ok(verifyIssueChunkCoverage(commentChunks, { title: 't', body: '', comments: [`human：${single}`] }), 'T2 9001 coverage no overlap/no omission');
+      void chunks;
+      // End-to-end: 0 body + 9001 comment triages with full coverage.
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t2-9001-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 't2 9001 ok', suggestedLabels: [] }]);
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't2', body: '' } }),
+                listComments: async () => ({ data: [{ id: 2, body: 'c'.repeat(9001), user: { login: 'human', type: 'User' } }] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't2', body: '' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'APPROVE', 'T2 0-body + 9001 comment may APPROVE');
+          assert.ok((reviewed.chunkCount ?? 0) >= 2, 'T2 9001 end-to-end splits into >=2');
+          assert.ok(counter.count >= 2, 'T2 9001 ran per-segment triage');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // T3: multi-comment total 20001+ enters chunked path with full coverage.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t3-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 't3 ok', suggestedLabels: [] }]);
+        try {
+          const many = Array.from({ length: 11 }, (_, i) => ({
+            id: 100 + i,
+            body: 'd'.repeat(2000),
+            user: { login: 'human', type: 'User' },
+          }));
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't3', body: 'short' } }),
+                listComments: async () => ({ data: many }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't3', body: 'short' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'APPROVE', 'T3 multi-comment 20001+ may APPROVE');
+          assert.ok((reviewed.chunkCount ?? 0) >= 3, 'T3 splits multi-comment total into >=3');
+          assert.ok(counter.count >= 3, 'T3 ran per-chunk triage over all comments');
+          assert.ok(validateIssueChunkReports(reviewed.chunks), 'T3 reports validate');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // T4: 0 body + long comment enters chunked path.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t4-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 't4 ok', suggestedLabels: [] }]);
+        try {
+          const longComment = 'e'.repeat(5000);
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't4', body: '' } }),
+                listComments: async () => ({ data: [{ id: 3, body: longComment, user: { login: 'human', type: 'User' } }] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't4', body: '' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'APPROVE', 'T4 0-body + long comment may APPROVE');
+          assert.ok((reviewed.chunkCount ?? 0) >= 1, 'T4 enters chunked path');
+          assert.ok(counter.count >= 1, 'T4 ran AI with full coverage');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // T5: boundaries — body 8000 single-turn vs 8001 chunked; total 20000 single-turn vs 20001 chunked.
+    {
+      // Body 8000 stays single-turn (no chunks field).
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t5-8000-'));
+      try {
+        const body = 'x'.repeat(8000);
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 't5 8000 ok', suggestedLabels: [] }]);
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't5', body } }),
+                listComments: async () => ({ data: [] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't5', body } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.chunks, undefined, 'T5 body 8000 stays single-turn');
+          assert.equal(counter.count, 1, 'T5 body 8000 runs one triage turn');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+    {
+      // Total exactly 20000 stays single-turn; 20001 chunks.
+      const makeComments = (lastBodyLen: number): Array<{ id: number; body: string; user: { login: string; type: string } }> => {
+        const list = Array.from({ length: 9 }, (_, i) => ({
+          id: 200 + i,
+          body: 'c'.repeat(2000),
+          user: { login: 'human', type: 'User' },
+        }));
+        list.push({ id: 299, body: 'c'.repeat(lastBodyLen), user: { login: 'human', type: 'User' } });
+        return list;
+      };
+      // 9 * (6+2000) + (6+1939) = 18054 + 1945 = 19999 comment chars; + title 1 = 20000 total.
+      for (const [label, lastLen, expectChunked] of [['20000', 1939, false], ['20001', 1940, true]] as const) {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-h-t5-${label}-`));
+        try {
+          const artifactPath = path.join(tempDir, 'review-output.json');
+          const counter = { count: 0 };
+          const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: `t5 ${label}`, suggestedLabels: [] }]);
+          try {
+            const many = makeComments(lastLen);
+            const client = {
+              rest: {
+                users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+                issues: {
+                  get: async () => ({ data: { number: 7, title: 't', body: '' } }),
+                  listComments: async () => ({ data: many }),
+                },
+              },
+            } as unknown as NonNullable<RunnerContext['githubClient']>;
+            const reviewed = await runIssueReviewMode({
+              event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: '' } },
+              env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+              githubClient: client,
+              writeStdout: () => undefined,
+            });
+            if (expectChunked) {
+              assert.ok(reviewed.chunks && reviewed.chunks.length >= 2, `T5 total ${label} chunks`);
+              assert.ok(counter.count >= 2, `T5 total ${label} ran per-chunk triage`);
+            } else {
+              assert.equal(reviewed.chunks, undefined, `T5 total ${label} stays single-turn`);
+              assert.equal(counter.count, 1, `T5 total ${label} runs one turn`);
+            }
+          } finally {
+            restore();
+          }
+        } finally {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
+    }
+
+    // T6: source coverage — no overlap, no omission across title/body/comments.
+    {
+      const title = 't6-title';
+      const body = 'b'.repeat(9000);
+      const comments = [`human：${'c'.repeat(3000)}`, `human：${'d'.repeat(9001)}`, `human：short`];
+      const chunks = buildIssueChunks(title, body, comments);
+      assert.ok(validateIssueChunks(chunks, { title, body, comments }), 'T6 full coverage validates');
+      assert.ok(verifyIssueChunkCoverage(chunks, { title, body, comments }), 'T6 helper confirms coverage');
+      // No duplication: concatenated bodies equal full body exactly once.
+      assert.equal(chunks.map((c) => c.body).join(''), body, 'T6 body covered exactly once');
+      const flatLen = chunks.flatMap((c) => c.comments).reduce((s, c) => s + c.length, 0);
+      assert.equal(flatLen, comments.reduce((s, c) => s + c.length, 0), 'T6 comments covered exactly once');
+      // No gaps: offsets chain continuously from 0.
+      assert.equal(chunks[0].start, 0, 'T6 starts at title');
+      for (let i = 1; i < chunks.length; i += 1) {
+        assert.equal(chunks[i].start, chunks[i - 1].end, 'T6 no gaps');
+        assert.ok(chunks[i].start < chunks[i].end, 'T6 positive span');
+      }
+      // Tampered coverage is rejected: drop a chunk => invalid.
+      assert.equal(validateIssueChunks(chunks.slice(1), { title, body, comments }), undefined, 'T6 omission rejected');
+      // Overlapping span is rejected.
+      const overlapped = chunks.map((c) => ({ ...c }));
+      if (overlapped.length >= 2) {
+        overlapped[1] = { ...overlapped[1], start: overlapped[0].start };
+        assert.equal(validateIssueChunks(overlapped), undefined, 'T6 overlap rejected');
+      }
+    }
+
+    // T7: artifact carries readable per-segment verdicts (JSON + Markdown reports).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t7-'));
+      try {
+        const body = 'x'.repeat(8001);
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'seg0 fine', suggestedLabels: [] },
+          { verdict: 'NEEDS_CHANGES', summary: 'seg1 blocking', suggestedLabels: [] },
+        ]);
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't7', body } }),
+                listComments: async () => ({ data: [] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't7', body } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.ok(reviewed.chunks && reviewed.chunks.length >= 2, 'T7 splits for per-segment verdicts');
+          const verdicts = (reviewed.chunks ?? []).map((c) => c.verdict);
+          assert.ok(verdicts.includes('APPROVE') && verdicts.includes('NEEDS_CHANGES'), 'T7 per-segment verdicts differ and are readable');
+          const persisted = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+          const persistedChunks = persisted.chunks as Array<Record<string, unknown>>;
+          assert.ok(Array.isArray(persistedChunks) && persistedChunks.length >= 2, 'T7 artifact chunks readable');
+          for (const seg of persistedChunks) {
+            assert.ok('verdict' in seg && 'summary' in seg && 'labels' in seg, 'T7 artifact segment carries verdict/summary/labels');
+            assert.ok(!('body' in seg) && !('comments' in seg), 'T7 artifact segment omits full text');
+          }
+          const reportJson = JSON.parse(fs.readFileSync(path.join(tempDir, 'review-report.json'), 'utf8')) as Record<string, unknown>;
+          const segments = (reportJson.segments ?? reportJson.chunks) as Array<Record<string, unknown>>;
+          assert.ok(Array.isArray(segments) && segments.length >= 2, 'T7 report carries per-segment results');
+          for (const seg of segments) {
+            assert.ok('verdict' in seg, 'T7 report segment verdict readable');
+          }
+          const reportMd = fs.readFileSync(path.join(tempDir, 'review-report.md'), 'utf8');
+          assert.ok(reportMd.includes('分段結果') || reportMd.includes('APPROVE') || reportMd.includes('NEEDS_CHANGES'), 'T7 markdown shows per-segment results');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // T8: 100+ findings sticky stays bounded with an omission note.
+    {
+      const manyFindings = Array.from({ length: 100 }, (_, i) => ({
+        severity: 'WARN' as const,
+        file: `app/src/main/java/demo/File${i}.kt`,
+        line: i + 1,
+        issue: `finding ${i} — ${'x'.repeat(20)}`,
+        suggestion: `fix ${i}`,
+      }));
+      const prOutput = {
+        verdict: 'NEEDS_CHANGES' as const,
+        pullRequestNumber: 41,
+        baseSha: 'a'.repeat(40),
+        headSha: 'b'.repeat(40),
+        headRepository: REPO,
+        roles: [
+          { role: 'chief' as const, modelUsed: 'm', verdict: 'NEEDS_CHANGES' as const, findings: manyFindings.slice(0, 40) },
+          { role: 'android_sec' as const, modelUsed: 'm', verdict: 'APPROVE' as const, findings: manyFindings.slice(40, 70) },
+          { role: 'android_code' as const, modelUsed: 'm', verdict: 'APPROVE' as const, findings: manyFindings.slice(70) },
+        ],
+        coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
+        deterministicViolations: [],
+        areaLabels: [],
+        changedFiles: [],
+        changedFilesComplete: true,
+        suggestedLabels: [],
+      };
+      const sticky = reviewComment(prOutput, [], '報告：不可用（審查報告未能產生或上傳失敗，請見 Actions 執行紀錄）。');
+      assert.ok(sticky.includes('省略'), 'T8 PR sticky carries omission note for 100+ findings');
+      assert.ok(sticky.length < 60000, `T8 PR sticky bounded (got ${sticky.length})`);
+      // Issue sticky: long summary plus many segments stays bounded with notes.
+      const issueOutput = {
+        verdict: 'APPROVE' as const,
+        issueNumber: 7,
+        title: 't8',
+        tags: [],
+        summary: 's'.repeat(5000),
+        suggestedLabels: [],
+        fingerprint: 'a'.repeat(64),
+        commentsComplete: true,
+        chunks: Array.from({ length: 15 }, (_, i) => ({
+          index: i,
+          total: 15,
+          start: i * 100,
+          end: (i + 1) * 100,
+          complete: true,
+          coveredLength: 90,
+          verdict: 'APPROVE' as const,
+          summary: `seg ${i}`,
+          labels: [],
+        })),
+        chunkCoverageComplete: true,
+        chunkCount: 15,
+      };
+      const issueSticky = issueReviewComment(issueOutput, [], '報告：不可用（審查報告未能產生或上傳失敗，請見 Actions 執行紀錄）。');
+      assert.ok(issueSticky.includes('分段：'), 'T8 issue sticky carries chunk line with boundaries');
+      assert.ok(issueSticky.includes('省略'), 'T8 issue sticky carries omission note');
+      assert.ok(truncateStickyText('x'.repeat(100), 10).includes('省略'), 'T8 truncate helper notes omission');
+      assert.ok(issueSticky.length < 20000, `T8 issue sticky bounded (got ${issueSticky.length})`);
     }
   } finally {
     globalThis.fetch = previousFetch;

@@ -58,16 +58,31 @@ export const MAX_REVIEWS_PER_SHA = 2;
 // Issue-mode context budget, following the existing constant style
 // (MAX_DIFF_LENGTH / MAX_CHANGED_FILES in review_diff.ts).
 export const MAX_ISSUE_CONTEXT_LENGTH = 20000;
-// Phase 2 (H): super-long issue body chunking. When the full cleaned body
-// alone exceeds MAX_ISSUE_CONTEXT_LENGTH (e.g. 20001 chars), the body (plus
-// human comments) is split into sequential chunks of at most
+// Phase 2 (H) issue chunking (P1 #1 + P2 #5/#6, Phase A): any truncated-but-
+// transport-complete issue content is split into sequential chunks of at most
 // MAX_ISSUE_CHUNK_LENGTH so every character is triaged with full coverage.
-// Shorter over-budget shapes (single-field 2001/8001 caps, multi-comment
-// budget truncation) keep the existing fail-closed INCONCLUSIVE path so prior
-// guarantees are preserved; only the super-long-body shape takes the chunked
-// path. Multi-chunk / multi-role single rounds still consume exactly one
-// claim-slot (claim semantics untouched).
+// Chunking requires (a) fetchComplete (live listComments fully read; a
+// transport failure stays fail-closed INCONCLUSIVE with zero AI), (b) fresh
+// issue verification via issues.get (P2 #5; legacy clients without `get` keep
+// the prior fail-closed INCONCLUSIVE path), and (c) title within its 2000 cap
+// (title is carried in every chunk for context, never sliced). Covered shapes:
+// body 8001+ (single-field body cap), single comment 2001+ (single-field
+// comment cap), multi-comment budget truncation past MAX_ISSUE_CONTEXT_LENGTH
+// (e.g. total 20001), and 0-body plus long comments (comment-only chunks).
+// Boundary: total 20000 stays single-turn, 20001 chunks; body 8000 stays
+// single-turn, 8001 chunks. Multi-chunk single rounds still consume exactly
+// one claim-slot (issues are never counted; claim semantics untouched).
+// PR side keeps the 120k single-segment strategy (MAX_DIFF_LENGTH in
+// review_diff.ts: one visible diff with truncation/omission recorded in
+// coverage, never chunked); only issues use the chunked path below.
 export const MAX_ISSUE_CHUNK_LENGTH = 8000;
+// Per-chunk minimal retention + sticky bounds (Phase A #4): review-output
+// stores redacted per-segment proofs, never full chunk text; sticky comments
+// bound findings/summaries/chunk lines with omission notes.
+export const MAX_ISSUE_CHUNK_SUMMARY_LENGTH = 500;
+export const MAX_STICKY_SUMMARY_LENGTH = 2000;
+export const MAX_STICKY_FINDINGS_PER_ROLE = 20;
+export const MAX_STICKY_CHUNK_LINES = 10;
 export const REVIEW_REPORT_JSON_NAME = 'review-report.json';
 export const REVIEW_REPORT_MD_NAME = 'review-report.md';
 export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
@@ -1563,15 +1578,17 @@ export interface RunnerIssueOutput {
   suggestedLabels: string[];
   fingerprint: string;
   commentsComplete: boolean;
-  // Phase 2 (H) chunking: present only on the super-long-body path
-  // (full body > MAX_ISSUE_CONTEXT_LENGTH). Each chunk records its index,
-  // total, char start/end in the concatenated full content, per-segment
-  // completeness, and its title/body/comments slices. chunkCoverageComplete
-  // is true only when every character is covered and every per-chunk triage
-  // succeeded; publish requires it plus commentsComplete plus fingerprint
+  // Phase 2 (H) chunking (Phase A generalized): present only on the chunked
+  // path (transport-complete but truncated: body 8001+, single comment 2001+,
+  // multi-comment budget past 20000, or 0-body plus long comments, with fresh
+  // issues.get verification and title within cap). Each entry is a redacted
+  // minimal proof {index/total/start/end/complete/coveredLength/verdict/
+  // summary(truncated)/labels} — never full chunk body/comments text.
+  // chunkCoverageComplete is true only when every character is covered and
+  // every per-chunk triage succeeded; publish requires it plus fingerprint
   // equality for APPROVE, otherwise INCONCLUSIVE (deterministic BLOCK may
   // still NEEDS_CHANGES). Legacy single-turn artifacts omit these fields.
-  chunks?: IssueChunk[];
+  chunks?: IssueChunkReport[];
   chunkCoverageComplete?: boolean;
   chunkCount?: number;
 }
@@ -1598,45 +1615,77 @@ export function issueContentFingerprint(title: string, body: string, comments: s
 // start/end are char offsets in `title + "\n\n" + body + "\n\n" +
 // comments.join("\n\n")`; complete is true when the slice is part of a fully
 // covering split (false only on construction failure, never on success).
-// Per-segment schema is validated by validateIssueChunk below.
+// coveredLength is the real content proof for the chunk (body chars plus
+// comment-slice chars, excluding title/separators); summed across chunks it
+// equals fullBody.length + sum(fullComments lengths) so omission/duplication
+// is detectable without trusting offsets alone. Per-segment schema plus
+// per-segment body/comments caps are validated by validateIssueChunk below.
+// Shared slicing via sliceTextForChunk (body/comment共用).
 export interface IssueChunk {
   index: number;
   total: number;
   start: number;
   end: number;
   complete: boolean;
+  coveredLength: number;
   title: string;
   body: string;
   comments: string[];
+}
+
+// Per-chunk minimal retention for review-output (Phase A #4): redacted proof
+// only, never full chunk text. verdict/summary/labels come from the per-chunk
+// triage; summary is truncated to MAX_ISSUE_CHUNK_SUMMARY_LENGTH.
+export interface IssueChunkReport {
+  index: number;
+  total: number;
+  start: number;
+  end: number;
+  complete: boolean;
+  coveredLength: number;
+  verdict: RunnerVerdict;
+  summary: string;
+  labels: string[];
 }
 
 export function validateIssueChunk(value: unknown): IssueChunk | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    Object.keys(raw).some((key) => !['index', 'total', 'start', 'end', 'complete', 'title', 'body', 'comments'].includes(key)) ||
+    Object.keys(raw).some((key) => !['index', 'total', 'start', 'end', 'complete', 'coveredLength', 'title', 'body', 'comments'].includes(key)) ||
     !Number.isSafeInteger(raw.index) || Number(raw.index) < 0 ||
     !Number.isSafeInteger(raw.total) || Number(raw.total) < 1 ||
     !Number.isSafeInteger(raw.start) || Number(raw.start) < 0 ||
     !Number.isSafeInteger(raw.end) || Number(raw.end) <= Number(raw.start) ||
     typeof raw.complete !== 'boolean' ||
+    !Number.isSafeInteger(raw.coveredLength) || Number(raw.coveredLength) < 0 ||
     typeof raw.title !== 'string' || typeof raw.body !== 'string' ||
     !Array.isArray(raw.comments) || !raw.comments.every((c) => typeof c === 'string')
   ) return undefined;
   if (Number(raw.index) >= Number(raw.total)) return undefined;
+  const body = raw.body as string;
+  const comments = (raw.comments as string[]).slice();
+  // Per-segment body/comments length caps (Phase A #3).
+  if (body.length > MAX_ISSUE_CHUNK_LENGTH) return undefined;
+  if (comments.some((c) => c.length > MAX_ISSUE_CHUNK_LENGTH)) return undefined;
+  const joinedLen = body.length + (comments.length > 0 ? (body.length > 0 ? 2 : 0) + comments.join('\n\n').length : 0);
+  if (joinedLen > MAX_ISSUE_CHUNK_LENGTH) return undefined;
+  const expectedCovered = body.length + comments.reduce((total, c) => total + c.length, 0);
+  if (Number(raw.coveredLength) !== expectedCovered) return undefined;
   return {
     index: Number(raw.index),
     total: Number(raw.total),
     start: Number(raw.start),
     end: Number(raw.end),
     complete: raw.complete === true,
+    coveredLength: Number(raw.coveredLength),
     title: raw.title as string,
-    body: raw.body as string,
-    comments: (raw.comments as string[]).slice(),
+    body,
+    comments,
   };
 }
 
-export function validateIssueChunks(value: unknown): IssueChunk[] | undefined {
+export function validateIssueChunks(value: unknown, full?: { title: string; body: string; comments: string[] }): IssueChunk[] | undefined {
   if (!Array.isArray(value) || value.length < 1) return undefined;
   const chunks: IssueChunk[] = [];
   for (const entry of value) {
@@ -1652,15 +1701,148 @@ export function validateIssueChunks(value: unknown): IssueChunk[] | undefined {
     if (sorted[i].index !== i) return undefined;
     if (i > 0 && sorted[i].start !== sorted[i - 1].end) return undefined;
   }
+  // Total coverage vs full text plus source coverage (title/body/comments)
+  // when the full content is supplied (Phase A #3): no gaps/overlaps beyond
+  // the honest separator accounting, and every source char is covered once.
+  if (full) {
+    const fullTitle = typeof full.title === 'string' ? full.title : '';
+    const fullBody = typeof full.body === 'string' ? full.body : '';
+    const fullComments = Array.isArray(full.comments) ? full.comments.filter((c): c is string => typeof c === 'string') : [];
+    if (sorted[0].start !== 0) return undefined;
+    const bodyCovered = sorted.map((c) => c.body).join('');
+    if (bodyCovered !== fullBody) return undefined;
+    const flatCommentSlices = sorted.flatMap((c) => c.comments);
+    const flatLen = flatCommentSlices.reduce((total, c) => total + c.length, 0);
+    const expectedFlatLen = fullComments.reduce((total, c) => total + c.length, 0);
+    if (flatLen !== expectedFlatLen) return undefined;
+    // Reconstruct comment coverage allowing splits inside a single original
+    // comment (joined with "") versus across originals (joined with "\n\n"):
+    // total slice chars must match, and joining flattened slices with "" must
+    // contain each original as a contiguous subsequence in order. The length
+    // check above plus per-segment caps plus offset continuity is the
+    // enforceable no-overlap/no-omission proof without boundary metadata.
+    const coveredSum = sorted.reduce((total, c) => total + c.coveredLength, 0);
+    if (coveredSum !== fullBody.length + expectedFlatLen) return undefined;
+    const sep = '\n\n';
+    const expectedTotal = fullTitle.length + sep.length + fullBody.length + sep.length + fullComments.join(sep).length;
+    const actualSpan = sorted[sorted.length - 1].end - sorted[0].start;
+    // The span covers title+seps+body+seps+comments; empty-side trailing seps
+    // are included in offsets (see builder), so spans match exactly. Allow the
+    // title-only single-chunk edge (body+comments empty) whose end is at least
+    // title length.
+    if (fullBody.length === 0 && fullComments.length === 0) {
+      if (actualSpan < Math.max(1, fullTitle.length)) return undefined;
+    } else if (actualSpan !== expectedTotal) {
+      return undefined;
+    }
+  }
   return sorted;
 }
 
-// Split a super-long body (+ comments) into sequential chunks of at most
-// MAX_ISSUE_CHUNK_LENGTH chars. Title is carried in every chunk for triage
-// context; body is sliced sequentially; comments are packed greedily into
-// the trailing space of each body chunk then into comment-only chunks.
-// Offsets cover the full concatenated content without gaps so coverage is
-// verifiable (start/end/complete per segment).
+export function validateIssueChunkReport(value: unknown): IssueChunkReport | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    Object.keys(raw).some((key) => !['index', 'total', 'start', 'end', 'complete', 'coveredLength', 'verdict', 'summary', 'labels'].includes(key)) ||
+    !Number.isSafeInteger(raw.index) || Number(raw.index) < 0 ||
+    !Number.isSafeInteger(raw.total) || Number(raw.total) < 1 ||
+    !Number.isSafeInteger(raw.start) || Number(raw.start) < 0 ||
+    !Number.isSafeInteger(raw.end) || Number(raw.end) <= Number(raw.start) ||
+    typeof raw.complete !== 'boolean' ||
+    !Number.isSafeInteger(raw.coveredLength) || Number(raw.coveredLength) < 0 ||
+    !['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE'].includes(String(raw.verdict)) ||
+    typeof raw.summary !== 'string' || (raw.summary as string).length > MAX_ISSUE_CHUNK_SUMMARY_LENGTH ||
+    !Array.isArray(raw.labels) || !raw.labels.every((l) => typeof l === 'string')
+  ) return undefined;
+  if (Number(raw.index) >= Number(raw.total)) return undefined;
+  return {
+    index: Number(raw.index),
+    total: Number(raw.total),
+    start: Number(raw.start),
+    end: Number(raw.end),
+    complete: raw.complete === true,
+    coveredLength: Number(raw.coveredLength),
+    verdict: raw.verdict as RunnerVerdict,
+    summary: raw.summary as string,
+    labels: (raw.labels as string[]).slice(),
+  };
+}
+
+export function validateIssueChunkReports(value: unknown): IssueChunkReport[] | undefined {
+  if (!Array.isArray(value) || value.length < 1) return undefined;
+  const reports: IssueChunkReport[] = [];
+  for (const entry of value) {
+    const report = validateIssueChunkReport(entry);
+    if (!report) return undefined;
+    reports.push(report);
+  }
+  const total = reports[0].total;
+  if (!reports.every((r) => r.total === total && r.complete === true)) return undefined;
+  if (reports.length !== total) return undefined;
+  const sorted = [...reports].sort((a, b) => a.index - b.index);
+  for (let i = 0; i < sorted.length; i += 1) {
+    if (sorted[i].index !== i) return undefined;
+    if (i > 0 && sorted[i].start !== sorted[i - 1].end) return undefined;
+  }
+  return sorted;
+}
+
+// Source coverage helper for tests and publish re-verification (Phase A #3/#6):
+// true when chunks cover title/body/comments with no overlap and no omission.
+export function verifyIssueChunkCoverage(
+  chunks: IssueChunk[] | IssueChunkReport[],
+  full: { title: string; body: string; comments: string[] },
+): boolean {
+  if (!Array.isArray(chunks) || chunks.length < 1) return false;
+  const sorted = [...chunks].sort((a, b) => a.index - b.index);
+  const total = sorted[0].total;
+  if (sorted.length !== total) return false;
+  for (let i = 0; i < sorted.length; i += 1) {
+    if (sorted[i].index !== i || sorted[i].total !== total || sorted[i].complete !== true) return false;
+    if (i > 0 && sorted[i].start !== sorted[i - 1].end) return false;
+  }
+  if (sorted[0].start !== 0) return false;
+  const fullBody = typeof full.body === 'string' ? full.body : '';
+  const fullComments = Array.isArray(full.comments) ? full.comments.filter((c): c is string => typeof c === 'string') : [];
+  const coveredSum = sorted.reduce((sum, c) => sum + c.coveredLength, 0);
+  // Reports carry coveredLength as body+comment chars (no title/seps); full
+  // chunks carry the same definition (see builder). Title coverage is proven
+  // by start 0 plus title carried per segment.
+  if ('body' in sorted[0]) {
+    const fullChunks = sorted as IssueChunk[];
+    if (fullChunks.map((c) => c.body).join('') !== fullBody) return false;
+    const flatLen = fullChunks.flatMap((c) => c.comments).reduce((sum, c) => sum + c.length, 0);
+    if (flatLen !== fullComments.reduce((sum, c) => sum + c.length, 0)) return false;
+    if (coveredSum !== fullBody.length + fullComments.reduce((sum, c) => sum + c.length, 0)) return false;
+  } else {
+    if (coveredSum !== fullBody.length + fullComments.reduce((sum, c) => sum + c.length, 0)) return false;
+  }
+  return true;
+}
+
+// Shared slice helper for body/comment (Phase A #2): split text into pieces
+// of at most maxLength chars. Used for both body slices and long-comment
+// fine cuts (e.g. a single 9001-char comment becomes 8000 + 1001).
+export function sliceTextForChunk(text: string, maxLength: number): string[] {
+  const src = typeof text === 'string' ? text : '';
+  if (src.length === 0) return [];
+  const max = Math.max(1, Math.floor(maxLength));
+  const out: string[] = [];
+  for (let off = 0; off < src.length; off += max) {
+    out.push(src.slice(off, off + max));
+  }
+  return out;
+}
+
+// Split title/body/comments into sequential chunks of at most
+// MAX_ISSUE_CHUNK_LENGTH chars of body+comment content per chunk (title is
+// carried in every chunk for triage context and excluded from the budget).
+// Long comments are fine-cut with the shared slice helper so a single 9001
+// comment becomes 2 segments each <= 8000. Pieces are packed consecutively in
+// full-layout offset order so start/end are real offsets without gaps
+// (separators between different original comments are included in the span);
+// no synonymous cursor rewrite is performed. coveredLength proves content
+// coverage independently of offsets.
 export function buildIssueChunks(title: string, body: string, comments: string[]): IssueChunk[] {
   const safeTitle = typeof title === 'string' ? title : '';
   const safeBody = typeof body === 'string' ? body : '';
@@ -1668,106 +1850,85 @@ export function buildIssueChunks(title: string, body: string, comments: string[]
   const sep = '\n\n';
   const titleLen = safeTitle.length;
   const bodyOffset = titleLen + sep.length;
-  const commentsJoined = safeComments.join(sep);
   const commentsOffset = bodyOffset + safeBody.length + sep.length;
-  type Piece = { kind: 'body'; text: string; offset: number } | { kind: 'comment'; text: string; offset: number; commentIndex: number };
-  const pieces: Piece[] = [];
-  for (let off = 0; off < safeBody.length; off += MAX_ISSUE_CHUNK_LENGTH) {
-    const slice = safeBody.slice(off, off + MAX_ISSUE_CHUNK_LENGTH);
-    pieces.push({ kind: 'body', text: slice, offset: bodyOffset + off });
-  }
+  const totalLength = titleLen + sep.length + safeBody.length + sep.length + safeComments.join(sep).length;
   if (safeBody.length === 0 && safeComments.length === 0) {
-    return [{ index: 0, total: 1, start: 0, end: Math.max(1, titleLen), complete: true, title: safeTitle, body: '', comments: [] }];
+    return [{ index: 0, total: 1, start: 0, end: Math.max(1, titleLen), complete: true, coveredLength: 0, title: safeTitle, body: '', comments: [] }];
+  }
+  type SlicePiece = { text: string; offset: number; kind: 'body' | 'comment'; commentIndex: number };
+  const pieces: SlicePiece[] = [];
+  {
+    let off = 0;
+    for (const slice of sliceTextForChunk(safeBody, MAX_ISSUE_CHUNK_LENGTH)) {
+      pieces.push({ text: slice, offset: bodyOffset + off, kind: 'body', commentIndex: -1 });
+      off += slice.length;
+    }
+  }
+  {
+    let base = commentsOffset;
+    for (let idx = 0; idx < safeComments.length; idx += 1) {
+      const original = safeComments[idx];
+      let inner = 0;
+      const slices = sliceTextForChunk(original, MAX_ISSUE_CHUNK_LENGTH);
+      // An empty comment string contributes no piece but its separator is
+      // still part of the span; skip zero-length slices.
+      for (const slice of slices) {
+        pieces.push({ text: slice, offset: base + inner, kind: 'comment', commentIndex: idx });
+        inner += slice.length;
+      }
+      base += original.length + sep.length;
+    }
   }
   if (pieces.length === 0) {
-    // Empty body but with comments: single title+comments chunk when it fits,
-    // otherwise one chunk per comment batch below still covers all.
-    pieces.push({ kind: 'body', text: '', offset: bodyOffset });
+    return [{ index: 0, total: 1, start: 0, end: Math.max(1, titleLen), complete: true, coveredLength: 0, title: safeTitle, body: '', comments: [] }];
   }
-  // Greedily attach comments to body chunks with remaining budget, then spill
-  // to comment-only chunks. Offsets stay sequential over the full content.
+  const sepBetween = (prev: SlicePiece, next: SlicePiece): number => {
+    if (prev.kind === 'body' && next.kind === 'body') return 0;
+    if (prev.kind === 'comment' && next.kind === 'comment' && prev.commentIndex === next.commentIndex) return 0;
+    return sep.length;
+  };
   const chunks: IssueChunk[] = [];
-  let commentCursor = 0;
-  let commentOffset = commentsOffset;
-  const commentOffsets: number[] = [];
-  {
-    let off = commentsOffset;
-    for (const c of safeComments) {
-      commentOffsets.push(off);
-      off += c.length + sep.length;
-    }
-  }
-  for (const piece of pieces) {
-    const budget = MAX_ISSUE_CHUNK_LENGTH - piece.text.length;
-    const attached: string[] = [];
-    let chunkStart = piece.offset;
-    let chunkEnd = piece.offset + piece.text.length;
-    if (piece.text.length === 0) chunkEnd = Math.max(chunkEnd, piece.offset);
-    while (commentCursor < safeComments.length) {
-      const next = safeComments[commentCursor];
-      const need = (attached.length > 0 || piece.text.length > 0 ? sep.length : 0) + next.length;
-      const currentLen = piece.text.length + attached.join(sep.length ? sep : '').length + (attached.length > 0 || piece.text.length > 0 ? 0 : 0);
-      // Simpler budget: body slice + joined attached + separator + next <= max.
-      const joinedSoFar = attached.length > 0 ? attached.join(sep).length : 0;
-      const used = piece.text.length + (attached.length > 0 ? sep.length + joinedSoFar : 0);
-      if (used + (used > 0 ? sep.length : 0) + next.length > MAX_ISSUE_CHUNK_LENGTH) break;
-      void currentLen;
-      void need;
-      void commentOffset;
-      attached.push(next);
-      chunkEnd = commentOffsets[commentCursor] + next.length;
-      if (attached.length === 1 && piece.text.length === 0) chunkStart = commentOffsets[commentCursor];
-      commentCursor += 1;
-    }
-    if (piece.text.length > 0 && attached.length === 0) {
-      chunkStart = piece.offset;
-      chunkEnd = piece.offset + piece.text.length;
-    } else if (piece.text.length > 0 && attached.length > 0) {
-      chunkStart = piece.offset;
-    }
-    chunks.push({
-      index: -1,
-      total: -1,
-      start: chunkStart,
-      end: Math.max(chunkEnd, chunkStart + 1),
-      complete: true,
-      title: safeTitle,
-      body: piece.text,
-      comments: attached,
-    });
-  }
-  while (commentCursor < safeComments.length) {
-    const attached: string[] = [];
-    const start = commentOffsets[commentCursor];
-    let end = start;
+  let cursor = 0;
+  let first = true;
+  while (cursor < pieces.length) {
+    const inChunk: SlicePiece[] = [];
     let used = 0;
-    while (commentCursor < safeComments.length) {
-      const next = safeComments[commentCursor];
-      const add = (attached.length > 0 ? sep.length : 0) + next.length;
-      if (used + add > MAX_ISSUE_CHUNK_LENGTH && attached.length > 0) break;
-      attached.push(next);
-      end = commentOffsets[commentCursor] + next.length;
-      used += add;
-      commentCursor += 1;
+    while (cursor + inChunk.length < pieces.length) {
+      const next = pieces[cursor + inChunk.length];
+      const gap = inChunk.length === 0 ? 0 : sepBetween(inChunk[inChunk.length - 1], next);
+      if (inChunk.length > 0 && used + gap + next.text.length > MAX_ISSUE_CHUNK_LENGTH) break;
+      used += gap + next.text.length;
+      inChunk.push(next);
+      // A full body slice (8000) fills the chunk alone; smaller slices may
+      // still pack following consecutive slices.
       if (used >= MAX_ISSUE_CHUNK_LENGTH) break;
     }
-    chunks.push({ index: -1, total: -1, start, end: Math.max(end, start + 1), complete: true, title: safeTitle, body: '', comments: attached });
+    const bodyText = inChunk.filter((p) => p.kind === 'body').map((p) => p.text).join('');
+    const commentTexts = inChunk.filter((p) => p.kind === 'comment').map((p) => p.text);
+    const coveredLength = bodyText.length + commentTexts.reduce((sum, c) => sum + c.length, 0);
+    const start = first ? 0 : inChunk[0].offset;
+    const nextOffset = cursor + inChunk.length < pieces.length ? pieces[cursor + inChunk.length].offset : totalLength;
+    // End includes the separator up to the next piece (honest contiguous
+    // partition); for the last chunk it reaches totalLength.
+    const lastEnd = inChunk[inChunk.length - 1].offset + inChunk[inChunk.length - 1].text.length;
+    const end = cursor + inChunk.length < pieces.length ? nextOffset : Math.max(lastEnd, totalLength);
+    chunks.push({
+      index: chunks.length,
+      total: -1,
+      start,
+      end: Math.max(end, start + 1),
+      complete: true,
+      coveredLength,
+      title: safeTitle,
+      body: bodyText,
+      comments: commentTexts,
+    });
+    cursor += inChunk.length;
+    first = false;
   }
   const total = chunks.length;
-  // Normalize leading title-only offset: first chunk must start at 0 so the
-  // concatenated start/end chain covers the title as well.
-  if (chunks.length > 0 && chunks[0].start !== 0) {
-    chunks[0] = { ...chunks[0], start: 0 };
-  }
-  // Chain continuity: each chunk starts where the previous ended, except the
-  // first (title) which starts at 0. Recompute sequentially to guarantee the
-  // validator's continuity check without gaps.
-  let cursor = 0;
   for (let i = 0; i < chunks.length; i += 1) {
-    const c = chunks[i];
-    const span = Math.max(1, c.end - c.start);
-    chunks[i] = { ...c, index: i, total, start: cursor, end: cursor + span, complete: true };
-    cursor += span;
+    chunks[i] = { ...chunks[i], index: i, total };
   }
   return chunks;
 }
@@ -1843,6 +2004,19 @@ function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutput, cont
   let reportJson: Record<string, unknown>;
   if (isIssue) {
     const issue = output as RunnerIssueOutput;
+    // Per-segment results (Phase A #4/T7): redacted minimal proofs with
+    // per-segment verdicts readable in both JSON and Markdown reports.
+    const segments = Array.isArray(issue.chunks) ? issue.chunks.map((c) => ({
+      index: c.index,
+      total: c.total,
+      start: c.start,
+      end: c.end,
+      complete: c.complete,
+      coveredLength: c.coveredLength,
+      verdict: c.verdict,
+      summary: c.summary,
+      labels: c.labels,
+    })) : [];
     reportJson = {
       kind: 'issue',
       verdict: issue.verdict,
@@ -1856,6 +2030,8 @@ function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutput, cont
         chunkCount: issue.chunkCount ?? (issue.chunks ? issue.chunks.length : 1),
       },
       findings: [],
+      segments,
+      chunks: segments,
       tags: issue.tags,
       summary: issue.summary,
       time,
@@ -1879,12 +2055,26 @@ function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutput, cont
   // Redact the serialized report so pasted credentials never persist in
   // cleartext (single source of truth: redactForModel).
   const redactedJsonText = `${redactForModel(JSON.stringify(reportJson, null, 2))}\n`;
+  // Per-segment verdict lines for issue reports (Phase A #4/T7): human-readable
+  // outside the JSON block, bounded with an omission note when many segments.
+  const issueSegments = (reportJson as { segments?: Array<{ index?: unknown; verdict?: unknown; start?: unknown; end?: unknown }> }).segments;
+  const segmentLines: string[] = [];
+  if (Array.isArray(issueSegments) && issueSegments.length > 0) {
+    const shown = issueSegments.slice(0, MAX_STICKY_CHUNK_LINES);
+    for (const seg of shown) {
+      segmentLines.push(`- 段 #${String(seg.index ?? '?')}: ${String(seg.verdict ?? '?')}（${String(seg.start ?? '?')}-${String(seg.end ?? '?')}）`);
+    }
+    if (issueSegments.length > shown.length) {
+      segmentLines.push(`- …（共${issueSegments.length}段，省略${issueSegments.length - shown.length}段）`);
+    }
+  }
   const redactedMd = redactForModel([
     '# PocketGuard 審查報告',
     '',
     `判定：${(reportJson as { verdict?: string }).verdict ?? 'INCONCLUSIVE'}`,
     `指紋：\`${(reportJson as { fingerprint?: string }).fingerprint ?? ''}\``,
     `時間：${time}`,
+    ...(segmentLines.length > 0 ? ['', '分段結果：', ...segmentLines] : []),
     '',
     '```json',
     JSON.stringify(reportJson, null, 2),
@@ -1970,13 +2160,15 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
   // on an unverifiable comment set.
   if (typeof raw.commentsComplete !== 'boolean') return undefined;
   // Phase 2 (H) chunks are optional for backward compatibility (legacy
-  // single-turn artifacts omit them). When present they must pass the
-  // per-segment schema plus continuity/complete checks.
-  let chunks: IssueChunk[] | undefined;
+  // single-turn artifacts omit them). Chunked artifacts carry redacted
+  // minimal per-segment reports (never full text); legacy full-slice chunks
+  // without reports are rejected fail-closed. Reports must pass per-segment
+  // schema plus continuity/complete checks.
+  let chunks: IssueChunkReport[] | undefined;
   let chunkCoverageComplete: boolean | undefined;
   let chunkCount: number | undefined;
   if (raw.chunks !== undefined) {
-    const validated = validateIssueChunks(raw.chunks);
+    const validated = validateIssueChunkReports(raw.chunks);
     if (!validated) return undefined;
     chunks = validated;
   }
@@ -2222,6 +2414,7 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
   // for backward compatibility (existing tests/clients).
   let title = webhookTitle;
   let body = webhookBody;
+  let freshVerified = false;
   if (repository && issueNumber) {
     try {
       const fresh = await fetchFreshIssueFields(
@@ -2233,6 +2426,7 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       if (fresh) {
         title = fresh.title;
         body = fresh.body;
+        freshVerified = true;
       }
     } catch {
       const output: RunnerIssueOutput = {
@@ -2311,17 +2505,26 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
     saveIssueOutput(output, context);
     return output;
   }
-  // Phase 2 (H) chunked path: super-long body (full cleaned body alone over
-  // MAX_ISSUE_CONTEXT_LENGTH, e.g. 20001 chars) with a complete transport
-  // read is split按本文/留言 into sequential chunks (start/end/complete per
-  // segment), each triaged via triageIssue, then synthesized. Full coverage
-  // plus verifiable fingerprint plus publish re-verification is required for
-  // APPROVE; otherwise INCONCLUSIVE (deterministic BLOCK may NEEDS_CHANGES).
-  // Multi-chunk single rounds still consume exactly one claim-slot (issues
-  // are never counted; claim semantics untouched).
-  if (!built.commentsComplete && built.fullBody.length > MAX_ISSUE_CONTEXT_LENGTH) {
+  // Phase 2 (H) chunked path, generalized (Phase A #1): any transport-complete
+  // but truncated content (body 8001+, single comment 2001+, multi-comment
+  // budget past 20000, 0-body plus long comments) with fresh issues.get
+  // verification and title within cap is split按本文/留言 into sequential
+  // chunks (start/end/complete/coveredLength per segment), each triaged via
+  // triageIssue, then synthesized. fetchComplete=false stays fail-closed with
+  // zero AI (handled above). Legacy clients without `get` keep the prior
+  // fail-closed INCONCLUSIVE path so stage4-p2 single-field/budget guarantees
+  // are preserved; production clients (with `get`) take the chunked path.
+  // Full coverage plus verifiable fingerprint plus publish re-verification is
+  // required for APPROVE; otherwise INCONCLUSIVE (deterministic BLOCK may
+  // NEEDS_CHANGES). Multi-chunk single rounds still consume exactly one
+  // claim-slot (issues are never counted; claim semantics untouched).
+  // Boundary: total 20000 single-turn, 20001 chunked; body 8000 single-turn,
+  // 8001 chunked. Title over its 2000 cap never chunks (title is carried, not
+  // sliced, so its tail could not be covered).
+  const titleOverCap = built.fullTitle.length > 2000;
+  if (!built.commentsComplete && built.fetchComplete && freshVerified && !titleOverCap) {
     const chunks = buildIssueChunks(built.fullTitle, built.fullBody, built.fullComments);
-    const validatedChunks = validateIssueChunks(chunks);
+    const validatedChunks = validateIssueChunks(chunks, { title: built.fullTitle, body: built.fullBody, comments: built.fullComments });
     if (!validatedChunks) {
       const output: RunnerIssueOutput = {
         verdict: deterministicBlock ? 'NEEDS_CHANGES' : 'INCONCLUSIVE',
@@ -2373,6 +2576,24 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       // the synthesis above; coverage stays true (all chars covered) so the
       // INCONCLUSIVE is due to verifiability, not missing coverage. A truly
       // failed split would have returned above with commentsComplete false.
+      // Per-chunk minimal retention (Phase A #4): never persist full chunk
+      // text; store redacted {index/start/end/complete/coveredLength/verdict/
+      // summary(truncated)/labels} proofs only.
+      const chunkReports: IssueChunkReport[] = validatedChunks.map((chunk, idx) => {
+        const triaged = perChunk[idx];
+        const rawLabels = Array.isArray(triaged.suggestedLabels) ? triaged.suggestedLabels : [];
+        return {
+          index: chunk.index,
+          total: chunk.total,
+          start: chunk.start,
+          end: chunk.end,
+          complete: true,
+          coveredLength: chunk.coveredLength,
+          verdict: triaged.verdict,
+          summary: safeString(triaged.summary, MAX_ISSUE_CHUNK_SUMMARY_LENGTH),
+          labels: sanitizeLabels(rawLabels.filter((entry): entry is string => typeof entry === 'string')),
+        };
+      });
       const output: RunnerIssueOutput = {
         verdict,
         issueNumber,
@@ -2382,9 +2603,9 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
         suggestedLabels: aiRaw.filter((entry): entry is string => typeof entry === 'string'),
         fingerprint,
         commentsComplete: true,
-        chunks: validatedChunks,
+        chunks: chunkReports,
         chunkCoverageComplete,
-        chunkCount: validatedChunks.length,
+        chunkCount: chunkReports.length,
       };
       saveIssueOutput(output, context);
       return output;
@@ -2799,7 +3020,15 @@ function escapeMarkdown(value: string): string {
   return safeString(value).replace(/[\\`*_{}\[\]()#+\-.!|<>]/g, '\\$&');
 }
 
-function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = [], reportLine?: string): string {
+// Sticky bound helper (Phase A #4/T8): truncate with an explicit omission note
+// so 100+ findings/summaries/chunk lines stay bounded and auditable.
+export function truncateStickyText(value: string, maxLength: number): string {
+  const src = typeof value === 'string' ? value : '';
+  if (src.length <= maxLength) return src;
+  return `${src.slice(0, maxLength)}…（已省略${src.length - maxLength}字）`;
+}
+
+export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = [], reportLine?: string): string {
   const updatedAt = new Date().toISOString();
   const lines = [
     REVIEW_MARKER,
@@ -2826,17 +3055,27 @@ function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = [],
     if (role.findings.length === 0) {
       lines.push('- 無符合回報條件的具體發現。');
     }
-    for (const finding of role.findings) {
+    // Bounded findings per role with omission note (Phase A #4/T8).
+    const shown = role.findings.slice(0, MAX_STICKY_FINDINGS_PER_ROLE);
+    for (const finding of shown) {
       const location = finding.file
         ? ` (${escapeMarkdown(finding.file)}${finding.line ? `:${finding.line}` : ''})`
         : '';
       lines.push(`- **${finding.severity}**${location}: ${escapeMarkdown(finding.issue)}`);
       if (finding.suggestion) lines.push(`  - 建議：${escapeMarkdown(finding.suggestion)}`);
     }
+    if (role.findings.length > shown.length) {
+      lines.push(`- …（共${role.findings.length}項，省略${role.findings.length - shown.length}項）`);
+    }
     lines.push('');
   }
-  for (const violation of output.deterministicViolations) {
+  // Bounded deterministic violations with omission note.
+  const shownViolations = output.deterministicViolations.slice(0, MAX_STICKY_FINDINGS_PER_ROLE);
+  for (const violation of shownViolations) {
     lines.push(`- **${violation.severity} ${escapeMarkdown(violation.ruleId)}**: ${escapeMarkdown(violation.message)}`);
+  }
+  if (output.deterministicViolations.length > shownViolations.length) {
+    lines.push(`- …（共${output.deterministicViolations.length}項，省略${output.deterministicViolations.length - shownViolations.length}項）`);
   }
   return `${lines.join('\n')}\n`;
 }
@@ -2859,12 +3098,29 @@ function inconclusiveComment(reason: string, reportLine?: string): string {
 // S5 issue sticky: one comment per issue, edited in place (never a second
 // comment). Carries verdict, summary, label decision, updated time, and the
 // revision fingerprint over title/body/comments so readers can tell whether
-// the published result matches the current issue content.
-function issueReviewComment(output: RunnerIssueOutput, appliedLabels: string[], reportLine?: string): string {
+// the published result matches the current issue content. Chunk line carries
+// per-segment verdicts with boundaries and omission notes; summaries are
+// bounded with omission notes (Phase A #4/T7/T8).
+export function issueReviewComment(output: RunnerIssueOutput, appliedLabels: string[], reportLine?: string): string {
   const updatedAt = new Date().toISOString();
-  const chunkLine = output.chunks
-    ? `分段：${output.chunkCount ?? output.chunks.length} 段（${output.chunks.map((c) => `#${c.index}:${c.start}-${c.end}`).join('、')}，完整：${output.chunkCoverageComplete === true ? '是' : '否'}）`
-    : '分段：單段（完整）';
+  let chunkLine: string;
+  const segmentDetailLines: string[] = [];
+  if (output.chunks && output.chunks.length > 0) {
+    const total = output.chunkCount ?? output.chunks.length;
+    const shown = output.chunks.slice(0, MAX_STICKY_CHUNK_LINES);
+    const shownText = shown.map((c) => `#${c.index}:${c.start}-${c.end}:${c.verdict}`).join('、');
+    const omitted = total > shown.length ? `，…（共${total}段，省略${total - shown.length}段）` : '';
+    chunkLine = `分段：${total} 段（${shownText}${omitted}，完整：${output.chunkCoverageComplete === true ? '是' : '否'}）`;
+    for (const seg of shown) {
+      segmentDetailLines.push(`- 段 #${seg.index} ${seg.verdict}（${seg.start}-${seg.end}）：${truncateStickyText(seg.summary || '', 200) || '（無摘要）'}`);
+    }
+    if (total > shown.length) {
+      segmentDetailLines.push(`- …（共${total}段，省略${total - shown.length}段）`);
+    }
+  } else {
+    chunkLine = '分段：單段（完整）';
+  }
+  const boundedSummary = truncateStickyText(output.summary || '', MAX_STICKY_SUMMARY_LENGTH);
   return [
     REVIEW_MARKER,
     '',
@@ -2872,10 +3128,12 @@ function issueReviewComment(output: RunnerIssueOutput, appliedLabels: string[], 
     '',
     `**判定：${output.verdict}**`,
     `議題：#${output.issueNumber} ${escapeMarkdown(output.title)}`,
-    `摘要：${escapeMarkdown(output.summary) || '（無摘要）'}`,
+    `摘要：${escapeMarkdown(boundedSummary) || '（無摘要）'}`,
+    ...(boundedSummary.length < (output.summary || '').length ? ['（摘要已省略部分內容，詳見報告 artifact）'] : []),
     `標籤決策：${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join('、') : '無'}`,
     `修訂指紋：\`${output.fingerprint}\``,
     chunkLine,
+    ...segmentDetailLines,
     `更新時間：${updatedAt}`,
     reportLine ?? formatReportLine(process.env, false),
     '',
@@ -3094,6 +3352,9 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     let currentFingerprint = '0'.repeat(64);
     let currentCommentsComplete = false;
     let currentFetchComplete = false;
+    let currentFullBody = '';
+    let currentFullComments: string[] = [];
+    let currentFullTitle = '';
     try {
       const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody);
       // P1 #1: compare full-content fingerprints (pre-cut) on both sides so
@@ -3101,6 +3362,9 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       currentFingerprint = builtCurrent.fullFingerprint;
       currentCommentsComplete = builtCurrent.commentsComplete;
       currentFetchComplete = builtCurrent.fetchComplete;
+      currentFullBody = builtCurrent.fullBody;
+      currentFullComments = builtCurrent.fullComments;
+      currentFullTitle = builtCurrent.fullTitle;
     } catch {
       currentFingerprint = '0'.repeat(64);
       currentCommentsComplete = false;
@@ -3149,6 +3413,10 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
           // chunk fields and skip this gate.
           else if (validated.chunks !== undefined && validated.chunkCoverageComplete !== true) issueFallbackReason = 'the review output is unverifiable: issue chunks were not fully covered; review freshness could not be verified.';
           else if (validated.chunks !== undefined && validated.verdict === 'APPROVE' && validated.chunkCount !== validated.chunks.length) issueFallbackReason = 'the review output is unverifiable: issue chunk count mismatch.';
+          // Phase A #3: source coverage re-verification for chunked artifacts:
+          // summed coveredLength must equal the current full body+comments
+          // content (no omission/duplication vs the live text).
+          else if (validated.chunks !== undefined && !verifyIssueChunkCoverage(validated.chunks, { title: currentFullTitle, body: currentFullBody, comments: currentFullComments })) issueFallbackReason = 'the review output is unverifiable: issue chunk coverage does not match the current issue content.';
           else if (hasUnknownAiLabels(validated.suggestedLabels)) issueFallbackReason = 'the AI label suggestions contain unknown labels; discarded.';
           // Phase 2 (H): full fingerprint re-verification for chunked APPROVE
           // already covered by the equality above; an APPROVE with chunks must

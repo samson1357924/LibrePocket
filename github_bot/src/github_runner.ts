@@ -209,15 +209,17 @@ export function extractCommentUsername(event: GithubEvent): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-export function isTrustedCommentAuthor(event: GithubEvent, opts?: { authorAssociation?: string }): boolean {
-  void opts;
-  // Only creation events may trigger a review; an explicit non-created action
-  // (edited/deleted/...) denies. A missing action is not denied here so older
-  // pull_request_target fixtures keep working; the permission check below
-  // still applies on the issue_comment path. author_association is never
-  // trusted (see checkCommenterPermission) and only accepted here for logging.
-  if (typeof event.action === 'string' && event.action !== 'created') return false;
-  if (event.comment?.user?.type === 'Bot' || event.sender?.type === 'Bot') return false;
+export function isTrustedCommentAuthor(event: GithubEvent, opts?: { authorAssociation?: string; eventName?: string }): boolean {
+  void opts?.authorAssociation;
+  // issue_comment must carry an explicit created action; edited/deleted/missing
+  // deny fail-closed. Other events keep the legacy rule (explicit non-created
+  // denies, missing allowed) so older pull_request_target fixtures keep
+  // working; that path does not use this gate for authorization anyway.
+  // author_association is never trusted (see checkCommenterPermission).
+  if (opts?.eventName === 'issue_comment') {
+    if (event.action !== 'created') return false;
+  } else if (typeof event.action === 'string' && event.action !== 'created') return false;
+  if (event.comment?.user?.type?.toLowerCase() === 'bot' || event.sender?.type?.toLowerCase() === 'bot') return false;
   const username = extractCommentUsername(event);
   if (!username) return false;
   if (isBotLogin(username)) return false;
@@ -295,8 +297,9 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
     const needsDiff = commentCommandNeedsGitDiff(command);
     // Fail-closed authorization gate: the synchronous author check runs before
     // any pulls.get so denied comments cost no API quota and never attach a
-    // pull request. author_association is never trusted here.
-    if (!isTrustedCommentAuthor(event, { authorAssociation: event.comment?.author_association })) {
+    // pull request. author_association is never trusted here. On
+    // issue_comment the check also requires action === 'created'.
+    if (!isTrustedCommentAuthor(event, { authorAssociation: event.comment?.author_association, eventName })) {
       return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
     }
     let authorized = false;

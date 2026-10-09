@@ -58,6 +58,8 @@ Repository maintainers own this external gate. This guide describes the checks; 
 - [ ] Create every label the bot can emit before enabling publication, including `security`, `performance`, `type:tracking`, and `status:needs-decision`, plus any applicable `area:*` labels. Human-only labels do not need bot permissions.
 - [ ] Keep GitHub Actions run URLs/IDs and concise results for the default-branch, same-repository, fork, artifact-fallback, permission, and staging-CPA checks with the maintainer's go-live record. Do not include keys, authorization headers, or private review content. Revisit the evidence when any listed source of truth changes.
 
+Operation notes: `issue_comment` requires maintainer `write`+ authorization; unauthorized comments skip publish without touching the sticky comment or labels. Workflow `concurrency` serializes runs per PR/issue but provides no per-PR rate limit. Operators must monitor GitHub API quota and Actions minutes for comment-triggered runs.
+
 ## Local verification
 
 Use `npm test` and `npm run build`. The runner tests use fake CPA configuration and a fetch stub; they do not call external services. Never use production credentials or private review content in local tests.

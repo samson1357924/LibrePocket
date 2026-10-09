@@ -965,7 +965,9 @@ export async function runCommentAuthTests(): Promise<void> {
       commentUser?: { login?: string; type?: string } | null;
       sender?: { login?: string; type?: string };
       action?: string;
+      omitAction?: boolean;
       authorAssociation?: string;
+      safeReviewEnv?: string;
     }) => {
       const state = {
         permissionCalls: [] as Array<{ owner: string; repo: string; username: string }>,
@@ -998,7 +1000,7 @@ export async function runCommentAuthTests(): Promise<void> {
         ? { login: 'maintainer', type: 'User' }
         : options.commentUser;
       const event: Record<string, unknown> = {
-        action: options.action ?? 'created',
+        ...(options.omitAction ? {} : { action: options.action ?? 'created' }),
         repository: { full_name: 'sample/repository' },
         issue: { number: 41, pull_request: { url: 'unused' }, title: 'topic' },
         comment: {
@@ -1012,7 +1014,7 @@ export async function runCommentAuthTests(): Promise<void> {
         GITHUB_EVENT_NAME: 'issue_comment',
         GITHUB_REPOSITORY: 'sample/repository',
         GITHUB_TOKEN: 'fake-read-token',
-        POCKETGUARD_SAFE_REVIEW: 'true',
+        POCKETGUARD_SAFE_REVIEW: options.safeReviewEnv ?? 'true',
         CPA_BASE_URL: TEST_BASE_URL,
         CPA_API_KEY: 'fake-cpa-key',
         POCKETGUARD_CPA_ORIGIN: TEST_ORIGIN,
@@ -1077,14 +1079,21 @@ export async function runCommentAuthTests(): Promise<void> {
         { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 2, 'outsider-read: tag and review each verify');
       assert.equal(harness.state.permissionCalls[0].username, 'outsider', 'outsider-read: username forwarded');
+      assert.equal(harness.state.pullsGetCalls, 0, 'outsider-read: no pulls.get call');
     }
 
     // d. collaborator without access, and a 404-style API failure, both deny.
-    await runAuthCase('outsider-none', { permission: 'none' },
-      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
-    await runAuthCase('permission-404',
-      { permissionThrows: 'synthetic permission lookup failure' },
-      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+    {
+      const { harness } = await runAuthCase('outsider-none', { permission: 'none' },
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.pullsGetCalls, 0, 'outsider-none: no pulls.get call');
+    }
+    {
+      const { harness } = await runAuthCase('permission-404',
+        { permissionThrows: 'synthetic permission lookup failure' },
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.pullsGetCalls, 0, 'permission-404: no pulls.get call');
+    }
 
     // e. FIRST_TIME_CONTRIBUTOR without write access is denied.
     await runAuthCase('first-time-contributor',
@@ -1109,12 +1118,16 @@ export async function runCommentAuthTests(): Promise<void> {
         { permission: 'write', sender: { login: 'sender-bot', type: 'Bot' } },
         { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'bot-sender: no permission API call');
+      assert.equal(harness.state.pullsGetCalls, 0, 'bot-sender: no pulls.get call');
     }
 
     // h. a spoofed COLLABORATOR association with only read access is denied.
-    await runAuthCase('spoofed-association',
-      { permission: 'read', authorAssociation: 'COLLABORATOR' },
-      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+    {
+      const { harness } = await runAuthCase('spoofed-association',
+        { permission: 'read', authorAssociation: 'COLLABORATOR' },
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.pullsGetCalls, 0, 'spoofed-association: no pulls.get call');
+    }
 
     // i. missing usernames deny without touching the permission API.
     {
@@ -1147,9 +1160,53 @@ export async function runCommentAuthTests(): Promise<void> {
       assert.equal(harness.state.pullsGetCalls, 0, 'edited-action: no pulls.get call');
     }
 
+    // k2. deleted and missing actions deny on the issue_comment path.
+    {
+      const { harness } = await runAuthCase('deleted-action',
+        { permission: 'write', action: 'deleted' },
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 0, 'deleted-action: no permission API call');
+      assert.equal(harness.state.pullsGetCalls, 0, 'deleted-action: no pulls.get call');
+    }
+    {
+      const { harness } = await runAuthCase('missing-action',
+        { permission: 'write', omitAction: true },
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 0, 'missing-action: no permission API call');
+      assert.equal(harness.state.pullsGetCalls, 0, 'missing-action: no pulls.get call');
+    }
+
+    // k3. Bot type matching is case-insensitive (bot/BOT deny like Bot).
+    for (const botType of ['bot', 'BOT']) {
+      const { harness } = await runAuthCase(`bot-type-${botType}`,
+        { permission: 'write', commentUser: { login: 'some-bot', type: botType } },
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 0, `bot-type-${botType}: no permission API call`);
+      assert.equal(harness.state.pullsGetCalls, 0, `bot-type-${botType}: no pulls.get call`);
+    }
+    {
+      const { harness } = await runAuthCase('bot-sender-lowercase',
+        { permission: 'write', sender: { login: 'sender-bot', type: 'bot' } },
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 0, 'bot-sender-lowercase: no permission API call');
+      assert.equal(harness.state.pullsGetCalls, 0, 'bot-sender-lowercase: no pulls.get call');
+    }
+
+    // k4. Authorization deny wins over any bypass: an outsider stays at zero
+    // CPA calls even with POCKETGUARD_SAFE_REVIEW='false'.
+    {
+      const { harness } = await runAuthCase('outsider-deny-safe-review-false',
+        { permission: 'read', commentUser: { login: 'outsider', type: 'User' }, safeReviewEnv: 'false' },
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.pullsGetCalls, 0, 'outsider-deny-safe-review-false: no pulls.get call');
+    }
+
     // A missing repos API on the client denies fail-closed.
-    await runAuthCase('missing-repos-api', { omitRepos: true },
-      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+    {
+      const { harness } = await runAuthCase('missing-repos-api', { omitRepos: true },
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.pullsGetCalls, 0, 'missing-repos-api: no pulls.get call');
+    }
 
     // An authorized maintainer sending an unsupported command is authorized
     // but not safe for review; an outsider sending the same is neither.

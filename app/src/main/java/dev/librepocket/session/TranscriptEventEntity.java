@@ -8,6 +8,18 @@ import androidx.room.PrimaryKey;
 /**
  * {@code transcript_events} table (spec §8.1); {@code text} is stored redacted.
  *
+ * <p>Phase 3 Target (no schema change in Phase 2: this database is version 1
+ * with no Migration infrastructure, and the JSONL wire format in
+ * {@code JsonlCodec} is a closed object — both need a coordinated,
+ * device-verified change, so the partial/failed columns stay a Phase 3
+ * decision): {@code isPartial INTEGER NOT NULL DEFAULT 0} for cancelled /
+ * failed assistant rows plus nullable {@code failureReason TEXT} for failed
+ * rows, added via a backward-compatible {@code Migration(1, 2)} using
+ * {@code ALTER TABLE transcript_events ADD COLUMN ...} (never a destructive
+ * migration), with matching {@code TranscriptEvent} fields, DAO pass-through,
+ * and JSONL optional-key decode. Until then partial-ness lives only in UI
+ * memory and the in-memory INTERRUPTED marks.
+ *
  * <p>Written in Java so the plain {@code javac} annotation processor (already declared
  * in the build) generates the Room implementation; the store and tests stay in Kotlin.
  */

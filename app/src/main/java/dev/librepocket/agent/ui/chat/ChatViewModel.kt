@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -41,6 +42,21 @@ private val EMPTY_SESSION_STATE = ChatUiState(
 
 private const val HISTORY_PAGE = 200
 private const val HISTORY_CAP = 2000
+
+/**
+ * Per-phase budget for the bounded pre-close ledger drain (Phase 2
+ * conversation-ledger wiring): newChat / openSession / endpoint-switch /
+ * transport-replace flush the detached live session before closing it, so
+ * admitted transcript events are not lost with the session.
+ * [ChatSession.flush] spends one such budget on the close shutdown-join and
+ * another on the admitted-event drain, so one flush-then-close waits up to
+ * ~2x this value after close (~1x when nothing was closed yet). The UI never
+ * waits on it: VM state is detached synchronously and the flush itself is
+ * bounded — a stalled store only delays the background close, never user
+ * interaction. Mirrors
+ * [dev.librepocket.chat.OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS].
+ */
+private const val SESSION_FLUSH_TIMEOUT_MS = 5_000L
 
 /**
  * Chat UI state holder wired to the real [ChatSession] plus the transcript store.
@@ -858,8 +874,9 @@ class ChatViewModel(
         // the invalidate path); the current op stays in pendingOps and is
         // never touched here.
         if (currentSession != null) {
+            val mismatched = currentSession
             val queuedBeforeReplace: List<dev.librepocket.chat.QueuedIntent> = try {
-                currentSession?.drainQueued() ?: emptyList()
+                mismatched?.drainQueued() ?: emptyList()
             } catch (_: Exception) {
                 emptyList()
             }
@@ -867,7 +884,10 @@ class ChatViewModel(
             generation = lifecycleGeneration
             // F2: keep visible transcript when the transport is replaced.
             snapshotLiveToHistory()
-            closeLive()
+            // Bounded flush-then-close in the background (never a bare
+            // closeLive: admitted events must drain, as on every other
+            // detach path).
+            if (mismatched != null) detachAndFlushClose(mismatched)
             _sessionState.value = EMPTY_SESSION_STATE
             absorbDrainedQueued(queuedBeforeReplace, fillInput = false, includePending = false)
         }
@@ -949,15 +969,12 @@ class ChatViewModel(
     ) {
         // F1: openSession() reads history before taking sessionMutex, so a
         // send() in that window can attach a live same-generation session.
-        // Close the replaced incumbent (credential wipe + hosted-turn cancel)
-        // instead of orphaning it past cancel()/newChat()/onCleared() reach.
-        // Its transcript row is retained: it already received user input.
+        // Flush-then-close the replaced incumbent (bounded, background) so its
+        // admitted transcript events still drain; its transcript row is
+        // retained: it already received user input.
         val incumbent = currentSession
         if (incumbent != null && incumbent !== created.session) {
-            try {
-                incumbent.close()
-            } catch (_: Exception) {
-            }
+            detachAndFlushClose(incumbent)
         }
         currentSession = created.session
         currentBinding = binding
@@ -1116,9 +1133,11 @@ class ChatViewModel(
         // N1: reclaim queued-but-unstarted intents BEFORE close() drops the
         // FIFO. Queued is not acceptance, so the caller still owns the text:
         // it joins the recoverable outbox below (never auto-resent).
-        // Reclaim and closeLive() run back-to-back with no suspension on
+        // Reclaim and detach run back-to-back with no suspension on
         // this Main-confined path, so no admission slips between them; the
-        // generation bump below only fences generations.
+        // generation bump below only fences generations. The detached live
+        // session is flushed (bounded) before its background close, so no
+        // suspension here ever blocks the UI.
         val queuedFromSession: List<dev.librepocket.chat.QueuedIntent> = try {
             currentSession?.drainQueued() ?: emptyList()
         } catch (_: Exception) {
@@ -1135,7 +1154,7 @@ class ChatViewModel(
         openJob = null
         // F2: decouple transport invalidation from transcript display.
         if (binding != null) snapshotLiveToHistory()
-        closeLive()
+        releaseLiveAfterBoundedFlush()
         _sessionState.value = EMPTY_SESSION_STATE
         if (binding == null) {
             _history.value = emptyList()
@@ -1230,7 +1249,9 @@ class ChatViewModel(
         cancelLifecycleOperations()
         openJob?.cancel()
         openJob = null
-        closeLive()
+        // Flush (bounded, background) before close on the newChat / openSession
+        // reset path; the UI observes only the synchronous detach above.
+        releaseLiveAfterBoundedFlush()
         _sessionState.value = EMPTY_SESSION_STATE
         _notice.value = null
         if (clearChat) {
@@ -1275,7 +1296,7 @@ class ChatViewModel(
     // Timing note: the VM projection (_sessionState) trails the controller by
     // one collector dispatch. A text already accepted (appended) but not yet
     // projected must still survive: also read the live session truth
-    // (synchronous StateFlow value) before closeLive() nulls it. Accepted
+    // (synchronous StateFlow value) before the detach below nulls it. Accepted
     // text belongs here in _history, never in the unsent outbox.
     private fun snapshotLiveToHistory() {
         val projected = _sessionState.value.messages.filter { it.role == "user" || it.role == "assistant" }
@@ -1488,6 +1509,14 @@ class ChatViewModel(
         return stashed
     }
 
+    /**
+     * Synchronous detach + close, only for [onCleared]: ViewModel teardown
+     * cannot host background work (viewModelScope is cancelled there), so
+     * there is no background flush to await — the bounded drain relies on
+     * [dev.librepocket.chat.TurnController.close]'s internal bounded
+     * settle+drain+seal instead. Every other detach path uses
+     * [detachAndFlushClose] so admitted events drain before close.
+     */
     private fun closeLive() {
         sessionCollectJob?.cancel()
         sessionCollectJob = null
@@ -1498,6 +1527,71 @@ class ChatViewModel(
         currentSession = null
         currentBinding = null
         currentSessionGeneration = null
+    }
+
+    /**
+     * Detach + bounded flush-then-close for explicit lifecycle resets
+     * (newChat / openSession pre-clear), endpoint switches, transport
+     * replacement, and attach-time incumbent replacement. The live turn is
+     * cancelled synchronously (prompt stop, IO-free, a no-op when idle) and
+     * VM state is detached synchronously so the UI updates immediately; the
+     * detached session is then flushed and closed on [viewModelScope] —
+     * never the per-generation lifecycle scope, so a later invalidation
+     * cannot cancel another generation's teardown — strictly in that order.
+     * No outer timeout wraps the flush: [ChatSession.flush] is already
+     * bounded (one [SESSION_FLUSH_TIMEOUT_MS] budget for the close
+     * shutdown-join plus one for the admitted-event drain, ~2x total after
+     * close). [close] runs under [NonCancellable] so teardown always seals
+     * the session even if the background launch is cancelled. A stalled
+     * store only delays that background close — the next generation is
+     * unaffected because all VM references were already detached above.
+     */
+    private fun detachAndFlushClose(session: ChatSession) {
+        // Prompt stop first: cancel() is synchronous, IO-free, and a no-op
+        // when idle, so a running turn never lingers into the flush window.
+        try {
+            session.cancel()
+        } catch (_: Exception) {
+        }
+        if (currentSession === session) {
+            sessionCollectJob?.cancel()
+            sessionCollectJob = null
+            currentSession = null
+            currentBinding = null
+            currentSessionGeneration = null
+        }
+        viewModelScope.launch {
+            try {
+                session.flush(SESSION_FLUSH_TIMEOUT_MS)
+            } catch (_: Exception) {
+                // Bounded: timeout or flush failure still falls through to
+                // close below. A scope-teardown CancellationException is
+                // absorbed here on purpose: close() below is the teardown
+                // that matters and still runs under NonCancellable.
+            }
+            try {
+                withContext(NonCancellable) {
+                    session.close()
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Detach + bounded flush-then-close for explicit lifecycle resets
+     * (newChat / openSession pre-clear) and endpoint switches. Thin wrapper
+     * over [detachAndFlushClose]: the live turn is cancelled synchronously
+     * and VM state is detached synchronously so the UI updates immediately,
+     * while the detached session flushes (bounded) before its background
+     * close. Callers cancel lifecycle operations first
+     * ([cancelLifecycleOperations] before this call); that order is load
+     * bearing — the teardown launch below lives on [viewModelScope], not the
+     * just-invalidated lifecycle scope, so it survives the cancel above.
+     */
+    private fun releaseLiveAfterBoundedFlush() {
+        val detached = currentSession ?: return
+        detachAndFlushClose(detached)
     }
 
     private suspend fun loadHistory(sessionId: String): List<UiMessage>? {
@@ -1524,6 +1618,9 @@ class ChatViewModel(
         retryInFlight = null
         lifecycleJob.cancel()
         openJob?.cancel()
+        // Synchronous close only: background flush-then-close is infeasible
+        // here (viewModelScope is cancelled on teardown), so closeLive()
+        // relies on TurnController.close's internal bounded drain.
         closeLive()
         super.onCleared()
     }

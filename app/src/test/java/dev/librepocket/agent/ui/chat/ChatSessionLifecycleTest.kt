@@ -264,6 +264,35 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // Phase 2 ledger wiring: an endpoint switch flushes the detached live
+    // session before closing it. The detach is synchronous (the UI never
+    // waits); flush-then-close runs bounded in the background, strictly in
+    // that order. The outbox recovery contract is unchanged.
+    @Test
+    fun endpointSwitchFlushesLiveSessionBeforeClose() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.hostEntered.await() }
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { live.closed.await() }
+            assertEquals(listOf("flush", "close"), live.lifecycle.toList())
+            assertEquals(1, live.flushCalls.get())
+            assertEquals(1, live.closeCalls.get())
+            assertEquals(listOf("first"), live.sent.toList())
+        } finally {
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     // N1 negative control: newer typing is never overwritten by reclaimed
     // queued text; the queued intent waits in the outbox instead.
     @Test
@@ -691,7 +720,9 @@ class ChatSessionLifecycleTest {
             assertEquals("H", vm.currentSessionId.value)
 
             chatMain.run { vm.newChat() }
-            assertTrue(historySession.closed.isCompleted)
+            // Phase 2: newChat detaches synchronously but flushes (bounded)
+            // before closing in the background, so await the background close.
+            withTimeout(5_000) { historySession.closed.await() }
             assertTrue(!historySession.hostedTurnActive)
             assertTrue(!live.hostedTurnActive)
         } finally {
@@ -3432,6 +3463,8 @@ class ChatSessionLifecycleTest {
             return listOf(dev.librepocket.chat.QueuedIntent(77L, "queued"))
         }
 
+        override suspend fun flush(timeoutMs: Long): Boolean = true
+
         override fun cancel() = Unit
         override fun steer(text: String) = Unit
         override fun close() = Unit
@@ -3521,6 +3554,7 @@ class ChatSessionLifecycleTest {
         }
 
         override fun drainQueued(): List<dev.librepocket.chat.QueuedIntent> = emptyList()
+        override suspend fun flush(timeoutMs: Long): Boolean = true
         override fun cancel() = Unit
         override fun steer(text: String) = Unit
         override fun close() = Unit
@@ -3574,6 +3608,7 @@ class ChatSessionLifecycleTest {
         }
 
         override fun drainQueued(): List<dev.librepocket.chat.QueuedIntent> = emptyList()
+        override suspend fun flush(timeoutMs: Long): Boolean = true
         override fun cancel() = Unit
         override fun steer(text: String) = Unit
         override fun close() = Unit
@@ -3718,6 +3753,9 @@ class ChatSessionLifecycleTest {
         val steerReceived = CompletableDeferred<String>()
         val closeCalls = AtomicInteger()
         val cancelCalls = AtomicInteger()
+        // Phase 2 flush-before-close order record ("flush" must precede "close").
+        val flushCalls = AtomicInteger()
+        val lifecycle = CopyOnWriteArrayList<String>()
         @Volatile
         var hostedTurnActive = false
             private set
@@ -3884,6 +3922,12 @@ class ChatSessionLifecycleTest {
             hosted?.cancel()
         }
 
+        override suspend fun flush(timeoutMs: Long): Boolean {
+            flushCalls.incrementAndGet()
+            lifecycle.add("flush")
+            return true
+        }
+
         // Post-Q1 the VM never calls session.steer(): admission goes through
         // startOrEnqueue only. Kept for the ChatSession interface; records
         // receipt without modeling the controller FIFO.
@@ -3896,6 +3940,7 @@ class ChatSessionLifecycleTest {
                 if (closedFlag) return
                 closedFlag = true
                 closeCalls.incrementAndGet()
+                lifecycle.add("close")
                 fakeQueue.clear()
                 closed.complete(Unit)
             }

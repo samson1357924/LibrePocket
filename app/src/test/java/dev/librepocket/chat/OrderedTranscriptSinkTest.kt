@@ -2,6 +2,7 @@ package dev.librepocket.chat
 
 import java.util.Collections
 import java.util.concurrent.Executors
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
@@ -89,6 +90,37 @@ class OrderedTranscriptSinkTest {
           } catch (_: ClosedSendChannelException) {
             // Visible failure: the caller owns the seal race.
           }
+        }
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  @Test fun writerCancellationFailsAckExplicitlyAndMarksInterrupted() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val delegate = object : SinkProbe() {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          // Simulates writer teardown mid-entry: the row may never persist.
+          throw CancellationException("writer teardown")
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        withTimeout(10_000) {
+          try {
+            sink.onTurnStarted("run-1", "hi")
+            fail("writer teardown must not ack as durable")
+          } catch (_: CancellationException) {
+            // Explicit failure: the caller owns the teardown, never a silent success.
+          }
+          assertTrue(
+            "a failed ack must surface as INTERRUPTED, never a false durable ack",
+            sink.interruptedRunIds().contains("run-1"),
+          )
+          assertTrue(sink.pendingRunIds().isEmpty())
         }
       }
     } finally {

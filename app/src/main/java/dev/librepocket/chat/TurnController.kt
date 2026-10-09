@@ -481,10 +481,12 @@ class TurnController(
   }
 
   /**
-   * Suspends until the session ledger is fully settled, bounded by
-   * [timeoutMs] (true = drained, false = timed out): first the background
+   * Suspends until the session ledger is fully settled: first the background
    * [close] drain (doomed-host settle + admitted drain + seal, all bounded),
-   * then every event admitted so far. Send returning already implies
+   * then every event admitted so far. Each phase gets its own [timeoutMs]
+   * budget — the [close] shutdown-join first, then the admitted-event drain —
+   * so the total wait is bounded by roughly 2x[timeoutMs], not [timeoutMs]
+   * (true = drained, false = timed out). Send returning already implies
    * durability for the terminal record (core writes are acked inline); use
    * this after [close]/[cancel] to await the asynchronous terminal record.
    * Cancellation of the caller still propagates.
@@ -903,7 +905,10 @@ class TurnController(
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
-      // starts a brand-new assistant block with a brand-new runId.
+      // starts a brand-new assistant block with a brand-new runId. Phase 2
+      // keeps the failed partial in UI memory only (the ledger row stores the
+      // sanitized reason); persisting partial text + reason structurally is a
+      // Phase 3 Target (see TranscriptEvent / SessionTranscriptSink KDoc).
       if (!failure.retryable || attempt >= retryConfig.maxRetries) {
         val clean = sanitizeError(failure.message)
         synchronized(lock) {

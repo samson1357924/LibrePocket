@@ -21,6 +21,16 @@ import kotlinx.coroutines.CancellationException
  * calls in order and must still stay best-effort themselves: failures here
  * must never propagate, so every call guards its store access as well.
  * Text is redacted again by [RoomSessionStore] on write.
+ *
+ * Phase 3 Target (partial / failed marking; no Room schema change in
+ * Phase 2): cancelled rows become `assistant` rows with `isPartial=1` — the
+ * partial text is already preserved today, only the structured flag is
+ * missing. Failed rows must keep BOTH the partial fragment and the sanitized
+ * reason — today only the reason is persisted (`system` row) while the partial
+ * fragment lives in UI memory ([dev.librepocket.chat.UiMessage.isPartial]).
+ * Cross-restart RUNNING → INTERRUPTED backfill likewise lands in Phase 3
+ * (see `ChatSessionFactory.open`); until then interruption stays a
+ * memory + interface-layer mark.
  */
 class SessionTranscriptSink(
     private val store: SessionStore,

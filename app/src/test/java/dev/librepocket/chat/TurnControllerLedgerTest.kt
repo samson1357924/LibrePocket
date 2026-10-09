@@ -204,6 +204,44 @@ class TurnControllerLedgerTest {
     }
   }
 
+  @Test fun cancelledTurnKeepsPartialFlagInMemoryAndPartialTextInLedger() {
+    val store = DelaySessionStore()
+    val gate = CompletableDeferred<Unit>()
+    val provider = LedgerFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        gate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider, store)
+    try {
+      val admission = runBlocking { c.startOrEnqueue("hi", opId = 7) }
+      assertTrue(admission is TurnStart.Started)
+      runBlocking {
+        withTimeout(5_000) {
+          while (c.uiState.value.messages.none { it.role == "assistant" && it.text == "half" }) {
+            delay(10)
+          }
+        }
+      }
+      c.cancel()
+      c.close()
+      runBlocking { withTimeout(5_000) { c.flushTranscript() } }
+      // Ledger keeps the partial text unstructured (the structured partial
+      // flag column is a Phase 3 Target; see TranscriptEvent KDoc).
+      assertEquals(listOf("half"), store.events.filter { it.kind == "assistant" }.map { it.text })
+      // Memory partial flag survives: the cancelled block is never finalized.
+      val assistants = c.uiState.value.messages.filter { it.role == "assistant" }
+      assertEquals(1, assistants.size)
+      assertTrue("cancelled partial must stay isPartial in memory", assistants.single().isPartial)
+      assertTrue(c.interruptedTranscriptRunIds().isEmpty())
+    } finally {
+      gate.complete(Unit)
+      c.close()
+    }
+  }
+
   @Test fun retryEmitsExactlyOneUserRowBoundToItsAttempts() {
     val store = DelaySessionStore()
     val calls = AtomicInteger(0)

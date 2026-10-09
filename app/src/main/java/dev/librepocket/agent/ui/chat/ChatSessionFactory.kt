@@ -195,7 +195,20 @@ class ChatSessionFactory(
         }
     }
 
-    /** Binds a live session to an existing transcript session (resume, no re-create). */
+    /**
+     * Binds a live session to an existing transcript session (resume, no re-create).
+     *
+     * Phase 3 Target (cross-restart recovery; NOT implemented in Phase 2 —
+     * resume hydrate stays untouched): after loading [meta] and before
+     * attaching, backfill any turn the previous process left RUNNING (a
+     * dangling partial row with no terminal record for its runId) with an
+     * explicit INTERRUPTED marker row. This needs the Phase-3 persisted
+     * partial/status bits (see TranscriptEvent / TranscriptEventEntity KDoc);
+     * without a schema change no stored row can reliably distinguish a
+     * crashed partial from a completed assistant row, so Phase 2 replays rows
+     * as-is and records interruption only in memory
+     * (TurnController.interruptedTranscriptRunIds).
+     */
     override suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,

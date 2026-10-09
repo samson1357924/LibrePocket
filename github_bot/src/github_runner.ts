@@ -19,6 +19,7 @@ import {
   resolveLabelsFromTitle,
   resolveReviewLabels,
   sanitizeLabels,
+  sanitizePrAiSuggestions,
   type GitHubLabelClient,
   type ReconcileScope,
 } from './label_manager';
@@ -390,7 +391,9 @@ function inferRouteEventName(event: GithubEvent, env: NodeJS.ProcessEnv | undefi
 // Read-only event router (S3). Classifies every event into first-review,
 // issue-update, manual-pr-review, owner-commit, or ignore without performing
 // review, labeling, counting, or sticky writes. S4/S5 consume kind plus the
-// should_review/should_tag flags emitted by runTagMode.
+// should_review/should_tag flags emitted by runTagMode. P2 #3: opened and
+// reopened share first-review here; the per-SHA quota in runTagMode still
+// applies to reopened (reopening never resets the budget).
 export function routeEvent(event: GithubEvent, env?: NodeJS.ProcessEnv): RouteResult {
   const eventName = inferRouteEventName(event, env);
   const action = typeof event.action === 'string' ? event.action : '';
@@ -938,6 +941,13 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
   // with no auth/quota gate by owner decision (this phase: no budget/rate
   // limit, only bot exclusion in routing plus per-issue concurrency
   // serialization).
+  // P2 #3 reopened semantics: routeEvent keeps opened||reopened as
+  // first-review (no routing change). The per-SHA ledger below applies
+  // equally to reopened: reopened + used=1 stays gate auto with
+  // reviewsUsed=1/shouldReview=true (a second review is allowed); used>=2
+  // closes to gate none with quota-exhausted (zero OpenAI); an unreadable
+  // ledger closes to gate none with quota-unknown. Reopening never resets
+  // the budget — only a new head SHA does.
   let reviewGate = resolveReviewGate(route.kind, flags.shouldReview);
   let shouldReview = flags.shouldReview;
   let reason = route.reason;
@@ -2766,20 +2776,31 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     return;
   }
 
-  // S5 AI label gate: raw suggestions are allowlisted at publish. Unknown
-  // entries are discarded with a log and force INCONCLUSIVE on the same
-  // sticky (never a wrong APPROVE, never writing illegal labels). Manual
-  // labels outside the bot scope are always preserved by reconciliation.
-  // The ledger stays as the claim left it (reconciliation only).
+  // S5 AI label gate + P2 #4 convergence: raw suggestions are allowlisted at
+  // publish. Unknown entries are discarded with a log and force INCONCLUSIVE
+  // on the same sticky (never a wrong APPROVE, never writing illegal labels).
+  // PR convergence: only area:*/security/performance/status:needs-decision
+  // (+ type:tracking) may be written from PR AI; priority:*/gate:* /
+  // bug/enhancement/documentation (and verified statuses) are
+  // issue-triage-only, so a PR suggestion carrying them is likewise discarded
+  // and forces INCONCLUSIVE. Manual labels outside the bot scope are always
+  // preserved by reconciliation. The ledger stays as the claim left it
+  // (reconciliation only).
   const aiRaw = Array.isArray(output.suggestedLabels) ? output.suggestedLabels : [];
-  const { sanitizedAi, hadUnknown } = mergeRulesWithAiSuggestions([], aiRaw);
-  if (hadUnknown) {
+  const { hadUnknown } = mergeRulesWithAiSuggestions([], aiRaw);
+  const prFiltered = sanitizePrAiSuggestions(aiRaw);
+  if (hadUnknown || prFiltered.discardedCount > 0) {
+    const discardReason = hadUnknown
+      ? 'the AI label suggestions contain unknown labels; discarded.'
+      : 'the AI label suggestions contain issue-triage-only labels; discarded for PR publish.';
+    // Never log raw label values (model-controlled); record only the count.
+    console.warn(`[PocketGuard] Discarded ${prFiltered.discardedCount} PR AI label(s) outside the convergence allowlist.`);
     await publishStickyComment(
       client,
       repository,
       target.issueNumber,
-      reconciledInitialBody(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
-      async () => buildReconciledBody(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
+      reconciledInitialBody(inconclusiveComment(discardReason)),
+      async () => buildReconciledBody(inconclusiveComment(discardReason)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -2801,7 +2822,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       hasSecurityFinding: hasSecurityBlock,
     }),
   ]);
-  const labels = sanitizeLabels([...rulesLabels, ...sanitizedAi]);
+  const labels = sanitizeLabels([...rulesLabels, ...prFiltered.kept]);
   const coverageComplete = output.coverage.complete && output.changedFilesComplete;
 
   let publishFallbackReason: string | undefined;

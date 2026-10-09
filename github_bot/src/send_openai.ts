@@ -11,7 +11,37 @@ const DEFAULT_TIMEOUT_MS = 420000;
 
 export const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
 export const DEFAULT_OPENAI_ORIGIN = 'https://api.openai.com';
+// Default reasoning effort when no explicit effort is configured. Overridable
+// via POCKETGUARD_REASONING_EFFORT (global) or
+// POCKETGUARD_MODEL_<ROLE>_REASONING_EFFORT (per-role); see
+// resolveDefaultReasoningEffort and README Configuration.
 export const DEFAULT_REASONING_EFFORT = 'high';
+
+/**
+ * Resolves the configured default reasoning effort. Precedence: per-call
+ * env POCKETGUARD_REASONING_EFFORT, then POCKETGUARD_DEFAULT_REASONING_EFFORT
+ * alias, then the builtin 'high'. Placeholders never count as configured.
+ */
+export function resolveDefaultReasoningEffort(env: OpenAIEnvironment): string {
+  const global = env.POCKETGUARD_REASONING_EFFORT?.trim() ?? '';
+  if (global && !containsPlaceholder(global)) return global;
+  const alias = env.POCKETGUARD_DEFAULT_REASONING_EFFORT?.trim() ?? '';
+  if (alias && !containsPlaceholder(alias)) return alias;
+  return DEFAULT_REASONING_EFFORT;
+}
+
+/**
+ * Whether reasoning effort 'none' is supported for this model. Only the
+ * gpt-5 family is verified to accept the omission path used here (see
+ * sendOpenAISingleTurn). Other reasoning families (e.g. o-series) reject or
+ * ignore it, so resolveModelProfile returns undefined for model+none
+ * (fail-closed, zero fetch before send).
+ */
+export function isReasoningNoneSupported(modelId: string): boolean {
+  const lower = modelId.trim().toLowerCase();
+  if (!lower) return false;
+  return lower.startsWith('gpt-5');
+}
 
 export type ModelProfileKind = 'reasoning' | 'chat';
 
@@ -88,7 +118,7 @@ function normalizeKind(value: unknown): ModelProfileKind | undefined {
   return undefined;
 }
 
-function parseProfileString(raw: string): ModelProfile | undefined {
+function parseProfileString(raw: string, defaultEffort: string = DEFAULT_REASONING_EFFORT): ModelProfile | undefined {
   const trimmed = raw.trim();
   if (!trimmed || containsPlaceholder(trimmed)) return undefined;
   if (trimmed.startsWith('{')) {
@@ -100,7 +130,7 @@ function parseProfileString(raw: string): ModelProfile | undefined {
         if (!kind) return undefined;
         if (kind === 'chat') return { kind };
         const effortRaw = record.effort ?? record.reasoningEffort;
-        const effort = typeof effortRaw === 'string' && effortRaw.trim() ? effortRaw.trim() : DEFAULT_REASONING_EFFORT;
+        const effort = typeof effortRaw === 'string' && effortRaw.trim() ? effortRaw.trim() : defaultEffort;
         return { kind, effort };
       }
     } catch {
@@ -113,11 +143,11 @@ function parseProfileString(raw: string): ModelProfile | undefined {
   const kind = normalizeKind(parts[0]);
   if (!kind) return undefined;
   if (kind === 'chat') return { kind };
-  const effort = parts[1] ? parts[1].trim() : DEFAULT_REASONING_EFFORT;
-  return { kind, effort: effort || DEFAULT_REASONING_EFFORT };
+  const effort = parts[1] ? parts[1].trim() : defaultEffort;
+  return { kind, effort: effort || defaultEffort };
 }
 
-function lookupProfileInJsonMap(parsed: unknown, modelId: string): ModelProfile | undefined {
+function lookupProfileInJsonMap(parsed: unknown, modelId: string, defaultEffort: string = DEFAULT_REASONING_EFFORT): ModelProfile | undefined {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
   const record = parsed as Record<string, unknown>;
   const lowerId = modelId.toLowerCase();
@@ -136,7 +166,7 @@ function lookupProfileInJsonMap(parsed: unknown, modelId: string): ModelProfile 
     const inChat = matches(chatList);
     if (inReasoning && !inChat) {
       const effortRaw = record.reasoningEffort ?? record.effort;
-      const effort = typeof effortRaw === 'string' && effortRaw.trim() ? effortRaw.trim() : DEFAULT_REASONING_EFFORT;
+      const effort = typeof effortRaw === 'string' && effortRaw.trim() ? effortRaw.trim() : defaultEffort;
       return { kind: 'reasoning', effort };
     }
     if (inChat && !inReasoning) return { kind: 'chat' };
@@ -146,7 +176,7 @@ function lookupProfileInJsonMap(parsed: unknown, modelId: string): ModelProfile 
     if (key.toLowerCase() === lowerId) {
       const value = record[key];
       if (typeof value === 'string') {
-        const profile = parseProfileString(value);
+        const profile = parseProfileString(value, defaultEffort);
         if (profile) return profile;
       } else if (value && typeof value === 'object' && !Array.isArray(value)) {
         const obj = value as Record<string, unknown>;
@@ -154,7 +184,7 @@ function lookupProfileInJsonMap(parsed: unknown, modelId: string): ModelProfile 
         if (kind === 'chat') return { kind: 'chat' };
         if (kind === 'reasoning') {
           const effortRaw = obj.effort ?? obj.reasoningEffort;
-          const effort = typeof effortRaw === 'string' && effortRaw.trim() ? effortRaw.trim() : DEFAULT_REASONING_EFFORT;
+          const effort = typeof effortRaw === 'string' && effortRaw.trim() ? effortRaw.trim() : defaultEffort;
           return { kind: 'reasoning', effort };
         }
       }
@@ -171,7 +201,7 @@ function lookupProfileInJsonMap(parsed: unknown, modelId: string): ModelProfile 
     if (!lowerId.startsWith(lowerKey)) continue;
     const value = record[key];
     let candidate: ModelProfile | undefined;
-    if (typeof value === 'string') candidate = parseProfileString(value);
+    if (typeof value === 'string') candidate = parseProfileString(value, defaultEffort);
     else if (value && typeof value === 'object' && !Array.isArray(value)) {
       const obj = value as Record<string, unknown>;
       const kind = normalizeKind(obj.type ?? obj.kind ?? obj.profile ?? obj.mode);
@@ -180,7 +210,7 @@ function lookupProfileInJsonMap(parsed: unknown, modelId: string): ModelProfile 
         const effortRaw = obj.effort ?? obj.reasoningEffort;
         candidate = {
           kind: 'reasoning',
-          effort: typeof effortRaw === 'string' && effortRaw.trim() ? effortRaw.trim() : DEFAULT_REASONING_EFFORT,
+          effort: typeof effortRaw === 'string' && effortRaw.trim() ? effortRaw.trim() : defaultEffort,
         };
       }
     } else continue;
@@ -201,9 +231,7 @@ function effortForModel(modelId: string, env: OpenAIEnvironment): string {
       break;
     }
   }
-  const global = env.POCKETGUARD_REASONING_EFFORT?.trim() ?? '';
-  if (global && !containsPlaceholder(global)) return global;
-  return DEFAULT_REASONING_EFFORT;
+  return resolveDefaultReasoningEffort(env);
 }
 
 function isReasoningFamily(modelId: string): boolean {
@@ -218,10 +246,20 @@ function isChatFamily(modelId: string): boolean {
 // Per-model request profile. Explicit configuration wins; builtin family
 // defaults cover GPT-5 reasoning and gpt-4o/gpt-4.1 chat only. Anything else
 // without an explicit profile returns undefined so callers fail closed
-// without sending a guessed body.
+// without sending a guessed body. A reasoning+none profile for a model that
+// does not support none (see isReasoningNoneSupported) likewise returns
+// undefined so sendOpenAISingleTurn fails closed with zero fetch.
 export function resolveModelProfile(modelId: string, env: OpenAIEnvironment): ModelProfile | undefined {
   const trimmedId = modelId.trim();
   if (!trimmedId || containsPlaceholder(trimmedId)) return undefined;
+  const gateNone = (profile: ModelProfile | undefined): ModelProfile | undefined => {
+    if (!profile) return undefined;
+    if (profile.kind === 'reasoning' && (profile.effort ?? '').trim().toLowerCase() === 'none' && !isReasoningNoneSupported(trimmedId)) {
+      return undefined;
+    }
+    return profile;
+  };
+  const defaultEffort = resolveDefaultReasoningEffort(env);
 
   for (const role of ['chief', 'android_sec', 'android_code'] as const) {
     const configuredModel = env[roleEnvironmentNames[role]]?.trim() ?? '';
@@ -229,15 +267,17 @@ export function resolveModelProfile(modelId: string, env: OpenAIEnvironment): Mo
       const rawProfile = env[roleProfileEnvName(role)]?.trim() ?? '';
       if (rawProfile) {
         if (containsPlaceholder(rawProfile)) return undefined;
-        const parsed = parseProfileString(rawProfile);
+        const parsed = parseProfileString(rawProfile, defaultEffort);
         if (!parsed) return undefined;
         if (parsed.kind === 'reasoning') {
           const override = env[roleEffortEnvName(role)]?.trim() ?? '';
           const global = env.POCKETGUARD_REASONING_EFFORT?.trim() ?? '';
-          if (override && !containsPlaceholder(override)) return { kind: 'reasoning', effort: override };
-          if (global && !containsPlaceholder(global)) return { kind: 'reasoning', effort: global };
+          const alias = env.POCKETGUARD_DEFAULT_REASONING_EFFORT?.trim() ?? '';
+          if (override && !containsPlaceholder(override)) return gateNone({ kind: 'reasoning', effort: override });
+          if (global && !containsPlaceholder(global)) return gateNone({ kind: 'reasoning', effort: global });
+          if (alias && !containsPlaceholder(alias)) return gateNone({ kind: 'reasoning', effort: alias });
         }
-        return parsed;
+        return gateNone(parsed);
       }
       break;
     }
@@ -252,12 +292,12 @@ export function resolveModelProfile(modelId: string, env: OpenAIEnvironment): Mo
     } catch {
       return undefined;
     }
-    const found = lookupProfileInJsonMap(parsed, trimmedId);
+    const found = lookupProfileInJsonMap(parsed, trimmedId, defaultEffort);
     if (found) {
       if (found.kind === 'reasoning' && (!found.effort || !found.effort.trim())) {
-        return { kind: 'reasoning', effort: effortForModel(trimmedId, env) };
+        return gateNone({ kind: 'reasoning', effort: effortForModel(trimmedId, env) });
       }
-      return found;
+      return gateNone(found);
     }
     // An explicitly configured map is authoritative: a model absent from it
     // is unknown rather than guessed from builtin families.
@@ -267,15 +307,15 @@ export function resolveModelProfile(modelId: string, env: OpenAIEnvironment): Mo
   const rawGlobal = env.POCKETGUARD_MODEL_PROFILE?.trim() ?? '';
   if (rawGlobal) {
     if (containsPlaceholder(rawGlobal)) return undefined;
-    const parsed = parseProfileString(rawGlobal);
+    const parsed = parseProfileString(rawGlobal, defaultEffort);
     if (!parsed) return undefined;
     if (parsed.kind === 'reasoning' && (!parsed.effort || !parsed.effort.trim())) {
-      return { kind: 'reasoning', effort: effortForModel(trimmedId, env) };
+      return gateNone({ kind: 'reasoning', effort: effortForModel(trimmedId, env) });
     }
-    return parsed;
+    return gateNone(parsed);
   }
 
-  if (isReasoningFamily(trimmedId)) return { kind: 'reasoning', effort: effortForModel(trimmedId, env) };
+  if (isReasoningFamily(trimmedId)) return gateNone({ kind: 'reasoning', effort: effortForModel(trimmedId, env) });
   if (isChatFamily(trimmedId)) return { kind: 'chat' };
   return undefined;
 }
@@ -347,8 +387,16 @@ export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions)
   const reasoningActive = profile.kind === 'reasoning' && effort.toLowerCase() !== 'none';
   if (reasoningActive) {
     // GPT-5-class reasoning with effort != none rejects temperature/top_p.
-    body.reasoning = { effort: effort || DEFAULT_REASONING_EFFORT };
+    body.reasoning = { effort: effort || resolveDefaultReasoningEffort(env) };
   } else {
+    // P2 #5 Responses API semantics (pinned): effort 'none' OMITS the
+    // reasoning key entirely (never sends reasoning:{effort:'none'}).
+    // Rationale: omitting reasoning selects the model default non-reasoning
+    // path, while an explicit {effort:'none'} is rejected with 400 on models
+    // that do not support none (see isReasoningNoneSupported, which fails
+    // closed before any fetch). Reference:
+    // https://platform.openai.com/docs/api-reference/responses/create
+    // (reasoning.effort; omitted reasoning == default behavior).
     // Non-reasoning (or reasoning with effort none): never send reasoning.
     // Temperature/top_p are opt-in only, so the default body stays minimal.
     if (options.temperature !== undefined) body.temperature = options.temperature;

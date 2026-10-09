@@ -6,12 +6,15 @@ import {
   BOT_MENTION,
   COMMENT_MARKERS,
   DEFAULT_PR_RECONCILE_SCOPE,
+  MUTEX_LABEL_GROUPS,
   REPO_ALLOWED_LABELS,
   applyBotLabels,
   applyLabelsSafely,
   ensureNeedsDecision,
   extractLabelsFromTriageText,
   isManagedByBot,
+  isMutexLabel,
+  isPrAiSuggestibleLabel,
   normalizeLabelName,
   parseReviewReport,
   reconcileBotLabelsSafely,
@@ -19,6 +22,8 @@ import {
   resolveLabelsFromTitle,
   resolveReviewLabels,
   sanitizeLabels,
+  sanitizePrAiSuggestions,
+  warnOnMutexCoexistence,
   type GitHubLabelClient,
 } from '../src/label_manager';
 
@@ -278,6 +283,91 @@ ${reportWith('A security flaw remains.')}`);
   assert.ok(managedMock.getLabels(1).includes('security'));
   assert.ok(managedMock.getLabels(1).includes('good first issue'));
   assert.ok(managedMock.getLabels(1).includes('priority:P1'));
+
+  // P2 #4 mutex groups: priority, gate:*, verified statuses, bug/enhancement/documentation.
+  assert.ok(MUTEX_LABEL_GROUPS.some((group) => group.includes('priority:P1') && group.includes('priority:P2')));
+  assert.ok(MUTEX_LABEL_GROUPS.some((group) => group.includes('gate:live') && group.includes('gate:release')));
+  assert.ok(MUTEX_LABEL_GROUPS.some((group) => group.includes('status:verified-main')));
+  assert.ok(MUTEX_LABEL_GROUPS.some((group) => group.includes('bug') && group.includes('enhancement')));
+  for (const mutex of ['priority:P1', 'priority:P2', 'gate:live', 'gate:release', 'status:verified-main', 'status:partial', 'status:latent', 'bug', 'enhancement', 'documentation']) {
+    assert.equal(isMutexLabel(mutex), true, mutex);
+    assert.equal(isManagedByBot(mutex, DEFAULT_PR_RECONCILE_SCOPE), false, `${mutex} never managed`);
+    assert.equal(isPrAiSuggestibleLabel(mutex), false, `${mutex} never PR-AI-suggestible`);
+  }
+  for (const prAllowed of ['area:runtime', 'area:docs', 'security', 'performance', 'status:needs-decision']) {
+    assert.equal(isPrAiSuggestibleLabel(prAllowed), true, prAllowed);
+    assert.equal(isMutexLabel(prAllowed), false, prAllowed);
+  }
+  // PR convergence: priority/gate/bug/enhancement are discarded even though
+  // they are allowlisted for issue triage.
+  {
+    const prFiltered = sanitizePrAiSuggestions(['area:runtime', 'security', 'priority:P1', 'gate:release', 'bug', 'alien-label']);
+    assert.deepEqual(prFiltered.kept, ['area:runtime', 'security']);
+    assert.equal(prFiltered.discardedCount, 4, 'priority/gate/bug/alien all discarded for PR');
+  }
+  // P1+P2 coexistence: both survive, only a warning, never auto-removal.
+  {
+    const coexistenceMock = new StatefulMockLabelClient({ 20: ['priority:P1', 'priority:P2', 'area:runtime'] });
+    const { result, calls } = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+      client: coexistenceMock,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 20,
+      desiredLabels: ['area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+    }));
+    assert.deepEqual(result.removed, [], 'P1+P2 coexistence never auto-removes');
+    assert.ok(coexistenceMock.getLabels(20).includes('priority:P1'));
+    assert.ok(coexistenceMock.getLabels(20).includes('priority:P2'));
+    assert.ok(calls.some((call) => call.level === 'warn'), 'mutex coexistence warns');
+    // Direct helper also warns without removing.
+    const direct = await captureConsoleCalls(async () => { warnOnMutexCoexistence(['priority:P1', 'priority:P2']); });
+    assert.ok(direct.calls.some((call) => call.level === 'warn'));
+  }
+  // Bot never writes priority/gate on PRs: PR AI suggestions are filtered
+  // through the convergence allowlist before reconcile, so a PR desired
+  // never carries mutex members (issue triage is the only writer of
+  // priority/gate/bug/enhancement).
+  {
+    const rawAi = ['priority:P1', 'gate:release', 'area:runtime'];
+    const filtered = sanitizePrAiSuggestions(rawAi);
+    assert.deepEqual(filtered.kept, ['area:runtime']);
+    assert.equal(filtered.discardedCount, 2);
+    const prMock = new StatefulMockLabelClient({ 21: [] });
+    const prResult = await reconcileBotLabelsSafely({
+      client: prMock,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 21,
+      desiredLabels: filtered.kept,
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+    });
+    assert.ok(!prMock.getLabels(21).includes('priority:P1'), 'PR never writes priority');
+    assert.ok(!prMock.getLabels(21).includes('gate:release'), 'PR never writes gate');
+    assert.ok(prMock.getLabels(21).includes('area:runtime'));
+    assert.ok(!prResult.removed.includes('priority:P1'));
+    assert.ok(!prResult.removed.includes('gate:release'));
+    assert.equal(isManagedByBot('priority:P1', DEFAULT_PR_RECONCILE_SCOPE), false);
+    assert.equal(isManagedByBot('gate:release', DEFAULT_PR_RECONCILE_SCOPE), false);
+  }
+  // Human area: retention — incomplete coverage preserves a human-added area
+  // label (human lock priority) instead of replacing it.
+  {
+    const humanAreaMock = new StatefulMockLabelClient({ 22: ['area:delivery'] });
+    const humanAreaResult = await reconcileBotLabelsSafely({
+      client: humanAreaMock,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 22,
+      desiredLabels: ['area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+      coverageComplete: false,
+    });
+    assert.deepEqual(humanAreaResult.removed, [], 'incomplete coverage never removes human area');
+    assert.ok(humanAreaMock.getLabels(22).includes('area:delivery'), 'human area:delivery retained');
+    assert.ok(humanAreaMock.getLabels(22).includes('area:runtime'));
+    assert.ok(humanAreaMock.getLabels(22).includes('status:needs-decision'));
+  }
 
   // Incomplete path coverage always asks for a decision and never removes existing area labels.
   const incompleteMock = new StatefulMockLabelClient({ 2: ['area:platform', 'area:runtime'] });

@@ -4,6 +4,8 @@ import {
   securityLabelsFor,
 } from '../src/deterministic_scanner';
 import {
+  isReasoningNoneSupported,
+  resolveDefaultReasoningEffort,
   resolveModelProfile,
   resolveOpenAIConfig,
   resolveRoleModel,
@@ -605,6 +607,70 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     assert.equal(Object.hasOwn(noneBody, 'reasoning'), false);
     assert.equal(Object.hasOwn(noneBody, 'temperature'), false);
     assert.equal(Object.hasOwn(noneBody, 'top_p'), false);
+
+    // P2 #5 none two-choice: omission (not explicit reasoning:{effort:none}).
+    // The pinned Responses API semantics omit the key entirely; an explicit
+    // none object must never appear on the wire.
+    {
+      assert.equal(JSON.stringify(noneBody).includes('"effort":"none"'), false, 'none omits, never explicit');
+      assert.equal(JSON.stringify(noneBody).includes('"reasoning"'), false, 'none carries no reasoning key');
+      assert.equal(isReasoningNoneSupported('gpt-5.2'), true, 'gpt-5 supports none');
+      assert.equal(isReasoningNoneSupported('o3-mini'), false, 'o-series does not support none');
+    }
+
+    // P2 #5 unsupported none fails closed with zero fetch (before any send).
+    {
+      const unsupportedEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_CHIEF: 'o3-mini',
+        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+      };
+      assert.equal(resolveModelProfile('o3-mini', unsupportedEnv), undefined, 'o3-mini + none is undefined');
+      const previous = globalThis.fetch;
+      let fetchCount = 0;
+      globalThis.fetch = (async () => {
+        fetchCount += 1;
+        return new Response(JSON.stringify({
+          output: [{ content: [{ type: 'output_text', text: 'must not be called' }] }],
+        }), { status: 200 });
+      }) as typeof fetch;
+      try {
+        await assert.rejects(
+          sendOpenAISingleTurn({
+            modelId: 'o3-mini',
+            systemPrompt: 'fake system prompt',
+            userPrompt: 'fake user prompt',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: unsupportedEnv,
+            timeoutMs: 1000,
+          }),
+          /model profile not configured/,
+        );
+        assert.equal(fetchCount, 0, 'unsupported none makes zero fetch calls');
+      } finally {
+        globalThis.fetch = previous;
+      }
+    }
+
+    // P2 #5 DEFAULT_REASONING_EFFORT is env-configurable (vars preferred).
+    {
+      assert.equal(resolveDefaultReasoningEffort({}), 'high', 'builtin default is high');
+      assert.equal(
+        resolveDefaultReasoningEffort({ POCKETGUARD_REASONING_EFFORT: 'medium' }),
+        'medium',
+      );
+      assert.equal(
+        resolveDefaultReasoningEffort({ POCKETGUARD_DEFAULT_REASONING_EFFORT: 'low' }),
+        'low',
+      );
+      const customDefaultEnv = {
+        OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL,
+        OPENAI_API_KEY: 'fake-api-key',
+        POCKETGUARD_REASONING_EFFORT: 'medium',
+      };
+      const customDefaultBody = await captureSingleTurnBody('gpt-5.2', customDefaultEnv);
+      assert.deepEqual(customDefaultBody.reasoning, { effort: 'medium' }, 'env default backs builtin reasoning');
+    }
 
     // Builtin family defaults apply without any explicit profile map.
     const builtinEnv = { OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL, OPENAI_API_KEY: 'fake-api-key' };

@@ -576,6 +576,116 @@ export const DEFAULT_PR_RECONCILE_SCOPE: Readonly<ReconcileScope> = Object.freez
   managedExactLabels: Object.freeze(['status:needs-decision']) as readonly string[],
 });
 
+// P2 #4 mutual-exclusion groups (human-owned taxonomy; the bot never writes
+// or auto-removes these — coexistence only warns). At least:
+// - priority:{P1,P2} (exactly one should apply; P1+P2 coexistence warns)
+// - gate:* (release/activation/live/docs gates are human release decisions)
+// - status:verified-main/partial/latent (human verification outcomes)
+// - bug/enhancement/documentation (issue-triage tradeoff; PR publish never
+//   writes these — they are issue-triage-only).
+export const MUTEX_LABEL_GROUPS: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
+  Object.freeze(['priority:P1', 'priority:P2']),
+  Object.freeze(['gate:live', 'gate:release', 'gate:activation', 'gate:docs']),
+  Object.freeze(['status:verified-main', 'status:partial', 'status:latent']),
+  Object.freeze(['bug', 'enhancement', 'documentation']),
+]);
+
+// PR publish AI convergence allowlist: AI suggestions on PRs are limited to
+// area:*/security/performance/status:needs-decision (+ type:tracking for
+// backward compatibility with the existing deterministic title path).
+// priority:*/gate:* /bug/enhancement/documentation (and the verified statuses)
+// are issue-triage-only: a PR AI suggestion carrying them is discarded and
+// forces INCONCLUSIVE (never APPROVE, never written).
+const PR_AI_ALLOWED_EXACT_LABELS: ReadonlySet<string> = new Set([
+  'security',
+  'performance',
+  'status:needs-decision',
+  'type:tracking',
+]);
+
+/** True when the canonical label belongs to a human-owned mutex group. */
+export function isMutexLabel(labelName: string): boolean {
+  if (!labelName || typeof labelName !== 'string') return false;
+  const lower = labelName.trim().toLowerCase();
+  if (!lower) return false;
+  for (const group of MUTEX_LABEL_GROUPS) {
+    for (const member of group) {
+      if (lower === member.toLowerCase()) return true;
+    }
+  }
+  // gate:* is a prefix group: any gate: label is mutex even if the taxonomy
+  // grows beyond the four listed gates.
+  if (lower.startsWith('gate:')) return true;
+  if (lower.startsWith('priority:')) return true;
+  return false;
+}
+
+/** True when a canonical PR AI suggestion may be written by the bot. */
+export function isPrAiSuggestibleLabel(canonicalLabel: string): boolean {
+  if (!canonicalLabel || typeof canonicalLabel !== 'string') return false;
+  const lower = canonicalLabel.trim().toLowerCase();
+  if (!lower) return false;
+  if (lower.startsWith('area:')) return true;
+  for (const allowed of PR_AI_ALLOWED_EXACT_LABELS) {
+    if (lower === allowed.toLowerCase()) return true;
+  }
+  return false;
+}
+
+/**
+ * Filters raw PR AI suggestions through the convergence allowlist.
+ * Returns kept (PR-writable canonical) plus discarded count. Unknown labels
+ * and issue-triage-only labels (priority/gate/bug/enhancement/documentation/
+ * verified statuses) are discarded; callers must force non-APPROVE when
+ * discarded > 0. Raw values are never logged (prompt-injection safe).
+ */
+export function sanitizePrAiSuggestions(candidates: string[]): { kept: string[]; discardedCount: number } {
+  const kept = new Set<string>();
+  let discardedCount = 0;
+  for (const raw of candidates) {
+    if (typeof raw !== 'string') {
+      discardedCount += 1;
+      continue;
+    }
+    const canonical = normalizeLabelName(raw);
+    if (!canonical || !isPrAiSuggestibleLabel(canonical)) {
+      discardedCount += 1;
+      continue;
+    }
+    kept.add(canonical);
+  }
+  return { kept: Array.from(kept).sort(), discardedCount };
+}
+
+/**
+ * Warns (never removes) when several mutex-group members coexist on the
+ * same issue/PR. Human coexistence is preserved; the bot only warns so a
+ * maintainer can resolve the tradeoff (e.g. P1+P2, or bug+enhancement).
+ */
+export function warnOnMutexCoexistence(existingLabels: string[]): void {
+  const lowerSet = new Set(
+    existingLabels
+      .filter((label): label is string => typeof label === 'string')
+      .map((label) => label.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  for (const group of MUTEX_LABEL_GROUPS) {
+    const present = group.filter((member) => lowerSet.has(member.toLowerCase()));
+    if (present.length > 1) {
+      console.warn(
+        `[LabelManager] Mutex coexistence: ${present.length} labels from one group are present; human decision required (no auto-removal).`,
+      );
+    }
+  }
+  // gate:* prefix group coexistence (any two distinct gate: labels).
+  const gates = [...lowerSet].filter((label) => label.startsWith('gate:'));
+  if (gates.length > 1) {
+    console.warn(
+      `[LabelManager] Mutex coexistence: ${gates.length} gate labels are present; human decision required (no auto-removal).`,
+    );
+  }
+}
+
 export interface ReconcileLabelsOptions {
   client: GitHubLabelClient;
   owner: string;
@@ -597,6 +707,13 @@ export interface ReconcileResult {
 
 /**
  * Checks whether a given label name belongs to the bot-managed scope.
+ * Provenance contract (P2 #4): the bot owns only area:* plus
+ * status:needs-decision. Mutex/human labels (priority:*, gate:*, verified
+ * statuses, bug/enhancement/documentation, type:tracking, security,
+ * performance, accessibility/run-instrumented, and all other human labels)
+ * are never managed: coexistence only warns (see warnOnMutexCoexistence),
+ * never auto-removes. For area:*, an incomplete-coverage run preserves
+ * existing area labels (human lock priority) instead of removing them.
  */
 export function isManagedByBot(labelName: string, scope?: ReconcileScope): boolean {
   if (!scope || !labelName || typeof labelName !== 'string') return false;
@@ -607,6 +724,9 @@ export function isManagedByBot(labelName: string, scope?: ReconcileScope): boole
     lower === 'accessibility' ||
     lower === 'run-instrumented' ||
     lower === 'type:tracking' ||
+    lower === 'bug' ||
+    lower === 'enhancement' ||
+    lower === 'documentation' ||
     lower.startsWith('priority:') ||
     lower.startsWith('gate:') ||
     ['status:verified-main', 'status:partial', 'status:latent'].includes(lower)
@@ -628,6 +748,12 @@ export function isManagedByBot(labelName: string, scope?: ReconcileScope): boole
  * - Adds missing desired labels.
  * - Surgically removes obsolete bot-managed labels (e.g. stale status:needs-decision or obsolete area:* labels).
  * - NEVER deletes unmanaged/human labels (e.g. good first issue, help wanted, custom tags).
+ * - Mutex coexistence (P1+P2, multiple gates, verified statuses,
+ *   bug/enhancement/documentation) only warns via warnOnMutexCoexistence;
+ *   the bot never auto-removes a mutex member.
+ * - Provenance: the bot only deletes labels inside its managed scope
+ *   (area:* + status:needs-decision). Incomplete coverage preserves existing
+ *   area:* labels (human lock priority) instead of removing them.
  * - Fails safely on any API failure without throwing exceptions.
  */
 export async function reconcileBotLabelsSafely(
@@ -683,6 +809,9 @@ export async function reconcileBotLabelsSafely(
     for (const name of existingLabels) {
       existingLowerMap.set(name.toLowerCase(), name);
     }
+
+    // P2 #4: human mutex coexistence only warns, never auto-removes.
+    warnOnMutexCoexistence(existingLabels);
 
     const validDesiredLower = new Set(validDesired.map((l) => l.toLowerCase()));
 

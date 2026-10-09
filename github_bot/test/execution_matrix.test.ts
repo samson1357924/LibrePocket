@@ -678,6 +678,101 @@ export async function runExecutionMatrixTests(): Promise<void> {
       assert.equal(counter.count - before, 0, 'quota-exhausted review makes zero OpenAI calls');
     }
 
+    // P2 #3 reopened+ledger: reopened keeps first-review routing but shares
+    // the per-SHA ledger (reopening never resets). used=1 stays auto (a
+    // second review is allowed); used=2 closes to none quota-exhausted;
+    // unreadable closes to none quota-unknown.
+    {
+      const reopenedEvent = {
+        action: 'reopened',
+        repository: { full_name: REPO },
+        pull_request: {
+          number: 41,
+          title: 'security: validate capability boundary',
+          base: { sha: BASE_SHA, ref: 'main' },
+          head: { sha: HEAD_SHA, ref: 'topic', repo: { full_name: REPO } },
+        },
+      };
+      const reopenedEnv = openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' });
+      // used=1: gate stays auto, second review allowed.
+      {
+        const state = makeState({
+          comments: [{ id: 7, body: stickyBody(HEAD_SHA, 1), user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        const tagged = await runTagMode({
+          event: reopenedEvent,
+          env: reopenedEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(tagged.routeKind, 'first-review', 'reopened routes first-review');
+        assert.equal(tagged.action, 'reopened');
+        assert.equal(tagged.reviewsUsed, 1);
+        assert.equal(tagged.reviewGate, 'auto', 'reopened used=1 stays auto');
+        assert.equal(tagged.shouldReview, true, 'reopened used=1 allows a second review');
+        assert.ok(!/quota-exhausted/.test(tagged.reason) && !/quota-unknown/.test(tagged.reason));
+      }
+      // used=2: gate closes quota-exhausted, zero OpenAI.
+      {
+        const state = makeState({
+          comments: [{ id: 7, body: stickyBody(HEAD_SHA, 2), user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        const tagged = await runTagMode({
+          event: reopenedEvent,
+          env: reopenedEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(tagged.routeKind, 'first-review', 'reopened used=2 still routes first-review');
+        assert.equal(tagged.reviewsUsed, 2);
+        assert.equal(tagged.reviewGate, 'none', 'reopened used=2 closes the gate');
+        assert.equal(tagged.shouldReview, false);
+        assert.match(tagged.reason, /quota-exhausted/);
+        const before = counter.count;
+        const reviewed = await runReviewMode({
+          event: reopenedEvent,
+          env: { ...reopenedEnv, POCKETGUARD_OUTPUT: '' } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+          runGit: throwingGitStub(),
+        });
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE');
+        assert.equal(counter.count - before, 0, 'reopened quota-exhausted makes zero OpenAI calls');
+      }
+      // Unreadable ledger: gate closes quota-unknown.
+      {
+        const throwingClient = {
+          rest: {
+            pulls: {
+              get: async () => ({ data: defaultPullRequest(HEAD_SHA) }),
+            },
+            users: {
+              getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }),
+            },
+            issues: {
+              listComments: async () => { throw new Error('synthetic reopened ledger failure'); },
+              createComment: async () => { throw new Error('must not write on quota-unknown'); },
+              updateComment: async () => { throw new Error('must not write on quota-unknown'); },
+              addLabels: async () => { throw new Error('must not label on quota-unknown'); },
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        const tagged = await runTagMode({
+          event: reopenedEvent,
+          env: reopenedEnv,
+          githubClient: throwingClient,
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(tagged.routeKind, 'first-review');
+        assert.equal(tagged.reviewGate, 'none', 'reopened unreadable ledger closes the gate');
+        assert.equal(tagged.shouldReview, false);
+        assert.match(tagged.reason, /quota-unknown/);
+      }
+    }
+
     // Quota unknown (fail-closed): listComments throw closes all three
     // stages with zero OpenAI and an untouched sticky.
     {

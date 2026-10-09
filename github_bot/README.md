@@ -36,7 +36,7 @@ Owner means the repository owner (`github.repository_owner`, passed as `POCKETGU
 
 The workflow schedules the secrets-bearing review job from routing, not from raw event fields: a pull-request review runs only with `should_review` plus an open `review_gate` (`auto` for first reviews and owner commits, which need no commenter gate; `manual` for explicit `/review` commands, which additionally require `authorized`), each additionally gated on `target == 'pull-request'`. Issue execution runs only by the explicit issue-auto route (`target == 'issue'` with `should_review` and `route_kind` `first-review`/`issue-update`). A quota-exhausted or quota-unknown run reports `review_gate none`, schedules nothing, and publishes nothing — the sticky comment and labels keep the previous review untouched. The trusted review step admits `(diff_safe && authorized)` plus the intentional issue-auto route, so issue AI receives OpenAI secrets in prod; the generic complement keeps no secrets. `diff_safe` means the diff is safely readable (same-repo or fork via the pinned PR-ref fetch, see below); `safe_review` stays same-repo-only so runs can distinguish the two. This issue-auto secrets path is intentional by owner decision: issue auto-review carries no auth/quota gate in this phase (no budget/rate limit; only bot exclusion in routing plus per-issue concurrency serialization).
 
-- Budget: at most 2 AI reviews per PR plus head SHA (first review plus one re-review); a new head SHA restarts the budget. Issues are never counted, and routing/authorization denials never count — only a started review counts, including `INCONCLUSIVE` and failed-review fallbacks. An unreadable sticky counter is fail-closed (unknown): tag closes the gate with a `quota-unknown` reason, review returns generic `INCONCLUSIVE` with zero OpenAI calls, and publish writes nothing and counts nothing. A successful read with no marker is `0` (first review proceeds).
+- Budget: at most 2 AI reviews per PR plus head SHA (first review plus one re-review); a new head SHA restarts the budget. `reopened` shares the `opened` budget: `reopened` routes to `first-review` but never resets the ledger — `reopened` with `used=1` stays `auto` (a second review is allowed), `used>=2` closes to `none` with `quota-exhausted`, and an unreadable ledger closes to `none` with `quota-unknown`. Issues are never counted, and routing/authorization denials never count — only a started review counts, including `INCONCLUSIVE` and failed-review fallbacks. An unreadable sticky counter is fail-closed (unknown): tag closes the gate with a `quota-unknown` reason, review returns generic `INCONCLUSIVE` with zero OpenAI calls, and publish writes nothing and counts nothing. A successful read with no marker is `0` (first review proceeds).
 
 - Storage: the sticky bot comment carries `<!-- PocketGuard-reviews:<sha>:<n> -->` alongside the review body. Tag mode reads it into `reviews_used`; review mode re-reads it immediately before any git or OpenAI work (defense in depth against concurrent runs that both passed tagging); publish mode stamps the incremented marker on every sticky write of the run. The per-PR workflow `concurrency` group serializes runs as the primary mutex; GitHub offers no compare-and-swap on comments, so a residual race remains if overlapping runs ever escape the group.
 - Authorization for manual reviews: maintainer `write`+ as before, plus the PR author reviewing their own PR (comment login matching the fresh `pulls.get` author login, case-insensitive; an unreadable author identity denies). Other users stay denied. Fork authors self-review through the same path, under the same budget: the fork diff is read via the pinned PR-ref fetch and counts like any other review.
@@ -68,7 +68,10 @@ repository secrets kept as a compatibility fallback (`vars.X || secrets.X` in
 - `POCKETGUARD_MODEL_<ROLE>_PROFILE` (optional per-role override, e.g.
   `POCKETGUARD_MODEL_CHIEF_PROFILE: "reasoning:high"` or `"chat"`)
 - `POCKETGUARD_REASONING_EFFORT` or `POCKETGUARD_MODEL_<ROLE>_REASONING_EFFORT`
-  (optional effort override, default `high`)
+  (optional effort override, default `high`). `POCKETGUARD_DEFAULT_REASONING_EFFORT`
+  is an alias for the global default. The resolved default backs every
+  `reasoning` profile without an explicit effort (explicit `reasoning:high`,
+  JSON maps, and builtin `gpt-5*` defaults).
 
 `POCKETGUARD_OPENAI_ORIGIN` is the exact-origin allowlist for `OPENAI_BASE_URL`; it is not a wildcard or a path prefix. `OPENAI_BASE_URL` must use
 `https:` with no credentials, query, or fragment, and requests use
@@ -82,7 +85,14 @@ Request bodies are built per model profile with a minimal default
 (`model` + `input` + `max_output_tokens` + `stream`, no `temperature`/`top_p`/
 `reasoning` unless the profile requires it): reasoning models with
 `effort != none` send `reasoning: { effort }` and omit `temperature`/`top_p`
-(GPT-5-class reasoning rejects `temperature` with 400); non-reasoning models
+(GPT-5-class reasoning rejects `temperature` with 400); reasoning with
+`effort == none` omits the `reasoning` key entirely (never sends
+`reasoning: { effort: 'none' }`; see
+https://platform.openai.com/docs/api-reference/responses/create — omitted
+`reasoning` selects the default non-reasoning path, while an explicit
+`none` is rejected with 400 on models without none support, so
+`resolveModelProfile` returns `undefined` for model+`none` when unsupported
+and the send fails closed with zero fetch); non-reasoning models
 never send `reasoning`, and `temperature`/`top_p` are sent only when the
 caller explicitly sets them. Builtin defaults cover `gpt-5*` as reasoning and
 `gpt-4o*`/`gpt-4.1*` as chat; any other model without an explicit profile
@@ -110,6 +120,8 @@ official OpenAI defaults.
 - The bot allowlist includes `accessibility` and `run-instrumented` only to preserve existing repository labels; they are human-only and the bot never emits or manages them.
 - The bot may emit `security`, `performance`, `type:tracking`, and `status:needs-decision`. Maintainers must create these labels before go-live; allowlisting them does not create them in the repository.
 - `area:*` labels are derived from the full changed-path list. If that list is unavailable, publication preserves existing area labels and only reconciles `status:needs-decision`.
+- Mutual exclusion (P2 #4): `priority:{P1,P2}`, `gate:*`, `status:verified-main/partial/latent`, and `bug/enhancement/documentation` are human-owned mutex groups. The bot never writes or auto-removes a mutex member (excluded from the managed scope); coexistence (e.g. `P1`+`P2`) only warns for a maintainer to resolve. Provenance: the bot only deletes inside `area:*` + `status:needs-decision`, and incomplete coverage preserves existing `area:*` (human lock priority).
+- PR convergence: PR publish AI suggestions are limited to `area:*`/`security`/`performance`/`status:needs-decision` (+ `type:tracking`); `priority:*`/`gate:*`/`bug`/`enhancement`/`documentation` (and verified statuses) are issue-triage-only. A PR AI suggestion carrying an issue-only or unknown label is discarded and forces `INCONCLUSIVE` (never `APPROVE`, never written).
 
 ## Maintainer go-live gate — NOT YET LOCALLY OR HOSTED-VERIFIED
 

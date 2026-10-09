@@ -406,6 +406,61 @@ export async function runStickyLabelTests(): Promise<void> {
       }
     }
 
+    // P2 #4 PR convergence: AI priority/gate/bug in a PR publish are
+    // discarded (issue-triage-only) and force INCONCLUSIVE, never APPROVE,
+    // never written — even though the same labels are allowlisted for issues.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p2-pr-priority-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', findings: [], suggestedLabels: [] });
+        let goodArtifact: unknown;
+        try {
+          const s = makeState();
+          await runReviewMode({
+            event: prOpenedEvent(),
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'good.json') } as NodeJS.ProcessEnv,
+            githubClient: makeClient(s),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          goodArtifact = JSON.parse(fs.readFileSync(path.join(tempDir, 'good.json'), 'utf8'));
+        } finally {
+          restore();
+        }
+        for (const issueOnly of ['priority:P1', 'gate:release', 'bug']) {
+          const tampered = { ...(goodArtifact as Record<string, unknown>), suggestedLabels: [issueOnly, 'area:runtime'] };
+          const tamperedPath = path.join(tempDir, `tampered-${issueOnly.replace(/[^A-Za-z0-9]+/g, '-')}.json`);
+          fs.writeFileSync(tamperedPath, JSON.stringify(tampered));
+          const publishState = makeState({
+            existingLabels: ['bug', 'area:docs'],
+            comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          });
+          await runPublishMode({
+            event: prOpenedEvent(),
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: tamperedPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(publishState),
+          });
+          assert.equal(publishState.created, 0, `${issueOnly}: creates no second comment`);
+          assert.equal(publishState.updated, 1, `${issueOnly}: updates the same sticky`);
+          assert.ok(publishState.comments[0].body.includes('判定：INCONCLUSIVE'), `${issueOnly}: forces non-APPROVE`);
+          assert.ok(!publishState.comments[0].body.includes('判定：APPROVE'), `${issueOnly}: never APPROVE`);
+          assert.ok(!publishState.existingLabels.includes('priority:P1'), `${issueOnly}: priority never written from PR AI`);
+          assert.ok(!publishState.existingLabels.includes('gate:release'), `${issueOnly}: gate never written from PR AI`);
+          assert.ok(publishState.existingLabels.includes('bug'), `${issueOnly}: pre-existing manual bug preserved`);
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
     // PR bad-schema suggestedLabels artifact: invalid schema falls back on
     // the same sticky.
     {

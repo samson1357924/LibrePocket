@@ -3,8 +3,14 @@ package dev.librepocket.chat
 /**
  * Minimal persistence port. [TurnController] routes every call through its
  * session-owned [OrderedTranscriptSink] (bounded channel, single writer, core
- * events durably acked), so implementations observe admission order and must
- * only stay best-effort themselves (never throw into the chat loop).
+ * events durably acked), so implementations observe admission order.
+ *
+ * Core vs notice: [onTurnStarted], [onTurnSucceeded], both [onTurnFailed]
+ * overloads and [onTurnCancelled] are durable core events — a store failure
+ * propagates so the session writer fails the ack instead of reporting a
+ * false durable write. [onTurnRetried], [onSteerQueued], [onToolDone] and
+ * [onUsage] stay best-effort notices: failures are swallowed and never
+ * break the chat loop. Cancellation always propagates.
  *
  * [onTurnCancelled] still runs off the [dev.librepocket.chat.ChatSession.cancel]
  * fast path: cancel only flips in-memory state, while this callback is

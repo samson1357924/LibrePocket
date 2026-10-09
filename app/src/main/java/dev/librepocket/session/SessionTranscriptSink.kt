@@ -21,9 +21,14 @@ import kotlinx.coroutines.CancellationException
  * [dev.librepocket.chat.OrderedTranscriptSink] (single session writer:
  * admission order is preserved, core events are durably acked before the
  * turn proceeds, and one logical turn owns exactly one `user` row with
- * retry notices bound to that same id). Implementations therefore observe
- * calls in order and must still stay best-effort themselves: failures here
- * must never propagate, so every call guards its store access as well.
+ * retry notices bound to that same id).
+ *
+ * Core vs notice: [onTurnStarted], [onTurnSucceeded], both [onTurnFailed]
+ * overloads and [onTurnCancelled] are durable core events — a store failure
+ * propagates so the session writer fails the ack instead of reporting a
+ * false durable write. [onTurnRetried], [onSteerQueued], [onToolDone] and
+ * [onUsage] stay best-effort notices: failures are swallowed and never
+ * break the chat loop. Cancellation always propagates.
  * Text is redacted again by [RoomSessionStore] on write.
  *
  * Cross-restart RUNNING → INTERRUPTED backfill lives in Phase 3 as well (see
@@ -37,7 +42,8 @@ class SessionTranscriptSink(
     private val clock: () -> Long = System::currentTimeMillis,
 ) : TranscriptSink {
 
-    private suspend fun append(
+    /** Durable core write: store failures propagate so the writer fails the ack. */
+    private suspend fun appendDurable(
         runId: String,
         kind: String,
         text: String,
@@ -60,37 +66,62 @@ class SessionTranscriptSink(
             // Writer teardown: the session writer owns cancellation, so
             // propagate instead of swallowing it as a store failure.
             throw e
+        }
+    }
+
+    /** Best-effort notice write: persistence must never break the chat loop. */
+    private suspend fun appendNotice(
+        runId: String,
+        kind: String,
+        text: String,
+        isPartial: Boolean = false,
+        failureReason: String? = null,
+    ) {
+        try {
+            store.appendEvent(
+                TranscriptEvent(
+                    sessionId = sessionId,
+                    runId = runId,
+                    kind = kind,
+                    text = text,
+                    createdAt = clock(),
+                    isPartial = isPartial,
+                    failureReason = failureReason,
+                ),
+            )
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
-            // Best effort: persistence must never break the chat loop.
+            // Best effort: notices never break the chat loop.
         }
     }
 
     override suspend fun onTurnStarted(runId: String, text: String) {
-        append(runId, "user", text)
+        appendDurable(runId, "user", text)
     }
 
     override suspend fun onTurnSucceeded(runId: String, text: String) {
-        append(runId, "assistant", text)
+        appendDurable(runId, "assistant", text)
     }
 
     override suspend fun onTurnFailed(runId: String, error: String) {
-        append(runId, "system", "turn $runId failed: $error")
+        appendDurable(runId, "system", "turn $runId failed: $error")
     }
 
     override suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
-        append(runId, "assistant", partialText, isPartial = true, failureReason = error)
+        appendDurable(runId, "assistant", partialText, isPartial = true, failureReason = error)
     }
 
     override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
-        append(runId, "retry", "attempt $attempt/$maxAttempts after ${delayMs}ms")
+        appendNotice(runId, "retry", "attempt $attempt/$maxAttempts after ${delayMs}ms")
     }
 
     override suspend fun onTurnCancelled(runId: String, partialText: String) {
-        append(runId, "assistant", partialText, isPartial = true)
+        appendDurable(runId, "assistant", partialText, isPartial = true)
     }
 
     override suspend fun onSteerQueued(text: String) {
-        append("steer-${UUID.randomUUID()}", "steer", text)
+        appendNotice("steer-${UUID.randomUUID()}", "steer", text)
     }
 
     override suspend fun onToolDone(
@@ -100,10 +131,10 @@ class SessionTranscriptSink(
         name: String,
         argumentsJson: String,
     ) {
-        append(runId, "tool", "[tool:$name $argumentsJson]")
+        appendNotice(runId, "tool", "[tool:$name $argumentsJson]")
     }
 
     override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) {
-        append(runId, "system", "usage input=$inputTokens output=$outputTokens")
+        appendNotice(runId, "system", "usage input=$inputTokens output=$outputTokens")
     }
 }

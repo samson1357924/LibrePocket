@@ -734,8 +734,22 @@ class TurnController(
       val cancelText = latestAssistantText()
       // Durable and non-cancellable: the host is cancelled but the session
       // writer is independent, so this record still drains on close (or is
-      // explicitly marked INTERRUPTED instead of silently dropped).
-      withContext(NonCancellable) { orderedTranscript.onTurnCancelled(cancelId, cancelText) }
+      // explicitly marked INTERRUPTED instead of silently dropped). A
+      // sealed/closed writer after close()/shutdown fails this write fast
+      // (ClosedSendChannelException or the sealed fail-fast
+      // CancellationException, already marked INTERRUPTED in the sink): swallow
+      // only that seal race so it cannot mask the original cancellation, then
+      // still rethrow the original. Any other write failure propagates.
+      withContext(NonCancellable) {
+        try {
+          orderedTranscript.onTurnCancelled(cancelId, cancelText)
+        } catch (_: ClosedSendChannelException) {
+          // Sealed after close(): explicit INTERRUPTED mark already recorded.
+        } catch (sealFailure: CancellationException) {
+          if (!orderedTranscript.isSealed()) throw sealFailure
+          // Sealed fail-fast: INTERRUPTED already marked, keep original cancel.
+        }
+      }
       throw e
     }
     // Normal completion only: hand off at most one queued steer as a detached

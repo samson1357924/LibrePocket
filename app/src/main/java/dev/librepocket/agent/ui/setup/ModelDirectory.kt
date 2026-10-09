@@ -13,6 +13,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.Authenticator
 import okhttp3.Call
+import okhttp3.CookieJar
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -56,7 +57,14 @@ object ModelDirectory {
      * deadline. Wire bytes are the encoded HTTP body before transparent gzip,
      * not TCP/TLS, headers, chunk framing, or a socket-buffer hard cap. Okio may
      * prefetch bounded internal buffers beyond the cap+1 bytes delivered here.
-     * The request carries no API key or Authorization.
+     * The fetch never inherits the caller's interceptors, cookieJar, or cache;
+     * it builds an isolated client from [budget] timeouts and strips
+     * Authorization, Proxy-Authorization, Cookie, x-api-key, api-key, and
+     * x-goog-api-key at both the application and network layers. The [client]
+     * argument is accepted for API compatibility; its configuration is
+     * intentionally ignored so any passed client upholds the same guarantee,
+     * except its EventListener.Factory, which is propagated as observability
+     * only and cannot alter requests.
      */
     @OptIn(InternalCoroutinesApi::class)
     suspend fun fetchBody(
@@ -76,7 +84,15 @@ object ModelDirectory {
             throw fetchFailure(ModelsDevSnapshot.SnapshotFallbackReason.INVALID_URL)
         }
 
-        val boundedClient = client.newBuilder()
+        // Build an isolated client from scratch so no caller configuration is
+        // inherited: no application/network interceptors, cookieJar, cache,
+        // authenticator, or redirect/retry policy. Only the budget timeouts
+        // are reused. The wire budget interceptor below is the sole network
+        // interceptor, so with no Cache configured nothing can short-circuit the cap.
+        // The caller's EventListener.Factory is propagated as observability
+        // only: listeners cannot modify requests, so the keyless guarantee is
+        // unaffected, and callers keep visibility into cancel/close behavior.
+        val boundedClient = OkHttpClient.Builder()
             .connectTimeout(budget.connectTimeoutMs, TimeUnit.MILLISECONDS)
             .readTimeout(budget.readIdleTimeoutMs, TimeUnit.MILLISECONDS)
             .callTimeout(budget.callTimeoutMs, TimeUnit.MILLISECONDS)
@@ -85,13 +101,20 @@ object ModelDirectory {
             .retryOnConnectionFailure(false)
             .authenticator(Authenticator.NONE)
             .proxyAuthenticator(Authenticator.NONE)
-            // Keep this directory GET keyless even if a caller's client has
-            // an application interceptor that normally adds Authorization.
+            .cookieJar(CookieJar.NO_COOKIES)
+            .cache(null)
+            .eventListenerFactory(client.eventListenerFactory)
+            // Defense in depth: strip auth material at the application layer
+            // even though the isolated client inherits no caller interceptors.
+            // removeHeader is case-insensitive.
             .addInterceptor { chain ->
                 val keyless = chain.request().newBuilder()
                     .removeHeader("Authorization")
                     .removeHeader("Proxy-Authorization")
                     .removeHeader("Cookie")
+                    .removeHeader("x-api-key")
+                    .removeHeader("api-key")
+                    .removeHeader("x-goog-api-key")
                     .build()
                 chain.proceed(keyless)
             }
@@ -154,12 +177,16 @@ object ModelDirectory {
     }
 
     private fun wireBudgetInterceptor(maxBytes: Long): Interceptor = Interceptor { chain ->
-        // Network interceptors and the CookieJar run after application
-        // interceptors; strip their auth material at the final request layer.
+        // Defense in depth: strip auth material at the final request layer in
+        // case this interceptor is ever attached to a client that inherits
+        // caller network interceptors. removeHeader is case-insensitive.
         val keylessRequest = chain.request().newBuilder()
             .removeHeader("Authorization")
             .removeHeader("Proxy-Authorization")
             .removeHeader("Cookie")
+            .removeHeader("x-api-key")
+            .removeHeader("api-key")
+            .removeHeader("x-goog-api-key")
             .build()
         val response = chain.proceed(keylessRequest)
         // Fail before RetryAndFollowUpInterceptor can replay a non-2xx response

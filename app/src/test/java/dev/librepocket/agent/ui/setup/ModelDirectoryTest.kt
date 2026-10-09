@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui.setup
 
 import dev.librepocket.models.ModelsDevSnapshot
 import java.io.ByteArrayOutputStream
+import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.GZIPOutputStream
@@ -12,9 +13,14 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Cache
 import okhttp3.Call
+import okhttp3.Cookie
+import okhttp3.CookieJar
 import okhttp3.EventListener
+import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.SocketPolicy
@@ -279,6 +285,243 @@ class ModelDirectoryTest {
     }
 
     @Test
+    fun fetchBodyStripsAppLayerXApiKey(): Unit {
+        runBlocking {
+            withServer { server ->
+                server.enqueue(MockResponse().setBody("{}"))
+                val leakingClient = OkHttpClient.Builder()
+                    .addInterceptor { chain ->
+                        chain.proceed(
+                            chain.request().newBuilder()
+                                .header("x-api-key", "synthetic-test-only")
+                                .build(),
+                        )
+                    }
+                    .build()
+
+                assertEquals("{}", ModelDirectory.fetchBody(leakingClient, server.url("/models.json").toString()))
+                val request = server.takeRequest(1, TimeUnit.SECONDS)
+                assertNotNull(request)
+                assertNull("x-api-key must be stripped", request!!.getHeader("x-api-key"))
+            }
+        }
+    }
+
+    // Verifies isolation (the isolated client inherits no caller network
+    // interceptors), not the strip path itself; the strip in the wire-budget
+    // interceptor is defense-in-depth for hypothetical future attachment.
+    @Test
+    fun fetchBodyStripsNetworkLayerXApiKey(): Unit {
+        runBlocking {
+            withServer { server ->
+                server.enqueue(MockResponse().setBody("{}"))
+                val leakingClient = OkHttpClient.Builder()
+                    .addNetworkInterceptor { chain ->
+                        chain.proceed(
+                            chain.request().newBuilder()
+                                .header("x-api-key", "synthetic-network-test-only")
+                                .build(),
+                        )
+                    }
+                    .build()
+
+                assertEquals("{}", ModelDirectory.fetchBody(leakingClient, server.url("/models.json").toString()))
+                val request = server.takeRequest(1, TimeUnit.SECONDS)
+                assertNotNull(request)
+                assertNull("x-api-key must be stripped", request!!.getHeader("x-api-key"))
+            }
+        }
+    }
+
+    @Test
+    fun fetchBodyStripsApiKeyVariantsAtAppLayer(): Unit {
+        runBlocking {
+            withServer { server ->
+                for (headerName in API_KEY_HEADER_VARIANTS) {
+                    server.enqueue(MockResponse().setBody("{}"))
+                    val leakingClient = OkHttpClient.Builder()
+                        .addInterceptor { chain ->
+                            chain.proceed(
+                                chain.request().newBuilder()
+                                    .header(headerName, "synthetic-test-only")
+                                    .build(),
+                            )
+                        }
+                        .build()
+
+                    assertEquals(
+                        "{}",
+                        ModelDirectory.fetchBody(leakingClient, server.url("/models.json").toString()),
+                    )
+                    val request = server.takeRequest(1, TimeUnit.SECONDS)
+                    assertNotNull("request leaking $headerName should reach the local server", request)
+                    assertNull(request!!.getHeader(headerName))
+                }
+            }
+        }
+    }
+
+    // Verifies isolation (the isolated client inherits no caller network
+    // interceptors), not the strip path itself; the strip in the wire-budget
+    // interceptor is defense-in-depth for hypothetical future attachment.
+    @Test
+    fun fetchBodyStripsApiKeyVariantsAtNetworkLayer(): Unit {
+        runBlocking {
+            withServer { server ->
+                for (headerName in API_KEY_HEADER_VARIANTS) {
+                    server.enqueue(MockResponse().setBody("{}"))
+                    val leakingClient = OkHttpClient.Builder()
+                        .addNetworkInterceptor { chain ->
+                            chain.proceed(
+                                chain.request().newBuilder()
+                                    .header(headerName, "synthetic-network-test-only")
+                                    .build(),
+                            )
+                        }
+                        .build()
+
+                    assertEquals(
+                        "{}",
+                        ModelDirectory.fetchBody(leakingClient, server.url("/models.json").toString()),
+                    )
+                    val request = server.takeRequest(1, TimeUnit.SECONDS)
+                    assertNotNull("request leaking $headerName should reach the local server", request)
+                    assertNull(request!!.getHeader(headerName))
+                }
+            }
+        }
+    }
+
+    @Test
+    fun fetchBodyIgnoresInjectedCookieJar(): Unit {
+        runBlocking {
+            withServer { server ->
+                server.enqueue(
+                    MockResponse()
+                        .setBody("{}")
+                        .addHeader("Set-Cookie", "server=synthetic-server-cookie; Path=/"),
+                )
+                val savedCookies = mutableListOf<Cookie>()
+                val injectingJar = object : CookieJar {
+                    override fun loadForRequest(url: HttpUrl): List<Cookie> = listOf(
+                        Cookie.Builder()
+                            .name("session")
+                            .value("synthetic-cookie-injected")
+                            .hostOnlyDomain(url.host)
+                            .build(),
+                    )
+
+                    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+                        savedCookies += cookies
+                    }
+                }
+                val clientWithJar = OkHttpClient.Builder()
+                    .cookieJar(injectingJar)
+                    .build()
+
+                assertEquals("{}", ModelDirectory.fetchBody(clientWithJar, server.url("/models.json").toString()))
+                val request = server.takeRequest(1, TimeUnit.SECONDS)
+                assertNotNull(request)
+                assertNull(request!!.getHeader("Cookie"))
+                assertTrue("isolated client must not persist server cookies", savedCookies.isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun fetchBodyIgnoresInheritedCacheUnderSmallWireBudget(): Unit {
+        runBlocking {
+            val cacheDir = Files.createTempDirectory("model-directory-cache-test").toFile()
+            var cachingClientRef: OkHttpClient? = null
+            try {
+                withServer { server ->
+                    val cacheableBody = "x".repeat(64)
+                    server.enqueue(
+                        MockResponse()
+                            .setBody(cacheableBody)
+                            .addHeader("Cache-Control", "max-age=60"),
+                    )
+                    val cachingClient = OkHttpClient.Builder()
+                        .cache(Cache(cacheDir, 1024 * 1024L))
+                        .build()
+                        .also { cachingClientRef = it }
+                    // Populate the injected client's cache outside fetchBody.
+                    val seedRequest = Request.Builder().url(server.url("/models.json")).get().build()
+                    cachingClient.newCall(seedRequest).execute().use {
+                        assertTrue(it.isSuccessful)
+                        it.body.string()
+                    }
+                    assertEquals(1, server.requestCount)
+
+                    // Positive control: the seed must actually be cached, otherwise
+                    // the wire-cap assertion below would pass vacuously.
+                    cachingClient.newCall(seedRequest).execute().use {
+                        assertTrue(it.isSuccessful)
+                        it.body.string()
+                        assertNotNull("seeded response must be served from cache", it.cacheResponse)
+                    }
+                    assertEquals("seeded response must not hit the network again", 1, server.requestCount)
+
+                    server.enqueue(
+                        MockResponse()
+                            .setBody(cacheableBody)
+                            .addHeader("Cache-Control", "max-age=60"),
+                    )
+                    val failure = fetchFailure(
+                        server,
+                        smallBudget(maxWireBytes = 16, maxDecodedBytes = 128),
+                        cachingClient,
+                    )
+                    assertEquals(ModelsDevSnapshot.SnapshotFallbackReason.WIRE_BODY_TOO_LARGE, failure.reason)
+                    assertEquals(
+                        "a cached response must not short-circuit the wire cap",
+                        2,
+                        server.requestCount,
+                    )
+                }
+            } finally {
+                try {
+                    cachingClientRef?.cache?.close()
+                } finally {
+                    cacheDir.deleteRecursively()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun fetchBodyStripsCompositeAuthFromBothLayers(): Unit {
+        runBlocking {
+            withServer { server ->
+                server.enqueue(MockResponse().setBody("{}"))
+                val compositeClient = OkHttpClient.Builder()
+                    .addInterceptor { chain ->
+                        var leaked = chain.request().newBuilder()
+                        for (headerName in STRIPPED_HEADERS) {
+                            leaked = leaked.header(headerName, "synthetic-app-test-only")
+                        }
+                        chain.proceed(leaked.build())
+                    }
+                    .addNetworkInterceptor { chain ->
+                        var leaked = chain.request().newBuilder()
+                        for (headerName in STRIPPED_HEADERS) {
+                            leaked = leaked.header(headerName, "synthetic-network-test-only")
+                        }
+                        chain.proceed(leaked.build())
+                    }
+                    .build()
+
+                assertEquals("{}", ModelDirectory.fetchBody(compositeClient, server.url("/models.json").toString()))
+                val request = server.takeRequest(1, TimeUnit.SECONDS)
+                assertNotNull(request)
+                for (headerName in STRIPPED_HEADERS) {
+                    assertNull("header $headerName must be stripped", request!!.getHeader(headerName))
+                }
+            }
+        }
+    }
+
+    @Test
     fun cancellingFetchClosesBlockingCallPromptly(): Unit {
         runBlocking {
             val server = MockWebServer()
@@ -380,5 +623,14 @@ class ModelDirectoryTest {
     private companion object {
         const val DEFAULT_BODY_CAP_BYTES = 4 * 1024 * 1024
         const val CANCEL_COMPLETION_BUDGET_MS = 750L
+        val STRIPPED_HEADERS = listOf(
+            "Authorization",
+            "Proxy-Authorization",
+            "Cookie",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+        )
+        val API_KEY_HEADER_VARIANTS = listOf("api-key", "x-goog-api-key", "X-Api-Key")
     }
 }

@@ -89,7 +89,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         action: 'created',
         repository: { full_name: 'sample/repository' },
         issue: { number: 41, pull_request: { url: 'unused' }, title: 'topic' },
-        comment: { body: '@pocketguard' },
+        comment: { body: '@pocketguard', user: { login: 'maintainer', type: 'User' } },
       },
       env: {
         GITHUB_EVENT_NAME: 'issue_comment',
@@ -104,6 +104,9 @@ export async function runCommentRunnerTests(): Promise<void> {
               base: { sha: BASE_SHA },
               head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
             } }),
+          },
+          repos: {
+            getCollaboratorPermissionLevel: async () => ({ data: { permission: 'write' } }),
           },
         },
       },
@@ -904,4 +907,229 @@ export async function runCommentRunnerTests(): Promise<void> {
   const runnerSource = fs.readFileSync(path.resolve(__dirname, '../src/github_runner.ts'), 'utf8');
   assert.doesNotMatch(runnerSource, /send_cpa/i, 'tag and publish entry must not import the CPA client');
   console.log('[PocketGuard comment/runner tests] All tests passed.');
+}
+
+type RunnerVerdictLike = 'APPROVE' | 'NEEDS_CHANGES' | 'INCONCLUSIVE';
+
+export async function runCommentAuthTests(): Promise<void> {
+  const previousFetch = globalThis.fetch;
+  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-comment-auth-'));
+  let outputSeq = 0;
+  try {
+    let cpaRequestCount = 0;
+    globalThis.fetch = (async () => {
+      cpaRequestCount += 1;
+      return new Response(JSON.stringify({
+        output: [{ content: [{ type: 'output_text', text: JSON.stringify({ verdict: 'APPROVE', summary: 'ok', findings: [] }) }] }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+
+    const authGit = (args: string[]): string => {
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/java/demo/Safe.kt\0';
+      return [
+        'diff --git a/app/src/main/java/demo/Safe.kt b/app/src/main/java/demo/Safe.kt',
+        '--- a/app/src/main/java/demo/Safe.kt',
+        '+++ b/app/src/main/java/demo/Safe.kt',
+        '@@ -1,1 +1,1 @@',
+        '+class Safe',
+      ].join('\n');
+    };
+
+    const makeAuthHarness = (options: {
+      permission?: string;
+      permissionThrows?: string;
+      omitRepos?: boolean;
+      commentUser?: { login?: string; type?: string } | null;
+      sender?: { login?: string; type?: string };
+      action?: string;
+      authorAssociation?: string;
+    }) => {
+      const state = {
+        permissionCalls: [] as Array<{ owner: string; repo: string; username: string }>,
+        pullsGetCalls: 0,
+      };
+      const client = {
+        rest: {
+          pulls: {
+            get: async () => {
+              state.pullsGetCalls += 1;
+              return { data: {
+                number: 41,
+                base: { sha: BASE_SHA },
+                head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
+              } };
+            },
+          },
+          ...(options.omitRepos ? {} : {
+            repos: {
+              getCollaboratorPermissionLevel: async (params: { owner: string; repo: string; username: string }) => {
+                state.permissionCalls.push(params);
+                if (options.permissionThrows) throw new Error(options.permissionThrows);
+                return { data: { permission: options.permission } };
+              },
+            },
+          }),
+        },
+      };
+      const commentUser = options.commentUser === undefined
+        ? { login: 'maintainer', type: 'User' }
+        : options.commentUser;
+      const event: Record<string, unknown> = {
+        action: options.action ?? 'created',
+        repository: { full_name: 'sample/repository' },
+        issue: { number: 41, pull_request: { url: 'unused' }, title: 'topic' },
+        comment: {
+          body: '/review',
+          ...(commentUser ? { user: commentUser } : {}),
+          ...(options.authorAssociation ? { author_association: options.authorAssociation } : {}),
+        },
+        ...(options.sender ? { sender: options.sender } : {}),
+      };
+      const baseEnv = {
+        GITHUB_EVENT_NAME: 'issue_comment',
+        GITHUB_REPOSITORY: 'sample/repository',
+        GITHUB_TOKEN: 'fake-read-token',
+        POCKETGUARD_SAFE_REVIEW: 'true',
+        CPA_BASE_URL: TEST_BASE_URL,
+        CPA_API_KEY: 'fake-cpa-key',
+        POCKETGUARD_CPA_ORIGIN: TEST_ORIGIN,
+        POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+        POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
+        POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
+      } as NodeJS.ProcessEnv;
+      const tagContext = {
+        event,
+        env: baseEnv,
+        githubClient: client,
+        writeStdout: () => undefined,
+        runGit: authGit,
+      } as unknown as RunnerContext;
+      const reviewContext: RunnerContext = {
+        event,
+        env: {
+          ...baseEnv,
+          POCKETGUARD_OUTPUT: path.join(tempDirectory, `auth-review-${outputSeq++}.json`),
+        } as NodeJS.ProcessEnv,
+        githubClient: client as unknown as NonNullable<RunnerContext['githubClient']>,
+        writeStdout: () => undefined,
+        runGit: authGit,
+      };
+      return { state, tagContext, reviewContext };
+    };
+
+    const runAuthCase = async (
+      name: string,
+      options: Parameters<typeof makeAuthHarness>[0],
+      expected: { safeReview: boolean; verdict: RunnerVerdictLike; cpaCalls: number | 'positive' },
+    ) => {
+      const harness = makeAuthHarness(options);
+      let tagStdout = '';
+      const tagged = await runTagMode({ ...harness.tagContext, writeStdout: (value) => { tagStdout += value; } });
+      assert.equal(tagged.safeReview, expected.safeReview, `${name}: safeReview`);
+      const before = cpaRequestCount;
+      let reviewStdout = '';
+      const reviewed = await runReviewMode({ ...harness.reviewContext, writeStdout: (value) => { reviewStdout += value; } });
+      assert.equal(reviewed.verdict, expected.verdict, `${name}: review verdict`);
+      const made = cpaRequestCount - before;
+      if (expected.cpaCalls === 'positive') {
+        assert.ok(made > 0, `${name}: authorized review must reach the CPA`);
+      } else {
+        assert.equal(made, expected.cpaCalls, `${name}: denied review must not call the CPA`);
+      }
+      return { harness, tagged, reviewed, tagStdout, reviewStdout };
+    };
+
+    // a. maintainer with write permission is authorized.
+    await runAuthCase('maintainer-write', { permission: 'write' },
+      { safeReview: true, verdict: 'APPROVE', cpaCalls: 'positive' });
+    // b. maintainer with admin permission is authorized.
+    await runAuthCase('maintainer-admin', { permission: 'admin' },
+      { safeReview: true, verdict: 'APPROVE', cpaCalls: 'positive' });
+
+    // c. outsider with read permission is denied; the permission call carries the comment username.
+    {
+      const { harness } = await runAuthCase('outsider-read',
+        { permission: 'read', commentUser: { login: 'outsider', type: 'User' } },
+        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 2, 'outsider-read: tag and review each verify');
+      assert.equal(harness.state.permissionCalls[0].username, 'outsider', 'outsider-read: username forwarded');
+    }
+
+    // d. collaborator without access, and a 404-style API failure, both deny.
+    await runAuthCase('outsider-none', { permission: 'none' },
+      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+    await runAuthCase('permission-404',
+      { permissionThrows: 'synthetic permission lookup failure' },
+      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+
+    // e. FIRST_TIME_CONTRIBUTOR without write access is denied.
+    await runAuthCase('first-time-contributor',
+      { permission: 'none', authorAssociation: 'FIRST_TIME_CONTRIBUTOR' },
+      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+
+    // f. bot comments deny before any permission API call.
+    {
+      const { harness } = await runAuthCase('bot-comment',
+        {
+          permission: 'write',
+          commentUser: { login: 'github-actions[bot]', type: 'Bot' },
+        },
+        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 0, 'bot-comment: no permission API call');
+      assert.equal(harness.state.pullsGetCalls, 0, 'bot-comment: no pulls.get call');
+    }
+
+    // g. bot senders deny even with a human comment author.
+    {
+      const { harness } = await runAuthCase('bot-sender',
+        { permission: 'write', sender: { login: 'sender-bot', type: 'Bot' } },
+        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 0, 'bot-sender: no permission API call');
+    }
+
+    // h. a spoofed COLLABORATOR association with only read access is denied.
+    await runAuthCase('spoofed-association',
+      { permission: 'read', authorAssociation: 'COLLABORATOR' },
+      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+
+    // i. missing usernames deny without touching the permission API.
+    {
+      const { harness } = await runAuthCase('missing-username',
+        { permission: 'write', commentUser: null },
+        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 0, 'missing-username: no permission API call');
+      assert.equal(harness.state.pullsGetCalls, 0, 'missing-username: no pulls.get call');
+    }
+
+    // j. permission API failures deny with generic output that leaks no detail.
+    {
+      const probe = 'synthetic-probe-username-7f3a';
+      const { harness, tagStdout, reviewStdout } = await runAuthCase('permission-500',
+        { permissionThrows: `synthetic failure for ${probe}`, commentUser: { login: probe, type: 'User' } },
+        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 2, 'permission-500: tag and review each verify');
+      assert.ok(!tagStdout.includes('synthetic'), 'permission-500: tag output stays generic');
+      assert.ok(!tagStdout.includes(probe), 'permission-500: tag output hides the username');
+      assert.ok(!reviewStdout.includes('synthetic'), 'permission-500: review output stays generic');
+      assert.ok(!reviewStdout.includes(probe), 'permission-500: review output hides the username');
+    }
+
+    // k. edited actions deny even for an otherwise authorized maintainer.
+    {
+      const { harness } = await runAuthCase('edited-action',
+        { permission: 'write', action: 'edited' },
+        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      assert.equal(harness.state.permissionCalls.length, 0, 'edited-action: no permission API call');
+      assert.equal(harness.state.pullsGetCalls, 0, 'edited-action: no pulls.get call');
+    }
+
+    // A missing repos API on the client denies fail-closed.
+    await runAuthCase('missing-repos-api', { omitRepos: true },
+      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+  } finally {
+    fs.rmSync(tempDirectory, { recursive: true, force: true });
+    globalThis.fetch = previousFetch;
+  }
+  console.log('[PocketGuard comment-auth tests] All tests passed.');
 }

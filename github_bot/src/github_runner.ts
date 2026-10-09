@@ -53,7 +53,8 @@ interface GithubEvent {
   repository?: EventRepository;
   pull_request?: PullRequestPayload;
   issue?: { number?: number; title?: string; pull_request?: unknown };
-  comment?: { body?: string };
+  comment?: { body?: string; user?: { login?: string; type?: string }; author_association?: string };
+  sender?: { login?: string; type?: string };
 }
 
 interface PullRequestData {
@@ -80,6 +81,7 @@ interface RunnerGitHubClient {
       removeLabel?: GitHubLabelClient['rest']['issues']['removeLabel'];
     };
     users: { getAuthenticated(): Promise<{ data: { login: string } }> };
+    repos?: { getCollaboratorPermissionLevel(params: { owner: string; repo: string; username: string }): Promise<{ data: { permission?: string } }> };
   };
 }
 
@@ -96,6 +98,7 @@ interface ReviewTarget {
   command: CommentCommand;
   needsDiff: boolean;
   safeReview: boolean;
+  authorized?: boolean;
   issueNumber?: number;
   pullRequest?: PullRequestData;
   title: string;
@@ -194,6 +197,57 @@ function validPullRequestData(value: unknown): value is PullRequestData {
   return safeSha(base.sha) && safeSha(head.sha) && safeRepositoryName(headRepo.full_name);
 }
 
+export function isBotLogin(login?: string): boolean {
+  return typeof login === 'string' && login.trim().toLowerCase().endsWith('[bot]');
+}
+
+export function extractCommentUsername(event: GithubEvent): string | undefined {
+  const raw = event.comment?.user?.login ?? event.sender?.login;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+export function isTrustedCommentAuthor(event: GithubEvent, opts?: { authorAssociation?: string }): boolean {
+  void opts;
+  // Only creation events may trigger a review; an explicit non-created action
+  // (edited/deleted/...) denies. A missing action is not denied here so older
+  // pull_request_target fixtures keep working; the permission check below
+  // still applies on the issue_comment path. author_association is never
+  // trusted (see checkCommenterPermission) and only accepted here for logging.
+  if (typeof event.action === 'string' && event.action !== 'created') return false;
+  if (event.comment?.user?.type === 'Bot' || event.sender?.type === 'Bot') return false;
+  const username = extractCommentUsername(event);
+  if (!username) return false;
+  if (isBotLogin(username)) return false;
+  return true;
+}
+
+export async function checkCommenterPermission(
+  client: RunnerGitHubClient | undefined,
+  owner: string,
+  repo: string,
+  username: string | undefined,
+): Promise<boolean> {
+  if (!username || !username.trim()) return false;
+  if (!client) return false;
+  const repos = client.rest.repos;
+  if (typeof repos?.getCollaboratorPermissionLevel !== 'function') return false;
+  try {
+    const response = await repos.getCollaboratorPermissionLevel({
+      owner,
+      repo,
+      username: username.trim(),
+    });
+    const permission = response?.data?.permission;
+    return permission === 'admin' || permission === 'write';
+  } catch {
+    // Fail closed on 404/403/429/network errors. Never fall back to
+    // author_association, and never leak the username or permission detail.
+    return false;
+  }
+}
+
 async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
   const env = context.env ?? process.env;
   const event = eventFrom(context);
@@ -231,9 +285,29 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
     const issueNumber = Number(event.issue?.number);
     const command = classifyCommentCommand(event.comment?.body ?? '');
     const isPullRequest = Boolean(event.issue?.pull_request);
+    const target: CommentTarget = isPullRequest ? 'pull-request' : 'issue';
+    const title = typeof event.issue?.title === 'string' ? event.issue.title : '';
+    const issueRef = Number.isSafeInteger(issueNumber) && issueNumber > 0 ? { issueNumber } : {};
+    const needsDiff = commentCommandNeedsGitDiff(command);
+    // Fail-closed authorization gate: the synchronous author check runs before
+    // any pulls.get so denied comments cost no API quota and never attach a
+    // pull request. author_association is never trusted here.
+    if (!isTrustedCommentAuthor(event, { authorAssociation: event.comment?.author_association })) {
+      return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
+    }
+    let authorized = false;
     let pullRequest: PullRequestData | undefined;
     if (isPullRequest && repository && Number.isSafeInteger(issueNumber) && issueNumber > 0) {
       const client = apiClient(context, env.GITHUB_TOKEN ?? '');
+      authorized = await checkCommenterPermission(
+        client,
+        repository.owner,
+        repository.repo,
+        extractCommentUsername(event),
+      );
+      if (!authorized) {
+        return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
+      }
       if (client) {
         try {
           const response = await client.rest.pulls.get({
@@ -246,21 +320,23 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
           pullRequest = undefined;
         }
       }
+    } else {
+      return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
     }
     const safeReview = Boolean(
-      pullRequest && repository &&
+      authorized && pullRequest && repository &&
       sameRepository(pullRequest.head.repo?.full_name, repository.fullName) &&
       safeSha(pullRequest.base.sha) && safeSha(pullRequest.head.sha),
     );
-    const target: CommentTarget = isPullRequest ? 'pull-request' : 'issue';
     return {
       target,
       command,
-      needsDiff: commentCommandNeedsGitDiff(command),
+      needsDiff,
       safeReview: safeReview && isCommentCommandAllowed(command, target),
+      authorized,
       ...(Number.isSafeInteger(issueNumber) && issueNumber > 0 ? { issueNumber } : {}),
       ...(safeReview ? { pullRequest } : {}),
-      title: typeof event.issue?.title === 'string' ? event.issue.title : '',
+      title,
     };
   }
 
@@ -508,6 +584,10 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
   try {
     const target = await inspectTarget(context);
     const forcedUnsafe = env.POCKETGUARD_SAFE_REVIEW === 'false';
+    // Defense-in-depth: inspectTarget re-verifies commenter authorization on
+    // every call, so safeReview === false (including any auth deny) returns
+    // the generic output before any CPA call, even with POCKETGUARD_SAFE_REVIEW
+    // set. No separate auth logic is needed here.
     if (
       target.target !== 'pull-request' || !target.safeReview || forcedUnsafe || !target.pullRequest ||
       !target.issueNumber || !isCommentCommandAllowed(target.command, 'pull-request')

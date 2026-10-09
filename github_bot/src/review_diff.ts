@@ -1,5 +1,9 @@
 export const MAX_DIFF_LENGTH = 120000;
 
+// Local equivalent of the GitHub PR-files pagination concept (3000 files):
+// beyond this the changed-path list is treated as incomplete (fail-closed).
+export const MAX_CHANGED_FILES = 3000;
+
 // MUST NOT exclude AndroidManifest.xml, permissions, *.gradle.kts, ProGuard files,
 // .github/workflows, or tests.
 export const DEFAULT_GIT_DIFF_EXCLUDES = [

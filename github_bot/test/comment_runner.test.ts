@@ -59,6 +59,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       writeStdout: (value) => { tagStdout += value; },
       runGit: (args: string[]) => {
         if (args[0] === 'fetch') return '';
+        if (args[0] === 'merge-base') return BASE_SHA;
         if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/AndroidManifest.xml\0';
         throw new Error('unexpected tag-mode git call');
       },
@@ -115,6 +116,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       writeStdout: () => undefined,
       runGit: (args: string[]) => {
         if (args[0] === 'fetch') return '';
+        if (args[0] === 'merge-base') return BASE_SHA;
         if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/AndroidManifest.xml\0';
         throw new Error('unexpected mention-mode git call');
       },
@@ -146,6 +148,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         writeStdout: () => undefined,
         runGit: (args) => {
           if (args[0] === 'fetch') return '';
+          if (args[0] === 'merge-base') return BASE_SHA;
           if (args[0] === 'diff' && args[1] === '--name-only') {
             return 'app/src/main/AndroidManifest.xml\0app/src/main/java/demo/Safe.kt\0';
           }
@@ -220,6 +223,7 @@ export async function runCommentRunnerTests(): Promise<void> {
             env: blockerEnv,
             runGit: (args) => {
               if (args[0] === 'fetch') return '';
+              if (args[0] === 'merge-base') return BASE_SHA;
               if (args[0] === 'diff' && args[1] === '--name-only') {
                 return 'app/src/main/java/demo/Secret.kt\0';
               }
@@ -283,6 +287,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         env: { ...reviewContext.env, POCKETGUARD_OUTPUT: truncatedPath } as NodeJS.ProcessEnv,
         runGit: (args) => {
           if (args[0] === 'fetch') return '';
+          if (args[0] === 'merge-base') return BASE_SHA;
           if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/AndroidManifest.xml\0';
           return [
             'diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml',
@@ -947,6 +952,7 @@ export async function runCommentAuthTests(): Promise<void> {
 
     const authGit = (args: string[]): string => {
       if (args[0] === 'fetch') return '';
+      if (args[0] === 'merge-base') return BASE_SHA;
       if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/java/demo/Safe.kt\0';
       return [
         'diff --git a/app/src/main/java/demo/Safe.kt b/app/src/main/java/demo/Safe.kt',

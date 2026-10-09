@@ -23,6 +23,7 @@ import {
 import {
   coverageSummary,
   filterReviewDiffFiles,
+  MAX_CHANGED_FILES,
   MAX_DIFF_LENGTH,
   prioritizeFiles,
   truncateDiff,
@@ -418,11 +419,43 @@ function defaultGit(args: string[]): string {
   });
 }
 
-function getChangedPaths(context: RunnerContext, baseSha: string, headSha: string): string[] {
+function getChangedPaths(context: RunnerContext, mergeBaseSha: string, headSha: string): string[] {
   const runGit = context.runGit ?? defaultGit;
-  return runGit(['diff', '--name-only', '-z', baseSha, headSha])
+  return runGit(['diff', '--name-only', '-z', mergeBaseSha, headSha])
     .split('\0')
     .filter(Boolean);
+}
+
+// Resolve the merge-base of base and head so a PR that lags the default
+// branch is compared against its fork point, not the base tip. Any failure
+// (non-zero exit, non-SHA output) throws a generic error; callers fail
+// closed and must never silently fall back to a base..head comparison.
+export function resolveMergeBase(
+  runGit: (args: string[]) => string,
+  baseSha: string,
+  headSha: string,
+): string {
+  let output: string;
+  try {
+    output = runGit(['merge-base', baseSha, headSha]);
+  } catch {
+    throw new Error('PocketGuard: unable to resolve merge base.');
+  }
+  const sha = output.trim();
+  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('PocketGuard: unable to resolve merge base.');
+  return sha;
+}
+
+function fetchReviewCommits(
+  runGit: (args: string[]) => string,
+  baseSha: string,
+  headSha: string,
+): void {
+  // Fetch immutable base/head objects only. The checkout stays on the
+  // default branch (fork code is never checked out). No --depth flag: the
+  // workflow provides full default-branch history (fetch-depth: 0) and this
+  // fetch supplies the head objects needed to compute the merge-base.
+  runGit(['fetch', '--no-tags', 'origin', baseSha, headSha]);
 }
 
 function collectChangedPaths(
@@ -431,9 +464,12 @@ function collectChangedPaths(
 ): { changedFiles: string[]; complete: boolean } {
   try {
     const runGit = context.runGit ?? defaultGit;
-    runGit(['fetch', '--no-tags', '--depth=1', 'origin', pullRequest.base.sha, pullRequest.head.sha]);
+    fetchReviewCommits(runGit, pullRequest.base.sha, pullRequest.head.sha);
+    const mergeBase = resolveMergeBase(runGit, pullRequest.base.sha, pullRequest.head.sha);
+    const changedFiles = getChangedPaths(context, mergeBase, pullRequest.head.sha);
+    if (changedFiles.length > MAX_CHANGED_FILES) return { changedFiles: [], complete: false };
     return {
-      changedFiles: getChangedPaths(context, pullRequest.base.sha, pullRequest.head.sha),
+      changedFiles,
       complete: true,
     };
   } catch {
@@ -441,9 +477,14 @@ function collectChangedPaths(
   }
 }
 
+// Callers must pass the resolveMergeBase() result as compareBaseSha, never
+// the raw PR base SHA: buildReviewDiff compares fork-point..head so
+// default-branch-only changes are excluded. A missing per-file patch for a
+// review file throws (fail-closed); truncation/omission is reported via
+// coverage and can never approve (see validateReviewOutput/orchestrator).
 export function buildReviewDiff(
   context: RunnerContext,
-  baseSha: string,
+  compareBaseSha: string,
   headSha: string,
   changedFiles: string[],
 ): { diff: string; coverage: ReviewCoverage; fullDiff: string } {
@@ -461,7 +502,7 @@ export function buildReviewDiff(
       '--no-ext-diff',
       '--no-color',
       '--unified=3',
-      baseSha,
+      compareBaseSha,
       headSha,
       '--',
       file,
@@ -611,10 +652,14 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
     const headSha = target.pullRequest.head.sha;
     const runGit = context.runGit ?? defaultGit;
     try {
-      runGit(['fetch', '--no-tags', '--depth=1', 'origin', baseSha, headSha]);
-      changedFiles = getChangedPaths(context, baseSha, headSha);
+      fetchReviewCommits(runGit, baseSha, headSha);
+      const mergeBase = resolveMergeBase(runGit, baseSha, headSha);
+      changedFiles = getChangedPaths(context, mergeBase, headSha);
+      if (changedFiles.length > MAX_CHANGED_FILES) {
+        throw new Error('PocketGuard: changed file list exceeds limit.');
+      }
       changedFilesComplete = true;
-      const reviewDiff = buildReviewDiff(context, baseSha, headSha, changedFiles);
+      const reviewDiff = buildReviewDiff(context, mergeBase, headSha, changedFiles);
       const scan = DeterministicScanner.scan(changedFiles, reviewDiff.fullDiff);
       if (scan.hasBlockers) {
         output = {

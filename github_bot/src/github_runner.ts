@@ -404,9 +404,12 @@ function inferRouteEventName(event: GithubEvent, env: NodeJS.ProcessEnv | undefi
 // Read-only event router (S3). Classifies every event into first-review,
 // issue-update, manual-pr-review, owner-commit, or ignore without performing
 // review, labeling, counting, or sticky writes. S4/S5 consume kind plus the
-// should_review/should_tag flags emitted by runTagMode. P2 #3: opened and
-// reopened share first-review here; the per-SHA quota in runTagMode still
-// applies to reopened (reopening never resets the budget).
+// should_review/should_tag flags emitted by runTagMode. P2 #3 / Phase 3:
+// opened and reopened share first-review here; the per-SHA quota in
+// runTagMode still applies to reopened (reopening never resets the budget).
+// Phase 3 reopened only supplements an incomplete first review: reopened
+// with used>=1 closes to gate none with reopened-completed (only used==0
+// may auto); opened keeps the two-review budget.
 export function routeEvent(event: GithubEvent, env?: NodeJS.ProcessEnv): RouteResult {
   const eventName = inferRouteEventName(event, env);
   const action = typeof event.action === 'string' ? event.action : '';
@@ -954,19 +957,36 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
   // with no auth/quota gate by owner decision (this phase: no budget/rate
   // limit, only bot exclusion in routing plus per-issue concurrency
   // serialization).
-  // P2 #3 reopened semantics: routeEvent keeps opened||reopened as
-  // first-review (no routing change). The per-SHA ledger below applies
-  // equally to reopened: reopened + used=1 stays gate auto with
-  // reviewsUsed=1/shouldReview=true (a second review is allowed); used>=2
-  // closes to gate none with quota-exhausted (zero OpenAI); an unreadable
-  // ledger closes to gate none with quota-unknown. Reopening never resets
-  // the budget — only a new head SHA does.
+  // P2 #3 / Phase 3 reopened semantics: routeEvent keeps opened||reopened
+  // as first-review (no routing change). Reopened only supplements an
+  // incomplete first review: reopened + used>=1 closes to gate none with
+  // reopened-completed (zero OpenAI, zero writes); only reopened used==0
+  // may auto. Opened keeps the two-review budget (used=1 stays auto,
+  // used>=2 quota-exhausted). An unreadable ledger closes to gate none
+  // with quota-unknown. Reopening never resets the budget — only a new
+  // head SHA does.
+  // Phase 3 diff-unavailable (P2 #5): a PR with a readable diff expected
+  // but an incomplete changed list fails closed without scheduling AI
+  // (changed.complete==false → gate none). Issues never use the diff path
+  // (forced none below), and unauthorized manual keeps its auth gate so
+  // the denial reason stays explicit.
   let reviewGate = resolveReviewGate(route.kind, flags.shouldReview);
   let shouldReview = flags.shouldReview;
   let reason = route.reason;
   let reviewsUsed = 0;
   if (target.target === 'issue') {
     reviewGate = 'none';
+  }
+  if (
+    (reviewGate === 'auto' || reviewGate === 'manual') &&
+    target.target === 'pull-request' &&
+    target.authorized === true &&
+    target.diffSafe &&
+    !changed.complete
+  ) {
+    reviewGate = 'none';
+    shouldReview = false;
+    reason = 'diff-unavailable: changed file list incomplete; fail-closed without scheduling AI';
   }
   const quotaSha = target.quotaHeadSha ?? target.pullRequest?.head.sha;
   if ((reviewGate === 'auto' || reviewGate === 'manual') && quotaSha && safeSha(quotaSha) && target.issueNumber) {
@@ -994,6 +1014,10 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
           reviewGate = 'none';
           shouldReview = false;
           reason = `quota-exhausted: head ${quotaSha.toLowerCase()} already reviewed ${reviewsUsed} times (limit ${MAX_REVIEWS_PER_SHA}); a new head SHA restarts the budget`;
+        } else if (action === 'reopened' && eventName === 'pull_request_target' && reviewsUsed >= 1) {
+          reviewGate = 'none';
+          shouldReview = false;
+          reason = `reopened-completed: head ${quotaSha.toLowerCase()} already reviewed ${reviewsUsed} time(s); reopened only supplements an incomplete first review`;
         }
       }
     }
@@ -1060,11 +1084,18 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
 // (route/authorized/review_gate) plus a trusted fresh pulls.get SHA pin; an
 // optional POCKETGUARD_QUOTA_SHA (the tag `quota_head_sha` output) must match
 // the fresh head when present, otherwise fail-closed with no write.
+// Phase 3 (P2 #5) pre-flight runs before any slot is occupied: the diff must
+// be readable (diffSafe plus a valid pull request, fork ref plus SHA pin,
+// merge-base, and a changed list within MAX_CHANGED_FILES); any failure is
+// unstarted with zero writes so transient git failures never consume.
+// Phase 3 reopened only supplements an incomplete first review
+// (reopened used>=1 claims nothing with reopened-completed).
 //
 // Semantics: claim = (repo,PR,full head SHA) first +1 plus a per-run
 // (sha,run_id,attempt) marker. review-send only runs AI when its own claim
 // marker is present; publish only reconciles and never +1. Routing,
-// authorization, or quota blocks (unstarted) write nothing and count zero; a
+// authorization, quota, diff-unavailable, or reopened-completed blocks
+// (unstarted) write nothing and count zero; a
 // reserved slot whose later transport/artifact/publish fails is never
 // refunded. Same-PR workflow concurrency serializes runs as the primary
 // mutex; the claim re-reads the ledger immediately before writing, the same
@@ -1164,6 +1195,25 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
     }
   }
   const claimSha = freshPullRequest.head.sha.toLowerCase();
+  // Phase 3 pre-flight (P2 #5): verify the diff is actually readable before
+  // pre-occupying the slot (diffSafe plus a valid pull request, fork ref
+  // plus SHA pin, merge-base, and a changed list within MAX_CHANGED_FILES).
+  // Any failure is unstarted with zero writes so transient git failures
+  // never consume the budget.
+  if (!target.diffSafe || !target.pullRequest) {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'diff-unavailable: readable diff not available; fail-closed without occupying a slot', issueNumber });
+  }
+  try {
+    const runGit = context.runGit ?? defaultGit;
+    fetchReviewCommitsForPR(context, freshPullRequest);
+    const mergeBase = resolveMergeBase(runGit, freshPullRequest.base.sha, freshPullRequest.head.sha);
+    const changedFiles = getChangedPaths(context, mergeBase, freshPullRequest.head.sha);
+    if (changedFiles.length > MAX_CHANGED_FILES) {
+      return emit({ claimed: false, reviewsUsed: 0, reason: 'diff-unavailable: changed file list exceeds limit; fail-closed without occupying a slot', issueNumber });
+    }
+  } catch {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'diff-unavailable: diff pre-flight failed; fail-closed without occupying a slot', issueNumber });
+  }
   // Read-then-write: an unreadable ledger fails closed with no write.
   const baseline = await readStickyLedger(client, repository.owner, repository.repo, issueNumber);
   if (!baseline.ok) {
@@ -1172,6 +1222,13 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
   const existing = baseline.ledger.get(claimSha) ?? 0;
   if (existing >= MAX_REVIEWS_PER_SHA) {
     return emit({ claimed: false, reviewsUsed: existing, reason: `quota-exhausted: head ${claimSha} already at ${existing}`, issueNumber, claimSha });
+  }
+  // Phase 3 reopened: only supplements an incomplete first review.
+  {
+    const claimAction = typeof event.action === 'string' ? event.action : '';
+    if (inferRouteEventName(event, env) === 'pull_request_target' && claimAction === 'reopened' && existing >= 1) {
+      return emit({ claimed: false, reviewsUsed: existing, reason: `reopened-completed: head ${claimSha} already reviewed ${existing} time(s); reopened only supplements an incomplete first review`, issueNumber, claimSha });
+    }
   }
   const claimKey = resolveCountClaimKey(env);
   const claimPresent = claimKey ? baseline.claims.has(`${claimSha}:${claimKey}`) : false;
@@ -2432,6 +2489,8 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
     // its slot even at the limit); without its own claim — claim skipped,
     // failed, or exhausted — it returns the generic output with zero OpenAI
     // calls. Runs without a run id (local) fall back to the count check.
+    // Phase 3 reopened (no-key local path): reopened with used>=1 returns
+    // generic with zero OpenAI and zero git (only used==0 may review).
     // Like every routing or authorization denial, a blocked review is never
     // counted (counting happens only in the claim job).
     const reviewEvent = eventFrom(context);
@@ -2475,6 +2534,19 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
         if (!quota.ok || quota.used >= MAX_REVIEWS_PER_SHA) {
           saveReviewOutput(output, context);
           return output;
+        }
+        // Phase 3 reopened (no-key local path): reopened only supplements
+        // an incomplete first review, with zero git/OpenAI when completed.
+        {
+          const reviewAction = typeof reviewEvent.action === 'string' ? reviewEvent.action : '';
+          if (
+            inferRouteEventName(reviewEvent, env) === 'pull_request_target' &&
+            reviewAction === 'reopened' &&
+            quota.used >= 1
+          ) {
+            saveReviewOutput(output, context);
+            return output;
+          }
         }
       }
     }
@@ -3221,14 +3293,20 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // an unreadable counter (fail-closed) — publishes nothing. Only claimed
   // reviews consume: routing/authorization denials return above with zero
   // writes, and quota-exhausted without a claim returns here.
+  // Phase 3 reopened: a reopened run without its own claim and with
+  // used>=1 publishes nothing (no fallback noise); only the incomplete
+  // first review (used==0) may publish its fallback.
   if (freshPullRequest && safeSha(freshPullRequest.head.sha)) {
     const freshLower = freshPullRequest.head.sha.toLowerCase();
     const publishClaimKey = resolveCountClaimKey(env);
+    const publishAction = typeof event.action === 'string' ? event.action : '';
+    const isReopenedPublish = inferRouteEventName(event, env) === 'pull_request_target' && publishAction === 'reopened';
     if (publishClaimKey) {
       const ledger = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber);
       if (!ledger.ok) return;
       const used = ledger.ledger.get(freshLower) ?? 0;
       if (!ledger.claims.has(`${freshLower}:${publishClaimKey}`) && used >= MAX_REVIEWS_PER_SHA) return;
+      if (!ledger.claims.has(`${freshLower}:${publishClaimKey}`) && isReopenedPublish && used >= 1) return;
     } else {
       const quota = await readStickyReviewCount(
         client,
@@ -3239,6 +3317,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       );
       if (!quota.ok) return;
       if (quota.used >= MAX_REVIEWS_PER_SHA) return;
+      if (isReopenedPublish && quota.used >= 1) return;
     }
   }
 

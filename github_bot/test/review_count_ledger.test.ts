@@ -225,6 +225,7 @@ async function runClaimPass(
     } as NodeJS.ProcessEnv,
     githubClient: makeClient(state),
     writeStdout: () => undefined,
+    runGit: safeGitStub(),
   });
   return { claimed: claimed.claimed, used: claimed.reviewsUsed };
 }
@@ -259,6 +260,7 @@ async function runFullPass(
     env: claimEnv,
     githubClient: makeClient(state),
     writeStdout: () => undefined,
+    runGit: safeGitStub(),
   });
   assert.equal(claimed.claimed, true, `claim pre-occupies the slot for ${runId}`);
   const before = counter.count;
@@ -377,6 +379,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
             } as NodeJS.ProcessEnv,
             githubClient: makeClient(state),
             writeStdout: () => undefined,
+            runGit: safeGitStub(),
           });
           assert.equal(claimBlocked.claimed, false, 'quota-exhausted claim writes nothing');
           const createdBefore = state.created;
@@ -705,6 +708,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           } as NodeJS.ProcessEnv,
           githubClient: makeClient(state),
           writeStdout: () => undefined,
+          runGit: safeGitStub(),
         });
         assert.equal(exhausted.claimed, false);
         assert.equal(state.created, 0, 'quota-exhausted claim creates nothing');
@@ -918,6 +922,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
             } as NodeJS.ProcessEnv,
             githubClient: makeClient(state),
             writeStdout: () => undefined,
+            runGit: safeGitStub(),
           });
           assert.equal(secondClaim.claimed, true);
           assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2);

@@ -88,11 +88,17 @@ jobs:
     # any AI work. Scheduling is identical to review-send below: an open PR
     # gate (auto, or manual with authorization) or the explicit issue-auto
     # route. Issues are a no-op success (never counted) so issue-auto review
-    # still runs. Routing/authorization/quota blocks claim nothing and count
-    # zero; a reserved slot whose later transport/artifact/publish fails is
-    # never refunded. This job holds no OpenAI secrets and never checks out
-    # fork code: the checkout stays on the default branch for the bot code
-    # only, and the head SHA is pinned via a trusted pulls.get read.
+    # still runs. Routing/authorization/quota/diff-unavailable/reopened-
+    # completed blocks claim nothing and count zero; a reserved slot whose
+    # later transport/artifact/publish fails is never refunded. Phase 3
+    # (P2 #5) pre-flight verifies the diff before occupying (fork ref plus
+    # SHA pin, merge-base, changed list within cap) with read-only git; any
+    # failure claims nothing with zero writes. Reopened only supplements an
+    # incomplete first review (tag gates used>=1 to none, so this job is
+    # skipped; the TS claim also refuses reopened used>=1). This job holds
+    # no OpenAI secrets and never checks out fork code: the checkout stays
+    # on the default branch for the bot code only, and the head SHA is
+    # pinned via a trusted pulls.get read.
     if: >-
       (needs.prepare-tag.outputs.target == 'pull-request' &&
       needs.prepare-tag.outputs.should_review == 'true' &&
@@ -123,9 +129,9 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           # Full history kept consistent with the tag/review/publish jobs. The
-          # claim itself runs no git commands (no diff, no merge-base, no fork
-          # fetch) — only GitHub API reads plus one sticky write. Fork code is
-          # never checked out or executed.
+          # claim runs a read-only diff pre-flight (fetch plus merge-base plus
+          # diff --name-only, no checkout) before any sticky write; fork code
+          # is never checked out or executed.
           fetch-depth: 0
 
       - name: Set up Node.js
@@ -291,17 +297,22 @@ jobs:
   publish:
     name: Publish review and labels
     needs: [prepare-tag, review-send]
-    # Quota/authorization skip (S4) plus issue sticky (S5): an issue_comment
-    # publishes only an authorized manual pull-request review with an open
-    # gate, or a human issue update (target issue with should_review and a
-    # non-ignore route, covering issue_comment on issues). Unauthorized
-    # comments, quota-exhausted runs (review_gate none), and bot-routed
-    # ignores skip publish without touching the sticky comment or labels.
+    # Quota/authorization/diff skip (S4) plus issue sticky (S5): a
+    # pull_request_target publishes only with an open gate (review_gate !=
+    # none), so quota-exhausted, quota-unknown, diff-unavailable, and
+    # reopened-completed (reopened used>=1, only the incomplete first review
+    # may publish) skip without touching the sticky comment or labels and
+    # without fallback noise. An issue_comment publishes only an authorized
+    # manual pull-request review with an open gate, or a human issue update
+    # (target issue with should_review and a non-ignore route, covering
+    # issue_comment on issues). Unauthorized comments and bot-routed ignores
+    # skip publish without touching the sticky comment or labels.
     # Stage 5: counting happens only in the claim-slot job before AI; publish
     # only reconciles content and never increments the ledger.
     if: >-
       always() && needs.prepare-tag.result == 'success' &&
-      (github.event_name != 'issue_comment' ||
+      ((github.event_name != 'issue_comment' &&
+      needs.prepare-tag.outputs.review_gate != 'none') ||
       (needs.prepare-tag.outputs.authorized == 'true' &&
       needs.prepare-tag.outputs.review_gate != 'none') ||
       (needs.prepare-tag.outputs.target == 'issue' &&

@@ -678,10 +678,12 @@ export async function runExecutionMatrixTests(): Promise<void> {
       assert.equal(counter.count - before, 0, 'quota-exhausted review makes zero OpenAI calls');
     }
 
-    // P2 #3 reopened+ledger: reopened keeps first-review routing but shares
-    // the per-SHA ledger (reopening never resets). used=1 stays auto (a
-    // second review is allowed); used=2 closes to none quota-exhausted;
-    // unreadable closes to none quota-unknown.
+    // Phase 3 reopened+ledger: reopened keeps first-review routing but only
+    // supplements an incomplete first review (reopening never resets).
+    // reopened used==0 stays auto (claim may occupy to 1); reopened used>=1
+    // closes to none with reopened-completed (zero OpenAI, zero writes);
+    // opened keeps used=1 auto; used>=2 closes quota-exhausted; unreadable
+    // closes quota-unknown.
     {
       const reopenedEvent = {
         action: 'reopened',
@@ -694,7 +696,40 @@ export async function runExecutionMatrixTests(): Promise<void> {
         },
       };
       const reopenedEnv = openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' });
-      // used=1: gate stays auto, second review allowed.
+      // used=0: gate stays auto, claim may occupy the first slot.
+      {
+        const state = makeState({ comments: [] });
+        const tagged = await runTagMode({
+          event: reopenedEvent,
+          env: reopenedEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(tagged.routeKind, 'first-review', 'reopened routes first-review');
+        assert.equal(tagged.action, 'reopened');
+        assert.equal(tagged.reviewsUsed, 0);
+        assert.equal(tagged.reviewGate, 'auto', 'reopened used=0 stays auto');
+        assert.equal(tagged.shouldReview, true);
+        const claimed = await runClaimMode({
+          event: reopenedEvent,
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'reopened-used0-1',
+            ...(tagged.quotaHeadSha ? { POCKETGUARD_QUOTA_SHA: tagged.quotaHeadSha } : {}),
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(claimed.claimed, true, 'reopened used=0 claims the first slot');
+        assert.equal(claimed.reviewsUsed, 1);
+        assert.equal(parseReviewCountMarker(state.comments[0].body, HEAD_SHA), 1);
+      }
+      // used=1: gate closes reopened-completed, zero writes, zero AI,
+      // publish zero-touch (no fallback noise).
       {
         const state = makeState({
           comments: [{ id: 7, body: stickyBody(HEAD_SHA, 1), user: { login: 'pocketguard[bot]', type: 'Bot' } }],
@@ -709,9 +744,80 @@ export async function runExecutionMatrixTests(): Promise<void> {
         assert.equal(tagged.routeKind, 'first-review', 'reopened routes first-review');
         assert.equal(tagged.action, 'reopened');
         assert.equal(tagged.reviewsUsed, 1);
-        assert.equal(tagged.reviewGate, 'auto', 'reopened used=1 stays auto');
-        assert.equal(tagged.shouldReview, true, 'reopened used=1 allows a second review');
-        assert.ok(!/quota-exhausted/.test(tagged.reason) && !/quota-unknown/.test(tagged.reason));
+        assert.equal(tagged.reviewGate, 'none', 'reopened used=1 closes the gate');
+        assert.equal(tagged.shouldReview, false);
+        assert.match(tagged.reason, /reopened-completed/);
+        const createdBefore = state.created;
+        const updatedBefore = state.updated;
+        const stickyBefore = state.comments[0].body;
+        const opsBefore = state.operations.length;
+        const claimState = makeState({
+          comments: [{ id: 7, body: stickyBody(HEAD_SHA, 1), user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        const claimed = await runClaimMode({
+          event: reopenedEvent,
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'reopened-used1-1',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(claimState),
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(claimed.claimed, false, 'reopened used=1 claims nothing');
+        assert.match(claimed.reason, /reopened-completed/);
+        assert.equal(claimState.created, 0, 'reopened-completed claim creates nothing');
+        assert.equal(claimState.updated, 0, 'reopened-completed claim updates nothing');
+        assert.equal(parseReviewCountMarker(claimState.comments[0].body, HEAD_SHA), 1);
+        // No-key local review path: zero OpenAI and zero git.
+        {
+          let gitCalls = 0;
+          const before = counter.count;
+          const reviewed = await runReviewMode({
+            event: reopenedEvent,
+            env: { ...reopenedEnv, POCKETGUARD_OUTPUT: '' } as NodeJS.ProcessEnv,
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: () => { gitCalls += 1; return ''; },
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE');
+          assert.equal(counter.count - before, 0, 'reopened-completed review makes zero OpenAI calls');
+          assert.equal(gitCalls, 0, 'reopened-completed review runs zero git commands');
+        }
+        // Publish without its own claim: zero-touch, no fallback noise.
+        {
+          const publishState = makeState({
+            comments: [{ id: 7, body: stickyBody(HEAD_SHA, 1), user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          });
+          const tempReopenedPath = path.join(os.tmpdir(), `pocketguard-matrix-reopened-${Date.now()}.json`);
+          await runPublishMode({
+            event: reopenedEvent,
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: tempReopenedPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+              POCKETGUARD_RUN_ID: 'reopened-used1-publish',
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(publishState),
+          });
+          assert.equal(publishState.created, 0, 'reopened-completed publish creates nothing');
+          assert.equal(publishState.updated, 0, 'reopened-completed publish updates nothing');
+          assert.equal(publishState.comments[0].body, stickyBody(HEAD_SHA, 1), 'reopened-completed publish leaves the sticky untouched');
+          assert.deepEqual(
+            publishState.operations.filter((op) => op !== 'list-comments' && op !== 'pulls-get' && op !== 'authenticated-user'),
+            [],
+            'reopened-completed publish performs no comment or label writes',
+          );
+          void createdBefore;
+          void updatedBefore;
+          void stickyBefore;
+          void opsBefore;
+        }
       }
       // used=2: gate closes quota-exhausted, zero OpenAI.
       {
@@ -771,6 +877,96 @@ export async function runExecutionMatrixTests(): Promise<void> {
         assert.equal(tagged.shouldReview, false);
         assert.match(tagged.reason, /quota-unknown/);
       }
+    }
+
+    // Phase 3 diff-unavailable: an incomplete changed list closes the tag
+    // gate with zero AI (fail-closed, no scheduling).
+    {
+      const diffEnv = openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' });
+      const tagged = await runTagMode({
+        event: prOpenedEvent(),
+        env: diffEnv,
+        githubClient: makeClient(makeState()),
+        writeStdout: () => undefined,
+        runGit: throwingGitStub(),
+      });
+      assert.equal(tagged.changedFilesComplete, false);
+      assert.equal(tagged.reviewGate, 'none', 'incomplete diff closes the gate');
+      assert.equal(tagged.shouldReview, false);
+      assert.match(tagged.reason, /diff-unavailable/);
+      const before = counter.count;
+      const reviewed = await runReviewMode({
+        event: prOpenedEvent(),
+        env: { ...diffEnv, POCKETGUARD_OUTPUT: '' } as NodeJS.ProcessEnv,
+        githubClient: makeClient(makeState()),
+        writeStdout: () => undefined,
+        runGit: throwingGitStub(),
+      });
+      assert.equal(reviewed.verdict, 'INCONCLUSIVE');
+      assert.equal(counter.count - before, 0, 'diff-unavailable review makes zero OpenAI calls');
+    }
+
+    // Phase 3 claim pre-flight: a fetch throw claims nothing with zero
+    // writes and zero budget consumption.
+    {
+      const state = makeState();
+      const claimed = await runClaimMode({
+        event: prOpenedEvent(),
+        env: {
+          GITHUB_EVENT_NAME: 'pull_request_target',
+          GITHUB_REPOSITORY: REPO,
+          GITHUB_TOKEN: 'fake-token',
+          POCKETGUARD_RUN_ID: 'preflight-fetch-throw-1',
+        } as NodeJS.ProcessEnv,
+        githubClient: makeClient(state),
+        writeStdout: () => undefined,
+        runGit: () => { throw new Error('synthetic fetch failure'); },
+      });
+      assert.equal(claimed.claimed, false, 'pre-flight fetch failure claims nothing');
+      assert.match(claimed.reason, /diff-unavailable/);
+      assert.equal(state.created, 0, 'pre-flight failure creates nothing');
+      assert.equal(state.updated, 0, 'pre-flight failure updates nothing');
+      assert.equal(parseReviewCountMarker(state.comments.length > 0 ? state.comments[0].body : '', HEAD_SHA), 0);
+    }
+
+    // Phase 3 transient pre-flight failures never consume: two failures
+    // leave the ledger at zero, and the third fixed run may still review.
+    {
+      const state = makeState();
+      const failingGit = (): string => { throw new Error('synthetic transient git failure'); };
+      for (const runId of ['transient-1', 'transient-2']) {
+        const attempted = await runClaimMode({
+          event: prOpenedEvent(),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: runId,
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+          runGit: failingGit,
+        });
+        assert.equal(attempted.claimed, false, `${runId} transient failure claims nothing`);
+      }
+      assert.equal(state.created, 0, 'transient failures create nothing');
+      assert.equal(state.updated, 0, 'transient failures update nothing');
+      assert.equal(state.comments.length, 0, 'transient failures leave no sticky');
+      const recovered = await runClaimMode({
+        event: prOpenedEvent(),
+        env: {
+          GITHUB_EVENT_NAME: 'pull_request_target',
+          GITHUB_REPOSITORY: REPO,
+          GITHUB_TOKEN: 'fake-token',
+          POCKETGUARD_RUN_ID: 'transient-3',
+        } as NodeJS.ProcessEnv,
+        githubClient: makeClient(state),
+        writeStdout: () => undefined,
+        runGit: safeGitStub(),
+      });
+      assert.equal(recovered.claimed, true, 'fixed third run may still claim');
+      assert.equal(recovered.reviewsUsed, 1);
+      assert.equal(parseReviewCountMarker(state.comments[0].body, HEAD_SHA), 1);
     }
 
     // Quota unknown (fail-closed): listComments throw closes all three
@@ -948,6 +1144,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
               } as NodeJS.ProcessEnv,
               githubClient: makeClient(state),
               writeStdout: () => undefined,
+              runGit: safeGitStub(),
             });
             if (tagged.reviewGate !== 'none') {
               assert.equal(claimed.claimed, true, `${label}: open gate claims a slot`);

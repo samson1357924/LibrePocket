@@ -1503,7 +1503,12 @@ export async function runRouteEventTests(): Promise<void> {
         },
       } as unknown as RunnerContext['githubClient'],
       writeStdout: () => undefined,
-      runGit: () => { throw new Error('no git needed for routing outputs'); },
+      runGit: (args: string[]) => {
+        if (args[0] === 'fetch') return '';
+        if (args[0] === 'merge-base') return BASE_SHA;
+        if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/AndroidManifest.xml\0';
+        return '';
+      },
     });
     const outputs = fs.readFileSync(outputPath, 'utf8');
     assert.match(outputs, /^should_review=true$/m);

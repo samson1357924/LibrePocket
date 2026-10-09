@@ -266,6 +266,7 @@ export async function runStickyLabelTests(): Promise<void> {
               } as NodeJS.ProcessEnv,
               githubClient: makeClient(state),
               writeStdout: () => undefined,
+              runGit: safeGitStub(),
             });
             if (tagged.reviewGate !== 'none') {
               assert.equal(claimed.claimed, true, 'open gate claims a slot');

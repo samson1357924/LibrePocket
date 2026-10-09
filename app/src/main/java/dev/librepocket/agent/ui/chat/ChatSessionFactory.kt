@@ -23,6 +23,9 @@ import dev.librepocket.session.LibrePocketDb
 import dev.librepocket.session.RoomSessionStore
 import dev.librepocket.session.SessionStore
 import dev.librepocket.session.SessionTranscriptSink
+import java.time.Clock
+import java.time.Instant
+import java.time.ZoneId
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -55,6 +58,10 @@ data class CreatedSession(
     val model: String,
 )
 
+/** Session creation epoch millis → Instant; invalid (<=0 or out-of-range) omits. */
+private fun Long.toInstantOrNull(): Instant? =
+    if (this > 0) runCatching { Instant.ofEpochMilli(this) }.getOrNull() else null
+
 /**
  * Builds a [ChatSession] from the persisted endpoint.
  *
@@ -69,6 +76,9 @@ class ChatSessionFactory(
     private val buildProvider: (ProviderConfig, KeyProvider) -> LlmProvider =
         { cfg, keys -> DefaultProviderFactory(keys).create(cfg) },
     private val sessionStores: SessionStoreSource? = null,
+    private val clock: Clock = Clock.systemDefaultZone(),
+    private val userTimezone: String? = null,
+    private val systemZone: () -> ZoneId = ZoneId::systemDefault,
 ) {
     suspend fun create(endpoint: EndpointConfig, title: String): CreatedSession {
         val config = endpoint.toProviderConfig()
@@ -82,7 +92,23 @@ class ChatSessionFactory(
             } else {
                 NoOpTranscriptSink()
             }
-        return CreatedSession(sessionId, buildSession(endpoint, config, transcript), endpoint.providerId, model)
+        // Room SessionMeta.createdAt is the source of truth for `Session started`.
+        // Storeless/sessionId null/unknown/invalid/exception → null (omit, never fake now).
+        val sessionStart: Instant? = try {
+            if (store != null && sessionId != null) {
+                store.getSession(sessionId)?.let { it.createdAt.toInstantOrNull() }
+            } else {
+                null
+            }
+        } catch (_: Exception) {
+            null
+        }
+        return CreatedSession(
+            sessionId,
+            buildSession(endpoint, config, transcript, clock, userTimezone, systemZone, sessionStart),
+            endpoint.providerId,
+            model,
+        )
     }
 
     /** Binds a live session to an existing transcript session (resume, no re-create). */
@@ -90,11 +116,19 @@ class ChatSessionFactory(
         val config = endpoint.toProviderConfig()
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         val store = sessionStores?.store()
-        require(store != null && store.getSession(sessionId) != null) { "UNKNOWN_SESSION" }
+        // Retain the meta so resume reuses the original createdAt (never re-stamps now).
+        // getSession failure → null → UNKNOWN_SESSION (never masks unknown with now).
+        val meta = try {
+            store?.getSession(sessionId)
+        } catch (_: Exception) {
+            null
+        }
+        require(store != null && meta != null) { "UNKNOWN_SESSION" }
         val model = modelFor(endpoint)
+        val sessionStart = meta.createdAt.toInstantOrNull()
         return CreatedSession(
             sessionId,
-            buildSession(endpoint, config, SessionTranscriptSink(store, sessionId)),
+            buildSession(endpoint, config, SessionTranscriptSink(store, sessionId), clock, userTimezone, systemZone, sessionStart),
             endpoint.providerId,
             model,
         )
@@ -119,11 +153,24 @@ class ChatSessionFactory(
         endpoint: EndpointConfig,
         config: ProviderConfig,
         transcript: TranscriptSink,
+        clock: Clock = this.clock,
+        userTimezone: String? = this.userTimezone,
+        systemZone: () -> ZoneId = this.systemZone,
+        sessionStart: Instant? = null,
     ): ChatSession {
         val vault = vaultSource.vault()
         val keys = KeyProvider { ref -> vault.getKey(ref.removePrefix("provider_key/")) }
         val provider = buildProvider(config, keys)
-        return ChatSessionImpl(provider, policy, transcript, model = modelFor(endpoint))
+        return ChatSessionImpl(
+            provider,
+            policy,
+            transcript,
+            model = modelFor(endpoint),
+            clock = clock,
+            userTimezone = userTimezone,
+            sessionStart = sessionStart,
+            systemZone = systemZone,
+        )
     }
 
 }

@@ -37,6 +37,7 @@ import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
 
 /**
@@ -433,7 +434,12 @@ class TurnController(
       _uiState.update {
         it.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
       }
-      val job = scope.launch { hostedTurn(text, images) }
+      // Stage B: the logical turn id exists before the first suspension
+      // (onTurnStarted ack), so a cancel parked on that ack still attributes
+      // to this turn instead of falling back to the previous assistant.
+      val logicalTurnId = newId()
+      val attemptRef = AtomicReference(logicalTurnId)
+      val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef) }
       inFlight = job
       job.invokeOnCompletion {
         synchronized(lock) {
@@ -524,7 +530,10 @@ class TurnController(
       _uiState.update {
         it.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
       }
-      val job = scope.launch { hostedTurn(text, images) }
+      // Same Stage B ownership as startTurn: id before first suspension.
+      val logicalTurnId = newId()
+      val attemptRef = AtomicReference(logicalTurnId)
+      val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef) }
       inFlight = job
       job.invokeOnCompletion {
         synchronized(lock) {
@@ -802,13 +811,33 @@ class TurnController(
     }
   }
 
-  private suspend fun hostedTurn(text: String, images: List<ChatImageRef>) {
+  /**
+   * Hosts one logical turn. [logicalTurnId] and [attemptRef] are created
+   * before the host launches (before the first suspension), so a cancel
+   * parked on the `onTurnStarted` ack still attributes to this turn.
+   * Cancel always records the current attempt id + that attempt's text
+   * (pre-placeholder partial is "" with this turn's id); it never falls
+   * back to a previous turn's id and never uses an empty runId. If the user
+   * row itself is not yet durable, the cancel terminal still uses this
+   * turn's id (ordered behind the started entry, or INTERRUPTED-marked on
+   * store/seal failure).
+   */
+  private suspend fun hostedTurn(
+    text: String,
+    images: List<ChatImageRef>,
+    logicalTurnId: String,
+    attemptRef: AtomicReference<String>,
+  ) {
     val self = coroutineContext[Job]
     try {
-      runTurnLoop(text, images)
+      runTurnLoop(text, images, logicalTurnId, attemptRef)
     } catch (e: CancellationException) {
-      // Snapshot before the write: latest* reads uiState at execution time,
-      // and the ordered write below suspends until admitted.
+      // Current attempt only: attemptRef tracks the live attempt across
+      // retries/sleeper gaps, so this never reuses a previous turn's id.
+      // Snapshot before the write: assistantTextOf reads uiState at execution
+      // time, and the ordered write below suspends until admitted.
+      val cancelId = attemptRef.get()
+      val cancelText = assistantTextOf(cancelId)
       // Durable and non-cancellable: the host is cancelled but the session
       // writer is independent, so this record still drains on close (or is
       // explicitly marked INTERRUPTED instead of silently dropped). A
@@ -816,10 +845,10 @@ class TurnController(
       // (ClosedSendChannelException or the sealed fail-fast
       // CancellationException, already marked INTERRUPTED in the sink): swallow
       // only that seal race so it cannot mask the original cancellation, then
-      // still rethrow the original. Any other write failure propagates.
-      val cancelId = latestAssistantId()
-      val cancelText = latestAssistantText()
-      val cancelReasoning = latestAssistantReasoning()
+      // still rethrow the original. A durable store failure is likewise
+      // already INTERRUPTED-marked: keep the original cancellation.
+      // Any other write failure propagates.
+      val cancelReasoning = assistantReasoningOf(cancelId)
       withContext(NonCancellable) {
         try {
           orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelReasoning)
@@ -828,9 +857,25 @@ class TurnController(
         } catch (sealFailure: CancellationException) {
           if (!orderedTranscript.isSealed()) throw sealFailure
           // Sealed fail-fast: INTERRUPTED already marked, keep original cancel.
+        } catch (_: Exception) {
+          // Durable store failure for the cancel terminal itself: the sink
+          // already marked this runId INTERRUPTED; keep original cancel.
         }
       }
       throw e
+    } catch (e: Exception) {
+      // Durable core-write failure (e.g. store IOException on started/
+      // succeeded/failed): the sink already failed the ack loudly and marked
+      // the runId INTERRUPTED. Project ERROR so the UI never sticks in
+      // STREAMING, and never report success. Falls through to the normal
+      // completion path below (same as a provider failure): empty queue keeps
+      // ERROR, queued work may still promote.
+      synchronized(lock) {
+        activityRevision++
+        _uiState.update {
+          it.copy(status = ChatStatus.ERROR, error = sanitizeError(e.message ?: "transcript store failed"))
+        }
+      }
     }
     // Normal completion only: hand off at most one queued steer as a detached
     // follow-up turn, so send() returns after its own turn. The follow-up
@@ -929,7 +974,10 @@ class TurnController(
       activityRevision++
       appendUser(next.text, next.opId)
       _uiState.update { it.copy(status = ChatStatus.STREAMING, error = null, pendingSteerCount = steerQueue.size) }
-      val follow = scope.launch { hostedTurn(next.text, next.images) }
+      // Follow-up owns a fresh logical id, also created before launch.
+      val followLogicalId = newId()
+      val followAttemptRef = AtomicReference(followLogicalId)
+      val follow = scope.launch { hostedTurn(next.text, next.images, followLogicalId, followAttemptRef) }
       inFlight = follow
       follow.invokeOnCompletion {
         synchronized(lock) {
@@ -978,13 +1026,20 @@ class TurnController(
     }
   }
 
-  private suspend fun runTurnLoop(text: String, images: List<ChatImageRef>) {
-    // One logical turn owns exactly one user row (logicalTurnId), durably
-    // acked before the first provider attempt. Retries add attempt records
-    // bound to that id and start a new assistant block each; they never emit
-    // another user row. Direct suspend calls (no fire-and-forget hop), so no
-    // snapshot copies are needed: each write completes in call order.
-    val logicalTurnId = newId()
+  private suspend fun runTurnLoop(
+    text: String,
+    images: List<ChatImageRef>,
+    logicalTurnId: String,
+    attemptRef: AtomicReference<String>,
+  ) {
+    // One logical turn owns exactly one user row (logicalTurnId, created
+    // before launch), durably acked before the first provider attempt.
+    // Retries add attempt records bound to that id and start a new assistant
+    // block each; they never emit another user row. Direct suspend calls (no
+    // fire-and-forget hop), so no snapshot copies are needed: each write
+    // completes in call order. attemptRef always holds the live attempt id
+    // (sleeper gaps keep the just-failed id until the next id is minted), so
+    // the hostedTurn cancel handler never needs the global latest assistant.
     orderedTranscript.onTurnStarted(logicalTurnId, text)
     var attempt = 0
     var attemptRunId = logicalTurnId
@@ -1204,6 +1259,9 @@ class TurnController(
         throw e
       }
       attemptRunId = newId()
+      // Publish before the next placeholder: a cancel in the gap still sees
+      // the just-failed id only until the new id is minted here.
+      attemptRef.set(attemptRunId)
     }
   }
 
@@ -1389,16 +1447,6 @@ class TurnController(
   /** Reasoning-source flag of one attempt's block (false when absent). */
   private fun assistantReasoningOf(runId: String): Boolean =
     _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.hasReasoning == true
-
-  private fun latestAssistantId(): String =
-    _uiState.value.messages.lastOrNull { it.role == "assistant" }?.id.orEmpty()
-
-  private fun latestAssistantText(): String =
-    _uiState.value.messages.lastOrNull { it.role == "assistant" }?.text.orEmpty()
-
-  /** Reasoning-source flag of the latest assistant block (false when absent). */
-  private fun latestAssistantReasoning(): Boolean =
-    _uiState.value.messages.lastOrNull { it.role == "assistant" }?.hasReasoning == true
 }
 
 /**

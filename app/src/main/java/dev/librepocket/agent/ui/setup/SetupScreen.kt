@@ -47,6 +47,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -54,6 +55,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.librepocket.models.ModelsDevSnapshot.SnapshotFallbackReason
 import dev.librepocket.preset.ProviderCatalog
+
+private const val THREAT_MODEL_URL =
+    "https://github.com/samson1357924/LibrePocket/blob/main/docs/THREAT_MODEL.md"
 
 private fun modelDirectoryStatusText(status: ModelDirectoryStatus): String? = when (status) {
     ModelDirectoryStatus.NotLoaded -> null
@@ -102,6 +106,7 @@ fun SetupScreen(
 ) {
     val state by viewModel.form.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
 
     // Key-entry page: block screenshots / recents thumbnails while visible.
     DisposableEffect(Unit) {
@@ -270,8 +275,14 @@ fun SetupScreen(
                     )
                 }
             },
-            supportingText = { Text("金鑰只存於本機加密儲存，不會上傳別處；換機需重輸。") },
+            supportingText = { Text("金鑰存於本機加密儲存；向你設定的 AI API 端點發出聊天或模型列表等需驗證的請求時，會傳送 API Key（包含自訂端點）。換機需重輸。") },
         )
+        TextButton(
+            onClick = { uriHandler.openUri(THREAT_MODEL_URL) },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("查看威脅模型說明（docs/THREAT_MODEL.md）")
+        }
 
         state.errorCode?.let { code ->
             Card(
@@ -346,7 +357,12 @@ fun SetupScreen(
             onDismissRequest = viewModel::dismissKeyWriteConfirm,
             title = { Text("寫入金鑰確認") },
             text = {
-                Text("即將把此 API Key 存入本機加密儲存（key.write）。換機或還原後需重輸；金鑰永不離開本機。確定繼續嗎？")
+                Column {
+                    Text("即將把此 API Key 存入本機加密儲存（key.write）。換機或還原後需重輸；向你設定的 AI API 端點發出聊天或模型列表等需驗證的請求時，會傳送 API Key（包含自訂端點）。確定繼續嗎？")
+                    TextButton(onClick = { uriHandler.openUri(THREAT_MODEL_URL) }) {
+                        Text("查看威脅模型說明（docs/THREAT_MODEL.md）")
+                    }
+                }
             },
             confirmButton = {
                 TextButton(onClick = viewModel::confirmKeyWriteSave) { Text("確定寫入") }

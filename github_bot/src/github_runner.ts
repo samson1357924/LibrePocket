@@ -366,7 +366,22 @@ export function buildReviewDiff(
   let originalLength = 0;
   let includedDiffCount = 0;
   for (const file of changedFiles) {
-    const fileDiff = runGit(['diff', '--no-ext-diff', '--no-color', '--unified=3', baseSha, headSha, '--', file]);
+    // PR-controlled filenames may contain Git pathspec magic even after `--`;
+    // force literal interpretation so a name cannot exclude itself from review.
+    const fileDiff = runGit([
+      '--literal-pathspecs',
+      'diff',
+      '--no-ext-diff',
+      '--no-color',
+      '--unified=3',
+      baseSha,
+      headSha,
+      '--',
+      file,
+    ]);
+    if (reviewFiles.has(file) && !fileDiff) {
+      throw new Error('Git returned no diff for a changed review file.');
+    }
     diffs.set(file, fileDiff);
     if (reviewFiles.has(file)) {
       originalLength += fileDiff.length + (includedDiffCount > 0 ? 1 : 0);

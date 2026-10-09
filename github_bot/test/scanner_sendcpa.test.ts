@@ -233,6 +233,38 @@ export async function runScannerSendCpaTests(): Promise<void> {
   assert.ok(assembled.diff.includes('PocketGuard diff truncated'));
   assert.deepEqual(assembled.coverage.truncatedFiles, ['app/src/main/java/example/Second.kt']);
 
+  const pathspecMagicFile = ':(exclude)**';
+  const pathspecMagicDiff = [
+    `diff --git a/${pathspecMagicFile} b/${pathspecMagicFile}`,
+    `--- a/${pathspecMagicFile}`,
+    `+++ b/${pathspecMagicFile}`,
+    '@@ -0,0 +1 @@',
+    `+${FAKE_SECRET_FIXTURES.credential}`,
+  ].join('\n');
+  let usedLiteralPathspecs = false;
+  const literalPathspecReview = buildReviewDiff({
+    runGit: (args) => {
+      if (args[0] !== '--literal-pathspecs' || args[1] !== 'diff') return '';
+      usedLiteralPathspecs = true;
+      assert.equal(args[args.length - 1], pathspecMagicFile);
+      return pathspecMagicDiff;
+    },
+  }, 'a'.repeat(40), 'b'.repeat(40), [pathspecMagicFile]);
+  assert.equal(usedLiteralPathspecs, true, 'PR-controlled filenames use literal Git pathspec handling');
+  assert.equal(literalPathspecReview.coverage.complete, true);
+  assert.ok(literalPathspecReview.fullDiff.includes(FAKE_SECRET_FIXTURES.credential));
+  assert.ok(literalPathspecReview.diff.includes(FAKE_SECRET_FIXTURES.credential));
+  assert.equal(
+    DeterministicScanner.scan([pathspecMagicFile], literalPathspecReview.fullDiff).hasBlockers,
+    true,
+    'the literal filename diff reaches deterministic scanning',
+  );
+
+  assert.throws(() => buildReviewDiff({
+    runGit: () => '',
+  }, 'a'.repeat(40), 'b'.repeat(40), [pathspecMagicFile]),
+  /no diff for a changed review file/, 'empty retrieval for a review-eligible changed file fails closed');
+
   assert.deepEqual(prioritizeFiles([
     'docs/guide.md',
     'app/src/main/java/example/Regular.java',

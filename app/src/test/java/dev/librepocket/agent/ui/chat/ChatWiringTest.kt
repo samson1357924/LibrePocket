@@ -12,22 +12,23 @@ import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
 import java.nio.file.Files
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.test.UnconfinedTestDispatcher
-import kotlinx.coroutines.test.resetMain
-import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -49,22 +50,37 @@ private class FakeChatProvider(
     override suspend fun listModels(): List<String> = emptyList()
 }
 
-@OptIn(ExperimentalCoroutinesApi::class)
 class ChatWiringTest {
 
     private val tmpDirs = ArrayList<java.io.File>()
     private val scopes = ArrayList<CoroutineScope>()
+    private val chatViewModels = ChatTestViewModelStore()
+    private val chatMain = ChatTestMainDispatcher()
 
     @Before
     fun setUp() {
-        Dispatchers.setMain(UnconfinedTestDispatcher())
+        chatMain.install()
     }
 
     @After
     fun tearDown() {
-        Dispatchers.resetMain()
-        scopes.forEach { it.cancel() }
-        tmpDirs.forEach { it.deleteRecursively() }
+        try {
+            chatMain.clearViewModels(chatViewModels)
+        } finally {
+            try {
+                cancelAndJoinChatTestScopes(scopes)
+            } finally {
+                try {
+                    tmpDirs.forEach { it.deleteRecursively() }
+                } finally {
+                    chatMain.resetAndClose()
+                }
+            }
+        }
+    }
+
+    private fun onMain(block: () -> Unit) {
+        runBlocking { chatMain.run(block) }
     }
 
     private fun newStore(): EndpointStore {
@@ -95,12 +111,13 @@ class ChatWiringTest {
         fake: FakeChatProvider = FakeChatProvider(),
     ): ChatViewModel {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        return ChatViewModel(store, factory, InMemoryPolicyStore())
+        return chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
     }
 
     private fun awaitTrue(timeoutMs: Long = 8000, cond: () -> Boolean) {
@@ -120,11 +137,10 @@ class ChatWiringTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
-        // Note: the fake provider ignores keys, so no vault seeding is needed.
         val vm = newVm(store, fake)
         runBlocking { store.save(sampleEndpoint()) }
-        vm.onInputChange("hi")
-        vm.send()
+        onMain { vm.onInputChange("hi") }
+        onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.sessionState.value.messages.size == 2 }
         val assistant = vm.sessionState.value.messages.first { it.role == "assistant" }
         assertEquals("hello", assistant.text)
@@ -151,21 +167,21 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
         try {
-            vm.onInputChange("first")
-            vm.send()
+            onMain { vm.onInputChange("first") }
+            onMain { vm.send() }
             awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
-            vm.onInputChange("second")
-            vm.send() // busy: steered, never preempts; input consumed into the queue
+            onMain { vm.onInputChange("second") }
+            onMain { vm.send() } // busy: steered, never preempts; input consumed into the queue
             awaitTrue { vm.sessionState.value.pendingSteerCount == 1 }
             assertEquals(ChatStatus.STREAMING, vm.sessionState.value.status)
-            vm.cancel()
+            onMain { vm.cancel() }
             awaitTrue { vm.sessionState.value.status == ChatStatus.CANCELLED }
             val partial = vm.sessionState.value.messages.first { it.role == "assistant" }
             assertTrue(partial.isPartial)
         } finally {
-            vm.newChat() // close session: drains the queued steer, no background leak
+            onMain { vm.newChat() } // close session: drains the queued steer, no background leak
         }
     }
 
@@ -193,18 +209,91 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
-        vm.onInputChange("hi")
-        vm.send()
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.onInputChange("hi") }
+        onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.ERROR }
         assertTrue(vm.sessionState.value.error != null)
         assertEquals(1, fake.streamCalls)
         assertTrue(vm.canRetry)
         failFirst = false
-        vm.retry()
+        onMain { vm.retry() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE }
         assertEquals(2, fake.streamCalls)
         assertNull(vm.sessionState.value.error)
+    }
+
+    @Test
+    fun factoryCancellationAfterDurableCreateDeletesOnlyTheNewTranscriptRow() = runBlocking {
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        val rowCreated = CompletableDeferred<Unit>()
+        val allowCreateReturn = CompletableDeferred<Unit>()
+        val transcripts = object : dev.librepocket.session.FakeSessionStore() {
+            override suspend fun createSession(title: String, model: String): String {
+                val id = super.createSession(title, model)
+                rowCreated.complete(Unit)
+                allowCreateReturn.await()
+                return id
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> FakeChatProvider() },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val creation = async { factory.create(sampleEndpoint(), "cancel after row") }
+
+        try {
+            withTimeout(5_000) { rowCreated.await() }
+            creation.cancel()
+            assertFalse(creation.isCompleted)
+        } finally {
+            allowCreateReturn.complete(Unit)
+        }
+        withTimeout(7_000) { creation.cancelAndJoin() }
+        assertTrue(transcripts.metas.isEmpty())
+    }
+
+    @Test
+    fun discardingAnUnattachedNewSessionDeletesItsTranscriptRow() = runBlocking {
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> FakeChatProvider() },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+
+        val created = factory.create(sampleEndpoint(), "not attached")
+        val sessionId = checkNotNull(created.sessionId)
+        assertNotNull(transcripts.getSession(sessionId))
+
+        factory.discardUnattached(created, deleteTranscriptRow = true)
+
+        assertNull(transcripts.getSession(sessionId))
+    }
+
+    @Test
+    fun discardingAnOpenedSessionNeverDeletesItsExistingTranscriptRow() = runBlocking {
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sessionId = transcripts.createSession("existing", "gpt-4o-mini")
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> FakeChatProvider() },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+
+        val opened = factory.open(sampleEndpoint(), sessionId)
+        factory.discardUnattached(opened, deleteTranscriptRow = false)
+
+        assertNotNull(transcripts.getSession(sessionId))
     }
 
     @Test
@@ -248,6 +337,8 @@ class ChatWiringTest {
                 ),
             )
         }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "ok"))
@@ -256,18 +347,18 @@ class ChatWiringTest {
         }
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
-        vm.openSession(sid)
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
-        vm.onInputChange("new")
-        vm.send()
+        onMain { vm.onInputChange("new") }
+        onMain { vm.send() }
         awaitTrue { vm.messages.value.size == 4 }
         assertEquals("ok", vm.messages.value.last().text)
         // Live turn persisted into the same transcript session.
@@ -285,7 +376,7 @@ class ChatWiringTest {
             }
         }
         val vm = newVm(store, fake)
-        vm.steer("go")
+        onMain { vm.steer("go") }
         awaitTrue { vm.sessionState.value.messages.size == 2 }
         assertEquals("go", vm.sessionState.value.messages.first { it.role == "user" }.text)
     }
@@ -302,10 +393,10 @@ class ChatWiringTest {
             }
         }
         val vm = newVm(store, fake)
-        vm.onInputChange("first")
-        vm.send()
+        onMain { vm.onInputChange("first") }
+        onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
-        vm.steer("follow")
+        onMain { vm.steer("follow") }
         awaitTrue { vm.sessionState.value.pendingSteerCount == 1 || vm.messages.value.size == 4 }
         awaitTrue(timeoutMs = 12000) { vm.messages.value.size == 4 }
         assertEquals("follow", vm.messages.value[2].text)
@@ -340,9 +431,9 @@ class ChatWiringTest {
             vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
             buildProvider = { _, _ -> fake },
         )
-        val vm = ChatViewModel(store, factory, deny)
-        vm.onInputChange("hi")
-        vm.send()
+        val vm = chatViewModels.own(ChatViewModel(store, factory, deny))
+        onMain { vm.onInputChange("hi") }
+        onMain { vm.send() }
         awaitTrue { vm.notice.value == "POLICY_DENIED" }
         assertEquals(0, fake.streamCalls)
         assertTrue(vm.sessionState.value.messages.isEmpty())
@@ -377,8 +468,8 @@ class ChatWiringTest {
             vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
             buildProvider = { _, _ -> fake },
         )
-        val vm = ChatViewModel(store, factory, deny)
-        vm.steer("queued-evil")
+        val vm = chatViewModels.own(ChatViewModel(store, factory, deny))
+        onMain { vm.steer("queued-evil") }
         awaitTrue { vm.notice.value == "POLICY_DENIED" }
         assertEquals(0, fake.streamCalls)
     }
@@ -387,6 +478,8 @@ class ChatWiringTest {
     fun modelSwitchRecreatesLiveSession() {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "ok"))
@@ -397,7 +490,7 @@ class ChatWiringTest {
         val transcripts = dev.librepocket.session.FakeSessionStore()
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = VaultSource { vault },
             buildProvider = { _, _ ->
                 creates++
                 fake
@@ -406,9 +499,9 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
-        vm.onInputChange("one")
-        vm.send()
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.onInputChange("one") }
+        onMain { vm.send() }
         awaitTrue { vm.sessionState.value.messages.isNotEmpty() }
         assertEquals(1, creates)
         // The transcript sink persists asynchronously; wait for it before switching.
@@ -416,8 +509,8 @@ class ChatWiringTest {
         // Same provider, different model -> live session must rebuild with the
         // new model, and the previous transcript stays visible.
         runBlocking { store.save(sampleEndpoint().copy(model = "gpt-4o")) }
-        vm.onInputChange("two")
-        vm.send()
+        onMain { vm.onInputChange("two") }
+        onMain { vm.send() }
         awaitTrue { creates == 2 }
         awaitTrue { vm.messages.value.size == 4 }
         assertEquals(listOf("gpt-4o-mini", "gpt-4o"), fake.seenRequests.map { it.model })
@@ -447,9 +540,9 @@ class ChatWiringTest {
                 fake
             },
         )
-        val vm = ChatViewModel(store, factory, InMemoryPolicyStore())
-        vm.onInputChange("one")
-        vm.send()
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.onInputChange("one") }
+        onMain { vm.send() }
         awaitTrue { vm.sessionState.value.messages.isNotEmpty() }
         assertEquals(1, creates)
         runBlocking {
@@ -460,11 +553,12 @@ class ChatWiringTest {
                     label = "自訂",
                     baseUrl = "http://127.0.0.1:11434/v1",
                     model = "local",
+                    apiKeyRef = "provider_key/preset:custom",
                 ),
             )
         }
-        vm.onInputChange("two")
-        vm.send()
+        onMain { vm.onInputChange("two") }
+        onMain { vm.send() }
         awaitTrue { creates == 2 }
     }
 }

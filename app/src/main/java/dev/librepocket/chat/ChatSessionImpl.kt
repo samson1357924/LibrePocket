@@ -63,6 +63,16 @@ class ChatSessionImpl(
 
   override suspend fun send(text: String, images: List<ChatImageRef>) = controller.send(text, images)
 
+  override suspend fun startTurn(text: String, images: List<ChatImageRef>) = controller.startTurn(text, images)
+
+  override suspend fun startOrEnqueue(
+    text: String,
+    images: List<ChatImageRef>,
+    opId: Long?,
+  ) = controller.startOrEnqueue(text, images, opId)
+
+  override fun drainQueued(): List<QueuedIntent> = controller.drainQueued()
+
   override fun cancel() = controller.cancel()
 
   override fun steer(text: String) = controller.steer(text)

@@ -66,6 +66,21 @@ import dev.librepocket.voice.VoiceStt
 import dev.librepocket.voice.VoiceSpeaker
 import dev.librepocket.voice.VoiceTools
 
+/** User-visible text for a chat notice code; unknown codes fall through raw. */
+internal fun chatNoticeText(code: String): String =
+    when (code) {
+        "NO_ENDPOINT" -> "尚未設定端點，請先設定 API 金鑰。"
+        "POLICY_DENIED" -> "政策拒絕讀取金鑰（key.read DENY），本次未發送任何請求。"
+        "CHAT_SEND_DENIED" -> "對話送出被政策拒絕（chat.send DENY），本次未發送任何請求。"
+        "CHAT_APPROVAL_REQUIRED" -> "此操作需要明確核准；目前沒有互動核准流程，本次未送出，也未自動允許。"
+        "CHAT_POLICY_UNAVAILABLE" -> "無法驗證對話權限，本次未送出，請稍後重試"
+        "CHAT_CANCELLED_RECOVERY" -> "對話已取消；尚未送出的排隊訊息已保留，請確認後手動送出。"
+        "CHAT_QUEUE_RECOVERY_REQUIRED" -> "排隊中的訊息尚未送出，已保留，請確認後手動送出。"
+        "UNKNOWN_SESSION" -> "找不到該會話，可能已被刪除。"
+        "SEND_CANCELLED_ENDPOINT_CHANGED" -> "端點已變更，本次未送出，請確認後重送。"
+        else -> code
+    }
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ChatScreen(
@@ -82,6 +97,7 @@ fun ChatScreen(
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val input by viewModel.input.collectAsStateWithLifecycle()
     val notice by viewModel.notice.collectAsStateWithLifecycle()
+    val pendingRecoveryCount by viewModel.pendingRecoveryCount.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val streaming = session.status == ChatStatus.STREAMING
     var wasActive by remember { mutableStateOf(false) }
@@ -287,16 +303,32 @@ fun ChatScreen(
 
         notice?.let {
             Text(
-                text = when (it) {
-                    "NO_ENDPOINT" -> "尚未設定端點，請先設定 API 金鑰。"
-                    "POLICY_DENIED" -> "政策拒絕讀取金鑰（key.read DENY），本次未發送任何請求。"
-                    "UNKNOWN_SESSION" -> "找不到該會話，可能已被刪除。"
-                    else -> it
-                },
+                text = chatNoticeText(it),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(horizontal = 16.dp),
             )
+        }
+
+        // Q3: outbox recovery entry. Restoring fills a blank box only and
+        // never sends; both actions cost zero provider calls.
+        if (pendingRecoveryCount > 0) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "有 $pendingRecoveryCount 則未送出的訊息可恢復",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = viewModel::restoreNextRecovered) { Text("恢復") }
+                TextButton(onClick = viewModel::discardNextRecovered) { Text("捨棄") }
+            }
         }
 
         voiceError?.let {

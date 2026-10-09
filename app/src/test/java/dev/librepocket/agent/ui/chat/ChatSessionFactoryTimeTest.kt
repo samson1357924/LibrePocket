@@ -81,6 +81,12 @@ class ChatSessionFactoryTimeTest {
         }
     }) = FactoryFakeProvider(handler)
 
+    private fun testVaultSource(): VaultSource = VaultSource {
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        vault.putKey("preset:openai", "test-key-12345678".toCharArray())
+        vault
+    }
+
     private fun lastUserText(req: ChatRequest): String? =
         req.messages.lastOrNull { it.role == "user" }?.text
 
@@ -105,7 +111,7 @@ class ChatSessionFactoryTimeTest {
         val fake = ok()
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
@@ -138,7 +144,7 @@ class ChatSessionFactoryTimeTest {
         val fake = ok()
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
@@ -172,7 +178,7 @@ class ChatSessionFactoryTimeTest {
         val fake = ok()
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = null,
             clock = Clock.fixed(Instant.parse("2026-01-15T12:00:00Z"), ZoneId.of("UTC")),
@@ -196,7 +202,7 @@ class ChatSessionFactoryTimeTest {
             val fake = ok()
             val factory = ChatSessionFactory(
                 policy = InMemoryPolicyStore(),
-                vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+                vaultSource = testVaultSource(),
                 buildProvider = { _, _ -> fake },
                 sessionStores = object : SessionStoreSource {
                     override suspend fun store() = transcripts
@@ -219,7 +225,7 @@ class ChatSessionFactoryTimeTest {
         val fake = ok()
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
@@ -249,7 +255,7 @@ class ChatSessionFactoryTimeTest {
         val fake = ok()
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 // Delegate creation to the throwing store's own map so ids stay consistent.
@@ -272,7 +278,7 @@ class ChatSessionFactoryTimeTest {
         val transcripts = FakeSessionStore()
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> ok() },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
@@ -294,7 +300,7 @@ class ChatSessionFactoryTimeTest {
         }
         val throwingFactory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> ok() },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = throwing
@@ -318,7 +324,7 @@ class ChatSessionFactoryTimeTest {
         val fake = ok()
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
@@ -365,7 +371,7 @@ class ChatSessionFactoryTimeTest {
         }
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
@@ -409,7 +415,7 @@ class ChatSessionFactoryTimeTest {
         }
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
-            vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
+            vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts

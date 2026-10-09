@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dev.librepocket.keystore.KeyVault
@@ -30,6 +31,7 @@ internal val ENDPOINT_BASE_URL_V1 = stringPreferencesKey("endpoint_base_url_v1")
 internal val ENDPOINT_PROTOCOL_V1 = stringPreferencesKey("endpoint_protocol_v1")
 internal val ENDPOINT_MODEL_V1 = stringPreferencesKey("endpoint_model_v1")
 internal val ENDPOINT_API_KEY_REF_V1 = stringPreferencesKey("endpoint_api_key_ref_v1")
+internal val ENDPOINT_CONFIG_REVISION_V1 = longPreferencesKey("endpoint_config_revision_v1")
 
 /** Usability verdict for the endpoint gate (log the code only, never key material). */
 enum class EndpointReadiness {
@@ -45,7 +47,9 @@ enum class EndpointReadiness {
  * Never carries the plaintext key: the key itself lives in
  * [dev.librepocket.keystore.KeyVault] under [providerId], referenced here
  * only by [apiKeyRef] (form `provider_key/<...>`). [providerId] follows
- * `ProviderCatalog.fromPreset` convention (`preset:<presetId>`).
+ * `ProviderCatalog.fromPreset` convention (`preset:<presetId>`). The local
+ * [configRevision] is atomically advanced by [EndpointStore.save]/[clear] and
+ * is for stale-session fencing, not endpoint identity or vault-write atomicity.
  */
 data class EndpointConfig(
     val providerId: String,
@@ -55,6 +59,8 @@ data class EndpointConfig(
     val protocol: ProviderProtocol,
     val model: String,
     val apiKeyRef: String,
+    /** Monotonic metadata revision, assigned atomically by [EndpointStore]. */
+    val configRevision: Long = 0L,
 )
 
 /**
@@ -89,6 +95,7 @@ class EndpointStore(
                 protocol = protocol,
                 model = prefs[ENDPOINT_MODEL_V1].orEmpty(),
                 apiKeyRef = apiKeyRef,
+                configRevision = prefs[ENDPOINT_CONFIG_REVISION_V1] ?: 0L,
             )
         }
 
@@ -141,6 +148,7 @@ class EndpointStore(
                 prefs[ENDPOINT_PROTOCOL_V1] = config.protocol.name
                 prefs[ENDPOINT_MODEL_V1] = config.model
                 prefs[ENDPOINT_API_KEY_REF_V1] = config.apiKeyRef
+                prefs[ENDPOINT_CONFIG_REVISION_V1] = nextRevision(prefs[ENDPOINT_CONFIG_REVISION_V1])
             }
         }
     }
@@ -159,7 +167,13 @@ class EndpointStore(
                 prefs.remove(ENDPOINT_PROTOCOL_V1)
                 prefs.remove(ENDPOINT_MODEL_V1)
                 prefs.remove(ENDPOINT_API_KEY_REF_V1)
+                // Keep the revision across logout so a later endpoint cannot
+                // accidentally compare equal to a pre-logout snapshot.
+                prefs[ENDPOINT_CONFIG_REVISION_V1] = nextRevision(prefs[ENDPOINT_CONFIG_REVISION_V1])
             }
         }
     }
+
+    private fun nextRevision(current: Long?): Long =
+        Math.addExact(current ?: 0L, 1L)
 }

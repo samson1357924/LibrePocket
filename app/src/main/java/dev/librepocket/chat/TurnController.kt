@@ -46,7 +46,36 @@ data class TurnRetryConfig(
     retryDelaysMs.getOrElse(retryIndex - 1) { retryDelaysMs.lastOrNull() ?: 0L }
 }
 
-private data class PendingSteer(val text: String, val images: List<ChatImageRef>)
+private data class PendingSteer(val opId: Long?, val text: String, val images: List<ChatImageRef>)
+
+/** Explicit acknowledgment for [TurnController.startOrEnqueue]. */
+sealed interface TurnStart {
+  /** The text was accepted: gate passed, appended, turn running. Join it. */
+  data class Started(val host: Job) : TurnStart
+
+  /** A turn was already in flight: the text is queued FIFO for next round. */
+  data object Queued : TurnStart
+
+  /**
+   * The controller is idle but has intents left by a denied or failed
+   * promotion policy check. They
+   * have been atomically removed from the FIFO for caller recovery; the
+   * current admission is not accepted. In the second-lock branch it may
+   * already have passed one fresh policy gate; retrying after recovery
+   * evaluates policy again.
+   */
+  data class NeedsRecovery(val queuedIntents: List<QueuedIntent>) : TurnStart
+}
+
+/** Fresh chat.send policy evaluation failed; the admission was not accepted. */
+class PolicyEvaluationException(cause: Exception) :
+  Exception("chat.send policy evaluation failed", cause)
+
+/** Fresh chat.send policy requires approval; this build has no interactive consent flow. */
+class ApprovalRequiredException : Exception("chat.send approval required")
+
+/** A direct admission cannot overtake queued work that still needs explicit recovery. */
+class RecoveryRequiredException : IllegalStateException("queued turn recovery required before admission")
 
 /**
  * Turn controller: per-turn [Flow] collection + retry orchestration +
@@ -147,6 +176,29 @@ class TurnController(
   private var inFlight: Job? = null
   private val steerQueue: ArrayDeque<PendingSteer> = ArrayDeque()
   private var closed = false
+  /** Monotonic under [lock]; invalidates fresh-gate failures after turn activity. */
+  private var activityRevision = 0L
+
+  /** Test seam between an idle admission snapshot and its fresh policy gate. */
+  internal var beforeAdmissionGateForTest: (() -> Unit)? = null
+
+  /** Test seam for racing an idle legacy steer with new recovery work. */
+  internal var afterIdleSteerCheckForTest: (() -> Unit)? = null
+
+  /** Test seam for pausing after follow-up policy approval, before handoff. */
+  internal var afterFollowUpGateForTest: (() -> Unit)? = null
+
+  /** Test seam for pausing after follow-up policy denial, before settlement. */
+  internal var afterFollowUpDenyForTest: (() -> Unit)? = null
+
+  /** Test seam for arranging a queue admission immediately before completion checks it. */
+  internal var beforeCompletionQueueCheckForTest: (() -> Unit)? = null
+
+  /** Test seam for pausing startOrEnqueue after its fresh gate and before its second lock. */
+  internal var afterStartOrEnqueueGateForTest: (() -> Unit)? = null
+
+  /** Test seam for pausing startTurn after its fresh gate and before its second lock. */
+  internal var afterStartTurnGateForTest: (() -> Unit)? = null
 
   /** Returns the live in-flight job, dropping (and clearing) completed ones. */
   private fun activeLocked(): Job? {
@@ -159,32 +211,7 @@ class TurnController(
   }
 
   suspend fun send(text: String, images: List<ChatImageRef> = emptyList()) {
-    require(text.isNotBlank()) { "text must not be blank" }
-    synchronized(lock) {
-      check(!closed) { "controller is closed" }
-      if (activeLocked() != null) {
-        _uiState.update { it.copy(error = "busy: another turn is in flight") }
-        throw IllegalStateException("already in flight")
-      }
-    }
-    gateOrThrow()
-    val host = synchronized(lock) {
-      check(!closed) { "controller is closed" }
-      if (activeLocked() != null) {
-        _uiState.update { it.copy(error = "busy: another turn is in flight") }
-        throw IllegalStateException("already in flight")
-      }
-      appendUser(text)
-      _uiState.update { it.copy(status = ChatStatus.STREAMING, error = null) }
-      val job = scope.launch { hostedTurn(text, images) }
-      inFlight = job
-      job.invokeOnCompletion {
-        synchronized(lock) {
-          if (inFlight === job) inFlight = null
-        }
-      }
-      job
-    }
+    val host = startTurn(text, images)
     try {
       host.join()
     } catch (e: CancellationException) {
@@ -194,48 +221,219 @@ class TurnController(
     }
   }
 
+  /**
+   * Start a turn and return once the text is accepted (fresh `chat.send`
+   * policy passed, user message appended, STREAMING) without waiting for the
+   * hosted turn to finish. Callers that must retain an unsent draft across
+   * endpoint invalidation (R1) clear it only after this returns; a
+   * [CancellationException]/[SecurityException]/[IllegalStateException] before
+   * return means the text was NOT accepted and must stay recoverable. A
+   * [RecoveryRequiredException] means queued recovery work must be drained
+   * before this direct admission can proceed; this method never drains it. If
+   * recovery appears after the initial admission lock, this attempt may
+   * already have passed a fresh policy gate; retrying evaluates policy again.
+   */
+  suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): Job {
+    require(text.isNotBlank()) { "text must not be blank" }
+    val revisionAtAdmission = synchronized(lock) {
+      check(!closed) { "controller is closed" }
+      if (activeLocked() != null) {
+        _uiState.update { it.copy(error = "busy: another turn is in flight") }
+        throw IllegalStateException("already in flight")
+      }
+      checkNoQueuedRecoveryLocked()
+      activityRevision
+    }
+    beforeAdmissionGateForTest?.invoke()
+    gateOrThrow(revisionAtAdmission)
+    afterStartTurnGateForTest?.invoke()
+    val host = synchronized(lock) {
+      check(!closed) { "controller is closed" }
+      if (activeLocked() != null) {
+        _uiState.update { it.copy(error = "busy: another turn is in flight") }
+        throw IllegalStateException("already in flight")
+      }
+      checkNoQueuedRecoveryLocked()
+      activityRevision++
+      appendUser(text)
+      _uiState.update {
+        it.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
+      }
+      val job = scope.launch { hostedTurn(text, images) }
+      inFlight = job
+      job.invokeOnCompletion {
+        synchronized(lock) {
+          if (inFlight === job) inFlight = null
+        }
+      }
+      job
+    }
+    return host
+  }
+
   fun cancel() {
     synchronized(lock) {
       val current = activeLocked() ?: return
-      _uiState.update { it.copy(status = ChatStatus.CANCELLED) }
+      activityRevision++
+      _uiState.update {
+        it.copy(
+          status = ChatStatus.CANCELLED,
+          pendingSteerCount = steerQueue.size,
+          queuedRecoveryRequired = steerQueue.isNotEmpty(),
+        )
+      }
       // Cooperative: cancelling collection cancels the underlying HTTP call.
       current.cancel()
     }
     // No join, no IO: return immediately so the UI stops within 200ms.
   }
 
+  /**
+   * Atomic start-or-enqueue: the busy check and the FIFO insert happen under
+   * the same lock, so the decision is never stale. Returns [TurnStart.Started]
+   * once the text is accepted (fresh `chat.send` passed, user message
+   * appended) without waiting for the turn to finish, [TurnStart.Queued]
+   * when a turn was already in flight, or [TurnStart.NeedsRecovery] when an
+   * idle controller still has promotion-gate-failed intents to return to the
+   * caller before it retries this admission. A [CancellationException]/[SecurityException]/
+   * [IllegalStateException] before return means NOT accepted. Unlike
+   * [steer], the idle path never fire-and-forgets: callers always get an
+   * explicit acknowledgment.
+   *
+   * N1 ownership: [TurnStart.Queued] is NOT acceptance (no gate, no append).
+   * [TurnStart.NeedsRecovery] also does not accept the current text; its
+   * returned queue has been atomically drained and must be surfaced for
+   * explicit user recovery. In the second-lock branch, this admission may
+   * already have passed one fresh policy gate; retrying after recovery runs
+   * the policy gate again.
+   * An admission that finds a turn active (either at the initial lock or
+   * after losing the post-gate race) can queue text only. Non-empty [images]
+   * throws [IllegalStateException] without adding a FIFO entry; the caller
+   * retains ownership of both text and images and may explicitly retry later.
+   * The caller keeps owning the text — pass [opId] so endpoint teardown can
+   * reclaim it via [drainQueued] instead of losing it in [close]. Queued
+   * intents are never auto-resent to a new endpoint; draining only surfaces
+   * them for explicit user recovery.
+   */
+  suspend fun startOrEnqueue(
+    text: String,
+    images: List<ChatImageRef> = emptyList(),
+    opId: Long? = null,
+  ): TurnStart {
+    require(text.isNotBlank()) { "text must not be blank" }
+    val revisionAtAdmission = synchronized(lock) {
+      check(!closed) { "controller is closed" }
+      if (activeLocked() != null) {
+        check(images.isEmpty()) { "cannot queue a turn with images; text and images remain caller-owned" }
+        enqueueLocked(opId, text, images)
+        return TurnStart.Queued
+      }
+      drainRecoveryLocked()?.let { return TurnStart.NeedsRecovery(it) }
+      activityRevision
+    }
+    beforeAdmissionGateForTest?.invoke()
+    gateOrThrow(revisionAtAdmission)
+    afterStartOrEnqueueGateForTest?.invoke()
+    val host = synchronized(lock) {
+      check(!closed) { "controller is closed" }
+      if (activeLocked() != null) {
+        // Lost the race during the gate: queue instead of throwing, so the
+        // caller still gets an explicit acceptance signal. Image turns are
+        // the exception: QueuedIntent cannot preserve their image refs.
+        check(images.isEmpty()) { "cannot queue a turn with images; text and images remain caller-owned" }
+        enqueueLocked(opId, text, images)
+        return TurnStart.Queued
+      }
+      drainRecoveryLocked()?.let { return TurnStart.NeedsRecovery(it) }
+      activityRevision++
+      appendUser(text, opId)
+      _uiState.update {
+        it.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
+      }
+      val job = scope.launch { hostedTurn(text, images) }
+      inFlight = job
+      job.invokeOnCompletion {
+        synchronized(lock) {
+          if (inFlight === job) inFlight = null
+        }
+      }
+      job
+    }
+    return TurnStart.Started(host)
+  }
+
+  /**
+   * Queue behind an active turn, or start asynchronously when idle. An idle
+   * call that finds retained recovery work throws [RecoveryRequiredException]
+   * synchronously. If recovery wins after the idle check, this legacy intent
+   * is retained for recovery and the UI exposes the failure instead of
+   * silently dropping it or promoting it automatically.
+   */
   fun steer(text: String) {
     require(text.isNotBlank()) { "text must not be blank" }
     synchronized(lock) {
       check(!closed) { "controller is closed" }
       if (activeLocked() != null) {
         // Never cancel the current turn: queue for the next round (FIFO).
-        steerQueue.addLast(PendingSteer(text, emptyList()))
-        _uiState.update { it.copy(pendingSteerCount = steerQueue.size) }
-        fireTranscript { transcript.onSteerQueued(text) }
+        enqueueLocked(null, text, emptyList())
         return
       }
+      if (steerQueue.isNotEmpty()) {
+        // Keep the legacy synchronous recovery signal, but do not make its
+        // caller's new text disappear behind the already-retained FIFO.
+        retainSteerForRecoveryLocked(text)
+        throw RecoveryRequiredException()
+      }
     }
-    // Idle: behave like send, asynchronously (this entry is non-suspending).
+    afterIdleSteerCheckForTest?.invoke()
+    // Idle: use atomic admission so a turn that wins this race queues the
+    // instruction instead of making a stale busy check reject and lose it.
     scope.launch {
       try {
-        send(text)
+        when (val admission = startOrEnqueue(text, opId = null)) {
+          is TurnStart.Started, TurnStart.Queued -> Unit
+          is TurnStart.NeedsRecovery -> {
+            // Put the transferred older FIFO back first, then retain this
+            // unaccepted legacy intent. Recovery-owned work is never promoted.
+            retainSteerForRecovery(text, recovered = admission.queuedIntents)
+          }
+        }
+      } catch (_: SecurityException) {
+        retainSteerForRecovery(text, error = "denied by policy")
+      } catch (_: ApprovalRequiredException) {
+        retainSteerForRecovery(text, error = "approval required")
+      } catch (_: PolicyEvaluationException) {
+        retainSteerForRecovery(text, error = "policy evaluation failed")
+      } catch (_: CancellationException) {
+        // close() may discard intents by lifecycle contract. Other admission
+        // cancellation must leave the unaccepted text recoverable.
+        retainSteerForRecovery(text, error = "turn admission cancelled")
       } catch (_: Exception) {
-        // Surfaced via uiState (busy/denied/closed); nothing more to do here.
+        // Never silently swallow an unaccepted intent. Closed controllers are
+        // intentionally ignored by retainSteerForRecovery().
+        retainSteerForRecovery(text, error = "turn admission failed")
       }
     }
   }
 
   fun close() {
+    // Drop the FIFO under the same lock that seals the controller, so no
+    // admission can slip in after the seal. Reclaim-then-seal ordering across
+    // threads is the caller's job: the ViewModel drains-then-closes with no
+    // suspension on its Main-confined path, so nothing slips between them
+    // there. Callers that must keep unstarted work (endpoint-switch recovery)
+    // drain it explicitly via drainQueued() BEFORE close().
     synchronized(lock) {
       if (closed) return
       closed = true
+      activityRevision++
       steerQueue.clear()
       val current = activeLocked()
       _uiState.update {
         it.copy(
           pendingSteerCount = 0,
           status = if (current != null) ChatStatus.CANCELLED else it.status,
+          queuedRecoveryRequired = false,
         )
       }
       current?.cancel()
@@ -245,11 +443,130 @@ class TurnController(
 
   // ---- internals ----
 
-  private suspend fun gateOrThrow() {
-    val decision = policy.evaluateFresh(POLICY_ACTION, POLICY_RESOURCE)
+  /** Caller must hold [lock]. Direct starts cannot take ownership of recovery FIFO. */
+  private fun checkNoQueuedRecoveryLocked() {
+    if (steerQueue.isNotEmpty()) throw RecoveryRequiredException()
+  }
+
+  /** Retain an unaccepted steer and any transferred FIFO for explicit recovery. */
+  private fun retainSteerForRecovery(
+    text: String,
+    error: String? = null,
+    recovered: List<QueuedIntent> = emptyList(),
+  ) {
+    synchronized(lock) {
+      if (closed) return
+      retainSteerForRecoveryLocked(text, error, recovered)
+    }
+  }
+
+  /** Caller must hold [lock]. Transferred intents stay ahead of existing/new work. */
+  private fun retainSteerForRecoveryLocked(
+    text: String,
+    error: String? = null,
+    recovered: List<QueuedIntent> = emptyList(),
+  ) {
+    recovered.asReversed().forEach { intent ->
+      steerQueue.addFirst(PendingSteer(intent.opId, intent.text, emptyList()))
+    }
+    enqueueLocked(null, text, emptyList())
+    val active = activeLocked() != null
+    _uiState.update { state ->
+      val mayProjectError = !active && state.status in setOf(ChatStatus.IDLE, ChatStatus.ERROR)
+      state.copy(
+        status = if (mayProjectError) ChatStatus.ERROR else state.status,
+        error = if (!mayProjectError) state.error else if (state.queuedRecoveryRequired && state.error != null) {
+          state.error
+        } else {
+          error ?: state.error ?: "queued turn recovery required before admission"
+        },
+        pendingSteerCount = steerQueue.size,
+        queuedRecoveryRequired = true,
+      )
+    }
+  }
+
+  /** Caller must hold [lock]. Enqueues a follow-up and projects the count. */
+  private fun enqueueLocked(opId: Long?, text: String, images: List<ChatImageRef>) {
+    activityRevision++
+    steerQueue.addLast(PendingSteer(opId, text, images))
+    _uiState.update {
+      it.copy(
+        pendingSteerCount = steerQueue.size,
+        // A cancelled-but-not-yet-completed host still owns the single-flight
+        // slot. Sends in that window queue normally, but cannot be promoted.
+        queuedRecoveryRequired = it.queuedRecoveryRequired || it.status == ChatStatus.CANCELLED,
+      )
+    }
+    fireTranscript { transcript.onSteerQueued(text) }
+  }
+
+  /** Caller must hold [lock]; idle residual FIFO is transferred atomically. */
+  private fun drainRecoveryLocked(): List<QueuedIntent>? {
+    if (steerQueue.isEmpty()) return null
+    val out = steerQueue.map { QueuedIntent(it.opId, it.text) }
+    activityRevision++
+    steerQueue.clear()
+    _uiState.update { it.copy(pendingSteerCount = 0, queuedRecoveryRequired = false) }
+    return out
+  }
+
+  /**
+   * Reclaim queued-but-unstarted intents FIFO (N1). Returns the intents in
+   * queue order and clears the FIFO without starting anything. The caller
+   * owns them afterwards: surface for explicit user recovery, never
+   * auto-resend. Safe to call on a closed controller (drains the remainder).
+   */
+  fun drainQueued(): List<QueuedIntent> {
+    synchronized(lock) {
+      if (steerQueue.isEmpty()) return emptyList()
+      val out = steerQueue.map { QueuedIntent(it.opId, it.text) }
+      activityRevision++
+      steerQueue.clear()
+      _uiState.update { it.copy(pendingSteerCount = 0, queuedRecoveryRequired = false) }
+      return out
+    }
+  }
+
+  private suspend fun gateOrThrow(revisionAtAdmission: Long) {
+    val decision = try {
+      policy.evaluateFresh(POLICY_ACTION, POLICY_RESOURCE)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      projectIdleGateFailure("policy evaluation failed", revisionAtAdmission)
+      throw PolicyEvaluationException(e)
+    }
     if (decision.verdict == Verdict.DENY) {
-      _uiState.update { it.copy(status = ChatStatus.ERROR, error = "denied by policy") }
+      projectIdleGateFailure("denied by policy", revisionAtAdmission)
       throw SecurityException("chat.send denied by policy")
+    }
+    if (decision.verdict == Verdict.ASK) {
+      projectIdleGateFailure("approval required", revisionAtAdmission)
+      throw ApprovalRequiredException()
+    }
+  }
+
+  /** A stale gate result must not overwrite any controller activity since admission began. */
+  private fun projectIdleGateFailure(error: String, revisionAtAdmission: Long) {
+    synchronized(lock) {
+      val status = _uiState.value.status
+      if (
+        closed || activityRevision != revisionAtAdmission || activeLocked() != null ||
+        status == ChatStatus.CANCELLED || (status != ChatStatus.IDLE && status != ChatStatus.ERROR)
+      ) return
+      activityRevision++
+      _uiState.update {
+        val hasQueuedRecovery = steerQueue.isNotEmpty()
+        it.copy(
+          status = ChatStatus.ERROR,
+          // A late fresh-gate result must not replace the promotion failure
+          // that explains why this already-retained FIFO needs recovery.
+          error = if (hasQueuedRecovery && it.queuedRecoveryRequired && it.error != null) it.error else error,
+          pendingSteerCount = steerQueue.size,
+          queuedRecoveryRequired = hasQueuedRecovery,
+        )
+      }
     }
   }
 
@@ -276,10 +593,18 @@ class TurnController(
       throw e
     }
     // Normal completion only: hand off at most one queued steer as a detached
-    // follow-up turn, so send() returns after its own turn.
-    val next = synchronized(lock) { steerQueue.removeFirstOrNull() }
-    if (next == null) {
-      synchronized(lock) {
+    // follow-up turn, so send() returns after its own turn. The follow-up
+    // gate runs BEFORE dequeue, so a deny leaves the queue intact (still
+    // reclaimable via drainQueued). The dequeue and complete follow-up handoff
+    // then share the teardown lock, so the intent is either drained or fully
+    // accepted; it cannot be stranded between the queue and transcript.
+    beforeCompletionQueueCheckForTest?.invoke()
+    val hasQueued = synchronized(lock) {
+      if (closed || self?.isActive != true) {
+        if (inFlight === self) inFlight = null
+        false
+      } else if (steerQueue.isEmpty()) {
+        activityRevision++
         if (inFlight === self) inFlight = null
         _uiState.update { s ->
           if (s.status == ChatStatus.STREAMING || s.status == ChatStatus.WAITING_STEERED) {
@@ -288,21 +613,82 @@ class TurnController(
             s
           }
         }
-      }
-      return
-    }
-    _uiState.update { it.copy(pendingSteerCount = queueSize(), status = ChatStatus.WAITING_STEERED) }
-    val decision = policy.evaluateFresh(POLICY_ACTION, POLICY_RESOURCE)
-    if (decision.verdict == Verdict.DENY) {
-      _uiState.update { it.copy(status = ChatStatus.ERROR, error = "denied by policy") }
-      synchronized(lock) {
+        false
+      } else if (_uiState.value.queuedRecoveryRequired) {
+        // Recovery-owned FIFO must not be auto-promoted, including a legacy
+        // steer retained after its idle admission raced with recovery.
+        activityRevision++
         if (inFlight === self) inFlight = null
+        _uiState.update { state ->
+          val status = if (state.status == ChatStatus.STREAMING || state.status == ChatStatus.WAITING_STEERED) {
+            ChatStatus.ERROR
+          } else {
+            state.status
+          }
+          state.copy(
+            status = status,
+            error = if (status == ChatStatus.ERROR) {
+              state.error ?: "queued turn recovery required before admission"
+            } else {
+              state.error
+            },
+            pendingSteerCount = steerQueue.size,
+            queuedRecoveryRequired = steerQueue.isNotEmpty(),
+          )
+        }
+        false
+      } else {
+        activityRevision++
+        _uiState.update { it.copy(pendingSteerCount = steerQueue.size, status = ChatStatus.WAITING_STEERED) }
+        true
       }
+    }
+    if (!hasQueued) {
       return
     }
+    val decision = try {
+      policy.evaluateFresh(POLICY_ACTION, POLICY_RESOURCE)
+    } catch (e: CancellationException) {
+      throw e
+    } catch (_: Exception) {
+      failPromotion("policy evaluation failed", self)
+      return
+    }
+    if (decision.verdict == Verdict.ASK) {
+      failPromotion("approval required", self)
+      return
+    }
+    if (decision.verdict == Verdict.DENY) {
+      afterFollowUpDenyForTest?.invoke()
+      failPromotion("denied by policy", self)
+      return
+    }
+    afterFollowUpGateForTest?.invoke()
     synchronized(lock) {
-      appendUser(next.text)
-      _uiState.update { it.copy(status = ChatStatus.STREAMING, error = null) }
+      if (
+        closed || self?.isActive != true || _uiState.value.status == ChatStatus.CANCELLED ||
+        _uiState.value.queuedRecoveryRequired
+      ) {
+        if (inFlight === self) inFlight = null
+        return
+      }
+      val next = steerQueue.removeFirstOrNull()
+      if (next == null) {
+        // drainQueued() won after the fresh gate. Mirror the empty-queue
+        // transition while preserving a racing close()'s CANCELLED state.
+        if (inFlight === self) inFlight = null
+        _uiState.update { s ->
+          if (s.status == ChatStatus.STREAMING || s.status == ChatStatus.WAITING_STEERED) {
+            s.copy(status = ChatStatus.IDLE)
+          } else {
+            s
+          }
+        }
+        return
+      }
+      activityRevision++
+      appendUser(next.text, next.opId)
+      _uiState.update { it.copy(status = ChatStatus.STREAMING, error = null, pendingSteerCount = steerQueue.size) }
       val follow = scope.launch { hostedTurn(next.text, next.images) }
       inFlight = follow
       follow.invokeOnCompletion {
@@ -313,7 +699,27 @@ class TurnController(
     }
   }
 
-  private fun queueSize(): Int = synchronized(lock) { steerQueue.size }
+  /** Caller has completed the promotion gate; fail closed without consuming the FIFO. */
+  private fun failPromotion(error: String, host: Job?) {
+    synchronized(lock) {
+      // A concurrent close/cancel owns the terminal projection. Otherwise
+      // expose an idle error so the VM can explicitly recover the retained FIFO.
+      if (closed || (host != null && !host.isActive) || _uiState.value.status == ChatStatus.CANCELLED) {
+        if (inFlight === host) inFlight = null
+        return
+      }
+      if (inFlight === host) inFlight = null
+      activityRevision++
+      _uiState.update {
+        it.copy(
+          status = ChatStatus.ERROR,
+          error = error,
+          pendingSteerCount = steerQueue.size,
+          queuedRecoveryRequired = steerQueue.isNotEmpty(),
+        )
+      }
+    }
+  }
 
   private suspend fun runTurnLoop(text: String, images: List<ChatImageRef>) {
     var attempt = 0
@@ -412,7 +818,10 @@ class TurnController(
       // starts a brand-new assistant block with a brand-new runId.
       if (!failure.retryable || attempt >= retryConfig.maxRetries) {
         val clean = sanitizeError(failure.message)
-        _uiState.update { it.copy(status = ChatStatus.ERROR, error = clean) }
+        synchronized(lock) {
+          activityRevision++
+          _uiState.update { it.copy(status = ChatStatus.ERROR, error = clean) }
+        }
         fireTranscript { transcript.onTurnFailed(attemptRunId, clean) }
         return
       }
@@ -504,9 +913,17 @@ class TurnController(
 
   // ---- uiState helpers (StateFlow.update is atomic; no lock needed) ----
 
-  private fun appendUser(text: String) {
+  private fun appendUser(text: String, operationId: Long? = null) {
     _uiState.update { s ->
-      s.copy(messages = s.messages + UiMessage(id = newId(), role = "user", text = text, isPartial = false))
+      s.copy(
+        messages = s.messages + UiMessage(
+          id = newId(),
+          role = "user",
+          text = text,
+          isPartial = false,
+          operationId = operationId,
+        ),
+      )
     }
   }
 

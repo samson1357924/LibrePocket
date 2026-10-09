@@ -167,7 +167,9 @@ class SetupViewModel(
             errorCode = null,
             testModels = null,
             keyWriteConfirmed = false,
+            modelOptions = emptyList(),
             modelsLoading = false,
+            modelDirectoryStatus = ModelDirectoryStatus.NotLoaded,
         )
     }
 

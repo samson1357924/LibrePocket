@@ -810,6 +810,29 @@ class SetupModelDirectoryStatusTest {
     }
 
     @Test
+    fun onApiKeyChangeClearsStaleCandidatesButPreservesFreeText(): Unit {
+        runBlocking {
+            val vm = newViewModel { DIRECTORY_OPENAI }
+            vm.onApiKeyChange("synthetic-test-key")
+            vm.refreshModels()
+            awaitModelsIdle(vm)
+
+            assertEquals(ModelDirectoryStatus.Remote, vm.form.value.modelDirectoryStatus)
+            assertTrue(vm.form.value.modelOptions.isNotEmpty())
+
+            vm.onModelChange("user/free-text-model")
+            vm.onApiKeyChange("synthetic-test-key-2")
+
+            val state = vm.form.value
+            assertEquals("synthetic-test-key-2", state.apiKey)
+            assertEquals("user/free-text-model", state.model)
+            assertTrue(state.modelOptions.isEmpty())
+            assertEquals(ModelDirectoryStatus.NotLoaded, state.modelDirectoryStatus)
+            assertFalse(state.modelsLoading)
+        }
+    }
+
+    @Test
     fun onBaseUrlChangeCancelsHeldRefresh(): Unit {
         runBlocking {
             val firstStarted = CompletableDeferred<Unit>()

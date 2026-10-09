@@ -1022,6 +1022,149 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // Recovery order is assigned when each operation starts, not when its
+    // independent policy gate happens to settle. A starts first but waits;
+    // B is denied first and remains visible while A is then denied to outbox.
+    @Test
+    fun concurrentDeniedGatesKeepOperationCreationOrderInRecovery() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val aGateEntered = CompletableDeferred<Unit>()
+        val releaseADeny = CompletableDeferred<Unit>()
+        val aGateDenied = CompletableDeferred<Unit>()
+        val bGateDenied = CompletableDeferred<Unit>()
+        sessions.acceptGate = { text ->
+            when (text) {
+                "A" -> {
+                    aGateEntered.complete(Unit)
+                    releaseADeny.await()
+                    aGateDenied.complete(Unit)
+                    throw SecurityException("chat.send denied by policy")
+                }
+                "B" -> {
+                    bGateDenied.complete(Unit)
+                    throw SecurityException("chat.send denied by policy")
+                }
+            }
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { aGateEntered.await() }
+
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) { bGateDenied.await() }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.input.first { it == "B" } }
+            assertEquals(0, vm.pendingRecoveryCount.value)
+
+            // A settles later while B is still visible, so A joins the outbox.
+            releaseADeny.complete(Unit)
+            withTimeout(5_000) { aGateDenied.await() }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            assertEquals("B", vm.input.value)
+
+            // A control send stashes tagged B. A must surface first; B remains
+            // explicit recovery and can be restored next, never auto-sent.
+            chatMain.run { vm.sendDirect("control") }
+            val session = sessions.created.single()
+            withTimeout(5_000) { session.sendFinished.await() }
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            assertEquals(listOf("control"), session.sent.toList())
+
+            chatMain.run { vm.onInputChange("") }
+            var restored = false
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertTrue(restored)
+            assertEquals("B", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(listOf("control"), session.sent.toList())
+        } finally {
+            releaseADeny.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // Recovery FIFO provenance is independent of the visible input box:
+    // older A stays in the outbox while newer typed D is denied into the box.
+    // A denied retry of D must keep that later slot, and sendDirect must
+    // re-stash D behind A rather than promote it to the head.
+    @Test
+    fun retriedDeniedDraftRestashesAfterOlderOutboxEntry() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val aGateEntered = CompletableDeferred<Unit>()
+        val holdA = CompletableDeferred<Unit>()
+        val denyD = AtomicBoolean(false)
+        val denyDCalls = AtomicInteger()
+        sessions.acceptGate = { text ->
+            when (text) {
+                "A" -> {
+                    aGateEntered.complete(Unit)
+                    holdA.await()
+                }
+                "D" -> {
+                    denyDCalls.incrementAndGet()
+                    if (denyD.get()) throw SecurityException("chat.send denied by policy")
+                }
+            }
+        }
+        val vm = newViewModel(store, sessions)
+        try {
+            // A is still preaccept when the endpoint changes; newer user
+            // typing prevents the endpoint drain from taking over the box.
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { aGateEntered.await() }
+            chatMain.run { vm.onInputChange("D") }
+            store.save(endpoint().copy(model = "new-model"))
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            assertEquals("D", vm.input.value)
+
+            // D is fresh input, so its deny receives a later recovery slot.
+            denyD.set(true)
+            chatMain.run { vm.send() }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            assertEquals("D", vm.input.value)
+            assertEquals(1, vm.pendingRecoveryCount.value)
+
+            // Retry temporarily removes D from explicit recovery. Its second
+            // preaccept denial must retain the same later FIFO position.
+            chatMain.run { vm.retry() }
+            withTimeout(5_000) {
+                while (denyDCalls.get() < 2) delay(1)
+            }
+            chatMain.run { }
+            assertEquals("D", vm.input.value)
+            assertEquals(1, vm.pendingRecoveryCount.value)
+
+            // sendDirect stashes tagged D, but the pre-existing A must remain
+            // the next surfaced recovery. Neither recovery is auto-sent.
+            chatMain.run { vm.sendDirect("control") }
+            val controlSession = sessions.awaitCreated(2)
+            withTimeout(5_000) { controlSession.sendFinished.await() }
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            assertEquals(listOf("control"), controlSession.sent.toList())
+            assertEquals(emptyList<String>(), sessions.created.first().sent.toList())
+
+            // After explicitly clearing A, the retained newer D is next.
+            chatMain.run { vm.onInputChange("") }
+            var restored = false
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertTrue(restored)
+            assertEquals("D", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+        } finally {
+            holdA.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     // N2/M3: stashing denied A preserves it for explicit recovery, but newer
     // direct-send B owns Retry after a post-accept provider failure. Retrying B
     // must not send A; the tagged A draft remains available for explicit send.
@@ -2197,6 +2340,119 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // An explicitly restored old opId can be admitted after a newer queued
+    // op. Endpoint invalidation must preserve the real controller FIFO rather
+    // than sorting the drained batch by operation identity.
+    @Test
+    fun endpointSwitchPreservesControllerFifoWhenOldRecoveredOpQueuesLast() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val provider = PromotionProvider(blockedText = "X")
+        val policy = PromotionPolicy(denyChecks = setOf(1))
+        data class QueuedAdmission(val text: String, val opId: Long)
+        val attempts = CopyOnWriteArrayList<Pair<String, Long?>>()
+        val queuedAdmissions = CopyOnWriteArrayList<QueuedAdmission>()
+        val queuedB = CompletableDeferred<QueuedAdmission>()
+        val queuedA = CompletableDeferred<QueuedAdmission>()
+        val sessions = ProductionControllerSessions(
+            provider = provider,
+            policy = policy,
+            wrapSession = { delegate ->
+                object : ChatSession by delegate {
+                    override suspend fun startOrEnqueue(
+                        text: String,
+                        images: List<ChatImageRef>,
+                        opId: Long?,
+                    ): TurnStart {
+                        attempts.add(text to opId)
+                        val admission = delegate.startOrEnqueue(text, images, opId)
+                        if (admission == TurnStart.Queued) {
+                            val queued = QueuedAdmission(text, requireNotNull(opId))
+                            queuedAdmissions.add(queued)
+                            when (text) {
+                                "B" -> queuedB.complete(queued)
+                                "A" -> queuedA.complete(queued)
+                            }
+                        }
+                        return admission
+                    }
+                }
+            },
+        )
+        val vm = newViewModel(store, sessions, policy)
+        try {
+            // First A is denied and restored as a tagged recoverable draft.
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.input.first { it == "A" } }
+            val originalAOpId = requireNotNull(attempts.first { it.first == "A" }.second)
+            assertTrue(provider.sent.isEmpty())
+
+            // Sending X stashes A, then X becomes active and blocks in the
+            // real provider. B is admitted into the controller FIFO first.
+            chatMain.run { vm.sendDirect("X") }
+            withTimeout(5_000) { provider.blockedCall.await() }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.STREAMING } }
+            chatMain.run { vm.sendDirect("B") }
+            val admittedB = withTimeout(5_000) { queuedB.await() }
+
+            // Restore the original tagged A while X is active and queue it
+            // after B. It deliberately reuses A's older operation identity.
+            var restored = false
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertTrue(restored)
+            assertEquals("A", vm.input.value)
+            chatMain.run { vm.send() }
+            val admittedA = withTimeout(5_000) { queuedA.await() }
+            assertEquals(originalAOpId, admittedA.opId)
+            assertTrue("A has an older ID than B", originalAOpId < admittedB.opId)
+            assertEquals(listOf("B", "A"), queuedAdmissions.map { it.text })
+            assertEquals(listOf("X"), provider.sent.toList())
+
+            // Changing endpoint cancels blocked X and reclaims B then A.
+            store.save(endpoint().copy(model = "new-model"))
+            withTimeout(5_000) { vm.notice.first { it == "SEND_CANCELLED_ENDPOINT_CHANGED" } }
+            withTimeout(5_000) { provider.blockedCancelled.await() }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            assertEquals("B", vm.input.value)
+            assertEquals(listOf("X"), provider.sent.toList())
+            assertEquals(listOf("test-model"), provider.requestModels.toList())
+
+            // A new endpoint session is created only after an explicit send.
+            // B is stashed back at the recoverable head; control completion
+            // restores B first while A remains in the outbox. Neither is sent.
+            chatMain.run { vm.sendDirect("new endpoint control") }
+            withTimeout(5_000) { provider.sentCount.first { it == 2 } }
+            withTimeout(5_000) { vm.input.first { it == "B" } }
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.IDLE && it.messages.any { message ->
+                        message.role == "user" && message.text == "new endpoint control"
+                    }
+                }
+            }
+            assertEquals(2, sessions.controllerSessions.size)
+            assertEquals(listOf("test-model", "new-model"), sessions.createdModels.toList())
+            assertEquals(listOf("X", "new endpoint control"), provider.sent.toList())
+            assertEquals(listOf("test-model", "new-model"), provider.requestModels.toList())
+            assertEquals("B", vm.input.value)
+            assertEquals(1, vm.pendingRecoveryCount.value)
+
+            // A is still explicit recovery and never reached either
+            // endpoint's provider request.
+            chatMain.run { vm.onInputChange("") }
+            chatMain.run { restored = vm.restoreNextRecovered() }
+            assertTrue(restored)
+            assertEquals("A", vm.input.value)
+            assertEquals(0, vm.pendingRecoveryCount.value)
+            assertEquals(listOf("X", "new endpoint control"), provider.sent.toList())
+        } finally {
+            provider.releaseBlocked.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     // Q2: retry never clobbers newer typing, and a denied retry stashes the
     // intent instead of deleting it. Denied Q is restored, the user types
     // "newer", and a still-denied retry resends nothing and keeps "newer";
@@ -2775,6 +3031,7 @@ class ChatSessionLifecycleTest {
         private val created = AtomicInteger()
         val createdSessions = CopyOnWriteArrayList<ChatSession>()
         val controllerSessions = CopyOnWriteArrayList<ChatSession>()
+        val createdModels = CopyOnWriteArrayList<String>()
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
@@ -2784,6 +3041,7 @@ class ChatSessionLifecycleTest {
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
             val id = "controller-session-${created.incrementAndGet()}"
+            createdModels.add(endpoint.model)
             val transcript = object : TranscriptSink by NoOpTranscriptSink() {
                 override suspend fun onSteerQueued(text: String) = onQueued(text)
             }
@@ -2814,17 +3072,25 @@ class ChatSessionLifecycleTest {
     ) : LlmProvider {
         override val protocol = ProviderProtocol.CHAT_COMPLETIONS
         val sent = CopyOnWriteArrayList<String>()
+        val requestModels = CopyOnWriteArrayList<String>()
         val sentCount = MutableStateFlow(0)
         val blockedCall = CompletableDeferred<Unit>()
+        val blockedCancelled = CompletableDeferred<Unit>()
         val releaseBlocked = CompletableDeferred<Unit>()
 
         override fun stream(request: ChatRequest) = flow {
             val text = request.messages.last { it.role == "user" }.text
             sent.add(text)
+            requestModels.add(request.model)
             sentCount.value = sent.size
             if (text == blockedText) {
                 blockedCall.complete(Unit)
-                releaseBlocked.await()
+                try {
+                    releaseBlocked.await()
+                } catch (cancelled: CancellationException) {
+                    blockedCancelled.complete(Unit)
+                    throw cancelled
+                }
             }
             if (text == failedText) {
                 emit(StreamEvent.Failed("synthetic context error", retryable = false))

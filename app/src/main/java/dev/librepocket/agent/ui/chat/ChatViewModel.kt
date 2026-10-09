@@ -85,7 +85,7 @@ class ChatViewModel(
     fun restoreNextRecovered(): Boolean {
         if (_input.value.isNotBlank()) return false
         val next = recoverableOps.removeFirstOrNull() ?: return false
-        setInput(next.text, next.opId, next.text)
+        setInput(next.text, next.opId, next.text, next.recoverySequence)
         syncRecoveryCount()
         return true
     }
@@ -102,6 +102,30 @@ class ChatViewModel(
 
     private fun syncRecoveryCount() {
         _pendingRecoveryCount.value = recoverableOps.size
+    }
+
+    /** Give first-time recovery work a stable FIFO position; carried positions never change. */
+    private fun withRecoverySequence(op: PendingOp): PendingOp {
+        val existing = op.recoverySequence
+        if (existing != null) {
+            nextRecoverySequence = maxOf(nextRecoverySequence, existing)
+            return op
+        }
+        return op.copy(recoverySequence = ++nextRecoverySequence)
+    }
+
+    /** Insert idempotently by provenance rather than guessing head/tail from the current input path. */
+    private fun addRecoverable(op: PendingOp): PendingOp {
+        op.recoverySequence?.let { sequence ->
+            nextRecoverySequence = maxOf(nextRecoverySequence, sequence)
+        }
+        recoverableOps.firstOrNull { it.opId == op.opId }?.let { return it }
+        val sequenced = withRecoverySequence(op)
+        val ordered = (recoverableOps.toList() + sequenced)
+            .sortedBy { checkNotNull(it.recoverySequence) }
+        recoverableOps.clear()
+        recoverableOps.addAll(ordered)
+        return sequenced
     }
 
     // Lifecycle state is main-thread confined. The generation is also read by
@@ -130,6 +154,10 @@ class ChatViewModel(
         val generation: Long,
         val text: String,
         val retryTargetEpoch: Long = 0L,
+        // Stable FIFO provenance assigned when an attempt is created; it only
+        // affects explicit recovery if needed. Controller-accepted queue
+        // order is established anew by the controller's drained FIFO.
+        val recoverySequence: Long? = null,
     )
     private var nextOpId = 0L
     private var nextRetryTargetEpoch = 0L
@@ -137,13 +165,21 @@ class ChatViewModel(
     // Endpoint-cancelled but never accepted: surfaced one-by-one through the
     // input box after each explicit send; discarded by newChat/open/logout.
     private val recoverableOps = ArrayDeque<PendingOp>()
+    private var nextRecoverySequence = 0L
     // Q2: every box value has an owner — user input (null tag) or the op
-    // that restored it. Retry adopts the failed intent and consumes the box
-    // only while it still holds that unmodified draft (opId + revision +
-    // text must all match: no string-equality ownership, no clobbering newer
-    // typing, identical independent texts stay separate).
+    // that restored it. The recovery sequence preserves its FIFO provenance
+    // across restore → retry/direct-send → preaccept denial. Retry adopts the
+    // failed intent and consumes the box only while it still holds that
+    // unmodified draft (opId + revision + text must all match: no
+    // string-equality ownership, no clobbering newer typing, identical
+    // independent texts stay separate).
     private var inputRevision = 0L
-    private data class InputDraft(val opId: Long, val revision: Long, val text: String)
+    private data class InputDraft(
+        val opId: Long,
+        val revision: Long,
+        val text: String,
+        val recoverySequence: Long,
+    )
     private var inputDraft: InputDraft? = null
     // Latest denied-but-retryable intent (CHAT_SEND_DENIED path). A retry
     // reuses its opId, while retryTargetEpoch distinguishes later attempts.
@@ -166,10 +202,17 @@ class ChatViewModel(
     private var retryInFlight: RetryAttempt? = null
 
     /** Single choke point for all `_input` writes: bumps the revision and (re)tags the owner. */
-    private fun setInput(value: String, draftOpId: Long? = null, draftText: String? = null) {
+    private fun setInput(
+        value: String,
+        draftOpId: Long? = null,
+        draftText: String? = null,
+        recoverySequence: Long? = null,
+    ) {
         _input.value = value
         inputRevision++
-        inputDraft = draftOpId?.let { InputDraft(it, inputRevision, draftText ?: value) }
+        inputDraft = draftOpId?.let {
+            InputDraft(it, inputRevision, draftText ?: value, checkNotNull(recoverySequence))
+        }
     }
     private var observedBinding: EndpointSessionBinding? = null
     private var hasObservedBinding = false
@@ -222,14 +265,17 @@ class ChatViewModel(
         val draft = inputDraft
         val adoptedId =
             if (draft != null && draft.revision == inputRevision && draft.text == raw) draft.opId else null
+        val adoptedRecoverySequence = if (adoptedId != null) draft?.recoverySequence else null
         if (adoptedId != null) recoverableOps.removeAll { it.opId == adoptedId }
         else retryableOp = null
         syncRecoveryCount()
         setInput("")
         if (isBusy(_sessionState.value.status)) {
-            steer(text, adoptedId)
+            steer(text, adoptedId, adoptedRecoverySequence)
         } else {
-            if (adoptedId != null) launchSendOp(adoptedId, text, lifecycleGeneration)
+            if (adoptedId != null) {
+                launchSendOp(adoptedId, text, lifecycleGeneration, recoverySequence = adoptedRecoverySequence)
+            }
             else sendText(text)
         }
     }
@@ -253,7 +299,9 @@ class ChatViewModel(
     }
 
     /** Queue an instruction for the next round; never preempts the live turn. */
-    fun steer(text: String, adoptedOpId: Long? = null) {
+    fun steer(text: String, adoptedOpId: Long? = null) = steer(text, adoptedOpId, null)
+
+    private fun steer(text: String, adoptedOpId: Long?, recoverySequence: Long?) {
         val clean = text.trim()
         if (clean.isEmpty()) return
         val startedAt = lifecycleGeneration
@@ -263,7 +311,7 @@ class ChatViewModel(
         // draft — a visible restored draft stays retryable while the fresh
         // steer goes out alongside it.
         val opId = adoptedOpId ?: ++nextOpId
-        val pending = beginRetryTargetCandidate(opId, clean)
+        val pending = beginRetryTargetCandidate(opId, clean, recoverySequence)
         if (adoptedOpId == null && !isBoxHoldingTaggedDraft()) retryableOp = null
         pendingOps[opId] = pending.copy(generation = startedAt)
         lifecycleScope.launch {
@@ -432,7 +480,13 @@ class ChatViewModel(
             }
             recoverableOps.removeAll { it.opId == op.opId }
             syncRecoveryCount()
-            launchSendOp(op.opId, op.text, lifecycleGeneration, retryAttempt = attempt)
+            launchSendOp(
+                op.opId,
+                op.text,
+                lifecycleGeneration,
+                retryAttempt = attempt,
+                recoverySequence = op.recoverySequence,
+            )
         } catch (failure: Throwable) {
             finishRetryAttempt(attempt)
             throw failure
@@ -452,8 +506,9 @@ class ChatViewModel(
         text: String,
         startedAt: Long,
         retryAttempt: RetryAttempt? = null,
+        recoverySequence: Long? = null,
     ) {
-        val pending = beginRetryTargetCandidate(opId, text)
+        val pending = beginRetryTargetCandidate(opId, text, recoverySequence)
         _notice.value = null
         pendingOps[opId] = pending.copy(generation = startedAt)
         lifecycleScope.launch {
@@ -604,7 +659,7 @@ class ChatViewModel(
         } ?: return
         val queued = drained.first { it.opId == attempt.opId }
         val recovered = inputDraft?.takeIf { it.opId == attempt.opId }?.let {
-            PendingOp(it.opId, lifecycleGeneration, it.text)
+            PendingOp(it.opId, lifecycleGeneration, it.text, recoverySequence = it.recoverySequence)
         } ?: recoverableOps.firstOrNull { it.opId == attempt.opId }
             ?: PendingOp(attempt.opId, lifecycleGeneration, queued.text)
         promoteQueuedRetryTarget(recovered)
@@ -614,7 +669,7 @@ class ChatViewModel(
     private fun resolveRetryAlreadyRecovered(attempt: RetryAttempt) {
         if (retryInFlight !== attempt) return
         val recovered = inputDraft?.takeIf { it.opId == attempt.opId }?.let {
-            PendingOp(it.opId, lifecycleGeneration, it.text)
+            PendingOp(it.opId, lifecycleGeneration, it.text, recoverySequence = it.recoverySequence)
         } ?: recoverableOps.firstOrNull { it.opId == attempt.opId } ?: return
         setRetryableIfNewer(recovered)
         finishRetryAttempt(attempt)
@@ -969,7 +1024,9 @@ class ChatViewModel(
         absorbDrainedQueued(normalized, fillInput = true, includePending = false)
         val firstId = checkNotNull(normalized.first().opId)
         val op = firstId.let { id ->
-            inputDraft?.takeIf { it.opId == id }?.let { PendingOp(id, generation, it.text) }
+            inputDraft?.takeIf { it.opId == id }?.let {
+                PendingOp(id, generation, it.text, recoverySequence = it.recoverySequence)
+            }
                 ?: recoverableOps.firstOrNull { it.opId == id }
         }
         // A queue recovery is the latest failed operation and owns Retry,
@@ -1105,8 +1162,8 @@ class ChatViewModel(
             // box; newer typing is never overwritten; the rest wait in
             // recoverableOps and surface one-by-one after each explicit send.
             // N1: queued-but-unstarted intents reclaimed above join the same
-            // outbox via absorbDrainedQueued (canonical FIFO = opId creation
-            // order; never auto-sent).
+            // outbox via absorbDrainedQueued (pending preaccept entries first,
+            // then controller-drained FIFO; never auto-sent).
             val hadUnaccepted = pendingOps.isNotEmpty() || queuedFromSession.isNotEmpty()
             if (!hadUnaccepted) {
                 _notice.value = null
@@ -1119,9 +1176,10 @@ class ChatViewModel(
 
     /**
      * Merge reclaimed queued intents plus still-pending pre-accept ops into
-     * [recoverableOps] FIFO (N1/R2). Canonical order is opId creation order:
-     * both [pendingOps] insertion order and per-op incrementing ids agree on
-     * it, so a post-gate admission race cannot reorder the outbox. Returns
+     * [recoverableOps] FIFO (N1/R2). Merge order is still-pending preaccept
+     * entries in [pendingOps] insertion order, followed by [drained] in the
+     * controller's drain/FIFO order. opId is identity only, not admission
+     * order: an older recovered op may be queued after a newer op. Returns
      * true when anything became recoverable. Idempotent per opId within and
      * across calls (never duplicates entries already in [recoverableOps] or
      * the tagged input box; stale pending entries shadowed by those are
@@ -1158,11 +1216,15 @@ class ChatViewModel(
             emptyList()
         }
         if (includePending) pendingOps.clear()
-        val merged = (movedPending + reclaimed).sortedBy { it.opId }
-        for (op in merged) recoverableOps.addLast(op)
+        // Keep controller admission order within the drained batch; IDs only
+        // deduplicate operation identity and do not describe queue order.
+        val merged = movedPending + reclaimed
+        for (op in merged) addRecoverable(op)
         syncRecoveryCount()
         if (fillInput && merged.isNotEmpty() && _input.value.isBlank()) {
-            recoverableOps.removeFirstOrNull()?.let { setInput(it.text, it.opId, it.text) }
+            recoverableOps.removeFirstOrNull()?.let {
+                setInput(it.text, it.opId, it.text, it.recoverySequence)
+            }
             syncRecoveryCount()
         }
         resolveQueuedRetryFromRecovery(drained)
@@ -1265,13 +1327,14 @@ class ChatViewModel(
         // Gate calls may settle out of order. A delayed failure for an older
         // send must not steal Retry from newer queued recovery already
         // reclaimed by the session-state collector.
-        setRetryableIfNewer(op)
+        val recoverable = withRecoverySequence(op)
+        setRetryableIfNewer(recoverable)
         if (_input.value.isNotBlank()) {
-            recoverableOps.addLast(op)
+            addRecoverable(recoverable)
             syncRecoveryCount()
             return
         }
-        setInput(op.text, op.opId, op.text)
+        setInput(recoverable.text, recoverable.opId, recoverable.text, recoverable.recoverySequence)
         _notice.value = noticeValue
     }
 
@@ -1295,15 +1358,37 @@ class ChatViewModel(
     }
 
     /** A new retry-target attempt invalidates any older post-accept fallback candidate. */
-    private fun beginRetryTargetCandidate(opId: Long, text: String): PendingOp {
-        val candidate = PendingOp(opId, lifecycleGeneration, text, ++nextRetryTargetEpoch)
+    private fun beginRetryTargetCandidate(
+        opId: Long,
+        text: String,
+        recoverySequence: Long? = null,
+    ): PendingOp {
+        val stableRecoverySequence = recoverySequence ?: ++nextRecoverySequence
+        nextRecoverySequence = maxOf(nextRecoverySequence, stableRecoverySequence)
+        val candidate = PendingOp(
+            opId = opId,
+            generation = lifecycleGeneration,
+            text = text,
+            retryTargetEpoch = ++nextRetryTargetEpoch,
+            recoverySequence = stableRecoverySequence,
+        )
         retryTargetCandidate = candidate
         retryFallbackTarget = null
         return candidate
     }
 
-    /** Started/Queued may back fallback Retry under the queue contract; only Started advances the marker. */
+    /**
+     * Queued transfers ordering authority to the controller FIFO, while a
+     * preaccept denial keeps the existing recovery sequence on pendingOps.
+     * Only Started advances the started marker.
+     */
     private fun recordAcceptedRetryTarget(opId: Long, text: String) {
+        // This method is called only for controller-Queued admission. Even if
+        // another concurrent op superseded the shared retry candidate, queue
+        // admission still replaces this op's former recovery position.
+        pendingOps[opId]?.takeIf { it.text == text }?.let {
+            pendingOps[opId] = it.copy(recoverySequence = null)
+        }
         val candidate = retryTargetCandidate
         if (candidate?.opId == opId && candidate.text == text) {
             retryFallbackTarget = candidate.copy(generation = lifecycleGeneration)
@@ -1334,7 +1419,7 @@ class ChatViewModel(
         if (_input.value.isNotBlank()) return
         val next = recoverableOps.removeFirstOrNull() ?: return
         syncRecoveryCount()
-        setInput(next.text, next.opId, next.text)
+        setInput(next.text, next.opId, next.text, next.recoverySequence)
     }
 
     // N2: true only while the box still holds an unmodified tagged restore
@@ -1352,18 +1437,27 @@ class ChatViewModel(
      * send()). Only explicit user overwrite (untagged via onInputChange),
      * explicit discard, or newChat/open/logout may drop it unstashed.
      * Idempotent per opId; the stashed entry is always stamped with the
-     * current generation (same contract as absorbDrainedQueued). Never
-     * auto-sends. Returns the stashed entry, or null when the box held no
-     * tagged draft. Ownership of [retryableOp] is decided by the caller.
+     * current generation (same contract as absorbDrainedQueued). Restore and
+     * retry provenance carries its original recovery sequence, so it returns
+     * to that position even if newer entries were added meanwhile. A fresh
+     * attempt receives its sequence before its gate, preserving creation order
+     * when concurrent denials settle out of order. Never auto-sends. Returns
+     * the stashed entry, or null when the box held no tagged draft. Ownership
+     * of [retryableOp] is decided by the caller.
      */
     private fun stashInputDraftToRecoverable(): PendingOp? {
         val draft = inputDraft ?: return null
         if (draft.revision != inputRevision || _input.value != draft.text) return null
         recoverableOps.firstOrNull { it.opId == draft.opId }?.let { return it }
-        val op = PendingOp(draft.opId, lifecycleGeneration, draft.text)
-        recoverableOps.addLast(op)
+        val op = PendingOp(
+            opId = draft.opId,
+            generation = lifecycleGeneration,
+            text = draft.text,
+            recoverySequence = draft.recoverySequence,
+        )
+        val stashed = addRecoverable(op)
         syncRecoveryCount()
-        return op
+        return stashed
     }
 
     private fun closeLive() {

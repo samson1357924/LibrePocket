@@ -1,5 +1,6 @@
 package dev.librepocket.session;
 
+import androidx.room.ColumnInfo;
 import androidx.room.Entity;
 import androidx.room.ForeignKey;
 import androidx.room.Index;
@@ -8,17 +9,13 @@ import androidx.room.PrimaryKey;
 /**
  * {@code transcript_events} table (spec §8.1); {@code text} is stored redacted.
  *
- * <p>Phase 3 Target (no schema change in Phase 2: this database is version 1
- * with no Migration infrastructure, and the JSONL wire format in
- * {@code JsonlCodec} is a closed object — both need a coordinated,
- * device-verified change, so the partial/failed columns stay a Phase 3
- * decision): {@code isPartial INTEGER NOT NULL DEFAULT 0} for cancelled /
- * failed assistant rows plus nullable {@code failureReason TEXT} for failed
- * rows, added via a backward-compatible {@code Migration(1, 2)} using
- * {@code ALTER TABLE transcript_events ADD COLUMN ...} (never a destructive
- * migration), with matching {@code TranscriptEvent} fields, DAO pass-through,
- * and JSONL optional-key decode. Until then partial-ness lives only in UI
- * memory and the in-memory INTERRUPTED marks.
+ * <p>Phase 3 (implemented): {@code isPartial INTEGER NOT NULL DEFAULT 0} marks
+ * cancelled / failed assistant rows (they keep their partial text with the flag
+ * set) and nullable {@code failureReason TEXT} carries the sanitized error next
+ * to that partial text. Both arrived via the backward-compatible
+ * {@code MIGRATION_1_2} ({@code ALTER TABLE ... ADD COLUMN}, never a
+ * destructive migration); pre-migration rows read back as
+ * {@code isPartial=false} / {@code failureReason=null}.
  *
  * <p>Written in Java so the plain {@code javac} annotation processor (already declared
  * in the build) generates the Room implementation; the store and tests stay in Kotlin.
@@ -47,6 +44,15 @@ public class TranscriptEventEntity {
     private boolean truncated;
     private int imagesOmitted;
     private long createdAt;
+    // Phase 3: cancelled / failed assistant fragment marker. The field is named
+    // without the `is` prefix (mirroring `truncated` / `isTruncated()`) so the
+    // Room processor binds the getter unambiguously; the column keeps the
+    // spec §8.1 name `isPartial`.
+    @ColumnInfo(name = "isPartial", defaultValue = "0")
+    private boolean partial;
+    // Phase 3: sanitized failure reason for failed rows; null otherwise.
+    @ColumnInfo(name = "failureReason")
+    private String failureReason;
 
     public TranscriptEventEntity(
             long rowId,
@@ -57,7 +63,9 @@ public class TranscriptEventEntity {
             String text,
             boolean truncated,
             int imagesOmitted,
-            long createdAt) {
+            long createdAt,
+            boolean partial,
+            String failureReason) {
         this.rowId = rowId;
         this.sessionId = sessionId;
         this.seq = seq;
@@ -67,6 +75,8 @@ public class TranscriptEventEntity {
         this.truncated = truncated;
         this.imagesOmitted = imagesOmitted;
         this.createdAt = createdAt;
+        this.partial = partial;
+        this.failureReason = failureReason;
     }
 
     public long getRowId() {
@@ -139,5 +149,21 @@ public class TranscriptEventEntity {
 
     public void setCreatedAt(long createdAt) {
         this.createdAt = createdAt;
+    }
+
+    public boolean isPartial() {
+        return partial;
+    }
+
+    public void setPartial(boolean partial) {
+        this.partial = partial;
+    }
+
+    public String getFailureReason() {
+        return failureReason;
+    }
+
+    public void setFailureReason(String failureReason) {
+        this.failureReason = failureReason;
     }
 }

@@ -2408,8 +2408,11 @@ class ChatViewModel(
                 if (scanned >= HISTORY_SCAN_CAP) break@outer
                 scanned++
                 when (event.kind) {
+                    // Phase 3: restore the persisted partial flag (cancelled /
+                    // failed fragments replay flagged, never as completed
+                    // answers).
                     "user" -> if (out.size < HISTORY_CAP) {
-                        out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = false))
+                        out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = event.isPartial))
                     }
                     "assistant" -> if (out.size < HISTORY_CAP) {
                         val flagged = pendingMarkers.remove(event.runId)
@@ -2418,7 +2421,7 @@ class ChatViewModel(
                                 id = "hist-${event.seq}",
                                 role = event.kind,
                                 text = event.text,
-                                isPartial = false,
+                                isPartial = event.isPartial,
                                 hasReasoning = flagged,
                             ),
                         )

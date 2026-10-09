@@ -7,11 +7,15 @@ import kotlinx.coroutines.CancellationException
 /**
  * [TranscriptSink] that persists turns into a [SessionStore] session.
  *
- * Mapping: turn started -> `user` event, turn succeeded/cancelled -> `assistant`
- * event (cancel keeps the partial text so resume shows it), turn failed ->
- * `system` event (kept out of the chat replay, visible in export), retried ->
- * `retry` event, steer queued -> `steer` event, tool done -> `tool` event,
- * usage -> `system` event (accounting, P1 records only).
+ * Mapping: turn started -> `user` event, turn succeeded -> `assistant` event
+ * (`isPartial=0`), turn cancelled -> `assistant` event with `isPartial=1` (the
+ * partial text was already preserved; Phase 3 adds the structured flag),
+ * turn failed (three-arg) -> `assistant` event with `isPartial=1` plus
+ * `failureReason` (partial fragment AND sanitized reason — Phase 3
+ * implemented), legacy two-arg turn failed -> `system` event
+ * (`turn <runId> failed: <reason>`, kept out of the chat replay, visible in
+ * export), retried -> `retry` event, steer queued -> `steer` event, tool
+ * done -> `tool` event, usage -> `system` event (accounting, P1 records only).
  *
  * The controller routes every call through its session-owned
  * [dev.librepocket.chat.OrderedTranscriptSink] (single session writer:
@@ -22,15 +26,10 @@ import kotlinx.coroutines.CancellationException
  * must never propagate, so every call guards its store access as well.
  * Text is redacted again by [RoomSessionStore] on write.
  *
- * Phase 3 Target (partial / failed marking; no Room schema change in
- * Phase 2): cancelled rows become `assistant` rows with `isPartial=1` — the
- * partial text is already preserved today, only the structured flag is
- * missing. Failed rows must keep BOTH the partial fragment and the sanitized
- * reason — today only the reason is persisted (`system` row) while the partial
- * fragment lives in UI memory ([dev.librepocket.chat.UiMessage.isPartial]).
- * Cross-restart RUNNING → INTERRUPTED backfill likewise lands in Phase 3
- * (see `ChatSessionFactory.open`); until then interruption stays a
- * memory + interface-layer mark.
+ * Cross-restart RUNNING → INTERRUPTED backfill lives in Phase 3 as well (see
+ * `ChatSessionFactory.open`): a `system` marker row
+ * (`turn <runId> interrupted`) that the chat replay already hides, so it
+ * never pollutes normal history.
  */
 class SessionTranscriptSink(
     private val store: SessionStore,
@@ -38,7 +37,13 @@ class SessionTranscriptSink(
     private val clock: () -> Long = System::currentTimeMillis,
 ) : TranscriptSink {
 
-    private suspend fun append(runId: String, kind: String, text: String) {
+    private suspend fun append(
+        runId: String,
+        kind: String,
+        text: String,
+        isPartial: Boolean = false,
+        failureReason: String? = null,
+    ) {
         try {
             store.appendEvent(
                 TranscriptEvent(
@@ -47,6 +52,8 @@ class SessionTranscriptSink(
                     kind = kind,
                     text = text,
                     createdAt = clock(),
+                    isPartial = isPartial,
+                    failureReason = failureReason,
                 ),
             )
         } catch (e: CancellationException) {
@@ -70,12 +77,16 @@ class SessionTranscriptSink(
         append(runId, "system", "turn $runId failed: $error")
     }
 
+    override suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
+        append(runId, "assistant", partialText, isPartial = true, failureReason = error)
+    }
+
     override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
         append(runId, "retry", "attempt $attempt/$maxAttempts after ${delayMs}ms")
     }
 
     override suspend fun onTurnCancelled(runId: String, partialText: String) {
-        append(runId, "assistant", partialText)
+        append(runId, "assistant", partialText, isPartial = true)
     }
 
     override suspend fun onSteerQueued(text: String) {

@@ -1,6 +1,8 @@
 package dev.librepocket.session
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -14,6 +16,12 @@ val VALID_KINDS: Set<String> = setOf("user", "assistant", "tool", "steer", "retr
 /**
  * One JSONL line (spec §8.5): flat object, no header line, so `jq` reads it directly.
  * Example: `{"seq":1,"runId":"…","kind":"user","text":"…","imagesOmitted":0,"createdAt":…}`.
+ *
+ * Phase 3 (implemented): cancelled / failed assistant rows additionally carry
+ * `isPartial` (boolean; legacy encoders may write 0/1, both decode) and
+ * `failureReason` (string, omitted when null). Both keys are optional on
+ * decode: lines exported before Phase 3 have neither and read back as
+ * `isPartial=false` / `failureReason=null`.
  */
 data class JsonlLine(
     val seq: Long,
@@ -22,6 +30,8 @@ data class JsonlLine(
     val text: String,
     val imagesOmitted: Int = 0,
     val createdAt: Long,
+    val isPartial: Boolean = false,
+    val failureReason: String? = null,
 )
 
 /**
@@ -42,6 +52,8 @@ object JsonlCodec {
             put("text", event.text)
             put("imagesOmitted", event.imagesOmitted)
             put("createdAt", event.createdAt)
+            put("isPartial", event.isPartial)
+            if (event.failureReason != null) put("failureReason", event.failureReason)
         }.toString()
 
     /** Parses one line; throws [IllegalArgumentException] naming only the line number. */
@@ -61,6 +73,27 @@ object JsonlCodec {
         val seq = obj["seq"]?.jsonPrimitive?.longOrNull ?: fail()
         val imagesOmitted = obj["imagesOmitted"]?.jsonPrimitive?.intOrNull ?: fail()
         val createdAt = obj["createdAt"]?.jsonPrimitive?.longOrNull ?: fail()
+        // Phase 3 optional keys: absent (pre-Phase-3 exports) → defaults.
+        // `isPartial` accepts booleans and legacy 0/1 ints; anything else fails.
+        val isPartial = when (val raw = obj["isPartial"]) {
+            null, is JsonNull -> false
+            else -> {
+                val prim = raw.jsonPrimitive
+                prim.booleanOrNull ?: when (prim.intOrNull) {
+                    0 -> false
+                    1 -> true
+                    else -> fail()
+                }
+            }
+        }
+        val failureReason = when (val raw = obj["failureReason"]) {
+            null, is JsonNull -> null
+            else -> {
+                val prim = raw.jsonPrimitive
+                if (!prim.isString) fail()
+                prim.content
+            }
+        }
         val parsed = JsonlLine(
             seq = seq,
             runId = str("runId"),
@@ -68,6 +101,8 @@ object JsonlCodec {
             text = str("text"),
             imagesOmitted = imagesOmitted,
             createdAt = createdAt,
+            isPartial = isPartial,
+            failureReason = failureReason,
         )
         if (parsed.kind !in VALID_KINDS) fail()
         // Reject nonsensical fields early (spec §8.5): seqs start at 1 and the

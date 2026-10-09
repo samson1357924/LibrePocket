@@ -17,16 +17,14 @@ data class SessionMeta(
  * [text] must already be redacted when it reaches the store; [RoomSessionStore]
  * enforces this by running [dev.librepocket.redact.Redactor] on every write.
  *
- * Phase 3 Target (no Room schema change in Phase 2): `isPartial` for
- * cancelled / failed assistant rows (they keep their partial text with the
- * flag set) and `failureReason` for failed rows (sanitized error kept next to
- * that partial text), as `INTEGER NOT NULL DEFAULT 0` / nullable `TEXT`
- * columns via a backward-compatible Migration 1→2. Until then partial-ness
- * lives only in UI memory ([dev.librepocket.chat.UiMessage.isPartial]) and in
- * the in-memory INTERRUPTED marks ([dev.librepocket.chat.TurnController.interruptedTranscriptRunIds]):
- * cancelled ledger rows keep the partial text unstructured, failed ledger rows
- * keep the reason only. See also [SessionTranscriptSink] and
- * `TranscriptEventEntity`.
+ * Phase 3 (implemented): [isPartial] marks cancelled / failed assistant rows
+ * (they keep their partial text with the flag set) and [failureReason] carries
+ * the sanitized error next to that partial text. Persisted as
+ * `isPartial INTEGER NOT NULL DEFAULT 0` / nullable `failureReason TEXT` via
+ * the backward-compatible Migration 1→2 (never a destructive migration).
+ * Partial-ness is also mirrored in UI memory
+ * ([dev.librepocket.chat.UiMessage.isPartial]) and the in-memory INTERRUPTED
+ * marks ([dev.librepocket.chat.TurnController.interruptedTranscriptRunIds]).
  */
 data class TranscriptEvent(
     val seq: Long = 0, // DB-assigned; ignored on write
@@ -36,6 +34,8 @@ data class TranscriptEvent(
     val text: String, // redacted before write
     val imagesOmitted: Int = 0, // stripped image-body count (bytes never stored)
     val createdAt: Long,
+    val isPartial: Boolean = false, // cancelled / failed assistant fragment
+    val failureReason: String? = null, // sanitized error for failed rows (redacted on write)
 )
 
 /** Prune knobs (spec §8.3). */

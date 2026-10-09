@@ -1604,7 +1604,11 @@ class ChatViewModel(
             if (page.isEmpty()) break
             for (event in page) {
                 if (event.kind == "user" || event.kind == "assistant") {
-                    out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = false))
+                    // Phase 3: restore the persisted partial flag (cancelled /
+                    // failed fragments replay flagged, never as completed
+                    // answers). System markers (INTERRUPTED / failure /
+                    // usage) stay hidden from the chat replay by this filter.
+                    out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = event.isPartial))
                 }
                 afterSeq = event.seq
             }

@@ -19,6 +19,21 @@ interface TranscriptSink {
   suspend fun onTurnStarted(runId: String, text: String)
   suspend fun onTurnSucceeded(runId: String, text: String)
   suspend fun onTurnFailed(runId: String, error: String)
+  /**
+   * Phase 3 (implemented): terminal failure that keeps BOTH the partial
+   * fragment ([partialText]) and the sanitized [error]. Sinks persist this as
+   * an `assistant` row with `isPartial=1` plus `failureReason` (see
+   * [dev.librepocket.session.SessionTranscriptSink]).
+   *
+   * Minimal-churn overload: the default forwards to the legacy two-arg form
+   * (reason only) so existing fakes and probes that override only
+   * [onTurnFailed] keep compiling and keep their assertions; production paths
+   * ([dev.librepocket.chat.TurnController]) always call this three-arg form.
+   * The legacy two-arg form stays as the reason-only (system-row) record.
+   */
+  suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
+    onTurnFailed(runId, error)
+  }
   suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long)
   suspend fun onTurnCancelled(runId: String, partialText: String)
   suspend fun onSteerQueued(text: String)

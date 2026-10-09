@@ -78,6 +78,58 @@ class PolicyEvaluationException(cause: Exception) :
 /** Fresh chat.send policy requires approval; this build has no interactive consent flow. */
 class ApprovalRequiredException : Exception("chat.send approval required")
 
+/**
+ * Resumed-history window cap (Phase 3).
+ *
+ * Target: a measured token/size budget for the resumed prefix (TODO: measure
+ * real provider payloads across representative sessions before fixing a
+ * number — no threshold is hardcoded here). Until that measurement lands the
+ * default is [Unbounded] (hydrate everything, truncate nothing); the
+ * message/char-count variants exist so callers and tests can lock the
+ * truncation behavior (oldest-first, whole messages only) today.
+ *
+ * Tool-pair integrity: tool calls are recorded inline in their assistant
+ * block (`[tool:name args]` marker text, never separate provider `tool`
+ * messages), so truncating at whole-message boundaries can never detach a
+ * tool result from its call. Any truncation is observable via
+ * [TurnController.droppedHistoryCount], never silent.
+ */
+sealed interface HistoryWindowCap {
+  data object Unbounded : HistoryWindowCap
+  data class MaxMessages(val maxMessages: Int) : HistoryWindowCap {
+    init {
+      require(maxMessages > 0) { "maxMessages must be positive" }
+    }
+  }
+  data class MaxChars(val maxChars: Int) : HistoryWindowCap {
+    init {
+      require(maxChars > 0) { "maxChars must be positive" }
+    }
+  }
+}
+
+/**
+ * Oldest-first, whole-message truncation for a resumed prefix. Whole messages
+ * only (tool-pair integrity is structural: tools live inline in their
+ * assistant block). A single oldest message that already exceeds a char
+ * budget is still kept whole — truncation drops messages, never splits one.
+ */
+internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap): List<ChatMessage> =
+  when (cap) {
+    is HistoryWindowCap.Unbounded -> history
+    is HistoryWindowCap.MaxMessages -> history.takeLast(cap.maxMessages)
+    is HistoryWindowCap.MaxChars -> {
+      var kept = 0
+      var chars = 0
+      for (m in history.asReversed()) {
+        if (kept > 0 && chars + m.text.length > cap.maxChars) break
+        chars += m.text.length
+        kept++
+      }
+      history.takeLast(kept)
+    }
+  }
+
 /** A direct admission cannot overtake queued work that still needs explicit recovery. */
 class RecoveryRequiredException : IllegalStateException("queued turn recovery required before admission")
 
@@ -124,6 +176,16 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  * `isPartial=true` and the next attempt starts a new assistant block instead
  * of backfilling the old one.
  *
+ * Resumed history (Phase 3): [initialHistory] carries the pre-truncation
+ * user/assistant prefix restored from the transcript store (partial rows are
+ * excluded by the caller — they replay in the UI flagged, but never read as
+ * completed model context, mirroring the live `!isPartial` filter below).
+ * [historyCap] bounds that prefix oldest-first at whole-message boundaries
+ * ([HistoryWindowCap]); the default hydrates everything while the measured
+ * token budget is still a TODO. Every outgoing [ChatRequest] is
+ * history-prefix + live messages, so the first request after resume already
+ * sees the prior conversation.
+ *
  * Ephemeral runtime time context (Phase 2): every outgoing [ChatRequest]
  * carries a [buildRuntimeTimeContext] block appended to a **copy** of the last
  * user message. The block never touches [_uiState] (no [UiMessage] residue)
@@ -156,6 +218,8 @@ class TurnController(
   private val userTimezone: String? = null,
   private val sessionStart: Instant? = null,
   private val systemZone: () -> ZoneId = ZoneId::systemDefault,
+  initialHistory: List<ChatMessage> = emptyList(),
+  private val historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
 ) {
   companion object {
     const val POLICY_ACTION = "chat.send"
@@ -193,6 +257,16 @@ class TurnController(
   /** Last usage reported by the provider (billing/context accounting; P1 records only). */
   var lastUsage: StreamEvent.Usage? = null
     private set
+
+  /** Resumed-history prefix after [historyCap] (oldest-first, whole messages). */
+  private val cappedHistory: List<ChatMessage> = applyHistoryCap(initialHistory, historyCap)
+
+  /**
+   * Resumed-history messages dropped by [historyCap] (0 when Unbounded).
+   * The observable counterpart to truncation: the request never silently
+   * loses prefix context.
+   */
+  val droppedHistoryCount: Int = (initialHistory.size - cappedHistory.size).coerceAtLeast(0)
 
   private var inFlight: Job? = null
   private val steerQueue: ArrayDeque<PendingSteer> = ArrayDeque()
@@ -905,17 +979,17 @@ class TurnController(
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
-      // starts a brand-new assistant block with a brand-new runId. Phase 2
-      // keeps the failed partial in UI memory only (the ledger row stores the
-      // sanitized reason); persisting partial text + reason structurally is a
-      // Phase 3 Target (see TranscriptEvent / SessionTranscriptSink KDoc).
+      // starts a brand-new assistant block with a brand-new runId. Phase 3
+      // persists the failed partial structurally: the ledger row keeps the
+      // partial text with isPartial=1 plus the sanitized reason (three-arg
+      // onTurnFailed), while UI memory keeps the same fragment flagged.
       if (!failure.retryable || attempt >= retryConfig.maxRetries) {
         val clean = sanitizeError(failure.message)
         synchronized(lock) {
           activityRevision++
           _uiState.update { it.copy(status = ChatStatus.ERROR, error = clean) }
         }
-        orderedTranscript.onTurnFailed(attemptRunId, clean)
+        orderedTranscript.onTurnFailed(attemptRunId, assistantTextOf(attemptRunId), clean)
         return
       }
       attempt += 1
@@ -933,8 +1007,9 @@ class TurnController(
   }
 
   /**
-   * Maps the current (settled) UI history plus this turn's images to one
-   * [ChatRequest]. The current user message is already in [uiState] (appended
+   * Maps the resumed history plus the current (settled) UI history plus this
+   * turn's images to one [ChatRequest]: the capped history prefix first, then
+   * live messages. The current user message is already in [uiState] (appended
    * by [send] before the turn starts), so images attach to the last user line.
    *
    * Ephemeral time context: a [buildRuntimeTimeContext] block is appended to a
@@ -943,10 +1018,13 @@ class TurnController(
    * the raw user text.
    */
   private fun buildRequest(images: List<ChatImageRef>): ChatRequest {
-    val base = _uiState.value.messages
-      .filter { !it.isPartial }
-      .map { ChatMessage(role = it.role, text = it.text) }
-      .toMutableList()
+    val base = ArrayList<ChatMessage>(cappedHistory.size + 8)
+    base.addAll(cappedHistory)
+    base.addAll(
+      _uiState.value.messages
+        .filter { !it.isPartial }
+        .map { ChatMessage(role = it.role, text = it.text) },
+    )
     val loaded = runCatching { imageLoader(images) }.getOrDefault(emptyList())
     if (loaded.isNotEmpty()) {
       val lastUser = base.indexOfLast { it.role == "user" }

@@ -7,6 +7,7 @@ import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatSessionImpl
+import dev.librepocket.chat.HistoryWindowCap
 import dev.librepocket.chat.NoOpTranscriptSink
 import dev.librepocket.chat.TranscriptSink
 import dev.librepocket.chat.TurnController
@@ -15,6 +16,7 @@ import dev.librepocket.keystore.KeyVault
 import dev.librepocket.policy.DataStorePolicyStore
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.preset.ProviderCatalog
+import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.DefaultProviderFactory
 import dev.librepocket.provider.KeyProvider
 import dev.librepocket.provider.LlmProvider
@@ -23,6 +25,7 @@ import dev.librepocket.session.LibrePocketDb
 import dev.librepocket.session.RoomSessionStore
 import dev.librepocket.session.SessionStore
 import dev.librepocket.session.SessionTranscriptSink
+import dev.librepocket.session.TranscriptEvent
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
@@ -34,6 +37,46 @@ import kotlinx.coroutines.withTimeout
 
 private const val TRANSCRIPT_CLEANUP_TIMEOUT_MS = 5_000L
 private const val TRANSCRIPT_CREATE_TIMEOUT_MS = 5_000L
+private const val HISTORY_PAGE = 200
+
+/**
+ * Stored-events bound mirrored from the display replay: model context never
+ * hydrates more rows than the UI would show.
+ */
+private const val HISTORY_LOAD_CAP = 2000
+
+/** Marker kind for RUNNING → INTERRUPTED backfill: hidden from chat replay, kept in export. */
+internal const val INTERRUPTED_MARKER_KIND = "system"
+
+/** Explicit kill marker bound to the stranded runId (idempotent: exact text skips re-marking). */
+internal fun interruptedMarkerText(runId: String): String = "turn $runId interrupted"
+
+private fun isLegacyFailureText(runId: String, text: String): Boolean =
+    text.startsWith("turn $runId failed")
+
+/**
+ * User-owned runIds with no terminal record: no assistant row of any kind
+ * (completed, cancelled-partial, or failed-with-reason) and no legacy
+ * failure / already-marked system row. First-seen order; empty when nothing
+ * was stranded. Pure (no I/O) so the backfill rule is directly unit-testable.
+ */
+internal fun findDanglingRunIds(events: List<TranscriptEvent>): List<String> {
+    val terminal = HashSet<String>()
+    val userRunIds = LinkedHashSet<String>()
+    for (e in events) {
+        when (e.kind) {
+            "assistant" -> terminal.add(e.runId)
+            "system" -> {
+                if (e.text == interruptedMarkerText(e.runId) || isLegacyFailureText(e.runId, e.text)) {
+                    terminal.add(e.runId)
+                }
+            }
+            "user" -> userRunIds.add(e.runId)
+            else -> Unit
+        }
+    }
+    return userRunIds.filter { it !in terminal }
+}
 
 /** Lazily provides the product vault (Keystore I/O must stay off the main thread). */
 fun interface VaultSource {
@@ -198,16 +241,16 @@ class ChatSessionFactory(
     /**
      * Binds a live session to an existing transcript session (resume, no re-create).
      *
-     * Phase 3 Target (cross-restart recovery; NOT implemented in Phase 2 —
-     * resume hydrate stays untouched): after loading [meta] and before
-     * attaching, backfill any turn the previous process left RUNNING (a
-     * dangling partial row with no terminal record for its runId) with an
-     * explicit INTERRUPTED marker row. This needs the Phase-3 persisted
-     * partial/status bits (see TranscriptEvent / TranscriptEventEntity KDoc);
-     * without a schema change no stored row can reliably distinguish a
-     * crashed partial from a completed assistant row, so Phase 2 replays rows
-     * as-is and records interruption only in memory
-     * (TurnController.interruptedTranscriptRunIds).
+     * Phase 3 (implemented) cross-restart recovery: after loading [meta] and
+     * before attaching, [backfillInterrupted] marks any turn the previous
+     * process left RUNNING (a user row with no assistant / failure record for
+     * its runId) with an explicit `system` INTERRUPTED marker row, and the
+     * restored user/assistant prefix (partial rows excluded from model
+     * context, mirroring the live `!isPartial` request filter) is hydrated
+     * into the new controller so the first request after resume already sees
+     * prior context. The marker kind is `system`, which the chat replay
+     * already hides, so it never pollutes normal history; it stays visible in
+     * export for debugging.
      */
     override suspend fun open(
         endpoint: EndpointConfig,
@@ -228,6 +271,9 @@ class ChatSessionFactory(
         }
         require(meta != null) { "UNKNOWN_SESSION" }
         requireCurrentBinding(keyIsCurrent)
+        backfillInterrupted(store, sessionId)
+        val history = loadModelHistory(store, sessionId)
+        requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
         val credential = captureCredential(endpoint)
         var session: ChatSession? = null
@@ -244,6 +290,7 @@ class ChatSessionFactory(
                 userTimezone,
                 systemZone,
                 sessionStart,
+                history,
             )
             session = openedSession
             requireCurrentBinding(keyIsCurrent)
@@ -344,6 +391,7 @@ class ChatSessionFactory(
         userTimezone: String? = this.userTimezone,
         systemZone: () -> ZoneId = this.systemZone,
         sessionStart: Instant? = null,
+        history: List<ChatMessage> = emptyList(),
     ): ChatSession {
         val keys = KeyProvider { ref ->
             if (keyIsCurrent()) credential.copyFor(ref) else null
@@ -358,8 +406,87 @@ class ChatSessionFactory(
             userTimezone = userTimezone,
             sessionStart = sessionStart,
             systemZone = systemZone,
+            initialHistory = history,
+            historyCap = HistoryWindowCap.Unbounded,
         )
         return CredentialBoundChatSession(session, credential)
+    }
+
+    /**
+     * Cross-restart RUNNING → INTERRUPTED backfill: every user row whose
+     * runId owns no assistant row (completed, cancelled-partial, or
+     * failed-with-reason) and no legacy failure / already-marked system row
+     * is a turn the previous process killed before any terminal record, so it
+     * gets one explicit `system` marker row bound to the same runId.
+     *
+     * Deliberately NOT marked: intentional-cancel partials already own an
+     * assistant row (`isPartial=1`), so they replay as partial and never gain
+     * a marker; completed and failed turns likewise own theirs. Prune cannot
+     * cause false positives (it drops the oldest rows first, and an
+     * assistant row always has a larger seq than its user row, so prune can
+     * orphan assistants but never users). Re-running is idempotent: a marked
+     * runId owns its marker row and [findDanglingRunIds] skips it next time.
+     *
+     * Best-effort (never blocks resume): marker writes go through the same
+     * guarded path as every other transcript write. A failed backfill just
+     * leaves the run dangling for the next open to retry.
+     */
+    private suspend fun backfillInterrupted(store: SessionStore, sessionId: String) {
+        try {
+            val dangling = findDanglingRunIds(loadAllEvents(store, sessionId))
+            for (runId in dangling) {
+                try {
+                    store.appendEvent(
+                        TranscriptEvent(
+                            sessionId = sessionId,
+                            runId = runId,
+                            kind = INTERRUPTED_MARKER_KIND,
+                            text = interruptedMarkerText(runId),
+                            createdAt = clock.millis(),
+                        ),
+                    )
+                } catch (_: Exception) {
+                    // Best effort per marker; the next open retries.
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort overall; resume proceeds without markers.
+        }
+    }
+
+    /**
+     * Restored model-context prefix: stored user/assistant rows oldest-first,
+     * bounded like the display replay. Partial rows are excluded from model
+     * context (they replay in the UI flagged, but must never read as
+     * completed answers — mirroring the live `!isPartial` request filter);
+     * `system` markers stay export/debug-only via the same filter.
+     *
+     * Unlike the best-effort backfill, a history-read failure propagates:
+     * resuming blind (without the context the model needs) fails closed
+     * through the caller's UNKNOWN/NO_ENDPOINT path instead.
+     */
+    private suspend fun loadModelHistory(store: SessionStore, sessionId: String): List<ChatMessage> {
+        val out = ArrayList<ChatMessage>(256)
+        for (event in loadAllEvents(store, sessionId)) {
+            if (out.size >= HISTORY_LOAD_CAP) break
+            if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
+                out.add(ChatMessage(role = event.kind, text = event.text))
+            }
+        }
+        return out
+    }
+
+    private suspend fun loadAllEvents(store: SessionStore, sessionId: String): List<TranscriptEvent> {
+        val out = ArrayList<TranscriptEvent>(256)
+        var afterSeq = 0L
+        while (true) {
+            val page = store.loadEvents(sessionId, afterSeq, HISTORY_PAGE)
+            if (page.isEmpty()) break
+            out.addAll(page)
+            afterSeq = page.last().seq
+            if (page.size < HISTORY_PAGE) break
+        }
+        return out
     }
 
     /** The live provider never rereads a mutable alias after this snapshot. */

@@ -64,6 +64,11 @@ class RoomSessionStore(
         } else {
             redacted to false
         }
+        // Failure reasons are sanitized errors: re-redact on write like the
+        // body text (TurnController already sanitizes; this is defense in
+        // depth for rows written through other paths). redactError caps at
+        // 500 chars, so over-long reasons never bloat the row.
+        val reason = event.failureReason?.let { Redactor.redactError(it) }
         val rowId = appendMutex.withLock {
             withContext(Dispatchers.IO) {
                 db.withTransaction {
@@ -82,6 +87,8 @@ class RoomSessionStore(
                             truncated,
                             event.imagesOmitted,
                             event.createdAt,
+                            event.isPartial,
+                            reason,
                         ),
                     )
                     dao.touchSession(event.sessionId, clock())
@@ -140,7 +147,8 @@ class RoomSessionStore(
                             // redaction, so re-redact at export time before touching disk.
                             // Mirrors TranscriptExport.exportRedacted semantics.
                             val redacted = Redactor.redact(event.text).text
-                            val line = JsonlCodec.encode(event.copy(text = redacted))
+                            val reason = event.failureReason?.let { Redactor.redactError(it) }
+                            val line = JsonlCodec.encode(event.copy(text = redacted, failureReason = reason))
                             bytes += line.toByteArray(Charsets.UTF_8).size + 1
                             check(bytes <= EXPORT_MAX_BYTES) { "export too large" }
                             out.write(line)
@@ -220,6 +228,8 @@ class RoomSessionStore(
                             truncated,
                             line.imagesOmitted,
                             line.createdAt,
+                            line.isPartial,
+                            line.failureReason?.let { Redactor.redactError(it) },
                         ),
                     )
                 }
@@ -288,6 +298,8 @@ class RoomSessionStore(
         text = text,
         imagesOmitted = imagesOmitted,
         createdAt = createdAt,
+        isPartial = isPartial,
+        failureReason = failureReason,
     )
 
     private fun SessionEntity.toMeta(): SessionMeta = SessionMeta(

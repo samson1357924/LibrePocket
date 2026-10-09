@@ -109,6 +109,9 @@ class OrderedTranscriptSink(
   override suspend fun onTurnFailed(runId: String, error: String) =
     writeCore(runId) { delegate.onTurnFailed(runId, error) }
 
+  override suspend fun onTurnFailed(runId: String, partialText: String, error: String) =
+    writeCore(runId) { delegate.onTurnFailed(runId, partialText, error) }
+
   override suspend fun onTurnCancelled(runId: String, partialText: String) =
     writeCore(runId) { delegate.onTurnCancelled(runId, partialText) }
 

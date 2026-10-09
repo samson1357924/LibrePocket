@@ -238,6 +238,8 @@ data class TranscriptEvent(
   val text: String,             // 已脫敏（寫入前強制過 Redactor，§6）
   val imagesOmitted: Int = 0,   // 圖片正文剝離計數（只存省略說明，不存位元組）
   val createdAt: Long,
+  val isPartial: Boolean = false, // Phase 3：取消/失敗 assistant 半截標記
+  val failureReason: String? = null, // Phase 3：失敗行的脫敏原因（其餘行為 null）
 )
 
 data class PrunePolicy(
@@ -536,6 +538,10 @@ data class TranscriptEventEntity(
   val truncated: Boolean = false,
   val imagesOmitted: Int = 0,
   val createdAt: Long,
+  // Phase 3（DB version 2，Migration 1→2 向後相容加入；舊列預設 false/null）：
+  // 取消/失敗 assistant 半截（isPartial）+ 失敗行的脫敏原因（failureReason）。
+  val isPartial: Boolean = false,      // 欄位名 `isPartial INTEGER NOT NULL DEFAULT 0`
+  val failureReason: String? = null,   // 欄位名 `failureReason TEXT NULL`
 )
 ```
 
@@ -561,7 +567,7 @@ interface SessionDao {
 }
 ```
 
-- DB 名：`librepocket.db`；版本 1（P1 無遷移；P2 起寫 `Migration`）。
+- DB 名：`librepocket.db`；版本 2（Phase 3 起；`Migration(1, 2)` 以 `ALTER TABLE transcript_events ADD COLUMN isPartial INTEGER NOT NULL DEFAULT 0` + `ADD COLUMN failureReason TEXT` 向後相容升級，永不用 destructive migration；舊列讀回預設 `isPartial=false` / `failureReason=null`）。
 - `seq` 分配與插入必須在同一 `@Transaction`（`RoomSessionStore.appendEvent` 內 `withTransaction`）。
 - 並發：單一 `SessionStore` 實例 + `Mutex` 保證同 session `seq` 不重（Room 事務為第二道防線）。
 
@@ -590,14 +596,15 @@ ChatSessionImpl 產生 assistant 文本
 
 - `steer` 佇列內容寫 `kind="steer"` 事件（含排隊時間，供除錯）。
 - `Retrying` 寫 `kind="retry"` 事件（attempt/max/delayMs 結構化，不寫模型正文）。
-- cancel 寫 `kind="system"`（`text="cancelled by user"` 固定字串）。
+- turn succeeded 寫 `kind="assistant"`（`isPartial=0`）；cancel 寫 `kind="assistant"` 並置 `isPartial=1`（保留半截正文）；turn failed（三參數）寫 `kind="assistant"`（`isPartial=1`）+ `failureReason`（脫敏原因）；舊二參數 `onTurnFailed` 相容保留為 `kind="system"`（`text="turn <runId> failed: <reason>"`）。
 
 ### 8.5 JSONL 匯出 / 匯入（目標介面；非目前 UI 流程）
 
-- 匯出：一行一 JSON（`{"seq":N,"runId":"…","kind":"…","text":"…(已脫敏)","imagesOmitted":0,"createdAt":…}`）+ 檔頭註解行？**無檔頭**（純 JSONL，`jq` 可直接處理）。
+- 匯出：一行一 JSON（`{"seq":N,"runId":"…","kind":"…","text":"…(已脫敏)","imagesOmitted":0,"createdAt":…,"isPartial":false}`；Phase 3 起失敗/取消行另帶 `"failureReason":"…"`，`null` 時省略該鍵）+ 檔頭註解行？**無檔頭**（純 JSONL，`jq` 可直接處理）。
+- 匯入：逐行 `kotlinx.serialization` 解析 → 校验 `kind ∈ {…}` + `seq` 遞增 → 新 `sessionId` 重寫入；`isPartial` / `failureReason` 兩鍵可選（缺鍵的舊匯出讀回預設 `false` / `null`）；失敗行整批回滾（單事務），錯誤訊息只報行號不貼內容。
+- 續聊恢復（Phase 3）：`open` 在 meta 載入後、attach 前，把無 terminal 紀錄的 dangling turn（有 user 列而無同 runId assistant/失敗列）補一列 `kind="system"` 的 `turn <runId> interrupted` marker（replay 已過濾 system，不污染正常歷史）；已恢復的 user/assistant 前文（partial 列除外）納入首個 request，窗口上限介面見 `HistoryWindowCap`（量測出 token 預算前預設無截斷，截斷可觀察不靜默丟）。
 - 檔名：`librepocket-<sessionId8>-<yyyyMMddHHmm>.jsonl`；經 SAF 寫入用戶選位（P1 不自建 FileProvider 分享）。
 - 大小上限：單 session 匯出 ≤ 20 MiB（超限拒絕並提示 prune）。
-- 匯入：逐行 `kotlinx.serialization` 解析 → 校验 `kind ∈ {…}` + `seq` 遞增 → 新 `sessionId` 重寫入；失敗行整批回滾（單事務），錯誤訊息只報行號不貼內容。
 
 ---
 

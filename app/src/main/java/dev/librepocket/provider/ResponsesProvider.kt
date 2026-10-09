@@ -102,8 +102,7 @@ class ResponsesProvider(
             request.tools.forEach { t ->
                 if (ti > 0) sb.append(',')
                 ti++
-                sb.append("{\"type\":\"function\",\"name\":${q(t.name)},")
-                sb.append("\"description\":${q(t.description)},\"parameters\":${t.jsonSchema}}}")
+                sb.append(responsesFunctionToolJson(t))
             }
             if (webSearch != null) {
                 if (ti > 0) sb.append(',')

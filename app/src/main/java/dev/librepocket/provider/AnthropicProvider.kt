@@ -89,8 +89,7 @@ class AnthropicProvider(
             sb.append(",\"tools\":[")
             request.tools.forEachIndexed { i, t ->
                 if (i > 0) sb.append(',')
-                sb.append("{\"name\":${q(t.name)},\"description\":${q(t.description)},")
-                sb.append("\"input_schema\":${t.jsonSchema}}}")
+                sb.append(anthropicToolJson(t))
             }
             sb.append(']')
         }

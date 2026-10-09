@@ -98,8 +98,7 @@ class ChatCompletionsProvider(
             sb.append(",\"tools\":[")
             request.tools.forEachIndexed { i, t ->
                 if (i > 0) sb.append(',')
-                sb.append("{\"type\":\"function\",\"function\":{\"name\":${q(t.name)},")
-                sb.append("\"description\":${q(t.description)},\"parameters\":${t.jsonSchema}}}")
+                sb.append(chatFunctionToolJson(t))
             }
             sb.append(']')
         }
@@ -137,9 +136,7 @@ class ChatCompletionsProvider(
                         sb.append("\"tool_calls\":[")
                         m.toolCalls.forEachIndexed { i, tc ->
                             if (i > 0) sb.append(',')
-                            sb.append("{\"id\":${q(tc.id)},\"type\":\"function\",")
-                            sb.append("\"function\":{\"name\":${q(tc.name)},")
-                            sb.append("\"arguments\":${q(tc.argumentsJson)}}}")
+                            sb.append(chatToolCallJson(tc))
                         }
                         sb.append("],")
                     }

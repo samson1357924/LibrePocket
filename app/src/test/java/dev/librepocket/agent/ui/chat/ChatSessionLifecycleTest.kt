@@ -3220,10 +3220,14 @@ class ChatSessionLifecycleTest {
 
         override fun stream(request: ChatRequest) = flow {
             val text = request.messages.last { it.role == "user" }.text
-            sent.add(text)
+            // TurnController.buildRequest appends "\n\n<runtime time block>" to
+            // the last user message; strip that ephemeral suffix so promotion
+            // gates match on the admitted base text.
+            val base = baseTextOf(text)
+            sent.add(base)
             requestModels.add(request.model)
             sentCount.value = sent.size
-            if (text == blockedText) {
+            if (base == blockedText) {
                 blockedCall.complete(Unit)
                 try {
                     releaseBlocked.await()
@@ -3232,7 +3236,7 @@ class ChatSessionLifecycleTest {
                     throw cancelled
                 }
             }
-            if (text == failedText) {
+            if (base == failedText) {
                 emit(StreamEvent.Failed("synthetic context error", retryable = false))
                 return@flow
             }
@@ -3252,8 +3256,11 @@ class ChatSessionLifecycleTest {
 
         override fun stream(request: ChatRequest) = flow {
             val text = request.messages.last { it.role == "user" }.text
-            sent.add(text)
-            if (text == "A") {
+            // Same ephemeral time-suffix strip as PromotionProvider: match and
+            // record the admitted base text.
+            val base = baseTextOf(text)
+            sent.add(base)
+            if (base == "A") {
                 requestEntered.complete(Unit)
                 try {
                     CompletableDeferred<Unit>().await()
@@ -3901,3 +3908,12 @@ class ChatSessionLifecycleTest {
         }
     }
 }
+
+/**
+ * Strips the ephemeral TurnController time suffix (`"\n\n" + runtime time
+ * block`) from a provider-request user text, returning the admitted base
+ * text. Test-only tolerance: production time injection semantics are
+ * untouched; LlmProvider fakes use this so exact gate matching and `sent`
+ * assertions observe stable base text.
+ */
+private fun baseTextOf(text: String): String = text.substringBefore("\n\n")

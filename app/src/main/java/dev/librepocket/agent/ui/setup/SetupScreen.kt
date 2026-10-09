@@ -270,7 +270,7 @@ fun SetupScreen(
                     )
                 }
             },
-            supportingText = { Text("金鑰只存於本機加密儲存，不會上傳別處；換機需重輸。") },
+            supportingText = { Text("金鑰存於本機加密儲存；每次請求仍須送往所選供應商，範圍見威脅模型。換機需重輸。") },
         )
 
         state.errorCode?.let { code ->
@@ -346,7 +346,7 @@ fun SetupScreen(
             onDismissRequest = viewModel::dismissKeyWriteConfirm,
             title = { Text("寫入金鑰確認") },
             text = {
-                Text("即將把此 API Key 存入本機加密儲存（key.write）。換機或還原後需重輸；金鑰永不離開本機。確定繼續嗎？")
+                Text("即將把此 API Key 存入本機加密儲存（key.write）。換機或還原後需重輸；每次請求仍須把金鑰送往所選供應商，範圍見威脅模型。確定繼續嗎？")
             },
             confirmButton = {
                 TextButton(onClick = viewModel::confirmKeyWriteSave) { Text("確定寫入") }

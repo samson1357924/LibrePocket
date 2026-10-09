@@ -86,6 +86,7 @@ private fun errorText(code: String): String = when (code) {
     "PROVIDER_KEY_REF_BLANK", "PROVIDER_KEY_REF_MALFORMED" -> "內部參照異常，請重試。"
     "API key too short" -> "金鑰太短（至少 8 字元），請檢查後重貼。"
     "TEST_UNAUTHORIZED" -> "金鑰無效（認證失敗），請檢查後重貼。"
+    "TEST_TOO_LARGE" -> "模型列表過大，未能完整載入，請重試。"
     "TEST_RETRYABLE" -> "伺服器忙碌或網路不穩，請稍後重試。"
     "POLICY_DENIED_KEY_WRITE" -> "政策拒絕寫入金鑰（key.write DENY），請檢查權限設定。"
     else -> "儲存失敗（$code），請重試。"

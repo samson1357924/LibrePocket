@@ -113,6 +113,7 @@ export interface TagResult {
   command: CommentCommand;
   needsDiff: boolean;
   safeReview: boolean;
+  authorized: boolean;
   issueNumber?: number;
 }
 
@@ -256,7 +257,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
 
   if (eventName === 'pull_request_target' || event.pull_request) {
     const pull = event.pull_request;
-    if (!pull) return { target: 'none', command: 'unsupported', needsDiff: false, safeReview: false, title: '', };
+    if (!pull) return { target: 'none', command: 'unsupported', needsDiff: false, safeReview: false, authorized: false, title: '', };
     const headRepository = pull.head?.repo?.full_name;
     const baseSha = pull.base?.sha ?? '';
     const headSha = pull.head?.sha ?? '';
@@ -269,6 +270,9 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
       command: 'review',
       needsDiff: true,
       safeReview,
+      // pull_request_target carries no commenter to authorize; the same-repo
+      // origin check above governs. authorized is always true here.
+      authorized: true,
       ...(Number.isSafeInteger(number) && number > 0 ? { issueNumber: number } : {}),
       ...(safeReview ? {
         pullRequest: {
@@ -346,6 +350,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
       command: 'unsupported',
       needsDiff: false,
       safeReview: false,
+      authorized: false,
       ...(Number.isSafeInteger(Number(event.issue?.number)) && Number(event.issue?.number) > 0
         ? { issueNumber: Number(event.issue?.number) }
         : {}),
@@ -353,7 +358,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
     };
   }
 
-  return { target: 'none', command: 'unsupported', needsDiff: false, safeReview: false, title: '' };
+  return { target: 'none', command: 'unsupported', needsDiff: false, safeReview: false, authorized: false, title: '' };
 }
 
 function appendWorkflowOutputs(env: NodeJS.ProcessEnv, values: Record<string, string>): void {
@@ -382,6 +387,8 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     command: target.command,
     needsDiff: target.needsDiff,
     safeReview: target.safeReview,
+    // Fail-closed: only an explicit true counts as authorized.
+    authorized: target.authorized === true,
     ...(target.issueNumber ? { issueNumber: target.issueNumber } : {}),
   };
   appendWorkflowOutputs(env, {
@@ -393,6 +400,7 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     command: result.command,
     needs_diff: String(result.needsDiff),
     safe_review: String(result.safeReview),
+    authorized: String(result.authorized),
     ...(result.issueNumber ? { issue_number: String(result.issueNumber) } : {}),
   });
   stdout(context, `${JSON.stringify(result)}\n`);

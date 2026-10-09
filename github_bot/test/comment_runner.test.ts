@@ -64,6 +64,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       },
     });
     assert.equal(tagged.safeReview, true);
+    assert.equal(tagged.authorized, true, 'pull_request_target carries no commenter gate');
     assert.deepEqual(tagged.areaLabels, ['area:delivery']);
     assert.deepEqual(tagged.changedFiles, ['app/src/main/AndroidManifest.xml']);
     assert.equal(tagged.changedFilesComplete, true);
@@ -83,6 +84,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       writeStdout: () => undefined,
     });
     assert.equal(forkTag.safeReview, false);
+    assert.equal(forkTag.authorized, true, 'pull_request_target origin deny still reports authorized');
 
     const mentionContext = {
       event: {
@@ -120,6 +122,7 @@ export async function runCommentRunnerTests(): Promise<void> {
     const mentioned = await runTagMode(mentionContext);
     assert.equal(mentioned.command, 'review');
     assert.equal(mentioned.safeReview, true);
+    assert.equal(mentioned.authorized, true, 'authorized maintainer mention');
 
     const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-comment-runner-'));
     try {
@@ -880,6 +883,24 @@ export async function runCommentRunnerTests(): Promise<void> {
         'publish requires successful deterministic tagging');
       assert.doesNotMatch(normalizedCondition, /needs\.review-send\.result/,
         'review-send failure or cancellation must not skip publish');
+      assert.match(normalizedCondition, /needs\.prepare-tag\.outputs\.authorized\s*==\s*'true'/,
+        'unauthorized issue_comment skips publish without touching prior approval');
+      const tagStep = workflowStep(prepareTag, 'Emit deterministic labels and routing context');
+      assert.match(nestedMapping(tagStep, 'env'), /^\s{10}GITHUB_TOKEN:/m,
+        'prepare-tag exposes only the read-only token for the authorization gate');
+      assert.match(prepareTag, /pull-requests:\s*read/,
+        'prepare-tag may list pull requests for the read-only gate');
+      assert.match(prepareTag, /authorized:\s*\$\{\{\s*steps\.tag\.outputs\.authorized\s*\}\}/,
+        'prepare-tag forwards the authorization verdict');
+      const reviewCondition = reviewJob.slice(0, reviewJob.indexOf('    steps:'));
+      assert.match(reviewCondition, /needs\.prepare-tag\.outputs\.authorized\s*==\s*'true'/,
+        'unauthorized issue_comment never schedules the secrets-bearing review job');
+      const trustedStep = workflowStep(reviewJob, 'Run trusted single-turn review');
+      assert.match(trustedStep, /steps\.gate\.outputs\.safe_review\s*==\s*'true'\s*&&\s*steps\.gate\.outputs\.authorized\s*==\s*'true'/,
+        'CPA credentials are injected only when origin and authorization both pass');
+      const genericStep = workflowStep(reviewJob, 'Write generic result for untrusted pull request');
+      assert.match(genericStep, /steps\.gate\.outputs\.authorized\s*!=\s*'true'/,
+        'missing authorization falls through to the generic INCONCLUSIVE path');
       const uploadedArtifactName = withValue(uploadStep, 'name');
       const downloadedArtifactName = withValue(downloadStep, 'name');
       assert.ok(uploadedArtifactName, 'review job declares an uploaded artifact name');
@@ -940,6 +961,7 @@ export async function runCommentAuthTests(): Promise<void> {
       permission?: string;
       permissionThrows?: string;
       omitRepos?: boolean;
+      body?: string;
       commentUser?: { login?: string; type?: string } | null;
       sender?: { login?: string; type?: string };
       action?: string;
@@ -980,7 +1002,7 @@ export async function runCommentAuthTests(): Promise<void> {
         repository: { full_name: 'sample/repository' },
         issue: { number: 41, pull_request: { url: 'unused' }, title: 'topic' },
         comment: {
-          body: '/review',
+          body: options.body ?? '/review',
           ...(commentUser ? { user: commentUser } : {}),
           ...(options.authorAssociation ? { author_association: options.authorAssociation } : {}),
         },
@@ -1021,12 +1043,13 @@ export async function runCommentAuthTests(): Promise<void> {
     const runAuthCase = async (
       name: string,
       options: Parameters<typeof makeAuthHarness>[0],
-      expected: { safeReview: boolean; verdict: RunnerVerdictLike; cpaCalls: number | 'positive' },
+      expected: { safeReview: boolean; authorized: boolean; verdict: RunnerVerdictLike; cpaCalls: number | 'positive' },
     ) => {
       const harness = makeAuthHarness(options);
       let tagStdout = '';
       const tagged = await runTagMode({ ...harness.tagContext, writeStdout: (value) => { tagStdout += value; } });
       assert.equal(tagged.safeReview, expected.safeReview, `${name}: safeReview`);
+      assert.equal(tagged.authorized, expected.authorized, `${name}: authorized`);
       const before = cpaRequestCount;
       let reviewStdout = '';
       const reviewed = await runReviewMode({ ...harness.reviewContext, writeStdout: (value) => { reviewStdout += value; } });
@@ -1042,31 +1065,31 @@ export async function runCommentAuthTests(): Promise<void> {
 
     // a. maintainer with write permission is authorized.
     await runAuthCase('maintainer-write', { permission: 'write' },
-      { safeReview: true, verdict: 'APPROVE', cpaCalls: 'positive' });
+      { safeReview: true, authorized: true, verdict: 'APPROVE', cpaCalls: 'positive' });
     // b. maintainer with admin permission is authorized.
     await runAuthCase('maintainer-admin', { permission: 'admin' },
-      { safeReview: true, verdict: 'APPROVE', cpaCalls: 'positive' });
+      { safeReview: true, authorized: true, verdict: 'APPROVE', cpaCalls: 'positive' });
 
     // c. outsider with read permission is denied; the permission call carries the comment username.
     {
       const { harness } = await runAuthCase('outsider-read',
         { permission: 'read', commentUser: { login: 'outsider', type: 'User' } },
-        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 2, 'outsider-read: tag and review each verify');
       assert.equal(harness.state.permissionCalls[0].username, 'outsider', 'outsider-read: username forwarded');
     }
 
     // d. collaborator without access, and a 404-style API failure, both deny.
     await runAuthCase('outsider-none', { permission: 'none' },
-      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
     await runAuthCase('permission-404',
       { permissionThrows: 'synthetic permission lookup failure' },
-      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
 
     // e. FIRST_TIME_CONTRIBUTOR without write access is denied.
     await runAuthCase('first-time-contributor',
       { permission: 'none', authorAssociation: 'FIRST_TIME_CONTRIBUTOR' },
-      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
 
     // f. bot comments deny before any permission API call.
     {
@@ -1075,7 +1098,7 @@ export async function runCommentAuthTests(): Promise<void> {
           permission: 'write',
           commentUser: { login: 'github-actions[bot]', type: 'Bot' },
         },
-        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'bot-comment: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'bot-comment: no pulls.get call');
     }
@@ -1084,20 +1107,20 @@ export async function runCommentAuthTests(): Promise<void> {
     {
       const { harness } = await runAuthCase('bot-sender',
         { permission: 'write', sender: { login: 'sender-bot', type: 'Bot' } },
-        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'bot-sender: no permission API call');
     }
 
     // h. a spoofed COLLABORATOR association with only read access is denied.
     await runAuthCase('spoofed-association',
       { permission: 'read', authorAssociation: 'COLLABORATOR' },
-      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
 
     // i. missing usernames deny without touching the permission API.
     {
       const { harness } = await runAuthCase('missing-username',
         { permission: 'write', commentUser: null },
-        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'missing-username: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'missing-username: no pulls.get call');
     }
@@ -1107,7 +1130,7 @@ export async function runCommentAuthTests(): Promise<void> {
       const probe = 'synthetic-probe-username-7f3a';
       const { harness, tagStdout, reviewStdout } = await runAuthCase('permission-500',
         { permissionThrows: `synthetic failure for ${probe}`, commentUser: { login: probe, type: 'User' } },
-        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 2, 'permission-500: tag and review each verify');
       assert.ok(!tagStdout.includes('synthetic'), 'permission-500: tag output stays generic');
       assert.ok(!tagStdout.includes(probe), 'permission-500: tag output hides the username');
@@ -1119,14 +1142,43 @@ export async function runCommentAuthTests(): Promise<void> {
     {
       const { harness } = await runAuthCase('edited-action',
         { permission: 'write', action: 'edited' },
-        { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'edited-action: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'edited-action: no pulls.get call');
     }
 
     // A missing repos API on the client denies fail-closed.
     await runAuthCase('missing-repos-api', { omitRepos: true },
-      { safeReview: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+
+    // An authorized maintainer sending an unsupported command is authorized
+    // but not safe for review; an outsider sending the same is neither.
+    await runAuthCase('maintainer-unsupported', { permission: 'write', body: 'hello' },
+      { safeReview: false, authorized: true, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+    await runAuthCase('outsider-unsupported',
+      { permission: 'read', body: 'hello', commentUser: { login: 'outsider', type: 'User' } },
+      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+
+    // Tag mode forwards the authorization verdict to GITHUB_OUTPUT for the
+    // workflow read-only gate (fail-closed string comparison).
+    {
+      const outputPath = path.join(tempDirectory, 'auth-outputs.txt');
+      const allowed = makeAuthHarness({ permission: 'write' });
+      await runTagMode({
+        ...allowed.tagContext,
+        env: { ...allowed.tagContext.env, GITHUB_OUTPUT: outputPath } as NodeJS.ProcessEnv,
+      });
+      const allowedOutputs = fs.readFileSync(outputPath, 'utf8');
+      assert.match(allowedOutputs, /^authorized=true$/m, 'authorized maintainer emits authorized=true');
+      fs.rmSync(outputPath, { force: true });
+      const denied = makeAuthHarness({ permission: 'read', commentUser: { login: 'outsider', type: 'User' } });
+      await runTagMode({
+        ...denied.tagContext,
+        env: { ...denied.tagContext.env, GITHUB_OUTPUT: outputPath } as NodeJS.ProcessEnv,
+      });
+      const deniedOutputs = fs.readFileSync(outputPath, 'utf8');
+      assert.match(deniedOutputs, /^authorized=false$/m, 'outsider emits authorized=false');
+    }
   } finally {
     fs.rmSync(tempDirectory, { recursive: true, force: true });
     globalThis.fetch = previousFetch;

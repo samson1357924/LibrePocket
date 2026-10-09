@@ -22,12 +22,14 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      pull-requests: read
     outputs:
       labels: ${{ steps.tag.outputs.labels }}
       target: ${{ steps.tag.outputs.target }}
       command: ${{ steps.tag.outputs.command }}
       needs_diff: ${{ steps.tag.outputs.needs_diff }}
       safe_review: ${{ steps.tag.outputs.safe_review }}
+      authorized: ${{ steps.tag.outputs.authorized }}
       issue_number: ${{ steps.tag.outputs.issue_number }}
     steps:
       - name: Checkout default branch
@@ -49,14 +51,21 @@ jobs:
       - name: Emit deterministic labels and routing context
         id: tag
         working-directory: github_bot
+        # This job holds no secrets; GITHUB_TOKEN only allows the read-only
+        # authorization gate (permission check + pulls.get) on issue_comment.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
 
   review-send:
     name: Review with isolated CPA credentials
     needs: prepare-tag
+    # Read-only gate first: unauthorized issue_comment never schedules this
+    # secrets-bearing runner, so CPA secrets stay unreachable.
     if: >-
       needs.prepare-tag.outputs.target == 'pull-request' &&
-      (github.event_name != 'issue_comment' || needs.prepare-tag.outputs.needs_diff == 'true')
+      (github.event_name != 'issue_comment' || needs.prepare-tag.outputs.needs_diff == 'true') &&
+      (github.event_name != 'issue_comment' || needs.prepare-tag.outputs.authorized == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -87,7 +96,7 @@ jobs:
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
 
       - name: Run trusted single-turn review
-        if: steps.gate.outputs.safe_review == 'true'
+        if: steps.gate.outputs.safe_review == 'true' && steps.gate.outputs.authorized == 'true'
         working-directory: github_bot
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -102,7 +111,9 @@ jobs:
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=review
 
       - name: Write generic result for untrusted pull request
-        if: steps.gate.outputs.safe_review != 'true'
+        # Fail-closed complement of the trusted step: missing/empty/non-'true'
+        # authorized lands here and runs the generic INCONCLUSIVE path only.
+        if: steps.gate.outputs.safe_review != 'true' || steps.gate.outputs.authorized != 'true'
         working-directory: github_bot
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -122,8 +133,11 @@ jobs:
   publish:
     name: Publish review and labels
     needs: [prepare-tag, review-send]
+    # Unauthorized issue_comment skips publish entirely: no artifact read, no
+    # sticky write, no label changes, so an existing approval is never touched.
     if: >-
-      always() && needs.prepare-tag.result == 'success'
+      always() && needs.prepare-tag.result == 'success' &&
+      (github.event_name != 'issue_comment' || needs.prepare-tag.outputs.authorized == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

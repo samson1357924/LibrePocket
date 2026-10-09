@@ -8,7 +8,9 @@ import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.models.ModelsDevSnapshot
 import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.KeyProvider
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
 import java.nio.file.Files
@@ -17,6 +19,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -216,12 +219,32 @@ class SetupModelDirectoryStatusTest {
 
             firstRelease.complete(Unit)
             withTimeout(3_000) { firstFinished.await() }
-            delay(100)
+            awaitModelsIdle(vm)
 
-            assertEquals("user/new-free-text", vm.form.value.model)
-            assertEquals(ModelDirectoryStatus.Remote, vm.form.value.modelDirectoryStatus)
-            assertTrue(vm.form.value.modelOptions.contains("anthropic-model"))
-            assertFalse(vm.form.value.modelOptions.contains("directory-model"))
+            // Deterministic no-stale-write window: idle first, then poll instead of a bare delay.
+            withTimeout(3_000) {
+                repeat(20) {
+                    assertEquals(
+                        "stale first refresh must not overwrite model after release",
+                        "user/new-free-text",
+                        vm.form.value.model,
+                    )
+                    assertEquals(
+                        "stale first refresh must not overwrite directory status after release",
+                        ModelDirectoryStatus.Remote,
+                        vm.form.value.modelDirectoryStatus,
+                    )
+                    assertTrue(
+                        "stale first refresh must not drop second refresh options after release",
+                        vm.form.value.modelOptions.contains("anthropic-model"),
+                    )
+                    assertFalse(
+                        "stale first refresh must not restore obsolete options after release",
+                        vm.form.value.modelOptions.contains("directory-model"),
+                    )
+                    delay(10)
+                }
+            }
         }
     }
 
@@ -351,6 +374,502 @@ class SetupModelDirectoryStatusTest {
         }
     }
 
+    @Test
+    fun obsoleteDirectoryFetchIsCancelledWhenInputsChange(): Unit {
+        runBlocking {
+            val firstStarted = CompletableDeferred<Unit>()
+            val firstGate = CompletableDeferred<Unit>()
+            val firstFinished = CompletableDeferred<Unit>()
+            val firstCancelled = AtomicBoolean(false)
+            val secondStarted = CompletableDeferred<Unit>()
+            val secondBody = CompletableDeferred<String>()
+            val fetchCount = AtomicInteger()
+            val active = AtomicInteger()
+            val maxActive = AtomicInteger()
+            fun recordMax() {
+                maxActive.updateAndGet { prev -> maxOf(prev, active.get()) }
+            }
+            val vm = newViewModel { _ ->
+                when (fetchCount.incrementAndGet()) {
+                    1 -> {
+                        active.incrementAndGet()
+                        recordMax()
+                        firstStarted.complete(Unit)
+                        try {
+                            firstGate.await()
+                            error("obsolete directory fetch should have been cancelled")
+                        } catch (e: CancellationException) {
+                            firstCancelled.set(true)
+                            throw e
+                        } finally {
+                            active.decrementAndGet()
+                            firstFinished.complete(Unit)
+                        }
+                    }
+                    2 -> {
+                        active.incrementAndGet()
+                        recordMax()
+                        secondStarted.complete(Unit)
+                        try {
+                            secondBody.await()
+                        } finally {
+                            active.decrementAndGet()
+                        }
+                    }
+                    else -> error("unexpected extra directory fetch")
+                }
+            }
+
+            vm.onApiKeyChange("synthetic-openai-key")
+            vm.refreshModels()
+            withTimeout(3_000) { firstStarted.await() }
+            assertTrue(vm.form.value.modelsLoading)
+
+            vm.onApiKeyChange("synthetic-openai-key-2")
+            withTimeout(3_000) { firstFinished.await() }
+            assertTrue("obsolete refresh must be cancelled, not left running", firstCancelled.get())
+
+            vm.refreshModels()
+            withTimeout(3_000) { secondStarted.await() }
+            assertEquals("only the second directory fetch should be active", 1, active.get())
+            assertEquals("directory fetches must never overlap (maxActive)", 1, maxActive.get())
+
+            secondBody.complete(DIRECTORY_OPENAI)
+            awaitModelsIdle(vm)
+
+            assertFalse(vm.form.value.modelsLoading)
+            assertEquals(ModelDirectoryStatus.Remote, vm.form.value.modelDirectoryStatus)
+            assertTrue(vm.form.value.modelOptions.contains("directory-model"))
+        }
+    }
+
+    @Test
+    fun sequentialRefreshesNeverOverlap(): Unit {
+        runBlocking {
+            val total = 3
+            val fetchCount = AtomicInteger()
+            val active = AtomicInteger()
+            val maxActive = AtomicInteger()
+            val started = List(total) { CompletableDeferred<Unit>() }
+            val gates = List(total) { CompletableDeferred<String>() }
+            val finished = List(total) { CompletableDeferred<Unit>() }
+            val cancelled = List(total) { AtomicBoolean(false) }
+            fun recordMax() {
+                maxActive.updateAndGet { prev -> maxOf(prev, active.get()) }
+            }
+            val vm = newViewModel { _ ->
+                val id = fetchCount.incrementAndGet()
+                check(id in 1..total) { "unexpected extra directory fetch" }
+                active.incrementAndGet()
+                recordMax()
+                started[id - 1].complete(Unit)
+                try {
+                    gates[id - 1].await()
+                } catch (e: CancellationException) {
+                    cancelled[id - 1].set(true)
+                    throw e
+                } finally {
+                    active.decrementAndGet()
+                    finished[id - 1].complete(Unit)
+                }
+            }
+
+            vm.onApiKeyChange("synthetic-openai-key-1")
+            vm.refreshModels()
+            withTimeout(3_000) { started[0].await() }
+
+            for (i in 1 until total) {
+                vm.onApiKeyChange("synthetic-openai-key-${i + 1}")
+                withTimeout(3_000) { finished[i - 1].await() }
+                assertTrue("refresh #$i must be cancelled before refresh #${i + 1}", cancelled[i - 1].get())
+                vm.refreshModels()
+                withTimeout(3_000) { started[i].await() }
+                assertEquals("only refresh #${i + 1} should be active", 1, active.get())
+            }
+
+            assertEquals(total, fetchCount.get())
+            assertEquals("sequential directory fetches must never overlap (maxActive)", 1, maxActive.get())
+
+            gates[total - 1].complete(DIRECTORY_OPENAI)
+            awaitModelsIdle(vm)
+            assertEquals(ModelDirectoryStatus.Remote, vm.form.value.modelDirectoryStatus)
+            assertFalse(vm.form.value.modelsLoading)
+        }
+    }
+
+    @Test
+    fun secondRefreshResultSurvivesOldRelease(): Unit {
+        runBlocking {
+            val firstStarted = CompletableDeferred<Unit>()
+            val firstGate = CompletableDeferred<Unit>()
+            val firstFinished = CompletableDeferred<Unit>()
+            val firstCancelled = AtomicBoolean(false)
+            val secondStarted = CompletableDeferred<Unit>()
+            val secondBody = CompletableDeferred<String>()
+            val fetchCount = AtomicInteger()
+            val vm = newViewModel { _ ->
+                when (fetchCount.incrementAndGet()) {
+                    1 -> {
+                        firstStarted.complete(Unit)
+                        try {
+                            firstGate.await()
+                            error("obsolete directory fetch should have been cancelled")
+                        } catch (e: CancellationException) {
+                            firstCancelled.set(true)
+                            throw e
+                        } finally {
+                            firstFinished.complete(Unit)
+                        }
+                    }
+                    2 -> {
+                        secondStarted.complete(Unit)
+                        secondBody.await()
+                    }
+                    else -> error("unexpected extra directory fetch")
+                }
+            }
+
+            vm.onApiKeyChange("synthetic-openai-key")
+            vm.onModelChange("user/old-free-text")
+            vm.refreshModels()
+            withTimeout(3_000) { firstStarted.await() }
+
+            vm.selectPreset(dev.librepocket.preset.ProviderCatalog.ANTHROPIC_ID)
+            vm.onApiKeyChange("synthetic-anthropic-key")
+            vm.onModelChange("user/new-free-text")
+            vm.refreshModels()
+            withTimeout(3_000) { secondStarted.await() }
+
+            withTimeout(3_000) { firstFinished.await() }
+            assertTrue("obsolete refresh must be cancelled", firstCancelled.get())
+
+            secondBody.complete(DIRECTORY_ANTHROPIC)
+            awaitModelsIdle(vm)
+
+            assertEquals("user/new-free-text", vm.form.value.model)
+            assertEquals(ModelDirectoryStatus.Remote, vm.form.value.modelDirectoryStatus)
+            assertTrue(vm.form.value.modelOptions.contains("anthropic-model"))
+            assertFalse(vm.form.value.modelOptions.contains("directory-model"))
+
+            firstGate.complete(Unit)
+            awaitModelsIdle(vm)
+
+            // Deterministic no-stale-write window: idle first, then poll instead of a bare delay.
+            withTimeout(3_000) {
+                repeat(20) {
+                    assertEquals(
+                        "stale first refresh must not overwrite model after release",
+                        "user/new-free-text",
+                        vm.form.value.model,
+                    )
+                    assertEquals(
+                        "stale first refresh must not overwrite directory status after release",
+                        ModelDirectoryStatus.Remote,
+                        vm.form.value.modelDirectoryStatus,
+                    )
+                    assertTrue(
+                        "stale first refresh must not drop second refresh options after release",
+                        vm.form.value.modelOptions.contains("anthropic-model"),
+                    )
+                    assertFalse(
+                        "stale first refresh must not restore obsolete options after release",
+                        vm.form.value.modelOptions.contains("directory-model"),
+                    )
+                    delay(10)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun prefillForEditCancelsHeldRefresh(): Unit {
+        runBlocking {
+            val firstStarted = CompletableDeferred<Unit>()
+            val firstGate = CompletableDeferred<Unit>()
+            val firstFinished = CompletableDeferred<Unit>()
+            val firstCancelled = AtomicBoolean(false)
+            val vm = newViewModel {
+                firstStarted.complete(Unit)
+                try {
+                    firstGate.await()
+                    error("obsolete directory fetch should have been cancelled")
+                } catch (e: CancellationException) {
+                    firstCancelled.set(true)
+                    throw e
+                } finally {
+                    firstFinished.complete(Unit)
+                }
+            }
+
+            vm.onApiKeyChange("synthetic-openai-key")
+            vm.refreshModels()
+            withTimeout(3_000) { firstStarted.await() }
+            assertTrue(vm.form.value.modelsLoading)
+
+            vm.prefillForEdit(
+                EndpointConfig(
+                    providerId = "preset:openai",
+                    presetId = dev.librepocket.preset.ProviderCatalog.OPENAI_ID,
+                    label = "OpenAI",
+                    baseUrl = dev.librepocket.preset.ProviderCatalog.OPENAI_BASE_URL,
+                    protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                    model = "prefilled-model",
+                    apiKeyRef = "provider_key/preset:openai",
+                ),
+            )
+
+            withTimeout(3_000) { firstFinished.await() }
+            assertTrue("prefill must cancel the held refresh", firstCancelled.get())
+            assertFalse(vm.form.value.modelsLoading)
+            assertEquals(ModelDirectoryStatus.NotLoaded, vm.form.value.modelDirectoryStatus)
+            assertEquals("prefilled-model", vm.form.value.model)
+
+            firstGate.complete(Unit)
+            awaitModelsIdle(vm)
+
+            // Deterministic no-stale-write window: idle first, then poll instead of a bare delay.
+            withTimeout(3_000) {
+                repeat(20) {
+                    assertFalse(
+                        "released prefill-cancelled refresh must not restart loading",
+                        vm.form.value.modelsLoading,
+                    )
+                    assertEquals(
+                        "released prefill-cancelled refresh must not publish directory status",
+                        ModelDirectoryStatus.NotLoaded,
+                        vm.form.value.modelDirectoryStatus,
+                    )
+                    assertTrue(
+                        "released prefill-cancelled refresh must not publish options",
+                        vm.form.value.modelOptions.isEmpty(),
+                    )
+                    assertEquals(
+                        "released prefill-cancelled refresh must not overwrite prefilled model",
+                        "prefilled-model",
+                        vm.form.value.model,
+                    )
+                    delay(10)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun logoutCancelsHeldRefresh(): Unit {
+        runBlocking {
+            val firstStarted = CompletableDeferred<Unit>()
+            val firstGate = CompletableDeferred<Unit>()
+            val firstFinished = CompletableDeferred<Unit>()
+            val firstCancelled = AtomicBoolean(false)
+            val vm = newViewModel {
+                firstStarted.complete(Unit)
+                try {
+                    firstGate.await()
+                    error("obsolete directory fetch should have been cancelled")
+                } catch (e: CancellationException) {
+                    firstCancelled.set(true)
+                    throw e
+                } finally {
+                    firstFinished.complete(Unit)
+                }
+            }
+
+            vm.onApiKeyChange("synthetic-openai-key")
+            vm.refreshModels()
+            withTimeout(3_000) { firstStarted.await() }
+            assertTrue(vm.form.value.modelsLoading)
+
+            vm.logout()
+
+            withTimeout(3_000) { firstFinished.await() }
+            assertTrue("logout must cancel the held refresh", firstCancelled.get())
+            awaitModelsIdle(vm)
+            assertFalse(vm.form.value.modelsLoading)
+            assertEquals(ModelDirectoryStatus.NotLoaded, vm.form.value.modelDirectoryStatus)
+            assertTrue(vm.form.value.modelOptions.isEmpty())
+
+            firstGate.complete(Unit)
+            awaitModelsIdle(vm)
+
+            // Deterministic no-stale-write window: idle first, then poll instead of a bare delay.
+            withTimeout(3_000) {
+                repeat(20) {
+                    assertFalse(
+                        "released logout-cancelled refresh must not restart loading",
+                        vm.form.value.modelsLoading,
+                    )
+                    assertEquals(
+                        "released logout-cancelled refresh must not publish directory status",
+                        ModelDirectoryStatus.NotLoaded,
+                        vm.form.value.modelDirectoryStatus,
+                    )
+                    assertTrue(
+                        "released logout-cancelled refresh must not publish options",
+                        vm.form.value.modelOptions.isEmpty(),
+                    )
+                    delay(10)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun heldListModelsIsCancelledWhenInputsChange(): Unit {
+        runBlocking {
+            val firstListStarted = CompletableDeferred<Unit>()
+            val firstListGate = CompletableDeferred<Unit>()
+            val firstListFinished = CompletableDeferred<Unit>()
+            val firstListCancelled = AtomicBoolean(false)
+            val secondListStarted = CompletableDeferred<Unit>()
+            val secondListGate = CompletableDeferred<List<String>>()
+            val listCalls = AtomicInteger()
+            val vm = newViewModel(
+                fetchDirectory = { DIRECTORY_OPENAI },
+                buildProvider = { _, _ ->
+                    object : LlmProvider {
+                        override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
+                        override fun stream(request: ChatRequest): Flow<StreamEvent> = emptyFlow()
+                        override suspend fun listModels(): List<String> {
+                            return when (listCalls.incrementAndGet()) {
+                                1 -> {
+                                    firstListStarted.complete(Unit)
+                                    try {
+                                        firstListGate.await()
+                                        error("obsolete listModels should have been cancelled")
+                                    } catch (e: CancellationException) {
+                                        firstListCancelled.set(true)
+                                        throw e
+                                    } finally {
+                                        firstListFinished.complete(Unit)
+                                    }
+                                }
+                                2 -> {
+                                    secondListStarted.complete(Unit)
+                                    secondListGate.await()
+                                }
+                                else -> error("unexpected extra listModels call")
+                            }
+                        }
+                    }
+                },
+            )
+
+            vm.onApiKeyChange("synthetic-openai-key")
+            vm.refreshModels()
+            withTimeout(3_000) { firstListStarted.await() }
+            assertTrue("first refresh should be loading while listModels is held", vm.form.value.modelsLoading)
+
+            vm.onApiKeyChange("synthetic-openai-key-2")
+            withTimeout(3_000) { firstListFinished.await() }
+            assertTrue("obsolete listModels must be cancelled, not left running", firstListCancelled.get())
+
+            vm.refreshModels()
+            withTimeout(3_000) { secondListStarted.await() }
+
+            secondListGate.complete(listOf("new-live-model"))
+            awaitModelsIdle(vm)
+
+            assertFalse("modelsLoading must settle after new listModels wins", vm.form.value.modelsLoading)
+            assertEquals(
+                "new refresh must publish remote directory status",
+                ModelDirectoryStatus.Remote,
+                vm.form.value.modelDirectoryStatus,
+            )
+            assertTrue(
+                "new live listModels result must win",
+                vm.form.value.modelOptions.contains("new-live-model"),
+            )
+            assertTrue(
+                "directory snapshot must still merge with live result",
+                vm.form.value.modelOptions.contains("directory-model"),
+            )
+
+            firstListGate.complete(Unit)
+            awaitModelsIdle(vm)
+
+            // Deterministic no-stale-write window: idle first, then poll instead of a bare delay.
+            withTimeout(3_000) {
+                repeat(20) {
+                    assertFalse(
+                        "released stale listModels must not restart loading",
+                        vm.form.value.modelsLoading,
+                    )
+                    assertTrue(
+                        "released stale listModels must not drop new live result",
+                        vm.form.value.modelOptions.contains("new-live-model"),
+                    )
+                    assertEquals(
+                        "released stale listModels must not overwrite directory status",
+                        ModelDirectoryStatus.Remote,
+                        vm.form.value.modelDirectoryStatus,
+                    )
+                    delay(10)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun onBaseUrlChangeCancelsHeldRefresh(): Unit {
+        runBlocking {
+            val firstStarted = CompletableDeferred<Unit>()
+            val firstGate = CompletableDeferred<Unit>()
+            val firstFinished = CompletableDeferred<Unit>()
+            val firstCancelled = AtomicBoolean(false)
+            val vm = newViewModel {
+                firstStarted.complete(Unit)
+                try {
+                    firstGate.await()
+                    error("obsolete directory fetch should have been cancelled")
+                } catch (e: CancellationException) {
+                    firstCancelled.set(true)
+                    throw e
+                } finally {
+                    firstFinished.complete(Unit)
+                }
+            }
+
+            vm.selectPreset(dev.librepocket.preset.ProviderCatalog.CUSTOM_ID)
+            vm.onBaseUrlChange("https://example.com/v1")
+            vm.onApiKeyChange("synthetic-custom-key")
+            vm.refreshModels()
+            withTimeout(3_000) { firstStarted.await() }
+            assertTrue("refresh should be loading while directory fetch is held", vm.form.value.modelsLoading)
+
+            vm.onBaseUrlChange("https://example.org/v1")
+
+            withTimeout(3_000) { firstFinished.await() }
+            assertTrue("onBaseUrlChange must cancel the held refresh", firstCancelled.get())
+            awaitModelsIdle(vm)
+            assertFalse(vm.form.value.modelsLoading)
+            assertEquals(ModelDirectoryStatus.NotLoaded, vm.form.value.modelDirectoryStatus)
+            assertTrue(vm.form.value.modelOptions.isEmpty())
+
+            firstGate.complete(Unit)
+            awaitModelsIdle(vm)
+
+            // Deterministic no-stale-write window: idle first, then poll instead of a bare delay.
+            withTimeout(3_000) {
+                repeat(20) {
+                    assertFalse(
+                        "released baseUrl-cancelled refresh must not restart loading",
+                        vm.form.value.modelsLoading,
+                    )
+                    assertEquals(
+                        "released baseUrl-cancelled refresh must not publish directory status",
+                        ModelDirectoryStatus.NotLoaded,
+                        vm.form.value.modelDirectoryStatus,
+                    )
+                    assertTrue(
+                        "released baseUrl-cancelled refresh must not publish options",
+                        vm.form.value.modelOptions.isEmpty(),
+                    )
+                    delay(10)
+                }
+            }
+        }
+    }
+
     private fun assertRefreshStillLoading(vm: SetupViewModel, apiKey: String, model: String) {
         val state = vm.form.value
         assertEquals(dev.librepocket.preset.ProviderCatalog.OPENAI_ID, state.presetId)
@@ -415,7 +934,10 @@ class SetupModelDirectoryStatusTest {
         )
     }
 
-    private fun newViewModel(fetchDirectory: suspend (String) -> String): SetupViewModel {
+    private fun newViewModel(
+        buildProvider: (ProviderConfig, KeyProvider) -> LlmProvider = { _, _ -> DirectoryStatusProvider() },
+        fetchDirectory: suspend (String) -> String,
+    ): SetupViewModel {
         val dir = Files.createTempDirectory("setup-directory-status").toFile()
         tmpDirs.add(dir)
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -430,7 +952,7 @@ class SetupModelDirectoryStatusTest {
             store = store,
             vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
             policy = InMemoryPolicyStore(),
-            buildProvider = { _, _ -> DirectoryStatusProvider() },
+            buildProvider = buildProvider,
             fetchDirectory = fetchDirectory,
         )
         ViewModelStore().also {

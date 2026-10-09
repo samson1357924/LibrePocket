@@ -21,6 +21,7 @@ import dev.librepocket.provider.ProviderFailure
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -95,6 +96,7 @@ class SetupViewModel(
     private val _form = MutableStateFlow(SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID)))
     val form: StateFlow<SetupUiState> = _form
     private val modelRefreshGeneration = AtomicLong(0L)
+    private var modelRefreshJob: Job? = null
 
     val gate: StateFlow<EndpointGate> = store.observe()
         .map { config ->
@@ -120,6 +122,8 @@ class SetupViewModel(
 
     fun selectPreset(presetId: String) {
         val preset = ProviderCatalog.preset(presetId) ?: return
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
         _form.value = _form.value.copy(
             presetId = presetId,
@@ -135,6 +139,8 @@ class SetupViewModel(
     }
 
     fun onBaseUrlChange(v: String) {
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
         _form.value = _form.value.copy(
             baseUrl = v,
@@ -152,6 +158,8 @@ class SetupViewModel(
     }
 
     fun onApiKeyChange(v: String) {
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
         _form.value = _form.value.copy(
             apiKey = v,
@@ -173,6 +181,8 @@ class SetupViewModel(
      * Unknown presetIds fall back to custom with the stored URL editable.
      */
     fun prefillForEdit(config: EndpointConfig) {
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
         val preset = ProviderCatalog.preset(config.presetId)
         if (preset == null || config.presetId == ProviderCatalog.CUSTOM_ID) {
@@ -232,6 +242,8 @@ class SetupViewModel(
             _form.value = cur.copy(errorCode = err)
             return
         }
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
         val generation = modelRefreshGeneration.incrementAndGet()
         _form.value = cur.copy(
             modelsLoading = true,
@@ -239,7 +251,7 @@ class SetupViewModel(
             modelDirectoryStatus = ModelDirectoryStatus.NotLoaded,
             modelRefreshRevision = generation,
         )
-        viewModelScope.launch(Dispatchers.IO) {
+        modelRefreshJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 val config = providerConfigOf(cur, effectiveBaseUrl)
                 val typed = cur.apiKey.trim()
@@ -344,6 +356,9 @@ class SetupViewModel(
 
     /** Logout: delete the vault key, then clear metadata (order matters). */
     fun logout(onDone: () -> Unit = {}) {
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
+        modelRefreshGeneration.incrementAndGet()
         viewModelScope.launch(Dispatchers.IO) {
             val config = try {
                 store.observe().first()
@@ -403,6 +418,11 @@ class SetupViewModel(
         }
         if (e.retryable) return "TEST_RETRYABLE"
         return "TEST_FAILED"
+    }
+
+    override fun onCleared() {
+        modelRefreshJob?.cancel()
+        super.onCleared()
     }
 }
 

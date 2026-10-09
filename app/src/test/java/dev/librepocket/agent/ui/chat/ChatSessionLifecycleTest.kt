@@ -1720,6 +1720,89 @@ class ChatSessionLifecycleTest {
     }
 
     @Test
+    fun staleErrorCannotRetryQueuedCandidateBeforePromotionAcceptsIt() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val projectionHeld = CompletableDeferred<Unit>()
+        val releaseProjection = CompletableDeferred<Unit>()
+        val queuedB = CompletableDeferred<Unit>()
+        val duplicateBQueued = CompletableDeferred<Unit>()
+        val queuedBCount = AtomicInteger()
+        val provider = PromotionProvider(blockedText = "X")
+        val policy = PromotionPolicy(denyChecks = setOf(1))
+        val sessions = ProductionControllerSessions(
+            provider = provider,
+            policy = policy,
+            onQueued = { text ->
+                if (text == "B") {
+                    if (queuedBCount.incrementAndGet() == 1) queuedB.complete(Unit)
+                    else duplicateBQueued.complete(Unit)
+                }
+            },
+            wrapSession = { session -> HoldFirstStreamingProjection(session, projectionHeld, releaseProjection) },
+        )
+        val vm = newViewModel(store, sessions, policy)
+        try {
+            chatMain.run { vm.sendDirect("A") }
+            withTimeout(5_000) { vm.notice.first { it == "CHAT_SEND_DENIED" } }
+            withTimeout(5_000) { vm.sessionState.first { it.status == ChatStatus.ERROR } }
+            assertTrue("the initial denied A remains retryable until a newer send", vm.canRetry)
+
+            val session = withTimeout(5_000) { sessions.createdSessions.first() }
+            val controllerSession = sessions.controllerSessions.first()
+            val active = session.startOrEnqueue("X", opId = 900)
+            assertTrue(active is dev.librepocket.chat.TurnStart.Started)
+            withTimeout(5_000) { projectionHeld.await() }
+            withTimeout(5_000) { provider.blockedCall.await() }
+            assertEquals("the VM deliberately still projects A's prior ERROR", ChatStatus.ERROR, vm.sessionState.value.status)
+
+            chatMain.run { vm.sendDirect("B") }
+            withTimeout(5_000) { queuedB.await() }
+            assertEquals(1, controllerSession.uiState.value.pendingSteerCount)
+            assertEquals(ChatStatus.ERROR, vm.sessionState.value.status)
+            val retryWasShownForProvisionalB = vm.canRetry
+
+            // Exercise the action directly as well as the UI projection: stale
+            // ERROR must not mint another B operation behind the original.
+            chatMain.run { vm.retry() }
+            assertEquals(1, controllerSession.uiState.value.pendingSteerCount)
+            // On the unfixed behavior canRetry is true and Retry launches an
+            // asynchronous admission. Hold X until that duplicate is observed,
+            // so the provider assertion below catches the regression without
+            // sleeps or scheduler timing assumptions.
+            if (retryWasShownForProvisionalB) {
+                withTimeout(5_000) { duplicateBQueued.await() }
+            }
+
+            provider.releaseBlocked.complete(Unit)
+            withTimeout(5_000) { provider.sentCount.first { it == 2 } }
+            withTimeout(5_000) {
+                controllerSession.uiState.first {
+                    it.status == ChatStatus.IDLE && it.pendingSteerCount == 0
+                }
+            }
+            releaseProjection.complete(Unit)
+            withTimeout(5_000) {
+                vm.sessionState.first {
+                    it.status == ChatStatus.IDLE && it.messages.any { message ->
+                        message.role == "user" && message.text == "B"
+                    }
+                }
+            }
+
+            assertEquals(listOf("X", "B"), provider.sent.toList())
+            assertEquals(1, provider.sent.count { it == "B" })
+            assertEquals("only the original B admission entered the controller queue", 1, queuedBCount.get())
+            assertEquals("A deny, X start, and B promotion are the only send checks", 3, policy.chatSendCheckCount)
+            assertFalse("B is only provisional while it remains in the controller FIFO", retryWasShownForProvisionalB)
+        } finally {
+            releaseProjection.complete(Unit)
+            provider.releaseBlocked.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    @Test
     fun queuedRetryGuardSurvivesStaleErrorProjectionAndPromotionDrain() = runBlocking {
         val store = newStore()
         store.save(endpoint())

@@ -235,8 +235,7 @@ class ChatViewModel(
     }
 
     val canRetry: Boolean
-        get() = _sessionState.value.status == ChatStatus.ERROR &&
-            (retryableOp != null || retryFallbackTarget != null)
+        get() = resolveRetryTarget() != null
 
     /** In-flight or follow-up pending: a new turn must steer, never send. */
     private fun isBusy(status: ChatStatus): Boolean =
@@ -378,7 +377,7 @@ class ChatViewModel(
                                 if (verdict is TurnStart.Started) {
                                     recordStartedRetryTarget(opId, clean)
                                 } else {
-                                    recordAcceptedRetryTarget(opId, clean)
+                                    recordQueuedRetryTarget(opId, clean, handle.created.session)
                                 }
                                 started = verdict
                                 continue
@@ -444,16 +443,7 @@ class ChatViewModel(
     }
 
     fun retry() {
-        if (_sessionState.value.status != ChatStatus.ERROR) return
-        val fallbackTarget = retryFallbackTarget
-        // A queued admission may become recoverable after a later promotion
-        // denial. If the preferred retry target was explicitly discarded,
-        // adopt the fallback only when that exact operation still exists in
-        // the outbox; never infer ownership from matching text.
-        val op = retryableOp ?: fallbackTarget?.let { target ->
-            recoverableOps.firstOrNull { it.opId == target.opId }
-        }
-        val retryText = op?.text ?: fallbackTarget?.text ?: return
+        val (op, retryText) = resolveRetryTarget() ?: return
         if (retryInFlight != null) return
         val retryOpId = op?.opId ?: ++nextOpId
         val attempt = RetryAttempt(retryOpId, retryText)
@@ -573,7 +563,7 @@ class ChatViewModel(
                                 if (verdict is TurnStart.Started) {
                                     recordStartedRetryTarget(opId, text)
                                 } else {
-                                    recordAcceptedRetryTarget(opId, text)
+                                    recordQueuedRetryTarget(opId, text, handle.created.session)
                                 }
                                 started = verdict
                                 continue
@@ -977,6 +967,7 @@ class ChatViewModel(
         sessionCollectJob = viewModelScope.launch {
             created.session.uiState.collect { state ->
                 if (isGenerationCurrent(generation) && currentSession === created.session) {
+                    confirmQueuedRetryFallback(created.session, state)
                     confirmQueuedRetryAccepted(created.session, state)
                     if (state.queuedRecoveryRequired && state.pendingSteerCount > 0) {
                         reclaimQueuedRecovery(created.session, generation)
@@ -1384,15 +1375,19 @@ class ChatViewModel(
      * preaccept denial keeps the existing recovery sequence on pendingOps.
      * Only Started advances the started marker.
      */
-    private fun recordAcceptedRetryTarget(opId: Long, text: String) {
-        // This method is called only for controller-Queued admission. Even if
-        // another concurrent op superseded the shared retry candidate, queue
-        // admission still replaces this op's former recovery position.
+    private fun recordQueuedRetryTarget(opId: Long, text: String, session: ChatSession) {
         pendingOps[opId]?.takeIf { it.text == text }?.let {
             pendingOps[opId] = it.copy(recoverySequence = null)
         }
-        val candidate = retryTargetCandidate
-        if (candidate?.opId == opId && candidate.text == text) {
+        if (retryTargetCandidate?.let { it.opId == opId && it.text == text } == true) {
+            confirmQueuedRetryFallback(session, session.uiState.value)
+        }
+    }
+
+    private fun confirmQueuedRetryFallback(session: ChatSession, state: ChatUiState) {
+        if (session !== currentSession) return
+        val candidate = retryTargetCandidate ?: return
+        if (state.messages.any { it.role == "user" && it.operationId == candidate.opId }) {
             retryFallbackTarget = candidate.copy(generation = lifecycleGeneration)
         }
     }
@@ -1413,8 +1408,13 @@ class ChatViewModel(
 
     /** Started, unlike Queued, proves this target crossed the controller admission gate. */
     private fun recordStartedRetryTarget(opId: Long, text: String) {
-        recordAcceptedRetryTarget(opId, text)
+        pendingOps[opId]?.takeIf { it.text == text }?.let {
+            pendingOps[opId] = it.copy(recoverySequence = null)
+        }
         val started = pendingOps[opId]?.takeIf { it.text == text } ?: return
+        if (retryTargetCandidate?.let { it.opId == opId && it.text == text } == true) {
+            retryFallbackTarget = retryTargetCandidate?.copy(generation = lifecycleGeneration)
+        }
         val current = latestAcceptedStartedTarget
         if (current == null || started.retryTargetEpoch > current.retryTargetEpoch) {
             latestAcceptedStartedTarget = started
@@ -1425,6 +1425,18 @@ class ChatViewModel(
                 retryableOp = null
             }
         }
+    }
+
+    private fun resolveRetryTarget(): Pair<PendingOp?, String>? {
+        if (_sessionState.value.status != ChatStatus.ERROR) return null
+        retryableOp?.let { return it to it.text }
+        retryFallbackTarget?.let { target ->
+            val recovered = recoverableOps.firstOrNull { it.opId == target.opId }
+            return recovered to (recovered?.text ?: target.text)
+        }
+        val candidate = retryTargetCandidate ?: return null
+        val recovered = recoverableOps.firstOrNull { it.opId == candidate.opId } ?: return null
+        return recovered to recovered.text
     }
 
     // R2: surface the next endpoint-cancelled text after an explicit send

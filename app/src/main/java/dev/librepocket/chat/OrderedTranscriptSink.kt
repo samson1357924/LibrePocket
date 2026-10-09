@@ -27,10 +27,14 @@ import kotlinx.coroutines.withTimeoutOrNull
  * upstream reordering, which is fixed here.
  *
  * Durable ack: [onTurnStarted], [onTurnSucceeded], [onTurnCancelled] and
- * [onTurnFailed] suspend until the writer has run the delegate (the row is
- * durable, or swallowed best-effort by the delegate itself). A writer
- * teardown mid-entry fails the ack explicitly (never a false durable ack);
- * the waiter converts that into an INTERRUPTED mark via [interruptedRunIds].
+ * [onTurnFailed] suspend until the writer has run the delegate. A delegate
+ * failure (including a non-cancellation store error from a durable core
+ * write) fails the ack explicitly via `completeExceptionally` — never a
+ * false durable ack — and the waiter converts that into an INTERRUPTED mark
+ * via [interruptedRunIds] before rethrowing. A writer teardown mid-entry
+ * fails the ack the same way, then seals: the channel is closed, every
+ * outstanding and orphan-buffered core ack is failed boundedly, and later
+ * core writes fail fast instead of parking forever.
  *
  * Retry / tool /
  * usage / steer notices only suspend until admitted to the channel, so a slow
@@ -65,6 +69,10 @@ class OrderedTranscriptSink(
   private val writerScope = CoroutineScope(SupervisorJob() + dispatcher)
   private val channel = kotlinx.coroutines.channels.Channel<Entry>(capacity)
   private val pendingCore = ConcurrentHashMap.newKeySet<String>()
+  /** Outstanding core acks (ack -> runId) for bounded seal/shutdown failure. */
+  private val coreAcks = ConcurrentHashMap<CompletableDeferred<Unit>, String>()
+  /** Set once the writer exits (teardown or drain): later cores fail fast. */
+  private val writerDead = AtomicBoolean(false)
   private val interrupted = java.util.Collections.synchronizedList(mutableListOf<String>())
   private val shutdownGuard = AtomicBoolean(false)
   /**
@@ -77,26 +85,44 @@ class OrderedTranscriptSink(
   private val overflowChain = AtomicReference<CompletableDeferred<Unit>?>(null)
 
   private val writer: Job = writerScope.launch {
-    for (entry in channel) {
-      var cancelled: CancellationException? = null
-      try {
-        entry.block()
-      } catch (e: CancellationException) {
-        // Writer teardown (shutdown scope cancel): remember the failure so
-        // the finally below fails the ack explicitly instead of reporting a
-        // false durable ack, then propagate so the writer ends.
-        cancelled = e
-        throw e
-      } catch (_: Exception) {
-        // Best effort preserved: persistence must never break the chat loop.
-      } finally {
-        entry.runId?.let { pendingCore.remove(it) }
-        val ack = entry.ack
-        if (ack != null && !ack.isCompleted) {
-          val failure = cancelled
-          if (failure != null) ack.completeExceptionally(failure) else ack.complete(Unit)
+    try {
+      for (entry in channel) {
+        var failure: Throwable? = null
+        try {
+          entry.block()
+        } catch (e: CancellationException) {
+          // Writer teardown (shutdown scope cancel): remember the failure so
+          // the finally below fails the ack explicitly instead of reporting a
+          // false durable ack, then propagate so the writer ends.
+          failure = e
+          throw e
+        } catch (e: Exception) {
+          // Durable core failure (e.g. store IOException): fail this entry's
+          // ack explicitly; the writer itself stays alive for later entries.
+          // Notice entries carry no ack, so this stays best-effort for them.
+          failure = e
+        } finally {
+          entry.runId?.let { pendingCore.remove(it) }
+          val ack = entry.ack
+          if (ack != null) {
+            coreAcks.remove(ack)
+            if (!ack.isCompleted) {
+              if (failure != null) {
+                entry.runId?.let(::markInterrupted)
+                ack.completeExceptionally(failure)
+              } else {
+                ack.complete(Unit)
+              }
+            } else if (failure != null) {
+              entry.runId?.let(::markInterrupted)
+            }
+          }
         }
       }
+    } finally {
+      // Any exit (teardown, fatal, or post-seal drain) seals: no later core
+      // may park unbounded behind a dead writer.
+      sealWriter(CancellationException("transcript writer dead"))
     }
   }
 
@@ -134,36 +160,55 @@ class OrderedTranscriptSink(
 
   /** Core event: suspends until the single writer has run the delegate. */
   private suspend fun writeCore(runId: String, block: suspend () -> Unit) {
+    // Fail fast behind a dead/sealed writer: never park unbounded with no
+    // drainer. The mark keeps the interruption explicit.
+    if (writerDead.get() || writer.isCompleted || channel.isClosedForSend) {
+      markInterrupted(runId)
+      throw CancellationException("transcript writer sealed")
+    }
     val ack = CompletableDeferred<Unit>()
-    // Writer-side failure (teardown mid-entry) completes this ack
-    // exceptionally; convert that into an explicit INTERRUPTED mark instead
-    // of a false durable ack. A merely-abandoned wait (caller cancelled while
-    // the ack is still pending) does NOT mark: the independent writer still
-    // persists the queued entry.
+    // Writer-side failure (teardown mid-entry, seal, drain timeout, or a
+    // durable store error for this entry) completes this ack exceptionally;
+    // convert that into an explicit INTERRUPTED mark instead of a false
+    // durable ack. A merely-abandoned wait (caller cancelled while the ack
+    // is still pending) does NOT mark: the handler only fires when the ack
+    // itself completes, and abandonment leaves it pending for the
+    // independent writer to persist.
     ack.invokeOnCompletion { cause ->
       if (cause != null) markInterrupted(runId)
     }
+    coreAcks[ack] = runId
     pendingCore.add(runId)
     try {
       channel.send(Entry(runId, block, ack))
     } catch (e: CancellationException) {
       // The caller was cancelled before admission: the entry never entered
       // the channel, so drop the pending mark and propagate.
+      coreAcks.remove(ack)
       pendingCore.remove(runId)
       throw e
-    } catch (_: ClosedSendChannelException) {
-      // Sealed after shutdown: never throw into the chat loop; mark explicit.
+    } catch (e: ClosedSendChannelException) {
+      // Sealed after shutdown/writer death: fail fast instead of reporting
+      // success; the mark keeps the interruption explicit.
+      coreAcks.remove(ack)
       markInterrupted(runId)
-      return
+      if (!ack.isCompleted) ack.completeExceptionally(e)
+      throw e
     }
     try {
       ack.await()
     } catch (e: CancellationException) {
       // The handler above already marked INTERRUPTED when the writer failed
-      // the ack (teardown: the row may never have persisted). Otherwise only
-      // the wait was abandoned and the queued entry is still persisted by the
-      // independent writer. Either way propagate.
+      // the ack (teardown/seal: the row may never have persisted). Otherwise
+      // only the wait was abandoned and the queued entry is still persisted
+      // by the independent writer. Either way propagate.
       throw e
+    } catch (e: Exception) {
+      // Durable store failure for this entry: already marked INTERRUPTED via
+      // the handler; propagate instead of reporting durable success.
+      throw e
+    } finally {
+      coreAcks.remove(ack)
     }
   }
 
@@ -273,7 +318,11 @@ class OrderedTranscriptSink(
           // outer-scope cancel): the drain below still bounds the teardown.
         }
         if (!flush(drainTimeoutMs)) {
-          pendingCore.toList().forEach(::markInterrupted)
+          val cause = CancellationException("transcript drain timeout")
+          for (runId in pendingCore.toList()) {
+            markInterrupted(runId)
+            failAcksFor(runId, cause)
+          }
         }
         channel.close()
         withTimeoutOrNull(drainTimeoutMs) {
@@ -291,6 +340,15 @@ class OrderedTranscriptSink(
   /** Core runIds admitted but still awaiting the writer. */
   fun pendingRunIds(): List<String> = pendingCore.toList()
 
+  /**
+   * True once the writer is sealed/torn down: later core writes fail fast
+   * (fail-fast `CancellationException` or [ClosedSendChannelException]) instead
+   * of parking unbounded behind a dead writer. Mirrors the [writeCore]
+   * fail-fast gate; callers use it to distinguish a seal race (already marked
+   * INTERRUPTED) from a genuine write failure without matching message text.
+   */
+  fun isSealed(): Boolean = writerDead.get() || writer.isCompleted || channel.isClosedForSend
+
   /** Core runIds admitted but never acked (drain timeout / seal race). */
   fun interruptedRunIds(): List<String> = synchronized(interrupted) { interrupted.toList() }
 
@@ -298,6 +356,61 @@ class OrderedTranscriptSink(
     pendingCore.remove(runId)
     synchronized(interrupted) {
       if (!interrupted.contains(runId)) interrupted.add(runId)
+    }
+  }
+
+  /** Fails every outstanding core ack for [runId] (drain-timeout orphans). */
+  private fun failAcksFor(runId: String, cause: Throwable) {
+    for ((ack, id) in coreAcks.entries.toList()) {
+      if (id == runId && !ack.isCompleted) {
+        coreAcks.remove(ack)
+        ack.completeExceptionally(cause)
+      }
+    }
+  }
+
+  /**
+   * Seals the writer exactly once: closes the channel (unblocking parked
+   * senders with [ClosedSendChannelException]), fails every outstanding core
+   * ack, and drains orphan-buffered entries admitted but never consumed.
+   * Bounded and non-suspending; later core writes fail fast via [writerDead].
+   */
+  private fun sealWriter(cause: Throwable) {
+    if (!writerDead.compareAndSet(false, true)) return
+    try {
+      channel.close()
+    } catch (_: Exception) {
+      // Already sealed: fall through to fail the outstanding acks below.
+    }
+    for ((ack, runId) in coreAcks.entries.toList()) {
+      coreAcks.remove(ack)
+      pendingCore.remove(runId)
+      synchronized(interrupted) {
+        if (!interrupted.contains(runId)) interrupted.add(runId)
+      }
+      try {
+        if (!ack.isCompleted) ack.completeExceptionally(cause)
+      } catch (_: Exception) {
+        // Best effort: the waiter already observes the interrupt mark.
+      }
+    }
+    while (true) {
+      val entry = channel.tryReceive().getOrNull() ?: break
+      entry.runId?.let { runId ->
+        pendingCore.remove(runId)
+        synchronized(interrupted) {
+          if (!interrupted.contains(runId)) interrupted.add(runId)
+        }
+      }
+      val ack = entry.ack
+      if (ack != null) {
+        coreAcks.remove(ack)
+        try {
+          if (!ack.isCompleted) ack.completeExceptionally(cause)
+        } catch (_: Exception) {
+          // Best effort: same as above.
+        }
+      }
     }
   }
 

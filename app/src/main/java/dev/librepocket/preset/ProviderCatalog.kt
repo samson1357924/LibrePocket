@@ -54,6 +54,7 @@ object ProviderCatalog {
      *  （key 直填頭值，不加前綴）。
      * @param anthropicVersion 僅 Anthropic 非空，其餘一律 null。
      * @param defaultModel 線路用模型 id（非 models.dev 目錄 id）；custom 為空。
+     * @param modelsDevProviderId 僅填已確認的 models.dev provider identity。
      */
     data class ProviderPreset(
         val id: String,
@@ -65,6 +66,7 @@ object ProviderCatalog {
         val anthropicVersion: String?,
         val defaultModel: String,
         val notes: String,
+        val modelsDevProviderId: String? = null,
     )
 
     /** 全部內建預設（含 `custom` 佔位，順序即設定頁展示順序）。 */
@@ -79,6 +81,7 @@ object ProviderCatalog {
             anthropicVersion = null,
             defaultModel = "gpt-4o-mini",
             notes = "OpenAI 原廠 OpenAI 兼容口；Key 以 Bearer 隨 Authorization 送出，存放於 KeyVault。",
+            modelsDevProviderId = "openai",
         ),
         ProviderPreset(
             id = ANTHROPIC_ID,
@@ -90,6 +93,7 @@ object ProviderCatalog {
             anthropicVersion = ANTHROPIC_VERSION,
             defaultModel = "claude-haiku-4-5",
             notes = "Anthropic Messages 原生協議；以 x-api-key 送 key，另帶 anthropic-version 頭；baseUrl 不含 /v1，由轉接器補 /v1/messages。",
+            modelsDevProviderId = "anthropic",
         ),
         ProviderPreset(
             id = XAI_ID,
@@ -112,6 +116,7 @@ object ProviderCatalog {
             anthropicVersion = null,
             defaultModel = "gemini-2.0-flash",
             notes = "Gemini 經 OpenAI 兼容口接入；baseUrl 保留末尾 /，轉接器拼接 /chat/completions；以 API Key 作 Bearer。",
+            modelsDevProviderId = "google",
         ),
         ProviderPreset(
             id = DEEPSEEK_ID,
@@ -239,8 +244,8 @@ object ProviderCatalog {
     fun defaultModelFor(presetId: String): String = requirePreset(presetId).defaultModel
 
     /**
-     * 模型候選：預設模型置首（custom 略過），再併 `live` 與快照。
-     * 直接複用 [ModelsDevSnapshot.merge] 的「live 在前、快照補齊」語義。
+     * 模型候選：預設模型置首（custom 略過），再併 `live` 與該 preset
+     * 明確對應的 models.dev provider。未映射 preset/custom 僅保留 default/live。
      */
     fun listedModels(
         presetId: String,
@@ -253,6 +258,10 @@ object ProviderCatalog {
         } else {
             listOf(preset.defaultModel) + liveModelIds
         }
-        return ModelsDevSnapshot.merge(liveWithDefault, snapshot)
+        return ModelsDevSnapshot.mergeForProvider(
+            liveModelIds = liveWithDefault,
+            snapshot = snapshot,
+            providerId = preset.modelsDevProviderId,
+        )
     }
 }

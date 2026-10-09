@@ -1,0 +1,14 @@
+{
+  "openai": {
+    "models": {
+      "wire-openai-a": {"reasoning": false, "tool_call": true},
+      "wire-openai-b": {"reasoning": true, "tool_call": false}
+    }
+  },
+  "anthropic": {
+    "models": {
+      "wire-anthropic-a": {"reasoning": true, "tool_call": false},
+      "wire-anthropic-b": {"reasoning": false, "tool_call": true}
+    }
+  }
+}

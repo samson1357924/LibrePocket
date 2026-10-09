@@ -38,6 +38,7 @@ jobs:
       command: ${{ steps.tag.outputs.command }}
       needs_diff: ${{ steps.tag.outputs.needs_diff }}
       safe_review: ${{ steps.tag.outputs.safe_review }}
+      diff_safe: ${{ steps.tag.outputs.diff_safe }}
       authorized: ${{ steps.tag.outputs.authorized }}
       issue_number: ${{ steps.tag.outputs.issue_number }}
       should_review: ${{ steps.tag.outputs.should_review }}
@@ -52,8 +53,11 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           # Full history: the reviewer computes git merge-base locally, which
-          # needs base-side ancestry. Head objects arrive via an explicit
-          # `git fetch origin <base> <head>`; fork code is never checked out.
+          # needs base-side ancestry. Same-repo head objects arrive via an
+          # explicit `git fetch origin <base> <head>`; fork head objects
+          # arrive via an explicit `git fetch origin <base> +refs/pull/<N>/head`
+          # plus a FETCH_HEAD SHA-pin against the expected head SHA.
+          # Fork code is never checked out or executed — only read as a diff.
           fetch-depth: 0
 
       - name: Set up Node.js
@@ -118,8 +122,11 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           # Full history: the reviewer computes git merge-base locally, which
-          # needs base-side ancestry. Head objects arrive via an explicit
-          # `git fetch origin <base> <head>`; fork code is never checked out.
+          # needs base-side ancestry. Same-repo head objects arrive via an
+          # explicit `git fetch origin <base> <head>`; fork head objects
+          # arrive via an explicit `git fetch origin <base> +refs/pull/<N>/head`
+          # plus a FETCH_HEAD SHA-pin against the expected head SHA.
+          # Fork code is never checked out or executed — only read as a diff.
           fetch-depth: 0
 
       - name: Set up Node.js
@@ -140,13 +147,17 @@ jobs:
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
 
       - name: Run trusted single-turn review
-        # Trusted admission: same-repo pull requests with an explicit
-        # authorization verdict, plus the intentional issue-auto route (target
-        # issue with should_review and route_kind first-review/issue-update),
-        # which carries no auth/quota gate by owner decision. Only this step
-        # receives OpenAI secrets.
+        # Trusted admission: readable-diff pull requests (same-repo or fork
+        # via the pinned PR-ref fetch) with an explicit authorization verdict,
+        # plus the intentional issue-auto route (target issue with
+        # should_review and route_kind first-review/issue-update), which
+        # carries no auth/quota gate by owner decision. `diff_safe` is the
+        # readability gate (fork-safe); `safe_review` remains same-repo-only
+        # for distinction. Only this step receives OpenAI secrets. The
+        # checkout stays on the default branch; fork code is never checked
+        # out or executed.
         if: >-
-          (steps.gate.outputs.safe_review == 'true' && steps.gate.outputs.authorized == 'true') ||
+          (steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||
           (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
           (steps.gate.outputs.route_kind == 'first-review' || steps.gate.outputs.route_kind == 'issue-update'))
         working-directory: github_bot
@@ -165,10 +176,11 @@ jobs:
 
       - name: Write generic result for untrusted pull request
         # Fail-closed complement of the trusted step: anything not admitted
-        # above — including missing/empty/non-'true' authorized and non-issue
-        # routes — runs the generic INCONCLUSIVE path with no OpenAI secrets.
+        # above — including missing/empty/non-'true' authorized, unreadable
+        # diffs (SHA-pin or fetch failure), and non-issue routes — runs the
+        # generic INCONCLUSIVE path with no OpenAI secrets.
         if: >-
-          !((steps.gate.outputs.safe_review == 'true' && steps.gate.outputs.authorized == 'true') ||
+          !((steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||
           (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
           (steps.gate.outputs.route_kind == 'first-review' || steps.gate.outputs.route_kind == 'issue-update')))
         working-directory: github_bot

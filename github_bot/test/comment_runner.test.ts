@@ -988,8 +988,8 @@ export async function runCommentRunnerTests(): Promise<void> {
         'review-send schedules issue-auto execution by explicit route');
       const trustedStep = workflowStep(reviewJob, 'Run trusted single-turn review');
       const squashedTrusted = trustedStep.replace(/\s+/g, ' ');
-      assert.match(squashedTrusted, /steps\.gate\.outputs\.safe_review\s*==\s*'true'\s*&&\s*steps\.gate\.outputs\.authorized\s*==\s*'true'/,
-        'OpenAI credentials are injected only when origin and authorization both pass');
+      assert.match(squashedTrusted, /steps\.gate\.outputs\.diff_safe\s*==\s*'true'\s*&&\s*steps\.gate\.outputs\.authorized\s*==\s*'true'/,
+        'OpenAI credentials are injected only when the readable diff plus authorization both pass');
       assert.match(squashedTrusted, /steps\.gate\.outputs\.target\s*==\s*'issue'.*should_review\s*==\s*'true'.*route_kind/,
         'trusted step admits the intentional issue-auto route to secrets');
       const genericStep = workflowStep(reviewJob, 'Write generic result for untrusted pull request');

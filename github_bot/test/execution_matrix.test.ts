@@ -3,6 +3,9 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  buildForkFetchRefspec,
+  fetchForkReviewCommits,
+  isAllowedForkFetchRefspec,
   MAX_ISSUE_CONTEXT_LENGTH,
   MAX_REVIEWS_PER_SHA,
   formatReviewCountMarker,
@@ -171,6 +174,68 @@ function throwingGitStub(): (args: string[]) => string {
   return () => { throw new Error('git must not run on a denied path'); };
 }
 
+// P1 #1 fork stub: simulates the safe fork fetch (`git fetch origin <base>`
+// then `git fetch origin +refs/pull/<N>/head`), the FETCH_HEAD SHA-pin
+// (`git rev-parse FETCH_HEAD` -> expected head SHA), plus merge-base and a
+// one-file diff. Records every invocation so tests can assert the fetch
+// allowlist (only base SHA + the exact PR refspec) and zero execution
+// (never checkout/switch/clone/reset to fork code).
+function forkGitStub(
+  calls: string[][],
+  opts: { revParseSha?: string; fetchThrows?: boolean; mergeBaseThrows?: boolean } = {},
+): (args: string[]) => string {
+  return (args: string[]) => {
+    calls.push(args);
+    if (args[0] === 'fetch') {
+      if (opts.fetchThrows) throw new Error('synthetic fork fetch failure');
+      return '';
+    }
+    if (args[0] === 'rev-parse') return `${opts.revParseSha ?? HEAD_SHA}\n`;
+    if (args[0] === 'merge-base') {
+      if (opts.mergeBaseThrows) throw new Error('synthetic merge-base failure');
+      return BASE_SHA;
+    }
+    if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/java/demo/Safe.kt\0';
+    return [
+      'diff --git a/app/src/main/java/demo/Safe.kt b/app/src/main/java/demo/Safe.kt',
+      '--- a/app/src/main/java/demo/Safe.kt',
+      '+++ b/app/src/main/java/demo/Safe.kt',
+      '@@ -1,1 +1,1 @@',
+      '+class Safe',
+    ].join('\n');
+  };
+}
+
+function assertZeroExecution(gitCalls: string[][]): void {
+  for (const args of gitCalls) {
+    assert.ok(!args.includes('checkout'), `no git checkout of fork code (got ${JSON.stringify(args)})`);
+    assert.ok(!args.includes('switch'), `no git switch to fork code (got ${JSON.stringify(args)})`);
+    assert.ok(!args.includes('clone'), `no git clone of fork code (got ${JSON.stringify(args)})`);
+    assert.ok(!args.includes('reset'), `no git reset to fork code (got ${JSON.stringify(args)})`);
+  }
+}
+
+function assertForkFetchAllowlist(gitCalls: string[][], prNumber: number): void {
+  const fetches = gitCalls.filter((args) => args[0] === 'fetch');
+  assert.ok(fetches.length >= 2, `fork path fetches base plus PR ref (got ${fetches.length} fetches)`);
+  const allowed = new Set([BASE_SHA, buildForkFetchRefspec(prNumber)]);
+  for (const fetch of fetches) {
+    assert.deepEqual(fetch.slice(0, 3), ['fetch', '--no-tags', 'origin']);
+    assert.ok(!fetch.some((arg) => arg.startsWith('--depth')), 'no shallow fetch');
+    for (const source of fetch.slice(3)) {
+      assert.ok(allowed.has(source), `fetch source allowlisted (got ${source})`);
+    }
+  }
+  assert.ok(
+    fetches.some((fetch) => fetch.includes(buildForkFetchRefspec(prNumber))),
+    'fork fetch uses the explicit +refs/pull/<N>/head refspec',
+  );
+  assert.ok(
+    gitCalls.some((args) => args[0] === 'rev-parse' && args.includes('FETCH_HEAD')),
+    'fork fetch is SHA-pinned via FETCH_HEAD before any OpenAI call',
+  );
+}
+
 function installCountingOpenAI(counter: { count: number }, payload: unknown): () => void {
   const previousFetch = globalThis.fetch;
   globalThis.fetch = (async () => {
@@ -278,27 +343,96 @@ export async function runExecutionMatrixTests(): Promise<void> {
       assert.ok(counter.count - before > 0, 'first same-repo review reaches OpenAI');
     }
 
-    // First review, fork: auto gate (no commenter check), but the origin gate
-    // keeps it generic with zero OpenAI calls and no fork fetch.
+    // First review, fork: auto gate (no commenter check), readable diff via
+    // the pinned PR-ref fetch — reaches OpenAI with zero execution (the
+    // checkout stays on the default branch; fork code is only read as a diff).
     {
       const state = makeState();
       const env = openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' });
-      const { tagged } = await tagFor('first-fork', prOpenedEvent('untrusted/fork'), env, state);
+      const tagCalls: string[][] = [];
+      const { tagged } = await tagFor('first-fork', prOpenedEvent('untrusted/fork'), env, state, forkGitStub(tagCalls));
       assert.equal(tagged.routeKind, 'first-review');
       assert.equal(tagged.reviewGate, 'auto');
-      assert.equal(tagged.safeReview, false);
-      let gitCalls = 0;
+      assert.equal(tagged.safeReview, false, 'safeReview stays same-repo-only');
+      assert.equal(tagged.diffSafe, true, 'fork first review has a safely readable diff');
+      assert.ok(tagged.changedFiles.length > 0, 'fork tag resolves changed paths via the pinned fetch');
+      assertForkFetchAllowlist(tagCalls, 41);
+      assertZeroExecution(tagCalls);
+      const reviewCalls: string[][] = [];
       const before = counter.count;
       const reviewed = await runReviewMode({
         event: prOpenedEvent('untrusted/fork'),
         env: { ...env, POCKETGUARD_OUTPUT: '' } as NodeJS.ProcessEnv,
         githubClient: makeClient(state),
         writeStdout: () => undefined,
-        runGit: () => { gitCalls += 1; throw new Error('must not fetch fork changes'); },
+        runGit: forkGitStub(reviewCalls),
       });
-      assert.equal(reviewed.verdict, 'INCONCLUSIVE');
-      assert.equal(counter.count - before, 0, 'fork first review makes zero OpenAI calls');
-      assert.equal(gitCalls, 0);
+      assert.equal(reviewed.verdict, 'APPROVE');
+      assert.ok(counter.count - before > 0, 'fork first review reaches OpenAI');
+      assertForkFetchAllowlist(reviewCalls, 41);
+      assertZeroExecution(reviewCalls);
+    }
+
+    // Fork fetch/merge-base failure fails closed: INCONCLUSIVE, zero OpenAI.
+    {
+      const state = makeState();
+      const env = openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' });
+      for (const opts of [{ fetchThrows: true }, { mergeBaseThrows: true }]) {
+        const name = opts.fetchThrows ? 'fork-fetch-throws' : 'fork-merge-base-throws';
+        const before = counter.count;
+        const reviewed = await runReviewMode({
+          event: prOpenedEvent('untrusted/fork'),
+          env: { ...env, POCKETGUARD_OUTPUT: '' } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+          runGit: forkGitStub([], opts),
+        });
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', `${name}: review fails closed`);
+        assert.equal(counter.count - before, 0, `${name}: zero OpenAI calls`);
+      }
+    }
+
+    // Fork SHA-pin mismatch (TOCTOU push / wrong ref) fails closed: the
+    // fetched head does not equal the expected head SHA, so INCONCLUSIVE
+    // with zero OpenAI calls and no diff processing.
+    {
+      const state = makeState();
+      const env = openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' });
+      const pinCalls: string[][] = [];
+      const before = counter.count;
+      const reviewed = await runReviewMode({
+        event: prOpenedEvent('untrusted/fork'),
+        env: { ...env, POCKETGUARD_OUTPUT: '' } as NodeJS.ProcessEnv,
+        githubClient: makeClient(state),
+        writeStdout: () => undefined,
+        runGit: forkGitStub(pinCalls, { revParseSha: 'd'.repeat(40) }),
+      });
+      assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'SHA-pin mismatch fails closed');
+      assert.equal(counter.count - before, 0, 'SHA-pin mismatch makes zero OpenAI calls');
+      assertZeroExecution(pinCalls);
+    }
+
+    // Fork fetch refspec allowlist: only the base SHA and exactly
+    // `+refs/pull/<N>/head` are ever fetched; anything else is rejected.
+    {
+      assert.equal(buildForkFetchRefspec(41), '+refs/pull/41/head');
+      assert.equal(isAllowedForkFetchRefspec('+refs/pull/41/head', 41), true);
+      assert.equal(isAllowedForkFetchRefspec('+refs/pull/42/head', 41), false, 'wrong PR number rejected');
+      assert.equal(isAllowedForkFetchRefspec('+refs/pull/41/merge', 41), false, 'merge ref rejected');
+      assert.equal(isAllowedForkFetchRefspec('refs/pull/41/head', 41), false, 'missing + rejected');
+      assert.equal(isAllowedForkFetchRefspec('+refs/heads/main', 41), false, 'branch ref rejected');
+      assert.equal(isAllowedForkFetchRefspec(HEAD_SHA, 41), false, 'bare head SHA is not a refspec');
+      assert.equal(isAllowedForkFetchRefspec('+refs/pull/41/head;evil', 41), false, 'injection rejected');
+      assert.throws(() => buildForkFetchRefspec(0), /invalid pull request number/);
+      assert.throws(() => buildForkFetchRefspec(Number.NaN), /invalid pull request number/);
+      assert.throws(
+        () => fetchForkReviewCommits(() => '', BASE_SHA, HEAD_SHA, 0),
+        /invalid pull request number/,
+      );
+      assert.throws(
+        () => fetchForkReviewCommits(() => '', 'not-a-sha', HEAD_SHA, 41),
+        /invalid SHAs/,
+      );
     }
 
     // Non-owner synchronize on the same repo: routed ignore, zero OpenAI
@@ -434,6 +568,59 @@ export async function runExecutionMatrixTests(): Promise<void> {
       });
       assert.equal(reviewed.verdict, 'APPROVE');
       assert.ok(counter.count - before > 0, 'author self-review reaches OpenAI');
+    }
+
+    // Fork author self-review without write permission: the PR author may
+    // re-review their own fork PR (pinned PR-ref fetch, same budget).
+    {
+      const state = makeState({ permission: 'read', pullRequest: defaultPullRequest(HEAD_SHA, 'untrusted/fork') });
+      const env = openAiEnv({ GITHUB_EVENT_NAME: 'issue_comment' });
+      const tagCalls: string[][] = [];
+      const { tagged } = await tagFor(
+        'fork-author-self-review', prCommentEvent('/review', 'pr-author'), env, state, forkGitStub(tagCalls),
+      );
+      assert.equal(tagged.authorized, true, 'fork PR author may re-review their own PR');
+      assert.equal(tagged.safeReview, false, 'safeReview stays same-repo-only for forks');
+      assert.equal(tagged.diffSafe, true, 'fork author review has a safely readable diff');
+      assertForkFetchAllowlist(tagCalls, 41);
+      assertZeroExecution(tagCalls);
+      const reviewCalls: string[][] = [];
+      const before = counter.count;
+      const reviewed = await runReviewMode({
+        event: prCommentEvent('/review', 'pr-author'),
+        env: { ...env, POCKETGUARD_OUTPUT: '' } as NodeJS.ProcessEnv,
+        githubClient: makeClient(state),
+        writeStdout: () => undefined,
+        runGit: forkGitStub(reviewCalls),
+      });
+      assert.equal(reviewed.verdict, 'APPROVE');
+      assert.ok(counter.count - before > 0, 'fork author self-review reaches OpenAI');
+      assertForkFetchAllowlist(reviewCalls, 41);
+      assertZeroExecution(reviewCalls);
+    }
+
+    // Fork non-author without write permission stays denied: zero OpenAI
+    // calls and zero git calls.
+    {
+      const state = makeState({ permission: 'read', pullRequest: defaultPullRequest(HEAD_SHA, 'untrusted/fork') });
+      const env = openAiEnv({ GITHUB_EVENT_NAME: 'issue_comment' });
+      const { tagged } = await tagFor(
+        'fork-non-author', prCommentEvent('/review', 'someone-else'), env, state,
+      );
+      assert.equal(tagged.authorized, false);
+      assert.equal(tagged.diffSafe, false);
+      const before = counter.count;
+      let gitCalls = 0;
+      const reviewed = await runReviewMode({
+        event: prCommentEvent('/review', 'someone-else'),
+        env: { ...env, POCKETGUARD_OUTPUT: '' } as NodeJS.ProcessEnv,
+        githubClient: makeClient(state),
+        writeStdout: () => undefined,
+        runGit: () => { gitCalls += 1; throw new Error('must not fetch on a denied path'); },
+      });
+      assert.equal(reviewed.verdict, 'INCONCLUSIVE');
+      assert.equal(counter.count - before, 0, 'fork non-author makes zero OpenAI calls');
+      assert.equal(gitCalls, 0, 'fork non-author runs zero git commands');
     }
 
     // Author comparison is case-insensitive; a different read-only user stays denied.
@@ -1128,7 +1315,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
       const prepareTag = workflow.slice(workflow.indexOf('  prepare-tag:'), workflow.indexOf('  review-send:'));
       const reviewJob = workflow.slice(workflow.indexOf('  review-send:'), workflow.indexOf('  publish:'));
       const publishJob = workflow.slice(workflow.indexOf('  publish:'));
-      for (const output of ['should_review', 'should_tag', 'route_kind', 'review_gate', 'reviews_used']) {
+      for (const output of ['should_review', 'should_tag', 'route_kind', 'review_gate', 'reviews_used', 'diff_safe']) {
         assert.match(
           prepareTag,
           new RegExp(`${output}:\\s*\\$\\{\\{\\s*steps\\.tag\\.outputs\\.${output}\\s*\\}\\}`),
@@ -1163,13 +1350,14 @@ export async function runExecutionMatrixTests(): Promise<void> {
         /should_tag\s*==\s*'true'/,
         'should_tag is never a review-job scheduling reason',
       );
-      // Trusted step admits the issue-auto route to the OpenAI secrets; the
-      // generic complement keeps no secrets.
+      // Trusted step admits the readable-diff route (same-repo or fork via
+      // the pinned PR-ref fetch) to the OpenAI secrets; the generic
+      // complement keeps no secrets. safe_review stays same-repo-only.
       const trustedStep = reviewJob.slice(reviewJob.indexOf('Run trusted single-turn review'));
       assert.match(
         squashed(trustedStep.slice(0, 2000)),
-        /safe_review\s*==\s*'true'.*authorized\s*==\s*'true'/,
-        'trusted step keeps the PR origin plus authorization gate',
+        /diff_safe\s*==\s*'true'.*authorized\s*==\s*'true'/,
+        'trusted step gates the readable diff plus authorization',
       );
       assert.match(
         squashed(trustedStep.slice(0, 2000)),

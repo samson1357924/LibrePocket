@@ -115,6 +115,14 @@ interface ReviewTarget {
   command: CommentCommand;
   needsDiff: boolean;
   safeReview: boolean;
+  // P1 #1 fork-readable diff signal: true when the diff can be safely read
+  // (valid SHAs + valid PR number, plus authorization for issue_comment),
+  // regardless of same-repo vs fork. safeReview above stays same-repo-only so
+  // the workflow can distinguish "readable diff" (diffSafe) from "same repo"
+  // (safeReview). Fork code is never checked out: the checkout stays on the
+  // default branch and fork objects arrive only via an explicit
+  // `git fetch origin <base> +refs/pull/<N>/head` plus a FETCH_HEAD SHA-pin.
+  diffSafe: boolean;
   authorized?: boolean;
   issueNumber?: number;
   pullRequest?: PullRequestData;
@@ -140,6 +148,10 @@ export interface TagResult {
   command: CommentCommand;
   needsDiff: boolean;
   safeReview: boolean;
+  // P1 #1: readable-diff signal forwarded as `diff_safe`. safeReview stays
+  // same-repo-only; diffSafe is true for same-repo and for fork PRs whose
+  // diff is safely readable via the pinned PR-ref fetch.
+  diffSafe: boolean;
   authorized: boolean;
   issueNumber?: number;
   shouldReview: boolean;
@@ -536,7 +548,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
 
   if (eventName === 'pull_request_target' || event.pull_request) {
     const pull = event.pull_request;
-    if (!pull) return { target: 'none', command: 'unsupported', needsDiff: false, safeReview: false, authorized: false, title: '', };
+    if (!pull) return { target: 'none', command: 'unsupported', needsDiff: false, safeReview: false, diffSafe: false, authorized: false, title: '', };
     const headRepository = pull.head?.repo?.full_name;
     const baseSha = pull.base?.sha ?? '';
     const headSha = pull.head?.sha ?? '';
@@ -544,16 +556,22 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
       repository && sameRepository(headRepository, repository.fullName) && safeSha(baseSha) && safeSha(headSha),
     );
     const number = Number(pull.number ?? event.issue?.number);
+    const numberValid = Number.isSafeInteger(number) && number > 0;
+    // P1 #1: fork diffs are safely readable (no checkout, pinned PR-ref
+    // fetch + SHA-pin in review/tag mode). First-review auto needs no write
+    // permission, so diffSafe depends only on SHAs + PR number here.
+    const diffSafe = Boolean(repository && safeSha(baseSha) && safeSha(headSha) && numberValid);
     return {
       target: 'pull-request',
       command: 'review',
       needsDiff: true,
       safeReview,
-      // pull_request_target carries no commenter to authorize; the same-repo
-      // origin check above governs. authorized is always true here.
+      diffSafe,
+      // pull_request_target carries no commenter to authorize; the diffSafe
+      // readability check above governs. authorized is always true here.
       authorized: true,
-      ...(Number.isSafeInteger(number) && number > 0 ? { issueNumber: number } : {}),
-      ...(safeReview ? {
+      ...(numberValid ? { issueNumber: number } : {}),
+      ...(diffSafe ? {
         pullRequest: {
           number,
           base: { sha: baseSha },
@@ -580,7 +598,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
     // pull request. author_association is never trusted here. On
     // issue_comment the check also requires action === 'created' or 'edited'.
     if (!isTrustedCommentAuthor(event, { authorAssociation: event.comment?.author_association, eventName })) {
-      return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
+      return { target, command, needsDiff, safeReview: false, diffSafe: false, authorized: false, ...issueRef, title };
     }
     let authorized = false;
     let pullRequest: PullRequestData | undefined;
@@ -615,14 +633,22 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
         authorLogin.trim().toLowerCase() === username.trim().toLowerCase();
       authorized = hasWrite || isAuthor;
       if (!authorized) {
-        return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
+        return { target, command, needsDiff, safeReview: false, diffSafe: false, authorized: false, ...issueRef, title };
       }
     } else {
-      return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
+      return { target, command, needsDiff, safeReview: false, diffSafe: false, authorized: false, ...issueRef, title };
     }
+    // safeReview stays same-repo-only (backward-compatible origin signal).
+    // diffSafe unlocks the fork-legal path: authorized + valid SHAs,
+    // regardless of head repo. Fork head code is still never executed or
+    // checked out — only read as a diff via the pinned PR-ref fetch.
     const safeReview = Boolean(
       authorized && pullRequest && repository &&
       sameRepository(pullRequest.head.repo?.full_name, repository.fullName) &&
+      safeSha(pullRequest.base.sha) && safeSha(pullRequest.head.sha),
+    );
+    const diffSafeRaw = Boolean(
+      authorized && pullRequest && repository &&
       safeSha(pullRequest.base.sha) && safeSha(pullRequest.head.sha),
     );
     const quotaHeadSha = pullRequest && safeSha(pullRequest.head.sha) ? pullRequest.head.sha : undefined;
@@ -631,9 +657,10 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
       command,
       needsDiff,
       safeReview: safeReview && isCommentCommandAllowed(command, target),
+      diffSafe: diffSafeRaw && isCommentCommandAllowed(command, target),
       authorized,
       ...(Number.isSafeInteger(issueNumber) && issueNumber > 0 ? { issueNumber } : {}),
-      ...(safeReview ? { pullRequest } : {}),
+      ...(diffSafeRaw ? { pullRequest } : {}),
       ...(quotaHeadSha ? { quotaHeadSha } : {}),
       title,
     };
@@ -645,6 +672,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
       command: 'unsupported',
       needsDiff: false,
       safeReview: false,
+      diffSafe: false,
       authorized: false,
       ...(Number.isSafeInteger(Number(event.issue?.number)) && Number(event.issue?.number) > 0
         ? { issueNumber: Number(event.issue?.number) }
@@ -653,7 +681,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
     };
   }
 
-  return { target: 'none', command: 'unsupported', needsDiff: false, safeReview: false, authorized: false, title: '' };
+  return { target: 'none', command: 'unsupported', needsDiff: false, safeReview: false, diffSafe: false, authorized: false, title: '' };
 }
 
 function appendWorkflowOutputs(env: NodeJS.ProcessEnv, values: Record<string, string>): void {
@@ -666,10 +694,13 @@ function appendWorkflowOutputs(env: NodeJS.ProcessEnv, values: Record<string, st
 export async function runTagMode(context: RunnerContext = {}): Promise<TagResult> {
   const env = context.env ?? process.env;
   const target = await inspectTarget(context);
-  const changed = target.safeReview && target.pullRequest
+  // P1 #1: changed-path context uses the readable-diff signal so fork PRs
+  // (first-review + authorized manual) resolve area labels. Fork objects
+  // arrive via the pinned PR-ref fetch; nothing is checked out or executed.
+  const changed = target.diffSafe && target.pullRequest
     ? collectChangedPaths(context, target.pullRequest)
     : { changedFiles: [], complete: false };
-  const areaLabels = target.safeReview && target.pullRequest
+  const areaLabels = target.diffSafe && target.pullRequest
     ? resolveAreaLabelsFromPaths(changed.changedFiles, changed.complete)
     : [];
   const labels = sanitizeLabels([...resolveLabelsFromTitle(target.title), ...areaLabels]);
@@ -736,6 +767,7 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     command: target.command,
     needsDiff: target.needsDiff,
     safeReview: target.safeReview,
+    diffSafe: target.diffSafe,
     // Fail-closed: only an explicit true counts as authorized.
     authorized: target.authorized === true,
     ...(target.issueNumber ? { issueNumber: target.issueNumber } : {}),
@@ -760,6 +792,7 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     command: result.command,
     needs_diff: String(result.needsDiff),
     safe_review: String(result.safeReview),
+    diff_safe: String(result.diffSafe),
     authorized: String(result.authorized),
     ...(result.issueNumber ? { issue_number: String(result.issueNumber) } : {}),
     should_review: String(result.shouldReview),
@@ -825,13 +858,95 @@ function fetchReviewCommits(
   runGit(['fetch', '--no-tags', 'origin', baseSha, headSha]);
 }
 
+// P1 #1 fork-readable diff: explicit PR-head refspec plus SHA-pin.
+//
+// The checkout stays on the default branch (never checkout/checkout-index/
+// switch/clone of fork code). Only two fetch sources are ever allowed here:
+// the immutable base SHA and exactly `+refs/pull/<N>/head` for the PR under
+// review. After fetching, FETCH_HEAD must resolve to the webhook/pulls.get
+// expected head SHA; any mismatch (TOCTOU push, wrong PR, tampered ref)
+// fails closed with zero OpenAI.
+export function buildForkFetchRefspec(prNumber: number): string {
+  if (!Number.isSafeInteger(prNumber) || prNumber < 1) {
+    throw new Error('PocketGuard: invalid pull request number.');
+  }
+  return `+refs/pull/${prNumber}/head`;
+}
+
+export function isAllowedForkFetchRefspec(value: unknown, prNumber: number): boolean {
+  if (typeof value !== 'string') return false;
+  let expected: string;
+  try {
+    expected = buildForkFetchRefspec(prNumber);
+  } catch {
+    return false;
+  }
+  return value === expected && /^\+refs\/pull\/\d+\/head$/.test(value);
+}
+
+export function fetchForkReviewCommits(
+  runGit: (args: string[]) => string,
+  baseSha: string,
+  expectedHeadSha: string,
+  prNumber: number,
+): void {
+  if (!safeSha(baseSha) || !safeSha(expectedHeadSha)) {
+    throw new Error('PocketGuard: invalid SHAs.');
+  }
+  const refspec = buildForkFetchRefspec(prNumber);
+  if (!isAllowedForkFetchRefspec(refspec, prNumber)) {
+    throw new Error('PocketGuard: disallowed fetch refspec.');
+  }
+  // Two explicit fetches (base SHA, then the single allowlisted PR ref) so
+  // FETCH_HEAD after the second fetch holds exactly the PR head candidate.
+  // Never checkout, switch, clone, or reset to fork objects.
+  runGit(['fetch', '--no-tags', 'origin', baseSha]);
+  runGit(['fetch', '--no-tags', 'origin', refspec]);
+  let pinned: string;
+  try {
+    pinned = runGit(['rev-parse', 'FETCH_HEAD']);
+  } catch {
+    throw new Error('PocketGuard: unable to verify fork head.');
+  }
+  const pinnedSha = pinned.trim().split(/[\s\n]+/)[0] ?? '';
+  if (!safeSha(pinnedSha) || pinnedSha.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+    throw new Error('PocketGuard: fork head SHA mismatch.');
+  }
+}
+
+function isSameRepoPullRequest(
+  context: RunnerContext,
+  pullRequest: PullRequestData,
+): boolean {
+  try {
+    const event = eventFrom(context);
+    const repository = repositoryParts(context.env ?? process.env, event);
+    if (!repository) return false;
+    return sameRepository(pullRequest.head.repo?.full_name, repository.fullName);
+  } catch {
+    return false;
+  }
+}
+
+function fetchReviewCommitsForPR(
+  context: RunnerContext,
+  pullRequest: PullRequestData,
+): void {
+  const runGit = context.runGit ?? defaultGit;
+  if (isSameRepoPullRequest(context, pullRequest)) {
+    fetchReviewCommits(runGit, pullRequest.base.sha, pullRequest.head.sha);
+    return;
+  }
+  fetchForkReviewCommits(runGit, pullRequest.base.sha, pullRequest.head.sha, pullRequest.number);
+}
+
 function collectChangedPaths(
   context: RunnerContext,
   pullRequest: PullRequestData,
 ): { changedFiles: string[]; complete: boolean } {
   try {
     const runGit = context.runGit ?? defaultGit;
-    fetchReviewCommits(runGit, pullRequest.base.sha, pullRequest.head.sha);
+    fetchReviewCommitsForPR(context, pullRequest);
     const mergeBase = resolveMergeBase(runGit, pullRequest.base.sha, pullRequest.head.sha);
     const changedFiles = getChangedPaths(context, mergeBase, pullRequest.head.sha);
     if (changedFiles.length > MAX_CHANGED_FILES) return { changedFiles: [], complete: false };
@@ -1250,11 +1365,14 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
     const target = await inspectTarget(context);
     const forcedUnsafe = env.POCKETGUARD_SAFE_REVIEW === 'false';
     // Defense-in-depth: inspectTarget re-verifies commenter authorization on
-    // every call, so safeReview === false (including any auth deny) returns
+    // every call, so diffSafe === false (including any auth deny) returns
     // the generic output before any OpenAI call, even with POCKETGUARD_SAFE_REVIEW
-    // set. No separate auth logic is needed here.
+    // set. No separate auth logic is needed here. P1 #1: diffSafe admits
+    // same-repo and fork diffs alike (fork via pinned PR-ref fetch below);
+    // safeReview stays same-repo-only for workflow distinction. Fork code is
+    // never checked out or executed — only read as a diff.
     if (
-      target.target !== 'pull-request' || !target.safeReview || forcedUnsafe || !target.pullRequest ||
+      target.target !== 'pull-request' || !target.diffSafe || forcedUnsafe || !target.pullRequest ||
       !target.issueNumber || !isCommentCommandAllowed(target.command, 'pull-request')
     ) {
       saveReviewOutput(output, context);
@@ -1298,7 +1416,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
     const headSha = target.pullRequest.head.sha;
     const runGit = context.runGit ?? defaultGit;
     try {
-      fetchReviewCommits(runGit, baseSha, headSha);
+      fetchReviewCommitsForPR(context, target.pullRequest);
       const mergeBase = resolveMergeBase(runGit, baseSha, headSha);
       changedFiles = getChangedPaths(context, mergeBase, headSha);
       if (changedFiles.length > MAX_CHANGED_FILES) {

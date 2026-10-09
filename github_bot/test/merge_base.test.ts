@@ -364,10 +364,21 @@ export async function runMergeBaseTests(): Promise<void> {
     assert.equal(workflow.match(/fetch-depth:\s*0/g)?.length, 3, 'tag, review, and publish check out full history');
     assert.match(workflow, /ref:\s*\$\{\{\s*github\.event\.repository\.default_branch\s*\}\}/,
       'checkouts stay on the default branch');
-    assert.doesNotMatch(workflow, /refs\/pull/, 'never check out PR head refs');
+    assert.doesNotMatch(workflow, /ref:\s*.*refs\/pull/, 'never check out PR head refs');
+    assert.match(workflow, /persist-credentials:\s*false/, 'checkouts persist no credentials');
+    // P1 #1: fork diffs arrive via an explicit runner-side
+    // `git fetch origin <base> +refs/pull/<N>/head` (documented in workflow
+    // comments) plus a FETCH_HEAD SHA-pin; the checkout itself never takes a
+    // PR ref. The runner fetch is read-only: no checkout/switch/clone/reset.
+    assert.match(workflow, /refs\/pull/, 'fork fetch refspec is documented');
     const runnerSource = fs.readFileSync(path.resolve(__dirname, '../src/github_runner.ts'), 'utf8');
     assert.match(runnerSource, /merge-base/, 'reviewer resolves the merge-base');
     assert.doesNotMatch(runnerSource, /--depth=1/, 'no shallow fetch that would starve merge-base');
+    assert.match(runnerSource, /refs\/pull/, 'runner fetches fork heads via the allowlisted PR refspec');
+    assert.doesNotMatch(runnerSource, /git\s+checkout/i, 'runner never checks out fork code');
+    assert.doesNotMatch(runnerSource, /'checkout'/, 'runner never shells out to git checkout');
+    assert.doesNotMatch(runnerSource, /'switch'/, 'runner never shells out to git switch');
+    assert.doesNotMatch(runnerSource, /'clone'/, 'runner never shells out to git clone');
   }
 
   console.log('[PocketGuard merge-base tests] All tests passed.');

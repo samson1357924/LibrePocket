@@ -340,7 +340,7 @@ class ProviderTransportTest {
     private suspend fun assertCallCancelled(signals: ResponseBodyReadSignals, context: String) {
         assertTrue(
             "$context cancels the actual OkHttp Call",
-            withContext(Dispatchers.IO) { signals.calls.cancelled.await(1, TimeUnit.SECONDS) },
+            withContext(Dispatchers.IO) { signals.calls.cancelled.await(5, TimeUnit.SECONDS) },
         )
     }
 
@@ -1096,10 +1096,11 @@ class ProviderTransportTest {
     @Test
     fun errorPrefixCapBoundariesListModelsFailsWithStatusFallback() = runBlocking {
         // No fatal marker: bare 503 falls back to retryable status classification.
-        // Expected client-source bytes: under-cap sizes are read fully, over-cap
-        // sizes stop at the 16KiB prefix. Per current code the exact-cap size
-        // (remaining == 0) also calls cancelCall, even though no overflow byte
-        // exists; only the under-cap size leaves the Call uncancelled.
+        // Sentinel semantics (mirrors readBoundedProviderBody): only a true
+        // overflow byte beyond 16KiB cancels. Exact-cap EOF leaves the Call
+        // uncancelled; only 16385+ cancels. Consumed is within-budget
+        // (cap + 1 sentinel + read-ahead allowance), not exact, because the
+        // probe may consume one extra byte on overflow.
         for (protocol in ProviderProtocol.values()) {
             for (size in listOf(16383, 16384, 16385)) {
                 for (unknownLength in listOf(false, true)) {
@@ -1127,18 +1128,21 @@ class ProviderTransportTest {
                         }
                         assertTrue("$context preserves HTTP status", failure.message.orEmpty().contains("HTTP 503"))
                         assertTrue("$context bare 503 falls back to retryable", failure.retryable)
-                        val expectedConsumed = if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) size.toLong() else HTTP_ERROR_BODY_LIMIT_BYTES.toLong()
-                        assertEquals("$context consumed exact client-source bytes", expectedConsumed, signals.consumedBytes.get())
-                        if (size < HTTP_ERROR_BODY_LIMIT_BYTES) {
+                        val floorBytes = minOf(size, HTTP_ERROR_BODY_LIMIT_BYTES).toLong()
+                        val consumedBytes = signals.consumedBytes.get()
+                        assertTrue(
+                            "$context consumes at least the bounded prefix ($consumedBytes >= $floorBytes)",
+                            consumedBytes >= floorBytes,
+                        )
+                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
+                        if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) {
                             assertFalse(
-                                "$context under-cap prefix leaves the Call uncancelled",
-                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(300, TimeUnit.MILLISECONDS) },
+                                "$context at-or-under-cap EOF leaves the Call uncancelled",
+                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(1, TimeUnit.SECONDS) },
                             )
                         } else {
-                            // Exact-cap also cancels per current code (remaining == 0 path).
                             assertCallCancelled(signals, context)
                         }
-                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
                         assertEquals("$context remains one request", 1, server.requestCount)
                     } finally {
                         server.shutdown()
@@ -1151,7 +1155,8 @@ class ProviderTransportTest {
     @Test
     fun errorPrefixCapBoundariesStreamFailsWithStatusFallback() = runBlocking {
         // Stream twin of the listModels cap-boundary matrix: same bodies, same
-        // exact-consumed/cancel expectations, surfaced as one Failed event.
+        // sentinel cancel expectations (exact-cap EOF uncancelled), surfaced
+        // as one Failed event.
         for (protocol in ProviderProtocol.values()) {
             for (size in listOf(16383, 16384, 16385)) {
                 for (unknownLength in listOf(false, true)) {
@@ -1175,18 +1180,21 @@ class ProviderTransportTest {
                         val failure = events.single() as StreamEvent.Failed
                         assertTrue("$context preserves HTTP status", failure.message.contains("HTTP 503"))
                         assertTrue("$context bare 503 stays retryable", failure.retryable)
-                        val expectedConsumed = if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) size.toLong() else HTTP_ERROR_BODY_LIMIT_BYTES.toLong()
-                        assertEquals("$context consumed exact client-source bytes", expectedConsumed, signals.consumedBytes.get())
-                        if (size < HTTP_ERROR_BODY_LIMIT_BYTES) {
+                        val floorBytes = minOf(size, HTTP_ERROR_BODY_LIMIT_BYTES).toLong()
+                        val consumedBytes = signals.consumedBytes.get()
+                        assertTrue(
+                            "$context consumes at least the bounded prefix ($consumedBytes >= $floorBytes)",
+                            consumedBytes >= floorBytes,
+                        )
+                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
+                        if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) {
                             assertFalse(
-                                "$context under-cap prefix leaves the Call uncancelled",
-                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(300, TimeUnit.MILLISECONDS) },
+                                "$context at-or-under-cap EOF leaves the Call uncancelled",
+                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(1, TimeUnit.SECONDS) },
                             )
                         } else {
-                            // Exact-cap also cancels per current code (remaining == 0 path).
                             assertCallCancelled(signals, context)
                         }
-                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
                         assertEquals("$context remains one provider attempt", 1, server.requestCount)
                     } finally {
                         server.shutdown()

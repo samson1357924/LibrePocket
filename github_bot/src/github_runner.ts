@@ -96,6 +96,7 @@ interface RunnerGitHubClient {
   rest: {
     pulls: { get(params: { owner: string; repo: string; pull_number: number }): Promise<{ data: PullRequestData }> };
     issues: {
+      get?(params: { owner: string; repo: string; issue_number: number }): Promise<{ data: { number?: number; title?: string; body?: string | null } }>;
       listComments(params: { owner: string; repo: string; issue_number: number; per_page: number; page: number }): Promise<{ data: GithubComment[] }>;
       createComment(params: { owner: string; repo: string; issue_number: number; body: string }): Promise<unknown>;
       updateComment(params: { owner: string; repo: string; comment_id: number; body: string }): Promise<unknown>;
@@ -1364,8 +1365,11 @@ function mergeRulesWithAiSuggestions(rulesLabels: string[], aiRawLabels: string[
   const rawList = Array.isArray(aiRawLabels) ? aiRawLabels.filter((entry): entry is string => typeof entry === 'string') : [];
   const hadUnknown = hasUnknownAiLabels(rawList);
   if (hadUnknown) {
-    const unknown = rawList.filter((entry) => normalizeLabelName(entry) === undefined);
-    console.warn(`[PocketGuard] Discarded unknown AI labels: [${unknown.join(', ')}]`);
+    // Never log raw label values: they are model- or artifact-controlled and
+    // may carry prompt injection or sensitive text. Record only the count so
+    // operators can tell a discard happened without leaking the values.
+    const unknownCount = rawList.filter((entry) => normalizeLabelName(entry) === undefined).length;
+    console.warn(`[PocketGuard] Discarded ${unknownCount} unknown AI label(s).`);
   }
   const sanitizedAi = sanitizeLabels(rawList);
   return { merged: sanitizeLabels([...rulesLabels, ...sanitizedAi]), sanitizedAi, hadUnknown };
@@ -1410,6 +1414,36 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
     suggestedLabels,
     fingerprint: raw.fingerprint,
   };
+}
+
+// P2 #5 issue freshness: title/body must come from the live GitHub issue,
+// never from the webhook snapshot alone. Returns the fresh fields when the
+// client exposes issues.get and the read validates; returns undefined when
+// the API is unavailable (callers fall back to the webhook snapshot for
+// backward compatibility with clients that lack `get`); throws a generic
+// error when a present `get` fails or returns an identity mismatch so
+// callers degrade to INCONCLUSIVE instead of reviewing stale content.
+export async function fetchFreshIssueFields(
+  client: RunnerGitHubClient | undefined,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+): Promise<{ title: string; body: string } | undefined> {
+  const issues = client?.rest.issues as RunnerGitHubClient['rest']['issues'] | undefined;
+  if (!issues || typeof issues.get !== 'function') return undefined;
+  let data: { number?: number; title?: string; body?: string | null };
+  try {
+    const response = await issues.get({ owner, repo, issue_number: issueNumber });
+    data = response?.data;
+  } catch {
+    throw new Error('PocketGuard: failed to fetch current issue state.');
+  }
+  if (!data || typeof data !== 'object') throw new Error('PocketGuard: failed to fetch current issue state.');
+  if (typeof data.number === 'number' && data.number !== issueNumber) {
+    throw new Error('PocketGuard: failed to fetch current issue state.');
+  }
+  if (typeof data.title !== 'string') throw new Error('PocketGuard: failed to fetch current issue state.');
+  return { title: data.title, body: typeof data.body === 'string' ? data.body : '' };
 }
 
 // S4 issue context: title plus body plus human comments (bot authors and bot
@@ -1482,10 +1516,42 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
     return output;
   }
   const target = await inspectTarget(context);
-  const title = target.title;
-  const body = typeof event.issue?.body === 'string' ? event.issue.body : '';
+  const webhookTitle = target.title;
+  const webhookBody = typeof event.issue?.body === 'string' ? event.issue.body : '';
   const issueNumber = target.issueNumber ?? 0;
   const repository = repositoryParts(env, event);
+  // P2 #5: prefer the live GitHub issue title/body over the webhook
+  // snapshot. A present-but-failing issues.get degrades to INCONCLUSIVE
+  // (fail-closed); a client without `get` falls back to the webhook values
+  // for backward compatibility (existing tests/clients).
+  let title = webhookTitle;
+  let body = webhookBody;
+  if (repository && issueNumber) {
+    try {
+      const fresh = await fetchFreshIssueFields(
+        apiClient(context, env.GITHUB_TOKEN ?? ''),
+        repository.owner,
+        repository.repo,
+        issueNumber,
+      );
+      if (fresh) {
+        title = fresh.title;
+        body = fresh.body;
+      }
+    } catch {
+      const output: RunnerIssueOutput = {
+        verdict: 'INCONCLUSIVE',
+        issueNumber,
+        title: safeString(webhookTitle),
+        tags: issueRulesTags(webhookTitle),
+        summary: 'the current issue state could not be fetched from GitHub; review freshness could not be verified.',
+        suggestedLabels: [],
+        fingerprint: '0'.repeat(64),
+      };
+      saveIssueOutput(output, context);
+      return output;
+    }
+  }
   const fingerprintFor = async (): Promise<string> => {
     try {
       const builtForPrint = await buildIssueContext(context, repository, issueNumber, title, body);
@@ -2120,8 +2186,30 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // comment without creating a second one.
   if (target.target === 'issue' && target.issueNumber) {
     const issueNumber = target.issueNumber;
-    const issueTitle = target.title;
-    const issueBody = typeof event.issue?.body === 'string' ? event.issue.body : '';
+    // P2 #5: re-read the live issue title/body via issues.get (plus a fresh
+    // comment re-fetch inside buildIssueContext) and compare the fingerprint
+    // before any sticky write. Review and publish never rely on the webhook
+    // snapshot alone. A present-but-failing/unverifiable fresh read falls
+    // back to INCONCLUSIVE; a client without `get` uses the webhook values
+    // for backward compatibility.
+    const webhookIssueTitle = target.title;
+    const webhookIssueBody = typeof event.issue?.body === 'string' ? event.issue.body : '';
+    let issueTitle = webhookIssueTitle;
+    let issueBody = webhookIssueBody;
+    let freshIssueReadFailed = false;
+    if (typeof client.rest.issues.get === 'function') {
+      try {
+        const fresh = await fetchFreshIssueFields(client, repository.owner, repository.repo, issueNumber);
+        if (fresh) {
+          issueTitle = fresh.title;
+          issueBody = fresh.body;
+        } else {
+          freshIssueReadFailed = true;
+        }
+      } catch {
+        freshIssueReadFailed = true;
+      }
+    }
     const rulesTitle = sanitizeLabels([
       ...configuredTagLabels(env),
       ...resolveLabelsFromTitle(issueTitle),
@@ -2132,7 +2220,9 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     let validated: RunnerIssueOutput | undefined;
     let issueFallbackReason: string | undefined;
     const reviewJobResult = env.POCKETGUARD_REVIEW_JOB_RESULT ?? 'unavailable';
-    if (reviewJobResult !== 'success') {
+    if (freshIssueReadFailed) {
+      issueFallbackReason = 'the current issue state could not be fetched from GitHub; review freshness could not be verified.';
+    } else if (reviewJobResult !== 'success') {
       issueFallbackReason = `the review job did not complete successfully (result: ${safeString(reviewJobResult, 100)}).`;
     } else {
       let artifactText: string;

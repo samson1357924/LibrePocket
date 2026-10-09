@@ -5,6 +5,7 @@ import { runExecutionMatrixTests } from './execution_matrix.test';
 import { runReviewCountLedgerTests } from './review_count_ledger.test';
 import { runStickyLabelTests } from './sticky_labels.test';
 import { runMergeBaseTests } from './merge_base.test';
+import { runStage4P2Tests } from './stage4_p2.test';
 
 runLabelManagerTests()
   .then(() => runScannerSendOpenAITests())
@@ -15,6 +16,7 @@ runLabelManagerTests()
   .then(() => runReviewCountLedgerTests())
   .then(() => runStickyLabelTests())
   .then(() => runMergeBaseTests())
+  .then(() => runStage4P2Tests())
   .catch((error: unknown) => {
     console.error(error);
     process.exitCode = 1;

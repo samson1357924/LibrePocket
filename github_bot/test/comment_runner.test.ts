@@ -1438,7 +1438,13 @@ export async function runRouteEventTests(): Promise<void> {
   assert.equal(routeEvent({ ...prComment('/review'), action: 'edited' }, commentEnv()).kind, 'manual-pr-review');
   assert.equal(routeEvent(prComment('@pocketguard review'), commentEnv()).kind, 'manual-pr-review');
   assert.equal(routeEvent(prComment('@pocketguard /review'), commentEnv()).kind, 'manual-pr-review');
-  assert.equal(routeEvent(prComment('/explain'), commentEnv()).kind, 'manual-pr-review');
+  // Stage 4 (P2 #4): /explain, /fix, and /fix-ci have no independent
+  // implementation and are legal no-ops on pull requests (ignore, zero AI,
+  // zero quota), even though they still classify and report needsDiff.
+  assert.equal(routeEvent(prComment('/explain'), commentEnv()).kind, 'ignore');
+  assert.equal(routeEvent(prComment('/fix'), commentEnv()).kind, 'ignore');
+  assert.equal(routeEvent(prComment('/fix-ci'), commentEnv()).kind, 'ignore');
+  assert.equal(routeEvent(prComment('@pocketguard explain'), commentEnv()).kind, 'ignore');
   assert.equal(routeEvent(prComment('hello'), commentEnv()).kind, 'ignore');
   assert.equal(routeEvent(prComment('@pocketguard'), commentEnv()).kind, 'ignore');
   assert.equal(routeEvent(prComment('/triage'), commentEnv()).kind, 'ignore');

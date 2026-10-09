@@ -97,6 +97,10 @@ private data class PendingSteer(val text: String, val images: List<ChatImageRef>
  *   falls back to the system zone (fail-closed, never throws).
  * @param sessionStart session creation instant for the `Session started`
  *   line; null omits the line. Callers should pass the session creation time.
+ * @param systemZone supplier re-read every turn for the ephemeral time block
+ *   when [userTimezone] is blank (defaults to `ZoneId.systemDefault`, so a
+ *   mid-session system timezone change is picked up on the next turn instead
+ *   of reusing the [clock] construction-time snapshot).
  */
 class TurnController(
   private val provider: LlmProvider,
@@ -111,6 +115,7 @@ class TurnController(
   private val clock: Clock = Clock.systemDefaultZone(),
   private val userTimezone: String? = null,
   private val sessionStart: Instant? = null,
+  private val systemZone: () -> ZoneId = ZoneId::systemDefault,
 ) {
   companion object {
     const val POLICY_ACTION = "chat.send"
@@ -455,7 +460,7 @@ class TurnController(
     }
     val lastUser = base.indexOfLast { it.role == "user" }
     if (lastUser >= 0) {
-      val block = buildRuntimeTimeContext(clock, userTimezone, sessionStart)
+      val block = buildRuntimeTimeContext(clock, userTimezone, sessionStart, systemZone)
       warnOnTimeContextDegraded(block)
       base[lastUser] = base[lastUser].copy(text = base[lastUser].text + "\n\n" + block)
     }
@@ -473,11 +478,22 @@ class TurnController(
    * A successful parse never warns, even when the resolved id is normalized
    * (e.g. `UTC+8` → `UTC+08:00`). `runCatching` keeps JVM unit tests (no
    * mocked `android.util.Log`) green.
+   *
+   * Log/block consistency: the reported `used` zone is resolved exactly like
+   * [buildRequest] — blank [userTimezone] reads [systemZone] (with the same
+   * `resolveZone(null)` fallback), so the log never names a different zone
+   * than the block actually used.
    */
   private fun warnOnTimeContextDegraded(block: String) {
     val fellBack = isTimezoneFallback(userTimezone)
     if (!block.contains("(time unknown)") && !fellBack) return
-    val used = runCatching { resolveZone(userTimezone).id }.getOrDefault("?")
+    val used = if (userTimezone.isNullOrBlank()) {
+      runCatching { systemZone().id }.getOrDefault(
+        runCatching { resolveZone(null).id }.getOrDefault("?"),
+      )
+    } else {
+      runCatching { resolveZone(userTimezone).id }.getOrDefault("?")
+    }
     runCatching {
       android.util.Log.w(
         "TurnController",

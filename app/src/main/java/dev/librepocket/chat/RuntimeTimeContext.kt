@@ -96,16 +96,22 @@ private fun buildWithZone(now: ZonedDateTime, zone: ZoneId, sessionStart: ZonedD
  * Phase 2 契約建議（此處僅註明選項，不實作 TurnController）：当 block 為 `(time unknown)` 時，
  * TurnController 應照發（讓模型知道時間未知，而非靜默用舊時間）或省略，二選一由 Phase 2 定案。
  * 本 helper 明確 never-throws 且回傳字串可直接用。
+ *
+ * 時區新鮮度：未顯式指定 [userTimezone]（null/blank）時，每次呼叫都經由 [zoneSupplier]
+ * 重新讀取系統時區，而非沿用 [now] 建構時快照的 zone。Caller 若傳入的 [now] 其 zone
+ * 已是過期快照，仍會被 [zoneSupplier] 的 fresh zone 覆寫（[now] 只供 instant）。
+ * [zoneSupplier] 抛異常時 fallback 到 [resolveZone]（null）再到 UTC 保底。
  */
 fun buildRuntimeTimeContext(
   now: ZonedDateTime,
   userTimezone: String? = null,
   sessionStart: ZonedDateTime? = null,
+  zoneSupplier: () -> ZoneId = ZoneId::systemDefault,
 ): String {
   return try {
     val zone = if (userTimezone.isNullOrBlank()) {
       try {
-        now.zone
+        zoneSupplier()
       } catch (_: Exception) {
         resolveZone(null)
       }
@@ -121,6 +127,11 @@ fun buildRuntimeTimeContext(
 /**
  * Clock-based overload. Any failure yields the unknown marker, never throws.
  *
+ * 時區新鮮度：未顯式指定 [userTimezone]（null/blank）時，每 turn 都經由 [zoneSupplier]
+ * 重新讀取 `ZoneId.systemDefault()`，而非沿用 [clock] 建構時快照的 `clock.zone`。
+ * [clock] 僅供 instant（保留 `clock.withZone(zone)` tick）；[zoneSupplier] 抛異常時
+ * fallback 到 [resolveZone]（null）再到 UTC 保底（沿用現有保底）。
+ *
  * The already-resolved [ZoneId] is passed straight into the shared assembler — never
  * round-tripped through `zone.id` back into [resolveZone]/`withZoneSameInstant` — so fixed-offset
  * ids cannot re-resolve ambiguously.
@@ -133,11 +144,12 @@ fun buildRuntimeTimeContext(
   clock: Clock,
   userTimezone: String? = null,
   sessionStart: Instant? = null,
+  zoneSupplier: () -> ZoneId = ZoneId::systemDefault,
 ): String {
   return try {
     val zone = if (userTimezone.isNullOrBlank()) {
       try {
-        clock.zone
+        zoneSupplier()
       } catch (_: Exception) {
         resolveZone(null)
       }

@@ -52,10 +52,20 @@ class RuntimeTimeContextTest {
     assertEquals(ZoneId.of("Asia/Taipei"), resolveZone("Asia/Taipei"))
   }
 
-  @Test fun emptyStringTimezoneFallsBackToClockZone() {
-    val text = buildRuntimeTimeContext(fixedTaipei(), userTimezone = "")
-    assertTrue(text.contains("Asia/Taipei (UTC+08:00)"))
+  @Test fun emptyStringTimezoneFallsBackToSystemZone() {
+    val system = ZoneId.systemDefault()
+    // Clock zone deliberately differs from systemDefault: blank must follow
+    // the supplier (default = systemDefault), never clock.zone.
+    val clockZone = if (system.id != "UTC") ZoneId.of("UTC") else ZoneId.of("Asia/Taipei")
+    val clock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), clockZone)
+    val text = buildRuntimeTimeContext(clock, userTimezone = "")
+    val expected = resolveZone(null).id
+    assertEquals(system.id, expected)
+    assertTrue(text.contains("- User timezone: " + expected))
+    assertTrue(text.contains(expected + " (UTC"))
     assertFalse(text.contains("(time unknown)"))
+    // Blank requests nothing, so the warn detector stays quiet.
+    assertFalse(isTimezoneFallback(""))
   }
 
   @Test fun paddedTimezoneIsTrimmed() {
@@ -141,5 +151,58 @@ class RuntimeTimeContextTest {
     assertTrue(
       lines.any { it.startsWith("- Current time: ") && it.contains("Asia/Taipei (UTC+08:00)") },
     )
+  }
+
+  @Test fun blankTimezoneReadsSupplierFreshEachCall() {
+    var current = ZoneId.of("Asia/Taipei")
+    // Clock zone is deliberately UTC: blank must follow the supplier, never clock.zone.
+    val clock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), ZoneId.of("UTC"))
+    val before = buildRuntimeTimeContext(clock, userTimezone = null, zoneSupplier = { current })
+    assertTrue(before.contains("- User timezone: Asia/Taipei"))
+    assertTrue(before.contains("(UTC+08:00)"))
+    current = ZoneId.of("America/New_York")
+    val after = buildRuntimeTimeContext(clock, userTimezone = null, zoneSupplier = { current })
+    assertTrue(after.contains("- User timezone: America/New_York"))
+    // 2026-10-09 is EDT (-04:00).
+    assertTrue(after.contains("(UTC-04:00)"))
+    assertFalse(after.contains("(time unknown)"))
+  }
+
+  @Test fun pinnedUserTimezoneIgnoresSupplierFlip() {
+    var current = ZoneId.of("Asia/Taipei")
+    val clock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), ZoneId.of("UTC"))
+    val before = buildRuntimeTimeContext(clock, userTimezone = "Asia/Taipei", zoneSupplier = { current })
+    current = ZoneId.of("America/New_York")
+    val after = buildRuntimeTimeContext(clock, userTimezone = "Asia/Taipei", zoneSupplier = { current })
+    assertEquals(before, after)
+    assertTrue(after.contains("- User timezone: Asia/Taipei"))
+  }
+
+  @Test fun throwingSupplierFallsBackWithoutThrowing() {
+    val clock = Clock.fixed(Instant.parse("2026-10-09T01:41:22Z"), ZoneId.of("UTC"))
+    val text = buildRuntimeTimeContext(
+      clock,
+      userTimezone = null,
+      zoneSupplier = { throw IllegalStateException("zone boom") },
+    )
+    assertFalse(text.contains("(time unknown)"))
+    assertTrue(text.contains("- User timezone: " + resolveZone(null).id))
+  }
+
+  @Test fun pureOverloadBlankTimezoneAlsoHonorsSupplier() {
+    val stale = ZonedDateTime.of(2026, 10, 9, 9, 41, 22, 0, ZoneId.of("Asia/Taipei"))
+    val text = buildRuntimeTimeContext(stale, userTimezone = null, zoneSupplier = { ZoneId.of("UTC") })
+    assertTrue(text.contains("- User timezone: UTC"))
+    assertTrue(text.contains("(UTC+00:00)"))
+  }
+
+  @Test fun sameInstantAcrossZonesShiftsWallTimeAndOffset() {
+    val instant = Instant.parse("2026-10-09T01:41:22Z")
+    val utcClock = Clock.fixed(instant, ZoneId.of("UTC"))
+    val taipei = buildRuntimeTimeContext(utcClock, userTimezone = null, zoneSupplier = { ZoneId.of("Asia/Taipei") })
+    val newYork = buildRuntimeTimeContext(utcClock, userTimezone = null, zoneSupplier = { ZoneId.of("America/New_York") })
+    // Same instant: Taipei stays 10-09 09:41 +08:00, New York (EDT) falls back to 10-08 21:41 -04:00.
+    assertTrue(taipei.contains("- Current time: 2026-10-09 Fri 09:41:22 Asia/Taipei (UTC+08:00)"))
+    assertTrue(newYork.contains("- Current time: 2026-10-08 Thu 21:41:22 America/New_York (UTC-04:00)"))
   }
 }

@@ -103,6 +103,7 @@ class TurnControllerTimeContextTest {
     delays: MutableList<Long> = mutableListOf(),
     retry: TurnRetryConfig = TurnRetryConfig(),
     imageLoader: (List<ChatImageRef>) -> List<ChatImage> = { emptyList() },
+    systemZone: () -> ZoneId = ZoneId::systemDefault,
   ): TurnController {
     var n = 0
     return TurnController(
@@ -117,6 +118,7 @@ class TurnControllerTimeContextTest {
       clock = clock,
       userTimezone = userTimezone,
       sessionStart = sessionStart,
+      systemZone = systemZone,
     )
   }
 
@@ -310,5 +312,169 @@ class TurnControllerTimeContextTest {
     } finally {
       outer.cancel()
     }
+  }
+
+  @Test fun consecutiveTurnsPickUpSystemZoneChange() {
+    var current = ZoneId.of("Asia/Taipei")
+    val provider = ok()
+    val c = controller(
+      provider,
+      // Clock zone is deliberately UTC: blank must follow the supplier, never clock.zone.
+      clock = Clock.fixed(Instant.parse("2026-01-15T12:00:00Z"), ZoneId.of("UTC")),
+      userTimezone = null,
+      systemZone = { current },
+    )
+    runBlocking { c.send("one") }
+    current = ZoneId.of("America/New_York")
+    runBlocking { c.send("two") }
+
+    assertEquals(2, provider.seenRequests.size)
+    val first = lastUserText(provider.seenRequests[0])!!
+    val second = lastUserText(provider.seenRequests[1])!!
+    assertTrue(first.startsWith("one\n\nRuntime time context:"))
+    assertTrue(first.contains("- User timezone: Asia/Taipei"))
+    assertTrue(first.contains("(UTC+08:00)"))
+    assertTrue(second.startsWith("two\n\nRuntime time context:"))
+    assertTrue(second.contains("- User timezone: America/New_York"))
+    // 2026-01-15 is EST (-05:00).
+    assertTrue(second.contains("(UTC-05:00)"))
+    // UI keeps the raw user text across both turns, no time residue.
+    val uiUsers = c.uiState.value.messages.filter { it.role == "user" }.map { it.text }
+    assertEquals(listOf("one", "two"), uiUsers)
+    assertFalse(uiUsers.any { it.contains("Runtime time context") })
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+  }
+
+  @Test fun retryPicksUpZoneFlipBetweenAttempts() {
+    var current = ZoneId.of("Asia/Taipei")
+    val calls = AtomicInteger(0)
+    val provider = TimeFakeProvider {
+      flow {
+        if (calls.incrementAndGet() == 1) {
+          // Flip before the retry builds its request: the second attempt must use the new zone.
+          current = ZoneId.of("America/New_York")
+          emit(StreamEvent.Failed("boom", retryable = true))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "recovered"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    val sink = TimeRecordingSink()
+    val c = controller(
+      provider,
+      transcript = sink,
+      clock = Clock.fixed(Instant.parse("2026-01-15T12:00:00Z"), ZoneId.of("UTC")),
+      userTimezone = null,
+      sessionStart = null,
+      retry = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(0L)),
+      systemZone = { current },
+    )
+    runBlocking { c.send("hi") }
+
+    assertEquals(2, provider.seenRequests.size)
+    val first = lastUserText(provider.seenRequests[0])!!
+    val second = lastUserText(provider.seenRequests[1])!!
+    assertTrue(first.contains("- User timezone: Asia/Taipei"))
+    assertTrue(first.contains("(UTC+08:00)"))
+    assertTrue(second.contains("- User timezone: America/New_York"))
+    // 2026-01-15 is EST (-05:00).
+    assertTrue(second.contains("(UTC-05:00)"))
+    // Transcript keeps the raw text across the retry, no time residue.
+    awaitTrue { sink.started.size >= 2 }
+    for ((_, text) in sink.started) {
+      assertEquals("hi", text)
+      assertFalse(text.contains("Runtime time context"))
+    }
+    assertEquals("hi", c.uiState.value.messages.last { it.role == "user" }.text)
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+  }
+
+  @Test fun steerFollowUpPicksUpZoneFlip() {
+    var current = ZoneId.of("Asia/Taipei")
+    val gate = CompletableDeferred<Unit>()
+    val provider = TimeFakeProvider { input ->
+      flow {
+        // Phase 2 appends an ephemeral time block; branch on the raw text.
+        val rawUserText = lastUserText(input)?.substringBefore("\n\n")
+        if (rawUserText == "first") {
+          emit(StreamEvent.TextDelta(0, 0, "A"))
+          gate.await()
+          emit(StreamEvent.Done("stop"))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "B-$rawUserText"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    val sink = TimeRecordingSink()
+    val c = controller(
+      provider,
+      transcript = sink,
+      clock = Clock.fixed(Instant.parse("2026-01-15T12:00:00Z"), ZoneId.of("UTC")),
+      userTimezone = null,
+      sessionStart = null,
+      systemZone = { current },
+    )
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { c.uiState.value.messages.any { it.role == "assistant" && it.text == "A" } }
+      // Flip after the first request is built but before the follow-up builds its own.
+      awaitTrue { provider.seenRequests.size == 1 }
+      current = ZoneId.of("America/New_York")
+      c.steer("follow-1")
+      gate.complete(Unit)
+      runBlocking { withTimeout(5000) { first.join() } }
+      awaitTrue { c.uiState.value.status == ChatStatus.IDLE && provider.seenRequests.size == 2 }
+      assertEquals(2, provider.seenRequests.size)
+      val firstReq = lastUserText(provider.seenRequests[0])!!
+      val followReq = lastUserText(provider.seenRequests[1])!!
+      assertTrue(firstReq.startsWith("first\n\nRuntime time context:"))
+      assertTrue(firstReq.contains("- User timezone: Asia/Taipei"))
+      assertTrue(followReq.startsWith("follow-1\n\nRuntime time context:"))
+      assertTrue(followReq.contains("- User timezone: America/New_York"))
+      assertTrue(followReq.contains("(UTC-05:00)"))
+      // Transcript keeps raw texts, no time residue.
+      awaitTrue { sink.started.size >= 2 }
+      for ((_, text) in sink.started) {
+        assertFalse(text.contains("Runtime time context"))
+      }
+      assertEquals(
+        listOf("first", "follow-1"),
+        c.uiState.value.messages.filter { it.role == "user" }.map { it.text },
+      )
+      assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    } finally {
+      outer.cancel()
+    }
+  }
+
+  @Test fun chatSessionImplPassesThroughSystemZoneSupplier() {
+    var current = ZoneId.of("Asia/Taipei")
+    val provider = ok()
+    var n = 0
+    val session = ChatSessionImpl(
+      provider = provider,
+      policy = TimeAllowPolicy(),
+      transcript = NoOpTranscriptSink(),
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "smoke-${n++}" },
+      clock = Clock.fixed(Instant.parse("2026-01-15T12:00:00Z"), ZoneId.of("UTC")),
+      userTimezone = null,
+      sessionStart = null,
+      systemZone = { current },
+    )
+    runBlocking { session.send("one") }
+    current = ZoneId.of("America/New_York")
+    runBlocking { session.send("two") }
+    assertEquals(2, provider.seenRequests.size)
+    assertTrue(lastUserText(provider.seenRequests[0])!!.contains("- User timezone: Asia/Taipei"))
+    assertTrue(lastUserText(provider.seenRequests[1])!!.contains("- User timezone: America/New_York"))
+    assertEquals(
+      listOf("one", "two"),
+      session.uiState.value.messages.filter { it.role == "user" }.map { it.text },
+    )
   }
 }

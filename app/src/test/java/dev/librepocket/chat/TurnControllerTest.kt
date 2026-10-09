@@ -1245,9 +1245,17 @@ class TurnControllerTest {
   @Test fun postGateBusyRaceRejectsImagesWithoutQueueOrProviderSideEffects() = runBlocking {
     val gateEntered = CountDownLatch(1)
     val releaseGate = CountDownLatch(1)
-    val provider = FakeLlmProvider { _ ->
-      flow { emit(StreamEvent.Done("stop")) }
+    // Pin the active turn inside the provider: without this barrier the
+    // immediate-Done flow can finish and clear inFlight before the racing
+    // image op resumes post-gate (hosted-only flake), making it see idle.
+    val activeTurnGate = CompletableDeferred<Unit>()
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "active") activeTurnGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
     }
+    val activeRequestEntered = provider.signalRequestEntry("active")
     val loadedImageCount = AtomicInteger()
     val c = TurnController(
       provider = provider,
@@ -1274,10 +1282,14 @@ class TurnControllerTest {
       assertTrue("image admission did not reach its post-gate seam", gateEntered.await(5, TimeUnit.SECONDS))
 
       val active = c.startOrEnqueue("active") as TurnStart.Started
+      // Prove the active turn is pinned inside the provider before releasing
+      // the racing op; otherwise it may complete first and the race is lost.
+      assertTrue("active provider request did not enter", activeRequestEntered.await(5, TimeUnit.SECONDS))
       releaseGate.countDown()
       val failure = withTimeout(5_000) { imageAdmission.await() }
 
       assertTrue("post-gate image race must throw IllegalStateException", failure is IllegalStateException)
+      activeTurnGate.complete(Unit)
       withTimeout(5_000) { active.host.join() }
       assertEquals(0, c.uiState.value.pendingSteerCount)
       assertTrue(c.drainQueued().isEmpty())
@@ -1286,6 +1298,7 @@ class TurnControllerTest {
       assertEquals(listOf("active"), usersOf(c))
     } finally {
       releaseGate.countDown()
+      activeTurnGate.complete(Unit)
       outer.cancel()
       c.close()
     }

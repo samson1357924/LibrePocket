@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { Octokit } from '@octokit/rest';
 import {
@@ -12,6 +13,7 @@ import {
 import { DeterministicScanner, type ScanViolation } from './deterministic_scanner';
 import {
   DEFAULT_PR_RECONCILE_SCOPE,
+  normalizeLabelName,
   reconcileBotLabelsSafely,
   resolveAreaLabelsFromPaths,
   resolveLabelsFromTitle,
@@ -176,6 +178,13 @@ export interface RunnerReviewOutput {
   areaLabels: string[];
   changedFiles: string[];
   changedFilesComplete: boolean;
+  // S5 AI label schema: raw merged model suggestions (string array, not yet
+  // allowlisted). Publish sanitizes through the allowlist, discards unknown
+  // with a log, and forces INCONCLUSIVE when any unknown entry is present so
+  // illegal labels are never written and the verdict is never a wrong
+  // APPROVE. Optional for backward compatibility with pre-S5 artifacts
+  // (missing defaults to []).
+  suggestedLabels?: string[];
 }
 
 function stdout(context: RunnerContext, text: string): void {
@@ -945,6 +954,7 @@ function genericReviewOutput(): RunnerReviewOutput {
     areaLabels: [],
     changedFiles: [],
     changedFilesComplete: false,
+    suggestedLabels: [],
   };
 }
 
@@ -992,10 +1002,58 @@ export interface RunnerIssueOutput {
   title: string;
   tags: string[];
   summary: string;
+  // S5: raw AI label suggestions (strict string array, allowlisted at
+  // publish) plus a revision fingerprint over title/body/comments so publish
+  // can verify freshness and update the same sticky on mismatch.
+  suggestedLabels: string[];
+  fingerprint: string;
 }
 
 function issueRulesTags(title: string): string[] {
   return sanitizeLabels(resolveLabelsFromTitle(title));
+}
+
+// S5 content fingerprint for issues: SHA-256 over the normalized review
+// context (title, body, human comments). PR freshness reuses the existing
+// head/base SHA identity (sameReviewIdentity); issues hash their mutable
+// text content instead. Publish recomputes from the current context and
+// falls back to INCONCLUSIVE on the same sticky when the fingerprint
+// mismatches.
+export function issueContentFingerprint(title: string, body: string, comments: string[]): string {
+  const normalized = JSON.stringify({ title, body, comments });
+  return createHash('sha256').update(normalized, 'utf8').digest('hex');
+}
+
+function parseSuggestedLabelsField(value: unknown): string[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return undefined;
+  for (const entry of value) {
+    if (typeof entry !== 'string') return undefined;
+  }
+  return [...(value as string[])];
+}
+
+// True when any raw AI label falls outside the allowlist (unknown after
+// normalization). Callers discard unknown via sanitizeLabels, log the event,
+// and force a non-APPROVE verdict so illegal suggestions are never written
+// and never approve.
+export function hasUnknownAiLabels(rawLabels: string[]): boolean {
+  for (const raw of rawLabels) {
+    if (typeof raw !== 'string') return true;
+    if (normalizeLabelName(raw) === undefined) return true;
+  }
+  return false;
+}
+
+function mergeRulesWithAiSuggestions(rulesLabels: string[], aiRawLabels: string[]): { merged: string[]; sanitizedAi: string[]; hadUnknown: boolean } {
+  const rawList = Array.isArray(aiRawLabels) ? aiRawLabels.filter((entry): entry is string => typeof entry === 'string') : [];
+  const hadUnknown = hasUnknownAiLabels(rawList);
+  if (hadUnknown) {
+    const unknown = rawList.filter((entry) => normalizeLabelName(entry) === undefined);
+    console.warn(`[PocketGuard] Discarded unknown AI labels: [${unknown.join(', ')}]`);
+  }
+  const sanitizedAi = sanitizeLabels(rawList);
+  return { merged: sanitizeLabels([...rulesLabels, ...sanitizedAi]), sanitizedAi, hadUnknown };
 }
 
 function saveIssueOutput(output: RunnerIssueOutput, context: RunnerContext): void {
@@ -1015,12 +1073,17 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    Object.keys(raw).some((key) => !['verdict', 'issueNumber', 'title', 'tags', 'summary'].includes(key)) ||
+    Object.keys(raw).some((key) => !['verdict', 'issueNumber', 'title', 'tags', 'summary', 'suggestedLabels', 'fingerprint'].includes(key)) ||
     !['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE'].includes(String(raw.verdict)) ||
     !Number.isSafeInteger(raw.issueNumber) || Number(raw.issueNumber) < 1 ||
     typeof raw.title !== 'string' || typeof raw.summary !== 'string' ||
     !Array.isArray(raw.tags) || !raw.tags.every((tag) => typeof tag === 'string')
   ) return undefined;
+  const suggestedLabels = parseSuggestedLabelsField(raw.suggestedLabels);
+  if (!suggestedLabels) return undefined;
+  // Fingerprint is required on S5 artifacts (hex SHA-256). Pre-S5 artifacts
+  // without it are treated as invalid so publish falls back fail-closed.
+  if (typeof raw.fingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(raw.fingerprint)) return undefined;
   return {
     verdict: raw.verdict as RunnerVerdict,
     issueNumber: Number(raw.issueNumber),
@@ -1029,6 +1092,8 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
       (raw.tags as string[]).filter((tag): tag is string => typeof tag === 'string'),
     ),
     summary: safeString(raw.summary),
+    suggestedLabels,
+    fingerprint: raw.fingerprint,
   };
 }
 
@@ -1084,17 +1149,20 @@ async function buildIssueContext(
   return { title: safeTitle, body: safeBody, comments: kept };
 }
 
-// S4 issue execution (minimal, never counted): issues opened/edited/reopened
-// and human issue comments each take one chief single-turn over the issue
-// context and record verdict plus rules-only tags (AI label schema stays in
-// S5). Routing or AI failures fall back to rules-only INCONCLUSIVE.
+// S5 issue execution (never counted): issues opened/edited/reopened and
+// human issue comments each take one chief single-turn over the issue
+// context and record verdict plus merged tags (deterministic rules first,
+// then allowlisted AI suggestions). Unknown AI labels are discarded with a
+// log and force INCONCLUSIVE so illegal suggestions are never written and
+// never approve. Routing or AI failures fall back to rules-only
+// INCONCLUSIVE with a fingerprint over the current context.
 export async function runIssueReviewMode(context: RunnerContext = {}): Promise<RunnerIssueOutput> {
   const env = context.env ?? process.env;
   let event: GithubEvent;
   try {
     event = eventFrom(context);
   } catch {
-    const output: RunnerIssueOutput = { verdict: 'INCONCLUSIVE', issueNumber: 0, title: '', tags: [], summary: '' };
+    const output: RunnerIssueOutput = { verdict: 'INCONCLUSIVE', issueNumber: 0, title: '', tags: [], summary: '', suggestedLabels: [], fingerprint: '0'.repeat(64) };
     saveIssueOutput(output, context);
     return output;
   }
@@ -1102,21 +1170,32 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
   const title = target.title;
   const body = typeof event.issue?.body === 'string' ? event.issue.body : '';
   const issueNumber = target.issueNumber ?? 0;
-  const rulesOnly = (summary: string): RunnerIssueOutput => ({
+  const repository = repositoryParts(env, event);
+  const fingerprintFor = async (): Promise<string> => {
+    try {
+      const builtForPrint = await buildIssueContext(context, repository, issueNumber, title, body);
+      return issueContentFingerprint(builtForPrint.title, builtForPrint.body, builtForPrint.comments);
+    } catch {
+      return '0'.repeat(64);
+    }
+  };
+  const rulesOnly = async (summary: string): Promise<RunnerIssueOutput> => ({
     verdict: 'INCONCLUSIVE',
     issueNumber,
     title: safeString(title),
     tags: issueRulesTags(title),
     summary: safeString(summary),
+    suggestedLabels: [],
+    fingerprint: issueNumber ? await fingerprintFor() : '0'.repeat(64),
   });
   const route = routeEvent(event, env);
   if (target.target !== 'issue' || !issueNumber || (route.kind !== 'first-review' && route.kind !== 'issue-update')) {
-    const output = rulesOnly(`no issue review: ${route.reason}`);
+    const output = await rulesOnly(`no issue review: ${route.reason}`);
     saveIssueOutput(output, context);
     return output;
   }
-  const repository = repositoryParts(env, event);
   const built = await buildIssueContext(context, repository, issueNumber, title, body);
+  const fingerprint = issueContentFingerprint(built.title, built.body, built.comments);
   const restoreFetch = installOpenAIStub(env);
   try {
     const { triageIssue } = await import('./orchestrator');
@@ -1125,12 +1204,22 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       env,
       allowedOrigins: parseAllowedOrigins(env),
     });
+    const aiRaw = Array.isArray(triaged.suggestedLabels) ? triaged.suggestedLabels : [];
+    const { merged, hadUnknown } = mergeRulesWithAiSuggestions(issueRulesTags(title), aiRaw);
+    // Deterministic needs-decision for non-APPROVE cannot be cleared by AI.
+    let verdict = triaged.verdict;
+    if (hadUnknown && verdict === 'APPROVE') verdict = 'INCONCLUSIVE';
+    const tags = hadUnknown
+      ? sanitizeLabels([...issueRulesTags(title), ...(verdict !== 'APPROVE' ? ['status:needs-decision'] : [])])
+      : sanitizeLabels([...merged, ...(verdict !== 'APPROVE' ? ['status:needs-decision'] : [])]);
     const output: RunnerIssueOutput = {
-      verdict: triaged.verdict,
+      verdict,
       issueNumber,
       title: safeString(title),
-      tags: issueRulesTags(title),
+      tags,
       summary: triaged.summary,
+      suggestedLabels: aiRaw.filter((entry): entry is string => typeof entry === 'string'),
+      fingerprint,
     };
     saveIssueOutput(output, context);
     return output;
@@ -1231,6 +1320,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
           areaLabels: resolveAreaLabelsFromPaths(changedFiles),
           changedFiles,
           changedFilesComplete,
+          suggestedLabels: [],
         };
       } else {
         const { orchestrateReview } = await import('./orchestrator');
@@ -1244,8 +1334,27 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
             env,
             allowedOrigins: parseAllowedOrigins(env),
           });
+          const mergedSuggested = [...new Set(orchestrated.roles.flatMap((role) => role.suggestedLabels))];
+          const runnerRoles: RunnerReviewOutput['roles'] = orchestrated.roles.map((role) => ({
+            role: role.role as ReviewRoleName,
+            modelUsed: role.modelUsed,
+            verdict: role.verdict as RunnerVerdict,
+            findings: role.findings.map((finding) => ({ ...finding })),
+          }));
+          let reviewVerdict = orchestrated.verdict as RunnerVerdict;
+          // S5: illegal AI labels can never approve. Any unknown suggestion
+          // downgrades an APPROVE to INCONCLUSIVE (rules-only path at
+          // publish); NEEDS_CHANGES/INCONCLUSIVE stay as computed by the
+          // existing deterministic-BLOCK-first semantics.
+          if (hasUnknownAiLabels(mergedSuggested) && reviewVerdict === 'APPROVE') {
+            console.warn('[PocketGuard] Discarded unknown AI labels; downgrading review verdict to INCONCLUSIVE.');
+            reviewVerdict = 'INCONCLUSIVE';
+          }
           output = {
-            ...orchestrated,
+            verdict: reviewVerdict,
+            roles: runnerRoles,
+            coverage: orchestrated.coverage,
+            deterministicViolations: orchestrated.deterministicViolations,
             pullRequestNumber: target.pullRequest.number,
             baseSha,
             headSha,
@@ -1253,6 +1362,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
             areaLabels: resolveAreaLabelsFromPaths(changedFiles),
             changedFiles,
             changedFilesComplete,
+            suggestedLabels: mergedSuggested,
           };
         } finally {
           restoreFetch();
@@ -1297,7 +1407,7 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
   if (
     Object.keys(raw).some((key) => ![
       'verdict', 'pullRequestNumber', 'baseSha', 'headSha', 'headRepository', 'roles', 'coverage',
-      'deterministicViolations', 'areaLabels', 'changedFiles', 'changedFilesComplete',
+      'deterministicViolations', 'areaLabels', 'changedFiles', 'changedFilesComplete', 'suggestedLabels',
     ].includes(key)) ||
     !Number.isSafeInteger(raw.pullRequestNumber) || Number(raw.pullRequestNumber) < 1 ||
     !safeSha(raw.baseSha) || !safeSha(raw.headSha) || !safeRepositoryName(raw.headRepository) ||
@@ -1307,6 +1417,8 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
     !Array.isArray(raw.changedFiles) || !raw.changedFiles.every((file) => typeof file === 'string') ||
     typeof raw.changedFilesComplete !== 'boolean'
   ) return undefined;
+  const suggestedLabels = parseSuggestedLabelsField(raw.suggestedLabels);
+  if (!suggestedLabels) return undefined;
   const rawCoverage = raw.coverage;
   if (!rawCoverage || typeof rawCoverage !== 'object' || Array.isArray(rawCoverage)) return undefined;
   const coverage = rawCoverage as Record<string, unknown>;
@@ -1428,6 +1540,7 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
       ? raw.changedFiles.filter((file): file is string => typeof file === 'string').map((file) => safeString(file))
       : [],
     changedFilesComplete: raw.changedFilesComplete === true,
+    suggestedLabels,
   };
 }
 
@@ -1435,7 +1548,8 @@ function escapeMarkdown(value: string): string {
   return safeString(value).replace(/[\\`*_{}\[\]()#+\-.!|<>]/g, '\\$&');
 }
 
-function reviewComment(output: RunnerReviewOutput): string {
+function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = []): string {
+  const updatedAt = new Date().toISOString();
   const lines = [
     REVIEW_MARKER,
     '',
@@ -1443,6 +1557,9 @@ function reviewComment(output: RunnerReviewOutput): string {
     '',
     `**判定：${output.verdict}**`,
     `審查的 head SHA：\`${output.headSha}\``,
+    `審查的 base SHA：\`${output.baseSha}\``,
+    `標籤決策：${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join('、') : '無'}`,
+    `更新時間：${updatedAt}`,
     coverageSummary(output.coverage),
     `省略檔案：${output.coverage.omittedFiles.length > 0
       ? output.coverage.omittedFiles.map((file) => escapeMarkdown(file)).join('、')
@@ -1480,6 +1597,44 @@ function inconclusiveComment(reason: string): string {
     '',
     '**判定：INCONCLUSIVE**',
     `**審查結果不可用：${safeString(reason)}**`,
+    `更新時間：${new Date().toISOString()}`,
+    SAFE_MESSAGE,
+    '',
+  ].join('\n');
+}
+
+// S5 issue sticky: one comment per issue, edited in place (never a second
+// comment). Carries verdict, summary, label decision, updated time, and the
+// revision fingerprint over title/body/comments so readers can tell whether
+// the published result matches the current issue content.
+function issueReviewComment(output: RunnerIssueOutput, appliedLabels: string[]): string {
+  const updatedAt = new Date().toISOString();
+  return [
+    REVIEW_MARKER,
+    '',
+    '## PocketGuard 議題審查',
+    '',
+    `**判定：${output.verdict}**`,
+    `議題：#${output.issueNumber} ${escapeMarkdown(output.title)}`,
+    `摘要：${escapeMarkdown(output.summary) || '（無摘要）'}`,
+    `標籤決策：${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join('、') : '無'}`,
+    `修訂指紋：\`${output.fingerprint}\``,
+    `更新時間：${updatedAt}`,
+    '',
+  ].join('\n');
+}
+
+function issueInconclusiveComment(issueNumber: number, title: string, reason: string, fingerprint: string): string {
+  return [
+    REVIEW_MARKER,
+    '',
+    '## PocketGuard 議題審查',
+    '',
+    '**判定：INCONCLUSIVE**',
+    `議題：#${issueNumber} ${escapeMarkdown(title)}`,
+    `**審查結果不可用：${safeString(reason)}**`,
+    `修訂指紋：\`${safeString(fingerprint, 100)}\``,
+    `更新時間：${new Date().toISOString()}`,
     SAFE_MESSAGE,
     '',
   ].join('\n');
@@ -1633,40 +1788,145 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
 
   // S4 execution matrix: routed-ignore events (non-owner synchronize, ordinary
   // chatter, unsubscribed actions, bot events) publish nothing — no sticky
-  // write, no label changes.
+  // write, no label changes. S5 adds an explicit bot guard so a direct
+  // publish call with a bot comment also returns without writes.
   const publishRoute = routeEvent(event, env);
   if (publishRoute.kind === 'ignore') return;
+  if (isBotEventActor(event)) return;
 
-  if (eventName === 'issues' && target.target === 'issue') {
-    const titleLabels = sanitizeLabels([
+  // S5 issue sticky: exactly one comment per issue (REVIEW_MARKER shared with
+  // PRs), edited in place. Covers issues opened/edited/reopened plus human
+  // issue_comment on issues (no auth gate by owner decision, bot excluded
+  // above). Publish verifies the artifact fingerprint against the current
+  // title/body/comments; mismatch falls back to INCONCLUSIVE on the same
+  // comment without creating a second one.
+  if (target.target === 'issue' && target.issueNumber) {
+    const issueNumber = target.issueNumber;
+    const issueTitle = target.title;
+    const issueBody = typeof event.issue?.body === 'string' ? event.issue.body : '';
+    const rulesTitle = sanitizeLabels([
       ...configuredTagLabels(env),
-      ...resolveLabelsFromTitle(target.title),
+      ...resolveLabelsFromTitle(issueTitle),
     ]);
-    // S4 issue execution: apply the reviewed issue's rules-only tags when a
-    // matching valid artifact exists (AI label schema stays in S5); any
-    // missing or invalid artifact falls back to title labels only.
-    let issueTags: string[] = [];
-    if ((env.POCKETGUARD_REVIEW_JOB_RESULT ?? 'unavailable') === 'success') {
+    const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody);
+    const currentFingerprint = issueContentFingerprint(builtCurrent.title, builtCurrent.body, builtCurrent.comments);
+
+    let validated: RunnerIssueOutput | undefined;
+    let issueFallbackReason: string | undefined;
+    const reviewJobResult = env.POCKETGUARD_REVIEW_JOB_RESULT ?? 'unavailable';
+    if (reviewJobResult !== 'success') {
+      issueFallbackReason = `the review job did not complete successfully (result: ${safeString(reviewJobResult, 100)}).`;
+    } else {
+      let artifactText: string;
       try {
-        const artifactText = fs.readFileSync(env.POCKETGUARD_OUTPUT ?? 'review-output.json', 'utf8');
-        const validated = validateIssueOutput(JSON.parse(artifactText) as unknown);
-        if (validated && validated.issueNumber === target.issueNumber) issueTags = validated.tags;
+        artifactText = fs.readFileSync(env.POCKETGUARD_OUTPUT ?? 'review-output.json', 'utf8');
       } catch {
-        // Best-effort: fall back to title labels only.
+        issueFallbackReason = 'the review output artifact is missing or unreadable.';
+        artifactText = '';
+      }
+      if (!issueFallbackReason) {
+        let artifactValue: unknown;
+        try {
+          artifactValue = JSON.parse(artifactText) as unknown;
+        } catch {
+          issueFallbackReason = 'the review output JSON is malformed.';
+        }
+        if (!issueFallbackReason) {
+          validated = validateIssueOutput(artifactValue);
+          if (!validated) issueFallbackReason = 'the review output schema or contents are invalid.';
+          else if (validated.issueNumber !== issueNumber) issueFallbackReason = 'the review output is stale: its issue number no longer matches GitHub.';
+          else if (validated.fingerprint !== currentFingerprint) issueFallbackReason = 'the review output is stale: the issue content changed after review.';
+          else if (hasUnknownAiLabels(validated.suggestedLabels)) issueFallbackReason = 'the AI label suggestions contain unknown labels; discarded.';
+        }
       }
     }
-    const labels = sanitizeLabels([...titleLabels, ...issueTags]);
-    if (labels.length > 0) {
+
+    if (issueFallbackReason || !validated) {
+      const fallbackFingerprint = validated?.fingerprint && /^[0-9a-f]{64}$/.test(validated.fingerprint)
+        ? validated.fingerprint
+        : currentFingerprint;
+      await publishStickyComment(
+        client,
+        repository,
+        issueNumber,
+        issueInconclusiveComment(issueNumber, issueTitle, issueFallbackReason ?? 'a valid review result was unavailable.', fallbackFingerprint),
+      );
+      const fallbackDesired = sanitizeLabels([...rulesTitle, 'status:needs-decision']);
       try {
-        await client.rest.issues.addLabels({
+        const reconciliation = await reconcileBotLabelsSafely({
+          client,
           owner: repository.owner,
           repo: repository.repo,
-          issue_number: target.issueNumber,
-          labels,
+          issueNumber,
+          desiredLabels: fallbackDesired,
+          scope: DEFAULT_PR_RECONCILE_SCOPE,
+          coverageComplete: false,
+        });
+        const reconciled = new Set([...reconciliation.added, ...reconciliation.skipped]);
+        if (reconciliation.failedToList || fallbackDesired.some((label) => !reconciled.has(label)) || (reconciliation.failedRemovals?.length ?? 0) > 0) {
+          throw new Error('label reconcile incomplete');
+        }
+      } catch {
+        throw new Error('PocketGuard: failed to apply issue labels.');
+      }
+      return;
+    }
+
+    const { merged, hadUnknown } = mergeRulesWithAiSuggestions(rulesTitle, validated.suggestedLabels);
+    if (hadUnknown) {
+      await publishStickyComment(
+        client,
+        repository,
+        issueNumber,
+        issueInconclusiveComment(issueNumber, issueTitle, 'the AI label suggestions contain unknown labels; discarded.', currentFingerprint),
+      );
+      const fallbackDesired = sanitizeLabels([...rulesTitle, 'status:needs-decision']);
+      try {
+        await reconcileBotLabelsSafely({
+          client,
+          owner: repository.owner,
+          repo: repository.repo,
+          issueNumber,
+          desiredLabels: fallbackDesired,
+          scope: DEFAULT_PR_RECONCILE_SCOPE,
+          coverageComplete: false,
         });
       } catch {
         throw new Error('PocketGuard: failed to apply issue labels.');
       }
+      return;
+    }
+    // Defense in depth: review mode already downgrades APPROVE with unknown
+    // labels, but a crafted artifact could still carry APPROVE with valid
+    // labels yet stale tags; the merged desired below always enforces the
+    // deterministic needs-decision for non-APPROVE.
+    const desiredIssueLabels = sanitizeLabels([
+      ...merged,
+      ...(validated.verdict !== 'APPROVE' ? ['status:needs-decision'] : []),
+    ]);
+    const stickyOutput: RunnerIssueOutput = { ...validated, tags: desiredIssueLabels, fingerprint: validated.fingerprint };
+    await publishStickyComment(
+      client,
+      repository,
+      issueNumber,
+      issueReviewComment(stickyOutput, desiredIssueLabels),
+    );
+    try {
+      const reconciliation = await reconcileBotLabelsSafely({
+        client,
+        owner: repository.owner,
+        repo: repository.repo,
+        issueNumber,
+        desiredLabels: desiredIssueLabels,
+        scope: DEFAULT_PR_RECONCILE_SCOPE,
+        coverageComplete: true,
+      });
+      const reconciled = new Set([...reconciliation.added, ...reconciliation.skipped]);
+      if (reconciliation.failedToList || desiredIssueLabels.some((label) => !reconciled.has(label)) || (reconciliation.failedRemovals?.length ?? 0) > 0) {
+        throw new Error('label reconcile incomplete');
+      }
+    } catch {
+      throw new Error('PocketGuard: failed to apply issue labels.');
     }
     return;
   }
@@ -1763,12 +2023,19 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     return;
   }
 
-  let publishFallbackReason: string | undefined;
-  await publishStickyComment(client, repository, target.issueNumber, stampSticky(reviewComment(output)), async () => {
-    publishFallbackReason = await currentReviewProblem(client, repository, target.issueNumber!, output!);
-    return publishFallbackReason ? stampSticky(inconclusiveComment(publishFallbackReason)) : stampSticky(reviewComment(output!));
-  });
-  if (publishFallbackReason) {
+  // S5 AI label gate: raw suggestions are allowlisted at publish. Unknown
+  // entries are discarded with a log and force INCONCLUSIVE on the same
+  // sticky (never a wrong APPROVE, never writing illegal labels). Manual
+  // labels outside the bot scope are always preserved by reconciliation.
+  const aiRaw = Array.isArray(output.suggestedLabels) ? output.suggestedLabels : [];
+  const { sanitizedAi, hadUnknown } = mergeRulesWithAiSuggestions([], aiRaw);
+  if (hadUnknown) {
+    await publishStickyComment(
+      client,
+      repository,
+      target.issueNumber,
+      stampSticky(inconclusiveComment('the AI label suggestions contain unknown labels; discarded.')),
+    );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }
@@ -1776,7 +2043,12 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   const hasSecurityBlock = output.deterministicViolations.some((violation) =>
     violation.severity === 'BLOCK' && (violation.category === 'security' || violation.ruleId.startsWith('SEC-'))) ||
     output.roles.some((role) => role.role === 'android_sec' && role.findings.some((finding) => finding.severity === 'BLOCK'));
-  const labels = sanitizeLabels([
+  // Deterministic rules first (priority): configured + area + review verdict
+  // labels (security/needs-decision from BLOCK verdict). AI suggestions are
+  // merged second and cannot override or clear deterministic BLOCK-related
+  // labels because the merge is a union and reconciliation only touches the
+  // bot-managed scope.
+  const rulesLabels = sanitizeLabels([
     ...configuredTagLabels(env),
     ...(output.changedFilesComplete ? output.areaLabels : []),
     ...resolveReviewLabels({
@@ -1784,7 +2056,19 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       hasSecurityFinding: hasSecurityBlock,
     }),
   ]);
+  const labels = sanitizeLabels([...rulesLabels, ...sanitizedAi]);
   const coverageComplete = output.coverage.complete && output.changedFilesComplete;
+
+  let publishFallbackReason: string | undefined;
+  await publishStickyComment(client, repository, target.issueNumber, stampSticky(reviewComment(output, labels)), async () => {
+    publishFallbackReason = await currentReviewProblem(client, repository, target.issueNumber!, output!);
+    return publishFallbackReason ? stampSticky(inconclusiveComment(publishFallbackReason)) : stampSticky(reviewComment(output!, labels));
+  });
+  if (publishFallbackReason) {
+    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    return;
+  }
+
   const labelFallbackReason = await currentReviewProblem(client, repository, target.issueNumber, output);
   if (labelFallbackReason) {
     await publishStickyComment(

@@ -937,8 +937,8 @@ export async function runExecutionMatrixTests(): Promise<void> {
           });
           assert.equal(onComment.verdict, 'APPROVE');
 
-          // Issue publish applies labels from a matching valid artifact and
-          // never touches comments.
+          // Issue publish writes exactly one sticky (S5) and applies labels
+          // from a matching valid artifact (rules + allowlisted AI).
           const publishState = makeState();
           await runPublishMode({
             event: issueOpened,
@@ -952,12 +952,16 @@ export async function runExecutionMatrixTests(): Promise<void> {
             } as NodeJS.ProcessEnv,
             githubClient: makeClient(publishState),
           });
-          assert.equal(publishState.created, 0, 'issue publish writes no comment');
+          assert.equal(publishState.created, 1, 'issue publish creates the single sticky');
           assert.equal(publishState.updated, 0);
-          assert.ok(publishState.operations.includes('add-labels'), 'issue publish applies labels');
+          assert.ok(publishState.comments[0].body.includes('<!-- PocketGuard-review -->'), 'issue sticky carries the shared marker');
+          assert.ok(publishState.comments[0].body.includes('判定：APPROVE'), 'issue sticky shows the verdict');
+          assert.ok(publishState.comments[0].body.includes('修訂指紋'), 'issue sticky carries the revision fingerprint');
+          assert.ok(publishState.operations.includes('add-labels') || publishState.operations.includes('list-labels'), 'issue publish reconciles labels');
           assert.ok(publishState.existingLabels.includes('security'));
 
-          // A mismatched artifact falls back to title labels only.
+          // A mismatched artifact falls back to INCONCLUSIVE on the same
+          // sticky (no second comment) with title labels plus decision.
           const mismatchState = makeState();
           fs.writeFileSync(path.join(tempDirectory, 'mismatch.json'), JSON.stringify({ ...reviewed, issueNumber: 999 }));
           await runPublishMode({
@@ -972,7 +976,10 @@ export async function runExecutionMatrixTests(): Promise<void> {
             } as NodeJS.ProcessEnv,
             githubClient: makeClient(mismatchState),
           });
-          assert.ok(mismatchState.operations.includes('add-labels'));
+          assert.equal(mismatchState.created, 1, 'mismatched issue artifact still uses a single sticky');
+          assert.equal(mismatchState.updated, 0);
+          assert.ok(mismatchState.comments[0].body.includes('判定：INCONCLUSIVE'), 'stale issue artifact falls back to INCONCLUSIVE');
+          assert.ok(mismatchState.operations.includes('list-labels') || mismatchState.operations.includes('add-labels'));
         } finally {
           restore();
         }

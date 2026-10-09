@@ -25,6 +25,13 @@ export interface RoleReview {
   modelUsed: string;
   verdict: ReviewVerdict;
   findings: ReviewFinding[];
+  // S5 AI label schema (strict): raw model-suggested labels as a string
+  // array. Only sanitized through the allowlist at publish time; unknown
+  // entries are discarded there and force a non-APPROVE verdict. Decision
+  // record: only issue_triage.md and chief.md instruct label suggestions
+  // (minimal prompt change); android_sec/android_code prompts stay untouched
+  // and their responses default to [] when the field is absent.
+  suggestedLabels: string[];
 }
 
 export interface OrchestratedReview {
@@ -120,18 +127,29 @@ function parseFindings(value: unknown): ReviewFinding[] | undefined {
   return result;
 }
 
+function parseSuggestedLabelsStrict(value: unknown): string[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return undefined;
+  for (const entry of value) {
+    if (typeof entry !== 'string') return undefined;
+  }
+  return [...(value as string[])];
+}
+
 function parseRoleResponse(role: OpenAIModelRole, modelUsed: string, content: string): RoleReview {
   const sanitizedModel = redactSensitiveText(modelUsed);
-  const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [] };
+  const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [] };
   const parsed = parseJsonObject(content);
   if (
     !parsed ||
-    Object.keys(parsed).some((key) => !['verdict', 'summary', 'findings'].includes(key)) ||
+    Object.keys(parsed).some((key) => !['verdict', 'summary', 'findings', 'suggestedLabels'].includes(key)) ||
     !VERDICTS.has(parsed.verdict as ReviewVerdict)
   ) return fallback;
   const findings = parseFindings(parsed.findings);
   if (!findings) return fallback;
-  return { role, modelUsed: sanitizedModel, verdict: parsed.verdict as ReviewVerdict, findings };
+  const suggestedLabels = parseSuggestedLabelsStrict(parsed.suggestedLabels);
+  if (!suggestedLabels) return fallback;
+  return { role, modelUsed: sanitizedModel, verdict: parsed.verdict as ReviewVerdict, findings, suggestedLabels };
 }
 
 function safeCoverage(coverage: ReviewCoverage): ReviewCoverage {
@@ -180,6 +198,10 @@ export interface IssueTriageInput {
 export interface IssueTriageResult {
   verdict: ReviewVerdict;
   summary: string;
+  // S5: strict string-array AI label suggestions (see RoleReview decision
+  // record). Missing field defaults to []; a present-but-invalid field falls
+  // back to INCONCLUSIVE with [].
+  suggestedLabels: string[];
 }
 
 export interface TriageIssueOptions {
@@ -192,12 +214,14 @@ export interface TriageIssueOptions {
 // S4 issue execution (minimal): a single chief-role turn over the issue
 // title, body, and human comments. Decision record: a dedicated
 // issue_triage.md prompt with one role call is the smallest viable path —
-// reusing orchestrateReview would force diff/coverage concepts onto issues,
-// and AI-emitted labels stay out of scope until S5 (tags are rules-only
-// here). Any failure (missing config, transport, or schema) falls back to
-// INCONCLUSIVE with an empty summary; callers pair it with rules-only tags.
+// reusing orchestrateReview would force diff/coverage concepts onto issues.
+// S5 adds a strict suggestedLabels string-array to the triage schema
+// (AI label suggestions filtered through the allowlist at publish time);
+// any failure (missing config, transport, or schema) falls back to
+// INCONCLUSIVE with an empty summary and no suggestions; callers pair it
+// with rules-only tags.
 export async function triageIssue(options: TriageIssueOptions): Promise<IssueTriageResult> {
-  const fallback: IssueTriageResult = { verdict: 'INCONCLUSIVE', summary: '' };
+  const fallback: IssueTriageResult = { verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [] };
   try {
     const env = options.env ?? process.env;
     const promptDirectory = options.promptDirectory ?? path.resolve(__dirname, '../prompts');
@@ -220,13 +244,16 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
     const parsed = parseJsonObject(result.content);
     if (
       !parsed ||
-      Object.keys(parsed).some((key) => !['verdict', 'summary'].includes(key)) ||
+      Object.keys(parsed).some((key) => !['verdict', 'summary', 'suggestedLabels'].includes(key)) ||
       !VERDICTS.has(parsed.verdict as ReviewVerdict) ||
       typeof parsed.summary !== 'string'
     ) return fallback;
+    const suggestedLabels = parseSuggestedLabelsStrict(parsed.suggestedLabels);
+    if (!suggestedLabels) return fallback;
     return {
       verdict: parsed.verdict as ReviewVerdict,
       summary: redactSensitiveText(parsed.summary).slice(0, MAX_TEXT_LENGTH),
+      suggestedLabels,
     };
   } catch {
     return fallback;
@@ -253,7 +280,7 @@ export async function orchestrateReview(options: OrchestratorOptions): Promise<O
       });
       return parseRoleResponse(role, result.modelId, result.content);
     } catch {
-      return { role, modelUsed: redactSensitiveText(modelUsed), verdict: 'INCONCLUSIVE', findings: [] };
+      return { role, modelUsed: redactSensitiveText(modelUsed), verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [] };
     }
   }));
 

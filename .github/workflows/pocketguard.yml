@@ -191,15 +191,20 @@ jobs:
   publish:
     name: Publish review and labels
     needs: [prepare-tag, review-send]
-    # Quota/authorization skip (S4): an issue_comment publishes only an
-    # authorized manual pull-request review with an open gate. Unauthorized
-    # comments and quota-exhausted runs (review_gate none) skip publish
-    # without touching the sticky comment or labels.
+    # Quota/authorization skip (S4) plus issue sticky (S5): an issue_comment
+    # publishes only an authorized manual pull-request review with an open
+    # gate, or a human issue update (target issue with should_review and a
+    # non-ignore route, covering issue_comment on issues). Unauthorized
+    # comments, quota-exhausted runs (review_gate none), and bot-routed
+    # ignores skip publish without touching the sticky comment or labels.
     if: >-
       always() && needs.prepare-tag.result == 'success' &&
       (github.event_name != 'issue_comment' ||
       (needs.prepare-tag.outputs.authorized == 'true' &&
-      needs.prepare-tag.outputs.review_gate != 'none'))
+      needs.prepare-tag.outputs.review_gate != 'none') ||
+      (needs.prepare-tag.outputs.target == 'issue' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.route_kind != 'ignore'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

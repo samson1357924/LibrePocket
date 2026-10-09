@@ -148,7 +148,8 @@ class ChatSessionTest {
     val gate = CompletableDeferred<Unit>()
     val provider = FakeSessionLlm { req ->
       flow {
-        val current = req.messages.lastOrNull { it.role == "user" }?.text
+        // Phase 2 appends an ephemeral time block; branch on the raw text.
+        val current = req.messages.lastOrNull { it.role == "user" }?.text?.substringBefore("\n\n")
         if (current == "first") {
           emit(StreamEvent.TextDelta(0, 0, "A"))
           gate.await()

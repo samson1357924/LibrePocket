@@ -17,6 +17,13 @@ import kotlinx.coroutines.flow.StateFlow
  * The controller consumes the unified M1 [dev.librepocket.provider.StreamEvent]
  * union via [LlmProvider] directly; [model] selects the ChatRequest model and
  * [imageLoader] maps [ChatImageRef] paths to [ChatImage] bytes.
+ *
+ * Ephemeral time context is passed through to [TurnController]. Prefer passing
+ * `sessionStart` from the persisted `SessionMeta.createdAt` (see `ChatSessionFactory`,
+ * which reuses the original creation instant on resume; defaults to null, which omits
+ * the `Session started` line, for call compatibility).
+ * [systemZone] is re-read every turn when no explicit timezone is set, so a
+ * mid-session system timezone change is picked up on the next turn.
  */
 class ChatSessionImpl(
   provider: LlmProvider,
@@ -28,6 +35,10 @@ class ChatSessionImpl(
   newId: () -> String = { java.util.UUID.randomUUID().toString() },
   model: String = TurnController.DEFAULT_MODEL,
   imageLoader: (List<ChatImageRef>) -> List<ChatImage> = ::defaultChatImageLoader,
+  clock: java.time.Clock = java.time.Clock.systemDefaultZone(),
+  userTimezone: String? = null,
+  sessionStart: java.time.Instant? = null,
+  systemZone: () -> java.time.ZoneId = java.time.ZoneId::systemDefault,
 ) : ChatSession {
   private val controller = TurnController(
     provider = provider,
@@ -39,6 +50,10 @@ class ChatSessionImpl(
     newId = newId,
     model = model,
     imageLoader = imageLoader,
+    clock = clock,
+    userTimezone = userTimezone,
+    sessionStart = sessionStart,
+    systemZone = systemZone,
   )
 
   @Suppress("unused")

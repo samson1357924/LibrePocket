@@ -236,7 +236,6 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
       modelId: modelUsed,
       systemPrompt,
       userPrompt,
-      temperature: 0.2,
       maxOutputTokens: 1024,
       allowedOrigins: options.allowedOrigins,
       env,

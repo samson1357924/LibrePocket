@@ -51,16 +51,48 @@ The workflow schedules the secrets-bearing review job from routing, not from raw
 
 ## Configuration
 
-Configure the following GitHub Actions secrets:
+Configure non-secret model IDs as GitHub Actions variables (`vars`), with
+repository secrets kept as a compatibility fallback (`vars.X || secrets.X` in
+`pocketguard.yml`). Only `OPENAI_API_KEY` must stay a secret.
 
-- `OPENAI_BASE_URL`
-- `OPENAI_API_KEY`
-- `POCKETGUARD_MODEL_CHIEF`
-- `POCKETGUARD_MODEL_ANDROID_SEC`
-- `POCKETGUARD_MODEL_ANDROID_CODE`
-- `POCKETGUARD_OPENAI_ORIGIN`
+- `OPENAI_API_KEY` (secret, required)
+- `POCKETGUARD_MODEL_CHIEF`, `POCKETGUARD_MODEL_ANDROID_SEC`,
+  `POCKETGUARD_MODEL_ANDROID_CODE` (vars preferred, secrets fallback)
+- `OPENAI_BASE_URL` (optional; defaults to `https://api.openai.com/v1`)
+- `POCKETGUARD_OPENAI_ORIGIN` (optional exact-origin allowlist; defaults to
+  `https://api.openai.com`)
+- `POCKETGUARD_MODEL_PROFILES` (optional JSON map from model ID or ID prefix
+  to `reasoning`/`chat`, e.g. `{"gpt-5.2": "reasoning:high", "gpt-4o": "chat"}`)
+- `POCKETGUARD_MODEL_PROFILE` (optional global fallback when
+  `POCKETGUARD_MODEL_PROFILES` is unset, e.g. `"reasoning:high"` or `"chat"`)
+- `POCKETGUARD_MODEL_<ROLE>_PROFILE` (optional per-role override, e.g.
+  `POCKETGUARD_MODEL_CHIEF_PROFILE: "reasoning:high"` or `"chat"`)
+- `POCKETGUARD_REASONING_EFFORT` or `POCKETGUARD_MODEL_<ROLE>_REASONING_EFFORT`
+  (optional effort override, default `high`)
 
-`POCKETGUARD_OPENAI_ORIGIN` is the exact-origin allowlist for `OPENAI_BASE_URL`; it is not a wildcard or a path prefix. Model and endpoint configuration are supplied only through environment variables. The OpenAI credential is used as an authorization header and is not included in review prompts, comments, or generated artifacts.
+`POCKETGUARD_OPENAI_ORIGIN` is the exact-origin allowlist for `OPENAI_BASE_URL`; it is not a wildcard or a path prefix. `OPENAI_BASE_URL` must use
+`https:` with no credentials, query, or fragment, and requests use
+`redirect: 'error'` so authorization headers are never forwarded.
+"OpenAI-compatible" here means the endpoint must support the OpenAI
+Responses API (`POST {base}/responses` with `model`/`input`/
+`max_output_tokens`/`stream:false`); providers without that API are not
+supported. The OpenAI credential is used as an authorization header and is not included in review prompts, comments, or generated artifacts.
+
+Request bodies are built per model profile with a minimal default
+(`model` + `input` + `max_output_tokens` + `stream`, no `temperature`/`top_p`/
+`reasoning` unless the profile requires it): reasoning models with
+`effort != none` send `reasoning: { effort }` and omit `temperature`/`top_p`
+(GPT-5-class reasoning rejects `temperature` with 400); non-reasoning models
+never send `reasoning`, and `temperature`/`top_p` are sent only when the
+caller explicitly sets them. Builtin defaults cover `gpt-5*` as reasoning and
+`gpt-4o*`/`gpt-4.1*` as chat; any other model without an explicit profile
+fails closed (`model profile not configured`, no request sent) and the
+orchestrator converges to `INCONCLUSIVE` without retry, downgrade, or labels.
+A `400` for an unsupported parameter surfaces with its status code and follows
+the same fail-closed path. Fork quickstart: set the three model vars (and
+optionally `POCKETGUARD_MODEL_PROFILES`) on your fork, keep only
+`OPENAI_API_KEY` as a secret, and leave the URL/origin unset to use the
+official OpenAI defaults.
 
 ## Security and coverage constraints
 

@@ -167,6 +167,7 @@ export async function runMergeBaseTests(): Promise<void> {
           POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
           POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
           POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
+          POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
         } as NodeJS.ProcessEnv,
         githubClient: {
           rest: {
@@ -262,6 +263,7 @@ export async function runMergeBaseTests(): Promise<void> {
             POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
             POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
             POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
+          POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
           } as NodeJS.ProcessEnv,
           writeStdout: () => undefined,
           runGit,
@@ -344,6 +346,7 @@ export async function runMergeBaseTests(): Promise<void> {
           POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
           POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
           POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
+          POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
         } as NodeJS.ProcessEnv,
         writeStdout: () => undefined,
         runGit,

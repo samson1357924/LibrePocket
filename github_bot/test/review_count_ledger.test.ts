@@ -140,6 +140,7 @@ function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
     POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
     POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
+    POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
     ...extra,
   } as NodeJS.ProcessEnv;
 }

@@ -4,6 +4,7 @@ import {
   securityLabelsFor,
 } from '../src/deterministic_scanner';
 import {
+  resolveModelProfile,
   resolveOpenAIConfig,
   resolveRoleModel,
   sendOpenAISingleTurn,
@@ -16,7 +17,7 @@ import {
   truncateDiff,
 } from '../src/review_diff';
 import { buildReviewDiff } from '../src/github_runner';
-import { orchestrateReview } from '../src/orchestrator';
+import { orchestrateReview, triageIssue } from '../src/orchestrator';
 
 const FAKE_OPENAI_BASE_URL = ['https:', '', 'pocketguard-openai.test', 'v1'].join('/');
 const FAKE_ALLOWED_ORIGINS = [new URL(FAKE_OPENAI_BASE_URL).origin];
@@ -319,11 +320,30 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     );
   }
   assert.throws(() => resolveRoleModel('android_sec', {}), /model not configured/);
+  // Fork onboarding defaults: an unset base URL falls back to the official
+  // endpoint and an empty allowlist falls back to the official origin.
+  const defaultedConfig = resolveOpenAIConfig({ OPENAI_API_KEY: 'fake-key' }, []);
+  assert.equal(defaultedConfig.baseUrl, 'https://api.openai.com/v1');
+  const placeholderBase = resolveOpenAIConfig(
+    { OPENAI_BASE_URL: '${OPENAI_BASE_URL}', OPENAI_API_KEY: 'fake-key' },
+    [],
+  );
+  assert.equal(placeholderBase.baseUrl, 'https://api.openai.com/v1');
+  assert.throws(
+    () => resolveOpenAIConfig({ OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL, OPENAI_API_KEY: 'fake-key' }, []),
+    /OpenAI configuration/,
+    'a custom endpoint still requires its origin in the allowlist',
+  );
 
   const originalFetch = globalThis.fetch;
   const openaiEnvironment = {
     OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL,
     OPENAI_API_KEY: 'fake-api-key',
+    POCKETGUARD_MODEL_PROFILES: JSON.stringify({
+      [FAKE_MODEL_ID]: 'chat',
+      'gpt-5.2': 'reasoning:high',
+      'gpt-4o': 'chat',
+    }),
   };
   try {
     let ordinaryRedirectMode: RequestInit['redirect'] | undefined;
@@ -516,6 +536,210 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     }));
     assert.equal(unknownTopLevelField.verdict, 'INCONCLUSIVE');
     assert.equal(unknownTopLevelField.roles.every((role) => role.verdict === 'INCONCLUSIVE'), true);
+
+    // P1 #3: per-model request profiles. Reasoning bodies carry
+    // reasoning.effort and never temperature/top_p; chat bodies never carry
+    // reasoning; the default body is otherwise minimal.
+    async function captureSingleTurnBody(
+      modelId: string,
+      env: Record<string, string>,
+      extra: { temperature?: number; topP?: number } = {},
+    ): Promise<Record<string, unknown>> {
+      const previous = globalThis.fetch;
+      const bodies: Array<Record<string, unknown>> = [];
+      globalThis.fetch = (async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({
+          output: [{ content: [{ type: 'output_text', text: 'profile probe' }] }],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }) as typeof fetch;
+      try {
+        await sendOpenAISingleTurn({
+          modelId,
+          systemPrompt: 'fake system prompt',
+          userPrompt: 'fake user prompt',
+          allowedOrigins: FAKE_ALLOWED_ORIGINS,
+          env,
+          timeoutMs: 1000,
+          ...extra,
+        });
+        assert.equal(bodies.length, 1);
+        return bodies[0] as Record<string, unknown>;
+      } finally {
+        globalThis.fetch = previous;
+      }
+    }
+
+    const reasoningBody = await captureSingleTurnBody('gpt-5.2', openaiEnvironment);
+    assert.deepEqual(reasoningBody.reasoning, { effort: 'high' });
+    assert.equal(Object.hasOwn(reasoningBody, 'temperature'), false);
+    assert.equal(Object.hasOwn(reasoningBody, 'top_p'), false);
+    assert.equal(reasoningBody.model, 'gpt-5.2');
+    assert.equal(reasoningBody.stream, false);
+
+    const chatBody = await captureSingleTurnBody('gpt-4o', openaiEnvironment);
+    assert.equal(Object.hasOwn(chatBody, 'reasoning'), false);
+    assert.equal(Object.hasOwn(chatBody, 'temperature'), false);
+    assert.equal(Object.hasOwn(chatBody, 'top_p'), false);
+    assert.equal(chatBody.model, 'gpt-4o');
+
+    // Explicit temperature/topP are forwarded on chat bodies (send_openai.ts
+    // sends them only when the caller sets them).
+    const chatExplicitBody = await captureSingleTurnBody('gpt-4o', openaiEnvironment, {
+      temperature: 0.2,
+      topP: 0.9,
+    });
+    assert.equal(Object.hasOwn(chatExplicitBody, 'reasoning'), false);
+    assert.equal(chatExplicitBody.temperature, 0.2);
+    assert.equal(chatExplicitBody.top_p, 0.9);
+
+    // Reasoning with effort none sends no reasoning key (and still omits
+    // temperature/top_p by default).
+    const noneEnv = {
+      ...openaiEnvironment,
+      POCKETGUARD_MODEL_CHIEF: 'gpt-5.2',
+      POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+    };
+    assert.deepEqual(resolveModelProfile('gpt-5.2', noneEnv), { kind: 'reasoning', effort: 'none' });
+    const noneBody = await captureSingleTurnBody('gpt-5.2', noneEnv);
+    assert.equal(Object.hasOwn(noneBody, 'reasoning'), false);
+    assert.equal(Object.hasOwn(noneBody, 'temperature'), false);
+    assert.equal(Object.hasOwn(noneBody, 'top_p'), false);
+
+    // Builtin family defaults apply without any explicit profile map.
+    const builtinEnv = { OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL, OPENAI_API_KEY: 'fake-api-key' };
+    const builtinReasoning = await captureSingleTurnBody('gpt-5.2', builtinEnv);
+    assert.deepEqual(builtinReasoning.reasoning, { effort: 'high' });
+    assert.equal(Object.hasOwn(builtinReasoning, 'temperature'), false);
+    const builtinChat = await captureSingleTurnBody('gpt-4o-mini', builtinEnv);
+    assert.equal(Object.hasOwn(builtinChat, 'reasoning'), false);
+
+    // Per-role profile override with a custom effort.
+    const perRoleEnv = {
+      ...openaiEnvironment,
+      POCKETGUARD_MODEL_CHIEF: 'gpt-5.2',
+      POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:medium',
+    };
+    const perRoleBody = await captureSingleTurnBody('gpt-5.2', perRoleEnv);
+    assert.deepEqual(perRoleBody.reasoning, { effort: 'medium' });
+    assert.equal(Object.hasOwn(perRoleBody, 'temperature'), false);
+    assert.deepEqual(resolveModelProfile('gpt-5.2', perRoleEnv), { kind: 'reasoning', effort: 'medium' });
+    assert.deepEqual(resolveModelProfile('gpt-4o', openaiEnvironment), { kind: 'chat' });
+
+    // A 400 for an unsupported parameter rejects with its status code.
+    {
+      const previous = globalThis.fetch;
+      globalThis.fetch = (async () => new Response('unsupported parameter', { status: 400 })) as typeof fetch;
+      try {
+        await assert.rejects(
+          sendOpenAISingleTurn({
+            modelId: 'gpt-5.2',
+            systemPrompt: 'fake system prompt',
+            userPrompt: 'fake user prompt',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: openaiEnvironment,
+            timeoutMs: 1000,
+          }),
+          (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.equal((error as Error & { statusCode?: number }).statusCode, 400);
+            return true;
+          },
+        );
+      } finally {
+        globalThis.fetch = previous;
+      }
+    }
+
+    // Orchestrator 400 fail-closed: three roles INCONCLUSIVE, one fetch each,
+    // no retry, no APPROVE, no label suggestions.
+    {
+      const previous = globalThis.fetch;
+      let fetchCount = 0;
+      globalThis.fetch = (async () => {
+        fetchCount += 1;
+        return new Response('unsupported parameter', { status: 400 });
+      }) as typeof fetch;
+      try {
+        const review = await orchestrateReview({
+          changedFiles: ['app/src/main/AndroidManifest.xml'],
+          diff: '+synthetic test diff',
+          coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 20 },
+          deterministicViolations: [],
+          env: orchestratorEnv,
+          allowedOrigins: FAKE_ALLOWED_ORIGINS,
+        });
+        assert.equal(fetchCount, 3, 'each role makes exactly one request with no retry');
+        assert.equal(review.roles.length, 3);
+        assert.ok(review.roles.every((role) => role.verdict === 'INCONCLUSIVE'));
+        assert.ok(review.roles.every((role) => role.suggestedLabels.length === 0));
+        assert.equal(review.verdict, 'INCONCLUSIVE');
+      } finally {
+        globalThis.fetch = previous;
+      }
+    }
+
+    // Triage 400 fail-closed: INCONCLUSIVE with no suggestions.
+    {
+      const previous = globalThis.fetch;
+      globalThis.fetch = (async () => new Response('unsupported parameter', { status: 400 })) as typeof fetch;
+      try {
+        const triaged = await triageIssue({
+          input: { title: 'fake title', body: 'fake body', comments: [] },
+          env: orchestratorEnv,
+          allowedOrigins: FAKE_ALLOWED_ORIGINS,
+        });
+        assert.deepEqual(triaged, { verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [] });
+      } finally {
+        globalThis.fetch = previous;
+      }
+    }
+
+    // Unknown profile fail-closed: no request is sent.
+    {
+      const previous = globalThis.fetch;
+      let fetchCount = 0;
+      globalThis.fetch = (async () => {
+        fetchCount += 1;
+        return new Response(JSON.stringify({
+          output: [{ content: [{ type: 'output_text', text: 'must not be called' }] }],
+        }), { status: 200 });
+      }) as typeof fetch;
+      try {
+        assert.equal(resolveModelProfile('unknown-model-xyz', openaiEnvironment), undefined);
+        await assert.rejects(
+          sendOpenAISingleTurn({
+            modelId: 'unknown-model-xyz',
+            systemPrompt: 'fake system prompt',
+            userPrompt: 'fake user prompt',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: openaiEnvironment,
+            timeoutMs: 1000,
+          }),
+          /model profile not configured/,
+        );
+        assert.equal(fetchCount, 0, 'unknown profile must not send a request');
+        const unknownReview = await orchestrateReview({
+          changedFiles: ['app/src/main/AndroidManifest.xml'],
+          diff: '+synthetic test diff',
+          coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 20 },
+          deterministicViolations: [],
+          env: {
+            ...openaiEnvironment,
+            POCKETGUARD_MODEL_CHIEF: 'unknown-model-xyz',
+            POCKETGUARD_MODEL_ANDROID_SEC: 'unknown-model-xyz',
+            POCKETGUARD_MODEL_ANDROID_CODE: 'unknown-model-xyz',
+          },
+          allowedOrigins: FAKE_ALLOWED_ORIGINS,
+        });
+        assert.ok(unknownReview.roles.every((role) => role.verdict === 'INCONCLUSIVE'));
+        assert.ok(unknownReview.roles.every((role) => role.suggestedLabels.length === 0));
+        assert.equal(unknownReview.verdict, 'INCONCLUSIVE');
+        assert.equal(fetchCount, 0, 'unknown profile orchestrator must not send requests');
+      } finally {
+        globalThis.fetch = previous;
+      }
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -52,7 +52,30 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.librepocket.models.ModelsDevSnapshot.SnapshotFallbackReason
 import dev.librepocket.preset.ProviderCatalog
+
+private fun modelDirectoryStatusText(status: ModelDirectoryStatus): String? = when (status) {
+    ModelDirectoryStatus.NotLoaded -> null
+    ModelDirectoryStatus.Remote -> "模型目錄來源：models.dev（已更新）。"
+    is ModelDirectoryStatus.Bundled -> {
+        val reason = when (status.reason) {
+            SnapshotFallbackReason.INVALID_URL -> "位址無效"
+            SnapshotFallbackReason.HTTP_STATUS -> "伺服器回應錯誤"
+            SnapshotFallbackReason.WIRE_BODY_TOO_LARGE -> "傳輸內容超過大小限制"
+            SnapshotFallbackReason.DECODED_BODY_TOO_LARGE -> "解碼內容超過大小限制"
+            SnapshotFallbackReason.TRUNCATED_BODY -> "回應不完整"
+            SnapshotFallbackReason.UNSUPPORTED_CONTENT_ENCODING -> "壓縮格式不支援"
+            SnapshotFallbackReason.EMPTY_BODY -> "回應為空"
+            SnapshotFallbackReason.NETWORK_ERROR -> "無法連線"
+            SnapshotFallbackReason.TIMEOUT -> "連線逾時"
+            SnapshotFallbackReason.INVALID_JSON -> "資料格式無效"
+            SnapshotFallbackReason.INVALID_SHAPE -> "資料結構無效"
+            SnapshotFallbackReason.EMPTY_DIRECTORY -> "沒有可用模型"
+        }
+        "模型目錄來源：內建備援（$reason）。"
+    }
+}
 
 private fun errorText(code: String): String = when (code) {
     "SETUP_UNKNOWN_PRESET" -> "未知的供應商，請重新選擇。"
@@ -220,6 +243,13 @@ fun SetupScreen(
                     Icon(Icons.Filled.Refresh, contentDescription = "更新模型列表")
                 }
             }
+        }
+        modelDirectoryStatusText(state.modelDirectoryStatus)?.let { statusText ->
+            Text(
+                text = statusText,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
 
         OutlinedTextField(

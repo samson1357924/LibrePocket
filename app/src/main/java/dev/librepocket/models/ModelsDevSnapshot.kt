@@ -1,20 +1,24 @@
 package dev.librepocket.models
 
+import java.io.IOException
+import java.io.InterruptedIOException
 import dev.librepocket.provider.MiniJson
 import dev.librepocket.provider.arr
 import dev.librepocket.provider.bool
 import dev.librepocket.provider.obj
 import dev.librepocket.provider.string
 import dev.librepocket.provider.validateBaseUrl
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /**
- * models.dev snapshot reader/cache/fallback (P1 SPEC §1.2 / §10.3).
+ * models.dev snapshot reader/fallback (P1 SPEC §1.2 / §10.3).
  *
  * Decouples "model list refresh" from app releases (ARCHITECTURE §12):
- * - [fetchSnapshot] pulls the upstream directory over plain HTTPS with an
- *   injectable [fetcher] (no Android, no OkHttp dependency here; the caller
- *   supplies transport). Non-https URLs, oversize bodies and parse failures
- *   all fall back to [bundledSnapshot].
+ * - [fetchSnapshotOutcome] pulls the directory through an injectable [fetcher]
+ *   and reports remote versus bundled source with a stable fallback reason.
+ *   Caller cancellation propagates and is never converted to fallback.
  * - [mergeForProvider] adds only candidates belonging to an explicit directory
  *   provider identity, and exposes their wire IDs unchanged.
  *
@@ -34,6 +38,45 @@ object ModelsDevSnapshot {
     )
 
     data class Snapshot(val fetchedAt: Long, val models: List<ModelEntry>)
+
+    enum class SnapshotSource { REMOTE_DIRECTORY, BUNDLED }
+
+    enum class SnapshotFallbackReason {
+        INVALID_URL,
+        HTTP_STATUS,
+        WIRE_BODY_TOO_LARGE,
+        DECODED_BODY_TOO_LARGE,
+        TRUNCATED_BODY,
+        UNSUPPORTED_CONTENT_ENCODING,
+        EMPTY_BODY,
+        NETWORK_ERROR,
+        TIMEOUT,
+        INVALID_JSON,
+        INVALID_SHAPE,
+        EMPTY_DIRECTORY,
+    }
+
+    data class SnapshotFetchOutcome(
+        val snapshot: Snapshot,
+        val source: SnapshotSource,
+        val fallbackReason: SnapshotFallbackReason? = null,
+        val httpStatusCode: Int? = null,
+    ) {
+        init {
+            require((source == SnapshotSource.REMOTE_DIRECTORY) == (fallbackReason == null))
+            require((fallbackReason == SnapshotFallbackReason.HTTP_STATUS) == (httpStatusCode != null))
+        }
+    }
+
+    /** Safe typed transport result; no exception text, URL, headers, or body is retained. */
+    class FetchException(
+        val reason: SnapshotFallbackReason,
+        val httpStatusCode: Int? = null,
+    ) : IOException("MODELS_DIRECTORY_${reason.name}") {
+        init {
+            require((reason == SnapshotFallbackReason.HTTP_STATUS) == (httpStatusCode != null))
+        }
+    }
 
     /** Minimal bundled fallback so the model picker works fully offline. */
     fun bundledSnapshot(nowMs: Long = System.currentTimeMillis()): Snapshot = Snapshot(
@@ -123,27 +166,81 @@ object ModelsDevSnapshot {
     )
 
     /**
-     * Fetch with fallback. [fetcher] performs `GET(url)` and returns the body;
-     * it must send no Authorization header (asserted by tests at the call
-     * site). Any failure -> [bundledSnapshot].
+     * Compatibility view of [fetchSnapshotOutcome] that returns only its
+     * [Snapshot]. [fetcher] performs `GET(url)` and must not send Authorization.
+     * Fetch and parse failures use [bundledSnapshot]; caller cancellation propagates.
      */
     suspend fun fetchSnapshot(
         url: String = DEFAULT_DIRECTORY_URL,
         nowMs: Long = System.currentTimeMillis(),
         fetcher: suspend (String) -> String,
-    ): Snapshot {
+    ): Snapshot = fetchSnapshotOutcome(url, nowMs, fetcher).snapshot
+
+    /** Fetch and retain only safe, stable source/fallback metadata. */
+    suspend fun fetchSnapshotOutcome(
+        url: String = DEFAULT_DIRECTORY_URL,
+        nowMs: Long = System.currentTimeMillis(),
+        fetcher: suspend (String) -> String,
+    ): SnapshotFetchOutcome {
+        fun bundled(
+            reason: SnapshotFallbackReason,
+            statusCode: Int? = null,
+        ) = SnapshotFetchOutcome(
+            snapshot = bundledSnapshot(nowMs),
+            source = SnapshotSource.BUNDLED,
+            fallbackReason = reason,
+            httpStatusCode = statusCode,
+        )
+
         try {
             validateBaseUrl(url)
-            val body = fetcher(url)
-            if (body.toByteArray(Charsets.UTF_8).size > MAX_SNAPSHOT_BYTES) {
-                return bundledSnapshot(nowMs)
-            }
-            val parsed = parse(body, nowMs)
-            if (parsed.models.isEmpty()) return bundledSnapshot(nowMs)
-            return parsed
         } catch (_: Exception) {
-            return bundledSnapshot(nowMs)
+            currentCoroutineContext().ensureActive()
+            return bundled(SnapshotFallbackReason.INVALID_URL)
         }
+
+        val body = try {
+            fetcher(url)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: FetchException) {
+            currentCoroutineContext().ensureActive()
+            return bundled(e.reason, e.httpStatusCode)
+        } catch (e: InterruptedIOException) {
+            currentCoroutineContext().ensureActive()
+            return bundled(SnapshotFallbackReason.TIMEOUT)
+        } catch (_: Exception) {
+            currentCoroutineContext().ensureActive()
+            return bundled(SnapshotFallbackReason.NETWORK_ERROR)
+        }
+
+        currentCoroutineContext().ensureActive()
+        if (body.isEmpty()) {
+            currentCoroutineContext().ensureActive()
+            return bundled(SnapshotFallbackReason.EMPTY_BODY)
+        }
+        if (body.toByteArray(Charsets.UTF_8).size > MAX_SNAPSHOT_BYTES) {
+            currentCoroutineContext().ensureActive()
+            return bundled(SnapshotFallbackReason.DECODED_BODY_TOO_LARGE)
+        }
+
+        val parsed = try {
+            parse(body, nowMs)
+        } catch (e: SnapshotException) {
+            currentCoroutineContext().ensureActive()
+            return bundled(
+                when (e.message) {
+                    "MODELS_SNAPSHOT_SHAPE" -> SnapshotFallbackReason.INVALID_SHAPE
+                    else -> SnapshotFallbackReason.INVALID_JSON
+                },
+            )
+        }
+        currentCoroutineContext().ensureActive()
+        if (parsed.models.isEmpty()) return bundled(SnapshotFallbackReason.EMPTY_DIRECTORY)
+        return SnapshotFetchOutcome(
+            snapshot = parsed,
+            source = SnapshotSource.REMOTE_DIRECTORY,
+        )
     }
 
     /** Add matching provider wire IDs after live IDs, preserving stable order. */

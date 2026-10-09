@@ -1,9 +1,9 @@
 import { runLabelManagerTests } from './label_manager.test';
-import { runScannerSendCpaTests } from './scanner_sendcpa.test';
+import { runScannerSendOpenAITests } from './scanner_sendopenai.test';
 import { runCommentAuthTests, runCommentRunnerTests } from './comment_runner.test';
 
 runLabelManagerTests()
-  .then(() => runScannerSendCpaTests())
+  .then(() => runScannerSendOpenAITests())
   .then(() => runCommentRunnerTests())
   .then(() => runCommentAuthTests())
   .catch((error: unknown) => {

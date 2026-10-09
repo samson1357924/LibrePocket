@@ -58,10 +58,10 @@ jobs:
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
 
   review-send:
-    name: Review with isolated CPA credentials
+    name: Review with isolated OpenAI credentials
     needs: prepare-tag
     # Read-only gate first: unauthorized issue_comment never schedules this
-    # secrets-bearing runner, so CPA secrets stay unreachable.
+    # secrets-bearing runner, so OpenAI secrets stay unreachable.
     if: >-
       needs.prepare-tag.outputs.target == 'pull-request' &&
       (github.event_name != 'issue_comment' || needs.prepare-tag.outputs.needs_diff == 'true') &&
@@ -102,12 +102,12 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           POCKETGUARD_SAFE_REVIEW: 'true'
           POCKETGUARD_OUTPUT: review-output.json
-          CPA_BASE_URL: ${{ secrets.CPA_BASE_URL }}
-          CPA_API_KEY: ${{ secrets.CPA_API_KEY }}
-          POCKETGUARD_MODEL_CHIEF: ${{ vars.POCKETGUARD_MODEL_CHIEF }}
-          POCKETGUARD_MODEL_ANDROID_SEC: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC }}
-          POCKETGUARD_MODEL_ANDROID_CODE: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE }}
-          POCKETGUARD_CPA_ORIGIN: ${{ vars.POCKETGUARD_CPA_ORIGIN }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POCKETGUARD_MODEL_CHIEF: ${{ secrets.POCKETGUARD_MODEL_CHIEF }}
+          POCKETGUARD_MODEL_ANDROID_SEC: ${{ secrets.POCKETGUARD_MODEL_ANDROID_SEC }}
+          POCKETGUARD_MODEL_ANDROID_CODE: ${{ secrets.POCKETGUARD_MODEL_ANDROID_CODE }}
+          POCKETGUARD_OPENAI_ORIGIN: ${{ secrets.POCKETGUARD_OPENAI_ORIGIN }}
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=review
 
       - name: Write generic result for untrusted pull request

@@ -1,11 +1,11 @@
-export interface CpaConfig {
+export interface OpenAIConfig {
   baseUrl: string;
   apiKey: string;
   timeoutMs: number;
 }
 
-export type CpaEnvironment = Readonly<Record<string, string | undefined>>;
-export type CpaModelRole = 'chief' | 'android_sec' | 'android_code';
+export type OpenAIEnvironment = Readonly<Record<string, string | undefined>>;
+export type OpenAIModelRole = 'chief' | 'android_sec' | 'android_code';
 
 const DEFAULT_TIMEOUT_MS = 420000;
 
@@ -13,21 +13,21 @@ function containsPlaceholder(value: string): boolean {
   return /\$\{[^}]*\}/.test(value);
 }
 
-export function resolveCpaConfig(
-  env: CpaEnvironment,
+export function resolveOpenAIConfig(
+  env: OpenAIEnvironment,
   allowedOrigins: string[] = [],
-): CpaConfig {
-  const configuredUrl = env.CPA_BASE_URL?.trim() ?? '';
-  const apiKey = env.CPA_API_KEY?.trim() ?? '';
+): OpenAIConfig {
+  const configuredUrl = env.OPENAI_BASE_URL?.trim() ?? '';
+  const apiKey = env.OPENAI_API_KEY?.trim() ?? '';
   if (!configuredUrl || !apiKey || containsPlaceholder(configuredUrl) || containsPlaceholder(apiKey)) {
-    throw new Error('CPA configuration not configured');
+    throw new Error('OpenAI configuration not configured');
   }
 
   let parsed: URL;
   try {
     parsed = new URL(configuredUrl);
   } catch {
-    throw new Error('CPA configuration invalid');
+    throw new Error('OpenAI configuration invalid');
   }
   if (
     parsed.protocol !== 'https:' ||
@@ -40,26 +40,26 @@ export function resolveCpaConfig(
     parsed.search.length > 0 ||
     !allowedOrigins.includes(parsed.origin)
   ) {
-    throw new Error('CPA configuration rejected');
+    throw new Error('OpenAI configuration rejected');
   }
 
   const baseUrl = parsed.toString().replace(/\/+$/, '');
   return { baseUrl, apiKey, timeoutMs: DEFAULT_TIMEOUT_MS };
 }
 
-const roleEnvironmentNames: Record<CpaModelRole, string> = {
+const roleEnvironmentNames: Record<OpenAIModelRole, string> = {
   chief: 'POCKETGUARD_MODEL_CHIEF',
   android_sec: 'POCKETGUARD_MODEL_ANDROID_SEC',
   android_code: 'POCKETGUARD_MODEL_ANDROID_CODE',
 };
 
-export function resolveRoleModel(role: CpaModelRole, env: CpaEnvironment): string {
+export function resolveRoleModel(role: OpenAIModelRole, env: OpenAIEnvironment): string {
   const modelId = env[roleEnvironmentNames[role]]?.trim() ?? '';
   if (!modelId || containsPlaceholder(modelId)) throw new Error('model not configured');
   return modelId;
 }
 
-export interface SendCpaSingleTurnOptions {
+export interface SendOpenAISingleTurnOptions {
   modelId: string;
   systemPrompt: string;
   userPrompt: string;
@@ -68,16 +68,16 @@ export interface SendCpaSingleTurnOptions {
   timeoutMs?: number;
   allowedOrigins?: string[];
   /** An injection seam for offline callers and tests; omitted in production. */
-  env?: CpaEnvironment;
+  env?: OpenAIEnvironment;
 }
 
-export interface CpaSingleTurnResult {
+export interface OpenAISingleTurnResult {
   content: string;
   modelId: string;
 }
 
 function errorWithStatus(status: number): Error & { statusCode: number } {
-  const error = new Error('CPA request failed') as Error & { statusCode: number };
+  const error = new Error('OpenAI request failed') as Error & { statusCode: number };
   error.statusCode = status;
   return error;
 }
@@ -101,11 +101,11 @@ function extractOutputText(payload: unknown): string {
   return pieces.join('');
 }
 
-export async function sendCpaSingleTurn(options: SendCpaSingleTurnOptions): Promise<CpaSingleTurnResult> {
+export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions): Promise<OpenAISingleTurnResult> {
   if (!options.modelId.trim() || containsPlaceholder(options.modelId)) throw new Error('model not configured');
-  const config = resolveCpaConfig(options.env ?? process.env, options.allowedOrigins ?? []);
+  const config = resolveOpenAIConfig(options.env ?? process.env, options.allowedOrigins ?? []);
   const timeoutMs = options.timeoutMs ?? config.timeoutMs;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('CPA timeout invalid');
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('OpenAI timeout invalid');
 
   const endpoint = new URL('responses', `${config.baseUrl.replace(/\/+$/, '')}/`).toString();
   const controller = new AbortController();
@@ -134,7 +134,7 @@ export async function sendCpaSingleTurn(options: SendCpaSingleTurnOptions): Prom
         signal: controller.signal,
       });
     } catch {
-      throw new Error('CPA request failed');
+      throw new Error('OpenAI request failed');
     }
 
     if (!response.ok) throw errorWithStatus(response.status);
@@ -143,10 +143,10 @@ export async function sendCpaSingleTurn(options: SendCpaSingleTurnOptions): Prom
     try {
       payload = await response.json();
     } catch {
-      throw new Error('CPA response invalid');
+      throw new Error('OpenAI response invalid');
     }
     const content = extractOutputText(payload).trim();
-    if (!content) throw new Error('CPA response empty');
+    if (!content) throw new Error('OpenAI response empty');
     return { content, modelId: options.modelId };
   } finally {
     clearTimeout(timeout);

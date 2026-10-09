@@ -563,7 +563,7 @@ function saveReviewOutput(output: RunnerReviewOutput, context: RunnerContext): v
 }
 
 function parseAllowedOrigins(env: NodeJS.ProcessEnv): string[] {
-  return (env.POCKETGUARD_CPA_ORIGIN ?? '')
+  return (env.POCKETGUARD_OPENAI_ORIGIN ?? '')
     .split(/[\s,]+/)
     .map((value) => value.trim())
     .filter((value) => {
@@ -577,8 +577,8 @@ function parseAllowedOrigins(env: NodeJS.ProcessEnv): string[] {
     });
 }
 
-function installCpaStub(env: NodeJS.ProcessEnv): () => void {
-  if (env.POCKETGUARD_CPA_STUB !== '1') return () => undefined;
+function installOpenAIStub(env: NodeJS.ProcessEnv): () => void {
+  if (env.POCKETGUARD_OPENAI_STUB !== '1') return () => undefined;
   const previousFetch = globalThis.fetch;
   const responseText = JSON.stringify({ verdict: 'APPROVE', summary: '測試審查完成。', findings: [] });
   globalThis.fetch = (async () => new Response(JSON.stringify({
@@ -597,7 +597,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
     const forcedUnsafe = env.POCKETGUARD_SAFE_REVIEW === 'false';
     // Defense-in-depth: inspectTarget re-verifies commenter authorization on
     // every call, so safeReview === false (including any auth deny) returns
-    // the generic output before any CPA call, even with POCKETGUARD_SAFE_REVIEW
+    // the generic output before any OpenAI call, even with POCKETGUARD_SAFE_REVIEW
     // set. No separate auth logic is needed here.
     if (
       target.target !== 'pull-request' || !target.safeReview || forcedUnsafe || !target.pullRequest ||
@@ -632,7 +632,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
         };
       } else {
         const { orchestrateReview } = await import('./orchestrator');
-        const restoreFetch = installCpaStub(env);
+        const restoreFetch = installOpenAIStub(env);
         try {
           const orchestrated = await orchestrateReview({
             changedFiles,

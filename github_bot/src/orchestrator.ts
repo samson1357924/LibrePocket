@@ -1,11 +1,11 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
-  sendCpaSingleTurn,
+  sendOpenAISingleTurn,
   resolveRoleModel,
-  type CpaEnvironment,
-  type CpaModelRole,
-} from './send_cpa';
+  type OpenAIEnvironment,
+  type OpenAIModelRole,
+} from './send_openai';
 import type { ReviewCoverage } from './review_diff';
 import type { ScanViolation } from './deterministic_scanner';
 
@@ -21,7 +21,7 @@ export interface ReviewFinding {
 }
 
 export interface RoleReview {
-  role: CpaModelRole;
+  role: OpenAIModelRole;
   modelUsed: string;
   verdict: ReviewVerdict;
   findings: ReviewFinding[];
@@ -39,12 +39,12 @@ export interface OrchestratorOptions {
   diff: string;
   coverage: ReviewCoverage;
   deterministicViolations: ScanViolation[];
-  env?: CpaEnvironment;
+  env?: OpenAIEnvironment;
   promptDirectory?: string;
   allowedOrigins?: string[];
 }
 
-const ROLES: readonly CpaModelRole[] = ['chief', 'android_sec', 'android_code'];
+const ROLES: readonly OpenAIModelRole[] = ['chief', 'android_sec', 'android_code'];
 const VERDICTS = new Set<ReviewVerdict>(['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE']);
 const SEVERITIES = new Set<FindingSeverity>(['BLOCK', 'WARN', 'SUGGESTION']);
 const MAX_TEXT_LENGTH = 2000;
@@ -120,7 +120,7 @@ function parseFindings(value: unknown): ReviewFinding[] | undefined {
   return result;
 }
 
-function parseRoleResponse(role: CpaModelRole, modelUsed: string, content: string): RoleReview {
+function parseRoleResponse(role: OpenAIModelRole, modelUsed: string, content: string): RoleReview {
   const sanitizedModel = redactSensitiveText(modelUsed);
   const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [] };
   const parsed = parseJsonObject(content);
@@ -158,7 +158,7 @@ function safeViolations(violations: ScanViolation[]): ScanViolation[] {
   }));
 }
 
-function roleUserPrompt(role: CpaModelRole, changedFiles: string[], diff: string, coverage: ReviewCoverage): string {
+function roleUserPrompt(role: OpenAIModelRole, changedFiles: string[], diff: string, coverage: ReviewCoverage): string {
   const files = changedFiles.map((file) => redactSensitiveText(file));
   const tierZeroToThreeOmissions = coverage.omittedFiles.filter((file) => reviewTier(file) <= 3);
   return [
@@ -182,7 +182,7 @@ export async function orchestrateReview(options: OrchestratorOptions): Promise<O
     try {
       modelUsed = resolveRoleModel(role, env);
       const systemPrompt = fs.readFileSync(path.join(promptDirectory, `${role}.md`), 'utf8');
-      const result = await sendCpaSingleTurn({
+      const result = await sendOpenAISingleTurn({
         modelId: modelUsed,
         systemPrompt,
         userPrompt: roleUserPrompt(role, options.changedFiles, options.diff, coverage),

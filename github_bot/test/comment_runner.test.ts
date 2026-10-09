@@ -14,7 +14,7 @@ import {
   type RunnerContext,
 } from '../src/github_runner';
 
-const TEST_BASE_URL = ['https:', '', 'pocketguard-cpa.test', 'v1'].join('/');
+const TEST_BASE_URL = ['https:', '', 'pocketguard-openai.test', 'v1'].join('/');
 const TEST_ORIGIN = new URL(TEST_BASE_URL).origin;
 const BASE_SHA = 'a'.repeat(40);
 const HEAD_SHA = 'b'.repeat(40);
@@ -134,11 +134,11 @@ export async function runCommentRunnerTests(): Promise<void> {
           GITHUB_REPOSITORY: 'sample/repository',
           GITHUB_TOKEN: 'fake-read-token',
           POCKETGUARD_SAFE_REVIEW: 'true',
-          POCKETGUARD_CPA_STUB: '1',
+          POCKETGUARD_OPENAI_STUB: '1',
           POCKETGUARD_OUTPUT: outputPath,
-          CPA_BASE_URL: TEST_BASE_URL,
-          CPA_API_KEY: 'fake-cpa-key',
-          POCKETGUARD_CPA_ORIGIN: TEST_ORIGIN,
+          OPENAI_BASE_URL: TEST_BASE_URL,
+          OPENAI_API_KEY: 'fake-openai-key',
+          POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
           POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
           POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
           POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
@@ -172,7 +172,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.equal(reviewed.verdict, 'APPROVE');
       assert.equal(reviewed.roles.length, 3);
       assert.equal(reviewed.roles.every((role) => role.verdict === 'APPROVE'), true,
-        'a no-blocker review still reaches the CPA stub');
+        'a no-blocker review still reaches the OpenAI stub');
       assert.equal(reviewed.coverage.complete, true);
       const persistedReview = JSON.parse(fs.readFileSync(outputPath, 'utf8')) as {
         verdict: string;
@@ -205,13 +205,13 @@ export async function runCommentRunnerTests(): Promise<void> {
         ...reviewContext.env,
         POCKETGUARD_OUTPUT: blockerOutputPath,
       } as NodeJS.ProcessEnv;
-      delete blockerEnv.POCKETGUARD_CPA_STUB;
+      delete blockerEnv.POCKETGUARD_OPENAI_STUB;
       const fakeSplitSecretParts = ['const fakeSecret = "ghp_', `${'A'.repeat(20)}";`];
-      let cpaRequestCount = 0;
+      let openaiRequestCount = 0;
       const fetchBeforeBlockerReview = globalThis.fetch;
       globalThis.fetch = (async () => {
-        cpaRequestCount += 1;
-        throw new Error('unexpected CPA request for deterministic blocker');
+        openaiRequestCount += 1;
+        throw new Error('unexpected OpenAI request for deterministic blocker');
       }) as typeof fetch;
       const blockedReview = await (async () => {
         try {
@@ -237,7 +237,7 @@ export async function runCommentRunnerTests(): Promise<void> {
           globalThis.fetch = fetchBeforeBlockerReview;
         }
       })();
-      assert.equal(cpaRequestCount, 0, 'deterministic BLOCK must prevent every CPA request');
+      assert.equal(openaiRequestCount, 0, 'deterministic BLOCK must prevent every OpenAI request');
       assert.equal(blockedReview.verdict, 'NEEDS_CHANGES');
       assert.ok(blockedReview.deterministicViolations.some((violation) =>
         violation.ruleId === 'SEC-PRIVATE-KEY' && violation.severity === 'BLOCK'));
@@ -258,14 +258,14 @@ export async function runCommentRunnerTests(): Promise<void> {
         role.modelUsed === 'not-run' && role.verdict === 'INCONCLUSIVE'), true);
 
       let unsafeGitCalls = 0;
-      const genericPath = path.join(tempDirectory, 'fork-review-output.json');
+      const fallbackPath = path.join(tempDirectory, 'fork-review-output.json');
       const untrusted = await runReviewMode({
         event: forkEvent,
         env: {
           GITHUB_EVENT_NAME: 'pull_request_target',
           GITHUB_REPOSITORY: 'sample/repository',
           POCKETGUARD_SAFE_REVIEW: 'false',
-          POCKETGUARD_OUTPUT: genericPath,
+          POCKETGUARD_OUTPUT: fallbackPath,
         } as NodeJS.ProcessEnv,
         runGit: () => {
           unsafeGitCalls += 1;
@@ -897,7 +897,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         'unauthorized issue_comment never schedules the secrets-bearing review job');
       const trustedStep = workflowStep(reviewJob, 'Run trusted single-turn review');
       assert.match(trustedStep, /steps\.gate\.outputs\.safe_review\s*==\s*'true'\s*&&\s*steps\.gate\.outputs\.authorized\s*==\s*'true'/,
-        'CPA credentials are injected only when origin and authorization both pass');
+        'OpenAI credentials are injected only when origin and authorization both pass');
       const genericStep = workflowStep(reviewJob, 'Write generic result for untrusted pull request');
       assert.match(genericStep, /steps\.gate\.outputs\.authorized\s*!=\s*'true'/,
         'missing authorization falls through to the generic INCONCLUSIVE path');
@@ -911,13 +911,13 @@ export async function runCommentRunnerTests(): Promise<void> {
       const publishEnv = nestedMapping(publishStep, 'env');
       assert.match(publishEnv, /^\s{10}POCKETGUARD_OUTPUT:\s*['"]?review-output\.json['"]?\s*$/m,
         'download destination contains the file expected by the publisher');
-      assert.match(reviewJob, /CPA_API_KEY:/);
-      assert.match(reviewJob, /CPA_BASE_URL:/);
-      const cpaSecretKeys = /CPA_API_KEY|CPA_BASE_URL/;
-      assert.doesNotMatch(workflow.slice(0, jobsStart), cpaSecretKeys,
-        'CPA secrets stay out of workflow-level configuration');
-      assert.doesNotMatch(prepareTag, cpaSecretKeys, 'CPA secrets stay out of prepare-tag');
-      assert.doesNotMatch(publishJob, cpaSecretKeys, 'CPA secrets stay out of publish');
+      assert.match(reviewJob, /OPENAI_API_KEY:/);
+      assert.match(reviewJob, /OPENAI_BASE_URL:/);
+      const openaiSecretKeys = /OPENAI_API_KEY|OPENAI_BASE_URL/;
+      assert.doesNotMatch(workflow.slice(0, jobsStart), openaiSecretKeys,
+        'OpenAI secrets stay out of workflow-level configuration');
+      assert.doesNotMatch(prepareTag, openaiSecretKeys, 'OpenAI secrets stay out of prepare-tag');
+      assert.doesNotMatch(publishJob, openaiSecretKeys, 'OpenAI secrets stay out of publish');
     } finally {
       fs.rmSync(tempDirectory, { recursive: true, force: true });
     }
@@ -926,7 +926,7 @@ export async function runCommentRunnerTests(): Promise<void> {
   }
 
   const runnerSource = fs.readFileSync(path.resolve(__dirname, '../src/github_runner.ts'), 'utf8');
-  assert.doesNotMatch(runnerSource, /send_cpa/i, 'tag and publish entry must not import the CPA client');
+  assert.doesNotMatch(runnerSource, /send_openai/i, 'tag and publish entry must not import the OpenAI client');
   console.log('[PocketGuard comment/runner tests] All tests passed.');
 }
 
@@ -937,9 +937,9 @@ export async function runCommentAuthTests(): Promise<void> {
   const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-comment-auth-'));
   let outputSeq = 0;
   try {
-    let cpaRequestCount = 0;
+    let openaiRequestCount = 0;
     globalThis.fetch = (async () => {
-      cpaRequestCount += 1;
+      openaiRequestCount += 1;
       return new Response(JSON.stringify({
         output: [{ content: [{ type: 'output_text', text: JSON.stringify({ verdict: 'APPROVE', summary: 'ok', findings: [] }) }] }],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -1015,9 +1015,9 @@ export async function runCommentAuthTests(): Promise<void> {
         GITHUB_REPOSITORY: 'sample/repository',
         GITHUB_TOKEN: 'fake-read-token',
         POCKETGUARD_SAFE_REVIEW: options.safeReviewEnv ?? 'true',
-        CPA_BASE_URL: TEST_BASE_URL,
-        CPA_API_KEY: 'fake-cpa-key',
-        POCKETGUARD_CPA_ORIGIN: TEST_ORIGIN,
+        OPENAI_BASE_URL: TEST_BASE_URL,
+        OPENAI_API_KEY: 'fake-openai-key',
+        POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
         POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
         POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
         POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
@@ -1045,38 +1045,38 @@ export async function runCommentAuthTests(): Promise<void> {
     const runAuthCase = async (
       name: string,
       options: Parameters<typeof makeAuthHarness>[0],
-      expected: { safeReview: boolean; authorized: boolean; verdict: RunnerVerdictLike; cpaCalls: number | 'positive' },
+      expected: { safeReview: boolean; authorized: boolean; verdict: RunnerVerdictLike; openaiCalls: number | 'positive' },
     ) => {
       const harness = makeAuthHarness(options);
       let tagStdout = '';
       const tagged = await runTagMode({ ...harness.tagContext, writeStdout: (value) => { tagStdout += value; } });
       assert.equal(tagged.safeReview, expected.safeReview, `${name}: safeReview`);
       assert.equal(tagged.authorized, expected.authorized, `${name}: authorized`);
-      const before = cpaRequestCount;
+      const before = openaiRequestCount;
       let reviewStdout = '';
       const reviewed = await runReviewMode({ ...harness.reviewContext, writeStdout: (value) => { reviewStdout += value; } });
       assert.equal(reviewed.verdict, expected.verdict, `${name}: review verdict`);
-      const made = cpaRequestCount - before;
-      if (expected.cpaCalls === 'positive') {
-        assert.ok(made > 0, `${name}: authorized review must reach the CPA`);
+      const made = openaiRequestCount - before;
+      if (expected.openaiCalls === 'positive') {
+        assert.ok(made > 0, `${name}: authorized review must reach the OpenAI`);
       } else {
-        assert.equal(made, expected.cpaCalls, `${name}: denied review must not call the CPA`);
+        assert.equal(made, expected.openaiCalls, `${name}: denied review must not call the OpenAI`);
       }
       return { harness, tagged, reviewed, tagStdout, reviewStdout };
     };
 
     // a. maintainer with write permission is authorized.
     await runAuthCase('maintainer-write', { permission: 'write' },
-      { safeReview: true, authorized: true, verdict: 'APPROVE', cpaCalls: 'positive' });
+      { safeReview: true, authorized: true, verdict: 'APPROVE', openaiCalls: 'positive' });
     // b. maintainer with admin permission is authorized.
     await runAuthCase('maintainer-admin', { permission: 'admin' },
-      { safeReview: true, authorized: true, verdict: 'APPROVE', cpaCalls: 'positive' });
+      { safeReview: true, authorized: true, verdict: 'APPROVE', openaiCalls: 'positive' });
 
     // c. outsider with read permission is denied; the permission call carries the comment username.
     {
       const { harness } = await runAuthCase('outsider-read',
         { permission: 'read', commentUser: { login: 'outsider', type: 'User' } },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 2, 'outsider-read: tag and review each verify');
       assert.equal(harness.state.permissionCalls[0].username, 'outsider', 'outsider-read: username forwarded');
       assert.equal(harness.state.pullsGetCalls, 0, 'outsider-read: no pulls.get call');
@@ -1085,20 +1085,20 @@ export async function runCommentAuthTests(): Promise<void> {
     // d. collaborator without access, and a 404-style API failure, both deny.
     {
       const { harness } = await runAuthCase('outsider-none', { permission: 'none' },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.pullsGetCalls, 0, 'outsider-none: no pulls.get call');
     }
     {
       const { harness } = await runAuthCase('permission-404',
         { permissionThrows: 'synthetic permission lookup failure' },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.pullsGetCalls, 0, 'permission-404: no pulls.get call');
     }
 
     // e. FIRST_TIME_CONTRIBUTOR without write access is denied.
     await runAuthCase('first-time-contributor',
       { permission: 'none', authorAssociation: 'FIRST_TIME_CONTRIBUTOR' },
-      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
 
     // f. bot comments deny before any permission API call.
     {
@@ -1107,7 +1107,7 @@ export async function runCommentAuthTests(): Promise<void> {
           permission: 'write',
           commentUser: { login: 'github-actions[bot]', type: 'Bot' },
         },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'bot-comment: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'bot-comment: no pulls.get call');
     }
@@ -1116,7 +1116,7 @@ export async function runCommentAuthTests(): Promise<void> {
     {
       const { harness } = await runAuthCase('bot-sender',
         { permission: 'write', sender: { login: 'sender-bot', type: 'Bot' } },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'bot-sender: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'bot-sender: no pulls.get call');
     }
@@ -1125,7 +1125,7 @@ export async function runCommentAuthTests(): Promise<void> {
     {
       const { harness } = await runAuthCase('spoofed-association',
         { permission: 'read', authorAssociation: 'COLLABORATOR' },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.pullsGetCalls, 0, 'spoofed-association: no pulls.get call');
     }
 
@@ -1133,7 +1133,7 @@ export async function runCommentAuthTests(): Promise<void> {
     {
       const { harness } = await runAuthCase('missing-username',
         { permission: 'write', commentUser: null },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'missing-username: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'missing-username: no pulls.get call');
     }
@@ -1143,7 +1143,7 @@ export async function runCommentAuthTests(): Promise<void> {
       const probe = 'synthetic-probe-username-7f3a';
       const { harness, tagStdout, reviewStdout } = await runAuthCase('permission-500',
         { permissionThrows: `synthetic failure for ${probe}`, commentUser: { login: probe, type: 'User' } },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 2, 'permission-500: tag and review each verify');
       assert.ok(!tagStdout.includes('synthetic'), 'permission-500: tag output stays generic');
       assert.ok(!tagStdout.includes(probe), 'permission-500: tag output hides the username');
@@ -1155,7 +1155,7 @@ export async function runCommentAuthTests(): Promise<void> {
     {
       const { harness } = await runAuthCase('edited-action',
         { permission: 'write', action: 'edited' },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'edited-action: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'edited-action: no pulls.get call');
     }
@@ -1164,14 +1164,14 @@ export async function runCommentAuthTests(): Promise<void> {
     {
       const { harness } = await runAuthCase('deleted-action',
         { permission: 'write', action: 'deleted' },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'deleted-action: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'deleted-action: no pulls.get call');
     }
     {
       const { harness } = await runAuthCase('missing-action',
         { permission: 'write', omitAction: true },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'missing-action: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'missing-action: no pulls.get call');
     }
@@ -1180,41 +1180,41 @@ export async function runCommentAuthTests(): Promise<void> {
     for (const botType of ['bot', 'BOT']) {
       const { harness } = await runAuthCase(`bot-type-${botType}`,
         { permission: 'write', commentUser: { login: 'some-bot', type: botType } },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, `bot-type-${botType}: no permission API call`);
       assert.equal(harness.state.pullsGetCalls, 0, `bot-type-${botType}: no pulls.get call`);
     }
     {
       const { harness } = await runAuthCase('bot-sender-lowercase',
         { permission: 'write', sender: { login: 'sender-bot', type: 'bot' } },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.permissionCalls.length, 0, 'bot-sender-lowercase: no permission API call');
       assert.equal(harness.state.pullsGetCalls, 0, 'bot-sender-lowercase: no pulls.get call');
     }
 
     // k4. Authorization deny wins over any bypass: an outsider stays at zero
-    // CPA calls even with POCKETGUARD_SAFE_REVIEW='false'.
+    // OpenAI calls even with POCKETGUARD_SAFE_REVIEW='false'.
     {
       const { harness } = await runAuthCase('outsider-deny-safe-review-false',
         { permission: 'read', commentUser: { login: 'outsider', type: 'User' }, safeReviewEnv: 'false' },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.pullsGetCalls, 0, 'outsider-deny-safe-review-false: no pulls.get call');
     }
 
     // A missing repos API on the client denies fail-closed.
     {
       const { harness } = await runAuthCase('missing-repos-api', { omitRepos: true },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
       assert.equal(harness.state.pullsGetCalls, 0, 'missing-repos-api: no pulls.get call');
     }
 
     // An authorized maintainer sending an unsupported command is authorized
     // but not safe for review; an outsider sending the same is neither.
     await runAuthCase('maintainer-unsupported', { permission: 'write', body: 'hello' },
-      { safeReview: false, authorized: true, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      { safeReview: false, authorized: true, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
     await runAuthCase('outsider-unsupported',
       { permission: 'read', body: 'hello', commentUser: { login: 'outsider', type: 'User' } },
-      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', cpaCalls: 0 });
+      { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
 
     // Tag mode forwards the authorization verdict to GITHUB_OUTPUT for the
     // workflow read-only gate (fail-closed string comparison).

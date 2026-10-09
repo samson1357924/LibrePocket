@@ -4,10 +4,10 @@ import {
   securityLabelsFor,
 } from '../src/deterministic_scanner';
 import {
-  resolveCpaConfig,
+  resolveOpenAIConfig,
   resolveRoleModel,
-  sendCpaSingleTurn,
-} from '../src/send_cpa';
+  sendOpenAISingleTurn,
+} from '../src/send_openai';
 import {
   coverageSummary,
   filterReviewDiffFiles,
@@ -18,8 +18,8 @@ import {
 import { buildReviewDiff } from '../src/github_runner';
 import { orchestrateReview } from '../src/orchestrator';
 
-const FAKE_CPA_BASE_URL = ['https:', '', 'pocketguard-cpa.test', 'v1'].join('/');
-const FAKE_ALLOWED_ORIGINS = [new URL(FAKE_CPA_BASE_URL).origin];
+const FAKE_OPENAI_BASE_URL = ['https:', '', 'pocketguard-openai.test', 'v1'].join('/');
+const FAKE_ALLOWED_ORIGINS = [new URL(FAKE_OPENAI_BASE_URL).origin];
 const FAKE_MODEL_ID = 'fake-model-id';
 const FAKE_SECRET_FIXTURES = {
   placeholderKey: '${fake-placeholder}',
@@ -40,7 +40,7 @@ function diffFor(file: string, added: string[], removed: string[] = []): string 
   ].join('\n');
 }
 
-export async function runScannerSendCpaTests(): Promise<void> {
+export async function runScannerSendOpenAITests(): Promise<void> {
   // Credential rules only inspect added lines, so a secret removed by a repair is not flagged.
   const removedOnly = diffFor('app/src/main/res/values/strings.xml', [], [FAKE_SECRET_FIXTURES.removedCredential]);
   assert.deepEqual(DeterministicScanner.scan(['app/src/main/res/values/strings.xml'], removedOnly).violations, []);
@@ -294,36 +294,36 @@ export async function runScannerSendCpaTests(): Promise<void> {
   // Callers must treat incomplete coverage as requiring a human decision.
 
   assert.throws(
-    () => resolveCpaConfig({ CPA_BASE_URL: FAKE_CPA_BASE_URL, CPA_API_KEY: FAKE_SECRET_FIXTURES.placeholderKey }, FAKE_ALLOWED_ORIGINS),
-    /CPA configuration/,
+    () => resolveOpenAIConfig({ OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL, OPENAI_API_KEY: FAKE_SECRET_FIXTURES.placeholderKey }, FAKE_ALLOWED_ORIGINS),
+    /OpenAI configuration/,
   );
   assert.throws(
-    () => resolveCpaConfig({ CPA_BASE_URL: FAKE_CPA_BASE_URL.replace('https:', 'http:'), CPA_API_KEY: 'fake-key' }, FAKE_ALLOWED_ORIGINS),
-    /CPA configuration/,
+    () => resolveOpenAIConfig({ OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL.replace('https:', 'http:'), OPENAI_API_KEY: 'fake-key' }, FAKE_ALLOWED_ORIGINS),
+    /OpenAI configuration/,
   );
-  const userInfoUrl = new URL(FAKE_CPA_BASE_URL);
+  const userInfoUrl = new URL(FAKE_OPENAI_BASE_URL);
   userInfoUrl.username = 'fake-user';
   userInfoUrl.password = 'fake-pass';
   assert.throws(
-    () => resolveCpaConfig({ CPA_BASE_URL: userInfoUrl.toString(), CPA_API_KEY: 'fake-key' }, FAKE_ALLOWED_ORIGINS),
-    /CPA configuration/,
+    () => resolveOpenAIConfig({ OPENAI_BASE_URL: userInfoUrl.toString(), OPENAI_API_KEY: 'fake-key' }, FAKE_ALLOWED_ORIGINS),
+    /OpenAI configuration/,
   );
   assert.throws(
-    () => resolveCpaConfig({ CPA_BASE_URL: FAKE_CPA_BASE_URL, CPA_API_KEY: 'fake-key' }, []),
-    /CPA configuration/,
+    () => resolveOpenAIConfig({ OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL, OPENAI_API_KEY: 'fake-key' }, []),
+    /OpenAI configuration/,
   );
   for (const suffix of ['?', '#']) {
     assert.throws(
-      () => resolveCpaConfig({ CPA_BASE_URL: `${FAKE_CPA_BASE_URL}${suffix}`, CPA_API_KEY: 'fake-key' }, FAKE_ALLOWED_ORIGINS),
-      /CPA configuration/,
+      () => resolveOpenAIConfig({ OPENAI_BASE_URL: `${FAKE_OPENAI_BASE_URL}${suffix}`, OPENAI_API_KEY: 'fake-key' }, FAKE_ALLOWED_ORIGINS),
+      /OpenAI configuration/,
     );
   }
   assert.throws(() => resolveRoleModel('android_sec', {}), /model not configured/);
 
   const originalFetch = globalThis.fetch;
-  const cpaEnvironment = {
-    CPA_BASE_URL: FAKE_CPA_BASE_URL,
-    CPA_API_KEY: 'fake-api-key',
+  const openaiEnvironment = {
+    OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL,
+    OPENAI_API_KEY: 'fake-api-key',
   };
   try {
     let ordinaryRedirectMode: RequestInit['redirect'] | undefined;
@@ -333,12 +333,12 @@ export async function runScannerSendCpaTests(): Promise<void> {
         output: [{ content: [{ type: 'output_text', text: 'review result' }] }],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }) as typeof fetch;
-    const result = await sendCpaSingleTurn({
+    const result = await sendOpenAISingleTurn({
       modelId: FAKE_MODEL_ID,
       systemPrompt: 'fake system prompt',
       userPrompt: 'fake user prompt',
       allowedOrigins: FAKE_ALLOWED_ORIGINS,
-      env: cpaEnvironment,
+      env: openaiEnvironment,
       timeoutMs: 1000,
     });
     assert.deepEqual(result, { content: 'review result', modelId: FAKE_MODEL_ID });
@@ -353,7 +353,7 @@ export async function runScannerSendCpaTests(): Promise<void> {
       const unexpectedTargets: string[] = [];
       globalThis.fetch = (async (input, init) => {
         const url = new URL(String(input));
-        if (url.origin === new URL(FAKE_CPA_BASE_URL).origin) {
+        if (url.origin === new URL(FAKE_OPENAI_BASE_URL).origin) {
           initialBodies.push(typeof init?.body === 'string' ? init.body : '<missing body>');
           const redirectResponse = new Response(null, {
             status,
@@ -380,15 +380,15 @@ export async function runScannerSendCpaTests(): Promise<void> {
       }) as typeof fetch;
 
       await assert.rejects(
-        sendCpaSingleTurn({
+        sendOpenAISingleTurn({
           modelId: FAKE_MODEL_ID,
           systemPrompt: 'fake system prompt',
           userPrompt: 'fake user prompt',
           allowedOrigins: FAKE_ALLOWED_ORIGINS,
-          env: cpaEnvironment,
+          env: openaiEnvironment,
           timeoutMs: 1000,
         }),
-        /CPA request failed/,
+        /OpenAI request failed/,
         `${status} redirect should be rejected`,
       );
       assert.equal(initialBodies.length, 1, `${status} initial request count`);
@@ -401,17 +401,17 @@ export async function runScannerSendCpaTests(): Promise<void> {
 
     globalThis.fetch = (async () => new Response('FAKE_RESPONSE_BODY_SECRET', { status: 503 })) as typeof fetch;
     await assert.rejects(
-      sendCpaSingleTurn({
+      sendOpenAISingleTurn({
         modelId: FAKE_MODEL_ID,
         systemPrompt: 'fake system prompt',
         userPrompt: 'fake user prompt',
         allowedOrigins: FAKE_ALLOWED_ORIGINS,
-        env: cpaEnvironment,
+        env: openaiEnvironment,
         timeoutMs: 1000,
       }),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.equal(error.message, 'CPA request failed');
+        assert.equal(error.message, 'OpenAI request failed');
         assert.equal(error.message.includes('FAKE_RESPONSE_BODY_SECRET'), false);
         assert.equal((error as Error & { statusCode?: number }).statusCode, 503);
         return true;
@@ -420,19 +420,19 @@ export async function runScannerSendCpaTests(): Promise<void> {
 
     globalThis.fetch = (async () => new Response(JSON.stringify({ output: [] }), { status: 200 })) as typeof fetch;
     await assert.rejects(
-      sendCpaSingleTurn({
+      sendOpenAISingleTurn({
         modelId: FAKE_MODEL_ID,
         systemPrompt: 'fake system prompt',
         userPrompt: 'fake user prompt',
         allowedOrigins: FAKE_ALLOWED_ORIGINS,
-        env: cpaEnvironment,
+        env: openaiEnvironment,
         timeoutMs: 1000,
       }),
-      /CPA response empty/,
+      /OpenAI response empty/,
     );
 
     const orchestratorEnv = {
-      ...cpaEnvironment,
+      ...openaiEnvironment,
       POCKETGUARD_MODEL_CHIEF: FAKE_MODEL_ID,
       POCKETGUARD_MODEL_ANDROID_SEC: FAKE_MODEL_ID,
       POCKETGUARD_MODEL_ANDROID_CODE: FAKE_MODEL_ID,
@@ -520,5 +520,5 @@ export async function runScannerSendCpaTests(): Promise<void> {
     globalThis.fetch = originalFetch;
   }
 
-  console.log('[PocketGuard scanner/CPA tests] All tests passed.');
+  console.log('[PocketGuard scanner/OpenAI tests] All tests passed.');
 }

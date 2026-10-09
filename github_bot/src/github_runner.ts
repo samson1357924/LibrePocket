@@ -116,6 +116,15 @@ export interface TagResult {
   safeReview: boolean;
   authorized: boolean;
   issueNumber?: number;
+  shouldReview: boolean;
+  shouldTag: boolean;
+  reason: string;
+  routeKind: RouteKind;
+  isOwner: boolean;
+  actor?: string;
+  repoOwner?: string;
+  eventName?: string;
+  action?: string;
 }
 
 export interface RunnerReviewOutput {
@@ -212,13 +221,13 @@ export function extractCommentUsername(event: GithubEvent): string | undefined {
 
 export function isTrustedCommentAuthor(event: GithubEvent, opts?: { authorAssociation?: string; eventName?: string }): boolean {
   void opts?.authorAssociation;
-  // issue_comment must carry an explicit created action; edited/deleted/missing
-  // deny fail-closed. Other events keep the legacy rule (explicit non-created
-  // denies, missing allowed) so older pull_request_target fixtures keep
-  // working; that path does not use this gate for authorization anyway.
+  // issue_comment accepts created or edited; deleted/missing deny fail-closed.
+  // Other events keep the legacy rule (explicit non-created denies, missing
+  // allowed) so older pull_request_target fixtures keep working; that path
+  // does not use this gate for authorization anyway.
   // author_association is never trusted (see checkCommenterPermission).
   if (opts?.eventName === 'issue_comment') {
-    if (event.action !== 'created') return false;
+    if (event.action !== 'created' && event.action !== 'edited') return false;
   } else if (typeof event.action === 'string' && event.action !== 'created') return false;
   if (event.comment?.user?.type?.toLowerCase() === 'bot' || event.sender?.type?.toLowerCase() === 'bot') return false;
   const username = extractCommentUsername(event);
@@ -250,6 +259,137 @@ export async function checkCommenterPermission(
     // author_association, and never leak the username or permission detail.
     return false;
   }
+}
+
+export type RouteKind = 'first-review' | 'issue-update' | 'manual-pr-review' | 'owner-commit' | 'ignore';
+
+export interface RouteResult {
+  kind: RouteKind;
+  reason: string;
+}
+
+// Actor snapshot for routing: workflow GITHUB_ACTOR first, event sender as
+// fallback. Commit-author strings are never consulted.
+export function resolveRouteActor(env: NodeJS.ProcessEnv | undefined, event: GithubEvent): string | undefined {
+  const raw = env?.GITHUB_ACTOR ?? event.sender?.login;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+// Repository-owner snapshot: explicit POCKETGUARD_REPO_OWNER first (workflow
+// sets it from github.repository_owner), otherwise the owner segment of the
+// repository full name. Never derived from commit authorship.
+export function resolveRouteRepoOwner(env: NodeJS.ProcessEnv | undefined, event: GithubEvent): string | undefined {
+  const explicit = env?.POCKETGUARD_REPO_OWNER;
+  if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
+  const fullName = (env?.GITHUB_REPOSITORY ?? event.repository?.full_name ?? '').trim();
+  const match = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(fullName);
+  return match ? match[1] : undefined;
+}
+
+// Case-insensitive owner comparison. A missing field on either side is
+// fail-closed (not owner), routing synchronize toward ignore.
+export function isRepositoryOwner(actor: string | undefined, repoOwner: string | undefined): boolean {
+  if (!actor || !repoOwner) return false;
+  const left = actor.trim();
+  const right = repoOwner.trim();
+  if (!left || !right) return false;
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+// Bot-loop guard for routing: comment author or sender with Bot type, or a
+// login ending in [bot] (case-insensitive via isBotLogin), counts as a bot.
+// Reuses the same rules as the authorization gate but performs no permission
+// lookup; read-only.
+export function isBotEventActor(event: GithubEvent): boolean {
+  if (event.comment?.user?.type?.toLowerCase() === 'bot' || event.sender?.type?.toLowerCase() === 'bot') return true;
+  const commentLogin = event.comment?.user?.login;
+  const senderLogin = event.sender?.login;
+  if (typeof commentLogin === 'string' && isBotLogin(commentLogin)) return true;
+  if (typeof senderLogin === 'string' && isBotLogin(senderLogin)) return true;
+  return false;
+}
+
+function inferRouteEventName(event: GithubEvent, env: NodeJS.ProcessEnv | undefined): string {
+  const explicit = env?.GITHUB_EVENT_NAME;
+  if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
+  if (event.pull_request) return 'pull_request_target';
+  if (event.comment) return 'issue_comment';
+  if (event.issue) return 'issues';
+  return '';
+}
+
+// Read-only event router (S3). Classifies every event into first-review,
+// issue-update, manual-pr-review, owner-commit, or ignore without performing
+// review, labeling, counting, or sticky writes. S4/S5 consume kind plus the
+// should_review/should_tag flags emitted by runTagMode.
+export function routeEvent(event: GithubEvent, env?: NodeJS.ProcessEnv): RouteResult {
+  const eventName = inferRouteEventName(event, env);
+  const action = typeof event.action === 'string' ? event.action : '';
+
+  if (eventName === 'pull_request_target') {
+    if (action === 'opened' || action === 'reopened') {
+      return {
+        kind: 'first-review',
+        reason: `pull_request_target ${action}: first review regardless of fork or author permission`,
+      };
+    }
+    if (action === 'synchronize') {
+      const actor = resolveRouteActor(env, event);
+      const repoOwner = resolveRouteRepoOwner(env, event);
+      if (isRepositoryOwner(actor, repoOwner)) {
+        return { kind: 'owner-commit', reason: 'pull_request_target synchronize by repository owner: owner commit review' };
+      }
+      return { kind: 'ignore', reason: 'pull_request_target synchronize by non-owner does not auto-review (owner-only)' };
+    }
+    return { kind: 'ignore', reason: `pull_request_target action '${action || 'missing'}' is not routed` };
+  }
+
+  if (eventName === 'issues') {
+    if (action !== 'opened' && action !== 'edited' && action !== 'reopened') {
+      return { kind: 'ignore', reason: `issues action '${action || 'missing'}' is not routed` };
+    }
+    if (isBotEventActor(event)) {
+      return { kind: 'ignore', reason: 'issues event from a bot sender is ignored (loop protection)' };
+    }
+    if (action === 'opened') {
+      return { kind: 'first-review', reason: 'issues opened by a human: first review (tagging context)' };
+    }
+    return { kind: 'issue-update', reason: `issues ${action} by a human: issue update` };
+  }
+
+  if (eventName === 'issue_comment') {
+    if (action !== 'created' && action !== 'edited') {
+      return { kind: 'ignore', reason: `issue_comment action '${action || 'missing'}' is not routed` };
+    }
+    if (isBotEventActor(event)) {
+      return { kind: 'ignore', reason: 'issue_comment from a bot author or sender is ignored (loop protection)' };
+    }
+    const isPullRequest = Boolean(event.issue?.pull_request);
+    const command = classifyCommentCommand(event.comment?.body ?? '');
+    if (isPullRequest) {
+      if (isCommentCommandAllowed(command, 'pull-request')) {
+        return { kind: 'manual-pr-review', reason: `explicit '${command}' command on a pull request: manual review` };
+      }
+      return { kind: 'ignore', reason: `pull-request comment '${command}' is not an explicit review command (unsupported, ordinary, or triage)` };
+    }
+    return { kind: 'issue-update', reason: 'human comment on an issue: issue update' };
+  }
+
+  return { kind: 'ignore', reason: `event '${eventName || 'unknown'}' is not routed` };
+}
+
+export function routeReviewFlags(kind: RouteKind, eventName: string, event?: GithubEvent): { shouldReview: boolean; shouldTag: boolean } {
+  if (kind === 'ignore') return { shouldReview: false, shouldTag: false };
+  if (kind === 'issue-update') return { shouldReview: false, shouldTag: true };
+  if (kind === 'manual-pr-review' || kind === 'owner-commit') return { shouldReview: true, shouldTag: true };
+  // first-review: pull-request opens request review; issue opens request
+  // tagging context only (no PR to review).
+  const isPullRequest = eventName === 'pull_request_target' || Boolean(event?.pull_request);
+  return isPullRequest
+    ? { shouldReview: true, shouldTag: true }
+    : { shouldReview: false, shouldTag: true };
 }
 
 async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
@@ -299,7 +439,7 @@ async function inspectTarget(context: RunnerContext): Promise<ReviewTarget> {
     // Fail-closed authorization gate: the synchronous author check runs before
     // any pulls.get so denied comments cost no API quota and never attach a
     // pull request. author_association is never trusted here. On
-    // issue_comment the check also requires action === 'created'.
+    // issue_comment the check also requires action === 'created' or 'edited'.
     if (!isTrustedCommentAuthor(event, { authorAssociation: event.comment?.author_association, eventName })) {
       return { target, command, needsDiff, safeReview: false, authorized: false, ...issueRef, title };
     }
@@ -382,6 +522,14 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     ? resolveAreaLabelsFromPaths(changed.changedFiles, changed.complete)
     : [];
   const labels = sanitizeLabels([...resolveLabelsFromTitle(target.title), ...areaLabels]);
+  const event = eventFrom(context);
+  const route = routeEvent(event, env);
+  const eventName = inferRouteEventName(event, env);
+  const flags = routeReviewFlags(route.kind, eventName, event);
+  const actor = resolveRouteActor(env, event);
+  const repoOwner = resolveRouteRepoOwner(env, event);
+  const isOwner = isRepositoryOwner(actor, repoOwner);
+  const action = typeof event.action === 'string' ? event.action : '';
   const result: TagResult = {
     labels,
     areaLabels,
@@ -394,6 +542,15 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     // Fail-closed: only an explicit true counts as authorized.
     authorized: target.authorized === true,
     ...(target.issueNumber ? { issueNumber: target.issueNumber } : {}),
+    shouldReview: flags.shouldReview,
+    shouldTag: flags.shouldTag,
+    reason: route.reason,
+    routeKind: route.kind,
+    isOwner,
+    ...(actor ? { actor } : {}),
+    ...(repoOwner ? { repoOwner } : {}),
+    ...(eventName ? { eventName } : {}),
+    ...(action ? { action } : {}),
   };
   appendWorkflowOutputs(env, {
     labels: JSON.stringify(result.labels),
@@ -406,6 +563,15 @@ export async function runTagMode(context: RunnerContext = {}): Promise<TagResult
     safe_review: String(result.safeReview),
     authorized: String(result.authorized),
     ...(result.issueNumber ? { issue_number: String(result.issueNumber) } : {}),
+    should_review: String(result.shouldReview),
+    should_tag: String(result.shouldTag),
+    reason: result.reason,
+    route_kind: result.routeKind,
+    is_owner: String(result.isOwner),
+    ...(result.actor ? { actor: result.actor } : {}),
+    ...(result.repoOwner ? { repo_owner: result.repoOwner } : {}),
+    ...(result.eventName ? { event_name: result.eventName } : {}),
+    ...(result.action ? { event_action: result.action } : {}),
   });
   stdout(context, `${JSON.stringify(result)}\n`);
   return result;

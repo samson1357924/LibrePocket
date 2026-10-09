@@ -3,10 +3,10 @@ name: PocketGuard
 on:
   pull_request_target:
     types: [opened, reopened, synchronize]
-  issue_comment:
-    types: [created]
   issues:
-    types: [opened]
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created, edited]
 
 concurrency:
   group: pocketguard-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
@@ -58,6 +58,7 @@ jobs:
         # authorization gate (permission check + pulls.get) on issue_comment.
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
 
   review-send:
@@ -99,6 +100,7 @@ jobs:
         working-directory: github_bot
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
 
       - name: Run trusted single-turn review
@@ -106,6 +108,7 @@ jobs:
         working-directory: github_bot
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
           POCKETGUARD_SAFE_REVIEW: 'true'
           POCKETGUARD_OUTPUT: review-output.json
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
@@ -123,6 +126,7 @@ jobs:
         working-directory: github_bot
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
           POCKETGUARD_SAFE_REVIEW: 'false'
           POCKETGUARD_OUTPUT: review-output.json
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=review
@@ -181,6 +185,7 @@ jobs:
         working-directory: github_bot
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
           POCKETGUARD_OUTPUT: review-output.json
           POCKETGUARD_REVIEW_JOB_RESULT: ${{ needs.review-send.result }}
           POCKETGUARD_TAG_LABELS: ${{ needs.prepare-tag.outputs.labels }}

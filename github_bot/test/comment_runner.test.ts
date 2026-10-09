@@ -8,6 +8,9 @@ import {
   isCommentCommandAllowed,
 } from '../src/comment_command';
 import {
+  isRepositoryOwner,
+  routeEvent,
+  routeReviewFlags,
   runPublishMode,
   runReviewMode,
   runTagMode,
@@ -38,8 +41,14 @@ export async function runCommentRunnerTests(): Promise<void> {
   assert.equal(classifyCommentCommand('/explain'), 'explain');
   assert.equal(classifyCommentCommand('/fix'), 'fix');
   assert.equal(classifyCommentCommand('/fix-ci'), 'fix-ci');
-  assert.equal(classifyCommentCommand('@pocketguard'), 'review');
-  assert.equal(classifyCommentCommand('Please @pocketguard check this'), 'review');
+  assert.equal(classifyCommentCommand('@pocketguard review'), 'review');
+  assert.equal(classifyCommentCommand('@pocketguard /review'), 'review');
+  assert.equal(classifyCommentCommand('@POCKETGUARD REVIEW'), 'review');
+  assert.equal(classifyCommentCommand('／review'), 'review');
+  // Bare "@pocketguard" (no verb) is no longer a review command (S3).
+  assert.equal(classifyCommentCommand('@pocketguard'), 'unsupported');
+  assert.equal(classifyCommentCommand('Please @pocketguard check this'), 'unsupported');
+  assert.equal(classifyCommentCommand('Please @pocketguard review this'), 'review');
   assert.equal(classifyCommentCommand('/not-supported'), 'unsupported');
   assert.equal(commentCommandNeedsGitDiff('fix-ci'), true);
   assert.equal(commentCommandNeedsGitDiff('triage'), false);
@@ -71,6 +80,15 @@ export async function runCommentRunnerTests(): Promise<void> {
     assert.equal(tagged.changedFilesComplete, true);
     assert.deepEqual(tagged.labels, ['area:delivery', 'security']);
     assert.deepEqual(JSON.parse(tagStdout).labels, ['area:delivery', 'security']);
+    assert.equal(tagged.routeKind, 'first-review');
+    assert.equal(tagged.shouldReview, true);
+    assert.equal(tagged.shouldTag, true);
+    assert.ok(tagged.reason.length > 0);
+    assert.deepEqual(
+      { should_review: JSON.parse(tagStdout).shouldReview, should_tag: JSON.parse(tagStdout).shouldTag },
+      { should_review: true, should_tag: true },
+    );
+    assert.equal(JSON.parse(tagStdout).routeKind, 'first-review');
 
     const forkEvent = JSON.parse(JSON.stringify(pullRequestEvent())) as {
       pull_request: { head: { repo: { full_name: string } } };
@@ -92,7 +110,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         action: 'created',
         repository: { full_name: 'sample/repository' },
         issue: { number: 41, pull_request: { url: 'unused' }, title: 'topic' },
-        comment: { body: '@pocketguard', user: { login: 'maintainer', type: 'User' } },
+        comment: { body: '@pocketguard review', user: { login: 'maintainer', type: 'User' } },
       },
       env: {
         GITHUB_EVENT_NAME: 'issue_comment',
@@ -125,6 +143,26 @@ export async function runCommentRunnerTests(): Promise<void> {
     assert.equal(mentioned.command, 'review');
     assert.equal(mentioned.safeReview, true);
     assert.equal(mentioned.authorized, true, 'authorized maintainer mention');
+    assert.equal(mentioned.routeKind, 'manual-pr-review');
+    assert.equal(mentioned.shouldReview, true);
+    assert.equal(mentioned.shouldTag, true);
+    assert.ok(mentioned.reason.length > 0);
+
+    // Bare "@pocketguard" (no verb) is unsupported since S3: authorized but
+    // never safe for review, and routed to ignore.
+    const bareMention = await runTagMode({
+      ...mentionContext,
+      event: {
+        ...(mentionContext.event as Record<string, unknown>),
+        comment: { body: '@pocketguard', user: { login: 'maintainer', type: 'User' } },
+      },
+    });
+    assert.equal(bareMention.command, 'unsupported');
+    assert.equal(bareMention.safeReview, false, 'bare mention is never safe for review');
+    assert.equal(bareMention.authorized, true, 'bare mention by a writer still passes the auth gate');
+    assert.equal(bareMention.routeKind, 'ignore');
+    assert.equal(bareMention.shouldReview, false);
+    assert.equal(bareMention.shouldTag, false);
 
     const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-comment-runner-'));
     try {
@@ -1157,13 +1195,14 @@ export async function runCommentAuthTests(): Promise<void> {
       assert.ok(!reviewStdout.includes(probe), 'permission-500: review output hides the username');
     }
 
-    // k. edited actions deny even for an otherwise authorized maintainer.
+    // k. edited actions pass the gate like created (S3): an authorized
+    // maintainer edit proceeds to the permission check and review.
     {
       const { harness } = await runAuthCase('edited-action',
         { permission: 'write', action: 'edited' },
-        { safeReview: false, authorized: false, verdict: 'INCONCLUSIVE', openaiCalls: 0 });
-      assert.equal(harness.state.permissionCalls.length, 0, 'edited-action: no permission API call');
-      assert.equal(harness.state.pullsGetCalls, 0, 'edited-action: no pulls.get call');
+        { safeReview: true, authorized: true, verdict: 'APPROVE', openaiCalls: 'positive' });
+      assert.equal(harness.state.permissionCalls.length, 2, 'edited-action: tag and review each verify');
+      assert.ok(harness.state.pullsGetCalls > 0, 'edited-action: authorized edit fetches the pull request');
     }
 
     // k2. deleted and missing actions deny on the issue_comment path.
@@ -1247,4 +1286,164 @@ export async function runCommentAuthTests(): Promise<void> {
     globalThis.fetch = previousFetch;
   }
   console.log('[PocketGuard comment-auth tests] All tests passed.');
+}
+
+export async function runRouteEventTests(): Promise<void> {
+  const prEnv = (overrides: Record<string, string> = {}): NodeJS.ProcessEnv => ({
+    GITHUB_EVENT_NAME: 'pull_request_target',
+    GITHUB_REPOSITORY: 'Sample/Repository',
+    ...overrides,
+  } as NodeJS.ProcessEnv);
+
+  // pull_request_target opened/reopened route regardless of fork or permission.
+  for (const action of ['opened', 'reopened']) {
+    for (const head of ['sample/repository', 'untrusted/fork']) {
+      const routed = routeEvent({
+        action,
+        repository: { full_name: 'sample/repository' },
+        pull_request: {
+          number: 41, title: 't',
+          base: { sha: BASE_SHA }, head: { sha: HEAD_SHA, repo: { full_name: head } },
+        },
+        sender: { login: 'outsider', type: 'User' },
+      }, prEnv());
+      assert.equal(routed.kind, 'first-review', `${action}/${head}`);
+      assert.ok(routed.reason.length > 0);
+      const flags = routeReviewFlags(routed.kind, 'pull_request_target', {
+        pull_request: { number: 41 },
+      });
+      assert.deepEqual(flags, { shouldReview: true, shouldTag: true });
+    }
+  }
+
+  // pull_request_target synchronize: owner-only.
+  const syncEvent = (sender?: { login?: string; type?: string }) => ({
+    action: 'synchronize',
+    repository: { full_name: 'sample/repository' },
+    pull_request: {
+      number: 41, title: 't',
+      base: { sha: BASE_SHA }, head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
+    },
+    ...(sender ? { sender } : {}),
+  });
+  assert.equal(routeEvent(syncEvent({ login: 'sample', type: 'User' }),
+    prEnv({ GITHUB_ACTOR: 'SAMPLE', POCKETGUARD_REPO_OWNER: 'sample' })).kind, 'owner-commit');
+  assert.equal(routeEvent(syncEvent({ login: 'contributor', type: 'User' }),
+    prEnv({ GITHUB_ACTOR: 'contributor', POCKETGUARD_REPO_OWNER: 'sample' })).kind, 'ignore');
+  // Missing actor fails closed to ignore.
+  assert.equal(routeEvent({ action: 'synchronize', repository: { full_name: 'sample/repository' } },
+    prEnv({ POCKETGUARD_REPO_OWNER: 'sample' })).kind, 'ignore');
+  // Missing owner fails closed to ignore (neither explicit owner nor repository).
+  assert.equal(routeEvent(
+    {
+      action: 'synchronize',
+      sender: { login: 'sample', type: 'User' },
+      pull_request: {
+        number: 41, title: 't',
+        base: { sha: BASE_SHA }, head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
+      },
+    },
+    { GITHUB_EVENT_NAME: 'pull_request_target' } as NodeJS.ProcessEnv).kind, 'ignore');
+  // Owner comparison is case-insensitive and never uses commit authors.
+  assert.equal(isRepositoryOwner('Sample', 'sample'), true);
+  assert.equal(isRepositoryOwner('other', 'sample'), false);
+  assert.equal(isRepositoryOwner(undefined, 'sample'), false);
+  assert.equal(isRepositoryOwner('sample', undefined), false);
+
+  // issues opened/edited/reopened (non-bot).
+  const issuesEnv = (): NodeJS.ProcessEnv =>
+    ({ GITHUB_EVENT_NAME: 'issues', GITHUB_REPOSITORY: 'sample/repository' } as NodeJS.ProcessEnv);
+  assert.equal(routeEvent({ action: 'opened', issue: { number: 7 } }, issuesEnv()).kind, 'first-review');
+  const issueOpenedFlags = routeReviewFlags('first-review', 'issues', { issue: { number: 7 } });
+  assert.deepEqual(issueOpenedFlags, { shouldReview: false, shouldTag: true });
+  assert.equal(routeEvent({ action: 'edited', issue: { number: 7 } }, issuesEnv()).kind, 'issue-update');
+  assert.equal(routeEvent({ action: 'reopened', issue: { number: 7 } }, issuesEnv()).kind, 'issue-update');
+  assert.equal(routeEvent(
+    { action: 'opened', issue: { number: 7 }, sender: { login: 'bot[bot]', type: 'User' } },
+    issuesEnv()).kind, 'ignore');
+  assert.equal(routeEvent(
+    { action: 'opened', issue: { number: 7 }, sender: { login: 'human', type: 'Bot' } },
+    issuesEnv()).kind, 'ignore');
+
+  // issue_comment matrix.
+  const commentEnv = (): NodeJS.ProcessEnv =>
+    ({ GITHUB_EVENT_NAME: 'issue_comment', GITHUB_REPOSITORY: 'sample/repository' } as NodeJS.ProcessEnv);
+  const prComment = (body: string, user = { login: 'maintainer', type: 'User' }) => ({
+    action: 'created',
+    repository: { full_name: 'sample/repository' },
+    issue: { number: 41, pull_request: {} },
+    comment: { body, user },
+  });
+  assert.equal(routeEvent(prComment('/review'), commentEnv()).kind, 'manual-pr-review');
+  assert.equal(routeEvent({ ...prComment('/review'), action: 'edited' }, commentEnv()).kind, 'manual-pr-review');
+  assert.equal(routeEvent(prComment('@pocketguard review'), commentEnv()).kind, 'manual-pr-review');
+  assert.equal(routeEvent(prComment('@pocketguard /review'), commentEnv()).kind, 'manual-pr-review');
+  assert.equal(routeEvent(prComment('/explain'), commentEnv()).kind, 'manual-pr-review');
+  assert.equal(routeEvent(prComment('hello'), commentEnv()).kind, 'ignore');
+  assert.equal(routeEvent(prComment('@pocketguard'), commentEnv()).kind, 'ignore');
+  assert.equal(routeEvent(prComment('/triage'), commentEnv()).kind, 'ignore');
+  assert.equal(routeEvent(
+    prComment('/review', { login: 'pocketguard[bot]', type: 'Bot' }), commentEnv()).kind, 'ignore');
+  assert.equal(routeEvent({
+    action: 'created',
+    repository: { full_name: 'sample/repository' },
+    issue: { number: 41, pull_request: {} },
+    comment: { body: '/review', user: { login: 'maintainer', type: 'User' } },
+    sender: { login: 'github-actions[bot]', type: 'Bot' },
+  }, commentEnv()).kind, 'ignore');
+
+  const issueComment = (body: string) => ({
+    action: 'created',
+    repository: { full_name: 'sample/repository' },
+    issue: { number: 7, title: 't' },
+    comment: { body, user: { login: 'human', type: 'User' } },
+  });
+  assert.equal(routeEvent(issueComment('looks good'), commentEnv()).kind, 'issue-update');
+  assert.equal(routeEvent({ ...issueComment('looks good'), action: 'edited' }, commentEnv()).kind, 'issue-update');
+  assert.equal(routeEvent({
+    action: 'created',
+    repository: { full_name: 'sample/repository' },
+    issue: { number: 7 },
+    comment: { body: 'bot note', user: { login: 'bot[bot]', type: 'User' } },
+  }, commentEnv()).kind, 'ignore');
+
+  // Tag mode forwards routing flags and snapshot identity to GITHUB_OUTPUT.
+  const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-route-event-'));
+  try {
+    const outputPath = path.join(tempDirectory, 'tag-outputs.txt');
+    await runTagMode({
+      event: {
+        action: 'opened',
+        repository: { full_name: 'sample/repository' },
+        pull_request: {
+          number: 41, title: 't',
+          base: { sha: BASE_SHA }, head: { sha: HEAD_SHA, repo: { full_name: 'sample/repository' } },
+        },
+      },
+      env: {
+        ...prEnv(),
+        GITHUB_OUTPUT: outputPath,
+        GITHUB_ACTOR: 'sample',
+        POCKETGUARD_REPO_OWNER: 'sample',
+      } as NodeJS.ProcessEnv,
+      writeStdout: () => undefined,
+      runGit: () => { throw new Error('no git needed for routing outputs'); },
+    });
+    const outputs = fs.readFileSync(outputPath, 'utf8');
+    assert.match(outputs, /^should_review=true$/m);
+    assert.match(outputs, /^should_tag=true$/m);
+    assert.match(outputs, /^reason=.+$/m);
+    assert.match(outputs, /^route_kind=first-review$/m);
+    assert.match(outputs, /^is_owner=true$/m);
+  } finally {
+    fs.rmSync(tempDirectory, { recursive: true, force: true });
+  }
+
+  // Workflow triggers cover edited/reopened issue paths and edited comments.
+  const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');
+  assert.match(workflow, /issues:\s*\n\s*types:\s*\[opened,\s*edited,\s*reopened\]/);
+  assert.match(workflow, /issue_comment:\s*\n\s*types:\s*\[created,\s*edited\]/);
+  assert.match(workflow, /POCKETGUARD_REPO_OWNER:\s*\$\{\{\s*github\.repository_owner\s*\}\}/);
+
+  console.log('[PocketGuard route-event tests] All tests passed.');
 }

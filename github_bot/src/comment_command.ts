@@ -18,12 +18,16 @@ const COMMANDS = new Map<string, CommentCommand>([
 
 export function classifyCommentCommand(commentBody: string): CommentCommand {
   const body = typeof commentBody === 'string' ? commentBody : '';
-  const slashCommand = body.match(/(?:^|\s)(\/[a-z][a-z0-9-]*)\b/i)?.[1]?.toLowerCase();
+  // Normalize fullwidth variants so ／review / ＠pocketguard behave like ASCII.
+  // Code-fence/quote stripping is NOT handled here (known limitation, see README).
+  const normalized = body.replace(/／/g, '/').replace(/＠/g, '@');
+  const slashCommand = normalized.match(/(?:^|\s)(\/[a-z][a-z0-9-]*)\b/i)?.[1]?.toLowerCase();
   if (slashCommand) return COMMANDS.get(slashCommand) ?? 'unsupported';
 
-  const mentionCommand = body.match(/(?:^|\s)@pocketguard\s+(review|triage|explain|fix|fix-ci)\b/i)?.[1]?.toLowerCase();
+  const mentionCommand = normalized.match(/(?:^|\s)@pocketguard\s+\/?(review|triage|explain|fix|fix-ci)\b/i)?.[1]?.toLowerCase();
   if (mentionCommand) return COMMANDS.get(`/${mentionCommand}`) ?? 'unsupported';
-  if (/(?:^|\s)@pocketguard\b/i.test(body)) return 'review';
+  // Bare "@pocketguard" (no verb) is NOT a review command; it classifies as
+  // unsupported so PR re-review requires an explicit instruction.
   return 'unsupported';
 }
 

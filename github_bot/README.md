@@ -12,7 +12,31 @@ Run from this directory after installing the committed lockfile with `npm ci --i
 - `node_modules/.bin/ts-node src/github_runner.ts --mode=review` runs the deterministic scanner, then writes `review-output.json` (or JSON to stdout when `POCKETGUARD_OUTPUT` is unset). A deterministic `BLOCK` stops the review before any OpenAI request. If there is no deterministic `BLOCK`, the review makes one single-turn OpenAI request for each of the chief, Android security/policy, and Android code roles in parallel.
 - `node_modules/.bin/ts-node src/github_runner.ts --mode=publish` reads the review output, updates only a marker comment authored by the authenticated bot (otherwise creates one), and adds allowlisted labels. It does not call OpenAI.
 
-Supported comment commands are `/review`, `/triage`, `/explain`, `/fix`, and `/fix-ci`. `/triage` is issue-only; commands requiring a diff are pull-request-only. A bare `@pocketguard` mention falls back to review. Unknown slash commands are ignored. Command classification does not itself perform code changes or issue triage. Triage applies only to automatic labeling on `issues opened`; a comment `/triage` on an issue is currently a legal no-op (no comment or label writes, no crash).
+Supported comment commands are `/review`, `/triage`, `/explain`, `/fix`, and `/fix-ci` (ASCII `/` or fullwidth `／`). `/triage` is issue-only; commands requiring a diff (`/review`, `/explain`, `/fix`, `/fix-ci`) are pull-request-only. Explicit mention forms `@pocketguard review` and `@pocketguard /review` are accepted and equivalent to `/review` (the same verb rule applies to `triage`, `explain`, `fix`, and `fix-ci`). A bare `@pocketguard` mention with no verb is `unsupported` and never triggers a review. Unknown slash commands are ignored. Command classification does not itself perform code changes or issue triage. Triage applies only to automatic labeling on `issues opened`; a comment `/triage` on an issue is currently a legal no-op (no comment or label writes, no crash).
+
+Known limitation: code-fence or quote stripping is not performed, so a command-looking string inside a fenced block or quotation still classifies as that command. Later stages treat only routed kinds as actionable, but authors should still use explicit standalone commands.
+
+## Event routing (read-only, S3)
+
+Every event is first classified by the pure `routeEvent()` function into one of `first-review`, `issue-update`, `manual-pr-review`, `owner-commit`, or `ignore`, with a human-readable `reason`. Tag mode emits `should_review`, `should_tag`, `reason`, and a snapshot identity (`route_kind`, `actor`, `repo_owner`, `is_owner`, `event_name`, `event_action`) to both `GITHUB_OUTPUT` and the result JSON. Routing performs no review, labeling, counting, or sticky writes; S4/S5 consume these flags.
+
+- `pull_request_target opened/reopened` → `first-review` (regardless of fork/same-repo or author permission; fork filtering stays in the `safe_review` gate). Issues `opened` by a human is also `first-review`, but requests tagging context only (`should_review=false`, `should_tag=true`).
+- `pull_request_target synchronize` by the repository owner → `owner-commit` (`should_review=true`); a non-owner synchronize → `ignore` with an owner-only reason.
+- `issues edited/reopened` by a human, or any human `issue_comment` on an issue (bot senders excluded) → `issue-update` (`should_review=false`, `should_tag=true`).
+- `issue_comment created/edited` on a pull request with an explicit diff-needing command (`review`, `explain`, `fix`, `fix-ci`, via slash or `@pocketguard` verb form) → `manual-pr-review`. Anything else on a PR (`unsupported`, ordinary chatter, `/triage`) → `ignore`.
+- Bot-authored or bot-sent comments (account `type` `Bot`, case-insensitive, or a login ending in `[bot]`) → `ignore` (loop protection). Other unknown events or actions → `ignore`.
+
+Flag summary: `should_tag` is true for every non-`ignore` kind; `should_review` is true for pull-request `first-review`, `manual-pr-review`, and `owner-commit`, and false for issue `first-review`, all `issue-update`, and `ignore`.
+
+## Owner identity
+
+Owner means the repository owner (`github.repository_owner`, passed as `POCKETGUARD_REPO_OWNER`), compared case-insensitively against the actor (`GITHUB_ACTOR`, falling back to `event.sender.login`). Commit-author strings are never used. Either side missing or blank means non-owner (fail-closed toward `ignore`).
+
+## Triggers
+
+- `pull_request_target`: `opened`, `reopened`, `synchronize`.
+- `issues`: `opened`, `edited`, `reopened`.
+- `issue_comment`: `created`, `edited` (the authorization gate accepts `created` and `edited`; `deleted` and missing actions deny).
 
 ## Configuration
 

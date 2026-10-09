@@ -265,6 +265,7 @@ class ProviderTransportTest {
     /** Counts bytes consumed at the client ResponseBody source boundary, not bytes the server queued. */
     private class ResponseBodyReadSignals {
         val consumedBytes = AtomicLong()
+        val readEntered = CountDownLatch(1)
         val calls = CallSignals()
 
         private val countingInterceptor = object : Interceptor {
@@ -274,6 +275,9 @@ class ProviderTransportTest {
                 val counted = object : ResponseBody() {
                     private val countedSource: BufferedSource = object : ForwardingSource(delegate.source()) {
                         override fun read(sink: Buffer, byteCount: Long): Long {
+                            // Entry latch: count down before the blocking delegate read so
+                            // cancellation tests can prove the Job was inside source.read().
+                            readEntered.countDown()
                             val read = super.read(sink, byteCount)
                             if (read > 0L) consumedBytes.addAndGet(read)
                             return read
@@ -643,6 +647,25 @@ class ProviderTransportTest {
                 server.enqueue(MockResponse().setBody(body))
                 assertEquals(listOf("budget-model"), providerFor(protocol, server).listModels())
                 assertEquals("$protocol uses one model-list request", 1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun modelListChunkedAtExactlyOneMiBAcceptsValidJsonForEveryProtocol() = runBlocking {
+        // Unknown-length twin of the exact-cap success: the same 1MiB JSON over
+        // chunked encoding must pass via the one-byte sentinel EOF probe.
+        val body = modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES)
+        assertEquals(MODEL_LIST_BODY_LIMIT_BYTES, body.toByteArray(Charsets.UTF_8).size)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                server.enqueue(MockResponse().setChunkedBody(body, 1024))
+                assertEquals(listOf("budget-model"), providerFor(protocol, server).listModels())
+                assertEquals("$protocol chunked exact-cap uses one model-list request", 1, server.requestCount)
             } finally {
                 server.shutdown()
             }
@@ -1193,6 +1216,10 @@ class ProviderTransportTest {
                     "$protocol error headers arrive before body delay",
                     withContext(Dispatchers.IO) { signals.calls.headers.await(3, TimeUnit.SECONDS) },
                 )
+                assertTrue(
+                    "$protocol error-prefix read entered before cancel",
+                    withContext(Dispatchers.IO) { signals.readEntered.await(3, TimeUnit.SECONDS) },
+                )
                 withTimeout(1_500) { active.cancelAndJoin() }
                 assertCallCancelled(signals, "$protocol error-prefix cancellation")
                 withTimeoutOrNull(1_500) { active.join() }
@@ -1237,6 +1264,10 @@ class ProviderTransportTest {
                 assertTrue(
                     "$protocol SSE error headers arrive before body delay",
                     withContext(Dispatchers.IO) { signals.calls.headers.await(3, TimeUnit.SECONDS) },
+                )
+                assertTrue(
+                    "$protocol SSE error-prefix read entered before cancel",
+                    withContext(Dispatchers.IO) { signals.readEntered.await(3, TimeUnit.SECONDS) },
                 )
                 withTimeout(1_500) { active.cancelAndJoin() }
                 assertCallCancelled(signals, "$protocol SSE error-prefix cancellation")

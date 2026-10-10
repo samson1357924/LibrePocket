@@ -31,6 +31,7 @@ import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
 
@@ -358,9 +359,12 @@ class TurnController(
       // Stage B: the logical turn id exists before the first suspension
       // (onTurnStarted ack), so a cancel parked on that ack still attributes
       // to this turn instead of falling back to the previous assistant.
+      // Stage C: the attempt index ref travels with the attempt id ref so a
+      // cancel in any retry gap attributes to the live attempt's family.
       val logicalTurnId = newId()
       val attemptRef = AtomicReference(logicalTurnId)
-      val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef) }
+      val attemptIndexRef = AtomicInteger(0)
+      val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef, attemptIndexRef) }
       inFlight = job
       job.invokeOnCompletion {
         synchronized(lock) {
@@ -452,9 +456,11 @@ class TurnController(
         it.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
       }
       // Same Stage B ownership as startTurn: id before first suspension.
+      // Stage C: attempt index ref travels with the attempt id ref.
       val logicalTurnId = newId()
       val attemptRef = AtomicReference(logicalTurnId)
-      val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef) }
+      val attemptIndexRef = AtomicInteger(0)
+      val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef, attemptIndexRef) }
       inFlight = job
       job.invokeOnCompletion {
         synchronized(lock) {
@@ -733,29 +739,34 @@ class TurnController(
   }
 
   /**
-   * Hosts one logical turn. [logicalTurnId] and [attemptRef] are created
-   * before the host launches (before the first suspension), so a cancel
-   * parked on the `onTurnStarted` ack still attributes to this turn.
+   * Hosts one logical turn. [logicalTurnId] and [attemptRef]/[attemptIndexRef]
+   * are created before the host launches (before the first suspension), so a
+   * cancel parked on the `onTurnStarted` ack still attributes to this turn.
    * Cancel always records the current attempt id + that attempt's text
    * (pre-placeholder partial is "" with this turn's id); it never falls
    * back to a previous turn's id and never uses an empty runId. If the user
    * row itself is not yet durable, the cancel terminal still uses this
    * turn's id (ordered behind the started entry, or INTERRUPTED-marked on
-   * store/seal failure).
+   * store/seal failure). Stage C: the cancel terminal carries the logical
+   * family linkage (`parentRunId` + `attemptIndex`) like every other attempt
+   * terminal.
    */
   private suspend fun hostedTurn(
     text: String,
     images: List<ChatImageRef>,
     logicalTurnId: String,
     attemptRef: AtomicReference<String>,
+    attemptIndexRef: AtomicInteger,
   ) {
     val self = coroutineContext[Job]
     try {
-      runTurnLoop(text, images, logicalTurnId, attemptRef)
+      runTurnLoop(text, images, logicalTurnId, attemptRef, attemptIndexRef)
     } catch (e: CancellationException) {
       // Current attempt only: attemptRef tracks the live attempt across
       // retries/sleeper gaps, so this never reuses a previous turn's id.
       val cancelId = attemptRef.get()
+      val cancelIndex = attemptIndexRef.get()
+      val cancelParent = parentFor(cancelId, logicalTurnId)
       val cancelText = assistantTextOf(cancelId)
       // Durable and non-cancellable: the host is cancelled but the session
       // writer is independent, so this record still drains on close (or is
@@ -768,7 +779,7 @@ class TurnController(
       // already INTERRUPTED-marked: keep the original cancellation.
       withContext(NonCancellable) {
         try {
-          orderedTranscript.onTurnCancelled(cancelId, cancelText)
+          orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex)
         } catch (_: ClosedSendChannelException) {
           // Sealed after close(): explicit INTERRUPTED mark already recorded.
         } catch (sealFailure: CancellationException) {
@@ -894,7 +905,8 @@ class TurnController(
       // Follow-up owns a fresh logical id, also created before launch.
       val followLogicalId = newId()
       val followAttemptRef = AtomicReference(followLogicalId)
-      val follow = scope.launch { hostedTurn(next.text, next.images, followLogicalId, followAttemptRef) }
+      val followAttemptIndexRef = AtomicInteger(0)
+      val follow = scope.launch { hostedTurn(next.text, next.images, followLogicalId, followAttemptRef, followAttemptIndexRef) }
       inFlight = follow
       follow.invokeOnCompletion {
         synchronized(lock) {
@@ -943,11 +955,20 @@ class TurnController(
     }
   }
 
+  /**
+   * Stage C family linkage: the first attempt reuses the logical id (parent
+   * stays null for byte-compat with pre-C rows); later attempts get
+   * `parentRunId=logicalTurnId`. Retry notices already bind the logical id.
+   */
+  private fun parentFor(attemptRunId: String, logicalTurnId: String): String? =
+    if (attemptRunId == logicalTurnId) null else logicalTurnId
+
   private suspend fun runTurnLoop(
     text: String,
     images: List<ChatImageRef>,
     logicalTurnId: String,
     attemptRef: AtomicReference<String>,
+    attemptIndexRef: AtomicInteger,
   ) {
     // One logical turn owns exactly one user row (logicalTurnId, created
     // before launch), durably acked before the first provider attempt.
@@ -957,6 +978,10 @@ class TurnController(
     // completes in call order. attemptRef always holds the live attempt id
     // (sleeper gaps keep the just-failed id until the next id is minted), so
     // the hostedTurn cancel handler never needs the global latest assistant.
+    // Stage C: every attempt terminal (success, terminal failure, retried
+    // partial, cancel) carries parentRunId/attemptIndex so the logical family
+    // (parentRunId ?: runId) owns the full attempt chain; retry notices stay
+    // bound to the logical id.
     orderedTranscript.onTurnStarted(logicalTurnId, text)
     var attempt = 0
     var attemptRunId = logicalTurnId
@@ -1041,13 +1066,16 @@ class TurnController(
       }
       val failure = failed
       if (failure == null) {
-        orderedTranscript.onTurnSucceeded(attemptRunId, assistantTextOf(attemptRunId))
+        orderedTranscript.onTurnSucceeded(
+          attemptRunId, assistantTextOf(attemptRunId),
+          parentFor(attemptRunId, logicalTurnId), attempt,
+        )
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
       // starts a brand-new assistant block with a brand-new runId. Phase 3
       // persists the failed partial structurally: the ledger row keeps the
-      // partial text with isPartial=1 plus the sanitized reason (three-arg
+      // partial text with isPartial=1 plus the sanitized reason (parent-aware
       // onTurnFailed), while UI memory keeps the same fragment flagged.
       if (!failure.retryable || attempt >= retryConfig.maxRetries) {
         val clean = sanitizeError(failure.message)
@@ -1055,9 +1083,22 @@ class TurnController(
           activityRevision++
           _uiState.update { it.copy(status = ChatStatus.ERROR, error = clean) }
         }
-        orderedTranscript.onTurnFailed(attemptRunId, assistantTextOf(attemptRunId), clean)
+        orderedTranscript.onTurnFailed(
+          attemptRunId, assistantTextOf(attemptRunId), clean,
+          parentFor(attemptRunId, logicalTurnId), attempt,
+        )
         return
       }
+      // Stage C: persist the retried partial BEFORE the retry notice, so a
+      // retryable failure's intermediate fragment survives reopen/export even
+      // when the next attempt later succeeds. Same durable three-arg form as
+      // the terminal failure above (isPartial=1 + sanitized reason), bound to
+      // the same logical family.
+      val retriedClean = sanitizeError(failure.message)
+      orderedTranscript.onTurnFailed(
+        attemptRunId, assistantTextOf(attemptRunId), retriedClean,
+        parentFor(attemptRunId, logicalTurnId), attempt,
+      )
       attempt += 1
       val waitMs = retryConfig.delayForRetry(attempt)
       // Bound to the logical turn (single user row), not to the failed
@@ -1066,12 +1107,17 @@ class TurnController(
       try {
         sleeper(waitMs)
       } catch (e: CancellationException) {
+        // A cancel during the backoff gap still attributes to the just-failed
+        // attempt (its partial is already durable above); the new id is minted
+        // only after the sleep, so rethrow without minting.
         throw e
       }
       attemptRunId = newId()
       // Publish before the next placeholder: a cancel in the gap still sees
-      // the just-failed id only until the new id is minted here.
+      // the just-failed id only until the new id is minted here. The index
+      // travels with the id so the cancel terminal keeps the family linkage.
       attemptRef.set(attemptRunId)
+      attemptIndexRef.set(attempt)
     }
   }
 

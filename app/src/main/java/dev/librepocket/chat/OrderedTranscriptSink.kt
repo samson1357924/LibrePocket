@@ -132,14 +132,32 @@ class OrderedTranscriptSink(
   override suspend fun onTurnSucceeded(runId: String, text: String) =
     writeCore(runId) { delegate.onTurnSucceeded(runId, text) }
 
+  override suspend fun onTurnSucceeded(runId: String, text: String, parentRunId: String?, attemptIndex: Int?) =
+    writeCore(runId) { delegate.onTurnSucceeded(runId, text, parentRunId, attemptIndex) }
+
   override suspend fun onTurnFailed(runId: String, error: String) =
     writeCore(runId) { delegate.onTurnFailed(runId, error) }
 
   override suspend fun onTurnFailed(runId: String, partialText: String, error: String) =
     writeCore(runId) { delegate.onTurnFailed(runId, partialText, error) }
 
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) = writeCore(runId) { delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex) }
+
   override suspend fun onTurnCancelled(runId: String, partialText: String) =
     writeCore(runId) { delegate.onTurnCancelled(runId, partialText) }
+
+  override suspend fun onTurnCancelled(
+    runId: String,
+    partialText: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) = writeCore(runId) { delegate.onTurnCancelled(runId, partialText, parentRunId, attemptIndex) }
 
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) =
     writeOrdered { delegate.onTurnRetried(runId, attempt, maxAttempts, delayMs) }

@@ -24,6 +24,18 @@ package dev.librepocket.chat
 interface TranscriptSink {
   suspend fun onTurnStarted(runId: String, text: String)
   suspend fun onTurnSucceeded(runId: String, text: String)
+  /**
+   * Stage C (implemented): attempt-bound success terminal linked to its
+   * logical turn. [parentRunId] is the logical turn id (null when
+   * `runId` already is the logical id, i.e. the first attempt);
+   * [attemptIndex] is the 0-based attempt number. The default forwards to
+   * the legacy two-arg form (dropping the linkage) so existing fakes keep
+   * compiling; production ([dev.librepocket.chat.TurnController] →
+   * [dev.librepocket.session.SessionTranscriptSink]) always calls this form.
+   */
+  suspend fun onTurnSucceeded(runId: String, text: String, parentRunId: String?, attemptIndex: Int?) {
+    onTurnSucceeded(runId, text)
+  }
   suspend fun onTurnFailed(runId: String, error: String)
   /**
    * Phase 3 (implemented): terminal failure that keeps BOTH the partial
@@ -40,8 +52,31 @@ interface TranscriptSink {
   suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
     onTurnFailed(runId, error)
   }
+  /**
+   * Stage C (implemented): attempt-bound failure terminal (including retried
+   * partials written before the retry notice) linked to its logical turn.
+   * Same [parentRunId]/[attemptIndex] semantics as the success overload. The
+   * default forwards to the three-arg form so existing fakes keep compiling.
+   */
+  suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) {
+    onTurnFailed(runId, partialText, error)
+  }
   suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long)
   suspend fun onTurnCancelled(runId: String, partialText: String)
+  /**
+   * Stage C (implemented): attempt-bound cancel terminal linked to its
+   * logical turn. Same [parentRunId]/[attemptIndex] semantics as above. The
+   * default forwards to the two-arg form so existing fakes keep compiling.
+   */
+  suspend fun onTurnCancelled(runId: String, partialText: String, parentRunId: String?, attemptIndex: Int?) {
+    onTurnCancelled(runId, partialText)
+  }
   suspend fun onSteerQueued(text: String)
 
   /** One tool call finished (P1 records only, never executes). */

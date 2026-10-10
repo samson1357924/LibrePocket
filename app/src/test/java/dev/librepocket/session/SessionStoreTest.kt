@@ -395,6 +395,8 @@ class SessionStoreTest {
                 now,
                 false,
                 null,
+                null,
+                null,
             ),
         )
 

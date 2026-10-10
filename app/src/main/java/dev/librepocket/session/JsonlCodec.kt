@@ -22,6 +22,12 @@ val VALID_KINDS: Set<String> = setOf("user", "assistant", "tool", "steer", "retr
  * `failureReason` (string, omitted when null). Both keys are optional on
  * decode: lines exported before Phase 3 have neither and read back as
  * `isPartial=false` / `failureReason=null`.
+ *
+ * Stage C (implemented): attempt-bound assistant terminals additionally carry
+ * `parentRunId` (logical turn id, omitted when null) and `attemptIndex`
+ * (0-based attempt number, omitted when null). Both keys are optional on
+ * decode: pre-C lines have neither and read back as null (single-id legacy
+ * semantics: family = `runId`).
  */
 data class JsonlLine(
     val seq: Long,
@@ -32,6 +38,8 @@ data class JsonlLine(
     val createdAt: Long,
     val isPartial: Boolean = false,
     val failureReason: String? = null,
+    val parentRunId: String? = null,
+    val attemptIndex: Int? = null,
 )
 
 /**
@@ -54,6 +62,8 @@ object JsonlCodec {
             put("createdAt", event.createdAt)
             put("isPartial", event.isPartial)
             if (event.failureReason != null) put("failureReason", event.failureReason)
+            if (event.parentRunId != null) put("parentRunId", event.parentRunId)
+            if (event.attemptIndex != null) put("attemptIndex", event.attemptIndex)
         }.toString()
 
     /** Parses one line; throws [IllegalArgumentException] naming only the line number. */
@@ -94,6 +104,22 @@ object JsonlCodec {
                 prim.content
             }
         }
+        // Stage C optional keys: absent (pre-C exports) → null (single-id legacy).
+        val parentRunId = when (val raw = obj["parentRunId"]) {
+            null, is JsonNull -> null
+            else -> {
+                val prim = raw.jsonPrimitive
+                if (!prim.isString) fail()
+                prim.content
+            }
+        }
+        val attemptIndex = when (val raw = obj["attemptIndex"]) {
+            null, is JsonNull -> null
+            else -> {
+                val prim = raw.jsonPrimitive
+                prim.intOrNull ?: fail()
+            }
+        }
         val parsed = JsonlLine(
             seq = seq,
             runId = str("runId"),
@@ -103,6 +129,8 @@ object JsonlCodec {
             createdAt = createdAt,
             isPartial = isPartial,
             failureReason = failureReason,
+            parentRunId = parentRunId,
+            attemptIndex = attemptIndex,
         )
         if (parsed.kind !in VALID_KINDS) fail()
         // Reject nonsensical fields early (spec §8.5): seqs start at 1 and the
@@ -112,6 +140,8 @@ object JsonlCodec {
         if (parsed.runId.isBlank()) fail()
         if (parsed.imagesOmitted < 0) fail()
         if (parsed.createdAt < 0) fail()
+        if (parsed.parentRunId != null && parsed.parentRunId.isBlank()) fail()
+        if (parsed.attemptIndex != null && parsed.attemptIndex < 0) fail()
         return parsed
     }
 }

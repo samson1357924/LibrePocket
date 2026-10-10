@@ -17,6 +17,15 @@ import androidx.room.PrimaryKey;
  * destructive migration); pre-migration rows read back as
  * {@code isPartial=false} / {@code failureReason=null}.
  *
+ * <p>Stage C (implemented): nullable {@code parentRunId TEXT} links each
+ * attempt-bound assistant terminal back to its logical turn
+ * ({@code runId=attemptRunId}, {@code parentRunId=logicalTurnId}; the first
+ * attempt reuses the logical id so its parent stays null), and nullable
+ * {@code attemptIndex INTEGER} carries the 0-based attempt number. Both
+ * arrived via {@code MIGRATION_2_3} (ALTER ADD COLUMN only, never a rebuild);
+ * pre-migration rows read back as {@code parentRunId=null} /
+ * {@code attemptIndex=null} (single-id legacy semantics).
+ *
  * <p>Written in Java so the plain {@code javac} annotation processor (already declared
  * in the build) generates the Room implementation; the store and tests stay in Kotlin.
  */
@@ -53,6 +62,13 @@ public class TranscriptEventEntity {
     // Phase 3: sanitized failure reason for failed rows; null otherwise.
     @ColumnInfo(name = "failureReason")
     private String failureReason;
+    // Stage C: logical turn id for attempt-bound assistant terminals; null for
+    // user/retry rows and all pre-C rows (single-id legacy semantics).
+    @ColumnInfo(name = "parentRunId")
+    private String parentRunId;
+    // Stage C: 0-based attempt number for attempt rows; null for user/legacy rows.
+    @ColumnInfo(name = "attemptIndex")
+    private Integer attemptIndex;
 
     public TranscriptEventEntity(
             long rowId,
@@ -65,7 +81,9 @@ public class TranscriptEventEntity {
             int imagesOmitted,
             long createdAt,
             boolean partial,
-            String failureReason) {
+            String failureReason,
+            String parentRunId,
+            Integer attemptIndex) {
         this.rowId = rowId;
         this.sessionId = sessionId;
         this.seq = seq;
@@ -77,6 +95,8 @@ public class TranscriptEventEntity {
         this.createdAt = createdAt;
         this.partial = partial;
         this.failureReason = failureReason;
+        this.parentRunId = parentRunId;
+        this.attemptIndex = attemptIndex;
     }
 
     public long getRowId() {
@@ -165,5 +185,21 @@ public class TranscriptEventEntity {
 
     public void setFailureReason(String failureReason) {
         this.failureReason = failureReason;
+    }
+
+    public String getParentRunId() {
+        return parentRunId;
+    }
+
+    public void setParentRunId(String parentRunId) {
+        this.parentRunId = parentRunId;
+    }
+
+    public Integer getAttemptIndex() {
+        return attemptIndex;
+    }
+
+    public void setAttemptIndex(Integer attemptIndex) {
+        this.attemptIndex = attemptIndex;
     }
 }

@@ -268,8 +268,31 @@ class TurnControllerLedgerTest {
         users.single().runId,
         retries.single().runId,
       )
-      assertEquals(listOf("user", "retry", "assistant"), kindsOf(store))
-      assertEquals("recovered", store.events.last().text)
+      // Stage C: every retryable failure persists its partial terminal BEFORE
+      // the retry notice (here the first attempt emitted no deltas, so the
+      // partial keeps "" with the sanitized reason), then the success row.
+      assertEquals(listOf("user", "assistant", "retry", "assistant"), kindsOf(store))
+      val retriedPartial = store.events[1]
+      assertEquals("assistant", retriedPartial.kind)
+      assertTrue("retried partial must be flagged", retriedPartial.isPartial)
+      assertEquals("", retriedPartial.text)
+      assertEquals("boom", retriedPartial.failureReason)
+      assertEquals(
+        "first attempt reuses the logical id, so its parent stays null (pre-C compat)",
+        users.single().runId,
+        retriedPartial.runId,
+      )
+      assertEquals(null, retriedPartial.parentRunId)
+      assertEquals(0, retriedPartial.attemptIndex)
+      val success = store.events.last()
+      assertEquals("recovered", success.text)
+      assertEquals(users.single().runId, success.parentRunId)
+      assertEquals(1, success.attemptIndex)
+      // The success family completes the logical turn (no dangling).
+      assertTrue(
+        "retry-success family must not dangle",
+        dev.librepocket.agent.ui.chat.findDanglingRunIds(store.events).isEmpty(),
+      )
       // UI keeps one assistant block per attempt with distinct ids.
       val assistants = c.uiState.value.messages.filter { it.role == "assistant" }
       assertEquals(2, assistants.size)

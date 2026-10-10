@@ -233,13 +233,15 @@ interface SessionStore {
 data class TranscriptEvent(
   val seq: Long = 0,             // DB 自增；寫入時忽略
   val sessionId: String,
-  val runId: String,            // 同一 turn 共享；重試新 turn = 新 runId
+  val runId: String,            // user/retry 列 = logical turn id；assistant/tool/usage 列 = attempt id（首嘗試重用 logical id）
   val kind: String,             // "user" | "assistant" | "tool" | "steer" | "retry" | "system"
   val text: String,             // 已脫敏（寫入前強制過 Redactor，§6）
   val imagesOmitted: Int = 0,   // 圖片正文剝離計數（只存省略說明，不存位元組）
   val createdAt: Long,
   val isPartial: Boolean = false, // Phase 3：取消/失敗 assistant 半截標記
   val failureReason: String? = null, // Phase 3：失敗行的脫敏原因（其餘行為 null）
+  val parentRunId: String? = null, // Stage C：attempt assistant 終端回綁的 logical turn id（首嘗試為 null；舊列為 null）
+  val attemptIndex: Int? = null, // Stage C：0-based 嘗試序號（user/舊列為 null）
 )
 
 data class PrunePolicy(
@@ -436,7 +438,8 @@ object ProviderErrorClassifier {
 ### 5.3 重試語義
 
 - 失敗嘗試不提交 assistant history；前面已完成 turn 的工具記錄保持不變。
-- 重試用新 `runId` + 新 UI 輪次；失敗半截輸出保留標 `isPartial`，新輸出不拼接舊塊。
+- 一個 logical turn 只寫一列 user（`runId=logicalTurnId`）；首嘗試重用該 id，後續重試各用新 `runId=attemptRunId` + 新 UI 輪次，並以 `parentRunId=logicalTurnId` + `attemptIndex` 回綁（logical 家族語義）；失敗半截輸出保留標 `isPartial`，新輸出不拼接舊塊。
+- 每次 retryable 失敗先持久化該 attempt 的 partial 終端（`assistant` 列，`isPartial=1` + 脫敏 `failureReason`，已綁定家族），再寫 `retry` notice（`runId=logicalTurnId`）；重開/匯出不丟中間 partial。
 - 每次 `Retrying(attempt, max, delayMs)` 發射到 `Flow`，UI 顯示進度；等待期間 `cancel()` 立即中斷（`delay` 可取消）。
 - 3 次耗盡 → `Failed` 終態 + transcript `retry` 事件（記 attempts=3）。
 
@@ -542,6 +545,10 @@ data class TranscriptEventEntity(
   // 取消/失敗 assistant 半截（isPartial）+ 失敗行的脫敏原因（failureReason）。
   val isPartial: Boolean = false,      // 欄位名 `isPartial INTEGER NOT NULL DEFAULT 0`
   val failureReason: String? = null,   // 欄位名 `failureReason TEXT NULL`
+  // Stage C（DB version 3，Migration 2→3 向後相容加入；舊列預設 null/null）：
+  // attempt 終端回綁 logical turn（parentRunId）+ 0-based 嘗試序號（attemptIndex）。
+  val parentRunId: String? = null,     // 欄位名 `parentRunId TEXT NULL`
+  val attemptIndex: Int? = null,       // 欄位名 `attemptIndex INTEGER NULL`
 )
 ```
 
@@ -567,7 +574,7 @@ interface SessionDao {
 }
 ```
 
-- DB 名：`librepocket.db`；版本 2（Phase 3 起；`Migration(1, 2)` 以 `ALTER TABLE transcript_events ADD COLUMN isPartial INTEGER NOT NULL DEFAULT 0` + `ADD COLUMN failureReason TEXT` 向後相容升級，永不用 destructive migration；舊列讀回預設 `isPartial=false` / `failureReason=null`）。
+- DB 名：`librepocket.db`；版本 3（Stage C 起；`Migration(2, 3)` 以 `ALTER TABLE transcript_events ADD COLUMN parentRunId TEXT` + `ADD COLUMN attemptIndex INTEGER` 向後相容升級，永不用 destructive migration；舊列讀回預設 `parentRunId=null` / `attemptIndex=null`，即單 id 舊語義 `family = runId`。`Migration(1, 2)` 保留見上）。
 - `seq` 分配與插入必須在同一 `@Transaction`（`RoomSessionStore.appendEvent` 內 `withTransaction`）。
 - 並發：單一 `SessionStore` 實例 + `Mutex` 保證同 session `seq` 不重（Room 事務為第二道防線）。
 
@@ -595,14 +602,14 @@ ChatSessionImpl 產生 assistant 文本
 ```
 
 - `steer` 佇列內容寫 `kind="steer"` 事件（含排隊時間，供除錯）。
-- `Retrying` 寫 `kind="retry"` 事件（attempt/max/delayMs 結構化，不寫模型正文）。
-- turn succeeded 寫 `kind="assistant"`（`isPartial=0`）；cancel 寫 `kind="assistant"` 並置 `isPartial=1`（保留半截正文）；turn failed（三參數）寫 `kind="assistant"`（`isPartial=1`）+ `failureReason`（脫敏原因）；舊二參數 `onTurnFailed` 相容保留為 `kind="system"`（`text="turn <runId> failed: <reason>"`）。
+- `Retrying` 寫 `kind="retry"` 事件（attempt/max/delayMs 結構化，不寫模型正文；Stage C 起一律綁 `runId=logicalTurnId`，非 terminal）。
+- turn succeeded 寫 `kind="assistant"`（`isPartial=0`，Stage C 起帶 `parentRunId/attemptIndex` 回綁家族）；cancel 寫 `kind="assistant"` 並置 `isPartial=1`（保留半截正文，Stage C 起同樣回綁）；turn failed（三參數/五參數）寫 `kind="assistant"`（`isPartial=1`）+ `failureReason`（脫敏原因，Stage C 起回綁）；每次 retryable 失敗先寫該 attempt 的 partial 終端再寫 `retry` notice；舊二參數 `onTurnFailed` 相容保留為 `kind="system"`（`text="turn <runId> failed: <reason>"`）。
 
 ### 8.5 JSONL 匯出 / 匯入（目標介面；非目前 UI 流程）
 
-- 匯出：一行一 JSON（`{"seq":N,"runId":"…","kind":"…","text":"…(已脫敏)","imagesOmitted":0,"createdAt":…,"isPartial":false}`；Phase 3 起失敗/取消行另帶 `"failureReason":"…"`，`null` 時省略該鍵）+ 檔頭註解行？**無檔頭**（純 JSONL，`jq` 可直接處理）。
-- 匯入：逐行 `kotlinx.serialization` 解析 → 校验 `kind ∈ {…}` + `seq` 遞增 → 新 `sessionId` 重寫入；`isPartial` / `failureReason` 兩鍵可選（缺鍵的舊匯出讀回預設 `false` / `null`）；失敗行整批回滾（單事務），錯誤訊息只報行號不貼內容。
-- 續聊恢復（Phase 3）：`open` 在 meta 載入後、attach 前，把無 terminal 紀錄的 dangling turn（有 user 列而無同 runId assistant/失敗列）補一列 `kind="system"` 的 `turn <runId> interrupted` marker（replay 已過濾 system，不污染正常歷史）；已恢復的 user/assistant 前文（partial 列除外）納入首個 request，窗口上限介面見 `HistoryWindowCap`（量測出 token 預算前預設無截斷，截斷可觀察不靜默丟）。
+- 匯出：一行一 JSON（`{"seq":N,"runId":"…","kind":"…","text":"…(已脫敏)","imagesOmitted":0,"createdAt":…,"isPartial":false}`；Phase 3 起失敗/取消行另帶 `"failureReason":"…"`，`null` 時省略該鍵；Stage C 起 attempt 終端另帶 `"parentRunId":"…"` / `"attemptIndex":N`，`null` 時省略）+ 檔頭註解行？**無檔頭**（純 JSONL，`jq` 可直接處理）。
+- 匯入：逐行 `kotlinx.serialization` 解析 → 校验 `kind ∈ {…}` + `seq` 遞增 → 新 `sessionId` 重寫入；`isPartial` / `failureReason` / `parentRunId` / `attemptIndex` 四鍵可選（缺鍵的舊匯出讀回預設 `false` / `null` / `null` / `null`，即單 id 舊語義）；失敗行整批回滾（單事務），錯誤訊息只報行號不貼內容。
+- 續聊恢復（Phase 3；Stage C 改為 logical 家族判定）：`open` 在 meta 載入後、attach 前，把無 terminal 紀錄的 dangling 家族（有 user 列而同家族 `parentRunId ?: runId` 無 assistant/失敗列；retry/tool/steer 永非 terminal）補一列 `kind="system"` 的 `turn <familyId> interrupted` marker（replay 已過濾 system，不污染正常歷史）；retry→success 與 retry→terminal-failure 家族已擁 attempt 列，不誤標；已恢復的 user/assistant 前文（partial 列除外）納入首個 request，窗口上限介面見 `HistoryWindowCap`（量測出 token 預算前預設無截斷，截斷可觀察不靜默丟）。
 - 檔名：`librepocket-<sessionId8>-<yyyyMMddHHmm>.jsonl`；經 SAF 寫入用戶選位（P1 不自建 FileProvider 分享）。
 - 大小上限：單 session 匯出 ≤ 20 MiB（超限拒絕並提示 prune）。
 

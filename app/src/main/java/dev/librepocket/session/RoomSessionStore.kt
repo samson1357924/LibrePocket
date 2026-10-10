@@ -115,6 +115,47 @@ class RoomSessionStore(
         dao.eventsAfter(sessionId, afterSeq, limit).map { it.toEvent() }
     }
 
+    /**
+     * Stage E: one DESC query keeps the newest [limit] rows, then restores
+     * ascending order. Memory stays O(limit), never O(session).
+     */
+    override suspend fun loadTailEvents(
+        sessionId: String,
+        limit: Int,
+    ): List<TranscriptEvent> = withContext(Dispatchers.IO) {
+        require(limit > 0) { "limit must be positive" }
+        dao.eventsTail(sessionId, limit).map { it.toEvent() }.reversed()
+    }
+
+    override suspend fun countEvents(sessionId: String): Int =
+        withContext(Dispatchers.IO) {
+            dao.eventCount(sessionId)
+        }
+
+    /**
+     * Stage E: exact filtered total via one COUNT query (O(1) memory), so the
+     * truncation count is exact without scanning the session.
+     */
+    override suspend fun countHistoryEvents(
+        sessionId: String,
+        includePartial: Boolean,
+    ): Int = withContext(Dispatchers.IO) {
+        if (includePartial) dao.countUiHistory(sessionId) else dao.countModelHistory(sessionId)
+    }
+
+    /**
+     * Stage E: backward page (newest-first) via one DESC query. Memory stays
+     * O(limit), never O(session).
+     */
+    override suspend fun loadEventsBefore(
+        sessionId: String,
+        beforeSeq: Long,
+        limit: Int,
+    ): List<TranscriptEvent> = withContext(Dispatchers.IO) {
+        require(limit > 0) { "limit must be positive" }
+        dao.eventsBefore(sessionId, beforeSeq, limit).map { it.toEvent() }
+    }
+
     override suspend fun listSessions(): List<SessionMeta> = withContext(Dispatchers.IO) {
         dao.allSessions().map { it.toMeta() }
     }

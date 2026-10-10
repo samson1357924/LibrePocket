@@ -43,6 +43,12 @@ private val EMPTY_SESSION_STATE = ChatUiState(
 private const val HISTORY_PAGE = 200
 private const val HISTORY_CAP = 2000
 
+/** Stage E: tail-loaded replay prefix with its exact omitted-row count. */
+internal data class LoadedUiHistory(
+    val messages: List<UiMessage>,
+    val droppedCount: Int,
+)
+
 /**
  * Per-phase budget for the bounded pre-close ledger drain (Phase 2
  * conversation-ledger wiring): newChat / openSession / endpoint-switch /
@@ -79,6 +85,14 @@ class ChatViewModel(
     val sessionState: StateFlow<ChatUiState> = _sessionState.asStateFlow()
 
     private val _history = MutableStateFlow<List<UiMessage>>(emptyList())
+
+    /**
+     * Stage E: exact number of older replay rows omitted by the tail cap.
+     * Observable truncation (never silent): surfaces "已省略N則" without a
+     * new UI flow. Reset alongside [_history] on every load path.
+     */
+    private val _historyOmittedCount = MutableStateFlow(0)
+    val historyOmittedCount: StateFlow<Int> = _historyOmittedCount.asStateFlow()
 
     val messages: StateFlow<List<UiMessage>> =
         combine(_history, _sessionState) { history, live ->
@@ -757,7 +771,8 @@ class ChatViewModel(
                         return@withLock
                     }
 
-                    _history.value = loaded
+                    _history.value = loaded.messages
+                    _historyOmittedCount.value = loaded.droppedCount
                     attach(created, access.binding, creationGeneration)
                     attached = true
                     candidate = null
@@ -909,7 +924,10 @@ class ChatViewModel(
                 reconcileReadBinding(bindingOf(afterHistory))
                 return@withLock null
             }
-            if (replay != null) _history.value = replay
+            if (replay != null) {
+                _history.value = replay.messages
+                _historyOmittedCount.value = replay.droppedCount
+            }
         }
 
         val creationGeneration = generation
@@ -1165,6 +1183,7 @@ class ChatViewModel(
         _sessionState.value = EMPTY_SESSION_STATE
         if (binding == null) {
             _history.value = emptyList()
+            _historyOmittedCount.value = 0
             _currentSessionId.value = null
             pendingOps.clear()
             recoverableOps.clear()
@@ -1263,6 +1282,7 @@ class ChatViewModel(
         _notice.value = null
         if (clearChat) {
             _history.value = emptyList()
+            _historyOmittedCount.value = 0
             _currentSessionId.value = null
             pendingOps.clear()
             recoverableOps.clear()
@@ -1601,27 +1621,37 @@ class ChatViewModel(
         detachAndFlushClose(detached)
     }
 
-    private suspend fun loadHistory(sessionId: String): List<UiMessage>? {
-        val backing: SessionStore = sessions.storeOrNull() ?: return emptyList()
+    private suspend fun loadHistory(sessionId: String): LoadedUiHistory? {
+        val backing: SessionStore = sessions.storeOrNull() ?: return LoadedUiHistory(emptyList(), 0)
         if (backing.getSession(sessionId) == null) return null
-        val out = ArrayList<UiMessage>()
-        var afterSeq = 0L
-        while (out.size < HISTORY_CAP) {
-            val page = backing.loadEvents(sessionId, afterSeq, HISTORY_PAGE)
+        // Stage E tail semantics: newest replay rows first via backward
+        // paging (memory O(cap), never O(session); sparse seqs safe), then
+        // restored to oldest-first. Same filter as before (user/assistant incl.
+        // partial; system markers stay hidden).
+        val keptNewestFirst = ArrayList<UiMessage>(HISTORY_CAP)
+        var beforeSeq = Long.MAX_VALUE
+        outer@ while (keptNewestFirst.size < HISTORY_CAP) {
+            val page = backing.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
             if (page.isEmpty()) break
             for (event in page) {
                 if (event.kind == "user" || event.kind == "assistant") {
+                    if (keptNewestFirst.size >= HISTORY_CAP) break@outer
                     // Phase 3: restore the persisted partial flag (cancelled /
                     // failed fragments replay flagged, never as completed
                     // answers). System markers (INTERRUPTED / failure /
                     // usage) stay hidden from the chat replay by this filter.
-                    out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = event.isPartial))
+                    keptNewestFirst.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = event.isPartial))
                 }
-                afterSeq = event.seq
             }
+            val pageMin = page.minOf { it.seq }
+            if (pageMin >= beforeSeq) break
+            beforeSeq = pageMin
             if (page.size < HISTORY_PAGE) break
         }
-        return out
+        // Exact omitted-row total via one filtered COUNT (O(1) memory).
+        val total = backing.countHistoryEvents(sessionId, includePartial = true)
+        val dropped = (total - keptNewestFirst.size).coerceAtLeast(0)
+        return LoadedUiHistory(keptNewestFirst.asReversed(), dropped)
     }
 
     override fun onCleared() {

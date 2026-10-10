@@ -79,6 +79,91 @@ interface SessionStore {
     /** Page events by [afterSeq] (exclusive), ascending, at most [limit]. */
     suspend fun loadEvents(sessionId: String, afterSeq: Long = 0, limit: Int = 200): List<TranscriptEvent>
 
+    /**
+     * Stage E: newest [limit] events, ascending (oldest of the tail first).
+     * Default pages forward and keeps the tail (test-scale fakes); the Room
+     * store overrides with a single DESC query so resume never materializes
+     * the whole session (OOM-safe).
+     */
+    suspend fun loadTailEvents(sessionId: String, limit: Int): List<TranscriptEvent> {
+        require(limit > 0) { "limit must be positive" }
+        val all = ArrayList<TranscriptEvent>()
+        var afterSeq = 0L
+        while (true) {
+            val page = loadEvents(sessionId, afterSeq, 200)
+            if (page.isEmpty()) break
+            all.addAll(page)
+            afterSeq = page.last().seq
+            if (page.size < 200) break
+        }
+        return if (all.size <= limit) all else all.subList(all.size - limit, all.size)
+    }
+
+    /**
+     * Stage E: page backward from [beforeSeq] (exclusive), newest-first, at
+     * most [limit]. Backs the tail-fill loop so resume scans only the newest
+     * rows (sparse seqs safe: predicate is `seq <`, never an offset).
+     * Default pages forward and filters (test-scale fakes); the Room store
+     * overrides with a single DESC query.
+     */
+    suspend fun loadEventsBefore(
+        sessionId: String,
+        beforeSeq: Long,
+        limit: Int,
+    ): List<TranscriptEvent> {
+        require(limit > 0) { "limit must be positive" }
+        val all = ArrayList<TranscriptEvent>()
+        var afterSeq = 0L
+        while (true) {
+            val page = loadEvents(sessionId, afterSeq, 200)
+            if (page.isEmpty()) break
+            all.addAll(page)
+            afterSeq = page.last().seq
+            if (page.size < 200) break
+        }
+        return all.filter { it.seq < beforeSeq }.takeLast(limit).reversed()
+    }
+
+    /**
+     * Stage E: total stored events for one session. Drives the observable
+     * truncation count (`dropped = total - tail kept`). Default counts via
+     * paging; the Room store overrides with the DAO COUNT query.
+     */
+    suspend fun countEvents(sessionId: String): Int {
+        var total = 0
+        var afterSeq = 0L
+        while (true) {
+            val page = loadEvents(sessionId, afterSeq, 500)
+            if (page.isEmpty()) break
+            total += page.size
+            afterSeq = page.last().seq
+            if (page.size < 500) break
+        }
+        return total
+    }
+
+    /**
+     * Stage E: exact history-row total backing the observable truncation
+     * count. [includePartial]=false counts model-context rows
+     * (user/assistant, non-partial); true counts replay rows (user/assistant
+     * incl. partial). Default filters via paging; the Room store overrides
+     * with a filtered DAO COUNT query (one query, O(1) memory).
+     */
+    suspend fun countHistoryEvents(sessionId: String, includePartial: Boolean): Int {
+        var total = 0
+        var afterSeq = 0L
+        while (true) {
+            val page = loadEvents(sessionId, afterSeq, 500)
+            if (page.isEmpty()) break
+            total += page.count { e ->
+                (e.kind == "user" || e.kind == "assistant") && (includePartial || !e.isPartial)
+            }
+            afterSeq = page.last().seq
+            if (page.size < 500) break
+        }
+        return total
+    }
+
     /** Export one session as pure JSONL (no header; `jq`-parseable, spec §8.5). */
     suspend fun exportJsonl(sessionId: String, destFile: File)
 

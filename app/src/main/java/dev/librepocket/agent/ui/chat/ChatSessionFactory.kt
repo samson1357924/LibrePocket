@@ -45,6 +45,41 @@ private const val HISTORY_PAGE = 200
  */
 private const val HISTORY_LOAD_CAP = 2000
 
+/**
+ * Stage E: per-message char bound for model-context hydration. The write path
+ * already caps a stored row at 100k chars ([RoomSessionStore.MAX_TEXT_CHARS]);
+ * a single such row (~25k tokens at ~4 chars/token) must never reach the
+ * provider unbounded. 20k chars (~5k tokens) keeps one row a bounded fraction
+ * of any realistic context window while staying far above normal turns.
+ * Over-long rows are truncated with a visible marker (fail-closed, never
+ * silent). A measured token/byte budget is still TODO (see
+ * [HistoryWindowCap]); until it lands this char bound is the interim cap.
+ */
+internal const val MODEL_HISTORY_MAX_CHARS_PER_MESSAGE = 20_000
+
+/** Stage E: truncation marker appended to an over-long hydrated row. */
+internal const val HISTORY_TRUNCATION_MARKER = "…[history truncated]"
+
+/**
+ * Stage E: raw-row window for the INTERRUPTED backfill scan. Dangling turns
+ * are always recent (the first open after a kill marks them), so a bounded
+ * newest-first window replaces the old unbounded full load (OOM-safe).
+ * Best-effort: an ancient unmarked row outside the window stays for the next
+ * open, same as any failed backfill before.
+ */
+private const val BACKFILL_SCAN_LIMIT = 2000
+
+/**
+ * Stage E: tail-loaded model prefix. [droppedCount] is the exact number of
+ * older qualifying rows omitted by the cap — the observable counterpart to
+ * truncation (never silent; surfaced via [CreatedSession.historyDroppedCount]
+ * and [TurnController.droppedHistoryCount]).
+ */
+internal data class LoadedModelHistory(
+    val messages: List<ChatMessage>,
+    val droppedCount: Int,
+)
+
 /** Marker kind for RUNNING → INTERRUPTED backfill: hidden from chat replay, kept in export. */
 internal const val INTERRUPTED_MARKER_KIND = "system"
 
@@ -172,6 +207,12 @@ data class CreatedSession(
      * notice instead of resuming silently blank-context.
      */
     val historyWithheld: Boolean = false,
+    /**
+     * Stage E: exact number of older history rows omitted by the tail cap.
+     * 0 when everything fit. Observable truncation: callers surface
+     * "已省略N則" instead of resuming silently short-context.
+     */
+    val historyDroppedCount: Int = 0,
 )
 
 /** Session creation epoch millis → Instant; invalid (<=0 or out-of-range) omits. */
@@ -354,7 +395,11 @@ class ChatSessionFactory(
         // bookkeeping), but the stored rows only enter the new provider's
         // model context when their provenance matches this endpoint.
         val sameOrigin = isSameProviderOrigin(meta.model, endpoint.providerId)
-        val history = if (sameOrigin) loadModelHistory(store, sessionId) else emptyList()
+        // Stage E: tail load (newest kept) with an exact dropped count; the
+        // cap also travels as MaxMessages so TurnController.droppedHistoryCount
+        // observes the same truncation (defense in depth: pre-trimmed prefix
+        // makes the controller trim a no-op).
+        val loaded = if (sameOrigin) loadModelHistory(store, sessionId) else LoadedModelHistory(emptyList(), 0)
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
         val credential = captureCredential(endpoint)
@@ -372,7 +417,8 @@ class ChatSessionFactory(
                 userTimezone,
                 systemZone,
                 sessionStart,
-                history,
+                loaded.messages,
+                HistoryWindowCap.MaxMessages(HISTORY_LOAD_CAP),
             )
             session = openedSession
             requireCurrentBinding(keyIsCurrent)
@@ -382,6 +428,7 @@ class ChatSessionFactory(
                 endpoint.providerId,
                 model,
                 historyWithheld = !sameOrigin,
+                historyDroppedCount = loaded.droppedCount,
             )
         } catch (failure: Throwable) {
             try {
@@ -475,6 +522,7 @@ class ChatSessionFactory(
         systemZone: () -> ZoneId = this.systemZone,
         sessionStart: Instant? = null,
         history: List<ChatMessage> = emptyList(),
+        historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
     ): ChatSession {
         val keys = KeyProvider { ref ->
             if (keyIsCurrent()) credential.copyFor(ref) else null
@@ -490,7 +538,7 @@ class ChatSessionFactory(
             sessionStart = sessionStart,
             systemZone = systemZone,
             initialHistory = history,
-            historyCap = HistoryWindowCap.Unbounded,
+            historyCap = historyCap,
         )
         return CredentialBoundChatSession(session, credential)
     }
@@ -521,7 +569,11 @@ class ChatSessionFactory(
      */
     private suspend fun backfillInterrupted(store: SessionStore, sessionId: String) {
         try {
-            val dangling = findDanglingRunIds(loadAllEvents(store, sessionId))
+            // Stage E: bounded newest-first window instead of the old unbounded
+            // full load (OOM-safe). Dangling turns are recent by construction:
+            // the first open after a kill marks them, later opens are no-ops.
+            val tail = store.loadTailEvents(sessionId, BACKFILL_SCAN_LIMIT)
+            val dangling = findDanglingRunIds(tail)
             for (runId in dangling) {
                 try {
                     store.appendEvent(
@@ -543,38 +595,57 @@ class ChatSessionFactory(
     }
 
     /**
-     * Restored model-context prefix: stored user/assistant rows oldest-first,
-     * bounded like the display replay. Partial rows are excluded from model
-     * context (they replay in the UI flagged, but must never read as
-     * completed answers — mirroring the live `!isPartial` request filter);
-     * `system` markers stay export/debug-only via the same filter.
+     * Restored model-context prefix, Stage E tail semantics: the newest
+     * qualifying rows (user/assistant, non-partial) up to [HISTORY_LOAD_CAP],
+     * oldest-first, via backward paging (memory O(cap), never O(session);
+     * sparse seqs safe). Partial rows are excluded from model context (they
+     * replay in the UI flagged, but must never read as completed answers —
+     * mirroring the live `!isPartial` request filter); `system` markers stay
+     * export/debug-only via the same filter.
+     *
+     * Truncation is observable: [LoadedModelHistory.droppedCount] carries the
+     * exact omitted-row total (filtered COUNT query, O(1) memory). A giant
+     * single row is truncated to [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] with a
+     * visible marker — fail-closed, never a silent unbounded payload (a
+     * measured token budget is still TODO; the char bound is interim).
      *
      * Unlike the best-effort backfill, a history-read failure propagates:
      * resuming blind (without the context the model needs) fails closed
      * through the caller's UNKNOWN/NO_ENDPOINT path instead.
      */
-    private suspend fun loadModelHistory(store: SessionStore, sessionId: String): List<ChatMessage> {
-        val out = ArrayList<ChatMessage>(256)
-        for (event in loadAllEvents(store, sessionId)) {
-            if (out.size >= HISTORY_LOAD_CAP) break
-            if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
-                out.add(ChatMessage(role = event.kind, text = event.text))
-            }
-        }
-        return out
-    }
-
-    private suspend fun loadAllEvents(store: SessionStore, sessionId: String): List<TranscriptEvent> {
-        val out = ArrayList<TranscriptEvent>(256)
-        var afterSeq = 0L
-        while (true) {
-            val page = store.loadEvents(sessionId, afterSeq, HISTORY_PAGE)
+    internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): LoadedModelHistory {
+        val keptNewestFirst = ArrayList<ChatMessage>(HISTORY_LOAD_CAP)
+        var beforeSeq = Long.MAX_VALUE
+        outer@ while (keptNewestFirst.size < HISTORY_LOAD_CAP) {
+            val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
             if (page.isEmpty()) break
-            out.addAll(page)
-            afterSeq = page.last().seq
+            for (event in page) {
+                if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
+                    if (keptNewestFirst.size >= HISTORY_LOAD_CAP) break@outer
+                    keptNewestFirst.add(ChatMessage(role = event.kind, text = cappedHistoryText(event.text)))
+                }
+            }
+            // Pages are newest-first with distinct seqs; the next window ends
+            // strictly below this page's minimum. A non-advancing store would
+            // spin forever, so fail closed instead.
+            val pageMin = page.minOf { it.seq }
+            if (pageMin >= beforeSeq) break
+            beforeSeq = pageMin
             if (page.size < HISTORY_PAGE) break
         }
-        return out
+        val total = store.countHistoryEvents(sessionId, includePartial = false)
+        val dropped = (total - keptNewestFirst.size).coerceAtLeast(0)
+        return LoadedModelHistory(keptNewestFirst.asReversed(), dropped)
+    }
+
+    /**
+     * Stage E: fail-closed single-row bound. Rows longer than
+     * [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] are cut with a visible marker so
+     * the omission is observable in the payload itself, never silent.
+     */
+    internal fun cappedHistoryText(text: String): String {
+        if (text.length <= MODEL_HISTORY_MAX_CHARS_PER_MESSAGE) return text
+        return text.take(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE) + HISTORY_TRUNCATION_MARKER
     }
 
     /** The live provider never rereads a mutable alias after this snapshot. */

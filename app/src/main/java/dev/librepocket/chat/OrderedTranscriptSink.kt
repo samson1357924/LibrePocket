@@ -253,14 +253,21 @@ class OrderedTranscriptSink(
    * chained behind the previous parked send so admissions match offer order
    * regardless of dispatcher scheduling (a mutex cannot do this: acquisition
    * order is not offer order, and parked bodies still lose to direct sends).
-   * Mixed trySend/overflow interleavings under a continuously-full channel
-   * stay best-effort. A seal race after shutdown drops here with no recovery
+   *
+   * Stage E: the fast path is only taken when no parked predecessor exists.
+   * A later offer arriving while the overflow chain is non-empty joins the
+   * same admission path (queued behind the tail) instead of trySend-ing past
+   * it — otherwise a freed slot lets the newcomer overtake parked A,B
+   * (A,B,D,C reorder). Callers hold the controller lock, so the
+   * chain-check and the park below are mutually ordered with other offers;
+   * the synchronous getAndSet is the linearization point either way.
+   * A seal race after shutdown drops here with no recovery
    * path (`close()` clears the controller FIFO, so there is no drainQueued
    * fallback for it).
    */
   fun offerSteer(text: String) {
     val entry = Entry(runId = null, block = { delegate.onSteerQueued(text) })
-    if (channel.trySend(entry).isSuccess) return
+    if (overflowChain.get() == null && channel.trySend(entry).isSuccess) return
     val gate = CompletableDeferred<Unit>()
     val prev = overflowChain.getAndSet(gate)
     writerScope.launch {
@@ -289,11 +296,22 @@ class OrderedTranscriptSink(
    * Parked [offerSteer] sends offered before this call are awaited first via
    * the overflow chain: without that, this barrier could be admitted ahead
    * of their still-unscheduled sends and report a drain that missed them.
+   * Stage E: after awaiting the snapshot tail, the tail is re-read — a send
+   * parked while we awaited joins a newer gate that the first await did not
+   * cover. The loop ends on a stable (same completed gate, whose send was
+   * already attempted) or empty chain; a send offered after the barrier is
+   * admitted cannot be waited on, by construction.
    */
   suspend fun flush(timeoutMs: Long = DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
     try {
       return withTimeoutOrNull(timeoutMs) {
-        overflowChain.get()?.await()
+        var tail = overflowChain.get()
+        while (tail != null) {
+          tail.await()
+          val current = overflowChain.get()
+          if (current == null || current === tail) break
+          tail = current
+        }
         val barrier = CompletableDeferred<Unit>()
         try {
           channel.send(Entry(runId = null, block = {}, barrier))

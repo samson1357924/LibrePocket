@@ -65,6 +65,7 @@ import dev.librepocket.tool.DenyReason
 import dev.librepocket.voice.VoiceStt
 import dev.librepocket.voice.VoiceSpeaker
 import dev.librepocket.voice.VoiceTools
+import dev.librepocket.voice.VoiceTts
 
 /** User-visible text for a chat notice code; unknown codes fall through raw. */
 internal fun chatNoticeText(code: String): String =
@@ -106,11 +107,16 @@ fun ChatScreen(
     val outputEnabled = userSwitches.getOrDefault(VoiceTools.SWITCH_OUTPUT, VoiceTools.SWITCH_OUTPUT_DEFAULT)
 
     // S2 系統 STT（優先）+ 系統 TTS（優先）：零新權限。
+    // TTS 引擎失敗（無引擎／初始化／語言／朗讀）經 speaker onError → voiceError 顯示。
     val context = LocalContext.current
     var voiceError by remember { mutableStateOf<String?>(null) }
     // M2 延遲建構：voice_output 關閉時不初始化 TTS 引擎（不佔系統服務）。
     val speaker: VoiceSpeaker? = remember(context, outputEnabled) {
-        if (outputEnabled) VoiceSpeaker(context.applicationContext) else null
+        if (outputEnabled) {
+            VoiceSpeaker(context.applicationContext, onError = { voiceError = it })
+        } else {
+            null
+        }
     }
     DisposableEffect(speaker) {
         onDispose { speaker?.shutdown() }
@@ -228,7 +234,8 @@ fun ChatScreen(
             ) {
                 items(messages, key = { it.id }) { msg ->
                     // M2：voice_output 關閉時隱藏朗讀鈕（與投影層同開關）；speaker
-                    // 為 null（延遲建構）時 onSpeak 為 no-op。
+                    // 為 null（延遲建構）時 onSpeak 為 no-op；引擎失敗經 onError
+                    // 進 voiceError 顯示（見 VoiceSpeaker 失敗通道）。
                     MessageBubble(
                         msg,
                         onSpeak = { speaker?.speak(it) },
@@ -430,7 +437,10 @@ private fun MessageBubble(
                     text = if (msg.isPartial) msg.text + " ▍" else msg.text,
                     style = MaterialTheme.typography.bodyLarge,
                 )
-                // S2 系統 TTS：助理氣泡加朗讀鈕（本地引擎，零新權限；開關關閉時隱藏）。
+                // S2 系統 TTS：助理氣泡加朗讀鈕（系統語音引擎處理，
+                // 離線能力與資料傳輸取決於已安裝的引擎，非「本地保證」；
+                // 零新權限；開關關閉時隱藏）。朗讀為逐則手勢，
+                // 引擎揭露見按鈕無障礙文案（VoiceTts.SPEAK_BUTTON_DESCRIPTION）。
                 if (!isUser && msg.text.isNotBlank() && !msg.isPartial && showSpeak) {
                     IconButton(
                         onClick = { onSpeak(msg.text) },
@@ -438,7 +448,7 @@ private fun MessageBubble(
                     ) {
                         Icon(
                             imageVector = Icons.Filled.VolumeUp,
-                            contentDescription = "朗讀",
+                            contentDescription = VoiceTts.SPEAK_BUTTON_DESCRIPTION,
                         )
                     }
                 }

@@ -28,6 +28,7 @@ Built-in ToolRegistry: 41 declared definitions; executionReady=false for all
 - Room backs the current session transcript path. JSONL codec and import/export code exist at library level; a user-facing migration workflow is not present in the current app flow.
 - Permission projection, tool definitions, routing/helper classes, and flavor services do not by themselves mean that an end-to-end tool can be invoked. Tool execution is not wired for the built-in registry in this snapshot.
 - Android backup is enabled and excludes key-specific paths, not a general transcript exclusion. See [Threat Model](THREAT_MODEL.md).
+- 語音 UI 手勢直連（有意決策 Stage2）：`ChatScreen` 的系統 STT 委託（`RecognizerIntent`）與系統 TTS（`VoiceSpeaker`）是使用者逐次手勢的直接呼叫（朗讀需逐則點按；`voice_input`/`voice_output` 開關關閉即隱藏入口，與投影層同 key、同預設），不經模型工具鏈；`executionReady=false` 僅封鎖模型可見與可執行（`visibleTools` 為空），不約束使用者手勢。引擎失敗經 `voiceError` 可觀察；系統引擎的資料處理取決於已安裝引擎（朗讀鈕無障礙文案與設定頁語音卡揭露）。未來雲端語音分派（Azure fallback）落地時走 dispatcher + 新鮮政策評估 + 送雲前 redact（見 `VoiceTools.redactForCloud`）。
 
 ## Target：現有設計文件描述的方向
 

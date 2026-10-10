@@ -761,7 +761,14 @@ class ChatViewModel(
                     attach(created, access.binding, creationGeneration)
                     attached = true
                     candidate = null
-                    _notice.value = null
+                    // Stage D: a cross-provider resume keeps the local replay
+                    // but withholds the model prefix; say so visibly instead
+                    // of resuming silently on a blank context.
+                    _notice.value = if (created.historyWithheld) {
+                        "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                    } else {
+                        null
+                    }
                 }
             } catch (cancelled: CancellationException) {
                 cancellation = cancelled

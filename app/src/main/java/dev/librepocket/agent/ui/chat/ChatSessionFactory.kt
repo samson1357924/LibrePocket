@@ -97,6 +97,47 @@ internal fun findDanglingRunIds(events: List<TranscriptEvent>): List<String> {
     return userFamilies.filter { it !in terminalFamilies }
 }
 
+/**
+ * Stored resume-provenance provider segment (Stage D): `SessionMeta.model`
+ * is persisted as `"providerId/modelId"` (see `create`), so everything
+ * before the first `/` is the origin providerId. Returns null for legacy
+ * rows that predate provenance (bare model id, no `/`).
+ *
+ * The first-`/` split is load bearing: model ids themselves may contain `/`
+ * (e.g. `"preset:openrouter/openrouter/auto"`), while providerIds
+ * (`"preset:<presetId>"`) never do.
+ */
+internal fun storedProviderOf(storedModel: String): String? =
+    if ("/" in storedModel) storedModel.substringBefore("/") else null
+
+/**
+ * Cross-provider resume gate (Stage D): true when the stored history may be
+ * hydrated into the current endpoint's model context.
+ *
+ * - Provenance present and provider differs (including an empty provider
+ *   segment) → false: fail closed, the old history is never forwarded to the
+ *   new provider.
+ * - Same provider, different model → true: the credential and the recipient
+ *   are unchanged (KeyVault keys off providerId), so no new party receives
+ *   the history; this also matches the live model-switch behavior, which
+ *   keeps the transcript visible across models of one provider.
+ * - Provenance absent (legacy bare model id, no `/`) → true (compat): rows
+ *   written before provenance cannot be attributed to any provider, and
+ *   withholding them would drop resume context for every pre-existing
+ *   session. Every session created after provenance carries the qualified
+ *   form, so the gate is effective going forward.
+ *
+ * SessionMeta records no historical baseUrl/origin, so only providerId can
+ * be compared here. Same-providerId endpoint URL changes stay inside one
+ * key trust domain (the vault alias is the providerId); recording the origin
+ * URL for a stricter check is a schema change, deliberately out of scope.
+ */
+internal fun isSameProviderOrigin(storedModel: String, currentProviderId: String): Boolean {
+    val stored = storedProviderOf(storedModel)
+    if (stored == null) return true
+    return stored == currentProviderId
+}
+
 /** Lazily provides the product vault (Keystore I/O must stay off the main thread). */
 fun interface VaultSource {
     suspend fun vault(): KeyVault
@@ -124,6 +165,13 @@ data class CreatedSession(
     val session: ChatSession,
     val endpointId: String,
     val model: String,
+    /**
+     * Stage D: true when resume crossed providers and the stored model prefix
+     * was withheld (the live session starts with an empty model context).
+     * The local display replay is unaffected; callers surface a visible
+     * notice instead of resuming silently blank-context.
+     */
+    val historyWithheld: Boolean = false,
 )
 
 /** Session creation epoch millis → Instant; invalid (<=0 or out-of-range) omits. */
@@ -195,7 +243,10 @@ class ChatSessionFactory(
                 // is captured for rollback if the parent is cancelled mid-insert.
                 withContext(NonCancellable + Dispatchers.IO) {
                     createdSessionId = withTimeout(TRANSCRIPT_CREATE_TIMEOUT_MS) {
-                        store.createSession(title.take(30), model)
+                        // Stage D resume provenance: persist the origin as
+                        // "providerId/modelId" so open() can refuse to forward
+                        // another provider's history to this endpoint.
+                        store.createSession(title.take(30), endpoint.providerId + "/" + model)
                     }
                 }
             }
@@ -270,6 +321,13 @@ class ChatSessionFactory(
      * prior context. The marker kind is `system`, which the chat replay
      * already hides, so it never pollutes normal history; it stays visible in
      * export for debugging.
+     *
+     * Stage D (implemented) cross-provider fail-closed: the prefix is only
+     * hydrated when [isSameProviderOrigin] attributes the stored rows to the
+     * current endpoint's provider. A different provider resumes with an empty
+     * model context ([CreatedSession.historyWithheld] = true) so the old
+     * provider's history is never forwarded to the new one; the local display
+     * replay and the INTERRUPTED backfill above stay provider-agnostic.
      */
     override suspend fun open(
         endpoint: EndpointConfig,
@@ -291,7 +349,12 @@ class ChatSessionFactory(
         require(meta != null) { "UNKNOWN_SESSION" }
         requireCurrentBinding(keyIsCurrent)
         backfillInterrupted(store, sessionId)
-        val history = loadModelHistory(store, sessionId)
+        // Stage D: cross-provider resume hydrates nothing. The local
+        // INTERRUPTED backfill above still runs (provider-agnostic transcript
+        // bookkeeping), but the stored rows only enter the new provider's
+        // model context when their provenance matches this endpoint.
+        val sameOrigin = isSameProviderOrigin(meta.model, endpoint.providerId)
+        val history = if (sameOrigin) loadModelHistory(store, sessionId) else emptyList()
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
         val credential = captureCredential(endpoint)
@@ -318,6 +381,7 @@ class ChatSessionFactory(
                 openedSession,
                 endpoint.providerId,
                 model,
+                historyWithheld = !sameOrigin,
             )
         } catch (failure: Throwable) {
             try {

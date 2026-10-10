@@ -633,6 +633,94 @@ export async function runScannerSendOpenAITests(): Promise<void> {
       assert.equal(Object.hasOwn(none55Body, 'top_p'), false);
     }
 
+    // P2 #7 JSON-map none path: string, object, and prefix-key forms all
+    // resolve to reasoning none and send it explicitly on the wire.
+    {
+      const jsonMapStringEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_PROFILES: JSON.stringify({ 'gpt-5.2': 'reasoning:none' }),
+      };
+      assert.deepEqual(resolveModelProfile('gpt-5.2', jsonMapStringEnv), { kind: 'reasoning', effort: 'none' });
+      const jsonMapStringBody = await captureSingleTurnBody('gpt-5.2', jsonMapStringEnv);
+      assert.deepEqual(jsonMapStringBody.reasoning, { effort: 'none' });
+
+      const jsonMapObjectEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_PROFILES: JSON.stringify({ 'gpt-5.2': { kind: 'reasoning', effort: 'none' } }),
+      };
+      assert.deepEqual(resolveModelProfile('gpt-5.2', jsonMapObjectEnv), { kind: 'reasoning', effort: 'none' });
+      const jsonMapObjectBody = await captureSingleTurnBody('gpt-5.2', jsonMapObjectEnv);
+      assert.deepEqual(jsonMapObjectBody.reasoning, { effort: 'none' });
+
+      // Longest-prefix key: a 'gpt-5' map entry covers family variants.
+      const jsonMapPrefixEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_PROFILES: JSON.stringify({ 'gpt-5': 'reasoning:none' }),
+      };
+      assert.deepEqual(resolveModelProfile('gpt-5-codex', jsonMapPrefixEnv), { kind: 'reasoning', effort: 'none' });
+      const jsonMapPrefixBody = await captureSingleTurnBody('gpt-5-codex', jsonMapPrefixEnv);
+      assert.deepEqual(jsonMapPrefixBody.reasoning, { effort: 'none' });
+      assert.equal(JSON.stringify(jsonMapPrefixBody).includes('"effort":"none"'), true);
+    }
+
+    // P2 #7 effort case-insensitivity: None/NONE (with surrounding
+    // whitespace) resolve as explicit none and normalize to 'none' on
+    // the wire; unsupported models still fail closed.
+    for (const effort of ['None', 'NONE', ' nOnE ']) {
+      const caseEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_CHIEF: 'gpt-5.2',
+        POCKETGUARD_MODEL_CHIEF_PROFILE: `reasoning:${effort}`,
+      };
+      assert.deepEqual(resolveModelProfile('gpt-5.2', caseEnv), { kind: 'reasoning', effort: effort.trim() });
+      const caseBody = await captureSingleTurnBody('gpt-5.2', caseEnv);
+      assert.deepEqual(caseBody.reasoning, { effort: 'none' }, `effort ${JSON.stringify(effort)} normalizes on the wire`);
+
+      const caseMapEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_PROFILES: JSON.stringify({ 'gpt-5.2': `reasoning:${effort}` }),
+      };
+      assert.deepEqual(resolveModelProfile('gpt-5.2', caseMapEnv), { kind: 'reasoning', effort: effort.trim() });
+      const caseMapBody = await captureSingleTurnBody('gpt-5.2', caseMapEnv);
+      assert.deepEqual(caseMapBody.reasoning, { effort: 'none' }, `map effort ${JSON.stringify(effort)} normalizes on the wire`);
+    }
+    {
+      const unsupportedCaseEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_CHIEF: 'o3-mini',
+        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:NONE',
+      };
+      assert.equal(resolveModelProfile('o3-mini', unsupportedCaseEnv), undefined, 'o3-mini + NONE is undefined');
+    }
+
+    // P2 #7 gpt-5 prefix variants: isReasoningNoneSupported matches the
+    // whole family by prefix (case-insensitive); wire proof for a short
+    // variant and an uppercase model id.
+    {
+      for (const modelId of ['gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5.2', 'gpt-5.5-turbo', 'GPT-5.2']) {
+        assert.equal(isReasoningNoneSupported(modelId), true, `${modelId} supports none`);
+      }
+      assert.equal(isReasoningNoneSupported('gpt-4o'), false, 'gpt-4o does not support none');
+      assert.equal(isReasoningNoneSupported(''), false, 'empty model id does not support none');
+
+      const miniMapEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_PROFILES: JSON.stringify({ 'gpt-5-mini': 'reasoning:none' }),
+      };
+      assert.deepEqual(resolveModelProfile('gpt-5-mini', miniMapEnv), { kind: 'reasoning', effort: 'none' });
+      const miniBody = await captureSingleTurnBody('gpt-5-mini', miniMapEnv);
+      assert.deepEqual(miniBody.reasoning, { effort: 'none' });
+
+      const upperEnv = {
+        ...openaiEnvironment,
+        POCKETGUARD_MODEL_CHIEF: 'GPT-5.2',
+        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+      };
+      assert.deepEqual(resolveModelProfile('GPT-5.2', upperEnv), { kind: 'reasoning', effort: 'none' });
+      const upperBody = await captureSingleTurnBody('GPT-5.2', upperEnv);
+      assert.deepEqual(upperBody.reasoning, { effort: 'none' });
+    }
+
     // P2 #3 temperature/top_p are mutually exclusive with reasoning
     // (including explicit none): carrying both throws before any fetch.
     {

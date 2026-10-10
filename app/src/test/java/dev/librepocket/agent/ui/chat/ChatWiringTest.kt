@@ -365,6 +365,48 @@ class ChatWiringTest {
         assertTrue(transcripts.events.count { it.kind == "user" } == 2)
     }
 
+    // Phase 2 baseline (fake store, synthetic rows only): open replays
+    // pre-existing rows as-is and invents no INTERRUPTED markers.
+    // Cross-restart RUNNING -> INTERRUPTED backfill needs the Phase-3
+    // persisted partial/status bits and lands in Phase 3 (see
+    // ChatSessionFactory.open KDoc); this pins the baseline it extends.
+    @Test
+    fun openReplaysDanglingPartialAsIsWithoutInventedMarks() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        runBlocking {
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+                ),
+            )
+            // Dangling partial from a killed process: no terminal row follows.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "assistant", text = "half answer", createdAt = 2L,
+                ),
+            )
+        }
+        val before = transcripts.events.size
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> FakeChatProvider() },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 2 }
+        assertEquals(listOf("q1", "half answer"), vm.messages.value.map { it.text })
+        assertEquals("Phase 2 invents no backfill rows", before, transcripts.events.size)
+    }
+
     @Test
     fun steerWhenIdleSends() {
         val store = newStore()

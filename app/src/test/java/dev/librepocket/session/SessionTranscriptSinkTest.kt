@@ -5,6 +5,7 @@ import java.util.UUID
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /** In-memory SessionStore fake (JVM, no Room). */
@@ -69,17 +70,29 @@ class SessionTranscriptSinkTest {
     }
 
     @Test
-    fun sinkNeverThrowsOnStoreFailure() = runBlocking {
+    fun coreThrowsButNoticesStayBestEffortOnStoreFailure() = runBlocking {
         val store = object : FakeSessionStore() {
             override suspend fun appendEvent(event: TranscriptEvent): Long = error("db down")
         }
         val sink = SessionTranscriptSink(store, "sid")
-        // Must not propagate: persistence never breaks the chat loop.
-        sink.onTurnStarted("r1", "hello")
-        sink.onTurnSucceeded("r1", "hi")
-        sink.onTurnFailed("r1", "boom")
+        // Durable core events must propagate so the session writer fails the
+        // ack instead of reporting a false durable write.
+        for (core in listOf<suspend () -> Unit>(
+            { sink.onTurnStarted("r1", "hello") },
+            { sink.onTurnSucceeded("r1", "hi") },
+            { sink.onTurnFailed("r1", "boom") },
+            { sink.onTurnFailed("r1", "half", "boom") },
+            { sink.onTurnCancelled("r1", "partial") },
+        )) {
+            try {
+                core()
+                fail("durable core write must not swallow a store failure")
+            } catch (_: IllegalStateException) {
+                // Explicit failure: no false durable report.
+            }
+        }
+        // Best-effort notices never break the chat loop.
         sink.onTurnRetried("r1", 1, 3, 2000)
-        sink.onTurnCancelled("r1", "partial")
         sink.onSteerQueued("be brief")
         sink.onToolDone("r1", 0, "t1", "search", """{"q":"x"}""")
         sink.onUsage("r1", 10, 20)

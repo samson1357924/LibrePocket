@@ -7,6 +7,7 @@ import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatSessionImpl
+import dev.librepocket.chat.HistoryWindowCap
 import dev.librepocket.chat.NoOpTranscriptSink
 import dev.librepocket.chat.TranscriptSink
 import dev.librepocket.chat.TurnController
@@ -15,6 +16,7 @@ import dev.librepocket.keystore.KeyVault
 import dev.librepocket.policy.DataStorePolicyStore
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.preset.ProviderCatalog
+import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.DefaultProviderFactory
 import dev.librepocket.provider.KeyProvider
 import dev.librepocket.provider.LlmProvider
@@ -23,6 +25,7 @@ import dev.librepocket.session.LibrePocketDb
 import dev.librepocket.session.RoomSessionStore
 import dev.librepocket.session.SessionStore
 import dev.librepocket.session.SessionTranscriptSink
+import dev.librepocket.session.TranscriptEvent
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
@@ -34,6 +37,141 @@ import kotlinx.coroutines.withTimeout
 
 private const val TRANSCRIPT_CLEANUP_TIMEOUT_MS = 5_000L
 private const val TRANSCRIPT_CREATE_TIMEOUT_MS = 5_000L
+private const val HISTORY_PAGE = 200
+
+/**
+ * Stored-events bound mirrored from the display replay: model context never
+ * hydrates more rows than the UI would show.
+ */
+private const val HISTORY_LOAD_CAP = 2000
+
+/**
+ * Stage E: per-message char bound for model-context hydration. The write path
+ * already caps a stored row at 100k chars ([RoomSessionStore.MAX_TEXT_CHARS]);
+ * a single such row (~25k tokens at ~4 chars/token) must never reach the
+ * provider unbounded. 20k chars (~5k tokens) keeps one row a bounded fraction
+ * of any realistic context window while staying far above normal turns.
+ * Over-long rows are truncated with a visible marker (fail-closed, never
+ * silent). A measured token/byte budget is still TODO (see
+ * [HistoryWindowCap]); until it lands this char bound is the interim cap.
+ */
+internal const val MODEL_HISTORY_MAX_CHARS_PER_MESSAGE = 20_000
+
+/** Stage E: truncation marker appended to an over-long hydrated row. */
+internal const val HISTORY_TRUNCATION_MARKER = "…[history truncated]"
+
+/**
+ * Stage E: raw-row window for the INTERRUPTED backfill scan. Dangling turns
+ * are always recent (the first open after a kill marks them), so a bounded
+ * newest-first window replaces the old unbounded full load (OOM-safe).
+ * Best-effort: an ancient unmarked row outside the window stays for the next
+ * open, same as any failed backfill before.
+ */
+private const val BACKFILL_SCAN_LIMIT = 2000
+
+/**
+ * Stage E: tail-loaded model prefix. [droppedCount] is the exact number of
+ * older qualifying rows omitted by the cap — the observable counterpart to
+ * truncation (never silent; surfaced via [CreatedSession.historyDroppedCount]
+ * and [TurnController.droppedHistoryCount]).
+ */
+internal data class LoadedModelHistory(
+    val messages: List<ChatMessage>,
+    val droppedCount: Int,
+)
+
+/** Marker kind for RUNNING → INTERRUPTED backfill: hidden from chat replay, kept in export. */
+internal const val INTERRUPTED_MARKER_KIND = "system"
+
+/** Explicit kill marker bound to the stranded runId (idempotent: exact text skips re-marking). */
+internal fun interruptedMarkerText(runId: String): String = "turn $runId interrupted"
+
+private fun isLegacyFailureText(runId: String, text: String): Boolean =
+    text.startsWith("turn $runId failed")
+
+/**
+ * Logical-family id for one transcript row (Stage C): attempt-bound rows
+ * carry `parentRunId=logicalTurnId`, everything else (user/retry/legacy
+ * rows) has null and falls back to its own `runId`. Pre-C rows all have
+ * null, so their family is exactly the old single-id semantics.
+ */
+internal fun familyOf(event: TranscriptEvent): String = event.parentRunId ?: event.runId
+
+/**
+ * User-owned logical families with no terminal record: no assistant row of
+ * any kind in the same family (completed, cancelled-partial, failed-with-
+ * reason, or retried partial — Stage C persists every retryable failure's
+ * fragment before its retry notice) and no legacy failure / already-marked
+ * system row for that family. First-seen order; empty when nothing was
+ * stranded. Pure (no I/O) so the backfill rule is directly unit-testable.
+ *
+ * Stage C (implemented): grouping is by logical family
+ * (`parentRunId ?: runId`), not by raw `runId`. A retry→success turn leaves
+ * `user(L) + assistant(A1 parent L, partial retried) + retry(L) +
+ * assistant(A2 parent L, success)`: family L owns assistant rows, so it is
+ * completed and never gains an INTERRUPTED marker. A terminal failure family
+ * likewise owns its failed assistant row. Retry/tool/steer rows are never
+ * terminals. Legacy single-id rows (parent null) keep the old behavior.
+ */
+internal fun findDanglingRunIds(events: List<TranscriptEvent>): List<String> {
+    val terminalFamilies = HashSet<String>()
+    val userFamilies = LinkedHashSet<String>()
+    for (e in events) {
+        val family = familyOf(e)
+        when (e.kind) {
+            "assistant" -> terminalFamilies.add(family)
+            "system" -> {
+                if (e.text == interruptedMarkerText(e.runId) || isLegacyFailureText(e.runId, e.text)) {
+                    terminalFamilies.add(family)
+                }
+            }
+            "user" -> userFamilies.add(family)
+            else -> Unit
+        }
+    }
+    return userFamilies.filter { it !in terminalFamilies }
+}
+
+/**
+ * Stored resume-provenance provider segment (Stage D): `SessionMeta.model`
+ * is persisted as `"providerId/modelId"` (see `create`), so everything
+ * before the first `/` is the origin providerId. Returns null for legacy
+ * rows that predate provenance (bare model id, no `/`).
+ *
+ * The first-`/` split is load bearing: model ids themselves may contain `/`
+ * (e.g. `"preset:openrouter/openrouter/auto"`), while providerIds
+ * (`"preset:<presetId>"`) never do.
+ */
+internal fun storedProviderOf(storedModel: String): String? =
+    if ("/" in storedModel) storedModel.substringBefore("/") else null
+
+/**
+ * Cross-provider resume gate (Stage D): true when the stored history may be
+ * hydrated into the current endpoint's model context.
+ *
+ * - Provenance present and provider differs (including an empty provider
+ *   segment) → false: fail closed, the old history is never forwarded to the
+ *   new provider.
+ * - Same provider, different model → true: the credential and the recipient
+ *   are unchanged (KeyVault keys off providerId), so no new party receives
+ *   the history; this also matches the live model-switch behavior, which
+ *   keeps the transcript visible across models of one provider.
+ * - Provenance absent (legacy bare model id, no `/`) → true (compat): rows
+ *   written before provenance cannot be attributed to any provider, and
+ *   withholding them would drop resume context for every pre-existing
+ *   session. Every session created after provenance carries the qualified
+ *   form, so the gate is effective going forward.
+ *
+ * SessionMeta records no historical baseUrl/origin, so only providerId can
+ * be compared here. Same-providerId endpoint URL changes stay inside one
+ * key trust domain (the vault alias is the providerId); recording the origin
+ * URL for a stricter check is a schema change, deliberately out of scope.
+ */
+internal fun isSameProviderOrigin(storedModel: String, currentProviderId: String): Boolean {
+    val stored = storedProviderOf(storedModel)
+    if (stored == null) return true
+    return stored == currentProviderId
+}
 
 /** Lazily provides the product vault (Keystore I/O must stay off the main thread). */
 fun interface VaultSource {
@@ -62,6 +200,19 @@ data class CreatedSession(
     val session: ChatSession,
     val endpointId: String,
     val model: String,
+    /**
+     * Stage D: true when resume crossed providers and the stored model prefix
+     * was withheld (the live session starts with an empty model context).
+     * The local display replay is unaffected; callers surface a visible
+     * notice instead of resuming silently blank-context.
+     */
+    val historyWithheld: Boolean = false,
+    /**
+     * Stage E: exact number of older history rows omitted by the tail cap.
+     * 0 when everything fit. Observable truncation: callers surface
+     * "已省略N則" instead of resuming silently short-context.
+     */
+    val historyDroppedCount: Int = 0,
 )
 
 /** Session creation epoch millis → Instant; invalid (<=0 or out-of-range) omits. */
@@ -133,7 +284,10 @@ class ChatSessionFactory(
                 // is captured for rollback if the parent is cancelled mid-insert.
                 withContext(NonCancellable + Dispatchers.IO) {
                     createdSessionId = withTimeout(TRANSCRIPT_CREATE_TIMEOUT_MS) {
-                        store.createSession(title.take(30), model)
+                        // Stage D resume provenance: persist the origin as
+                        // "providerId/modelId" so open() can refuse to forward
+                        // another provider's history to this endpoint.
+                        store.createSession(title.take(30), endpoint.providerId + "/" + model)
                     }
                 }
             }
@@ -195,7 +349,27 @@ class ChatSessionFactory(
         }
     }
 
-    /** Binds a live session to an existing transcript session (resume, no re-create). */
+    /**
+     * Binds a live session to an existing transcript session (resume, no re-create).
+     *
+     * Phase 3 (implemented) cross-restart recovery: after loading [meta] and
+     * before attaching, [backfillInterrupted] marks any turn the previous
+     * process left RUNNING (a logical-turn family with no assistant terminal
+     * for its family id) with an explicit `system` INTERRUPTED marker row, and the
+     * restored user/assistant prefix (partial rows excluded from model
+     * context, mirroring the live `!isPartial` request filter) is hydrated
+     * into the new controller so the first request after resume already sees
+     * prior context. The marker kind is `system`, which the chat replay
+     * already hides, so it never pollutes normal history; it stays visible in
+     * export for debugging.
+     *
+     * Stage D (implemented) cross-provider fail-closed: the prefix is only
+     * hydrated when [isSameProviderOrigin] attributes the stored rows to the
+     * current endpoint's provider. A different provider resumes with an empty
+     * model context ([CreatedSession.historyWithheld] = true) so the old
+     * provider's history is never forwarded to the new one; the local display
+     * replay and the INTERRUPTED backfill above stay provider-agnostic.
+     */
     override suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,
@@ -215,6 +389,18 @@ class ChatSessionFactory(
         }
         require(meta != null) { "UNKNOWN_SESSION" }
         requireCurrentBinding(keyIsCurrent)
+        backfillInterrupted(store, sessionId)
+        // Stage D: cross-provider resume hydrates nothing. The local
+        // INTERRUPTED backfill above still runs (provider-agnostic transcript
+        // bookkeeping), but the stored rows only enter the new provider's
+        // model context when their provenance matches this endpoint.
+        val sameOrigin = isSameProviderOrigin(meta.model, endpoint.providerId)
+        // Stage E: tail load (newest kept) with an exact dropped count; the
+        // cap also travels as MaxMessages so TurnController.droppedHistoryCount
+        // observes the same truncation (defense in depth: pre-trimmed prefix
+        // makes the controller trim a no-op).
+        val loaded = if (sameOrigin) loadModelHistory(store, sessionId) else LoadedModelHistory(emptyList(), 0)
+        requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
         val credential = captureCredential(endpoint)
         var session: ChatSession? = null
@@ -231,6 +417,8 @@ class ChatSessionFactory(
                 userTimezone,
                 systemZone,
                 sessionStart,
+                loaded.messages,
+                HistoryWindowCap.MaxMessages(HISTORY_LOAD_CAP),
             )
             session = openedSession
             requireCurrentBinding(keyIsCurrent)
@@ -239,6 +427,8 @@ class ChatSessionFactory(
                 openedSession,
                 endpoint.providerId,
                 model,
+                historyWithheld = !sameOrigin,
+                historyDroppedCount = loaded.droppedCount,
             )
         } catch (failure: Throwable) {
             try {
@@ -331,6 +521,8 @@ class ChatSessionFactory(
         userTimezone: String? = this.userTimezone,
         systemZone: () -> ZoneId = this.systemZone,
         sessionStart: Instant? = null,
+        history: List<ChatMessage> = emptyList(),
+        historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
     ): ChatSession {
         val keys = KeyProvider { ref ->
             if (keyIsCurrent()) credential.copyFor(ref) else null
@@ -345,8 +537,115 @@ class ChatSessionFactory(
             userTimezone = userTimezone,
             sessionStart = sessionStart,
             systemZone = systemZone,
+            initialHistory = history,
+            historyCap = historyCap,
         )
         return CredentialBoundChatSession(session, credential)
+    }
+
+    /**
+     * Cross-restart RUNNING → INTERRUPTED backfill: every user-owned logical
+     * family with no assistant row in the same family (completed,
+     * cancelled-partial, failed-with-reason, or Stage C retried partial) and
+     * no legacy failure / already-marked system row is a turn the previous
+     * process killed before any terminal record, so it gets one explicit
+     * `system` marker row bound to the same family id.
+     *
+     * Stage C (implemented): retry→success and retry→terminal-failure
+     * families already own attempt assistant rows (bound via
+     * `parentRunId`), so they are completed and never gain a marker — this
+     * is the Finding #3 fix. Deliberately NOT marked: intentional-cancel
+     * partials already own an assistant row (`isPartial=1`), so they replay
+     * as partial and never gain a marker; completed and failed turns
+     * likewise own theirs. Prune cannot cause false positives (it drops the
+     * oldest rows first, and an assistant row always has a larger seq than
+     * its user row, so prune can orphan assistants but never users).
+     * Re-running is idempotent: a marked family owns its marker row and
+     * [findDanglingRunIds] skips it next time.
+     *
+     * Best-effort (never blocks resume): marker writes go through the same
+     * guarded path as every other transcript write. A failed backfill just
+     * leaves the run dangling for the next open to retry.
+     */
+    private suspend fun backfillInterrupted(store: SessionStore, sessionId: String) {
+        try {
+            // Stage E: bounded newest-first window instead of the old unbounded
+            // full load (OOM-safe). Dangling turns are recent by construction:
+            // the first open after a kill marks them, later opens are no-ops.
+            val tail = store.loadTailEvents(sessionId, BACKFILL_SCAN_LIMIT)
+            val dangling = findDanglingRunIds(tail)
+            for (runId in dangling) {
+                try {
+                    store.appendEvent(
+                        TranscriptEvent(
+                            sessionId = sessionId,
+                            runId = runId,
+                            kind = INTERRUPTED_MARKER_KIND,
+                            text = interruptedMarkerText(runId),
+                            createdAt = clock.millis(),
+                        ),
+                    )
+                } catch (_: Exception) {
+                    // Best effort per marker; the next open retries.
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort overall; resume proceeds without markers.
+        }
+    }
+
+    /**
+     * Restored model-context prefix, Stage E tail semantics: the newest
+     * qualifying rows (user/assistant, non-partial) up to [HISTORY_LOAD_CAP],
+     * oldest-first, via backward paging (memory O(cap), never O(session);
+     * sparse seqs safe). Partial rows are excluded from model context (they
+     * replay in the UI flagged, but must never read as completed answers —
+     * mirroring the live `!isPartial` request filter); `system` markers stay
+     * export/debug-only via the same filter.
+     *
+     * Truncation is observable: [LoadedModelHistory.droppedCount] carries the
+     * exact omitted-row total (filtered COUNT query, O(1) memory). A giant
+     * single row is truncated to [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] with a
+     * visible marker — fail-closed, never a silent unbounded payload (a
+     * measured token budget is still TODO; the char bound is interim).
+     *
+     * Unlike the best-effort backfill, a history-read failure propagates:
+     * resuming blind (without the context the model needs) fails closed
+     * through the caller's UNKNOWN/NO_ENDPOINT path instead.
+     */
+    internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): LoadedModelHistory {
+        val keptNewestFirst = ArrayList<ChatMessage>(HISTORY_LOAD_CAP)
+        var beforeSeq = Long.MAX_VALUE
+        outer@ while (keptNewestFirst.size < HISTORY_LOAD_CAP) {
+            val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
+            if (page.isEmpty()) break
+            for (event in page) {
+                if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
+                    if (keptNewestFirst.size >= HISTORY_LOAD_CAP) break@outer
+                    keptNewestFirst.add(ChatMessage(role = event.kind, text = cappedHistoryText(event.text)))
+                }
+            }
+            // Pages are newest-first with distinct seqs; the next window ends
+            // strictly below this page's minimum. A non-advancing store would
+            // spin forever, so fail closed instead.
+            val pageMin = page.minOf { it.seq }
+            if (pageMin >= beforeSeq) break
+            beforeSeq = pageMin
+            if (page.size < HISTORY_PAGE) break
+        }
+        val total = store.countHistoryEvents(sessionId, includePartial = false)
+        val dropped = (total - keptNewestFirst.size).coerceAtLeast(0)
+        return LoadedModelHistory(keptNewestFirst.asReversed(), dropped)
+    }
+
+    /**
+     * Stage E: fail-closed single-row bound. Rows longer than
+     * [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] are cut with a visible marker so
+     * the omission is observable in the payload itself, never silent.
+     */
+    internal fun cappedHistoryText(text: String): String {
+        if (text.length <= MODEL_HISTORY_MAX_CHARS_PER_MESSAGE) return text
+        return text.take(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE) + HISTORY_TRUNCATION_MARKER
     }
 
     /** The live provider never rereads a mutable alias after this snapshot. */

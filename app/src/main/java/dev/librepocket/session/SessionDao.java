@@ -40,6 +40,16 @@ public interface SessionDao {
                     + "ORDER BY seq ASC LIMIT :limit")
     List<TranscriptEventEntity> eventsAfter(String sid, long after, int limit);
 
+    @Query(
+            "SELECT * FROM transcript_events WHERE sessionId = :sid "
+                    + "ORDER BY seq DESC LIMIT :limit")
+    List<TranscriptEventEntity> eventsTail(String sid, int limit);
+
+    @Query(
+            "SELECT * FROM transcript_events WHERE sessionId = :sid AND seq < :before "
+                    + "ORDER BY seq DESC LIMIT :limit")
+    List<TranscriptEventEntity> eventsBefore(String sid, long before, int limit);
+
     @Query("SELECT * FROM transcript_events WHERE sessionId = :sid ORDER BY seq ASC")
     List<TranscriptEventEntity> allEvents(String sid);
 
@@ -52,6 +62,12 @@ public interface SessionDao {
 
     @Query("SELECT COUNT(*) FROM transcript_events WHERE sessionId = :sid")
     int eventCount(String sid);
+
+    @Query("SELECT COUNT(*) FROM transcript_events WHERE sessionId = :sid AND kind IN ('user','assistant')")
+    int countUiHistory(String sid);
+
+    @Query("SELECT COUNT(*) FROM transcript_events WHERE sessionId = :sid AND kind IN ('user','assistant') AND isPartial = 0")
+    int countModelHistory(String sid);
 
     @Query("DELETE FROM transcript_events WHERE sessionId = :sid AND rowId NOT IN "
             + "(SELECT rowId FROM transcript_events WHERE sessionId = :sid "

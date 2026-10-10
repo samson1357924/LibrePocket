@@ -2,6 +2,7 @@ package dev.librepocket.chat
 
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.provider.ChatImage
+import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.LlmProvider
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -24,6 +25,11 @@ import kotlinx.coroutines.flow.StateFlow
  * the `Session started` line, for call compatibility).
  * [systemZone] is re-read every turn when no explicit timezone is set, so a
  * mid-session system timezone change is picked up on the next turn.
+ *
+ * Resumed history is passed through to [TurnController] the same way: the
+ * caller (see `ChatSessionFactory.open`) restores the stored user/assistant
+ * prefix (excluding partial rows) so the first request after resume already
+ * carries prior context.
  */
 class ChatSessionImpl(
   provider: LlmProvider,
@@ -39,6 +45,8 @@ class ChatSessionImpl(
   userTimezone: String? = null,
   sessionStart: java.time.Instant? = null,
   systemZone: () -> java.time.ZoneId = java.time.ZoneId::systemDefault,
+  initialHistory: List<ChatMessage> = emptyList(),
+  historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
 ) : ChatSession {
   private val controller = TurnController(
     provider = provider,
@@ -54,6 +62,8 @@ class ChatSessionImpl(
     userTimezone = userTimezone,
     sessionStart = sessionStart,
     systemZone = systemZone,
+    initialHistory = initialHistory,
+    historyCap = historyCap,
   )
 
   @Suppress("unused")
@@ -74,6 +84,8 @@ class ChatSessionImpl(
   override fun drainQueued(): List<QueuedIntent> = controller.drainQueued()
 
   override fun cancel() = controller.cancel()
+
+  override suspend fun flush(timeoutMs: Long): Boolean = controller.flushTranscript(timeoutMs)
 
   override fun steer(text: String) = controller.steer(text)
 

@@ -393,6 +393,10 @@ class SessionStoreTest {
                 false,
                 0,
                 now,
+                false,
+                null,
+                null,
+                null,
             ),
         )
 
@@ -492,5 +496,54 @@ class SessionStoreTest {
 
         val seqs = store.loadEvents(sid, limit = 1000).map { it.seq }.sorted()
         assertEquals((1L..500L).toList(), seqs)
+    }
+
+    // ---- Stage E: DESC tail paging + filtered counts ----
+
+    @Test fun tail_descPagingAndFilteredCounts(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        store.appendEvent(event(sid, kind = "user", text = "u0", run = "r0"))
+        store.appendEvent(event(sid, kind = "assistant", text = "a0", run = "r0"))
+        store.appendEvent(event(sid, kind = "system", text = "sys", run = "r0"))
+        store.appendEvent(event(sid, kind = "user", text = "u1", run = "r1"))
+        store.appendEvent(
+            TranscriptEvent(
+                sessionId = sid,
+                runId = "r1",
+                kind = "assistant",
+                text = "half",
+                createdAt = now,
+                isPartial = true,
+            ),
+        )
+        store.appendEvent(event(sid, kind = "assistant", text = "a1", run = "r1"))
+
+        // Raw total vs replay total (user/assistant incl. partial) vs model
+        // total (user/assistant, non-partial): the exact dropped-count basis.
+        assertEquals(6, store.countEvents(sid))
+        assertEquals(5, store.countHistoryEvents(sid, includePartial = true))
+        assertEquals(4, store.countHistoryEvents(sid, includePartial = false))
+
+        // Newest-first window, restored to oldest-first.
+        val tail = store.loadTailEvents(sid, 3)
+        assertEquals(listOf(4L, 5L, 6L), tail.map { it.seq })
+        assertEquals(listOf("u1", "half", "a1"), tail.map { it.text })
+
+        // Backward page below a seq bound, newest-first (sparse-seq safe:
+        // predicate is `seq <`, never an offset).
+        val before = store.loadEventsBefore(sid, 4, 2)
+        assertEquals(listOf(3L, 2L), before.map { it.seq })
+
+        // Over-large limit keeps everything, still ascending.
+        val all = store.loadTailEvents(sid, 100)
+        assertEquals((1L..6L).toList(), all.map { it.seq })
+
+        try {
+            store.loadTailEvents(sid, 0)
+            fail("non-positive tail limit must throw")
+        } catch (_: IllegalArgumentException) {
+            // Fail closed on bad limits.
+        }
     }
 }

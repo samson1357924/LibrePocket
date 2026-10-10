@@ -222,6 +222,10 @@ object ShellPolicy {
      * @param safRoots 已授權 SAF 樹前綴。
      * @param flavor 風味：play 跨域一律拒絕；foss/github 跨域即使橋接已授權，
      *   直接 exec 仍拒絕（需改走 D09 橋，[FileScope.decide] 回 needsBridge）。
+     * @param trustedBinDirs `argv[0]` 詞法可信門的目錄表（預設
+     *   [ShellExecutables.TRUSTED_BIN_DIRS]；產品碼一律用預設值，單測可注入
+     *   暫存目錄以覆蓋絕對 `argv[0]` 的全鏈路徑，呼叫方須同步把同表傳給
+     *   [ShellExecutables.resolve] 的 `searchDirs`）。
      */
     fun validate(
         argv: List<String>,
@@ -231,6 +235,7 @@ object ShellPolicy {
         bridgeGranted: Boolean = false,
         allowedBinaries: Set<String> = ALLOWED_BINARIES,
         isGuest: Boolean = false,
+        trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
@@ -275,7 +280,7 @@ object ShellPolicy {
         // 提權通道（validateElevated）依本次範圍維持原判，不在此改。
         val rawArgv0 = argv[0].trim()
         if (!isGuest && (rawArgv0.contains('/') || rawArgv0.contains('\\'))) {
-            if (!ShellExecutables.isTrustedAbsoluteArgv0(rawArgv0)) {
+            if (!ShellExecutables.isTrustedAbsoluteArgv0(rawArgv0, trustedBinDirs)) {
                 return Validation.Denied(
                     ShellDeny.BLACKLISTED,
                     "untrusted executable path: $rawArgv0",

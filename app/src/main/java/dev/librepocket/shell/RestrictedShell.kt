@@ -150,9 +150,14 @@ class ShellQuota(
  *
  * 執行順序：[ShellPolicy.validate]（含 argv[0] 詞法可信門）→
  * 可信 executable 映射（[ShellExecutables.resolve]：logical command →
- * 驗證後絕對路徑，拒 `PATH` 劫持；失敗即拒且零 spawn、不佔配額）→
+ * [ShellExecutables.ResolvedExec]，拒 `PATH` 劫持；失敗即拒且零 spawn、不佔配額）→
  * 配額 → 建子進程（argv[0] 已改寫為固定絕對路徑 + [ShellExecutables.CLEAN_ENV]
  * 乾淨 env + cwd 釘死到 [privateRoot]）→ 超時殺 → 輸出截斷。
+ * spawn 固定形態：非 multicall 為 `[real, ...args]`；實體 basename 落
+ * [ShellExecutables.MULTICALL_BINARIES]（toybox / toolbox / busybox）時為
+ * `[real, applet, ...args]`，其中 `applet` 取白名單放行值（`Allowed.binary`，
+ * 即 `argv[0]` 的 basename），還原被 link 吞掉的子命令名
+ * （Android toybox 下 `ls -l` 不得丟成 `toybox -l`）。
  * 策略拒絕、映射拒絕與配額拒絕一律不建子進程；提權執行不在此類（見 [ElevatedShellRunner]）。
  * 操作數 schema（`--opt=value`、短旗標合併、取值旗標值槽、grep pattern 槽）
  * 沿 [ShellPolicy] 既有嚴格語義，本類不放寬、不重寫。
@@ -171,24 +176,35 @@ class RestrictedShell(
     private val flavor: Flavor = Flavor.PLAY,
     private val bridgeGranted: Boolean = false,
     /**
+     * 受控搜尋／可信目錄表（預設 [ShellExecutables.TRUSTED_BIN_DIRS]；
+     * 產品碼一律用預設值）。同時餵給 [ShellPolicy.validate] 的 argv[0]
+     * 詞法可信門與 [ShellExecutables.resolve] 的 `searchDirs`，兩者同表
+     * 才保證「放行即能解析」；單測可注入暫存目錄以覆蓋絕對 `argv[0]` 全鏈。
+     */
+    private val execSearchDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
+    /**
      * 可信 executable 解析（預設 [ShellExecutables.resolve] 真查 FS；
      * 單測可注入假映射，但生產必須用預設）。
-     * 輸入為原始 `argv[0]`（保留絕對/相對形態供驗證），輸出為驗證後
-     * 絕對路徑或 null（不可信/不存在即 null，呼叫方轉拒絕且零 spawn）。
+     * 輸入為原始 `argv[0]`（保留絕對/相對形態供驗證），輸出為
+     * [ShellExecutables.ResolvedExec]（驗證後實體路徑 + multicall applet
+     * 訊號）或 null（不可信/不存在即 null，呼叫方轉拒絕且零 spawn）。
+     * 自訂映射回 multicall 時，其 `applet` 會被白名單放行值（`Allowed.binary`）
+     * 覆寫後才 spawn，不採信映射自帶字串。
      */
-    private val execResolver: (String) -> String? = { ShellExecutables.resolve(it) },
+    private val execResolver: (String) -> ShellExecutables.ResolvedExec? =
+        { ShellExecutables.resolve(it, execSearchDirs) },
 ) {
     fun execute(argv: List<String>, timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS): ShellResult {
-        when (
-            val v = ShellPolicy.validate(argv, privateRoot, safRoots, flavor, bridgeGranted)
+        val binary = when (
+            val v = ShellPolicy.validate(argv, privateRoot, safRoots, flavor, bridgeGranted, trustedBinDirs = execSearchDirs)
         ) {
             is Validation.Denied -> return ShellResult.Denied(v.reason, v.message)
-            is Validation.Allowed -> Unit
+            is Validation.Allowed -> v.binary
         }
-        // 可信 executable 映射（建程序前）：logical command → 驗證後絕對路徑。
+        // 可信 executable 映射（建程序前）：logical command → 已驗證實體。
         // 失敗（同名不同路徑假二進位、`PATH` 劫持、檔案缺失/不可執行）即拒，
         // 不建子進程、不佔配額（沿用「拒絕零 spawn」不變量）。
-        val executable = try {
+        val resolved = try {
             execResolver(argv[0].trim())
         } catch (_: Exception) {
             null
@@ -209,10 +225,18 @@ class RestrictedShell(
             } else {
                 runner
             }
-        // spawn 固定形態：argv[0] 已改寫為驗證後絕對路徑（可執行目標不再由
+        // spawn 固定形態：argv[0] 已改寫為驗證後實體路徑（可執行目標不再由
         // OS 經 `PATH`/cwd 解析）+ 乾淨 env（固定 `PATH`、無危險變數，
         // 不繼承宿主）。操作數（drop(1)）原樣傳遞，不重寫、不放寬。
-        val spawnArgv = listOf(executable) + argv.drop(1)
+        // multicall（resolved.applet 非 null，即實體為 toybox/toolbox/busybox）
+        // 時在 argv[1] 補回白名單放行值 `binary`（即 argv[0] 的 basename），
+        // 還原被 link 吞掉的子命令名；此處用 validate 回傳值而非映射自帶字串，
+        // 自訂映射不得注入未過白名單的 applet 名。非 multicall 不插入。
+        val spawnArgv = if (resolved.applet != null) {
+            listOf(resolved.path, binary) + argv.drop(1)
+        } else {
+            listOf(resolved.path) + argv.drop(1)
+        }
         val raw: RawOutput = try {
             effectiveRunner.run(spawnArgv, timeoutMs, ShellExecutables.CLEAN_ENV)
         } catch (e: Exception) {

@@ -199,6 +199,8 @@ class ScopedFileStore(val root: File) {
      * NOFOLLOW 逐段建立父目錄：每段前驗連結、僅用單層 `mkdir`，
      * 不用會跟隨連結的 `mkdirs`。入口先做建前二驗（[resolve] 內已做一驗），
      * 每段建後再驗該段，呼叫方（[write]）在建完後做建後三驗。
+     * 缺席 [root] 以單層 `mkdir` 安全建立（父層為 OS 已建的可信基，不用 `mkdirs`），
+     * 建後驗為目錄且非連結，否則 fail-closed。
      * 懸空連結視為連結一律拒絕；檢查失敗 fail-closed。
      * 殘餘：段前驗→`mkdir`→建後驗之間仍有併發替換窗口，見類註解。
      */
@@ -206,9 +208,11 @@ class ScopedFileStore(val root: File) {
         val segs = safe.split("/")
         if (segs.size <= 1) {
             ensureNoSymlinkChain(safe, original)
+            ensureRootDirNoFollow(original)
             return
         }
         ensureNoSymlinkChain(safe, original)
+        ensureRootDirNoFollow(original)
         try {
             ensureRootChainNoSymlink(original)
             var cur = root
@@ -226,8 +230,36 @@ class ScopedFileStore(val root: File) {
                         throw IllegalArgumentException("symlink not allowed: $original")
                     }
                 }
+                if (!next.isDirectory) {
+                    throw IllegalArgumentException("symlink check failed: $original")
+                }
                 cur = next
             }
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
+    }
+
+    /**
+     * 缺席根的安全建立：僅用單層 `mkdir`（不用跟隨連結的 `mkdirs`），
+     * 建後驗為目錄且非連結。併發競建由建後驗自然容忍（他線程建好即通過）。
+     * 毒根先由 [ensureRootChainNoSymlink] 拒絕；已存在普通檔亦 fail-closed。
+     */
+    private fun ensureRootDirNoFollow(original: String) {
+        try {
+            ensureRootChainNoSymlink(original)
+            if (!root.exists()) {
+                root.mkdir()
+            }
+            if (Files.isSymbolicLink(root.toPath())) {
+                throw IllegalArgumentException("symlink not allowed: $original")
+            }
+            if (!root.isDirectory) {
+                throw IllegalArgumentException("root not directory: $original")
+            }
+            ensureRootChainNoSymlink(original)
         } catch (e: IllegalArgumentException) {
             throw e
         } catch (e: Exception) {

@@ -169,6 +169,54 @@ class ScopedFileSymlinkTest {
         assertFalse(File(out, "existingSubdir/evil.txt").exists())
     }
 
+    @Test fun absentRootSingleSegmentWriteCreatesRoot() {
+        // P2: 缺席根的單段寫入須自動建根（舊 mkdirs 語義），不用 mkdirs 穿連結。
+        val parent = Files.createTempDirectory("ws-absent-single").toFile().apply { deleteOnExit() }
+        val absent = File(parent, "not-created")
+        assertFalse(absent.exists())
+        val store = ScopedFileStore(absent)
+        store.write("a.txt", byteArrayOf(1))
+        assertTrue("root must be created", absent.isDirectory)
+        assertTrue(File(absent, "a.txt").isFile)
+        assertEquals(1, store.read("a.txt").size)
+    }
+
+    @Test fun absentRootNestedWriteCreatesRoot() {
+        // P2: 缺席根的巢狀寫入同樣建根+逐段建父目錄。
+        val parent = Files.createTempDirectory("ws-absent-nested").toFile().apply { deleteOnExit() }
+        val absent = File(parent, "not-created")
+        val store = ScopedFileStore(absent)
+        store.write("sub/a.txt", byteArrayOf(2))
+        assertTrue(absent.isDirectory)
+        assertTrue(store.read("sub/a.txt").contentEquals(byteArrayOf(2)))
+    }
+
+    @Test fun rootIsFileFailClosed() {
+        val parent = Files.createTempDirectory("ws-root-is-file").toFile().apply { deleteOnExit() }
+        val fileRoot = File(parent, "fileRoot")
+        fileRoot.writeText("i am a file")
+        val store = ScopedFileStore(fileRoot)
+        try {
+            store.write("a.txt", byteArrayOf(1))
+            fail("expected IllegalArgumentException: root is file")
+        } catch (_: IllegalArgumentException) {
+            // 預期 fail-closed。
+        }
+    }
+
+    @Test fun absentRootUnderPoisonedParentDenied() {
+        // 缺席根位於毒父段下仍須拒，不建外部目錄。
+        val parent = Files.createTempDirectory("ws-absent-poison").toFile().apply { deleteOnExit() }
+        val out = outside()
+        val alias = File(parent, "alias")
+        link(alias, out)
+        val absent = File(alias, "not-created")
+        val store = ScopedFileStore(absent)
+        assertRejected({ store.write("a.txt", "x".toByteArray()) }, "poisoned absent root write")
+        assertRejected({ store.write("sub/a.txt", "x".toByteArray()) }, "poisoned absent nested write")
+        assertFalse(File(out, "not-created").exists())
+    }
+
     @Test fun nestedSymlinkDenied() {
         val ws = workspace()
         val out = outside()

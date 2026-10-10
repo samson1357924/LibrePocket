@@ -253,6 +253,15 @@ class FileEditExecutor(
             readBytes(target)
         } catch (e: FileNotFoundException) {
             return failed("NOT_FOUND", "檔案不存在，先用 file.edit 建立「$path」")
+        } catch (e: FileBudgetException) {
+            // 私有域讀預算耗盡：沿既有用語回 FILE_TOO_LARGE（不經全量讀即拒）。
+            if (e.budget == FileBudgetCode.READ_TOO_LARGE) {
+                return failed(
+                    "FILE_TOO_LARGE",
+                    "檔案過大（超過 ${ScopedFileStore.MAX_READ_BYTES} 位元組上限），改用 file.edit 全量覆寫「$path」",
+                )
+            }
+            return failed("READ_FAILED", "讀取失敗「$path」：${e.message}")
         } catch (e: Exception) {
             return failed("READ_FAILED", "讀取失敗「$path」：${e.message}")
         }

@@ -265,4 +265,67 @@ class OrderedTranscriptSinkTest {
       exec.shutdown()
     }
   }
+
+  /**
+   * R2-7: When the writer is blocked and the buffer is full (capacity=1),
+   * an offerSteer is parked in overflowChain. Subsequent writeCore and
+   * writeOrdered calls must await the parked steer admission so that
+   * the delegate receives events strictly in order (parked steer -> core -> notice).
+   */
+  @Test fun parkedSteerTakesPrecedenceOverLaterCoreAndOrderedWrites() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val blockerGate = CompletableDeferred<Unit>()
+      var isFirst = true
+      val delegate = object : SinkProbe() {
+        override suspend fun onSteerQueued(text: String) {
+          if (isFirst) {
+            isFirst = false
+            blockerGate.await()
+          }
+          recorded.add(text)
+        }
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          recorded.add("core:$runId")
+        }
+        override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
+          recorded.add("notice:$runId")
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 1)
+      runBlocking {
+        withTimeout(10_000) {
+          // 1. Blocker: writer enters onSteerQueued and suspends on blockerGate
+          sink.offerSteer("blocker")
+          // 2. Filler: buffer of capacity=1 is now full
+          sink.offerSteer("filler")
+          // 3. Parked steer: buffer full, parked in overflowChain
+          sink.offerSteer("parked-steer")
+          kotlinx.coroutines.delay(100)
+
+          // 4. While steer is parked, call writeCore and writeOrdered
+          val coreJob = async { sink.onTurnStarted("turn-1", "core-text") }
+          val orderedJob = async { sink.onTurnRetried("turn-2", 1, 3, 1000L) }
+          kotlinx.coroutines.delay(100)
+
+          // 5. Unblock writer
+          blockerGate.complete(Unit)
+
+          // 6. Await writes and flush
+          coreJob.await()
+          orderedJob.await()
+          assertTrue("flush must succeed", sink.flush())
+
+          // 7. Assert strict ordering: parked steer must precede core and ordered notice
+          assertEquals(
+            listOf("blocker", "filler", "parked-steer", "core:turn-1", "notice:turn-2"),
+            delegate.recorded,
+          )
+        }
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
 }

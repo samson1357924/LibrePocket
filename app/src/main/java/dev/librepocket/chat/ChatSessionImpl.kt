@@ -87,6 +87,10 @@ class ChatSessionImpl(
 
   override suspend fun flush(timeoutMs: Long): Boolean = controller.flushTranscript(timeoutMs)
 
+  override fun hasDurableFailures(): Boolean = controller.hasDurableFailures()
+
+  override suspend fun flushDurable(timeoutMs: Long): Boolean = controller.flushDurable(timeoutMs)
+
   override fun steer(text: String) = controller.steer(text)
 
   override fun close() {

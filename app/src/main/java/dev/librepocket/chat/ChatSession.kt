@@ -79,6 +79,21 @@ interface ChatSession {
   suspend fun flush(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean
 
   /**
+   * Returns true if any admitted transcript event encountered a durable persistence failure
+   * (e.g. store IOException) or seal/interruption mark.
+   */
+  fun hasDurableFailures(): Boolean = false
+
+  /**
+   * Suspends until every transcript event admitted so far is persisted and verifies
+   * that no durable store failure occurred.
+   *
+   * Returns true only when [flush] drains within [timeoutMs] AND [hasDurableFailures] is false.
+   */
+  suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
+    flush(timeoutMs) && !hasDurableFailures()
+
+  /**
    * Steering: queue an instruction for the next round.
    * Never cancels the current HTTP request or the current turn; the queued
    * instruction is sent automatically once the current turn fully ends. When

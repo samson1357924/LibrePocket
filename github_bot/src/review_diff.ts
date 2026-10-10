@@ -189,51 +189,125 @@ export interface ReviewDiffChunkReport {
   verdict: 'APPROVE' | 'NEEDS_CHANGES' | 'INCONCLUSIVE';
 }
 
-// Slice one file's diff into pieces of at most maxLength chars without
-// splitting lines. Breaks prefer hunk boundaries: when adding the next line
-// would overflow, the cut moves back to the most recent '^@@ ' hunk header
-// strictly inside the current piece (when that keeps the piece non-empty),
-// so hunks stay whole unless a single hunk exceeds the budget. A single line
-// longer than the budget becomes its own (oversized) piece so packing always
-// makes progress. Deterministic: same input always yields the same pieces.
+// Slice one file's diff into pieces of at most maxLength chars, preferring
+// line boundaries and hunk boundaries. Breaks prefer hunk boundaries: when
+// adding the next line would overflow, the cut moves back to the most recent
+// '^@@ ' hunk header strictly inside the current piece (when that keeps the
+// piece non-empty), so hunks stay whole unless a single hunk exceeds the
+// budget. A single line longer than the budget is cut inside the line at
+// fixed offsets with safe-context fallback: within each max-char window the
+// cut moves back to the last ';' first, then '}', then ',', then whitespace
+// (space/tab), then '<'/'>' — but only within the trailing half of the window
+// (cut >= off + ceil(max/2)) so a distant boundary never yields a tiny
+// fragment; with no boundary in that trailing half the cut is a hard cut at
+// the fixed offset. Hunk headers longer than the budget are cut
+// the same way with continuations attributed to the original line (only the
+// first fragment counts as '^@@ ' for later hunk rollback, so no spurious
+// hunk boundary is synthesized). Every returned piece is at most maxLength
+// chars and concatenated pieces reproduce src exactly (direct concatenation,
+// no added/omitted separators), so chunk spans prove full coverage.
+// Deterministic: same input always yields the same pieces.
+function splitLongCarried(carried: string, max: number): string[] {
+  if (carried.length <= max) return [carried];
+  const tiers = [';', '}', ',', ' \t', '<>'];
+  const out: string[] = [];
+  let off = 0;
+  // Only fall back to a safe boundary in the trailing half of the window so
+  // fragments stay densely packed (no tiny slivers from a distant ';').
+  const half = Math.ceil(max / 2);
+  while (off < carried.length) {
+    const remaining = carried.length - off;
+    if (remaining <= max) {
+      out.push(carried.slice(off));
+      break;
+    }
+    const windowEnd = off + max;
+    const minCut = off + half;
+    let cut = -1;
+    for (const tier of tiers) {
+      for (let idx = windowEnd - 1; idx >= minCut - 1 && idx >= off; idx -= 1) {
+        if (tier.includes(carried[idx])) {
+          cut = idx + 1;
+          break;
+        }
+      }
+      if (cut !== -1) break;
+    }
+    if (cut === -1 || cut <= off || cut > windowEnd) cut = windowEnd;
+    out.push(carried.slice(off, cut));
+    off = cut;
+  }
+  return out;
+}
+
 export function sliceDiffForChunk(text: string, maxLength: number): string[] {
   const src = typeof text === 'string' ? text : '';
   if (src.length === 0) return [];
-  const max = Math.max(1, Math.floor(maxLength));
+  const floored = Math.floor(Number(maxLength));
+  const max = Number.isFinite(floored) && floored >= 1 ? floored : 1;
   const lines = src.split('\n');
   const lastLine = lines.length - 1;
-  // Carried length: every non-final line keeps its newline so concatenated
-  // pieces reproduce src exactly (no coverage gap at slice boundaries).
-  const carried = (idx: number): number => lines[idx].length + (idx < lastLine ? 1 : 0);
-  const pieceText = (from: number, to: number): string => {
-    const text = lines.slice(from, to + 1).join('\n');
-    return to < lastLine ? `${text}\n` : text;
-  };
-  const out: string[] = [];
-  let from = 0;
-  let used = 0;
-  let lastHunk = -1;
+  // Atomic units: every non-final line keeps its newline (carried text) so
+  // concatenated units reproduce src exactly. Lines longer than the budget
+  // are pre-split inside the line via splitLongCarried; only the first
+  // fragment of a '^@@ ' header counts as a hunk header so continuations
+  // stay attributed to the original line number.
+  type Unit = { text: string; isHunk: boolean };
+  const units: Unit[] = [];
   for (let i = 0; i < lines.length; i += 1) {
-    if (used > 0 && used + carried(i) > max) {
-      if (lastHunk > from) {
-        out.push(pieceText(from, lastHunk - 1));
-        used = 0;
-        for (let k = lastHunk; k < i; k += 1) used += carried(k);
-        from = lastHunk;
-      } else {
-        out.push(pieceText(from, i - 1));
-        from = i;
-        used = 0;
-      }
-      lastHunk = -1;
-      for (let k = from; k < i; k += 1) {
-        if (/^@@ /.test(lines[k])) lastHunk = k;
+    const carriedText = i < lastLine ? `${lines[i]}\n` : lines[i];
+    const isHunkLine = /^@@ /.test(lines[i]);
+    if (carriedText.length <= max) {
+      units.push({ text: carriedText, isHunk: isHunkLine });
+    } else {
+      const subs = splitLongCarried(carriedText, max);
+      for (let j = 0; j < subs.length; j += 1) {
+        units.push({ text: subs[j], isHunk: j === 0 && isHunkLine });
       }
     }
-    used += carried(i);
-    if (/^@@ /.test(lines[i])) lastHunk = i;
   }
-  out.push(pieceText(from, lastLine));
+  // Greedy pack of whole units with hunk-boundary rollback: when the next
+  // unit would overflow, cut back to the most recent hunk header strictly
+  // inside the current piece (when that keeps the piece non-empty).
+  const out: string[] = [];
+  let cur: Unit[] = [];
+  let used = 0;
+  let lastHunkPos = -1;
+  const curText = (): string => cur.map((u) => u.text).join('');
+  const recomputeHunk = (): void => {
+    lastHunkPos = -1;
+    for (let k = 0; k < cur.length; k += 1) {
+      if (cur[k].isHunk) lastHunkPos = k;
+    }
+  };
+  for (const unit of units) {
+    if (cur.length > 0 && used + unit.text.length > max) {
+      if (lastHunkPos > 0) {
+        out.push(cur.slice(0, lastHunkPos).map((u) => u.text).join(''));
+        cur = cur.slice(lastHunkPos);
+        used = cur.reduce((sum, u) => sum + u.text.length, 0);
+        recomputeHunk();
+      } else {
+        out.push(curText());
+        cur = [];
+        used = 0;
+        lastHunkPos = -1;
+      }
+      if (cur.length > 0 && used + unit.text.length > max) {
+        // Single hunk exceeds the budget: the carried prefix alone still
+        // overflows with the next unit, so flush it as-is (hunk split is
+        // unavoidable; intra-line units are already <= max so progress holds).
+        out.push(curText());
+        cur = [];
+        used = 0;
+        lastHunkPos = -1;
+      }
+    }
+    cur.push(unit);
+    used += unit.text.length;
+    if (unit.isHunk) lastHunkPos = cur.length - 1;
+  }
+  if (cur.length > 0) out.push(curText());
   return out;
 }
 
@@ -275,10 +349,13 @@ export function collectFileDiffs(
 // fileDiffs maps file path to its full patch (see collectFileDiffs);
 // changedFiles selects and orders the review subset via filterReviewDiffFiles
 // + prioritizeFiles. Small files pack greedily (whole, atomic); a file larger
-// than the budget is sliced with sliceDiffForChunk and its slices pack
-// across consecutive chunks. Chunk spans are contiguous over
-// reviewDiffs.join('\n') (end includes the separator up to the next piece, as
-// with issue chunks), so start[0] === 0, start[i] === end[i-1], and
+// than the budget is sliced with sliceDiffForChunk (line-aware with
+// intra-line safe-context cuts, every slice <= budget) and its slices pack
+// across consecutive chunks. Intra-file slices concatenate directly with no
+// separator, so pieces join to the per-file full text and the chunk layout
+// reassembles to reviewFiles.map(lookup).join('\n') exactly. Chunk spans are
+// contiguous over that layout (end includes the separator up to the next
+// piece, as with issue chunks), so start[0] === 0, start[i] === end[i-1], and
 // end[last] === totalLength where totalLength equals the single-turn
 // originalLength over the same file set.
 export function buildReviewDiffChunks(
@@ -286,7 +363,8 @@ export function buildReviewDiffChunks(
   changedFiles: string[],
   maxLength: number = MAX_PR_CHUNK_LENGTH,
 ): ReviewDiffChunk[] {
-  const max = Math.max(1, Math.floor(maxLength));
+  const floored = Math.floor(Number(maxLength));
+  const max = Number.isFinite(floored) && floored >= 1 ? floored : 1;
   const lookup = (file: string): string => {
     if (fileDiffs instanceof Map) return fileDiffs.get(file) ?? '';
     const entry = (fileDiffs as Record<string, string>)[file];
@@ -313,10 +391,11 @@ export function buildReviewDiffChunks(
   if (pieces.length === 0) throw new Error('No review diffs to chunk.');
   const totalLength = pieces[pieces.length - 1].offset + pieces[pieces.length - 1].text.length;
   // Greedy pack: whole pieces only (a file within budget is a single piece,
-  // hence atomic). Separators exist only between files (slices of one file
-  // concatenate directly), so the joined layout length always equals the
-  // single-turn originalLength over the same file set. A piece larger than
-  // the budget (single long line) still occupies its own chunk alone.
+  // hence atomic). Separators exist only between files (slices of one file —
+  // including intra-line fragments — concatenate directly with no separator),
+  // so the joined layout length always equals the single-turn originalLength
+  // over the same file set. Every slice is already <= budget via
+  // sliceDiffForChunk, so every packed chunk diff is also <= budget.
   const groups: Piece[][] = [];
   let current: Piece[] = [];
   let used = 0;
@@ -415,6 +494,10 @@ export function validateReviewDiffChunk(value: unknown): ReviewDiffChunk | undef
   const raw = value as Record<string, unknown>;
   if (typeof raw.diff !== 'string' || (raw.diff as string).length === 0) return undefined;
   if ((raw.diff as string).length > skeleton.coveredLength) return undefined;
+  // Input upper bound fail-closed: model-bound chunk text must fit the
+  // per-chunk budget (intra-line slicing guarantees the builder never emits
+  // an oversized chunk, so an oversized input is tampered/forged).
+  if ((raw.diff as string).length > MAX_PR_CHUNK_LENGTH) return undefined;
   return { ...skeleton, diff: raw.diff as string };
 }
 
@@ -502,15 +585,30 @@ export function validateReviewDiffChunkReports(
 // Source coverage proof for PR chunks (mirrors verifyIssueChunkCoverage):
 // continuity plus span/total plus file-set equality. totalLength is the
 // concatenated review-diff length (coverage.originalLength); files is the
-// review-eligible file set (filterReviewDiffFiles output). Without opts only
-// internal continuity is checked.
+// review-eligible file set (filterReviewDiffFiles output). maxLength is an
+// optional per-chunk input upper bound for publish: diff-carrying chunks must
+// satisfy diff.length <= maxLength and every chunk must satisfy
+// coveredLength <= maxLength + 1 (the +1 is the single file separator counted
+// in the span but not in the diff text when a chunk ends at a file boundary).
+// Without opts only internal continuity is checked.
 export function verifyReviewDiffChunkCoverage(
   chunks: Array<ReviewDiffChunk | ReviewDiffChunkReport>,
-  opts?: { totalLength?: number; files?: string[] },
+  opts?: { totalLength?: number; files?: string[]; maxLength?: number },
 ): boolean {
   if (!Array.isArray(chunks) || chunks.length < 1) return false;
   const sorted = [...chunks].sort((a, b) => a.index - b.index);
   if (!checkChunkContinuity(sorted)) return false;
+  if (opts?.maxLength !== undefined) {
+    const floored = Math.floor(Number(opts.maxLength));
+    if (!Number.isFinite(floored) || floored < 1) return false;
+    const max = floored;
+    for (const chunk of sorted) {
+      if (chunk.coveredLength > max + 1) return false;
+      if ('diff' in chunk && typeof (chunk as ReviewDiffChunk).diff === 'string') {
+        if ((chunk as ReviewDiffChunk).diff.length > max) return false;
+      }
+    }
+  }
   if (opts?.totalLength !== undefined) {
     if (!Number.isSafeInteger(opts.totalLength) || opts.totalLength < 0) return false;
     if (sorted[sorted.length - 1].end !== opts.totalLength) return false;

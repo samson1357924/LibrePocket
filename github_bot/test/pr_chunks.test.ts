@@ -219,13 +219,141 @@ export async function runPrChunksTests(): Promise<void> {
         totalLength: chunks[chunks.length - 1].end,
         files: ['app/src/main/java/demo/Big.kt'],
       }), 'giant slices cover fully');
+      assert.ok(verifyReviewDiffChunkCoverage(chunks, {
+        totalLength: chunks[chunks.length - 1].end,
+        files: ['app/src/main/java/demo/Big.kt'],
+        maxLength: MAX_PR_CHUNK_LENGTH,
+      }), 'giant slices respect the per-chunk budget');
+      for (const chunk of chunks) {
+        assert.ok(chunk.diff.length <= MAX_PR_CHUNK_LENGTH, `chunk diff respects budget (got ${chunk.diff.length})`);
+      }
       // Hunk integrity: no chunk starts mid-hunk except the slice carrying it.
       const slices = sliceDiffForChunk(fileDiff('f', body), MAX_PR_CHUNK_LENGTH);
       assert.ok(slices.length >= 2, 'slicer splits the giant file');
-      for (const slice of slices.slice(0, -1)) {
-        assert.ok(slice.length <= MAX_PR_CHUNK_LENGTH || !slice.includes('\n'), 'budget holds except single long lines');
+      for (const slice of slices) {
+        assert.ok(slice.length <= MAX_PR_CHUNK_LENGTH, `strict budget holds (got ${slice.length})`);
       }
+      assert.equal(slices.join(''), fileDiff('f', body), 'slices reassemble exactly');
       assert.ok(slices.some((s) => s.includes('@@ -99,3 +101,4 @@')), 'second hunk header survives slicing');
+    }
+
+    // Unit: 8001-char single line splits inside the line with strict budget.
+    {
+      const single8001 = `+${'a'.repeat(8000)}`;
+      assert.equal(single8001.length, 8001, 'fixture is one 8001-char line');
+      const slices = sliceDiffForChunk(single8001, MAX_PR_CHUNK_LENGTH);
+      assert.ok(slices.length >= 2, `8001-char line splits (got ${slices.length})`);
+      for (const slice of slices) {
+        assert.ok(slice.length <= MAX_PR_CHUNK_LENGTH, `8001 slice respects budget (got ${slice.length})`);
+      }
+      assert.equal(slices.join(''), single8001, '8001 slices reassemble exactly');
+      const src = fileDiff('app/src/main/java/demo/Single.kt', [single8001]);
+      const fileSlices = sliceDiffForChunk(src, MAX_PR_CHUNK_LENGTH);
+      assert.ok(fileSlices.every((s) => s.length <= MAX_PR_CHUNK_LENGTH), 'file with 8001 line respects budget');
+      assert.equal(fileSlices.join(''), src, 'file slices reassemble exactly');
+      const diffs = new Map<string, string>([['app/src/main/java/demo/Single.kt', src]]);
+      const chunks = buildReviewDiffChunks(diffs, ['app/src/main/java/demo/Single.kt']);
+      assert.ok(chunks.length >= 2, `8001 file chunks (got ${chunks.length})`);
+      for (const chunk of chunks) {
+        assert.ok(validateReviewDiffChunk(chunk), 'each 8001 chunk validates');
+        assert.ok(chunk.diff.length <= MAX_PR_CHUNK_LENGTH, '8001 chunk diff respects budget');
+      }
+      assert.equal(chunks.map((c) => c.diff).join(''), src, '8001 chunk diffs reassemble to the file diff');
+      assert.ok(verifyReviewDiffChunkCoverage(chunks, {
+        totalLength: chunks[chunks.length - 1].end,
+        files: ['app/src/main/java/demo/Single.kt'],
+        maxLength: MAX_PR_CHUNK_LENGTH,
+      }), '8001 coverage verifies with budget');
+      assert.deepEqual(chunks.flatMap((c) => c.files).filter((f, i, a) => a.indexOf(f) === i), ['app/src/main/java/demo/Single.kt'], '8001 preserves file attribution');
+    }
+
+    // Unit: 120001-char single minified line splits fully and can APPROVE.
+    {
+      const hugeLine = `+${Array.from({ length: 120000 }, (_, i) => (i % 10 === 0 ? ';' : 'x')).join('')}`;
+      assert.equal(hugeLine.length, 120001, 'fixture is one 120001-char line');
+      const slices = sliceDiffForChunk(hugeLine, MAX_PR_CHUNK_LENGTH);
+      assert.ok(slices.length >= 15, `120001-char line splits (got ${slices.length})`);
+      for (const slice of slices) {
+        assert.ok(slice.length <= MAX_PR_CHUNK_LENGTH, `120001 slice respects budget (got ${slice.length})`);
+      }
+      assert.equal(slices.join(''), hugeLine, '120001 slices reassemble exactly');
+      // Safe-context preference: a ';' near the fixed offset ends a fragment.
+      assert.ok(slices.slice(0, -1).some((s) => s.endsWith(';')), 'safe boundary preferred over hard cut');
+      const src = fileDiff('app/src/main/java/demo/Huge.kt', [hugeLine]);
+      const diffs = new Map<string, string>([['app/src/main/java/demo/Huge.kt', src]]);
+      const chunks = buildReviewDiffChunks(diffs, ['app/src/main/java/demo/Huge.kt']);
+      assert.ok(chunks.length >= 2, `120001 file chunks (got ${chunks.length})`);
+      for (const chunk of chunks) {
+        assert.ok(validateReviewDiffChunk(chunk), 'each 120001 chunk validates');
+        assert.ok(chunk.diff.length <= MAX_PR_CHUNK_LENGTH, '120001 chunk diff respects budget');
+        assert.deepEqual(chunk.files, ['app/src/main/java/demo/Huge.kt'], '120001 preserves file attribution');
+      }
+      assert.equal(chunks.map((c) => c.diff).join(''), src, '120001 chunk diffs reassemble to the file diff');
+      assert.ok(verifyReviewDiffChunkCoverage(chunks, {
+        totalLength: chunks[chunks.length - 1].end,
+        files: ['app/src/main/java/demo/Huge.kt'],
+        maxLength: MAX_PR_CHUNK_LENGTH,
+      }), '120001 coverage verifies with budget');
+      assert.ok(validateReviewDiffChunks(chunks, { fileDiffs: diffs, changedFiles: ['app/src/main/java/demo/Huge.kt'] }), '120001 rebuild validates');
+      // Full coverage with unanimous APPROVE synthesizes APPROVE (never INCONCLUSIVE by truncation).
+      const perChunk = chunks.map(() => fakeOrchestrated('APPROVE'));
+      assert.equal(synthesizeChunkedReview(perChunk, {
+        coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: src.length },
+        deterministicViolations: [],
+      }).verdict, 'APPROVE', '120001 full chunk coverage may APPROVE');
+    }
+
+    // Unit: giant minified file preserves file/hunk attribution with intra-line cuts.
+    {
+      const minLine = `+${'a'.repeat(7890)};${'b'.repeat(5000)}`;
+      const body = ['+header-a', '@@ -10,3 +10,5 @@', minLine, '+tail-b'];
+      const src = fileDiff('app/src/main/java/demo/Min.kt', body);
+      const slices = sliceDiffForChunk(src, MAX_PR_CHUNK_LENGTH);
+      for (const slice of slices) {
+        assert.ok(slice.length <= MAX_PR_CHUNK_LENGTH, `minified slice respects budget (got ${slice.length})`);
+      }
+      assert.equal(slices.join(''), src, 'minified slices reassemble exactly');
+      assert.ok(slices.some((s) => s.includes('@@ -10,3 +10,5 @@')), 'minified hunk header survives slicing');
+      assert.ok(slices.some((s) => s.endsWith(';')), 'minified safe boundary preferred');
+      const diffs = new Map<string, string>([['app/src/main/java/demo/Min.kt', src]]);
+      const chunks = buildReviewDiffChunks(diffs, ['app/src/main/java/demo/Min.kt']);
+      for (const chunk of chunks) {
+        assert.ok(chunk.diff.length <= MAX_PR_CHUNK_LENGTH, 'minified chunk diff respects budget');
+        assert.deepEqual(chunk.files, ['app/src/main/java/demo/Min.kt'], 'minified preserves file attribution');
+        assert.ok(!chunk.diff.startsWith('\n'), 'no leading separator');
+      }
+      assert.equal(chunks.map((c) => c.diff).join(''), src, 'minified chunk diffs reassemble');
+      assert.ok(verifyReviewDiffChunkCoverage(chunks, {
+        totalLength: chunks[chunks.length - 1].end,
+        files: ['app/src/main/java/demo/Min.kt'],
+        maxLength: MAX_PR_CHUNK_LENGTH,
+      }), 'minified coverage verifies with budget');
+      // Overlong hunk header is cut the same way with continuations attributed
+      // to the original line (only the first fragment carries '^@@ ').
+      const hunkLong = `@@ ${'x'.repeat(9000)} @@`;
+      const hunkSrc = `a\n${hunkLong}\nb`;
+      const hunkSlices = sliceDiffForChunk(hunkSrc, MAX_PR_CHUNK_LENGTH);
+      assert.ok(hunkSlices.every((s) => s.length <= MAX_PR_CHUNK_LENGTH), 'overlong hunk respects budget');
+      assert.equal(hunkSlices.join(''), hunkSrc, 'overlong hunk reassembles exactly');
+      assert.equal(hunkSlices.filter((s) => /^@@ /.test(s)).length, 1, 'only first fragment carries the hunk header');
+    }
+
+    // Unit: per-chunk input upper bound fails closed.
+    {
+      const diffs = new Map<string, string>([['app/src/main/java/demo/Single.kt', fileDiff('app/src/main/java/demo/Single.kt', ['+' + 'q'.repeat(9000)])]]);
+      const chunks = buildReviewDiffChunks(diffs, ['app/src/main/java/demo/Single.kt']);
+      assert.ok(chunks.length >= 1, 'fixture chunks');
+      const good = chunks[0];
+      assert.ok(validateReviewDiffChunk(good), 'good chunk validates');
+      const oversizedDiff = `${'x'.repeat(MAX_PR_CHUNK_LENGTH + 1)}`;
+      const tampered = { ...good, files: [...good.files], diff: oversizedDiff, coveredLength: oversizedDiff.length, end: good.start + oversizedDiff.length };
+      assert.equal(validateReviewDiffChunk(tampered), undefined, 'oversized diff rejected fail-closed');
+      assert.equal(validateReviewDiffChunks([tampered]), undefined, 'oversized chunk list rejected');
+      assert.equal(verifyReviewDiffChunkCoverage([tampered], { maxLength: MAX_PR_CHUNK_LENGTH }), false, 'verify rejects oversized diff with budget');
+      assert.equal(verifyReviewDiffChunkCoverage(chunks, { maxLength: MAX_PR_CHUNK_LENGTH }), true, 'verify accepts budgeted chunks');
+      assert.equal(verifyReviewDiffChunkCoverage(chunks, { maxLength: 0 }), false, 'verify rejects invalid budget fail-closed');
+      assert.equal(verifyReviewDiffChunkCoverage(chunks, { maxLength: Number.NaN }), false, 'verify rejects NaN budget fail-closed');
+      assert.throws(() => buildReviewDiffChunks(new Map(), ['app/src/main/java/demo/Single.kt']), /No review diffs/, 'empty input fails closed');
     }
 
     // Unit: tampered coverage is rejected.

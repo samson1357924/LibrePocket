@@ -648,6 +648,114 @@ export function withReviewClaimMarker(body: string, sha: string, runId: string, 
   return `${base}${formatReviewClaimMarker(sha.toLowerCase(), runId, attempt)}\n`;
 }
 
+// Phase 1 (ninth P1 #1) sticky overflow fail-closed: metadata (ledger/claim
+// markers plus this footer) is never truncated — only the visible summary is
+// trimmed (reviewComment's metadataReserve). A metadata-carrying body that
+// still exceeds GITHUB_COMMENT_HARD_LIMIT fails closed (no write, old ledger
+// preserved) instead of being blindly cut. Single sticky unchanged; the
+// report artifact is never a ledger (counts are not recoverable from it).
+export const STICKY_TAIL_MARGIN = 256;
+export const STICKY_LIMIT_EXCEEDED_MESSAGE =
+  'PocketGuard: sticky body exceeds the GitHub comment limit; fail-closed without writing.';
+export const STICKY_LEDGER_UNREADABLE_MESSAGE =
+  'PocketGuard: sticky ledger unreadable during publish; fail-closed without writing.';
+
+export function isStickyLimitError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('exceeds the GitHub comment limit');
+}
+
+export function isStickyLedgerUnreadableError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('sticky ledger unreadable during publish');
+}
+
+// True when the body carries sticky metadata that must never be truncated:
+// the review marker, count/claim ledger markers, or the ledger footer below.
+export function hasStickyMetadata(body: unknown): boolean {
+  if (typeof body !== 'string') return false;
+  return body.includes(REVIEW_MARKER) ||
+    body.includes(REVIEW_COUNT_MARKER_PREFIX) ||
+    body.includes(REVIEW_CLAIM_MARKER_PREFIX) ||
+    body.includes(LEDGER_META_MARKER_PREFIX);
+}
+
+// Ledger integrity footer: appended by buildStampedBody so a truncated body
+// is detectable on re-read. `counts`/`claims` are the marker totals and `len`
+// is the char length of the body without the footer line itself. A legacy
+// body without a footer verifies as unknown-provenance (accepted) so old
+// stickies keep working; a present footer with mismatched counts or length
+// means truncation and readers fail closed (ok:false).
+export const LEDGER_META_MARKER_PREFIX = '<!-- PocketGuard-ledger-meta:';
+
+export function formatLedgerFooter(ledgerSize: number, claimSize: number, bodyLength: number): string {
+  const lc = Number.isSafeInteger(Math.floor(ledgerSize)) ? Math.max(0, Math.floor(ledgerSize)) : 0;
+  const cc = Number.isSafeInteger(Math.floor(claimSize)) ? Math.max(0, Math.floor(claimSize)) : 0;
+  const len = Number.isSafeInteger(Math.floor(bodyLength)) ? Math.max(0, Math.floor(bodyLength)) : 0;
+  return `${LEDGER_META_MARKER_PREFIX}counts=${lc}:claims=${cc}:len=${len} -->`;
+}
+
+export function parseLedgerFooter(body: unknown): { counts: number; claims: number; len: number } | undefined {
+  if (typeof body !== 'string') return undefined;
+  const pattern = new RegExp(
+    `${LEDGER_META_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}counts=(\\d+):claims=(\\d+):len=(\\d+)\\s*-->`,
+    'gi',
+  );
+  let found: { counts: number; claims: number; len: number } | undefined;
+  for (const match of body.matchAll(pattern)) {
+    const counts = Number.parseInt(match[1], 10);
+    const claims = Number.parseInt(match[2], 10);
+    const len = Number.parseInt(match[3], 10);
+    if (!Number.isSafeInteger(counts) || !Number.isSafeInteger(claims) || !Number.isSafeInteger(len)) continue;
+    found = { counts, claims, len };
+  }
+  return found;
+}
+
+export function stripLedgerFooters(body: string): string {
+  const pattern = new RegExp(
+    `${LEDGER_META_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}counts=\\d+:claims=\\d+:len=\\d+\\s*-->\n?`,
+    'gi',
+  );
+  return body.replace(pattern, '');
+}
+
+export function verifyLedgerFooter(body: string, ledger: Map<string, number>, claims: Set<string>): boolean {
+  const footer = parseLedgerFooter(body);
+  if (!footer) return true;
+  const stripped = stripLedgerFooters(body);
+  return stripped.length === footer.len &&
+    ledger.size === footer.counts &&
+    claims.size === footer.claims;
+}
+
+// Length of the marker suffix buildStampedBody would append for the given
+// merged ledger/claims (markers plus footer, probed against an empty visible
+// base; the footer's embedded length digits may shift by a few chars against
+// a real base, covered by STICKY_TAIL_MARGIN at the callers).
+export function estimateStickyMetadataLength(ledger: Map<string, number>, claims: Set<string>): number {
+  return appendStickyMetadataSuffix('', ledger, claims).length;
+}
+
+function appendStickyMetadataSuffix(base: string, ledger: Map<string, number>, claims: Set<string>): string {
+  const ledgerPart = [...ledger.entries()]
+    .sort((left, right) => left[0].localeCompare(right[0]))
+    .map(([entrySha, entryCount]) => formatReviewCountMarker(entrySha, entryCount))
+    .join('\n');
+  const claimMarkers = [...claims]
+    .sort()
+    .map((id) => {
+      const parts = id.split(':');
+      if (parts.length !== 3 || !safeSha(parts[0])) return undefined;
+      return formatReviewClaimMarker(parts[0], parts[1], parts[2]);
+    })
+    .filter((marker): marker is string => typeof marker === 'string')
+    .join('\n');
+  let result = base;
+  if (ledgerPart) result += `${ledgerPart}\n`;
+  if (claimMarkers) result += `${claimMarkers}\n`;
+  result += `${formatLedgerFooter(ledger.size, claims.size, result.length)}\n`;
+  return result;
+}
+
 // P1 #3 bot-written label ledger marker: the sticky body may carry one
 // `<!-- PocketGuard-bot-labels:<csv> -->` line recording the last bot-written
 // label set (canonical names, comma-separated). Publish reads it before
@@ -720,7 +828,11 @@ export function resolveCountClaimKey(env: NodeJS.ProcessEnv | undefined): string
 // Merge a fresh review body with the freshly re-read sticky ledger: preserve
 // every other SHA, set target to the merged count, and carry (plus add) claim
 // markers. When target/expected are undefined the ledger is preserved
-// unchanged (uncounted fallback: no new marker, no increment).
+// unchanged (uncounted fallback: no new marker, no increment). Always
+// appends the ledger integrity footer (Phase 1); any stale footer riding on
+// freshContent is stripped first so exactly one footer exists. The returned
+// body is never truncated here — callers check requiredLength/fits and fail
+// closed instead of cutting metadata.
 export function buildStampedBody(
   freshContent: string,
   freshLedger: Map<string, number>,
@@ -751,25 +863,44 @@ export function buildStampedBody(
     }
     mergedLedger.set(target, mergedCount);
   }
-  const stripped = stripReviewCountMarkers(freshContent);
+  const stripped = stripLedgerFooters(stripReviewCountMarkers(freshContent));
   const base = stripped.length === 0 || stripped.endsWith('\n') ? stripped : `${stripped}\n`;
-  const ledgerPart = [...mergedLedger.entries()]
-    .sort((left, right) => left[0].localeCompare(right[0]))
-    .map(([entrySha, entryCount]) => formatReviewCountMarker(entrySha, entryCount))
-    .join('\n');
-  const claimMarkers = [...mergedClaims]
-    .sort()
-    .map((id) => {
-      const parts = id.split(':');
-      if (parts.length !== 3 || !safeSha(parts[0])) return undefined;
-      return formatReviewClaimMarker(parts[0], parts[1], parts[2]);
-    })
-    .filter((marker): marker is string => typeof marker === 'string')
-    .join('\n');
-  let result = base;
-  if (ledgerPart) result += `${ledgerPart}\n`;
-  if (claimMarkers) result += `${claimMarkers}\n`;
-  return result;
+  return appendStickyMetadataSuffix(base, mergedLedger, mergedClaims);
+}
+
+export interface StampedBodyLength {
+  body: string;
+  requiredLength: number;
+  fits: boolean;
+}
+
+// Length-reporting build (Phase 1): requiredLength is the exact stamped body
+// length; fits is requiredLength within GITHUB_COMMENT_HARD_LIMIT.
+export function buildStampedBodyWithLength(
+  freshContent: string,
+  freshLedger: Map<string, number>,
+  freshClaims: Set<string>,
+  targetSha: string | undefined,
+  expectedCount: number | undefined,
+  claimKey: string | undefined,
+): StampedBodyLength {
+  const body = buildStampedBody(freshContent, freshLedger, freshClaims, targetSha, expectedCount, claimKey);
+  return { body, requiredLength: body.length, fits: body.length <= GITHUB_COMMENT_HARD_LIMIT };
+}
+
+// Fit-or-throw build (Phase 1): returns the stamped body, or throws a
+// sticky-limit error (see isStickyLimitError) instead of truncating metadata.
+export function assertStampedBodyFits(
+  freshContent: string,
+  freshLedger: Map<string, number>,
+  freshClaims: Set<string>,
+  targetSha: string | undefined,
+  expectedCount: number | undefined,
+  claimKey: string | undefined,
+): string {
+  const built = buildStampedBodyWithLength(freshContent, freshLedger, freshClaims, targetSha, expectedCount, claimKey);
+  if (!built.fits) throw new Error(STICKY_LIMIT_EXCEEDED_MESSAGE);
+  return built.body;
 }
 
 function isStickyReviewComment(comment: GithubComment, botLogin: string | undefined): boolean {
@@ -825,7 +956,12 @@ export async function readStickyReviewCount(
       }
       if (!comments || !Array.isArray(comments.data)) return { ok: false };
       const sticky = comments.data.find((comment) => isStickyReviewComment(comment, botLogin));
-      if (sticky) return { ok: true, used: parseReviewCountMarker(sticky.body, headSha) };
+      if (sticky) {
+        const text = typeof sticky.body === 'string' ? sticky.body : '';
+        // Phase 1: same truncation guard as the full ledger read.
+        if (!verifyLedgerFooter(text, parseReviewCountLedger(text), parseReviewClaimSet(text))) return { ok: false };
+        return { ok: true, used: parseReviewCountMarker(text, headSha) };
+      }
       if (comments.data.length < 100) return { ok: true, used: 0 };
     }
   } catch {
@@ -876,12 +1012,13 @@ export async function readStickyLedger(
       if (!comments || !Array.isArray(comments.data)) return { ok: false };
       const sticky = comments.data.find((comment) => isStickyReviewComment(comment, botLogin));
       if (sticky) {
-        return {
-          ok: true,
-          ledger: parseReviewCountLedger(sticky.body),
-          claims: parseReviewClaimSet(sticky.body),
-          body: typeof sticky.body === 'string' ? sticky.body : '',
-        };
+        const text = typeof sticky.body === 'string' ? sticky.body : '';
+        const ledger = parseReviewCountLedger(text);
+        const claims = parseReviewClaimSet(text);
+        // Phase 1: a present-but-mismatched integrity footer means truncation;
+        // fail closed instead of trusting a partial ledger.
+        if (!verifyLedgerFooter(text, ledger, claims)) return { ok: false };
+        return { ok: true, ledger, claims, body: text };
       }
       if (comments.data.length < 100) return { ok: true, ledger: new Map(), claims: new Set(), body: '' };
     }
@@ -1350,10 +1487,33 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
   const expected = claimPresent ? existing : existing + 1;
   const baseText = baseline.body.includes(REVIEW_MARKER) ? baseline.body : CLAIM_PLACEHOLDER_BODY;
   const cleanText = stripReviewClaimMarkers(baseText);
-  const initialBody = buildStampedBody(cleanText, baseline.ledger, baseline.claims, claimSha, expected, claimKey);
+  // Phase 1: estimate before any write. A stamped body past the GitHub hard
+  // limit fails closed with zero writes (claimed:false, quota-unknown,
+  // reviewsUsed 0, nothing consumed) instead of a truncated write that would
+  // silently drop ledger markers. The minimal visible (placeholder plus
+  // markers) is reported so callers can tell a hopelessly overgrown ledger
+  // from a merely verbose visible body; either way nothing is written.
+  const initialMeasured = buildStampedBodyWithLength(cleanText, baseline.ledger, baseline.claims, claimSha, expected, claimKey);
+  if (!initialMeasured.fits) {
+    const minimalLength = buildStampedBody(
+      CLAIM_PLACEHOLDER_BODY,
+      baseline.ledger,
+      baseline.claims,
+      claimSha,
+      expected,
+      claimKey,
+    ).length;
+    return emit({
+      claimed: false,
+      reviewsUsed: 0,
+      reason: `quota-unknown: sticky body would exceed the comment limit (needs ${initialMeasured.requiredLength}, minimal ${minimalLength} > ${GITHUB_COMMENT_HARD_LIMIT}); fail-closed without occupying a slot`,
+      issueNumber,
+    });
+  }
+  const initialBody = initialMeasured.body;
   const buildFreshBody = async (): Promise<string> => {
     const fresh = await readStickyLedger(client, repository.owner, repository.repo, issueNumber);
-    if (!fresh.ok) throw new Error('PocketGuard: failed to claim review slot.');
+    if (!fresh.ok) throw new Error(STICKY_LEDGER_UNREADABLE_MESSAGE);
     const freshExisting = fresh.ledger.get(claimSha) ?? 0;
     const freshPresent = claimKey ? fresh.claims.has(`${claimSha}:${claimKey}`) : false;
     const freshExpected = freshPresent ? freshExisting : freshExisting + 1;
@@ -1362,8 +1522,53 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
   };
   try {
     await publishStickyComment(client, repository, issueNumber, initialBody, buildFreshBody);
-  } catch {
+  } catch (error) {
+    // Over-limit or mid-claim unreadable ledger: explicit failure with zero
+    // consumption (nothing was written). Genuine write failures still throw.
+    if (isStickyLimitError(error) || isStickyLedgerUnreadableError(error)) {
+      return emit({
+        claimed: false,
+        reviewsUsed: 0,
+        reason: 'quota-unknown: sticky body would exceed the comment limit or the ledger became unreadable; fail-closed without occupying a slot',
+        issueNumber,
+      });
+    }
     throw new Error('PocketGuard: failed to claim review slot.');
+  }
+  // Phase 1: the claim counts only when a re-read proves the marker survived
+  // the write (no truncation, no lost race). Otherwise fail closed.
+  const verify = await readStickyLedger(client, repository.owner, repository.repo, issueNumber);
+  if (!verify.ok) {
+    return emit({
+      claimed: false,
+      reviewsUsed: expected,
+      reason: 'quota-unknown: claim write unverifiable; sticky ledger unreadable after write',
+      issueNumber,
+      claimSha,
+    });
+  }
+  if (claimKey) {
+    if (!verify.claims.has(`${claimSha}:${claimKey}`)) {
+      const current = verify.ledger.get(claimSha) ?? 0;
+      return emit({
+        claimed: false,
+        reviewsUsed: current,
+        reason: 'quota-unknown: claim marker missing after write; fail-closed',
+        issueNumber,
+        claimSha,
+      });
+    }
+  } else {
+    const current = verify.ledger.get(claimSha) ?? 0;
+    if (current < expected) {
+      return emit({
+        claimed: false,
+        reviewsUsed: current,
+        reason: 'quota-unknown: claim count missing after write; fail-closed',
+        issueNumber,
+        claimSha,
+      });
+    }
   }
   return emit({ claimed: true, reviewsUsed: expected, reason: `claimed: head ${claimSha} now at ${expected}`, issueNumber, claimSha });
 }
@@ -3993,21 +4198,29 @@ function formatStickyFileList(label: string, files: string[]): string {
 
 function hardTruncateSticky(body: string, limit: number): string {
   if (body.length <= limit) return body;
-  const note = '…（已省略超長內容，完整結果見 artifact）';
+  // Visible-only last resort (never used on a metadata-carrying ledger path;
+  // see publishStickyComment). Counts live only in the sticky ledger and are
+  // never recoverable from the report artifact.
+  const note = '…（已省略超長審查明細，完整明細見 artifact；計數以本則為準）';
   const keep = Math.max(0, limit - note.length);
   return `${body.slice(0, keep)}${note}`;
 }
 
-// Pre-send fail-safe for publishStickyComment: GitHub rejects bodies past
-// 65536 chars. The PR budget (50000) plus ledger markers normally stays far
-// below it; this last resort keeps a single sticky write (never a second
-// comment) with an explicit note. Excess detail stays in the report artifact.
+// Pre-send cap for metadata-free plain text only. Ledger paths must precheck
+// with buildStampedBodyWithLength/assertStampedBodyFits and fail closed
+// instead of calling this: GitHub rejects bodies past 65536 chars, and a
+// blind cut could drop ledger markers and silently lose counts.
 export function enforceGithubCommentLimit(body: string): string {
   if (typeof body !== 'string') return body;
   return hardTruncateSticky(body, GITHUB_COMMENT_HARD_LIMIT);
 }
 
-export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = [], reportLine?: string): string {
+// metadataReserve (Phase 1): expected marker-suffix length from
+// estimateStickyMetadataLength. The visible-findings budget reserves
+// max(1500, metadataReserve + margin) so visible + markers still fits while
+// header metadata and the tail counts line are always kept — only the
+// summary/findings list is trimmed, never metadata.
+export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = [], reportLine?: string, metadataReserve = 0): string {
   const updatedAt = new Date().toISOString();
   const omittedFiles = Array.isArray(output.coverage?.omittedFiles)
     ? output.coverage.omittedFiles.filter((file): file is string => typeof file === 'string')
@@ -4107,8 +4320,13 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
     .slice(0, MAX_STICKY_VIOLATION_POOL_SIZE);
   // Incremental fill under the total budget: each entry is truncated->escaped
   // first and accounted post-escape; over budget stops (never a second
-  // comment). TAIL_RESERVE keeps room for the total/omitted/artifact tail.
-  const TAIL_RESERVE = 1500;
+  // comment). The reserve keeps room for the tail counts line plus the marker
+  // suffix stamped later, so metadata always survives and only the
+  // summary/findings list shrinks.
+  const reserveInput = typeof metadataReserve === 'number' && Number.isFinite(metadataReserve)
+    ? Math.max(0, Math.floor(metadataReserve))
+    : 0;
+  const TAIL_RESERVE = Math.max(1500, reserveInput + STICKY_TAIL_MARGIN);
   const lines: string[] = [
     ...headerLines,
     `### 發現（共${totalFindings}，候選${poolFindings.length}，按 BLOCK>WARN>SUGGESTION 擇要，同級保持原序）`,
@@ -4147,7 +4365,7 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
   lines.push(
     '',
     `共${totalFindings}項發現，示${shownFindings}項，省略${omittedFindings}項；共${totalViolations}項確定性違規，示${shownViolations}項，省略${omittedViolations}項。`,
-    '完整結果見 artifact `pocketguard-review-report`；超量內容只進 artifact，本則不另開留言。',
+    '完整審查明細見 artifact `pocketguard-review-report`；超量審查內容只進 artifact，本則不另開留言。計數以本則 ledger 為準，不由 artifact 恢復。',
   );
   const body = `${lines.join('\n')}\n`;
   if (body.length <= MAX_STICKY_TOTAL_LENGTH) return body;
@@ -4289,11 +4507,14 @@ async function publishStickyComment(
     // the write. GitHub offers no compare-and-swap, so this narrows but cannot
     // eliminate the race with a concurrent PR update.
     const resolvedBody = bodyBeforeWrite ? await bodyBeforeWrite() : body;
-    // Phase 3 (P2 #3) pre-send fail-safe: GitHub rejects bodies past 65536
-    // chars. The PR budget (50000) plus ledger markers normally stays far
-    // below it; this last resort keeps a single sticky write (never a second
-    // comment) with an explicit note. Excess detail stays in the report
-    // artifact.
+    // Phase 1 fail-closed: a metadata-carrying body past the GitHub hard
+    // limit is never truncated (a blind cut could drop ledger markers and
+    // silently lose counts). Callers convert this throw into a no-write
+    // fail-closed that preserves the old ledger. Only metadata-free plain
+    // text keeps the legacy enforce cap.
+    if (resolvedBody.length > GITHUB_COMMENT_HARD_LIMIT && hasStickyMetadata(resolvedBody)) {
+      throw new Error(STICKY_LIMIT_EXCEEDED_MESSAGE);
+    }
     const currentBody = enforceGithubCommentLimit(resolvedBody);
     if (existing) {
       await client.rest.issues.updateComment({
@@ -4310,8 +4531,11 @@ async function publishStickyComment(
         body: currentBody,
       });
     }
-  } catch {
+  } catch (error) {
+    // Distinct fail-closed signals propagate so callers can keep the old
+    // ledger with zero writes; anything else stays a generic publish failure.
     // Do not leak API details, and do not let labels advertise an unpublished result.
+    if (isStickyLimitError(error) || isStickyLedgerUnreadableError(error)) throw error;
     throw new Error('PocketGuard: failed to publish review comment.');
   }
 }
@@ -4785,10 +5009,22 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // fallback toward the preserved ledger, and without verifiable output the
   // fallback likewise preserves. Started-but-failed runs keep the claim's
   // count (never refunded); unstarted runs (no claim) keep zero.
+  // Phase 1: every write below would rather not write (old ledger preserved,
+  // no label changes) than write a truncated body — publishPrSticky converts
+  // the over-limit/unreadable-ledger throws into a quiet false.
   const buildPreservedBody = async (freshContent: string): Promise<string> => {
     const fresh = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber!);
-    if (!fresh.ok) throw new Error('PocketGuard: failed to publish review comment.');
+    if (!fresh.ok) throw new Error(STICKY_LEDGER_UNREADABLE_MESSAGE);
     return buildStampedBody(freshContent, fresh.ledger, fresh.claims, undefined, undefined, undefined);
+  };
+  const publishPrSticky = async (initialBody: string, rebuild: () => Promise<string>): Promise<boolean> => {
+    try {
+      await publishStickyComment(client, repository, target.issueNumber!, initialBody, rebuild);
+      return true;
+    } catch (error) {
+      if (isStickyLimitError(error) || isStickyLedgerUnreadableError(error)) return false;
+      throw error;
+    }
   };
 
   // Unverifiable output (missing artifact, job != success, malformed,
@@ -4800,13 +5036,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     const baseline = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber);
     if (!baseline.ok) return;
     const unavailableLine = formatReportLine(env, false);
-    await publishStickyComment(
-      client,
-      repository,
-      target.issueNumber,
+    const wroteFallback = await publishPrSticky(
       buildStampedBody(inconclusiveComment(reasonText, unavailableLine), baseline.ledger, baseline.claims, undefined, undefined, undefined),
       async () => buildPreservedBody(inconclusiveComment(reasonText, unavailableLine)),
     );
+    if (!wroteFallback) return;
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }
@@ -4819,7 +5053,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   if (!baselineReconciled.ok) return;
   const buildReconciledBody = async (freshContent: string): Promise<string> => {
     const fresh = await readStickyLedger(client, repository.owner, repository.repo, target.issueNumber!);
-    if (!fresh.ok) throw new Error('PocketGuard: failed to publish review comment.');
+    if (!fresh.ok) throw new Error(STICKY_LEDGER_UNREADABLE_MESSAGE);
     return buildStampedBody(freshContent, fresh.ledger, fresh.claims, undefined, undefined, undefined);
   };
   const reconciledInitialBody = (freshContent: string): string =>
@@ -4829,13 +5063,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // the claim's ledger untouched (never polluting another SHA).
   if (staleReason) {
     const staleLine = formatReportLine(env, false);
-    await publishStickyComment(
-      client,
-      repository,
-      target.issueNumber,
+    const wroteStale = await publishPrSticky(
       reconciledInitialBody(inconclusiveComment(staleReason, staleLine)),
       async () => buildReconciledBody(inconclusiveComment(staleReason, staleLine)),
     );
+    if (!wroteStale) return;
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }
@@ -4850,26 +5082,22 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   if (output.chunks !== undefined && output.chunkCoverageComplete !== true) {
     const chunkLine = formatReportLine(env, false);
     const chunkReason = 'the review output is unverifiable: PR chunks were not fully covered; review freshness could not be verified.';
-    await publishStickyComment(
-      client,
-      repository,
-      target.issueNumber,
+    const wroteChunks = await publishPrSticky(
       reconciledInitialBody(inconclusiveComment(chunkReason, chunkLine)),
       async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
+    if (!wroteChunks) return;
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }
   if (output.chunks !== undefined && output.verdict === 'APPROVE' && output.chunkCount !== output.chunks.length) {
     const chunkLine = formatReportLine(env, false);
     const chunkReason = 'the review output is unverifiable: PR chunk count mismatch.';
-    await publishStickyComment(
-      client,
-      repository,
-      target.issueNumber,
+    const wroteCount = await publishPrSticky(
       reconciledInitialBody(inconclusiveComment(chunkReason, chunkLine)),
       async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
+    if (!wroteCount) return;
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }
@@ -4879,13 +5107,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   })) {
     const chunkLine = formatReportLine(env, false);
     const chunkReason = 'the review output is unverifiable: PR chunk coverage does not match the reviewed diff.';
-    await publishStickyComment(
-      client,
-      repository,
-      target.issueNumber,
+    const wroteSpan = await publishPrSticky(
       reconciledInitialBody(inconclusiveComment(chunkReason, chunkLine)),
       async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
+    if (!wroteSpan) return;
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }
@@ -4913,13 +5139,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     // Never log raw label values (model-controlled); record only the count.
     console.warn(`[PocketGuard] Discarded ${prFiltered.discardedCount} PR AI label(s) outside the convergence allowlist.`);
     const discardLine = formatReportLine(env, false);
-    await publishStickyComment(
-      client,
-      repository,
-      target.issueNumber,
+    const wroteDiscard = await publishPrSticky(
       reconciledInitialBody(inconclusiveComment(discardReason, discardLine)),
       async () => buildReconciledBody(inconclusiveComment(discardReason, discardLine)),
     );
+    if (!wroteDiscard) return;
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }
@@ -4951,13 +5175,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   if (!prReportsAvailable) {
     const unavailableLine = formatReportLine(env, false);
     const reportsMissingReason = 'the review reports are missing or inconsistent; review freshness could not be verified.';
-    await publishStickyComment(
-      client,
-      repository,
-      target.issueNumber,
+    const wroteReportsMissing = await publishPrSticky(
       reconciledInitialBody(inconclusiveComment(reportsMissingReason, unavailableLine)),
       async () => buildReconciledBody(inconclusiveComment(reportsMissingReason, unavailableLine)),
     );
+    if (!wroteReportsMissing) return;
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }
@@ -4965,14 +5187,18 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // guarantees content-valid reports, so only a missing run identity degrades
   // to unavailable (still no fake link).
   const prReportLine = formatReportLine(env, getReportRunUrl(env) !== undefined);
+  // Phase 1: size the visible summary against the marker suffix stamped
+  // later, so visible + ledger still fits and only findings shrink.
+  const prMetadataReserve = estimateStickyMetadataLength(baselineReconciled.ledger, baselineReconciled.claims);
 
   let publishFallbackReason: string | undefined;
-  await publishStickyComment(client, repository, target.issueNumber, reconciledInitialBody(reviewComment(output, labels, prReportLine)), async () => {
+  const wroteSuccess = await publishPrSticky(reconciledInitialBody(reviewComment(output, labels, prReportLine, prMetadataReserve)), async () => {
     publishFallbackReason = await currentReviewProblem(client, repository, target.issueNumber!, output!);
     const unavailableFallback = formatReportLine(env, false);
-    const content = publishFallbackReason ? inconclusiveComment(publishFallbackReason, unavailableFallback) : reviewComment(output!, labels, prReportLine);
+    const content = publishFallbackReason ? inconclusiveComment(publishFallbackReason, unavailableFallback) : reviewComment(output!, labels, prReportLine, prMetadataReserve);
     return buildReconciledBody(content);
   });
+  if (!wroteSuccess) return;
   if (publishFallbackReason) {
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
@@ -4981,13 +5207,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   const labelFallbackReason = await currentReviewProblem(client, repository, target.issueNumber, output);
   if (labelFallbackReason) {
     const labelFallbackLine = formatReportLine(env, false);
-    await publishStickyComment(
-      client,
-      repository,
-      target.issueNumber,
+    const wroteLabelFallback = await publishPrSticky(
       reconciledInitialBody(inconclusiveComment(labelFallbackReason, labelFallbackLine)),
       async () => buildReconciledBody(inconclusiveComment(labelFallbackReason, labelFallbackLine)),
     );
+    if (!wroteLabelFallback) return;
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;
   }

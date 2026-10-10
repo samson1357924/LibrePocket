@@ -3,20 +3,28 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  assertStampedBodyFits,
   buildStampedBody,
+  buildStampedBodyWithLength,
+  estimateStickyMetadataLength,
   formatReviewClaimMarker,
   formatReviewCountMarker,
+  GITHUB_COMMENT_HARD_LIMIT,
   MAX_REVIEWS_PER_SHA,
+  MAX_STICKY_TOTAL_LENGTH,
+  parseLedgerFooter,
   parseReviewClaimSet,
   parseReviewCountLedger,
   parseReviewCountMarker,
   readStickyLedger,
   resolveCountClaimKey,
+  reviewComment,
   runClaimMode,
   runPublishMode,
   runReviewMode,
   runTagMode,
   stripReviewCountMarkers,
+  verifyLedgerFooter,
   withReviewClaimMarker,
   withReviewCountMarker,
   type RunnerContext,
@@ -197,6 +205,11 @@ function ledgerOf(body: string): Map<string, number> {
   return parseReviewCountLedger(body);
 }
 
+// Deterministic synthetic head SHAs for large-ledger tests (hex, 40 chars).
+function synthSha(index: number): string {
+  return index.toString(16).padStart(40, '0');
+}
+
 function prCommentEventFor(body: string, login: string): Record<string, unknown> {
   return {
     action: 'created',
@@ -332,6 +345,46 @@ export async function runReviewCountLedgerTests(): Promise<void> {
     assert.ok(parseReviewClaimSet(stamped).has(`${SHA_B}:run-x:1`));
     const preserved = buildStampedBody('fresh\n', new Map([[SHA_A, 2]]), new Set(), undefined, undefined, undefined);
     assert.equal(parseReviewCountMarker(preserved, SHA_A), 2, 'uncounted write preserves the ledger');
+
+    // Phase 1: requiredLength reporting, fit-or-throw, and footer integrity.
+    {
+      const measured = buildStampedBodyWithLength('fresh\n', new Map([[SHA_A, 2]]), new Set(), SHA_B, 1, 'run-x:1');
+      assert.equal(measured.requiredLength, measured.body.length, 'requiredLength is the exact body length');
+      assert.equal(measured.fits, true, 'small stamped body fits');
+      assert.equal(
+        assertStampedBodyFits('fresh\n', new Map([[SHA_A, 2]]), new Set(), SHA_B, 1, 'run-x:1'),
+        measured.body,
+        'fit-or-throw returns the body when it fits',
+      );
+      const footer = parseLedgerFooter(measured.body);
+      assert.ok(footer, 'stamped body carries a ledger footer');
+      assert.equal(footer!.counts, 2, 'footer counts the merged ledger entries');
+      assert.equal(footer!.claims, 1, 'footer counts the merged claim markers');
+      assert.equal(
+        verifyLedgerFooter(measured.body, parseReviewCountLedger(measured.body), parseReviewClaimSet(measured.body)),
+        true,
+        'fresh footer verifies',
+      );
+      // Dropping one marker line while keeping the footer breaks both the
+      // count and the length proof.
+      const tampered = measured.body.split('\n').filter((line) => !line.includes(SHA_A)).join('\n');
+      assert.equal(
+        verifyLedgerFooter(tampered, parseReviewCountLedger(tampered), parseReviewClaimSet(tampered)),
+        false,
+        'truncated markers fail the footer check',
+      );
+      // A 1000-entry ledger overflows even the minimal visible body.
+      const huge = new Map<string, number>();
+      for (let i = 0; i < 1000; i += 1) huge.set(synthSha(i), 1);
+      const hugeMeasured = buildStampedBodyWithLength('fresh\n', huge, new Set(), synthSha(1001), 1, 'run-big:1');
+      assert.ok(hugeMeasured.requiredLength > GITHUB_COMMENT_HARD_LIMIT, `1000 markers overflow (got ${hugeMeasured.requiredLength})`);
+      assert.equal(hugeMeasured.fits, false);
+      assert.throws(
+        () => assertStampedBodyFits('fresh\n', huge, new Set(), synthSha(1001), 1, 'run-big:1'),
+        /comment limit/,
+        'fit-or-throw refuses to truncate metadata',
+      );
+    }
   }
 
   const previousFetch = globalThis.fetch;
@@ -997,6 +1050,274 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
+    }
+
+    // --- Test 10 (Phase 1): 500+ markers stay fully readable end to end. ---
+    // A:2 plus 500 synthetic SHAs: claim a fresh SHA, run AI, publish, then
+    // re-read — every marker parses and A:2 survives.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-big-'));
+      try {
+        const seedLedger = new Map<string, number>([[SHA_A, 2]]);
+        for (let i = 0; i < 500; i += 1) seedLedger.set(synthSha(i), 1);
+        const seedBody = buildStampedBody('<!-- PocketGuard-review -->\n\n## PocketGuard 審查\n', seedLedger, new Set(), undefined, undefined, undefined);
+        assert.ok(seedBody.length <= GITHUB_COMMENT_HARD_LIMIT, `500-entry seed fits (got ${seedBody.length})`);
+        const state = makeState({
+          comments: [{ id: 7, body: seedBody, user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        const freshSha = synthSha(9999);
+        const claimed = await runClaimPass(state, freshSha, 'run-big-1');
+        assert.equal(claimed.claimed, true, 'claim on a 500-entry ledger completes');
+        assert.equal(claimed.used, 1);
+
+        const counter = { count: 0 };
+        const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', findings: [] });
+        const outputPath = path.join(tempDir, 'review.json');
+        try {
+          state.pullRequest = defaultPullRequest(freshSha);
+          const before = counter.count;
+          await runReviewMode({
+            event: prOpenedEvent(freshSha),
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: 'run-big-1' }),
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          assert.ok(counter.count - before > 0, 'claimed run reaches AI');
+          await runPublishMode({
+            event: prOpenedEvent(freshSha),
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: outputPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+              POCKETGUARD_RUN_ID: 'run-big-1',
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(state),
+          });
+        } finally {
+          restore();
+        }
+        const reread = await readStickyLedger(makeClient(state), 'sample', 'repository', 41);
+        assert.equal(reread.ok, true, 'big sticky re-reads cleanly with a valid footer');
+        if (reread.ok) {
+          assert.equal(reread.ledger.size, 502, 'all 502 entries readable');
+          assert.equal(reread.ledger.get(SHA_A), 2, 'A:2 survives under 500 other SHAs');
+          assert.equal(reread.ledger.get(freshSha), 1, 'fresh SHA keeps its single claimed slot');
+          for (let i = 0; i < 500; i += 1) assert.equal(reread.ledger.get(synthSha(i)), 1, `synthetic SHA ${i} readable`);
+          assert.ok(reread.claims.has(`${freshSha}:run-big-1:1`), 'claim marker survives publish');
+          assert.ok(state.comments[0].body.includes('判定'), 'visible verdict preserved alongside the ledger');
+        }
+        assert.equal(state.comments.length, 1, 'single sticky throughout');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // --- Test 11 (Phase 1): over-limit ledger fails closed with zero writes. ---
+    // A 1000-entry ledger overflows even the minimal placeholder body: the new
+    // claim reports claimed:false/quota-unknown with reviewsUsed 0, writes
+    // nothing, consumes nothing, and leaves the old ledger byte-identical.
+    {
+      const seedLedger = new Map<string, number>([[SHA_A, 2]]);
+      for (let i = 0; i < 1000; i += 1) seedLedger.set(synthSha(i), 1);
+      const seedBody = buildStampedBody('<!-- PocketGuard-review -->\nold\n', seedLedger, new Set(), undefined, undefined, undefined);
+      assert.ok(seedBody.length > GITHUB_COMMENT_HARD_LIMIT, `1000-entry seed overflows (got ${seedBody.length})`);
+      const state = makeState({
+        comments: [{ id: 7, body: seedBody, user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+      });
+      const freshSha = synthSha(4242);
+      state.pullRequest = defaultPullRequest(freshSha);
+      const outcome = await runClaimMode({
+        event: prOpenedEvent(freshSha),
+        env: {
+          GITHUB_EVENT_NAME: 'pull_request_target',
+          GITHUB_REPOSITORY: REPO,
+          GITHUB_TOKEN: 'fake-token',
+          POCKETGUARD_RUN_ID: 'run-overflow-1',
+        } as NodeJS.ProcessEnv,
+        githubClient: makeClient(state),
+        writeStdout: () => undefined,
+        runGit: safeGitStub(),
+      });
+      assert.equal(outcome.claimed, false, 'overflow claim is an explicit failure, not a partial write');
+      assert.match(outcome.reason, /quota-unknown/, 'overflow reports quota-unknown');
+      assert.equal(outcome.reviewsUsed, 0, 'overflow consumes no quota');
+      assert.equal(state.created, 0, 'overflow creates nothing');
+      assert.equal(state.updated, 0, 'overflow updates nothing');
+      assert.equal(state.comments[0].body, seedBody, 'old ledger preserved byte-identical');
+      assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2, 'A:2 intact after refused claim');
+      assert.equal(parseReviewCountLedger(state.comments[0].body).size, 1001, 'no entry lost, none added');
+      assert.equal(parseReviewClaimSet(state.comments[0].body).size, 0, 'refused claim leaves no marker');
+    }
+
+    // --- Test 12 (Phase 1): A x2, multi-SHA, back to A — third A is 0 AI. ---
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-multisha-'));
+      try {
+        const state = makeState();
+        const counter = { count: 0 };
+        const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', findings: [] });
+        try {
+          const outputPath = path.join(tempDir, 'review.json');
+          await runFullPass(state, SHA_A, 'run-m1', outputPath, counter);
+          await runFullPass(state, SHA_A, 'run-m2', outputPath, counter);
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2);
+          await runFullPass(state, SHA_B, 'run-m3', outputPath, counter);
+          await runFullPass(state, synthSha(7), 'run-m4', outputPath, counter);
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2, 'A:2 survives B and C');
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_B), 1);
+          assert.equal(parseReviewCountMarker(state.comments[0].body, synthSha(7)), 1);
+
+          state.pullRequest = defaultPullRequest(SHA_A);
+          const thirdEvent = prOpenedEvent(SHA_A);
+          const thirdTag = await runTagMode({
+            event: thirdEvent,
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          assert.equal(thirdTag.reviewsUsed, 2);
+          assert.equal(thirdTag.reviewGate, 'none');
+          const beforeThird = counter.count;
+          const thirdReview = await runReviewMode({
+            event: thirdEvent,
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: 'run-m5' }),
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          assert.equal(thirdReview.verdict, 'INCONCLUSIVE');
+          assert.equal(counter.count - beforeThird, 0, 'third A makes zero OpenAI calls');
+          const updatedBefore = state.updated;
+          const createdBefore = state.created;
+          await runPublishMode({
+            event: thirdEvent,
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: outputPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+              POCKETGUARD_RUN_ID: 'run-m5',
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(state),
+          });
+          assert.equal(state.updated, updatedBefore, 'third publish updates nothing');
+          assert.equal(state.created, createdBefore, 'third publish creates nothing');
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2);
+          assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_B), 1);
+          assert.equal(parseReviewCountMarker(state.comments[0].body, synthSha(7)), 1);
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // --- Test 13 (Phase 1): same-key claim retry never adds a second slot. ---
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-claimretry-'));
+      try {
+        const state = makeState();
+        const first = await runClaimPass(state, SHA_A, 'run-dup-1');
+        assert.equal(first.claimed, true);
+        assert.equal(first.used, 1);
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1);
+        const second = await runClaimPass(state, SHA_A, 'run-dup-1');
+        assert.equal(second.claimed, true, 'same-key re-entry still owns its slot');
+        assert.equal(second.used, 1, 'same-key re-entry consumes nothing more');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'retry never increments');
+        assert.equal(state.comments.length, 1, 'single sticky throughout');
+
+        // Same-key publish retry after a real review also stays at 1.
+        const counter = { count: 0 };
+        const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', findings: [] });
+        const outputPath = path.join(tempDir, 'review.json');
+        try {
+          await runReviewMode({
+            event: prOpenedEvent(SHA_A),
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: 'run-dup-1' }),
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+        } finally {
+          restore();
+        }
+        const publishEnv = {
+          GITHUB_EVENT_NAME: 'pull_request_target',
+          GITHUB_REPOSITORY: REPO,
+          GITHUB_TOKEN: 'fake-token',
+          POCKETGUARD_OUTPUT: outputPath,
+          POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+          POCKETGUARD_TAG_LABELS: '[]',
+          POCKETGUARD_RUN_ID: 'run-dup-1',
+        } as NodeJS.ProcessEnv;
+        await runPublishMode({ event: prOpenedEvent(SHA_A), env: publishEnv, githubClient: makeClient(state) });
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1);
+        await runPublishMode({ event: prOpenedEvent(SHA_A), env: publishEnv, githubClient: makeClient(state) });
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'publish retry never increments');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // --- Test 14 (Phase 1): heavy findings trim the summary, never metadata. ---
+    {
+      const roles = ['chief', 'android_sec', 'android_code'] as const;
+      const output = {
+        verdict: 'NEEDS_CHANGES' as const,
+        pullRequestNumber: 41,
+        baseSha: BASE_SHA,
+        headSha: SHA_A,
+        headRepository: REPO,
+        roles: roles.map((role, roleIdx) => ({
+          role,
+          modelUsed: 'fake-model',
+          verdict: 'NEEDS_CHANGES' as const,
+          findings: Array.from({ length: roleIdx === 0 ? 100 : 50 }, (_, i) => {
+            const global = roleIdx * 100 + i;
+            const severity = global < 5 ? ('BLOCK' as const) : ('SUGGESTION' as const);
+            return {
+              severity,
+              file: `src/Heavy${global}.kt`,
+              line: global + 1,
+              issue: `${global < 5 ? `HFBLOCK${global}` : `HFSUG${global}`} ${'y'.repeat(800)}`,
+              suggestion: `fix it ${'z'.repeat(200)}`,
+            };
+          }),
+        })),
+        coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 0 },
+        deterministicViolations: [],
+        areaLabels: [],
+        changedFiles: ['app/src/main/java/demo/Safe.kt'],
+        changedFilesComplete: true,
+        suggestedLabels: [],
+      };
+      const ledger = new Map<string, number>([[SHA_A, 2], [SHA_B, 1]]);
+      for (let i = 0; i < 5; i += 1) ledger.set(synthSha(i), 1);
+      const claims = new Set<string>([`${SHA_A}:run-hf:1`]);
+      const reserve = estimateStickyMetadataLength(ledger, claims);
+      const visible = reviewComment(output, [], '報告行', reserve);
+      assert.ok(visible.length <= MAX_STICKY_TOTAL_LENGTH, `reserved visible stays in budget (got ${visible.length})`);
+      const stamped = buildStampedBody(visible, ledger, claims, undefined, undefined, undefined);
+      assert.ok(stamped.length <= GITHUB_COMMENT_HARD_LIMIT, `stamped heavy review fits (got ${stamped.length})`);
+      assert.equal(parseReviewCountMarker(stamped, SHA_A), 2, 'ledger metadata intact under heavy findings');
+      assert.equal(parseReviewCountMarker(stamped, SHA_B), 1);
+      for (let i = 0; i < 5; i += 1) assert.equal(parseReviewCountMarker(stamped, synthSha(i)), 1);
+      assert.ok(parseReviewClaimSet(stamped).has(`${SHA_A}:run-hf:1`), 'claim metadata intact');
+      assert.ok(verifyLedgerFooter(stamped, parseReviewCountLedger(stamped), parseReviewClaimSet(stamped)), 'footer verifies');
+      assert.ok(stamped.includes('<!-- PocketGuard-review -->'), 'review marker intact');
+      assert.ok(stamped.includes(SHA_A), 'head SHA metadata intact');
+      assert.ok(stamped.includes('共200項發現'), 'tail counts line intact');
+      assert.ok(stamped.includes('省略'), 'trimming is disclosed, not silent');
+      for (let i = 0; i < 5; i += 1) assert.ok(stamped.includes(`HFBLOCK${i}`), `BLOCK ${i} kept by priority`);
     }
 
     // --- Test 9 (Stage 5): workflow wiring for the claim-slot job. ---

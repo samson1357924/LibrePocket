@@ -269,7 +269,7 @@ class ChatSessionFactoryBackfillTest {
 
     @Test fun open_firstResumeRequestSeesRestoredHistoryWithoutPartials() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "m")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(event(sid, "r1", "user", "q1"))
         transcripts.appendEvent(event(sid, "r1", "assistant", "a1"))
         // A cancelled partial replays in the UI flagged, but must not read as

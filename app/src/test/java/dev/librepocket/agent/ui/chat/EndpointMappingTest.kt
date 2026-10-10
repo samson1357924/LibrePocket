@@ -57,4 +57,13 @@ class EndpointMappingTest {
         assertEquals("自訂", config.label)
         assertEquals("http://127.0.0.1:11434/v1", config.baseUrl)
     }
+
+    @Test
+    fun normalizeOriginHandlesPortsAndPaths() {
+        assertEquals("https://api.openai.com", normalizeOrigin("https://api.openai.com/v1"))
+        assertEquals("https://api.openai.com", normalizeOrigin("https://api.openai.com:443/v1"))
+        assertEquals("http://127.0.0.1:11434", normalizeOrigin("http://127.0.0.1:11434/v1"))
+        assertEquals("http://localhost", normalizeOrigin("http://localhost:80/path"))
+        assertEquals("", normalizeOrigin("invalid-url"))
+    }
 }

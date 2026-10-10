@@ -388,6 +388,7 @@ class ChatSessionLifecycleTest {
             withTimeout(5_000) { live.hostEntered.await() }
 
             chatMain.run { vm.sendDirect("second") }
+            withTimeout(5_000) { while (live.steered.isEmpty()) delay(1) }
             chatMain.run { vm.sendDirect("third") }
             withTimeout(5_000) { while (live.steered.size < 2) delay(1) }
             assertEquals(listOf("second", "third"), live.steered.toList())

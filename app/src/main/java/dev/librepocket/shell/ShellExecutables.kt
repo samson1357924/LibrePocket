@@ -21,6 +21,9 @@ import java.nio.file.Paths
  *   發行版 shim（如 `/bin/echo -> .../coreutils/echo`）屬部署事實而非攻擊者
  *   可控（可信目錄 root-owned，App 不可寫；攻擊者能寫可信目錄即已等同替換
  *   二進位本體），故跟隨後驗實體；dangling / 環 / 非正規檔 / 不可執行一律拒。
+ * - 殘餘 TOCTOU：[resolve] 的實體驗證與 `ProcessBuilder.start()` 非原子，
+ *   二進位替換 / link 置換競態窗口仍然存在（可信目錄 root-owned、App 不可寫，
+ *   故不在本威脅模型內；參 scoped-file 分支的 check-then-act 揭露）。
  * - 最小乾淨 env（[CLEAN_ENV]）：固定 `PATH` + `LANG`，其餘不繼承
  *   （`LD_PRELOAD` / `LD_LIBRARY_PATH` / `PROOT_*` / 代理變數等經 `clear()` 消除）。
  *

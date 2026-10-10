@@ -1,7 +1,10 @@
 package dev.librepocket.shell
 
 import dev.librepocket.tool.Flavor
+import java.io.File
+import java.nio.file.Files
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -97,35 +100,87 @@ class ShellWhitelistTest {
     }
 
     @Test fun timeoutKillsSleep() {
-        // S3 下仍用宿主真 sleep：real 落點隨發行版而異（本機 cargo shim 在快照外），
-        // 故測試側把 sleep 實體父目錄併入允許集（僅測試，生產表不動；正常發行版
-        // 此為 no-op，因 real 本就在 /usr/bin 快照內）。缺 sleep 即跳過
-        // （沿既有 probe 缺失即跳過的寫法）。
-        val shell = RestrictedShell(execAllowedRoots = hostSleepRoots() ?: return)
-        val startMs = System.currentTimeMillis()
-        val result = shell.execute(listOf("sleep", "30"), timeoutMs = 500L)
-        val elapsedMs = System.currentTimeMillis() - startMs
-        assertTrue("expected TimedOut, got $result", result is ShellResult.TimedOut)
-        assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 15_000L)
+        // Stage1 hermetic：自建 `sleep` fixture（無限迴圈，不依賴宿主 /bin/sleep
+        // 實體落點與宿主 searchDirs 可寫性），真 DefaultProcessRunner 真超時殺。
+        // 舊 host-sniffing（hostSleepRoots 只補 allowedRoots，未覆 S5 searchDir
+        // 守衛）在 CI `ubuntu-24.04`（/usr/local/bin 777）整表拒，已刪除。
+        // systemOwned 模擬裝置不可寫（宿主 fixture 屬主可寫，見 TrustedExec 註解）；
+        // 守衛存活另由 writableFixture_* 負向控制證明，非假綠。
+        // 需 host `/bin/sh`（與 multicall fixture 同約束）；缺失則硬紅非跳過。
+        val bin = Files.createTempDirectory("sleep-bin").toFile()
+        val scope = Files.createTempDirectory("sleep-scope").toFile()
+        try {
+            val sleepFile = File(bin, "sleep")
+            sleepFile.writeText("#!/bin/sh\nwhile true; do :; done\n")
+            assertTrue("setExecutable failed for $sleepFile", sleepFile.setExecutable(true))
+            val systemOwned: (java.nio.file.Path) -> Boolean = { _ -> false }
+            // 預檢：解析必先成功，否則 TimedOut 斷言 vacuous（未 spawn 即回傳不算殺）。
+            val pre = ShellExecutables.resolve(
+                "sleep",
+                listOf(bin.absolutePath),
+                allowedRoots = listOf(bin.canonicalPath),
+                isWritable = systemOwned,
+            )
+            assertTrue("fixture must resolve before spawn, got null", pre != null)
+            val shell = RestrictedShell(
+                runner = DefaultProcessRunner(),
+                privateRoot = scope.absolutePath,
+                execSearchDirs = listOf(bin.absolutePath),
+                execAllowedRoots = listOf(bin.canonicalPath),
+                execIsWritable = systemOwned,
+            )
+            val startMs = System.currentTimeMillis()
+            val result = shell.execute(listOf("sleep", "30"), timeoutMs = 500L)
+            val elapsedMs = System.currentTimeMillis() - startMs
+            assertTrue("expected TimedOut, got $result", result is ShellResult.TimedOut)
+            assertTrue("must actually wait for timeout (no instant fake): ${elapsedMs}ms", elapsedMs >= 400L)
+            assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 15_000L)
+        } finally {
+            bin.deleteRecursively()
+            scope.deleteRecursively()
+        }
     }
 
-    /**
-     * 宿主 sleep 的 containment 允許集：預設快照 + sleep 實體父目錄。
-     * 正常發行版（real 在 /usr/bin 內）等於預設快照；cargo-shim 類宿主
-     * （real 在 /usr/lib/...）靠附加項放行。找不到可執行 sleep 即回 null，
-     * 呼叫方跳過（不斷言，避免無 sleep 宿主誤報）。
-     */
-    private fun hostSleepRoots(): List<String>? {
-        val real = listOf("/bin/sleep", "/usr/bin/sleep").firstNotNullOfOrNull { c ->
-            try {
-                val p = java.nio.file.Paths.get(c)
-                if (java.nio.file.Files.isExecutable(p)) p.toRealPath().toString() else null
-            } catch (_: Exception) {
-                null
-            }
-        } ?: return null
-        return ShellExecutables.snapshotRealRoots(ShellExecutables.TRUSTED_BIN_DIRS) +
-            real.substringBeforeLast('/')
+    @Test fun writableFixture_deniedWithoutSpawn() {
+        // 負向控制：同一 fixture 在可寫判定下必須拒且零 spawn，證守衛仍咬合。
+        val bin = Files.createTempDirectory("sleep-w-bin").toFile()
+        val scope = Files.createTempDirectory("sleep-w-scope").toFile()
+        try {
+            val sleepFile = File(bin, "sleep")
+            sleepFile.writeText("#!/bin/sh\nwhile true; do :; done\n")
+            assertTrue("setExecutable failed for $sleepFile", sleepFile.setExecutable(true))
+            val direct = ShellExecutables.resolve(
+                "sleep",
+                listOf(bin.absolutePath),
+                allowedRoots = listOf(bin.canonicalPath),
+                isWritable = { _ -> true },
+            )
+            assertTrue("writable fixture must not resolve, got $direct", direct == null)
+            val detailed = ShellExecutables.resolveDetailed(
+                "sleep",
+                listOf(bin.absolutePath),
+                allowedRoots = listOf(bin.canonicalPath),
+                isWritable = { _ -> true },
+            )
+            assertTrue("expected SEARCH_DIR_UNTRUSTED, got $detailed", detailed is ShellExecutables.ResolveOutcome.Denied &&
+                detailed.reason == ShellExecutables.ResolveDeny.SEARCH_DIR_UNTRUSTED)
+            val runner = FakeRunner(ByteArray(0))
+            val shell = RestrictedShell(
+                runner = runner,
+                privateRoot = scope.absolutePath,
+                execSearchDirs = listOf(bin.absolutePath),
+                execAllowedRoots = listOf(bin.canonicalPath),
+                execIsWritable = { _ -> true },
+            )
+            val r = shell.execute(listOf("sleep", "30"), timeoutMs = 500L)
+            assertTrue("expected Denied, got $r", r is ShellResult.Denied)
+            assertTrue("message=$r", (r as ShellResult.Denied).message.contains("SEARCH_DIR_UNTRUSTED"))
+            assertFalse("message must not leak path: $r", r.message.contains(bin.canonicalPath))
+            assertEquals(0, runner.calls)
+        } finally {
+            bin.deleteRecursively()
+            scope.deleteRecursively()
+        }
     }
 
     @Test fun outputTruncatedAtCap() {

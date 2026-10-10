@@ -39,12 +39,17 @@ import java.nio.file.Paths
  *   （lexical 相等或 real 相等即停；既有 usrMergeShape 正例保持綠）。
  *   toybox 合法形（entry != real）在 entry chain 全乾淨時放行不受影響；
  *   絕對 `argv[0]` 形走同一 [verifiedTarget] 同一閘，不分叉。
- * - searchDir 本體守衛（S5，部署前提的 runtime 守衛）：[resolve] 入口驗
- *   `searchDirs`（real 化後）本體不可寫；任一可寫／判定異常／非法即整表拒
- *   （fail-closed，可回報擴表）。生產系統目錄對 App 恆不可寫，此守衛只是把
- *   部署假設變成執行時檢查；exotic ROM（合法二進位落在快照 + 前綴外，或系統
- *   目錄可寫）降級為拒（安全但誤殺，須回報擴表，不得放寬）。只驗本體，不走
- *   parent chain（否則 host `/tmp` 可寫必殺一切，與 entry 閘上界同理）。
+ * - searchDir 本體守衛（S5，部署前提的 runtime 守衛，Stage1 窄化）：
+ *   不再整表預檢。bare 按固定順序逐項驗本體：可寫項跳過（永不執行其候選），
+ *   命中乾淨項時若前序出現過可寫項即拒（防 shadowing 混淆）；命中項之後的
+ *   無關可寫項不污染本次命中。絕對 `argv[0]` 只驗所屬 parent 本體。
+ *   生產系統目錄對 App 恆不可寫，此守衛只是把部署假設變成執行時檢查；
+ *   exotic ROM（合法二進位落在快照 + 前綴外，或系統目錄可寫）降級為拒
+ *   （安全但誤殺，須回報擴表，不得放寬）。只驗本體，不走 parent chain
+ *   （否則 host `/tmp` 可寫必殺一切，與 entry 閘上界同理；ancestor 可替換性
+ *   見 Finding B 後續階段）。
+ *   拒絕細項經 [ResolveDeny] 回報（`SEARCH_DIR_UNTRUSTED`／`ENTRY_WRITABLE`／
+ *   `REAL_WRITABLE`／`OUTSIDE_ROOTS`），僅 reason code，不含任意 filesystem path。
  * - multicall（toybox / toolbox / busybox，見 [MULTICALL_BINARIES]）：實體
  *   basename 落此顯式表時，spawn 形狀為 `[realPath, applet, ...args]`——
  *   applet 取自 `argv[0]` 的 basename（[ShellPolicy.basename]），其值已由
@@ -141,6 +146,26 @@ object ShellExecutables {
      * `argv[1]` 還原被 link 吞掉的子命令名；非 multicall 為 null，spawn 不插入。
      */
     data class ResolvedExec(val path: String, val applet: String?)
+
+    /**
+     * 解析拒絕細項（可觀測但不洩敏：僅 reason code，不含任意 filesystem path；
+     * 呼叫方訊息只可攜帶原始 `argv[0]` 與本 code，不得內插搜尋目錄／實體路徑）。
+     */
+    enum class ResolveDeny {
+        INVALID_INPUT,
+        UNTRUSTED_PATH,
+        SEARCH_DIR_UNTRUSTED,
+        OUTSIDE_ROOTS,
+        REAL_WRITABLE,
+        ENTRY_WRITABLE,
+        NOT_FOUND,
+    }
+
+    /** [resolveDetailed] 回執：成功攜 [ResolvedExec]，失敗攜 [ResolveDeny]。 */
+    sealed interface ResolveOutcome {
+        data class Ok(val exec: ResolvedExec) : ResolveOutcome
+        data class Denied(val reason: ResolveDeny) : ResolveOutcome
+    }
 
     /**
      * `argv[0]` 是否為可信絕對路徑（詞法，不碰 FS）：
@@ -374,28 +399,74 @@ object ShellExecutables {
         isWritable: (Path) -> Boolean = ::defaultIsWritable,
         entryRoot: String? = null,
     ): String? {
+        return verifiedTargetDetailed(candidate, allowedRoots, isWritable, entryRoot).first
+    }
+
+    /**
+     * [verifiedTarget] 的細項版：成功回 `Pair(real, null)`，失敗回 `Pair(null, reason)`。
+     * - `NOT_FOUND`：不存在／解析失敗／非正規檔／不可執行／非法輸入（含非所屬 entryRoot）。
+     * - `OUTSIDE_ROOTS`：containment 不通過。
+     * - `REAL_WRITABLE`：real 本體或 parent chain 可寫／判定異常。
+     * - `ENTRY_WRITABLE`：lexical entry chain 可寫／判定異常。
+     */
+    fun verifiedTargetDetailed(
+        candidate: String,
+        allowedRoots: List<String>? = null,
+        isWritable: (Path) -> Boolean = ::defaultIsWritable,
+        entryRoot: String? = null,
+    ): Pair<String?, ResolveDeny?> {
         return try {
             val p = Paths.get(candidate)
-            if (!Files.exists(p)) return null
-            val real = p.toRealPath()
-            if (!Files.isRegularFile(real, LinkOption.NOFOLLOW_LINKS)) return null
-            if (!Files.isExecutable(real)) return null
-            if (allowedRoots != null && !isUnderRoots(real.toString(), allowedRoots)) return null
-            if (!chainNonWritable(real, isWritable)) return null
+            if (!Files.exists(p)) return null to ResolveDeny.NOT_FOUND
+            val real = try {
+                p.toRealPath()
+            } catch (_: Exception) {
+                return null to ResolveDeny.NOT_FOUND
+            }
+            if (!Files.isRegularFile(real, LinkOption.NOFOLLOW_LINKS)) return null to ResolveDeny.NOT_FOUND
+            if (!Files.isExecutable(real)) return null to ResolveDeny.NOT_FOUND
+            if (allowedRoots != null && !isUnderRoots(real.toString(), allowedRoots)) {
+                return null to ResolveDeny.OUTSIDE_ROOTS
+            }
+            if (!chainNonWritable(real, isWritable)) return null to ResolveDeny.REAL_WRITABLE
             if (entryRoot != null) {
                 val entryNorm = try {
                     FileScope.normalize(entryRoot.trim())
                 } catch (_: Exception) {
-                    return null
+                    return null to ResolveDeny.NOT_FOUND
                 }
-                if (entryNorm.isEmpty() || entryNorm.contains('\u0000')) return null
+                if (entryNorm.isEmpty() || entryNorm.contains('\u0000')) return null to ResolveDeny.NOT_FOUND
                 if (!entryChainNonWritable(FileScope.normalize(candidate), entryNorm, isWritable)) {
-                    return null
+                    return null to ResolveDeny.ENTRY_WRITABLE
                 }
             }
-            real.toString()
+            real.toString() to null
         } catch (_: Exception) {
-            null
+            null to ResolveDeny.NOT_FOUND
+        }
+    }
+
+    /**
+     * 搜尋目錄本體是否不可信（可寫／判定異常／非法即 true，fail-closed）。
+     * 只驗本體 real 化後路徑，不走 parent chain（Stage2 ancestor 檢查另見
+     * Finding B；此處與 entry 閘上界同理，避免 host `/tmp` 誤殺 fixture）。
+     */
+    fun isSearchDirUntrusted(dirNorm: String, isWritable: (Path) -> Boolean): Boolean {
+        return try {
+            if (dirNorm.isEmpty() || dirNorm.contains('\u0000')) return true
+            val realDir: Path = try {
+                val p = Paths.get(dirNorm)
+                if (Files.exists(p)) p.toRealPath() else p
+            } catch (_: Exception) {
+                return true
+            }
+            try {
+                isWritable(realDir)
+            } catch (_: Exception) {
+                true
+            }
+        } catch (_: Exception) {
+            true
         }
     }
 
@@ -407,14 +478,21 @@ object ShellExecutables {
      *   （含 containment + real writability + S5 entry 閘，允許集見下，
      *   entryRoot 取 lexical parent；bare 與絕對同閘不分叉）；
      *   相對含 `/`（`./ls`、`chat/ls`）一律 null。
+     *   絕對形只驗其所屬 parent 目錄本體（[isSearchDirUntrusted]），不受其他
+     *   無關搜尋項污染；其他搜尋項可寫不影響乾淨絕對路徑（fail-closed 仍禁
+     *   執行可寫候選，見下）。
      * - bare：只在 [searchDirs]（預設 [TRUSTED_BIN_DIRS]，固定順序）內找；
      *   候選必須仍落在該 dir 下（當輪 `dirNorm` 即 entryRoot）。呼叫方不得傳入
      *   非受控目錄（產品碼一律用預設值；單測可注入暫存目錄；絕對 `argv[0]` 的
      *   詞法門同表覆寫，使絕對路徑的全鏈（validate → resolve → spawn）可在暫存
      *   fixture 下受測，而不必寫入系統目錄）。
-     * - searchDir 本體守衛（S5，部署前提的 runtime 守衛）：入口先驗 `searchDirs`
-     *  （real 化後）本體不可寫；任一可寫／判定異常／非法即整表拒（fail-closed，
-     *   可回報擴表；只驗本體，不走 parent chain，否則 host `/tmp` 可寫必殺一切）。
+     * - searchDir 本體守衛（S5，部署前提的 runtime 守衛，Stage1 窄化）：
+     *   不再入口整表預檢。bare 按固定順序逐項驗本體：可寫／判定異常項直接
+     *   跳過（永不執行其候選），命中乾淨項時若其前序出現過可寫項即整體拒
+     *   （防 shadowing 混淆：可寫前序可植同名檔，雖本次未執行但搜尋順序已受
+     *   污染）；命中項之後的無關可寫項不污染本次命中。絕對形只驗所屬 parent。
+     *   仍不退回環境 `PATH`、不執行任何可寫候選。非法表項跳過（不執行），
+     *   不再整表拒。
      *   生產系統目錄對 App 恆不可寫；exotic ROM 降級為拒，須回報擴表、不得放寬。
      * - containment 允許集：[allowedRoots] 非 null 即用（單測注入）；
      *   null 時由 [snapshotRealRoots]（[searchDirs] real 化 + [SYSTEM_REAL_PREFIXES]）
@@ -427,7 +505,7 @@ object ShellExecutables {
      *   entry 閘，逃逸或 entry 可寫照拒；entry 全乾淨時合法形放行不受影響）；
      *   其餘回 `applet = null`。
      * - 本函數不管白名單（由 [ShellPolicy.validate] 先判）；回 null 呼叫方必須
-     *   拒絕且不建子進程。
+     *   拒絕且不建子進程。需定位時用 [resolveDetailed] 取 [ResolveDeny]。
      */
     fun resolve(
         argv0: String,
@@ -435,52 +513,76 @@ object ShellExecutables {
         allowedRoots: List<String>? = null,
         isWritable: (Path) -> Boolean = ::defaultIsWritable,
     ): ResolvedExec? {
+        return when (val o = resolveDetailed(argv0, searchDirs, allowedRoots, isWritable)) {
+            is ResolveOutcome.Ok -> o.exec
+            is ResolveOutcome.Denied -> null
+        }
+    }
+
+    /**
+     * [resolve] 的細項版：成功回 `Ok`，失敗回 `Denied(reason)`（見 [ResolveDeny]，
+     * 不含任意 filesystem path，呼叫方可安全寫入拒絕訊息）。
+     */
+    fun resolveDetailed(
+        argv0: String,
+        searchDirs: List<String> = TRUSTED_BIN_DIRS,
+        allowedRoots: List<String>? = null,
+        isWritable: (Path) -> Boolean = ::defaultIsWritable,
+    ): ResolveOutcome {
         val raw = argv0.trim()
-        if (raw.isEmpty() || raw.contains('\u0000')) return null
+        if (raw.isEmpty() || raw.contains('\u0000')) return ResolveOutcome.Denied(ResolveDeny.INVALID_INPUT)
         val roots = allowedRoots ?: snapshotRealRoots(searchDirs)
-        // S5 searchDir 本體守衛：逐一 real 化後驗本體不可寫；任一可寫／異常／
-        // 非法即整表拒（fail-closed）。只驗本體，不走 parent chain。
+        if (raw.contains('/') || raw.contains('\\')) {
+            if (!isTrustedAbsoluteArgv0(raw, searchDirs)) {
+                return ResolveOutcome.Denied(ResolveDeny.UNTRUSTED_PATH)
+            }
+            val normRaw = try {
+                FileScope.normalize(raw)
+            } catch (_: Exception) {
+                return ResolveOutcome.Denied(ResolveDeny.INVALID_INPUT)
+            }
+            val slash = normRaw.lastIndexOf('/')
+            if (slash < 0) return ResolveOutcome.Denied(ResolveDeny.INVALID_INPUT)
+            val parentNorm = normRaw.substring(0, slash).ifEmpty { "/" }
+            if (isSearchDirUntrusted(parentNorm, isWritable)) {
+                return ResolveOutcome.Denied(ResolveDeny.SEARCH_DIR_UNTRUSTED)
+            }
+            val (real, failure) = verifiedTargetDetailed(normRaw, roots, isWritable, parentNorm)
+            if (real == null) return ResolveOutcome.Denied(failure ?: ResolveDeny.NOT_FOUND)
+            return toResolved(raw, real)?.let { ResolveOutcome.Ok(it) }
+                ?: ResolveOutcome.Denied(ResolveDeny.INVALID_INPUT)
+        }
+        var taintedBeforeHit = false
+        var lastFailure: ResolveDeny? = null
         for (dir in searchDirs) {
-            val t = dir.trim()
-            if (t.isEmpty() || t.contains('\u0000')) return null
-            val normDir = try {
+            val dirNorm = try {
+                val t = dir.trim()
+                if (t.isEmpty() || t.contains('\u0000')) continue
                 FileScope.normalize(t)
             } catch (_: Exception) {
-                return null
+                continue
             }
-            val realDir: Path = try {
-                val p = Paths.get(normDir)
-                if (Files.exists(p)) p.toRealPath() else p
+            if (isSearchDirUntrusted(dirNorm, isWritable)) {
+                taintedBeforeHit = true
+                continue
+            }
+            val candidate = try {
+                FileScope.normalize("$dirNorm/$raw")
             } catch (_: Exception) {
-                return null
+                continue
             }
-            val w = try {
-                isWritable(realDir)
-            } catch (_: Exception) {
-                true
-            }
-            if (w) return null
-        }
-        if (raw.contains('/') || raw.contains('\\')) {
-            if (!isTrustedAbsoluteArgv0(raw, searchDirs)) return null
-            val normRaw = FileScope.normalize(raw)
-            val slash = normRaw.lastIndexOf('/')
-            if (slash < 0) return null
-            val parentNorm = normRaw.substring(0, slash).ifEmpty { "/" }
-            val real = verifiedTarget(normRaw, roots, isWritable, parentNorm) ?: return null
-            return toResolved(raw, real)
-        }
-        for (dir in searchDirs) {
-            val dirNorm = dir.trim().let {
-                if (it.isEmpty() || it.contains('\u0000')) return@let null
-                FileScope.normalize(it)
-            } ?: continue
-            val candidate = FileScope.normalize("$dirNorm/$raw")
             if (candidate == dirNorm || !candidate.startsWith("$dirNorm/")) continue
-            val hit = verifiedTarget(candidate, roots, isWritable, dirNorm) ?: continue
-            return toResolved(raw, hit)
+            val (hit, failure) = verifiedTargetDetailed(candidate, roots, isWritable, dirNorm)
+            if (hit != null) {
+                if (taintedBeforeHit) return ResolveOutcome.Denied(ResolveDeny.SEARCH_DIR_UNTRUSTED)
+                return toResolved(raw, hit)?.let { ResolveOutcome.Ok(it) }
+                    ?: ResolveOutcome.Denied(ResolveDeny.INVALID_INPUT)
+            } else if (failure != null && failure != ResolveDeny.NOT_FOUND) {
+                if (lastFailure == null) lastFailure = failure
+            }
         }
-        return null
+        if (taintedBeforeHit) return ResolveOutcome.Denied(ResolveDeny.SEARCH_DIR_UNTRUSTED)
+        return ResolveOutcome.Denied(lastFailure ?: ResolveDeny.NOT_FOUND)
     }
 
     /**

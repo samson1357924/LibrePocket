@@ -24,9 +24,10 @@ import org.junit.Test
  *   屬主可寫故經 `isWritable` 注入模擬裝置不可寫，見 `systemOwned`）；
  * - S5 entry-side（Finding A）：可寫 entry 內 `ls -> sysbin/sh`（real 乾淨、
  *   containment 覆蓋兩側）即拒（bare／絕對兩形 + 全鏈 Denied(BLACKLISTED) +
- *   零 spawn）；同目錄直連正規檔、中間 parent 可寫、表內任一 searchDir 可寫
- *   （整表拒）、entry 判定拋異常一律拒；entry 全乾淨時 multicall／APEX 形／
- *   usr 合併形放行不受影響；
+ *   零 spawn）；同目錄直連正規檔、中間 parent 可寫、bare 前序可寫污染命中、
+ *   entry 判定拋異常一律拒；Stage1 窄化後 bare 命中後無關可寫不污染、絕對形
+ *   與無關表項解耦（只驗所屬 parent）；entry 全乾淨時 multicall／APEX 形／
+ *   usr 合併形放行不受影響；拒絕細項經 ResolveDeny 可觀測（不含 path）；
  * - 操作數 schema（`--opt=value`、短旗標合併、值槽、pattern 槽）維持既有嚴格語義；
  * - null 作用域的隱式 cwd bare fail-closed，且放行者 spawn 仍是固定路徑 + 乾淨 env；
  * - multicall（toybox/toolbox/busybox）：實體 basename 落顯式表時 spawn 還原
@@ -998,12 +999,13 @@ class ShellTrustedExecTest {
             val cleanReal = clean.canonicalPath
             val writableReal = writableEmpty.canonicalPath
             val roots = listOf(cleanReal)
-            // writableEmpty 可寫、clean 全乾淨：tool 只在 clean 內，
-            // 但整表仍拒（fail-closed，不跳過可寫表項去用乾淨表項）。
+            // Stage1 窄化：bare 按序逐項驗本體，可寫前序污染命中（防 shadowing），
+            // 命中後無關可寫不污染；絕對形只驗所屬 parent，與無關表項解耦。
             val split: (java.nio.file.Path) -> Boolean = { p ->
                 val s = p.toString()
                 s == writableReal || s.startsWith("$writableReal/")
             }
+            // bare：可寫空目錄排在乾淨命中前 → 拒（前序污染），reason 可觀測。
             assertNull(
                 ShellExecutables.resolve(
                     "ls",
@@ -1012,15 +1014,25 @@ class ShellTrustedExecTest {
                     isWritable = split,
                 ),
             )
-            // 絕對形同樣整表拒（落點在乾淨表項亦拒）。
-            assertNull(
-                ShellExecutables.resolve(
-                    "${clean.absolutePath}/ls",
-                    listOf(writableEmpty.absolutePath, clean.absolutePath),
-                    allowedRoots = roots,
-                    isWritable = split,
-                ),
+            val bareDetailed = ShellExecutables.resolveDetailed(
+                "ls",
+                listOf(writableEmpty.absolutePath, clean.absolutePath),
+                allowedRoots = roots,
+                isWritable = split,
             )
+            assertTrue(
+                "expected SEARCH_DIR_UNTRUSTED, got $bareDetailed",
+                bareDetailed is ShellExecutables.ResolveOutcome.Denied &&
+                    bareDetailed.reason == ShellExecutables.ResolveDeny.SEARCH_DIR_UNTRUSTED,
+            )
+            // 絕對形：落點在乾淨表項，所屬 parent 乾淨 → 放行（與無關可寫解耦）。
+            val abs = ShellExecutables.resolve(
+                "${clean.absolutePath}/ls",
+                listOf(writableEmpty.absolutePath, clean.absolutePath),
+                allowedRoots = roots,
+                isWritable = split,
+            )!!
+            assertEquals(tool.canonicalPath, abs.path)
             // 對照：單用乾淨表項即放行。
             val ok = ShellExecutables.resolve(
                 "ls",
@@ -1029,9 +1041,185 @@ class ShellTrustedExecTest {
                 isWritable = split,
             )!!
             assertEquals(tool.canonicalPath, ok.path)
+            // 全鏈：bare 前序污染 → Denied(BLACKLISTED)+reason+零 spawn，且不洩 path。
+            run {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = "/data/data/dev.librepocket.agent/files",
+                    execSearchDirs = listOf(writableEmpty.absolutePath, clean.absolutePath),
+                    execAllowedRoots = roots,
+                    execIsWritable = split,
+                )
+                val r = shell.execute(listOf("ls", "-l"))
+                assertTrue("$r", r is ShellResult.Denied)
+                assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+                assertTrue("$r", r.message.contains("SEARCH_DIR_UNTRUSTED"))
+                assertFalse("$r", r.message.contains(writableReal))
+                assertFalse("$r", r.message.contains(cleanReal))
+                assertEquals(0, runner.calls)
+            }
+            // 全鏈：絕對解耦放行 → Ok + spawn [real, ...] + 乾淨 env。
+            run {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = "/data/data/dev.librepocket.agent/files",
+                    execSearchDirs = listOf(writableEmpty.absolutePath, clean.absolutePath),
+                    execAllowedRoots = roots,
+                    execIsWritable = split,
+                )
+                val r = shell.execute(listOf("${clean.absolutePath}/ls", "-l"))
+                assertTrue("$r", r is ShellResult.Ok)
+                assertEquals(listOf(tool.canonicalPath, "-l"), runner.lastArgv)
+                assertEquals(ShellExecutables.CLEAN_ENV, runner.lastEnv)
+            }
         } finally {
             writableEmpty.deleteRecursively()
             clean.deleteRecursively()
+        }
+    }
+
+    @Test fun writableAfterHit_doesNotPoisonBare() {
+        val clean = tempDir("s5-poison-after-c")
+        val writableAfter = tempDir("s5-poison-after-w")
+        val scope = tempDir("s5-poison-after-scope")
+        try {
+            val tool = executable(clean, "ls")
+            val cleanReal = clean.canonicalPath
+            val writableReal = writableAfter.canonicalPath
+            val roots = listOf(cleanReal)
+            val split: (java.nio.file.Path) -> Boolean = { p ->
+                val s = p.toString()
+                s == writableReal || s.startsWith("$writableReal/")
+            }
+            // bare：命中在前，無關後繼可寫不污染 → 放行（仍不執行可寫候選）。
+            val hit = ShellExecutables.resolve(
+                "ls",
+                listOf(clean.absolutePath, writableAfter.absolutePath),
+                allowedRoots = roots,
+                isWritable = split,
+            )!!
+            assertEquals(tool.canonicalPath, hit.path)
+            // 全鏈同樣放行。
+            val runner = CapRunner()
+            val shell = RestrictedShell(
+                runner = runner,
+                privateRoot = scope.absolutePath,
+                execSearchDirs = listOf(clean.absolutePath, writableAfter.absolutePath),
+                execAllowedRoots = roots,
+                execIsWritable = split,
+            )
+            val r = shell.execute(listOf("ls", "-l"))
+            assertTrue("$r", r is ShellResult.Ok)
+            assertEquals(listOf(tool.canonicalPath, "-l"), runner.lastArgv)
+            assertEquals(ShellExecutables.CLEAN_ENV, runner.lastEnv)
+        } finally {
+            clean.deleteRecursively()
+            writableAfter.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun resolveDetailed_reasonsAreTyped() {
+        val trusted = tempDir("s5-reason")
+        try {
+            val tool = executable(trusted, "ls")
+            val trustedReal = trusted.canonicalPath
+            // NOT_FOUND：空目錄無候選。
+            val empty = tempDir("s5-reason-empty")
+            try {
+                val nf = ShellExecutables.resolveDetailed(
+                    "ls",
+                    listOf(empty.absolutePath),
+                    allowedRoots = listOf(trustedReal),
+                    isWritable = { _ -> false },
+                )
+                assertTrue(
+                    "expected NOT_FOUND, got $nf",
+                    nf is ShellExecutables.ResolveOutcome.Denied &&
+                        nf.reason == ShellExecutables.ResolveDeny.NOT_FOUND,
+                )
+            } finally {
+                empty.deleteRecursively()
+            }
+            // OUTSIDE_ROOTS：集外 real（containment 拒，與 writability 無關）。
+            val evilDir = tempDir("s5-reason-evil")
+            try {
+                val evil = executable(evilDir, "payload")
+                java.nio.file.Files.createSymbolicLink(
+                    java.io.File(trusted, "ls2").toPath(),
+                    evil.toPath(),
+                )
+                val outside = ShellExecutables.resolveDetailed(
+                    "ls2",
+                    listOf(trusted.absolutePath),
+                    allowedRoots = listOf(trustedReal),
+                    isWritable = { _ -> false },
+                )
+                assertTrue(
+                    "expected OUTSIDE_ROOTS, got $outside",
+                    outside is ShellExecutables.ResolveOutcome.Denied &&
+                        outside.reason == ShellExecutables.ResolveDeny.OUTSIDE_ROOTS,
+                )
+            } finally {
+                evilDir.deleteRecursively()
+            }
+            // ENTRY_WRITABLE：candidate 本體可寫但 searchDir 本體乾淨
+            // （避開 searchDir 守衛，單測 entry 閘分支）。
+            run {
+                val sysbin = tempDir("s5-reason-sys")
+                try {
+                    val target = executable(sysbin, "sh")
+                    Files.createSymbolicLink(File(trusted, "ls-entry").toPath(), target.toPath())
+                    val sysbinReal = sysbin.canonicalPath
+                    val entryRoots = listOf(trustedReal, sysbinReal)
+                    val entryWritable: (java.nio.file.Path) -> Boolean = { p ->
+                        p.toString().endsWith("/ls-entry")
+                    }
+                    val entryDenied = ShellExecutables.resolveDetailed(
+                        "ls-entry",
+                        listOf(trusted.absolutePath),
+                        allowedRoots = entryRoots,
+                        isWritable = entryWritable,
+                    )
+                    assertTrue(
+                        "expected ENTRY_WRITABLE, got $entryDenied",
+                        entryDenied is ShellExecutables.ResolveOutcome.Denied &&
+                            entryDenied.reason == ShellExecutables.ResolveDeny.ENTRY_WRITABLE,
+                    )
+                } finally {
+                    sysbin.deleteRecursively()
+                    File(trusted, "ls-entry").delete()
+                }
+            }
+            // REAL_WRITABLE：real 本體可寫（containment 通過，real 閘拒）。
+            run {
+                val realFile = File(trusted, "ls-real")
+                if (!realFile.exists()) executable(trusted, "ls-real")
+                val realDenied = ShellExecutables.resolveDetailed(
+                    "ls-real",
+                    listOf(trusted.absolutePath),
+                    allowedRoots = listOf(trustedReal),
+                    isWritable = { p -> p.toString() == File(trusted, "ls-real").canonicalPath },
+                )
+                assertTrue(
+                    "expected REAL_WRITABLE, got $realDenied",
+                    realDenied is ShellExecutables.ResolveOutcome.Denied &&
+                        realDenied.reason == ShellExecutables.ResolveDeny.REAL_WRITABLE,
+                )
+            }
+            // 此處僅鎖住 containment 分支非 vacuous（tool 本體直連正例放行）。
+            val ok = ShellExecutables.resolveDetailed(
+                "ls",
+                listOf(trusted.absolutePath),
+                allowedRoots = listOf(trustedReal),
+                isWritable = { _ -> false },
+            )
+            assertTrue("$ok", ok is ShellExecutables.ResolveOutcome.Ok)
+            assertEquals(tool.canonicalPath, (ok as ShellExecutables.ResolveOutcome.Ok).exec.path)
+        } finally {
+            trusted.deleteRecursively()
         }
     }
 

@@ -14,6 +14,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** Serial Main dispatcher so callbacks from IO return to a stable, Main-like thread. */
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -55,7 +56,15 @@ internal class ChatTestViewModelStore {
 
     suspend fun clearAndJoin() {
         store.clear()
-        viewModelJobs.joinAll()
+        val finished = withTimeoutOrNull(10_000L) {
+            viewModelJobs.joinAll()
+            true
+        }
+        if (finished == null) {
+            throw IllegalStateException(
+                "ChatTestViewModelStore teardown timed out after 10000ms waiting for viewModelJobs to join",
+            )
+        }
     }
 }
 
@@ -63,5 +72,15 @@ internal class ChatTestViewModelStore {
 internal fun cancelAndJoinChatTestScopes(scopes: List<CoroutineScope>) {
     val jobs = scopes.mapNotNull { it.coroutineContext[Job] }
     scopes.forEach { it.cancel() }
-    runBlocking { jobs.joinAll() }
+    runBlocking {
+        val finished = withTimeoutOrNull(10_000L) {
+            jobs.joinAll()
+            true
+        }
+        if (finished == null) {
+            throw IllegalStateException(
+                "cancelAndJoinChatTestScopes teardown timed out after 10000ms waiting for scopes to join",
+            )
+        }
+    }
 }

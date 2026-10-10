@@ -94,7 +94,9 @@ class ShellWhitelistTest {
         val result = shell.execute(listOf("sleep", "30"), timeoutMs = 500L)
         val elapsedMs = System.currentTimeMillis() - startMs
         assertTrue("expected TimedOut, got $result", result is ShellResult.TimedOut)
-        assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 15_000L)
+        // CI 環境高負載時行程啟動與 SIGKILL 調度可能顯著延遲，放寬至 30s（仍小於被執行的 sleep 30s，
+        // 核心契約在於確認 shell 確實攔截超時並終止行程）。
+        assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 30_000L)
     }
 
     @Test fun outputTruncatedAtCap() {

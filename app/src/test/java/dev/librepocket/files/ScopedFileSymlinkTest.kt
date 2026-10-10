@@ -217,6 +217,27 @@ class ScopedFileSymlinkTest {
         assertFalse(File(out, "not-created").exists())
     }
 
+    @Test fun rootAliasDotDotDenied() {
+        // alias/.. 經 kernel 先跟隨 alias 再回退，詞法折疊後看似無連結，必須直接拒原始 ../. 段。
+        val parent = Files.createTempDirectory("ws-alias-dotdot").toFile().apply { deleteOnExit() }
+        val out = outside()
+        File(out, "secret.txt").writeText("OUTSIDE")
+        val alias = File(parent, "alias")
+        link(alias, out)
+        val poisoned = File(alias, "..")
+        val before = parent.listFiles()?.map { it.name }?.toSet() ?: emptySet<String>()
+        val store = ScopedFileStore(poisoned)
+        assertRejected({ store.resolve("evil.txt") }, "alias/.. resolve")
+        assertRejected({ store.read("evil.txt") }, "alias/.. read")
+        assertRejected({ store.write("evil.txt", "x".toByteArray()) }, "alias/.. write")
+        assertRejected({ store.exists("evil.txt") }, "alias/.. exists")
+        assertRejected({ store.delete("evil.txt") }, "alias/.. delete")
+        assertTrue("alias/.. list must be empty", store.list().isEmpty())
+        // 不得在父層或 /tmp 落下外部檔案。
+        assertEquals(before, parent.listFiles()?.map { it.name }?.toSet() ?: emptySet<String>())
+        assertFalse(File(parent, "evil.txt").exists())
+    }
+
     @Test fun nestedSymlinkDenied() {
         val ws = workspace()
         val out = outside()

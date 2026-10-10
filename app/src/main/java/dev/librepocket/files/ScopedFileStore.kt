@@ -16,7 +16,8 @@ import java.security.MessageDigest
  *   語義一致。列目（[list]）不跟隨任何連結：遇 symlink 直接略過、
  *   不下鑽，並以已造訪正規目錄集合防循環。
  *   信任邊界：呼叫方須傳入可信正規根（例如 `filesDir.canonicalFile` 直建的
- *   app 私有域），不得傳入不可信別名；`alias/.`、`alias/sub` 類毒根一律拒絕。
+ *   app 私有域），不得傳入不可信別名；`alias/.`、`alias/sub`、`alias/..`
+ *   類毒根一律拒絕（含原始 `.`/`..` 段直接 fail-closed，因 kernel 先跟隨再回退）。
  *   若傳入非正規系統別名路徑，將 fail-closed 拒絕，呼叫方應改傳正規路徑。
  * - 寫入冪等：內容相同即回 [WriteOutcome.Unchanged] 且不改 mtime；
  *   不同才原子落盤（同目錄暫存 +搬移），回 Created/Updated。
@@ -109,11 +110,17 @@ class ScopedFileStore(val root: File) {
 
     /**
      * 驗構成 [root] 的每一詞法路徑段皆非 symlink。
-     * 以 [FileScope.normalize] 先折疊尾端 `/.`、`sub/..`，再逐段 lstat；
+     * 先拒原始路徑中的 `.`/`..` 段（`alias/..` 經 kernel 先跟隨再回退，
+     * 詞法折疊後會誤判為無連結，必須 fail-closed；正規可信根永不含此類段）。
+     * 再以 [FileScope.normalize] 折疊尾端 `/.` 後逐段 lstat；
      * 不存在路徑回 false（缺席根仍可檢查已存在的毒父段）。
      * 呼叫方須傳正規可信根；非正規系統別名將 fail-closed，屬預期行為。
      */
     private fun ensureRootChainNoSymlink(original: String) {
+        val rawParts = root.absolutePath.split("/").filter { it.isNotEmpty() }
+        if (rawParts.any { it == "." || it == ".." }) {
+            throw IllegalArgumentException("symlink not allowed: $original")
+        }
         val rootNorm = FileScope.normalize(root.absolutePath)
         if (rootNorm.isEmpty()) {
             throw IllegalArgumentException("symlink check failed: $original")

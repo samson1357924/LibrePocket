@@ -542,7 +542,13 @@ export interface LabelTimelineEvent {
   event?: string;
   actor?: { login?: string | null } | null;
   label?: { name?: string | null } | null;
+  created_at?: string | null;
+  id?: number;
+  commit_id?: string | null;
 }
+
+export const TIMELINE_LABELS_PER_PAGE = 100;
+export const MAX_TIMELINE_PAGES = 20;
 
 export interface GitHubLabelClient {
   rest: {
@@ -575,14 +581,14 @@ export interface GitHubLabelClient {
         issue_number: number;
         per_page?: number;
         page?: number;
-      }) => Promise<{ data: Array<LabelTimelineEvent> }>;
+      }) => Promise<{ data: Array<LabelTimelineEvent>; headers?: { link?: string } & Record<string, unknown> }>;
       listEventsForTimeline?: (params: {
         owner: string;
         repo: string;
         issue_number: number;
         per_page?: number;
         page?: number;
-      }) => Promise<{ data: Array<LabelTimelineEvent> }>;
+      }) => Promise<{ data: Array<LabelTimelineEvent>; headers?: { link?: string } & Record<string, unknown> }>;
     };
     users?: {
       getAuthenticated?: () => Promise<{ data: { login?: string } }>;
@@ -821,12 +827,20 @@ export interface ReconcileLabelsOptions {
 
 /**
  * Resolves the bot-written label set via the issue timeline/events API when
- * the caller supplies no proven set (P1 #3 timeline fallback). Returns the
- * lowercased set of labels whose most recent `labeled` event actor matches
- * botLogin (case-insensitive), or undefined when provenance is unknowable:
- * missing login, missing timeline reader, malformed payload, or any API
- * failure. Callers treat undefined as unproven (warn-only preserve). Never
- * throws and never logs raw API data.
+ * the caller supplies no proven set (P1 #3 timeline fallback, P1 #1 pagination
+ * hardening). Returns the lowercased set of labels whose most recent event is
+ * a `labeled` event by botLogin (case-insensitive), or undefined when
+ * provenance is unknowable. Never throws and never logs raw API data.
+ *
+ * Pagination: fetches page=1..N with per_page=100 until a page returns
+ * fewer than 100 entries (or a Link header confirms no next page). A full
+ * page (100) with no Link confirmation requires fetching the next page; a
+ * full page at the MAX_TIMELINE_PAGES cap is unknowable (fail-closed
+ * undefined). Any page throw, non-array payload, or labeled/unlabeled event
+ * missing its key fields (label name / actor login) is unknowable. Events
+ * are ordered by created_at (with id/fetch order as tiebreakers) for
+ * last-writer-wins; both `labeled` and `unlabeled` participate, and only a
+ * terminal `labeled`-by-bot counts as proven.
  */
 export async function resolveTimelineBotWrittenLabels(options: {
   client: GitHubLabelClient;
@@ -858,27 +872,137 @@ export async function resolveTimelineBotWrittenLabels(options: {
         : undefined;
   if (!reader) return undefined;
   try {
-    const response = await reader({ owner, repo, issue_number: issueNumber, per_page: 100 });
-    const events = (response as { data?: unknown })?.data;
-    if (!Array.isArray(events)) return undefined;
-    const lastActorByLabel = new Map<string, string>();
-    for (const entry of events) {
-      if (!entry || typeof entry !== 'object') continue;
-      const record = entry as LabelTimelineEvent;
-      const eventName = typeof record.event === 'string' ? record.event.trim().toLowerCase() : '';
-      if (eventName !== 'labeled') continue;
-      const labelName = typeof record.label?.name === 'string' ? record.label.name.trim().toLowerCase() : '';
-      const actorLogin = typeof record.actor?.login === 'string' ? record.actor.login.trim().toLowerCase() : '';
-      if (!labelName || !actorLogin) continue;
-      lastActorByLabel.set(labelName, actorLogin);
+    interface CollectedLabelEvent {
+      label: string;
+      event: 'labeled' | 'unlabeled';
+      actor: string;
+      createdAtMs: number | null;
+      id: number | undefined;
+      seq: number;
+    }
+    const collected: CollectedLabelEvent[] = [];
+    let seq = 0;
+    for (let page = 1; page <= MAX_TIMELINE_PAGES; page += 1) {
+      let response: unknown;
+      try {
+        response = await reader({ owner, repo, issue_number: issueNumber, per_page: TIMELINE_LABELS_PER_PAGE, page });
+      } catch {
+        return undefined;
+      }
+      const events = (response as { data?: unknown })?.data;
+      if (!Array.isArray(events)) return undefined;
+      for (const entry of events) {
+        if (!entry || typeof entry !== 'object') continue;
+        const record = entry as LabelTimelineEvent;
+        const eventName = typeof record.event === 'string' ? record.event.trim().toLowerCase() : '';
+        if (eventName !== 'labeled' && eventName !== 'unlabeled') continue;
+        const labelName = typeof record.label?.name === 'string' ? record.label.name.trim().toLowerCase() : '';
+        const actorLogin = typeof record.actor?.login === 'string' ? record.actor.login.trim().toLowerCase() : '';
+        if (!labelName || !actorLogin) return undefined;
+        let createdAtMs: number | null = null;
+        const rawCreated = (record as { created_at?: unknown }).created_at;
+        if (rawCreated === undefined || rawCreated === null) {
+          createdAtMs = null;
+        } else if (typeof rawCreated === 'string') {
+          const trimmed = rawCreated.trim();
+          if (!trimmed) {
+            createdAtMs = null;
+          } else {
+            const parsed = Date.parse(trimmed);
+            if (Number.isNaN(parsed)) return undefined;
+            createdAtMs = parsed;
+          }
+        } else {
+          return undefined;
+        }
+        const rawId = (record as { id?: unknown }).id;
+        const id = typeof rawId === 'number' && Number.isFinite(rawId) ? rawId : undefined;
+        collected.push({ label: labelName, event: eventName, actor: actorLogin, createdAtMs, id, seq: seq += 1 });
+      }
+      const linkHeader = getTimelineLinkHeader(response);
+      if (linkHeader !== undefined) {
+        if (hasTimelineNextPage(linkHeader)) {
+          if (page >= MAX_TIMELINE_PAGES) return undefined;
+          continue;
+        }
+        break;
+      }
+      if (events.length < TIMELINE_LABELS_PER_PAGE) break;
+      if (page >= MAX_TIMELINE_PAGES) return undefined;
+    }
+    // Fail closed when ordering is ambiguous: a label with 2+ relevant
+    // events where any timestamp is missing cannot be sorted reliably.
+    const countsByLabel = new Map<string, { total: number; missing: number }>();
+    for (const item of collected) {
+      const slot = countsByLabel.get(item.label) ?? { total: 0, missing: 0 };
+      slot.total += 1;
+      if (item.createdAtMs === null) slot.missing += 1;
+      countsByLabel.set(item.label, slot);
+    }
+    for (const slot of countsByLabel.values()) {
+      if (slot.total >= 2 && slot.missing > 0) return undefined;
+    }
+    const sorted = [...collected].sort((a, b) => {
+      const aHas = a.createdAtMs !== null;
+      const bHas = b.createdAtMs !== null;
+      if (aHas && bHas) {
+        const msA = a.createdAtMs as number;
+        const msB = b.createdAtMs as number;
+        if (msA !== msB) return msA - msB;
+      } else if (aHas !== bHas) {
+        return aHas ? 1 : -1;
+      }
+      if (a.id !== undefined && b.id !== undefined && a.id !== b.id) return a.id - b.id;
+      return a.seq - b.seq;
+    });
+    const lastByLabel = new Map<string, { lastEvent: 'labeled' | 'unlabeled'; actor: string }>();
+    for (const item of sorted) {
+      lastByLabel.set(item.label, { lastEvent: item.event, actor: item.actor });
     }
     const proven = new Set<string>();
-    for (const [labelName, actorLogin] of lastActorByLabel) {
-      if (actorLogin === login) proven.add(labelName);
+    for (const [labelName, state] of lastByLabel) {
+      if (state.lastEvent === 'labeled' && state.actor === login) proven.add(labelName);
     }
     return proven;
   } catch {
     return undefined;
+  }
+}
+
+function getTimelineLinkHeader(response: unknown): string | undefined {
+  try {
+    const headers = (response as { headers?: unknown })?.headers;
+    if (!headers || typeof headers !== 'object') return undefined;
+    const record = headers as Record<string, unknown>;
+    const direct = record.link ?? record.Link ?? (record as Record<string, unknown>).LINK;
+    if (typeof direct === 'string') return direct;
+    if (Array.isArray(direct)) {
+      const joined = direct.filter((part): part is string => typeof part === 'string').join(', ');
+      return joined ? joined : undefined;
+    }
+    const getter = (headers as { get?: unknown }).get;
+    if (typeof getter === 'function') {
+      try {
+        const value = (getter as (name: string) => unknown).call(headers, 'link');
+        if (typeof value === 'string') return value;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasTimelineNextPage(linkHeader: string): boolean {
+  try {
+    for (const part of linkHeader.split(',')) {
+      if (/\brel\s*=\s*"?next"?\b/i.test(part)) return true;
+    }
+    return false;
+  } catch {
+    return false;
   }
 }
 

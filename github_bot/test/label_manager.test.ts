@@ -28,6 +28,7 @@ import {
   sanitizePrAiSuggestions,
   warnOnMutexCoexistence,
   type GitHubLabelClient,
+  type LabelTimelineEvent,
 } from '../src/label_manager';
 
 class StatefulMockLabelClient implements GitHubLabelClient {
@@ -866,6 +867,282 @@ ${reportWith('A security flaw remains.')}`);
   });
   assert.deepEqual(applied.added, ['status:needs-decision']);
   assert.deepEqual(appendOnlyMock.getLabels(4), ['area:runtime', 'status:needs-decision']);
+
+  // Phase 1 (eighth P1 #1): timeline pagination + last-writer-wins over
+  // created_at with unlabeled participation. All cases go through
+  // reconcileBotLabelsSafely and assert a human label is never removed
+  // unless the sorted timeline proves bot-last-labeled.
+  {
+    const BOT_LOGIN = 'pocketguard[bot]';
+    const HUMAN_LOGIN = 'human-maintainer';
+    // Compile-time guard: the timeline event carries ordering/identity fields.
+    const fieldGuard: LabelTimelineEvent = {
+      event: 'labeled',
+      actor: { login: BOT_LOGIN },
+      label: { name: 'priority:P1' },
+      created_at: '2024-01-01T00:00:00.000Z',
+      id: 1,
+      commit_id: null,
+    };
+    assert.equal(fieldGuard.created_at, '2024-01-01T00:00:00.000Z');
+
+    const tlLabeled = (label: string, actor: string, createdAt: string, id?: number) => ({
+      event: 'labeled',
+      actor: { login: actor },
+      label: { name: label },
+      created_at: createdAt,
+      ...(id !== undefined ? { id } : {}),
+    });
+    const tlUnlabeled = (label: string, actor: string, createdAt: string, id?: number) => ({
+      event: 'unlabeled',
+      actor: { login: actor },
+      label: { name: label },
+      created_at: createdAt,
+      ...(id !== undefined ? { id } : {}),
+    });
+    const tlCommented = (createdAt: string, id?: number) => ({
+      event: 'commented',
+      actor: { login: 'someone-else' },
+      created_at: createdAt,
+      ...(id !== undefined ? { id } : {}),
+    });
+    const isoMinute = (base: number) => `2024-01-01T00:${String(base).padStart(2, '0')}:00.000Z`;
+
+    interface PageDef {
+      data?: unknown;
+      link?: string;
+      throwMarker?: string;
+    }
+    function makePagedClient(existingLabels: string[], pages: PageDef[], pageCalls: { count: number }) {
+      const labels = new Set<string>(existingLabels);
+      return {
+        getLabels: () => Array.from(labels).sort(),
+        rest: {
+          issues: {
+            listLabelsOnIssue: async () => ({ data: Array.from(labels).map((name) => ({ name })) }),
+            addLabels: async (params: { labels: string[] }) => {
+              for (const label of params.labels) labels.add(label);
+              return {};
+            },
+            removeLabel: async (params: { name: string }) => {
+              labels.delete(params.name);
+              return {};
+            },
+            listEventsForTimeline: async (params: { page?: number; per_page?: number }) => {
+              pageCalls.count += 1;
+              assert.equal(params.per_page, 100, 'timeline pagination uses per_page=100');
+              const page = params.page ?? 1;
+              const def = pages[page - 1];
+              if (!def) return { data: [] };
+              if (def.throwMarker) throw new Error(def.throwMarker);
+              const headers = def.link !== undefined ? { link: def.link } : undefined;
+              return headers ? { data: def.data as never[], headers } : { data: def.data as never[] };
+            },
+          },
+        },
+      } as unknown as GitHubLabelClient & { getLabels: () => string[] };
+    }
+
+    // >100 events: page 1 full (bot P1 + 99 filler), page 2 human re-adds P1 later.
+    {
+      const filler = Array.from({ length: 99 }, (_, i) => tlCommented(isoMinute(0), 1000 + i));
+      const page1 = [...filler, tlLabeled('priority:P1', BOT_LOGIN, '2024-01-01T01:00:00.000Z', 2000)];
+      const page2 = [tlLabeled('priority:P1', HUMAN_LOGIN, '2024-01-01T02:00:00.000Z', 3000)];
+      const calls = { count: 0 };
+      const client = makePagedClient(['priority:P1', 'area:runtime'], [{ data: page1 }, { data: page2 }], calls);
+      const result = await reconcileBotLabelsSafely({
+        client, owner: 'owner', repo: 'repo', issueNumber: 100,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.ok(calls.count >= 2, '>100 events must fetch page 2');
+      assert.deepEqual(result.removed, [], 'later-page human re-add is never removed');
+      assert.ok(client.getLabels().includes('priority:P1'), 'human P1 preserved across pages');
+      const proven = await resolveTimelineBotWrittenLabels({
+        client, owner: 'owner', repo: 'repo', issueNumber: 100, botLogin: BOT_LOGIN,
+      });
+      assert.ok(proven !== undefined && !proven.has('priority:p1'), 'human-last across pages is not proven');
+    }
+
+    // Mixed labeled/unlabeled: bot labels, human removes → terminal unlabeled is not proven.
+    {
+      const calls = { count: 0 };
+      const client = makePagedClient(['priority:P1', 'area:runtime'], [{
+        data: [
+          tlLabeled('priority:P1', BOT_LOGIN, '2024-01-01T01:00:00.000Z', 1),
+          tlUnlabeled('priority:P1', HUMAN_LOGIN, '2024-01-01T02:00:00.000Z', 2),
+        ],
+      }], calls);
+      const result = await reconcileBotLabelsSafely({
+        client, owner: 'owner', repo: 'repo', issueNumber: 101,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.deepEqual(result.removed, [], 'terminal unlabeled is never proven bot-written');
+      assert.ok(client.getLabels().includes('priority:P1'));
+      // Bot re-labels after the human removal → bot-last-labeled is proven again.
+      const calls2 = { count: 0 };
+      const client2 = makePagedClient(['bug', 'area:runtime'], [{
+        data: [
+          tlLabeled('bug', BOT_LOGIN, '2024-01-01T01:00:00.000Z', 1),
+          tlUnlabeled('bug', HUMAN_LOGIN, '2024-01-01T02:00:00.000Z', 2),
+          tlLabeled('bug', BOT_LOGIN, '2024-01-01T03:00:00.000Z', 3),
+        ],
+      }], calls2);
+      const proven2 = await resolveTimelineBotWrittenLabels({
+        client: client2, owner: 'owner', repo: 'repo', issueNumber: 102, botLogin: BOT_LOGIN,
+      });
+      assert.ok(proven2 !== undefined && proven2.has('bug'), 'bot re-label after unlabeled is proven');
+    }
+
+    // 100-event boundary: page 1 exactly 100, page 2 empty → determinable (bot proven).
+    {
+      const filler = Array.from({ length: 99 }, (_, i) => tlCommented(isoMinute(0), 5000 + i));
+      const page1 = [...filler, tlLabeled('priority:P1', BOT_LOGIN, '2024-01-01T01:00:00.000Z', 9000)];
+      const calls = { count: 0 };
+      const client = makePagedClient(['priority:P1', 'area:runtime'], [{ data: page1 }, { data: [] }], calls);
+      const result = await reconcileBotLabelsSafely({
+        client, owner: 'owner', repo: 'repo', issueNumber: 103,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.ok(calls.count >= 2, 'full page must probe the next page before concluding');
+      assert.ok(result.removed.includes('priority:P1'), '100-boundary bot write stays removable');
+      assert.ok(!client.getLabels().includes('priority:P1'));
+    }
+
+    // Second page throws → unknown (fail-closed), never throws, never logs raw.
+    {
+      const marker = 'synthetic second-page timeline marker';
+      const filler = Array.from({ length: 99 }, (_, i) => tlCommented(isoMinute(0), 7000 + i));
+      const page1 = [...filler, tlLabeled('priority:P1', BOT_LOGIN, '2024-01-01T01:00:00.000Z', 9500)];
+      const calls = { count: 0 };
+      const client = makePagedClient(['priority:P1', 'area:runtime'], [{ data: page1 }, { throwMarker: marker }], calls);
+      const { result, calls: consoleCalls } = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+        client, owner: 'owner', repo: 'repo', issueNumber: 104,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      }));
+      assert.deepEqual(result.removed, [], 'second-page failure retains the human-visible label');
+      assert.ok(client.getLabels().includes('priority:P1'));
+      assertNoSensitiveConsoleOutput(consoleCalls, marker, 'second-page timeline failure');
+      const direct = await resolveTimelineBotWrittenLabels({
+        client, owner: 'owner', repo: 'repo', issueNumber: 104, botLogin: BOT_LOGIN,
+      });
+      assert.equal(direct, undefined, 'second-page throw is unknown provenance');
+    }
+
+    // Out-of-order: array order disagrees with created_at; sorted order wins.
+    {
+      // Array ends with bot (old), but human is chronologically last → retain.
+      const callsA = { count: 0 };
+      const clientA = makePagedClient(['priority:P1', 'area:runtime'], [{
+        data: [
+          tlLabeled('priority:P1', HUMAN_LOGIN, '2024-01-01T03:00:00.000Z', 2),
+          tlLabeled('priority:P1', BOT_LOGIN, '2024-01-01T01:00:00.000Z', 1),
+        ],
+      }], callsA);
+      const resultA = await reconcileBotLabelsSafely({
+        client: clientA, owner: 'owner', repo: 'repo', issueNumber: 105,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.deepEqual(resultA.removed, [], 'unsorted array must not mask a human-last write');
+      assert.ok(clientA.getLabels().includes('priority:P1'));
+      // Array ends with human (old), but bot is chronologically last → removable.
+      const callsB = { count: 0 };
+      const clientB = makePagedClient(['priority:P1', 'area:runtime'], [{
+        data: [
+          tlLabeled('priority:P1', BOT_LOGIN, '2024-01-01T03:00:00.000Z', 2),
+          tlLabeled('priority:P1', HUMAN_LOGIN, '2024-01-01T01:00:00.000Z', 1),
+        ],
+      }], callsB);
+      const resultB = await reconcileBotLabelsSafely({
+        client: clientB, owner: 'owner', repo: 'repo', issueNumber: 106,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.ok(resultB.removed.includes('priority:P1'), 'sorted bot-last write is removable');
+    }
+
+    // Bot-latest positive (in-order): human then bot → proven transition removes.
+    {
+      const calls = { count: 0 };
+      const client = makePagedClient(['priority:P1', 'area:runtime'], [{
+        data: [
+          tlLabeled('priority:P1', HUMAN_LOGIN, '2024-01-01T01:00:00.000Z', 1),
+          tlLabeled('priority:P1', BOT_LOGIN, '2024-01-01T02:00:00.000Z', 2),
+        ],
+      }], calls);
+      const result = await reconcileBotLabelsSafely({
+        client, owner: 'owner', repo: 'repo', issueNumber: 107,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.ok(result.removed.includes('priority:P1'), 'bot-latest proven write is removable');
+      assert.ok(client.getLabels().includes('priority:P2'));
+    }
+
+    // Unknown fail-closed: missing actor, missing label, ambiguous timestamps.
+    {
+      const missingActor = { count: 0 };
+      const clientActor = makePagedClient(['priority:P1', 'area:runtime'], [{
+        data: [{ event: 'labeled', label: { name: 'priority:P1' }, created_at: '2024-01-01T01:00:00.000Z' }],
+      }], missingActor);
+      const resActor = await reconcileBotLabelsSafely({
+        client: clientActor, owner: 'owner', repo: 'repo', issueNumber: 108,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.deepEqual(resActor.removed, [], 'labeled event without actor is unknown');
+      assert.ok(clientActor.getLabels().includes('priority:P1'));
+
+      const missingLabel = { count: 0 };
+      const clientLabel = makePagedClient(['priority:P1', 'area:runtime'], [{
+        data: [{ event: 'labeled', actor: { login: BOT_LOGIN }, created_at: '2024-01-01T01:00:00.000Z' }],
+      }], missingLabel);
+      const resLabel = await reconcileBotLabelsSafely({
+        client: clientLabel, owner: 'owner', repo: 'repo', issueNumber: 109,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.deepEqual(resLabel.removed, [], 'labeled event without label is unknown');
+
+      const ambiguousTime = { count: 0 };
+      const clientTime = makePagedClient(['priority:P1', 'area:runtime'], [{
+        data: [
+          { event: 'labeled', actor: { login: BOT_LOGIN }, label: { name: 'priority:P1' } },
+          tlLabeled('priority:P1', HUMAN_LOGIN, '2024-01-01T02:00:00.000Z', 2),
+        ],
+      }], ambiguousTime);
+      const resTime = await reconcileBotLabelsSafely({
+        client: clientTime, owner: 'owner', repo: 'repo', issueNumber: 110,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.deepEqual(resTime.removed, [], 'multi-write without ordering timestamps is unknown');
+      assert.ok(clientTime.getLabels().includes('priority:P1'));
+    }
+
+    // Link header: a full page that confirms no next page needs no extra fetch.
+    {
+      const filler = Array.from({ length: 99 }, (_, i) => tlCommented(isoMinute(0), 11000 + i));
+      const page1 = [...filler, tlLabeled('priority:P1', BOT_LOGIN, '2024-01-01T01:00:00.000Z', 12000)];
+      const calls = { count: 0 };
+      const client = makePagedClient(
+        ['priority:P1', 'area:runtime'],
+        [{ data: page1, link: '<https://api.github.com/issues/1/timeline?page=1>; rel="last"' }],
+        calls,
+      );
+      const result = await reconcileBotLabelsSafely({
+        client, owner: 'owner', repo: 'repo', issueNumber: 111,
+        desiredLabels: ['priority:P2', 'area:runtime'],
+        scope: DEFAULT_PR_RECONCILE_SCOPE, botLogin: BOT_LOGIN,
+      });
+      assert.equal(calls.count, 1, 'Link without rel="next" confirms the end of a full page');
+      assert.ok(result.removed.includes('priority:P1'), 'Link-confirmed bot write stays removable');
+    }
+  }
 
   console.log('[PocketGuard label tests] All tests passed.');
 }

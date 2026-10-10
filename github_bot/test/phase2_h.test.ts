@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import {
   areReviewReportsAvailable,
   buildIssueChunks,
+  enforceGithubCommentLimit,
   formatReportLine,
   getReportRunUrl,
   issueContentFingerprint,
@@ -15,6 +16,7 @@ import {
   runPublishMode,
   runClaimMode,
   sliceTextForChunk,
+  stickyField,
   truncateStickyText,
   validateIssueChunk,
   validateIssueChunkReport,
@@ -24,8 +26,12 @@ import {
   verifyIssueChunkCoverage,
   writeReviewReports,
   REVIEW_REPORT_WRITE_ERROR,
+  GITHUB_COMMENT_HARD_LIMIT,
   MAX_ISSUE_CHUNK_LENGTH,
   MAX_ISSUE_CHUNK_SUMMARY_LENGTH,
+  MAX_STICKY_FILE_LIST_SHOWN,
+  MAX_STICKY_ITEM_LENGTH,
+  MAX_STICKY_TOTAL_LENGTH,
   type RunnerContext,
 } from '../src/github_runner';
 
@@ -955,6 +961,11 @@ export async function runPhase2HTests(): Promise<void> {
       const sticky = reviewComment(prOutput, [], '報告：不可用（審查報告未能產生或上傳失敗，請見 Actions 執行紀錄）。');
       assert.ok(sticky.includes('省略'), 'T8 PR sticky carries omission note for 100+ findings');
       assert.ok(sticky.length < 60000, `T8 PR sticky bounded (got ${sticky.length})`);
+      // T8 extended (Phase 3 P2 #3): whole-sticky hard budget plus tail counts.
+      assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `T8 PR sticky within total cap ${MAX_STICKY_TOTAL_LENGTH} (got ${sticky.length})`);
+      assert.ok(sticky.length <= GITHUB_COMMENT_HARD_LIMIT, 'T8 PR sticky within GitHub hard limit');
+      assert.ok(sticky.includes('共100'), 'T8 tail carries total finding count');
+      assert.ok(sticky.includes('artifact'), 'T8 tail guides to the report artifact');
       // Issue sticky: long summary plus many segments stays bounded with notes.
       const issueOutput = {
         verdict: 'APPROVE' as const,
@@ -987,6 +998,148 @@ export async function runPhase2HTests(): Promise<void> {
       assert.ok(issueSticky.includes('省略'), 'T8 issue sticky carries omission note');
       assert.ok(truncateStickyText('x'.repeat(100), 10).includes('省略'), 'T8 truncate helper notes omission');
       assert.ok(issueSticky.length < 20000, `T8 issue sticky bounded (got ${issueSticky.length})`);
+    }
+
+    // Phase 3 (P2 #3): whole-sticky hard cap. Single sticky only (never a
+    // second comment); overflow stays in the artifact with total/shown/omitted
+    // plus artifact guidance in the tail.
+    {
+      assert.equal(MAX_STICKY_TOTAL_LENGTH, 50000, 'P3 total budget leaves 65536 headroom');
+      assert.equal(GITHUB_COMMENT_HARD_LIMIT, 65536, 'P3 fail-safe matches the GitHub limit');
+      const prShape = (
+        roles: Array<{ role: 'chief' | 'android_sec' | 'android_code'; findings: Array<{ severity: 'BLOCK' | 'WARN' | 'SUGGESTION'; file?: string; line?: number; issue: string; suggestion?: string }> }>,
+        violations: Array<{ ruleId: string; severity: 'BLOCK' | 'WARN'; category: 'security' | 'reliability'; message: string }> = [],
+        coverage: { complete: boolean; omittedFiles: string[]; truncatedFiles: string[]; originalLength: number } = { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
+      ): Parameters<typeof reviewComment>[0] => ({
+        verdict: 'NEEDS_CHANGES' as const,
+        pullRequestNumber: 41,
+        baseSha: 'a'.repeat(40),
+        headSha: 'b'.repeat(40),
+        headRepository: REPO,
+        roles: roles.map((r) => ({ role: r.role, modelUsed: 'm', verdict: 'NEEDS_CHANGES' as const, findings: r.findings })),
+        coverage,
+        deterministicViolations: violations,
+        areaLabels: [],
+        changedFiles: [],
+        changedFilesComplete: true,
+        suggestedLabels: [],
+      });
+
+      // P3-1: 3x20 long findings (each issue+suggestion 2000 chars) stay safe.
+      {
+        const mkLong = (tag: string, i: number): { severity: 'WARN'; file: string; line: number; issue: string; suggestion: string } => ({
+          severity: 'WARN' as const,
+          file: `app/src/main/java/demo/P3Long${tag}${i}.kt`,
+          line: i + 1,
+          issue: `P3LONG-${tag}-${i} ${'x'.repeat(2000)}`,
+          suggestion: `fix-${tag}-${i} ${'y'.repeat(2000)}`,
+        });
+        const roles = (['chief', 'android_sec', 'android_code'] as const).map((role) => ({
+          role,
+          findings: Array.from({ length: 20 }, (_, i) => mkLong(role, i)),
+        }));
+        const sticky = reviewComment(prShape(roles), [], '報告行');
+        assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-1 60 long findings within total cap (got ${sticky.length})`);
+        assert.ok(sticky.length <= GITHUB_COMMENT_HARD_LIMIT, 'P3-1 within GitHub hard limit');
+        assert.ok(sticky.includes('省略'), 'P3-1 carries omission note');
+        assert.ok(sticky.includes('共60'), 'P3-1 tail carries total finding count');
+        assert.ok(sticky.includes('artifact'), 'P3-1 tail guides to artifact');
+        // Per-item cap: no 2000-char raw run survives verbatim.
+        assert.ok(!sticky.includes('x'.repeat(2000)), 'P3-1 single-item cap truncates long issues');
+        assert.ok(!sticky.includes('y'.repeat(2000)), 'P3-1 single-item cap truncates long suggestions');
+      }
+
+      // P3-2: 100+ long violations stay safe via the 20-pool plus budget fill.
+      {
+        const violations = Array.from({ length: 120 }, (_, i) => ({
+          ruleId: `P3RULE-${i}`,
+          severity: (i % 9 === 0 ? 'BLOCK' : 'WARN') as 'BLOCK' | 'WARN',
+          category: 'security' as const,
+          message: `P3V-${i} ${'z'.repeat(2000)}`,
+        }));
+        const sticky = reviewComment(prShape([{ role: 'chief', findings: [] }], violations), [], '報告行');
+        assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-2 120 long violations within total cap (got ${sticky.length})`);
+        assert.ok(sticky.includes('省略'), 'P3-2 carries omission note');
+        assert.ok(sticky.includes('共120'), 'P3-2 tail carries total violation count');
+        assert.ok(!sticky.includes('z'.repeat(2000)), 'P3-2 single-item cap truncates long messages');
+      }
+
+      // P3-3: escape-dense text is truncated->escaped and accounted post-escape.
+      {
+        const dense = '`*_{}[]()#+-.!|<>\\'.repeat(200);
+        const roles = [{ role: 'chief' as const, findings: [{ severity: 'BLOCK' as const, file: 'a*b_c[d](e)#f.kt', line: 1, issue: dense, suggestion: dense }] }];
+        const sticky = reviewComment(prShape(roles), [], '報告行');
+        assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-3 escape-dense within total cap (got ${sticky.length})`);
+        // Truncate->escape helper: raw cut first, escaped length accounted.
+        const single = stickyField(dense, MAX_STICKY_ITEM_LENGTH);
+        assert.ok(single.includes('省略'), 'P3-3 helper notes omission for dense input');
+        assert.ok(single.includes('\\*'), 'P3-3 helper escapes markdown after truncation');
+        assert.ok(!sticky.includes(dense), 'P3-3 raw dense run never lands verbatim');
+      }
+
+      // P3-4: 500+ char filenames stay safe in findings plus both file lists.
+      {
+        const longName = `${'d'.repeat(300)}/${'e'.repeat(300)}.kt`;
+        assert.ok(longName.length > 500, 'P3-4 fixture really exceeds 500 chars');
+        const roles = [{ role: 'chief' as const, findings: [{ severity: 'WARN' as const, file: longName, line: 7, issue: 'name check', suggestion: 'rename' }] }];
+        const coverage = {
+          complete: false,
+          omittedFiles: Array.from({ length: 30 }, (_, i) => `${'o'.repeat(250)}/omitted-${i}.kt`),
+          truncatedFiles: Array.from({ length: 25 }, (_, i) => `${'t'.repeat(250)}/truncated-${i}.kt`),
+          originalLength: 999,
+        };
+        const sticky = reviewComment(prShape(roles, [], coverage), [], '報告行');
+        assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-4 long filenames within total cap (got ${sticky.length})`);
+        assert.ok(!sticky.includes(longName), 'P3-4 full 500+ filename never lands verbatim');
+        assert.ok(sticky.includes('共30'), 'P3-4 omitted list carries total count');
+        assert.ok(sticky.includes('共25'), 'P3-4 truncated list carries total count');
+        assert.ok(sticky.includes(`示${MAX_STICKY_FILE_LIST_SHOWN}`), 'P3-4 file lists carry shown count');
+        assert.ok(sticky.includes('省略'), 'P3-4 file lists carry omission note');
+      }
+
+      // P3-5: BLOCK all kept, SUGGESTION dropped first, severity order held.
+      {
+        const blocks = Array.from({ length: 5 }, (_, i) => ({
+          severity: 'BLOCK' as const,
+          file: `keep/Block${i}.kt`,
+          line: i + 1,
+          issue: `BLOCKKEEP${i} ${'x'.repeat(2000)}`,
+          suggestion: `keep fix ${i}`,
+        }));
+        const sugs = Array.from({ length: 80 }, (_, i) => ({
+          severity: 'SUGGESTION' as const,
+          file: `drop/Sug${i}.kt`,
+          line: i + 1,
+          issue: `SUGDROP${i} ${'q'.repeat(2000)}`,
+          suggestion: `drop fix ${i} ${'w'.repeat(2000)}`,
+        }));
+        // Interleave roles so input order alone would not keep BLOCKs first.
+        const roles = [
+          { role: 'chief' as const, findings: [...sugs.slice(0, 30), ...blocks.slice(0, 2)] },
+          { role: 'android_sec' as const, findings: [...sugs.slice(30, 60), ...blocks.slice(2, 4)] },
+          { role: 'android_code' as const, findings: [...sugs.slice(60), ...blocks.slice(4)] },
+        ];
+        const sticky = reviewComment(prShape(roles), [], '報告行');
+        assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-5 mixed severities within total cap (got ${sticky.length})`);
+        for (let i = 0; i < 5; i += 1) {
+          assert.ok(sticky.includes(`BLOCKKEEP${i}`), `P3-5 keeps BLOCK ${i}`);
+        }
+        const keptSugs = sugs.filter((s) => sticky.includes(s.issue.slice(0, 12))).length;
+        assert.ok(keptSugs < sugs.length, `P3-5 drops some SUGGESTION first (kept ${keptSugs}/${sugs.length})`);
+        const firstBlock = sticky.indexOf('BLOCKKEEP');
+        const firstSug = sticky.indexOf('SUGDROP');
+        assert.ok(firstBlock >= 0 && firstSug >= 0 && firstBlock < firstSug, 'P3-5 BLOCK precedes SUGGESTION');
+      }
+
+      // P3-6: pre-send fail-safe never exceeds 65536 and keeps short bodies.
+      {
+        const huge = `<!-- PocketGuard-review -->\n${'v'.repeat(70000)}`;
+        const capped = enforceGithubCommentLimit(huge);
+        assert.equal(capped.length, GITHUB_COMMENT_HARD_LIMIT, 'P3-6 fail-safe caps at exactly 65536');
+        assert.ok(capped.includes('artifact'), 'P3-6 fail-safe notes the artifact');
+        const short = '<!-- PocketGuard-review -->\nshort';
+        assert.equal(enforceGithubCommentLimit(short), short, 'P3-6 short body passes through');
+      }
     }
 
     // Phase D (P1 #4) issue double-gate: valid APPROVE output without

@@ -83,6 +83,23 @@ export const MAX_ISSUE_CHUNK_SUMMARY_LENGTH = 500;
 export const MAX_STICKY_SUMMARY_LENGTH = 2000;
 export const MAX_STICKY_FINDINGS_PER_ROLE = 20;
 export const MAX_STICKY_CHUNK_LINES = 10;
+// Phase 3 (P2 #3): whole-sticky hard budget. GitHub issue/PR comments reject
+// bodies past 65536 chars, so the PR sticky (reviewComment) is capped at
+// MAX_STICKY_TOTAL_LENGTH leaving headroom for ledger/claim markers stamped
+// later by buildStampedBody. Single-item and file-list caps bound each entry;
+// the candidate pools (60 findings = 3 roles x 20, 20 violations) are selected
+// by BLOCK>WARN>SUGGESTION with stable original order within a severity, then
+// filled incrementally (truncate->escape, accounted post-escape) until the
+// budget stops; the tail carries total/shown/omitted plus artifact guidance.
+// Overflow never opens a second comment: excess stays in the report artifact.
+export const MAX_STICKY_TOTAL_LENGTH = 50000;
+export const MAX_STICKY_ITEM_LENGTH = 500;
+export const MAX_STICKY_FILE_NAME_LENGTH = 200;
+export const MAX_STICKY_FILE_LIST_SHOWN = 20;
+export const MAX_STICKY_FINDING_POOL_SIZE = 60;
+export const MAX_STICKY_VIOLATION_POOL_SIZE = 20;
+// GitHub comment hard limit (fail-safe in publishStickyComment).
+export const GITHUB_COMMENT_HARD_LIMIT = 65536;
 export const REVIEW_REPORT_JSON_NAME = 'review-report.json';
 export const REVIEW_REPORT_MD_NAME = 'review-report.md';
 export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
@@ -3787,9 +3804,70 @@ export function truncateStickyText(value: string, maxLength: number): string {
   return `${src.slice(0, maxLength)}…（已省略${src.length - maxLength}字）`;
 }
 
+// Phase 3 (P2 #3) sticky helpers: truncate raw first, then escape, and
+// account post-escape lengths so escape expansion (e.g. `*` -> `\*`) never
+// overflows the total budget.
+function stickySeverityRank(severity: string): number {
+  if (severity === 'BLOCK') return 0;
+  if (severity === 'WARN') return 1;
+  return 2;
+}
+
+// Unified truncate->escape field: raw is cut to cap first, then escaped, and
+// callers account the escaped length. The omission note uses full-width
+// parentheses so escaping never litters it with backslashes.
+export function stickyField(raw: unknown, cap: number): string {
+  const src = typeof raw === 'string' ? raw : '';
+  const budget = Math.max(0, Math.floor(cap));
+  if (src.length <= budget) return escapeMarkdown(src);
+  return `${escapeMarkdown(src.slice(0, budget))}…（已省略${src.length - budget}字）`;
+}
+
+function formatStickyFileList(label: string, files: string[]): string {
+  const total = files.length;
+  if (total === 0) return `${label}：無`;
+  const shownCount = Math.min(total, MAX_STICKY_FILE_LIST_SHOWN);
+  const shown = files.slice(0, shownCount).map((file) => stickyField(file, MAX_STICKY_FILE_NAME_LENGTH));
+  const omitted = total - shownCount;
+  const counts = `（共${total}，示${shownCount}，省略${omitted}）`;
+  if (omitted > 0) {
+    return `${label}${counts}：${shown.join('、')}…（另省略${omitted}個檔案，完整清單見 artifact）`;
+  }
+  return `${label}${counts}：${shown.join('、')}`;
+}
+
+function hardTruncateSticky(body: string, limit: number): string {
+  if (body.length <= limit) return body;
+  const note = '…（已省略超長內容，完整結果見 artifact）';
+  const keep = Math.max(0, limit - note.length);
+  return `${body.slice(0, keep)}${note}`;
+}
+
+// Pre-send fail-safe for publishStickyComment: GitHub rejects bodies past
+// 65536 chars. The PR budget (50000) plus ledger markers normally stays far
+// below it; this last resort keeps a single sticky write (never a second
+// comment) with an explicit note. Excess detail stays in the report artifact.
+export function enforceGithubCommentLimit(body: string): string {
+  if (typeof body !== 'string') return body;
+  return hardTruncateSticky(body, GITHUB_COMMENT_HARD_LIMIT);
+}
+
 export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[] = [], reportLine?: string): string {
   const updatedAt = new Date().toISOString();
-  const lines = [
+  const omittedFiles = Array.isArray(output.coverage?.omittedFiles)
+    ? output.coverage.omittedFiles.filter((file): file is string => typeof file === 'string')
+    : [];
+  const truncatedFiles = Array.isArray(output.coverage?.truncatedFiles)
+    ? output.coverage.truncatedFiles.filter((file): file is string => typeof file === 'string')
+    : [];
+  const labelsLine = appliedLabels.length > 0
+    ? appliedLabels.filter((label): label is string => typeof label === 'string')
+      .map((label) => stickyField(label, MAX_STICKY_FILE_NAME_LENGTH)).join('、')
+    : '無';
+  const roleVerdicts = Array.isArray(output.roles) && output.roles.length > 0
+    ? output.roles.map((role) => `${role.role}=${role.verdict}`).join('、')
+    : '無';
+  const headerLines = [
     REVIEW_MARKER,
     '',
     '## PocketGuard 審查',
@@ -3797,46 +3875,115 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
     `**判定：${output.verdict}**`,
     `審查的 head SHA：\`${output.headSha}\``,
     `審查的 base SHA：\`${output.baseSha}\``,
-    `標籤決策：${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join('、') : '無'}`,
+    `標籤決策：${labelsLine}`,
     `更新時間：${updatedAt}`,
     reportLine ?? formatReportLine(process.env, false),
     coverageSummary(output.coverage),
-    `省略檔案：${output.coverage.omittedFiles.length > 0
-      ? output.coverage.omittedFiles.map((file) => escapeMarkdown(file)).join('、')
-      : '無'}`,
-    `截斷檔案：${output.coverage.truncatedFiles.length > 0
-      ? output.coverage.truncatedFiles.map((file) => escapeMarkdown(file)).join('、')
-      : '無'}`,
+    formatStickyFileList('省略檔案', omittedFiles),
+    formatStickyFileList('截斷檔案', truncatedFiles),
+    `角色判定：${roleVerdicts}`,
     '',
   ];
-  for (const role of output.roles) {
-    lines.push(`### ${role.role} — ${role.verdict}`);
-    if (role.findings.length === 0) {
-      lines.push('- 無符合回報條件的具體發現。');
-    }
-    // Bounded findings per role with omission note (Phase A #4/T8).
-    const shown = role.findings.slice(0, MAX_STICKY_FINDINGS_PER_ROLE);
-    for (const finding of shown) {
-      const location = finding.file
-        ? ` (${escapeMarkdown(finding.file)}${finding.line ? `:${finding.line}` : ''})`
-        : '';
-      lines.push(`- **${finding.severity}**${location}: ${escapeMarkdown(finding.issue)}`);
-      if (finding.suggestion) lines.push(`  - 建議：${escapeMarkdown(finding.suggestion)}`);
-    }
-    if (role.findings.length > shown.length) {
-      lines.push(`- …（共${role.findings.length}項，省略${role.findings.length - shown.length}項）`);
-    }
-    lines.push('');
+  // Candidate pools: all findings/violations sorted by BLOCK>WARN>SUGGESTION
+  // with stable original order within a severity, then capped to 60/20. Totals
+  // below stay over the full sets so the tail omission counts are honest.
+  const totalFindings = Array.isArray(output.roles)
+    ? output.roles.reduce((sum, role) => sum + (Array.isArray(role.findings) ? role.findings.length : 0), 0)
+    : 0;
+  const totalViolations = Array.isArray(output.deterministicViolations) ? output.deterministicViolations.length : 0;
+  interface PooledFinding {
+    severity: string;
+    file?: string;
+    line?: number;
+    issue: string;
+    suggestion?: string;
+    role: string;
+    order: number;
   }
-  // Bounded deterministic violations with omission note.
-  const shownViolations = output.deterministicViolations.slice(0, MAX_STICKY_FINDINGS_PER_ROLE);
-  for (const violation of shownViolations) {
-    lines.push(`- **${violation.severity} ${escapeMarkdown(violation.ruleId)}**: ${escapeMarkdown(violation.message)}`);
+  const allFindings: PooledFinding[] = [];
+  if (Array.isArray(output.roles)) {
+    output.roles.forEach((role, roleIdx) => {
+      const list = Array.isArray(role.findings) ? role.findings : [];
+      list.forEach((finding, findingIdx) => {
+        allFindings.push({
+          severity: finding.severity,
+          file: finding.file,
+          line: finding.line,
+          issue: finding.issue,
+          suggestion: finding.suggestion,
+          role: role.role,
+          order: roleIdx * 1000000 + findingIdx,
+        });
+      });
+    });
   }
-  if (output.deterministicViolations.length > shownViolations.length) {
-    lines.push(`- …（共${output.deterministicViolations.length}項，省略${output.deterministicViolations.length - shownViolations.length}項）`);
+  const poolFindings = [...allFindings]
+    .sort((left, right) => stickySeverityRank(left.severity) - stickySeverityRank(right.severity) || left.order - right.order)
+    .slice(0, MAX_STICKY_FINDING_POOL_SIZE);
+  interface PooledViolation {
+    severity: string;
+    ruleId: string;
+    message: string;
+    order: number;
   }
-  return `${lines.join('\n')}\n`;
+  const allViolations: PooledViolation[] = Array.isArray(output.deterministicViolations)
+    ? output.deterministicViolations.map((violation, idx) => ({
+      severity: violation.severity,
+      ruleId: violation.ruleId,
+      message: violation.message,
+      order: idx,
+    }))
+    : [];
+  const poolViolations = [...allViolations]
+    .sort((left, right) => stickySeverityRank(left.severity) - stickySeverityRank(right.severity) || left.order - right.order)
+    .slice(0, MAX_STICKY_VIOLATION_POOL_SIZE);
+  // Incremental fill under the total budget: each entry is truncated->escaped
+  // first and accounted post-escape; over budget stops (never a second
+  // comment). TAIL_RESERVE keeps room for the total/omitted/artifact tail.
+  const TAIL_RESERVE = 1500;
+  const lines: string[] = [
+    ...headerLines,
+    `### 發現（共${totalFindings}，候選${poolFindings.length}，按 BLOCK>WARN>SUGGESTION 擇要，同級保持原序）`,
+  ];
+  const joinedLength = (entries: string[]): number => entries.join('\n').length + 1;
+  let shownFindings = 0;
+  for (const finding of poolFindings) {
+    const severity = finding.severity === 'BLOCK' || finding.severity === 'WARN' || finding.severity === 'SUGGESTION'
+      ? finding.severity
+      : 'WARN';
+    const role = typeof finding.role === 'string' && finding.role ? finding.role : 'chief';
+    const location = typeof finding.file === 'string' && finding.file
+      ? ` (${stickyField(finding.file, MAX_STICKY_FILE_NAME_LENGTH)}${typeof finding.line === 'number' && Number.isInteger(finding.line) && finding.line >= 1 ? `:${finding.line}` : ''})`
+      : '';
+    const main = `- **${severity}** [${role}]${location}: ${stickyField(finding.issue, MAX_STICKY_ITEM_LENGTH)}`;
+    const extra = typeof finding.suggestion === 'string' && finding.suggestion
+      ? `  - 建議：${stickyField(finding.suggestion, MAX_STICKY_ITEM_LENGTH)}`
+      : undefined;
+    const probe = extra ? [...lines, main, extra] : [...lines, main];
+    if (joinedLength(probe) + TAIL_RESERVE > MAX_STICKY_TOTAL_LENGTH) break;
+    lines.push(main);
+    if (extra) lines.push(extra);
+    shownFindings += 1;
+  }
+  lines.push(`### 確定性檢查（共${totalViolations}，候選${poolViolations.length}）`);
+  let shownViolations = 0;
+  for (const violation of poolViolations) {
+    const severity = violation.severity === 'BLOCK' || violation.severity === 'WARN' ? violation.severity : 'WARN';
+    const main = `- **${severity} ${stickyField(violation.ruleId, MAX_STICKY_ITEM_LENGTH)}**: ${stickyField(violation.message, MAX_STICKY_ITEM_LENGTH)}`;
+    if (joinedLength([...lines, main]) + TAIL_RESERVE > MAX_STICKY_TOTAL_LENGTH) break;
+    lines.push(main);
+    shownViolations += 1;
+  }
+  const omittedFindings = totalFindings - shownFindings;
+  const omittedViolations = totalViolations - shownViolations;
+  lines.push(
+    '',
+    `共${totalFindings}項發現，示${shownFindings}項，省略${omittedFindings}項；共${totalViolations}項確定性違規，示${shownViolations}項，省略${omittedViolations}項。`,
+    '完整結果見 artifact `pocketguard-review-report`；超量內容只進 artifact，本則不另開留言。',
+  );
+  const body = `${lines.join('\n')}\n`;
+  if (body.length <= MAX_STICKY_TOTAL_LENGTH) return body;
+  return hardTruncateSticky(body, MAX_STICKY_TOTAL_LENGTH);
 }
 
 function inconclusiveComment(reason: string, reportLine?: string): string {
@@ -3880,7 +4027,7 @@ export function issueReviewComment(output: RunnerIssueOutput, appliedLabels: str
     chunkLine = '分段：單段（完整）';
   }
   const boundedSummary = truncateStickyText(output.summary || '', MAX_STICKY_SUMMARY_LENGTH);
-  return [
+  const issueBody = [
     REVIEW_MARKER,
     '',
     '## PocketGuard 議題審查',
@@ -3897,6 +4044,10 @@ export function issueReviewComment(output: RunnerIssueOutput, appliedLabels: str
     reportLine ?? formatReportLine(process.env, false),
     '',
   ].join('\n');
+  // Phase 3 (P2 #3): whole-sticky hard budget also guards the issue path
+  // (normally far below it); excess stays in the report artifact.
+  if (issueBody.length <= MAX_STICKY_TOTAL_LENGTH) return issueBody;
+  return hardTruncateSticky(issueBody, MAX_STICKY_TOTAL_LENGTH);
 }
 
 function issueInconclusiveComment(issueNumber: number, title: string, reason: string, fingerprint: string, reportLine?: string): string {
@@ -3969,7 +4120,13 @@ async function publishStickyComment(
     // Revalidate only after locating the sticky comment and immediately before
     // the write. GitHub offers no compare-and-swap, so this narrows but cannot
     // eliminate the race with a concurrent PR update.
-    const currentBody = bodyBeforeWrite ? await bodyBeforeWrite() : body;
+    const resolvedBody = bodyBeforeWrite ? await bodyBeforeWrite() : body;
+    // Phase 3 (P2 #3) pre-send fail-safe: GitHub rejects bodies past 65536
+    // chars. The PR budget (50000) plus ledger markers normally stays far
+    // below it; this last resort keeps a single sticky write (never a second
+    // comment) with an explicit note. Excess detail stays in the report
+    // artifact.
+    const currentBody = enforceGithubCommentLimit(resolvedBody);
     if (existing) {
       await client.rest.issues.updateComment({
         owner: repository.owner,

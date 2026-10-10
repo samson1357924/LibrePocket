@@ -24,7 +24,7 @@ stage as pass only when the corresponding `changes` output is explicitly
 
 When `code == true`, the workflow uses JDK 17 and runs these Gradle stages:
 
-1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets).
+1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets). The unit-tests job fans out over a flavor matrix with fail-fast disabled, so each flavor runs on its own runner and wall time is the slowest shard rather than the sum.
 2. `:app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug`.
 3. `:app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug`, then `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss. This stage also runs when only `policy == true`.
 

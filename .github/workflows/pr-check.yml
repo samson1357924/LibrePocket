@@ -60,12 +60,16 @@ jobs:
               - '.github/workflows/pr-check.yml'
 
   unit-tests:
-    name: Unit & Robolectric Tests
+    name: Unit & Robolectric Tests (${{ matrix.flavor }})
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # 三風味串行實測約 24-25 分鐘（編譯 3.5m + 每風味 ~7m），20m 必超時。
-    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [play, foss, github]
+    # 單風味實測約 7m（編譯 3.5m + 測試）；三 job 並跑，wall 取決於最慢分片。
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -81,15 +85,23 @@ jobs:
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/main' }}
 
-      - name: Run Unit Tests (Play, Foss & GitHub Flavors)
-        run: ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --continue --stacktrace
+      # NOTE: keep the three literal task names below — scripts/docs_claim_check.sh
+      # greps them from this file and requires TESTING.md to document each one.
+      - name: Run Unit Tests (${{ matrix.flavor }} flavor)
+        run: |
+          case "${{ matrix.flavor }}" in
+            play) ./gradlew :app:testPlayDebugUnitTest --stacktrace ;;
+            foss) ./gradlew :app:testFossDebugUnitTest --stacktrace ;;
+            github) ./gradlew :app:testGithubDebugUnitTest --stacktrace ;;
+            *) echo "unknown flavor: ${{ matrix.flavor }}"; exit 1 ;;
+          esac
 
       - name: Upload Test Reports
         # cancelled（超時被砍）時也要上傳，否則下次仍是盲修。
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: unit-test-reports
+          name: unit-test-reports-${{ matrix.flavor }}
           path: app/build/reports/tests/
           retention-days: 7
 

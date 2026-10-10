@@ -101,14 +101,173 @@ jobs:
             *) echo "unknown flavor: ${{ matrix.flavor }}"; exit 1 ;;
           esac
 
+      # 報告（非 gate）：flaky 取證要在 run 頁面直接可見——不必下載 artifact、
+      # 不必翻 job log。這一步只讀 JUnit XML（app/build/test-results/**/TEST-*.xml），
+      # 把 tests/failures/errors/skipped 總數、失敗的「類別.方法」（含 assertion
+      # 摘要第一行）與 skipped 清單寫進 $GITHUB_STEP_SUMMARY。真正的 gate 是
+      # pr-gate job，所以本 step 任何情況都 exit 0（no XML → 一句說明略過；
+      # 解析異常 → 記訊息後照常結束），絕不因報告失敗變紅。
+      - name: Summarize Unit Test Results (${{ matrix.flavor }})
+        # always()：測試失敗時後續 step 預設會被跳過，而失敗恰恰是 needs
+        # summary 的時刻，所以必須無條件執行。
+        if: always()
+        env:
+          FLAVOR: ${{ matrix.flavor }}
+        run: |
+          # parser 自己崩潰（語法錯誤、BaseException、python3 不存在）時 run 頁面
+          # 不可完全空白：fallback 必須同時具備
+          #   1) [ -n "${GITHUB_STEP_SUMMARY:-}" ] guard——變數為空時 >> "" 在
+          #      bash -e 下會讓 step 變紅，等於新增 exit 非 0 路徑；
+          #   2) printf 自身 || true、function 呼叫再 || true——fallback 失敗
+          #      也不得弄紅本 step（報告功能壞掉不是 gate 失敗）。
+          # function 放在 heredoc 起始行的 || 分支：heredoc 體從下一物理行開始收集，
+          # 不能在這行之後跨行寫 { ... }（群組內容會被 heredoc 吞掉、語法錯誤）。
+          summary_parser_crashed_fallback() {
+            echo "WARN: summary parser crashed (ignored; reporting only, not a gate)"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '%s\n' \
+                "### Unit test summary — ${FLAVOR:-?} flavor" \
+                "" \
+                "> **Summary parser crashed** before it could write a unit-test summary — see this job's log for the parser error (reporting only; the real gate is pr-gate)." \
+                "" >>"${GITHUB_STEP_SUMMARY}" || true
+            fi
+          }
+
+          python3 - <<'PY' || summary_parser_crashed_fallback || true
+          import glob
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          SUMMARY_PATH = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          FLAVOR = os.environ.get("FLAVOR", "?")
+          # GitHub 每個 step summary 上限 1 MiB；超過會整份丟棄並只印
+          # "upload aborted" annotation——巨型 assertion 訊息（base64/JSON
+          # 比對）必須截斷，否則整個摘要靜默消失。
+          MAX_SUMMARY_LINE = 300
+          LINES = []
+
+          def emit(text=""):
+              print(text)
+              LINES.append(text)
+
+          def flush():
+              # 寫 summary 檔失敗只進 log，不反過來弄紅本 step。
+              if not SUMMARY_PATH:
+                  return
+              try:
+                  with open(SUMMARY_PATH, "a", encoding="utf-8") as fh:
+                      fh.write("\n".join(LINES) + "\n")
+              except OSError as exc:
+                  print("warning: cannot append GITHUB_STEP_SUMMARY: %s" % exc)
+
+          def first_line(text):
+              for line in (text or "").splitlines():
+                  line = line.strip()
+                  if line:
+                      # 單行截斷：避免一行幾 MB 的比對訊息把 run summary 撐過
+                      # 1 MiB 上限（超限 GitHub 整份丟棄，摘要全部看不到）。
+                      if len(line) > MAX_SUMMARY_LINE:
+                          return line[:MAX_SUMMARY_LINE] + "…"
+                      return line
+              return ""
+
+          def main():
+              paths = sorted(glob.glob("app/build/test-results/**/TEST-*.xml", recursive=True))
+              if not paths:
+                  emit("### Unit test summary — %s flavor" % FLAVOR)
+                  emit("")
+                  emit("No `app/build/test-results/**/TEST-*.xml` found — likely the "
+                       "setup/compile stage failed before tests ran. Summary skipped "
+                       "(reporting only, not a gate).")
+                  return
+
+              tests = failures = errors = skipped = 0
+              failed, skipped_cases, unreadable = [], [], 0
+
+              for path in paths:
+                  try:
+                      root = ET.parse(path).getroot()
+                  except Exception as exc:  # noqa: BLE001 — reporting must never fail
+                      unreadable += 1
+                      print("warning: unreadable %s: %s" % (path, exc))
+                      continue
+                  for suite in root.iter("testsuite"):
+                      tests += int(suite.get("tests", 0) or 0)
+                      failures += int(suite.get("failures", 0) or 0)
+                      errors += int(suite.get("errors", 0) or 0)
+                      skipped += int(suite.get("skipped", 0) or 0)
+                      for case in suite.findall("testcase"):
+                          ident = "%s.%s" % (case.get("classname", "?"), case.get("name", "?"))
+                          bad = case.find("failure")
+                          if bad is None:
+                              bad = case.find("error")
+                          if bad is not None:
+                              summary = first_line(bad.get("message")) or first_line(bad.text)
+                              failed.append((ident, summary or "(no message)"))
+                          elif case.find("skipped") is not None:
+                              skipped_cases.append(ident)
+
+              emit("### Unit test summary — %s flavor" % FLAVOR)
+              emit("")
+              emit("| metric | count |")
+              emit("| --- | ---: |")
+              emit("| tests | %d |" % tests)
+              emit("| failures | %d |" % failures)
+              emit("| errors | %d |" % errors)
+              emit("| skipped | %d |" % skipped)
+              emit("")
+              emit("Scanned %d JUnit XML file(s)%s." % (
+                  len(paths),
+                  ", %d unreadable" % unreadable if unreadable else ""))
+              emit("")
+              emit("**Failed tests (%d):**" % len(failed))
+              if failed:
+                  for ident, summary in failed:
+                      emit("- `%s` — %s" % (ident, summary))
+              else:
+                  emit("_none — all executed tests passed._")
+              emit("")
+              emit("**Skipped tests (%d):**" % len(skipped_cases))
+              if skipped_cases:
+                  for ident in skipped_cases:
+                      emit("- `%s`" % ident)
+              else:
+                  emit("_none._")
+
+          try:
+              main()
+          except Exception as exc:  # noqa: BLE001 — 絕不 exit 非 0，這不是 gate
+              emit("summary step error (ignored, reporting only): %r" % exc)
+          flush()
+          sys.exit(0)
+          PY
+          echo "unit-test summary done (report only — real gate is pr-gate)"
+
       - name: Upload Test Reports
-        # cancelled（超時被砍）時也要上傳，否則下次仍是盲修。
-        if: failure() || cancelled()
+        # always()：綠燈 run 也要留存，才能做「同一測試方法跨 run 失敗率」統計
+        # 與 re-run 的 attempt 1 vs 2 比對（flaky 取證）；cancelled（超時被砍）
+        # 同理，盡力上傳（best-effort）——超時或取消時 runner 可能在 step 完成前被殺，
+        # always() 保證被排入執行，不保證一定完成。
+        # JUnit XML（app/build/test-results/）是逐測試方法的結構化資料，必須與
+        # HTML 報告一起留存——只留 HTML 無法跨 run 比對。
+        if: always()
+        # 避免 GitHub Actions artifact 後端暫時性抖動（如 502/短暫中斷）把「測試全綠」
+        # 的 job 打成 failure 誤判為紅燈。上傳報告是取證輔助，不應成為新的 flake 來源。
+        # 真正的 gate 是 pr-gate job（評估 unit-tests 的執行結果，不依賴 artifact）。
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: unit-test-reports-${{ matrix.flavor }}
-          path: app/build/reports/tests/
-          retention-days: 7
+          # run_attempt 後綴：同一 run re-run 時不會撞到 v4 的 artifact 重名錯誤。
+          name: unit-test-reports-${{ matrix.flavor }}-attempt-${{ github.run_attempt }}
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+          retention-days: 14
+          # 不設定 if-no-files-found：預設值 warn 只會在檔案不存在（路徑漂移）時
+          # 印一條 warning，不會 fail action——只有 error 才會失敗。這裡刻意保留
+          # 預設 warn 的診斷訊號：若設 ignore 等於靜默壓制「報告沒上傳」的警告。
+          # setup 階段失敗的紅燈由 pr-gate 決定，warn 不會額外多開一盞紅燈。
 
   lint:
     name: Android Lint Check

@@ -4,16 +4,73 @@ import dev.librepocket.keystore.KeyVault
 import dev.librepocket.redact.Redactor
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.ResponseBody
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
+
+/** Internal transport failure; overflow is fail-closed and maps to [JevStatus.ERROR] at the API boundary. */
+internal enum class JevFailureCode { TOO_LARGE }
+
+internal class JevFailure(
+    val retryable: Boolean,
+    message: String,
+    cause: Throwable? = null,
+    val code: JevFailureCode? = null,
+) : IOException(message, cause)
+
+private const val JEV_READ_CHUNK_BYTES = 8 * 1024
+
+/**
+ * Read a Jev POST response body with a hard wire cap before decoding.
+ * The one-byte probe distinguishes an exact-cap EOF from an oversized body.
+ * The actual Call must be cancelled before response.close() can try to discard
+ * unread bytes from the network. Counts decoded bytes at the source boundary
+ * (same as provider transport), so the cap holds under transparent gzip.
+ */
+internal fun readBoundedJevBody(
+    body: ResponseBody,
+    cancelCall: () -> Unit,
+): String {
+    val limit = JevClient.MAX_BODY_CHARS.toLong()
+    if (body.contentLength() > limit) {
+        cancelCall()
+        throw tooLargeJevFailure()
+    }
+
+    val source = body.source()
+    val bytes = Buffer()
+    var remaining = limit
+    while (true) {
+        val requested = minOf(JEV_READ_CHUNK_BYTES.toLong(), remaining + 1L)
+        val read = source.read(bytes, requested)
+        if (read == -1L) break
+        if (read > remaining) {
+            cancelCall()
+            throw tooLargeJevFailure()
+        }
+        remaining -= read
+    }
+    return bytes.readByteArray().toResponseBody(body.contentType()).string()
+}
+
+private fun tooLargeJevFailure() = JevFailure(
+    retryable = false,
+    message = "TOO_LARGE jev response",
+    code = JevFailureCode.TOO_LARGE,
+)
 
 /**
  * D01 遠端小模型客戶端：POST `{baseUrl}/v1/systemone`，model pin [JevModel.MODEL_ID]。
@@ -123,6 +180,18 @@ class JevClient(
         } catch (e: TimeoutCancellationException) {
             try { key.fill('\u0000') } catch (_: Exception) { }
             throw e // 讓上層以 TIMEOUT 計；此處不吞超時（由呼叫點映射）。
+        } catch (e: CancellationException) {
+            try { key.fill('\u0000') } catch (_: Exception) { }
+            throw e // 外部取消不吞為 ERROR，由呼叫方傳播。
+        } catch (_: JevFailure) {
+            try { key.fill('\u0000') } catch (_: Exception) { }
+            return ChoiceResult(
+                bestId = JevIntents.GUI_FALLBACK,
+                confidences = emptyMap(),
+                abstain = true,
+                status = JevStatus.ERROR,
+                latencyMs = clockMs() - start,
+            )
         } catch (_: Exception) {
             try { key.fill('\u0000') } catch (_: Exception) { }
             return ChoiceResult(
@@ -190,6 +259,17 @@ class JevClient(
         } catch (e: TimeoutCancellationException) {
             try { key.fill('\u0000') } catch (_: Exception) { }
             throw e
+        } catch (e: CancellationException) {
+            try { key.fill('\u0000') } catch (_: Exception) { }
+            throw e // 外部取消不吞為 ERROR，由呼叫方傳播。
+        } catch (_: JevFailure) {
+            try { key.fill('\u0000') } catch (_: Exception) { }
+            return ScoreResult(
+                score = conservativeScore(context.sideEffect),
+                reasonCodes = listOf("TOO_LARGE"),
+                status = JevStatus.ERROR,
+                latencyMs = clockMs() - start,
+            )
         } catch (_: Exception) {
             try { key.fill('\u0000') } catch (_: Exception) { }
             return ScoreResult(
@@ -270,6 +350,17 @@ class JevClient(
         } catch (e: TimeoutCancellationException) {
             try { key.fill('\u0000') } catch (_: Exception) { }
             throw e
+        } catch (e: CancellationException) {
+            try { key.fill('\u0000') } catch (_: Exception) { }
+            throw e // 外部取消不吞為 ERROR，由呼叫方傳播。
+        } catch (_: JevFailure) {
+            try { key.fill('\u0000') } catch (_: Exception) { }
+            return NoulResult(
+                needConfirm = true,
+                confidence = 0.5f,
+                status = JevStatus.ERROR,
+                latencyMs = clockMs() - start,
+            )
         } catch (_: Exception) {
             try { key.fill('\u0000') } catch (_: Exception) { }
             return NoulResult(
@@ -284,7 +375,14 @@ class JevClient(
     /**
      * POST 一次。回傳 null = 本步超時（呼叫方映射為 TIMEOUT，不重試）；
      * 非 2xx 連同 code 回傳，由各頭映射為 ERROR。
+     * 回應體以 [readBoundedJevBody] 有界讀：超限拋 [JevFailure]（TOO_LARGE），
+     * 由各頭映射為 ERROR，不截斷續解。
+     *
+     * 取消語義對齊 provider 傳輸層：只以 coroutine Job 判斷取消
+     * （ensureActive），不用 Call.isCanceled()；handler 僅在 cause != null
+     * 時 cancel，並在所有出口 dispose。
      */
+    @OptIn(InternalCoroutinesApi::class)
     private suspend fun post(bodyJson: String, bearer: String, timeoutMs: Long): Pair<Int, String?>? {
         val url = endpoint(baseUrl)
         val request = Request.Builder()
@@ -294,15 +392,26 @@ class JevClient(
             .header("Accept", "application/json")
             .build()
         val call = http.newCall(request)
-        currentCoroutineContext().job?.invokeOnCompletion { if (call.isCanceled().not()) call.cancel() }
+        val job = currentCoroutineContext()[Job]
+        val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+            if (cause != null) call.cancel()
+        }
         try {
+            currentCoroutineContext().ensureActive()
             return withTimeout(timeoutMs) {
                 withContext(Dispatchers.IO) {
                     call.execute().use { resp ->
                         val code = resp.code
-                        val text = try {
-                            resp.body?.string()?.take(MAX_BODY_CHARS)
-                        } catch (_: IOException) {
+                        val body = resp.body
+                        val text = if (body == null) {
+                            null
+                        } else try {
+                            readBoundedJevBody(body) { call.cancel() }
+                        } catch (e: JevFailure) {
+                            currentCoroutineContext().ensureActive()
+                            throw e
+                        } catch (e: IOException) {
+                            currentCoroutineContext().ensureActive()
                             null
                         }
                         code to text
@@ -312,6 +421,14 @@ class JevClient(
         } catch (e: TimeoutCancellationException) {
             try { call.cancel() } catch (_: Exception) { }
             return null
+        } catch (e: CancellationException) {
+            try { call.cancel() } catch (_: Exception) { }
+            throw e
+        } catch (e: IOException) {
+            currentCoroutineContext().ensureActive()
+            throw e
+        } finally {
+            cancellation?.dispose()
         }
     }
 

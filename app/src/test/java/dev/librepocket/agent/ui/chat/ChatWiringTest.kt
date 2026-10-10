@@ -603,4 +603,134 @@ class ChatWiringTest {
         onMain { vm.send() }
         awaitTrue { creates == 2 }
     }
+
+    @Test
+    fun sameProviderModelSwitchCarriesHistoryIntoNextRequest() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                if (userMsg.startsWith("u1")) {
+                    emit(StreamEvent.TextDelta(0, 0, "a1"))
+                } else {
+                    emit(StreamEvent.TextDelta(0, 0, "a2"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+
+        // Round 1: send u1
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        assertEquals("a1", vm.messages.value.last().text)
+        assertEquals(1, fake.seenRequests.size)
+
+        // Wait for transcript persistence
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+
+        // Switch model within same provider
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o"))
+        }
+
+        // Round 2: send u2
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        assertEquals("a2", vm.messages.value.last().text)
+        assertEquals(2, fake.seenRequests.size)
+
+        // Provider spy asserts seenRequests[1].messages contains round 1 history (u1, a1, u2)
+        val secondReq = fake.seenRequests[1]
+        assertEquals(3, secondReq.messages.size)
+        assertEquals("user", secondReq.messages[0].role)
+        assertTrue(secondReq.messages[0].text.startsWith("u1"))
+        assertEquals("assistant", secondReq.messages[1].role)
+        assertEquals("a1", secondReq.messages[1].text)
+        assertEquals("user", secondReq.messages[2].role)
+        assertTrue(secondReq.messages[2].text.startsWith("u2"))
+        assertNull(vm.notice.value)
+    }
+
+    @Test
+    fun crossProviderModelSwitchWithholdsHistoryAndSetsNotice() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:anthropic", "sk-ant-test-key".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                if (userMsg.startsWith("u1")) {
+                    emit(StreamEvent.TextDelta(0, 0, "a1"))
+                } else {
+                    emit(StreamEvent.TextDelta(0, 0, "a2"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+
+        // Round 1: send u1
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        assertEquals("a1", vm.messages.value.last().text)
+        assertEquals(1, fake.seenRequests.size)
+
+        // Wait for transcript persistence
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+
+        // Switch to different provider (Anthropic)
+        val anthropicEndpoint = EndpointConfig(
+            providerId = "preset:anthropic",
+            presetId = "anthropic",
+            label = "Anthropic",
+            baseUrl = "https://api.anthropic.com/v1",
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            model = "claude-3-5-sonnet",
+            apiKeyRef = "provider_key/preset:anthropic",
+        )
+        runBlocking {
+            store.save(anthropicEndpoint)
+        }
+
+        // Round 2: send u2
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        assertEquals("a2", vm.messages.value.last().text)
+        assertEquals(2, fake.seenRequests.size)
+
+        // Provider spy asserts seenRequests[1].messages contains ONLY new message (u2)
+        val secondReq = fake.seenRequests[1]
+        assertEquals(1, secondReq.messages.size)
+        assertEquals("user", secondReq.messages[0].role)
+        assertTrue(secondReq.messages[0].text.startsWith("u2"))
+        assertEquals("RESUME_CROSS_PROVIDER_HISTORY_WITHHELD", vm.notice.value)
+    }
 }

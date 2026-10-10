@@ -210,6 +210,15 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  *   mid-session system timezone change is picked up on the next turn instead
  *   of reusing the [clock] construction-time snapshot).
  */
+/** Admission details for a turn that passed policy and appended a user row but whose host has not yet started. */
+data class PendingAdmission(
+  val logicalTurnId: String,
+  val text: String,
+  val images: List<ChatImageRef>,
+  val attemptRef: AtomicReference<String>,
+  val attemptIndexRef: AtomicInteger,
+)
+
 class TurnController(
   private val provider: LlmProvider,
   private val policy: PolicyStore,
@@ -245,6 +254,7 @@ class TurnController(
 
   private val lock = Any()
   private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+  private val writerScope = CoroutineScope(SupervisorJob() + dispatcher)
   /**
    * Session-owned serialized transcript writer. All [TranscriptSink] calls
    * below go through it (never directly to [transcript]), so persistence
@@ -255,6 +265,29 @@ class TurnController(
   private val orderedTranscript = OrderedTranscriptSink(transcript, dispatcher)
   /** Background settle+drain+seal launched by [close]; awaited by [flushTranscript]. Guarded by [lock]. */
   private var shutdownJob: Job? = null
+  private var pendingAdmission: PendingAdmission? = null
+  private var orphanDrainJob: Job? = null
+
+  private fun drainOrphanLocked(pending: PendingAdmission): Job {
+    if (pendingAdmission?.logicalTurnId == pending.logicalTurnId) {
+      pendingAdmission = null
+    }
+    val drain = writerScope.launch(NonCancellable) {
+      try {
+        orderedTranscript.onTurnStarted(pending.logicalTurnId, pending.text)
+        orderedTranscript.onLogicalTurnCancelled(
+          pending.logicalTurnId,
+          pending.attemptRef.get(),
+          "",
+          pending.attemptIndexRef.get(),
+        )
+      } catch (_: Exception) {
+        orderedTranscript.markInterrupted(pending.logicalTurnId)
+      }
+    }
+    orphanDrainJob = drain
+    return drain
+  }
   private val _uiState = MutableStateFlow(
     ChatUiState(messages = emptyList(), status = ChatStatus.IDLE, pendingSteerCount = 0, error = null),
   )
@@ -378,11 +411,16 @@ class TurnController(
       val logicalTurnId = newId()
       val attemptRef = AtomicReference(logicalTurnId)
       val attemptIndexRef = AtomicInteger(0)
+      pendingAdmission = PendingAdmission(logicalTurnId, text, images, attemptRef, attemptIndexRef)
       val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef, attemptIndexRef) }
       inFlight = job
       job.invokeOnCompletion {
         synchronized(lock) {
           if (inFlight === job) inFlight = null
+          val pending = pendingAdmission
+          if (pending?.logicalTurnId == logicalTurnId) {
+            drainOrphanLocked(pending)
+          }
         }
       }
       job
@@ -474,11 +512,16 @@ class TurnController(
       val logicalTurnId = newId()
       val attemptRef = AtomicReference(logicalTurnId)
       val attemptIndexRef = AtomicInteger(0)
+      pendingAdmission = PendingAdmission(logicalTurnId, text, images, attemptRef, attemptIndexRef)
       val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef, attemptIndexRef) }
       inFlight = job
       job.invokeOnCompletion {
         synchronized(lock) {
           if (inFlight === job) inFlight = null
+          val pending = pendingAdmission
+          if (pending?.logicalTurnId == logicalTurnId) {
+            drainOrphanLocked(pending)
+          }
         }
       }
       job
@@ -548,6 +591,7 @@ class TurnController(
     // there. Callers that must keep unstarted work (endpoint-switch recovery)
     // drain it explicitly via drainQueued() BEFORE close().
     val doomed: Job?
+    val orphanJob: Job?
     synchronized(lock) {
       if (closed) return
       closed = true
@@ -555,6 +599,12 @@ class TurnController(
       steerQueue.clear()
       val current = activeLocked()
       doomed = current
+      val orphaned = pendingAdmission
+      orphanJob = if (orphaned != null) {
+        drainOrphanLocked(orphaned)
+      } else {
+        orphanDrainJob
+      }
       _uiState.update {
         it.copy(
           pendingSteerCount = 0,
@@ -579,6 +629,14 @@ class TurnController(
       } catch (_: CancellationException) {
         // Hosts rethrow cancellation after persisting the terminal record.
       }
+      try {
+        val drain = synchronized(lock) { orphanDrainJob } ?: orphanJob
+        drain?.join()
+      } catch (_: CancellationException) {
+      }
+    }
+    shutdown?.invokeOnCompletion {
+      writerScope.cancel()
     }
     synchronized(lock) { shutdownJob = shutdown }
   }
@@ -776,6 +834,11 @@ class TurnController(
     attemptRef: AtomicReference<String>,
     attemptIndexRef: AtomicInteger,
   ) {
+    synchronized(lock) {
+      if (pendingAdmission?.logicalTurnId == logicalTurnId) {
+        pendingAdmission = null
+      }
+    }
     val self = coroutineContext[Job]
     try {
       runTurnLoop(text, images, logicalTurnId, attemptRef, attemptIndexRef)
@@ -935,11 +998,16 @@ class TurnController(
       val followLogicalId = newId()
       val followAttemptRef = AtomicReference(followLogicalId)
       val followAttemptIndexRef = AtomicInteger(0)
+      pendingAdmission = PendingAdmission(followLogicalId, next.text, next.images, followAttemptRef, followAttemptIndexRef)
       val follow = scope.launch { hostedTurn(next.text, next.images, followLogicalId, followAttemptRef, followAttemptIndexRef) }
       inFlight = follow
       follow.invokeOnCompletion {
         synchronized(lock) {
           if (inFlight === follow) inFlight = null
+          val pending = pendingAdmission
+          if (pending?.logicalTurnId == followLogicalId) {
+            drainOrphanLocked(pending)
+          }
         }
       }
     }

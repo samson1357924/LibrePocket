@@ -409,4 +409,130 @@ class TurnControllerLedgerTest {
       c.close()
     }
   }
+
+  @Test
+  fun zeroDispatchImmediateCloseDoesNotLoseAcceptedUserTurn() {
+    val store = DelaySessionStore()
+    val provider = LedgerFakeProvider()
+
+    class PausedDispatcher : kotlinx.coroutines.CoroutineDispatcher() {
+      private val tasks = Collections.synchronizedList(ArrayList<Runnable>())
+      @Volatile var paused = true
+
+      override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) {
+        if (paused) {
+          tasks.add(block)
+        } else {
+          Dispatchers.Default.dispatch(context, block)
+        }
+      }
+
+      fun resumeAll() {
+        paused = false
+        val queued = synchronized(tasks) {
+          val copy = ArrayList(tasks)
+          tasks.clear()
+          copy
+        }
+        for (task in queued) {
+          Dispatchers.Default.dispatch(kotlin.coroutines.EmptyCoroutineContext, task)
+        }
+      }
+    }
+
+    val pausedDispatcher = PausedDispatcher()
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = SessionTranscriptSink(store, store.sessionId),
+      retryConfig = TurnRetryConfig(),
+      dispatcher = pausedDispatcher,
+      sleeper = {},
+      newId = { "zero-dispatch-${n++}" },
+    )
+
+    // Call startOrEnqueue while dispatcher is paused -> Started, host coroutine never executed
+    val admission = runBlocking { c.startOrEnqueue("zero dispatch user turn", opId = 42L) }
+    assertTrue(admission is TurnStart.Started)
+    assertEquals(0, provider.streamCalls.get())
+
+    // Zero-dispatch immediate close
+    c.close()
+
+    // Resume dispatcher and flush transcript
+    pausedDispatcher.resumeAll()
+    val drained = runBlocking { withTimeout(5_000) { c.flushTranscript() } }
+    assertTrue(drained)
+
+    // Assert: transcript has recorded the user row and has a cancellation or interrupted terminal record
+    val userEvents = store.events.filter { it.kind == "user" }
+    assertEquals(1, userEvents.size)
+    assertEquals("zero dispatch user turn", userEvents[0].text)
+
+    // Terminal record exists (cancellation system mark or marked interrupted)
+    val terminalEvents = store.events.filter { it.kind == "system" && it.text.contains("cancelled") }
+    val isInterrupted = c.interruptedTranscriptRunIds().isNotEmpty()
+    assertTrue(terminalEvents.isNotEmpty() || isInterrupted)
+  }
+
+  @Test
+  fun zeroDispatchImmediateCloseDoesNotLoseAcceptedStartTurn() {
+    val store = DelaySessionStore()
+    val provider = LedgerFakeProvider()
+
+    class PausedDispatcher : kotlinx.coroutines.CoroutineDispatcher() {
+      private val tasks = Collections.synchronizedList(ArrayList<Runnable>())
+      @Volatile var paused = true
+
+      override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) {
+        if (paused) {
+          tasks.add(block)
+        } else {
+          Dispatchers.Default.dispatch(context, block)
+        }
+      }
+
+      fun resumeAll() {
+        paused = false
+        val queued = synchronized(tasks) {
+          val copy = ArrayList(tasks)
+          tasks.clear()
+          copy
+        }
+        for (task in queued) {
+          Dispatchers.Default.dispatch(kotlin.coroutines.EmptyCoroutineContext, task)
+        }
+      }
+    }
+
+    val pausedDispatcher = PausedDispatcher()
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = SessionTranscriptSink(store, store.sessionId),
+      retryConfig = TurnRetryConfig(),
+      dispatcher = pausedDispatcher,
+      sleeper = {},
+      newId = { "zero-dispatch-st-${n++}" },
+    )
+
+    val job = runBlocking { c.startTurn("zero dispatch startTurn") }
+    assertEquals(0, provider.streamCalls.get())
+
+    c.close()
+
+    pausedDispatcher.resumeAll()
+    val drained = runBlocking { withTimeout(5_000) { c.flushTranscript() } }
+    assertTrue(drained)
+
+    val userEvents = store.events.filter { it.kind == "user" }
+    assertEquals(1, userEvents.size)
+    assertEquals("zero dispatch startTurn", userEvents[0].text)
+
+    val terminalEvents = store.events.filter { it.kind == "system" && it.text.contains("cancelled") }
+    val isInterrupted = c.interruptedTranscriptRunIds().isNotEmpty()
+    assertTrue(terminalEvents.isNotEmpty() || isInterrupted)
+  }
 }

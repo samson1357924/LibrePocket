@@ -406,7 +406,7 @@ class OrderedTranscriptSink(
   /** Core runIds admitted but never acked (drain timeout / seal race). */
   fun interruptedRunIds(): List<String> = synchronized(interrupted) { interrupted.toList() }
 
-  private fun markInterrupted(runId: String) {
+  internal fun markInterrupted(runId: String) {
     pendingCore.remove(runId)
     synchronized(interrupted) {
       if (!interrupted.contains(runId)) interrupted.add(runId)

@@ -13,6 +13,7 @@ import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
+import dev.librepocket.provider.ChatMessage
 import dev.librepocket.session.SessionStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -915,8 +916,26 @@ class ChatViewModel(
         }
 
         val previousSessionId = _currentSessionId.value
+        var initialHistory: List<ChatMessage> = emptyList()
         if (previousSessionId != null) {
-            val replay = withContext(Dispatchers.IO) { loadHistory(previousSessionId) }
+            val (replay, loadedHistory, crossProviderWithheld) = withContext(Dispatchers.IO) {
+                val store = sessions.storeOrNull()
+                val previousMeta = store?.getSession(previousSessionId)
+                val sameOrigin = previousMeta != null && isSameProviderOrigin(
+                    previousMeta.model,
+                    endpoint.providerId,
+                    endpoint.toProviderConfig().baseUrl,
+                )
+                val rep = loadHistory(previousSessionId)
+                val hasHistory = (rep != null && rep.messages.isNotEmpty()) || (store != null && store.countHistoryEvents(previousSessionId, includePartial = true) > 0)
+                val hist = if (sameOrigin) {
+                    loadModelHistory(checkNotNull(store), previousSessionId).messages
+                } else {
+                    emptyList()
+                }
+                val withheld = !sameOrigin && hasHistory
+                Triple(rep, hist, withheld)
+            }
             if (!isGenerationCurrent(generation)) return@withLock null
             val afterHistory = readEndpoint()
             if (!isGenerationCurrent(generation)) return@withLock null
@@ -928,6 +947,12 @@ class ChatViewModel(
                 _history.value = replay.messages
                 _historyOmittedCount.value = replay.droppedCount
             }
+            initialHistory = loadedHistory
+            if (crossProviderWithheld) {
+                _notice.value = "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+            } else if (_notice.value == "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD") {
+                _notice.value = null
+            }
         }
 
         val creationGeneration = generation
@@ -936,7 +961,7 @@ class ChatViewModel(
         var failure: Throwable? = null
         try {
             withContext(Dispatchers.IO) {
-                candidate = sessions.create(endpoint, title) {
+                candidate = sessions.create(endpoint, title, initialHistory) {
                     isBindingCurrent(authorized.binding, creationGeneration)
                 }
             }

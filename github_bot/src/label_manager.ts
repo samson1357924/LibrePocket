@@ -538,6 +538,12 @@ export function extractLabelsFromTriageText(text: string): string[] {
   return sanitizeLabels(Array.from(proposed));
 }
 
+export interface LabelTimelineEvent {
+  event?: string;
+  actor?: { login?: string | null } | null;
+  label?: { name?: string | null } | null;
+}
+
 export interface GitHubLabelClient {
   rest: {
     issues: {
@@ -559,6 +565,27 @@ export interface GitHubLabelClient {
         issue_number: number;
         name: string;
       }) => Promise<unknown>;
+      // P1 #3 provenance (timeline fallback): optional issue timeline/events
+      // readers used to verify bot authorship (actor == botLogin) when the
+      // caller supplies no proven set. Absent methods mean unknown provenance
+      // (fail-closed, never delete). Loosely typed so fakes may omit them.
+      listEvents?: (params: {
+        owner: string;
+        repo: string;
+        issue_number: number;
+        per_page?: number;
+        page?: number;
+      }) => Promise<{ data: Array<LabelTimelineEvent> }>;
+      listEventsForTimeline?: (params: {
+        owner: string;
+        repo: string;
+        issue_number: number;
+        per_page?: number;
+        page?: number;
+      }) => Promise<{ data: Array<LabelTimelineEvent> }>;
+    };
+    users?: {
+      getAuthenticated?: () => Promise<{ data: { login?: string } }>;
     };
   };
   [key: string]: any;
@@ -668,23 +695,38 @@ export function sanitizePrAiSuggestions(candidates: string[]): { kept: string[];
 // P2 #4 bot-owned transition groups (Owner decision, Phase 4): within these
 // mutex groups the bot may move its own prior write (P1→P2,
 // bug→enhancement) when the desired set carries a different peer of the same
-// group. A human-owned label (existing member with no desired peer in the
-// group) is warn-only and preserved. gate:* and verified statuses are NOT
-// transitionable — human release/verification decisions are never moved.
+// group AND provenance proves the existing label was bot-written (P1 #3:
+// caller-verified botWrittenLabels set, or timeline actor == botLogin
+// materialized into that set; unknown/absent/failed provenance is fail-closed
+// warn-only preserve). A human-owned label (existing member with no desired
+// peer in the group, or any unproven member) is warn-only and preserved.
+// gate:* and verified statuses are NOT transitionable — human
+// release/verification decisions are never moved.
 export const BOT_TRANSITIONABLE_GROUPS: ReadonlyArray<ReadonlyArray<string>> = Object.freeze([
   Object.freeze(['priority:P1', 'priority:P2']),
   Object.freeze(['bug', 'enhancement', 'documentation']),
 ]);
 
 /**
- * True when removing existingLabel is a bot-owned transition: the existing
- * label sits in a BOT_TRANSITIONABLE_GROUPS group and desiredLabels carries a
- * different peer of the same group (bot intent to move P1→P2 or
- * bug→enhancement). Desired without any peer means human-owned → false
- * (warn-only, preserve). Case-insensitive; desired values need not be
- * pre-sanitized.
+ * True when removing existingLabel is a proven bot-owned transition: the
+ * existing label sits in a BOT_TRANSITIONABLE_GROUPS group, desiredLabels
+ * carries a different peer of the same group (bot intent to move P1→P2 or
+ * bug→enhancement), AND provenance proves the existing label was written by
+ * the bot (P1 #3). Provenance contract (fail-closed): opts.botWrittenLabels
+ * carries the caller-verified set of bot-written labels (lowercased compare);
+ * unknown/absent (opts omitted or botWrittenLabels undefined), query failure,
+ * or absence of the existing label in the set returns false with a warn and
+ * the label is preserved — never deleted. Desired without any peer means
+ * human-owned → false (warn-only, preserve). Case-insensitive; desired values
+ * need not be pre-sanitized. Callers that resolve provenance via the issue
+ * timeline (actor == botLogin) must materialize it into botWrittenLabels
+ * before calling; this helper never performs network I/O itself.
  */
-export function isBotOwnedTransitionRemoval(existingLabel: string, desiredLabels: readonly string[]): boolean {
+export function isBotOwnedTransitionRemoval(
+  existingLabel: string,
+  desiredLabels: readonly string[],
+  opts?: { botWrittenLabels?: ReadonlySet<string> | readonly string[] },
+): boolean {
   if (!existingLabel || typeof existingLabel !== 'string') return false;
   const lower = existingLabel.trim().toLowerCase();
   if (!lower) return false;
@@ -698,8 +740,28 @@ export function isBotOwnedTransitionRemoval(existingLabel: string, desiredLabels
     const lowerGroup = group.map((member) => member.toLowerCase());
     if (!lowerGroup.includes(lower)) continue;
     const desiredPeers = lowerGroup.filter((member) => desiredLower.has(member));
-    if (desiredPeers.length > 0 && !desiredLower.has(lower)) return true;
-    return false;
+    if (desiredPeers.length === 0 || desiredLower.has(lower)) return false;
+    // Structural transition (P1→P2, bug→enhancement); now gate on provenance.
+    const proven = opts?.botWrittenLabels;
+    if (proven === undefined || proven === null) {
+      console.warn(
+        '[LabelManager] Transition provenance unknown; preserving label (no auto-removal).',
+      );
+      return false;
+    }
+    const provenLower = new Set<string>();
+    for (const entry of proven) {
+      if (typeof entry !== 'string') continue;
+      const trimmed = entry.trim().toLowerCase();
+      if (trimmed) provenLower.add(trimmed);
+    }
+    if (!provenLower.has(lower)) {
+      console.warn(
+        '[LabelManager] Transition not proven bot-written; preserving label (no auto-removal).',
+      );
+      return false;
+    }
+    return true;
   }
   return false;
 }
@@ -741,6 +803,83 @@ export interface ReconcileLabelsOptions {
   desiredLabels: string[];
   scope?: ReconcileScope;
   coverageComplete?: boolean;
+  // P1 #3 provenance (fail-closed): caller-verified set of bot-written label
+  // names (case-insensitive). A structural transition (P1→P2,
+  // bug→enhancement) deletes the superseded label only when it is proven in
+  // this set. Unknown/absent (undefined) means every transition is unproven:
+  // warn-only preserve, never delete. Callers should derive this set from the
+  // sticky bot-labels ledger marker (publish reads the marker before
+  // reconciling) or from the issue timeline (actor == botLogin); when neither
+  // source is available, omit it and reconciliation stays conservative.
+  botWrittenLabels?: ReadonlySet<string> | readonly string[];
+  // Optional bot identity for the timeline fallback (actor comparison). When
+  // botWrittenLabels is omitted and the client offers a timeline/events
+  // reader, reconciliation resolves the bot login from here or via
+  // users.getAuthenticated; an unresolvable login stays fail-closed.
+  botLogin?: string;
+}
+
+/**
+ * Resolves the bot-written label set via the issue timeline/events API when
+ * the caller supplies no proven set (P1 #3 timeline fallback). Returns the
+ * lowercased set of labels whose most recent `labeled` event actor matches
+ * botLogin (case-insensitive), or undefined when provenance is unknowable:
+ * missing login, missing timeline reader, malformed payload, or any API
+ * failure. Callers treat undefined as unproven (warn-only preserve). Never
+ * throws and never logs raw API data.
+ */
+export async function resolveTimelineBotWrittenLabels(options: {
+  client: GitHubLabelClient;
+  owner: string;
+  repo: string;
+  issueNumber: number;
+  botLogin?: string;
+}): Promise<Set<string> | undefined> {
+  const { client, owner, repo, issueNumber } = options;
+  let login = typeof options.botLogin === 'string' ? options.botLogin.trim().toLowerCase() : '';
+  if (!login) {
+    try {
+      const users = client.rest.users;
+      if (!users || typeof users.getAuthenticated !== 'function') return undefined;
+      const identity = await users.getAuthenticated();
+      const raw = identity?.data?.login;
+      if (typeof raw !== 'string' || !raw.trim()) return undefined;
+      login = raw.trim().toLowerCase();
+    } catch {
+      return undefined;
+    }
+  }
+  const issues = client.rest.issues;
+  const reader =
+    typeof issues.listEventsForTimeline === 'function'
+      ? issues.listEventsForTimeline
+      : typeof issues.listEvents === 'function'
+        ? issues.listEvents
+        : undefined;
+  if (!reader) return undefined;
+  try {
+    const response = await reader({ owner, repo, issue_number: issueNumber, per_page: 100 });
+    const events = (response as { data?: unknown })?.data;
+    if (!Array.isArray(events)) return undefined;
+    const lastActorByLabel = new Map<string, string>();
+    for (const entry of events) {
+      if (!entry || typeof entry !== 'object') continue;
+      const record = entry as LabelTimelineEvent;
+      const eventName = typeof record.event === 'string' ? record.event.trim().toLowerCase() : '';
+      if (eventName !== 'labeled') continue;
+      const labelName = typeof record.label?.name === 'string' ? record.label.name.trim().toLowerCase() : '';
+      const actorLogin = typeof record.actor?.login === 'string' ? record.actor.login.trim().toLowerCase() : '';
+      if (!labelName || !actorLogin) continue;
+      lastActorByLabel.set(labelName, actorLogin);
+    }
+    const proven = new Set<string>();
+    for (const [labelName, actorLogin] of lastActorByLabel) {
+      if (actorLogin === login) proven.add(labelName);
+    }
+    return proven;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface ReconcileResult {
@@ -754,20 +893,24 @@ export interface ReconcileResult {
 
 /**
  * Checks whether a given label name belongs to the bot-managed scope.
- * Provenance contract (P2 #4, Phase 4 Owner decision): the bot owns area:*
- * plus status:needs-decision outright. Mutex/human labels (priority:*,
- * gate:*, verified statuses, type:tracking, security, performance,
- * accessibility/run-instrumented, and all other human labels) are never
- * blanket-managed: coexistence only warns (see warnOnMutexCoexistence),
- * never auto-removes — EXCEPT a bot-owned transition (see
- * isBotOwnedTransitionRemoval): when the desired set carries a different peer
- * of the same transitionable group (P1→P2, bug→enhancement),
+ * Provenance contract (P2 #4, Phase 4 Owner decision, plus P1 #3): the bot
+ * owns area:* plus status:needs-decision outright. Mutex/human labels
+ * (priority:*, gate:*, verified statuses, type:tracking, security,
+ * performance, accessibility/run-instrumented, and all other human labels)
+ * are never blanket-managed: coexistence only warns (see
+ * warnOnMutexCoexistence), never auto-removes — EXCEPT a proven bot-owned
+ * transition (see isBotOwnedTransitionRemoval): when the desired set carries
+ * a different peer of the same transitionable group (P1→P2,
+ * bug→enhancement) AND provenance proves the existing label was bot-written
+ * (caller botWrittenLabels set or timeline actor == botLogin; unknown/absent/
+ * failed provenance is fail-closed warn-only preserve),
  * reconcileBotLabelsSafely may remove the superseded bot-written label. A
- * human label with no desired peer is warn-only and preserved. bug /
- * enhancement / documentation are PR-AI-writable per the Owner B restore but
- * still reconcile only via the transition rule, never via blanket scope. For
- * area:*, an incomplete-coverage run preserves existing area labels (human
- * lock priority) instead of removing them.
+ * human label with no desired peer — or any unproven transition candidate —
+ * is warn-only and preserved. bug / enhancement / documentation are
+ * PR-AI-writable per the Owner B restore but still reconcile only via the
+ * proven-transition rule, never via blanket scope. For area:*, an
+ * incomplete-coverage run preserves existing area labels (human lock
+ * priority) instead of removing them.
  */
 export function isManagedByBot(labelName: string, scope?: ReconcileScope): boolean {
   if (!scope || !labelName || typeof labelName !== 'string') return false;
@@ -804,13 +947,19 @@ export function isManagedByBot(labelName: string, scope?: ReconcileScope): boole
  * - NEVER deletes unmanaged/human labels (e.g. good first issue, help wanted, custom tags).
  * - Mutex coexistence (P1+P2, multiple gates, verified statuses,
  *   bug/enhancement/documentation) only warns via warnOnMutexCoexistence,
- *   except a bot-owned transition (desired carries a different peer of the
- *   same transitionable group: P1→P2, bug→enhancement), which removes the
- *   superseded bot-written label; a human label with no desired peer is
- *   preserved warn-only.
- * - Provenance: the bot only deletes labels inside its managed scope
- *   (area:* + status:needs-decision). Incomplete coverage preserves existing
- *   area:* labels (human lock priority) instead of removing them.
+ *   except a proven bot-owned transition (desired carries a different peer
+ *   of the same transitionable group: P1→P2, bug→enhancement, AND provenance
+ *   proves the existing label was bot-written); a human label with no desired
+ *   peer — or any unproven transition candidate — is preserved warn-only.
+ * - Provenance (P1 #3, fail-closed): the bot only deletes labels inside its
+ *   managed scope (area:* + status:needs-decision), plus a transition
+ *   candidate only when proven (managed || (transition && proven)). Provenance
+ *   comes from options.botWrittenLabels (caller-verified set, e.g. the sticky
+ *   bot-labels ledger marker) or, when omitted, from the issue timeline
+ *   fallback (actor == botLogin via resolveTimelineBotWrittenLabels).
+ *   Unknown/absent/failed provenance deletes nothing. Incomplete coverage
+ *   preserves existing area:* labels (human lock priority) instead of
+ *   removing them.
  * - Fails safely on any API failure without throwing exceptions.
  */
 export async function reconcileBotLabelsSafely(
@@ -875,16 +1024,52 @@ export async function reconcileBotLabelsSafely(
     const toAdd = validDesired.filter((l) => !existingLowerMap.has(l.toLowerCase()));
     const skipped = validDesired.filter((l) => existingLowerMap.has(l.toLowerCase()));
 
-    // Compute removals strictly within the managed scope, plus bot-owned
-    // transitions (desired carries a different peer of the same
-    // transitionable group, e.g. P1→P2 or bug→enhancement). Human-owned
-    // mutex members with no desired peer are preserved warn-only.
+    // Compute removals strictly within the managed scope, plus proven
+    // bot-owned transitions (P1 #3: desired carries a different peer of the
+    // same transitionable group, e.g. P1→P2 or bug→enhancement, AND
+    // provenance proves the existing label was bot-written). Deletion
+    // requires managed || (transition && proven); unproven candidates
+    // (unknown/absent/failed provenance) are preserved warn-only, as are
+    // human-owned mutex members with no desired peer.
+    // Provenance resolution (lazy): only when the caller supplies no proven
+    // set AND a structural transition candidate exists do we attempt the
+    // timeline fallback; otherwise reconciliation performs no extra reads.
+    let effectiveProven: ReadonlySet<string> | readonly string[] | undefined = options.botWrittenLabels;
+    if (effectiveProven === undefined && scope) {
+      let hasStructuralCandidate = false;
+      for (const [lowerName] of existingLowerMap.entries()) {
+        for (const group of BOT_TRANSITIONABLE_GROUPS) {
+          const lowerGroup = group.map((member) => member.toLowerCase());
+          if (!lowerGroup.includes(lowerName)) continue;
+          const desiredPeers = lowerGroup.filter((member) => validDesiredLower.has(member));
+          if (desiredPeers.length > 0 && !validDesiredLower.has(lowerName)) {
+            hasStructuralCandidate = true;
+            break;
+          }
+        }
+        if (hasStructuralCandidate) break;
+      }
+      if (hasStructuralCandidate) {
+        const timelineProven = await resolveTimelineBotWrittenLabels({
+          client,
+          owner,
+          repo,
+          issueNumber,
+          botLogin: options.botLogin,
+        });
+        // Undefined (unknown/failed) stays fail-closed; a defined set — even
+        // empty — is the timeline verdict (absent label == not proven).
+        if (timelineProven !== undefined) effectiveProven = timelineProven;
+      }
+    }
     const toRemove: string[] = [];
     if (scope) {
       for (const [lowerName, originalName] of existingLowerMap.entries()) {
         const isIncompleteCoverageArea = !coverageComplete && lowerName.startsWith('area:');
         const managed = isManagedByBot(originalName, scope);
-        const transition = isBotOwnedTransitionRemoval(originalName, validDesired);
+        const transition = isBotOwnedTransitionRemoval(originalName, validDesired, {
+          botWrittenLabels: effectiveProven,
+        });
         if ((managed || transition) && !validDesiredLower.has(lowerName) && !isIncompleteCoverageArea) {
           toRemove.push(originalName);
         }
@@ -955,6 +1140,11 @@ export interface ApplyLabelsOptions {
   labels: string[];
   scope?: ReconcileScope;
   coverageComplete?: boolean;
+  // P1 #3 provenance passthrough for scoped reconciliation (see
+  // ReconcileLabelsOptions.botWrittenLabels/botLogin). Omitted stays
+  // fail-closed. Ignored for legacy append-only calls (which never remove).
+  botWrittenLabels?: ReadonlySet<string> | readonly string[];
+  botLogin?: string;
 }
 
 /**
@@ -984,6 +1174,8 @@ export async function applyLabelsSafely(options: ApplyLabelsOptions): Promise<Ap
       desiredLabels: options.labels,
       scope: options.scope,
       coverageComplete: options.coverageComplete,
+      botWrittenLabels: options.botWrittenLabels,
+      botLogin: options.botLogin,
     });
     return {
       added: res.added,
@@ -1046,6 +1238,11 @@ export interface ApplyBotLabelsOptions {
   scope?: ReconcileScope;
   customClient?: GitHubLabelClient;
   coverageComplete?: boolean;
+  // P1 #3 provenance passthrough for scoped reconciliation (see
+  // ReconcileLabelsOptions.botWrittenLabels/botLogin). Omitted stays
+  // fail-closed.
+  botWrittenLabels?: ReadonlySet<string> | readonly string[];
+  botLogin?: string;
 }
 
 export type ApplyBotLabelsResult =
@@ -1067,6 +1264,8 @@ export async function applyBotLabels(
   let customClient: GitHubLabelClient | undefined;
   let scope: ReconcileScope | undefined;
   let coverageComplete: boolean | undefined;
+  let botWrittenLabels: ReadonlySet<string> | readonly string[] | undefined;
+  let botLogin: string | undefined;
 
   if (optionsOrClient) {
     if ('rest' in optionsOrClient) {
@@ -1076,6 +1275,8 @@ export async function applyBotLabels(
       customClient = opts.customClient;
       scope = opts.scope;
       coverageComplete = opts.coverageComplete;
+      botWrittenLabels = opts.botWrittenLabels;
+      botLogin = opts.botLogin;
     }
   }
 
@@ -1104,6 +1305,8 @@ export async function applyBotLabels(
         desiredLabels: labels,
         scope,
         coverageComplete,
+        botWrittenLabels,
+        botLogin,
       });
     }
 

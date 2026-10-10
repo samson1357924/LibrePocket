@@ -3,14 +3,18 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  formatBotLabelsMarker,
   hasUnknownAiLabels,
   issueContentFingerprint,
+  parseBotLabelsMarker,
   runClaimMode,
   runIssueReviewMode,
   runPublishMode,
   runReviewMode,
   runTagMode,
+  stripBotLabelsMarkers,
   validateIssueOutput,
+  withBotLabelsMarker,
   type RunnerContext,
 } from '../src/github_runner';
 import { triageIssue } from '../src/orchestrator';
@@ -812,6 +816,115 @@ export async function runStickyLabelTests(): Promise<void> {
         assert.notEqual(reviewed!.verdict, 'APPROVE', 'issue unknown AI labels force non-APPROVE');
         assert.ok(!reviewed!.tags.includes('alien-label'));
         assert.ok(reviewed!.tags.includes('security'), 'deterministic issue label survives');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #3 provenance ledger marker: round-trip, unknown-label filtering,
+    // and absent-marker semantics (absent == unknown == fail-closed retain).
+    {
+      const marker = formatBotLabelsMarker(['priority:P1', 'bug', 'area:runtime']);
+      assert.ok(marker.startsWith('<!-- PocketGuard-bot-labels:'), 'marker carries the ledger prefix');
+      const parsed = parseBotLabelsMarker(marker);
+      assert.ok(parsed instanceof Set, 'present marker parses to a set');
+      assert.deepEqual([...parsed!].sort(), ['area:runtime', 'bug', 'priority:p1']);
+      assert.equal(parseBotLabelsMarker('plain sticky without marker'), undefined, 'absent marker is unknown');
+      assert.equal(parseBotLabelsMarker(undefined), undefined, 'non-string body is unknown');
+      assert.ok(!formatBotLabelsMarker(['alien-label']).includes('alien'), 'unknown labels never enter the marker');
+      const embedded = withBotLabelsMarker('existing sticky', ['priority:P2']);
+      assert.ok(embedded.includes('existing sticky'), 'marker write preserves content');
+      assert.ok(parseBotLabelsMarker(embedded)?.has('priority:p2'), 'written marker re-parses');
+      assert.equal(parseBotLabelsMarker(stripBotLabelsMarkers(embedded)), undefined, 'stripped marker is unknown again');
+    }
+
+    // P1 #3 issue end-to-end (conservative): human P1 present, AI suggests
+    // P2 — P2 is added, P1 is retained warn-only (no provenance: no sticky
+    // marker yet, fake offers no timeline reader).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1-human-p1-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', suggestedLabels: ['priority:P2'] });
+        const outputPath = path.join(tempDir, 'issue.json');
+        try {
+          const reviewState = makeState();
+          await runIssueReviewMode({
+            event: issueOpenedEvent(),
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: outputPath } as NodeJS.ProcessEnv,
+            githubClient: makeClient(reviewState),
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        const publishState = makeState({
+          existingLabels: ['priority:P1'],
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        await runPublishMode({
+          event: issueOpenedEvent(),
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: outputPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(publishState),
+        });
+        assert.equal(publishState.created, 0, 'human-P1 publish creates no second comment');
+        assert.ok(publishState.existingLabels.includes('priority:P2'), 'AI P2 is still added');
+        assert.ok(publishState.existingLabels.includes('priority:P1'), 'human P1 retained without provenance');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #3 PR end-to-end (conservative): human bug present, PR AI suggests
+    // enhancement — enhancement is added, bug is retained warn-only.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p1-human-bug-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', findings: [], suggestedLabels: [] });
+        let goodArtifact: unknown;
+        try {
+          const s = makeState();
+          await runReviewMode({
+            event: prOpenedEvent(),
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'good.json') } as NodeJS.ProcessEnv,
+            githubClient: makeClient(s),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          goodArtifact = JSON.parse(fs.readFileSync(path.join(tempDir, 'good.json'), 'utf8'));
+        } finally {
+          restore();
+        }
+        const tampered = { ...(goodArtifact as Record<string, unknown>), suggestedLabels: ['enhancement', 'area:runtime'] };
+        const tamperedPath = path.join(tempDir, 'tampered-enh.json');
+        fs.writeFileSync(tamperedPath, JSON.stringify(tampered));
+        const publishState = makeState({
+          existingLabels: ['bug'],
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        await runPublishMode({
+          event: prOpenedEvent(),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: tamperedPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(publishState),
+        });
+        assert.equal(publishState.created, 0, 'human-bug publish creates no second comment');
+        assert.ok(publishState.existingLabels.includes('enhancement'), 'AI enhancement is still added');
+        assert.ok(publishState.existingLabels.includes('bug'), 'human bug retained without provenance');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }

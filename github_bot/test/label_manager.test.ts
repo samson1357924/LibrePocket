@@ -23,6 +23,7 @@ import {
   resolveAreaLabelsFromPaths,
   resolveLabelsFromTitle,
   resolveReviewLabels,
+  resolveTimelineBotWrittenLabels,
   sanitizeLabels,
   sanitizePrAiSuggestions,
   warnOnMutexCoexistence,
@@ -359,20 +360,43 @@ ${reportWith('A security flaw remains.')}`);
     assert.equal(isManagedByBot('priority:P1', DEFAULT_PR_RECONCILE_SCOPE), false);
     assert.equal(isManagedByBot('gate:release', DEFAULT_PR_RECONCILE_SCOPE), false);
   }
-  // P2 #4 bot-owned vs human-owned: a bot transition (desired carries a
-  // different peer of the same transitionable group) removes the superseded
-  // bot-written label; a human label with no desired peer is warn-only kept.
+  // P2 #4 bot-owned vs human-owned + P1 #3 provenance: a structural
+  // transition (desired carries a different peer of the same transitionable
+  // group) removes the superseded label ONLY when provenance proves
+  // bot authorship. Unknown/absent/failed provenance is warn-only preserve;
+  // a human label with no desired peer is warn-only kept.
   {
     assert.ok(BOT_TRANSITIONABLE_GROUPS.some((group) => group.includes('priority:P1') && group.includes('priority:P2')));
     assert.ok(BOT_TRANSITIONABLE_GROUPS.some((group) => group.includes('bug') && group.includes('enhancement')));
-    assert.equal(isBotOwnedTransitionRemoval('priority:P1', ['priority:P2']), true, 'P1→P2 is a bot transition');
-    assert.equal(isBotOwnedTransitionRemoval('bug', ['enhancement']), true, 'bug→enhancement is a bot transition');
-    assert.equal(isBotOwnedTransitionRemoval('priority:P1', ['area:runtime']), false, 'human P1 without desired peer stays');
-    assert.equal(isBotOwnedTransitionRemoval('bug', ['area:runtime']), false, 'human bug without desired peer stays');
-    assert.equal(isBotOwnedTransitionRemoval('gate:release', ['gate:live']), false, 'gate never transitions');
-    assert.equal(isBotOwnedTransitionRemoval('area:runtime', ['area:docs']), false, 'area is scope-managed, not transition-managed');
+    // Proven transitions (caller-verified bot-written set, case-insensitive).
+    assert.equal(isBotOwnedTransitionRemoval('priority:P1', ['priority:P2'], { botWrittenLabels: ['priority:P1'] }), true, 'proven P1→P2 is a bot transition');
+    assert.equal(isBotOwnedTransitionRemoval('bug', ['enhancement'], { botWrittenLabels: new Set(['bug']) }), true, 'proven bug→enhancement is a bot transition');
+    assert.equal(isBotOwnedTransitionRemoval('priority:P1', ['priority:P2'], { botWrittenLabels: ['PRIORITY:p1'] }), true, 'provenance compare is case-insensitive');
+    // Unknown provenance (opts absent) → false + warn, never delete.
+    const unknownP1 = await captureConsoleCalls(async () => {
+      assert.equal(isBotOwnedTransitionRemoval('priority:P1', ['priority:P2']), false, 'unproven P1→P2 stays');
+    });
+    assert.ok(unknownP1.calls.some((call) => call.level === 'warn'), 'unknown provenance warns');
+    const unknownBug = await captureConsoleCalls(async () => {
+      assert.equal(isBotOwnedTransitionRemoval('bug', ['enhancement']), false, 'unproven bug→enhancement stays');
+    });
+    assert.ok(unknownBug.calls.some((call) => call.level === 'warn'), 'unknown provenance warns');
+    // Present-but-unproven set (existing label absent) → false + warn.
+    const unprovenP1 = await captureConsoleCalls(async () => {
+      assert.equal(isBotOwnedTransitionRemoval('priority:P1', ['priority:P2'], { botWrittenLabels: ['area:runtime'] }), false, 'P1 absent from proven set stays');
+    });
+    assert.ok(unprovenP1.calls.some((call) => call.level === 'warn'), 'unproven set warns');
+    const unprovenBug = await captureConsoleCalls(async () => {
+      assert.equal(isBotOwnedTransitionRemoval('bug', ['enhancement'], { botWrittenLabels: ['priority:P1'] }), false, 'bug absent from proven set stays');
+    });
+    assert.ok(unprovenBug.calls.some((call) => call.level === 'warn'), 'unproven set warns');
+    // Non-transitions stay false regardless of provenance.
+    assert.equal(isBotOwnedTransitionRemoval('priority:P1', ['area:runtime'], { botWrittenLabels: ['priority:P1'] }), false, 'human P1 without desired peer stays');
+    assert.equal(isBotOwnedTransitionRemoval('bug', ['area:runtime'], { botWrittenLabels: ['bug'] }), false, 'human bug without desired peer stays');
+    assert.equal(isBotOwnedTransitionRemoval('gate:release', ['gate:live'], { botWrittenLabels: ['gate:release'] }), false, 'gate never transitions');
+    assert.equal(isBotOwnedTransitionRemoval('area:runtime', ['area:docs'], { botWrittenLabels: ['area:runtime'] }), false, 'area is scope-managed, not transition-managed');
 
-    // Issue P1→P2 bot-owned: desired P2 adds P2 and removes superseded P1.
+    // Issue P1→P2 proven: desired P2 adds P2 and removes superseded P1.
     const p1ToP2Mock = new StatefulMockLabelClient({ 30: ['priority:P1', 'area:runtime'] });
     const p1ToP2 = await reconcileBotLabelsSafely({
       client: p1ToP2Mock,
@@ -381,9 +405,10 @@ ${reportWith('A security flaw remains.')}`);
       issueNumber: 30,
       desiredLabels: ['priority:P2', 'area:runtime'],
       scope: DEFAULT_PR_RECONCILE_SCOPE,
+      botWrittenLabels: ['priority:P1'],
     });
-    assert.ok(p1ToP2.added.includes('priority:P2'), 'bot-owned P2 is added');
-    assert.ok(p1ToP2.removed.includes('priority:P1'), 'superseded bot-owned P1 is removed');
+    assert.ok(p1ToP2.added.includes('priority:P2'), 'proven bot-owned P2 is added');
+    assert.ok(p1ToP2.removed.includes('priority:P1'), 'proven superseded P1 is removed');
     assert.ok(!p1ToP2Mock.getLabels(30).includes('priority:P1'));
     assert.ok(p1ToP2Mock.getLabels(30).includes('priority:P2'));
 
@@ -400,7 +425,24 @@ ${reportWith('A security flaw remains.')}`);
     assert.deepEqual(humanP1.removed, [], 'human-owned P1 is never auto-removed');
     assert.ok(humanP1Mock.getLabels(31).includes('priority:P1'), 'human-owned P1 preserved');
 
-    // Issue bug→enhancement bot-owned: desired enhancement swaps the type.
+    // Human P1 + AI P2 without provenance: P2 is added, P1 is retained
+    // warn-only (conservative; unproven transitions never delete).
+    const humanP1vsP2Mock = new StatefulMockLabelClient({ 34: ['priority:P1', 'area:runtime'] });
+    const humanP1vsP2 = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+      client: humanP1vsP2Mock,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 34,
+      desiredLabels: ['priority:P2', 'area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+    }));
+    assert.ok(humanP1vsP2.result.added.includes('priority:P2'), 'AI P2 is still added');
+    assert.deepEqual(humanP1vsP2.result.removed, [], 'unproven P1 is never auto-removed');
+    assert.ok(humanP1vsP2Mock.getLabels(34).includes('priority:P1'), 'human P1 retained');
+    assert.ok(humanP1vsP2Mock.getLabels(34).includes('priority:P2'), 'AI P2 present alongside');
+    assert.ok(humanP1vsP2.calls.some((call) => call.level === 'warn'), 'unproven transition warns');
+
+    // Issue bug→enhancement proven: desired enhancement swaps the type.
     const bugToEnhMock = new StatefulMockLabelClient({ 32: ['bug', 'area:runtime'] });
     const bugToEnh = await reconcileBotLabelsSafely({
       client: bugToEnhMock,
@@ -409,9 +451,10 @@ ${reportWith('A security flaw remains.')}`);
       issueNumber: 32,
       desiredLabels: ['enhancement', 'area:runtime'],
       scope: DEFAULT_PR_RECONCILE_SCOPE,
+      botWrittenLabels: new Set(['bug']),
     });
-    assert.ok(bugToEnh.added.includes('enhancement'), 'bot-owned enhancement is added');
-    assert.ok(bugToEnh.removed.includes('bug'), 'superseded bot-owned bug is removed');
+    assert.ok(bugToEnh.added.includes('enhancement'), 'proven bot-owned enhancement is added');
+    assert.ok(bugToEnh.removed.includes('bug'), 'proven superseded bug is removed');
     assert.ok(!bugToEnhMock.getLabels(32).includes('bug'));
     assert.ok(bugToEnhMock.getLabels(32).includes('enhancement'));
 
@@ -427,6 +470,111 @@ ${reportWith('A security flaw remains.')}`);
     });
     assert.deepEqual(humanBug.removed, [], 'human-owned bug is never auto-removed');
     assert.ok(humanBugMock.getLabels(33).includes('bug'), 'human-owned bug preserved');
+
+    // Human bug + AI enhancement without provenance: enhancement is added,
+    // bug is retained warn-only.
+    const humanBugVsEnhMock = new StatefulMockLabelClient({ 35: ['bug', 'area:runtime'] });
+    const humanBugVsEnh = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+      client: humanBugVsEnhMock,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 35,
+      desiredLabels: ['enhancement', 'area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+    }));
+    assert.ok(humanBugVsEnh.result.added.includes('enhancement'), 'AI enhancement is still added');
+    assert.deepEqual(humanBugVsEnh.result.removed, [], 'unproven bug is never auto-removed');
+    assert.ok(humanBugVsEnhMock.getLabels(35).includes('bug'), 'human bug retained');
+    assert.ok(humanBugVsEnhMock.getLabels(35).includes('enhancement'), 'AI enhancement present alongside');
+    assert.ok(humanBugVsEnh.calls.some((call) => call.level === 'warn'), 'unproven transition warns');
+
+    // Timeline fallback (actor == botLogin): a bot-labeled event proves the
+    // transition with no explicit caller set.
+    const botTimelineClient = {
+      rest: { issues: {
+        listLabelsOnIssue: async () => ({ data: [{ name: 'priority:P1' }, { name: 'area:runtime' }] }),
+        addLabels: async () => ({}),
+        removeLabel: async () => ({}),
+        listEventsForTimeline: async () => ({ data: [
+          { event: 'labeled', actor: { login: 'pocketguard[bot]' }, label: { name: 'priority:P1' } },
+        ] }),
+      } },
+    } as unknown as GitHubLabelClient;
+    const botTimeline = await reconcileBotLabelsSafely({
+      client: botTimelineClient,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 40,
+      desiredLabels: ['priority:P2', 'area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+      botLogin: 'pocketguard[bot]',
+    });
+    assert.ok(botTimeline.removed.includes('priority:P1'), 'timeline-proven P1 is removed');
+
+    // Timeline with a human actor: retained.
+    const humanTimelineClient = {
+      rest: { issues: {
+        listLabelsOnIssue: async () => ({ data: [{ name: 'priority:P1' }, { name: 'area:runtime' }] }),
+        addLabels: async () => ({}),
+        removeLabel: async () => ({}),
+        listEventsForTimeline: async () => ({ data: [
+          { event: 'labeled', actor: { login: 'human-maintainer' }, label: { name: 'priority:P1' } },
+        ] }),
+      } },
+    } as unknown as GitHubLabelClient;
+    const humanTimeline = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+      client: humanTimelineClient,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 41,
+      desiredLabels: ['priority:P2', 'area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+      botLogin: 'pocketguard[bot]',
+    }));
+    assert.deepEqual(humanTimeline.result.removed, [], 'human-actor timeline retains P1');
+    assert.ok(humanTimeline.calls.some((call) => call.level === 'warn'), 'human-actor timeline warns');
+
+    // Timeline failure / unknown provenance: retained (fail-closed).
+    const failingTimelineClient = {
+      rest: { issues: {
+        listLabelsOnIssue: async () => ({ data: [{ name: 'bug' }, { name: 'area:runtime' }] }),
+        addLabels: async () => ({}),
+        removeLabel: async () => ({}),
+        listEventsForTimeline: async () => { throw new Error('synthetic timeline failure'); },
+      } },
+    } as unknown as GitHubLabelClient;
+    const failingTimeline = await captureConsoleCalls(() => reconcileBotLabelsSafely({
+      client: failingTimelineClient,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 42,
+      desiredLabels: ['enhancement', 'area:runtime'],
+      scope: DEFAULT_PR_RECONCILE_SCOPE,
+      botLogin: 'pocketguard[bot]',
+    }));
+    assert.deepEqual(failingTimeline.result.removed, [], 'timeline failure retains bug');
+    assert.ok(failingTimeline.calls.some((call) => call.level === 'warn'), 'timeline failure warns');
+
+    // Timeline helper directly: malformed payload and missing reader are unknown.
+    assert.equal(await resolveTimelineBotWrittenLabels({
+      client: { rest: { issues: { addLabels: async () => ({}) } } } as unknown as GitHubLabelClient,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 43,
+      botLogin: 'pocketguard[bot]',
+    }), undefined, 'missing timeline reader is unknown');
+    assert.equal(await resolveTimelineBotWrittenLabels({
+      client: {
+        rest: { issues: {
+          addLabels: async () => ({}),
+          listEventsForTimeline: async () => ({ data: 'not-an-array' }),
+        } },
+      } as unknown as GitHubLabelClient,
+      owner: 'owner',
+      repo: 'repo',
+      issueNumber: 44,
+      botLogin: 'pocketguard[bot]',
+    }), undefined, 'malformed timeline payload is unknown');
   }
   // Human area: retention — incomplete coverage preserves a human-added area
   // label (human lock priority) instead of replacing it.

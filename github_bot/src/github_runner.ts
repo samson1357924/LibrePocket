@@ -606,6 +606,59 @@ export function withReviewClaimMarker(body: string, sha: string, runId: string, 
   return `${base}${formatReviewClaimMarker(sha.toLowerCase(), runId, attempt)}\n`;
 }
 
+// P1 #3 bot-written label ledger marker: the sticky body may carry one
+// `<!-- PocketGuard-bot-labels:<csv> -->` line recording the last bot-written
+// label set (canonical names, comma-separated). Publish reads it before
+// reconciling and passes the parsed set as provenance (botWrittenLabels); an
+// absent marker means unknown provenance (fail-closed, transitions retained).
+// Marker writes are deferred (TODO): the timeline fallback (actor == botLogin
+// inside reconcile) already provides provenance growth with zero extra sticky
+// writes, so readers must treat a missing marker as unknown, never as proof
+// of human authorship. Raw label values are allowlisted before formatting so
+// model-controlled text can never inject marker content.
+export const BOT_LABELS_MARKER_PREFIX = '<!-- PocketGuard-bot-labels:';
+
+export function formatBotLabelsMarker(labels: readonly string[]): string {
+  const kept = sanitizeLabels(
+    (Array.isArray(labels) ? labels : []).filter((entry): entry is string => typeof entry === 'string'),
+  );
+  return `${BOT_LABELS_MARKER_PREFIX}${kept.join(',')} -->`;
+}
+
+export function parseBotLabelsMarker(body: unknown): Set<string> | undefined {
+  if (typeof body !== 'string') return undefined;
+  const pattern = new RegExp(
+    `${BOT_LABELS_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^\\n]*?)-->`,
+    'gi',
+  );
+  let found = false;
+  const proven = new Set<string>();
+  for (const match of body.matchAll(pattern)) {
+    found = true;
+    const rawItems = match[1].split(',');
+    for (const raw of rawItems) {
+      const canonical = normalizeLabelName(raw);
+      if (canonical) proven.add(canonical.toLowerCase());
+    }
+  }
+  return found ? proven : undefined;
+}
+
+export function stripBotLabelsMarkers(body: string): string {
+  const pattern = new RegExp(
+    `${BOT_LABELS_MARKER_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*?-->`,
+    'gi',
+  );
+  return body.replace(pattern, '');
+}
+
+export function withBotLabelsMarker(body: string, labels: readonly string[]): string {
+  const stripped = stripBotLabelsMarkers(body);
+  const marker = formatBotLabelsMarker(labels);
+  const base = stripped.length === 0 || stripped.endsWith('\n') ? stripped : `${stripped}\n`;
+  return `${base}${marker}\n`;
+}
+
 // Dedup key for the current publish run: (run_id, run_attempt). Prefers the
 // GitHub Actions defaults (GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT, always present
 // in the workflow) with POCKETGUARD_* overrides for tests. Returns undefined
@@ -3410,6 +3463,9 @@ async function reconcileNeedsDecisionOnly(
   repository: { owner: string; repo: string },
   issueNumber: number,
 ): Promise<void> {
+  // P1 #3 provenance: this fallback only desires status:needs-decision (never
+  // a transitionable peer), so no transition can occur; provenance is passed
+  // explicitly as unknown (fail-closed) for contract uniformity.
   const reconciliation = await reconcileBotLabelsSafely({
     client,
     owner: repository.owner,
@@ -3418,6 +3474,7 @@ async function reconcileNeedsDecisionOnly(
     desiredLabels: ['status:needs-decision'],
     scope: { managedExactLabels: ['status:needs-decision'] } satisfies ReconcileScope,
     coverageComplete: false,
+    botWrittenLabels: undefined,
   });
   if (
     !reconciliation.added.includes('status:needs-decision') &&
@@ -3600,6 +3657,10 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
           desiredLabels: fallbackDesired,
           scope: DEFAULT_PR_RECONCILE_SCOPE,
           coverageComplete: false,
+          // P1 #3 provenance: issue fallback carries no verified bot-written
+          // set (no sticky marker read on this path); unproven transitions
+          // are warn-only preserved, never deleted.
+          botWrittenLabels: undefined,
         });
         const reconciled = new Set([...reconciliation.added, ...reconciliation.skipped]);
         if (reconciliation.failedToList || fallbackDesired.some((label) => !reconciled.has(label)) || (reconciliation.failedRemovals?.length ?? 0) > 0) {
@@ -3629,6 +3690,9 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
           desiredLabels: fallbackDesired,
           scope: DEFAULT_PR_RECONCILE_SCOPE,
           coverageComplete: false,
+          // P1 #3 provenance: unknown-AI fallback carries no verified
+          // bot-written set; unproven transitions are warn-only preserved.
+          botWrittenLabels: undefined,
         });
       } catch {
         throw new Error('PocketGuard: failed to apply issue labels.');
@@ -3664,6 +3728,10 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
         desiredLabels: desiredIssueLabels,
         scope: DEFAULT_PR_RECONCILE_SCOPE,
         coverageComplete: true,
+        // P1 #3 provenance: issue success carries no sticky-marker read yet;
+        // the timeline fallback inside reconcile (actor == botLogin) is the
+        // provenance source. Unknown/failed provenance retains transitions.
+        botWrittenLabels: undefined,
       });
       const reconciled = new Set([...reconciliation.added, ...reconciliation.skipped]);
       if (reconciliation.failedToList || desiredIssueLabels.some((label) => !reconciled.has(label)) || (reconciliation.failedRemovals?.length ?? 0) > 0) {
@@ -3843,8 +3911,10 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // from PR AI; priority:*/gate:* (and verified statuses) are
   // issue-triage-only, so a PR suggestion carrying them is likewise discarded
   // and forces INCONCLUSIVE. Manual labels outside the bot scope are always
-  // preserved by reconciliation (bot-owned P1->P2 / bug->enhancement
-  // transitions excepted). The ledger stays as the claim left it
+  // preserved by reconciliation (proven bot-owned P1->P2 / bug->enhancement
+  // transitions excepted — P1 #3: only when provenance proves bot authorship
+  // via the sticky marker or timeline actor == botLogin; otherwise warn-only
+  // retain). The ledger stays as the claim left it
   // (reconciliation only).
   const aiRaw = Array.isArray(output.suggestedLabels) ? output.suggestedLabels : [];
   const { hadUnknown } = mergeRulesWithAiSuggestions([], aiRaw);
@@ -3916,6 +3986,12 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     return;
   }
 
+  // P1 #3 provenance: the sticky bot-labels ledger marker (last bot-written
+  // set) is read from the pre-reconcile baseline and passed as the proven
+  // set; a missing marker means unknown provenance (fail-closed, transitions
+  // retained). The timeline fallback inside reconcile (actor == botLogin)
+  // covers GitHub-recorded writes with zero extra sticky writes.
+  const prProvenBotLabels = parseBotLabelsMarker(baselineReconciled.body);
   const reconciliation = await reconcileBotLabelsSafely({
     client,
     owner: repository.owner,
@@ -3926,6 +4002,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       ? DEFAULT_PR_RECONCILE_SCOPE
       : { managedExactLabels: ['status:needs-decision'] } satisfies ReconcileScope,
     coverageComplete,
+    botWrittenLabels: prProvenBotLabels,
   });
   const expectedLabels = sanitizeLabels([
     ...labels,

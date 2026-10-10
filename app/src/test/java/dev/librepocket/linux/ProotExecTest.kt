@@ -4,11 +4,14 @@ import dev.librepocket.shell.DefaultProcessRunner
 import dev.librepocket.shell.ProcessRunner
 import dev.librepocket.shell.RawOutput
 import dev.librepocket.shell.ShellDeny
+import dev.librepocket.shell.ShellExecutables
 import dev.librepocket.shell.ShellPolicy
 import dev.librepocket.shell.ShellQuota
 import dev.librepocket.shell.ShellResult
+import dev.librepocket.shell.Validation
 import dev.librepocket.tool.Flavor
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -213,6 +216,73 @@ class ProotExecTest {
         assertTrue(denied is ShellResult.Denied)
         assertEquals(0, deniedRunner.calls)
         assertEquals(null, deniedRunner.lastEnv)
+    }
+
+    // ---- S1：guest argv0 可信路徑門 host-only（review finding 2） ----
+
+    @Test fun guestOptAbsoluteArgv0_allowedAtValidateAndSpawn() {
+        // 回歸形狀必須用父目錄在宿主表外的 /opt/...：
+        // /usr/local/bin/... 恰在 TRUSTED_BIN_DIRS 內，修前亦放行，不能當案例。
+        assertFalse(ShellExecutables.isTrustedAbsoluteArgv0("/opt/jadx/bin/jadx"))
+        assertFalse(ShellExecutables.isTrustedAbsoluteArgv0("/opt/toolchain/bin/clang"))
+        val guestRoot = LinuxEnv.root(filesDir)
+        for (argv in listOf(
+            listOf("/opt/jadx/bin/jadx", "--version"),
+            listOf("/opt/toolchain/bin/clang", "--version"),
+        )) {
+            // validate 層：guest 跳過 argv0 可信路徑門，放行。
+            val v = ShellPolicy.validate(
+                argv = argv,
+                privateRoot = guestRoot,
+                safRoots = emptyList(),
+                flavor = Flavor.GITHUB,
+                bridgeGranted = false,
+                allowedBinaries = ProotExec.GUEST_BINARIES,
+                isGuest = true,
+            )
+            assertTrue("expected Allowed for $argv, got $v", v is Validation.Allowed)
+            // execute 層：spawn proot 包裝 argv（零 spawn 即回歸失敗）。
+            val runner = FakeRunner()
+            val result = exec(argv, runner = runner)
+            assertTrue("expected Ok for $argv, got $result", result is ShellResult.Ok)
+            assertEquals(1, runner.calls)
+            val spawned = runner.lastArgv!!
+            assertEquals(LinuxEnv.prootBin(filesDir), spawned[0])
+            assertEquals(
+                listOf("-r", "$filesDir/linux/containers/alpine/rootfs"),
+                spawned.subList(1, 3),
+            )
+            assertEquals(argv, spawned.takeLast(argv.size))
+            assertEquals(LinuxEnv.GUEST_ENV, runner.lastEnv)
+        }
+    }
+
+    @Test fun guestHostAbsoluteArgv0_deniedWithoutSpawn() {
+        // Gate 改為 host-only 後，guest host-絕對路徑仍由執行入口守衛
+        //（hostLinuxAbsoluteRef）在 validate 之前 fail-closed，不建子進程。
+        for (argv in listOf(
+            listOf("$filesDir/linux/containers/alpine/rootfs/bin/ls", "-l"),
+            listOf("$filesDir/linux/bin/proot", "--version"),
+        )) {
+            val runner = FakeRunner()
+            val result = exec(argv, runner = runner)
+            assertTrue("expected Denied for $argv, got $result", result is ShellResult.Denied)
+            assertEquals("$argv", ShellDeny.BLACKLISTED, (result as ShellResult.Denied).reason)
+            assertEquals("$argv", 0, runner.calls)
+            assertEquals("$argv", null, runner.lastEnv)
+        }
+    }
+
+    @Test fun directUntrustedArgv0_stillDenied() {
+        // 直接通道（isGuest=false）既有行為不變：/tmp/evil/ls 政策層即拒。
+        val v = ShellPolicy.validate(
+            listOf("/tmp/evil/ls", "-l"),
+            privateRoot = filesDir,
+            isGuest = false,
+        )
+        assertTrue("$v", v is Validation.Denied)
+        assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        assertTrue(v.message.contains("untrusted executable"))
     }
 
     @Test fun defaultRunner_clearsHostEnv() {

@@ -27,6 +27,7 @@
 | `foss` | `.foss` application ID；Foss manifest/source set 有 accessibility service 與 OSS vision dependencies | 與 `github` 有相同能力或已由 F-Droid 發布 |
 | `github` | `.github` application ID；含 accessibility service 及 GitHub-only ML Kit/Azure Speech/Shizuku dependencies | 「完整版」意指所有設計能力均已接線 |
 | Backup | manifest 設 `allowBackup=true`；XML rules 排除 key-specific paths | transcript、preferences、audit 都不會進入 Android backup |
+| Direct shell executable | `ShellExecutables.resolve`＋`RestrictedShell` 有實作，正/負向 JVM 測試存在 | 已在指定裝置/API 實跑驗證（含 toybox/APEX、`isWritable` 真實語義）或可上線啟用 |
 
 `foss` 和 `github` 在某些 source/service 形狀上相似，不代表依賴、bridge 或能力相同。Flavor distribution/source-of-truth 見 [README](../README.md)、[Architecture](ARCHITECTURE.md) 與 [Threat Model](THREAT_MODEL.md)。
 

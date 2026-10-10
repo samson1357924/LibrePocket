@@ -166,8 +166,11 @@ internal fun readBoundedProviderBody(
 /**
  * Read and decode only the bounded prefix of an HTTP error body. Unlike a
  * successful JSON body, a capped error remains classified by its HTTP status
- * and markers present in this prefix. At the cap, cancel the actual Call so
- * closing the response cannot spend time draining the remainder.
+ * and markers present in this prefix. A one-byte sentinel probe distinguishes
+ * an exact-cap EOF from a truly oversized body: only when a byte exists
+ * beyond the cap is the actual Call cancelled, so closing the response cannot
+ * spend time draining the remainder. An exact-cap body ending at the boundary
+ * leaves the Call uncancelled.
  */
 internal fun readProviderErrorPrefix(
     body: ResponseBody?,
@@ -182,7 +185,15 @@ internal fun readProviderErrorPrefix(
         if (read == -1L) break
         remaining -= read
     }
-    if (remaining == 0L) cancelCall()
+    if (remaining == 0L) {
+        // Sentinel: exact-cap EOF probes -1 (no cancel); true overflow probes
+        // one byte (cancel). The probe byte is discarded; the prefix stays capped.
+        val probe = Buffer()
+        if (source.read(probe, 1L) != -1L) {
+            probe.clear()
+            cancelCall()
+        }
+    }
     return bytes.readByteArray().toResponseBody(body.contentType()).string()
 }
 

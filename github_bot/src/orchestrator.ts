@@ -1,0 +1,373 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import {
+  sendOpenAISingleTurn,
+  resolveRoleModel,
+  type OpenAIEnvironment,
+  type OpenAIModelRole,
+} from './send_openai';
+import { redactForModel } from './redact';
+import type { ReviewCoverage } from './review_diff';
+import type { ScanViolation } from './deterministic_scanner';
+
+export type ReviewVerdict = 'APPROVE' | 'NEEDS_CHANGES' | 'INCONCLUSIVE';
+export type FindingSeverity = 'BLOCK' | 'WARN' | 'SUGGESTION';
+
+export interface ReviewFinding {
+  severity: FindingSeverity;
+  file?: string;
+  line?: number;
+  issue: string;
+  suggestion?: string;
+}
+
+export interface RoleReview {
+  role: OpenAIModelRole;
+  modelUsed: string;
+  verdict: ReviewVerdict;
+  findings: ReviewFinding[];
+  // S5 AI label schema (strict): raw model-suggested labels as a string
+  // array. Only sanitized through the allowlist at publish time; unknown
+  // entries are discarded there and force a non-APPROVE verdict. Decision
+  // record: only issue_triage.md and chief.md instruct label suggestions
+  // (minimal prompt change); android_sec/android_code prompts stay untouched
+  // and their responses default to [] when the field is absent.
+  suggestedLabels: string[];
+}
+
+export interface OrchestratedReview {
+  verdict: ReviewVerdict;
+  roles: RoleReview[];
+  coverage: ReviewCoverage;
+  deterministicViolations: ScanViolation[];
+}
+
+export interface OrchestratorOptions {
+  changedFiles: string[];
+  diff: string;
+  coverage: ReviewCoverage;
+  deterministicViolations: ScanViolation[];
+  env?: OpenAIEnvironment;
+  promptDirectory?: string;
+  allowedOrigins?: string[];
+  // Phase 3 (P2 #3): per-chunk timeout passthrough (fail-closed). When set,
+  // forwarded to every sendOpenAISingleTurn role call so slow roles abort via
+  // the transport timeout instead of hanging the chunk wave. Omitted keeps
+  // the send default (420s). Must be >0 when provided; invalid values throw
+  // fail-closed (zero AI) via the send path.
+  timeoutMs?: number;
+}
+
+const ROLES: readonly OpenAIModelRole[] = ['chief', 'android_sec', 'android_code'];
+const VERDICTS = new Set<ReviewVerdict>(['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE']);
+const SEVERITIES = new Set<FindingSeverity>(['BLOCK', 'WARN', 'SUGGESTION']);
+const MAX_TEXT_LENGTH = 2000;
+
+function reviewTier(filePath: string): number {
+  const normalized = filePath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+  if (normalized.endsWith('.md') || normalized.startsWith('docs/') || normalized.includes('/docs/')) return 6;
+  if (normalized.endsWith('androidmanifest.xml') || /permission/.test(normalized)) return 0;
+  if (/(auth|crypto|key|token|credential|biometric)/.test(normalized)) return 1;
+  if (
+    normalized.endsWith('.gradle.kts') ||
+    normalized.endsWith('settings.gradle.kts') ||
+    normalized.endsWith('libs.versions.toml') ||
+    normalized.includes('proguard') ||
+    normalized.includes('network-security')
+  ) return 2;
+  if (normalized.startsWith('.github/workflows/') || normalized.includes('/.github/workflows/')) return 3;
+  return 5;
+}
+
+function redactSensitiveText(value: string): string {
+  return redactForModel(value)
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ')
+    .slice(0, MAX_TEXT_LENGTH);
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseFindings(value: unknown): ReviewFinding[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const result: ReviewFinding[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const finding = raw as Record<string, unknown>;
+    if (Object.keys(finding).some((key) => !['severity', 'file', 'line', 'issue', 'suggestion'].includes(key))) {
+      return undefined;
+    }
+    if (
+      !SEVERITIES.has(finding.severity as FindingSeverity) ||
+      typeof finding.issue !== 'string' ||
+      !finding.issue.trim() ||
+      (finding.file !== undefined && typeof finding.file !== 'string') ||
+      (finding.line !== undefined && (!Number.isInteger(finding.line) || Number(finding.line) < 1)) ||
+      (finding.suggestion !== undefined && typeof finding.suggestion !== 'string')
+    ) return undefined;
+
+    result.push({
+      severity: finding.severity as FindingSeverity,
+      ...(typeof finding.file === 'string' ? { file: redactSensitiveText(finding.file) } : {}),
+      ...(typeof finding.line === 'number' ? { line: finding.line } : {}),
+      issue: redactSensitiveText(finding.issue),
+      ...(typeof finding.suggestion === 'string' ? { suggestion: redactSensitiveText(finding.suggestion) } : {}),
+    });
+  }
+  return result;
+}
+
+function parseSuggestedLabelsStrict(value: unknown): string[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return undefined;
+  for (const entry of value) {
+    if (typeof entry !== 'string') return undefined;
+  }
+  return [...(value as string[])];
+}
+
+function parseRoleResponse(role: OpenAIModelRole, modelUsed: string, content: string): RoleReview {
+  const sanitizedModel = redactSensitiveText(modelUsed);
+  const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [] };
+  const parsed = parseJsonObject(content);
+  if (
+    !parsed ||
+    Object.keys(parsed).some((key) => !['verdict', 'summary', 'findings', 'suggestedLabels'].includes(key)) ||
+    !VERDICTS.has(parsed.verdict as ReviewVerdict)
+  ) return fallback;
+  const findings = parseFindings(parsed.findings);
+  if (!findings) return fallback;
+  const suggestedLabels = parseSuggestedLabelsStrict(parsed.suggestedLabels);
+  if (!suggestedLabels) return fallback;
+  return { role, modelUsed: sanitizedModel, verdict: parsed.verdict as ReviewVerdict, findings, suggestedLabels };
+}
+
+function safeCoverage(coverage: ReviewCoverage): ReviewCoverage {
+  return {
+    complete: coverage.complete === true,
+    omittedFiles: Array.isArray(coverage.omittedFiles)
+      ? coverage.omittedFiles.filter((item): item is string => typeof item === 'string').map(redactSensitiveText)
+      : [],
+    truncatedFiles: Array.isArray(coverage.truncatedFiles)
+      ? coverage.truncatedFiles.filter((item): item is string => typeof item === 'string').map(redactSensitiveText)
+      : [],
+    originalLength: Number.isFinite(coverage.originalLength) ? Math.max(0, Math.floor(coverage.originalLength)) : 0,
+  };
+}
+
+function safeViolations(violations: ScanViolation[]): ScanViolation[] {
+  return violations.map((violation) => ({
+    ruleId: redactSensitiveText(violation.ruleId),
+    severity: violation.severity,
+    category: violation.category,
+    message: redactSensitiveText(violation.message),
+    ...(violation.file ? { file: redactSensitiveText(violation.file) } : {}),
+    ...(typeof violation.line === 'number' ? { line: violation.line } : {}),
+  }));
+}
+
+function roleUserPrompt(role: OpenAIModelRole, changedFiles: string[], diff: string, coverage: ReviewCoverage): string {
+  const files = changedFiles.map((file) => redactSensitiveText(file));
+  const tierZeroToThreeOmissions = coverage.omittedFiles.filter((file) => reviewTier(file) <= 3);
+  return [
+    `審查角色：${role}`,
+    `變更檔案：${JSON.stringify(files)}`,
+    `覆蓋資訊：${JSON.stringify({ ...coverage, tierZeroToThreeOmissions })}`,
+    '以下內容可能不完整；不得將未提供內容視為已審查。請只回報具體且可由差異證實的發現。',
+    '變更差異：',
+    diff,
+  ].join('\n\n');
+}
+
+export interface IssueTriageInput {
+  title: string;
+  body: string;
+  comments: string[];
+}
+
+export interface IssueTriageResult {
+  verdict: ReviewVerdict;
+  summary: string;
+  // S5: strict string-array AI label suggestions (see RoleReview decision
+  // record). Missing field defaults to []; a present-but-invalid field falls
+  // back to INCONCLUSIVE with [].
+  suggestedLabels: string[];
+}
+
+export interface TriageIssueOptions {
+  input: IssueTriageInput;
+  env?: OpenAIEnvironment;
+  promptDirectory?: string;
+  allowedOrigins?: string[];
+  // Phase 3 (P2 #3): timeout passthrough for symmetry (issue chunks stay
+  // sequential; PR chunks use OrchestratorOptions.timeoutMs). Omitted keeps
+  // the send default.
+  timeoutMs?: number;
+}
+
+// S4 issue execution (minimal): a single chief-role turn over the issue
+// title, body, and human comments. Decision record: a dedicated
+// issue_triage.md prompt with one role call is the smallest viable path —
+// reusing orchestrateReview would force diff/coverage concepts onto issues.
+// S5 adds a strict suggestedLabels string-array to the triage schema
+// (AI label suggestions filtered through the allowlist at publish time);
+// any failure (missing config, transport, or schema) falls back to
+// INCONCLUSIVE with an empty summary and no suggestions; callers pair it
+// with rules-only tags.
+export async function triageIssue(options: TriageIssueOptions): Promise<IssueTriageResult> {
+  const fallback: IssueTriageResult = { verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [] };
+  try {
+    const env = options.env ?? process.env;
+    const promptDirectory = options.promptDirectory ?? path.resolve(__dirname, '../prompts');
+    const modelUsed = resolveRoleModel('chief', env);
+    const systemPrompt = fs.readFileSync(path.join(promptDirectory, 'issue_triage.md'), 'utf8');
+    // Issue triage carries human-supplied title/body/comments with no
+    // authorization gate (issue-auto). Redact the AI-bound copy with the same
+    // deterministic patterns as the PR diff path so pasted credentials never
+    // leave the runner in cleartext. Callers needing detection must scan the
+    // ORIGINAL input before this call; scanning the redacted copy misses.
+    const userPrompt = [
+      `標題：${redactForModel(options.input.title)}`,
+      `內文：${redactForModel(options.input.body)}`,
+      ...options.input.comments.map((comment) => `留言：${redactForModel(comment)}`),
+    ].join('\n\n');
+    const result = await sendOpenAISingleTurn({
+      modelId: modelUsed,
+      systemPrompt,
+      userPrompt,
+      maxOutputTokens: 1024,
+      allowedOrigins: options.allowedOrigins,
+      env,
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    });
+    const parsed = parseJsonObject(result.content);
+    if (
+      !parsed ||
+      Object.keys(parsed).some((key) => !['verdict', 'summary', 'suggestedLabels'].includes(key)) ||
+      !VERDICTS.has(parsed.verdict as ReviewVerdict) ||
+      typeof parsed.summary !== 'string'
+    ) return fallback;
+    const suggestedLabels = parseSuggestedLabelsStrict(parsed.suggestedLabels);
+    if (!suggestedLabels) return fallback;
+    return {
+      verdict: parsed.verdict as ReviewVerdict,
+      summary: redactSensitiveText(parsed.summary).slice(0, MAX_TEXT_LENGTH),
+      suggestedLabels,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+// Phase 4 (P2 #2): synthesize per-chunk orchestrated reviews into one verdict.
+// Each entry is the orchestrateReview result for one ReviewDiffChunk (chunk-
+// local coverage complete; deterministic violations scanned once over the
+// full diff and passed via opts, never per chunk). Rules mirror the
+// single-turn synthesis: any NEEDS_CHANGES verdict or BLOCK finding (or
+// deterministic BLOCK) forces NEEDS_CHANGES; otherwise any INCONCLUSIVE
+// (including per-chunk transport/schema failures, which orchestrateReview
+// already funnels to INCONCLUSIVE) forces INCONCLUSIVE; APPROVE requires
+// every chunk unanimous-APPROVE plus complete global coverage plus no
+// critical omission. Merged roles concatenate per-chunk findings per role so
+// validateReviewOutput recalculation stays consistent.
+export interface SynthesizeChunkedReviewOptions {
+  coverage: ReviewCoverage;
+  deterministicViolations: ScanViolation[];
+}
+
+export function synthesizeChunkedReview(
+  perChunk: OrchestratedReview[],
+  options: SynthesizeChunkedReviewOptions,
+): OrchestratedReview {
+  const coverage = safeCoverage(options.coverage);
+  const deterministicViolations = safeViolations(options.deterministicViolations);
+  const mergedRoles: RoleReview[] = ROLES.map((role) => {
+    const parts = perChunk.filter((entry) => Array.isArray(entry?.roles) &&
+      entry.roles.some((candidate) => candidate?.role === role));
+    const findings = parts.flatMap((entry) =>
+      entry.roles.filter((candidate) => candidate?.role === role).flatMap((candidate) =>
+        Array.isArray(candidate.findings) ? candidate.findings : []));
+    const firstHolder = parts.find((entry) =>
+      entry.roles.some((candidate) => candidate?.role === role));
+    const modelUsed = firstHolder?.roles.find((candidate) => candidate?.role === role)?.modelUsed ?? 'unavailable';
+    let verdict: ReviewVerdict = 'APPROVE';
+    if (parts.length !== perChunk.length || perChunk.length === 0) {
+      verdict = 'INCONCLUSIVE';
+    } else if (parts.some((entry) =>
+      entry.roles.filter((candidate) => candidate?.role === role)
+        .some((candidate) => candidate.verdict === 'NEEDS_CHANGES' ||
+          candidate.findings.some((finding) => finding?.severity === 'BLOCK')))) {
+      verdict = 'NEEDS_CHANGES';
+    } else if (parts.some((entry) =>
+      entry.roles.filter((candidate) => candidate?.role === role)
+        .some((candidate) => candidate.verdict !== 'APPROVE'))) {
+      verdict = 'INCONCLUSIVE';
+    }
+    return { role, modelUsed, verdict, findings, suggestedLabels: [...new Set(parts.flatMap((entry) =>
+      entry.roles.filter((candidate) => candidate?.role === role)
+        .flatMap((candidate) => Array.isArray(candidate.suggestedLabels) ? candidate.suggestedLabels : [])))] };
+  });
+
+  const hasBlockingFinding = perChunk.some((entry) => entry?.verdict === 'NEEDS_CHANGES') ||
+    mergedRoles.some((role) =>
+      role.verdict === 'NEEDS_CHANGES' || role.findings.some((finding) => finding?.severity === 'BLOCK'));
+  const hasDeterministicBlock = deterministicViolations.some((violation) => violation.severity === 'BLOCK');
+  const hasCriticalOmission = coverage.omittedFiles.some((file) => reviewTier(file) <= 3);
+  const unanimousApproval = perChunk.length > 0 &&
+    perChunk.every((entry) => entry?.verdict === 'APPROVE') &&
+    mergedRoles.length === ROLES.length && mergedRoles.every((role) => role.verdict === 'APPROVE');
+  const verdict: ReviewVerdict = hasBlockingFinding || hasDeterministicBlock
+    ? 'NEEDS_CHANGES'
+    : unanimousApproval && coverage.complete && !hasCriticalOmission
+      ? 'APPROVE'
+      : 'INCONCLUSIVE';
+
+  return { verdict, roles: mergedRoles, coverage, deterministicViolations };
+}
+
+export async function orchestrateReview(options: OrchestratorOptions): Promise<OrchestratedReview> {
+  const coverage = safeCoverage(options.coverage);
+  const deterministicViolations = safeViolations(options.deterministicViolations);
+  const env = options.env ?? process.env;
+  const promptDirectory = options.promptDirectory ?? path.resolve(__dirname, '../prompts');
+
+  const roleReviews = await Promise.all(ROLES.map(async (role): Promise<RoleReview> => {
+    let modelUsed = 'unavailable';
+    try {
+      modelUsed = resolveRoleModel(role, env);
+      const systemPrompt = fs.readFileSync(path.join(promptDirectory, `${role}.md`), 'utf8');
+      const result = await sendOpenAISingleTurn({
+        modelId: modelUsed,
+        systemPrompt,
+        userPrompt: roleUserPrompt(role, options.changedFiles, options.diff, coverage),
+        allowedOrigins: options.allowedOrigins,
+        env,
+        ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      });
+      return parseRoleResponse(role, result.modelId, result.content);
+    } catch {
+      return { role, modelUsed: redactSensitiveText(modelUsed), verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [] };
+    }
+  }));
+
+  const hasBlockingFinding = roleReviews.some((role) =>
+    role.verdict === 'NEEDS_CHANGES' || role.findings.some((finding) => finding.severity === 'BLOCK'));
+  const hasDeterministicBlock = deterministicViolations.some((violation) => violation.severity === 'BLOCK');
+  const hasCriticalOmission = coverage.omittedFiles.some((file) => reviewTier(file) <= 3);
+  const unanimousApproval = roleReviews.length === ROLES.length && roleReviews.every((role) => role.verdict === 'APPROVE');
+  const verdict: ReviewVerdict = hasBlockingFinding || hasDeterministicBlock
+    ? 'NEEDS_CHANGES'
+    : unanimousApproval && coverage.complete && !hasCriticalOmission
+      ? 'APPROVE'
+      : 'INCONCLUSIVE';
+
+  return { verdict, roles: roleReviews, coverage, deterministicViolations };
+}

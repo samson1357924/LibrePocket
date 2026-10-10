@@ -1,0 +1,411 @@
+name: PocketGuard
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created, edited]
+
+concurrency:
+  # Per-PR/issue serialization is the primary mutex for the S4 per-SHA review
+  # quota (at most 2 AI reviews per PR+head SHA, pre-occupied by the claim-slot
+  # job before any AI work). GitHub offers no compare-and-swap on comments, so
+  # a residual race remains if overlapping runs for the same PR ever escape
+  # this group; the claim re-reads the ledger immediately before writing and
+  # review mode requires its own claim marker immediately before any OpenAI
+  # call as defense in depth.
+  group: pocketguard-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-tag:
+    name: Prepare and deterministic tagging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      # Read-only issue metadata for the S4 per-SHA quota read (sticky
+      # comment) and issue context assembly. No writes, no OpenAI secrets.
+      issues: read
+    outputs:
+      labels: ${{ steps.tag.outputs.labels }}
+      target: ${{ steps.tag.outputs.target }}
+      command: ${{ steps.tag.outputs.command }}
+      needs_diff: ${{ steps.tag.outputs.needs_diff }}
+      safe_review: ${{ steps.tag.outputs.safe_review }}
+      diff_safe: ${{ steps.tag.outputs.diff_safe }}
+      authorized: ${{ steps.tag.outputs.authorized }}
+      issue_number: ${{ steps.tag.outputs.issue_number }}
+      should_review: ${{ steps.tag.outputs.should_review }}
+      should_tag: ${{ steps.tag.outputs.should_tag }}
+      route_kind: ${{ steps.tag.outputs.route_kind }}
+      review_gate: ${{ steps.tag.outputs.review_gate }}
+      reviews_used: ${{ steps.tag.outputs.reviews_used }}
+      quota_head_sha: ${{ steps.tag.outputs.quota_head_sha }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          # Full history: the reviewer computes git merge-base locally, which
+          # needs base-side ancestry. Same-repo head objects arrive via an
+          # explicit `git fetch origin <base> <head>`; fork head objects
+          # arrive via an explicit `git fetch origin <base> +refs/pull/<N>/head`
+          # plus a FETCH_HEAD SHA-pin against the expected head SHA.
+          # Fork code is never checked out or executed — only read as a diff.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies
+        working-directory: github_bot
+        run: npm ci --ignore-scripts
+
+      - name: Emit deterministic labels and routing context
+        id: tag
+        working-directory: github_bot
+        # This job holds no secrets; GITHUB_TOKEN only allows the read-only
+        # authorization gate (permission check + pulls.get) on issue_comment.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
+        run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
+
+  claim-slot:
+    name: Claim review slot (quota pre-occupation)
+    needs: prepare-tag
+    # Stage 5 (P1 #1, scheme A): pre-occupies one per-SHA review slot before
+    # any AI work. Scheduling is identical to review-send below: an open PR
+    # gate (auto, or manual with authorization) or the explicit issue-auto
+    # route. Issues are a no-op success (never counted) so issue-auto review
+    # still runs. Routing/authorization/quota/diff-unavailable/reopened-
+    # completed blocks claim nothing and count zero; a reserved slot whose
+    # later transport/artifact/publish fails is never refunded. Phase 3
+    # (P2 #5) pre-flight verifies the diff before occupying (fork ref plus
+    # SHA pin, merge-base, changed list within cap) with read-only git; any
+    # failure claims nothing with zero writes. Reopened only supplements an
+    # incomplete first review (tag gates used>=1 to none, so this job is
+    # skipped; the TS claim also refuses reopened used>=1). This job holds
+    # no OpenAI secrets and never checks out fork code: the checkout stays
+    # on the default branch for the bot code only, and the head SHA is
+    # pinned via a trusted pulls.get read.
+    # Phase 3 (P2 #3) claim budget: the TS pre-flight estimates chunkCount via
+    # the read-only diff (collectFileDiffs plus MAX_PR_CHUNK_LENGTH partition)
+    # and refuses when waves x timeout cannot fit the review deadline
+    # (POCKETGUARD_REVIEW_DEADLINE_MS, default 20min minus margin; per-chunk
+    # share below the viable minimum claims nothing with zero writes, never
+    # occupying a slot). A granted claim whose later review times out still
+    # holds its slot (never refunded).
+    if: >-
+      (needs.prepare-tag.outputs.target == 'pull-request' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.review_gate == 'auto') ||
+      (needs.prepare-tag.outputs.target == 'pull-request' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.review_gate == 'manual' &&
+      needs.prepare-tag.outputs.authorized == 'true') ||
+      (needs.prepare-tag.outputs.target == 'issue' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      (needs.prepare-tag.outputs.route_kind == 'first-review' ||
+      needs.prepare-tag.outputs.route_kind == 'issue-update'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      # Minimal write: the sticky quota ledger only. No OpenAI secrets here.
+      issues: write
+    outputs:
+      claimed: ${{ steps.claim.outputs.claimed }}
+      claim_sha: ${{ steps.claim.outputs.claim_sha }}
+      reviews_used: ${{ steps.claim.outputs.reviews_used }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          # Full history kept consistent with the tag/review/publish jobs. The
+          # claim runs a read-only diff pre-flight (fetch plus merge-base plus
+          # diff --name-only, no checkout) before any sticky write; fork code
+          # is never checked out or executed.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies
+        working-directory: github_bot
+        run: npm ci --ignore-scripts
+
+      - name: Pre-occupy review slot
+        id: claim
+        working-directory: github_bot
+        # No OpenAI secrets in this job. POCKETGUARD_QUOTA_SHA pins the claim
+        # to the tag-observed head SHA; the claim verifies it against a fresh
+        # pulls.get and fails closed on any mismatch.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
+          POCKETGUARD_QUOTA_SHA: ${{ needs.prepare-tag.outputs.quota_head_sha }}
+        run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=claim
+
+  review-send:
+    name: Review with isolated OpenAI credentials
+    needs: [prepare-tag, claim-slot]
+    # Route-driven scheduling (S4): a pull-request review is scheduled only
+    # with should_review and an open review_gate. The auto gate (first review,
+    # owner commit) needs no commenter gate; the manual gate (/review-style
+    # commands) additionally requires authorized, which covers maintainer
+    # write+ and the PR author reviewing their own PR. Quota-exhausted or
+    # quota-unknown runs report review_gate none and schedule nothing. Issue
+    # execution is scheduled only by the explicit issue-auto route (target
+    # issue with should_review and route_kind first-review/issue-update);
+    # should_tag is a deterministic publish signal, never a scheduling reason.
+    # Owner decision: issue auto-review carries no auth/quota gate in this
+    # phase (no budget/rate limit; only bot exclusion in routing plus
+    # per-issue concurrency serialization), so the trusted step below admits
+    # the issue-auto route to the OpenAI secrets. Stage 5: pull-request
+    # reviews additionally require the claim-slot reservation
+    # (needs.claim-slot.outputs.claimed == 'true'); without its own approved
+    # claim the run makes zero OpenAI calls. The claim-slot job is a no-op
+    # success for issues, so the issue-auto route needs no claimed check.
+    # Phase 3 (P2 #3) N-chunk safety: the TS review runs chunked PR diffs
+    # under t0 + effectiveDeadline = min(configured
+    # POCKETGUARD_REVIEW_DEADLINE_MS (default 20min minus 60s margin for
+    # artifact/upload), jobRemaining - 60s skew) with jobRemaining =
+    # REVIEW_JOB_TIMEOUT_MS(20min) - (now - POCKETGUARD_JOB_STARTED_MS),
+    # matching this job's timeout-minutes: 20 (unchanged). The first step
+    # records POCKETGUARD_JOB_STARTED_MS into $GITHUB_ENV (trusted
+    # workflow-defined wall-clock, never PR content) and both review steps
+    # receive it via env; a missing value downgrades to the configured
+    # deadline fail-closed. Fixed concurrency 2, per-wave need estimation
+    # (effectiveRemaining < need exits early fail-closed), per-chunk timeoutMs passthrough min(420s,
+    # effectiveRemaining/remainingWaves, optional POCKETGUARD_CHUNK_TIMEOUT_MS
+    # override for tests), and a computed chunkCoverageComplete (any
+    # transport/timeout/deadline INCONCLUSIVE forces false; publish gates on
+    # true). Deadline exits save INCONCLUSIVE + false artifacts (checkpoint)
+    # with completed reports plus omission placeholders, never true and never
+    # silent.
+    if: >-
+      (needs.prepare-tag.outputs.target == 'pull-request' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.review_gate == 'auto' &&
+      needs.claim-slot.outputs.claimed == 'true') ||
+      (needs.prepare-tag.outputs.target == 'pull-request' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.review_gate == 'manual' &&
+      needs.prepare-tag.outputs.authorized == 'true' &&
+      needs.claim-slot.outputs.claimed == 'true') ||
+      (needs.prepare-tag.outputs.target == 'issue' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      (needs.prepare-tag.outputs.route_kind == 'first-review' ||
+      needs.prepare-tag.outputs.route_kind == 'issue-update'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      # Read-only issue metadata for the S4 quota re-check and issue context
+      # assembly. OpenAI secrets stay confined to the trusted review step.
+      issues: read
+    steps:
+      - name: Record job start time
+        # Phase 2 (P2 #2) trusted job wall-clock: records the review-send job
+        # start (ms since epoch) into $GITHUB_ENV before any setup cost. Both
+        # review steps below receive it as POCKETGUARD_JOB_STARTED_MS so the
+        # TS effective deadline min(configured, jobRemaining - 60s skew) keeps
+        # upload headroom under this job's timeout-minutes: 20 even on slow
+        # hosted setup. Workflow-defined and trusted (never PR content); a
+        # missing value downgrades fail-closed to the configured deadline.
+        run: echo "POCKETGUARD_JOB_STARTED_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
+
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          # Full history: the reviewer computes git merge-base locally, which
+          # needs base-side ancestry. Same-repo head objects arrive via an
+          # explicit `git fetch origin <base> <head>`; fork head objects
+          # arrive via an explicit `git fetch origin <base> +refs/pull/<N>/head`
+          # plus a FETCH_HEAD SHA-pin against the expected head SHA.
+          # Fork code is never checked out or executed — only read as a diff.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies
+        working-directory: github_bot
+        run: npm ci --ignore-scripts
+
+      - name: Resolve trusted pull-request origin
+        id: gate
+        working-directory: github_bot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
+        run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=tag
+
+      - name: Run trusted single-turn review
+        # Trusted admission: readable-diff pull requests (same-repo or fork
+        # via the pinned PR-ref fetch) with an explicit authorization verdict,
+        # plus the intentional issue-auto route (target issue with
+        # should_review and route_kind first-review/issue-update), which
+        # carries no auth/quota gate by owner decision. `diff_safe` is the
+        # readability gate (fork-safe); `safe_review` remains same-repo-only
+        # for distinction. Only this step receives OpenAI secrets. The
+        # checkout stays on the default branch; fork code is never checked
+        # out or executed. POCKETGUARD_JOB_STARTED_MS (first step, trusted)
+        # caps chunked reviews via the TS effective deadline.
+        if: >-
+          (steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||
+          (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
+          (steps.gate.outputs.route_kind == 'first-review' || steps.gate.outputs.route_kind == 'issue-update'))
+        working-directory: github_bot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
+          POCKETGUARD_JOB_STARTED_MS: ${{ env.POCKETGUARD_JOB_STARTED_MS }}
+          POCKETGUARD_SAFE_REVIEW: 'true'
+          POCKETGUARD_OUTPUT: review-output.json
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POCKETGUARD_MODEL_CHIEF: ${{ vars.POCKETGUARD_MODEL_CHIEF || secrets.POCKETGUARD_MODEL_CHIEF }}
+          POCKETGUARD_MODEL_ANDROID_SEC: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC || secrets.POCKETGUARD_MODEL_ANDROID_SEC }}
+          POCKETGUARD_MODEL_ANDROID_CODE: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE || secrets.POCKETGUARD_MODEL_ANDROID_CODE }}
+          POCKETGUARD_MODEL_PROFILES: ${{ vars.POCKETGUARD_MODEL_PROFILES || secrets.POCKETGUARD_MODEL_PROFILES }}
+          POCKETGUARD_MODEL_PROFILE: ${{ vars.POCKETGUARD_MODEL_PROFILE || secrets.POCKETGUARD_MODEL_PROFILE }}
+          POCKETGUARD_MODEL_CHIEF_PROFILE: ${{ vars.POCKETGUARD_MODEL_CHIEF_PROFILE || secrets.POCKETGUARD_MODEL_CHIEF_PROFILE }}
+          POCKETGUARD_MODEL_ANDROID_SEC_PROFILE: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC_PROFILE || secrets.POCKETGUARD_MODEL_ANDROID_SEC_PROFILE }}
+          POCKETGUARD_MODEL_ANDROID_CODE_PROFILE: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE_PROFILE || secrets.POCKETGUARD_MODEL_ANDROID_CODE_PROFILE }}
+          POCKETGUARD_REASONING_EFFORT: ${{ vars.POCKETGUARD_REASONING_EFFORT || secrets.POCKETGUARD_REASONING_EFFORT }}
+          POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT: ${{ vars.POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT || secrets.POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT }}
+          POCKETGUARD_MODEL_ANDROID_SEC_REASONING_EFFORT: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC_REASONING_EFFORT || secrets.POCKETGUARD_MODEL_ANDROID_SEC_REASONING_EFFORT }}
+          POCKETGUARD_MODEL_ANDROID_CODE_REASONING_EFFORT: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE_REASONING_EFFORT || secrets.POCKETGUARD_MODEL_ANDROID_CODE_REASONING_EFFORT }}
+          POCKETGUARD_OPENAI_ORIGIN: ${{ vars.POCKETGUARD_OPENAI_ORIGIN || secrets.POCKETGUARD_OPENAI_ORIGIN }}
+        run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=review
+
+      - name: Write generic result for untrusted pull request
+        # Fail-closed complement of the trusted step: anything not admitted
+        # above — including missing/empty/non-'true' authorized, unreadable
+        # diffs (SHA-pin or fetch failure), and non-issue routes — runs the
+        # generic INCONCLUSIVE path with no OpenAI secrets. It receives the
+        # same trusted POCKETGUARD_JOB_STARTED_MS so chunked INCONCLUSIVE
+        # checkpoints share the job cap.
+        if: >-
+          !((steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||
+          (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
+          (steps.gate.outputs.route_kind == 'first-review' || steps.gate.outputs.route_kind == 'issue-update')))
+        working-directory: github_bot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
+          POCKETGUARD_JOB_STARTED_MS: ${{ env.POCKETGUARD_JOB_STARTED_MS }}
+          POCKETGUARD_SAFE_REVIEW: 'false'
+          POCKETGUARD_OUTPUT: review-output.json
+        run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=review
+
+      - name: Upload review result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pocketguard-review-report
+          path: |
+            github_bot/review-output.json
+            github_bot/review-report.md
+            github_bot/review-report.json
+          # Phase D (P1 #4): a partial upload must fail the review job so the
+          # publish double-gate (JOB_RESULT plus content-validated reports)
+          # falls back to INCONCLUSIVE instead of APPROVE with unavailable.
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish review and labels
+    needs: [prepare-tag, review-send]
+    # Quota/authorization/diff skip (S4) plus issue sticky (S5): a
+    # pull_request_target publishes only with an open gate (review_gate !=
+    # none), so quota-exhausted, quota-unknown, diff-unavailable, and
+    # reopened-completed (reopened used>=1, only the incomplete first review
+    # may publish) skip without touching the sticky comment or labels and
+    # without fallback noise. An issue_comment publishes only an authorized
+    # manual pull-request review with an open gate, or a human issue update
+    # (target issue with should_review and a non-ignore route, covering
+    # issue_comment on issues). Unauthorized comments and bot-routed ignores
+    # skip publish without touching the sticky comment or labels.
+    # Stage 5: counting happens only in the claim-slot job before AI; publish
+    # only reconciles content and never increments the ledger.
+    if: >-
+      always() && needs.prepare-tag.result == 'success' &&
+      ((github.event_name != 'issue_comment' &&
+      needs.prepare-tag.outputs.review_gate != 'none') ||
+      (needs.prepare-tag.outputs.authorized == 'true' &&
+      needs.prepare-tag.outputs.review_gate != 'none') ||
+      (needs.prepare-tag.outputs.target == 'issue' &&
+      needs.prepare-tag.outputs.should_review == 'true' &&
+      needs.prepare-tag.outputs.route_kind != 'ignore'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          # Full history: kept consistent with the review/tag jobs so any
+          # future local diff here shares the same merge-base ancestry.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies
+        working-directory: github_bot
+        run: npm ci --ignore-scripts
+
+      - name: Download review result
+        # Phase D (P1 #4): no continue-on-error. A download failure fails this
+        # step, but the publish step below still runs (if: always) and the
+        # TypeScript double-gate (JOB_RESULT plus content-validated
+        # output↔report verdict/fingerprint/time) falls back to the same
+        # sticky INCONCLUSIVE with no fake link.
+        if: needs.review-send.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pocketguard-review-report
+          path: github_bot
+
+      - name: Publish sticky result and labels
+        # Always run so a download failure still publishes the INCONCLUSIVE
+        # fallback (never silently skipping the sticky).
+        if: always()
+        working-directory: github_bot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
+          POCKETGUARD_OUTPUT: review-output.json
+          POCKETGUARD_REVIEW_JOB_RESULT: ${{ needs.review-send.result }}
+          POCKETGUARD_TAG_LABELS: ${{ needs.prepare-tag.outputs.labels }}
+        run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=publish

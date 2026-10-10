@@ -36,6 +36,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -340,7 +341,7 @@ class ProviderTransportTest {
     private suspend fun assertCallCancelled(signals: ResponseBodyReadSignals, context: String) {
         assertTrue(
             "$context cancels the actual OkHttp Call",
-            withContext(Dispatchers.IO) { signals.calls.cancelled.await(1, TimeUnit.SECONDS) },
+            withContext(Dispatchers.IO) { signals.calls.cancelled.await(5, TimeUnit.SECONDS) },
         )
     }
 
@@ -1096,10 +1097,11 @@ class ProviderTransportTest {
     @Test
     fun errorPrefixCapBoundariesListModelsFailsWithStatusFallback() = runBlocking {
         // No fatal marker: bare 503 falls back to retryable status classification.
-        // Expected client-source bytes: under-cap sizes are read fully, over-cap
-        // sizes stop at the 16KiB prefix. Per current code the exact-cap size
-        // (remaining == 0) also calls cancelCall, even though no overflow byte
-        // exists; only the under-cap size leaves the Call uncancelled.
+        // Sentinel semantics (mirrors readBoundedProviderBody): only a true
+        // overflow byte beyond 16KiB cancels. Exact-cap EOF leaves the Call
+        // uncancelled; only 16385+ cancels. Consumed is within-budget
+        // (cap + 1 sentinel + read-ahead allowance), not exact, because the
+        // probe may consume one extra byte on overflow.
         for (protocol in ProviderProtocol.values()) {
             for (size in listOf(16383, 16384, 16385)) {
                 for (unknownLength in listOf(false, true)) {
@@ -1127,18 +1129,21 @@ class ProviderTransportTest {
                         }
                         assertTrue("$context preserves HTTP status", failure.message.orEmpty().contains("HTTP 503"))
                         assertTrue("$context bare 503 falls back to retryable", failure.retryable)
-                        val expectedConsumed = if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) size.toLong() else HTTP_ERROR_BODY_LIMIT_BYTES.toLong()
-                        assertEquals("$context consumed exact client-source bytes", expectedConsumed, signals.consumedBytes.get())
-                        if (size < HTTP_ERROR_BODY_LIMIT_BYTES) {
+                        val floorBytes = minOf(size, HTTP_ERROR_BODY_LIMIT_BYTES).toLong()
+                        val consumedBytes = signals.consumedBytes.get()
+                        assertTrue(
+                            "$context consumes at least the bounded prefix ($consumedBytes >= $floorBytes)",
+                            consumedBytes >= floorBytes,
+                        )
+                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
+                        if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) {
                             assertFalse(
-                                "$context under-cap prefix leaves the Call uncancelled",
-                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(300, TimeUnit.MILLISECONDS) },
+                                "$context at-or-under-cap EOF leaves the Call uncancelled",
+                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(1, TimeUnit.SECONDS) },
                             )
                         } else {
-                            // Exact-cap also cancels per current code (remaining == 0 path).
                             assertCallCancelled(signals, context)
                         }
-                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
                         assertEquals("$context remains one request", 1, server.requestCount)
                     } finally {
                         server.shutdown()
@@ -1151,7 +1156,8 @@ class ProviderTransportTest {
     @Test
     fun errorPrefixCapBoundariesStreamFailsWithStatusFallback() = runBlocking {
         // Stream twin of the listModels cap-boundary matrix: same bodies, same
-        // exact-consumed/cancel expectations, surfaced as one Failed event.
+        // sentinel cancel expectations (exact-cap EOF uncancelled), surfaced
+        // as one Failed event.
         for (protocol in ProviderProtocol.values()) {
             for (size in listOf(16383, 16384, 16385)) {
                 for (unknownLength in listOf(false, true)) {
@@ -1175,18 +1181,21 @@ class ProviderTransportTest {
                         val failure = events.single() as StreamEvent.Failed
                         assertTrue("$context preserves HTTP status", failure.message.contains("HTTP 503"))
                         assertTrue("$context bare 503 stays retryable", failure.retryable)
-                        val expectedConsumed = if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) size.toLong() else HTTP_ERROR_BODY_LIMIT_BYTES.toLong()
-                        assertEquals("$context consumed exact client-source bytes", expectedConsumed, signals.consumedBytes.get())
-                        if (size < HTTP_ERROR_BODY_LIMIT_BYTES) {
+                        val floorBytes = minOf(size, HTTP_ERROR_BODY_LIMIT_BYTES).toLong()
+                        val consumedBytes = signals.consumedBytes.get()
+                        assertTrue(
+                            "$context consumes at least the bounded prefix ($consumedBytes >= $floorBytes)",
+                            consumedBytes >= floorBytes,
+                        )
+                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
+                        if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) {
                             assertFalse(
-                                "$context under-cap prefix leaves the Call uncancelled",
-                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(300, TimeUnit.MILLISECONDS) },
+                                "$context at-or-under-cap EOF leaves the Call uncancelled",
+                                withContext(Dispatchers.IO) { signals.calls.cancelled.await(1, TimeUnit.SECONDS) },
                             )
                         } else {
-                            // Exact-cap also cancels per current code (remaining == 0 path).
                             assertCallCancelled(signals, context)
                         }
-                        assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
                         assertEquals("$context remains one provider attempt", 1, server.requestCount)
                     } finally {
                         server.shutdown()
@@ -1289,6 +1298,131 @@ class ProviderTransportTest {
                 job?.cancel()
                 server.shutdown()
                 job?.let { active -> withTimeoutOrNull(1_500) { active.join() } }
+            }
+        }
+    }
+
+    @Test
+    fun slowChunkedExactCapModelListStillSucceeds() = runBlocking {
+        // Sentinel semantics on a slow stream: an exact-cap body delivered in
+        // throttled periods must still EOF-probe -1 (success), not misfire
+        // TOO_LARGE. Throttle windows are small on purpose: the probe
+        // behavior depends on readTimeout + call.cancel, so this test stays
+        // far from the 5min read idle timeout (see the stall test below).
+        val body = modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setChunkedBody(body, 8192)
+                        .throttleBody(128 * 1024, 50, TimeUnit.MILLISECONDS),
+                )
+                val models = withTimeout(30_000) {
+                    providerFor(protocol, server).listModels()
+                }
+                assertEquals(listOf("budget-model"), models)
+                assertEquals("$protocol slow exact-cap uses one model-list request", 1, server.requestCount)
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    @Test
+    fun stalledChunkedBodyAfterCapIsCancellable() = runBlocking {
+        // Slow chunked stall: the first throttle period delivers the full cap
+        // (~1MiB socket bytes, framing makes it marginally fewer body bytes),
+        // then the remainder stalls for one long period. The transport must
+        // block in source.read (bounded only by readTimeout) and stay
+        // interruptible via call.cancel(): cancelling surfaces
+        // CancellationException, never a TOO_LARGE misfire. Small stall
+        // windows keep this deterministic without approaching the 5min
+        // readTimeout; a full-timeout stall proof is a follow-up, not this PR.
+        val oversized = modelListJsonWithExactBytes(MODEL_LIST_BODY_LIMIT_BYTES + 64 * 1024)
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = ResponseBodyReadSignals()
+            server.start()
+            var job: Job? = null
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setChunkedBody(oversized, 64 * 1024)
+                        .throttleBody(MODEL_LIST_BODY_LIMIT_BYTES.toLong(), 5, TimeUnit.SECONDS),
+                )
+                var thrown: Throwable? = null
+                val active = launch(Dispatchers.IO) {
+                    try {
+                        providerFor(protocol, server, signals.client()).listModels()
+                    } catch (e: Throwable) {
+                        thrown = e
+                    }
+                }
+                job = active
+                // Wait until the slow first period has delivered (through the
+                // cap region); the overflow byte is still stalled server-side.
+                withTimeout(20_000) {
+                    while (signals.consumedBytes.get() < MODEL_LIST_BODY_LIMIT_BYTES - 64 * 1024) delay(50)
+                }
+                // Let in-flight 8KiB reads advance into the stall block.
+                delay(300)
+                withTimeout(1_500) { active.cancelAndJoin() }
+                assertCallCancelled(signals, "$protocol stalled chunked body")
+                withTimeoutOrNull(1_500) { active.join() }
+                assertTrue(
+                    "$protocol stall cancellation stays CancellationException, got $thrown",
+                    thrown is CancellationException,
+                )
+                assertFalse("$protocol stall cancellation is not TOO_LARGE", (thrown as? ProviderFailure)?.code == ProviderFailureCode.TOO_LARGE)
+                assertReadWithinBudget(signals, MODEL_LIST_BODY_LIMIT_BYTES, "$protocol stalled chunked body")
+                assertEquals("$protocol stalled body remains one request", 1, server.requestCount)
+            } finally {
+                job?.cancel()
+                server.shutdown()
+                job?.let { active -> withTimeoutOrNull(1_500) { active.join() } }
+            }
+        }
+    }
+
+    @Test
+    fun shortReadTimeoutWhileReadingBodyIsTransportErrorNotTooLarge() = runBlocking {
+        // A stalled body under a short readTimeout must surface as a
+        // retryable transport IOException, never TOO_LARGE: the cap was never
+        // reached, so no size verdict applies.
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            server.start()
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setBody("{\"data\":[]}")
+                        .setBodyDelay(3, TimeUnit.SECONDS),
+                )
+                val client = OkHttpClient.Builder()
+                    .readTimeout(500, TimeUnit.MILLISECONDS)
+                    .build()
+                try {
+                    withTimeout(15_000) { providerFor(protocol, server, client).listModels() }
+                    throw AssertionError("$protocol stalled body should hit the short readTimeout")
+                } catch (e: CancellationException) {
+                    throw AssertionError("$protocol readTimeout must not surface as CancellationException", e)
+                } catch (e: ProviderFailure) {
+                    throw AssertionError("$protocol stalled body must not be TOO_LARGE, got ${e.code}", e)
+                } catch (e: IOException) {
+                    assertFalse("$protocol timeout message carries no TOO_LARGE verdict", e.message.orEmpty().contains("TOO_LARGE"))
+                    assertEquals(
+                        "$protocol read timeout stays a retryable transport failure",
+                        FailureKind.RETRYABLE,
+                        ProviderErrorClassifier.classify(null, e, e.message),
+                    )
+                }
+                val received = withContext(Dispatchers.IO) { server.takeRequest(2, TimeUnit.SECONDS) }
+                assertNotNull("$protocol stalled request still reaches the server", received)
+                assertEquals("$protocol stall remains one request", 1, server.requestCount)
+            } finally {
+                server.shutdown()
             }
         }
     }

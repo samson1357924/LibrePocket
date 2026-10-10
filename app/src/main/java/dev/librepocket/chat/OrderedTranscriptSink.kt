@@ -194,6 +194,21 @@ class OrderedTranscriptSink(
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) =
     writeOrdered { delegate.onUsage(runId, inputTokens, outputTokens) }
 
+  /**
+   * Awaits any parked overflow steer admissions from [offerSteer].
+   * Ensures that steers offered before a subsequent writeCore, writeOrdered,
+   * or flush barrier enter the channel strictly ahead of it (R2-7).
+   */
+  private suspend fun awaitParkedOverflow() {
+    var tail = overflowChain.get()
+    while (tail != null) {
+      tail.await()
+      val current = overflowChain.get()
+      if (current == null || current === tail) break
+      tail = current
+    }
+  }
+
   /** Core event: suspends until the single writer has run the delegate. */
   private suspend fun writeCore(runId: String, block: suspend () -> Unit) {
     // Fail fast behind a dead/sealed writer: never park unbounded with no
@@ -216,6 +231,7 @@ class OrderedTranscriptSink(
     coreAcks[ack] = runId
     pendingCore.add(runId)
     try {
+      awaitParkedOverflow()
       channel.send(Entry(runId, block, ack))
     } catch (e: CancellationException) {
       // The caller was cancelled before admission: the entry never entered
@@ -262,6 +278,7 @@ class OrderedTranscriptSink(
     // CancellationException propagates to the cancelled caller, and
     // ClosedSendChannelException (sealed after shutdown) propagates to the
     // caller instead of succeeding silently.
+    awaitParkedOverflow()
     channel.send(Entry(runId = null, block))
   }
 
@@ -311,6 +328,11 @@ class OrderedTranscriptSink(
    * seals the channel, when the writer finished pre-seal work in time);
    * false on timeout. Cancellation of the caller still propagates.
    *
+   * Note on durability: [flush] returns true once the barrier drains through the
+   * writer, even if individual core entries encountered store exceptions and were
+   * marked interrupted. Callers requiring guaranteed durable persistence without
+   * store failures should check [hasDurableFailures] or call [flushDurable].
+   *
    * Parked [offerSteer] sends offered before this call are awaited first via
    * the overflow chain: without that, this barrier could be admitted ahead
    * of their still-unscheduled sends and report a drain that missed them.
@@ -323,13 +345,7 @@ class OrderedTranscriptSink(
   suspend fun flush(timeoutMs: Long = DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
     try {
       return withTimeoutOrNull(timeoutMs) {
-        var tail = overflowChain.get()
-        while (tail != null) {
-          tail.await()
-          val current = overflowChain.get()
-          if (current == null || current === tail) break
-          tail = current
-        }
+        awaitParkedOverflow()
         val barrier = CompletableDeferred<Unit>()
         try {
           channel.send(Entry(runId = null, block = {}, barrier))
@@ -347,6 +363,20 @@ class OrderedTranscriptSink(
       throw e
     }
   }
+
+  /**
+   * True if any admitted core event failed during persistence or was interrupted by teardown/timeout.
+   */
+  fun hasDurableFailures(): Boolean = synchronized(interrupted) { interrupted.isNotEmpty() }
+
+  /**
+   * Suspends until every event admitted so far is persisted and verifies that
+   * no durable store failure occurred.
+   *
+   * Returns true only when [flush] drains within [timeoutMs] AND [hasDurableFailures] is false.
+   */
+  suspend fun flushDurable(timeoutMs: Long = DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
+    flush(timeoutMs) && !hasDurableFailures()
 
   /**
    * Bounded teardown: settle in-flight hosts first (so their terminal records

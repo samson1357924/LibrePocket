@@ -13,6 +13,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -218,6 +219,63 @@ class OrderedTranscriptSinkSealTest {
         }
       }
       gate.complete(Unit)
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * R2-8: When store fault-injection throws IOException:
+   * - core event ack throws exception;
+   * - hasDurableFailures() is true;
+   * - flush() returns true (barrier drained);
+   * - flushDurable() returns false (persistence failed);
+   * - shutdown does not mislabel healthy pending core as drain timeout.
+   */
+  @Test fun storeFaultInjectionSurfacesDurableFailuresAndFlushContract() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val store = object : FakeSessionStore() {
+        override suspend fun appendEvent(event: TranscriptEvent): Long {
+          if (event.runId == "faulty-core") throw IOException("fault-injected disk failure")
+          return super.appendEvent(event)
+        }
+      }
+      val sid = runBlocking { store.createSession("title", "model") }
+      val sink = OrderedTranscriptSink(SessionTranscriptSink(store, sid), dispatcher, capacity = 8)
+      runBlocking {
+        withTimeout(10_000) {
+          // 1. core 事件 ack 拋出例外
+          try {
+            sink.onTurnStarted("faulty-core", "faulty user text")
+            fail("store fault-injection must cause core ack to throw")
+          } catch (e: Exception) {
+            assertTrue("core ack must throw IOException, got: $e", e is IOException)
+          }
+
+          // 2. hasDurableFailures() 為 true
+          assertTrue("hasDurableFailures() must be true after store failure", sink.hasDurableFailures())
+
+          // Admit a healthy core event to verify shutdown does not mislabel it
+          sink.onTurnStarted("healthy-core", "healthy user text")
+
+          // 3. flush() 回傳 true（barrier 已 drain）
+          assertTrue("flush() must return true as barrier drained", sink.flush())
+
+          // 4. flushDurable() 回傳 false（持久化失敗）
+          assertFalse("flushDurable() must return false due to durable store failure", sink.flushDurable())
+
+          // 5. shutdown 不會因此將健康的 pending core 誤標為 drain timeout
+          sink.shutdown()?.join()
+          assertEquals(listOf("faulty-core"), sink.interruptedRunIds())
+          assertTrue("healthy core must not be pending", sink.pendingRunIds().isEmpty())
+          assertTrue(
+            "healthy core must have persisted to store successfully",
+            store.events.any { it.runId == "healthy-core" },
+          )
+        }
+      }
     } finally {
       exec.shutdown()
     }

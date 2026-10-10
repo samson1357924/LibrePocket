@@ -246,6 +246,12 @@ class TurnController(
 
     /** Spec §4: at most 4 images per turn; extras are omitted. */
     const val MAX_IMAGES_PER_TURN = 4
+
+    /**
+     * Aggregate request context char cap (R2-6). Equal to RoomSessionStore.MAX_TEXT_CHARS.
+     * Prevents unbounded payload explosion across large resumed history + live messages.
+     */
+    const val MAX_REQUEST_CHARS = 100_000
   }
 
   init {
@@ -306,6 +312,14 @@ class TurnController(
    * loses prefix context.
    */
   val droppedHistoryCount: Int = (initialHistory.size - cappedHistory.size).coerceAtLeast(0)
+
+  private val _lastRequestTrimmedCount = AtomicInteger(0)
+
+  /**
+   * Number of messages trimmed from the head of the request to fit within [MAX_REQUEST_CHARS] (R2-6).
+   * Observable counterpart to request-level context trimming.
+   */
+  val lastRequestTrimmedCount: Int get() = _lastRequestTrimmedCount.get()
 
   private var inFlight: Job? = null
   private val steerQueue: ArrayDeque<PendingSteer> = ArrayDeque()
@@ -668,6 +682,18 @@ class TurnController(
     }
     return orderedTranscript.flush(timeoutMs)
   }
+
+  /** True if any admitted transcript event encountered a durable store failure or interruption. */
+  fun hasDurableFailures(): Boolean = orderedTranscript.hasDurableFailures()
+
+  /**
+   * Suspends until every transcript event admitted so far is persisted and verifies
+   * that no durable store failure occurred.
+   *
+   * Returns true only when [flushTranscript] drains within [timeoutMs] AND [hasDurableFailures] is false.
+   */
+  suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
+    flushTranscript(timeoutMs) && !hasDurableFailures()
 
   /**
    * Core runIds admitted but never acked (drain timeout / seal race).
@@ -1256,7 +1282,17 @@ class TurnController(
       warnOnTimeContextDegraded(block)
       base[lastUser] = base[lastUser].copy(text = base[lastUser].text + "\n\n" + block)
     }
-    return ChatRequest(model = model, messages = base)
+
+    var totalChars = base.sumOf { it.text.length }
+    var dropCount = 0
+    val maxDropLimit = if (lastUser >= 0) lastUser else (base.size - 1).coerceAtLeast(0)
+    while (dropCount < maxDropLimit && totalChars > MAX_REQUEST_CHARS) {
+      totalChars -= base[dropCount].text.length
+      dropCount++
+    }
+    _lastRequestTrimmedCount.set(dropCount)
+    val finalMessages = if (dropCount > 0) base.drop(dropCount) else base
+    return ChatRequest(model = model, messages = finalMessages)
     // NOTE (PR#1 scope-down): tools deliberately NOT attached here.
     // ChatRequest.tools may only carry ToolRegistry.visibleTools() output
     // (projection + executionReady); all 41 tools are executionReady=false

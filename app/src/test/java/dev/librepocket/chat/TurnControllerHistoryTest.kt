@@ -245,4 +245,81 @@ class TurnControllerHistoryTest {
             c.close()
         }
     }
+
+    @Test fun aggregateRequestContextCapTruncatesOldestFirst() {
+        val provider = HistoryFakeProvider(doneOnce())
+        var n = 0
+        // Create 8 history messages of 18,000 chars each = 144,000 chars.
+        val historyList = (0 until 8).map { i ->
+            val role = if (i % 2 == 0) "user" else "assistant"
+            ChatMessage(role = role, text = "hist-$i: " + "x".repeat(17990))
+        }
+        val c = TurnController(
+            provider = provider,
+            policy = HistoryAllowPolicy(),
+            dispatcher = Dispatchers.Default,
+            sleeper = {},
+            newId = { "agg-${n++}" },
+            initialHistory = historyList,
+        )
+        try {
+            val latestUserText = "latest user: " + "y".repeat(17985)
+            runBlocking { c.send(latestUserText) }
+            val req = provider.seenRequests.single()
+            val totalChars = req.messages.sumOf { it.text.length }
+            assertTrue(
+                "total request chars must be <= MAX_REQUEST_CHARS, was $totalChars",
+                totalChars <= TurnController.MAX_REQUEST_CHARS,
+            )
+            val lastMsg = req.messages.last()
+            assertEquals("user", lastMsg.role)
+            assertTrue(
+                "latest user message must be completely preserved",
+                lastMsg.text.startsWith(latestUserText),
+            )
+            // Initial chars = 8 * 18,000 + ~18,000 (user) + time context (~100) = ~162,100
+            // Dropping msg 0 (18,000) -> ~144,100
+            // Dropping msg 1 (18,000) -> ~126,100
+            // Dropping msg 2 (18,000) -> ~108,100
+            // Dropping msg 3 (18,000) -> ~90,100 <= 100,000
+            // Exactly 4 messages trimmed.
+            assertEquals(4, c.lastRequestTrimmedCount)
+            assertEquals(8 + 1 - 4, req.messages.size)
+            assertEquals("hist-4", req.messages[0].text.substring(0, 6))
+        } finally {
+            c.close()
+        }
+    }
+
+    @Test fun aggregateRequestContextCapNeverDiscardsLatestUserInput() {
+        val provider = HistoryFakeProvider(doneOnce())
+        var n = 0
+        // History has 2 messages of 20,000 chars each = 40,000 chars.
+        val historyList = listOf(
+            ChatMessage(role = "user", text = "hist-0: " + "a".repeat(19990)),
+            ChatMessage(role = "assistant", text = "hist-1: " + "b".repeat(19990)),
+        )
+        val c = TurnController(
+            provider = provider,
+            policy = HistoryAllowPolicy(),
+            dispatcher = Dispatchers.Default,
+            sleeper = {},
+            newId = { "single-${n++}" },
+            initialHistory = historyList,
+        )
+        try {
+            // Latest user message alone is 105,000 chars (> MAX_REQUEST_CHARS)
+            val hugeUserText = "huge-user: " + "z".repeat(105_000)
+            runBlocking { c.send(hugeUserText) }
+            val req = provider.seenRequests.single()
+            assertEquals(1, req.messages.size)
+            val onlyMsg = req.messages.single()
+            assertEquals("user", onlyMsg.role)
+            assertTrue(onlyMsg.text.startsWith(hugeUserText))
+            // Both history messages were trimmed, but the latest user input was NEVER discarded.
+            assertEquals(2, c.lastRequestTrimmedCount)
+        } finally {
+            c.close()
+        }
+    }
 }

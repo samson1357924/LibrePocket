@@ -226,11 +226,18 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
                     val agg = tools.getOrPut(index) { AggCall() }
                     switchTo(Kind.TOOL)
                     val idChunk = tc.string("id")?.takeIf { it.isNotEmpty() }
-                    if (idChunk != null && agg.id.isEmpty()) agg.id = idChunk
                     val fn = tc.obj("function")
                     val nameChunk = fn?.string("name")?.takeIf { it.isNotEmpty() }
-                    if (nameChunk != null && agg.name.isEmpty()) agg.name = nameChunk
                     val argsChunk = fn?.string("arguments").orEmpty()
+                    // Fail-closed aggregation budget (no silent truncation):
+                    // id/name winners are first-chunk-wins, so only genuinely
+                    // appended fragments count toward the incoming side.
+                    val incoming = argsChunk.length +
+                        (if (idChunk != null && agg.id.isEmpty()) idChunk.length else 0) +
+                        (if (nameChunk != null && agg.name.isEmpty()) nameChunk.length else 0)
+                    requireToolAggBudget(agg.id.length + agg.name.length + agg.args.length, incoming)
+                    if (idChunk != null && agg.id.isEmpty()) agg.id = idChunk
+                    if (nameChunk != null && agg.name.isEmpty()) agg.name = nameChunk
                     agg.args.append(argsChunk)
                     out.add(StreamEvent.ToolDelta(index, idChunk, nameChunk, argsChunk))
                 }

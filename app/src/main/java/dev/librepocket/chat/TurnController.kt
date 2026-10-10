@@ -7,7 +7,9 @@ import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderFailure
+import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.provider.requireToolAggBudget
 import dev.librepocket.redact.Redactor
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -74,6 +76,60 @@ class PolicyEvaluationException(cause: Exception) :
 /** Fresh chat.send policy requires approval; this build has no interactive consent flow. */
 class ApprovalRequiredException : Exception("chat.send approval required")
 
+/**
+ * Outgoing context window for one [ChatRequest] (Current, minimal).
+ *
+ * Mirrors the ledger branch's `HistoryWindowCap` shape (kept identical on
+ * purpose so the pending merge converges): oldest-first truncation at
+ * whole-message boundaries. Tool-pair integrity is structural — tool calls
+ * ride inline in their assistant block (`[tool:name args]` marker text, never
+ * separate provider `tool` messages) — so whole-message truncation can never
+ * detach a tool result from its call. Any truncation is observable via
+ * [TurnController.droppedHistoryCount], never silent.
+ *
+ * The default is [Unbounded] (window everything, truncate nothing): no
+ * on-device token/context measurement exists in this branch to justify a
+ * tighter default (TODO #16: measure real session sizes before fixing a
+ * number). [MaxMessages]/[MaxChars] exist so callers and tests can lock the
+ * truncation behavior today.
+ */
+sealed interface HistoryWindowCap {
+  data object Unbounded : HistoryWindowCap
+  data class MaxMessages(val maxMessages: Int) : HistoryWindowCap {
+    init {
+      require(maxMessages > 0) { "maxMessages must be positive" }
+    }
+  }
+  data class MaxChars(val maxChars: Int) : HistoryWindowCap {
+    init {
+      require(maxChars > 0) { "maxChars must be positive" }
+    }
+  }
+}
+
+/**
+ * Oldest-first, whole-message truncation for an outgoing request copy.
+ * Whole messages only (tool-pair integrity is structural, see above). A
+ * single newest message that already exceeds a char budget is still kept
+ * whole — truncation drops messages, never splits one — so at least the
+ * newest message always survives.
+ */
+internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap): List<ChatMessage> =
+  when (cap) {
+    is HistoryWindowCap.Unbounded -> history
+    is HistoryWindowCap.MaxMessages -> history.takeLast(cap.maxMessages)
+    is HistoryWindowCap.MaxChars -> {
+      var kept = 0
+      var chars = 0
+      for (m in history.asReversed()) {
+        if (kept > 0 && chars + m.text.length > cap.maxChars) break
+        chars += m.text.length
+        kept++
+      }
+      history.takeLast(kept)
+    }
+  }
+
 /** A direct admission cannot overtake queued work that still needs explicit recovery. */
 class RecoveryRequiredException : IllegalStateException("queued turn recovery required before admission")
 
@@ -113,6 +169,22 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  * `isPartial=true` and the next attempt starts a new assistant block instead
  * of backfilling the old one.
  *
+ * Aggregation budget: ToolDelta fragments (args/id/name) for one tool index
+ * share one memory budget (see `MAX_TOOL_CALL_AGG_BYTES`); exceeding it ends
+ * the attempt with typed non-retryable `TOOL_ARGS_TOO_LARGE` (never silent
+ * truncation, never a retry of the poisoned stream).
+ *
+ * UI update cost: every visible delta still performs one UI update (streaming
+ * visibility and cancel snapshots depend on it), so no batching cadence is
+ * claimed. The cost is observable via [streamedTextDeltaCount],
+ * [uiTextUpdateCount] and [uiTextCopiedChars] as the measured baseline for a
+ * future throttle (TODO #16: measure on-device first; no unmeasured
+ * threshold is hardcoded here).
+ *
+ * Context window: the outgoing request carries [historyCap] (default
+ * Unbounded — zero behavior change); truncation is oldest-first,
+ * whole-message, and counted on [droppedHistoryCount].
+ *
  * Ephemeral runtime time context (Phase 2): every outgoing [ChatRequest]
  * carries a [buildRuntimeTimeContext] block appended to a **copy** of the last
  * user message. The block never touches [_uiState] (no [UiMessage] residue)
@@ -145,6 +217,7 @@ class TurnController(
   private val userTimezone: String? = null,
   private val sessionStart: Instant? = null,
   private val systemZone: () -> ZoneId = ZoneId::systemDefault,
+  private val historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
 ) {
   companion object {
     const val POLICY_ACTION = "chat.send"
@@ -171,6 +244,47 @@ class TurnController(
 
   /** Last usage reported by the provider (billing/context accounting; P1 records only). */
   var lastUsage: StreamEvent.Usage? = null
+    private set
+
+  /**
+   * Messages dropped from the last outgoing request by [historyCap] (0 when
+   * [HistoryWindowCap.Unbounded]). The observable counterpart to context
+   * truncation: the request copy never silently loses history. Updated on
+   * every [buildRequest]; the UI list and transcript keep everything.
+   */
+  var droppedHistoryCount: Int = 0
+    private set
+
+  /**
+   * Visible-text deltas collected this controller lifetime (text + reasoning).
+   * Together with [uiTextUpdateCount]/[uiTextCopiedChars] this makes the
+   * per-delta UI-update cost observable for the future throttle decision
+   * (TODO #16): today every delta still performs one UI update (streaming
+   * visibility and the cancel-before-flush snapshot depend on it — see
+   * `cancelStopsStreamFastAndKeepsPartial`), so no batching cadence is
+   * claimed here.
+   *
+   * TODO(#16): measure delta inter-arrival rates and Compose frame times on
+   * a mid-range device across representative sessions FIRST, then introduce a
+   * count- or time-based flush throttle justified by those numbers. An
+   * unmeasured threshold must not be hardcoded; until it lands these counters
+   * are the observable baseline (a throttle must reduce [uiTextUpdateCount]
+   * and [uiTextCopiedChars] while keeping cancellation snapshots exact).
+   */
+  var streamedTextDeltaCount: Int = 0
+    private set
+
+  /** UI text writes performed (one per non-empty visible write; tool markers included). */
+  var uiTextUpdateCount: Int = 0
+    private set
+
+  /**
+   * Chars copied by immutable UI text updates (prior block length + delta
+   * length per write, tool markers included). This is the quadratic term a
+   * future throttle must cut; exact under the controller's single-writer
+   * discipline.
+   */
+  var uiTextCopiedChars: Long = 0
     private set
 
   private var inFlight: Job? = null
@@ -758,11 +872,30 @@ class TurnController(
           // that an implementation emits after Done or Failed.
           if (done || failed != null) return@collect
           when (event) {
-            is StreamEvent.TextDelta -> appendAssistantText(attemptRunId, event.delta)
+            is StreamEvent.TextDelta -> {
+              streamedTextDeltaCount++
+              appendAssistantText(attemptRunId, event.delta)
+            }
             // Reasoning stays in the same assistant block: P1 keeps one visible
             // stream and never loses thinking content.
-            is StreamEvent.ReasoningDelta -> appendAssistantText(attemptRunId, event.delta)
+            is StreamEvent.ReasoningDelta -> {
+              streamedTextDeltaCount++
+              appendAssistantText(attemptRunId, event.delta)
+            }
             is StreamEvent.ToolDelta -> {
+              // Fail-closed per-call aggregation budget: a hostile stream of
+              // tiny fragments (args or id/name chunks) must not grow memory
+              // without bound. Throws typed non-retryable TOOL_ARGS_TOO_LARGE
+              // (never silent truncation); the catch below skips the pending
+              // flush so poison-adjacent fragments are never recorded.
+              requireToolAggBudget(
+                (toolArgText[event.toolIndex]?.length ?: 0) +
+                  (toolIdText[event.toolIndex]?.length ?: 0) +
+                  (toolNameText[event.toolIndex]?.length ?: 0),
+                event.argsChunk.length +
+                  (event.idChunk?.length ?: 0) +
+                  (event.nameChunk?.length ?: 0),
+              )
               toolArgText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
               event.idChunk?.let {
                 if (it.isNotEmpty()) toolIdText.getOrPut(event.toolIndex) { StringBuilder() }.append(it)
@@ -802,7 +935,13 @@ class TurnController(
         throw e
       } catch (e: ProviderFailure) {
         failed = StreamEvent.Failed(e.message ?: "provider error", retryable = e.retryable)
-        flushPendingTools()
+        if (e.code != ProviderFailureCode.AGG_TOO_LARGE) {
+          flushPendingTools()
+        }
+        // AGG_TOO_LARGE is this collector's own guard: fail closed without
+        // recording poison-adjacent pending tools (the typed terminal error
+        // is the observable record). Visible text is already current because
+        // text updates stay per-delta (see uiTextUpdateCount).
       } catch (e: Exception) {
         failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
         flushPendingTools()
@@ -848,16 +987,23 @@ class TurnController(
    * [ChatRequest]. The current user message is already in [uiState] (appended
    * by [send] before the turn starts), so images attach to the last user line.
    *
+   * Context window: [historyCap] truncates a **copy** of the settled
+   * non-partial history oldest-first at whole-message boundaries before
+   * images/time-block attach. UI state and transcript keep everything; only
+   * the outgoing request is windowed. The drop count is published on
+   * [droppedHistoryCount] (0 when Unbounded), never silent.
+   *
    * Ephemeral time context: a [buildRuntimeTimeContext] block is appended to a
    * copy of the last user message only. No user message means no injection
    * (never fabricates a message for the clock). UI state and transcript keep
    * the raw user text.
    */
   private fun buildRequest(images: List<ChatImageRef>): ChatRequest {
-    val base = _uiState.value.messages
+    val settled = _uiState.value.messages
       .filter { !it.isPartial }
       .map { ChatMessage(role = it.role, text = it.text) }
-      .toMutableList()
+    val base = applyHistoryCap(settled, historyCap).toMutableList()
+    droppedHistoryCount = (settled.size - base.size).coerceAtLeast(0)
     val loaded = runCatching { imageLoader(images) }.getOrDefault(emptyList())
     if (loaded.isNotEmpty()) {
       val lastUser = base.indexOfLast { it.role == "user" }
@@ -935,6 +1081,7 @@ class TurnController(
 
   private fun appendAssistantText(runId: String, delta: String) {
     if (delta.isEmpty()) return
+    val prior = _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
     _uiState.update { s ->
       s.copy(
         messages = s.messages.map { m ->
@@ -942,6 +1089,8 @@ class TurnController(
         },
       )
     }
+    uiTextUpdateCount++
+    uiTextCopiedChars += prior + delta.length
   }
 
   private fun finalizeAssistant(runId: String) {

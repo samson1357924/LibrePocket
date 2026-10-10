@@ -49,3 +49,36 @@ sealed interface StreamEvent {
     /** Retry notice (attempt counter + wait); UI shows "retrying i/n...". */
     data class Retrying(val attempt: Int, val maxAttempts: Int, val delayMs: Long) : StreamEvent
 }
+
+/**
+ * Per-tool-call aggregation budget (chars across `args + id + name`
+ * fragments for one tool index, estimated ×3 to bytes).
+ *
+ * The value reuses the measured single-SSE-line memory budget
+ * ([SseFrameParser.MAX_LINE_BYTES]): no per-tool measured budget exists yet
+ * (TODO #16: measure real tool-payload sizes across sessions before fixing a
+ * dedicated number), so one tool call's aggregate may never exceed what a
+ * single line may already hold. Exceeding it throws a non-retryable typed
+ * [ProviderFailure] ([TOOL_ARGS_TOO_LARGE]) instead of silently truncating.
+ */
+internal const val MAX_TOOL_CALL_AGG_BYTES = 1024 * 1024
+
+/** Typed aggregation-overflow failure, distinct from malformed/ignored payloads and `SSE_TRUNCATED`. */
+internal const val TOOL_ARGS_TOO_LARGE = "TOOL_ARGS_TOO_LARGE"
+
+/**
+ * Fail-closed aggregation guard shared by every ToolDelta→ToolDone
+ * aggregator (all three protocol mappers plus TurnController's collector).
+ * [currentChars] is the already-buffered `args + id + name` length for one
+ * tool index, [incomingChars] the fragments about to be appended. The ×3
+ * char→byte estimate mirrors [SseFrameParser]'s worst-case CJK heuristic so
+ * the same 1 MiB memory budget holds on every path.
+ *
+ * @throws ProviderFailure non-retryable, [ProviderFailureCode.AGG_TOO_LARGE].
+ */
+internal fun requireToolAggBudget(currentChars: Int, incomingChars: Int) {
+    val estimatedBytes = (currentChars.toLong() + incomingChars.toLong()) * 3L
+    if (estimatedBytes > MAX_TOOL_CALL_AGG_BYTES) {
+        throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+    }
+}

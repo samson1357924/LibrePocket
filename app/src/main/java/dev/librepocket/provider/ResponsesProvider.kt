@@ -200,6 +200,9 @@ internal class ResponsesMapper(val round: Int = 0) {
                 val itemId = root.string("item_id") ?: return emptyList()
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 val frag = root.string("delta").orEmpty()
+                // Fail-closed: a hostile stream of tiny fragments must not
+                // grow one call's aggregate without bound (typed, non-retryable).
+                requireToolAggBudget(agg.id.length + agg.name.length + agg.args.length, frag.length)
                 agg.args.append(frag)
                 out.add(StreamEvent.ToolDelta(agg.toolIndex, null, null, frag))
             }
@@ -214,7 +217,13 @@ internal class ResponsesMapper(val round: Int = 0) {
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 item.string("call_id")?.takeIf { it.isNotEmpty() }?.let { agg.id = it }
                 item.string("name")?.takeIf { it.isNotEmpty() }?.let { agg.name = it }
-                item.string("arguments")?.let { if (agg.args.isEmpty()) agg.args.append(it) }
+                item.string("arguments")?.let { full ->
+                    if (agg.args.isEmpty() && full.isNotEmpty()) {
+                        // A single terminal payload is bounded like fragments.
+                        requireToolAggBudget(agg.id.length + agg.name.length, full.length)
+                        agg.args.append(full)
+                    }
+                }
                 if (agg.id.isEmpty()) agg.id = "call_" + UUID.randomUUID().toString().take(8)
                 emittedToolIds.add(agg.toolIndex to agg.id)
                 out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))

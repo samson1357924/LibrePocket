@@ -10,11 +10,14 @@ import java.security.MessageDigest
  *
  * - 作用域限定在 [root] 之下：任何穿越/絕對路徑在 [resolve] 即拋
  *   [IllegalArgumentException]，不觸碰檔案系統。
- * - Symlink 政策（選項 a：禁 symlink，NOFOLLOW 語義）：[root] 自身與
- *   目標路徑上每一路徑段若為 symlink 即拒絕（[resolve] 拋
- *   [IllegalArgumentException]）；點存取（read/write/exists/delete）
+ * - Symlink 政策（選項 a：禁 symlink，NOFOLLOW 語義）：[root] 自身、
+ *   構成 [root] 的每一詞法路徑段，以及目標路徑上每一路徑段若為 symlink
+ *   即拒絕（[resolve] 拋 [IllegalArgumentException]）；點存取（read/write/exists/delete）
  *   語義一致。列目（[list]）不跟隨任何連結：遇 symlink 直接略過、
  *   不下鑽，並以已造訪正規目錄集合防循環。
+ *   信任邊界：呼叫方須傳入可信正規根（例如 `filesDir.canonicalFile` 直建的
+ *   app 私有域），不得傳入不可信別名；`alias/.`、`alias/sub` 類毒根一律拒絕。
+ *   若傳入非正規系統別名路徑，將 fail-closed 拒絕，呼叫方應改傳正規路徑。
  * - 寫入冪等：內容相同即回 [WriteOutcome.Unchanged] 且不改 mtime；
  *   不同才原子落盤（同目錄暫存 +搬移），回 Created/Updated。
  * - 寫前驗 parent chain：[write] 在建父目錄前後各驗一次鏈上無
@@ -76,14 +79,15 @@ class ScopedFileStore(val root: File) {
 
     /**
      * 驗證自 [root] 至目標的每一路徑段（含兩端）皆非 symlink。
+     * 另驗構成 [root] 自身的每一詞法路徑段（防 `alias/.`、`alias/sub`
+     * 類毒根：`Files.isSymbolicLink(alias/.)` 為 false，但父段 `alias`
+     * 仍是連結，必須拒絕）。
      * 不跟隨連結（NOFOLLOW）；懸空連結同樣拒絕。僅做單次檢查，
      * 不防檢查-使用之間的併發替換（見類註解）。
      */
     private fun ensureNoSymlinkChain(safe: String, original: String) {
         try {
-            if (Files.isSymbolicLink(root.toPath())) {
-                throw IllegalArgumentException("symlink not allowed: $original")
-            }
+            ensureRootChainNoSymlink(original)
             var cur = root
             for (seg in safe.split("/")) {
                 cur = File(cur, seg)
@@ -95,6 +99,36 @@ class ScopedFileStore(val root: File) {
             throw e
         } catch (e: Exception) {
             // fail-closed：無法判定是否為連結時一律拒絕。
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
+    }
+
+    /**
+     * 驗構成 [root] 的每一詞法路徑段皆非 symlink。
+     * 以 [FileScope.normalize] 先折疊尾端 `/.`、`sub/..`，再逐段 lstat；
+     * 不存在路徑回 false（缺席根仍可檢查已存在的毒父段）。
+     * 呼叫方須傳正規可信根；非正規系統別名將 fail-closed，屬預期行為。
+     */
+    private fun ensureRootChainNoSymlink(original: String) {
+        val rootNorm = FileScope.normalize(root.absolutePath)
+        if (rootNorm.isEmpty()) {
+            throw IllegalArgumentException("symlink check failed: $original")
+        }
+        try {
+            val parts = rootNorm.split("/").filter { it.isNotEmpty() }
+            var cur = File("/")
+            if (Files.isSymbolicLink(cur.toPath())) {
+                throw IllegalArgumentException("symlink not allowed: $original")
+            }
+            for (part in parts) {
+                cur = File(cur, part)
+                if (Files.isSymbolicLink(cur.toPath())) {
+                    throw IllegalArgumentException("symlink not allowed: $original")
+                }
+            }
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
             throw IllegalArgumentException("symlink check failed: $original", e)
         }
     }
@@ -176,9 +210,7 @@ class ScopedFileStore(val root: File) {
         }
         ensureNoSymlinkChain(safe, original)
         try {
-            if (Files.isSymbolicLink(root.toPath())) {
-                throw IllegalArgumentException("symlink not allowed: $original")
-            }
+            ensureRootChainNoSymlink(original)
             var cur = root
             for (i in 0 until segs.size - 1) {
                 if (Files.isSymbolicLink(cur.toPath())) {
@@ -209,7 +241,11 @@ class ScopedFileStore(val root: File) {
      * 殘餘：回傳檔名本身即洩露存在性，呼叫方不得將列目結果視為授權證明；
      * 併發替換下僅保證快照有界（不跟隨、不懸掛），不保證與某次檢查原子一致。 */
     fun list(relativePrefix: String = ""): List<String> {
-        if (Files.isSymbolicLink(root.toPath())) return emptyList()
+        try {
+            ensureRootChainNoSymlink(relativePrefix.ifEmpty { "<root>" })
+        } catch (_: IllegalArgumentException) {
+            return emptyList()
+        }
         val base = if (relativePrefix.isEmpty()) {
             root
         } else {

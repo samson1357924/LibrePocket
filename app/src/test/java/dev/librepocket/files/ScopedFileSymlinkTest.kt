@@ -130,6 +130,45 @@ class ScopedFileSymlinkTest {
         assertTrue(store.list().isEmpty())
     }
 
+    @Test fun rootAliasDotDenied() {
+        // P1: root=alias/. 词法上看似在 ws 下，但 alias 本身是指外連結；
+        // Files.isSymbolicLink(alias/.) 为 false，必须檢查父段 alias。
+        val parent = Files.createTempDirectory("ws-alias-dot").toFile().apply { deleteOnExit() }
+        val out = outside()
+        File(out, "secret.txt").writeText("OUTSIDE")
+        val alias = File(parent, "alias")
+        link(alias, out)
+        val store = ScopedFileStore(File(alias, "."))
+        assertRejected({ store.resolve("secret.txt") }, "alias/. resolve")
+        assertRejected({ store.read("secret.txt") }, "alias/. read")
+        assertRejected({ store.write("evil.txt", "x".toByteArray()) }, "alias/. write")
+        assertRejected({ store.exists("secret.txt") }, "alias/. exists")
+        assertRejected({ store.delete("secret.txt") }, "alias/. delete")
+        assertTrue("alias/. list must be empty", store.list().isEmpty())
+        assertEquals("OUTSIDE", File(out, "secret.txt").readText())
+        assertFalse(File(out, "evil.txt").exists())
+    }
+
+    @Test fun rootAliasSubdirDenied() {
+        // P1: root=alias/existingSubdir，中段 alias 指外，同樣必須拒絕。
+        val parent = Files.createTempDirectory("ws-alias-sub").toFile().apply { deleteOnExit() }
+        val out = outside()
+        File(out, "secret.txt").writeText("OUTSIDE")
+        File(out, "existingSubdir").mkdirs()
+        File(out, "existingSubdir/inner.txt").writeText("OUTSIDE-INNER")
+        val alias = File(parent, "alias")
+        link(alias, out)
+        val store = ScopedFileStore(File(alias, "existingSubdir"))
+        assertRejected({ store.resolve("inner.txt") }, "alias/sub resolve")
+        assertRejected({ store.read("inner.txt") }, "alias/sub read")
+        assertRejected({ store.write("evil.txt", "x".toByteArray()) }, "alias/sub write")
+        assertRejected({ store.exists("inner.txt") }, "alias/sub exists")
+        assertRejected({ store.delete("inner.txt") }, "alias/sub delete")
+        assertTrue("alias/sub list must be empty", store.list().isEmpty())
+        assertEquals("OUTSIDE-INNER", File(out, "existingSubdir/inner.txt").readText())
+        assertFalse(File(out, "existingSubdir/evil.txt").exists())
+    }
+
     @Test fun nestedSymlinkDenied() {
         val ws = workspace()
         val out = outside()

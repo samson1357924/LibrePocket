@@ -27,6 +27,7 @@
 | `foss` | `.foss` application ID；Foss manifest/source set 有 accessibility service 與 OSS vision dependencies | 與 `github` 有相同能力或已由 F-Droid 發布 |
 | `github` | `.github` application ID；含 accessibility service 及 GitHub-only ML Kit/Azure Speech/Shizuku dependencies | 「完整版」意指所有設計能力均已接線 |
 | Backup | manifest 設 `allowBackup=true`；XML rules 排除 key-specific paths | transcript、preferences、audit 都不會進入 Android backup |
+| 語音 UI 手勢直連 | `ChatScreen` 直連系統引擎：使用者逐次手勢 + 同名開關（`voice_input`/`voice_output`）門禁；引擎失敗經 `voiceError` 可觀察；引擎資料處理已揭露 | 直連等同政策授權；模型可經工具鏈執行語音（模型側 `executionReady=false` 維持未啟用） |
 
 `foss` 和 `github` 在某些 source/service 形狀上相似，不代表依賴、bridge 或能力相同。Flavor distribution/source-of-truth 見 [README](../README.md)、[Architecture](ARCHITECTURE.md) 與 [Threat Model](THREAT_MODEL.md)。
 

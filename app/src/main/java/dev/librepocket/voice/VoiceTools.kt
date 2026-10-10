@@ -19,6 +19,10 @@ import dev.librepocket.redact.Redactor
  *   前一律走 [Redactor.redact]（該類寫路徑已全覆蓋，此處再收斂一次）；
  * - 音檔不落地：麥克風音訊只駐留記憶體，絕不寫檔；
  * - 送雲（Azure）前再 redact 一次，設定頁明示此行為。
+ * - 系統 TTS 手勢路徑採明確揭露（逐則點按 + 引擎揭露文案，
+ *   見 [VoiceTts.SPEAK_BUTTON_DESCRIPTION][dev.librepocket.voice.VoiceTts]），
+ *   不做送引擎前 redact（避免朗讀遮罩 token；可見原文即使用者點按的當則訊息）；
+ *   雲端（Azure）自動上傳路徑維持送雲前 redact（[redactForCloud]）。
  */
 object VoiceTools {
 

@@ -359,6 +359,12 @@ class ChatSessionLifecycleTest {
             withTimeout(5_000) { live.hostEntered.await() }
 
             chatMain.run { vm.sendDirect("second") }
+            // Determinism barrier: the two queued sends admit asynchronously
+            // (IO policy/endpoint read + session mutex), so submitting both
+            // back-to-back lets arrival order race and flips FIFO order
+            // ([third, second]). Await the first queue record before
+            // submitting the second; FIFO intent (oldest first) is unchanged.
+            withTimeout(5_000) { while (live.steered.size < 1) delay(1) }
             chatMain.run { vm.sendDirect("third") }
             withTimeout(5_000) { while (live.steered.size < 2) delay(1) }
             assertEquals(listOf("second", "third"), live.steered.toList())

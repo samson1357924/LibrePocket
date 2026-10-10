@@ -137,8 +137,12 @@ class ChatWiringTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
-        val vm = newVm(store, fake)
+        // Determinism: save before VM creation, as every sibling test does.
+        // Creating the VM first races the initial null→endpoint observation
+        // against send: the send can self-invalidate as Stale and drop,
+        // so awaitTrue never reaches IDLE+2 and times out.
         runBlocking { store.save(sampleEndpoint()) }
+        val vm = newVm(store, fake)
         onMain { vm.onInputChange("hi") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.sessionState.value.messages.size == 2 }

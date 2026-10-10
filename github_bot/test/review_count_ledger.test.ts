@@ -1320,6 +1320,389 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       for (let i = 0; i < 5; i += 1) assert.ok(stamped.includes(`HFBLOCK${i}`), `BLOCK ${i} kept by priority`);
     }
 
+    // --- Test 15 (Phase 1): 300 SHAs x1~2 + 300 claims stay fully readable. ---
+    // Seed A:2 plus 300 synthetic SHAs with alternating 1~2 counts and one
+    // claim per synthetic SHA. buildStampedBody must fit, the footer must
+    // match both sizes, and a readStickyLedger re-read must match both sizes
+    // with A:2 intact and no entry lost.
+    {
+      const ledger = new Map<string, number>([[SHA_A, 2]]);
+      for (let i = 0; i < 300; i += 1) ledger.set(synthSha(i), (i % 2) + 1);
+      const claims = new Set<string>();
+      for (let i = 0; i < 300; i += 1) claims.add(`${synthSha(i)}:run-t15-${i}:1`);
+      assert.equal(ledger.size, 301, '300 synthetic SHAs plus A');
+      assert.equal(claims.size, 300, 'one claim per synthetic SHA');
+      const visibleBase = '<!-- PocketGuard-review -->\n\n## PocketGuard 審查\n';
+      const measured = buildStampedBodyWithLength(visibleBase, ledger, claims, undefined, undefined, undefined);
+      assert.equal(measured.requiredLength, measured.body.length, 'requiredLength is exact');
+      assert.equal(measured.fits, true, '300+300 stamped body fits the hard limit');
+      assert.ok(measured.body.length <= GITHUB_COMMENT_HARD_LIMIT, `stamped fits (got ${measured.body.length})`);
+      const footer = parseLedgerFooter(measured.body);
+      assert.ok(footer, 'stamped body carries a ledger footer');
+      assert.equal(footer!.counts, ledger.size, 'footer counts match the ledger');
+      assert.equal(footer!.claims, claims.size, 'footer claims match the claim set');
+      const parsedLedger = parseReviewCountLedger(measured.body);
+      const parsedClaims = parseReviewClaimSet(measured.body);
+      assert.equal(parsedLedger.size, ledger.size, 'all counts parse');
+      assert.equal(parsedClaims.size, claims.size, 'all claims parse');
+      assert.equal(
+        estimateStickyMetadataLength(parsedLedger, parsedClaims),
+        estimateStickyMetadataLength(ledger, claims),
+        'estimate is stable across a parse round-trip',
+      );
+      assert.equal(verifyLedgerFooter(measured.body, parsedLedger, parsedClaims), true, 'fresh footer verifies');
+      assert.equal(parsedLedger.get(SHA_A), 2, 'A:2 survives 300 other SHAs');
+      for (const idx of [0, 1, 42, 299]) {
+        assert.equal(parsedLedger.get(synthSha(idx)), (idx % 2) + 1, `synthetic SHA ${idx} keeps its 1~2 count`);
+        assert.ok(parsedClaims.has(`${synthSha(idx)}:run-t15-${idx}:1`), `claim ${idx} survives stamping`);
+      }
+      const state = makeState({
+        comments: [{ id: 7, body: measured.body, user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+      });
+      const reread = await readStickyLedger(makeClient(state), 'sample', 'repository', 41);
+      assert.equal(reread.ok, true, 'large sticky re-reads cleanly with a valid footer');
+      if (reread.ok) {
+        assert.equal(reread.ledger.size, ledger.size, 're-read ledger size matches');
+        assert.equal(reread.claims.size, claims.size, 're-read claim size matches');
+        assert.equal(reread.ledger.get(SHA_A), 2, 'A:2 survives the sticky re-read');
+        for (const idx of [0, 1, 42, 299]) {
+          assert.equal(reread.ledger.get(synthSha(idx)), (idx % 2) + 1, `re-read SHA ${idx} intact`);
+        }
+        assert.ok(reread.claims.has(`${synthSha(42)}:run-t15-42:1`), 're-read claim marker intact');
+        assert.equal(verifyLedgerFooter(reread.body, reread.ledger, reread.claims), true, 're-read footer verifies');
+        const rereadFooter = parseLedgerFooter(reread.body);
+        assert.equal(rereadFooter!.counts, ledger.size, 're-read footer counts match');
+        assert.equal(rereadFooter!.claims, claims.size, 're-read footer claims match');
+      }
+      assert.equal(state.comments.length, 1, 'single sticky throughout');
+    }
+
+    // --- Test 16 (Phase 1): heavy 200 findings over a large ledger keep metadata. ---
+    // A 302-entry ledger reserves metadata headroom, then a 200-finding review
+    // (5 BLOCK + rest SUGGESTION) is rendered with that reserve and stamped.
+    // Either the stamped body fits with BLOCK priority, an omission tail, and
+    // a valid footer — or the over-limit path fails closed without truncation.
+    {
+      const ledger = new Map<string, number>([[SHA_A, 2], [SHA_B, 1]]);
+      for (let i = 0; i < 300; i += 1) ledger.set(synthSha(10000 + i), 1);
+      const claims = new Set<string>([`${SHA_A}:run-hflarge:1`]);
+      const reserve = estimateStickyMetadataLength(ledger, claims);
+      assert.ok(reserve > 20000, `large ledger reserves headroom (got ${reserve})`);
+      const roles = ['chief', 'android_sec', 'android_code'] as const;
+      const output = {
+        verdict: 'NEEDS_CHANGES' as const,
+        pullRequestNumber: 41,
+        baseSha: BASE_SHA,
+        headSha: SHA_A,
+        headRepository: REPO,
+        roles: roles.map((role, roleIdx) => ({
+          role,
+          modelUsed: 'fake-model',
+          verdict: 'NEEDS_CHANGES' as const,
+          findings: Array.from({ length: roleIdx === 0 ? 100 : 50 }, (_, i) => {
+            const global = roleIdx * 100 + i;
+            const severity = global < 5 ? ('BLOCK' as const) : ('SUGGESTION' as const);
+            return {
+              severity,
+              file: `src/Heavy${global}.kt`,
+              line: global + 1,
+              issue: `${global < 5 ? `HFLBLOCK${global}` : `HFLSUG${global}`} ${'y'.repeat(800)}`,
+              suggestion: `fix it ${'z'.repeat(200)}`,
+            };
+          }),
+        })),
+        coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 0 },
+        deterministicViolations: [],
+        areaLabels: [],
+        changedFiles: ['app/src/main/java/demo/Safe.kt'],
+        changedFilesComplete: true,
+        suggestedLabels: [],
+      };
+      const visible = reviewComment(output, [], '報告行', reserve);
+      assert.ok(visible.length <= MAX_STICKY_TOTAL_LENGTH, `reserved visible stays in budget (got ${visible.length})`);
+      const measured = buildStampedBodyWithLength(visible, ledger, claims, undefined, undefined, undefined);
+      if (!measured.fits) {
+        assert.ok(measured.requiredLength > GITHUB_COMMENT_HARD_LIMIT, `over-limit large+heavy fails closed (needs ${measured.requiredLength})`);
+        assert.throws(
+          () => assertStampedBodyFits(visible, ledger, claims, undefined, undefined, undefined),
+          /comment limit/,
+          'fit-or-throw refuses to truncate metadata under heavy findings',
+        );
+      } else {
+        const stamped = measured.body;
+        assert.ok(stamped.length <= GITHUB_COMMENT_HARD_LIMIT, `stamped heavy+large fits (got ${stamped.length})`);
+        assert.equal(parseReviewCountMarker(stamped, SHA_A), 2, 'ledger metadata intact under heavy findings');
+        assert.equal(parseReviewCountMarker(stamped, SHA_B), 1);
+        assert.equal(parseReviewCountMarker(stamped, synthSha(10000)), 1, 'large-ledger entry intact');
+        assert.equal(parseReviewCountMarker(stamped, synthSha(10299)), 1, 'large-ledger tail intact');
+        assert.ok(parseReviewClaimSet(stamped).has(`${SHA_A}:run-hflarge:1`), 'claim metadata intact');
+        assert.ok(verifyLedgerFooter(stamped, parseReviewCountLedger(stamped), parseReviewClaimSet(stamped)), 'footer verifies');
+        const footer = parseLedgerFooter(stamped);
+        assert.equal(footer!.counts, ledger.size, 'footer counts match the large ledger');
+        assert.equal(footer!.claims, claims.size, 'footer claims match');
+        assert.ok(stamped.includes('共200項發現'), 'tail counts line intact');
+        assert.ok(stamped.includes('省略'), 'trimming is disclosed, not silent');
+        for (let i = 0; i < 5; i += 1) assert.ok(stamped.includes(`HFLBLOCK${i}`), `BLOCK ${i} kept by priority over SUGGESTION`);
+      }
+    }
+
+    // --- Test 17 (Phase 1): 500 counts + 500 claims already overflow, claim fails closed. ---
+    // The seed itself exceeds the hard limit; a new claim must report
+    // claimed:false/quota-unknown with reviewsUsed 0, write nothing, and leave
+    // the old ledger byte-identical with both sizes unchanged and a valid footer.
+    {
+      const seedLedger = new Map<string, number>([[SHA_A, 2]]);
+      for (let i = 0; i < 500; i += 1) seedLedger.set(synthSha(i), 1);
+      const seedClaims = new Set<string>();
+      for (let i = 0; i < 500; i += 1) seedClaims.add(`${synthSha(i)}:run-ov-${i}:1`);
+      const seedBody = buildStampedBody('<!-- PocketGuard-review -->\nold\n', seedLedger, seedClaims, undefined, undefined, undefined);
+      assert.ok(seedBody.length > GITHUB_COMMENT_HARD_LIMIT, `500+500 seed overflows (got ${seedBody.length})`);
+      const seedFooter = parseLedgerFooter(seedBody);
+      assert.ok(seedFooter, 'overflow seed carries a footer');
+      assert.equal(seedFooter!.counts, seedLedger.size, 'seed footer counts match (501)');
+      assert.equal(seedFooter!.claims, seedClaims.size, 'seed footer claims match (500)');
+      assert.equal(
+        verifyLedgerFooter(seedBody, parseReviewCountLedger(seedBody), parseReviewClaimSet(seedBody)),
+        true,
+        'overflow seed footer verifies before the refused claim',
+      );
+      const ledgerBefore = parseReviewCountLedger(seedBody).size;
+      const claimsBefore = parseReviewClaimSet(seedBody).size;
+      assert.equal(ledgerBefore, 501, 'seed holds 501 counts');
+      assert.equal(claimsBefore, 500, 'seed holds 500 claims');
+      const state = makeState({
+        comments: [{ id: 7, body: seedBody, user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+      });
+      const freshSha = synthSha(5000);
+      state.pullRequest = defaultPullRequest(freshSha);
+      const outcome = await runClaimMode({
+        event: prOpenedEvent(freshSha),
+        env: {
+          GITHUB_EVENT_NAME: 'pull_request_target',
+          GITHUB_REPOSITORY: REPO,
+          GITHUB_TOKEN: 'fake-token',
+          POCKETGUARD_RUN_ID: 'run-ov-new-1',
+        } as NodeJS.ProcessEnv,
+        githubClient: makeClient(state),
+        writeStdout: () => undefined,
+        runGit: safeGitStub(),
+      });
+      assert.equal(outcome.claimed, false, 'overflow claim is an explicit failure, not a partial write');
+      assert.match(outcome.reason, /quota-unknown/, 'overflow reports quota-unknown');
+      assert.equal(outcome.reviewsUsed, 0, 'overflow consumes no quota');
+      assert.equal(state.created, 0, 'overflow creates nothing');
+      assert.equal(state.updated, 0, 'overflow updates nothing');
+      assert.equal(state.comments[0].body, seedBody, 'old ledger preserved byte-identical');
+      assert.equal(parseReviewCountLedger(state.comments[0].body).size, ledgerBefore, 'count size unchanged');
+      assert.equal(parseReviewClaimSet(state.comments[0].body).size, claimsBefore, 'claim size unchanged');
+      assert.equal(parseReviewCountLedger(state.comments[0].body).size, 501, 'no entry lost, none added');
+      assert.equal(parseReviewClaimSet(state.comments[0].body).size, 500, 'refused claim leaves no marker');
+      assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2, 'A:2 intact after refused claim');
+      assert.equal(
+        verifyLedgerFooter(state.comments[0].body, parseReviewCountLedger(state.comments[0].body), parseReviewClaimSet(state.comments[0].body)),
+        true,
+        'footer still verifies after the refused claim',
+      );
+      const afterFooter = parseLedgerFooter(state.comments[0].body);
+      assert.equal(afterFooter!.counts, 501, 'footer counts unchanged');
+      assert.equal(afterFooter!.claims, 500, 'footer claims unchanged');
+    }
+
+    // --- Test 18 (Phase 1): workflow reporting for the claim-slot job. ---
+    // Claim outputs pass through GITHUB_OUTPUT; an over-limit claimed==false
+    // keeps every review-send PR branch false; a gate-none publish skips
+    // without touching the sticky.
+    {
+      // (a) Claim GITHUB_OUTPUT passthrough: success then overflow.
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-outputs-'));
+      try {
+        const successFile = path.join(tempDir, 'github_output_success');
+        fs.writeFileSync(successFile, '', 'utf8');
+        const successState = makeState();
+        successState.pullRequest = defaultPullRequest(SHA_A);
+        const success = await runClaimMode({
+          event: prOpenedEvent(SHA_A),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'run-out-ok-1',
+            GITHUB_OUTPUT: successFile,
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(successState),
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(success.claimed, true, 'success claim owns its slot');
+        assert.equal(success.reviewsUsed, 1);
+        const successText = fs.readFileSync(successFile, 'utf8');
+        assert.ok(successText.includes('claimed=true'), 'GITHUB_OUTPUT carries claimed=true');
+        assert.ok(successText.includes('reviews_used=1'), 'GITHUB_OUTPUT carries reviews_used=1');
+        assert.ok(successText.includes(`claim_sha=${SHA_A.toLowerCase()}`), 'GITHUB_OUTPUT carries the claim SHA');
+        assert.ok(successText.includes('claim_reason='), 'GITHUB_OUTPUT carries the claim reason');
+
+        const overflowLedger = new Map<string, number>([[SHA_A, 2]]);
+        for (let i = 0; i < 500; i += 1) overflowLedger.set(synthSha(i), 1);
+        const overflowClaims = new Set<string>();
+        for (let i = 0; i < 500; i += 1) overflowClaims.add(`${synthSha(i)}:run-out-ov-${i}:1`);
+        const overflowBody = buildStampedBody('<!-- PocketGuard-review -->\nold\n', overflowLedger, overflowClaims, undefined, undefined, undefined);
+        assert.ok(overflowBody.length > GITHUB_COMMENT_HARD_LIMIT, 'overflow fixture exceeds the limit');
+        const overflowFile = path.join(tempDir, 'github_output_overflow');
+        fs.writeFileSync(overflowFile, '', 'utf8');
+        const overflowState = makeState({
+          comments: [{ id: 7, body: overflowBody, user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        const overflowSha = synthSha(5001);
+        overflowState.pullRequest = defaultPullRequest(overflowSha);
+        const overflow = await runClaimMode({
+          event: prOpenedEvent(overflowSha),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'run-out-ov-1',
+            GITHUB_OUTPUT: overflowFile,
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(overflowState),
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(overflow.claimed, false, 'overflow claim fails closed');
+        assert.equal(overflow.reviewsUsed, 0);
+        const overflowText = fs.readFileSync(overflowFile, 'utf8');
+        assert.ok(overflowText.includes('claimed=false'), 'GITHUB_OUTPUT carries claimed=false on overflow');
+        assert.ok(overflowText.includes('reviews_used=0'), 'GITHUB_OUTPUT carries reviews_used=0 on overflow');
+        assert.ok(overflowText.includes('claim_reason='), 'GITHUB_OUTPUT carries the overflow reason');
+        assert.match(overflow.reason, /quota-unknown/, 'overflow reason is quota-unknown');
+
+        // (b) Workflow wiring: claim outputs feed review-send and publish gates.
+        const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');
+        const claimIdx = workflow.indexOf('  claim-slot:');
+        const reviewIdx = workflow.indexOf('  review-send:');
+        const publishIdx = workflow.indexOf('  publish:');
+        assert.ok(claimIdx !== -1 && reviewIdx !== -1 && publishIdx !== -1, 'claim/review/publish jobs exist');
+        const claimJob = workflow.slice(claimIdx, reviewIdx);
+        const reviewJob = workflow.slice(reviewIdx, publishIdx);
+        const publishJob = workflow.slice(publishIdx);
+        const outputsBlock = claimJob.slice(claimJob.indexOf('outputs:'), claimJob.indexOf('    steps:'));
+        assert.match(outputsBlock, /claimed:/, 'claim-slot forwards claimed');
+        assert.match(outputsBlock, /claim_sha:/, 'claim-slot forwards claim_sha');
+        assert.match(outputsBlock, /reviews_used:/, 'claim-slot forwards reviews_used');
+        const claimedGates = reviewJob.match(/needs\.claim-slot\.outputs\.claimed\s*==\s*'true'/g) ?? [];
+        assert.ok(claimedGates.length >= 2, `both PR review-send branches require the approved claim (got ${claimedGates.length})`);
+        assert.match(reviewJob, /needs:\s*\[prepare-tag,\s*claim-slot\]/, 'review-send waits for the claim');
+        assert.match(publishJob, /review_gate\s*!=\s*'none'/, 'publish skips when the gate is none');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+
+      // (c) Runtime: overflow claimed==false means zero AI; gate-none publish is a no-op.
+      {
+        const overflowLedger = new Map<string, number>([[SHA_A, 2]]);
+        for (let i = 0; i < 500; i += 1) overflowLedger.set(synthSha(6000 + i), 1);
+        const overflowClaims = new Set<string>();
+        for (let i = 0; i < 500; i += 1) overflowClaims.add(`${synthSha(6000 + i)}:run-rt-ov-${i}:1`);
+        const overflowBody = buildStampedBody('<!-- PocketGuard-review -->\nold\n', overflowLedger, overflowClaims, undefined, undefined, undefined);
+        const state = makeState({
+          comments: [{ id: 7, body: overflowBody, user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        const freshSha = synthSha(7000);
+        state.pullRequest = defaultPullRequest(freshSha);
+        const failed = await runClaimMode({
+          event: prOpenedEvent(freshSha),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'run-rt-ov-1',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(failed.claimed, false, 'overflow claim fails so review-send must stay skipped');
+        const counter = { count: 0 };
+        const restore = installCountingOpenAI(counter, { verdict: 'APPROVE', summary: 'ok', findings: [] });
+        const outputPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-rt-')), 'review.json');
+        try {
+          const reviewed = await runReviewMode({
+            event: prOpenedEvent(freshSha),
+            env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target', POCKETGUARD_OUTPUT: outputPath, POCKETGUARD_RUN_ID: 'run-rt-ov-1' }),
+            githubClient: makeClient(state),
+            writeStdout: () => undefined,
+            runGit: safeGitStub(),
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'review without its own claim falls back');
+          assert.equal(counter.count, 0, 'failed claim means zero OpenAI calls (review-send stays false)');
+        } finally {
+          restore();
+          fs.rmSync(path.dirname(outputPath), { recursive: true, force: true });
+        }
+        const bodyBefore = state.comments[0].body;
+        const createdBefore = state.created;
+        const updatedBefore = state.updated;
+        await runPublishMode({
+          event: prOpenedEvent(freshSha),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: outputPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+            POCKETGUARD_RUN_ID: 'run-rt-ov-1',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+        });
+        assert.equal(state.comments[0].body, bodyBefore, 'overflow publish leaves the sticky byte-identical');
+        assert.equal(state.created, createdBefore, 'overflow publish creates nothing');
+        assert.equal(state.updated, updatedBefore, 'overflow publish updates nothing');
+      }
+
+      // (d) Gate-none publish skips without touching the sticky.
+      {
+        const sticky = stickyBodyFor(new Map([[SHA_A, 2]]));
+        const state = makeState({
+          comments: [{ id: 7, body: sticky, user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+        });
+        state.pullRequest = defaultPullRequest(SHA_A);
+        const tagged = await runTagMode({
+          event: prOpenedEvent(SHA_A),
+          env: openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+          githubClient: makeClient(state),
+          writeStdout: () => undefined,
+          runGit: safeGitStub(),
+        });
+        assert.equal(tagged.reviewsUsed, 2);
+        assert.equal(tagged.reviewGate, 'none', 'quota-exhausted tag closes the gate');
+        const bodyBefore = state.comments[0].body;
+        const createdBefore = state.created;
+        const updatedBefore = state.updated;
+        const missingPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-ledger-gatenone-')), 'absent.json');
+        try {
+          await runPublishMode({
+            event: prOpenedEvent(SHA_A),
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: missingPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+              POCKETGUARD_RUN_ID: 'run-gate-none-rt-1',
+            } as NodeJS.ProcessEnv,
+            githubClient: makeClient(state),
+          });
+        } finally {
+          fs.rmSync(path.dirname(missingPath), { recursive: true, force: true });
+        }
+        assert.equal(state.comments[0].body, bodyBefore, 'gate-none publish leaves the sticky untouched');
+        assert.equal(state.created, createdBefore, 'gate-none publish creates nothing');
+        assert.equal(state.updated, updatedBefore, 'gate-none publish updates nothing');
+        assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 2, 'A:2 preserved');
+      }
+    }
+
     // --- Test 9 (Stage 5): workflow wiring for the claim-slot job. ---
     {
       const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');

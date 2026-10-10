@@ -3,6 +3,7 @@ package dev.librepocket.shell
 import dev.librepocket.files.FileScope
 import java.nio.file.Files
 import java.nio.file.LinkOption
+import java.nio.file.Path
 import java.nio.file.Paths
 
 /**
@@ -18,9 +19,15 @@ import java.nio.file.Paths
  *   不查 `PATH`、不看 cwd；候選經 `toRealPath()` 固定後再以 NOFOLLOW
  *   驗正規檔 + 可執行，spawn 直接用固定後的實體路徑。
  * - symlink 取捨：link 本體必須位於可信位置（詞法門），實體解析後再驗。
- *   發行版 shim（如 `/bin/echo -> .../coreutils/echo`）屬部署事實而非攻擊者
- *   可控（可信目錄 root-owned，App 不可寫；攻擊者能寫可信目錄即已等同替換
- *   二進位本體），故跟隨後驗實體；dangling / 環 / 非正規檔 / 不可執行一律拒。
+ *   實體另加兩道閘（見 [verifiedTarget]，review finding 3 S3）：
+ *   (1) containment：real 必須仍落在允許前綴集合內（預設由本次 [resolve] 的
+ *   `searchDirs` real 化快照 + [SYSTEM_REAL_PREFIXES] 組成；單測可經 `allowedRoots`
+ *   注入）。發行版合併（如 `/bin -> usr/bin`）與同集內 shim 因 real 仍在集內而
+ *   放行；指到集外 app-writable 目標（App 私有域、`/data/local/tmp` 等）一律拒。
+ *   (2) app-writability：real 本體及其 parent chain 對 App uid 必須不可寫
+ *   （經 [defaultIsWritable]，即 `Files.isWritable`；任何異常視為可寫而拒，
+ *   fail-closed；`getOwner`/POSIX 在部分 FS 會拋異常故不用）。
+ *   dangling / 環 / 非正規檔 / 不可執行 / 逃逸 / 可寫一律拒。
  * - multicall（toybox / toolbox / busybox，見 [MULTICALL_BINARIES]）：實體
  *   basename 落此顯式表時，spawn 形狀為 `[realPath, applet, ...args]`——
  *   applet 取自 `argv[0]` 的 basename（[ShellPolicy.basename]），其值已由
@@ -30,16 +37,23 @@ import java.nio.file.Paths
  *   判定只認實體 basename 的精確集合成員，不用「名不同即插」的籠統規則。
  *   toolbox 在部分舊版本／廠商改版上的 applet 傳參語義（`[real, applet, ...]`
  *   是否被接受）未經實機驗證，此處為保留說明，待 Android 實機覆蓋。
- * - 殘餘 TOCTOU：[resolve] 的實體驗證與 `ProcessBuilder.start()` 非原子，
- *   二進位替換 / link 置換競態窗口仍然存在（可信目錄 root-owned、App 不可寫，
- *   故不在本威脅模型內；參 scoped-file 分支的 check-then-act 揭露）。
+ * - 殘餘 TOCTOU（誠實揭露）：[resolve] 的實體驗證與 `ProcessBuilder.start()` 非原子，
+ *   check-then-act 窗口仍在：驗證通過到 spawn 前的二進位替換 / link 置換仍可能發生。
+ *   直接通道沒有可持的容器鎖（不像 scoped-file 可持 fd/lock 語義），spawn 前緊貼重驗
+ *   最多縮小窗口、不能消除。舊註解「可信目錄 root-owned、App 不可寫故無 TOCTOU」
+ *   只是部署假設而非驗證事實：「不可寫」現已改為執行時檢查（writability 閘），但
+ *   擁有者語義在部分 FS 不可靠、窗口仍在，故仍列殘餘風險。
+ * - 已知限制（fail-closed 可能誤殺）：real 前綴快照無法窮舉所有裝置的 overlay /
+ *   APEX 實體路徑；落在快照 + [SYSTEM_REAL_PREFIXES] 之外的合法系統二進位會被拒
+ *   （安全但可能誤殺 exotic ROM）。如遇此類裝置應回報並擴表，不得放寬為無 containment。
  * - 最小乾淨 env（[CLEAN_ENV]）：固定 `PATH` + `LANG`，其餘不繼承
  *   （`LD_PRELOAD` / `LD_LIBRARY_PATH` / `PROOT_*` / 代理變數等經 `clear()` 消除）。
  *
  * 本檔案零 Android 依賴，JVM 單測可直接斷言。
  * 提權通道（`validateElevated` / Root / Shizuku）與 Linux guest 通道
  * （`ProotExec` + `LinuxEnv.GUEST_ENV`）依本次範圍不動，只用本檔案的詞法門
- * （經 [ShellPolicy.validate] 共享路徑，僅加嚴不放寬）。
+ * （經 [ShellPolicy.validate] 共享路徑，僅加嚴不放寬）；guest 不調 [resolve]，
+ * 故 containment / writability 閘不影響 guest（S1 行為保持）。
  */
 object ShellExecutables {
 
@@ -52,6 +66,24 @@ object ShellExecutables {
         "/bin",
         "/usr/bin",
         "/usr/local/bin",
+    )
+
+    /**
+     * 系統實體前綴（containment 允許集的第二部分，見 [snapshotRealRoots]）：
+     * 正常系統 symlink 的 real 落點若逃出 bin 目錄樹（如 APEX 下的
+     * `/apex/.../bin/...`、system overlay 合併路徑），靠此表放行，避免把部屬
+     * 事實誤殺。表內全為系統分區（App 正常不可寫），真正的可寫逃逸仍由
+     * writability 閘擋下；不在快照亦不在此表的 real 落點一律 fail-closed 拒
+     * （exotic ROM 誤殺風險見檔案 KDoc，須回報擴表、不得放寬）。
+     */
+    val SYSTEM_REAL_PREFIXES: List<String> = listOf(
+        "/system",
+        "/vendor",
+        "/odm",
+        "/oem",
+        "/product",
+        "/system_ext",
+        "/apex",
     )
 
     /** 直接通道固定 `PATH`（[TRUSTED_BIN_DIRS] 串接，不取宿主 `PATH`）。 */
@@ -128,17 +160,111 @@ object ShellExecutables {
     }
 
     /**
-     * 實體驗證：存在 → `toRealPath()` 全解析固定 → NOFOLLOW 驗正規檔 + 可執行，
-     * 回傳固定後的實體路徑（spawn 直接用此路徑，不再經 link）。
-     * dangling / 環 / 指向非正規檔 / 不可執行 / 任何異常一律 null。
+     * App-uid 可寫判定（writability 閘的預設實現）：
+     * 回 true 表示「App 可寫 → 呼叫方必須拒」。`Files.isWritable` 抛異常時
+     * 回 true（fail-closed；部分 FS 的屬主/POSIX 語義不可靠，不另取 owner）。
+     * 單測可注入假判定以模擬「系統自帶不可寫」（宿主暫存檔屬主可寫，直接用
+     * 預設值會全拒；見 `ShellTrustedExecTest` 的注入註解）。
      */
-    fun verifiedTarget(candidate: String): String? {
+    fun defaultIsWritable(p: Path): Boolean {
+        return try {
+            Files.isWritable(p)
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    /**
+     * 允許前綴快照：把 [dirs] 逐一 real 化（存在即 `toRealPath` 全解析，覆蓋
+     * `/bin -> usr/bin` 類合併；不存在/異常即退回詞法正規化，不抛），再併入
+     * [SYSTEM_REAL_PREFIXES] 去重。best-effort：快照時與驗證時之間的 FS 變化
+     * 仍屬 TOCTOU 窗口（見檔案 KDoc），呼叫方不得快照一次長期重用。
+     */
+    fun snapshotRealRoots(dirs: List<String>): List<String> {
+        val out = LinkedHashSet<String>()
+        for (d in dirs) {
+            val t = d.trim()
+            if (t.isEmpty() || t.contains('\u0000')) continue
+            val real = try {
+                val p = Paths.get(FileScope.normalize(t))
+                if (Files.exists(p)) p.toRealPath().toString() else FileScope.normalize(t)
+            } catch (_: Exception) {
+                FileScope.normalize(t)
+            }
+            out.add(real)
+        }
+        for (s in SYSTEM_REAL_PREFIXES) out.add(s)
+        return out.toList()
+    }
+
+    /**
+     * real 是否落在允許前綴內（邊界感知：`==` 或 `root/…` 前綴；純詞法比對，
+     * 呼叫方保證傳入者皆為已 real 化路徑）。任何異常回 false（fail-closed）。
+     */
+    fun isUnderRoots(realPath: String, roots: List<String>): Boolean {
+        return try {
+            val r = FileScope.normalize(realPath)
+            roots.any { root ->
+                val n = FileScope.normalize(root.trim())
+                if (n.isEmpty()) false
+                else r == n || r.startsWith(n.trimEnd('/') + "/")
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * real 本體及其 parent chain 是否全不可寫（writability 閘本體）：
+     * 任一層 [isWritable] 回 true 即回 false（拒）；判定抛異常視為可寫
+     * （fail-closed）。走到 FS 根為止；空鏈視為可寫（fail-closed，不應發生）。
+     */
+    private fun chainNonWritable(real: Path, isWritable: (Path) -> Boolean): Boolean {
+        return try {
+            var cur: Path? = real
+            var seen = false
+            while (cur != null) {
+                seen = true
+                val w = try {
+                    isWritable(cur)
+                } catch (_: Exception) {
+                    true
+                }
+                if (w) return false
+                cur = cur.parent
+            }
+            seen
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * 實體驗證：存在 → `toRealPath()` 全解析固定 → NOFOLLOW 驗正規檔 + 可執行 →
+     * containment（real 落在 [allowedRoots] 內）→ writability（real 本體及
+     * parent chain 對 App uid 不可寫），回傳固定後的實體路徑（spawn 直接用此
+     * 路徑，不再經 link）。dangling / 環 / 指向非正規檔 / 不可執行 / 逃逸 /
+     * 可寫 / 任何異常一律 null。
+     *
+     * @param allowedRoots containment 前綴；null 表跳過 containment（僅既有直接
+     *   呼叫相容用；[resolve] 一律傳非 null，生產路徑必查）。單測可注入暫存
+     *   目錄快照；產品碼經 [resolve] 預設即快照（見 [snapshotRealRoots]）。
+     * @param isWritable app-uid 可寫判定（預設 [defaultIsWritable] 真查 FS；
+     *   單測可注入以模擬系統自帶不可寫）。
+     */
+    fun verifiedTarget(
+        candidate: String,
+        allowedRoots: List<String>? = null,
+        isWritable: (Path) -> Boolean = ::defaultIsWritable,
+    ): String? {
         return try {
             val p = Paths.get(candidate)
             if (!Files.exists(p)) return null
             val real = p.toRealPath()
             if (!Files.isRegularFile(real, LinkOption.NOFOLLOW_LINKS)) return null
             if (!Files.isExecutable(real)) return null
+            if (allowedRoots != null && !isUnderRoots(real.toString(), allowedRoots)) return null
+            if (!chainNonWritable(real, isWritable)) return null
             real.toString()
         } catch (_: Exception) {
             null
@@ -149,25 +275,38 @@ object ShellExecutables {
      * `argv[0]` → 已驗證 executable（spawn 前唯一解析入口，不查 `PATH`、不看 cwd）。
      *
      * - 含 `/`/`\`：父目錄必須先過詞法可信門（預設 [TRUSTED_BIN_DIRS]，
-     *   經 [searchDirs] 覆寫，見下），再經 [verifiedTarget] 實體驗證；
+     *   經 [searchDirs] 覆寫，見下），再經 [verifiedTarget] 實體驗證
+     *   （含 containment + writability 閘，允許集見下）；
      *   相對含 `/`（`./ls`、`chat/ls`）一律 null。
      * - bare：只在 [searchDirs]（預設 [TRUSTED_BIN_DIRS]，固定順序）內找；
      *   候選必須仍落在該 dir 下。呼叫方不得傳入非受控目錄（產品碼一律用預設值；
      *   單測可注入暫存目錄；絕對 `argv[0]` 的詞法門同表覆寫，使絕對路徑的
      *   全鏈（validate → resolve → spawn）可在暫存 fixture 下受測，
      *   而不必寫入系統目錄）。
+     * - containment 允許集：[allowedRoots] 非 null 即用（單測注入）；
+     *   null 時由 [snapshotRealRoots]（[searchDirs] real 化 + [SYSTEM_REAL_PREFIXES]）
+     *   現場快照。bare 與絕對 `argv[0]` 同表（S2「放行即能解析」不變）。
+     * - writability 判定：[isWritable]（預設 [defaultIsWritable]；單測可注入
+     *   以模擬系統自帶不可寫，宿主暫存檔屬主可寫故直接用預設值會全拒）。
      * - multicall：實體 basename ∈ [MULTICALL_BINARIES] 時回 [ResolvedExec]
      *   攜 `applet = argv[0]` 的 basename（呼叫方須先經 [ShellPolicy.validate]
-     *   白名單放行，本函數不管白名單）；其餘回 `applet = null`。
+     *   白名單放行，本函數不管白名單；multicall 不豁免 containment/writability，
+     *   逃逸照拒）；其餘回 `applet = null`。
      * - 本函數不管白名單（由 [ShellPolicy.validate] 先判）；回 null 呼叫方必須
      *   拒絕且不建子進程。
      */
-    fun resolve(argv0: String, searchDirs: List<String> = TRUSTED_BIN_DIRS): ResolvedExec? {
+    fun resolve(
+        argv0: String,
+        searchDirs: List<String> = TRUSTED_BIN_DIRS,
+        allowedRoots: List<String>? = null,
+        isWritable: (Path) -> Boolean = ::defaultIsWritable,
+    ): ResolvedExec? {
         val raw = argv0.trim()
         if (raw.isEmpty() || raw.contains('\u0000')) return null
+        val roots = allowedRoots ?: snapshotRealRoots(searchDirs)
         if (raw.contains('/') || raw.contains('\\')) {
             if (!isTrustedAbsoluteArgv0(raw, searchDirs)) return null
-            val real = verifiedTarget(FileScope.normalize(raw)) ?: return null
+            val real = verifiedTarget(FileScope.normalize(raw), roots, isWritable) ?: return null
             return toResolved(raw, real)
         }
         for (dir in searchDirs) {
@@ -177,7 +316,7 @@ object ShellExecutables {
             } ?: continue
             val candidate = FileScope.normalize("$dirNorm/$raw")
             if (candidate == dirNorm || !candidate.startsWith("$dirNorm/")) continue
-            val hit = verifiedTarget(candidate) ?: continue
+            val hit = verifiedTarget(candidate, roots, isWritable) ?: continue
             return toResolved(raw, hit)
         }
         return null

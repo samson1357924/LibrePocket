@@ -26,7 +26,15 @@ class ShellWhitelistTest {
 
     private fun shellWithFake(stdoutSize: Int): Pair<RestrictedShell, FakeRunner> {
         val runner = FakeRunner(ByteArray(stdoutSize) { 'x'.code.toByte() })
-        return RestrictedShell(runner = runner) to runner
+        // S3 hermetic：FakeRunner 不執行，spawn 目標永不落地；解析一律用桩，
+        // 只驗政策/配額/截斷語義。真解析覆蓋見 ShellTrustedExecTest（暫存 fixture
+        // + systemOwned 模擬裝置不可寫）。桩因：宿主 /bin/echo 實體落點隨發行版
+        // 而異（本機 -> /usr/lib/cargo/...，containment 快照外），預設解析在
+        // 此類宿主必拒，與被測語義無關。
+        return RestrictedShell(
+            runner = runner,
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+        ) to runner
     }
 
     @Test fun nonWhitelistedBinaryDeniedWithoutSpawn() {
@@ -89,12 +97,35 @@ class ShellWhitelistTest {
     }
 
     @Test fun timeoutKillsSleep() {
-        val shell = RestrictedShell()
+        // S3 下仍用宿主真 sleep：real 落點隨發行版而異（本機 cargo shim 在快照外），
+        // 故測試側把 sleep 實體父目錄併入允許集（僅測試，生產表不動；正常發行版
+        // 此為 no-op，因 real 本就在 /usr/bin 快照內）。缺 sleep 即跳過
+        // （沿既有 probe 缺失即跳過的寫法）。
+        val shell = RestrictedShell(execAllowedRoots = hostSleepRoots() ?: return)
         val startMs = System.currentTimeMillis()
         val result = shell.execute(listOf("sleep", "30"), timeoutMs = 500L)
         val elapsedMs = System.currentTimeMillis() - startMs
         assertTrue("expected TimedOut, got $result", result is ShellResult.TimedOut)
         assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 15_000L)
+    }
+
+    /**
+     * 宿主 sleep 的 containment 允許集：預設快照 + sleep 實體父目錄。
+     * 正常發行版（real 在 /usr/bin 內）等於預設快照；cargo-shim 類宿主
+     * （real 在 /usr/lib/...）靠附加項放行。找不到可執行 sleep 即回 null，
+     * 呼叫方跳過（不斷言，避免無 sleep 宿主誤報）。
+     */
+    private fun hostSleepRoots(): List<String>? {
+        val real = listOf("/bin/sleep", "/usr/bin/sleep").firstNotNullOfOrNull { c ->
+            try {
+                val p = java.nio.file.Paths.get(c)
+                if (java.nio.file.Files.isExecutable(p)) p.toRealPath().toString() else null
+            } catch (_: Exception) {
+                null
+            }
+        } ?: return null
+        return ShellExecutables.snapshotRealRoots(ShellExecutables.TRUSTED_BIN_DIRS) +
+            real.substringBeforeLast('/')
     }
 
     @Test fun outputTruncatedAtCap() {
@@ -119,7 +150,11 @@ class ShellWhitelistTest {
     @Test fun quotaExceededAfterLimit() {
         val runner = FakeRunner("ok".toByteArray())
         val quota = ShellQuota(maxCalls = 2, windowMs = 60_000L)
-        val shell = RestrictedShell(quota = quota, runner = runner)
+        val shell = RestrictedShell(
+            quota = quota,
+            runner = runner,
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+        )
         assertTrue(shell.execute(listOf("echo", "1")) is ShellResult.Ok)
         assertTrue(shell.execute(listOf("echo", "2")) is ShellResult.Ok)
         val third = shell.execute(listOf("echo", "3"))
@@ -131,7 +166,11 @@ class ShellWhitelistTest {
     @Test fun deniedCallsDoNotConsumeQuota() {
         val runner = FakeRunner(ByteArray(0))
         val quota = ShellQuota(maxCalls = 1, windowMs = 60_000L)
-        val shell = RestrictedShell(quota = quota, runner = runner)
+        val shell = RestrictedShell(
+            quota = quota,
+            runner = runner,
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+        )
         assertTrue(shell.execute(listOf("nope-bin-xyz")) is ShellResult.Denied)
         // 策略拒絕不佔配額：隨後一次合法呼叫仍應放行。
         assertTrue(shell.execute(listOf("echo", "hi")) is ShellResult.Ok)
@@ -266,7 +305,11 @@ class ShellWhitelistTest {
 
     @Test fun privateAbsoluteAllowedWithScope() {
         val runner = FakeRunner("ok".toByteArray())
-        val shell = RestrictedShell(runner = runner, privateRoot = shellPrivateRoot)
+        val shell = RestrictedShell(
+            runner = runner,
+            privateRoot = shellPrivateRoot,
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+        )
         val result = shell.execute(listOf("cat", "$shellPrivateRoot/chat/x.txt"))
         assertTrue("expected Ok, got $result", result is ShellResult.Ok)
         assertEquals(1, runner.calls)
@@ -279,6 +322,7 @@ class ShellWhitelistTest {
             runner = runner,
             privateRoot = shellPrivateRoot,
             safRoots = listOf(safTree),
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
         )
         val result = shell.execute(listOf("cat", "$safTree/report.pdf"))
         assertTrue("expected Ok, got $result", result is ShellResult.Ok)

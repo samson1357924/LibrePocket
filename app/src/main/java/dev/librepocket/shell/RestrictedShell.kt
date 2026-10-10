@@ -150,7 +150,8 @@ class ShellQuota(
  *
  * 執行順序：[ShellPolicy.validate]（含 argv[0] 詞法可信門）→
  * 可信 executable 映射（[ShellExecutables.resolve]：logical command →
- * [ShellExecutables.ResolvedExec]，拒 `PATH` 劫持；失敗即拒且零 spawn、不佔配額）→
+ * [ShellExecutables.ResolvedExec]，拒 `PATH` 劫持；含 real containment +
+ * app-writability 閘，逃逸/可寫即拒且零 spawn、不佔配額）→
  * 配額 → 建子進程（argv[0] 已改寫為固定絕對路徑 + [ShellExecutables.CLEAN_ENV]
  * 乾淨 env + cwd 釘死到 [privateRoot]）→ 超時殺 → 輸出截斷。
  * spawn 固定形態：非 multicall 為 `[real, ...args]`；實體 basename 落
@@ -183,6 +184,18 @@ class RestrictedShell(
      */
     private val execSearchDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
     /**
+     * containment 允許前綴（預設 null → 由 [execSearchDirs] real 化快照 +
+     * 系統實體前綴；見 [ShellExecutables.snapshotRealRoots]）。單測可注入，
+     * 產品碼一律用預設 null（現場快照，不長期重用）。
+     */
+    private val execAllowedRoots: List<String>? = null,
+    /**
+     * app-uid 可寫判定（預設真查 `Files.isWritable`，見
+     * [ShellExecutables.defaultIsWritable]）。單測可注入以模擬系統自帶不可寫
+     * （宿主暫存檔屬主可寫）；產品碼一律用預設。
+     */
+    private val execIsWritable: (java.nio.file.Path) -> Boolean = ShellExecutables::defaultIsWritable,
+    /**
      * 可信 executable 解析（預設 [ShellExecutables.resolve] 真查 FS；
      * 單測可注入假映射，但生產必須用預設）。
      * 輸入為原始 `argv[0]`（保留絕對/相對形態供驗證），輸出為
@@ -192,7 +205,7 @@ class RestrictedShell(
      * 覆寫後才 spawn，不採信映射自帶字串。
      */
     private val execResolver: (String) -> ShellExecutables.ResolvedExec? =
-        { ShellExecutables.resolve(it, execSearchDirs) },
+        { ShellExecutables.resolve(it, execSearchDirs, execAllowedRoots, execIsWritable) },
 ) {
     fun execute(argv: List<String>, timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS): ShellResult {
         val binary = when (
@@ -202,7 +215,8 @@ class RestrictedShell(
             is Validation.Allowed -> v.binary
         }
         // 可信 executable 映射（建程序前）：logical command → 已驗證實體。
-        // 失敗（同名不同路徑假二進位、`PATH` 劫持、檔案缺失/不可執行）即拒，
+        // 失敗（同名不同路徑假二進位、`PATH` 劫持、檔案缺失/不可執行、
+        // symlink 逃逸集外、可寫目標）即拒，
         // 不建子進程、不佔配額（沿用「拒絕零 spawn」不變量）。
         val resolved = try {
             execResolver(argv[0].trim())

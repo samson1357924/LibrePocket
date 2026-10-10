@@ -18,6 +18,10 @@ import org.junit.Test
  *   惡意同名檔（不同目錄）永遠落選；
  * - symlink：嚴格 NOFOLLOW 判 link 本體，實體驗證固定實體；
  *   dangling / 環 / 非正規檔 / 不可執行一律拒；
+ *   S3 containment + writability：可信 dir 內 entry 經 symlink 指到集外
+ *   app-writable 目標即拒（resolve 回 null，全鏈零 spawn）；同集內（含
+ *   `/bin -> usr/bin` 形合併）放行；real 本體/parent 可寫即拒（宿主暫存檔
+ *   屬主可寫故經 `isWritable` 注入模擬裝置不可寫，見 `systemOwned`）；
  * - 操作數 schema（`--opt=value`、短旗標合併、值槽、pattern 槽）維持既有嚴格語義；
  * - null 作用域的隱式 cwd bare fail-closed，且放行者 spawn 仍是固定路徑 + 乾淨 env；
  * - multicall（toybox/toolbox/busybox）：實體 basename 落顯式表時 spawn 還原
@@ -52,6 +56,14 @@ class ShellTrustedExecTest {
         assertTrue("setExecutable failed for $f", f.setExecutable(true))
         return f
     }
+
+    /**
+     * 模擬裝置「系統自帶不可寫」：宿主單測的暫存檔屬主可寫（`Files.isWritable`
+     * 真查必回 true），直接用預設判定會把合法 fixture 全拒；故凡「合法系統
+     * 二進位」情境一律注入此判定。writability 閘本身的存活另由
+     * `defaultWritabilityGate_liveOnHost` 以預設值真查證明（屬主可寫即拒）。
+     */
+    private val systemOwned: (java.nio.file.Path) -> Boolean = { _ -> false }
 
     // ---- 同名不同路徑：政策層即拒，零解析、零 spawn ----
 
@@ -119,7 +131,7 @@ class ShellTrustedExecTest {
             val shell = RestrictedShell(
                 runner = runner,
                 privateRoot = scope.absolutePath,
-                execResolver = { ShellExecutables.resolve(it, listOf(trusted.absolutePath)) },
+                execResolver = { ShellExecutables.resolve(it, listOf(trusted.absolutePath), isWritable = systemOwned) },
             )
             val r = shell.execute(listOf("ls", "-l"))
             assertTrue("$r", r is ShellResult.Ok)
@@ -160,7 +172,16 @@ class ShellTrustedExecTest {
             assertFalse(ShellExecutables.isExecutableNoFollow(plain.absolutePath))
             assertFalse(ShellExecutables.isExecutableNoFollow(dir.absolutePath))
             // 實體驗證：link 固定到實體；dangling / 環 / 指向目錄一律 null。
-            assertEquals(real.canonicalPath, ShellExecutables.verifiedTarget(link.toString()))
+            // （合法 fixture 經 systemOwned 模擬裝置不可寫；dangling/環/目錄
+            // 在閘前即拒，預設值亦同。）
+            assertEquals(
+                real.canonicalPath,
+                ShellExecutables.verifiedTarget(
+                    link.toString(),
+                    allowedRoots = listOf(dir.canonicalPath),
+                    isWritable = systemOwned,
+                ),
+            )
             assertNull(ShellExecutables.verifiedTarget(dangling.toString()))
             assertNull(ShellExecutables.verifiedTarget(loopA.toString()))
             assertNull(ShellExecutables.verifiedTarget(linkToDir.toString()))
@@ -171,7 +192,11 @@ class ShellTrustedExecTest {
                 executable(okDir, "mybin")
                 assertEquals(
                     File(okDir, "mybin").canonicalPath,
-                    ShellExecutables.resolve("mybin", listOf(emptyDir.absolutePath, okDir.absolutePath))?.path,
+                    ShellExecutables.resolve(
+                        "mybin",
+                        listOf(emptyDir.absolutePath, okDir.absolutePath),
+                        isWritable = systemOwned,
+                    )?.path,
                 )
                 assertNull(ShellExecutables.resolve("mybin", listOf(emptyDir.absolutePath)))
                 assertNull(ShellExecutables.resolve("dangling", listOf(dir.absolutePath)))
@@ -393,7 +418,8 @@ class ShellTrustedExecTest {
             val toyboxReal = File(bin, "toybox").canonicalPath
             val input = File(scope, "in.txt").apply { writeText("hello\n") }
             // resolve 層：實體落表即攜 applet（取自 argv[0] basename）。
-            val bare = ShellExecutables.resolve("ls", listOf(bin.absolutePath))!!
+            // systemOwned 模擬裝置不可寫（宿主 fixture 屬主可寫，見 helper 註解）。
+            val bare = ShellExecutables.resolve("ls", listOf(bin.absolutePath), isWritable = systemOwned)!!
             assertEquals(toyboxReal, bare.path)
             assertEquals("ls", bare.applet)
             // 全鏈 spawn 形狀：[real, applet, ...args]。
@@ -409,6 +435,7 @@ class ShellTrustedExecTest {
                     runner = runner,
                     privateRoot = scope.absolutePath,
                     execSearchDirs = listOf(bin.absolutePath),
+                    execIsWritable = systemOwned,
                 )
                 val r = shell.execute(argv)
                 assertTrue("$argv -> $r", r is ShellResult.Ok)
@@ -428,7 +455,11 @@ class ShellTrustedExecTest {
             val toyboxReal = File(bin, "toybox").canonicalPath
             val input = File(scope, "in.txt").apply { writeText("hello\n") }
             // resolve 層：絕對 argv[0]（link 路徑）同樣固定實體 + 還原 applet。
-            val abs = ShellExecutables.resolve("${bin.absolutePath}/ls", listOf(bin.absolutePath))!!
+            val abs = ShellExecutables.resolve(
+                "${bin.absolutePath}/ls",
+                listOf(bin.absolutePath),
+                isWritable = systemOwned,
+            )!!
             assertEquals(toyboxReal, abs.path)
             assertEquals("ls", abs.applet)
             // 全鏈 spawn 形狀：[real, applet, ...args]（validate 詞法門與
@@ -445,6 +476,7 @@ class ShellTrustedExecTest {
                     runner = runner,
                     privateRoot = scope.absolutePath,
                     execSearchDirs = listOf(bin.absolutePath),
+                    execIsWritable = systemOwned,
                 )
                 val r = shell.execute(argv)
                 assertTrue("$argv -> $r", r is ShellResult.Ok)
@@ -463,6 +495,8 @@ class ShellTrustedExecTest {
         try {
             val input = File(scope, "in.txt").apply { writeText("hello\n") }
             // echo/ls/cat × bare/絕對：真跑道、真 fixture，斷言 exit + stdout。
+            // execIsWritable 注入 systemOwned：宿主 fixture 屬主可寫，預設值
+            // 會 fail-closed 全拒；validate → resolve → spawn 全鏈仍走預設解析。
             val cases = listOf(
                 listOf("echo", "hi") to "hi\n",
                 listOf("ls", "-l") to toyboxLsOut,
@@ -476,6 +510,7 @@ class ShellTrustedExecTest {
                     runner = DefaultProcessRunner(),
                     privateRoot = scope.absolutePath,
                     execSearchDirs = listOf(bin.absolutePath),
+                    execIsWritable = systemOwned,
                 )
                 val r = shell.execute(argv)
                 assertTrue("$argv -> $r", r is ShellResult.Ok)
@@ -524,10 +559,10 @@ class ShellTrustedExecTest {
             Files.createSymbolicLink(File(first, "echo").toPath(), plain.toPath())
             val dirs = listOf(first.absolutePath, second.absolutePath)
             // resolve 層：link 與直找一律 applet == null。
-            val viaLink = ShellExecutables.resolve("echo", dirs)!!
+            val viaLink = ShellExecutables.resolve("echo", dirs, isWritable = systemOwned)!!
             assertEquals(plain.canonicalPath, viaLink.path)
             assertNull(viaLink.applet)
-            val direct = ShellExecutables.resolve("echo", listOf(second.absolutePath))!!
+            val direct = ShellExecutables.resolve("echo", listOf(second.absolutePath), isWritable = systemOwned)!!
             assertEquals(plain.canonicalPath, direct.path)
             assertNull(direct.applet)
             // 全鏈 spawn 維持 [real, ...args]，不插入。
@@ -536,6 +571,7 @@ class ShellTrustedExecTest {
                 runner = runner,
                 privateRoot = scope.absolutePath,
                 execSearchDirs = dirs,
+                execIsWritable = systemOwned,
             )
             val r = shell.execute(listOf("echo", "hi"))
             assertTrue("$r", r is ShellResult.Ok)
@@ -545,6 +581,7 @@ class ShellTrustedExecTest {
                 runner = DefaultProcessRunner(),
                 privateRoot = scope.absolutePath,
                 execSearchDirs = dirs,
+                execIsWritable = systemOwned,
             )
             val e2e = real.execute(listOf("echo", "hi"))
             assertTrue("$e2e", e2e is ShellResult.Ok)
@@ -567,7 +604,7 @@ class ShellTrustedExecTest {
                 val f = File(dir, name)
                 f.writeText("#!/bin/sh\necho marker\n")
                 assertTrue("setExecutable failed for $f", f.setExecutable(true))
-                val hit = ShellExecutables.resolve(name, listOf(dir.absolutePath))!!
+                val hit = ShellExecutables.resolve(name, listOf(dir.absolutePath), isWritable = systemOwned)!!
                 assertEquals("$name", name, hit.applet)
             }
             // 版本化／改名／普通二進位不在表：一律無插入（拒「名不同即插」）。
@@ -575,11 +612,206 @@ class ShellTrustedExecTest {
                 val f = File(dir, name)
                 f.writeText("#!/bin/sh\necho marker\n")
                 assertTrue("setExecutable failed for $f", f.setExecutable(true))
-                val hit = ShellExecutables.resolve(name, listOf(dir.absolutePath))!!
+                val hit = ShellExecutables.resolve(name, listOf(dir.absolutePath), isWritable = systemOwned)!!
                 assertNull("$name", hit.applet)
             }
         } finally {
             dir.deleteRecursively()
+        }
+    }
+
+    // ---- S3 containment：可信 entry 指到集外即拒（writability 無關） ----
+
+    @Test fun symlinkEscapeOutsideRoots_rejected() {
+        val trusted = tempDir("s3-trusted")
+        val evilDir = tempDir("s3-evil")
+        try {
+            val evil = executable(evilDir, "payload")
+            Files.createSymbolicLink(File(trusted, "ls").toPath(), evil.toPath())
+            // 即使「全不可寫」（containment 單獨作用），逃逸仍拒：
+            // bare 與絕對 argv0 兩形。
+            assertNull(
+                ShellExecutables.resolve("ls", listOf(trusted.absolutePath), isWritable = systemOwned),
+            )
+            assertNull(
+                ShellExecutables.resolve(
+                    "${trusted.absolutePath}/ls",
+                    listOf(trusted.absolutePath),
+                    isWritable = systemOwned,
+                ),
+            )
+            // 預設判定（宿主屬主可寫）同樣拒。
+            assertNull(ShellExecutables.resolve("ls", listOf(trusted.absolutePath)))
+        } finally {
+            trusted.deleteRecursively()
+            evilDir.deleteRecursively()
+        }
+    }
+
+    @Test fun escape_zeroSpawnAtShell() {
+        val trusted = tempDir("s3-escape")
+        val evilDir = tempDir("s3-escape-evil")
+        val scope = tempDir("s3-escape-scope")
+        try {
+            val evil = executable(evilDir, "payload")
+            Files.createSymbolicLink(File(trusted, "ls").toPath(), evil.toPath())
+            // 外層可寫、內層視為系統自帶：containment 拒，與 writability 無關。
+            val evilRoot = evilDir.canonicalPath
+            val outsideWritable: (java.nio.file.Path) -> Boolean = { p ->
+                p.toString() == evil.canonicalPath || p.toString().startsWith("$evilRoot/")
+            }
+            for (argv in listOf(
+                listOf("ls", "-l"),
+                listOf("${trusted.absolutePath}/ls", "-l"),
+            )) {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(trusted.absolutePath),
+                    execIsWritable = outsideWritable,
+                )
+                val r = shell.execute(argv)
+                assertTrue("$argv -> $r", r is ShellResult.Denied)
+                assertEquals("$argv", ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+                assertEquals("$argv must not spawn", 0, runner.calls)
+                assertEquals("$argv", null, runner.lastEnv)
+            }
+        } finally {
+            trusted.deleteRecursively()
+            evilDir.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    // ---- S3 writability：集內但可寫即拒（containment 放行才輪到此閘） ----
+
+    @Test fun writableTarget_rejectedByWritabilityGate() {
+        val dir = tempDir("s3-writable")
+        try {
+            val target = executable(dir, "tool")
+            Files.createSymbolicLink(File(dir, "ls").toPath(), target.toPath())
+            val targetReal = target.canonicalPath
+            val dirReal = dir.canonicalPath
+            // 對照：全不可寫即放行（containment 本就通過，writability 不擋）。
+            val ok = ShellExecutables.resolve("ls", listOf(dir.absolutePath), isWritable = systemOwned)!!
+            assertEquals(targetReal, ok.path)
+            // real 本體可寫 → 拒。
+            assertNull(
+                ShellExecutables.resolve(
+                    "ls",
+                    listOf(dir.absolutePath),
+                    isWritable = { p -> p.toString() == targetReal },
+                ),
+            )
+            // parent dir 可寫（本體自稱不可寫）→ 仍拒（rename 置換同等致命）。
+            assertNull(
+                ShellExecutables.resolve(
+                    "ls",
+                    listOf(dir.absolutePath),
+                    isWritable = { p -> p.toString() == dirReal },
+                ),
+            )
+            // 判定抛異常 → 視為可寫而拒（fail-closed）。
+            assertNull(
+                ShellExecutables.resolve(
+                    "ls",
+                    listOf(dir.absolutePath),
+                    isWritable = { throw IllegalStateException("fs owner query blew up") },
+                ),
+            )
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test fun defaultWritabilityGate_liveOnHost() {
+        // 存活證明：宿主暫存檔屬主可寫，預設判定必須拒（這正是其餘 fixture
+        // 測試注入 systemOwned 的原因；裝置上系統自帶檔對 App 不可寫即放行）。
+        val dir = tempDir("s3-live")
+        try {
+            val target = executable(dir, "tool")
+            assertTrue(
+                "test premise broken: temp file must be owner-writable on host",
+                ShellExecutables.defaultIsWritable(target.toPath()),
+            )
+            assertNull(ShellExecutables.resolve("tool", listOf(dir.absolutePath)))
+            assertNull(
+                ShellExecutables.verifiedTarget(
+                    target.absolutePath,
+                    allowedRoots = listOf(dir.canonicalPath),
+                ),
+            )
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    // ---- S3 正常系統 symlink 形（/bin -> usr/bin 合併、同集內 shim）放行 ----
+
+    @Test fun usrMergeShape_withinRoots_allowed() {
+        val root = tempDir("s3-merge")
+        try {
+            val usrbin = File(root, "usrbin").apply { mkdir() }
+            Files.createSymbolicLink(File(root, "bin").toPath(), usrbin.toPath())
+            val tool = executable(usrbin, "echo")
+            val dirs = listOf(File(root, "bin").absolutePath, usrbin.absolutePath)
+            // bare：經 link 目錄命中，real 落第二根內 → 放行。
+            val bare = ShellExecutables.resolve("echo", dirs, isWritable = systemOwned)!!
+            assertEquals(tool.canonicalPath, bare.path)
+            assertNull(bare.applet)
+            // 絕對：link 路徑本身即 argv[0] → 同樣放行。
+            val abs = ShellExecutables.resolve(
+                "${File(root, "bin").absolutePath}/echo",
+                dirs,
+                isWritable = systemOwned,
+            )!!
+            assertEquals(tool.canonicalPath, abs.path)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun snapshotRealRoots_bestEffortAndBoundary() {
+        val dir = tempDir("s3-snap")
+        try {
+            val snap = ShellExecutables.snapshotRealRoots(listOf(dir.absolutePath, "/nonexistent-xyz-123"))
+            // 存在即 real 化（與 canonical 一致），去重後仍含系統實體前綴。
+            assertTrue("snapshot=$snap", snap.contains(dir.canonicalPath))
+            assertTrue("snapshot=$snap", snap.containsAll(ShellExecutables.SYSTEM_REAL_PREFIXES))
+            // 邊界感知：同名前綴兄弟（/a/bc）不得沾 /a/b 的光。
+            assertTrue(ShellExecutables.isUnderRoots("${dir.canonicalPath}/x", snap))
+            assertFalse(ShellExecutables.isUnderRoots("${dir.canonicalPath}-sibling/x", snap))
+            assertFalse(ShellExecutables.isUnderRoots("/tmp/s3-evil-payload", emptyList()))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    // ---- S3 × S2：multicall 不豁免 containment（逃逸照拒） ----
+
+    @Test fun multicallEscape_rejected() {
+        val bin = multicallDir()
+        val evilDir = tempDir("s3-mcb-evil")
+        try {
+            // 集外放一個同名 toybox 形狀的 payable script，可信 dir 內以 applet
+            // 名 link 過去：multicall 表不得把它救回來。
+            val evilToybox = File(evilDir, "toybox")
+            evilToybox.writeText("#!/bin/sh\necho pwned\n")
+            assertTrue("setExecutable failed for $evilToybox", evilToybox.setExecutable(true))
+            Files.delete(File(bin, "ls").toPath())
+            Files.createSymbolicLink(File(bin, "ls").toPath(), evilToybox.toPath())
+            assertNull(ShellExecutables.resolve("ls", listOf(bin.absolutePath), isWritable = systemOwned))
+            assertNull(
+                ShellExecutables.resolve(
+                    "${bin.absolutePath}/ls",
+                    listOf(bin.absolutePath),
+                    isWritable = systemOwned,
+                ),
+            )
+        } finally {
+            bin.deleteRecursively()
+            evilDir.deleteRecursively()
         }
     }
 }

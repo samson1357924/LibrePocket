@@ -26,7 +26,8 @@ import org.junit.Test
  *   containment 覆蓋兩側）即拒（bare／絕對兩形 + 全鏈 Denied(BLACKLISTED) +
  *   零 spawn）；同目錄直連正規檔、中間 parent 可寫、bare 前序可寫污染命中、
  *   entry 判定拋異常一律拒；Stage1 窄化後 bare 命中後無關可寫不污染、絕對形
- *   與無關表項解耦（只驗所屬 parent）；entry 全乾淨時 multicall／APEX 形／
+ *   與無關表項解耦（只驗所屬 parent）；Stage2 祖先可替換（searchDir 本體乾淨
+ *   但 parent 可寫，整目錄 rename/replace）即拒；entry 全乾淨時 multicall／APEX 形／
  *   usr 合併形放行不受影響；拒絕細項經 ResolveDeny 可觀測（不含 path）；
  * - 操作數 schema（`--opt=value`、短旗標合併、值槽、pattern 槽）維持既有嚴格語義；
  * - null 作用域的隱式 cwd bare fail-closed，且放行者 spawn 仍是固定路徑 + 乾淨 env；
@@ -1117,6 +1118,106 @@ class ShellTrustedExecTest {
         } finally {
             clean.deleteRecursively()
             writableAfter.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun searchDirParentWritable_rejectedBareAndAbsolute() {
+        // Stage2 Finding B：searchDir 本體乾淨但 parent 可寫，整目錄可被
+        // rename/replace（`ls -> sysbin/sh`，real 乾淨但非 allowlisted）。
+        // fixture 自訂 protected anchor（wparent 下 bin），不把 /tmp 寫入生產信任表。
+        val wparent = tempDir("s5-anc-wp")
+        val trusted = File(wparent, "bin").apply { mkdir() }
+        val sysbin = tempDir("s5-anc-sys")
+        val scope = tempDir("s5-anc-scope")
+        try {
+            val target = executable(sysbin, "sh")
+            Files.createSymbolicLink(File(trusted, "ls").toPath(), target.toPath())
+            val trustedReal = trusted.canonicalPath
+            val sysbinReal = sysbin.canonicalPath
+            val wparentReal = wparent.canonicalPath
+            val roots = listOf(trustedReal, sysbinReal)
+            // 僅 parent 可寫，本體／候選／real 全乾淨：舊本體-only 守衛會放行，
+            // 祖先檢查必須拒。
+            val parentWritable: (java.nio.file.Path) -> Boolean = { p ->
+                p.toString() == wparentReal
+            }
+            assertTrue(
+                "premise: trusted itself must be clean",
+                !ShellExecutables.isSearchDirUntrusted(trusted.absolutePath, { _ -> false }),
+            )
+            assertTrue(
+                "premise: parent writable must taint",
+                ShellExecutables.isSearchDirUntrusted(trusted.absolutePath, parentWritable),
+            )
+            for (argv0 in listOf("ls", "${trusted.absolutePath}/ls")) {
+                assertNull(
+                    "$argv0 must not resolve",
+                    ShellExecutables.resolve(argv0, listOf(trusted.absolutePath), roots, parentWritable),
+                )
+                val detailed = ShellExecutables.resolveDetailed(
+                    argv0,
+                    listOf(trusted.absolutePath),
+                    roots,
+                    parentWritable,
+                )
+                assertTrue(
+                    "$argv0 expected SEARCH_DIR_UNTRUSTED, got $detailed",
+                    detailed is ShellExecutables.ResolveOutcome.Denied &&
+                        detailed.reason == ShellExecutables.ResolveDeny.SEARCH_DIR_UNTRUSTED,
+                )
+            }
+            // 對照：全乾淨即放行（同形，祖先乾淨）。
+            val ok = ShellExecutables.resolve(
+                "ls",
+                listOf(trusted.absolutePath),
+                roots,
+                systemOwned,
+            )!!
+            assertEquals(target.canonicalPath, ok.path)
+            // 全鏈：Denied(BLACKLISTED)+reason+零 spawn+不洩無關 path（bare／絕對兩形）。
+            // bare 回顯僅 `ls`，不得含任何實體路徑；絕對回顯含使用者輸入的 argv0
+            // 本身（非洩漏），但不得含無關 parent（wparent）路徑。
+            run {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(trusted.absolutePath),
+                    execAllowedRoots = roots,
+                    execIsWritable = parentWritable,
+                )
+                val r = shell.execute(listOf("ls", "-l"))
+                assertTrue("ls -> $r", r is ShellResult.Denied)
+                assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+                assertTrue("$r", r.message.contains("SEARCH_DIR_UNTRUSTED"))
+                assertFalse("$r", r.message.contains(trustedReal))
+                assertFalse("$r", r.message.contains(wparentReal))
+                assertEquals(0, runner.calls)
+                assertEquals(null, runner.lastEnv)
+            }
+            run {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(trusted.absolutePath),
+                    execAllowedRoots = roots,
+                    execIsWritable = parentWritable,
+                )
+                val argv = listOf("${trusted.absolutePath}/ls", "-l")
+                val r = shell.execute(argv)
+                assertTrue("$argv -> $r", r is ShellResult.Denied)
+                assertEquals("$argv", ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+                assertTrue("$argv -> $r", r.message.contains("SEARCH_DIR_UNTRUSTED"))
+                // 絕對回顯含 argv0 本身（wparent 前綴不可避免），僅斷言不含無關 real。
+                assertFalse("$argv -> $r", r.message.contains(sysbinReal))
+                assertEquals("$argv must not spawn", 0, runner.calls)
+                assertEquals("$argv", null, runner.lastEnv)
+            }
+        } finally {
+            wparent.deleteRecursively()
+            sysbin.deleteRecursively()
             scope.deleteRecursively()
         }
     }

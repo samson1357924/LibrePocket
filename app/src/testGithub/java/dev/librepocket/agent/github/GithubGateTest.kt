@@ -3,9 +3,11 @@ package dev.librepocket.agent.github
 import dev.librepocket.automation.A11yAction
 import dev.librepocket.automation.AutomationCore
 import dev.librepocket.guard.ArbitrationCode
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -15,6 +17,18 @@ import org.junit.Test
  * 不碰 Android 框架。
  */
 class GithubGateTest {
+
+    @Before fun resetGlobalState() {
+        GithubA11yState.switchOn = false
+        GithubA11yState.serviceGranted = false
+        GithubA11yState.clockMs = System::currentTimeMillis
+        GithubA11yState.clearConfirmation()
+        GithubA11yState.lastCompressed = emptyList()
+    }
+
+    @After fun tearDown() {
+        resetGlobalState()
+    }
 
     @Test fun paymentDeleteSendForceConfirm() {
         val pay = GithubAccessibilityService.gateAction("幫我轉帳 500 元", A11yAction.Tap("n1"))

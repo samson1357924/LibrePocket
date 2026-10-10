@@ -24,7 +24,7 @@ stage as pass only when the corresponding `changes` output is explicitly
 
 When `code == true`, the workflow uses JDK 17 and runs these Gradle stages:
 
-1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets). The unit-tests job fans out over a flavor matrix with fail-fast disabled, so each flavor runs on its own runner and wall time is the slowest shard rather than the sum.
+1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets). The unit-tests job fans out over a flavor matrix with fail-fast disabled, so each flavor runs on its own runner and wall time is the slowest shard rather than the sum. Test report artifacts now include both HTML reports and structured JUnit XML (`app/build/test-results/`), retained for 14 days; results are parsed in real time into GitHub Actions Step Summary (`$GITHUB_STEP_SUMMARY`) to surface failure counts, skipped tests, and assertion summaries directly without requiring artifact downloads.
 2. `:app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug`.
 3. `:app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug`, then `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss. This stage also runs when only `policy == true`.
 
@@ -92,7 +92,14 @@ For changes involving credentials, policy, persistence, session lifecycle, cance
 - Use fake keys, temporary databases/files, synthetic transcript text, and local fake HTTP servers only. Do not use live credentials, production signing keys, paid endpoints, or private transcripts.
 - Test fail-closed behavior and stale/late callbacks, not only the successful path.
 - Keep tool states distinct: declared, implemented, wired, and verified. A test-only fake executor does not verify production wiring.
+- Test execution contract: all asynchronous and coroutine waits must enforce a bounded timeout; teardown procedures, socket closures, and synthetic HTTP server (such as MockWebServer) requests must never block indefinitely.
 
 ## Reporting evidence
 
 Record the base SHA, exact commands, exit status, relevant test/report artifact, JDK/SDK/API/device where applicable, and checks not run. A planned command, an old runbook checkbox, or a successful build alone is not a security conclusion.
+
+Flaky test resolution and debugging principles:
+
+- Do not rely on silent retries to mask regressions or timing bugs.
+- When test failures occur, investigate and capture forensic evidence via the Step Summary and console FULL stack trace (`--stacktrace`) captured in the workflow logs.
+- Differential triage relies on the 14-day retention of test report artifacts (HTML reports and structured JUnit XML under `app/build/test-results/`) across attempts and runs.

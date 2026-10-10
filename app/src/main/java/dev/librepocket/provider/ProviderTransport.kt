@@ -26,7 +26,18 @@ import okio.BufferedSink
 import okio.Buffer
 
 /** Internal transport failure; [retryable] comes from [ProviderErrorClassifier] unless a typed code applies. */
-internal enum class ProviderFailureCode { TOO_LARGE }
+internal enum class ProviderFailureCode {
+    /** Bounded finite body (model list) exceeded its byte budget. */
+    TOO_LARGE,
+    /**
+     * A streaming aggregate exceeded its memory budget (per-tool-call
+     * ToolDelta fragments or one SSE event's total `data:` payload).
+     * Always pairs with a distinct non-retryable message
+     * (`TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE`), never silent
+     * truncation, and never a retry of the poisoned stream.
+     */
+    AGG_TOO_LARGE,
+}
 
 internal class ProviderFailure(
     val retryable: Boolean,
@@ -300,12 +311,22 @@ internal suspend fun pumpSse(
                             break
                         }
                     }
-                    if (parser.lineTooLong && !protocolTerminalReached) {
-                        throw ProviderFailure(false, "SSE_LINE_TOO_LONG")
+                    if (!protocolTerminalReached) {
+                        if (parser.lineTooLong) {
+                            throw ProviderFailure(false, "SSE_LINE_TOO_LONG")
+                        }
+                        if (parser.frameTooLong) {
+                            throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE)
+                        }
                     }
                 }
-                if (parser.lineTooLong && !protocolTerminalReached) {
-                    throw ProviderFailure(false, "SSE_LINE_TOO_LONG")
+                if (!protocolTerminalReached) {
+                    if (parser.lineTooLong) {
+                        throw ProviderFailure(false, "SSE_LINE_TOO_LONG")
+                    }
+                    if (parser.frameTooLong) {
+                        throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE)
+                    }
                 }
             }
         } catch (e: IOException) {

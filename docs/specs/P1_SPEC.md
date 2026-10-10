@@ -357,9 +357,13 @@ sealed interface StreamEvent {
 | 正文增量 | `choices[].delta.content` → `TextDelta` | `response.output_text.delta` → `TextDelta` | `content_block_delta(text_delta)` → `TextDelta` |
 | 思考增量 | `delta.reasoning_content`（兼容 `reasoning` / `reasoning_details` 摘要；同分片多表示只取一次） → `ReasoningDelta` | `reasoning_summary_text.delta` / `reasoning_text.delta` → `ReasoningDelta` | `thinking_delta` → `ReasoningDelta`（簽名/加密塊不展示，工具回合透傳見 §3.3） |
 | 工具增量 | `delta.tool_calls[]`（按 `index` 聚合；空 ID 不覆蓋有效 ID） → `ToolDelta` | `response.output_item.added/done`（function_call） → `ToolDelta`/`ToolDone` | `content_block_start(tool_use)` + `input_json_delta` → `ToolDelta`；`content_block_stop` → `ToolDone` |
+| 工具聚合上限 | 三協議＋TurnController 收集層共用單 tool call 聚合預算（args+id+name，沿用 1 MiB 串流記憶體預算；超限 → `Failed(retryable=false, "TOOL_ARGS_TOO_LARGE")`，不靜默截斷、不重試、不記錄毒化片段） | 同左 | 同左 |
 | 用量 | 終態 `usage` → `Usage` | `response.completed.usage` → `Usage` | `message_start.message.usage` + `message_delta.usage` → `Usage` |
 | 終態成功 | `finish_reason` + `[DONE]` → `Done` | `response.completed`（非空 output 為權威） → `Done` | `message_stop`（前需 `message_delta stop_reason`） → `Done` |
 | 終態異常 | 缺 `[DONE]`/無合法 `finish_reason` → `Failed(retryable=true)` | `response.completed` 缺 `output`/空陣列 → 用流內已收增量恢復（記 `recovered=true`）；`response.failed/incomplete` → `Failed` | 缺 `message_stop` 或可見/工具塊未閉合 → `Failed(retryable=true)` |
+
+- 發送前上下文窗口（Current）：`HistoryWindowCap` 僅裁剪發送用請求副本（oldest-first、整訊息；預設 `Unbounded` 即不裁剪），UI 與 transcript 保留完整歷史；裁剪數見 `TurnController.droppedHistoryCount`（永不靜默）。token 預算待裝置量測後再定（TODO #16，不硬編數字）。
+- UI 更新成本（Current）：可見增量仍逐 delta 寫入（串流可見性＋cancel 快照依賴）；`streamedTextDeltaCount`／`uiTextUpdateCount`／`uiTextCopiedChars` 為節流決策提供可觀察基線，節流閾值待裝置量測後再定（TODO #16）。
 
 ### 3.3 工具 ID 與多輪一致性（P1 記錄、不執行）
 
@@ -374,6 +378,7 @@ sealed interface StreamEvent {
 - `data: [DONE]`（Chat）為流結束標記，不做 JSON 解析。
 - UTF-8 按位元組流解碼，不得按 Char 切分（多位元組字元跨 chunk 時緩衝未完成位元組）。
 - 單行上限 1 MiB（防惡意服務端撐爆內存；超限 → `Failed(retryable=false, "SSE_LINE_TOO_LONG")`）。
+- 單事件 `data:` 總量上限 1 MiB（沿用單行預算，非新數字；防多小行堆疊攻擊——每行合法但合併超限 → `Failed(retryable=false, "SSE_FRAME_TOO_LONG")`，與單行超限／`SSE_TRUNCATED` 斷線區分）。
 - 空行 = 事件邊界；無 `event:` 欄位時按 payload 內容嗅探（Chat/Responses/Anthropic 各自 try-parse，順序見實現）。
 
 ### 3.5 Block 身份規則
@@ -428,8 +433,8 @@ object ProviderErrorClassifier {
 | 類別 | 條件 | `retryable` |
 |------|------|-------------|
 | RETRYABLE | 連接中斷、讀超時、提前 EOF、HTTP 408/409/425/429/5xx（除 501）、`SSE_TRUNCATED` | `true` |
-| FATAL | 401/403（認證）、402/402變體（額度/計費）、400/422（協議格式）、證書錯誤（SSLHandshake）、`IMAGE_TOO_LARGE`、`SSE_LINE_TOO_LONG`、URL/協議配置錯 | `false` |
-| 啟發式 | body 含 `insufficient_quota|billing|invalid_api_key|unauthorized`（大小寫無關） → FATAL；含 `rate_limit|overloaded|timeout|temporarily` → RETRYABLE | — |
+| FATAL | 401/403（認證）、402/402變體（額度/計費）、400/422（協議格式）、證書錯誤（SSLHandshake）、`IMAGE_TOO_LARGE`、`SSE_LINE_TOO_LONG`、`SSE_FRAME_TOO_LARGE`、`TOOL_ARGS_TOO_LARGE`、URL/協議配置錯 | `false` |
+| 啟發式 | body 含 `insufficient_quota|billing|invalid_api_key|unauthorized|image_too_large|sse_line_too_long|sse_frame_too_large|tool_args_too_large`（大小寫無關） → FATAL；含 `rate_limit|overloaded|timeout|temporarily` → RETRYABLE | — |
 
 ### 5.3 重試語義
 

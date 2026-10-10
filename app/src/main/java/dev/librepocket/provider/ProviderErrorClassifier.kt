@@ -29,6 +29,8 @@ object ProviderErrorClassifier {
         "unauthorized",
         "image_too_large",
         "sse_line_too_long",
+        "sse_frame_too_large",
+        "tool_args_too_large",
     )
     private val retryableBodyMarkers = listOf(
         "rate_limit",

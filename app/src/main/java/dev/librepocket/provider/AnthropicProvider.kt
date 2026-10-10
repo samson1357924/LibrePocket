@@ -211,6 +211,8 @@ internal class AnthropicMapper(val round: Int = 0) {
                     "signature_delta" -> Unit // never displayed, never persisted
                     "input_json_delta" -> {
                         val frag = delta.string("partial_json").orEmpty()
+                        // Fail-closed aggregation budget (typed, non-retryable).
+                        requireToolAggBudget(block.toolId.length + block.toolName.length + block.args.length, frag.length)
                         block.args.append(frag)
                         out.add(StreamEvent.ToolDelta(index, null, null, frag))
                     }

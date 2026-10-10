@@ -1,3 +1,6 @@
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
+import org.gradle.api.tasks.testing.logging.TestLogEvent
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose.compiler)
@@ -100,6 +103,20 @@ android {
     testOptions {
         unitTests {
             isIncludeAndroidResources = true
+            // Console output on failure: full stack traces inline so CI logs are
+            // actionable without downloading the HTML report artifact. Only the
+            // failed/skipped events are logged (passed is omitted to keep logs small).
+            // Placed in unitTests.all (AGP DSL) rather than tasks.withType<Test> so
+            // it scopes exactly to the AGP-created unit-test tasks this file configures.
+            all { test ->
+                test.testLogging {
+                    events(TestLogEvent.FAILED, TestLogEvent.SKIPPED)
+                    exceptionFormat = TestExceptionFormat.FULL
+                    showExceptions = true
+                    showCauses = true
+                    showStackTraces = true
+                }
+            }
         }
     }
     lint {

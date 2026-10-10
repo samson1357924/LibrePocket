@@ -31,6 +31,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -566,7 +567,12 @@ class ProviderTransportTest {
                     true
                 } ?: false
                 if (!completedBeforeAnotherRead) release.countDown()
-                collection.join()
+                withTimeoutOrNull(5_000L) {
+                    collection.join()
+                } ?: run {
+                    collection.cancel()
+                    fail("$protocol collection timed out waiting to join")
+                }
                 assertTrue("$protocol stops before the peer's five-minute read timeout", completedBeforeAnotherRead)
                 assertTrue("$protocol produces a healthy terminal fixture", events.last() is StreamEvent.Done)
                 assertEquals(

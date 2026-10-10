@@ -99,18 +99,35 @@ class AnthropicProvider(
         sb.append(",\"messages\":[")
         var first = true
         val resolved = validateToolPairing(request.messages, false)
-        for ((i, m) in request.messages.withIndex()) {
-            if (m.role == "system") continue
+        val pendingResults = ArrayList<String>()
+        fun flushPendingResults() {
+            if (pendingResults.isEmpty()) return
             if (!first) sb.append(',')
             first = false
+            sb.append("{\"role\":\"user\",\"content\":[")
+            pendingResults.forEachIndexed { idx, r ->
+                if (idx > 0) sb.append(',')
+                sb.append(r)
+            }
+            sb.append("]}")
+            pendingResults.clear()
+        }
+        for ((i, m) in request.messages.withIndex()) {
+            if (m.role == "system") continue
             if (m.role == "tool") {
                 // Phase 2: tool turns are user-carried tool_result blocks paired
-                // with the assistant tool_use id. Illegal pairings fail closed.
+                // with the assistant tool_use id. Consecutive outputs merge
+                // into one user message (single framing); validation stays
+                // per-message fail-closed via resolved ids.
                 val toolUseId = resolved[i]!!
-                sb.append("{\"role\":\"user\",\"content\":[${anthropicToolResultJson(toolUseId, m.text)}]}")
+                pendingResults.add(anthropicToolResultJson(toolUseId, m.text))
                 continue
             }
-            val blocks = StringBuilder("[{\"type\":\"text\",\"text\":${q(m.text)}}")
+            flushPendingResults()
+            if (!first) sb.append(',')
+            first = false
+            val parts = ArrayList<String>()
+            if (m.text.isNotEmpty()) parts.add("{\"type\":\"text\",\"text\":${q(m.text)}}")
             val infos = m.images.map { ImageFallbackPolicy.fromChatImage(it) }
             when (val d = ImageFallbackPolicy.decide(infos, supportsImages = true)) {
                 is ImageFallbackPolicy.Decision.Reject ->
@@ -120,20 +137,22 @@ class AnthropicProvider(
                     val encoder = java.util.Base64.getEncoder()
                     for (idx in d.indices) {
                         val img = m.images[idx]
-                        blocks.append(",{\"type\":\"image\",\"source\":{\"type\":\"base64\",")
-                        blocks.append("\"media_type\":${q(img.mimeType)},")
-                        blocks.append("\"data\":${q(encoder.encodeToString(img.bytes))}}}")
+                        val part = StringBuilder("{\"type\":\"image\",\"source\":{\"type\":\"base64\",")
+                        part.append("\"media_type\":${q(img.mimeType)},")
+                        part.append("\"data\":${q(encoder.encodeToString(img.bytes))}}}")
+                        parts.add(part.toString())
                     }
                 }
             }
             if (m.toolCalls.isNotEmpty()) {
                 for (tc in m.toolCalls) {
-                    blocks.append(",${anthropicToolUseJson(tc)}")
+                    parts.add(anthropicToolUseJson(tc))
                 }
             }
-            blocks.append(']')
-            sb.append("{\"role\":${q(m.role)},\"content\":$blocks}")
+            if (parts.isEmpty()) throw ProviderFailure(false, "ANTHROPIC_EMPTY_CONTENT")
+            sb.append("{\"role\":${q(m.role)},\"content\":[${parts.joinToString(",")}]}")
         }
+        flushPendingResults()
         sb.append("]}")
         return sb.toString()
     }

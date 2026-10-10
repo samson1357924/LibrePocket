@@ -304,6 +304,83 @@ class ProviderToolRoundTripTest {
         }
     }
 
+    @Test
+    fun anthropicToolOnlyTurnOmitsEmptyText() {
+        val tc = ToolCall(id = "toolu_empty1", name = "get_weather", argumentsJson = """{"city":"Taipei"}""")
+        val body = AnthropicProvider(anthropicConfig(), { null }).buildBody(
+            ChatRequest(
+                model = "m",
+                messages = listOf(
+                    ChatMessage("user", "hi"),
+                    ChatMessage("assistant", "", toolCalls = listOf(tc)),
+                    ChatMessage("tool", "sunny", toolCallId = tc.id),
+                ),
+                tools = advTools(),
+            ),
+        )
+        val messages = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
+        val assistant = messages.first { it["role"]!!.jsonPrimitive.content == "assistant" }
+        val blocks = assistant["content"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(1, blocks.size)
+        assertEquals("tool_use", blocks[0]["type"]!!.jsonPrimitive.content)
+        assertTrue(blocks.none { it["type"]!!.jsonPrimitive.content == "text" })
+        assertEquals(setOf("type", "id", "name", "input"), blocks[0].keys)
+    }
+
+    @Test
+    fun anthropicToolOnlyTurnWithTextKeepsOrder() {
+        val tc = ToolCall(id = "toolu_text1", name = "get_weather", argumentsJson = """{"city":"Taipei"}""")
+        val body = AnthropicProvider(anthropicConfig(), { null }).buildBody(
+            ChatRequest(
+                model = "m",
+                messages = listOf(
+                    ChatMessage("user", "hi"),
+                    ChatMessage("assistant", "hi", toolCalls = listOf(tc)),
+                    ChatMessage("tool", "sunny", toolCallId = tc.id),
+                ),
+                tools = advTools(),
+            ),
+        )
+        val messages = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
+        val assistant = messages.first { it["role"]!!.jsonPrimitive.content == "assistant" }
+        val blocks = assistant["content"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(2, blocks.size)
+        assertEquals("text", blocks[0]["type"]!!.jsonPrimitive.content)
+        assertEquals("hi", blocks[0]["text"]!!.jsonPrimitive.content)
+        assertEquals("tool_use", blocks[1]["type"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun anthropicParallelToolsMergeToSingleUserMessage() {
+        val tc1 = ToolCall(id = "toolu_p1", name = "get_weather", argumentsJson = """{"city":"Taipei"}""")
+        val tc2 = ToolCall(id = "toolu_p2", name = "get_weather", argumentsJson = """{"city":"Taichung"}""")
+        val body = AnthropicProvider(anthropicConfig(), { null }).buildBody(
+            ChatRequest(
+                model = "m",
+                messages = listOf(
+                    ChatMessage("assistant", "", toolCalls = listOf(tc1, tc2)),
+                    ChatMessage("tool", "sunny", toolCallId = tc1.id),
+                    ChatMessage("tool", "cloudy", toolCallId = tc2.id),
+                ),
+                tools = advTools(),
+            ),
+        )
+        val messages = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(2, messages.size)
+        assertEquals(
+            listOf("assistant", "user"),
+            messages.map { it["role"]!!.jsonPrimitive.content },
+        )
+        val userBlocks = messages[1]["content"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(2, userBlocks.size)
+        assertTrue(userBlocks.all { it["type"]!!.jsonPrimitive.content == "tool_result" })
+        assertEquals(
+            listOf(tc1.id, tc2.id),
+            userBlocks.map { it["tool_use_id"]!!.jsonPrimitive.content },
+        )
+        for (b in userBlocks) assertEquals(setOf("type", "tool_use_id", "content"), b.keys)
+    }
+
     // ---- Chat: verify-or-fill ----
 
     @Test
@@ -687,5 +764,19 @@ class ProviderToolRoundTripTest {
             .filter { it["role"]!!.jsonPrimitive.content == "tool" }
             .map { it["tool_call_id"]!!.jsonPrimitive.content }
         assertEquals(listOf("call_c1", "call_c2"), chatToolIds)
+    }
+
+    @Test
+    fun anthropicEmptyPlainMessageFailsClosed() {
+        expectFailWithCode("ANTHROPIC_EMPTY_CONTENT") {
+            anthropicBodyOf(listOf(ChatMessage("user", "")))
+        }
+    }
+
+    @Test
+    fun anthropicEmptyAssistantFailsClosed() {
+        expectFailWithCode("ANTHROPIC_EMPTY_CONTENT") {
+            anthropicBodyOf(listOf(ChatMessage("assistant", "")))
+        }
     }
 }

@@ -46,19 +46,19 @@ private class ProvenanceFakeProvider(
 }
 
 /**
- * Stage D resume-provenance regressions (all fake data).
+ * Stage G (R2-3 [P1/privacy]) resume-provenance regressions (all fake data).
  *
- * - `create` persists the origin as `"providerId/modelId"` so `open` can
- *   attribute the stored history to one provider.
- * - `open` with a matching provider hydrates the restored prefix into the
- *   first request (same provider + different model still hydrates: the
- *   credential/recipient is unchanged).
- * - `open` with a different providerId (or a malformed provider segment)
- *   withholds the prefix: the first request carries only the new user
- *   message, and [CreatedSession.historyWithheld] is true so the ViewModel
- *   shows a visible notice.
+ * - `create` persists provenance as `"${providerId}@${origin}/${modelId}"` so
+ *   `open` can attribute stored history to a specific provider and web origin.
+ * - `open` with matching provider and origin hydrates the restored prefix into
+ *   the first request (same provider + same origin + different model still
+ *   hydrates: recipient/credential unchanged).
+ * - `open` with different providerId, different host/origin, or malformed origin
+ *   withholds the prefix: the first request carries only the new user message,
+ *   and [CreatedSession.historyWithheld] is true so the ViewModel shows a visible
+ *   notice.
  * - Legacy rows without provenance (bare model id, no `/`, including blank)
- *   hydrate as before for compat; they cannot be attributed to any provider.
+ *   fail closed (withhold for privacy).
  */
 class ChatSessionFactoryProvenanceTest {
 
@@ -72,6 +72,16 @@ class ChatSessionFactoryProvenanceTest {
         apiKeyRef = "provider_key/preset:openai",
     )
 
+    private fun customEndpoint(baseUrl: String) = EndpointConfig(
+        providerId = "preset:custom",
+        presetId = "custom",
+        label = "Custom",
+        baseUrl = baseUrl,
+        protocol = ProviderProtocol.CHAT_COMPLETIONS,
+        model = "local-model",
+        apiKeyRef = "provider_key/preset:custom",
+    )
+
     private fun factoryWith(
         transcripts: FakeSessionStore,
         provider: ProvenanceFakeProvider,
@@ -80,6 +90,7 @@ class ChatSessionFactoryProvenanceTest {
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
+            vault.putKey("preset:custom", "test-key-12345678".toCharArray())
             vault
         },
         buildProvider = { _, _ -> provider },
@@ -103,23 +114,56 @@ class ChatSessionFactoryProvenanceTest {
 
     @Test fun storedProviderOf_parsesFirstSegmentOnly() {
         assertEquals("preset:openai", storedProviderOf("preset:openai/gpt-4o-mini"))
+        assertEquals("preset:openai", storedProviderOf("preset:openai@https://api.openai.com/gpt-4o-mini"))
         // Model ids may themselves contain "/"; the provider is still the
         // first segment (providerIds never contain "/").
         assertEquals("preset:openrouter", storedProviderOf("preset:openrouter/openrouter/auto"))
+        assertEquals("preset:openrouter", storedProviderOf("preset:openrouter@https://openrouter.ai/openrouter/auto"))
         assertEquals(null, storedProviderOf("gpt-4o-mini"))
         assertEquals(null, storedProviderOf(""))
         assertEquals("", storedProviderOf("/gpt-4o-mini"))
+        assertEquals("", storedProviderOf("@https://api.openai.com/gpt-4o-mini"))
+    }
+
+    @Test fun storedOriginOf_extractsOrigin() {
+        assertEquals("https://api.openai.com", storedOriginOf("preset:openai@https://api.openai.com/gpt-4o-mini"))
+        assertEquals("http://127.0.0.1:11434", storedOriginOf("preset:custom@http://127.0.0.1:11434/local-model"))
+        assertEquals(null, storedOriginOf("preset:openai/gpt-4o-mini"))
+        assertEquals(null, storedOriginOf("gpt-4o-mini"))
+        assertEquals(null, storedOriginOf(""))
+        assertEquals(null, storedOriginOf("/gpt-4o-mini"))
+        assertEquals("", storedOriginOf("preset:openai@/gpt-4o-mini"))
     }
 
     @Test fun isSameProviderOrigin_gateMatrix() {
-        assertTrue(isSameProviderOrigin("preset:openai/gpt-4o-mini", "preset:openai"))
-        assertTrue(isSameProviderOrigin("preset:openai/other-model", "preset:openai"))
-        assertFalse(isSameProviderOrigin("preset:deepseek/deepseek-chat", "preset:openai"))
-        assertFalse(isSameProviderOrigin("/gpt-4o-mini", "preset:openai"))
-        // Legacy pre-provenance rows (bare id, incl. blank) hydrate as before.
-        assertTrue(isSameProviderOrigin("gpt-4o-mini", "preset:openai"))
-        assertTrue(isSameProviderOrigin("m", "preset:openai"))
-        assertTrue(isSameProviderOrigin("", "preset:openai"))
+        val openaiUrl = "https://api.openai.com/v1"
+
+        // New format with @origin
+        assertTrue(isSameProviderOrigin("preset:openai@https://api.openai.com/gpt-4o-mini", "preset:openai", openaiUrl))
+        assertTrue(isSameProviderOrigin("preset:openai@https://api.openai.com/other-model", "preset:openai", openaiUrl))
+        assertFalse(isSameProviderOrigin("preset:openai@https://api.openai.com/gpt-4o-mini", "preset:deepseek", openaiUrl))
+        assertFalse(isSameProviderOrigin("preset:openai@https://api.openai.com/gpt-4o-mini", "preset:openai", "https://proxy.example.com/v1"))
+
+        // Custom endpoints: same host true, different host false
+        assertTrue(isSameProviderOrigin("preset:custom@http://127.0.0.1:11434/local-model", "preset:custom", "http://127.0.0.1:11434/v1"))
+        assertFalse(isSameProviderOrigin("preset:custom@http://127.0.0.1:11434/local-model", "preset:custom", "http://127.0.0.1:8080/v1"))
+        assertFalse(isSameProviderOrigin("preset:custom@http://host-a:8080/local-model", "preset:custom", "http://host-b:8080/v1"))
+
+        // Old format without @origin: built-in preset with canonical origin succeeds; custom fails closed
+        assertTrue(isSameProviderOrigin("preset:openai/gpt-4o-mini", "preset:openai", openaiUrl))
+        assertTrue(isSameProviderOrigin("preset:openai/other-model", "preset:openai", openaiUrl))
+        assertFalse(isSameProviderOrigin("preset:openai/gpt-4o-mini", "preset:openai", "https://proxy.example.com/v1"))
+        assertFalse(isSameProviderOrigin("preset:custom/local-model", "preset:custom", "http://127.0.0.1:11434/v1"))
+        assertFalse(isSameProviderOrigin("preset:deepseek/deepseek-chat", "preset:openai", openaiUrl))
+
+        // Legacy bare model id (no "/"): fail-closed (all false)
+        assertFalse(isSameProviderOrigin("gpt-4o-mini", "preset:openai", openaiUrl))
+        assertFalse(isSameProviderOrigin("m", "preset:openai", openaiUrl))
+        assertFalse(isSameProviderOrigin("", "preset:openai", openaiUrl))
+
+        // Malformed / foreign / imported: fail-closed (all false)
+        assertFalse(isSameProviderOrigin("/gpt-4o-mini", "preset:openai", openaiUrl))
+        assertFalse(isSameProviderOrigin("imported/unknown", "preset:openai", openaiUrl))
     }
 
     @Test fun create_writesQualifiedProvenanceModel() = runBlocking {
@@ -128,7 +172,8 @@ class ChatSessionFactoryProvenanceTest {
         val created = factory.create(openaiEndpoint(), "hello world chat title here")
         try {
             val sid = checkNotNull(created.sessionId)
-            assertEquals("preset:openai/gpt-4o-mini", transcripts.metas[sid]!!.model)
+            assertEquals("preset:openai@https://api.openai.com/gpt-4o-mini", transcripts.metas[sid]!!.model)
+            assertTrue(transcripts.metas[sid]!!.model.contains("@https://api.openai.com/"))
             assertFalse(created.historyWithheld)
         } finally {
             created.session.close()
@@ -213,7 +258,7 @@ class ChatSessionFactoryProvenanceTest {
         }
     }
 
-    @Test fun open_legacyBareModelHydratesForCompat() = runBlocking {
+    @Test fun open_legacyBareModelWithholdsForPrivacy() = runBlocking {
         val transcripts = FakeSessionStore()
         val sid = transcripts.createSession("old chat", "m")
         transcripts.appendEvent(event(sid, "r1", "user", "q1"))
@@ -227,10 +272,88 @@ class ChatSessionFactoryProvenanceTest {
         }
         val opened = factoryWith(transcripts, provider).open(openaiEndpoint(), sid)
         try {
-            assertFalse(opened.historyWithheld)
+            assertTrue(opened.historyWithheld)
             opened.session.send("q3")
             val req = provider.seenRequests.single()
+            assertEquals(listOf("user"), req.messages.map { it.role })
+            assertTrue(req.messages.single().text.startsWith("q3"))
+            assertTrue(req.messages.none { it.text.contains("q1") || it.text.contains("a1") })
+        } finally {
+            opened.session.close()
+        }
+    }
+
+    @Test fun open_sameProviderDifferentBaseUrlWithholdsModelContext() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:custom@http://127.0.0.1:11434/local-model")
+        transcripts.appendEvent(event(sid, "r1", "user", "q1"))
+        transcripts.appendEvent(event(sid, "r1", "assistant", "a1"))
+
+        val provider = ProvenanceFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "fresh"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val opened = factoryWith(transcripts, provider).open(customEndpoint("http://127.0.0.1:11435/v1"), sid)
+        try {
+            assertTrue(opened.historyWithheld)
+            opened.session.send("q2")
+            val req = provider.seenRequests.single()
+            assertEquals(listOf("user"), req.messages.map { it.role })
+            assertTrue(req.messages.single().text.startsWith("q2"))
+            assertTrue(req.messages.none { it.text.contains("q1") || it.text.contains("a1") })
+        } finally {
+            opened.session.close()
+        }
+    }
+
+    @Test fun open_sameProviderSameBaseUrlHydratesFirstRequest() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:custom@http://127.0.0.1:11434/local-model")
+        transcripts.appendEvent(event(sid, "r1", "user", "q1"))
+        transcripts.appendEvent(event(sid, "r1", "assistant", "a1"))
+
+        val provider = ProvenanceFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "fresh"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val opened = factoryWith(transcripts, provider).open(customEndpoint("http://127.0.0.1:11434/v1"), sid)
+        try {
+            assertFalse(opened.historyWithheld)
+            opened.session.send("q2")
+            val req = provider.seenRequests.single()
             assertEquals(listOf("user", "assistant", "user"), req.messages.map { it.role })
+            assertEquals("q1", req.messages[0].text)
+            assertEquals("a1", req.messages[1].text)
+            assertTrue(req.messages[2].text.startsWith("q2"))
+        } finally {
+            opened.session.close()
+        }
+    }
+
+    @Test fun open_importedUnknownWithholdsModelContext() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "imported/unknown")
+        transcripts.appendEvent(event(sid, "r1", "user", "q1"))
+        transcripts.appendEvent(event(sid, "r1", "assistant", "a1"))
+
+        val provider = ProvenanceFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "fresh"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val opened = factoryWith(transcripts, provider).open(openaiEndpoint(), sid)
+        try {
+            assertTrue(opened.historyWithheld)
+            opened.session.send("q2")
+            val req = provider.seenRequests.single()
+            assertEquals(listOf("user"), req.messages.map { it.role })
+            assertTrue(req.messages.single().text.startsWith("q2"))
+            assertTrue(req.messages.none { it.text.contains("q1") || it.text.contains("a1") })
         } finally {
             opened.session.close()
         }

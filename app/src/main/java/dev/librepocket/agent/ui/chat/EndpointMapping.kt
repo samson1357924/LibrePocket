@@ -43,16 +43,25 @@ data class EndpointSessionBinding(
     val model: String,
 )
 
-fun EndpointConfig.toSessionBinding(model: String): EndpointSessionBinding {
-    val effective = toProviderConfig()
-    val url = URL(effective.baseUrl)
+/**
+ * Normalizes a base URL into an RFC 6454-style web origin: scheme://host[:port].
+ * Default ports for known schemes (e.g. 80 for http, 443 for https) are omitted.
+ * Returns an empty string if baseUrl is invalid or lacks scheme/host.
+ */
+fun normalizeOrigin(baseUrl: String): String = runCatching {
+    val url = URL(baseUrl)
     val scheme = url.protocol.lowercase(Locale.ROOT)
     val host = url.host.lowercase(Locale.ROOT)
     val port = url.port.takeIf { it >= 0 && it != url.defaultPort }?.let { ":$it" }.orEmpty()
+    if (scheme.isNotEmpty() && host.isNotEmpty()) "$scheme://$host$port" else ""
+}.getOrDefault("")
+
+fun EndpointConfig.toSessionBinding(model: String): EndpointSessionBinding {
+    val effective = toProviderConfig()
     return EndpointSessionBinding(
         providerId = providerId,
         effectiveBaseUrl = effective.baseUrl,
-        origin = "$scheme://$host$port",
+        origin = normalizeOrigin(effective.baseUrl),
         protocol = effective.protocol,
         apiKeyRef = effective.apiKeyRef,
         configRevision = configRevision,

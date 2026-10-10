@@ -8,11 +8,11 @@ import kotlinx.coroutines.CancellationException
  * [TranscriptSink] that persists turns into a [SessionStore] session.
  *
  * Mapping: turn started -> `user` event, turn succeeded -> `assistant` event
- * (`isPartial=0`), turn cancelled -> `assistant` event with `isPartial=1` (the
- * partial text was already preserved; Phase 3 adds the structured flag),
- * turn failed (three-arg) -> `assistant` event with `isPartial=1` plus
+ * (`isPartial=0`, `isFinal=1`), turn cancelled -> `assistant` event with `isPartial=1`
+ * (the partial text was already preserved; Phase 3 adds the structured flag)
+ * and `isFinal=1`, turn failed (three-arg) -> `assistant` event with `isPartial=1` plus
  * `failureReason` (partial fragment AND sanitized reason — Phase 3
- * implemented), legacy two-arg turn failed -> `system` event
+ * implemented) and `isFinal=1`, legacy two-arg turn failed -> `system` event
  * (`turn <runId> failed: <reason>`, kept out of the chat replay, visible in
  * export), retried -> `retry` event, steer queued -> `steer` event, tool
  * done -> `tool` event, usage -> `system` event (accounting, P1 records only).
@@ -31,12 +31,24 @@ import kotlinx.coroutines.CancellationException
  * failure first persists its partial as an `isPartial=1` terminal before the
  * retry notice, so reopen/export never loses the intermediate fragment.
  *
+ * Stage F (implemented): [TranscriptEvent.isFinal] distinguishes the
+ * logical-turn final result from per-attempt intermediate partials. Success,
+ * terminal-failure and cancel assistant rows are final (`isFinal=1`); a
+ * retryable failure's intermediate fragment uses the six-arg failure
+ * overload with `isFinal=false` and never closes the family. A cancel that
+ * lands on an already-terminalized attempt (retry backoff gap) uses
+ * [onLogicalTurnCancelled]: one `system`-kind final mark
+ * (`turn <logicalTurnId> cancelled`, `isFinal=1`) instead of a second
+ * assistant row for the same attempt — hidden from the chat replay, visible
+ * in export, and a terminal for the backfill scan.
+ *
  * Core vs notice: [onTurnStarted], [onTurnSucceeded], all [onTurnFailed]
- * overloads and [onTurnCancelled] are durable core events — a store failure
- * propagates so the session writer fails the ack instead of reporting a
- * false durable write. [onTurnRetried], [onSteerQueued], [onToolDone] and
- * [onUsage] stay best-effort notices: failures are swallowed and never
- * break the chat loop. Cancellation always propagates.
+ * overloads, all [onTurnCancelled] overloads and [onLogicalTurnCancelled] are
+ * durable core events — a store failure propagates so the session writer
+ * fails the ack instead of reporting a false durable write. [onTurnRetried],
+ * [onSteerQueued], [onToolDone] and [onUsage] stay best-effort notices:
+ * failures are swallowed and never break the chat loop. Cancellation always
+ * propagates.
  * Text is redacted again by [RoomSessionStore] on write.
  *
  * Cross-restart RUNNING → INTERRUPTED backfill lives in Phase 3 as well (see
@@ -59,6 +71,7 @@ class SessionTranscriptSink(
         failureReason: String? = null,
         parentRunId: String? = null,
         attemptIndex: Int? = null,
+        isFinal: Boolean = true,
     ) {
         try {
             store.appendEvent(
@@ -72,6 +85,7 @@ class SessionTranscriptSink(
                     failureReason = failureReason,
                     parentRunId = parentRunId,
                     attemptIndex = attemptIndex,
+                    isFinal = isFinal,
                 ),
             )
         } catch (e: CancellationException) {
@@ -90,6 +104,7 @@ class SessionTranscriptSink(
         failureReason: String? = null,
         parentRunId: String? = null,
         attemptIndex: Int? = null,
+        isFinal: Boolean = true,
     ) {
         try {
             store.appendEvent(
@@ -103,6 +118,7 @@ class SessionTranscriptSink(
                     failureReason = failureReason,
                     parentRunId = parentRunId,
                     attemptIndex = attemptIndex,
+                    isFinal = isFinal,
                 ),
             )
         } catch (e: CancellationException) {
@@ -113,23 +129,23 @@ class SessionTranscriptSink(
     }
 
     override suspend fun onTurnStarted(runId: String, text: String) {
-        appendDurable(runId, "user", text)
+        appendDurable(runId, "user", text, isFinal = true)
     }
 
     override suspend fun onTurnSucceeded(runId: String, text: String) {
-        appendDurable(runId, "assistant", text)
+        appendDurable(runId, "assistant", text, isFinal = true)
     }
 
     override suspend fun onTurnSucceeded(runId: String, text: String, parentRunId: String?, attemptIndex: Int?) {
-        appendDurable(runId, "assistant", text, parentRunId = parentRunId, attemptIndex = attemptIndex)
+        appendDurable(runId, "assistant", text, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true)
     }
 
     override suspend fun onTurnFailed(runId: String, error: String) {
-        appendDurable(runId, "system", "turn $runId failed: $error")
+        appendDurable(runId, "system", "turn $runId failed: $error", isFinal = true)
     }
 
     override suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
-        appendDurable(runId, "assistant", partialText, isPartial = true, failureReason = error)
+        appendDurable(runId, "assistant", partialText, isPartial = true, failureReason = error, isFinal = true)
     }
 
     override suspend fun onTurnFailed(
@@ -143,15 +159,32 @@ class SessionTranscriptSink(
             runId, "assistant", partialText,
             isPartial = true, failureReason = error,
             parentRunId = parentRunId, attemptIndex = attemptIndex,
+            isFinal = true,
+        )
+    }
+
+    override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+    ) {
+        appendDurable(
+            runId, "assistant", partialText,
+            isPartial = true, failureReason = error,
+            parentRunId = parentRunId, attemptIndex = attemptIndex,
+            isFinal = isFinal,
         )
     }
 
     override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
-        appendNotice(runId, "retry", "attempt $attempt/$maxAttempts after ${delayMs}ms")
+        appendNotice(runId, "retry", "attempt $attempt/$maxAttempts after ${delayMs}ms", isFinal = true)
     }
 
     override suspend fun onTurnCancelled(runId: String, partialText: String) {
-        appendDurable(runId, "assistant", partialText, isPartial = true)
+        appendDurable(runId, "assistant", partialText, isPartial = true, isFinal = true)
     }
 
     override suspend fun onTurnCancelled(
@@ -163,11 +196,26 @@ class SessionTranscriptSink(
         appendDurable(
             runId, "assistant", partialText,
             isPartial = true, parentRunId = parentRunId, attemptIndex = attemptIndex,
+            isFinal = true,
         )
     }
 
+    override suspend fun onLogicalTurnCancelled(
+        logicalTurnId: String,
+        attemptRunId: String,
+        partialText: String,
+        attemptIndex: Int?,
+    ) {
+        // Deduped cancel: the attempt already owns a durable partial row, so
+        // bind one system-kind final mark to the logical family instead of a
+        // second assistant row for the same attempt. Exact text pattern (like
+        // the INTERRUPTED marker): hidden from the chat replay (system kind),
+        // visible in export, terminal for the backfill scan.
+        appendDurable(logicalTurnId, "system", "turn $logicalTurnId cancelled", isFinal = true)
+    }
+
     override suspend fun onSteerQueued(text: String) {
-        appendNotice("steer-${UUID.randomUUID()}", "steer", text)
+        appendNotice("steer-${UUID.randomUUID()}", "steer", text, isFinal = true)
     }
 
     override suspend fun onToolDone(
@@ -177,10 +225,10 @@ class SessionTranscriptSink(
         name: String,
         argumentsJson: String,
     ) {
-        appendNotice(runId, "tool", "[tool:$name $argumentsJson]")
+        appendNotice(runId, "tool", "[tool:$name $argumentsJson]", isFinal = true)
     }
 
     override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) {
-        appendNotice(runId, "system", "usage input=$inputTokens output=$outputTokens")
+        appendNotice(runId, "system", "usage input=$inputTokens output=$outputTokens", isFinal = true)
     }
 }

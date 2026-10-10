@@ -86,6 +86,17 @@ internal const val INTERRUPTED_MARKER_KIND = "system"
 /** Explicit kill marker bound to the stranded runId (idempotent: exact text skips re-marking). */
 internal fun interruptedMarkerText(runId: String): String = "turn $runId interrupted"
 
+/**
+ * Stage F: explicit cancel mark bound to the logical family (idempotent:
+ * exact text skips re-marking). Written by
+ * [dev.librepocket.chat.TurnController] when a cancel lands on an
+ * already-terminalized attempt (retry backoff gap) instead of a second
+ * assistant row for the same attempt. Same exact-text pattern as the
+ * INTERRUPTED marker: hidden from the chat replay (system kind), visible in
+ * export, terminal for [findDanglingRunIds].
+ */
+internal fun cancelledMarkerText(runId: String): String = "turn $runId cancelled"
+
 private fun isLegacyFailureText(runId: String, text: String): Boolean =
     text.startsWith("turn $runId failed")
 
@@ -98,12 +109,10 @@ private fun isLegacyFailureText(runId: String, text: String): Boolean =
 internal fun familyOf(event: TranscriptEvent): String = event.parentRunId ?: event.runId
 
 /**
- * User-owned logical families with no terminal record: no assistant row of
- * any kind in the same family (completed, cancelled-partial, failed-with-
- * reason, or retried partial — Stage C persists every retryable failure's
- * fragment before its retry notice) and no legacy failure / already-marked
- * system row for that family. First-seen order; empty when nothing was
- * stranded. Pure (no I/O) so the backfill rule is directly unit-testable.
+ * User-owned logical families with no terminal record: no final assistant
+ * row in the same family and no cancel/interrupted/legacy-failure system mark
+ * for that family. First-seen order; empty when nothing was stranded. Pure
+ * (no I/O) so the backfill rule is directly unit-testable.
  *
  * Stage C (implemented): grouping is by logical family
  * (`parentRunId ?: runId`), not by raw `runId`. A retry→success turn leaves
@@ -112,6 +121,18 @@ internal fun familyOf(event: TranscriptEvent): String = event.parentRunId ?: eve
  * completed and never gains an INTERRUPTED marker. A terminal failure family
  * likewise owns its failed assistant row. Retry/tool/steer rows are never
  * terminals. Legacy single-id rows (parent null) keep the old behavior.
+ *
+ * Stage F (implemented): only a final assistant row (`isFinal=1`) closes a
+ * family. A retryable intermediate partial (`isFinal=0`) is never terminal,
+ * so `user + partial(isFinal=0) + retry` (kill during the backoff sleeper,
+ * or kill between the partial write and its retry notice) still dangles and
+ * gains exactly one INTERRUPTED marker on reopen; `retry→success` and
+ * `retry→terminal-failure` families own a final row and never gain one. A
+ * backoff-gap cancel family owns the system cancel mark
+ * (`turn <familyId> cancelled`) and likewise never gains an INTERRUPTED
+ * marker. Pre-F rows and JSONL lines without the key read back as final
+ * (old single-terminal semantics). Marker writes stay idempotent: a marked
+ * family owns its marker row and is skipped next time.
  */
 internal fun findDanglingRunIds(events: List<TranscriptEvent>): List<String> {
     val terminalFamilies = HashSet<String>()
@@ -119,9 +140,12 @@ internal fun findDanglingRunIds(events: List<TranscriptEvent>): List<String> {
     for (e in events) {
         val family = familyOf(e)
         when (e.kind) {
-            "assistant" -> terminalFamilies.add(family)
+            "assistant" -> if (e.isFinal) terminalFamilies.add(family)
             "system" -> {
-                if (e.text == interruptedMarkerText(e.runId) || isLegacyFailureText(e.runId, e.text)) {
+                if (e.text == interruptedMarkerText(e.runId) ||
+                    e.text == cancelledMarkerText(e.runId) ||
+                    isLegacyFailureText(e.runId, e.text)
+                ) {
                     terminalFamilies.add(family)
                 }
             }
@@ -545,18 +569,23 @@ class ChatSessionFactory(
 
     /**
      * Cross-restart RUNNING → INTERRUPTED backfill: every user-owned logical
-     * family with no assistant row in the same family (completed,
-     * cancelled-partial, failed-with-reason, or Stage C retried partial) and
-     * no legacy failure / already-marked system row is a turn the previous
-     * process killed before any terminal record, so it gets one explicit
-     * `system` marker row bound to the same family id.
+     * family with no final assistant row in the same family (completed,
+     * cancelled-partial, failed-with-reason; Stage F retried partials are
+     * non-final and never count) and no cancel/interrupted/legacy-failure
+     * system mark is a turn the previous process killed before any terminal
+     * record, so it gets one explicit `system` marker row bound to the same
+     * family id.
      *
      * Stage C (implemented): retry→success and retry→terminal-failure
      * families already own attempt assistant rows (bound via
      * `parentRunId`), so they are completed and never gain a marker — this
-     * is the Finding #3 fix. Deliberately NOT marked: intentional-cancel
-     * partials already own an assistant row (`isPartial=1`), so they replay
-     * as partial and never gain a marker; completed and failed turns
+     * is the Finding #3 fix. Stage F: only final rows count — a lone
+     * non-final retried partial still dangles (kill during the backoff
+     * sleeper, or between its partial write and its retry notice); a
+     * backoff-gap cancel family owns the system cancel mark and never gains
+     * an INTERRUPTED marker. Deliberately NOT marked: intentional-cancel
+     * partials already own a final assistant row (`isPartial=1`), so they
+     * replay as partial and never gain a marker; completed and failed turns
      * likewise own theirs. Prune cannot cause false positives (it drops the
      * oldest rows first, and an assistant row always has a larger seq than
      * its user row, so prune can orphan assistants but never users).

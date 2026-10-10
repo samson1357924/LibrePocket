@@ -28,6 +28,11 @@ val VALID_KINDS: Set<String> = setOf("user", "assistant", "tool", "steer", "retr
  * (0-based attempt number, omitted when null). Both keys are optional on
  * decode: pre-C lines have neither and read back as null (single-id legacy
  * semantics: family = `runId`).
+ *
+ * Stage F (implemented): final vs intermediate partial is carried as
+ * `isFinal` (boolean; legacy encoders may write 0/1, both decode). The key is
+ * optional on decode: pre-F lines have no key and read back as `isFinal=true`
+ * (old single-terminal semantics). Encoders always write the key.
  */
 data class JsonlLine(
     val seq: Long,
@@ -40,6 +45,7 @@ data class JsonlLine(
     val failureReason: String? = null,
     val parentRunId: String? = null,
     val attemptIndex: Int? = null,
+    val isFinal: Boolean = true,
 )
 
 /**
@@ -61,6 +67,7 @@ object JsonlCodec {
             put("imagesOmitted", event.imagesOmitted)
             put("createdAt", event.createdAt)
             put("isPartial", event.isPartial)
+            put("isFinal", event.isFinal)
             if (event.failureReason != null) put("failureReason", event.failureReason)
             if (event.parentRunId != null) put("parentRunId", event.parentRunId)
             if (event.attemptIndex != null) put("attemptIndex", event.attemptIndex)
@@ -120,6 +127,19 @@ object JsonlCodec {
                 prim.intOrNull ?: fail()
             }
         }
+        // Stage F optional key: absent (pre-F exports) → true (single-terminal legacy).
+        // Accepts booleans and legacy 0/1 ints; anything else fails.
+        val isFinal = when (val raw = obj["isFinal"]) {
+            null, is JsonNull -> true
+            else -> {
+                val prim = raw.jsonPrimitive
+                prim.booleanOrNull ?: when (prim.intOrNull) {
+                    0 -> false
+                    1 -> true
+                    else -> fail()
+                }
+            }
+        }
         val parsed = JsonlLine(
             seq = seq,
             runId = str("runId"),
@@ -131,6 +151,7 @@ object JsonlCodec {
             failureReason = failureReason,
             parentRunId = parentRunId,
             attemptIndex = attemptIndex,
+            isFinal = isFinal,
         )
         if (parsed.kind !in VALID_KINDS) fail()
         // Reject nonsensical fields early (spec §8.5): seqs start at 1 and the

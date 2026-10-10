@@ -440,6 +440,7 @@ object ProviderErrorClassifier {
 - 失敗嘗試不提交 assistant history；前面已完成 turn 的工具記錄保持不變。
 - 一個 logical turn 只寫一列 user（`runId=logicalTurnId`）；首嘗試重用該 id，後續重試各用新 `runId=attemptRunId` + 新 UI 輪次，並以 `parentRunId=logicalTurnId` + `attemptIndex` 回綁（logical 家族語義）；失敗半截輸出保留標 `isPartial`，新輸出不拼接舊塊。
 - 每次 retryable 失敗先持久化該 attempt 的 partial 終端（`assistant` 列，`isPartial=1` + 脫敏 `failureReason`，已綁定家族），再寫 `retry` notice（`runId=logicalTurnId`）；重開/匯出不丟中間 partial。
+- Stage F 終局旗標：`isFinal` 區分 logical-turn 最終結果與 per-attempt 中間 partial。success / terminal-failure / cancel assistant 列 `isFinal=1`；retryable-failed 中間 partial `isFinal=0`（寫於 retry notice 之前，永不關閉家族）；retry notice 不變。backoff 間隙的 cancel 命中已 terminalized attempt 時不再寫第二筆同 attempt assistant，改寫一列 system-kind 最終 cancel 標（`turn <familyId> cancelled`，`isFinal=1`，UI 隱藏、export 可見、backfill 認作終局）；未命中時沿用原 cancel 列（`isFinal=1`）。家族完成 ⟺ 有 `assistant isFinal=1` 或 system cancel / interrupted 終標；`isFinal=0` 非終端。
 - 每次 `Retrying(attempt, max, delayMs)` 發射到 `Flow`，UI 顯示進度；等待期間 `cancel()` 立即中斷（`delay` 可取消）。
 - 3 次耗盡 → `Failed` 終態 + transcript `retry` 事件（記 attempts=3）。
 
@@ -549,6 +550,9 @@ data class TranscriptEventEntity(
   // attempt 終端回綁 logical turn（parentRunId）+ 0-based 嘗試序號（attemptIndex）。
   val parentRunId: String? = null,     // 欄位名 `parentRunId TEXT NULL`
   val attemptIndex: Int? = null,       // 欄位名 `attemptIndex INTEGER NULL`
+  // Stage F（DB version 4，Migration 3→4 向後相容加入；舊列預設 true）：
+  // logical-turn 最終結果（true）vs per-attempt 中間 partial（false）。
+  val isFinal: Boolean = true,         // 欄位名 `isFinal INTEGER NOT NULL DEFAULT 1`
 )
 ```
 
@@ -574,7 +578,7 @@ interface SessionDao {
 }
 ```
 
-- DB 名：`librepocket.db`；版本 3（Stage C 起；`Migration(2, 3)` 以 `ALTER TABLE transcript_events ADD COLUMN parentRunId TEXT` + `ADD COLUMN attemptIndex INTEGER` 向後相容升級，永不用 destructive migration；舊列讀回預設 `parentRunId=null` / `attemptIndex=null`，即單 id 舊語義 `family = runId`。`Migration(1, 2)` 保留見上）。
+- DB 名：`librepocket.db`；版本 4（Stage F 起；`Migration(2, 3)` 以 `ALTER TABLE transcript_events ADD COLUMN parentRunId TEXT` + `ADD COLUMN attemptIndex INTEGER` 向後相容升級，永不用 destructive migration；舊列讀回預設 `parentRunId=null` / `attemptIndex=null`，即單 id 舊語義 `family = runId`。`Migration(1, 2)` 保留見上；Stage F 起 `Migration(3, 4)` 以 `ALTER TABLE transcript_events ADD COLUMN isFinal INTEGER NOT NULL DEFAULT 1` 向後相容升級，舊列讀回預設 `isFinal=true`，即舊單終端語義）。
 - `seq` 分配與插入必須在同一 `@Transaction`（`RoomSessionStore.appendEvent` 內 `withTransaction`）。
 - 並發：單一 `SessionStore` 實例 + `Mutex` 保證同 session `seq` 不重（Room 事務為第二道防線）。
 
@@ -603,13 +607,13 @@ ChatSessionImpl 產生 assistant 文本
 
 - `steer` 佇列內容寫 `kind="steer"` 事件（含排隊時間，供除錯）。
 - `Retrying` 寫 `kind="retry"` 事件（attempt/max/delayMs 結構化，不寫模型正文；Stage C 起一律綁 `runId=logicalTurnId`，非 terminal）。
-- turn succeeded 寫 `kind="assistant"`（`isPartial=0`，Stage C 起帶 `parentRunId/attemptIndex` 回綁家族）；cancel 寫 `kind="assistant"` 並置 `isPartial=1`（保留半截正文，Stage C 起同樣回綁）；turn failed（三參數/五參數）寫 `kind="assistant"`（`isPartial=1`）+ `failureReason`（脫敏原因，Stage C 起回綁）；每次 retryable 失敗先寫該 attempt 的 partial 終端再寫 `retry` notice；舊二參數 `onTurnFailed` 相容保留為 `kind="system"`（`text="turn <runId> failed: <reason>"`）。
+- turn succeeded 寫 `kind="assistant"`（`isPartial=0`、`isFinal=1`，Stage C 起帶 `parentRunId/attemptIndex` 回綁家族）；cancel 寫 `kind="assistant"` 並置 `isPartial=1`（保留半截正文，Stage C 起同樣回綁，Stage F 起 `isFinal=1`）；turn failed（三參數/五參數）寫 `kind="assistant"`（`isPartial=1`）+ `failureReason`（脫敏原因，Stage C 起回綁；Stage F 起 terminal 用 `isFinal=1`、retryable 中間 partial 用六參數 `isFinal=0`）；每次 retryable 失敗先寫該 attempt 的 partial 終端（`isFinal=0`）再寫 `retry` notice；backoff 間隙 cancel 命中已 terminalized attempt 時改寫 `kind="system"` 的 `turn <familyId> cancelled` 終局標（`isFinal=1`，replay 隱藏、export 可見）；舊二參數 `onTurnFailed` 相容保留為 `kind="system"`（`text="turn <runId> failed: <reason>"`）。
 
 ### 8.5 JSONL 匯出 / 匯入（目標介面；非目前 UI 流程）
 
-- 匯出：一行一 JSON（`{"seq":N,"runId":"…","kind":"…","text":"…(已脫敏)","imagesOmitted":0,"createdAt":…,"isPartial":false}`；Phase 3 起失敗/取消行另帶 `"failureReason":"…"`，`null` 時省略該鍵；Stage C 起 attempt 終端另帶 `"parentRunId":"…"` / `"attemptIndex":N`，`null` 時省略）+ 檔頭註解行？**無檔頭**（純 JSONL，`jq` 可直接處理）。
-- 匯入：逐行 `kotlinx.serialization` 解析 → 校验 `kind ∈ {…}` + `seq` 遞增 → 新 `sessionId` 重寫入；`isPartial` / `failureReason` / `parentRunId` / `attemptIndex` 四鍵可選（缺鍵的舊匯出讀回預設 `false` / `null` / `null` / `null`，即單 id 舊語義）；失敗行整批回滾（單事務），錯誤訊息只報行號不貼內容。
-- 續聊恢復（Phase 3；Stage C 改為 logical 家族判定）：`open` 在 meta 載入後、attach 前，把無 terminal 紀錄的 dangling 家族（有 user 列而同家族 `parentRunId ?: runId` 無 assistant/失敗列；retry/tool/steer 永非 terminal）補一列 `kind="system"` 的 `turn <familyId> interrupted` marker（replay 已過濾 system，不污染正常歷史）；retry→success 與 retry→terminal-failure 家族已擁 attempt 列，不誤標；已恢復的 user/assistant 前文（partial 列除外）納入首個 request，窗口上限介面見 `HistoryWindowCap`（量測出 token 預算前預設無截斷，截斷可觀察不靜默丟）。
+- 匯出：一行一 JSON（`{"seq":N,"runId":"…","kind":"…","text":"…(已脫敏)","imagesOmitted":0,"createdAt":…,"isPartial":false,"isFinal":true}`；Phase 3 起失敗/取消行另帶 `"failureReason":"…"`，`null` 時省略該鍵；Stage C 起 attempt 終端另帶 `"parentRunId":"…"` / `"attemptIndex":N`，`null` 時省略；Stage F 起常帶 `"isFinal":true/false`）+ 檔頭註解行？**無檔頭**（純 JSONL，`jq` 可直接處理）。
+- 匯入：逐行 `kotlinx.serialization` 解析 → 校验 `kind ∈ {…}` + `seq` 遞增 → 新 `sessionId` 重寫入；`isPartial` / `failureReason` / `parentRunId` / `attemptIndex` / `isFinal` 五鍵可選（缺鍵的舊匯出讀回預設 `false` / `null` / `null` / `null` / `true`，即單 id 舊語義 + 舊單終端語義；`isFinal` 另接受 0/1）；失敗行整批回滾（單事務），錯誤訊息只報行號不貼內容。
+- 續聊恢復（Phase 3；Stage C 改為 logical 家族判定）：`open` 在 meta 載入後、attach 前，把無 terminal 紀錄的 dangling 家族（有 user 列而同家族 `parentRunId ?: runId` 無 `assistant isFinal=1` 列、亦無 system cancel / interrupted / 失敗終標；`isFinal=0` 中間 partial 永非 terminal，retry/tool/steer 永非 terminal）補一列 `kind="system"` 的 `turn <familyId> interrupted` marker（replay 已過濾 system，不污染正常歷史）；retry→success 與 retry→terminal-failure 家族已擁 final attempt 列，不誤標；僅含非終局 partial（`isFinal=0`）+ retry 的家族（backoff sleeper 中被 kill，或 kill 於 partial 寫入與 retry notice 之間）仍 dangling 並補一 marker；backoff-gap cancel 家族擁 system cancel 終標，不誤標；已恢復的 user/assistant 前文（partial 列除外）納入首個 request，窗口上限介面見 `HistoryWindowCap`（量測出 token 預算前預設無截斷，截斷可觀察不靜默丟）。
 - 續聊跨 provider fail-closed（Stage D；已實作）：`open` 先以 `meta.model` 的 provider 出處（`"providerId/modelId"` 首段）比對當前 endpoint `providerId`，不符即以空 model context 續聊——舊列不自動轉送給新 provider，本地顯示 replay 與 INTERRUPTED backfill 不變，並由 UI 可見提醒（`RESUME_CROSS_PROVIDER_HISTORY_WITHHELD`）揭露；同 provider 不同 model 仍 hydrate（credential 與接收方不變，KeyVault 以 providerId 綁定）；無出處的舊列（裸 model id，無 `/`）為相容仍 hydrate，新建會話一律寫出處；`meta` 不記歷史 baseUrl，故僅比 providerId（同 providerId 的 URL 變更仍屬同一 key trust domain）；匯入列（`model="imported/unknown"`）視為外來出處一律 withhold（fail-closed，尚無 import UI 流程）。
 - 檔名：`librepocket-<sessionId8>-<yyyyMMddHHmm>.jsonl`；經 SAF 寫入用戶選位（P1 不自建 FileProvider 分享）。
 - 大小上限：單 session 匯出 ≤ 20 MiB（超限拒絕並提示 prune）。

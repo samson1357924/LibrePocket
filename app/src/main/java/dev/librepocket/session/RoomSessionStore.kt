@@ -91,6 +91,7 @@ class RoomSessionStore(
                             reason,
                             event.parentRunId,
                             event.attemptIndex,
+                            event.isFinal,
                         ),
                     )
                     dao.touchSession(event.sessionId, clock())
@@ -275,6 +276,7 @@ class RoomSessionStore(
                             line.failureReason?.let { Redactor.redactError(it) },
                             line.parentRunId,
                             line.attemptIndex,
+                            line.isFinal,
                         ),
                     )
                 }
@@ -347,6 +349,7 @@ class RoomSessionStore(
         failureReason = failureReason,
         parentRunId = parentRunId,
         attemptIndex = attemptIndex,
+        isFinal = isFinalFlag,
     )
 
     private fun SessionEntity.toMeta(): SessionMeta = SessionMeta(

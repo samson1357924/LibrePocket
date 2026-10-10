@@ -26,8 +26,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * transaction in `RoomSessionStore` only assigns `seq`; it cannot repair
  * upstream reordering, which is fixed here.
  *
- * Durable ack: [onTurnStarted], [onTurnSucceeded], [onTurnCancelled] and
- * [onTurnFailed] suspend until the writer has run the delegate. A delegate
+ * Durable ack: [onTurnStarted], [onTurnSucceeded], [onTurnCancelled],
+ * [onLogicalTurnCancelled] and [onTurnFailed] suspend until the writer has run the delegate. A delegate
  * failure (including a non-cancellation store error from a durable core
  * write) fails the ack explicitly via `completeExceptionally` — never a
  * false durable ack — and the waiter converts that into an INTERRUPTED mark
@@ -149,6 +149,15 @@ class OrderedTranscriptSink(
     attemptIndex: Int?,
   ) = writeCore(runId) { delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex) }
 
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+  ) = writeCore(runId) { delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal) }
+
   override suspend fun onTurnCancelled(runId: String, partialText: String) =
     writeCore(runId) { delegate.onTurnCancelled(runId, partialText) }
 
@@ -158,6 +167,15 @@ class OrderedTranscriptSink(
     parentRunId: String?,
     attemptIndex: Int?,
   ) = writeCore(runId) { delegate.onTurnCancelled(runId, partialText, parentRunId, attemptIndex) }
+
+  override suspend fun onLogicalTurnCancelled(
+    logicalTurnId: String,
+    attemptRunId: String,
+    partialText: String,
+    attemptIndex: Int?,
+  ) = writeCore(logicalTurnId) {
+    delegate.onLogicalTurnCancelled(logicalTurnId, attemptRunId, partialText, attemptIndex)
+  }
 
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) =
     writeOrdered { delegate.onTurnRetried(runId, attempt, maxAttempts, delayMs) }

@@ -3,6 +3,7 @@ package dev.librepocket.session;
 import androidx.room.ColumnInfo;
 import androidx.room.Entity;
 import androidx.room.ForeignKey;
+import androidx.room.Ignore;
 import androidx.room.Index;
 import androidx.room.PrimaryKey;
 
@@ -25,6 +26,13 @@ import androidx.room.PrimaryKey;
  * arrived via {@code MIGRATION_2_3} (ALTER ADD COLUMN only, never a rebuild);
  * pre-migration rows read back as {@code parentRunId=null} /
  * {@code attemptIndex=null} (single-id legacy semantics).
+ *
+ * <p>Stage F (implemented): {@code isFinal INTEGER NOT NULL DEFAULT 1}
+ * distinguishes a logical-turn final result from a per-attempt intermediate
+ * partial. Success, terminal-failure and cancel assistant rows are final;
+ * a retryable failure's intermediate fragment (written before its retry
+ * notice) is non-final ({@code isFinal=0}). Arrived via {@code MIGRATION_3_4}
+ * (ALTER ADD COLUMN only); pre-migration rows read back as final.
  *
  * <p>Written in Java so the plain {@code javac} annotation processor (already declared
  * in the build) generates the Room implementation; the store and tests stay in Kotlin.
@@ -69,6 +77,14 @@ public class TranscriptEventEntity {
     // Stage C: 0-based attempt number for attempt rows; null for user/legacy rows.
     @ColumnInfo(name = "attemptIndex")
     private Integer attemptIndex;
+    // Stage F: logical-turn final vs per-attempt intermediate partial. Success,
+    // terminal-failure and cancel assistant rows are final (1); a retryable
+    // failure's intermediate fragment is non-final (0). The field keeps a
+    // non-keyword name (mirroring `partial` / `isPartial()`) so the Room
+    // processor binds the getter unambiguously; the column keeps the spec
+    // §8.1 name `isFinal`.
+    @ColumnInfo(name = "isFinal", defaultValue = "1")
+    private boolean finalFlag;
 
     public TranscriptEventEntity(
             long rowId,
@@ -83,7 +99,8 @@ public class TranscriptEventEntity {
             boolean partial,
             String failureReason,
             String parentRunId,
-            Integer attemptIndex) {
+            Integer attemptIndex,
+            boolean finalFlag) {
         this.rowId = rowId;
         this.sessionId = sessionId;
         this.seq = seq;
@@ -97,6 +114,28 @@ public class TranscriptEventEntity {
         this.failureReason = failureReason;
         this.parentRunId = parentRunId;
         this.attemptIndex = attemptIndex;
+        this.finalFlag = finalFlag;
+    }
+
+    // Backward-compatible 13-arg form (pre-F call sites): old rows and old
+    // callers default to final (single-terminal legacy semantics).
+    @Ignore
+    public TranscriptEventEntity(
+            long rowId,
+            String sessionId,
+            long seq,
+            String runId,
+            String kind,
+            String text,
+            boolean truncated,
+            int imagesOmitted,
+            long createdAt,
+            boolean partial,
+            String failureReason,
+            String parentRunId,
+            Integer attemptIndex) {
+        this(rowId, sessionId, seq, runId, kind, text, truncated, imagesOmitted,
+                createdAt, partial, failureReason, parentRunId, attemptIndex, true);
     }
 
     public long getRowId() {
@@ -201,5 +240,13 @@ public class TranscriptEventEntity {
 
     public void setAttemptIndex(Integer attemptIndex) {
         this.attemptIndex = attemptIndex;
+    }
+
+    public boolean isFinalFlag() {
+        return finalFlag;
+    }
+
+    public void setFinalFlag(boolean finalFlag) {
+        this.finalFlag = finalFlag;
     }
 }

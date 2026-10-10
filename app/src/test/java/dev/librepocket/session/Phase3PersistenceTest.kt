@@ -129,7 +129,7 @@ class Phase3PersistenceTest {
         // 1→2→3. Both migrations are backward-compatible ADD COLUMNs, so the
         // Phase 3 assertions below still hold, plus the Stage C null defaults.
         val db = Room.databaseBuilder(ctx, LibrePocketDb::class.java, name)
-            .addMigrations(LibrePocketDb.MIGRATION_1_2, LibrePocketDb.MIGRATION_2_3)
+            .addMigrations(LibrePocketDb.MIGRATION_1_2, LibrePocketDb.MIGRATION_2_3, LibrePocketDb.MIGRATION_3_4)
             .allowMainThreadQueries()
             .build()
         openDbs.add(db)

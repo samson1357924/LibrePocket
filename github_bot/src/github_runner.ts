@@ -110,10 +110,17 @@ export const REVIEW_REPORT_JSON_NAME = 'review-report.json';
 export const REVIEW_REPORT_MD_NAME = 'review-report.md';
 export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
 // Phase 3 (P2 #3) N-chunk deadline/concurrency/timeout (fail-closed, never
-// silent omission). t0 + POCKETGUARD_REVIEW_DEADLINE_MS (default 20min minus
-// REVIEW_DEADLINE_MARGIN_MS for artifact/report upload) bounds the whole
-// chunked PR review. Before each wave the runner estimates need (the
-// per-chunk timeout for the next wave: min(420s, remaining/remainingWaves));
+// silent omission). t0 + effectiveDeadline bounds the whole chunked PR
+// review, where effectiveDeadline = min(configured POCKETGUARD_REVIEW_DEADLINE_MS
+// (default 20min minus REVIEW_DEADLINE_MARGIN_MS for artifact/report upload),
+// jobRemaining - REVIEW_JOB_UPLOAD_SKEW_MS) with jobRemaining =
+// REVIEW_JOB_TIMEOUT_MS - (now - POCKETGUARD_JOB_STARTED_MS). The trusted
+// jobStarted is recorded by the first review-send step into $GITHUB_ENV so
+// slow hosted setup still leaves upload headroom; a missing/invalid
+// jobStarted downgrades to the configured deadline (fail-closed, never
+// extends). Before each wave the runner estimates need (the per-chunk timeout
+// for the next wave: min(420s, effectiveRemaining/remainingWaves) with
+// effectiveRemaining = min(reviewRemaining, jobRemaining - skew));
 // remaining < need exits early with INCONCLUSIVE + chunkCoverageComplete:false
 // + completed reports + omission placeholders (or legacy INCONCLUSIVE when
 // nothing was completed) and never writes true. Fixed concurrency
@@ -127,6 +134,16 @@ export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
 // saveReviewOutput (checkpoint artifact) as INCONCLUSIVE + false.
 export const REVIEW_DEADLINE_MARGIN_MS = 60_000;
 export const DEFAULT_REVIEW_DEADLINE_MS = 20 * 60 * 1000 - REVIEW_DEADLINE_MARGIN_MS;
+// Phase 2 (P2 #2) job wall-clock: the review-send job runs with
+// timeout-minutes: 20, so the trusted POCKETGUARD_JOB_STARTED_MS (ms since
+// epoch, recorded by the first review-send step into $GITHUB_ENV) bounds the
+// whole review by jobRemaining = REVIEW_JOB_TIMEOUT_MS - (now - jobStarted).
+// The effective budget is min(configured, jobRemaining - UPLOAD_SKEW) so slow
+// hosted setup (checkout + setup-node + npm ci) cannot push the artifact
+// upload past the job timeout. Missing/invalid jobStarted falls back to the
+// configured deadline (fail-closed conservative downgrade: never extends).
+export const REVIEW_JOB_TIMEOUT_MS = 20 * 60 * 1000;
+export const REVIEW_JOB_UPLOAD_SKEW_MS = 60_000;
 export const PR_CHUNK_CONCURRENCY = 2;
 export const MAX_PER_CHUNK_TIMEOUT_MS = 420_000;
 export const MIN_VIABLE_PER_CHUNK_TIMEOUT_MS = 10_000;
@@ -150,6 +167,39 @@ export function resolveReviewDeadlineMs(env?: NodeJS.ProcessEnv): number {
     if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
   }
   return DEFAULT_REVIEW_DEADLINE_MS;
+}
+
+// Phase 2 (P2 #2) trusted job-start instant (ms since epoch). The workflow
+// records it in the first review-send step
+// (`date +%s%3N` into $GITHUB_ENV); it is workflow-defined, never taken from
+// PR content or the event payload. Missing/non-numeric/non-positive values
+// return undefined so callers downgrade to the configured deadline.
+export function resolveJobStartedMs(env?: NodeJS.ProcessEnv): number | undefined {
+  const raw = env?.POCKETGUARD_JOB_STARTED_MS?.trim() ?? '';
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return Math.floor(parsed);
+}
+
+// Phase 2 (P2 #2) effective whole-review budget:
+// min(configured, jobRemaining - UPLOAD_SKEW) where
+// jobRemaining = REVIEW_JOB_TIMEOUT_MS - (nowMs - jobStartedMs).
+// Missing/invalid jobStarted falls back to configured (fail-closed
+// conservative: never extends the budget). A negative clock skew
+// (now < started) clamps elapsed to 0; an exhausted job budget clamps to 0
+// so callers exit early with INCONCLUSIVE instead of starting work.
+// nowMs defaults to Date.now() so production callers pass nothing while
+// tests inject a fake clock.
+export function resolveEffectiveReviewDeadlineMs(env?: NodeJS.ProcessEnv, nowMs?: number): number {
+  const configured = resolveReviewDeadlineMs(env);
+  const jobStarted = resolveJobStartedMs(env);
+  if (jobStarted === undefined) return configured;
+  const now = Number.isFinite(nowMs) ? Math.floor(nowMs as number) : Date.now();
+  if (!Number.isFinite(now)) return configured;
+  const elapsed = Math.max(0, now - jobStarted);
+  const jobBudget = REVIEW_JOB_TIMEOUT_MS - elapsed - REVIEW_JOB_UPLOAD_SKEW_MS;
+  return Math.max(0, Math.min(configured, Math.floor(jobBudget)));
 }
 
 // Per-chunk timeout passthrough: min(420s, remaining/remainingWaves) with an
@@ -1557,6 +1607,11 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
     // deadline budget cannot reliably cover all chunks. A refused claim
     // occupies nothing (claimed:false, reviewsUsed 0); a granted claim whose
     // later review times out still holds its slot (never refunded).
+    // Phase 2 (P2 #2): the budget is the effective deadline
+    // min(configured, jobRemaining - UPLOAD_SKEW) via
+    // resolveEffectiveReviewDeadlineMs so a slow-hosted claim (setup already
+    // consumed job wall-clock) refuses instead of reserving a slot the review
+    // job cannot finish; a missing jobStarted downgrades to configured.
     {
       let chunkCount = 1;
       try {
@@ -1572,7 +1627,7 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
       } catch {
         throw new Error('PocketGuard: diff pre-flight failed.');
       }
-      const deadlineMs = resolveReviewDeadlineMs(env);
+      const deadlineMs = resolveEffectiveReviewDeadlineMs(env, Date.now());
       const waves = Math.max(1, Math.ceil(Math.max(1, chunkCount) / PR_CHUNK_CONCURRENCY));
       const perChunkShare = Math.floor(deadlineMs / waves);
       const perChunkTimeout = Math.min(MAX_PER_CHUNK_TIMEOUT_MS, perChunkShare);
@@ -3930,10 +3985,12 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
         // boundaries) and each chunk takes a full orchestrateReview turn.
         // Deterministic BLOCK already short-circuited above over the FULL
         // diff (zero AI). Phase 3 (P2 #3): N chunks run under a whole-review
-        // deadline (t0 + POCKETGUARD_REVIEW_DEADLINE_MS, default 20min minus
-        // margin) with fixed PR_CHUNK_CONCURRENCY waves, per-wave need
-        // estimation (remaining < need exits early fail-closed), per-chunk
-        // timeoutMs passthrough min(420s, remaining/remainingWaves), and a
+        // effective deadline (t0 + min(configured POCKETGUARD_REVIEW_DEADLINE_MS,
+        // jobRemaining - UPLOAD_SKEW); trusted POCKETGUARD_JOB_STARTED_MS from
+        // the first review-send step, missing downgrades to configured) with
+        // fixed PR_CHUNK_CONCURRENCY waves, per-wave need estimation
+        // (effectiveRemaining < need exits early fail-closed), per-chunk
+        // timeoutMs passthrough min(420s, effectiveRemaining/remainingWaves), and a
         // computed chunkCoverageComplete (any INCONCLUSIVE — including
         // transport timeout/abort/deadline omission — forces false so the
         // publish triple-gate falls back). Deadline exits save via
@@ -3952,9 +4009,14 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
           const { orchestrateReview, synthesizeChunkedReview } = await import('./orchestrator');
           const restoreFetch = installOpenAIStub(env);
           try {
-            const deadlineMs = resolveReviewDeadlineMs(env);
+            // Phase 2 (P2 #2): effective budget min(configured, jobRemaining -
+            // UPLOAD_SKEW). t0 anchors the review clock; the deadline already
+            // embeds the job cap at start, and each wave re-takes
+            // min(reviewRemaining, liveJobRemaining - skew) so hosted setup
+            // overhead plus elapsed waves cannot overrun the 20min job.
             const t0 = Date.now();
-            const deadline = t0 + deadlineMs;
+            const effectiveMs = resolveEffectiveReviewDeadlineMs(env, t0);
+            const deadline = t0 + effectiveMs;
             const total = chunks.length;
             const reviewFiles = filterReviewDiffFiles(changedFiles);
             type ChunkResult = Awaited<ReturnType<typeof orchestrateReview>>;
@@ -3967,13 +4029,25 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
             // affects the merged verdict (verifiable aggregation).
             while (nextIndex < total) {
               const nowMs = Date.now();
-              const remainingMs = deadline - nowMs;
+              const reviewRemainingMs = deadline - nowMs;
+              // Per-chunk live job cap: min(reviewRemaining, jobRemaining -
+              // skew); missing jobStarted keeps reviewRemaining (fail-closed
+              // downgrade to configured). jobRemainingText stays 'n/a' without
+              // a trusted start so logs distinguish the two modes.
+              const jobStartedMs = resolveJobStartedMs(env);
+              let jobRemainingMs: number | undefined;
+              let remainingMs = reviewRemainingMs;
+              if (jobStartedMs !== undefined) {
+                jobRemainingMs = REVIEW_JOB_TIMEOUT_MS - (nowMs - jobStartedMs) - REVIEW_JOB_UPLOAD_SKEW_MS;
+                remainingMs = Math.min(reviewRemainingMs, jobRemainingMs);
+              }
               const remainingChunks = total - nextIndex;
               const remainingWaves = Math.ceil(remainingChunks / PR_CHUNK_CONCURRENCY);
               const timeoutMs = resolvePerChunkTimeoutMs(env, remainingMs, remainingWaves);
               const needMs = timeoutMs + CHUNK_DEADLINE_SAVE_MARGIN_MS;
               try {
-                console.warn(`[PocketGuard] chunk progress ${nextIndex}/${total} remaining=${Math.max(0, remainingMs)}ms need=${needMs}ms timeout=${timeoutMs}ms`);
+                const jobRemainingText = jobRemainingMs === undefined ? 'n/a' : `${Math.max(0, Math.floor(jobRemainingMs))}ms`;
+                console.warn(`[PocketGuard] chunk progress ${nextIndex}/${total} remaining=${Math.max(0, Math.floor(remainingMs))}ms need=${needMs}ms timeout=${timeoutMs}ms jobRemaining=${jobRemainingText}`);
               } catch {
                 // Logging never blocks review.
               }

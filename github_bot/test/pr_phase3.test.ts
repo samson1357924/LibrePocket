@@ -11,8 +11,12 @@ import {
   MIN_VIABLE_PER_CHUNK_TIMEOUT_MS,
   PR_CHUNK_CONCURRENCY,
   parseReviewCountMarker,
+  resolveEffectiveReviewDeadlineMs,
+  resolveJobStartedMs,
   resolvePerChunkTimeoutMs,
   resolveReviewDeadlineMs,
+  REVIEW_JOB_TIMEOUT_MS,
+  REVIEW_JOB_UPLOAD_SKEW_MS,
   runClaimMode,
   runPublishMode,
   runReviewMode,
@@ -223,6 +227,58 @@ export async function runPrPhase3Tests(): Promise<void> {
       assert.equal(computePrChunkCoverageComplete([], { totalLength: 0, files: [] }), false, 'empty set never covers');
     }
 
+    // Unit: Phase 2 (P2 #2) trusted job wall-clock (no I/O, fake clock).
+    {
+      assert.equal(REVIEW_JOB_TIMEOUT_MS, 20 * 60 * 1000, 'job timeout mirrors review-send timeout-minutes: 20');
+      assert.equal(REVIEW_JOB_UPLOAD_SKEW_MS, 60_000, 'job upload skew keeps artifact headroom');
+      assert.equal(resolveJobStartedMs({} as NodeJS.ProcessEnv), undefined, 'missing job start is undefined');
+      assert.equal(resolveJobStartedMs({ POCKETGUARD_JOB_STARTED_MS: '' } as unknown as NodeJS.ProcessEnv), undefined, 'empty job start is undefined');
+      assert.equal(resolveJobStartedMs({ POCKETGUARD_JOB_STARTED_MS: 'nope' } as NodeJS.ProcessEnv), undefined, 'non-numeric job start is undefined fail-closed');
+      assert.equal(resolveJobStartedMs({ POCKETGUARD_JOB_STARTED_MS: '-5' } as NodeJS.ProcessEnv), undefined, 'non-positive job start is undefined');
+      assert.equal(resolveJobStartedMs({ POCKETGUARD_JOB_STARTED_MS: ' 1700000000000 ' } as NodeJS.ProcessEnv), 1700000000000, 'job start trims whitespace');
+      assert.equal(resolveJobStartedMs({ POCKETGUARD_JOB_STARTED_MS: '1700000000000.9' } as NodeJS.ProcessEnv), 1700000000000, 'job start floors fractional');
+      const now = 2_000_000_000_000;
+      assert.equal(resolveEffectiveReviewDeadlineMs({} as NodeJS.ProcessEnv, now), DEFAULT_REVIEW_DEADLINE_MS, 'missing job start downgrades to configured');
+      assert.equal(
+        resolveEffectiveReviewDeadlineMs({ POCKETGUARD_JOB_STARTED_MS: 'bad' } as NodeJS.ProcessEnv, now),
+        DEFAULT_REVIEW_DEADLINE_MS,
+        'invalid job start downgrades to configured',
+      );
+      assert.equal(
+        resolveEffectiveReviewDeadlineMs({ POCKETGUARD_JOB_STARTED_MS: String(now) } as NodeJS.ProcessEnv, now),
+        DEFAULT_REVIEW_DEADLINE_MS,
+        'fresh job keeps configured (jobBudget equals configured)',
+      );
+      assert.equal(
+        resolveEffectiveReviewDeadlineMs({ POCKETGUARD_JOB_STARTED_MS: String(now - 120_000) } as NodeJS.ProcessEnv, now),
+        1_020_000,
+        '2min setup offset shrinks effective to jobRemaining - skew',
+      );
+      assert.equal(
+        resolveEffectiveReviewDeadlineMs(
+          { POCKETGUARD_REVIEW_DEADLINE_MS: '5000', POCKETGUARD_JOB_STARTED_MS: String(now) } as NodeJS.ProcessEnv,
+          now,
+        ),
+        5000,
+        'small configured wins over a fresh job (min)',
+      );
+      assert.equal(
+        resolveEffectiveReviewDeadlineMs({ POCKETGUARD_JOB_STARTED_MS: String(now - REVIEW_JOB_TIMEOUT_MS) } as NodeJS.ProcessEnv, now),
+        0,
+        'exhausted job clamps to 0 fail-closed',
+      );
+      assert.equal(
+        resolveEffectiveReviewDeadlineMs({ POCKETGUARD_JOB_STARTED_MS: String(now - 999_999_999) } as NodeJS.ProcessEnv, now),
+        0,
+        'long-dead job never goes negative',
+      );
+      assert.equal(
+        resolveEffectiveReviewDeadlineMs({ POCKETGUARD_JOB_STARTED_MS: String(now + 5000) } as NodeJS.ProcessEnv, now),
+        DEFAULT_REVIEW_DEADLINE_MS,
+        'future start (clock skew) clamps elapsed to 0',
+      );
+    }
+
     // E2E: slow chief role times out via timeoutMs passthrough (fake fetch
     // delay + abort), verdict INCONCLUSIVE with computed coverage false.
     {
@@ -424,6 +480,164 @@ export async function runPrPhase3Tests(): Promise<void> {
       assert.equal(state.updated, 0, 'over-budget performs zero sticky updates');
       assert.equal(state.comments.length, 0, 'over-budget leaves no placeholder (zero writes)');
       void MIN_VIABLE_PER_CHUNK_TIMEOUT_MS;
+    }
+
+    // E2E: hosted slow-setup smoke (Phase 2 P2 #2 direction). A 2min setup
+    // offset (jobStarted 2min before review t0) shrinks the effective budget
+    // to 1020000ms but still completes conclusive chunks (APPROVE + true).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-phase3-setup2min-'));
+      const frozenNow = 2_000_000_000_000;
+      Date.now = () => frozenNow;
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        assert.equal(
+          resolveEffectiveReviewDeadlineMs(
+            { POCKETGUARD_JOB_STARTED_MS: String(frozenNow - 120_000) } as NodeJS.ProcessEnv,
+            frozenNow,
+          ),
+          1_020_000,
+          '2min setup offset effective is 1020000ms (precondition)',
+        );
+        const counter = { count: 0 };
+        const restore = installImmediateApprove(counter);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: {
+              ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+              POCKETGUARD_OUTPUT: artifactPath,
+              POCKETGUARD_JOB_STARTED_MS: String(frozenNow - 120_000),
+            } as NodeJS.ProcessEnv,
+            githubClient: prClient({ comments: [], created: 0, updated: 0 }),
+            writeStdout: () => undefined,
+            runGit: prGitStub(chunkedFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'APPROVE', '2min setup smoke still approves conclusive chunks');
+        assert.equal(reviewed.chunkCoverageComplete, true, '2min setup smoke computes true');
+        assert.ok(reviewed.chunks && reviewed.chunks.length >= 3, '2min setup smoke keeps per-chunk reports');
+        assert.equal(reviewed.chunkCount, reviewed.chunks?.length, '2min setup chunkCount matches reports');
+        assert.ok(counter.count >= 9, `2min setup smoke attempted all chunk turns (got ${counter.count})`);
+        const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+        assert.equal(artifact.verdict, 'APPROVE', '2min setup smoke checkpoints APPROVE');
+        assert.equal(artifact.chunkCoverageComplete, true, '2min setup smoke checkpoints coverage true');
+      } finally {
+        Date.now = realNow;
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E: per-chunk live job cap (Phase 2 P2 #2). A nearly-exhausted job
+    // (jobRemaining - skew ~= 0 at t0) exits before the first wave with
+    // INCONCLUSIVE + false placeholders and zero OpenAI turns.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-phase3-jobcap-'));
+      const frozenNow = 2_000_000_000_000;
+      Date.now = () => frozenNow;
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const jobStarted = String(frozenNow - (REVIEW_JOB_TIMEOUT_MS - REVIEW_JOB_UPLOAD_SKEW_MS));
+        assert.equal(
+          resolveEffectiveReviewDeadlineMs({ POCKETGUARD_JOB_STARTED_MS: jobStarted } as NodeJS.ProcessEnv, frozenNow),
+          0,
+          'exhausted job effective is 0 (precondition)',
+        );
+        const counter = { count: 0 };
+        const restore = installImmediateApprove(counter);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: {
+              ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+              POCKETGUARD_OUTPUT: artifactPath,
+              POCKETGUARD_JOB_STARTED_MS: jobStarted,
+            } as NodeJS.ProcessEnv,
+            githubClient: prClient({ comments: [], created: 0, updated: 0 }),
+            writeStdout: () => undefined,
+            runGit: prGitStub(chunkedFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'exhausted job exits INCONCLUSIVE');
+        assert.equal(reviewed.chunkCoverageComplete, false, 'exhausted job never writes true');
+        assert.ok(reviewed.chunks && reviewed.chunks.length >= 3, 'exhausted job keeps placeholders');
+        assert.equal(counter.count, 0, 'exhausted job starts zero chunk turns (job cap, not review clock)');
+        const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+        assert.equal(artifact.verdict, 'INCONCLUSIVE', 'exhausted job checkpoints INCONCLUSIVE');
+        assert.equal(artifact.chunkCoverageComplete, false, 'exhausted job checkpoints coverage false');
+      } finally {
+        Date.now = realNow;
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E: claim pre-flight uses the same effective formula (Phase 2 P2 #2).
+    // A job with only ~19s of effective budget cannot cover 3 chunks over 2
+    // waves (share 9500ms < viable 10000ms) so it claims nothing with zero
+    // writes; without a job start the same tiny configured budget also
+    // refuses (missing downgrades fail-closed to configured).
+    {
+      const frozenNow = 2_000_000_000_000;
+      Date.now = () => frozenNow;
+      try {
+        const jobStarted = String(frozenNow - (REVIEW_JOB_TIMEOUT_MS - REVIEW_JOB_UPLOAD_SKEW_MS - 19_000));
+        assert.equal(
+          resolveEffectiveReviewDeadlineMs({ POCKETGUARD_JOB_STARTED_MS: jobStarted } as NodeJS.ProcessEnv, frozenNow),
+          19_000,
+          'claim job-cap effective is 19000ms (precondition)',
+        );
+        const state: { comments: StickyComment[]; created: number; updated: number } = { comments: [], created: 0, updated: 0 };
+        const denied = await runClaimMode({
+          event: prEvent(),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'phase3-jobcap-run',
+            POCKETGUARD_JOB_STARTED_MS: jobStarted,
+          } as NodeJS.ProcessEnv,
+          githubClient: prClient(state),
+          writeStdout: () => undefined,
+          runGit: prGitStub(chunkedFiles()),
+        });
+        assert.equal(denied.claimed, false, 'job-capped claim occupies nothing');
+        assert.match(denied.reason, /budget-exceeded/, 'job-capped reason is explicit');
+        assert.equal(denied.reviewsUsed, 0, 'job-capped claim consumes zero slots');
+        assert.equal(state.created, 0, 'job-capped claim performs zero creates');
+        assert.equal(state.updated, 0, 'job-capped claim performs zero updates');
+      } finally {
+        Date.now = realNow;
+      }
+    }
+
+    // Workflow structure: review-send records the trusted job start first,
+    // forwards it to both review steps, and keeps timeout-minutes: 20.
+    {
+      const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');
+      const reviewIdx = workflow.indexOf('  review-send:');
+      assert.ok(reviewIdx !== -1, 'review-send job exists');
+      const publishIdx = workflow.indexOf('  publish:', reviewIdx);
+      const reviewJob = publishIdx === -1 ? workflow.slice(reviewIdx) : workflow.slice(reviewIdx, publishIdx);
+      assert.match(reviewJob, /timeout-minutes:\s*20/, 'review-send keeps timeout-minutes: 20 (unchanged)');
+      assert.match(
+        reviewJob,
+        /Record job start time[\s\S]*?POCKETGUARD_JOB_STARTED_MS=\$\(date \+%s%3N\)[\s\S]*?>>\s*"\$GITHUB_ENV"/,
+        'first review-send step injects POCKETGUARD_JOB_STARTED_MS into $GITHUB_ENV',
+      );
+      const stepsBlock = reviewJob.slice(reviewJob.indexOf('    steps:'));
+      const recordPos = stepsBlock.indexOf('Record job start time');
+      const checkoutPos = stepsBlock.indexOf('Checkout default branch');
+      assert.ok(recordPos !== -1 && checkoutPos !== -1 && recordPos < checkoutPos, 'job-start record is the first review-send step');
+      const jobEnvPasses = stepsBlock.match(/POCKETGUARD_JOB_STARTED_MS:\s*\$\{\{\s*env\.POCKETGUARD_JOB_STARTED_MS\s*\}\}/g) ?? [];
+      assert.ok(jobEnvPasses.length >= 2, `both review steps receive POCKETGUARD_JOB_STARTED_MS (got ${jobEnvPasses.length})`);
+      assert.match(reviewJob, /POCKETGUARD_JOB_STARTED_MS/, 'review-send mentions the trusted job clock');
+      assert.match(reviewJob, /effective/i, 'review-send comment documents the effective deadline');
     }
   } finally {
     globalThis.fetch = previousFetch;

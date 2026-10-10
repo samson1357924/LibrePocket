@@ -183,11 +183,17 @@ jobs:
     # claim the run makes zero OpenAI calls. The claim-slot job is a no-op
     # success for issues, so the issue-auto route needs no claimed check.
     # Phase 3 (P2 #3) N-chunk safety: the TS review runs chunked PR diffs
-    # under t0 + POCKETGUARD_REVIEW_DEADLINE_MS (default 20min minus 60s
-    # margin for artifact/upload, matching this job's timeout-minutes: 20)
-    # with fixed concurrency 2, per-wave need estimation (remaining < need
-    # exits early fail-closed), per-chunk timeoutMs passthrough min(420s,
-    # remaining/remainingWaves, optional POCKETGUARD_CHUNK_TIMEOUT_MS
+    # under t0 + effectiveDeadline = min(configured
+    # POCKETGUARD_REVIEW_DEADLINE_MS (default 20min minus 60s margin for
+    # artifact/upload), jobRemaining - 60s skew) with jobRemaining =
+    # REVIEW_JOB_TIMEOUT_MS(20min) - (now - POCKETGUARD_JOB_STARTED_MS),
+    # matching this job's timeout-minutes: 20 (unchanged). The first step
+    # records POCKETGUARD_JOB_STARTED_MS into $GITHUB_ENV (trusted
+    # workflow-defined wall-clock, never PR content) and both review steps
+    # receive it via env; a missing value downgrades to the configured
+    # deadline fail-closed. Fixed concurrency 2, per-wave need estimation
+    # (effectiveRemaining < need exits early fail-closed), per-chunk timeoutMs passthrough min(420s,
+    # effectiveRemaining/remainingWaves, optional POCKETGUARD_CHUNK_TIMEOUT_MS
     # override for tests), and a computed chunkCoverageComplete (any
     # transport/timeout/deadline INCONCLUSIVE forces false; publish gates on
     # true). Deadline exits save INCONCLUSIVE + false artifacts (checkpoint)
@@ -216,6 +222,16 @@ jobs:
       # assembly. OpenAI secrets stay confined to the trusted review step.
       issues: read
     steps:
+      - name: Record job start time
+        # Phase 2 (P2 #2) trusted job wall-clock: records the review-send job
+        # start (ms since epoch) into $GITHUB_ENV before any setup cost. Both
+        # review steps below receive it as POCKETGUARD_JOB_STARTED_MS so the
+        # TS effective deadline min(configured, jobRemaining - 60s skew) keeps
+        # upload headroom under this job's timeout-minutes: 20 even on slow
+        # hosted setup. Workflow-defined and trusted (never PR content); a
+        # missing value downgrades fail-closed to the configured deadline.
+        run: echo "POCKETGUARD_JOB_STARTED_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
+
       - name: Checkout default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -255,7 +271,8 @@ jobs:
         # readability gate (fork-safe); `safe_review` remains same-repo-only
         # for distinction. Only this step receives OpenAI secrets. The
         # checkout stays on the default branch; fork code is never checked
-        # out or executed.
+        # out or executed. POCKETGUARD_JOB_STARTED_MS (first step, trusted)
+        # caps chunked reviews via the TS effective deadline.
         if: >-
           (steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||
           (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
@@ -264,6 +281,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
+          POCKETGUARD_JOB_STARTED_MS: ${{ env.POCKETGUARD_JOB_STARTED_MS }}
           POCKETGUARD_SAFE_REVIEW: 'true'
           POCKETGUARD_OUTPUT: review-output.json
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
@@ -287,7 +305,9 @@ jobs:
         # Fail-closed complement of the trusted step: anything not admitted
         # above — including missing/empty/non-'true' authorized, unreadable
         # diffs (SHA-pin or fetch failure), and non-issue routes — runs the
-        # generic INCONCLUSIVE path with no OpenAI secrets.
+        # generic INCONCLUSIVE path with no OpenAI secrets. It receives the
+        # same trusted POCKETGUARD_JOB_STARTED_MS so chunked INCONCLUSIVE
+        # checkpoints share the job cap.
         if: >-
           !((steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||
           (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
@@ -296,6 +316,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
+          POCKETGUARD_JOB_STARTED_MS: ${{ env.POCKETGUARD_JOB_STARTED_MS }}
           POCKETGUARD_SAFE_REVIEW: 'false'
           POCKETGUARD_OUTPUT: review-output.json
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=review

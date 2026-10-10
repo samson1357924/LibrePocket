@@ -24,13 +24,19 @@ import {
   type ReconcileScope,
 } from './label_manager';
 import {
+  buildReviewDiffChunks,
+  collectFileDiffs,
   coverageSummary,
   filterReviewDiffFiles,
   MAX_CHANGED_FILES,
   MAX_DIFF_LENGTH,
+  MAX_PR_CHUNK_LENGTH,
   prioritizeFiles,
   truncateDiff,
+  validateReviewDiffChunkReports,
+  verifyReviewDiffChunkCoverage,
   type ReviewCoverage,
+  type ReviewDiffChunkReport,
 } from './review_diff';
 import { redactForModel } from './redact';
 
@@ -274,6 +280,19 @@ export interface RunnerReviewOutput {
   // APPROVE. Optional for backward compatibility with pre-S5 artifacts
   // (missing defaults to []).
   suggestedLabels?: string[];
+  // Phase 4 (P2 #2) PR chunking: present only on the chunked path (single-
+  // turn coverage incomplete but changedFilesComplete with originalLength past
+  // MAX_DIFF_LENGTH). Each entry is a minimal proof
+  // {index/total/start/end/complete/coveredLength/files/verdict} — never
+  // chunk diff text. chunkCoverageComplete is true only when every review
+  // character is covered and every per-chunk orchestration ran; publish
+  // requires it plus count/coverage consistency for APPROVE, otherwise
+  // INCONCLUSIVE (deterministic BLOCK may still NEEDS_CHANGES). Legacy
+  // single-turn artifacts omit these fields. Multi-chunk single rounds still
+  // consume exactly one claim-slot (claim semantics untouched).
+  chunks?: ReviewDiffChunkReport[];
+  chunkCoverageComplete?: boolean;
+  chunkCount?: number;
 }
 
 function stdout(context: RunnerContext, text: string): void {
@@ -1507,30 +1526,14 @@ export function buildReviewDiff(
   compareBaseSha: string,
   headSha: string,
   changedFiles: string[],
-): { diff: string; coverage: ReviewCoverage; fullDiff: string } {
+): { diff: string; coverage: ReviewCoverage; fullDiff: string; fileDiffs: Map<string, string> } {
   const runGit = context.runGit ?? defaultGit;
-  const diffs = new Map<string, string>();
+  const diffs = collectFileDiffs(runGit, compareBaseSha, headSha, changedFiles);
   const reviewFiles = new Set(filterReviewDiffFiles(changedFiles));
   let originalLength = 0;
   let includedDiffCount = 0;
   for (const file of changedFiles) {
-    // PR-controlled filenames may contain Git pathspec magic even after `--`;
-    // force literal interpretation so a name cannot exclude itself from review.
-    const fileDiff = runGit([
-      '--literal-pathspecs',
-      'diff',
-      '--no-ext-diff',
-      '--no-color',
-      '--unified=3',
-      compareBaseSha,
-      headSha,
-      '--',
-      file,
-    ]);
-    if (reviewFiles.has(file) && !fileDiff) {
-      throw new Error('Git returned no diff for a changed review file.');
-    }
-    diffs.set(file, fileDiff);
+    const fileDiff = diffs.get(file) ?? '';
     if (reviewFiles.has(file)) {
       originalLength += fileDiff.length + (includedDiffCount > 0 ? 1 : 0);
       includedDiffCount += 1;
@@ -1576,6 +1579,7 @@ export function buildReviewDiff(
   return {
     diff,
     fullDiff,
+    fileDiffs: diffs,
     coverage: {
       complete: omittedFiles.length === 0 && truncatedFiles.length === 0,
       omittedFiles,
@@ -2675,6 +2679,19 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
       ...pr.roles.flatMap((r) => r.findings.map((f) => ({ role: r.role, ...f }))),
       ...pr.deterministicViolations.map((v) => ({ role: 'deterministic', severity: v.severity, issue: v.message, file: v.file, line: v.line })),
     ];
+    // Phase 4 (P2 #2) per-chunk results: minimal proofs with per-chunk
+    // verdicts readable in both JSON and Markdown reports (never chunk diff
+    // text). Single-turn outputs omit these keys.
+    const prSegments = Array.isArray(pr.chunks) ? pr.chunks.map((c) => ({
+      index: c.index,
+      total: c.total,
+      start: c.start,
+      end: c.end,
+      complete: c.complete,
+      coveredLength: c.coveredLength,
+      files: [...c.files],
+      verdict: c.verdict,
+    })) : [];
     reportJson = {
       kind: 'pull-request',
       verdict: pr.verdict,
@@ -2682,6 +2699,12 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
       roles: pr.roles,
       coverage: pr.coverage,
       findings,
+      ...(prSegments.length > 0 ? {
+        segments: prSegments,
+        chunks: prSegments,
+        chunkCoverageComplete: pr.chunkCoverageComplete ?? null,
+        chunkCount: pr.chunkCount ?? prSegments.length,
+      } : {}),
       time,
     };
   }
@@ -3576,6 +3599,103 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
           changedFilesComplete,
           suggestedLabels: [],
         };
+      } else if (!reviewDiff.coverage.complete && changedFilesComplete && reviewDiff.coverage.originalLength > MAX_DIFF_LENGTH) {
+        // Phase 4 (P2 #2) chunked path: the single-turn visible diff is
+        // incomplete but the changed list is complete and the full review
+        // length exceeds the single-turn budget, so every review character is
+        // partitioned into sequential MAX_PR_CHUNK_LENGTH chunks (prioritized
+        // file order, small files atomic, oversized files sliced at line
+        // boundaries) and each chunk takes a full orchestrateReview turn.
+        // Deterministic BLOCK already short-circuited above over the FULL
+        // diff (zero AI). Any chunk-construction or orchestration failure
+        // falls back to INCONCLUSIVE with no chunk fields (fail-closed).
+        // Multi-chunk rounds consume exactly one claim-slot: counting happened
+        // in the claim job before review and publish only reconciles.
+        try {
+          const chunks = buildReviewDiffChunks(reviewDiff.fileDiffs, changedFiles, MAX_PR_CHUNK_LENGTH);
+          if (!verifyReviewDiffChunkCoverage(chunks, {
+            totalLength: reviewDiff.coverage.originalLength,
+            files: filterReviewDiffFiles(changedFiles),
+          })) {
+            throw new Error('PocketGuard: PR chunks do not fully cover the review diff.');
+          }
+          const { orchestrateReview, synthesizeChunkedReview } = await import('./orchestrator');
+          const restoreFetch = installOpenAIStub(env);
+          try {
+            const perChunk: Array<Awaited<ReturnType<typeof orchestrateReview>>> = [];
+            for (const chunk of chunks) {
+              perChunk.push(await orchestrateReview({
+                changedFiles: chunk.files,
+                diff: redactForModel(chunk.diff),
+                coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: chunk.coveredLength },
+                deterministicViolations: [],
+                env,
+                allowedOrigins: parseAllowedOrigins(env),
+              }));
+            }
+            const synthesized = synthesizeChunkedReview(perChunk, {
+              coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: reviewDiff.coverage.originalLength },
+              deterministicViolations: scan.violations,
+            });
+            const mergedSuggested = [...new Set(synthesized.roles.flatMap((role) => role.suggestedLabels))];
+            const runnerRoles: RunnerReviewOutput['roles'] = synthesized.roles.map((role) => ({
+              role: role.role as ReviewRoleName,
+              modelUsed: role.modelUsed,
+              verdict: role.verdict as RunnerVerdict,
+              findings: role.findings.map((finding) => ({ ...finding })),
+            }));
+            let reviewVerdict = synthesized.verdict as RunnerVerdict;
+            if (hasUnknownAiLabels(mergedSuggested) && reviewVerdict === 'APPROVE') {
+              console.warn('[PocketGuard] Discarded unknown AI labels; downgrading review verdict to INCONCLUSIVE.');
+              reviewVerdict = 'INCONCLUSIVE';
+            }
+            // Per-chunk minimal retention: redacted proofs only (offsets,
+            // files, per-chunk verdict) — never chunk diff text.
+            const chunkReports: ReviewDiffChunkReport[] = chunks.map((chunk, idx) => ({
+              index: chunk.index,
+              total: chunk.total,
+              start: chunk.start,
+              end: chunk.end,
+              complete: true,
+              coveredLength: chunk.coveredLength,
+              files: [...chunk.files],
+              verdict: perChunk[idx].verdict as RunnerVerdict,
+            }));
+            output = {
+              verdict: reviewVerdict,
+              roles: runnerRoles,
+              coverage: synthesized.coverage,
+              deterministicViolations: synthesized.deterministicViolations,
+              pullRequestNumber: target.pullRequest.number,
+              baseSha,
+              headSha,
+              headRepository: target.pullRequest.head.repo?.full_name ?? '',
+              areaLabels: resolveAreaLabelsFromPaths(changedFiles),
+              changedFiles,
+              changedFilesComplete,
+              suggestedLabels: mergedSuggested,
+              chunks: chunkReports,
+              chunkCoverageComplete: true,
+              chunkCount: chunkReports.length,
+            };
+          } finally {
+            restoreFetch();
+          }
+        } catch {
+          output = {
+            ...genericReviewOutput(),
+            pullRequestNumber: target.pullRequest.number,
+            baseSha,
+            headSha,
+            headRepository: target.pullRequest.head.repo?.full_name ?? '',
+            coverage: reviewDiff.coverage,
+            deterministicViolations: scan.violations,
+            areaLabels: resolveAreaLabelsFromPaths(changedFiles),
+            changedFiles,
+            changedFilesComplete,
+            suggestedLabels: [],
+          };
+        }
       } else {
         const { orchestrateReview } = await import('./orchestrator');
         const restoreFetch = installOpenAIStub(env);
@@ -3656,6 +3776,7 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
     Object.keys(raw).some((key) => ![
       'verdict', 'pullRequestNumber', 'baseSha', 'headSha', 'headRepository', 'roles', 'coverage',
       'deterministicViolations', 'areaLabels', 'changedFiles', 'changedFilesComplete', 'suggestedLabels',
+      'chunks', 'chunkCoverageComplete', 'chunkCount',
     ].includes(key)) ||
     !Number.isSafeInteger(raw.pullRequestNumber) || Number(raw.pullRequestNumber) < 1 ||
     !safeSha(raw.baseSha) || !safeSha(raw.headSha) || !safeRepositoryName(raw.headRepository) ||
@@ -3667,6 +3788,31 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
   ) return undefined;
   const suggestedLabels = parseSuggestedLabelsField(raw.suggestedLabels);
   if (!suggestedLabels) return undefined;
+  // Phase 4 (P2 #2) PR chunks are optional for backward compatibility
+  // (legacy single-turn artifacts omit them). Chunked artifacts must carry
+  // all three fields consistently: per-segment schema plus continuity plus
+  // complete flags, chunkCount matching, and — for APPROVE — every per-chunk
+  // verdict APPROVE with full coverage (a missing chunk can never approve).
+  let chunks: ReviewDiffChunkReport[] | undefined;
+  let chunkCoverageComplete: boolean | undefined;
+  let chunkCount: number | undefined;
+  if (raw.chunks !== undefined) {
+    const validated = validateReviewDiffChunkReports(raw.chunks);
+    if (!validated) return undefined;
+    chunks = validated;
+  }
+  if (raw.chunkCoverageComplete !== undefined) {
+    if (typeof raw.chunkCoverageComplete !== 'boolean') return undefined;
+    chunkCoverageComplete = raw.chunkCoverageComplete;
+  }
+  if (raw.chunkCount !== undefined) {
+    if (!Number.isSafeInteger(raw.chunkCount) || Number(raw.chunkCount) < 1) return undefined;
+    chunkCount = Number(raw.chunkCount);
+  }
+  if (chunks !== undefined || chunkCoverageComplete !== undefined || chunkCount !== undefined) {
+    if (!chunks || chunkCoverageComplete === undefined || chunkCount === undefined) return undefined;
+    if (chunkCount !== chunks.length) return undefined;
+  }
   const rawCoverage = raw.coverage;
   if (!rawCoverage || typeof rawCoverage !== 'object' || Array.isArray(rawCoverage)) return undefined;
   const coverage = rawCoverage as Record<string, unknown>;
@@ -3766,6 +3912,12 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
       ? 'APPROVE'
       : 'INCONCLUSIVE';
   if (raw.verdict !== calculatedVerdict) return undefined;
+  // Phase 4: APPROVE over chunks additionally requires every per-chunk
+  // verdict APPROVE plus complete chunk coverage; NEEDS_CHANGES and
+  // INCONCLUSIVE flow through the recalculation above (merged roles carry
+  // the blocking or inconclusive signal).
+  if (chunks !== undefined && calculatedVerdict === 'APPROVE' &&
+    (!chunks.every((report) => report.verdict === 'APPROVE') || chunkCoverageComplete !== true)) return undefined;
 
   return {
     verdict: calculatedVerdict,
@@ -3789,6 +3941,9 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
       : [],
     changedFilesComplete: raw.changedFilesComplete === true,
     suggestedLabels,
+    ...(chunks ? { chunks } : {}),
+    ...(chunkCoverageComplete !== undefined ? { chunkCoverageComplete } : {}),
+    ...(chunkCount !== undefined ? { chunkCount } : {}),
   };
 }
 
@@ -3867,6 +4022,18 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
   const roleVerdicts = Array.isArray(output.roles) && output.roles.length > 0
     ? output.roles.map((role) => `${role.role}=${role.verdict}`).join('、')
     : '無';
+  // Phase 4 (P2 #2) chunk line: per-chunk verdicts with boundaries plus an
+  // omission note when many chunks; bounded like the issue chunk line.
+  let prChunkLine: string;
+  if (Array.isArray(output.chunks) && output.chunks.length > 0) {
+    const total = output.chunkCount ?? output.chunks.length;
+    const shown = output.chunks.slice(0, MAX_STICKY_CHUNK_LINES);
+    const shownText = shown.map((c) => `#${c.index}:${c.start}-${c.end}:${c.verdict}`).join('、');
+    const omitted = total > shown.length ? `，…（共${total}段，省略${total - shown.length}段）` : '';
+    prChunkLine = `分段：${total} 段（${shownText}${omitted}，完整：${output.chunkCoverageComplete === true ? '是' : '否'}）`;
+  } else {
+    prChunkLine = '分段：單段';
+  }
   const headerLines = [
     REVIEW_MARKER,
     '',
@@ -3882,6 +4049,7 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
     formatStickyFileList('省略檔案', omittedFiles),
     formatStickyFileList('截斷檔案', truncatedFiles),
     `角色判定：${roleVerdicts}`,
+    prChunkLine,
     '',
   ];
   // Candidate pools: all findings/violations sorted by BLOCK>WARN>SUGGESTION
@@ -4667,6 +4835,56 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       target.issueNumber,
       reconciledInitialBody(inconclusiveComment(staleReason, staleLine)),
       async () => buildReconciledBody(inconclusiveComment(staleReason, staleLine)),
+    );
+    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    return;
+  }
+
+  // Phase 4 (P2 #2) chunked-artifact triple gate (mirrors the issue chunk
+  // gates): incomplete chunk coverage, APPROVE count mismatch, or chunk
+  // spans/files totals inconsistent with the reviewed diff all fall back to
+  // the same sticky INCONCLUSIVE (never a wrong APPROVE). Legacy single-turn
+  // artifacts omit chunk fields and skip these gates. PR freshness is already
+  // pinned by sameReviewIdentity above plus the pre/post-write
+  // currentReviewProblem re-checks below.
+  if (output.chunks !== undefined && output.chunkCoverageComplete !== true) {
+    const chunkLine = formatReportLine(env, false);
+    const chunkReason = 'the review output is unverifiable: PR chunks were not fully covered; review freshness could not be verified.';
+    await publishStickyComment(
+      client,
+      repository,
+      target.issueNumber,
+      reconciledInitialBody(inconclusiveComment(chunkReason, chunkLine)),
+      async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
+    );
+    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    return;
+  }
+  if (output.chunks !== undefined && output.verdict === 'APPROVE' && output.chunkCount !== output.chunks.length) {
+    const chunkLine = formatReportLine(env, false);
+    const chunkReason = 'the review output is unverifiable: PR chunk count mismatch.';
+    await publishStickyComment(
+      client,
+      repository,
+      target.issueNumber,
+      reconciledInitialBody(inconclusiveComment(chunkReason, chunkLine)),
+      async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
+    );
+    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    return;
+  }
+  if (output.chunks !== undefined && !verifyReviewDiffChunkCoverage(output.chunks, {
+    totalLength: output.coverage.originalLength,
+    files: filterReviewDiffFiles(output.changedFiles),
+  })) {
+    const chunkLine = formatReportLine(env, false);
+    const chunkReason = 'the review output is unverifiable: PR chunk coverage does not match the reviewed diff.';
+    await publishStickyComment(
+      client,
+      repository,
+      target.issueNumber,
+      reconciledInitialBody(inconclusiveComment(chunkReason, chunkLine)),
+      async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
     await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
     return;

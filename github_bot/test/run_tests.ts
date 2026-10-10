@@ -7,6 +7,7 @@ import { runStickyLabelTests } from './sticky_labels.test';
 import { runMergeBaseTests } from './merge_base.test';
 import { runStage4P2Tests } from './stage4_p2.test';
 import { runPhase2HTests } from './phase2_h.test';
+import { runPrChunksTests } from './pr_chunks.test';
 
 runLabelManagerTests()
   .then(() => runScannerSendOpenAITests())
@@ -19,6 +20,7 @@ runLabelManagerTests()
   .then(() => runMergeBaseTests())
   .then(() => runStage4P2Tests())
   .then(() => runPhase2HTests())
+  .then(() => runPrChunksTests())
   .catch((error: unknown) => {
     console.error(error);
     process.exitCode = 1;

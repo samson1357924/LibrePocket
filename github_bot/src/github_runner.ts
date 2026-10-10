@@ -86,6 +86,12 @@ export const MAX_STICKY_CHUNK_LINES = 10;
 export const REVIEW_REPORT_JSON_NAME = 'review-report.json';
 export const REVIEW_REPORT_MD_NAME = 'review-report.md';
 export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
+// Phase D (P1 #4): identifiable report-write failure. writeReviewReports
+// returns this message in its status (and logs it) instead of swallowing the
+// error; saveReviewOutput/saveIssueOutput downgrade APPROVE to INCONCLUSIVE
+// on failure so a missing report can never approve.
+export const REVIEW_REPORT_WRITE_ERROR = 'PocketGuard: failed to write review reports.';
+export type ReviewReportWriteResult = { ok: true } | { ok: false; reason: string };
 const ROLE_NAMES = ['chief', 'android_sec', 'android_code'] as const;
 const SAFE_MESSAGE = '自動審查未執行；請由維護者檢視變更。';
 
@@ -1579,18 +1585,39 @@ function genericReviewOutput(): RunnerReviewOutput {
   };
 }
 
-function saveReviewOutput(output: RunnerReviewOutput, context: RunnerContext): void {
+function saveReviewOutput(output: RunnerReviewOutput, context: RunnerContext): ReviewReportWriteResult {
   const env = context.env ?? process.env;
   const serialized = `${JSON.stringify(output, null, 2)}\n`;
   const outputPath = env.POCKETGUARD_OUTPUT;
   if (!outputPath) {
     stdout(context, serialized);
-    return;
+    return { ok: true };
   }
   const resolved = path.resolve(outputPath);
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
   fs.writeFileSync(resolved, serialized, { encoding: 'utf8', mode: 0o600 });
-  writeReviewReports(output, context);
+  const result = writeReviewReports(output, context);
+  // Phase D (P1 #4): a report-write failure must never leave an APPROVE on
+  // disk. Mutate the caller's object (review modes return the same reference)
+  // and rewrite the artifact as INCONCLUSIVE with incomplete coverage so the
+  // recalculated verdict stays INCONCLUSIVE (validateReviewOutput derives
+  // APPROVE only from unanimous APPROVE plus complete coverage).
+  if (!result.ok && output.verdict === 'APPROVE') {
+    output.verdict = 'INCONCLUSIVE';
+    try {
+      output.coverage = { ...output.coverage, complete: false };
+    } catch {
+      // Keep the verdict downgrade even if coverage is malformed.
+    }
+    output.changedFilesComplete = false;
+    try {
+      fs.writeFileSync(resolved, `${JSON.stringify(output, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    } catch {
+      // The verdict is already downgraded in memory; a rewrite failure only
+      // leaves the on-disk copy stale, which publish treats as unavailable.
+    }
+  }
+  return result;
 }
 
 function parseAllowedOrigins(env: NodeJS.ProcessEnv): string[] {
@@ -2094,19 +2121,99 @@ function resolveReportPaths(env: NodeJS.ProcessEnv): { jsonPath: string; mdPath:
   return { jsonPath: path.join(dir, REVIEW_REPORT_JSON_NAME), mdPath: path.join(dir, REVIEW_REPORT_MD_NAME) };
 }
 
+// Phase D (P1 #4) isolated per-output reports: production uses the shared
+// pair above, but a directory may hold several outputs (tests run multiple
+// reviews in one temp dir). The isolated pair (<stem>.report.json/md) binds
+// each output file to its own verdict/fingerprint so one run never
+// overwrites another's binding. writeReviewReports maintains both; readers
+// accept either (content-validated).
+function resolveIsolatedReportPaths(env: NodeJS.ProcessEnv): { jsonPath: string; mdPath: string } | undefined {
+  try {
+    const outputPath = env.POCKETGUARD_OUTPUT;
+    if (!outputPath) return undefined;
+    const resolved = path.resolve(outputPath);
+    if (path.basename(resolved) === 'review-output.json') return undefined;
+    const dir = path.dirname(resolved);
+    const base = path.basename(resolved);
+    const stem = base.toLowerCase().endsWith('.json') ? base.slice(0, -'.json'.length) : base;
+    if (!stem || stem === '.' || stem === '..') return undefined;
+    return { jsonPath: path.join(dir, `${stem}.report.json`), mdPath: path.join(dir, `${stem}.report.md`) };
+  } catch {
+    return undefined;
+  }
+}
+
+function isReportPairConsistent(outputPath: string, jsonPath: string, mdPath: string): boolean {
+  const outputText = fs.readFileSync(outputPath, 'utf8');
+  const reportJsonText = fs.readFileSync(jsonPath, 'utf8');
+  const reportMd = fs.readFileSync(mdPath, 'utf8');
+  const outputValue: unknown = JSON.parse(outputText);
+  const reportValue: unknown = JSON.parse(reportJsonText);
+  if (!reportValue || typeof reportValue !== 'object' || Array.isArray(reportValue)) return false;
+  const report = reportValue as Record<string, unknown>;
+  if (!['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE'].includes(String(report.verdict))) return false;
+  if (typeof report.fingerprint !== 'string' || report.fingerprint.length === 0) return false;
+  if (typeof report.time !== 'string' || report.time.length === 0) return false;
+  if (!Number.isFinite(Date.parse(report.time))) return false;
+  if (!outputValue || typeof outputValue !== 'object' || Array.isArray(outputValue)) return false;
+  const output = outputValue as Record<string, unknown>;
+  if (!['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE'].includes(String(output.verdict))) return false;
+  if (String(output.verdict) !== String(report.verdict)) return false;
+  const outputFingerprint = typeof output.fingerprint === 'string'
+    ? output.fingerprint
+    : typeof output.headSha === 'string'
+      ? output.headSha
+      : undefined;
+  if (typeof outputFingerprint !== 'string' || outputFingerprint !== report.fingerprint) return false;
+  if (typeof report.kind === 'string') {
+    if (report.kind === 'issue') {
+      if (typeof (output as { issueNumber?: unknown }).issueNumber !== 'number') return false;
+    } else if (report.kind === 'pull-request') {
+      if (typeof (output as { pullRequestNumber?: unknown }).pullRequestNumber !== 'number') return false;
+    } else {
+      return false;
+    }
+  }
+  if (!reportMd.includes(String(report.verdict))) return false;
+  if (!reportMd.includes(String(report.fingerprint))) return false;
+  if (!reportMd.includes(String(report.time))) return false;
+  return true;
+}
+
 export function areReviewReportsAvailable(env: NodeJS.ProcessEnv | undefined): boolean {
   try {
     if (!env?.POCKETGUARD_OUTPUT) return false;
     const { jsonPath, mdPath } = resolveReportPaths(env);
-    return fs.existsSync(jsonPath) && fs.existsSync(mdPath);
+    const outputPath = path.resolve(env.POCKETGUARD_OUTPUT ?? 'review-output.json');
+    // Phase D (P1 #4): content validation, not just existence. The downloaded
+    // report must match the local review output (verdict + fingerprint) and
+    // carry a valid timestamp that the Markdown mirrors; a partial upload
+    // (either file missing), a stale/tampered report, or an unreadable output
+    // all report unavailable so publish falls back to INCONCLUSIVE with no
+    // fake link. The shared pair is checked first; the isolated per-output
+    // pair covers directories that hold several outputs.
+    try {
+      if (fs.existsSync(jsonPath) && fs.existsSync(mdPath) && isReportPairConsistent(outputPath, jsonPath, mdPath)) return true;
+    } catch {
+      // Fall through to the isolated pair.
+    }
+    const isolated = resolveIsolatedReportPaths(env);
+    if (isolated) {
+      try {
+        if (fs.existsSync(isolated.jsonPath) && fs.existsSync(isolated.mdPath) && isReportPairConsistent(outputPath, isolated.jsonPath, isolated.mdPath)) return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
   } catch {
     return false;
   }
 }
 
-function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutput, context: RunnerContext): void {
+export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutput, context: RunnerContext): ReviewReportWriteResult {
   const env = context.env ?? process.env;
-  if (!env.POCKETGUARD_OUTPUT) return;
+  if (!env.POCKETGUARD_OUTPUT) return { ok: false, reason: `${REVIEW_REPORT_WRITE_ERROR} (no output path; reports skipped)` };
   const { jsonPath, mdPath } = resolveReportPaths(env);
   const time = new Date().toISOString();
   const isIssue = (output as RunnerIssueOutput).issueNumber !== undefined && (output as RunnerReviewOutput).roles === undefined;
@@ -2194,10 +2301,29 @@ function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutput, cont
     fs.mkdirSync(path.dirname(jsonPath), { recursive: true });
     fs.writeFileSync(jsonPath, redactedJsonText, { encoding: 'utf8', mode: 0o600 });
     fs.writeFileSync(mdPath, redactedMd, { encoding: 'utf8', mode: 0o600 });
-  } catch {
-    // Report write failure must not break the review output itself; publish
-    // treats missing reports as unavailable (INCONCLUSIVE, no fake link).
+    // Isolated per-output copy so directories holding several outputs keep
+    // an exact binding per file (production review-output.json keeps the
+    // shared pair only).
+    const isolated = resolveIsolatedReportPaths(env);
+    if (isolated && (isolated.jsonPath !== jsonPath || isolated.mdPath !== mdPath)) {
+      fs.mkdirSync(path.dirname(isolated.jsonPath), { recursive: true });
+      fs.writeFileSync(isolated.jsonPath, redactedJsonText, { encoding: 'utf8', mode: 0o600 });
+      fs.writeFileSync(isolated.mdPath, redactedMd, { encoding: 'utf8', mode: 0o600 });
+    }
+  } catch (error) {
+    // Phase D (P1 #4): never swallow. Return an identifiable status so
+    // saveReviewOutput/saveIssueOutput can downgrade APPROVE; publish treats
+    // the missing report as unavailable (INCONCLUSIVE, no fake link).
+    const reason = REVIEW_REPORT_WRITE_ERROR;
+    try {
+      console.warn(`[PocketGuard] ${reason}`);
+    } catch {
+      // Logging must not mask the report failure.
+    }
+    void error;
+    return { ok: false, reason };
   }
+  return { ok: true };
 }
 
 function parseSuggestedLabelsField(value: unknown): string[] | undefined {
@@ -2235,18 +2361,43 @@ function mergeRulesWithAiSuggestions(rulesLabels: string[], aiRawLabels: string[
   return { merged: sanitizeLabels([...rulesLabels, ...sanitizedAi]), sanitizedAi, hadUnknown };
 }
 
-function saveIssueOutput(output: RunnerIssueOutput, context: RunnerContext): void {
+function saveIssueOutput(output: RunnerIssueOutput, context: RunnerContext): ReviewReportWriteResult {
   const env = context.env ?? process.env;
   const serialized = `${JSON.stringify(output, null, 2)}\n`;
   const outputPath = env.POCKETGUARD_OUTPUT;
   if (!outputPath) {
     stdout(context, serialized);
-    return;
+    return { ok: true };
   }
   const resolved = path.resolve(outputPath);
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
   fs.writeFileSync(resolved, serialized, { encoding: 'utf8', mode: 0o600 });
-  writeReviewReports(output, context);
+  const result = writeReviewReports(output, context);
+  // Phase D (P1 #4): same APPROVE ban as the PR path. A report failure marks
+  // the issue artifact INCONCLUSIVE (with needs-decision and an explicit
+  // summary note) and rewrites it so neither the file nor the returned object
+  // can approve without reports.
+  if (!result.ok && output.verdict === 'APPROVE') {
+    output.verdict = 'INCONCLUSIVE';
+    try {
+      output.tags = sanitizeLabels([...output.tags, 'status:needs-decision']);
+    } catch {
+      output.tags = ['status:needs-decision'];
+    }
+    try {
+      const note = '（審查報告未能產生；已降級為 INCONCLUSIVE，請見 Actions 執行紀錄。）';
+      output.summary = safeString(`${output.summary} ${note}`.trim());
+    } catch {
+      // Keep the verdict downgrade even if the summary cannot be updated.
+    }
+    try {
+      fs.writeFileSync(resolved, `${JSON.stringify(output, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    } catch {
+      // Memory verdict already downgraded; a stale file still fails closed at
+      // publish (reports unavailable).
+    }
+  }
+  return result;
 }
 
 export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefined {
@@ -3708,11 +3859,46 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       ...(validated.verdict !== 'APPROVE' ? ['status:needs-decision'] : []),
     ]);
     const stickyOutput: RunnerIssueOutput = { ...validated, tags: desiredIssueLabels, fingerprint: validated.fingerprint };
-    // Phase 2 (H): success writes back the artifact/run link (retention 30d);
-    // missing reports or missing run identity degrades to unavailable with no
-    // fake link. Single comment ID is updated in place (publishStickyComment).
+    // Phase D (P1 #4) double-gate: a validated output still requires
+    // content-validated reports (output↔report verdict/fingerprint/time).
+    // Without them the success path must not publish APPROVE with an
+    // unavailable line; fall back to the same sticky INCONCLUSIVE with no
+    // fake link plus the maintainer-decision label.
     const successReportsAvailable = areReviewReportsAvailable(env);
-    const successReportLine = formatReportLine(env, successReportsAvailable && getReportRunUrl(env) !== undefined);
+    if (!successReportsAvailable) {
+      const unavailableLine = formatReportLine(env, false);
+      await publishStickyComment(
+        client,
+        repository,
+        issueNumber,
+        issueInconclusiveComment(issueNumber, issueTitle, 'the review reports are missing or inconsistent; review freshness could not be verified.', currentFingerprint, unavailableLine),
+      );
+      const reportsMissingDesired = sanitizeLabels([...rulesTitle, 'status:needs-decision']);
+      try {
+        const reconciliation = await reconcileBotLabelsSafely({
+          client,
+          owner: repository.owner,
+          repo: repository.repo,
+          issueNumber,
+          desiredLabels: reportsMissingDesired,
+          scope: DEFAULT_PR_RECONCILE_SCOPE,
+          coverageComplete: false,
+          botWrittenLabels: undefined,
+        });
+        const reconciled = new Set([...reconciliation.added, ...reconciliation.skipped]);
+        if (reconciliation.failedToList || reportsMissingDesired.some((label) => !reconciled.has(label)) || (reconciliation.failedRemovals?.length ?? 0) > 0) {
+          throw new Error('label reconcile incomplete');
+        }
+      } catch {
+        throw new Error('PocketGuard: failed to apply issue labels.');
+      }
+      return;
+    }
+    // Phase 2 (H): success writes back the artifact/run link (retention 30d);
+    // the gate above guarantees reports are content-valid here, so a missing
+    // run identity is the only unavailable case (still no fake link). Single
+    // comment ID is updated in place (publishStickyComment).
+    const successReportLine = formatReportLine(env, getReportRunUrl(env) !== undefined);
     await publishStickyComment(
       client,
       repository,
@@ -3955,10 +4141,29 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   ]);
   const labels = sanitizeLabels([...rulesLabels, ...prFiltered.kept]);
   const coverageComplete = output.coverage.complete && output.changedFilesComplete;
-  // Phase 2 (H): success writes back the artifact/run link; failure shows
-  // unavailable with no fake link. Single comment ID updated in place.
+  // Phase D (P1 #4) double-gate: JOB_RESULT==success plus content-validated
+  // reports (output↔report verdict/fingerprint/time). A valid APPROVE with a
+  // missing/tampered/partial report must not publish APPROVE with an
+  // unavailable line; fall back to the same sticky INCONCLUSIVE with no fake
+  // link plus reconcileNeedsDecisionOnly. Single comment ID updated in place.
   const prReportsAvailable = areReviewReportsAvailable(env);
-  const prReportLine = formatReportLine(env, prReportsAvailable && getReportRunUrl(env) !== undefined);
+  if (!prReportsAvailable) {
+    const unavailableLine = formatReportLine(env, false);
+    const reportsMissingReason = 'the review reports are missing or inconsistent; review freshness could not be verified.';
+    await publishStickyComment(
+      client,
+      repository,
+      target.issueNumber,
+      reconciledInitialBody(inconclusiveComment(reportsMissingReason, unavailableLine)),
+      async () => buildReconciledBody(inconclusiveComment(reportsMissingReason, unavailableLine)),
+    );
+    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    return;
+  }
+  // Phase 2 (H): success writes back the artifact/run link; the gate above
+  // guarantees content-valid reports, so only a missing run identity degrades
+  // to unavailable (still no fake link).
+  const prReportLine = formatReportLine(env, getReportRunUrl(env) !== undefined);
 
   let publishFallbackReason: string | undefined;
   await publishStickyComment(client, repository, target.issueNumber, reconciledInitialBody(reviewComment(output, labels, prReportLine)), async () => {

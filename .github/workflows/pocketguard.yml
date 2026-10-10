@@ -291,7 +291,10 @@ jobs:
             github_bot/review-output.json
             github_bot/review-report.md
             github_bot/review-report.json
-          if-no-files-found: warn
+          # Phase D (P1 #4): a partial upload must fail the review job so the
+          # publish double-gate (JOB_RESULT plus content-validated reports)
+          # falls back to INCONCLUSIVE instead of APPROVE with unavailable.
+          if-no-files-found: error
           retention-days: 30
 
   publish:
@@ -344,14 +347,21 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Download review result
+        # Phase D (P1 #4): no continue-on-error. A download failure fails this
+        # step, but the publish step below still runs (if: always) and the
+        # TypeScript double-gate (JOB_RESULT plus content-validated
+        # output↔report verdict/fingerprint/time) falls back to the same
+        # sticky INCONCLUSIVE with no fake link.
         if: needs.review-send.result == 'success'
-        continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: pocketguard-review-report
           path: github_bot
 
       - name: Publish sticky result and labels
+        # Always run so a download failure still publishes the INCONCLUSIVE
+        # fallback (never silently skipping the sticky).
+        if: always()
         working-directory: github_bot
         env:
           GITHUB_TOKEN: ${{ github.token }}

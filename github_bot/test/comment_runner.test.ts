@@ -8,12 +8,15 @@ import {
   isCommentCommandAllowed,
 } from '../src/comment_command';
 import {
+  areReviewReportsAvailable,
   isRepositoryOwner,
   routeEvent,
   routeReviewFlags,
   runPublishMode,
   runReviewMode,
   runTagMode,
+  writeReviewReports,
+  REVIEW_REPORT_WRITE_ERROR,
   type RunnerContext,
 } from '../src/github_runner';
 
@@ -489,8 +492,24 @@ export async function runCommentRunnerTests(): Promise<void> {
         };
         return { state, context };
       };
+      // Phase D (P1 #4): per-directory reports are shared, so re-sync the
+      // matching report pair immediately before each publish that must see
+      // content-validated reports (output↔report verdict/fingerprint/time).
+      // Fallback cases below intentionally skip the sync.
+      const syncReportsForPublish = (outputFile: string): void => {
+        try {
+          const parsed: unknown = JSON.parse(fs.readFileSync(outputFile, 'utf8'));
+          writeReviewReports(
+            parsed as Parameters<typeof writeReviewReports>[0],
+            { env: { POCKETGUARD_OUTPUT: outputFile } as NodeJS.ProcessEnv },
+          );
+        } catch {
+          // Publish treats the missing/invalid report as unavailable.
+        }
+      };
 
       fs.writeFileSync(outputPath, JSON.stringify(reviewed));
+      syncReportsForPublish(blockerOutputPath);
       const blockerPublishHarness = makePublishHarness({ outputPath: blockerOutputPath });
       await runPublishMode(blockerPublishHarness.context);
       const blockerPublishedBody = blockerPublishHarness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
@@ -499,6 +518,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.equal(blockerPublishedBody.includes('schema or contents are invalid'), false);
 
       const successHarness = makePublishHarness({ outputPath });
+      syncReportsForPublish(outputPath);
       await runPublishMode(successHarness.context);
       assert.equal(successHarness.state.created, 0);
       assert.equal(successHarness.state.updated, 1, 'the existing bot sticky comment is updated');
@@ -527,6 +547,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         changedFilesComplete: false,
       }));
       const incompleteCoverageHarness = makePublishHarness({ outputPath: incompleteOutputPath });
+      syncReportsForPublish(incompleteOutputPath);
       await runPublishMode(incompleteCoverageHarness.context);
       assert.ok(incompleteCoverageHarness.state.existingLabels.includes('status:needs-decision'),
         'incomplete coverage must reconcile the implicit maintainer-decision label');
@@ -576,6 +597,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       }
 
       const identityFallbackHarness = makePublishHarness({ outputPath, identityFails: true });
+      syncReportsForPublish(outputPath);
       await runPublishMode(identityFallbackHarness.context);
       assert.equal(identityFallbackHarness.state.updated, 1,
         'identity lookup failure still updates the bot-authored marker comment');
@@ -688,6 +710,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         outputPath,
         changePullRequestDuringCommentLookup: changedPullRequest,
       });
+      syncReportsForPublish(outputPath);
       await runPublishMode(changedDuringLookup.context);
       const lookupFallbackBody = changedDuringLookup.state.comments.find((comment) => comment.id === 7)?.body ?? '';
       assert.equal(changedDuringLookup.state.commentWrites.length, 1);
@@ -705,6 +728,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         outputPath,
         changePullRequestAfterCommentUpdate: changedPullRequest,
       });
+      syncReportsForPublish(outputPath);
       await runPublishMode(changedAfterCommentUpdate.context);
       const postUpdateFallbackBody = changedAfterCommentUpdate.state.comments.find((comment) => comment.id === 7)?.body ?? '';
       assert.equal(changedAfterCommentUpdate.state.updated, 2,
@@ -737,6 +761,7 @@ export async function runCommentRunnerTests(): Promise<void> {
           commentFailure: failure,
           omitBotComment: failure === 'create',
         });
+        syncReportsForPublish(outputPath);
         await assert.rejects(
           runPublishMode(publishFailure.context),
           (error: unknown) => error instanceof Error &&
@@ -757,6 +782,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       {
         const listFailure = makePublishHarness({ outputPath, commentFailure: 'list' });
         const stickyBefore = listFailure.state.comments.find((comment) => comment.id === 7)?.body;
+        syncReportsForPublish(outputPath);
         await runPublishMode(listFailure.context);
         assert.equal(listFailure.state.operations.includes('list-labels'), false,
           'list comment API failure must prevent label reconciliation');
@@ -791,6 +817,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         'fallback status reconciliation must not remove any area labels');
 
       const failedReviewLabel = makePublishHarness({ outputPath, addLabelsFails: true });
+      syncReportsForPublish(outputPath);
       await assert.rejects(
         runPublishMode(failedReviewLabel.context),
         (error: unknown) => error instanceof Error &&
@@ -804,6 +831,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         'the failed label must not be represented as successfully applied');
 
       const failedReviewRemoval = makePublishHarness({ outputPath, removeLabelsFails: true });
+      syncReportsForPublish(outputPath);
       await assert.rejects(
         runPublishMode(failedReviewRemoval.context),
         (error: unknown) => error instanceof Error &&
@@ -815,6 +843,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         'normal reconciliation attempts stale managed-label removal');
 
       const failedReviewListing = makePublishHarness({ outputPath, listLabelsFails: true });
+      syncReportsForPublish(outputPath);
       await assert.rejects(
         runPublishMode(failedReviewListing.context),
         (error: unknown) => error instanceof Error &&
@@ -831,6 +860,7 @@ export async function runCommentRunnerTests(): Promise<void> {
 
       const emptyLabelsOutputPath = path.join(tempDirectory, 'empty-labels-review-output.json');
       fs.writeFileSync(emptyLabelsOutputPath, JSON.stringify({ ...reviewed, areaLabels: [] }));
+      syncReportsForPublish(emptyLabelsOutputPath);
       const failedEmptyLabelsListing = makePublishHarness({
         outputPath: emptyLabelsOutputPath,
         listLabelsFails: true,
@@ -916,6 +946,171 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.equal(triageHarness.state.operations.includes('add-labels'), false);
       assert.equal(triageHarness.state.operations.includes('remove-label'), false);
 
+      // Phase D (P1 #4) PR double-gate: valid APPROVE output without
+      // content-validated reports must fall back to INCONCLUSIVE with no fake
+      // link (same sticky, needs-decision-only), never APPROVE+unavailable.
+      {
+        const makeValidPrArtifact = async (): Promise<{ dir: string; outputPath: string }> => {
+          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-d-pr-'));
+          const dirOutput = path.join(dir, 'review-output.json');
+          const ctx: RunnerContext = {
+            event: pullRequestEvent(),
+            env: {
+              GITHUB_EVENT_NAME: 'pull_request_target',
+              GITHUB_REPOSITORY: 'sample/repository',
+              GITHUB_TOKEN: 'fake-read-token',
+              POCKETGUARD_SAFE_REVIEW: 'true',
+              POCKETGUARD_OPENAI_STUB: '1',
+              POCKETGUARD_OUTPUT: dirOutput,
+              OPENAI_BASE_URL: TEST_BASE_URL,
+              OPENAI_API_KEY: 'fake-openai-key',
+              POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
+              POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+              POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
+              POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
+              POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+            } as NodeJS.ProcessEnv,
+            githubClient: {
+              rest: {
+                users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+                issues: { listComments: async () => ({ data: [] }) },
+              },
+            } as unknown as NonNullable<RunnerContext['githubClient']>,
+            writeStdout: () => undefined,
+            runGit: (args) => {
+              if (args[0] === 'fetch') return '';
+              if (args[0] === 'merge-base') return BASE_SHA;
+              if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/AndroidManifest.xml\0';
+              return [
+                'diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml',
+                '--- a/app/src/main/AndroidManifest.xml',
+                '+++ b/app/src/main/AndroidManifest.xml',
+                '@@ -1,1 +1,1 @@',
+                '+<manifest />',
+              ].join('\n');
+            },
+          };
+          const prReviewed = await runReviewMode(ctx);
+          assert.equal(prReviewed.verdict, 'APPROVE', 'D PR setup stays APPROVE');
+          assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv), true, 'D PR setup reports content-valid');
+          return { dir, outputPath: dirOutput };
+        };
+        const publishPrAndReadSticky = async (dirOutput: string): Promise<string> => {
+          const harness = makePublishHarness({ outputPath: dirOutput });
+          // makePublishHarness points POCKETGUARD_OUTPUT at the shared
+          // tempDirectory copy; repoint it at the isolated D artifact.
+          harness.context.env = { ...(harness.context.env as NodeJS.ProcessEnv), POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv;
+          await runPublishMode(harness.context);
+          const stickyBody = harness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
+          assert.equal(harness.state.created, 0, 'D PR same sticky');
+          assert.equal(harness.state.updated, 1);
+          assert.ok(harness.state.existingLabels.includes('status:needs-decision'), 'D PR requires maintainer decision');
+          return stickyBody;
+        };
+        // D-PR-1: missing markdown → INCONCLUSIVE, no fake link.
+        {
+          const { dir, outputPath: dirOutput } = await makeValidPrArtifact();
+          try {
+            fs.rmSync(path.join(dir, 'review-report.md'), { force: true });
+            assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv), false, 'D-PR-1 missing md unavailable');
+            const stickyBody = await publishPrAndReadSticky(dirOutput);
+            assert.ok(stickyBody.includes('判定：INCONCLUSIVE'), 'D-PR-1 INCONCLUSIVE');
+            assert.ok(!stickyBody.includes('判定：APPROVE'), 'D-PR-1 never APPROVE');
+            assert.ok(stickyBody.includes('報告：不可用'), 'D-PR-1 unavailable');
+            assert.ok(!stickyBody.includes('actions/runs/'), 'D-PR-1 no fake link');
+          } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+          }
+        }
+        // D-PR-2: missing JSON (partial upload) → same fallback.
+        {
+          const { dir, outputPath: dirOutput } = await makeValidPrArtifact();
+          try {
+            fs.rmSync(path.join(dir, 'review-report.json'), { force: true });
+            assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv), false, 'D-PR-2 missing json unavailable');
+            const stickyBody = await publishPrAndReadSticky(dirOutput);
+            assert.ok(stickyBody.includes('判定：INCONCLUSIVE'));
+            assert.ok(!stickyBody.includes('判定：APPROVE'));
+            assert.ok(stickyBody.includes('報告：不可用'));
+            assert.ok(!stickyBody.includes('actions/runs/'));
+          } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+          }
+        }
+        // D-PR-3: inconsistency (verdict / fingerprint / time) → unavailable.
+        for (const variant of ['verdict', 'fingerprint', 'time'] as const) {
+          const { dir, outputPath: dirOutput } = await makeValidPrArtifact();
+          try {
+            const reportPath = path.join(dir, 'review-report.json');
+            const report = JSON.parse(fs.readFileSync(reportPath, 'utf8')) as Record<string, unknown>;
+            if (variant === 'verdict') report.verdict = report.verdict === 'APPROVE' ? 'NEEDS_CHANGES' : 'APPROVE';
+            if (variant === 'fingerprint') report.fingerprint = 'c'.repeat(40);
+            if (variant === 'time') report.time = 'bad-time';
+            fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+            assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv), false, `D-PR-3 tampered ${variant} unavailable`);
+            const stickyBody = await publishPrAndReadSticky(dirOutput);
+            assert.ok(stickyBody.includes('判定：INCONCLUSIVE'), `D-PR-3 ${variant} INCONCLUSIVE`);
+            assert.ok(!stickyBody.includes('判定：APPROVE'));
+            assert.ok(stickyBody.includes('報告：不可用'));
+            assert.ok(!stickyBody.includes('actions/runs/'));
+          } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+          }
+        }
+        // D-PR-4: write failure injection downgrades APPROVE (report path
+        // collides with a directory, so the output succeeds but the reports
+        // fail with EISDIR — no fs mock needed).
+        {
+          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-d-pr-writefail-'));
+          try {
+            const dirOutput = path.join(dir, 'review-output.json');
+            fs.rmSync(path.join(dir, 'review-report.json'), { force: true, recursive: true });
+            fs.mkdirSync(path.join(dir, 'review-report.json'), { recursive: true });
+            const prReviewed = await runReviewMode({
+              event: pullRequestEvent(),
+              env: {
+                GITHUB_EVENT_NAME: 'pull_request_target',
+                GITHUB_REPOSITORY: 'sample/repository',
+                GITHUB_TOKEN: 'fake-read-token',
+                POCKETGUARD_SAFE_REVIEW: 'true',
+                POCKETGUARD_OPENAI_STUB: '1',
+                POCKETGUARD_OUTPUT: dirOutput,
+                OPENAI_BASE_URL: TEST_BASE_URL,
+                OPENAI_API_KEY: 'fake-openai-key',
+                POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
+                POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+                POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
+                POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
+                POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+              } as NodeJS.ProcessEnv,
+              githubClient: {
+                rest: {
+                  users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+                  issues: { listComments: async () => ({ data: [] }) },
+                },
+              } as unknown as NonNullable<RunnerContext['githubClient']>,
+              writeStdout: () => undefined,
+              runGit: (args) => {
+                if (args[0] === 'fetch') return '';
+                if (args[0] === 'merge-base') return BASE_SHA;
+                if (args[0] === 'diff' && args[1] === '--name-only') return 'app/src/main/AndroidManifest.xml\0';
+                return ['diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml', '--- a/app/src/main/AndroidManifest.xml', '+++ b/app/src/main/AndroidManifest.xml', '@@ -1,1 +1,1 @@', '+<manifest />'].join('\n');
+              },
+            });
+            assert.notEqual(prReviewed.verdict, 'APPROVE', 'D-PR-4 write failure never APPROVE');
+            assert.equal(prReviewed.verdict, 'INCONCLUSIVE', 'D-PR-4 downgrades to INCONCLUSIVE');
+            const persisted = JSON.parse(fs.readFileSync(dirOutput, 'utf8')) as { verdict: string };
+            assert.notEqual(persisted.verdict, 'APPROVE', 'D-PR-4 file never APPROVE');
+            assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv), false);
+            const direct = writeReviewReports(prReviewed, { env: { POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv });
+            assert.equal(direct.ok, false, 'D-PR-4 direct injection reports failure');
+            if (!direct.ok) assert.ok(direct.reason.includes(REVIEW_REPORT_WRITE_ERROR), 'D-PR-4 identifiable error');
+          } finally {
+            fs.rmSync(dir, { recursive: true, force: true });
+          }
+        }
+      }
+
       const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');
       const jobsStart = workflow.indexOf('jobs:');
       const prepareTag = workflow.slice(workflow.indexOf('  prepare-tag:'), workflow.indexOf('  review-send:'));
@@ -951,8 +1146,16 @@ export async function runCommentRunnerTests(): Promise<void> {
       const uploadStep = workflowStep(reviewJob, 'Upload review result');
       const downloadStep = workflowStep(publishJob, 'Download review result');
       const publishStep = workflowStep(publishJob, 'Publish sticky result and labels');
-      assert.match(downloadStep, /continue-on-error:\s*true/,
-        'artifact download failure must not block fallback publishing');
+      // Phase D (P1 #4): no silent partial upload or download. A missing
+      // report fails the review job (upload error) and the publish
+      // double-gate (JOB_RESULT plus content-validated reports) falls back to
+      // INCONCLUSIVE; the publish step still runs after a download failure.
+      assert.doesNotMatch(downloadStep, /continue-on-error:/,
+        'download must not swallow artifact failures (publish double-gate covers fallback)');
+      assert.match(uploadStep, /if-no-files-found:\s*error/,
+        'partial upload must fail the review job instead of warning');
+      assert.match(publishStep, /if:\s*always\(\)/,
+        'publish still runs after a download failure to emit the INCONCLUSIVE fallback');
       const conditionLine = publishCondition.match(/^\s{4}if:\s*(.*)$/m);
       assert.ok(conditionLine, 'publish job declares an if condition');
       const conditionLines = publishCondition.split('\n');

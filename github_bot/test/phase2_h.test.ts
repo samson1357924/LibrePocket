@@ -20,6 +20,8 @@ import {
   validateIssueChunkReports,
   validateIssueChunks,
   verifyIssueChunkCoverage,
+  writeReviewReports,
+  REVIEW_REPORT_WRITE_ERROR,
   MAX_ISSUE_CHUNK_LENGTH,
   MAX_ISSUE_CHUNK_SUMMARY_LENGTH,
   type RunnerContext,
@@ -980,6 +982,198 @@ export async function runPhase2HTests(): Promise<void> {
       assert.ok(issueSticky.includes('省略'), 'T8 issue sticky carries omission note');
       assert.ok(truncateStickyText('x'.repeat(100), 10).includes('省略'), 'T8 truncate helper notes omission');
       assert.ok(issueSticky.length < 20000, `T8 issue sticky bounded (got ${issueSticky.length})`);
+    }
+
+    // Phase D (P1 #4) issue double-gate: valid APPROVE output without
+    // content-validated reports must fall back to INCONCLUSIVE with no fake
+    // link (same sticky, needs-decision), never APPROVE+unavailable.
+    {
+      const makeValidIssueArtifact = async (tempDir: string): Promise<{ artifactPath: string; title: string; body: string }> => {
+        const title = 'phase-d-issue';
+        const body = 'phase-d body';
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'd ok', suggestedLabels: [] }]);
+        try {
+          const client = issueClient({ comments: [], created: 0, updated: 0 }, { getTitle: title, getBody: body });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title, body } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'APPROVE', 'D setup stays APPROVE');
+          assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv), true, 'D setup reports content-valid');
+        } finally {
+          restore();
+        }
+        return { artifactPath, title, body };
+      };
+      const publishIssueAndReadSticky = async (artifactPath: string, title: string, body: string): Promise<{ sticky: string; created: number; updated: number; labels: string[][] }> => {
+        const state = {
+          comments: [{ id: 71, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+          labels: [] as string[][],
+        };
+        const client = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title, body } }),
+              listComments: async () => ({ data: state.comments }),
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const c = state.comments.find((x) => x.id === params.comment_id);
+                if (c) c.body = params.body;
+                return {};
+              },
+              addLabels: async (params: { labels: string[] }) => { state.labels.push(params.labels); return {}; },
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title, body } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_SERVER_URL: 'https://github.com',
+            GITHUB_RUN_ID: '424242',
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as unknown as NodeJS.ProcessEnv,
+          githubClient: client,
+        });
+        return { sticky: state.comments[0].body, created: state.created, updated: state.updated, labels: state.labels };
+      };
+      // D-1: missing markdown report → INCONCLUSIVE, unavailable, no fake link.
+      {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-d-issue-missing-md-'));
+        try {
+          const { artifactPath, title, body } = await makeValidIssueArtifact(tempDir);
+          fs.rmSync(path.join(tempDir, 'review-report.md'), { force: true });
+          assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv), false, 'D-1 missing md is unavailable');
+          const { sticky, created, updated } = await publishIssueAndReadSticky(artifactPath, title, body);
+          assert.equal(created, 0, 'D-1 same sticky');
+          assert.equal(updated, 1);
+          assert.ok(sticky.includes('判定：INCONCLUSIVE'), 'D-1 falls back to INCONCLUSIVE');
+          assert.ok(!sticky.includes('判定：APPROVE'), 'D-1 never APPROVE with unavailable');
+          assert.ok(sticky.includes('報告：不可用'), 'D-1 shows unavailable');
+          assert.ok(!sticky.includes('actions/runs/'), 'D-1 gives no fake link');
+        } finally {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
+      // D-2: missing JSON report → same fallback (partial upload).
+      {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-d-issue-missing-json-'));
+        try {
+          const { artifactPath, title, body } = await makeValidIssueArtifact(tempDir);
+          fs.rmSync(path.join(tempDir, 'review-report.json'), { force: true });
+          assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv), false, 'D-2 missing json is unavailable');
+          const { sticky } = await publishIssueAndReadSticky(artifactPath, title, body);
+          assert.ok(sticky.includes('判定：INCONCLUSIVE'), 'D-2 INCONCLUSIVE');
+          assert.ok(!sticky.includes('判定：APPROVE'));
+          assert.ok(sticky.includes('報告：不可用'));
+          assert.ok(!sticky.includes('actions/runs/'));
+        } finally {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
+      // D-3: download failure (both reports gone, output present, job success).
+      {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-d-issue-download-'));
+        try {
+          const { artifactPath, title, body } = await makeValidIssueArtifact(tempDir);
+          fs.rmSync(path.join(tempDir, 'review-report.json'), { force: true });
+          fs.rmSync(path.join(tempDir, 'review-report.md'), { force: true });
+          assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv), false, 'D-3 download loss is unavailable');
+          const { sticky } = await publishIssueAndReadSticky(artifactPath, title, body);
+          assert.ok(sticky.includes('判定：INCONCLUSIVE'), 'D-3 download failure stays INCONCLUSIVE');
+          assert.ok(sticky.includes('報告：不可用'));
+          assert.ok(!sticky.includes('actions/runs/'));
+        } finally {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
+      // D-4: output↔report inconsistency (verdict / fingerprint / time).
+      for (const variant of ['verdict', 'fingerprint', 'time'] as const) {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-d-issue-tamper-${variant}-`));
+        try {
+          const { artifactPath, title, body } = await makeValidIssueArtifact(tempDir);
+          const reportPath = path.join(tempDir, 'review-report.json');
+          const report = JSON.parse(fs.readFileSync(reportPath, 'utf8')) as Record<string, unknown>;
+          if (variant === 'verdict') report.verdict = report.verdict === 'APPROVE' ? 'NEEDS_CHANGES' : 'APPROVE';
+          if (variant === 'fingerprint') report.fingerprint = `${'0'.repeat(63)}1`;
+          if (variant === 'time') report.time = 'not-a-time';
+          fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+          assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv), false, `D-4 tampered ${variant} is unavailable`);
+          const { sticky } = await publishIssueAndReadSticky(artifactPath, title, body);
+          assert.ok(sticky.includes('判定：INCONCLUSIVE'), `D-4 tampered ${variant} stays INCONCLUSIVE`);
+          assert.ok(!sticky.includes('判定：APPROVE'));
+          assert.ok(sticky.includes('報告：不可用'));
+          assert.ok(!sticky.includes('actions/runs/'));
+        } finally {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
+      // D-5: write failure injection — reports unwritable downgrades APPROVE
+      // (report path collides with a directory → EISDIR; no fs mock needed).
+      {
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-d-issue-writefail-'));
+        try {
+          const artifactPath = path.join(tempDir, 'review-output.json');
+          fs.rmSync(path.join(tempDir, 'review-report.json'), { force: true, recursive: true });
+          fs.mkdirSync(path.join(tempDir, 'review-report.json'), { recursive: true });
+          const counter = { count: 0 };
+          const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'write-fail ok', suggestedLabels: [] }]);
+          let reviewed!: Awaited<ReturnType<typeof runIssueReviewMode>>;
+          try {
+            const client = issueClient({ comments: [], created: 0, updated: 0 }, { getTitle: 'w', getBody: 'b' });
+            reviewed = await runIssueReviewMode({
+              event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'w', body: 'b' } },
+              env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+              githubClient: client,
+              writeStdout: () => undefined,
+            });
+          } finally {
+            restore();
+          }
+          assert.notEqual(reviewed.verdict, 'APPROVE', 'D-5 write failure never APPROVE');
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'D-5 write failure downgrades to INCONCLUSIVE');
+          const persisted = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as { verdict: string };
+          assert.notEqual(persisted.verdict, 'APPROVE', 'D-5 persisted file never APPROVE');
+          assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv), false, 'D-5 reports unavailable after injection');
+          // Direct writeReviewReports status carries the identifiable error
+          // (same directory collision, still EISDIR).
+          {
+            const failDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-d-issue-direct-'));
+            try {
+              const failPath = path.join(failDir, 'review-output.json');
+              fs.writeFileSync(failPath, '{}');
+              fs.rmSync(path.join(failDir, 'review-report.json'), { force: true, recursive: true });
+              fs.mkdirSync(path.join(failDir, 'review-report.json'), { recursive: true });
+              const status = writeReviewReports(
+                { verdict: 'APPROVE', issueNumber: 7, title: 'w', tags: [], summary: 's', suggestedLabels: [], fingerprint: 'a'.repeat(64), commentsComplete: true } as never,
+                { env: { POCKETGUARD_OUTPUT: failPath } as NodeJS.ProcessEnv },
+              );
+              assert.equal(status.ok, false, 'D-5 direct injection reports failure');
+              if (!status.ok) assert.ok(status.reason.includes(REVIEW_REPORT_WRITE_ERROR), 'D-5 direct failure carries identifiable error');
+            } finally {
+              fs.rmSync(failDir, { recursive: true, force: true });
+            }
+          }
+          // Identifiable error string itself is stable.
+          assert.ok(REVIEW_REPORT_WRITE_ERROR.includes('failed to write review reports'));
+        } finally {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+      }
     }
   } finally {
     globalThis.fetch = previousFetch;

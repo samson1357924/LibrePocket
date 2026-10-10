@@ -16,6 +16,12 @@ import okhttp3.OkHttpClient
  * - `delta.tool_calls[]` aggregated by `index`; empty id chunks never
  *   overwrite a valid id; missing/conflicting ids are repaired at the end
  *   with response-scoped unique `call_<uuid8>`.
+ * - Phase 2 history: assistant-carried `tool_calls[]` paired with `tool`
+ *   messages by `tool_call_id`. A stored id is verified; a missing id is
+ *   filled only for the single-call case (otherwise fail-closed, no request).
+ *   Every request self-contains the full pairing (stateless).
+ *   Non-thinking only; reasoning-bearing histories fail closed
+ *   (`THINKING_ROUND_TRIP_NOT_SUPPORTED`, checked first in `buildBody`).
  * - `finish_reason` + `[DONE]` -> [StreamEvent.Done]; missing either ->
  *   `Failed(retryable=true)`.
  */
@@ -86,6 +92,7 @@ class ChatCompletionsProvider(
      * parts; `>4` images are cut with the omission recorded in [BuiltBody].
      */
     internal fun buildBody(request: ChatRequest): String {
+        requireNoReasoningHistory(request)
         val sb = StringBuilder()
         sb.append("{\"model\":${q(request.model)},\"stream\":true")
         request.maxTokens?.let { sb.append(",\"max_tokens\":$it") }
@@ -98,8 +105,7 @@ class ChatCompletionsProvider(
             sb.append(",\"tools\":[")
             request.tools.forEachIndexed { i, t ->
                 if (i > 0) sb.append(',')
-                sb.append("{\"type\":\"function\",\"function\":{\"name\":${q(t.name)},")
-                sb.append("\"description\":${q(t.description)},\"parameters\":${t.jsonSchema}}}")
+                sb.append(chatFunctionToolJson(t))
             }
             sb.append(']')
         }
@@ -118,32 +124,51 @@ class ChatCompletionsProvider(
         if (request.systemPromptOverride != null) systems.add(request.systemPromptOverride)
         for (m in request.messages) if (m.role == "system") systems.add(m.text)
         if (systems.isNotEmpty()) emitMsg("system", q(safeText(systems.joinToString("\n"))))
-        for (m in request.messages) {
+        val resolvedIds = validateToolPairing(request.messages, true)
+        for ((i, m) in request.messages.withIndex()) {
             if (m.role == "system") continue
             val safeM = if (serverSearch) m.copy(text = Redactor.redact(m.text).text) else m
             when {
                 m.role == "tool" -> {
+                    // Phase 2: stored tool_call_id is verified; a missing id is
+                    // filled only for the single-pending case, otherwise fail-closed.
+                    val resolved = resolvedIds[i]!!
                     if (!first) sb.append(',')
                     first = false
-                    sb.append("{\"role\":\"tool\",\"tool_call_id\":${q(m.toolCallId.orEmpty())},")
+                    sb.append("{\"role\":\"tool\",\"tool_call_id\":${q(resolved)},")
                     sb.append("\"content\":${q(safeM.text)}}")
                 }
                 m.images.isEmpty() && m.toolCalls.isEmpty() -> emitMsg(m.role, q(safeM.text))
-                else -> {
+                m.images.isEmpty() -> {
+                    // Tool calls without images: content is a plain string
+                    // (null when the text is empty); never multimodal parts,
+                    // never a top-level "text" field.
                     if (!first) sb.append(',')
                     first = false
-                    sb.append("{\"role\":${q(m.role)},\"content\":${contentParts(safeM)},")
-                    if (m.toolCalls.isNotEmpty()) {
-                        sb.append("\"tool_calls\":[")
-                        m.toolCalls.forEachIndexed { i, tc ->
-                            if (i > 0) sb.append(',')
-                            sb.append("{\"id\":${q(tc.id)},\"type\":\"function\",")
-                            sb.append("\"function\":{\"name\":${q(tc.name)},")
-                            sb.append("\"arguments\":${q(tc.argumentsJson)}}}")
-                        }
-                        sb.append("],")
+                    val contentJson = if (safeM.text.isEmpty()) "null" else q(safeM.text)
+                    sb.append("{\"role\":${q(m.role)},\"content\":$contentJson,")
+                    sb.append("\"tool_calls\":[")
+                    m.toolCalls.forEachIndexed { j, tc ->
+                        if (j > 0) sb.append(',')
+                        sb.append(chatToolCallJson(tc))
                     }
-                    sb.append("\"text\":${q(safeM.text)}}")
+                    sb.append("]}")
+                }
+                else -> {
+                    // Images (optionally with tool calls): multimodal content
+                    // array; no top-level "text" field.
+                    if (!first) sb.append(',')
+                    first = false
+                    sb.append("{\"role\":${q(m.role)},\"content\":${contentParts(safeM)}")
+                    if (m.toolCalls.isNotEmpty()) {
+                        sb.append(",\"tool_calls\":[")
+                        m.toolCalls.forEachIndexed { j, tc ->
+                            if (j > 0) sb.append(',')
+                            sb.append(chatToolCallJson(tc))
+                        }
+                        sb.append("]")
+                    }
+                    sb.append("}")
                 }
             }
         }

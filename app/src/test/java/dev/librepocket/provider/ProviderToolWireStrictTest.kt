@@ -2,12 +2,15 @@ package dev.librepocket.provider
 
 import dev.librepocket.tool.ToolRegistry
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -365,5 +368,162 @@ class ProviderToolWireStrictTest {
             ChatRequest(model = "m", messages = messages, tools = tools),
         )
         assertEquals(tools.size, strictObj(anthropicBody)["tools"]!!.jsonArray.size)
+    }
+
+    // ---- stage 3: Chat assistant tool_calls without images: no top-level "text" ----
+
+    @Test
+    fun chatAssistantToolCallsEmptyTextHasNullContentAndAllowedKeys() {
+        val tc = ToolCall(id = "call_stage3a", name = "get_weather", argumentsJson = """{"city":"Taipei"}""")
+        val body = ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+            ChatRequest(
+                model = "m",
+                messages = listOf(
+                    ChatMessage("user", "hi"),
+                    ChatMessage("assistant", "", toolCalls = listOf(tc)),
+                    ChatMessage("tool", "sunny", toolCallId = tc.id),
+                ),
+                tools = advTools(),
+            ),
+        )
+        val assistant = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
+            .first { it["role"]!!.jsonPrimitive.content == "assistant" }
+        assertFalse(assistant.containsKey("text"))
+        assertTrue(assistant.keys.all { it in setOf("role", "content", "tool_calls") })
+        assertTrue(assistant["content"] is JsonNull)
+        assertEquals(1, assistant["tool_calls"]!!.jsonArray.size)
+    }
+
+    @Test
+    fun chatAssistantToolCallsWithTextHasStringContentAndAllowedKeys() {
+        val tc = ToolCall(id = "call_stage3b", name = "get_weather", argumentsJson = """{"city":"Taipei"}""")
+        val body = ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+            ChatRequest(
+                model = "m",
+                messages = listOf(
+                    ChatMessage("user", "hi"),
+                    ChatMessage("assistant", "thinking 中文", toolCalls = listOf(tc)),
+                    ChatMessage("tool", "sunny", toolCallId = tc.id),
+                ),
+                tools = advTools(),
+            ),
+        )
+        val assistant = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
+            .first { it["role"]!!.jsonPrimitive.content == "assistant" }
+        assertFalse(assistant.containsKey("text"))
+        assertTrue(assistant.keys.all { it in setOf("role", "content", "tool_calls") })
+        assertEquals("thinking 中文", assistant["content"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun chatImageContentIsArrayWithNoTopLevelText() {
+        val tc = ToolCall(id = "call_stage3c", name = "get_weather", argumentsJson = """{"city":"Taipei"}""")
+        val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
+        val body = ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+            ChatRequest(
+                model = "m",
+                messages = listOf(
+                    ChatMessage("assistant", "look", images = listOf(img), toolCalls = listOf(tc)),
+                    ChatMessage("tool", "sunny", toolCallId = tc.id),
+                ),
+                tools = advTools(),
+            ),
+        )
+        val assistant = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
+            .first { it["role"]!!.jsonPrimitive.content == "assistant" }
+        assertFalse(assistant.containsKey("text"))
+        assertTrue(assistant["content"] is kotlinx.serialization.json.JsonArray)
+        assertTrue(assistant["tool_calls"]!!.jsonArray.size == 1)
+    }
+
+    @Test
+    fun chatPlainImageMessageHasNoTopLevelText() {
+        val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
+        val body = ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+            ChatRequest(
+                model = "m",
+                messages = listOf(ChatMessage("user", "look", images = listOf(img))),
+            ),
+        )
+        val user = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
+            .first { it["role"]!!.jsonPrimitive.content == "user" }
+        assertFalse(user.containsKey("text"))
+        assertTrue(user["content"] is kotlinx.serialization.json.JsonArray)
+    }
+
+    // ---- stage 3: tool schema must be a JSON object (fail-closed) ----
+
+    @Test
+    fun toolSchemaWrongRootTypeFailsClosedOnAllAdapters() {
+        val bad = mapOf(
+            "null" to "null",
+            "array" to "[]",
+            "string" to "\"text\"",
+            "number" to "123",
+            "blank" to "",
+        )
+        val expected = mapOf(
+            "null" to "TOOL_SCHEMA_MUST_BE_OBJECT",
+            "array" to "TOOL_SCHEMA_MUST_BE_OBJECT",
+            "string" to "TOOL_SCHEMA_MUST_BE_OBJECT",
+            "number" to "TOOL_SCHEMA_MUST_BE_OBJECT",
+            "blank" to "TOOL_SCHEMA_INVALID",
+        )
+        for ((label, schema) in bad) {
+            val tools = listOf(ToolSchema("bad_tool", "desc", schema))
+            val messages = listOf(ChatMessage("user", "hi"))
+            try {
+                ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+                    ChatRequest(model = "m", messages = messages, tools = tools),
+                )
+                fail("expected chat rejection for $label")
+            } catch (e: ProviderFailure) {
+                assertFalse(e.retryable)
+                assertEquals(expected[label], e.message)
+            }
+            try {
+                ResponsesProvider(responsesConfig(), { null }).buildBody(
+                    ChatRequest(model = "m", messages = messages, tools = tools),
+                )
+                fail("expected responses rejection for $label")
+            } catch (e: ProviderFailure) {
+                assertFalse(e.retryable)
+                assertEquals(expected[label], e.message)
+            }
+            try {
+                AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                    ChatRequest(model = "m", messages = messages, tools = tools),
+                )
+                fail("expected anthropic rejection for $label")
+            } catch (e: ProviderFailure) {
+                assertFalse(e.retryable)
+                assertEquals(expected[label], e.message)
+            }
+        }
+    }
+
+    @Test
+    fun toolSchemaObjectPositiveParsesAsObject() {
+        val schema = """{"type":"object","properties":{"q":{"type":"string"}}}"""
+        val tools = listOf(ToolSchema("good_tool", "desc", schema))
+        val messages = listOf(ChatMessage("user", "hi"))
+        val chatTools = strictObj(
+            ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = messages, tools = tools),
+            ),
+        )["tools"]!!.jsonArray
+        assertTrue(chatTools[0].jsonObject["function"]!!.jsonObject["parameters"] is JsonObject)
+        val respTools = strictObj(
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = messages, tools = tools),
+            ),
+        )["tools"]!!.jsonArray
+        assertTrue(respTools[0].jsonObject["parameters"] is JsonObject)
+        val anthTools = strictObj(
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = messages, tools = tools),
+            ),
+        )["tools"]!!.jsonArray
+        assertTrue(anthTools[0].jsonObject["input_schema"] is JsonObject)
     }
 }

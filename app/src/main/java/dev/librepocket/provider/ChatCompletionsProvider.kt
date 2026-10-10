@@ -136,19 +136,36 @@ class ChatCompletionsProvider(
                     sb.append("\"content\":${q(safeM.text)}}")
                 }
                 m.images.isEmpty() && m.toolCalls.isEmpty() -> emitMsg(m.role, q(safeM.text))
-                else -> {
+                m.images.isEmpty() -> {
+                    // Tool calls without images: content is a plain string
+                    // (null when the text is empty); never multimodal parts,
+                    // never a top-level "text" field.
                     if (!first) sb.append(',')
                     first = false
-                    sb.append("{\"role\":${q(m.role)},\"content\":${contentParts(safeM)},")
+                    val contentJson = if (safeM.text.isEmpty()) "null" else q(safeM.text)
+                    sb.append("{\"role\":${q(m.role)},\"content\":$contentJson,")
+                    sb.append("\"tool_calls\":[")
+                    m.toolCalls.forEachIndexed { j, tc ->
+                        if (j > 0) sb.append(',')
+                        sb.append(chatToolCallJson(tc))
+                    }
+                    sb.append("]}")
+                }
+                else -> {
+                    // Images (optionally with tool calls): multimodal content
+                    // array; no top-level "text" field.
+                    if (!first) sb.append(',')
+                    first = false
+                    sb.append("{\"role\":${q(m.role)},\"content\":${contentParts(safeM)}")
                     if (m.toolCalls.isNotEmpty()) {
-                        sb.append("\"tool_calls\":[")
-                        m.toolCalls.forEachIndexed { i, tc ->
-                            if (i > 0) sb.append(',')
+                        sb.append(",\"tool_calls\":[")
+                        m.toolCalls.forEachIndexed { j, tc ->
+                            if (j > 0) sb.append(',')
                             sb.append(chatToolCallJson(tc))
                         }
-                        sb.append("],")
+                        sb.append("]")
                     }
-                    sb.append("\"text\":${q(safeM.text)}}")
+                    sb.append("}")
                 }
             }
         }

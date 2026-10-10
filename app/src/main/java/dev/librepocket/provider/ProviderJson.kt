@@ -14,15 +14,27 @@ import kotlinx.serialization.json.put
  * `JsonPrimitive`). Structural braces/brackets therefore close exactly once
  * by construction, and every adapter shares one encoder path.
  *
- * [ToolSchema.jsonSchema] is embedded via [Json.parseToJsonElement]
- * (strict): a malformed schema fails fast with [IllegalArgumentException]
- * (mapped to a fatal provider failure upstream) instead of emitting an
- * invalid request body. Key order in each fragment preserves the previous
- * wire shape.
+ * [ToolSchema.jsonSchema] is embedded via [toolSchemaElement]
+ * (strict, fail-closed): a malformed schema throws
+ * `ProviderFailure(false, "TOOL_SCHEMA_INVALID")`, a well-formed but
+ * non-object root (null / array / string / number) throws
+ * `ProviderFailure(false, "TOOL_SCHEMA_MUST_BE_OBJECT")`, instead of
+ * emitting an invalid request body. Blank is INVALID (not `{}`), keeping
+ * schema semantics distinct from arguments blank-fills. Key order in each
+ * fragment preserves the previous wire shape.
  */
 
-/** Parse an already-balanced schema fragment strictly. */
-internal fun toolSchemaElement(schemaJson: String) = Json.parseToJsonElement(schemaJson)
+/** Parse an already-balanced schema fragment strictly; must be a JSON object (fail-closed). */
+internal fun toolSchemaElement(schemaJson: String) = try {
+    when (val el = Json.parseToJsonElement(schemaJson)) {
+        is JsonObject -> el
+        else -> throw ProviderFailure(false, "TOOL_SCHEMA_MUST_BE_OBJECT")
+    }
+} catch (e: ProviderFailure) {
+    throw e
+} catch (e: IllegalArgumentException) {
+    throw ProviderFailure(false, "TOOL_SCHEMA_INVALID")
+}
 
 /** Responses `{"type":"function","name":…,"description":…,"parameters":…}`. */
 internal fun responsesFunctionToolJson(t: ToolSchema): String = buildJsonObject {

@@ -125,7 +125,7 @@ class StageCPersistenceTest {
         createV2File(name, sid)
 
         val db = Room.databaseBuilder(ctx, LibrePocketDb::class.java, name)
-            .addMigrations(LibrePocketDb.MIGRATION_1_2, LibrePocketDb.MIGRATION_2_3)
+            .addMigrations(LibrePocketDb.MIGRATION_1_2, LibrePocketDb.MIGRATION_2_3, LibrePocketDb.MIGRATION_3_4)
             .allowMainThreadQueries()
             .build()
         openDbs.add(db)

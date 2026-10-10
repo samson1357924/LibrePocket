@@ -6,7 +6,8 @@ package dev.librepocket.chat
  * events durably acked), so implementations observe admission order.
  *
  * Core vs notice: [onTurnStarted], all [onTurnSucceeded] overloads, all
- * [onTurnFailed] overloads and all [onTurnCancelled] overloads are durable core events — a store failure
+ * [onTurnFailed] overloads, all [onTurnCancelled] overloads and
+ * [onLogicalTurnCancelled] are durable core events — a store failure
  * propagates so the session writer fails the ack instead of reporting a
  * false durable write. [onTurnRetried], [onSteerQueued], [onToolDone] and
  * [onUsage] stay best-effort notices: failures are swallowed and never
@@ -40,6 +41,8 @@ interface TranscriptSink {
    * the reasoning-aware base form (keeping the marker) so existing fakes keep
    * compiling; production ([dev.librepocket.chat.TurnController] →
    * [dev.librepocket.session.SessionTranscriptSink]) always calls this form.
+   *
+   * Stage F: success rows are always final (`isFinal=1`).
    */
   suspend fun onTurnSucceeded(
     runId: String,
@@ -62,6 +65,8 @@ interface TranscriptSink {
    * [onTurnFailed] keep compiling and keep their assertions; production paths
    * ([dev.librepocket.chat.TurnController]) always call this three-arg form.
    * The legacy two-arg form stays as the reason-only (system-row) record.
+   *
+   * Stage F: this three-arg form is always final (`isFinal=1`).
    */
   suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
     onTurnFailed(runId, error)
@@ -71,6 +76,9 @@ interface TranscriptSink {
    * partials written before the retry notice) linked to its logical turn.
    * Same [parentRunId]/[attemptIndex] semantics as the success overload. The
    * default forwards to the three-arg form so existing fakes keep compiling.
+   *
+   * Stage F: this five-arg form is always final (`isFinal=1`). Retryable
+   * intermediate partials (`isFinal=0`) use the six-arg form below.
    */
   suspend fun onTurnFailed(
     runId: String,
@@ -81,6 +89,25 @@ interface TranscriptSink {
   ) {
     onTurnFailed(runId, partialText, error)
   }
+  /**
+   * Stage F (implemented): explicit final flag for attempt failure rows.
+   * Success, terminal-failure and cancel rows pass `isFinal=true`; a
+   * retryable failure's intermediate fragment (written before its retry
+   * notice) passes `isFinal=false` and never closes the logical family. The
+   * default forwards to the five-arg form (dropping the flag) so existing
+   * fakes keep compiling; production ([dev.librepocket.session.SessionTranscriptSink])
+   * overrides to persist the flag.
+   */
+  suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+  ) {
+    onTurnFailed(runId, partialText, error, parentRunId, attemptIndex)
+  }
   suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long)
   /** Same [hasReasoning] marker contract as [onTurnSucceeded] for partial text. */
   suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean = false)
@@ -89,6 +116,8 @@ interface TranscriptSink {
    * logical turn. Same [parentRunId]/[attemptIndex] semantics as above plus
    * the [hasReasoning] marker contract. The default forwards to the
    * reasoning-aware base form so existing fakes keep compiling.
+   *
+   * Stage F: this form is always final (`isFinal=1`).
    */
   suspend fun onTurnCancelled(
     runId: String,
@@ -98,6 +127,33 @@ interface TranscriptSink {
     hasReasoning: Boolean = false,
   ) {
     onTurnCancelled(runId, partialText, hasReasoning)
+  }
+  /**
+   * Stage F (implemented): deduped cancel mark for an already-terminalized
+   * attempt. When [dev.librepocket.chat.TurnController] cancels in a retry
+   * backoff gap, the just-failed attempt already owns a durable partial row;
+   * writing a second assistant row for the same attempt would duplicate it.
+   * This call writes one `system`-kind final mark
+   * (`turn <logicalTurnId> cancelled`, `isFinal=1`) bound to the logical
+   * family instead — hidden from the chat replay, visible in export, and a
+   * terminal for [findDanglingRunIds][dev.librepocket.agent.ui.chat.findDanglingRunIds].
+   * Durable core event. The default forwards to the attempt-bound cancel
+   * terminal (second assistant) so existing fakes keep compiling and keep
+   * their assertions; production ([dev.librepocket.session.SessionTranscriptSink])
+   * overrides to the system mark.
+   */
+  suspend fun onLogicalTurnCancelled(
+    logicalTurnId: String,
+    attemptRunId: String,
+    partialText: String,
+    attemptIndex: Int?,
+  ) {
+    onTurnCancelled(
+      attemptRunId,
+      partialText,
+      if (attemptRunId == logicalTurnId) null else logicalTurnId,
+      attemptIndex,
+    )
   }
   suspend fun onSteerQueued(text: String)
 

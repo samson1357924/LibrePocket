@@ -37,6 +37,17 @@ data class SessionMeta(
  * groups by logical family (`parentRunId ?: runId`): any assistant row in the
  * family (completed or partial-failed, including retried partials) completes
  * the family, so a retry→success turn is never mis-marked INTERRUPTED.
+ *
+ * Stage F (implemented): [isFinal] distinguishes a logical-turn final result
+ * from a per-attempt intermediate partial. Success, terminal-failure and
+ * cancel assistant rows are final (`isFinal=true`); a retryable failure's
+ * intermediate fragment (written before its retry notice) is non-final
+ * (`isFinal=false`). Retry notices are unchanged (final by default, never a
+ * terminal). Persisted as `isFinal INTEGER NOT NULL DEFAULT 1` via Migration
+ * 3→4 (ALTER ADD COLUMN only); pre-F rows and JSONL lines without the key
+ * read back as `isFinal=true` (old single-terminal semantics). Only
+ * `assistant isFinal=1` rows (plus system cancel/interrupted terminals) close
+ * a logical family — see [findDanglingRunIds].
  */
 data class TranscriptEvent(
     val seq: Long = 0, // DB-assigned; ignored on write
@@ -50,6 +61,7 @@ data class TranscriptEvent(
     val failureReason: String? = null, // sanitized error for failed rows (redacted on write)
     val parentRunId: String? = null, // Stage C: logical turn id for attempt assistant terminals; null for user/retry/legacy rows
     val attemptIndex: Int? = null, // Stage C: 0-based attempt number for attempt rows; null for user/legacy rows
+    val isFinal: Boolean = true, // Stage F: false only for retryable-failed intermediate partials; missing key/old rows default final
 )
 
 /** Prune knobs (spec §8.3). */

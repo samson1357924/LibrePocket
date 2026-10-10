@@ -195,7 +195,11 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  *
  * Retry: each attempt gets a fresh runId; failed partial output is kept with
  * `isPartial=true` and the next attempt starts a new assistant block instead
- * of backfilling the old one.
+ * of backfilling the old one. Stage F: the intermediate fragment is
+ * non-final (`isFinal=false`) and never closes the logical family; only the
+ * final success / terminal-failure / cancel row (`isFinal=true`) does. A
+ * cancel in a retry backoff gap writes one system-kind final mark instead of
+ * a second assistant row for the same attempt.
  *
  * Aggregation budget: ToolDelta fragments (args/id/name) for one tool index
  * share one memory budget (see `MAX_TOOL_CALL_AGG_BYTES`); exceeding it ends
@@ -354,6 +358,16 @@ class TurnController(
   private var closed = false
   /** Monotonic under [lock]; invalidates fresh-gate failures after turn activity. */
   private var activityRevision = 0L
+  /**
+   * Stage F: attempt ids whose terminal row is already durably acked
+   * (success final, terminal-failure final, or retryable intermediate partial
+   * non-final). A cancel that lands on a contained id writes one system-kind
+   * final mark instead of a second assistant row for the same attempt. Ids
+   * are unique per attempt (UUID/newId), so the set stays bounded by the
+   * session's attempt count; entries are added only after the ack succeeds.
+   */
+  private val terminalizedAttempts: MutableSet<String> =
+    java.util.concurrent.ConcurrentHashMap.newKeySet()
 
   /** Test seam between an idle admission snapshot and its fresh policy gate. */
   internal var beforeAdmissionGateForTest: (() -> Unit)? = null
@@ -828,7 +842,11 @@ class TurnController(
    * turn's id (ordered behind the started entry, or INTERRUPTED-marked on
    * store/seal failure). Stage C: the cancel terminal carries the logical
    * family linkage (`parentRunId` + `attemptIndex`) like every other attempt
-   * terminal.
+   * terminal. Stage F: a cancel that lands on an already-terminalized
+   * attempt (retry backoff gap: the just-failed partial is already durable)
+   * writes one system-kind final mark instead of a second assistant row for
+   * the same attempt; otherwise the cancel assistant row is final
+   * (`isFinal=1`).
    */
   private suspend fun hostedTurn(
     text: String,
@@ -849,6 +867,13 @@ class TurnController(
       val cancelIndex = attemptIndexRef.get()
       val cancelParent = parentFor(cancelId, logicalTurnId)
       val cancelText = assistantTextOf(cancelId)
+      // Stage F dedup: the terminalized set holds every attempt whose row is
+      // already durably acked (success final, terminal-failure final, or
+      // retryable intermediate partial non-final). A backoff-gap cancel hits
+      // the just-failed id, so it writes one system-kind final mark instead
+      // of a second assistant row for the same attempt. A streaming cancel
+      // misses and keeps the original final assistant row.
+      val deduped = terminalizedAttempts.contains(cancelId)
       // Durable and non-cancellable: the host is cancelled but the session
       // writer is independent, so this record still drains on close (or is
       // explicitly marked INTERRUPTED instead of silently dropped). A
@@ -862,7 +887,11 @@ class TurnController(
       val cancelReasoning = assistantReasoningOf(cancelId)
       withContext(NonCancellable) {
         try {
-          orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex, cancelReasoning)
+          if (deduped) {
+            orderedTranscript.onLogicalTurnCancelled(logicalTurnId, cancelId, cancelText, cancelIndex)
+          } else {
+            orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex, cancelReasoning)
+          }
         } catch (_: ClosedSendChannelException) {
           // Sealed after close(): explicit INTERRUPTED mark already recorded.
         } catch (sealFailure: CancellationException) {
@@ -1260,6 +1289,7 @@ class TurnController(
           attemptRunId, successText,
           parentFor(attemptRunId, logicalTurnId), attempt, successReasoning,
         )
+        terminalizedAttempts.add(attemptRunId)
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
@@ -1275,20 +1305,23 @@ class TurnController(
         }
         orderedTranscript.onTurnFailed(
           attemptRunId, assistantTextOf(attemptRunId), clean,
-          parentFor(attemptRunId, logicalTurnId), attempt,
+          parentFor(attemptRunId, logicalTurnId), attempt, true,
         )
+        terminalizedAttempts.add(attemptRunId)
         return
       }
       // Stage C: persist the retried partial BEFORE the retry notice, so a
       // retryable failure's intermediate fragment survives reopen/export even
-      // when the next attempt later succeeds. Same durable three-arg form as
-      // the terminal failure above (isPartial=1 + sanitized reason), bound to
-      // the same logical family.
+      // when the next attempt later succeeds. Same durable form as the
+      // terminal failure above (isPartial=1 + sanitized reason), bound to the
+      // same logical family. Stage F: intermediate partials are non-final
+      // (isFinal=false) so the family still dangles until a final row lands.
       val retriedClean = sanitizeError(failure.message)
       orderedTranscript.onTurnFailed(
         attemptRunId, assistantTextOf(attemptRunId), retriedClean,
-        parentFor(attemptRunId, logicalTurnId), attempt,
+        parentFor(attemptRunId, logicalTurnId), attempt, false,
       )
+      terminalizedAttempts.add(attemptRunId)
       attempt += 1
       val waitMs = retryConfig.delayForRetry(attempt)
       // Bound to the logical turn (single user row), not to the failed

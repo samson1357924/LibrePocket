@@ -1754,6 +1754,41 @@ export function issueContentFingerprint(title: string, body: string, comments: s
 // is detectable without trusting offsets alone. Per-segment schema plus
 // per-segment body/comments caps are validated by validateIssueChunk below.
 // Shared slicing via sliceTextForChunk (body/comment共用).
+// P2 #4 per-slice raw binding: each comment slice records its origin
+// comment identity plus the raw slice range and the SHA-256 over
+// normalizeRawForFingerprint(rawSlice). No plaintext is stored — only
+// id/index/ranges/hex — so reports keep redaction while generation and
+// publish can re-derive the same binding from the RAW snapshot and compare
+// content/order exactly (same-length swap, comment reorder, duplicated
+// slice all mismatch). start/end are global REDACTED-layout offsets (same
+// coordinate as chunk start/end) for ordering; sliceStart/sliceEnd are
+// offsets within the RAW comment string rawComments[commentIndex].
+export interface IssueChunkSegment {
+  commentId: number | null;
+  commentIndex: number;
+  sliceStart: number;
+  sliceEnd: number;
+  sha256: string;
+  start: number;
+  end: number;
+}
+
+// P2 #4 body slice binding: sliceStart/sliceEnd are offsets within the RAW
+// body string; start/end are global REDACTED-layout offsets; sha256 is the
+// per-slice raw hash. bodySha (on the chunk/report) is the whole-RAW-body
+// hash so any body edit — even same-length — mismatches.
+export interface IssueBodyRange {
+  sliceStart: number;
+  sliceEnd: number;
+  start: number;
+  end: number;
+  sha256: string;
+}
+
+export function rawSliceHash(rawSlice: string): string {
+  return createHash('sha256').update(normalizeRawForFingerprint(rawSlice), 'utf8').digest('hex');
+}
+
 export interface IssueChunk {
   index: number;
   total: number;
@@ -1764,11 +1799,17 @@ export interface IssueChunk {
   title: string;
   body: string;
   comments: string[];
+  // P2 #4 raw bindings (hashes/ranges only, never plaintext).
+  segments: IssueChunkSegment[];
+  bodySha: string;
+  bodyRanges: IssueBodyRange[];
 }
 
 // Per-chunk minimal retention for review-output (Phase A #4): redacted proof
 // only, never full chunk text. verdict/summary/labels come from the per-chunk
 // triage; summary is truncated to MAX_ISSUE_CHUNK_SUMMARY_LENGTH.
+// P2 #4: reports carry only hash/ranges/verdict (+bounded summary/labels) —
+// segments/bodySha/bodyRanges bind the RAW snapshot, no raw text persists.
 export interface IssueChunkReport {
   index: number;
   total: number;
@@ -1779,13 +1820,63 @@ export interface IssueChunkReport {
   verdict: RunnerVerdict;
   summary: string;
   labels: string[];
+  // P2 #4 raw bindings (hashes/ranges only, never plaintext).
+  segments: IssueChunkSegment[];
+  bodySha: string;
+  bodyRanges: IssueBodyRange[];
+}
+
+export function validateIssueChunkSegment(value: unknown): IssueChunkSegment | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    Object.keys(raw).some((key) => !['commentId', 'commentIndex', 'sliceStart', 'sliceEnd', 'sha256', 'start', 'end'].includes(key)) ||
+    !((raw.commentId === null) || (Number.isSafeInteger(raw.commentId) && Number(raw.commentId) >= 0)) ||
+    !Number.isSafeInteger(raw.commentIndex) || Number(raw.commentIndex) < 0 ||
+    !Number.isSafeInteger(raw.sliceStart) || Number(raw.sliceStart) < 0 ||
+    !Number.isSafeInteger(raw.sliceEnd) || Number(raw.sliceEnd) < Number(raw.sliceStart) ||
+    typeof raw.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(raw.sha256) ||
+    !Number.isSafeInteger(raw.start) || Number(raw.start) < 0 ||
+    !Number.isSafeInteger(raw.end) || Number(raw.end) < Number(raw.start)
+  ) return undefined;
+  if (Number(raw.sliceEnd) - Number(raw.sliceStart) > MAX_ISSUE_CHUNK_LENGTH) return undefined;
+  return {
+    commentId: raw.commentId === null ? null : Number(raw.commentId),
+    commentIndex: Number(raw.commentIndex),
+    sliceStart: Number(raw.sliceStart),
+    sliceEnd: Number(raw.sliceEnd),
+    sha256: raw.sha256 as string,
+    start: Number(raw.start),
+    end: Number(raw.end),
+  };
+}
+
+export function validateIssueBodyRange(value: unknown): IssueBodyRange | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    Object.keys(raw).some((key) => !['sliceStart', 'sliceEnd', 'start', 'end', 'sha256'].includes(key)) ||
+    !Number.isSafeInteger(raw.sliceStart) || Number(raw.sliceStart) < 0 ||
+    !Number.isSafeInteger(raw.sliceEnd) || Number(raw.sliceEnd) < Number(raw.sliceStart) ||
+    !Number.isSafeInteger(raw.start) || Number(raw.start) < 0 ||
+    !Number.isSafeInteger(raw.end) || Number(raw.end) < Number(raw.start) ||
+    typeof raw.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(raw.sha256)
+  ) return undefined;
+  if (Number(raw.sliceEnd) - Number(raw.sliceStart) > MAX_ISSUE_CHUNK_LENGTH) return undefined;
+  return {
+    sliceStart: Number(raw.sliceStart),
+    sliceEnd: Number(raw.sliceEnd),
+    start: Number(raw.start),
+    end: Number(raw.end),
+    sha256: raw.sha256 as string,
+  };
 }
 
 export function validateIssueChunk(value: unknown): IssueChunk | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    Object.keys(raw).some((key) => !['index', 'total', 'start', 'end', 'complete', 'coveredLength', 'title', 'body', 'comments'].includes(key)) ||
+    Object.keys(raw).some((key) => !['index', 'total', 'start', 'end', 'complete', 'coveredLength', 'title', 'body', 'comments', 'segments', 'bodySha', 'bodyRanges'].includes(key)) ||
     !Number.isSafeInteger(raw.index) || Number(raw.index) < 0 ||
     !Number.isSafeInteger(raw.total) || Number(raw.total) < 1 ||
     !Number.isSafeInteger(raw.start) || Number(raw.start) < 0 ||
@@ -1793,7 +1884,10 @@ export function validateIssueChunk(value: unknown): IssueChunk | undefined {
     typeof raw.complete !== 'boolean' ||
     !Number.isSafeInteger(raw.coveredLength) || Number(raw.coveredLength) < 0 ||
     typeof raw.title !== 'string' || typeof raw.body !== 'string' ||
-    !Array.isArray(raw.comments) || !raw.comments.every((c) => typeof c === 'string')
+    !Array.isArray(raw.comments) || !raw.comments.every((c) => typeof c === 'string') ||
+    !Array.isArray(raw.segments) ||
+    typeof raw.bodySha !== 'string' || !/^[0-9a-f]{64}$/.test(raw.bodySha) ||
+    !Array.isArray(raw.bodyRanges)
   ) return undefined;
   if (Number(raw.index) >= Number(raw.total)) return undefined;
   const body = raw.body as string;
@@ -1805,6 +1899,35 @@ export function validateIssueChunk(value: unknown): IssueChunk | undefined {
   if (joinedLen > MAX_ISSUE_CHUNK_LENGTH) return undefined;
   const expectedCovered = body.length + comments.reduce((total, c) => total + c.length, 0);
   if (Number(raw.coveredLength) !== expectedCovered) return undefined;
+  // P2 #4 segment/body-range schema plus internal ordering (content/order
+  // binding vs the RAW snapshot happens in validateIssueChunks with full).
+  const segments: IssueChunkSegment[] = [];
+  for (const entry of (raw.segments as unknown[])) {
+    const seg = validateIssueChunkSegment(entry);
+    if (!seg) return undefined;
+    segments.push(seg);
+  }
+  const bodyRanges: IssueBodyRange[] = [];
+  for (const entry of (raw.bodyRanges as unknown[])) {
+    const range = validateIssueBodyRange(entry);
+    if (!range) return undefined;
+  bodyRanges.push(range);
+  }
+  for (let i = 1; i < segments.length; i += 1) {
+    const prev = segments[i - 1];
+    const cur = segments[i];
+    if (cur.commentIndex < prev.commentIndex) return undefined;
+    if (cur.commentIndex === prev.commentIndex && cur.sliceStart < prev.sliceEnd) return undefined;
+    if (cur.start < prev.start) return undefined;
+    if (cur.start < prev.end && cur.end > prev.start) {
+      // Overlapping global ranges are only legal for zero-width fillers.
+      if (!(cur.start === cur.end || prev.start === prev.end)) return undefined;
+    }
+  }
+  for (let i = 1; i < bodyRanges.length; i += 1) {
+    if (bodyRanges[i].sliceStart < bodyRanges[i - 1].sliceEnd) return undefined;
+    if (bodyRanges[i].start < bodyRanges[i - 1].start) return undefined;
+  }
   return {
     index: Number(raw.index),
     total: Number(raw.total),
@@ -1815,10 +1938,61 @@ export function validateIssueChunk(value: unknown): IssueChunk | undefined {
     title: raw.title as string,
     body,
     comments,
+    segments,
+    bodySha: raw.bodySha as string,
+    bodyRanges,
   };
 }
 
-export function validateIssueChunks(value: unknown, full?: { title: string; body: string; comments: string[] }): IssueChunk[] | undefined {
+export interface IssueChunkFull {
+  title: string;
+  body: string;
+  comments: string[];
+  // P2 #4 RAW snapshot for per-slice content/order binding. When omitted the
+  // builder fallback (raw == redacted) is used so legacy 3-field calls keep
+  // working; callers with a live RAW snapshot (review builder path, publish
+  // re-verification, new tests) pass commentIds/rawComments (+rawBody) so a
+  // same-length swap, a comment reorder, or a duplicated slice mismatches.
+  commentIds?: Array<number | null | undefined>;
+  rawComments?: string[];
+  rawBody?: string;
+}
+
+function segmentsEqual(left: IssueChunkSegment[], right: IssueChunkSegment[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    const a = left[i];
+    const b = right[i];
+    if (
+      (a.commentId ?? null) !== (b.commentId ?? null) ||
+      a.commentIndex !== b.commentIndex ||
+      a.sliceStart !== b.sliceStart ||
+      a.sliceEnd !== b.sliceEnd ||
+      a.sha256 !== b.sha256 ||
+      a.start !== b.start ||
+      a.end !== b.end
+    ) return false;
+  }
+  return true;
+}
+
+function bodyRangesEqual(left: IssueBodyRange[], right: IssueBodyRange[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i += 1) {
+    const a = left[i];
+    const b = right[i];
+    if (
+      a.sliceStart !== b.sliceStart ||
+      a.sliceEnd !== b.sliceEnd ||
+      a.start !== b.start ||
+      a.end !== b.end ||
+      a.sha256 !== b.sha256
+    ) return false;
+  }
+  return true;
+}
+
+export function validateIssueChunks(value: unknown, full?: IssueChunkFull): IssueChunk[] | undefined {
   if (!Array.isArray(value) || value.length < 1) return undefined;
   const chunks: IssueChunk[] = [];
   for (const entry of value) {
@@ -1868,6 +2042,36 @@ export function validateIssueChunks(value: unknown, full?: { title: string; body
     } else if (actualSpan !== expectedTotal) {
       return undefined;
     }
+    // P2 #4 RAW content/order binding: re-derive the expected per-slice
+    // bindings from the RAW snapshot with the same builder and require an
+    // exact match (id/index/slice/sha/order plus body hash/ranges). A
+    // same-length char swap alters a slice sha; a comment reorder alters
+    // id/index order; a duplicated slice alters the flattened sequence.
+    // Redacted per-chunk text is compared too so redacted swaps mismatch even
+    // when the caller omits the RAW snapshot (fallback raw == redacted).
+    const expected = buildIssueChunks(fullTitle, fullBody, fullComments, {
+      rawBody: typeof full.rawBody === 'string' ? full.rawBody : fullBody,
+      rawComments: Array.isArray(full.rawComments) ? full.rawComments : fullComments,
+      rawCommentIds: full.commentIds,
+    });
+    if (expected.length !== sorted.length) return undefined;
+    for (let i = 0; i < sorted.length; i += 1) {
+      const got = sorted[i];
+      const want = expected[i];
+      if (got.body !== want.body) return undefined;
+      if (got.comments.length !== want.comments.length) return undefined;
+      for (let j = 0; j < got.comments.length; j += 1) {
+        if (got.comments[j] !== want.comments[j]) return undefined;
+      }
+      if (got.bodySha !== want.bodySha) return undefined;
+      if (!bodyRangesEqual(got.bodyRanges, want.bodyRanges)) return undefined;
+      if (!segmentsEqual(got.segments, want.segments)) return undefined;
+    }
+    // Flattened global order across chunks must reconstruct the RAW snapshot
+    // in sequence (catches cross-chunk reorder/duplication).
+    const flatGot = sorted.flatMap((c) => c.segments);
+    const flatWant = expected.flatMap((c) => c.segments);
+    if (!segmentsEqual(flatGot, flatWant)) return undefined;
   }
   return sorted;
 }
@@ -1876,7 +2080,7 @@ export function validateIssueChunkReport(value: unknown): IssueChunkReport | und
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    Object.keys(raw).some((key) => !['index', 'total', 'start', 'end', 'complete', 'coveredLength', 'verdict', 'summary', 'labels'].includes(key)) ||
+    Object.keys(raw).some((key) => !['index', 'total', 'start', 'end', 'complete', 'coveredLength', 'verdict', 'summary', 'labels', 'segments', 'bodySha', 'bodyRanges'].includes(key)) ||
     !Number.isSafeInteger(raw.index) || Number(raw.index) < 0 ||
     !Number.isSafeInteger(raw.total) || Number(raw.total) < 1 ||
     !Number.isSafeInteger(raw.start) || Number(raw.start) < 0 ||
@@ -1885,9 +2089,35 @@ export function validateIssueChunkReport(value: unknown): IssueChunkReport | und
     !Number.isSafeInteger(raw.coveredLength) || Number(raw.coveredLength) < 0 ||
     !['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE'].includes(String(raw.verdict)) ||
     typeof raw.summary !== 'string' || (raw.summary as string).length > MAX_ISSUE_CHUNK_SUMMARY_LENGTH ||
-    !Array.isArray(raw.labels) || !raw.labels.every((l) => typeof l === 'string')
+    !Array.isArray(raw.labels) || !raw.labels.every((l) => typeof l === 'string') ||
+    !Array.isArray(raw.segments) ||
+    typeof raw.bodySha !== 'string' || !/^[0-9a-f]{64}$/.test(raw.bodySha) ||
+    !Array.isArray(raw.bodyRanges)
   ) return undefined;
   if (Number(raw.index) >= Number(raw.total)) return undefined;
+  const segments: IssueChunkSegment[] = [];
+  for (const entry of (raw.segments as unknown[])) {
+    const seg = validateIssueChunkSegment(entry);
+    if (!seg) return undefined;
+    segments.push(seg);
+  }
+  const bodyRanges: IssueBodyRange[] = [];
+  for (const entry of (raw.bodyRanges as unknown[])) {
+    const range = validateIssueBodyRange(entry);
+    if (!range) return undefined;
+    bodyRanges.push(range);
+  }
+  for (let i = 1; i < segments.length; i += 1) {
+    const prev = segments[i - 1];
+    const cur = segments[i];
+    if (cur.commentIndex < prev.commentIndex) return undefined;
+    if (cur.commentIndex === prev.commentIndex && cur.sliceStart < prev.sliceEnd) return undefined;
+    if (cur.start < prev.start) return undefined;
+  }
+  for (let i = 1; i < bodyRanges.length; i += 1) {
+    if (bodyRanges[i].sliceStart < bodyRanges[i - 1].sliceEnd) return undefined;
+    if (bodyRanges[i].start < bodyRanges[i - 1].start) return undefined;
+  }
   return {
     index: Number(raw.index),
     total: Number(raw.total),
@@ -1898,10 +2128,13 @@ export function validateIssueChunkReport(value: unknown): IssueChunkReport | und
     verdict: raw.verdict as RunnerVerdict,
     summary: raw.summary as string,
     labels: (raw.labels as string[]).slice(),
+    segments,
+    bodySha: raw.bodySha as string,
+    bodyRanges,
   };
 }
 
-export function validateIssueChunkReports(value: unknown): IssueChunkReport[] | undefined {
+export function validateIssueChunkReports(value: unknown, full?: IssueChunkFull): IssueChunkReport[] | undefined {
   if (!Array.isArray(value) || value.length < 1) return undefined;
   const reports: IssueChunkReport[] = [];
   for (const entry of value) {
@@ -1917,14 +2150,46 @@ export function validateIssueChunkReports(value: unknown): IssueChunkReport[] | 
     if (sorted[i].index !== i) return undefined;
     if (i > 0 && sorted[i].start !== sorted[i - 1].end) return undefined;
   }
+  // P2 #4: when the RAW snapshot is supplied, recompute the expected binding
+  // live and require an exact per-slice match (sha over live RAW computed
+  // instantly). Generation passes its review-time snapshot; publish passes
+  // the live re-read snapshot.
+  if (full) {
+    const fullTitle = typeof full.title === 'string' ? full.title : '';
+    const fullBody = typeof full.body === 'string' ? full.body : '';
+    const fullComments = Array.isArray(full.comments) ? full.comments.filter((c): c is string => typeof c === 'string') : [];
+    const expected = buildIssueChunks(fullTitle, fullBody, fullComments, {
+      rawBody: typeof full.rawBody === 'string' ? full.rawBody : fullBody,
+      rawComments: Array.isArray(full.rawComments) ? full.rawComments : fullComments,
+      rawCommentIds: full.commentIds,
+    });
+    if (expected.length !== sorted.length) return undefined;
+    for (let i = 0; i < sorted.length; i += 1) {
+      const got = sorted[i];
+      const want = expected[i];
+      if (got.start !== want.start || got.end !== want.end) return undefined;
+      if (got.coveredLength !== want.coveredLength) return undefined;
+      if (got.bodySha !== want.bodySha) return undefined;
+      if (!bodyRangesEqual(got.bodyRanges, want.bodyRanges)) return undefined;
+      if (!segmentsEqual(got.segments, want.segments)) return undefined;
+    }
+    const flatGot = sorted.flatMap((c) => c.segments);
+    const flatWant = expected.flatMap((c) => c.segments);
+    if (!segmentsEqual(flatGot, flatWant)) return undefined;
+  }
   return sorted;
 }
 
 // Source coverage helper for tests and publish re-verification (Phase A #3/#6):
 // true when chunks cover title/body/comments with no overlap and no omission.
+// P2 #4: full carries the REDACTED copies for the legacy length/span proof
+// plus the RAW snapshot ({commentIds, rawComments, rawBody}) for the
+// per-slice id/index/slice/sha/order proof. Both must hold; a same-length
+// char swap, a comment reorder, or a duplicated slice returns false even
+// though all lengths still add up.
 export function verifyIssueChunkCoverage(
   chunks: IssueChunk[] | IssueChunkReport[],
-  full: { title: string; body: string; comments: string[] },
+  full: IssueChunkFull,
 ): boolean {
   if (!Array.isArray(chunks) || chunks.length < 1) return false;
   const sorted = [...chunks].sort((a, b) => a.index - b.index);
@@ -1935,6 +2200,7 @@ export function verifyIssueChunkCoverage(
     if (i > 0 && sorted[i].start !== sorted[i - 1].end) return false;
   }
   if (sorted[0].start !== 0) return false;
+  const fullTitle = typeof full.title === 'string' ? full.title : '';
   const fullBody = typeof full.body === 'string' ? full.body : '';
   const fullComments = Array.isArray(full.comments) ? full.comments.filter((c): c is string => typeof c === 'string') : [];
   const coveredSum = sorted.reduce((sum, c) => sum + c.coveredLength, 0);
@@ -1950,6 +2216,28 @@ export function verifyIssueChunkCoverage(
   } else {
     if (coveredSum !== fullBody.length + fullComments.reduce((sum, c) => sum + c.length, 0)) return false;
   }
+  // P2 #4 RAW per-slice proof: recompute the expected binding from the RAW
+  // snapshot (live RAW computed instantly by callers) and require equality.
+  const expected = buildIssueChunks(fullTitle, fullBody, fullComments, {
+    rawBody: typeof full.rawBody === 'string' ? full.rawBody : fullBody,
+    rawComments: Array.isArray(full.rawComments) ? full.rawComments : fullComments,
+    rawCommentIds: full.commentIds,
+  });
+  if (expected.length !== sorted.length) return false;
+  for (let i = 0; i < sorted.length; i += 1) {
+    const got = sorted[i] as IssueChunkReport;
+    const want = expected[i];
+    if (got.start !== want.start || got.end !== want.end) return false;
+    if (got.coveredLength !== want.coveredLength) return false;
+    if (typeof (got as IssueChunkReport).bodySha !== 'string') return false;
+    if ((got as IssueChunkReport).bodySha !== want.bodySha) return false;
+    if (!Array.isArray((got as IssueChunkReport).segments) || !Array.isArray((got as IssueChunkReport).bodyRanges)) return false;
+    if (!segmentsEqual((got as IssueChunkReport).segments, want.segments)) return false;
+    if (!bodyRangesEqual((got as IssueChunkReport).bodyRanges, want.bodyRanges)) return false;
+  }
+  const flatGot = (sorted as IssueChunkReport[]).flatMap((c) => c.segments);
+  const flatWant = expected.flatMap((c) => c.segments);
+  if (!segmentsEqual(flatGot, flatWant)) return false;
   return true;
 }
 
@@ -1976,75 +2264,179 @@ export function sliceTextForChunk(text: string, maxLength: number): string[] {
 // (separators between different original comments are included in the span);
 // no synonymous cursor rewrite is performed. coveredLength proves content
 // coverage independently of offsets.
-export function buildIssueChunks(title: string, body: string, comments: string[]): IssueChunk[] {
+// P2 #4: simultaneously consumes the REDACTED full copies (for the model
+// chunks) and the RAW snapshot (+comment ids). Packing/budget/offsets follow
+// the REDACTED layout exactly as before; every slice additionally records
+// the RAW slice range plus sha256(normalizeRawForFingerprint(rawSlice)).
+// Redacted and RAW slices are paired per comment by slice index (both sliced
+// at MAX_ISSUE_CHUNK_LENGTH in their own coordinates); the rare count
+// mismatch yields deterministic zero-width fillers so legitimate content
+// still validates while any content/order change mismatches.
+export interface BuildIssueChunksRaw {
+  rawBody?: string;
+  rawComments?: string[];
+  rawCommentIds?: Array<number | null | undefined>;
+}
+
+export function buildIssueChunks(title: string, body: string, comments: string[], raw?: BuildIssueChunksRaw): IssueChunk[] {
   const safeTitle = typeof title === 'string' ? title : '';
   const safeBody = typeof body === 'string' ? body : '';
   const safeComments = Array.isArray(comments) ? comments.filter((c): c is string => typeof c === 'string') : [];
+  const rawBodyFull = typeof raw?.rawBody === 'string' ? raw.rawBody : safeBody;
+  const rawIds = Array.isArray(raw?.rawCommentIds) ? raw.rawCommentIds : [];
+  const rawTextAt = (idx: number, fallback: string): string => {
+    const list = Array.isArray(raw?.rawComments) ? raw.rawComments : undefined;
+    if (list && idx < list.length && typeof list[idx] === 'string') return list[idx] as string;
+    return fallback;
+  };
+  const rawIdAt = (idx: number): number | null => {
+    const id = idx < rawIds.length ? rawIds[idx] : undefined;
+    return typeof id === 'number' && Number.isSafeInteger(id) && id >= 0 ? id : null;
+  };
   const sep = '\n\n';
   const titleLen = safeTitle.length;
   const bodyOffset = titleLen + sep.length;
   const commentsOffset = bodyOffset + safeBody.length + sep.length;
   const totalLength = titleLen + sep.length + safeBody.length + sep.length + safeComments.join(sep).length;
+  const bodySha = rawSliceHash(rawBodyFull);
   if (safeBody.length === 0 && safeComments.length === 0) {
-    return [{ index: 0, total: 1, start: 0, end: Math.max(1, titleLen), complete: true, coveredLength: 0, title: safeTitle, body: '', comments: [] }];
+    return [{ index: 0, total: 1, start: 0, end: Math.max(1, titleLen), complete: true, coveredLength: 0, title: safeTitle, body: '', comments: [], segments: [], bodySha, bodyRanges: [] }];
   }
-  type SlicePiece = { text: string; offset: number; kind: 'body' | 'comment'; commentIndex: number };
-  const pieces: SlicePiece[] = [];
+  type SliceUnit = {
+    redText: string; redOffset: number; kind: 'body' | 'comment'; commentIndex: number;
+    commentId: number | null; rawSliceStart: number; rawSliceEnd: number; rawSha: string;
+  };
+  const units: SliceUnit[] = [];
+  // Body units (paired redacted/RAW slices by index).
   {
-    let off = 0;
-    for (const slice of sliceTextForChunk(safeBody, MAX_ISSUE_CHUNK_LENGTH)) {
-      pieces.push({ text: slice, offset: bodyOffset + off, kind: 'body', commentIndex: -1 });
-      off += slice.length;
+    const rSlices = sliceTextForChunk(safeBody, MAX_ISSUE_CHUNK_LENGTH);
+    const wSlices = sliceTextForChunk(rawBodyFull, MAX_ISSUE_CHUNK_LENGTH);
+    const n = Math.max(rSlices.length, wSlices.length);
+    let redOff = 0;
+    let rawOff = 0;
+    for (let j = 0; j < n; j += 1) {
+      const rT = j < rSlices.length ? rSlices[j] : '';
+      const wT = j < wSlices.length ? wSlices[j] : '';
+      const redOffset = bodyOffset + redOff;
+      const rawStart = rawOff;
+      const rawEnd = rawOff + wT.length;
+      units.push({
+        redText: rT, redOffset, kind: 'body', commentIndex: -1, commentId: null,
+        rawSliceStart: rawStart, rawSliceEnd: rawEnd, rawSha: rawSliceHash(wT),
+      });
+      redOff += rT.length;
+      rawOff = rawEnd;
     }
   }
+  // Comment units (paired per comment by slice index).
   {
     let base = commentsOffset;
     for (let idx = 0; idx < safeComments.length; idx += 1) {
       const original = safeComments[idx];
-      let inner = 0;
-      const slices = sliceTextForChunk(original, MAX_ISSUE_CHUNK_LENGTH);
-      // An empty comment string contributes no piece but its separator is
-      // still part of the span; skip zero-length slices.
-      for (const slice of slices) {
-        pieces.push({ text: slice, offset: base + inner, kind: 'comment', commentIndex: idx });
-        inner += slice.length;
+      const rawOriginal = rawTextAt(idx, original);
+      const rSlices = sliceTextForChunk(original, MAX_ISSUE_CHUNK_LENGTH);
+      const wSlices = sliceTextForChunk(rawOriginal, MAX_ISSUE_CHUNK_LENGTH);
+      const n = Math.max(rSlices.length, wSlices.length);
+      let redInner = 0;
+      let rawInner = 0;
+      for (let j = 0; j < n; j += 1) {
+        const rT = j < rSlices.length ? rSlices[j] : '';
+        const wT = j < wSlices.length ? wSlices[j] : '';
+        const redOffset = base + redInner;
+        const rawStart = rawInner;
+        const rawEnd = rawInner + wT.length;
+        units.push({
+          redText: rT, redOffset, kind: 'comment', commentIndex: idx, commentId: rawIdAt(idx),
+          rawSliceStart: rawStart, rawSliceEnd: rawEnd, rawSha: rawSliceHash(wT),
+        });
+        redInner += rT.length;
+        rawInner = rawEnd;
       }
       base += original.length + sep.length;
     }
   }
-  if (pieces.length === 0) {
-    return [{ index: 0, total: 1, start: 0, end: Math.max(1, titleLen), complete: true, coveredLength: 0, title: safeTitle, body: '', comments: [] }];
+  const nonEmpty = units.filter((u) => u.redText.length > 0);
+  if (nonEmpty.length === 0) {
+    // Only zero-width fillers (degenerate redaction-erasure edge): keep one
+    // chunk carrying the RAW bindings so nothing is silently dropped.
+    const segs: IssueChunkSegment[] = units
+      .filter((u) => u.kind === 'comment')
+      .map((u) => ({ commentId: u.commentId, commentIndex: u.commentIndex, sliceStart: u.rawSliceStart, sliceEnd: u.rawSliceEnd, sha256: u.rawSha, start: u.redOffset, end: u.redOffset }));
+    const ranges: IssueBodyRange[] = units
+      .filter((u) => u.kind === 'body')
+      .map((u) => ({ sliceStart: u.rawSliceStart, sliceEnd: u.rawSliceEnd, start: u.redOffset, end: u.redOffset, sha256: u.rawSha }));
+    return [{ index: 0, total: 1, start: 0, end: Math.max(1, titleLen), complete: true, coveredLength: 0, title: safeTitle, body: '', comments: [], segments: segs, bodySha, bodyRanges: ranges }];
   }
-  const sepBetween = (prev: SlicePiece, next: SlicePiece): number => {
+  const sepBetween = (prev: SliceUnit, next: SliceUnit): number => {
     if (prev.kind === 'body' && next.kind === 'body') return 0;
     if (prev.kind === 'comment' && next.kind === 'comment' && prev.commentIndex === next.commentIndex) return 0;
     return sep.length;
   };
+  // Pack only redacted-non-empty units for budget/offsets (fillers ride with
+  // their comment's neighbors deterministically below).
+  const packable = nonEmpty;
+  const fillerByComment = new Map<number, SliceUnit[]>();
+  for (const u of units) {
+    if (u.redText.length === 0 && u.kind === 'comment') {
+      const list = fillerByComment.get(u.commentIndex) ?? [];
+      list.push(u);
+      fillerByComment.set(u.commentIndex, list);
+    }
+  }
   const chunks: IssueChunk[] = [];
   let cursor = 0;
   let first = true;
-  while (cursor < pieces.length) {
-    const inChunk: SlicePiece[] = [];
+  while (cursor < packable.length) {
+    const inChunk: SliceUnit[] = [];
     let used = 0;
-    while (cursor + inChunk.length < pieces.length) {
-      const next = pieces[cursor + inChunk.length];
+    while (cursor + inChunk.length < packable.length) {
+      const next = packable[cursor + inChunk.length];
       const gap = inChunk.length === 0 ? 0 : sepBetween(inChunk[inChunk.length - 1], next);
-      if (inChunk.length > 0 && used + gap + next.text.length > MAX_ISSUE_CHUNK_LENGTH) break;
-      used += gap + next.text.length;
+      if (inChunk.length > 0 && used + gap + next.redText.length > MAX_ISSUE_CHUNK_LENGTH) break;
+      used += gap + next.redText.length;
       inChunk.push(next);
       // A full body slice (8000) fills the chunk alone; smaller slices may
       // still pack following consecutive slices.
       if (used >= MAX_ISSUE_CHUNK_LENGTH) break;
     }
-    const bodyText = inChunk.filter((p) => p.kind === 'body').map((p) => p.text).join('');
-    const commentTexts = inChunk.filter((p) => p.kind === 'comment').map((p) => p.text);
+    // Attach zero-width fillers belonging to comments touched by this chunk.
+    const touched = new Set(inChunk.filter((u) => u.kind === 'comment').map((u) => u.commentIndex));
+    const extras: SliceUnit[] = [];
+    for (const idx of touched) {
+      const list = fillerByComment.get(idx);
+      if (list) {
+        for (const f of list) {
+          if (!inChunk.includes(f) && !extras.includes(f)) extras.push(f);
+        }
+      }
+    }
+    const bodyUnits = inChunk.filter((p) => p.kind === 'body');
+    const commentUnits = [...inChunk.filter((p) => p.kind === 'comment'), ...extras];
+    const bodyText = bodyUnits.map((p) => p.redText).join('');
+    const commentTexts = commentUnits.map((p) => p.redText).filter((t) => t.length > 0);
     const coveredLength = bodyText.length + commentTexts.reduce((sum, c) => sum + c.length, 0);
-    const start = first ? 0 : inChunk[0].offset;
-    const nextOffset = cursor + inChunk.length < pieces.length ? pieces[cursor + inChunk.length].offset : totalLength;
+    const start = first ? 0 : inChunk[0].redOffset;
+    const nextOffset = cursor + inChunk.length < packable.length ? packable[cursor + inChunk.length].redOffset : totalLength;
     // End includes the separator up to the next piece (honest contiguous
     // partition); for the last chunk it reaches totalLength.
-    const lastEnd = inChunk[inChunk.length - 1].offset + inChunk[inChunk.length - 1].text.length;
-    const end = cursor + inChunk.length < pieces.length ? nextOffset : Math.max(lastEnd, totalLength);
+    const lastEnd = inChunk[inChunk.length - 1].redOffset + inChunk[inChunk.length - 1].redText.length;
+    const end = cursor + inChunk.length < packable.length ? nextOffset : Math.max(lastEnd, totalLength);
+    const segments: IssueChunkSegment[] = commentUnits.map((u) => ({
+      commentId: u.commentId,
+      commentIndex: u.commentIndex,
+      sliceStart: u.rawSliceStart,
+      sliceEnd: u.rawSliceEnd,
+      sha256: u.rawSha,
+      start: u.redOffset,
+      end: u.redOffset + u.redText.length,
+    }));
+    const bodyRanges: IssueBodyRange[] = bodyUnits.map((u) => ({
+      sliceStart: u.rawSliceStart,
+      sliceEnd: u.rawSliceEnd,
+      start: u.redOffset,
+      end: u.redOffset + u.redText.length,
+      sha256: u.rawSha,
+    }));
     chunks.push({
       index: chunks.length,
       total: -1,
@@ -2055,6 +2447,9 @@ export function buildIssueChunks(title: string, body: string, comments: string[]
       title: safeTitle,
       body: bodyText,
       comments: commentTexts,
+      segments,
+      bodySha,
+      bodyRanges,
     });
     cursor += inChunk.length;
     first = false;
@@ -2222,6 +2617,8 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
     const issue = output as RunnerIssueOutput;
     // Per-segment results (Phase A #4/T7): redacted minimal proofs with
     // per-segment verdicts readable in both JSON and Markdown reports.
+    // P2 #4: plus hash/range bindings only (segments/bodySha/bodyRanges) —
+    // hex and offsets, never raw text — so the report stays redacted.
     const segments = Array.isArray(issue.chunks) ? issue.chunks.map((c) => ({
       index: c.index,
       total: c.total,
@@ -2232,6 +2629,9 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
       verdict: c.verdict,
       summary: c.summary,
       labels: c.labels,
+      segments: Array.isArray(c.segments) ? c.segments : [],
+      bodySha: typeof c.bodySha === 'string' ? c.bodySha : '',
+      bodyRanges: Array.isArray(c.bodyRanges) ? c.bodyRanges : [],
     })) : [];
     reportJson = {
       kind: 'issue',
@@ -2869,8 +3269,16 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
   // sliced, so its tail could not be covered).
   const titleOverCap = built.fullTitle.length > 2000;
   if (!built.commentsComplete && built.fetchComplete && freshVerified && !titleOverCap) {
-    const chunks = buildIssueChunks(built.fullTitle, built.fullBody, built.fullComments);
-    const validatedChunks = validateIssueChunks(chunks, { title: built.fullTitle, body: built.fullBody, comments: built.fullComments });
+    // P2 #4: chunk from REDACTED full copies for the model, binding each
+    // slice to the RAW snapshot (+comment ids) with per-slice SHA. Both the
+    // generation-time validation below and the publish-time re-verification
+    // compare content/order against RAW (redacted coverage still via full*).
+    const chunks = buildIssueChunks(built.fullTitle, built.fullBody, built.fullComments, {
+      rawBody: built.rawBody,
+      rawComments: built.rawComments,
+      rawCommentIds: built.rawCommentIds,
+    });
+    const validatedChunks = validateIssueChunks(chunks, { title: built.fullTitle, body: built.fullBody, comments: built.fullComments, commentIds: built.rawCommentIds, rawComments: built.rawComments, rawBody: built.rawBody });
     if (!validatedChunks) {
       const output: RunnerIssueOutput = {
         verdict: deterministicBlock ? 'NEEDS_CHANGES' : 'INCONCLUSIVE',
@@ -2925,6 +3333,8 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       // Per-chunk minimal retention (Phase A #4): never persist full chunk
       // text; store redacted {index/start/end/complete/coveredLength/verdict/
       // summary(truncated)/labels} proofs only.
+      // P2 #4: plus hash/range bindings (segments/bodySha/bodyRanges) — hex
+      // and offsets only, never raw text — so reports keep redaction.
       const chunkReports: IssueChunkReport[] = validatedChunks.map((chunk, idx) => {
         const triaged = perChunk[idx];
         const rawLabels = Array.isArray(triaged.suggestedLabels) ? triaged.suggestedLabels : [];
@@ -2938,6 +3348,9 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
           verdict: triaged.verdict,
           summary: safeString(triaged.summary, MAX_ISSUE_CHUNK_SUMMARY_LENGTH),
           labels: sanitizeLabels(rawLabels.filter((entry): entry is string => typeof entry === 'string')),
+          segments: chunk.segments.map((s) => ({ ...s })),
+          bodySha: chunk.bodySha,
+          bodyRanges: chunk.bodyRanges.map((r) => ({ ...r })),
         };
       });
       const output: RunnerIssueOutput = {
@@ -3712,6 +4125,12 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     let currentFullBody = '';
     let currentFullComments: string[] = [];
     let currentFullTitle = '';
+    // P2 #4: live RAW snapshot for the per-slice double gate (segment hashes
+    // recomputed instantly from live RAW plus the fingerprint gate). Redacted
+    // coverage still uses the full* copies below.
+    let currentRawBody = '';
+    let currentRawComments: string[] = [];
+    let currentRawCommentIds: Array<number | null> = [];
     try {
       const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody, publishIssueMeta);
       // Phase B v2: compare full RAW-content fingerprints (pre-cut, no
@@ -3724,6 +4143,9 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       currentFullBody = builtCurrent.fullBody;
       currentFullComments = builtCurrent.fullComments;
       currentFullTitle = builtCurrent.fullTitle;
+      currentRawBody = builtCurrent.rawBody;
+      currentRawComments = builtCurrent.rawComments;
+      currentRawCommentIds = builtCurrent.rawCommentIds;
     } catch {
       currentFingerprint = '0'.repeat(64);
       currentCommentsComplete = false;
@@ -3775,7 +4197,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
           // Phase A #3: source coverage re-verification for chunked artifacts:
           // summed coveredLength must equal the current full body+comments
           // content (no omission/duplication vs the live text).
-          else if (validated.chunks !== undefined && !verifyIssueChunkCoverage(validated.chunks, { title: currentFullTitle, body: currentFullBody, comments: currentFullComments })) issueFallbackReason = 'the review output is unverifiable: issue chunk coverage does not match the current issue content.';
+          // P2 #4: plus the RAW per-slice double gate — segment hashes are
+          // recomputed instantly from the live RAW snapshot (comment ids,
+          // slice ranges, order) alongside the fingerprint gate above, while
+          // redacted coverage still uses the full* copies.
+          else if (validated.chunks !== undefined && !verifyIssueChunkCoverage(validated.chunks, { title: currentFullTitle, body: currentFullBody, comments: currentFullComments, commentIds: currentRawCommentIds, rawComments: currentRawComments, rawBody: currentRawBody })) issueFallbackReason = 'the review output is unverifiable: issue chunk coverage does not match the current issue content.';
           else if (hasUnknownAiLabels(validated.suggestedLabels)) issueFallbackReason = 'the AI label suggestions contain unknown labels; discarded.';
           // Phase 2 (H): full fingerprint re-verification for chunked APPROVE
           // already covered by the equality above; an APPROVE with chunks must

@@ -9,6 +9,7 @@ import {
   getReportRunUrl,
   issueContentFingerprint,
   issueReviewComment,
+  rawSliceHash,
   reviewComment,
   runIssueReviewMode,
   runPublishMode,
@@ -19,6 +20,7 @@ import {
   validateIssueChunkReport,
   validateIssueChunkReports,
   validateIssueChunks,
+  validateIssueOutput,
   verifyIssueChunkCoverage,
   writeReviewReports,
   REVIEW_REPORT_WRITE_ERROR,
@@ -973,6 +975,9 @@ export async function runPhase2HTests(): Promise<void> {
           verdict: 'APPROVE' as const,
           summary: `seg ${i}`,
           labels: [],
+          segments: [],
+          bodySha: 'b'.repeat(64),
+          bodyRanges: [],
         })),
         chunkCoverageComplete: true,
         chunkCount: 15,
@@ -1173,6 +1178,288 @@ export async function runPhase2HTests(): Promise<void> {
         } finally {
           fs.rmSync(tempDir, { recursive: true, force: true });
         }
+      }
+    }
+
+    // P2 #4: per-slice RAW binding (segments + bodySha/bodyRanges). Generation
+    // and publish compare content/order against the RAW snapshot; reports
+    // carry only hash/ranges/verdict and keep redaction.
+    {
+      // Positive: builder emits segments; full+RAW validation passes.
+      const title = 'p2-title';
+      const body = 'p2-body';
+      const comments = ['human：AAA', 'human：BBB'];
+      const ids = [11, 22];
+      const full = { title, body, comments, commentIds: ids, rawComments: comments, rawBody: body };
+      const chunks = buildIssueChunks(title, body, comments, { rawBody: body, rawComments: comments, rawCommentIds: ids });
+      assert.ok(chunks.length >= 1, 'P2 builder emits chunks');
+      for (const c of chunks) {
+        assert.ok(validateIssueChunk(c), 'P2 each chunk validates');
+        assert.ok(Array.isArray(c.segments) && c.segments.length === 2, 'P2 chunk carries per-slice segments');
+        assert.ok(/^[0-9a-f]{64}$/.test(c.bodySha), 'P2 bodySha is hex');
+        assert.ok(Array.isArray(c.bodyRanges), 'P2 bodyRanges present');
+        for (const s of c.segments) {
+          assert.ok(s.commentId === 11 || s.commentId === 22, 'P2 segment carries comment ID');
+          assert.ok(s.commentIndex === 0 || s.commentIndex === 1, 'P2 segment carries comment index');
+          assert.ok(s.sliceEnd > s.sliceStart && s.sliceEnd - s.sliceStart <= MAX_ISSUE_CHUNK_LENGTH, 'P2 slice range bounded');
+          assert.ok(/^[0-9a-f]{64}$/.test(s.sha256), 'P2 slice sha is hex');
+          assert.ok(s.end >= s.start, 'P2 global range ordered');
+        }
+      }
+      assert.ok(validateIssueChunks(chunks, full), 'P2 builder output validates with RAW snapshot');
+      assert.equal(verifyIssueChunkCoverage(chunks, full), true, 'P2 coverage helper confirms RAW binding');
+      // Reports validate against live RAW too and carry no plaintext.
+      const fakeReports = chunks.map((c) => ({
+        index: c.index,
+        total: c.total,
+        start: c.start,
+        end: c.end,
+        complete: true,
+        coveredLength: c.coveredLength,
+        verdict: 'APPROVE' as const,
+        summary: 'ok',
+        labels: [] as string[],
+        segments: c.segments.map((s) => ({ ...s })),
+        bodySha: c.bodySha,
+        bodyRanges: c.bodyRanges.map((r) => ({ ...r })),
+      }));
+      assert.ok(validateIssueChunkReports(fakeReports, full), 'P2 reports validate with RAW snapshot');
+      assert.equal(verifyIssueChunkCoverage(fakeReports, full), true, 'P2 report coverage confirms RAW binding');
+      assert.ok(validateIssueOutput({
+        verdict: 'APPROVE', issueNumber: 7, title, tags: [], summary: 'ok',
+        suggestedLabels: [], fingerprint: 'a'.repeat(64), commentsComplete: true,
+        chunks: fakeReports, chunkCoverageComplete: true, chunkCount: fakeReports.length,
+      }), 'P2 output with segments validates (segments schema)');
+      // Only hash/ranges/verdict: raw secret never persists in bindings.
+      {
+        const secretRaw = ['human：api_key supersecret123'];
+        const secretRed = ['human：api_key [REDACTED CREDENTIAL]'];
+        const sc = buildIssueChunks(title, body, secretRed, { rawBody: body, rawComments: secretRaw, rawCommentIds: [31] });
+        assert.ok(validateIssueChunks(sc, { title, body, comments: secretRed, commentIds: [31], rawComments: secretRaw, rawBody: body }), 'P2 secret binding validates');
+        const blob = JSON.stringify(sc);
+        assert.ok(!blob.includes('supersecret123'), 'P2 bindings carry no raw secret');
+        const segSha = sc.flatMap((c) => c.segments)[0].sha256;
+        assert.equal(segSha, rawSliceHash(secretRaw[0]), 'P2 slice sha binds RAW (not the redacted mask)');
+      }
+
+      // Negative: same-length char swap (lengths add up, content differs).
+      {
+        const swappedRaw = ['human：AAB', 'human：BBB'];
+        const swappedFull = { ...full, rawComments: swappedRaw };
+        assert.equal(validateIssueChunks(chunks, swappedFull), undefined, 'P2 same-length swap rejected by validate');
+        assert.equal(verifyIssueChunkCoverage(chunks, swappedFull), false, 'P2 same-length swap rejected by verify');
+        assert.equal(validateIssueChunkReports(fakeReports, swappedFull), undefined, 'P2 same-length swap rejected by report validate');
+        assert.equal(verifyIssueChunkCoverage(fakeReports, swappedFull), false, 'P2 same-length swap rejected by report verify');
+      }
+
+      // Negative: swapped comment order (ids + order mismatch).
+      {
+        const orderFull = {
+          title, body,
+          comments: [comments[1], comments[0]],
+          commentIds: [ids[1], ids[0]],
+          rawComments: [comments[1], comments[0]],
+          rawBody: body,
+        };
+        assert.equal(validateIssueChunks(chunks, orderFull), undefined, 'P2 comment reorder rejected by validate');
+        assert.equal(verifyIssueChunkCoverage(chunks, orderFull), false, 'P2 comment reorder rejected by verify');
+        assert.equal(validateIssueChunkReports(fakeReports, orderFull), undefined, 'P2 comment reorder rejected by report validate');
+      }
+
+      // Negative: duplicated slice (artifact tamper).
+      {
+        const dup = chunks.map((c) => ({
+          ...c,
+          comments: [...c.comments],
+          segments: c.segments.map((s) => ({ ...s })),
+          bodyRanges: c.bodyRanges.map((r) => ({ ...r })),
+        }));
+        dup[0].segments = [dup[0].segments[0], dup[0].segments[0], ...dup[0].segments.slice(1)];
+        assert.equal(validateIssueChunks(dup, full), undefined, 'P2 duplicated slice rejected by validate');
+        assert.equal(verifyIssueChunkCoverage(dup, full), false, 'P2 duplicated slice rejected by verify');
+      }
+    }
+
+    // P2 #4 publish double gate: live same-length swap falls back to
+    // INCONCLUSIVE on the same sticky (segment hashes + fingerprint gate).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p2-segswap-'));
+      try {
+        const bodyA = `${'x'.repeat(8000)}A`;
+        const bodyB = `${'x'.repeat(8000)}B`;
+        assert.equal(bodyA.length, bodyB.length, 'P2 swap keeps length');
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'p2 ok', suggestedLabels: [] }]);
+        try {
+          const reviewClient = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 'p2', body: bodyA } }),
+                listComments: async () => ({ data: [] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2', body: bodyA } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: reviewClient,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'APPROVE', 'P2 review may APPROVE before swap');
+          assert.ok(reviewed.chunks && reviewed.chunks.length >= 2, 'P2 review is chunked');
+          assert.ok(reviewed.chunks.every((c) => Array.isArray(c.segments) && typeof c.bodySha === 'string'), 'P2 artifact carries bindings');
+        } finally {
+          restore();
+        }
+        const state = {
+          comments: [{ id: 51, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const publishClient = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: 'p2', body: bodyB } }),
+              listComments: async () => ({ data: state.comments }),
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const c = state.comments.find((x) => x.id === params.comment_id);
+                if (c) c.body = params.body;
+                return {};
+              },
+              addLabels: async () => ({}),
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2', body: bodyB } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as NodeJS.ProcessEnv,
+          githubClient: publishClient,
+        });
+        assert.equal(state.created, 0, 'P2 swap publish creates no second comment');
+        assert.equal(state.updated, 1, 'P2 swap publish updates same sticky');
+        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'P2 live swap falls back to INCONCLUSIVE');
+        assert.ok(!state.comments[0].body.includes('判定：APPROVE'), 'P2 live swap never APPROVE');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P2 #4 segment gate isolates artifact tamper: live content unchanged
+    // (fingerprint still matches) but a forged slice hash falls back to
+    // INCONCLUSIVE on the same sticky.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p2-segtamper-'));
+      try {
+        const bodyC = `${'y'.repeat(8000)}C`;
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'p2 tamper ok', suggestedLabels: [] }]);
+        try {
+          const reviewClient = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 'p2t', body: bodyC } }),
+                listComments: async () => ({ data: [{ id: 61, body: 'human note', user: { login: 'human', type: 'User' } }] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2t', body: bodyC } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: reviewClient,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'APPROVE', 'P2 tamper setup may APPROVE');
+          assert.ok(reviewed.chunks && reviewed.chunks.length >= 1, 'P2 tamper setup is chunked');
+        } finally {
+          restore();
+        }
+        // Forge one slice hash (keep valid hex + schema so only the live
+        // binding mismatches, not the schema gate).
+        const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+        const achunks = artifact.chunks as Array<Record<string, unknown>>;
+        let forged = false;
+        for (const ch of achunks) {
+          const segs = ch.segments as Array<Record<string, unknown>>;
+          if (Array.isArray(segs) && segs.length > 0) {
+            const sha = String(segs[0].sha256);
+            segs[0].sha256 = sha.slice(0, 63) + (sha[63] === '0' ? '1' : '0');
+            forged = true;
+            break;
+          }
+        }
+        if (!forged) {
+          const first = achunks[0] as Record<string, unknown>;
+          const sha = String(first.bodySha);
+          first.bodySha = sha.slice(0, 63) + (sha[63] === '0' ? '1' : '0');
+        }
+        fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2));
+        // Schema still holds (valid hex), so validateIssueOutput passes — the
+        // publish live binding is what must catch the forgery.
+        assert.ok(validateIssueOutput(JSON.parse(fs.readFileSync(artifactPath, 'utf8'))), 'P2 forged artifact keeps schema');
+        const state = {
+          comments: [{ id: 52, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const publishClient = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: 'p2t', body: bodyC } }),
+              listComments: async (params: { page: number }) => {
+                void params;
+                // First call is the publish fingerprint/segment re-read (live
+                // human comment); sticky lookup reuses the same array since
+                // the bot sticky is filtered from the RAW snapshot by author.
+                return { data: [{ id: 61, body: 'human note', user: { login: 'human', type: 'User' } }, ...state.comments] };
+              },
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const c = state.comments.find((x) => x.id === params.comment_id);
+                if (c) c.body = params.body;
+                return {};
+              },
+              addLabels: async () => ({}),
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2t', body: bodyC } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as NodeJS.ProcessEnv,
+          githubClient: publishClient,
+        });
+        assert.equal(state.created, 0, 'P2 forgery publish creates no second comment');
+        assert.equal(state.updated, 1, 'P2 forgery publish updates same sticky');
+        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'P2 forged slice falls back to INCONCLUSIVE');
+        assert.ok(!state.comments[0].body.includes('判定：APPROVE'), 'P2 forged slice never APPROVE');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
       }
     }
   } finally {

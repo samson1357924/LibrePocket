@@ -31,7 +31,7 @@ import kotlinx.coroutines.CancellationException
  * failure first persists its partial as an `isPartial=1` terminal before the
  * retry notice, so reopen/export never loses the intermediate fragment.
  *
- * Core vs notice: [onTurnStarted], [onTurnSucceeded], both [onTurnFailed]
+ * Core vs notice: [onTurnStarted], [onTurnSucceeded], all [onTurnFailed]
  * overloads and [onTurnCancelled] are durable core events — a store failure
  * propagates so the session writer fails the ack instead of reporting a
  * false durable write. [onTurnRetried], [onSteerQueued], [onToolDone] and

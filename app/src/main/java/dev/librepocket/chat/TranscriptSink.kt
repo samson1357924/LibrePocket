@@ -5,7 +5,7 @@ package dev.librepocket.chat
  * session-owned [OrderedTranscriptSink] (bounded channel, single writer, core
  * events durably acked), so implementations observe admission order.
  *
- * Core vs notice: [onTurnStarted], [onTurnSucceeded], both [onTurnFailed]
+ * Core vs notice: [onTurnStarted], [onTurnSucceeded], all [onTurnFailed]
  * overloads and [onTurnCancelled] are durable core events — a store failure
  * propagates so the session writer fails the ack instead of reporting a
  * false durable write. [onTurnRetried], [onSteerQueued], [onToolDone] and

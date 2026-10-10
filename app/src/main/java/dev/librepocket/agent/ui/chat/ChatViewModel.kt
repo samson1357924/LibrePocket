@@ -52,6 +52,12 @@ private const val HISTORY_CAP = 2000
 // build messages from what was scanned.
 private const val HISTORY_SCAN_CAP = HISTORY_CAP * 4
 
+/** Stage E: tail-loaded replay prefix with its exact omitted-row count. */
+internal data class LoadedUiHistory(
+    val messages: List<UiMessage>,
+    val droppedCount: Int,
+)
+
 /**
  * One-shot key.read consent for an ASK verdict, mirroring the key.write
  * consent in SetupViewModel (SetupViewModel KeyWriteConsent).
@@ -131,6 +137,14 @@ class ChatViewModel(
     val sessionState: StateFlow<ChatUiState> = _sessionState.asStateFlow()
 
     private val _history = MutableStateFlow<List<UiMessage>>(emptyList())
+
+    /**
+     * Stage E: exact number of older replay rows omitted by the tail cap.
+     * Observable truncation (never silent): surfaces "已省略N則" without a
+     * new UI flow. Reset alongside [_history] on every load path.
+     */
+    private val _historyOmittedCount = MutableStateFlow(0)
+    val historyOmittedCount: StateFlow<Int> = _historyOmittedCount.asStateFlow()
 
     val messages: StateFlow<List<UiMessage>> =
         combine(_history, _sessionState) { history, live ->
@@ -1186,7 +1200,8 @@ class ChatViewModel(
                         return@withLock
                     }
 
-                    _history.value = loaded
+                    _history.value = loaded.messages
+                    _historyOmittedCount.value = loaded.droppedCount
                     attach(created, access.binding, creationGeneration)
                     attached = true
                     candidate = null
@@ -1557,7 +1572,10 @@ class ChatViewModel(
                 reconcileReadBinding(bindingOf(afterHistory))
                 return@withLock null
             }
-            if (replay != null) _history.value = replay
+            if (replay != null) {
+                _history.value = replay.messages
+                _historyOmittedCount.value = replay.droppedCount
+            }
         }
 
         val creationGeneration = generation
@@ -1850,6 +1868,7 @@ class ChatViewModel(
         _sessionState.value = EMPTY_SESSION_STATE
         if (binding == null) {
             _history.value = emptyList()
+            _historyOmittedCount.value = 0
             _currentSessionId.value = null
             pendingOps.clear()
             recoverableOps.clear()
@@ -1978,6 +1997,7 @@ class ChatViewModel(
         _notice.value = null
         if (clearChat) {
             _history.value = emptyList()
+            _historyOmittedCount.value = 0
             _currentSessionId.value = null
             pendingOpen = null
             _pendingOpenSessionId.value = null
@@ -2387,29 +2407,38 @@ class ChatViewModel(
         detachAndFlushClose(detached)
     }
 
-    private suspend fun loadHistory(sessionId: String): List<UiMessage>? {
-        val backing: SessionStore = sessions.storeOrNull() ?: return emptyList()
+    private suspend fun loadHistory(sessionId: String): LoadedUiHistory? {
+        val backing: SessionStore = sessions.storeOrNull() ?: return LoadedUiHistory(emptyList(), 0)
         if (backing.getSession(sessionId) == null) return null
-        // Single-pass streaming replay: pages are consumed as they arrive. out
-        // text stays O(HISTORY_CAP); runIdToIndex stays O(CAP) with one index
-        // per emitted assistant; pendingMarkers holds only orphan runId short
-        // strings, worst case O(HISTORY_SCAN_CAP) entries, far smaller than full events.
+        // Single-pass streaming replay over the newest tail: backward paging
+        // keeps memory O(HISTORY_CAP), never O(session) (sparse seqs safe via
+        // `seq <` predicates, never offsets), then restored to oldest-first.
+        // out text stays O(HISTORY_CAP); runIdToIndex stays O(CAP) with one
+        // index per emitted assistant; pendingMarkers holds only orphan runId
+        // short strings, worst case O(HISTORY_SCAN_CAP) entries, far smaller
+        // than full events. The raw scan stays bounded by HISTORY_SCAN_CAP.
         // Marker events never render; an assistant event whose runId has a marker
         // restores hasReasoning so resumed reasoning-origin turns still fail
         // closed on tool-dependent / thinking-mode follow-ups (ordinary
         // no-tools follow-ups continue). Resume history here is display-only
         // (rebuilt UiMessages, never fed into provider requests), so the flag
-        // is defense-in-depth only. The message cap still counts user/assistant
-        // messages only, while the scan bound counts raw scanned events.
-        val out = ArrayList<UiMessage>()
+        // is defense-in-depth only. Backward scan sees each marker before its
+        // assistant (markers append right after), so the pending path is the
+        // live one; the patch path stays for reorder tolerance. Cancelled /
+        // failed fragments replay with their persisted partial flag (never as
+        // completed answers); system markers stay hidden from the chat replay.
+        // The message cap counts user/assistant messages only, while the scan
+        // bound counts raw scanned events.
+        val out = ArrayList<UiMessage>(HISTORY_CAP)
         // Only already-emitted assistants, so a late marker can patch its flag.
         val runIdToIndex = HashMap<String, Int>()
-        // Markers seen before their assistant (reorder / cross-page tolerance).
+        // Markers seen before their assistant (reorder / cross-page tolerance;
+        // in backward order this is the common case: marker seq > assistant seq).
         val pendingMarkers = HashSet<String>()
         var scanned = 0
-        var afterSeq = 0L
-        outer@ while (scanned < HISTORY_SCAN_CAP) {
-            val page = backing.loadEvents(sessionId, afterSeq, HISTORY_PAGE)
+        var beforeSeq = Long.MAX_VALUE
+        outer@ while (out.size < HISTORY_CAP && scanned < HISTORY_SCAN_CAP) {
+            val page = backing.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
             if (page.isEmpty()) break
             for (event in page) {
                 if (scanned >= HISTORY_SCAN_CAP) break@outer
@@ -2440,20 +2469,30 @@ class ChatViewModel(
                             val cur = out[idx]
                             if (!cur.hasReasoning) out[idx] = cur.copy(hasReasoning = true)
                         } else if (out.size < HISTORY_CAP) {
-                            // out still has room, so a later assistant may consume
-                            // this marker. When out is full no further assistant
-                            // appends happen, so buffering would leave a dead entry.
+                            // out still has room, so a later (older) assistant
+                            // may consume this marker. When out is full no
+                            // further assistant appends happen, so buffering
+                            // would leave a dead entry.
                             pendingMarkers.add(event.runId)
                         }
                     }
                 }
             }
-            afterSeq = page.last().seq
+            val pageMin = page.minOf { it.seq }
+            if (pageMin >= beforeSeq) break
+            beforeSeq = pageMin
             if (page.size < HISTORY_PAGE) break
-            // When out is full no further appends happen, but scanning continues
-            // to SCAN_CAP/EOF so late markers still patch already-emitted flags.
         }
-        return out
+        // Exact omitted-row total via one filtered COUNT (O(1) memory).
+        val total = backing.countHistoryEvents(sessionId, includePartial = true)
+        val dropped = (total - out.size).coerceAtLeast(0)
+        return LoadedUiHistory(out.asReversed(), dropped)
+            if (page.size < HISTORY_PAGE) break
+        }
+        // Exact omitted-row total via one filtered COUNT (O(1) memory).
+        val total = backing.countHistoryEvents(sessionId, includePartial = true)
+        val dropped = (total - keptNewestFirst.size).coerceAtLeast(0)
+        return LoadedUiHistory(keptNewestFirst.asReversed(), dropped)
     }
 
     override fun onCleared() {

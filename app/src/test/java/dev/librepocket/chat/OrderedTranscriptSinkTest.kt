@@ -155,4 +155,114 @@ class OrderedTranscriptSinkTest {
       exec.shutdown()
     }
   }
+
+  /**
+   * Stage E: a later offer must not trySend past parked predecessors. The
+   * writer is frozen mid-drain (blocking sleeps on the single-thread
+   * dispatcher) so a freed slot coexists with a non-empty overflow chain —
+   * deterministically. Pre-fix, D trySend-succeeds into the free slot and the
+   * final order is blocker,filler,P,D,A,B; post-fix D queues behind B.
+   */
+  @Test fun laterOfferNeverOvertakesParkedPredecessors() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val started: MutableList<String> = Collections.synchronizedList(mutableListOf())
+      val delegate = object : SinkProbe() {
+        override suspend fun onSteerQueued(text: String) {
+          started.add(text)
+          // Blocking (not suspending): freezes the single-thread dispatcher
+          // mid-drain so parked coroutines cannot advance while the test
+          // thread offers the newcomer into the freed slot.
+          if (text == "blocker" || text == "filler") Thread.sleep(3_000)
+          recorded.add(text)
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 2)
+      fun awaitStarted(text: String, timeoutMs: Long = 10_000) {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (!started.contains(text)) {
+          if (System.currentTimeMillis() > end) throw AssertionError("timed out waiting for $text")
+          Thread.sleep(10)
+        }
+      }
+      fun awaitRecorded(size: Int, timeoutMs: Long = 30_000) {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (delegate.recorded.size < size) {
+          if (System.currentTimeMillis() > end) {
+            throw AssertionError("timed out waiting for $size records, have ${delegate.recorded}")
+          }
+          Thread.sleep(10)
+        }
+      }
+      sink.offerSteer("blocker")
+      awaitStarted("blocker")
+      // Writer is frozen in blocker-sleep with buffer space: P fast-paths,
+      // then A/B meet a full channel and park (chain=[B]).
+      sink.offerSteer("filler")
+      sink.offerSteer("P")
+      sink.offerSteer("A")
+      sink.offerSteer("B")
+      // Blocker sleep ends; writer takes filler and freezes again in
+      // filler-sleep. Buffer now holds only P (one free slot) while the
+      // chain is still [B] and A/B cannot advance. The newcomer D must queue
+      // behind B, never trySend into the free slot ahead of them.
+      awaitStarted("filler")
+      Thread.sleep(300)
+      sink.offerSteer("D")
+      awaitRecorded(6)
+      assertEquals(listOf("blocker", "filler", "P", "A", "B", "D"), delegate.recorded)
+      runBlocking {
+        withTimeout(10_000) {
+          assertTrue("drained sink must flush", sink.flush())
+        }
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * Stage E: flush awaits the parked tail — including a send parked while a
+   * previous tail was awaited (re-check) — and only then admits the barrier.
+   * After a true flush, every steer offered before it is recorded.
+   */
+  @Test fun flushDoesNotOvertakeTailPark() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val gate = CompletableDeferred<Unit>()
+      var first = true
+      val delegate = object : SinkProbe() {
+        override suspend fun onSteerQueued(text: String) {
+          if (first) {
+            first = false
+            gate.await()
+          }
+          recorded.add(text)
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 1)
+      runBlocking {
+        withTimeout(15_000) {
+          sink.offerSteer("blocker")
+          sink.offerSteer("filler")
+          // Buffer full behind the stalled writer: A parks (chain=[A]).
+          sink.offerSteer("A")
+          val flushing = async { sink.flush(10_000) }
+          // B parks while flush is awaiting the A tail (chain=[B]): the
+          // re-check must cover it, so the barrier cannot overtake B.
+          sink.offerSteer("B")
+          kotlinx.coroutines.delay(300)
+          assertTrue("flush must wait for the parked tail, not overtake it", !flushing.isCompleted)
+          gate.complete(Unit)
+          assertTrue("flush must drain the parked tail", flushing.await())
+          // A true flush implies every steer offered before it is recorded.
+          assertEquals(listOf("blocker", "filler", "A", "B"), delegate.recorded)
+        }
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
 }

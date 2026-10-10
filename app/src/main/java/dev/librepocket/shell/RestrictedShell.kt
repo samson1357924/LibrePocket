@@ -196,16 +196,17 @@ class RestrictedShell(
      */
     private val execIsWritable: (java.nio.file.Path) -> Boolean = ShellExecutables::defaultIsWritable,
     /**
-     * 可信 executable 解析（預設 [ShellExecutables.resolve] 真查 FS；
-     * 單測可注入假映射，但生產必須用預設）。
+     * 可信 executable 解析（預設 null → 內建 [ShellExecutables.resolveDetailed] 真查 FS；
+     * 單測可注入假映射，但生產必須用預設 null）。
      * 輸入為原始 `argv[0]`（保留絕對/相對形態供驗證），輸出為
      * [ShellExecutables.ResolvedExec]（驗證後實體路徑 + multicall applet
      * 訊號）或 null（不可信/不存在即 null，呼叫方轉拒絕且零 spawn）。
      * 自訂映射回 multicall 時，其 `applet` 會被白名單放行值（`Allowed.binary`）
      * 覆寫後才 spawn，不採信映射自帶字串。
+     * null（預設）路徑的拒絕訊息攜帶 [ShellExecutables.ResolveDeny] reason code
+     * （不含任意 filesystem path）；自訂映射路徑維持通用訊息。
      */
-    private val execResolver: (String) -> ShellExecutables.ResolvedExec? =
-        { ShellExecutables.resolve(it, execSearchDirs, execAllowedRoots, execIsWritable) },
+    private val execResolver: ((String) -> ShellExecutables.ResolvedExec?)? = null,
 ) {
     fun execute(argv: List<String>, timeoutMs: Long = ShellPolicy.DEFAULT_TIMEOUT_MS): ShellResult {
         val binary = when (
@@ -218,14 +219,46 @@ class RestrictedShell(
         // 失敗（同名不同路徑假二進位、`PATH` 劫持、檔案缺失/不可執行、
         // symlink 逃逸集外、可寫目標）即拒，
         // 不建子進程、不佔配額（沿用「拒絕零 spawn」不變量）。
-        val resolved = try {
-            execResolver(argv[0].trim())
+        val custom = execResolver
+        if (custom != null) {
+            val resolved = try {
+                custom(argv[0].trim())
+            } catch (_: Exception) {
+                null
+            } ?: return ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "untrusted executable: ${argv[0].trim()}",
+            )
+            return executeResolved(argv, binary, resolved, timeoutMs)
+        }
+        val outcome = try {
+            ShellExecutables.resolveDetailed(
+                argv[0].trim(),
+                execSearchDirs,
+                execAllowedRoots,
+                execIsWritable,
+            )
         } catch (_: Exception) {
             null
-        } ?: return ShellResult.Denied(
-            ShellDeny.BLACKLISTED,
-            "untrusted executable: ${argv[0].trim()}",
-        )
+        }
+        val resolved = (outcome as? ShellExecutables.ResolveOutcome.Ok)?.exec
+            ?: run {
+                val reason = (outcome as? ShellExecutables.ResolveOutcome.Denied)?.reason
+                return ShellResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    if (reason != null) "untrusted executable: ${argv[0].trim()} (reason=$reason)"
+                    else "untrusted executable: ${argv[0].trim()}",
+                )
+            }
+        return executeResolved(argv, binary, resolved, timeoutMs)
+    }
+
+    private fun executeResolved(
+        argv: List<String>,
+        binary: String,
+        resolved: ShellExecutables.ResolvedExec,
+        timeoutMs: Long,
+    ): ShellResult {
         if (!quota.tryAcquire()) {
             return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "shell quota exceeded")
         }

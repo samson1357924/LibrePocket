@@ -127,13 +127,18 @@ interface GithubComment {
   id: number;
   body?: string | null;
   user?: { login?: string | null; type?: string | null } | null;
+  // P1 #2 Phase B: retained for content-hash binding (never persisted as
+  // plaintext; only the SHA-256 hex is stored). Optional for backward
+  // compatibility with fakes/clients that omit them.
+  updated_at?: string | null;
+  created_at?: string | null;
 }
 
 interface RunnerGitHubClient {
   rest: {
     pulls: { get(params: { owner: string; repo: string; pull_number: number }): Promise<{ data: PullRequestData }> };
     issues: {
-      get?(params: { owner: string; repo: string; issue_number: number }): Promise<{ data: { number?: number; title?: string; body?: string | null } }>;
+      get?(params: { owner: string; repo: string; issue_number: number }): Promise<{ data: { number?: number; id?: number; title?: string; body?: string | null; updated_at?: string | null; created_at?: string | null } }>;
       listComments(params: { owner: string; repo: string; issue_number: number; per_page: number; page: number }): Promise<{ data: GithubComment[] }>;
       createComment(params: { owner: string; repo: string; issue_number: number; body: string }): Promise<unknown>;
       updateComment(params: { owner: string; repo: string; comment_id: number; body: string }): Promise<unknown>;
@@ -1567,10 +1572,16 @@ export interface RunnerIssueOutput {
   tags: string[];
   summary: string;
   // S5: raw AI label suggestions (strict string array, allowlisted at
-  // publish) plus a revision fingerprint over the FULL issue content
-  // (title/body/comments before any safeString or budget cut) so publish
-  // can verify freshness and update the same sticky on mismatch. Tail edits
-  // past any truncation cap still change the hash (no tail collision).
+  // publish) plus a revision fingerprint v2 over the FULL RAW issue content
+  // (rawTitle/rawBody/rawComments before any redaction or budget cut; control
+  // chars normalized, no masking) so publish can verify freshness and update
+  // the same sticky on mismatch. Tail edits past any truncation cap still
+  // change the hash (no tail collision); two secrets sharing one redacted
+  // mask hash differently (no mask collision). v1 redacted hashes naturally
+  // mismatch v2 raw hashes for secret-bearing content, so publish falls back
+  // to INCONCLUSIVE (same sticky, never a wrong APPROVE) with no version
+  // field (the mismatch is the version signal). Only the hex is persisted;
+  // raw text never leaves the hash/scan path (see buildIssueContext).
   // P1 #2: comments completeness over the live listComments read. Review
   // never APPROVEs when false; publish requires true on both the artifact
   // and the fresh re-read plus fingerprint equality, otherwise it falls back
@@ -1597,17 +1608,59 @@ function issueRulesTags(title: string): string[] {
   return sanitizeLabels(resolveLabelsFromTitle(title));
 }
 
-// S5 content fingerprint for issues: SHA-256 over the normalized review
-// context (title, body, human comments). Callers must pass the FULL
-// redacted-but-unsliced content (see buildIssueContext fullFingerprint):
-// hashing truncated copies would collide on tail edits past any cap, so
-// review and publish compare full values. PR freshness reuses the existing
-// head/base SHA identity (sameReviewIdentity); issues hash their mutable
-// text content instead. Publish recomputes from the current context and
-// falls back to INCONCLUSIVE on the same sticky when the fingerprint
-// mismatches.
-export function issueContentFingerprint(title: string, body: string, comments: string[]): string {
-  const normalized = JSON.stringify({ title, body, comments });
+// S5 content fingerprint v2 for issues (P1 #2 Phase B): SHA-256 over the RAW
+// (unredacted) full issue content. Control chars are normalized to space
+// (shared with cleanForModel) but credential masking is NEVER applied, so two
+// secrets sharing one redacted mask (e.g. `password: first` vs
+// `password: second` both → `password=[REDACTED CREDENTIAL]`) hash differently.
+// Callers must pass the FULL unsliced raw content (see buildIssueContext
+// rawTitle/rawBody/rawComments); hashing truncated copies would collide on
+// tail edits past any cap, so review and publish compare full values. The
+// optional meta binds comment/issue identity (id/updated_at) when available;
+// absent fields are omitted so legacy 3-arg calls over pure x/y strings hash
+// identically (backward compatible). v1 redacted hashes naturally mismatch v2
+// raw hashes for secret-bearing content, so publish falls back to
+// INCONCLUSIVE on the same sticky (no version field; the mismatch is the
+// version signal). PR freshness reuses the existing head/base SHA identity
+// (sameReviewIdentity); issues hash their mutable text instead. Only the hex
+// is persisted; raw text never leaves the hash/scan path.
+// Order contract (see redact.ts): deterministic scanning runs on the same RAW
+// input first; only the AI-bound copy is redacted.
+export interface IssueContentFingerprintMeta {
+  commentIds?: Array<number | null | undefined>;
+  commentUpdatedAts?: Array<string | null | undefined>;
+  issueUpdatedAt?: string | null | undefined;
+  issueId?: number | null | undefined;
+}
+
+// Control-char normalization shared with cleanForModel, without masking.
+// Used for the raw fingerprint so control-only differences are stable while
+// credential differences are preserved.
+export function normalizeRawForFingerprint(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return value.replace(/[\u0000-\u001f\u007f]/g, ' ');
+}
+
+export function issueContentFingerprint(title: string, body: string, comments: string[], meta?: IssueContentFingerprintMeta): string {
+  const normTitle = normalizeRawForFingerprint(title);
+  const normBody = normalizeRawForFingerprint(body);
+  const normComments = Array.isArray(comments) ? comments.map((c) => normalizeRawForFingerprint(c)) : [];
+  const payload: Record<string, unknown> = { title: normTitle, body: normBody, comments: normComments };
+  if (meta) {
+    if (meta.commentIds !== undefined) {
+      payload.commentIds = meta.commentIds.map((id) => (typeof id === 'number' && Number.isSafeInteger(id) ? id : null));
+    }
+    if (meta.commentUpdatedAts !== undefined) {
+      payload.commentUpdatedAts = meta.commentUpdatedAts.map((v) => (typeof v === 'string' ? v : null));
+    }
+    if (meta.issueUpdatedAt !== undefined) {
+      payload.issueUpdatedAt = typeof meta.issueUpdatedAt === 'string' ? meta.issueUpdatedAt : null;
+    }
+    if (meta.issueId !== undefined) {
+      payload.issueId = typeof meta.issueId === 'number' && Number.isSafeInteger(meta.issueId) ? meta.issueId : null;
+    }
+  }
+  const normalized = JSON.stringify(payload);
   return createHash('sha256').update(normalized, 'utf8').digest('hex');
 }
 
@@ -1934,9 +1987,12 @@ export function buildIssueChunks(title: string, body: string, comments: string[]
 }
 
 // Deterministic BLOCK for issues (fail-closed NEEDS_CHANGES even when chunk
-// triage is incomplete): scan the full cleaned content with the shared
-// DeterministicScanner. Any BLOCK (e.g. pasted private key / credential)
-// forces NEEDS_CHANGES; otherwise undefined.
+// triage is incomplete): scan the full RAW content with the shared
+// DeterministicScanner. Callers must pass rawTitle/rawBody/rawComments
+// (unredacted; see buildIssueContext) — scanning redacted text would miss
+// credentials whose patterns were replaced (order contract in redact.ts).
+// Any BLOCK (e.g. pasted private key / credential) forces NEEDS_CHANGES;
+// otherwise false.
 export function scanIssueDeterministicBlock(title: string, body: string, comments: string[]): boolean {
   try {
     const joined = [`issue: ${title}`, body, ...comments].join('\n');
@@ -2203,21 +2259,24 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
 }
 
 // P2 #5 issue freshness: title/body must come from the live GitHub issue,
-// never from the webhook snapshot alone. Returns the fresh fields when the
-// client exposes issues.get and the read validates; returns undefined when
-// the API is unavailable (callers fall back to the webhook snapshot for
-// backward compatibility with clients that lack `get`); throws a generic
-// error when a present `get` fails or returns an identity mismatch so
-// callers degrade to INCONCLUSIVE instead of reviewing stale content.
+// never from the webhook snapshot alone. Returns the fresh RAW fields (no
+// redaction) when the client exposes issues.get and the read validates;
+// id/updated_at/created_at are retained when present for content-hash binding
+// (see issueContentFingerprint meta; absent fields are omitted for backward
+// compatibility). Returns undefined when the API is unavailable (callers fall
+// back to the webhook snapshot for backward compatibility with clients that
+// lack `get`); throws a generic error when a present `get` fails or returns
+// an identity mismatch so callers degrade to INCONCLUSIVE instead of
+// reviewing stale content.
 export async function fetchFreshIssueFields(
   client: RunnerGitHubClient | undefined,
   owner: string,
   repo: string,
   issueNumber: number,
-): Promise<{ title: string; body: string } | undefined> {
+): Promise<{ title: string; body: string; updatedAt?: string; id?: number } | undefined> {
   const issues = client?.rest.issues as RunnerGitHubClient['rest']['issues'] | undefined;
   if (!issues || typeof issues.get !== 'function') return undefined;
-  let data: { number?: number; title?: string; body?: string | null };
+  let data: { number?: number; id?: number; title?: string; body?: string | null; updated_at?: string | null; created_at?: string | null };
   try {
     const response = await issues.get({ owner, repo, issue_number: issueNumber });
     data = response?.data;
@@ -2229,22 +2288,39 @@ export async function fetchFreshIssueFields(
     throw new Error('PocketGuard: failed to fetch current issue state.');
   }
   if (typeof data.title !== 'string') throw new Error('PocketGuard: failed to fetch current issue state.');
-  return { title: data.title, body: typeof data.body === 'string' ? data.body : '' };
+  const out: { title: string; body: string; updatedAt?: string; id?: number } = {
+    title: data.title,
+    body: typeof data.body === 'string' ? data.body : '',
+  };
+  if (typeof data.updated_at === 'string' && data.updated_at) out.updatedAt = data.updated_at;
+  if (typeof data.id === 'number' && Number.isSafeInteger(data.id)) out.id = data.id;
+  return out;
 }
 
-// S4 issue context: title plus body plus human comments (bot authors and bot
-// senders excluded by the same loop-protection rules as routing), truncated
-// to MAX_ISSUE_CONTEXT_LENGTH. P1 #2 fail-closed completeness: commentsComplete
-// is true only when every comment page was read successfully (client,
-// repository, and listComments present, every response.data an array of
-// objects, no throw), no fetched comment was dropped by the length budget,
-// and no single field was cut by its safeString cap (comment 2000, title
-// 2000, body 8000, or the MAX_ISSUE_CONTEXT_LENGTH body slice). Any other
-// outcome yields commentsComplete false (the caller must not APPROVE).
-// The returned title/body/comments stay truncated for the model, while
-// fullFingerprint is hashed over the full redacted-but-unsliced content so a
-// tail change past any cap still alters the fingerprint (no tail collision).
-// Only the hash is persisted; full text never leaves the model input path.
+// S4 issue context (P1 #2 Phase B split): title plus body plus human comments
+// (bot authors and bot senders excluded by the same loop-protection rules as
+// routing), truncated to MAX_ISSUE_CONTEXT_LENGTH for the MODEL. Memory-only
+// split: the redacted copy (cleanForModel) feeds the model and chunk builder,
+// while rawTitle/rawBody/rawComments (unredacted, full unsliced, control chars
+// left intact here and normalized inside issueContentFingerprint) feed ONLY the
+// SHA-256 fingerprint and the deterministic scan. Raw text is never persisted
+// (only hex + redacted copies reach artifacts/reports/stickies) and never
+// sent to the model. Comment id/updated_at are retained alongside rawComments
+// for hash binding when present (absent fields omitted for backward
+// compatibility). P1 #2 fail-closed completeness: commentsComplete is true
+// only when every comment page was read successfully (client, repository, and
+// listComments present, every response.data an array of objects, no throw),
+// no fetched comment was dropped by the length budget, and no single field
+// was cut by its safeString cap (comment 2000, title 2000, body 8000, or the
+// MAX_ISSUE_CONTEXT_LENGTH body slice). Any other outcome yields
+// commentsComplete false (the caller must not APPROVE).
+// The returned title/body/comments stay truncated REDACTED for the model,
+// fullTitle/fullBody/fullComments stay full REDACTED for chunking/coverage,
+// rawTitle/rawBody/rawComments (+ids/updated_ats) stay full RAW for hashing
+// and scanning so a tail change past any cap still alters the fingerprint (no
+// tail collision) and two secrets sharing one mask hash differently (no mask
+// collision). Only the hash is persisted; raw text never leaves the
+// hash/scan path.
 // A webhook issue_comment body may be merged as a minimal input after the
 // same bot filter, but the result stays incomplete and never lifts the
 // APPROVE ban. `truncated` distinguishes active budget truncation from
@@ -2255,9 +2331,13 @@ async function buildIssueContext(
   issueNumber: number,
   title: string,
   body: string,
-): Promise<{ title: string; body: string; comments: string[]; commentsComplete: boolean; truncated: boolean; fullFingerprint: string; fetchComplete: boolean; fullTitle: string; fullBody: string; fullComments: string[] }> {
+  issueMeta?: { updatedAt?: string | null; id?: number | null },
+): Promise<{ title: string; body: string; comments: string[]; commentsComplete: boolean; truncated: boolean; fullFingerprint: string; fetchComplete: boolean; fullTitle: string; fullBody: string; fullComments: string[]; rawTitle: string; rawBody: string; rawComments: string[]; rawCommentIds: Array<number | null>; rawCommentUpdatedAts: Array<string | null>; rawIssueUpdatedAt?: string; rawIssueId?: number }> {
   const comments: string[] = [];
   const fullComments: string[] = [];
+  const rawComments: string[] = [];
+  const rawCommentIds: Array<number | null> = [];
+  const rawCommentUpdatedAts: Array<string | null> = [];
   let commentsComplete = true;
   let fetchComplete = true;
   let truncated = false;
@@ -2296,13 +2376,21 @@ async function buildIssueContext(
             fetchComplete = false;
             continue;
           }
-          const entry = comment as { body?: unknown; user?: { login?: unknown; type?: unknown } | null };
+          const entry = comment as { body?: unknown; user?: { login?: unknown; type?: unknown } | null; id?: unknown; updated_at?: unknown; created_at?: unknown };
           if (typeof entry.body !== 'string' || !entry.body.trim()) continue;
           if (typeof entry.user?.type === 'string' && entry.user.type.toLowerCase() === 'bot') continue;
           if (typeof entry.user?.login === 'string' && isBotLogin(entry.user.login)) continue;
           const login = typeof entry.user?.login === 'string' && entry.user.login.trim()
             ? entry.user.login.trim()
             : 'unknown';
+          // Phase B: raw copy for hashing/scanning only (no redaction, no
+          // slice). The fingerprint normalizes control chars; the scan sees
+          // the original secret patterns. Never persisted, never sent to the
+          // model.
+          const rawBodyText = entry.body;
+          rawComments.push(`${login}：${rawBodyText}`);
+          rawCommentIds.push(typeof entry.id === 'number' && Number.isSafeInteger(entry.id) ? entry.id : null);
+          rawCommentUpdatedAts.push(typeof entry.updated_at === 'string' ? entry.updated_at : null);
           // P1 #1: a comment cut by the 2000-char safeString cap is a
           // fail-closed truncation (tail change must not hash equal).
           const cleanedComment = cleanForModel(entry.body);
@@ -2325,7 +2413,8 @@ async function buildIssueContext(
   // Webhook minimal input: when the live read is incomplete, merge the
   // triggering issue_comment body (after bot filtering) so the model still
   // sees the immediate human input. The result stays incomplete and never
-  // lifts the APPROVE ban.
+  // lifts the APPROVE ban. Both the redacted (model) and raw (hash/scan)
+  // copies are merged; the raw copy carries no id/updated_at (null).
   if (!commentsComplete) {
     try {
       const webhookEvent: GithubEvent = context.event ?? eventFrom(context);
@@ -2346,18 +2435,29 @@ async function buildIssueContext(
             comments.push(merged);
             fullComments.push(`${login}：${cleanedWebhook}`);
           }
+          const rawMerged = `${login}：${webhookBody}`;
+          if (!rawComments.includes(rawMerged)) {
+            rawComments.push(rawMerged);
+            rawCommentIds.push(null);
+            rawCommentUpdatedAts.push(null);
+          }
         }
       }
     } catch {
       // No webhook input available; stay incomplete with fetched comments only.
     }
   }
-  // Full redacted-but-unsliced content for the fingerprint. Any cut by the
+  // Full REDACTED-but-unsliced content for the model/chunks. Any cut by the
   // single-field caps (title 2000, body 8000) is fail-closed: the model still
   // sees the truncated copy, but completeness is lost so review and publish
   // must not APPROVE.
   const fullTitle = cleanForModel(title);
   const fullBody = cleanForModel(body);
+  // Full RAW-but-unsliced content for hashing/scanning only (no masking;
+  // control normalization happens inside issueContentFingerprint). Never
+  // persisted, never sent to the model.
+  const rawTitle = typeof title === 'string' ? title : '';
+  const rawBodyFull = typeof body === 'string' ? body : '';
   if (fullTitle.length > 2000 || fullBody.length > 8000) {
     truncated = true;
     commentsComplete = false;
@@ -2380,10 +2480,41 @@ async function buildIssueContext(
     // incomplete even though no comment row was dropped.
     commentsComplete = false;
   }
-  // Fingerprint over the FULL content (including comments later dropped from
-  // the model copy by the budget) so tail edits past any cap change the hash.
-  const fullFingerprint = issueContentFingerprint(fullTitle, fullBody, fullComments);
-  return { title: safeTitle, body: safeBody, comments: kept, commentsComplete, truncated, fullFingerprint, fetchComplete, fullTitle, fullBody, fullComments };
+  // Fingerprint v2 over the FULL RAW content (including comments later dropped
+  // from the model copy by the budget) so tail edits past any cap change the
+  // hash (no tail collision) and same-mask secrets hash differently (no mask
+  // collision). Comment/issue identity binds when present; empty comment sets
+  // with no issue meta omit the meta block so legacy 3-arg pure x/y hashes
+  // stay identical.
+  const hasRawMeta = rawComments.length > 0 || (issueMeta?.updatedAt ?? undefined) !== undefined || (issueMeta?.id ?? undefined) !== undefined;
+  const fingerprintMeta: IssueContentFingerprintMeta | undefined = hasRawMeta
+    ? {
+        commentIds: rawCommentIds,
+        commentUpdatedAts: rawCommentUpdatedAts,
+        ...(issueMeta?.updatedAt !== undefined ? { issueUpdatedAt: issueMeta.updatedAt } : {}),
+        ...(issueMeta?.id !== undefined ? { issueId: issueMeta.id } : {}),
+      }
+    : undefined;
+  const fullFingerprint = issueContentFingerprint(rawTitle, rawBodyFull, rawComments, fingerprintMeta);
+  return {
+    title: safeTitle,
+    body: safeBody,
+    comments: kept,
+    commentsComplete,
+    truncated,
+    fullFingerprint,
+    fetchComplete,
+    fullTitle,
+    fullBody,
+    fullComments,
+    rawTitle,
+    rawBody: rawBodyFull,
+    rawComments,
+    rawCommentIds,
+    rawCommentUpdatedAts,
+    ...(issueMeta?.updatedAt !== undefined && typeof issueMeta.updatedAt === 'string' ? { rawIssueUpdatedAt: issueMeta.updatedAt } : {}),
+    ...(issueMeta?.id !== undefined && typeof issueMeta.id === 'number' ? { rawIssueId: issueMeta.id } : {}),
+  };
 }
 
 // S5 issue execution (never counted): issues opened/edited/reopened and
@@ -2415,6 +2546,7 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
   let title = webhookTitle;
   let body = webhookBody;
   let freshVerified = false;
+  let freshIssueMeta: { updatedAt?: string | null; id?: number | null } | undefined;
   if (repository && issueNumber) {
     try {
       const fresh = await fetchFreshIssueFields(
@@ -2427,6 +2559,12 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
         title = fresh.title;
         body = fresh.body;
         freshVerified = true;
+        if (fresh.updatedAt !== undefined || fresh.id !== undefined) {
+          freshIssueMeta = {
+            ...(fresh.updatedAt !== undefined ? { updatedAt: fresh.updatedAt } : {}),
+            ...(fresh.id !== undefined ? { id: fresh.id } : {}),
+          };
+        }
       }
     } catch {
       const output: RunnerIssueOutput = {
@@ -2445,10 +2583,11 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
   }
   const fingerprintFor = async (): Promise<{ fingerprint: string; commentsComplete: boolean }> => {
     try {
-      const builtForPrint = await buildIssueContext(context, repository, issueNumber, title, body);
+      const builtForPrint = await buildIssueContext(context, repository, issueNumber, title, body, freshIssueMeta);
       return {
-        // P1 #1: fingerprint over the full original content (pre-cut) so a
-        // tail edit past any cap changes the hash.
+        // Phase B v2: fingerprint over the full RAW content (pre-cut, no
+        // masking) so a tail edit past any cap changes the hash and
+        // same-mask secrets hash differently.
         fingerprint: builtForPrint.fullFingerprint,
         commentsComplete: builtForPrint.commentsComplete,
       };
@@ -2481,11 +2620,14 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
     saveIssueOutput(output, context);
     return output;
   }
-  const built = await buildIssueContext(context, repository, issueNumber, title, body);
-  // P1 #1: full-content fingerprint (pre-cut); truncated-context hashes would
-  // collide on tail edits past any cap.
+  const built = await buildIssueContext(context, repository, issueNumber, title, body, freshIssueMeta);
+  // Phase B v2: full RAW-content fingerprint (pre-cut, no masking);
+  // truncated-context hashes would collide on tail edits past any cap, and
+  // redacted hashes would collide on same-mask secrets.
   const fingerprint = built.fullFingerprint;
-  const deterministicBlock = scanIssueDeterministicBlock(built.fullTitle, built.fullBody, built.fullComments);
+  // Phase B: deterministic scan eats RAW (order contract); redacted would
+  // miss credentials. Chunks below stay REDACTED for the model.
+  const deterministicBlock = scanIssueDeterministicBlock(built.rawTitle, built.rawBody, built.rawComments);
   // P1 #2: never APPROVE on an incomplete transport read. Downgrade before
   // any OpenAI call (zero model traffic) so a fail-open read cannot approve.
   // Deterministic BLOCK may still NEEDS_CHANGES (fail-closed, no APPROVE).
@@ -3329,6 +3471,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     const webhookIssueBody = typeof event.issue?.body === 'string' ? event.issue.body : '';
     let issueTitle = webhookIssueTitle;
     let issueBody = webhookIssueBody;
+    let publishIssueMeta: { updatedAt?: string | null; id?: number | null } | undefined;
     let freshIssueReadFailed = false;
     if (typeof client.rest.issues.get === 'function') {
       try {
@@ -3336,6 +3479,12 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
         if (fresh) {
           issueTitle = fresh.title;
           issueBody = fresh.body;
+          if (fresh.updatedAt !== undefined || fresh.id !== undefined) {
+            publishIssueMeta = {
+              ...(fresh.updatedAt !== undefined ? { updatedAt: fresh.updatedAt } : {}),
+              ...(fresh.id !== undefined ? { id: fresh.id } : {}),
+            };
+          }
         } else {
           freshIssueReadFailed = true;
         }
@@ -3356,9 +3505,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     let currentFullComments: string[] = [];
     let currentFullTitle = '';
     try {
-      const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody);
-      // P1 #1: compare full-content fingerprints (pre-cut) on both sides so
-      // a tail edit past any cap is detected as stale.
+      const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody, publishIssueMeta);
+      // Phase B v2: compare full RAW-content fingerprints (pre-cut, no
+      // masking) on both sides so a tail edit past any cap -- or a
+      // same-mask secret swap -- is detected as stale. Coverage below still
+      // uses the REDACTED full copies (chunks are redacted).
       currentFingerprint = builtCurrent.fullFingerprint;
       currentCommentsComplete = builtCurrent.commentsComplete;
       currentFetchComplete = builtCurrent.fetchComplete;

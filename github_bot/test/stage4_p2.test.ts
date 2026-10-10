@@ -11,13 +11,16 @@ import {
   fetchFreshIssueFields,
   hasUnknownAiLabels,
   issueContentFingerprint,
+  normalizeRawForFingerprint,
   runIssueReviewMode,
   runPublishMode,
   runReviewMode,
   runTagMode,
+  scanIssueDeterministicBlock,
   validateIssueOutput,
   type RunnerContext,
 } from '../src/github_runner';
+import { redactForModel } from '../src/redact';
 
 const TEST_BASE_URL = ['https:', '', 'pocketguard-openai.test', 'v1'].join('/');
 const TEST_ORIGIN = new URL(TEST_BASE_URL).origin;
@@ -1004,8 +1007,9 @@ export async function runStage4P2Tests(): Promise<void> {
         }
       }
       assert.notEqual(seen[0].fingerprint, seen[1].fingerprint, 'comment tail change alters the full fingerprint');
-      assert.equal(seen[0].fingerprint, issueContentFingerprint('t', 'b', [`human：${commentX}`]));
-      assert.equal(seen[1].fingerprint, issueContentFingerprint('t', 'b', [`human：${commentY}`]));
+      // Phase B v2: raw hash binds comment id/updated_at (id 31, no updated_at → null).
+      assert.equal(seen[0].fingerprint, issueContentFingerprint('t', 'b', [`human：${commentX}`], { commentIds: [31], commentUpdatedAts: [null] }));
+      assert.equal(seen[1].fingerprint, issueContentFingerprint('t', 'b', [`human：${commentY}`], { commentIds: [31], commentUpdatedAts: [null] }));
     }
 
     // P1 #1: title 2001 chars — tail X vs Y both INCONCLUSIVE, zero AI,
@@ -1145,6 +1149,197 @@ export async function runStage4P2Tests(): Promise<void> {
         assert.equal(state.updated, 1, 'tail collision updates the same sticky');
         assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'tail collision falls back');
         assert.ok(!state.comments[0].body.includes('判定：APPROVE'), 'tail collision never approves');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P1 #2 Phase B: raw fingerprint binds secrets (no mask collision).
+    // Same-mask pairs hash differently raw, identically redacted (control
+    // locking the pre-fix collision).
+    {
+      const pairs: Array<[string, string, string]> = [
+        ['password', 'password: first-secret-AAA', 'password: second-secret-BBB'],
+        ['api_key', 'api_key: supersecret123', 'api_key: othersecret456'],
+        ['sk', 'sk-live-AAAAAAAAAAAAAAAA', 'sk-live-BBBBBBBBBBBBBBBB'],
+        ['gh_p', 'ghp_AAAAAAAAAAAAAAAAAAAA', 'ghp_BBBBBBBBBBBBBBBBBBBB'],
+        ['Bearer', 'Bearer abc123XYZ456', 'Bearer different789QQQ'],
+      ];
+      for (const [label, rawA, rawB] of pairs) {
+        const fpA = issueContentFingerprint('t', `body ${rawA}`, []);
+        const fpB = issueContentFingerprint('t', `body ${rawB}`, []);
+        assert.notEqual(fpA, fpB, `Phase B ${label}: raw hashes differ`);
+        const redA = redactForModel(`body ${rawA}`);
+        const redB = redactForModel(`body ${rawB}`);
+        assert.equal(redA, redB, `Phase B ${label}: redacted masks equal (control)`);
+        assert.equal(
+          issueContentFingerprint('t', redA, []),
+          issueContentFingerprint('t', redB, []),
+          `Phase B ${label}: redacted hashes equal (pre-fix collision locked)`,
+        );
+      }
+      // Control-char normalization is shared, masking is not.
+      assert.equal(normalizeRawForFingerprint('a\u0000b\u001fc'), 'a b c', 'control normalized without masking');
+      assert.equal(normalizeRawForFingerprint('password: keepme'), 'password: keepme', 'raw preserves secret');
+      assert.ok(redactForModel('password: keepme').includes('[REDACTED'), 'redacted masks secret');
+      // Comment id binding: same body different ids hash differently.
+      const fpId1 = issueContentFingerprint('t', 'b', ['human：hi'], { commentIds: [31], commentUpdatedAts: [null] });
+      const fpId2 = issueContentFingerprint('t', 'b', ['human：hi'], { commentIds: [32], commentUpdatedAts: [null] });
+      assert.notEqual(fpId1, fpId2, 'comment id binds into hash');
+      // fetchFreshIssueFields retains id/updated_at when present, omits when absent.
+      {
+        const withMeta = {
+          rest: { issues: { get: async () => ({ data: { number: 7, title: 't', body: 'b', id: 99, updated_at: '2026-01-02T03:04:05Z' } }) } },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        const fresh = await fetchFreshIssueFields(withMeta, 'o', 'r', 7);
+        assert.equal(fresh?.id, 99, 'fresh retains issue id');
+        assert.equal(fresh?.updatedAt, '2026-01-02T03:04:05Z', 'fresh retains updated_at');
+        const withoutMeta = {
+          rest: { issues: { get: async () => ({ data: { number: 7, title: 'live', body: 'live body' } }) } },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        assert.deepEqual(await fetchFreshIssueFields(withoutMeta, 'o', 'r', 7), { title: 'live', body: 'live body' });
+      }
+    }
+
+    // Phase B: deterministic scan eats RAW (order contract in redact.ts).
+    {
+      const rawSecret = 'ghp_AAAAAAAAAAAAAAAAAAAA';
+      assert.equal(scanIssueDeterministicBlock('t', `body ${rawSecret}`, []), true, 'raw ghp BLOCKs');
+      assert.equal(scanIssueDeterministicBlock('t', redactForModel(`body ${rawSecret}`), []), false, 'redacted misses (order control)');
+      // End-to-end: review with raw ghp BLOCKs to NEEDS_CHANGES (never APPROVE).
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-phaseb-scan-'));
+      try {
+        const counter = { count: 0 };
+        const restore = installOpenAIStub(counter, { verdict: 'APPROVE', summary: 'should not approve', suggestedLabels: [] });
+        try {
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't', body: `body ${rawSecret}` } }),
+                listComments: async () => ({ data: [] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: `body ${rawSecret}` } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: path.join(tempDir, 'r.json') } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'NEEDS_CHANGES', 'raw scan BLOCK forces NEEDS_CHANGES');
+          const artifactText = fs.readFileSync(path.join(tempDir, 'r.json'), 'utf8');
+          assert.ok(!artifactText.includes(rawSecret), 'artifact never persists raw secret');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // Phase B: review(A) → publish live B same mask → INCONCLUSIVE same sticky,
+    // label falls back to needs-decision, no raw leak in artifact/report/sticky.
+    {
+      const secretA = 'password: AlphaSecret123';
+      const secretB = 'password: BetaSecret456';
+      assert.equal(redactForModel(secretA), redactForModel(secretB), 'same-mask sanity');
+      assert.notEqual(
+        issueContentFingerprint('t', `body ${secretA}`, []),
+        issueContentFingerprint('t', `body ${secretB}`, []),
+        'raw differs sanity',
+      );
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-phaseb-stale-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const bodyA = `please handle ${secretA} in this issue`;
+        const bodyB = `please handle ${secretB} in this issue`;
+        // Review with A (APPROVE-happy model, no deterministic BLOCK for password).
+        const reviewCounter = { count: 0 };
+        const reviewRestore = installOpenAIStub(reviewCounter, { verdict: 'APPROVE', summary: `triage ok ${secretA}`, suggestedLabels: [] });
+        let reviewed!: Awaited<ReturnType<typeof runIssueReviewMode>>;
+        try {
+          const reviewClient = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: 't', body: bodyA } }),
+                listComments: async () => ({ data: [] }),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: bodyA } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: reviewClient,
+            writeStdout: () => undefined,
+          });
+        } finally {
+          reviewRestore();
+        }
+        assert.equal(reviewed.verdict, 'APPROVE', 'review A approves (password has no deterministic BLOCK)');
+        assert.equal(reviewed.commentsComplete, true);
+        assert.match(reviewed.fingerprint, /^[0-9a-f]{64}$/);
+        // Artifact must not contain raw secrets (only [REDACTED + hex).
+        const artifactText = fs.readFileSync(artifactPath, 'utf8');
+        assert.ok(!artifactText.includes('AlphaSecret123'), 'artifact omits raw secret A');
+        assert.ok(!artifactText.includes(secretA), 'artifact omits full raw A');
+        assert.ok(artifactText.includes(reviewed.fingerprint), 'artifact carries hex fingerprint');
+        // Reports must not contain raw secrets.
+        const jsonReport = fs.readFileSync(path.join(tempDir, 'review-report.json'), 'utf8');
+        const mdReport = fs.readFileSync(path.join(tempDir, 'review-report.md'), 'utf8');
+        assert.ok(!jsonReport.includes('AlphaSecret123'), 'JSON report omits raw secret A');
+        assert.ok(!mdReport.includes('AlphaSecret123'), 'Markdown report omits raw secret A');
+        assert.ok(jsonReport.includes('[REDACTED') || jsonReport.includes(reviewed.fingerprint), 'report carries redaction/hex only');
+        // Publish with live B (same mask, different raw) → stale INCONCLUSIVE.
+        const publishState = {
+          comments: [{ id: 77, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+          labelsAdded: [] as string[][],
+        };
+        const publishClient = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: 't', body: bodyB } }),
+              listComments: async () => ({ data: publishState.comments }),
+              createComment: async () => { publishState.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                publishState.updated += 1;
+                const found = publishState.comments.find((c) => c.id === params.comment_id);
+                if (found) found.body = params.body;
+                return {};
+              },
+              addLabels: async (params: { labels: string[] }) => { publishState.labelsAdded.push(params.labels); return {}; },
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: bodyA } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as NodeJS.ProcessEnv,
+          githubClient: publishClient,
+        });
+        assert.equal(publishState.created, 0, 'same-mask stale creates no second comment');
+        assert.equal(publishState.updated, 1, 'same-mask stale updates the same sticky');
+        assert.equal(publishState.comments[0].id, 77, 'same comment ID updated in place');
+        assert.ok(publishState.comments[0].body.includes('判定：INCONCLUSIVE'), 'same-mask stale falls back');
+        assert.ok(!publishState.comments[0].body.includes('判定：APPROVE'), 'same-mask stale never approves');
+        assert.ok(publishState.comments[0].body.includes('修訂指紋'), 'sticky carries revision fingerprint');
+        assert.ok(!publishState.comments[0].body.includes('AlphaSecret123'), 'sticky omits raw secret A');
+        assert.ok(!publishState.comments[0].body.includes('BetaSecret456'), 'sticky omits raw secret B');
+        assert.ok(!publishState.comments[0].body.includes(secretA) && !publishState.comments[0].body.includes(secretB), 'sticky omits full raws');
+        const flatLabels = publishState.labelsAdded.flat();
+        assert.ok(flatLabels.includes('status:needs-decision'), 'label falls back to needs-decision');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }

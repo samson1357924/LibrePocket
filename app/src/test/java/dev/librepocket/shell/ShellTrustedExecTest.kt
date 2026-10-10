@@ -22,6 +22,11 @@ import org.junit.Test
  *   app-writable 目標即拒（resolve 回 null，全鏈零 spawn）；同集內（含
  *   `/bin -> usr/bin` 形合併）放行；real 本體/parent 可寫即拒（宿主暫存檔
  *   屬主可寫故經 `isWritable` 注入模擬裝置不可寫，見 `systemOwned`）；
+ * - S5 entry-side（Finding A）：可寫 entry 內 `ls -> sysbin/sh`（real 乾淨、
+ *   containment 覆蓋兩側）即拒（bare／絕對兩形 + 全鏈 Denied(BLACKLISTED) +
+ *   零 spawn）；同目錄直連正規檔、中間 parent 可寫、表內任一 searchDir 可寫
+ *   （整表拒）、entry 判定拋異常一律拒；entry 全乾淨時 multicall／APEX 形／
+ *   usr 合併形放行不受影響；
  * - 操作數 schema（`--opt=value`、短旗標合併、值槽、pattern 槽）維持既有嚴格語義；
  * - null 作用域的隱式 cwd bare fail-closed，且放行者 spawn 仍是固定路徑 + 乾淨 env；
  * - multicall（toybox/toolbox/busybox）：實體 basename 落顯式表時 spawn 還原
@@ -812,6 +817,343 @@ class ShellTrustedExecTest {
         } finally {
             bin.deleteRecursively()
             evilDir.deleteRecursively()
+        }
+    }
+
+    // ---- S5 entry-side（Finding A）：可寫 entry 指到乾淨非 allowlisted 實體即拒 ----
+    //
+    // 裝置切分：entry 側（trusted 樹）App 可寫，系統側（sysbin 樹）不可寫；
+    // allowedRoots 覆蓋兩側使 containment 與 real 閘全綠，唯 entry 閘拒。
+    // 對照組（systemOwned 全乾淨）同形放行，證閘非 vacuous。
+
+    @Test fun entrySideSymlinkToCleanTarget_rejectedBareAndAbsolute() {
+        val trusted = tempDir("s5-trusted")
+        val sysbin = tempDir("s5-sysbin")
+        val scope = tempDir("s5-scope")
+        try {
+            val target = executable(sysbin, "sh")
+            Files.createSymbolicLink(File(trusted, "ls").toPath(), target.toPath())
+            val trustedReal = trusted.canonicalPath
+            val sysbinReal = sysbin.canonicalPath
+            val roots = listOf(trustedReal, sysbinReal)
+            val split: (java.nio.file.Path) -> Boolean = { p ->
+                val s = p.toString()
+                s == trustedReal || s.startsWith("$trustedReal/")
+            }
+            // resolve 層：bare 與絕對兩形皆 null。
+            assertNull(
+                ShellExecutables.resolve(
+                    "ls",
+                    listOf(trusted.absolutePath),
+                    allowedRoots = roots,
+                    isWritable = split,
+                ),
+            )
+            assertNull(
+                ShellExecutables.resolve(
+                    "${trusted.absolutePath}/ls",
+                    listOf(trusted.absolutePath),
+                    allowedRoots = roots,
+                    isWritable = split,
+                ),
+            )
+            // 對照：全乾淨即放行（entry 乾淨時同形放行）。
+            val ok = ShellExecutables.resolve(
+                "ls",
+                listOf(trusted.absolutePath),
+                allowedRoots = roots,
+                isWritable = systemOwned,
+            )!!
+            assertEquals(target.canonicalPath, ok.path)
+            // 全鏈：Denied(BLACKLISTED) + 零 spawn + 無 env（bare／絕對兩形）。
+            for (argv in listOf(
+                listOf("ls", "-l"),
+                listOf("${trusted.absolutePath}/ls", "-l"),
+            )) {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(trusted.absolutePath),
+                    execAllowedRoots = roots,
+                    execIsWritable = split,
+                )
+                val r = shell.execute(argv)
+                assertTrue("$argv -> $r", r is ShellResult.Denied)
+                assertEquals("$argv", ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+                assertEquals("$argv must not spawn", 0, runner.calls)
+                assertEquals("$argv", null, runner.lastEnv)
+            }
+        } finally {
+            trusted.deleteRecursively()
+            sysbin.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun writableSearchDir_directRegularFile_rejected() {
+        val trusted = tempDir("s5-direct")
+        val scope = tempDir("s5-direct-scope")
+        try {
+            val direct = executable(trusted, "ls")
+            val trustedReal = trusted.canonicalPath
+            val roots = listOf(trustedReal)
+            val split: (java.nio.file.Path) -> Boolean = { p ->
+                val s = p.toString()
+                s == trustedReal || s.startsWith("$trustedReal/")
+            }
+            // 同目錄直連正規檔（無 symlink）亦拒：bare／絕對兩形。
+            assertNull(
+                ShellExecutables.resolve(
+                    "ls",
+                    listOf(trusted.absolutePath),
+                    allowedRoots = roots,
+                    isWritable = split,
+                ),
+            )
+            assertNull(
+                ShellExecutables.resolve(
+                    "${trusted.absolutePath}/ls",
+                    listOf(trusted.absolutePath),
+                    allowedRoots = roots,
+                    isWritable = split,
+                ),
+            )
+            // 對照：全乾淨即放行。
+            val ok = ShellExecutables.resolve(
+                "ls",
+                listOf(trusted.absolutePath),
+                allowedRoots = roots,
+                isWritable = systemOwned,
+            )!!
+            assertEquals(direct.canonicalPath, ok.path)
+            // 全鏈：Denied(BLACKLISTED) + 零 spawn。
+            val runner = CapRunner()
+            val shell = RestrictedShell(
+                runner = runner,
+                privateRoot = scope.absolutePath,
+                execSearchDirs = listOf(trusted.absolutePath),
+                execAllowedRoots = roots,
+                execIsWritable = split,
+            )
+            val r = shell.execute(listOf("ls", "-l"))
+            assertTrue("$r", r is ShellResult.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+            assertEquals(0, runner.calls)
+            assertEquals(null, runner.lastEnv)
+        } finally {
+            trusted.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun intermediateParentWritable_rejected() {
+        val trusted = tempDir("s5-inter")
+        try {
+            val sub = File(trusted, "sub").apply { mkdir() }
+            val target = executable(sub, "ls")
+            val trustedReal = trusted.canonicalPath
+            val subReal = sub.canonicalPath
+            val roots = listOf(trustedReal)
+            // sub 可寫、trusted 本體乾淨：中間層即拒。
+            val splitSub: (java.nio.file.Path) -> Boolean = { p ->
+                val s = p.toString()
+                s == subReal || s.startsWith("$subReal/")
+            }
+            assertNull(
+                ShellExecutables.verifiedTarget(
+                    File(sub, "ls").absolutePath,
+                    allowedRoots = roots,
+                    isWritable = splitSub,
+                    entryRoot = trusted.absolutePath,
+                ),
+            )
+            // 對照：全乾淨即放行（entry chain 含中間層全綠）。
+            val ok = ShellExecutables.verifiedTarget(
+                File(sub, "ls").absolutePath,
+                allowedRoots = roots,
+                isWritable = systemOwned,
+                entryRoot = trusted.absolutePath,
+            )!!
+            assertEquals(target.canonicalPath, ok)
+            // 非所屬 entryRoot 即 fail-closed（candidate 不在其下）。
+            assertNull(
+                ShellExecutables.verifiedTarget(
+                    target.absolutePath,
+                    allowedRoots = roots,
+                    isWritable = systemOwned,
+                    entryRoot = "/nonexistent-xyz-123",
+                ),
+            )
+        } finally {
+            trusted.deleteRecursively()
+        }
+    }
+
+    @Test fun writableSearchDir_poisonEntireTable() {
+        val writableEmpty = tempDir("s5-poison-w")
+        val clean = tempDir("s5-poison-c")
+        try {
+            val tool = executable(clean, "ls")
+            val cleanReal = clean.canonicalPath
+            val writableReal = writableEmpty.canonicalPath
+            val roots = listOf(cleanReal)
+            // writableEmpty 可寫、clean 全乾淨：tool 只在 clean 內，
+            // 但整表仍拒（fail-closed，不跳過可寫表項去用乾淨表項）。
+            val split: (java.nio.file.Path) -> Boolean = { p ->
+                val s = p.toString()
+                s == writableReal || s.startsWith("$writableReal/")
+            }
+            assertNull(
+                ShellExecutables.resolve(
+                    "ls",
+                    listOf(writableEmpty.absolutePath, clean.absolutePath),
+                    allowedRoots = roots,
+                    isWritable = split,
+                ),
+            )
+            // 絕對形同樣整表拒（落點在乾淨表項亦拒）。
+            assertNull(
+                ShellExecutables.resolve(
+                    "${clean.absolutePath}/ls",
+                    listOf(writableEmpty.absolutePath, clean.absolutePath),
+                    allowedRoots = roots,
+                    isWritable = split,
+                ),
+            )
+            // 對照：單用乾淨表項即放行。
+            val ok = ShellExecutables.resolve(
+                "ls",
+                listOf(clean.absolutePath),
+                allowedRoots = roots,
+                isWritable = split,
+            )!!
+            assertEquals(tool.canonicalPath, ok.path)
+        } finally {
+            writableEmpty.deleteRecursively()
+            clean.deleteRecursively()
+        }
+    }
+
+    @Test fun entryJudgeThrows_failClosed() {
+        val trusted = tempDir("s5-throw")
+        val sysbin = tempDir("s5-throw-sys")
+        try {
+            val target = executable(sysbin, "sh")
+            Files.createSymbolicLink(File(trusted, "ls").toPath(), target.toPath())
+            val trustedReal = trusted.canonicalPath
+            val sysbinReal = sysbin.canonicalPath
+            val roots = listOf(trustedReal, sysbinReal)
+            // 僅 candidate 本體拋異常（searchDir 本體乾淨使表守衛通過，
+            // real 側乾淨使 real 閘通過）：entry 閘 fail-closed 即拒。
+            val throwOnEntry: (java.nio.file.Path) -> Boolean = { p ->
+                if (p.toString().endsWith("/ls")) throw IllegalStateException("entry judge blew up")
+                false
+            }
+            assertNull(
+                ShellExecutables.resolve(
+                    "ls",
+                    listOf(trusted.absolutePath),
+                    allowedRoots = roots,
+                    isWritable = throwOnEntry,
+                ),
+            )
+            assertNull(
+                ShellExecutables.resolve(
+                    "${trusted.absolutePath}/ls",
+                    listOf(trusted.absolutePath),
+                    allowedRoots = roots,
+                    isWritable = throwOnEntry,
+                ),
+            )
+            // 全拋即全拒（表守衛／real 閘／entry 閘皆 fail-closed）。
+            assertNull(
+                ShellExecutables.resolve(
+                    "ls",
+                    listOf(trusted.absolutePath),
+                    allowedRoots = roots,
+                    isWritable = { throw IllegalStateException("fs owner query blew up") },
+                ),
+            )
+        } finally {
+            trusted.deleteRecursively()
+            sysbin.deleteRecursively()
+        }
+    }
+
+    // ---- S5 正例鎖：entry 全乾淨時 multicall／APEX 形／usr 合併形放行 ----
+
+    @Test fun protectedToyboxLinks_entryClean_stillMulticall() {
+        val bin = multicallDir()
+        val scope = tempDir("s5-mcb-scope")
+        try {
+            val toyboxReal = File(bin, "toybox").canonicalPath
+            // resolve 層：bare／絕對皆放行 + [real, applet] 形狀。
+            val bare = ShellExecutables.resolve("ls", listOf(bin.absolutePath), isWritable = systemOwned)!!
+            assertEquals(toyboxReal, bare.path)
+            assertEquals("ls", bare.applet)
+            val abs = ShellExecutables.resolve(
+                "${bin.absolutePath}/ls",
+                listOf(bin.absolutePath),
+                isWritable = systemOwned,
+            )!!
+            assertEquals(toyboxReal, abs.path)
+            assertEquals("ls", abs.applet)
+            // 全鏈 spawn 形狀：[real, applet, ...args]。
+            for (argv in listOf(
+                listOf("ls", "-l"),
+                listOf("${bin.absolutePath}/ls", "-l"),
+            )) {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(bin.absolutePath),
+                    execIsWritable = systemOwned,
+                )
+                val r = shell.execute(argv)
+                assertTrue("$argv -> $r", r is ShellResult.Ok)
+                assertEquals("$argv", listOf(toyboxReal, "ls", "-l"), runner.lastArgv)
+                assertEquals(ShellExecutables.CLEAN_ENV, runner.lastEnv)
+            }
+        } finally {
+            bin.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun apexShape_entryClean_realViaPrefix_allowed() {
+        // 詞法接線：快照恆含 /apex，落在其下的 real 過 containment。
+        val snap = ShellExecutables.snapshotRealRoots(listOf("/system/bin"))
+        assertTrue("snapshot=$snap", snap.contains("/apex"))
+        assertTrue(ShellExecutables.isUnderRoots("/apex/com.android.runtime/bin/ls", snap))
+        // 解析形狀：entry 乾淨、real 乾淨但在 searchDir 外（模擬 APEX 落點），
+        // 允許集覆蓋兩側即放行；異名（ls -> tool，非 multicall）不插入 applet。
+        val trusted = tempDir("s5-apex-e")
+        val apexFake = tempDir("s5-apex-r")
+        try {
+            val realTool = executable(apexFake, "tool")
+            Files.createSymbolicLink(File(trusted, "ls").toPath(), realTool.toPath())
+            val roots = listOf(trusted.canonicalPath, apexFake.canonicalPath)
+            val hit = ShellExecutables.resolve(
+                "ls",
+                listOf(trusted.absolutePath),
+                allowedRoots = roots,
+                isWritable = systemOwned,
+            )!!
+            assertEquals(realTool.canonicalPath, hit.path)
+            assertNull(hit.applet)
+            val hitAbs = ShellExecutables.resolve(
+                "${trusted.absolutePath}/ls",
+                listOf(trusted.absolutePath),
+                allowedRoots = roots,
+                isWritable = systemOwned,
+            )!!
+            assertEquals(realTool.canonicalPath, hitAbs.path)
+            assertNull(hitAbs.applet)
+        } finally {
+            trusted.deleteRecursively()
+            apexFake.deleteRecursively()
         }
     }
 }

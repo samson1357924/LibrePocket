@@ -28,6 +28,23 @@ import java.nio.file.Paths
  *   （經 [defaultIsWritable]，即 `Files.isWritable`；任何異常視為可寫而拒，
  *   fail-closed；`getOwner`/POSIX 在部分 FS 會拋異常故不用）。
  *   dangling / 環 / 非正規檔 / 不可執行 / 逃逸 / 可寫一律拒。
+ * - entry-side 閘（re-review Finding A，S5）：[verifiedTarget] 另查 lexical
+ *   entry chain —— candidate 本體及其 lexical parent chain「向上至所屬 searchDir
+ *  （含量 searchDir 本體）」對 App uid 必須不可寫（同一 [isWritable] 注入判定，
+ *   判定拋異常視為可寫而拒，fail-closed，保持 hermetic 可測）。上界走到所屬
+ *   searchDir 即停，不走到 FS 根（否則 host fixture 的 `/tmp` 可寫必殺一切）。
+ *   可寫 searchDir 內放 `ls -> /system/bin/sh`（real 乾淨但非 allowlisted）即拒，
+ *   阻斷「allowlisted `ls` 落地非 allowlisted `sh`」的 spawn。searchDir 本身若為
+ *   symlink（如 `/bin -> usr/bin`），所屬比對與停止條件用 real 化後路徑
+ *   （lexical 相等或 real 相等即停；既有 usrMergeShape 正例保持綠）。
+ *   toybox 合法形（entry != real）在 entry chain 全乾淨時放行不受影響；
+ *   絕對 `argv[0]` 形走同一 [verifiedTarget] 同一閘，不分叉。
+ * - searchDir 本體守衛（S5，部署前提的 runtime 守衛）：[resolve] 入口驗
+ *   `searchDirs`（real 化後）本體不可寫；任一可寫／判定異常／非法即整表拒
+ *   （fail-closed，可回報擴表）。生產系統目錄對 App 恆不可寫，此守衛只是把
+ *   部署假設變成執行時檢查；exotic ROM（合法二進位落在快照 + 前綴外，或系統
+ *   目錄可寫）降級為拒（安全但誤殺，須回報擴表，不得放寬）。只驗本體，不走
+ *   parent chain（否則 host `/tmp` 可寫必殺一切，與 entry 閘上界同理）。
  * - multicall（toybox / toolbox / busybox，見 [MULTICALL_BINARIES]）：實體
  *   basename 落此顯式表時，spawn 形狀為 `[realPath, applet, ...args]`——
  *   applet 取自 `argv[0]` 的 basename（[ShellPolicy.basename]），其值已由
@@ -41,8 +58,12 @@ import java.nio.file.Paths
  *   check-then-act 窗口仍在：驗證通過到 spawn 前的二進位替換 / link 置換仍可能發生。
  *   直接通道沒有可持的容器鎖（不像 scoped-file 可持 fd/lock 語義），spawn 前緊貼重驗
  *   最多縮小窗口、不能消除。舊註解「可信目錄 root-owned、App 不可寫故無 TOCTOU」
- *   只是部署假設而非驗證事實：「不可寫」現已改為執行時檢查（writability 閘），但
- *   擁有者語義在部分 FS 不可靠、窗口仍在，故仍列殘餘風險。
+ *   只是部署假設而非驗證事實：「不可寫」現已改為執行時檢查（real 閘 + S5 entry 閘
+ *   + searchDir 本體守衛），但擁有者語義在部分 FS 不可靠、窗口仍在，故仍列殘餘風險。
+ *   S5 entry 閘範圍一併揭露：覆 lexical entry chain（含 candidate 本體至所屬
+ *   searchDir）+ real chain（real 本體至 FS 根）；兩者之間的「中間層 link 置換」
+ *   （entry 下的子目錄 symlink 在驗證與 spawn 間被換指，或 parent  component 在
+ *   lexical 正規化後、real 固定前被置換）仍在窗口內，不能消除。
  * - 已知限制（fail-closed 可能誤殺）：real 前綴快照無法窮舉所有裝置的 overlay /
  *   APEX 實體路徑；落在快照 + [SYSTEM_REAL_PREFIXES] 之外的合法系統二進位會被拒
  *   （安全但可能誤殺 exotic ROM）。如遇此類裝置應回報並擴表，不得放寬為無 containment。
@@ -240,22 +261,118 @@ object ShellExecutables {
     }
 
     /**
+     * S5 entry-side 閘本體：lexical candidate 本體及其 parent chain「向上至所屬
+     * searchDir（含本體）」是否全不可寫。任一層 [isWritable] 回 true 即回 false
+     * （拒）；判定抛異常視為可寫（fail-closed）。上界走到 [entryRootNorm] 即停
+     * （含本體），不走到 FS 根；candidate 非所屬（lexical 非 `==`／`root/…` 且
+     * real 回退亦非所屬）即回 false（fail-closed）。
+     *
+     * searchDir 本身若為 symlink（如 `/bin -> usr/bin`）：停止條件用 real 化後
+     * 比對（lexical 相等或任一層 real 等於 entry real 即停），既有 usrMergeShape
+     * 正例保持綠。檢查本身走 lexical 路徑（[isWritable] 預設真查跟隨 link，
+     * 與 real 檢查等效；注入判定保持 hermetic）。
+     */
+    private fun entryChainNonWritable(
+        candidateNorm: String,
+        entryRootNorm: String,
+        isWritable: (Path) -> Boolean,
+    ): Boolean {
+        return try {
+            if (candidateNorm.isEmpty() || candidateNorm.contains('\u0000')) return false
+            if (entryRootNorm.isEmpty() || entryRootNorm.contains('\u0000')) return false
+            if (!candidateNorm.startsWith("/")) return false
+            if (!entryRootNorm.startsWith("/")) return false
+            val entryTrimmed = entryRootNorm.trimEnd('/')
+            val entryKey = entryTrimmed.ifEmpty { "/" }
+            // 所屬預檢（fail-closed）：lexical 含 real 回退。
+            val lexicalOwned =
+                candidateNorm == entryRootNorm || candidateNorm.startsWith("$entryKey/")
+            var realOwned = false
+            val entryRealNorm: String? = try {
+                val erp = Paths.get(entryRootNorm)
+                if (Files.exists(erp)) erp.toRealPath().toString() else null
+            } catch (_: Exception) {
+                null
+            }
+            if (!lexicalOwned && entryRealNorm != null) {
+                val parentLex = try {
+                    Paths.get(candidateNorm).parent?.toString()
+                } catch (_: Exception) {
+                    null
+                }
+                if (parentLex != null) {
+                    val parentReal: String? = try {
+                        val pp = Paths.get(FileScope.normalize(parentLex))
+                        if (Files.exists(pp)) pp.toRealPath().toString() else null
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (parentReal != null) {
+                        val entryRealKey = entryRealNorm.trimEnd('/').ifEmpty { "/" }
+                        realOwned =
+                            parentReal == entryRealNorm || parentReal.startsWith("$entryRealKey/")
+                    }
+                }
+            }
+            if (!lexicalOwned && !realOwned) return false
+            // 由 candidate 向上逐層檢查，至 entryRoot（含）即停。
+            var curNorm: String? = candidateNorm
+            var steps = 0
+            while (curNorm != null) {
+                if (steps++ > 256) return false
+                val w = try {
+                    isWritable(Paths.get(curNorm))
+                } catch (_: Exception) {
+                    true
+                }
+                if (w) return false
+                if (curNorm == entryRootNorm) return true
+                if (entryRealNorm != null) {
+                    val curReal: String? = try {
+                        val cp = Paths.get(curNorm)
+                        if (Files.exists(cp)) cp.toRealPath().toString() else null
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (curReal != null && curReal == entryRealNorm) return true
+                }
+                val parent = try {
+                    Paths.get(curNorm).parent?.toString()
+                } catch (_: Exception) {
+                    null
+                }
+                curNorm = if (parent == null) null else FileScope.normalize(parent)
+            }
+            false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
      * 實體驗證：存在 → `toRealPath()` 全解析固定 → NOFOLLOW 驗正規檔 + 可執行 →
-     * containment（real 落在 [allowedRoots] 內）→ writability（real 本體及
-     * parent chain 對 App uid 不可寫），回傳固定後的實體路徑（spawn 直接用此
-     * 路徑，不再經 link）。dangling / 環 / 指向非正規檔 / 不可執行 / 逃逸 /
-     * 可寫 / 任何異常一律 null。
+     * containment（real 落在 [allowedRoots] 內）→ real writability（real 本體及
+     * parent chain 對 App uid 不可寫）→ S5 entry 閘（[entryRoot] 非 null 時，
+     * lexical candidate 本體及 parent chain 向上至所屬 searchDir 含本體不可寫），
+     * 回傳固定後的實體路徑（spawn 直接用此路徑，不再經 link）。dangling / 環 /
+     * 指向非正規檔 / 不可執行 / 逃逸 / 可寫（任一閘）/ 任何異常一律 null。
      *
      * @param allowedRoots containment 前綴；null 表跳過 containment（僅既有直接
      *   呼叫相容用；[resolve] 一律傳非 null，生產路徑必查）。單測可注入暫存
      *   目錄快照；產品碼經 [resolve] 預設即快照（見 [snapshotRealRoots]）。
      * @param isWritable app-uid 可寫判定（預設 [defaultIsWritable] 真查 FS；
      *   單測可注入以模擬系統自帶不可寫）。
+     * @param entryRoot 所屬 searchDir（lexical 正規化形；[resolve] 的 bare 傳當輪
+     *   `dirNorm`，絕對 `argv[0]` 傳其 lexical parent）。非 null 即加驗 entry chain
+     *   （含 searchDir 本體，上界即停，不走 FS 根）；null 表跳過 entry 閘（僅既有
+     *   直接呼叫相容用；生產一律經 [resolve] 傳非 null，必查）。bare 與絕對同閘，
+     *   不分叉。
      */
     fun verifiedTarget(
         candidate: String,
         allowedRoots: List<String>? = null,
         isWritable: (Path) -> Boolean = ::defaultIsWritable,
+        entryRoot: String? = null,
     ): String? {
         return try {
             val p = Paths.get(candidate)
@@ -265,6 +382,17 @@ object ShellExecutables {
             if (!Files.isExecutable(real)) return null
             if (allowedRoots != null && !isUnderRoots(real.toString(), allowedRoots)) return null
             if (!chainNonWritable(real, isWritable)) return null
+            if (entryRoot != null) {
+                val entryNorm = try {
+                    FileScope.normalize(entryRoot.trim())
+                } catch (_: Exception) {
+                    return null
+                }
+                if (entryNorm.isEmpty() || entryNorm.contains('\u0000')) return null
+                if (!entryChainNonWritable(FileScope.normalize(candidate), entryNorm, isWritable)) {
+                    return null
+                }
+            }
             real.toString()
         } catch (_: Exception) {
             null
@@ -276,13 +404,18 @@ object ShellExecutables {
      *
      * - 含 `/`/`\`：父目錄必須先過詞法可信門（預設 [TRUSTED_BIN_DIRS]，
      *   經 [searchDirs] 覆寫，見下），再經 [verifiedTarget] 實體驗證
-     *   （含 containment + writability 閘，允許集見下）；
+     *   （含 containment + real writability + S5 entry 閘，允許集見下，
+     *   entryRoot 取 lexical parent；bare 與絕對同閘不分叉）；
      *   相對含 `/`（`./ls`、`chat/ls`）一律 null。
      * - bare：只在 [searchDirs]（預設 [TRUSTED_BIN_DIRS]，固定順序）內找；
-     *   候選必須仍落在該 dir 下。呼叫方不得傳入非受控目錄（產品碼一律用預設值；
-     *   單測可注入暫存目錄；絕對 `argv[0]` 的詞法門同表覆寫，使絕對路徑的
-     *   全鏈（validate → resolve → spawn）可在暫存 fixture 下受測，
-     *   而不必寫入系統目錄）。
+     *   候選必須仍落在該 dir 下（當輪 `dirNorm` 即 entryRoot）。呼叫方不得傳入
+     *   非受控目錄（產品碼一律用預設值；單測可注入暫存目錄；絕對 `argv[0]` 的
+     *   詞法門同表覆寫，使絕對路徑的全鏈（validate → resolve → spawn）可在暫存
+     *   fixture 下受測，而不必寫入系統目錄）。
+     * - searchDir 本體守衛（S5，部署前提的 runtime 守衛）：入口先驗 `searchDirs`
+     *  （real 化後）本體不可寫；任一可寫／判定異常／非法即整表拒（fail-closed，
+     *   可回報擴表；只驗本體，不走 parent chain，否則 host `/tmp` 可寫必殺一切）。
+     *   生產系統目錄對 App 恆不可寫；exotic ROM 降級為拒，須回報擴表、不得放寬。
      * - containment 允許集：[allowedRoots] 非 null 即用（單測注入）；
      *   null 時由 [snapshotRealRoots]（[searchDirs] real 化 + [SYSTEM_REAL_PREFIXES]）
      *   現場快照。bare 與絕對 `argv[0]` 同表（S2「放行即能解析」不變）。
@@ -290,8 +423,9 @@ object ShellExecutables {
      *   以模擬系統自帶不可寫，宿主暫存檔屬主可寫故直接用預設值會全拒）。
      * - multicall：實體 basename ∈ [MULTICALL_BINARIES] 時回 [ResolvedExec]
      *   攜 `applet = argv[0]` 的 basename（呼叫方須先經 [ShellPolicy.validate]
-     *   白名單放行，本函數不管白名單；multicall 不豁免 containment/writability，
-     *   逃逸照拒）；其餘回 `applet = null`。
+     *   白名單放行，本函數不管白名單；multicall 不豁免 containment/writability/
+     *   entry 閘，逃逸或 entry 可寫照拒；entry 全乾淨時合法形放行不受影響）；
+     *   其餘回 `applet = null`。
      * - 本函數不管白名單（由 [ShellPolicy.validate] 先判）；回 null 呼叫方必須
      *   拒絕且不建子進程。
      */
@@ -304,9 +438,36 @@ object ShellExecutables {
         val raw = argv0.trim()
         if (raw.isEmpty() || raw.contains('\u0000')) return null
         val roots = allowedRoots ?: snapshotRealRoots(searchDirs)
+        // S5 searchDir 本體守衛：逐一 real 化後驗本體不可寫；任一可寫／異常／
+        // 非法即整表拒（fail-closed）。只驗本體，不走 parent chain。
+        for (dir in searchDirs) {
+            val t = dir.trim()
+            if (t.isEmpty() || t.contains('\u0000')) return null
+            val normDir = try {
+                FileScope.normalize(t)
+            } catch (_: Exception) {
+                return null
+            }
+            val realDir: Path = try {
+                val p = Paths.get(normDir)
+                if (Files.exists(p)) p.toRealPath() else p
+            } catch (_: Exception) {
+                return null
+            }
+            val w = try {
+                isWritable(realDir)
+            } catch (_: Exception) {
+                true
+            }
+            if (w) return null
+        }
         if (raw.contains('/') || raw.contains('\\')) {
             if (!isTrustedAbsoluteArgv0(raw, searchDirs)) return null
-            val real = verifiedTarget(FileScope.normalize(raw), roots, isWritable) ?: return null
+            val normRaw = FileScope.normalize(raw)
+            val slash = normRaw.lastIndexOf('/')
+            if (slash < 0) return null
+            val parentNorm = normRaw.substring(0, slash).ifEmpty { "/" }
+            val real = verifiedTarget(normRaw, roots, isWritable, parentNorm) ?: return null
             return toResolved(raw, real)
         }
         for (dir in searchDirs) {
@@ -316,7 +477,7 @@ object ShellExecutables {
             } ?: continue
             val candidate = FileScope.normalize("$dirNorm/$raw")
             if (candidate == dirNorm || !candidate.startsWith("$dirNorm/")) continue
-            val hit = verifiedTarget(candidate, roots, isWritable) ?: continue
+            val hit = verifiedTarget(candidate, roots, isWritable, dirNorm) ?: continue
             return toResolved(raw, hit)
         }
         return null

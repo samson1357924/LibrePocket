@@ -50,6 +50,12 @@ export interface OrchestratorOptions {
   env?: OpenAIEnvironment;
   promptDirectory?: string;
   allowedOrigins?: string[];
+  // Phase 3 (P2 #3): per-chunk timeout passthrough (fail-closed). When set,
+  // forwarded to every sendOpenAISingleTurn role call so slow roles abort via
+  // the transport timeout instead of hanging the chunk wave. Omitted keeps
+  // the send default (420s). Must be >0 when provided; invalid values throw
+  // fail-closed (zero AI) via the send path.
+  timeoutMs?: number;
 }
 
 const ROLES: readonly OpenAIModelRole[] = ['chief', 'android_sec', 'android_code'];
@@ -201,6 +207,10 @@ export interface TriageIssueOptions {
   env?: OpenAIEnvironment;
   promptDirectory?: string;
   allowedOrigins?: string[];
+  // Phase 3 (P2 #3): timeout passthrough for symmetry (issue chunks stay
+  // sequential; PR chunks use OrchestratorOptions.timeoutMs). Omitted keeps
+  // the send default.
+  timeoutMs?: number;
 }
 
 // S4 issue execution (minimal): a single chief-role turn over the issue
@@ -236,6 +246,7 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
       maxOutputTokens: 1024,
       allowedOrigins: options.allowedOrigins,
       env,
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     });
     const parsed = parseJsonObject(result.content);
     if (
@@ -339,6 +350,7 @@ export async function orchestrateReview(options: OrchestratorOptions): Promise<O
         userPrompt: roleUserPrompt(role, options.changedFiles, options.diff, coverage),
         allowedOrigins: options.allowedOrigins,
         env,
+        ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       });
       return parseRoleResponse(role, result.modelId, result.content);
     } catch {

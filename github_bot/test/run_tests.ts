@@ -8,6 +8,7 @@ import { runMergeBaseTests } from './merge_base.test';
 import { runStage4P2Tests } from './stage4_p2.test';
 import { runPhase2HTests } from './phase2_h.test';
 import { runPrChunksTests } from './pr_chunks.test';
+import { runPrPhase3Tests } from './pr_phase3.test';
 
 runLabelManagerTests()
   .then(() => runScannerSendOpenAITests())
@@ -21,6 +22,7 @@ runLabelManagerTests()
   .then(() => runStage4P2Tests())
   .then(() => runPhase2HTests())
   .then(() => runPrChunksTests())
+  .then(() => runPrPhase3Tests())
   .catch((error: unknown) => {
     console.error(error);
     process.exitCode = 1;

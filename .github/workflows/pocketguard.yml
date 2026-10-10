@@ -99,6 +99,13 @@ jobs:
     # no OpenAI secrets and never checks out fork code: the checkout stays
     # on the default branch for the bot code only, and the head SHA is
     # pinned via a trusted pulls.get read.
+    # Phase 3 (P2 #3) claim budget: the TS pre-flight estimates chunkCount via
+    # the read-only diff (collectFileDiffs plus MAX_PR_CHUNK_LENGTH partition)
+    # and refuses when waves x timeout cannot fit the review deadline
+    # (POCKETGUARD_REVIEW_DEADLINE_MS, default 20min minus margin; per-chunk
+    # share below the viable minimum claims nothing with zero writes, never
+    # occupying a slot). A granted claim whose later review times out still
+    # holds its slot (never refunded).
     if: >-
       (needs.prepare-tag.outputs.target == 'pull-request' &&
       needs.prepare-tag.outputs.should_review == 'true' &&
@@ -175,6 +182,17 @@ jobs:
     # (needs.claim-slot.outputs.claimed == 'true'); without its own approved
     # claim the run makes zero OpenAI calls. The claim-slot job is a no-op
     # success for issues, so the issue-auto route needs no claimed check.
+    # Phase 3 (P2 #3) N-chunk safety: the TS review runs chunked PR diffs
+    # under t0 + POCKETGUARD_REVIEW_DEADLINE_MS (default 20min minus 60s
+    # margin for artifact/upload, matching this job's timeout-minutes: 20)
+    # with fixed concurrency 2, per-wave need estimation (remaining < need
+    # exits early fail-closed), per-chunk timeoutMs passthrough min(420s,
+    # remaining/remainingWaves, optional POCKETGUARD_CHUNK_TIMEOUT_MS
+    # override for tests), and a computed chunkCoverageComplete (any
+    # transport/timeout/deadline INCONCLUSIVE forces false; publish gates on
+    # true). Deadline exits save INCONCLUSIVE + false artifacts (checkpoint)
+    # with completed reports plus omission placeholders, never true and never
+    # silent.
     if: >-
       (needs.prepare-tag.outputs.target == 'pull-request' &&
       needs.prepare-tag.outputs.should_review == 'true' &&

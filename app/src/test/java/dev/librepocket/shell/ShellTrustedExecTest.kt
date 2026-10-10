@@ -20,6 +20,10 @@ import org.junit.Test
  *   dangling / 環 / 非正規檔 / 不可執行一律拒；
  * - 操作數 schema（`--opt=value`、短旗標合併、值槽、pattern 槽）維持既有嚴格語義；
  * - null 作用域的隱式 cwd bare fail-closed，且放行者 spawn 仍是固定路徑 + 乾淨 env；
+ * - multicall（toybox/toolbox/busybox）：實體 basename 落顯式表時 spawn 還原
+ *   applet（`[real, applet, ...]`），bare/絕對 `argv[0]` 全鏈覆蓋 + 真跑 e2e；
+ *   舊形狀（無 applet）負向對照證非 vacuous；非表內（正規檔/同名 link/
+ *   版本化名）維持無插入；
  * - `env == null` 不再繼承宿主（真實 runner 回落 [ShellExecutables.CLEAN_ENV]）。
  */
 class ShellTrustedExecTest {
@@ -72,7 +76,7 @@ class ShellTrustedExecTest {
             val shell = RestrictedShell(
                 runner = runner,
                 privateRoot = privateRoot,
-                execResolver = { resolves++; "/should-never-be-used/$it" },
+                execResolver = { resolves++; ShellExecutables.ResolvedExec("/should-never-be-used/$it", null) },
             )
             val r = shell.execute(argv)
             assertTrue("$argv -> $r", r is ShellResult.Denied)
@@ -167,7 +171,7 @@ class ShellTrustedExecTest {
                 executable(okDir, "mybin")
                 assertEquals(
                     File(okDir, "mybin").canonicalPath,
-                    ShellExecutables.resolve("mybin", listOf(emptyDir.absolutePath, okDir.absolutePath)),
+                    ShellExecutables.resolve("mybin", listOf(emptyDir.absolutePath, okDir.absolutePath))?.path,
                 )
                 assertNull(ShellExecutables.resolve("mybin", listOf(emptyDir.absolutePath)))
                 assertNull(ShellExecutables.resolve("dangling", listOf(dir.absolutePath)))
@@ -189,8 +193,8 @@ class ShellTrustedExecTest {
         try {
             val scopePath = scope.absolutePath
             val absFile = "$scopePath/x.txt"
-            val stub: (String) -> String? = { raw ->
-                if ('/' in raw || '\\' in raw) null else "/trusted/$raw"
+            val stub: (String) -> ShellExecutables.ResolvedExec? = { raw ->
+                if ('/' in raw || '\\' in raw) null else ShellExecutables.ResolvedExec("/trusted/$raw", null)
             }
             fun exec(argv: List<String>): Pair<ShellResult, CapRunner> {
                 val runner = CapRunner()
@@ -232,7 +236,7 @@ class ShellTrustedExecTest {
 
     @Test fun nullScope_bareDoesNotEscape() {
         var resolves = 0
-        val stub: (String) -> String? = { resolves++; "/trusted/$it" }
+        val stub: (String) -> ShellExecutables.ResolvedExec? = { resolves++; ShellExecutables.ResolvedExec("/trusted/$it", null) }
         // 隱式讀 cwd 的 bare 在 null 作用域 fail-closed：零解析、零 spawn。
         for (argv in listOf(
             listOf("ls"),
@@ -266,7 +270,7 @@ class ShellTrustedExecTest {
             val shell = RestrictedShell(
                 runner = runner,
                 privateRoot = scope.absolutePath,
-                execResolver = { "/trusted/$it" },
+                execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
             )
             val r = shell.execute(listOf("echo", "hi"))
             assertTrue("$r", r is ShellResult.Ok)
@@ -295,7 +299,7 @@ class ShellTrustedExecTest {
                 quota = ShellQuota(maxCalls = 1, windowMs = 60_000L),
                 runner = runner,
                 privateRoot = scope.absolutePath,
-                execResolver = { if (failNext) null else "/trusted/$it" },
+                execResolver = { if (failNext) null else ShellExecutables.ResolvedExec("/trusted/$it", null) },
             )
             val denied = shell.execute(listOf("echo", "hi"))
             assertTrue("$denied", denied is ShellResult.Denied)
@@ -338,6 +342,244 @@ class ShellTrustedExecTest {
             fail("expected IllegalStateException for non-dir cwd")
         } catch (e: IllegalStateException) {
             assertTrue(e.message!!.contains("/nonexistent-dir-xyz-123"))
+        }
+    }
+
+    // ---- multicall（toybox/toolbox/busybox）：spawn 還原 applet ----
+    //
+    // 生產預設路徑（validate → 預設解析 → spawn）全鏈直測，不用假映射：
+    // execSearchDirs 注入暫存 fixture（validate 詞法門與 resolve 同表），
+    // 解析一律走真實 ShellExecutables.resolve。
+
+    /** toybox multicall fixture：零宿主委派（不找系統 cat/ls/echo）。 */
+    private val toyboxScript: String = """
+        #!/bin/sh
+        # 被呼叫名是 toybox 本體時取 ${'$'}1 為 applet，否則取 basename(${'$'}0)；
+        # 只實作 echo/ls/cat 最小語義，未知 applet 即 stderr + exit 1
+        #（模擬真機 `toybox -l` 的 unknown-applet 失敗）。
+        self=${'$'}{0##*/}
+        if [ "${'$'}self" = "toybox" ]; then
+          if [ ${'$'}# -eq 0 ]; then echo "toybox: no applet" >&2; exit 1; fi
+          applet=${'$'}1; shift
+        else
+          applet="${'$'}self"
+        fi
+        case "${'$'}applet" in
+          echo) echo "${'$'}@" ;;
+          ls) printf 'total 0\n-rwxr-xr-x 1 root root 8 Jan  1  1970 toybox\n' ;;
+          cat) for f in "${'$'}@"; do while IFS= read -r line || [ -n "${'$'}line" ]; do printf '%s\n' "${'$'}line"; done < "${'$'}f"; done ;;
+          *) echo "toybox: unknown applet: ${'$'}applet" >&2; exit 1 ;;
+        esac
+    """.trimIndent()
+
+    private val toyboxLsOut = "total 0\n-rwxr-xr-x 1 root root 8 Jan  1  1970 toybox\n"
+
+    /** fixture：`toybox` 可執行腳本 + `ls/echo/cat` symlinks，全部同目錄。 */
+    private fun multicallDir(): File {
+        val bin = tempDir("mcb-bin")
+        val toybox = File(bin, "toybox")
+        toybox.writeText(toyboxScript)
+        assertTrue("setExecutable failed for $toybox", toybox.setExecutable(true))
+        for (applet in listOf("ls", "echo", "cat")) {
+            Files.createSymbolicLink(File(bin, applet).toPath(), toybox.toPath())
+        }
+        return bin
+    }
+
+    @Test fun multicall_bareSpawnShape_insertsApplet() {
+        val bin = multicallDir()
+        val scope = tempDir("mcb-scope")
+        try {
+            val toyboxReal = File(bin, "toybox").canonicalPath
+            val input = File(scope, "in.txt").apply { writeText("hello\n") }
+            // resolve 層：實體落表即攜 applet（取自 argv[0] basename）。
+            val bare = ShellExecutables.resolve("ls", listOf(bin.absolutePath))!!
+            assertEquals(toyboxReal, bare.path)
+            assertEquals("ls", bare.applet)
+            // 全鏈 spawn 形狀：[real, applet, ...args]。
+            val cases = listOf(
+                listOf("ls", "-l") to listOf(toyboxReal, "ls", "-l"),
+                listOf("echo", "hi") to listOf(toyboxReal, "echo", "hi"),
+                listOf("cat", input.absolutePath) to
+                    listOf(toyboxReal, "cat", input.absolutePath),
+            )
+            for ((argv, expected) in cases) {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(bin.absolutePath),
+                )
+                val r = shell.execute(argv)
+                assertTrue("$argv -> $r", r is ShellResult.Ok)
+                assertEquals("$argv", expected, runner.lastArgv)
+                assertEquals(ShellExecutables.CLEAN_ENV, runner.lastEnv)
+            }
+        } finally {
+            bin.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun multicall_absoluteSpawnShape_insertsApplet() {
+        val bin = multicallDir()
+        val scope = tempDir("mcb-scope")
+        try {
+            val toyboxReal = File(bin, "toybox").canonicalPath
+            val input = File(scope, "in.txt").apply { writeText("hello\n") }
+            // resolve 層：絕對 argv[0]（link 路徑）同樣固定實體 + 還原 applet。
+            val abs = ShellExecutables.resolve("${bin.absolutePath}/ls", listOf(bin.absolutePath))!!
+            assertEquals(toyboxReal, abs.path)
+            assertEquals("ls", abs.applet)
+            // 全鏈 spawn 形狀：[real, applet, ...args]（validate 詞法門與
+            // resolve 同用 execSearchDirs，故暫存絕對路徑可全鏈不斷言系統目錄）。
+            val cases = listOf(
+                listOf("${bin.absolutePath}/ls", "-l") to listOf(toyboxReal, "ls", "-l"),
+                listOf("${bin.absolutePath}/echo", "hi") to listOf(toyboxReal, "echo", "hi"),
+                listOf("${bin.absolutePath}/cat", input.absolutePath) to
+                    listOf(toyboxReal, "cat", input.absolutePath),
+            )
+            for ((argv, expected) in cases) {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(bin.absolutePath),
+                )
+                val r = shell.execute(argv)
+                assertTrue("$argv -> $r", r is ShellResult.Ok)
+                assertEquals("$argv", expected, runner.lastArgv)
+                assertEquals(ShellExecutables.CLEAN_ENV, runner.lastEnv)
+            }
+        } finally {
+            bin.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun multicall_endToEnd_defaultRunner() {
+        val bin = multicallDir()
+        val scope = tempDir("mcb-scope")
+        try {
+            val input = File(scope, "in.txt").apply { writeText("hello\n") }
+            // echo/ls/cat × bare/絕對：真跑道、真 fixture，斷言 exit + stdout。
+            val cases = listOf(
+                listOf("echo", "hi") to "hi\n",
+                listOf("ls", "-l") to toyboxLsOut,
+                listOf("cat", input.absolutePath) to "hello\n",
+                listOf("${bin.absolutePath}/echo", "hi") to "hi\n",
+                listOf("${bin.absolutePath}/ls", "-l") to toyboxLsOut,
+                listOf("${bin.absolutePath}/cat", input.absolutePath) to "hello\n",
+            )
+            for ((argv, expected) in cases) {
+                val shell = RestrictedShell(
+                    runner = DefaultProcessRunner(),
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(bin.absolutePath),
+                )
+                val r = shell.execute(argv)
+                assertTrue("$argv -> $r", r is ShellResult.Ok)
+                val ok = r as ShellResult.Ok
+                assertEquals("$argv", 0, ok.exitCode)
+                assertEquals("$argv", expected, ok.stdout)
+            }
+        } finally {
+            bin.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun multicall_oldShapeWithoutApplet_fails() {
+        val bin = multicallDir()
+        try {
+            val toyboxReal = File(bin, "toybox").canonicalPath
+            // 負向對照：舊形狀 [toyboxReal, "-l"]（無 applet）真跑一次，
+            // 必須非零 exit + unknown-applet 錯誤——證正向斷言非 vacuous
+            //（fixture 確實會因缺 applet 而死，新形狀的 applet 不可省）。
+            val raw = DefaultProcessRunner().run(
+                listOf(toyboxReal, "-l"),
+                10_000L,
+                ShellExecutables.CLEAN_ENV,
+            )
+            assertTrue("old shape must fail: exit=${raw.exitCode}", raw.exitCode != 0)
+            assertTrue(
+                "stderr=${String(raw.stderr, Charsets.UTF_8)}",
+                String(raw.stderr, Charsets.UTF_8).contains("unknown applet"),
+            )
+        } finally {
+            bin.deleteRecursively()
+        }
+    }
+
+    @Test fun nonMulticall_noAppletInserted() {
+        val first = tempDir("nm-first")
+        val second = tempDir("nm-second")
+        val scope = tempDir("nm-scope")
+        try {
+            // 正規檔：名為 echo 的普通腳本（實體 basename 不在 multicall 表）。
+            val plain = File(second, "echo")
+            plain.writeText("#!/bin/sh\necho plain\n")
+            assertTrue("setExecutable failed for $plain", plain.setExecutable(true))
+            // 同 basename symlink：first/echo -> second/echo（兩端皆名 echo）。
+            Files.createSymbolicLink(File(first, "echo").toPath(), plain.toPath())
+            val dirs = listOf(first.absolutePath, second.absolutePath)
+            // resolve 層：link 與直找一律 applet == null。
+            val viaLink = ShellExecutables.resolve("echo", dirs)!!
+            assertEquals(plain.canonicalPath, viaLink.path)
+            assertNull(viaLink.applet)
+            val direct = ShellExecutables.resolve("echo", listOf(second.absolutePath))!!
+            assertEquals(plain.canonicalPath, direct.path)
+            assertNull(direct.applet)
+            // 全鏈 spawn 維持 [real, ...args]，不插入。
+            val runner = CapRunner()
+            val shell = RestrictedShell(
+                runner = runner,
+                privateRoot = scope.absolutePath,
+                execSearchDirs = dirs,
+            )
+            val r = shell.execute(listOf("echo", "hi"))
+            assertTrue("$r", r is ShellResult.Ok)
+            assertEquals(listOf(plain.canonicalPath, "hi"), runner.lastArgv)
+            // 真跑：普通腳本確實執行（非 multicall 語義無損）。
+            val real = RestrictedShell(
+                runner = DefaultProcessRunner(),
+                privateRoot = scope.absolutePath,
+                execSearchDirs = dirs,
+            )
+            val e2e = real.execute(listOf("echo", "hi"))
+            assertTrue("$e2e", e2e is ShellResult.Ok)
+            assertEquals("plain\n", (e2e as ShellResult.Ok).stdout)
+        } finally {
+            first.deleteRecursively()
+            second.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun multicallTable_exactMatchOnly() {
+        val dir = tempDir("mcb-table")
+        try {
+            assertEquals(
+                setOf("toybox", "toolbox", "busybox"),
+                ShellExecutables.MULTICALL_BINARIES,
+            )
+            for (name in listOf("toybox", "toolbox", "busybox")) {
+                val f = File(dir, name)
+                f.writeText("#!/bin/sh\necho marker\n")
+                assertTrue("setExecutable failed for $f", f.setExecutable(true))
+                val hit = ShellExecutables.resolve(name, listOf(dir.absolutePath))!!
+                assertEquals("$name", name, hit.applet)
+            }
+            // 版本化／改名／普通二進位不在表：一律無插入（拒「名不同即插」）。
+            for (name in listOf("toybox-arm", "coreutils", "myecho")) {
+                val f = File(dir, name)
+                f.writeText("#!/bin/sh\necho marker\n")
+                assertTrue("setExecutable failed for $f", f.setExecutable(true))
+                val hit = ShellExecutables.resolve(name, listOf(dir.absolutePath))!!
+                assertNull("$name", hit.applet)
+            }
+        } finally {
+            dir.deleteRecursively()
         }
     }
 }

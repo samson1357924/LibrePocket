@@ -25,6 +25,18 @@ data class SessionMeta(
  * Partial-ness is also mirrored in UI memory
  * ([dev.librepocket.chat.UiMessage.isPartial]) and the in-memory INTERRUPTED
  * marks ([dev.librepocket.chat.TurnController.interruptedTranscriptRunIds]).
+ *
+ * Stage C (implemented): [parentRunId] links every attempt-bound assistant
+ * terminal back to its logical turn (`runId=attemptRunId`,
+ * `parentRunId=logicalTurnId`; the first attempt reuses the logical id so its
+ * parent stays null for byte-compat with pre-C rows). [attemptIndex] is the
+ * 0-based attempt number (null for user rows and legacy rows). Retry notices
+ * keep `runId=logicalTurnId`. Persisted as nullable `parentRunId TEXT` /
+ * nullable `attemptIndex INTEGER` via Migration 2→3 (ALTER ADD COLUMN only).
+ * [findDanglingRunIds][dev.librepocket.agent.ui.chat.findDanglingRunIds]
+ * groups by logical family (`parentRunId ?: runId`): any assistant row in the
+ * family (completed or partial-failed, including retried partials) completes
+ * the family, so a retry→success turn is never mis-marked INTERRUPTED.
  */
 data class TranscriptEvent(
     val seq: Long = 0, // DB-assigned; ignored on write
@@ -36,6 +48,8 @@ data class TranscriptEvent(
     val createdAt: Long,
     val isPartial: Boolean = false, // cancelled / failed assistant fragment
     val failureReason: String? = null, // sanitized error for failed rows (redacted on write)
+    val parentRunId: String? = null, // Stage C: logical turn id for attempt assistant terminals; null for user/retry/legacy rows
+    val attemptIndex: Int? = null, // Stage C: 0-based attempt number for attempt rows; null for user/legacy rows
 )
 
 /** Prune knobs (spec §8.3). */

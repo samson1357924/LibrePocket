@@ -5,8 +5,8 @@ package dev.librepocket.chat
  * session-owned [OrderedTranscriptSink] (bounded channel, single writer, core
  * events durably acked), so implementations observe admission order.
  *
- * Core vs notice: [onTurnStarted], [onTurnSucceeded], both [onTurnFailed]
- * overloads and [onTurnCancelled] are durable core events — a store failure
+ * Core vs notice: [onTurnStarted], all [onTurnSucceeded] overloads, all
+ * [onTurnFailed] overloads and all [onTurnCancelled] overloads are durable core events — a store failure
  * propagates so the session writer fails the ack instead of reporting a
  * false durable write. [onTurnRetried], [onSteerQueued], [onToolDone] and
  * [onUsage] stay best-effort notices: failures are swallowed and never
@@ -32,6 +32,24 @@ interface TranscriptSink {
    *   and persist as usual (pre-existing behavior).
    */
   suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean = false)
+  /**
+   * Stage C (implemented): attempt-bound success terminal linked to its
+   * logical turn. [parentRunId] is the logical turn id (null when
+   * `runId` already is the logical id, i.e. the first attempt);
+   * [attemptIndex] is the 0-based attempt number. The default forwards to
+   * the reasoning-aware base form (keeping the marker) so existing fakes keep
+   * compiling; production ([dev.librepocket.chat.TurnController] →
+   * [dev.librepocket.session.SessionTranscriptSink]) always calls this form.
+   */
+  suspend fun onTurnSucceeded(
+    runId: String,
+    text: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean = false,
+  ) {
+    onTurnSucceeded(runId, text, hasReasoning)
+  }
   suspend fun onTurnFailed(runId: String, error: String)
   /**
    * Phase 3 (implemented): terminal failure that keeps BOTH the partial
@@ -48,9 +66,39 @@ interface TranscriptSink {
   suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
     onTurnFailed(runId, error)
   }
+  /**
+   * Stage C (implemented): attempt-bound failure terminal (including retried
+   * partials written before the retry notice) linked to its logical turn.
+   * Same [parentRunId]/[attemptIndex] semantics as the success overload. The
+   * default forwards to the three-arg form so existing fakes keep compiling.
+   */
+  suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) {
+    onTurnFailed(runId, partialText, error)
+  }
   suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long)
   /** Same [hasReasoning] marker contract as [onTurnSucceeded] for partial text. */
   suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean = false)
+  /**
+   * Stage C (implemented): attempt-bound cancel terminal linked to its
+   * logical turn. Same [parentRunId]/[attemptIndex] semantics as above plus
+   * the [hasReasoning] marker contract. The default forwards to the
+   * reasoning-aware base form so existing fakes keep compiling.
+   */
+  suspend fun onTurnCancelled(
+    runId: String,
+    partialText: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean = false,
+  ) {
+    onTurnCancelled(runId, partialText, hasReasoning)
+  }
   suspend fun onSteerQueued(text: String)
 
   /** One tool call finished (P1 records only, never executes). */

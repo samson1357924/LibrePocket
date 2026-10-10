@@ -81,6 +81,8 @@ class ChatSessionFactoryBackfillTest {
         text: String,
         isPartial: Boolean = false,
         failureReason: String? = null,
+        parentRunId: String? = null,
+        attemptIndex: Int? = null,
     ) = TranscriptEvent(
         sessionId = sid,
         runId = runId,
@@ -89,6 +91,8 @@ class ChatSessionFactoryBackfillTest {
         createdAt = 1L,
         isPartial = isPartial,
         failureReason = failureReason,
+        parentRunId = parentRunId,
+        attemptIndex = attemptIndex,
     )
 
     @Test fun danglingRule_marksOnlyUserRowsWithoutTerminal() {
@@ -113,6 +117,105 @@ class ChatSessionFactoryBackfillTest {
 
     @Test fun danglingRule_emptyWhenNothingStranded() {
         assertTrue(findDanglingRunIds(emptyList()).isEmpty())
+    }
+
+    @Test fun danglingRule_stageCFamilyRetrySuccessNotDangling() {
+        val sid = "s"
+        // Retry→success ledger: user(L) + retried partial (runId L, first
+        // attempt reuses the logical id) + retry(L) + success (A2 parent L).
+        val events = listOf(
+            event(sid, "L", "user", "q"),
+            event(sid, "L", "assistant", "half", isPartial = true, failureReason = "boom", attemptIndex = 0),
+            event(sid, "L", "retry", "attempt 1/1 after 0ms"),
+            event(sid, "A2", "assistant", "ok", parentRunId = "L", attemptIndex = 1),
+        )
+        assertTrue(findDanglingRunIds(events).isEmpty())
+    }
+
+    @Test fun danglingRule_stageCFamilyRetryFailureNotDangling() {
+        val sid = "s"
+        val events = listOf(
+            event(sid, "L", "user", "q"),
+            event(sid, "L", "assistant", "half", isPartial = true, failureReason = "boom", attemptIndex = 0),
+            event(sid, "L", "retry", "attempt 1/1 after 0ms"),
+            event(sid, "A2", "assistant", "frag", isPartial = true, failureReason = "boom", parentRunId = "L", attemptIndex = 1),
+        )
+        assertTrue(findDanglingRunIds(events).isEmpty())
+    }
+
+    @Test fun danglingRule_stageCRetryAloneNeverCompletesFamily() {
+        val sid = "s"
+        // A retry notice without any assistant row must still dangle: retry
+        // itself is never terminal (covers a kill between the notice and the
+        // next attempt's terminal).
+        val events = listOf(
+            event(sid, "L", "user", "q"),
+            event(sid, "L", "retry", "attempt 1/3 after 2000ms"),
+        )
+        assertEquals(listOf("L"), findDanglingRunIds(events))
+    }
+
+    private fun interruptedMarkers(store: FakeSessionStore) =
+        store.events.filter { it.kind == INTERRUPTED_MARKER_KIND && it.text.endsWith("interrupted") }
+
+    @Test fun open_stageCRetrySuccessGainsNoMarkerAcrossTwoReopens() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "m")
+        transcripts.appendEvent(event(sid, "L", "user", "q"))
+        transcripts.appendEvent(
+            event(sid, "L", "assistant", "half", isPartial = true, failureReason = "boom", attemptIndex = 0),
+        )
+        transcripts.appendEvent(event(sid, "L", "retry", "attempt 1/1 after 0ms"))
+        transcripts.appendEvent(event(sid, "A2", "assistant", "ok", parentRunId = "L", attemptIndex = 1))
+
+        val factory = factoryWith(transcripts, BackfillFakeProvider {
+            flow { emit(StreamEvent.Done("stop")) }
+        })
+        val first = factory.open(sampleEndpoint(), sid)
+        first.session.close()
+        val second = factory.open(sampleEndpoint(), sid)
+        try {
+            assertTrue(
+                "retry-success family must gain zero INTERRUPTED markers across two reopens, " +
+                    "found: ${interruptedMarkers(transcripts)}",
+                interruptedMarkers(transcripts).isEmpty(),
+            )
+            // The intermediate half is still in the transcript.
+            assertTrue(transcripts.events.any { it.text == "half" && it.isPartial })
+            assertTrue(transcripts.events.any { it.text == "ok" && !it.isPartial })
+        } finally {
+            second.session.close()
+        }
+    }
+
+    @Test fun open_stageCRetryFailureGainsNoMarker() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "m")
+        transcripts.appendEvent(event(sid, "L", "user", "q"))
+        transcripts.appendEvent(
+            event(sid, "L", "assistant", "half", isPartial = true, failureReason = "boom", attemptIndex = 0),
+        )
+        transcripts.appendEvent(event(sid, "L", "retry", "attempt 1/1 after 0ms"))
+        transcripts.appendEvent(
+            event(
+                sid, "A2", "assistant", "frag", isPartial = true, failureReason = "boom",
+                parentRunId = "L", attemptIndex = 1,
+            ),
+        )
+
+        val factory = factoryWith(transcripts, BackfillFakeProvider {
+            flow { emit(StreamEvent.Done("stop")) }
+        })
+        val opened = factory.open(sampleEndpoint(), sid)
+        try {
+            assertTrue(
+                "retry-failure family must gain zero INTERRUPTED markers, " +
+                    "found: ${interruptedMarkers(transcripts)}",
+                interruptedMarkers(transcripts).isEmpty(),
+            )
+        } finally {
+            opened.session.close()
+        }
     }
 
     @Test fun open_backfillsKillStrandedTurnWithReplayCompatibleMarker() = runBlocking {

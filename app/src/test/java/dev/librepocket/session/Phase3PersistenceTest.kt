@@ -125,8 +125,11 @@ class Phase3PersistenceTest {
         val sid = "legacy-session-1"
         createV1File(name, sid)
 
+        // Stage C bumped the database to version 3: a v1 file now migrates
+        // 1→2→3. Both migrations are backward-compatible ADD COLUMNs, so the
+        // Phase 3 assertions below still hold, plus the Stage C null defaults.
         val db = Room.databaseBuilder(ctx, LibrePocketDb::class.java, name)
-            .addMigrations(LibrePocketDb.MIGRATION_1_2)
+            .addMigrations(LibrePocketDb.MIGRATION_1_2, LibrePocketDb.MIGRATION_2_3)
             .allowMainThreadQueries()
             .build()
         openDbs.add(db)
@@ -141,11 +144,14 @@ class Phase3PersistenceTest {
             for (row in rows) {
                 assertFalse("migrated row must default isPartial=false", row.isPartial)
                 assertNull("migrated row must default failureReason=null", row.failureReason)
+                assertNull("migrated row must default parentRunId=null", row.parentRunId)
+                assertNull("migrated row must default attemptIndex=null", row.attemptIndex)
             }
             // New writes use the new columns through the same DAO.
             db.sessionDao().insertEvent(
                 TranscriptEventEntity(
                     0, sid, 3, "run-2", "assistant", "half", false, 0, 1002L, true, "HTTP 500",
+                    null, null,
                 ),
             )
             val after = db.sessionDao().allEvents(sid)

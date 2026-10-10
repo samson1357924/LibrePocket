@@ -11,6 +11,7 @@
 
 - 使用者輸入文字與請求內容會經網路送往所選 provider 才能取得遠端模型回覆。一般聊天請求沒有全域 outbound redaction：例如 Chat Completions 在一般 chat path 會序列化原始訊息文字；部分 hosted-search path 才條件式套用 `Redactor`。Room 寫入 redaction 不會追溯影響已送出的 request。BYOK 表示使用者提供 credential，不表示本機推論、零資料傳輸或 provider 不保留請求。使用者須自行確認 endpoint、供應商條款與傳送內容。
 - 有使用者訊息的 turn，其送出的 `ChatRequest` 會在最後一則使用者訊息副本後附加 ephemeral `Runtime time context`（當下 wall-clock＋IANA 時區＋UTC offset＋weekday＋有 session start 時另附 session start，秒精度）；該區塊隨請求傳往 provider，不寫入 transcript／匯出／備份留存路徑。
+- 續聊恢復有跨 provider 出處檢查（Stage D）：`open` 以 `meta.model` 的 provider 出處比對當前 endpoint `providerId`，不符時舊歷史不進入新 provider 的 model context（空上下文續聊＋UI 可見提醒 `RESUME_CROSS_PROVIDER_HISTORY_WITHHELD`），本地顯示 replay 與 INTERRUPTED backfill 不變。`meta` 不記歷史 baseUrl，故僅比 providerId；無出處的舊列（裸 model id）為相容仍 hydrate，新建會話一律寫 `"providerId/modelId"` 出處。
 - Room 是目前 transcript 的持久化來源。Transcript sink/store 寫入時會套用 redaction；JSONL export helper 也再套一次。這只描述本機保存/匯出路徑，**不代表送出 provider 前的標準聊天請求已遮蔽**。不要因保存副本被遮蔽，就把原始文字當成未離開裝置。
 - manifest 設定 `android:allowBackup="true"`，並連結 legacy 與 Android 12+ backup rules。這些規則排除 key 專用檔案／目錄；它們沒有把 transcript、一般 preferences 或 audit data 設為排除對象。實際備份還受 Android/OEM/使用者設定影響，不能承諾一定備份或一定不備份。
 - JSONL codec、transcript export/import 與 backup bundle 有程式碼實作，但目前沒有可供使用者完成 flavor 遷移的 export/import UI 流程。backup bundle 預設不帶 key；其 API 可顯式要求帶 key。不要把「系統備份排除 key 檔」解讀成所有 app-level export 都不可能包含 key。

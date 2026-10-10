@@ -1110,6 +1110,12 @@ class ProviderTransportTest {
                         val errorBody = "e".repeat(size)
                         val response = MockResponse().setResponseCode(503)
                         if (unknownLength) response.setChunkedBody(errorBody, 1024) else response.setBody(errorBody)
+                        // Determinism: disable pooled-connection reuse-drain, which
+                        // otherwise races with cancelCall() and makes the exact
+                        // client-source byte count non-deterministic (16384 vs
+                        // 16385 for the 16385 over-cap case). Cancel, budget,
+                        // status and retryable assertions below are unchanged.
+                        response.addHeader("Connection", "close")
                         server.enqueue(response)
                         val kind = if (unknownLength) "chunked" else "known-length"
                         val context = "$protocol $kind error $size"
@@ -1156,6 +1162,10 @@ class ProviderTransportTest {
                         val errorBody = "e".repeat(size)
                         val response = MockResponse().setResponseCode(503)
                         if (unknownLength) response.setChunkedBody(errorBody, 1024) else response.setBody(errorBody)
+                        // Determinism: same pooled-drain race as the listModels
+                        // twin above; "Connection: close" keeps the exact byte
+                        // count deterministic without touching cancel/budget.
+                        response.addHeader("Connection", "close")
                         server.enqueue(response)
                         val kind = if (unknownLength) "chunked" else "known-length"
                         val context = "$protocol $kind SSE error $size"

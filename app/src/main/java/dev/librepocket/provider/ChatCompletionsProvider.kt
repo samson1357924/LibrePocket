@@ -20,6 +20,8 @@ import okhttp3.OkHttpClient
  *   messages by `tool_call_id`. A stored id is verified; a missing id is
  *   filled only for the single-call case (otherwise fail-closed, no request).
  *   Every request self-contains the full pairing (stateless).
+ *   Non-thinking only; reasoning-bearing histories fail closed
+ *   (`THINKING_ROUND_TRIP_NOT_SUPPORTED`, checked first in `buildBody`).
  * - `finish_reason` + `[DONE]` -> [StreamEvent.Done]; missing either ->
  *   `Failed(retryable=true)`.
  */
@@ -90,6 +92,7 @@ class ChatCompletionsProvider(
      * parts; `>4` images are cut with the omission recorded in [BuiltBody].
      */
     internal fun buildBody(request: ChatRequest): String {
+        requireNoReasoningHistory(request)
         val sb = StringBuilder()
         sb.append("{\"model\":${q(request.model)},\"stream\":true")
         request.maxTokens?.let { sb.append(",\"max_tokens\":$it") }

@@ -7,13 +7,21 @@ enum class ProviderProtocol {
     ANTHROPIC,
 }
 
-/** Protocol-agnostic chat message. */
+/** Protocol-agnostic chat message.
+ *
+ * @param hasReasoning source marker only (no reasoning payload is carried):
+ *   true means this history item came from a thinking/reasoning turn whose
+ *   opaque payload (Responses reasoning items, Anthropic thinking/signature
+ *   blocks) cannot be rebuilt statelessly. Adapters fail closed on true
+ *   (see `requireNoReasoningHistory`). Defaults to false: zero behavior change.
+ */
 data class ChatMessage(
     val role: String, // "system" | "user" | "assistant" | "tool"
     val text: String,
     val images: List<ChatImage> = emptyList(),
     val toolCallId: String? = null, // required when role == "tool"
     val toolCalls: List<ToolCall> = emptyList(), // assistant-carried tool calls
+    val hasReasoning: Boolean = false,
 )
 
 /**
@@ -59,9 +67,22 @@ data class ChatRequest(
     val systemPromptOverride: String? = null,
     /** 服务端工具（默认空 = 关闭；开启后请求体会透传 hosted tool 字段）。 */
     val serverTools: List<ServerTool> = emptyList(),
+    /** Thinking/reasoning mode request (null = non-thinking, default). */
+    val thinking: ThinkingConfig? = null,
 )
 
 data class ToolSchema(val name: String, val description: String, val jsonSchema: String)
+
+/**
+ * Minimal thinking-mode marker (Stage 4 fail-closed gate).
+ *
+ * Null (default) = non-thinking request: zero behavior change. Any non-null
+ * value means the caller wants thinking/reasoning mode; adapters currently
+ * refuse such requests statelessly via `requireNoReasoningHistory` because
+ * thinking histories need opaque passthrough (not yet supported). The budget
+ * field is reserved for a future passthrough; it is never serialized today.
+ */
+data class ThinkingConfig(val budgetTokens: Int? = null)
 
 /**
  * HTTP transport knobs (global defaults, not overridable per request).

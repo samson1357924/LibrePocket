@@ -18,6 +18,8 @@ import okhttp3.OkHttpClient
  *   `tool_use_id`. Every request self-contains the full pairing (stateless);
  *   illegal pairings fail closed. P1 executed nothing; P2 still executes
  *   nothing (no dispatcher — #19 vertical slice scope).
+ *   Non-thinking only; reasoning-bearing histories fail closed
+ *   (`THINKING_ROUND_TRIP_NOT_SUPPORTED`, checked first in `buildBody`).
  * - Missing `message_stop` or unclosed visible/tool blocks ->
  *   `Failed(retryable=true)`.
  */
@@ -80,6 +82,7 @@ class AnthropicProvider(
     internal fun endpoint(base: String): String = joinEndpoint(base, "/v1/messages")
 
     internal fun buildBody(request: ChatRequest): String {
+        requireNoReasoningHistory(request)
         val sb = StringBuilder()
         sb.append("{\"model\":${q(request.model)},\"stream\":true")
         sb.append(",\"max_tokens\":${request.maxTokens ?: DEFAULT_MAX_TOKENS}")

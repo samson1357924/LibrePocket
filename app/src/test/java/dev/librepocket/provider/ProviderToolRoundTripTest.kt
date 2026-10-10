@@ -21,6 +21,10 @@ import org.junit.Test
  *   the single-call case, otherwise fail-closed (no request is sent).
  * - Cross-adapter: one tool definition + call carries equal semantics on all
  *   three wires (mock call -> fake execution -> output -> final answer pairs).
+ *
+ * Non-thinking only; reasoning-bearing histories fail closed
+ * (`THINKING_ROUND_TRIP_NOT_SUPPORTED` — thinking histories need opaque
+ * passthrough, not yet supported).
  */
 class ProviderToolRoundTripTest {
 
@@ -778,5 +782,65 @@ class ProviderToolRoundTripTest {
         expectFailWithCode("ANTHROPIC_EMPTY_CONTENT") {
             anthropicBodyOf(listOf(ChatMessage("assistant", "")))
         }
+    }
+
+    // ---- Stage 4: thinking/reasoning fail-closed gate (non-thinking only) ----
+    //
+    // Stateless rebuilds cannot carry opaque reasoning payloads (Responses
+    // reasoning items, Anthropic thinking/signature blocks), so any
+    // reasoning-bearing history or thinking-mode request fails closed
+    // instead of being resent without its reasoning context.
+
+    @Test
+    fun reasoningHistoryFailsClosedOnAllAdapters() {
+        val history = listOf(
+            ChatMessage("user", "hi"),
+            ChatMessage("assistant", "thinking trace", hasReasoning = true),
+        )
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { chatBodyOf(history) }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { responsesBodyOf(history) }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun thinkingRequestFailsClosedOnAllAdapters() {
+        val messages = listOf(ChatMessage("user", "hi"))
+        val thinking = ChatRequest(model = "m", messages = messages, thinking = ThinkingConfig())
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            ChatCompletionsProvider(chatConfig(), { null }).buildBody(thinking)
+        }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            ResponsesProvider(responsesConfig(), { null }).buildBody(thinking)
+        }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(thinking)
+        }
+    }
+
+    @Test
+    fun reasoningHistoryWithValidToolPairingStillFailsClosed() {
+        // Tool pairing is fully legal; the reasoning gate (first line of
+        // buildBody) must still refuse before any pairing logic runs.
+        val history = listOf(
+            ChatMessage("user", "hi"),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_r1")), hasReasoning = true),
+            ChatMessage("tool", "r1", toolCallId = "call_r1"),
+        )
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { chatBodyOf(history) }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { responsesBodyOf(history) }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun reasoningGateRunsBeforeToolPairingValidation() {
+        // Orphan output alone would be TOOL_OUTPUT_ORPHAN_ID; with a
+        // reasoning marker the gate must win (proves first-line ordering).
+        val history = listOf(
+            ChatMessage("tool", "early", toolCallId = "call_b", hasReasoning = true),
+            ChatMessage("assistant", "", toolCalls = listOf(toolCall("call_b"))),
+        )
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { chatBodyOf(history) }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { responsesBodyOf(history) }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { anthropicBodyOf(history) }
     }
 }

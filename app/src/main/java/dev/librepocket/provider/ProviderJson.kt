@@ -85,6 +85,9 @@ internal fun chatToolCallJson(tc: ToolCall): String = buildJsonObject {
  * stays pure-chat); these helpers only validate explicit test/scaffold
  * histories. Any illegal pairing throws [ProviderFailure] (fail-closed,
  * retryable=false) so no request is sent.
+ *
+ * Non-thinking only: reasoning-bearing histories fail closed via
+ * [requireNoReasoningHistory] (see below) before any pairing check.
  */
 
 /**
@@ -164,6 +167,28 @@ internal fun validateToolPairing(messages: List<ChatMessage>, allowChatBackfill:
     }
     if (pending.isNotEmpty()) throw ProviderFailure(false, "TOOL_CALLS_UNRESOLVED")
     return resolved
+}
+
+/**
+ * Stage 4 fail-closed gate: thinking/reasoning histories need opaque
+ * passthrough, not yet supported — refusing stateless resend.
+ *
+ * A stateless rebuild cannot faithfully carry opaque reasoning payloads:
+ * Responses `store=false` rebuilds only cover text / function_call /
+ * function_call_output items (reasoning items have no text equivalent),
+ * and Anthropic rebuilds only emit text + tool_use blocks (thinking /
+ * signature blocks are dropped). Resending without them would silently
+ * change the reasoning context, so every adapter calls this first in
+ * `buildBody` — before any other validation — and throws
+ * `ProviderFailure(retryable=false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")`
+ * when `request.thinking != null` (thinking mode requested) or any message
+ * carries `hasReasoning == true` (reasoning-sourced history, payload not
+ * carried — marker only). Non-thinking histories (defaults) pass through
+ * with zero behavior change.
+ */
+internal fun requireNoReasoningHistory(request: ChatRequest) {
+    if (request.thinking != null) throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
+    if (request.messages.any { it.hasReasoning }) throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
 }
 
 /** Non-blank arguments must be a JSON object; blank means `{}` (filled by callers). */

@@ -17,6 +17,8 @@ import okhttp3.OkHttpClient
  *   tool turns as `{"type":"function_call_output"}` (`call_id`/`output`).
  *   Nothing is read back from a server store (`store=false`), so a truncated
  *   history without its call side fails closed instead of being sent.
+ *   Non-thinking only; reasoning-bearing histories fail closed
+ *   (`THINKING_ROUND_TRIP_NOT_SUPPORTED`, checked first in `buildBody`).
  * - `response.output_text.delta` -> [StreamEvent.TextDelta] with
  *   `blockIndex = output_index * 1000 + content_index` (§3.5 mapping).
  * - `reasoning_summary_text.delta` / `reasoning_text.delta` ->
@@ -86,6 +88,7 @@ class ResponsesProvider(
     internal fun endpoint(base: String): String = joinEndpoint(base, "/responses")
 
     internal fun buildBody(request: ChatRequest): String {
+        requireNoReasoningHistory(request)
         val sb = StringBuilder()
         sb.append("{\"model\":${q(request.model)},\"stream\":true,\"store\":false")
         request.maxTokens?.let { sb.append(",\"max_output_tokens\":$it") }

@@ -1,7 +1,7 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
-import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.CancellationException
 
 /**
  * D03 單伺服器客戶端（多伺服器 = 每個配置一個 [McpServer] 實例）。
@@ -69,8 +69,9 @@ class McpServer(
                 breaker.onFailure()
                 McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
             }
-        } catch (e: TimeoutCancellationException) {
-            breaker.onFailure()
+        } catch (e: CancellationException) {
+            // 外部取消/外部 deadline 一律透傳，不計熔斷、不映射 TRANSPORT/TIMEOUT。
+            // 傳輸層內部總 deadline 已轉為 null（TIMEOUT），不會以例外到達此處。
             throw e
         } catch (_: Exception) {
             breaker.onFailure()
@@ -140,8 +141,9 @@ class McpServer(
                 breaker.onFailure()
                 McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
             }
-        } catch (e: TimeoutCancellationException) {
-            breaker.onFailure()
+        } catch (e: CancellationException) {
+            // 外部取消/外部 deadline 一律透傳，不計熔斷、不映射 TRANSPORT/TIMEOUT。
+            // 傳輸層內部總 deadline 已轉為 null（TIMEOUT），不會以例外到達此處。
             throw e
         } catch (_: Exception) {
             breaker.onFailure()

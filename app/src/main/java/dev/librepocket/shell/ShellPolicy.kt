@@ -200,8 +200,11 @@ object ShellPolicy {
 
     /**
      * 純函數校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ 白名單
-     * → find 高危謂詞 → 檔案域（絕對路徑經 [FileScope.decide]）。
-     * 呼叫方（[RestrictedShell]）必須先調此函數，拒絕時不得建子進程。
+     * → argv[0] 可信路徑門（同名不同路徑封堵，詞法）→ find 高危謂詞
+     * → 檔案域（絕對路徑經 [FileScope.decide]）。
+     * 呼叫方（[RestrictedShell]）必須先調此函數，拒絕時不得建子進程；
+     * 放行後仍須經 [ShellExecutables.resolve] 把 `argv[0]` 換成驗證後絕對路徑
+     * 再 spawn（本函數不管落地實體，純詞法）。
      *
      * @param allowedBinaries 白名單集合（預設 [ALLOWED_BINARIES]；S4
      *   `linux.exec` 傳聯集，黑名單/參數衛生/find 封堵/檔案域邏輯完全繼承，
@@ -253,6 +256,20 @@ object ShellPolicy {
         }
         if (base !in allowedBinaries) {
             return Validation.Denied(ShellDeny.NOT_WHITELISTED, "not whitelisted: $base")
+        }
+        // argv[0] 可信路徑門（直接通道 PATH 劫持封堵，詞法無 IO）：
+        // 含 `/`/`\` 的寫法父目錄必須在可信系統目錄內，否則同名不同路徑的假
+        // 二進位（`/tmp/evil/ls`）可憑 basename 通過白名單；bare 由執行層經
+        // [ShellExecutables.resolve] 受控解析（不查 PATH、不看 cwd）。
+        // 提權通道（validateElevated）依本次範圍維持原判，不在此改。
+        val rawArgv0 = argv[0].trim()
+        if (rawArgv0.contains('/') || rawArgv0.contains('\\')) {
+            if (!ShellExecutables.isTrustedAbsoluteArgv0(rawArgv0)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "untrusted executable path: $rawArgv0",
+                )
+            }
         }
         // find 沙箱逃逸封堵：高危謂詞命中任一即拒絕（不建子進程）。
         if (base == "find") {

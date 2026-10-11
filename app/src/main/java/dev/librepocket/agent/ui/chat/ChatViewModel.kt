@@ -102,6 +102,28 @@ data class PendingKeyReadConfirm(
     val opId: Long?,
     val openSessionId: String?,
 )
+/**
+ * R4-2 (Stage 4): provenance captured before an endpoint-switch fork creates
+ * its fresh transcript session, consumed after creation by the durable
+ * snapshot. [oldModelShort] is the previous session's short model id
+ * ("unknown" when its header is gone); [sameOrigin] is the
+ * [isSameProviderOrigin] gate outcome; [crossProviderWithheld] is the exact
+ * withhold verdict also surfaced as the switch-time notice, so the persisted
+ * marker and the notice can never disagree.
+ */
+private data class ForkPrefix(
+    val oldModelShort: String,
+    val sameOrigin: Boolean,
+    val crossProviderWithheld: Boolean,
+)
+
+/** R4-2: one IO round-trip's fork inputs — display replay, model prefix, withhold verdict, snapshot provenance. */
+private data class ForkRead(
+    val replay: LoadedUiHistory?,
+    val modelHistory: List<ChatMessage>,
+    val crossProviderWithheld: Boolean,
+    val fork: ForkPrefix,
+)
 
 /**
  * Per-phase budget for the bounded pre-close ledger drain (Phase 2
@@ -1227,7 +1249,23 @@ class ChatViewModel(
                     _notice.value = if (created.historyWithheld) {
                         "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
                     } else {
-                        null
+                        // R4-2: a cross-provider fork marker persisted in this
+                        // session re-surfaces the withhold notice after a
+                        // restart (the switch-time notice lived in the old
+                        // process). The withhold itself is structural — the old
+                        // rows were never copied — so a failed scan only drops
+                        // the notice, never leaks history.
+                        try {
+                            val withheldFork = withContext(Dispatchers.IO) {
+                                val backing = sessions.storeOrNull()
+                                backing != null && hasWithheldSwitchMarker(backing, sessionId)
+                            }
+                            if (withheldFork) "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD" else null
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            null
+                        }
                     }
                 }
             } catch (cancelled: CancellationException) {
@@ -1580,8 +1618,9 @@ class ChatViewModel(
 
         val previousSessionId = _currentSessionId.value
         var initialHistory: List<ChatMessage> = emptyList()
+        var fork: ForkPrefix? = null
         if (previousSessionId != null) {
-            val (replay, loadedHistory, crossProviderWithheld) = withContext(Dispatchers.IO) {
+            val read = withContext(Dispatchers.IO) {
                 val store = sessions.storeOrNull()
                 val previousMeta = store?.getSession(previousSessionId)
                 val sameOrigin = previousMeta != null && isSameProviderOrigin(
@@ -1597,7 +1636,16 @@ class ChatViewModel(
                     emptyList()
                 }
                 val withheld = !sameOrigin && hasHistory
-                Triple(rep, hist, withheld)
+                ForkRead(
+                    rep,
+                    hist,
+                    withheld,
+                    ForkPrefix(
+                        oldModelShort = previousMeta?.model?.substringAfterLast('/')?.takeIf { it.isNotEmpty() } ?: "unknown",
+                        sameOrigin = sameOrigin,
+                        crossProviderWithheld = withheld,
+                    ),
+                )
             }
             if (!isGenerationCurrent(generation)) return@withLock null
             val afterHistory = readEndpoint()
@@ -1606,6 +1654,7 @@ class ChatViewModel(
                 reconcileReadBinding(bindingOf(afterHistory))
                 return@withLock null
             }
+            val (replay, loadedHistory, crossProviderWithheld) = read
             if (replay != null) {
                 _history.value = replay.messages
                 _historyOmittedCount.value = replay.droppedCount
@@ -1616,6 +1665,7 @@ class ChatViewModel(
             } else if (_notice.value == "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD") {
                 _notice.value = null
             }
+            fork = read.fork
         }
 
         val creationGeneration = generation
@@ -1635,6 +1685,40 @@ class ChatViewModel(
             if (afterCreate == null || bindingOf(afterCreate) != authorized.binding) {
                 reconcileReadBinding(bindingOf(afterCreate))
                 return@withLock null
+            }
+            // R4-2 durable fork snapshot: persist the carried prefix into the
+            // new transcript session so restart/openSession(newId) still sees
+            // the old context plus the new turns. Best-effort by contract
+            // (see snapshotSwitchHistory): the live turn already carries
+            // initialHistory in memory, so a bookkeeping failure must not
+            // fail the send. Runs before attach, so snapshot rows always sort
+            // below the new turn's rows; the single-flight sessionMutex fences
+            // concurrent switches. A stale generation here rolls back through
+            // the discardUnattached path below (Room cascades the snapshot).
+            val forkTargetId = created.sessionId
+            val forkProvenance = fork
+            if (forkTargetId != null && forkProvenance != null && previousSessionId != null) {
+                try {
+                    withContext(Dispatchers.IO) {
+                        val backing = sessions.storeOrNull()
+                        if (backing != null) {
+                            snapshotSwitchHistory(
+                                backing,
+                                previousSessionId,
+                                forkTargetId,
+                                forkProvenance.oldModelShort,
+                                created.model,
+                                forkProvenance.crossProviderWithheld,
+                            )
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // Best-effort: keep the in-memory behavior, degrade to
+                    // pre-R4-2 durability (new rows only after a restart).
+                }
+                if (!isGenerationCurrent(creationGeneration)) return@withLock null
             }
             attach(created, authorized.binding, creationGeneration)
             attached = true

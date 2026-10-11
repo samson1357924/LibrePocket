@@ -808,7 +808,31 @@ class ChatSessionFactory(
  * through the caller's UNKNOWN/NO_ENDPOINT path instead.
  */
 internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): LoadedModelHistory {
-    val keptNewestFirst = ArrayList<ChatMessage>(HISTORY_LOAD_CAP)
+    val events = loadModelHistoryEvents(store, sessionId)
+    val total = store.countHistoryEvents(sessionId, includePartial = false)
+    val dropped = (total - events.size).coerceAtLeast(0)
+    return LoadedModelHistory(
+        events.map { ChatMessage(role = it.kind, text = cappedHistoryText(it.text)) },
+        dropped,
+    )
+}
+
+/**
+ * Raw-event form of [loadModelHistory]: the newest qualifying rows
+ * (user/assistant, non-partial) up to [HISTORY_LOAD_CAP], oldest-first, via
+ * the same backward paging. Single source of truth for the carried prefix so
+ * the in-memory hydration and the R4-2 durable fork snapshot below always
+ * agree on exactly which rows cross a same-origin model switch.
+ *
+ * Unlike [loadModelHistory], texts are NOT truncated here: truncation stays a
+ * read-path concern ([cappedHistoryText] on hydrate), so a snapshot copy
+ * preserves the stored bytes verbatim and the reopened session re-applies the
+ * identical bound (idempotent). Family linkage (`runId` / `parentRunId` /
+ * `attemptIndex` / `isFinal` / `createdAt`) is preserved verbatim so the
+ * reopen backfill never mistakes a copied turn for a stranded one.
+ */
+internal suspend fun loadModelHistoryEvents(store: SessionStore, sessionId: String): List<TranscriptEvent> {
+    val keptNewestFirst = ArrayList<TranscriptEvent>(HISTORY_LOAD_CAP)
     var beforeSeq = Long.MAX_VALUE
     outer@ while (keptNewestFirst.size < HISTORY_LOAD_CAP) {
         val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
@@ -816,7 +840,7 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
         for (event in page) {
             if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
                 if (keptNewestFirst.size >= HISTORY_LOAD_CAP) break@outer
-                keptNewestFirst.add(ChatMessage(role = event.kind, text = cappedHistoryText(event.text)))
+                keptNewestFirst.add(event)
             }
         }
         // Pages are newest-first with distinct seqs; the next window ends
@@ -827,9 +851,106 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
         beforeSeq = pageMin
         if (page.size < HISTORY_PAGE) break
     }
-    val total = store.countHistoryEvents(sessionId, includePartial = false)
-    val dropped = (total - keptNewestFirst.size).coerceAtLeast(0)
-    return LoadedModelHistory(keptNewestFirst.asReversed(), dropped)
+    return keptNewestFirst.asReversed()
+}
+
+/** Marker kind for an R4-2 model-switch fork: hidden from chat replay, kept in export. */
+internal const val MODEL_SWITCH_MARKER_KIND = "system"
+
+/** Head-scan budget for [hasWithheldSwitchMarker]: the marker is row 1 of a forked session. */
+private const val MODEL_SWITCH_MARKER_SCAN_LIMIT = 16
+
+/**
+ * Audit marker for one endpoint-switch fork (`oldModel -> newModel` are the
+ * short model ids). Appended when [withheld] is true, the suffix records that
+ * the old prefix was deliberately NOT carried (cross provider/origin), so a
+ * later [dev.librepocket.agent.ui.chat.ChatViewModel.openSession] can
+ * re-surface the withhold notice after a restart.
+ */
+internal fun modelSwitchMarkerText(oldModel: String, newModel: String, historyWithheld: Boolean): String {
+    val base = "model switched $oldModel -> $newModel"
+    return if (historyWithheld) "$base [history withheld: cross-provider-origin]" else base
+}
+
+internal fun isModelSwitchMarker(text: String): Boolean = text.startsWith("model switched ")
+
+internal fun modelSwitchMarkerWithheld(text: String): Boolean =
+    isModelSwitchMarker(text) && text.contains("[history withheld: cross-provider-origin]")
+
+/**
+ * R4-2 (Stage 4) durable fork snapshot: after a same-origin model switch
+ * creates a fresh transcript session, persist the carried prefix INTO the new
+ * session so a restart / `openSession(newId)` still sees the old context plus
+ * the new turns. Cross-provider/origin forks persist only the marker (the old
+ * rows are never forwarded to the new destination).
+ *
+ * Layout: the audit marker is row 1 (head-anchored so reopen rediscovers it
+ * with one tiny bounded scan even after later turns or pruning of the tail),
+ * followed by the [loadModelHistoryEvents] prefix oldest-first. Copied rows
+ * keep their family linkage and `createdAt` verbatim; `seq` is reassigned by
+ * the store. The copy is bounded by [HISTORY_LOAD_CAP] newest-first, exactly
+ * the set the live session hydrated in memory, so pre- and post-restart
+ * model contexts agree.
+ *
+ * Failure semantics: THROWS on store failure — the caller
+ * ([dev.librepocket.agent.ui.chat.ChatViewModel.ensureSession]) treats the
+ * copy as best-effort (the live turn already carries the prefix in memory, so
+ * a bookkeeping failure must not fail the send; restart then degrades to the
+ * new rows only, i.e. pre-R4-2 behavior). Partial copies stay consistent: a
+ * later fork copies each source row at most once, so no duplication.
+ *
+ * Concurrency: callers hold the single-flight session mutex, and every fork
+ * targets a brand-new session id, so overlapping switches cannot interleave
+ * rows. Rollback rides on the existing `discardUnattached(deleteTranscriptRow
+ * = true)` path (`deleteSession` cascades the copied events in Room; the
+ * in-memory fake only drops the header — orphaned rows under a deleted id are
+ * never loaded because every read is session-gated).
+ *
+ * Redaction: [RoomSessionStore] re-runs the redactor on every write; the
+ * copied texts are already redacted and replacements carry no secret shapes,
+ * so the second pass is a no-op. The 100k per-row store bound applies as on
+ * any other write.
+ *
+ * @return number of history rows copied (0 when withheld).
+ */
+internal suspend fun snapshotSwitchHistory(
+    store: SessionStore,
+    fromSessionId: String,
+    toSessionId: String,
+    oldModel: String,
+    newModel: String,
+    historyWithheld: Boolean,
+    nowMillis: Long = System.currentTimeMillis(),
+): Int {
+    require(fromSessionId != toSessionId) { "snapshot source and destination must differ" }
+    store.appendEvent(
+        TranscriptEvent(
+            sessionId = toSessionId,
+            runId = "switch-${java.util.UUID.randomUUID()}",
+            kind = MODEL_SWITCH_MARKER_KIND,
+            text = modelSwitchMarkerText(oldModel, newModel, historyWithheld),
+            createdAt = nowMillis,
+        ),
+    )
+    if (historyWithheld) return 0
+    var copied = 0
+    for (event in loadModelHistoryEvents(store, fromSessionId)) {
+        store.appendEvent(event.copy(seq = 0, sessionId = toSessionId))
+        copied++
+    }
+    return copied
+}
+
+/**
+ * Bounded head scan for a cross-provider fork marker (see
+ * [snapshotSwitchHistory]). True when this session was forked across a
+ * provider/origin boundary with its old prefix withheld. Best-effort callers
+ * swallow failures as "no marker" (the withhold itself is structural — the
+ * rows were never copied — so only the notice is at stake).
+ */
+internal suspend fun hasWithheldSwitchMarker(store: SessionStore, sessionId: String): Boolean {
+    val head = store.loadEvents(sessionId, 0, MODEL_SWITCH_MARKER_SCAN_LIMIT)
+    return head.any { it.kind == MODEL_SWITCH_MARKER_KIND && modelSwitchMarkerWithheld(it.text) }
 }
 
 /**

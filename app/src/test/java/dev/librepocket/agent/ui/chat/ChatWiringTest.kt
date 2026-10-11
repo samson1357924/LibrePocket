@@ -982,4 +982,271 @@ class ChatWiringTest {
         assertTrue(secondReq.messages[0].text.startsWith("u2"))
         assertEquals("RESUME_CROSS_PROVIDER_HISTORY_WITHHELD", vm.notice.value)
     }
+
+    @Test
+    fun sameProviderSwitch_survivesRestart() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                when {
+                    userMsg.startsWith("u1") -> emit(StreamEvent.TextDelta(0, 0, "a1"))
+                    userMsg.startsWith("u2") -> emit(StreamEvent.TextDelta(0, 0, "a2"))
+                    else -> emit(StreamEvent.TextDelta(0, 0, "a3"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+
+        // Round 1 on the old model.
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+        val oldId = vm.currentSessionId.value
+        assertNotNull(oldId)
+
+        // Same-provider model switch, then round 2.
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o"))
+        }
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        val newId = vm.currentSessionId.value
+        assertNotNull(newId)
+        assertFalse(newId == oldId)
+        // The durable snapshot lands before the new turn's rows.
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == newId && (it.kind == "user" || it.kind == "assistant")
+            } == 4
+        }
+        val forkedRows = transcripts.events.filter { it.sessionId == newId }
+        assertEquals(listOf("system", "user", "assistant", "user", "assistant"), forkedRows.map { it.kind })
+        assertTrue(forkedRows[0].text.startsWith("model switched "))
+        assertTrue(forkedRows[0].text.contains("gpt-4o-mini"))
+        assertTrue(forkedRows[0].text.contains("gpt-4o"))
+        assertFalse(forkedRows[0].text.contains("withheld"))
+        assertTrue(forkedRows[1].text.startsWith("u1"))
+        assertEquals("a1", forkedRows[2].text)
+        assertTrue(forkedRows[3].text.startsWith("u2"))
+        assertEquals("a2", forkedRows[4].text)
+        assertNull(vm.notice.value)
+
+        // Restart: a fresh ViewModel reopens the forked session id.
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm2.openSession(newId!!) }
+        awaitTrue { vm2.currentSessionId.value == newId && vm2.messages.value.size == 4 }
+        val reopened = vm2.messages.value
+        assertTrue(reopened[0].text.startsWith("u1"))
+        assertEquals("a1", reopened[1].text)
+        assertTrue(reopened[2].text.startsWith("u2"))
+        assertEquals("a2", reopened[3].text)
+        assertNull(vm2.notice.value)
+
+        // The first request after restart still carries the old prefix.
+        onMain { vm2.onInputChange("u3") }
+        onMain { vm2.send() }
+        awaitTrue { vm2.sessionState.value.status == ChatStatus.IDLE && vm2.messages.value.size == 6 }
+        val restartReq = fake.seenRequests.last()
+        assertEquals(
+            listOf("user", "assistant", "user", "assistant", "user"),
+            restartReq.messages.map { it.role },
+        )
+        assertTrue(restartReq.messages[0].text.startsWith("u1"))
+        assertEquals("a1", restartReq.messages[1].text)
+        assertTrue(restartReq.messages[2].text.startsWith("u2"))
+        assertEquals("a2", restartReq.messages[3].text)
+        assertTrue(restartReq.messages[4].text.startsWith("u3"))
+    }
+
+    @Test
+    fun crossProviderSwitch_stillWithholdsAfterRestart() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:anthropic", "sk-ant-test-key".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                if (userMsg.startsWith("u1")) {
+                    emit(StreamEvent.TextDelta(0, 0, "a1"))
+                } else {
+                    emit(StreamEvent.TextDelta(0, 0, "a2"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+
+        runBlocking {
+            store.save(
+                EndpointConfig(
+                    providerId = "preset:anthropic",
+                    presetId = "anthropic",
+                    label = "Anthropic",
+                    baseUrl = "https://api.anthropic.com/v1",
+                    protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                    model = "claude-3-5-sonnet",
+                    apiKeyRef = "provider_key/preset:anthropic",
+                ),
+            )
+        }
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        val newId = vm.currentSessionId.value
+        assertNotNull(newId)
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == newId && (it.kind == "user" || it.kind == "assistant")
+            } == 2
+        }
+        // Only the marker plus the new turn: the old prefix never crosses providers.
+        val forkedRows = transcripts.events.filter { it.sessionId == newId }
+        assertEquals(listOf("system", "user", "assistant"), forkedRows.map { it.kind })
+        assertTrue(forkedRows[0].text.startsWith("model switched "))
+        assertTrue(forkedRows[0].text.contains("withheld"))
+        assertTrue(forkedRows[1].text.startsWith("u2"))
+        assertEquals("a2", forkedRows[2].text)
+        assertEquals(1, fake.seenRequests[1].messages.size)
+        assertEquals("RESUME_CROSS_PROVIDER_HISTORY_WITHHELD", vm.notice.value)
+
+        // Restart: the forked session still withholds, and the notice returns.
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm2.openSession(newId!!) }
+        awaitTrue { vm2.currentSessionId.value == newId && vm2.messages.value.size == 2 }
+        assertTrue(vm2.messages.value[0].text.startsWith("u2"))
+        assertEquals("a2", vm2.messages.value[1].text)
+        assertEquals("RESUME_CROSS_PROVIDER_HISTORY_WITHHELD", vm2.notice.value)
+        onMain { vm2.onInputChange("u3") }
+        onMain { vm2.send() }
+        awaitTrue { vm2.sessionState.value.status == ChatStatus.IDLE && vm2.messages.value.size == 4 }
+        val restartReq = fake.seenRequests.last()
+        assertEquals(listOf("user", "assistant", "user"), restartReq.messages.map { it.role })
+        assertTrue(restartReq.messages[0].text.startsWith("u2"))
+        assertEquals("a2", restartReq.messages[1].text)
+        assertTrue(restartReq.messages[2].text.startsWith("u3"))
+    }
+
+    @Test
+    fun sameProviderSwitchChainDoesNotDuplicate() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "m1"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                when {
+                    userMsg.startsWith("u1") -> emit(StreamEvent.TextDelta(0, 0, "a1"))
+                    userMsg.startsWith("u2") -> emit(StreamEvent.TextDelta(0, 0, "a2"))
+                    else -> emit(StreamEvent.TextDelta(0, 0, "a3"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+        val idA = vm.currentSessionId.value
+        assertNotNull(idA)
+
+        runBlocking { store.save(sampleEndpoint().copy(model = "m2")) }
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        val idB = vm.currentSessionId.value
+        assertNotNull(idB)
+        assertFalse(idB == idA)
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == idB && (it.kind == "user" || it.kind == "assistant")
+            } == 4
+        }
+
+        runBlocking { store.save(sampleEndpoint().copy(model = "m3")) }
+        onMain { vm.onInputChange("u3") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 6 }
+        val idC = vm.currentSessionId.value
+        assertNotNull(idC)
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == idC && (it.kind == "user" || it.kind == "assistant")
+            } == 6
+        }
+        // Each turn exactly once: old prefix + middle turn + new turn, one fork marker.
+        val rowsC = transcripts.events.filter { it.sessionId == idC }
+        assertEquals(
+            listOf("system", "user", "assistant", "user", "assistant", "user", "assistant"),
+            rowsC.map { it.kind },
+        )
+        assertEquals(1, rowsC.count { it.kind == "system" })
+        assertTrue(rowsC[0].text.startsWith("model switched m2 -> m3"))
+        assertTrue(rowsC[1].text.startsWith("u1"))
+        assertEquals("a1", rowsC[2].text)
+        assertTrue(rowsC[3].text.startsWith("u2"))
+        assertEquals("a2", rowsC[4].text)
+        assertTrue(rowsC[5].text.startsWith("u3"))
+        assertEquals("a3", rowsC[6].text)
+        // The middle session keeps its own marker plus the first prefix; markers never copy.
+        val rowsB = transcripts.events.filter { it.sessionId == idB }
+        assertEquals(1, rowsB.count { it.kind == "system" })
+        assertNull(vm.notice.value)
+
+        // Restart on the chain tip: full history, one copy each, then a live follow-up.
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm2.openSession(idC!!) }
+        awaitTrue { vm2.currentSessionId.value == idC && vm2.messages.value.size == 6 }
+        assertNull(vm2.notice.value)
+        onMain { vm2.onInputChange("u4") }
+        onMain { vm2.send() }
+        awaitTrue { vm2.sessionState.value.status == ChatStatus.IDLE && vm2.messages.value.size == 8 }
+        val restartReq = fake.seenRequests.last()
+        assertEquals(7, restartReq.messages.size)
+        assertEquals("a3", restartReq.messages[5].text)
+        assertTrue(restartReq.messages[6].text.startsWith("u4"))
+    }
 }

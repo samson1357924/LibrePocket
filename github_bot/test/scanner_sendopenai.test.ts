@@ -228,7 +228,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
   ]);
 
   const boundaryDiffs: Record<string, string> = {
-    'app/src/main/java/example/First.kt': 'A'.repeat(119850),
+    'app/src/main/java/example/First.kt': 'A'.repeat(999850),
     'app/src/main/java/example/Second.kt': 'B'.repeat(1000),
   };
   const assembled = buildReviewDiff({

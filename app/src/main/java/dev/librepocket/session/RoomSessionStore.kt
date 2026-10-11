@@ -1,9 +1,11 @@
 package dev.librepocket.session
 
+import android.util.Log
 import androidx.room.withTransaction
 import dev.librepocket.redact.Redactor
 import java.io.File
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -20,7 +22,12 @@ import kotlinx.coroutines.withContext
  *
  * The DAO is blocking Java; all DB access is confined to [Dispatchers.IO].
  * Prune auto-runs every [AUTO_PRUNE_EVERY] appends with the default policy;
- * callers needing other policies invoke [prune] explicitly.
+ * callers needing other policies invoke [prune] explicitly. Auto-prune is
+ * best-effort maintenance: it runs after the append transaction commits, and
+ * its failure only emits [Log.w] ([CancellationException] still propagates) —
+ * the committed rowId is still returned, so
+ * a prune failure never fails the durable core ack, never writes an
+ * INTERRUPTED mark, and never affects `hasDurableFailures`/`flushDurable`.
  *
  * Notes:
  * - seq gaps are legal (prune deletes old rows; import preserves file seqs);
@@ -36,6 +43,8 @@ class RoomSessionStore(
 
     private val dao: SessionDao get() = db.sessionDao()
     private val appendMutex = Mutex()
+    // Guarded by [appendMutex]: incremented on every committed append, reset
+    // whenever an auto-prune sweep is attempted (success or failure).
     private var appendsSincePrune = 0
 
     override suspend fun createSession(title: String, model: String): String =
@@ -100,10 +109,34 @@ class RoomSessionStore(
                 }
             }
         }
-        appendsSincePrune++
-        if (appendsSincePrune >= AUTO_PRUNE_EVERY) {
-            appendsSincePrune = 0
-            prune(PrunePolicy())
+        // R4-6: the counter lives under the same mutex as the seq-assigning
+        // transaction, so concurrent appends cannot lose increments or double
+        // -fire the sweep. Only the decision is made here; the sweep itself
+        // stays outside the mutex (and outside the transaction above), exactly
+        // as before.
+        val shouldPrune = appendMutex.withLock {
+            appendsSincePrune++
+            if (appendsSincePrune >= AUTO_PRUNE_EVERY) {
+                appendsSincePrune = 0
+                true
+            } else {
+                false
+            }
+        }
+        if (shouldPrune) {
+            try {
+                prune(PrunePolicy())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Best-effort maintenance: the row above already committed and
+                // its rowId is still returned below, so the durable core ack
+                // stays a success and no INTERRUPTED mark is written. The
+                // counter was already reset, so the failed sweep is retried
+                // (throttled) after the next AUTO_PRUNE_EVERY appends instead
+                // of retrying hot on every subsequent append.
+                Log.w(TAG, "auto-prune failed; append already durable, will retry later", e)
+            }
         }
         return rowId
     }
@@ -363,6 +396,7 @@ class RoomSessionStore(
     )
 
     companion object {
+        private const val TAG = "RoomSessionStore"
         const val MAX_TEXT_CHARS = 100_000
         const val EXPORT_MAX_BYTES = 20 * 1024 * 1024
         const val IMPORT_MAX_BYTES = EXPORT_MAX_BYTES

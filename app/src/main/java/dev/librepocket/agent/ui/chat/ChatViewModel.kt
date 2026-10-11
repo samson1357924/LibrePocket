@@ -1311,13 +1311,23 @@ class ChatViewModel(
                         // cross-origin open() forks to a new provider-owned id
                         // (attach() already points _currentSessionId at it),
                         // so scan the ATTACHED id, not the requested one.
+                        // R5-4: a failed fork snapshot outranks a clean
+                        // withhold — check the incomplete marker first so a
+                        // restart re-warns HISTORY_SNAPSHOT_INCOMPLETE even
+                        // when no withheld marker exists.
                         try {
                             val attachedId = created.sessionId ?: sessionId
-                            val withheldFork = withContext(Dispatchers.IO) {
+                            withContext(Dispatchers.IO) {
                                 val backing = sessions.storeOrNull()
-                                backing != null && hasWithheldSwitchMarker(backing, attachedId)
+                                when {
+                                    backing == null -> null
+                                    hasIncompleteSnapshotMarker(backing, attachedId) ->
+                                        "HISTORY_SNAPSHOT_INCOMPLETE"
+                                    hasWithheldSwitchMarker(backing, attachedId) ->
+                                        "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                                    else -> null
+                                }
                             }
-                            if (withheldFork) "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD" else null
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (_: Exception) {
@@ -1758,6 +1768,12 @@ class ChatViewModel(
             // below the new turn's rows; the single-flight sessionMutex fences
             // concurrent switches. A stale generation here rolls back through
             // the discardUnattached path below (Room cascades the snapshot).
+            // R5-4: the snapshot batch is atomic (marker + copies commit
+            // together or not at all), so a failure leaves zero snapshot rows
+            // — never a silent half prefix. The catch below best-effort
+            // appends one system incomplete marker and surfaces
+            // HISTORY_SNAPSHOT_INCOMPLETE (fail-open: the send still proceeds
+            // on the in-memory prefix).
             val forkTargetId = created.sessionId
             val forkProvenance = fork
             if (forkTargetId != null && forkProvenance != null && previousSessionId != null) {
@@ -1778,8 +1794,41 @@ class ChatViewModel(
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
-                    // Best-effort: keep the in-memory behavior, degrade to
-                    // pre-R4-2 durability (new rows only after a restart).
+                    // R5-4: the atomic batch failed, so the fork holds zero
+                    // snapshot rows (no silent half prefix). Mark it
+                    // explicitly with one system incomplete row so the
+                    // restart scan (hasIncompleteSnapshotMarker) can re-warn;
+                    // surface HISTORY_SNAPSHOT_INCOMPLETE now (overrides a
+                    // withhold notice: the copy itself is what failed). Both
+                    // are best-effort bookkeeping — the live turn already
+                    // carries the prefix in memory, so a marker failure here
+                    // still must not fail the send (fail-open, degrades to
+                    // pre-R4-2 durability: new rows only after a restart).
+                    try {
+                        withContext(Dispatchers.IO) {
+                            val backing = sessions.storeOrNull()
+                            if (backing != null) {
+                                backing.appendEvent(
+                                    TranscriptEvent(
+                                        sessionId = forkTargetId,
+                                        runId = "snapshot-incomplete-${java.util.UUID.randomUUID()}",
+                                        kind = SNAPSHOT_INCOMPLETE_MARKER_KIND,
+                                        text = snapshotIncompleteMarkerText(
+                                            forkProvenance.oldModelShort,
+                                            created.model,
+                                        ),
+                                        createdAt = System.currentTimeMillis(),
+                                    ),
+                                )
+                            }
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        // Degrades to an unmarked fork: isolation still holds,
+                        // only the restart notice is lost.
+                    }
+                    _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
                 }
                 if (!isGenerationCurrent(creationGeneration)) return@withLock null
             }

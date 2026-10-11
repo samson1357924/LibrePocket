@@ -66,19 +66,7 @@ class RoomSessionStore(
         }
 
     override suspend fun appendEvent(event: TranscriptEvent): Long {
-        require(event.kind in VALID_KINDS) { "unknown event kind: ${event.kind}" }
-        require(event.kind != "reasoning" || event.text.isEmpty()) { "reasoning marker must have empty text" }
-        val redacted = Redactor.redact(event.text).text
-        val (text, truncated) = if (redacted.length > MAX_TEXT_CHARS) {
-            redacted.take(MAX_TEXT_CHARS) to true
-        } else {
-            redacted to false
-        }
-        // Failure reasons are sanitized errors: re-redact on write like the
-        // body text (TurnController already sanitizes; this is defense in
-        // depth for rows written through other paths). redactError caps at
-        // 500 chars, so over-long reasons never bloat the row.
-        val reason = event.failureReason?.let { Redactor.redactError(it) }
+        val prepared = prepareEvent(event)
         val rowId = appendMutex.withLock {
             withContext(Dispatchers.IO) {
                 db.withTransaction {
@@ -93,12 +81,12 @@ class RoomSessionStore(
                             seq,
                             event.runId,
                             event.kind,
-                            text,
-                            truncated,
+                            prepared.text,
+                            prepared.truncated,
                             event.imagesOmitted,
                             event.createdAt,
                             event.isPartial,
-                            reason,
+                            prepared.reason,
                             event.parentRunId,
                             event.attemptIndex,
                             event.isFinal,
@@ -140,6 +128,112 @@ class RoomSessionStore(
         }
         return rowId
     }
+
+    /**
+     * R5-4 atomic batch (single DB transaction): every event is redacted /
+     * truncated / seq-assigned exactly as in [appendEvent], but the inserts
+     * share one [db.withTransaction] under [appendMutex], with one
+     * [SessionDao.touchSession] per touched session inside the same
+     * transaction. A failure (unknown session, unknown kind, I/O error,
+     * cancellation) rolls back the whole batch — including the touch — so
+     * the fork ledger holds all rows or zero. Deliberately inlines the DAO
+     * writes instead of delegating to [appendEvent]: re-entering per-row
+     * transactions would nest (and Room flattens nested transactions, losing
+     * the all-or-nothing boundary) and would touch/prune per row.
+     *
+     * Auto-prune accounting counts one bulk as ONE append toward
+     * [AUTO_PRUNE_EVERY] and the sweep (if due) runs once after commit,
+     * exactly like the single-row path: a committed bulk is never un-done by
+     * a prune failure ([Log.w] only, rowIds still returned).
+     */
+    override suspend fun appendEvents(events: List<TranscriptEvent>): List<Long> {
+        if (events.isEmpty()) return emptyList()
+        // Fail fast before any write: a bad kind aborts with zero rows.
+        val prepared = events.map { prepareEvent(it) }
+        val rowIds = appendMutex.withLock {
+            withContext(Dispatchers.IO) {
+                db.withTransaction {
+                    val ids = ArrayList<Long>(events.size)
+                    for (index in events.indices) {
+                        val event = events[index]
+                        val ready = prepared[index]
+                        require(dao.sessionById(event.sessionId) != null) {
+                            "unknown session"
+                        }
+                        val seq = dao.nextSeq(event.sessionId)
+                        ids.add(
+                            dao.insertEvent(
+                                TranscriptEventEntity(
+                                    0,
+                                    event.sessionId,
+                                    seq,
+                                    event.runId,
+                                    event.kind,
+                                    ready.text,
+                                    ready.truncated,
+                                    event.imagesOmitted,
+                                    event.createdAt,
+                                    event.isPartial,
+                                    ready.reason,
+                                    event.parentRunId,
+                                    event.attemptIndex,
+                                    event.isFinal,
+                                ),
+                            ),
+                        )
+                    }
+                    // One touch per session, inside the transaction: a bulk
+                    // failure rolls the touch back together with the rows.
+                    val touched = HashSet<String>()
+                    for (event in events) {
+                        if (touched.add(event.sessionId)) dao.touchSession(event.sessionId, clock())
+                    }
+                    ids
+                }
+            }
+        }
+        // Same throttled sweep as appendEvent, but one bulk counts once.
+        val shouldPrune = appendMutex.withLock {
+            appendsSincePrune++
+            if (appendsSincePrune >= AUTO_PRUNE_EVERY) {
+                appendsSincePrune = 0
+                true
+            } else {
+                false
+            }
+        }
+        if (shouldPrune) {
+            try {
+                prune(PrunePolicy())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Best-effort maintenance: the bulk above already committed
+                // and its rowIds are still returned below, so the durable
+                // core ack stays a success. The counter was already reset, so
+                // the failed sweep is retried (throttled) after the next
+                // AUTO_PRUNE_EVERY bulks/appends instead of retrying hot.
+                Log.w(TAG, "auto-prune failed; bulk already durable, will retry later", e)
+            }
+        }
+        return rowIds
+    }
+
+    /** Shared write-path shaping for [appendEvent]/[appendEvents]: kind gate + redact + truncate + reason. */
+    private fun prepareEvent(event: TranscriptEvent): PreparedEvent {
+        require(event.kind in VALID_KINDS) { "unknown event kind: ${event.kind}" }
+        require(event.kind != "reasoning" || event.text.isEmpty()) { "reasoning marker must have empty text" }
+        val redacted = Redactor.redact(event.text).text
+        val (text, truncated) = if (redacted.length > MAX_TEXT_CHARS) {
+            redacted.take(MAX_TEXT_CHARS) to true
+        } else {
+            redacted to false
+        }
+        val reason = event.failureReason?.let { Redactor.redactError(it) }
+        return PreparedEvent(text, truncated, reason)
+    }
+
+    private data class PreparedEvent(val text: String, val truncated: Boolean, val reason: String?)
 
     override suspend fun loadEvents(
         sessionId: String,

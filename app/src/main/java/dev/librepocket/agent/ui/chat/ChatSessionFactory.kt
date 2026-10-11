@@ -1098,6 +1098,46 @@ internal fun isModelSwitchMarker(text: String): Boolean = text.startsWith("model
 internal fun modelSwitchMarkerWithheld(text: String): Boolean =
     isModelSwitchMarker(text) && text.contains("[history withheld: cross-provider-origin]")
 
+/** Marker kind for an R5-4 incomplete fork snapshot: hidden from chat replay, kept in export. */
+internal const val SNAPSHOT_INCOMPLETE_MARKER_KIND = "system"
+
+/** Head/tail scan budget for [hasIncompleteSnapshotMarker] (see below). */
+private const val SNAPSHOT_INCOMPLETE_SCAN_LIMIT = 16
+
+/**
+ * R5-4 audit marker for a failed fork snapshot (`oldModel -> newModel` are
+ * the short model ids). Best-effort appended by
+ * [dev.librepocket.agent.ui.chat.ChatViewModel.ensureSession] to the fork
+ * target when the atomic [snapshotSwitchHistory] batch throws, so a later
+ * [dev.librepocket.agent.ui.chat.ChatViewModel.openSession] can re-surface
+ * HISTORY_SNAPSHOT_INCOMPLETE after a restart. Same `system`-kind
+ * hidden-from-replay / visible-in-export shape as the switch marker, with a
+ * distinct `snapshot incomplete ` prefix so the two scans never confuse
+ * each other.
+ */
+internal fun snapshotIncompleteMarkerText(oldModel: String, newModel: String): String =
+    "snapshot incomplete $oldModel -> $newModel [history incomplete: copy failed]"
+
+internal fun isSnapshotIncompleteMarker(text: String): Boolean =
+    text.startsWith("snapshot incomplete ")
+
+/**
+ * Bounded scan for an R5-4 incomplete-snapshot marker (see
+ * [snapshotSwitchHistory]). True when a fork snapshot failed and the
+ * best-effort marker landed. Scans the head AND the tail 16: atomic stores
+ * (Room / fake) roll the failed batch back to zero rows, so the marker is
+ * row 1 (head); a non-atomic fallback store (default
+ * [dev.librepocket.session.SessionStore.appendEvents]) may leave a partial
+ * prefix with the marker trailing it (tail). Best-effort callers swallow
+ * failures as "no marker" (only the notice is at stake).
+ */
+internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId: String): Boolean {
+    val head = store.loadEvents(sessionId, 0, SNAPSHOT_INCOMPLETE_SCAN_LIMIT)
+    if (head.any { it.kind == SNAPSHOT_INCOMPLETE_MARKER_KIND && isSnapshotIncompleteMarker(it.text) }) return true
+    val tail = store.loadTailEvents(sessionId, SNAPSHOT_INCOMPLETE_SCAN_LIMIT)
+    return tail.any { it.kind == SNAPSHOT_INCOMPLETE_MARKER_KIND && isSnapshotIncompleteMarker(it.text) }
+}
+
 /**
  * R4-2 (Stage 4) durable fork snapshot, R5-3 projection: after a same-origin
  * model switch creates a fresh transcript session, persist the carried prefix
@@ -1131,6 +1171,22 @@ internal fun modelSwitchMarkerWithheld(text: String): Boolean =
  * `model switched …` markers (each fork owns exactly one, never a copy),
  * and `retry`/`tool`/`steer` notices (neither replay nor terminal).
  *
+ * R5-4 atomicity (implemented): the marker and every copied row persist as
+ * ONE all-or-nothing batch ([SessionStore.appendEvents]) — the prefix is
+ * fully read ([loadSwitchSnapshotEvents]) before anything is written, then
+ * marker + copies commit in a single store transaction (Room) or under a
+ * snapshot-rollback batch (fake). A mid-copy store failure therefore throws
+ * with ZERO snapshot rows in the fork: a half snapshot (marker + N-1 rows,
+ * which the reopen backfill would misread as a stranded turn and stamp with
+ * a false INTERRUPTED) is structurally impossible on atomic stores. Callers
+ * treat the throw as bookkeeping: the live turn already carries the prefix
+ * in memory, so
+ * [dev.librepocket.agent.ui.chat.ChatViewModel.ensureSession] best-effort
+ * appends one system incomplete marker ([snapshotIncompleteMarkerText]) and
+ * surfaces HISTORY_SNAPSHOT_INCOMPLETE (fail-open; a restart then degrades
+ * to the new rows only, i.e. pre-R4-2 behavior, with the warning
+ * re-surfaced by [hasIncompleteSnapshotMarker]).
+ *
  * Known limitation: prune is keep-newest
  * (`dev.librepocket.session.SessionDao.deleteEventsBeyondLimit` drops the
  * oldest rows first), so the head marker goes first; the marker + copy cap
@@ -1142,12 +1198,16 @@ internal fun modelSwitchMarkerWithheld(text: String): Boolean =
  * copied), so isolation is unchanged; an `openSession` scan failure stays
  * "no marker", as before.
  *
- * Failure semantics: THROWS on store failure — the caller
+ * Failure semantics: THROWS on store failure with zero snapshot rows
+ * persisted (all-or-nothing on atomic stores — Room and the in-memory fake;
+ * a non-atomic [SessionStore.appendEvents] fallback may leave a partial
+ * prefix, still flagged by the caller's incomplete marker). The caller
  * ([dev.librepocket.agent.ui.chat.ChatViewModel.ensureSession]) treats the
  * copy as best-effort (the live turn already carries the prefix in memory, so
  * a bookkeeping failure must not fail the send; restart then degrades to the
- * new rows only, i.e. pre-R4-2 behavior). Partial copies stay consistent: a
- * later fork copies each source row at most once, so no duplication.
+ * new rows only, i.e. pre-R4-2 behavior, plus the incomplete marker +
+ * HISTORY_SNAPSHOT_INCOMPLETE notice). Cancellation propagates before any
+ * write (read phase) or aborts the batch (write phase) — never a partial.
  *
  * Concurrency: callers hold the single-flight session mutex, and every fork
  * targets a brand-new session id, so overlapping switches cannot interleave
@@ -1173,7 +1233,14 @@ internal suspend fun snapshotSwitchHistory(
     nowMillis: Long = System.currentTimeMillis(),
 ): Int {
     require(fromSessionId != toSessionId) { "snapshot source and destination must differ" }
-    store.appendEvent(
+    // R5-4: read the whole prefix BEFORE writing anything, then persist
+    // marker + copies as one atomic batch (single transaction on Room,
+    // snapshot-rollback on the fake). The marker rides inside the same batch
+    // so a marker-write failure also leaves zero rows — never a marker-only
+    // or half-copied ledger.
+    val prefix = if (historyWithheld) emptyList() else loadSwitchSnapshotEvents(store, fromSessionId)
+    val batch = ArrayList<TranscriptEvent>(prefix.size + 1)
+    batch.add(
         TranscriptEvent(
             sessionId = toSessionId,
             runId = "switch-${java.util.UUID.randomUUID()}",
@@ -1182,13 +1249,11 @@ internal suspend fun snapshotSwitchHistory(
             createdAt = nowMillis,
         ),
     )
-    if (historyWithheld) return 0
-    var copied = 0
-    for (event in loadSwitchSnapshotEvents(store, fromSessionId)) {
-        store.appendEvent(event.copy(seq = 0, sessionId = toSessionId))
-        copied++
+    for (event in prefix) {
+        batch.add(event.copy(seq = 0, sessionId = toSessionId))
     }
-    return copied
+    store.appendEvents(batch)
+    return prefix.size
 }
 
 /**

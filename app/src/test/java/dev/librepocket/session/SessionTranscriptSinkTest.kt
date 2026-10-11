@@ -31,6 +31,28 @@ open class FakeSessionStore : SessionStore {
         return events.size.toLong()
     }
 
+    /**
+     * R5-4 atomic batch: mirrors [RoomSessionStore.appendEvents] single-
+     * transaction semantics without Room — the pre-batch list is snapshotted
+     * and any throw (including [CancellationException]) restores it before
+     * rethrowing, so a mid-copy failure leaves zero snapshot rows behind.
+     * Routes each row through the virtual [appendEvent] so fault-injecting
+     * subclasses still observe every row write.
+     */
+    override suspend fun appendEvents(events: List<TranscriptEvent>): List<Long> {
+        if (events.isEmpty()) return emptyList()
+        val snapshot = ArrayList(this.events)
+        try {
+            val ids = ArrayList<Long>(events.size)
+            for (event in events) ids.add(appendEvent(event))
+            return ids
+        } catch (t: Throwable) {
+            this.events.clear()
+            this.events.addAll(snapshot)
+            throw t
+        }
+    }
+
     override suspend fun loadEvents(sessionId: String, afterSeq: Long, limit: Int): List<TranscriptEvent> =
         events.filter { it.sessionId == sessionId && it.seq > afterSeq }.take(limit)
 

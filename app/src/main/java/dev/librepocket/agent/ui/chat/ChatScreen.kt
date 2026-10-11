@@ -97,6 +97,7 @@ internal fun chatNoticeText(code: String): String =
         "UNKNOWN_SESSION" -> "找不到該會話，可能已被刪除。"
         "SEND_CANCELLED_ENDPOINT_CHANGED" -> "端點已變更，本次未送出，請確認後重送。"
         "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD" -> "先前對話屬於其他 provider 或來源不明，為保護隱私不會自動傳給目前 provider；舊紀錄仍顯示於畫面，新對話從空白上下文開始。"
+        "HISTORY_SNAPSHOT_INCOMPLETE" -> "切換模型時歷史快照寫入失敗，舊對話未能完整帶入；本次仍可繼續對話，重啟後僅保留新對話紀錄。"
         else -> code
     }
 

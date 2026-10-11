@@ -88,6 +88,25 @@ interface SessionStore {
     /** Append one event; returns the rowId. */
     suspend fun appendEvent(event: TranscriptEvent): Long
 
+    /**
+     * R5-4 atomic batch append: persists every event as one all-or-nothing
+     * unit and returns the rowIds in order. The default implementation is a
+     * sequential [appendEvent] loop (NON-ATOMIC: a mid-batch failure leaves
+     * the earlier rows behind); only [RoomSessionStore] (single DB
+     * transaction) and the in-memory test fake (snapshot + rollback) upgrade
+     * this to a true atomic commit. External [SessionStore] implementations
+     * inherit the sequential fallback, so callers must still treat a throw as
+     * a possibly-partial batch unless the store documents atomicity.
+     * [snapshotSwitchHistory][dev.librepocket.agent.ui.chat.snapshotSwitchHistory]
+     * funnels its marker + prefix through this one call, so Room/fake forks
+     * can never strand a half snapshot.
+     */
+    suspend fun appendEvents(events: List<TranscriptEvent>): List<Long> {
+        val ids = ArrayList<Long>(events.size)
+        for (event in events) ids.add(appendEvent(event))
+        return ids
+    }
+
     /** Page events by [afterSeq] (exclusive), ascending, at most [limit]. */
     suspend fun loadEvents(sessionId: String, afterSeq: Long = 0, limit: Int = 200): List<TranscriptEvent>
 

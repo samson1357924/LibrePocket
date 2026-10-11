@@ -1034,6 +1034,22 @@ class TurnControllerTest {
     assertFalse(assistantsOf(c).single().isPartial)
   }
 
+  @Test fun consecutiveReasoningDeltasMergeWithFlag() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ReasoningDelta(0, 1, "thought-"))
+        emit(StreamEvent.ReasoningDelta(0, 1, "part"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("hi") }
+    val block = assistantsOf(c).single()
+    assertEquals("thought-part", block.text)
+    assertTrue(block.hasReasoning)
+    assertFalse(block.isPartial)
+  }
+
   // ---- Finding A [P1]: reasoning origin must survive into history ----
   //
   // Stage 1 scoped gate: production TurnController.buildRequest always sends

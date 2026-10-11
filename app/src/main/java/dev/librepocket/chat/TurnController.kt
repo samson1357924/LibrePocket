@@ -772,10 +772,8 @@ class TurnController(
             // stream and never loses thinking content. The block is additionally
             // flagged reasoning-sourced so tool-dependent / thinking-mode
             // follow-up rebuilds fail closed (ordinary no-tools ones continue).
-            is StreamEvent.ReasoningDelta -> {
-              markAssistantReasoning(attemptRunId)
-              appendAssistantText(attemptRunId, event.delta)
-            }
+            // Single _uiState.update (text + flag) to avoid two full maps per delta.
+            is StreamEvent.ReasoningDelta -> appendReasoningDelta(attemptRunId, event.delta)
             // Opaque reasoning marker: no visible text, only the source flag
             // (covers reasoning origins with no replayable payload).
             is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
@@ -967,12 +965,33 @@ class TurnController(
    * Display text is untouched; the flag only rides [buildRequest] into
    * [ChatMessage.hasReasoning] so adapters fail closed on a tool-dependent /
    * thinking-mode follow-up (ordinary no-tools follow-ups continue).
+   * Short-circuits when the flag is already set to avoid a full list copy
+   * plus a no-op flow emission (opaque [StreamEvent.ReasoningPresent] path).
    */
   private fun markAssistantReasoning(runId: String) {
+    if (_uiState.value.messages.any { it.id == runId && it.role == "assistant" && it.hasReasoning }) return
     _uiState.update { s ->
       s.copy(
         messages = s.messages.map { m ->
           if (m.id == runId && m.role == "assistant") m.copy(hasReasoning = true) else m
+        },
+      )
+    }
+  }
+
+  /**
+   * Merges one reasoning delta into the attempt's assistant block with a
+   * single [_uiState] update (one list map): appends [delta] to the visible
+   * text and sets `hasReasoning=true` together. An empty [delta] still sets
+   * the flag (empty reasoning counts as reasoning-sourced, matching the
+   * previous mark-then-append behavior where the mark ran first and the
+   * empty append returned early).
+   */
+  private fun appendReasoningDelta(runId: String, delta: String) {
+    _uiState.update { s ->
+      s.copy(
+        messages = s.messages.map { m ->
+          if (m.id == runId && m.role == "assistant") m.copy(text = m.text + delta, hasReasoning = true) else m
         },
       )
     }

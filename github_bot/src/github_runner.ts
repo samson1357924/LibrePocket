@@ -1860,15 +1860,32 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
   return emit({ claimed: true, reviewsUsed: expected, reason: `claimed: head ${claimSha} now at ${expected}`, issueNumber, claimSha });
 }
 
-function defaultGit(args: string[]): string {
+// Git commands must resolve repo-root-relative pathspecs regardless of the
+// process working directory. The workflow invokes the runner with
+// `working-directory: github_bot`, and a path like `app/src/...` would then be
+// interpreted as `github_bot/app/src/...` (silently empty diff, exit code 0),
+// failing every per-file review. Anchor once at the worktree root.
+let cachedRepoRoot: string | undefined;
+function repoRoot(): string {
+  if (cachedRepoRoot === undefined) {
+    cachedRepoRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  }
+  return cachedRepoRoot;
+}
+
+export function defaultGit(args: string[]): string {
   return execFileSync('git', args, {
+    cwd: repoRoot(),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     maxBuffer: 64 * 1024 * 1024,
   });
 }
 
-function getChangedPaths(context: RunnerContext, mergeBaseSha: string, headSha: string): string[] {
+export function getChangedPaths(context: RunnerContext, mergeBaseSha: string, headSha: string): string[] {
   const runGit = context.runGit ?? defaultGit;
   return runGit(['diff', '--name-only', '-z', mergeBaseSha, headSha])
     .split('\0')

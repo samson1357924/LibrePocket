@@ -16,6 +16,7 @@ import {
 } from '../src/review_diff';
 import { synthesizeChunkedReview, type OrchestratedReview } from '../src/orchestrator';
 import {
+  defaultGit,
   parseReviewCountMarker,
   reviewComment,
   runClaimMode,
@@ -392,6 +393,29 @@ export async function runPrChunksTests(): Promise<void> {
       assert.ok(seen.every((args) => args[0] === '--literal-pathspecs'), 'literal pathspecs forced');
       assert.throws(() => collectFileDiffs(() => '', BASE_SHA, HEAD_SHA, ['app/src/main/java/demo/Safe.kt']),
         /no diff for a changed review file/, 'empty review patch fails closed');
+    }
+
+    // Regression (hosted smoke): the runner is invoked with
+    // `working-directory: github_bot`, so repo-root-relative pathspecs must not
+    // be resolved against that cwd. defaultGit pins the git process at the
+    // worktree root, so a root-relative pathspec resolves even when
+    // process.cwd() is a subdirectory (previously every per-file diff came back
+    // empty with exit code 0 and the claim pre-flight failed closed).
+    {
+      const previousCwd = process.cwd();
+      const subdir = path.join(defaultGit(['rev-parse', '--show-toplevel']).trim(), 'github_bot');
+      fs.mkdirSync(subdir, { recursive: true });
+      try {
+        process.chdir(subdir);
+        assert.equal(defaultGit(['rev-parse', '--show-prefix']).trim(), '',
+          'git runs at the worktree root regardless of process.cwd()');
+        // A root-relative pathspec matches from the subdir; from that cwd the
+        // interpreted path would be github_bot/github_bot/... and fail (128).
+        assert.doesNotThrow(() => defaultGit(['ls-files', '--error-unmatch', '--', 'github_bot/package.json']),
+          'root-relative pathspecs resolve from a subdirectory cwd');
+      } finally {
+        process.chdir(previousCwd);
+      }
     }
 
     // Unit: synthesis rules (BLOCK/NEEDS first, then INCONCLUSIVE, then APPROVE).

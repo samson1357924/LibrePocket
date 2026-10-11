@@ -156,6 +156,23 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
 class InputTooLongException(message: String) : IllegalArgumentException(message)
 
 /**
+ * Stage 6 (R4-3): admission-time durable failure for the user row.
+ *
+ * Thrown fail-closed when [TurnController.startTurn]/[TurnController.startOrEnqueue]
+ * cannot durably persist the user row within
+ * [TurnController.ACCEPT_DURABLE_TIMEOUT_MS] (store stall, delegate
+ * IOException, or writer seal race). Deliberately NOT a [CancellationException]
+ * so ViewModel admission loops treat it like [InputTooLongException]
+ * (notice + draft restore via `restoreOpForFailedSend`, caller retains the
+ * text for explicit retry) instead of propagating caller cancellation.
+ * The logical id is already INTERRUPTED-marked via
+ * [OrderedTranscriptSink.interruptedRunIds]; a later-unblocked writer may
+ * still persist the abandoned entry as a ghost row, but it stays marked and
+ * never reports false acceptance.
+ */
+class TranscriptDurabilityException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/**
  * Turn controller: per-turn [Flow] collection + retry orchestration +
  * single-flight guard + steer queue + cooperative cancel.
  *
@@ -288,11 +305,23 @@ class TurnController(
   private val systemZone: () -> ZoneId = ZoneId::systemDefault,
   initialHistory: List<ChatMessage> = emptyList(),
   private val historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
+  transcriptDispatcher: CoroutineDispatcher? = null,
+  private val acceptTimeoutMs: Long = ACCEPT_DURABLE_TIMEOUT_MS,
 ) {
   companion object {
     const val POLICY_ACTION = "chat.send"
     const val POLICY_RESOURCE = "chat"
     const val DEFAULT_MODEL = "default"
+
+    /**
+     * Stage 6 (R4-3): bounded wait for the admission-time durable user-row
+     * ack. [startTurn]/[startOrEnqueue] return `Started` only after
+     * `onTurnStarted` is acked within this budget; a stall throws
+     * [TranscriptDurabilityException] fail-closed (caller retains the text).
+     * Same 5s budget as the ledger drain/flush path. Suspend (never block),
+     * so no ANR: Room stays on IO via its own `withContext(IO)`.
+     */
+    const val ACCEPT_DURABLE_TIMEOUT_MS = 5_000L
 
     /** Single-image byte cap (spec §4: >10 MiB is rejected, never transcoded). */
     const val MAX_IMAGE_BYTES = 10 * 1024 * 1024L
@@ -342,7 +371,22 @@ class TurnController(
 
   private val lock = Any()
   private val scope = CoroutineScope(SupervisorJob() + dispatcher)
-  private val writerScope = CoroutineScope(SupervisorJob() + dispatcher)
+  /**
+   * Stage 6: writer runs on its own dispatcher so the admission-time durable
+   * await ([ACCEPT_DURABLE_TIMEOUT_MS]) never deadlocks against a paused host
+   * dispatcher. Defaults to [dispatcher] (prod: same Default pool); tests
+   * split host (paused) from writer (Default) to prove Started==durable
+   * without dispatching the host.
+   *
+   * Dispatcher precondition (R4-3 review): the bounded wait above only holds
+   * when this dispatcher can make progress independently of the host
+   * dispatcher. A single-threaded or paused dispatcher shared with the host
+   * self-deadlocks (neither the ack nor the 5s timeout can run), so prod must
+   * pass a multi-threaded pool (Dispatchers.Default) or an explicit
+   * `transcriptDispatcher = Dispatchers.Default`.
+   */
+  private val writerDispatcher: CoroutineDispatcher = transcriptDispatcher ?: dispatcher
+  private val writerScope = CoroutineScope(SupervisorJob() + writerDispatcher)
   /**
    * Session-owned serialized transcript writer. All [TranscriptSink] calls
    * below go through it (never directly to [transcript]), so persistence
@@ -350,25 +394,54 @@ class TurnController(
    * scope is independent of [scope], so turn cancellation cannot strand an
    * admitted event.
    */
-  private val orderedTranscript = OrderedTranscriptSink(transcript, dispatcher)
+  private val orderedTranscript = OrderedTranscriptSink(transcript, writerDispatcher)
+  /**
+   * Stage 6: logical ids whose user row ack already succeeded (admission
+   * await or [runTurnLoop] promotion write). [runTurnLoop] and
+   * [drainOrphanLocked] skip the user-row write when present, so exactly one
+   * user row exists per logical turn even across the admission/host/close
+   * race. Bounded by the session's turn count (same as
+   * [terminalizedAttempts]).
+   */
+  private val durableUserRows: MutableSet<String> =
+    java.util.concurrent.ConcurrentHashMap.newKeySet()
   /** Background settle+drain+seal launched by [close]; awaited by [flushTranscript]. Guarded by [lock]. */
   private var shutdownJob: Job? = null
   private var pendingAdmission: PendingAdmission? = null
+  /**
+   * Admission-window cancel flag (Finding 1): logicalTurnId for which [cancel]
+   * was called while [pendingAdmission] was set but no host had launched yet
+   * (the durable await runs outside [lock]). The waiter observes it in its
+   * finalize block, abandons the launch, drains a cancel (user row already
+   * durable, skipped there) and returns a cancelled host instead of
+   * ghost-launching. Guarded by [lock]; cleared by whichever waiter path wins
+   * (cancel-drain, closed-rollback, or durability-rollback).
+   */
+  private var admissionCancelRequestedId: String? = null
   private var orphanDrainJob: Job? = null
 
   private fun drainOrphanLocked(pending: PendingAdmission): Job {
     if (pendingAdmission?.logicalTurnId == pending.logicalTurnId) {
       pendingAdmission = null
     }
+    val alreadyDurable = durableUserRows.contains(pending.logicalTurnId)
     val drain = writerScope.launch(NonCancellable) {
       try {
-        orderedTranscript.onTurnStarted(pending.logicalTurnId, pending.text)
+        // Stage 6: admission-path user rows are already durable before the
+        // host launches; re-writing would duplicate the runId. Only
+        // promotion-path orphans (never durably awaited) need the user row.
+        if (!alreadyDurable) {
+          orderedTranscript.onTurnStarted(pending.logicalTurnId, pending.text)
+          durableUserRows.add(pending.logicalTurnId)
+        }
         orderedTranscript.onLogicalTurnCancelled(
           pending.logicalTurnId,
           pending.attemptRef.get(),
           "",
           pending.attemptIndexRef.get(),
         )
+      } catch (_: CancellationException) {
+        orderedTranscript.markInterrupted(pending.logicalTurnId)
       } catch (_: Exception) {
         orderedTranscript.markInterrupted(pending.logicalTurnId)
       }
@@ -487,6 +560,136 @@ class TurnController(
     return current
   }
 
+  /**
+   * Stage 6: single-flight including the admission-time durable window.
+   * [pendingAdmission] is set before the first suspend (durable await) and
+   * cleared only on failure or host entry, so a concurrent admission arriving
+   * during the await must queue/throw instead of starting a second turn.
+   * Caller must hold [lock].
+   */
+  private fun isBusyLocked(): Boolean = activeLocked() != null || pendingAdmission != null
+
+  /**
+   * Stage 6: durable user-row await shared by [startTurn]/[startOrEnqueue].
+   * Bounded by [ACCEPT_DURABLE_TIMEOUT_MS] (suspend, never block — Room stays
+   * on IO). Success records [durableUserRows]; timeout/store/seal failure
+   * marks INTERRUPTED and throws [TranscriptDurabilityException] (fail-closed,
+   * non-cancellation so the ViewModel restores the draft). Caller
+   * cancellation (external, writer still live) propagates as-is after the
+   * same rollback+mark, so no ghost UI remains.
+   */
+  private suspend fun awaitUserRowDurable(logicalTurnId: String, text: String) {
+    val acked = try {
+      withTimeoutOrNull(acceptTimeoutMs) {
+        orderedTranscript.onTurnStarted(logicalTurnId, text)
+      } != null
+    } catch (e: CancellationException) {
+      if (orderedTranscript.isSealed()) {
+        try {
+          orderedTranscript.markInterrupted(logicalTurnId)
+        } catch (_: Exception) {
+        }
+        throw TranscriptDurabilityException("transcript store unavailable (sealed)", e)
+      }
+      try {
+        orderedTranscript.markInterrupted(logicalTurnId)
+      } catch (_: Exception) {
+      }
+      throw e
+    } catch (e: Exception) {
+      try {
+        orderedTranscript.markInterrupted(logicalTurnId)
+      } catch (_: Exception) {
+      }
+      throw TranscriptDurabilityException("transcript store failed", e)
+    }
+    if (!acked) {
+      try {
+        orderedTranscript.markInterrupted(logicalTurnId)
+      } catch (_: Exception) {
+      }
+      throw TranscriptDurabilityException(
+        "transcript store timed out after $acceptTimeoutMs ms",
+      )
+    }
+    durableUserRows.add(logicalTurnId)
+  }
+
+  /**
+   * Stage 6: rollback for a durably-failed admission. Clears a still-owned
+   * [pendingAdmission] (and any matching [admissionCancelRequestedId]), removes
+   * the optimistically appended UI user row, and projects ERROR (fail-closed)
+   * without touching the FIFO. Caller must NOT hold [lock].
+   */
+  private fun rollbackFailedAdmission(
+    uiMessageId: String,
+    reservation: PendingAdmission,
+    error: String,
+  ) {
+    synchronized(lock) {
+      if (pendingAdmission?.logicalTurnId == reservation.logicalTurnId) {
+        pendingAdmission = null
+      }
+      if (admissionCancelRequestedId == reservation.logicalTurnId) {
+        admissionCancelRequestedId = null
+      }
+      activityRevision++
+      _uiState.update { s ->
+        s.copy(
+          messages = s.messages.filterNot { it.id == uiMessageId && it.role == "user" },
+          status = ChatStatus.ERROR,
+          error = error,
+        )
+      }
+    }
+  }
+
+  /**
+   * Locked rollback for a finalize that observed [closed] after its durable
+   * ack already succeeded (Finding 2). The ledger already holds the user row,
+   * so this first drains a cancel terminal (user row skipped as durable via
+   * [drainOrphanLocked]) and then rolls back the optimistic UI row + projects
+   * ERROR, so the caller retains the text for explicit retry (same restore
+   * semantics as [TranscriptDurabilityException], surfaced to the ViewModel
+   * as such instead of a bare IllegalStateException that strands pendingOps).
+   * Clears any matching [admissionCancelRequestedId]. Caller must hold [lock].
+   */
+  private fun rollbackClosedAdmissionLocked(uiMessageId: String, reservation: PendingAdmission): Job? {
+    if (admissionCancelRequestedId == reservation.logicalTurnId) {
+      admissionCancelRequestedId = null
+    }
+    val pending = pendingAdmission?.takeIf { it.logicalTurnId == reservation.logicalTurnId }
+    val drain: Job? = if (pending != null) {
+      drainOrphanLocked(pending)
+    } else if (!durableUserRows.contains(reservation.logicalTurnId)) {
+      // Pending already cleared but the user row never became durable (e.g. a
+      // racing rollback won): no ledger row to cancel, nothing to drain.
+      null
+    } else {
+      // Pending cleared by another path but the row is durable: still ensure
+      // the cancel terminal via the reservation itself.
+      drainOrphanLocked(reservation)
+    }
+    activityRevision++
+    _uiState.update { s ->
+      s.copy(
+        messages = s.messages.filterNot { it.id == uiMessageId && it.role == "user" },
+        status = ChatStatus.ERROR,
+        error = "transcript store unavailable",
+      )
+    }
+    return drain
+  }
+
+  /**
+   * Sends one turn and returns after the hosted turn finishes.
+   *
+   * Stage 6: returning already implied terminal durability (core writes are
+   * acked inline); since `Started` itself is now durable (user row acked
+   * before [startTurn] returns), the old asymmetry is gone — `send()` adds
+   * the terminal-row guarantee on top of the same durable user row, it no
+   * longer repairs a memory-only acceptance.
+   */
   suspend fun send(text: String, images: List<ChatImageRef> = emptyList()) {
     val host = startTurn(text, images)
     try {
@@ -503,19 +706,43 @@ class TurnController(
    * policy passed, user message appended, STREAMING) without waiting for the
    * hosted turn to finish. Callers that must retain an unsent draft across
    * endpoint invalidation (R1) clear it only after this returns; a
-   * [CancellationException]/[SecurityException]/[IllegalStateException] before
-   * return means the text was NOT accepted and must stay recoverable. A
-   * [RecoveryRequiredException] means queued recovery work must be drained
-   * before this direct admission can proceed; this method never drains it. If
-   * recovery appears after the initial admission lock, this attempt may
-   * already have passed a fresh policy gate; retrying evaluates policy again.
+   * [CancellationException]/[SecurityException]/[IllegalStateException]/
+   * [TranscriptDurabilityException] before return means the text was NOT
+   * accepted and must stay recoverable. A [RecoveryRequiredException] means
+   * queued recovery work must be drained before this direct admission can
+   * proceed; this method never drains it. If recovery appears after the
+   * initial admission lock, this attempt may already have passed a fresh
+   * policy gate; retrying evaluates policy again.
+   *
+   * Stage 6 (R4-3) durability: `Started` (the returned [Job]) is durable —
+   * the user row is acked by the session writer within
+   * [ACCEPT_DURABLE_TIMEOUT_MS] BEFORE this returns, so a process kill
+   * immediately after return never loses the text (no `close`/`flush`
+   * needed). A stalled store throws [TranscriptDurabilityException]
+   * fail-closed (UI append rolled back, logical id INTERRUPTED-marked,
+   * caller retains the text like [InputTooLongException]). This eliminates
+   * the old `send()` (join host, terminal acked) vs `Started` (memory-only)
+   * asymmetry: both now imply a durable user row; `send()` additionally
+   * implies the terminal row.
+   *
+   * Admission-window cancel (Finding 1): a [cancel] that lands while the
+   * durable await is still parked does NOT ghost-launch. The waiter observes
+   * the cancel flag in finalize, drains a cancel terminal (user row already
+   * durable, skipped there), keeps the UI user row with status CANCELLED, and
+   * returns an already-cancelled host (accepted-then-cancelled, never a second
+   * provider call). Finalize that observes [closed] after a successful ack is
+   * instead treated as a durability failure (Finding 2): ledger keeps the user
+   * row + cancel terminal, the UI row is rolled back with ERROR, and a
+   * [TranscriptDurabilityException] is thrown so the caller retains the text
+   * for explicit retry (never a bare IllegalStateException that strands
+   * pendingOps).
    */
   suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): Job {
     require(text.isNotBlank()) { "text must not be blank" }
     checkInputLengthOrThrow(text)
     val revisionAtAdmission = synchronized(lock) {
       check(!closed) { "controller is closed" }
-      if (activeLocked() != null) {
+      if (isBusyLocked()) {
         _uiState.update { it.copy(error = "busy: another turn is in flight") }
         throw IllegalStateException("already in flight")
       }
@@ -525,7 +752,14 @@ class TurnController(
     beforeAdmissionGateForTest?.invoke()
     gateOrThrow(revisionAtAdmission)
     afterStartTurnGateForTest?.invoke()
-    val host = synchronized(lock) {
+    // Second lock: reserve (bump + optimistic UI append + pending) but do NOT
+    // launch yet. The durable await below runs outside the lock (suspend must
+    // never hold the intrinsic monitor); [pendingAdmission] guards the window
+    // so concurrent admissions queue/throw instead of starting a second turn.
+    // STREAMING is projected only after the ack (Stage 6).
+    val reservation: PendingAdmission
+    val uiMessageId: String
+    synchronized(lock) {
       check(!closed) { "controller is closed" }
       // R4-4 second-lock re-validation: fresh zone read after the gate, before
       // any bump/append/transcript. Length first (before busy/recovery) for
@@ -533,16 +767,13 @@ class TurnController(
       // no bump, no transcript) with InputTooLongException to the caller.
       // Closed stays first (lifecycle seal); length still precedes busy/recovery.
       checkInputLengthOrThrow(text)
-      if (activeLocked() != null) {
+      if (isBusyLocked()) {
         _uiState.update { it.copy(error = "busy: another turn is in flight") }
         throw IllegalStateException("already in flight")
       }
       checkNoQueuedRecoveryLocked()
       activityRevision++
-      appendUser(text)
-      _uiState.update {
-        it.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
-      }
+      uiMessageId = appendUser(text)
       // Stage B: the logical turn id exists before the first suspension
       // (onTurnStarted ack), so a cancel parked on that ack still attributes
       // to this turn instead of falling back to the previous assistant.
@@ -551,9 +782,54 @@ class TurnController(
       val logicalTurnId = newId()
       val attemptRef = AtomicReference(logicalTurnId)
       val attemptIndexRef = AtomicInteger(0)
-      pendingAdmission = PendingAdmission(logicalTurnId, text, images, attemptRef, attemptIndexRef)
-      val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef, attemptIndexRef) }
+      reservation = PendingAdmission(logicalTurnId, text, images, attemptRef, attemptIndexRef)
+      pendingAdmission = reservation
+    }
+    // Stage 6 durable gate (outside the lock): Started == durable user row.
+    try {
+      awaitUserRowDurable(reservation.logicalTurnId, text)
+    } catch (e: CancellationException) {
+      rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+      throw e
+    } catch (e: TranscriptDurabilityException) {
+      rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+      throw e
+    }
+    // Finalize under lock: project STREAMING + launch. Closed after the ack
+    // is treated as a durability failure (Finding 2: drain cancel + roll back
+    // UI + throw TranscriptDurabilityException for retry, never a bare
+    // IllegalStateException). A cancel parked in the durable window (Finding 1)
+    // abandons the launch and returns an already-cancelled host instead of
+    // ghost-launching.
+    val host: Job = synchronized(lock) {
+      if (closed) {
+        rollbackClosedAdmissionLocked(uiMessageId, reservation)
+        throw TranscriptDurabilityException("controller is closed")
+      }
+      if (admissionCancelRequestedId == reservation.logicalTurnId) {
+        admissionCancelRequestedId = null
+        val pending =
+          pendingAdmission?.takeIf { it.logicalTurnId == reservation.logicalTurnId } ?: reservation
+        drainOrphanLocked(pending)
+        _uiState.update { s ->
+          s.copy(
+            status = ChatStatus.CANCELLED,
+            pendingSteerCount = steerQueue.size,
+            queuedRecoveryRequired = steerQueue.isNotEmpty(),
+          )
+        }
+        val cancelled = Job()
+        cancelled.cancel()
+        return@synchronized cancelled
+      }
+      _uiState.update {
+        it.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
+      }
+      val job = scope.launch {
+        hostedTurn(text, images, reservation.logicalTurnId, reservation.attemptRef, reservation.attemptIndexRef)
+      }
       inFlight = job
+      val logicalTurnId = reservation.logicalTurnId
       job.invokeOnCompletion {
         synchronized(lock) {
           if (inFlight === job) inFlight = null
@@ -568,9 +844,36 @@ class TurnController(
     return host
   }
 
+  /**
+   * Cooperative cancel. Cancelling a live host flips to CANCELLED first so the
+   * UI stops even if the transport close blocks briefly, then cancels the
+   * in-flight job. A cancel that lands in the admission-time durable window
+   * ([pendingAdmission] set, no host yet) is NOT a no-op: it records
+   * [admissionCancelRequestedId] and projects CANCELLED, so the waiter
+   * abandons its launch and drains a cancel terminal instead of
+   * ghost-launching (accepted-then-cancelled: ledger keeps the durable user
+   * row + cancel mark, UI keeps the row, caller gets an already-cancelled
+   * host). No join, no IO.
+   */
   fun cancel() {
     synchronized(lock) {
-      val current = activeLocked() ?: return
+      val current = activeLocked()
+      if (current != null) {
+        activityRevision++
+        _uiState.update {
+          it.copy(
+            status = ChatStatus.CANCELLED,
+            pendingSteerCount = steerQueue.size,
+            queuedRecoveryRequired = steerQueue.isNotEmpty(),
+          )
+        }
+        // Cooperative: cancelling collection cancels the underlying HTTP call.
+        current.cancel()
+        return
+      }
+      val pending = pendingAdmission ?: return
+      if (admissionCancelRequestedId == pending.logicalTurnId) return
+      admissionCancelRequestedId = pending.logicalTurnId
       activityRevision++
       _uiState.update {
         it.copy(
@@ -579,8 +882,6 @@ class TurnController(
           queuedRecoveryRequired = steerQueue.isNotEmpty(),
         )
       }
-      // Cooperative: cancelling collection cancels the underlying HTTP call.
-      current.cancel()
     }
     // No join, no IO: return immediately so the UI stops within 200ms.
   }
@@ -589,13 +890,23 @@ class TurnController(
    * Atomic start-or-enqueue: the busy check and the FIFO insert happen under
    * the same lock, so the decision is never stale. Returns [TurnStart.Started]
    * once the text is accepted (fresh `chat.send` passed, user message
-   * appended) without waiting for the turn to finish, [TurnStart.Queued]
-   * when a turn was already in flight, or [TurnStart.NeedsRecovery] when an
-   * idle controller still has promotion-gate-failed intents to return to the
-   * caller before it retries this admission. A [CancellationException]/[SecurityException]/
-   * [IllegalStateException] before return means NOT accepted. Unlike
-   * [steer], the idle path never fire-and-forgets: callers always get an
-   * explicit acknowledgment.
+   * appended, durably persisted) without waiting for the turn to finish,
+   * [TurnStart.Queued] when a turn was already in flight, or
+   * [TurnStart.NeedsRecovery] when an idle controller still has
+   * promotion-gate-failed intents to return to the caller before it retries
+   * this admission. A [CancellationException]/[SecurityException]/
+   * [IllegalStateException]/[TranscriptDurabilityException] before return
+   * means NOT accepted. Unlike [steer], the idle path never fire-and-forgets:
+   * callers always get an explicit acknowledgment.
+   *
+   * Stage 6 (R4-3): [TurnStart.Started] is durable — see [startTurn]. A
+   * stalled store throws [TranscriptDurabilityException] fail-closed (caller
+   * retains the text, INTERRUPTED-marked). An admission-window [cancel]
+   * abandons the launch and returns `Started` with an already-cancelled host
+   * (accepted-then-cancelled, no ghost provider call); a finalize that
+   * observes close after a successful ack rolls back the UI and throws
+   * [TranscriptDurabilityException] for retry (never a bare
+   * IllegalStateException).
    *
    * N1 ownership: [TurnStart.Queued] is NOT acceptance (no gate, no append).
    * [TurnStart.NeedsRecovery] also does not accept the current text; its
@@ -621,7 +932,7 @@ class TurnController(
     checkInputLengthOrThrow(text)
     val revisionAtAdmission = synchronized(lock) {
       check(!closed) { "controller is closed" }
-      if (activeLocked() != null) {
+      if (isBusyLocked()) {
         check(images.isEmpty()) { "cannot queue a turn with images; text and images remain caller-owned" }
         enqueueLocked(opId, text, images)
         return TurnStart.Queued
@@ -632,9 +943,14 @@ class TurnController(
     beforeAdmissionGateForTest?.invoke()
     gateOrThrow(revisionAtAdmission)
     afterStartOrEnqueueGateForTest?.invoke()
-    val host = synchronized(lock) {
+    // Second lock: reserve only (bump + optimistic append + pending). The
+    // durable await runs outside the lock; [pendingAdmission] guards the
+    // window. Lost-race arrivals enqueue (Queued) as before.
+    val reservation: PendingAdmission
+    val uiMessageId: String
+    synchronized(lock) {
       check(!closed) { "controller is closed" }
-      if (activeLocked() != null) {
+      if (isBusyLocked()) {
         // Lost the race during the gate: re-validate length with the fresh
         // zone before queueing, so a zone that grew during the gate cannot
         // enqueue oversize work. Oversize throws like admission (no enqueue,
@@ -655,18 +971,54 @@ class TurnController(
       checkInputLengthOrThrow(text)
       drainRecoveryLocked()?.let { return TurnStart.NeedsRecovery(it) }
       activityRevision++
-      appendUser(text, opId)
-      _uiState.update {
-        it.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
-      }
+      uiMessageId = appendUser(text, opId)
       // Same Stage B ownership as startTurn: id before first suspension.
       // Stage C: attempt index ref travels with the attempt id ref.
       val logicalTurnId = newId()
       val attemptRef = AtomicReference(logicalTurnId)
       val attemptIndexRef = AtomicInteger(0)
-      pendingAdmission = PendingAdmission(logicalTurnId, text, images, attemptRef, attemptIndexRef)
-      val job = scope.launch { hostedTurn(text, images, logicalTurnId, attemptRef, attemptIndexRef) }
+      reservation = PendingAdmission(logicalTurnId, text, images, attemptRef, attemptIndexRef)
+      pendingAdmission = reservation
+    }
+    // Stage 6 durable gate (outside the lock): Started == durable user row.
+    try {
+      awaitUserRowDurable(reservation.logicalTurnId, text)
+    } catch (e: CancellationException) {
+      rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+      throw e
+    } catch (e: TranscriptDurabilityException) {
+      rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+      throw e
+    }
+    val host = synchronized(lock) {
+      if (closed) {
+        rollbackClosedAdmissionLocked(uiMessageId, reservation)
+        throw TranscriptDurabilityException("controller is closed")
+      }
+      if (admissionCancelRequestedId == reservation.logicalTurnId) {
+        admissionCancelRequestedId = null
+        val pending =
+          pendingAdmission?.takeIf { it.logicalTurnId == reservation.logicalTurnId } ?: reservation
+        drainOrphanLocked(pending)
+        _uiState.update { s ->
+          s.copy(
+            status = ChatStatus.CANCELLED,
+            pendingSteerCount = steerQueue.size,
+            queuedRecoveryRequired = steerQueue.isNotEmpty(),
+          )
+        }
+        val cancelled = Job()
+        cancelled.cancel()
+        return@synchronized cancelled
+      }
+      _uiState.update {
+        it.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
+      }
+      val job = scope.launch {
+        hostedTurn(text, images, reservation.logicalTurnId, reservation.attemptRef, reservation.attemptIndexRef)
+      }
       inFlight = job
+      val logicalTurnId = reservation.logicalTurnId
       job.invokeOnCompletion {
         synchronized(lock) {
           if (inFlight === job) inFlight = null
@@ -693,8 +1045,11 @@ class TurnController(
     checkInputLengthOrThrow(text)
     synchronized(lock) {
       check(!closed) { "controller is closed" }
-      if (activeLocked() != null) {
+      if (isBusyLocked()) {
         // Never cancel the current turn: queue for the next round (FIFO).
+        // Stage 6: includes the admission-time durable window (pending set,
+        // host not yet launched) so a steer racing a durable await queues
+        // synchronously instead of taking the async idle path.
         enqueueLocked(null, text, emptyList())
         return
       }
@@ -729,6 +1084,11 @@ class TurnController(
         retainSteerForRecovery(text, error = "approval required")
       } catch (_: PolicyEvaluationException) {
         retainSteerForRecovery(text, error = "policy evaluation failed")
+      } catch (_: TranscriptDurabilityException) {
+        // Stage 6: admission-time durable failure (store stall/seal) never
+        // loses the steer text; retain for explicit recovery like any other
+        // unaccepted admission.
+        retainSteerForRecovery(text, error = "transcript store unavailable")
       } catch (_: CancellationException) {
         // close() may discard intents by lifecycle contract. Other admission
         // cancellation must leave the unaccepted text recoverable.
@@ -758,7 +1118,13 @@ class TurnController(
       val current = activeLocked()
       doomed = current
       val orphaned = pendingAdmission
-      orphanJob = if (orphaned != null) {
+      // Stage 6: a pending admission with no launched host is still in its
+      // admission-time durable window (the waiter owns the user-row write
+      // outside the lock). Do NOT launch a second concurrent user-row write
+      // here; the waiter finalizes (drains a cancel when it observes `closed`,
+      // or rolls back on durability failure). Only drain orphans whose host
+      // already launched (inFlight set) but never ran.
+      orphanJob = if (orphaned != null && current != null) {
         drainOrphanLocked(orphaned)
       } else {
         orphanDrainJob
@@ -897,11 +1263,12 @@ class TurnController(
    * and the async [startOrEnqueue] check). Intentionally side-effect free:
    * no enqueue, no transcript write, no [activityRevision] bump — the text
    * stays caller-owned. Only projects when idle so a live turn is never
-   * disturbed.
+   * disturbed (idle includes the admission-time durable window: [isBusyLocked]
+   * covers both the host and [pendingAdmission]).
    */
   private fun projectInputTooLongIdle() {
     synchronized(lock) {
-      if (closed || activeLocked() != null) return
+      if (closed || isBusyLocked()) return
       val status = _uiState.value.status
       if (status != ChatStatus.IDLE && status != ChatStatus.ERROR) return
       _uiState.update { it.copy(status = ChatStatus.ERROR, error = "input too long") }
@@ -930,9 +1297,11 @@ class TurnController(
       steerQueue.addFirst(PendingSteer(intent.opId, intent.text, emptyList()))
     }
     enqueueLocked(null, text, emptyList())
-    val active = activeLocked() != null
+    // Admission-window aware: a pending durable await still owns the
+    // single-flight slot, so recovery must not project ERROR over it.
+    val busy = isBusyLocked()
     _uiState.update { state ->
-      val mayProjectError = !active && state.status in setOf(ChatStatus.IDLE, ChatStatus.ERROR)
+      val mayProjectError = !busy && state.status in setOf(ChatStatus.IDLE, ChatStatus.ERROR)
       state.copy(
         status = if (mayProjectError) ChatStatus.ERROR else state.status,
         error = if (!mayProjectError) state.error else if (state.queuedRecoveryRequired && state.error != null) {
@@ -1129,6 +1498,18 @@ class TurnController(
     // reclaimable via drainQueued). The dequeue and complete follow-up handoff
     // then share the teardown lock, so the intent is either drained or fully
     // accepted; it cannot be stranded between the queue and transcript.
+    //
+    // Promotion asymmetry (R4-3 review, documented): unlike direct admissions
+    // ([startTurn]/[startOrEnqueue], which durably await the user row with
+    // [ACCEPT_DURABLE_TIMEOUT_MS] BEFORE returning and fail closed with caller
+    // retain), the promotion follow-up below is host-durable — it dequeues
+    // first and writes the user row inside [runTurnLoop] with no timeout
+    // bound. A user-row store failure there lands in the [hostedTurn] catch
+    // above (ERROR, runId INTERRUPTED-marked): the text is already dequeued,
+    // so it has no caller to retain it and [drainQueued] cannot reclaim it.
+    // The UI user row is kept (not rolled back) and the turn stays ERROR until
+    // an explicit user resend; see the promotion-failure regression test that
+    // locks this asymmetry.
     beforeCompletionQueueCheckForTest?.invoke()
     val hasQueued = synchronized(lock) {
       if (closed || self?.isActive != true) {
@@ -1306,18 +1687,25 @@ class TurnController(
     attemptIndexRef: AtomicInteger,
   ) {
     // One logical turn owns exactly one user row (logicalTurnId, created
-    // before launch), durably acked before the first provider attempt.
-    // Retries add attempt records bound to that id and start a new assistant
-    // block each; they never emit another user row. Direct suspend calls (no
-    // fire-and-forget hop), so no snapshot copies are needed: each write
-    // completes in call order. attemptRef always holds the live attempt id
-    // (sleeper gaps keep the just-failed id until the next id is minted), so
-    // the hostedTurn cancel handler never needs the global latest assistant.
+    // before launch). Stage 6: direct admissions ([startTurn]/[startOrEnqueue])
+    // already durably acked it before returning Started (and recorded
+    // [durableUserRows]), so the host skips it and starts from the first
+    // provider attempt; follow-up promotions (never durably awaited) still
+    // write it here. Retries add attempt records bound to that id and start
+    // a new assistant block each; they never emit another user row. Direct
+    // suspend calls (no fire-and-forget hop), so no snapshot copies are
+    // needed: each write completes in call order. attemptRef always holds the
+    // live attempt id (sleeper gaps keep the just-failed id until the next id
+    // is minted), so the hostedTurn cancel handler never needs the global
+    // latest assistant.
     // Stage C: every attempt terminal (success, terminal failure, retried
     // partial, cancel) carries parentRunId/attemptIndex so the logical family
     // (parentRunId ?: runId) owns the full attempt chain; retry notices stay
     // bound to the logical id.
-    orderedTranscript.onTurnStarted(logicalTurnId, text)
+    if (!durableUserRows.contains(logicalTurnId)) {
+      orderedTranscript.onTurnStarted(logicalTurnId, text)
+      durableUserRows.add(logicalTurnId)
+    }
     var attempt = 0
     var attemptRunId = logicalTurnId
     while (true) {
@@ -1658,11 +2046,19 @@ class TurnController(
 
   // ---- uiState helpers (StateFlow.update is atomic; no lock needed) ----
 
-  private fun appendUser(text: String, operationId: Long? = null) {
+  /**
+   * Stage 6: returns the UI row id so an admission-time durable failure can
+   * roll it back (see [rollbackFailedAdmission]/[rollbackClosedAdmissionLocked]).
+   * The ledger user row uses the separate logical turn id (see
+   * [PendingAdmission]); the two ids are intentionally distinct (UI row `*-0`,
+   * logical `*-1` in tests).
+   */
+  private fun appendUser(text: String, operationId: Long? = null): String {
+    val id = newId()
     _uiState.update { s ->
       s.copy(
         messages = s.messages + UiMessage(
-          id = newId(),
+          id = id,
           role = "user",
           text = text,
           isPartial = false,
@@ -1670,6 +2066,7 @@ class TurnController(
         ),
       )
     }
+    return id
   }
 
   private fun appendAssistantPlaceholder(runId: String) {

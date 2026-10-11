@@ -332,11 +332,26 @@ class TurnControllerLedgerTest {
       dispatcher = Dispatchers.Default,
       sleeper = {},
       newId = { "stalled-${n++}" },
+      // Stage 6: stall must fail-closed fast (not park 5s in tests).
+      acceptTimeoutMs = 400L,
     )
     try {
-      val admission = runBlocking { c.startOrEnqueue("hi", opId = 9) }
-      assertTrue(admission is TurnStart.Started)
-      // The host is parked on the durable user-row ack behind the gate.
+      // Stage 6 (R4-3): a stalled user-row ack no longer returns Started.
+      // It throws fail-closed (caller retains the text) and marks INTERRUPTED.
+      try {
+        runBlocking { c.startOrEnqueue("hi", opId = 9) }
+        fail("stalled admission must throw TranscriptDurabilityException, not return Started")
+      } catch (e: dev.librepocket.chat.TranscriptDurabilityException) {
+        // Expected fail-closed path.
+      }
+      // Fail-closed rollback: no ghost UI row remains for the unaccepted text.
+      assertTrue(
+        "failed admission must roll back the UI append",
+        c.uiState.value.messages.none { it.role == "user" && it.text == "hi" },
+      )
+      // The admission-time wait already marked the logical id (UI row
+      // stalled-0, logical stalled-1); close() must still stay fast while the
+      // store stalls.
       val started = System.currentTimeMillis()
       c.close(drainTimeoutMs = 200L)
       val elapsed = System.currentTimeMillis() - started
@@ -358,13 +373,25 @@ class TurnControllerLedgerTest {
   @Test fun flushTranscriptReportsDrainTimeoutAndDrainsAfterUnblock() {
     val gate = CompletableDeferred<Unit>()
     val blockingSink = object : dev.librepocket.chat.TranscriptSink {
-      override suspend fun onTurnStarted(runId: String, text: String) {
+      // Stage 6: admission (user row) stays fast so Started is still returned;
+      // terminal + orphan-cancel acks stall, parking the drain behind the gate.
+      override suspend fun onTurnStarted(runId: String, text: String) = Unit
+      override suspend fun onTurnSucceeded(runId: String, text: String) {
         gate.await()
       }
-      override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
       override suspend fun onTurnFailed(runId: String, error: String) = Unit
       override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-      override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+      override suspend fun onTurnCancelled(runId: String, partialText: String) {
+        gate.await()
+      }
+      override suspend fun onLogicalTurnCancelled(
+        logicalTurnId: String,
+        attemptRunId: String,
+        partialText: String,
+        attemptIndex: Int?,
+      ) {
+        gate.await()
+      }
       override suspend fun onSteerQueued(text: String) = Unit
       override suspend fun onToolDone(
         runId: String,
@@ -450,9 +477,13 @@ class TurnControllerLedgerTest {
       dispatcher = pausedDispatcher,
       sleeper = {},
       newId = { "zero-dispatch-${n++}" },
+      // Stage 6: writer stays unblocked so Started==durable still holds while
+      // the host never dispatches; the acceptance ack does not deadlock.
+      transcriptDispatcher = Dispatchers.Default,
     )
 
-    // Call startOrEnqueue while dispatcher is paused -> Started, host coroutine never executed
+    // Call startOrEnqueue while host dispatcher is paused -> Started (user row
+    // already durable via the writer dispatcher), host coroutine never executed
     val admission = runBlocking { c.startOrEnqueue("zero dispatch user turn", opId = 42L) }
     assertTrue(admission is TurnStart.Started)
     assertEquals(0, provider.streamCalls.get())
@@ -516,6 +547,8 @@ class TurnControllerLedgerTest {
       dispatcher = pausedDispatcher,
       sleeper = {},
       newId = { "zero-dispatch-st-${n++}" },
+      // Stage 6: same split as above (writer unblocked, host paused).
+      transcriptDispatcher = Dispatchers.Default,
     )
 
     val job = runBlocking { c.startTurn("zero dispatch startTurn") }
@@ -534,5 +567,120 @@ class TurnControllerLedgerTest {
     val terminalEvents = store.events.filter { it.kind == "system" && it.text.contains("cancelled") }
     val isInterrupted = c.interruptedTranscriptRunIds().isNotEmpty()
     assertTrue(terminalEvents.isNotEmpty() || isInterrupted)
+  }
+
+  /**
+   * Stage 6 (R4-3) SIGKILL regression: Started == durable user row.
+   *
+   * The host dispatcher never releases (zero dispatch, like a SIGKILL right
+   * after acceptance); the writer dispatcher stays unblocked so the
+   * admission-time ack can complete. No close/flush/resumeAll happens before
+   * the assertion — the controller is discarded outright. Before the fix this
+   * saw 0 rows (user row only existed in memory + pendingAdmission); after
+   * the fix it sees exactly 1 durable user row.
+   */
+  @Test
+  fun acceptedUserRowDurableBeforeHostDispatch() {
+    val store = DelaySessionStore()
+    val provider = LedgerFakeProvider()
+
+    class NeverDispatcher : kotlinx.coroutines.CoroutineDispatcher() {
+      override fun dispatch(context: kotlin.coroutines.CoroutineContext, block: Runnable) {
+        // Never run: the host never dispatches (SIGKILL before first suspend).
+      }
+    }
+
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = SessionTranscriptSink(store, store.sessionId),
+      retryConfig = TurnRetryConfig(),
+      dispatcher = NeverDispatcher(),
+      sleeper = {},
+      newId = { "sigkill-${n++}" },
+      transcriptDispatcher = Dispatchers.Default,
+    )
+
+    val text = "sigkill durable user turn"
+    val admission = runBlocking { c.startOrEnqueue(text, opId = 100L) }
+    assertTrue(admission is TurnStart.Started)
+    assertEquals("host must never have dispatched", 0, provider.streamCalls.get())
+
+    // SIGKILL: no close, no resumeAll, no flush — drop the controller and read
+    // the same underlying store directly. The row must already be durable.
+    val userEvents = store.events.filter { it.kind == "user" }
+    assertEquals("Started must imply a durable user row without close/flush", 1, userEvents.size)
+    assertEquals(text, userEvents[0].text)
+
+    // Cleanup only (after the durability assertion above).
+    c.close()
+  }
+
+  /**
+   * Stage 6 reverse: stalled store + bounded timeout fails closed without
+   * losing the text. Started must throw [TranscriptDurabilityException] (not
+   * return Started), the UI append is rolled back, the logical id is
+   * INTERRUPTED-marked, and the same text remains retryable once the store
+   * unblocks (caller retains ownership, mirroring the InputTooLong path).
+   */
+  @Test
+  fun stalledAdmissionFailsClosedWithoutLosingText() {
+    val gate = CompletableDeferred<Unit>()
+    val blockingSink = object : dev.librepocket.chat.TranscriptSink {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        gate.await()
+      }
+      override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+      override suspend fun onTurnFailed(runId: String, error: String) = Unit
+      override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+      override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+      override suspend fun onSteerQueued(text: String) = Unit
+      override suspend fun onToolDone(
+        runId: String,
+        toolIndex: Int,
+        id: String,
+        name: String,
+        argumentsJson: String,
+      ) = Unit
+      override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+    }
+    var n = 0
+    val c = TurnController(
+      provider = LedgerFakeProvider {
+        flow { emit(StreamEvent.Done("stop")) }
+      },
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "stall-reverse-${n++}" },
+      acceptTimeoutMs = 300L,
+    )
+    val text = "stall reverse retryable text"
+    try {
+      try {
+        runBlocking { c.startOrEnqueue(text, opId = 77L) }
+        fail("stalled admission must throw, not return Started")
+      } catch (e: TranscriptDurabilityException) {
+        // Expected fail-closed: caller retains `text` for retry.
+      }
+      // Fail-closed rollback: no ghost UI row.
+      assertTrue(
+        c.uiState.value.messages.none { it.role == "user" && it.text == text },
+      )
+      // Explicit INTERRUPTED mark for the logical id (UI stalled-0, logical
+      // stalled-1 equivalent with this prefix).
+      assertTrue(c.interruptedTranscriptRunIds().contains("stall-reverse-1"))
+      // The text is not lost: unblock and retry the same text — it admits.
+      gate.complete(Unit)
+      val retry = runBlocking {
+        withTimeout(5_000) { c.startOrEnqueue(text, opId = 77L) }
+      }
+      assertTrue("unblocked retry must admit", retry is TurnStart.Started)
+    } finally {
+      gate.complete(Unit)
+      c.close()
+    }
   }
 }

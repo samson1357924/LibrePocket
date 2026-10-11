@@ -11,6 +11,7 @@ import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.ChatUiState
 import dev.librepocket.chat.ApprovalRequiredException
 import dev.librepocket.chat.InputTooLongException
+import dev.librepocket.chat.TranscriptDurabilityException
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
@@ -817,6 +818,15 @@ class ChatViewModel(
                                 setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
                                 restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
                                 return@launch
+                            } catch (_: TranscriptDurabilityException) {
+                                // Stage 6 (R4-3) admission fail-closed: the user
+                                // row could not be durably persisted within the
+                                // bounded timeout (store stall/seal). Same
+                                // restore semantics as InputTooLong (notice +
+                                // draft, caller retains the text for retry).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_UNAVAILABLE")
+                                restoreOpForFailedSend(opId, "CHAT_STORE_UNAVAILABLE")
+                                return@launch
                             }
                             if (verdict !is TurnStart.NeedsRecovery) {
                                 if (verdict is TurnStart.Started) {
@@ -1032,6 +1042,12 @@ class ChatViewModel(
                                 // sent; keep the text recoverable (draft).
                                 setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
                                 restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
+                                return@launch
+                            } catch (_: TranscriptDurabilityException) {
+                                // Stage 6 (R4-3) admission fail-closed: same
+                                // restore semantics as InputTooLong.
+                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_UNAVAILABLE")
+                                restoreOpForFailedSend(opId, "CHAT_STORE_UNAVAILABLE")
                                 return@launch
                             }
                             if (verdict !is TurnStart.NeedsRecovery) {

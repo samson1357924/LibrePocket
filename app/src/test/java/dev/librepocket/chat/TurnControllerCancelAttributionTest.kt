@@ -14,13 +14,17 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -81,6 +85,11 @@ private class CancelAttrSink : TranscriptSink {
 /**
  * Stage B: cancel attribution must use the live turn's logical/attempt id,
  * never the previous turn's assistant and never an empty runId.
+ *
+ * Stage 6 (R4-3): admission (user row) is durable before Started, so the
+ * host-park tests below cover post-accept cancellation, while the
+ * admission-window tests cover a cancel parked on the durable await itself
+ * (Finding 1: accepted-then-cancelled, no ghost launch).
  */
 class TurnControllerCancelAttributionTest {
 
@@ -110,16 +119,14 @@ class TurnControllerCancelAttributionTest {
     }
   }
 
-  @Test fun cancelDuringStartedAckUsesCurrentTurnIdNotPrevious() {
+  @Test fun cancelDuringHostParkUsesCurrentTurnIdNotPrevious() {
     val sink = CancelAttrSink()
+    // Stage 6: admission (user row) is durable before Started, so the host —
+    // not the admission — is the cancellable park point. Park the provider
+    // (after the placeholder, before any TextDelta) instead of the transcript
+    // ack; attribution must still use the live turn's id, never the previous.
     val enteredQ2 = CountDownLatch(1)
     val releaseQ2 = CompletableDeferred<Unit>()
-    sink.startedGate = { text ->
-      if (text == "Q2") {
-        enteredQ2.countDown()
-        releaseQ2.await()
-      }
-    }
     val provider = CancelAttrProvider { request ->
       flow {
         val lastUser = request.messages.lastOrNull { it.role == "user" }?.text.orEmpty()
@@ -127,6 +134,8 @@ class TurnControllerCancelAttributionTest {
           emit(StreamEvent.TextDelta(0, 0, "A1"))
           emit(StreamEvent.Done("stop"))
         } else {
+          enteredQ2.countDown()
+          releaseQ2.await()
           emit(StreamEvent.TextDelta(0, 0, "A2"))
           emit(StreamEvent.Done("stop"))
         }
@@ -141,9 +150,9 @@ class TurnControllerCancelAttributionTest {
 
       val admission = runBlocking { c.startOrEnqueue("Q2") }
       assertTrue(admission is TurnStart.Started)
-      assertTrue("Q2 did not park on started ack", enteredQ2.await(5, TimeUnit.SECONDS))
-      // Placeholder for Q2 must not exist yet: latest assistant is still A1.
-      // A buggy latest*-based cancel would reuse A1's id here.
+      assertTrue("Q2 host did not park on provider", enteredQ2.await(5, TimeUnit.SECONDS))
+      // Host already appended the placeholder (empty) and parks before any
+      // TextDelta; a buggy latest*-based cancel would still reuse A1's id.
       c.cancel()
       assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
       releaseQ2.complete(Unit)
@@ -157,7 +166,7 @@ class TurnControllerCancelAttributionTest {
       assertTrue("cancel must not reuse previous turn id", q2Id != prevId)
       assertEquals("exactly one cancel record", 1, sink.cancelled.size)
       assertEquals("cancel must carry current turn id", q2Id, sink.cancelled.single().first)
-      // Pre-placeholder partial is "" with this turn's id; never A1's text.
+      // Pre-delta partial is "" with this turn's id; never A1's text.
       assertEquals("", sink.cancelled.single().second)
       assertFalse("cancel text must not duplicate previous answer", sink.cancelled.single().second == "A1")
       assertTrue("no success for cancelled turn", sink.succeeded.isEmpty() || sink.succeeded.none { it.first == q2Id })
@@ -167,16 +176,17 @@ class TurnControllerCancelAttributionTest {
     }
   }
 
-  @Test fun firstTurnCancelDuringStartedAckHasNonEmptyRunId() {
+  @Test fun firstTurnCancelDuringHostParkHasNonEmptyRunId() {
     val sink = CancelAttrSink()
+    // Stage 6: same provider-park as above (admission is already durable).
     val entered = CountDownLatch(1)
     val release = CompletableDeferred<Unit>()
-    sink.startedGate = {
-      entered.countDown()
-      release.await()
-    }
     val provider = CancelAttrProvider {
-      flow { emit(StreamEvent.Done("stop")) }
+      flow {
+        entered.countDown()
+        release.await()
+        emit(StreamEvent.Done("stop"))
+      }
     }
     val c = controller(provider, sink)
     try {
@@ -266,6 +276,267 @@ class TurnControllerCancelAttributionTest {
       assertTrue(c.uiState.value.error?.isNotEmpty() == true)
       assertTrue("store failure must be INTERRUPTED-marked", c.interruptedTranscriptRunIds().isNotEmpty())
     } finally {
+      c.close()
+    }
+  }
+
+  /**
+   * Finding 1 regression: a cancel parked on the admission-time durable await
+   * must not ghost-launch. Semantics locked here (accepted-then-cancelled):
+   * the user row stays durable, a cancel terminal is drained (no second user
+   * row), the provider is never called, the UI keeps the user row with
+   * CANCELLED, and the caller gets Started with an already-cancelled host.
+   */
+  @Test fun cancelDuringAdmissionDurableWindowDoesNotGhostLaunch() {
+    val sink = CancelAttrSink()
+    val entered = CountDownLatch(1)
+    val release = CompletableDeferred<Unit>()
+    sink.startedGate = { text ->
+      if (text == "Q-window") {
+        entered.countDown()
+        release.await()
+      }
+    }
+    val provider = CancelAttrProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "SHOULD-NEVER-STREAM"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider, sink)
+    try {
+      runBlocking {
+        val deferred = async(Dispatchers.Default) { c.startOrEnqueue("Q-window") }
+        assertTrue("admission did not park on durable await", entered.await(5, TimeUnit.SECONDS))
+        // Window: pendingAdmission set, no host yet. Cancel must be effective.
+        c.cancel()
+        assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+        release.complete(Unit)
+        val admission = withTimeout(5_000) { deferred.await() }
+        assertTrue("window-cancel must still report Started (accepted-then-cancelled)", admission is TurnStart.Started)
+        val host = (admission as TurnStart.Started).host
+        assertTrue("window-cancel host must already be cancelled", host.isCancelled || host.isCompleted)
+        try {
+          withTimeout(5_000) { host.join() }
+        } catch (_: CancellationException) {
+          // Expected: the cancelled host joins with cancellation.
+        }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals("ghost launch: provider must never be called", 0, provider.streamCalls.get())
+      assertEquals("exactly one durable user row", 1, sink.started.size)
+      assertEquals("Q-window", sink.started.single().second)
+      assertEquals("exactly one cancel terminal for the window turn", 1, sink.cancelled.size)
+      assertEquals("cancel must carry the window turn id", sink.started.single().first, sink.cancelled.single().first)
+      assertTrue(
+        "UI must keep the cancelled user row",
+        c.uiState.value.messages.any { it.role == "user" && it.text == "Q-window" },
+      )
+      assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+    } finally {
+      release.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * Finding 1 via [TurnController.startTurn]: same accepted-then-cancelled
+   * semantics, but the caller gets an already-cancelled Job instead of
+   * ghost-launching.
+   */
+  @Test fun cancelDuringAdmissionDurableWindowStartTurnDoesNotGhostLaunch() {
+    val sink = CancelAttrSink()
+    val entered = CountDownLatch(1)
+    val release = CompletableDeferred<Unit>()
+    sink.startedGate = { text ->
+      if (text == "Q-window-st") {
+        entered.countDown()
+        release.await()
+      }
+    }
+    val provider = CancelAttrProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "SHOULD-NEVER-STREAM"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider, sink)
+    try {
+      runBlocking {
+        val deferred = async(Dispatchers.Default) { c.startTurn("Q-window-st") }
+        assertTrue("admission did not park on durable await", entered.await(5, TimeUnit.SECONDS))
+        c.cancel()
+        assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+        release.complete(Unit)
+        val host = withTimeout(5_000) { deferred.await() }
+        assertTrue("window-cancel host must already be cancelled", host.isCancelled || host.isCompleted)
+        try {
+          withTimeout(5_000) { host.join() }
+        } catch (_: CancellationException) {
+        }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals("ghost launch: provider must never be called", 0, provider.streamCalls.get())
+      assertEquals(1, sink.started.size)
+      assertEquals(1, sink.cancelled.size)
+      assertEquals(sink.started.single().first, sink.cancelled.single().first)
+      assertTrue(
+        c.uiState.value.messages.any { it.role == "user" && it.text == "Q-window-st" },
+      )
+      assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+    } finally {
+      release.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * Finding 2 regression: a finalize that observes close after its durable ack
+   * already succeeded is a durability failure, not a bare
+   * IllegalStateException. The ledger keeps the user row + cancel terminal
+   * (no ghost host), the UI row is rolled back with ERROR, and the caller
+   * gets [TranscriptDurabilityException] so the text stays retryable (never a
+   * stranded pendingOps).
+   */
+  @Test fun finalizeClosedAfterDurableAckRollsBackForRetry() {
+    val sink = CancelAttrSink()
+    val entered = CountDownLatch(1)
+    val release = CompletableDeferred<Unit>()
+    sink.startedGate = { text ->
+      if (text == "Q-closed") {
+        entered.countDown()
+        release.await()
+      }
+    }
+    val provider = CancelAttrProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "SHOULD-NEVER-STREAM"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider, sink)
+    try {
+      runBlocking {
+        supervisorScope {
+          val deferred = async(Dispatchers.Default) { c.startOrEnqueue("Q-closed", opId = 99L) }
+          assertTrue("admission did not park on durable await", entered.await(5, TimeUnit.SECONDS))
+          // Close wins while the waiter is parked; release immediately so the
+          // ack still succeeds before the background seal, driving the
+          // finalize-closed path (not the seal-race rollback). supervisorScope
+          // isolates the expected child failure so it cannot cancel the test
+          // body (structured concurrency would otherwise fail runBlocking on
+          // exit even though await rethrows into our catch).
+          c.close(drainTimeoutMs = 5_000L)
+          release.complete(Unit)
+          try {
+            withTimeout(5_000) { deferred.await() }
+            fail("finalize-closed must throw TranscriptDurabilityException, not return Started")
+          } catch (e: TranscriptDurabilityException) {
+            // Expected fail-closed path (caller retains the text).
+          }
+          withTimeout(5_000) { c.flushTranscript() }
+        }
+      }
+      assertEquals("ghost launch: provider must never be called", 0, provider.streamCalls.get())
+      // Ledger: user row durable (exactly one user row, ack already succeeded
+      // before close won). The cancel terminal is best-effort under the
+      // background seal race: either a cancel record lands, or the runId is
+      // explicitly INTERRUPTED-marked (same OR as the zero-dispatch tests).
+      assertEquals(1, sink.started.size)
+      assertEquals("Q-closed", sink.started.single().second)
+      val closedLogicalId = sink.started.single().first
+      val hasClosedCancel =
+        sink.cancelled.size == 1 && sink.cancelled.single().first == closedLogicalId
+      val closedInterrupted = c.interruptedTranscriptRunIds().contains(closedLogicalId)
+      assertTrue(
+        "finalize-closed must leave a cancel terminal or an explicit interrupt mark",
+        hasClosedCancel || closedInterrupted,
+      )
+      // UI: optimistic row rolled back, ERROR for explicit retry.
+      assertTrue(
+        "finalize-closed must roll back the UI user row",
+        c.uiState.value.messages.none { it.role == "user" && it.text == "Q-closed" },
+      )
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    } finally {
+      release.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * Finding 5 asymmetry lock: promotion follow-ups are host-durable (dequeue
+   * then write, no accept timeout). A user-row store failure after dequeue
+   * cannot be reclaimed via drainQueued and has no caller to retain it: the
+   * UI user row is kept with ERROR and the runId is INTERRUPTED-marked.
+   */
+  @Test fun promotionUserRowFailureIsHostDurableNotReclaimable() {
+    val sink = CancelAttrSink()
+    val enteredFirst = CountDownLatch(1)
+    val releaseFirst = CompletableDeferred<Unit>()
+    val provider = CancelAttrProvider { request ->
+      flow {
+        val lastUser = request.messages.lastOrNull { it.role == "user" }?.text.orEmpty()
+        if (lastUser.contains("first")) {
+          enteredFirst.countDown()
+          releaseFirst.await()
+          emit(StreamEvent.TextDelta(0, 0, "first-ok"))
+          emit(StreamEvent.Done("stop"))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "SHOULD-NEVER-STREAM-FOLLOW"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    // Only the follow-up user row fails durably; the first turn persists.
+    val failingSink = object : TranscriptSink by sink {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        if (text == "follow") throw IOException("promotion store boom")
+        sink.onTurnStarted(runId, text)
+      }
+    }
+    val c = controller(provider, failingSink)
+    try {
+      runBlocking {
+        val firstDeferred = async(Dispatchers.Default) { c.startOrEnqueue("first") }
+        // Wait for the admission to become Started, then for the host to park
+        // on the provider so the follow-up queues behind a live turn.
+        var started: TurnStart? = null
+        val end = System.currentTimeMillis() + 5_000L
+        while (started == null) {
+          if (System.currentTimeMillis() > end) fail("first never started")
+          if (firstDeferred.isCompleted) {
+            started = firstDeferred.await()
+          } else {
+            delay(10)
+          }
+        }
+        assertTrue(started is TurnStart.Started)
+        assertTrue("first host did not park on provider", enteredFirst.await(5, TimeUnit.SECONDS))
+        val queued = c.startOrEnqueue("follow")
+        assertTrue("follow must queue behind the live first turn", queued is TurnStart.Queued)
+        releaseFirst.complete(Unit)
+        val host1 = (started as TurnStart.Started).host
+        withTimeout(5_000) { host1.join() }
+        // The promotion attempt dequeues follow, fails its user-row write,
+        // and projects ERROR (host-durable, no caller retain).
+        awaitTrue { c.uiState.value.status == ChatStatus.ERROR }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      // Asymmetry: the dequeued follow-up is NOT reclaimable.
+      assertTrue("promotion failure must leave FIFO drained, not reclaimable", c.drainQueued().isEmpty())
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertTrue(
+        "promotion UI row is kept (not rolled back like direct admissions)",
+        c.uiState.value.messages.any { it.role == "user" && it.text == "follow" },
+      )
+      assertTrue(
+        "promotion user-row failure must be INTERRUPTED-marked",
+        c.interruptedTranscriptRunIds().isNotEmpty(),
+      )
+      assertEquals("follow must never reach the provider (failed before dispatch)", 1, provider.streamCalls.get())
+    } finally {
+      releaseFirst.complete(Unit)
       c.close()
     }
   }

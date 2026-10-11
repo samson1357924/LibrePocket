@@ -232,7 +232,15 @@ class ChatSessionTest {
     try {
       assertFalse(session.hasDurableFailures())
       runBlocking {
-        session.send("hi")
+        // Stage 6: admission-time durable failure is fail-closed (throws, like
+        // InputTooLong) instead of returning with an ERROR turn — the caller
+        // retains the text. The controller still projects ERROR + marks.
+        try {
+          session.send("hi")
+          fail("send must throw TranscriptDurabilityException when the user row cannot persist")
+        } catch (e: TranscriptDurabilityException) {
+          // Expected fail-closed path (caused by the store IOException).
+        }
         assertEquals(ChatStatus.ERROR, session.uiState.value.status)
         assertTrue("hasDurableFailures must be true", session.hasDurableFailures())
         assertTrue("flush barrier must drain", session.flush())

@@ -24,10 +24,12 @@ import kotlinx.coroutines.withContext
  * Prune auto-runs every [AUTO_PRUNE_EVERY] appends with the default policy;
  * callers needing other policies invoke [prune] explicitly. Auto-prune is
  * best-effort maintenance: it runs after the append transaction commits, and
- * its failure only emits [Log.w] ([CancellationException] still propagates) —
- * the committed rowId is still returned, so
- * a prune failure never fails the durable core ack, never writes an
- * INTERRUPTED mark, and never affects `hasDurableFailures`/`flushDurable`.
+ * its failure — including [CancellationException] observed in the post-commit
+ * tail (counter or sweep) — only emits [Log.w]; the committed rowId is still
+ * returned, so a post-commit maintenance failure never fails the durable core
+ * ack, never writes an INTERRUPTED mark, and never affects
+ * `hasDurableFailures`/`flushDurable`. Only a cancellation inside the append
+ * transaction itself propagates (rollback → row absent → ack must fail).
  *
  * Notes:
  * - seq gaps are legal (prune deletes old rows; import preserves file seqs);
@@ -102,29 +104,49 @@ class RoomSessionStore(
         // -fire the sweep. Only the decision is made here; the sweep itself
         // stays outside the mutex (and outside the transaction above), exactly
         // as before.
-        val shouldPrune = appendMutex.withLock {
-            appendsSincePrune++
-            if (appendsSincePrune >= AUTO_PRUNE_EVERY) {
-                appendsSincePrune = 0
-                true
-            } else {
-                false
+        // R5-6: the whole post-commit tail (counter + sweep) is best-effort
+        // maintenance after the row above already committed: a
+        // CancellationException observed here (mutex wait or sweep) only emits
+        // Log.w and the committed rowId is still returned, so a post-commit
+        // cancel never fails the durable core ack and never kills the writer.
+        // Structured-concurrency teardown is deferred by at most one
+        // successful ack (the Job cancelled flag stays set; the next channel
+        // receive still seals normally). Deliberately no
+        // withContext(NonCancellable): the sweep is O(sessions) and must not
+        // hold the shutdown bound. Only a cancel inside the transaction above
+        // propagates (rollback → row absent → ack must fail).
+        try {
+            val shouldPrune = appendMutex.withLock {
+                appendsSincePrune++
+                if (appendsSincePrune >= AUTO_PRUNE_EVERY) {
+                    appendsSincePrune = 0
+                    true
+                } else {
+                    false
+                }
             }
-        }
-        if (shouldPrune) {
-            try {
-                prune(PrunePolicy())
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                // Best-effort maintenance: the row above already committed and
-                // its rowId is still returned below, so the durable core ack
-                // stays a success and no INTERRUPTED mark is written. The
-                // counter was already reset, so the failed sweep is retried
-                // (throttled) after the next AUTO_PRUNE_EVERY appends instead
-                // of retrying hot on every subsequent append.
-                Log.w(TAG, "auto-prune failed; append already durable, will retry later", e)
+            if (shouldPrune) {
+                try {
+                    prune(PrunePolicy())
+                } catch (e: Exception) {
+                    // Best-effort maintenance: the row above already committed
+                    // and its rowId is still returned below (this also swallows
+                    // post-commit cancellation), so the durable core ack stays
+                    // a success and no INTERRUPTED mark is written. The
+                    // counter was already reset, so the failed sweep is
+                    // retried (throttled) after the next AUTO_PRUNE_EVERY
+                    // appends instead of retrying hot on every subsequent
+                    // append.
+                    Log.w(TAG, "auto-prune failed; append already durable, will retry later", e)
+                }
             }
+        } catch (e: CancellationException) {
+            // Post-commit counter wait cancelled after the row committed:
+            // same best-effort outcome as a failed sweep — ack stays a
+            // success, writer stays alive.
+            Log.w(TAG, "auto-prune counter cancelled; append already durable, will retry later", e)
+        } catch (e: Exception) {
+            Log.w(TAG, "auto-prune failed; append already durable, will retry later", e)
         }
         return rowId
     }
@@ -144,7 +166,9 @@ class RoomSessionStore(
      * Auto-prune accounting counts one bulk as ONE append toward
      * [AUTO_PRUNE_EVERY] and the sweep (if due) runs once after commit,
      * exactly like the single-row path: a committed bulk is never un-done by
-     * a prune failure ([Log.w] only, rowIds still returned).
+     * a prune failure ([Log.w] only, including post-commit cancellation,
+     * rowIds still returned). Only a cancellation inside the transaction
+     * itself propagates (rollback → zero rows → ack must fail).
      */
     override suspend fun appendEvents(events: List<TranscriptEvent>): List<Long> {
         if (events.isEmpty()) return emptyList()
@@ -193,28 +217,37 @@ class RoomSessionStore(
             }
         }
         // Same throttled sweep as appendEvent, but one bulk counts once.
-        val shouldPrune = appendMutex.withLock {
-            appendsSincePrune++
-            if (appendsSincePrune >= AUTO_PRUNE_EVERY) {
-                appendsSincePrune = 0
-                true
-            } else {
-                false
+        // R5-6: same post-commit best-effort rule — a cancel observed here
+        // (counter or sweep) only emits Log.w and the committed rowIds are
+        // still returned. No withContext(NonCancellable): the sweep is
+        // O(sessions) and must not hold the shutdown bound.
+        try {
+            val shouldPrune = appendMutex.withLock {
+                appendsSincePrune++
+                if (appendsSincePrune >= AUTO_PRUNE_EVERY) {
+                    appendsSincePrune = 0
+                    true
+                } else {
+                    false
+                }
             }
-        }
-        if (shouldPrune) {
-            try {
-                prune(PrunePolicy())
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                // Best-effort maintenance: the bulk above already committed
-                // and its rowIds are still returned below, so the durable
-                // core ack stays a success. The counter was already reset, so
-                // the failed sweep is retried (throttled) after the next
-                // AUTO_PRUNE_EVERY bulks/appends instead of retrying hot.
-                Log.w(TAG, "auto-prune failed; bulk already durable, will retry later", e)
+            if (shouldPrune) {
+                try {
+                    prune(PrunePolicy())
+                } catch (e: Exception) {
+                    // Best-effort maintenance: the bulk above already committed
+                    // and its rowIds are still returned below (this also
+                    // swallows post-commit cancellation), so the durable core
+                    // ack stays a success. The counter was already reset, so
+                    // the failed sweep is retried (throttled) after the next
+                    // AUTO_PRUNE_EVERY bulks/appends instead of retrying hot.
+                    Log.w(TAG, "auto-prune failed; bulk already durable, will retry later", e)
+                }
             }
+        } catch (e: CancellationException) {
+            Log.w(TAG, "auto-prune counter cancelled; bulk already durable, will retry later", e)
+        } catch (e: Exception) {
+            Log.w(TAG, "auto-prune failed; bulk already durable, will retry later", e)
         }
         return rowIds
     }

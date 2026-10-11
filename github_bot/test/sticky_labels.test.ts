@@ -930,6 +930,47 @@ export async function runStickyLabelTests(): Promise<void> {
       }
     }
 
+    // Phase 1: deterministic label protection on review fallback.
+    // When review job fails / is skipped without an artifact, publish still
+    // reconciles deterministic rule tags (area:runtime, area:docs, title rules)
+    // plus status:needs-decision onto the PR.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-fallback-deterministic-'));
+      try {
+        const missingPath = path.join(tempDir, 'nonexistent-review-output.json');
+        const state = makeState({ existingLabels: [] });
+        const multiAreaGitStub = (args: string[]): string => {
+          if (args[0] === 'fetch') return '';
+          if (args[0] === 'merge-base') return BASE_SHA;
+          if (args[0] === 'diff' && args[1] === '--name-only') {
+            return 'app/src/main/java/dev/librepocket/chat/Chat.kt\0docs/README.md\0';
+          }
+          return '';
+        };
+        await runPublishMode({
+          event: prOpenedEvent(),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: missingPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'failure',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as NodeJS.ProcessEnv,
+          githubClient: makeClient(state),
+          runGit: multiAreaGitStub,
+        });
+        assert.ok(state.existingLabels.includes('area:runtime'), 'deterministic area:runtime is added despite review failure');
+        assert.ok(state.existingLabels.includes('area:docs'), 'deterministic area:docs is added despite review failure');
+        assert.ok(state.existingLabels.includes('status:needs-decision'), 'status:needs-decision is added on fallback');
+        assert.ok(state.existingLabels.includes('security'), 'title deterministic rule is preserved on fallback');
+        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'verdict is INCONCLUSIVE on fallback');
+        assert.equal(state.comments[0].body.includes('判定：APPROVE'), false, 'never pretend AI review approved');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
     // Workflow wiring: publish allows human issue updates (including
     // issue_comment on issues) while bots still skip via route ignore.
     {

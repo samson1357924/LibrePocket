@@ -886,8 +886,8 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.ok(fallbackListFailureBody.includes('判定：INCONCLUSIVE'));
       assert.ok(fallbackListFailure.state.existingLabels.includes('status:needs-decision'),
         'fallback succeeds if the decision-label append succeeds despite a failed listing');
-      assert.deepEqual(fallbackListFailure.state.labels, [['status:needs-decision']],
-        'fallback adds only the maintainer decision label');
+      assert.deepEqual(fallbackListFailure.state.labels, [['security', 'status:needs-decision']],
+        'fallback adds deterministic title rules and maintainer decision label');
       assert.deepEqual(fallbackListFailure.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
         ['area:docs', 'area:policy'], 'fallback listing failure preserves existing area labels');
       assert.equal(fallbackListFailure.state.operations.includes('remove-label'), false);

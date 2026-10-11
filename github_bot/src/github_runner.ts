@@ -4832,27 +4832,74 @@ async function currentReviewProblem(
   }
 }
 
-async function reconcileNeedsDecisionOnly(
-  client: RunnerGitHubClient,
-  repository: { owner: string; repo: string },
-  issueNumber: number,
-): Promise<void> {
-  // P1 #3 provenance: this fallback only desires status:needs-decision (never
-  // a transitionable peer), so no transition can occur; provenance is passed
-  // explicitly as unknown (fail-closed) for contract uniformity.
+interface ReconcileFallbackPrLabelsOptions {
+  client: RunnerGitHubClient;
+  repository: { owner: string; repo: string };
+  target: ReviewTarget;
+  context: RunnerContext;
+  env: NodeJS.ProcessEnv;
+  output?: RunnerReviewOutput;
+  freshPullRequest?: PullRequestData;
+  botWrittenLabels?: ReadonlySet<string> | readonly string[];
+  isStale?: boolean;
+}
+
+async function reconcileFallbackPrLabels(options: ReconcileFallbackPrLabelsOptions): Promise<void> {
+  const { client, repository, target, context, env, output, freshPullRequest, botWrittenLabels } = options;
+  if (!target.issueNumber) return;
+
+  const pullRequest = target.pullRequest ?? (
+    freshPullRequest && safeSha(freshPullRequest.base?.sha) && safeSha(freshPullRequest.head?.sha)
+      ? freshPullRequest
+      : undefined
+  );
+  const isStale = Boolean(options.isStale || (output && pullRequest && !sameReviewIdentity(output, pullRequest)));
+
+  let areaLabels: string[] = [];
+  if (output && !isStale && Array.isArray(output.areaLabels)) {
+    areaLabels = output.areaLabels;
+  } else if ((target.diffSafe || Boolean(pullRequest && safeSha(pullRequest.base?.sha) && safeSha(pullRequest.head?.sha))) && pullRequest) {
+    const changed = collectChangedPaths(context, pullRequest);
+    areaLabels = resolveAreaLabelsFromPaths(changed.changedFiles, changed.complete);
+  }
+
+  const titleLabels = resolveLabelsFromTitle(target.title);
+  const tagLabels = configuredTagLabels(env);
+
+  const hasSecurityBlock = Boolean(
+    !isStale && (
+      output?.deterministicViolations?.some((violation) =>
+        violation.severity === 'BLOCK' && (violation.category === 'security' || violation.ruleId.startsWith('SEC-'))
+      ) ||
+      output?.roles?.some((role) =>
+        role.role === 'android_sec' && role.findings?.some((finding) => finding.severity === 'BLOCK')
+      )
+    )
+  );
+
+  const fallbackDesired = sanitizeLabels([
+    ...tagLabels,
+    ...titleLabels,
+    ...areaLabels,
+    'status:needs-decision',
+    ...(hasSecurityBlock ? ['security'] : []),
+  ]);
+
   const reconciliation = await reconcileBotLabelsSafely({
     client,
     owner: repository.owner,
     repo: repository.repo,
-    issueNumber,
-    desiredLabels: ['status:needs-decision'],
-    scope: { managedExactLabels: ['status:needs-decision'] } satisfies ReconcileScope,
+    issueNumber: target.issueNumber,
+    desiredLabels: fallbackDesired,
+    scope: DEFAULT_PR_RECONCILE_SCOPE,
     coverageComplete: false,
-    botWrittenLabels: undefined,
+    botWrittenLabels,
   });
+
+  const reconciled = new Set([...reconciliation.added, ...reconciliation.skipped]);
   if (
-    !reconciliation.added.includes('status:needs-decision') &&
-    !reconciliation.skipped.includes('status:needs-decision')
+    !reconciled.has('status:needs-decision') ||
+    fallbackDesired.some((label) => !reconciled.has(label))
   ) {
     throw new Error('PocketGuard: failed to ensure maintainer decision label.');
   }
@@ -5302,7 +5349,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildPreservedBody(inconclusiveComment(reasonText, unavailableLine)),
     );
     if (!wroteFallback) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baseline.body),
+    });
     return;
   }
 
@@ -5329,7 +5385,17 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(staleReason, staleLine)),
     );
     if (!wroteStale) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+      isStale: true,
+    });
     return;
   }
 
@@ -5348,7 +5414,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
     if (!wroteChunks) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
   if (output.chunks !== undefined && output.verdict === 'APPROVE' && output.chunkCount !== output.chunks.length) {
@@ -5359,7 +5434,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
     if (!wroteCount) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
   if (output.chunks !== undefined && !verifyReviewDiffChunkCoverage(output.chunks, {
@@ -5373,7 +5457,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
     if (!wroteSpan) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
 
@@ -5405,7 +5498,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(discardReason, discardLine)),
     );
     if (!wroteDiscard) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
 
@@ -5431,7 +5533,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // reports (output↔report verdict/fingerprint/time). A valid APPROVE with a
   // missing/tampered/partial report must not publish APPROVE with an
   // unavailable line; fall back to the same sticky INCONCLUSIVE with no fake
-  // link plus reconcileNeedsDecisionOnly. Single comment ID updated in place.
+  // link plus reconcileFallbackPrLabels. Single comment ID updated in place.
   const prReportsAvailable = areReviewReportsAvailable(env);
   if (!prReportsAvailable) {
     const unavailableLine = formatReportLine(env, false);
@@ -5441,7 +5543,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(reportsMissingReason, unavailableLine)),
     );
     if (!wroteReportsMissing) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
   // Phase 2 (H): success writes back the artifact/run link; the gate above
@@ -5461,7 +5572,17 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   });
   if (!wroteSuccess) return;
   if (publishFallbackReason) {
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+      isStale: true,
+    });
     return;
   }
 
@@ -5473,7 +5594,17 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(labelFallbackReason, labelFallbackLine)),
     );
     if (!wroteLabelFallback) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+      isStale: true,
+    });
     return;
   }
 

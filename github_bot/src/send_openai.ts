@@ -346,27 +346,6 @@ export interface OpenAISingleTurnResult {
   modelId: string;
 }
 
-// Errors that justify trying the next model in the chain. A status code is
-// authoritative: only transport-ish statuses qualify, so a 400 (unsupported
-// parameter) or 401/403/404/422 still surfaces with its status and the
-// orchestrator converges to INCONCLUSIVE without silently retrying a different
-// request shape. Our own thrown messages cover network/abort and unusable
-// responses; every other message is a configuration failure that another model
-// cannot fix, so it propagates immediately.
-const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
-const RETRYABLE_MESSAGES = new Set([
-  'OpenAI request failed',
-  'OpenAI response invalid',
-  'OpenAI response empty',
-]);
-
-function isRetryableModelError(error: unknown): boolean {
-  const status = (error as { statusCode?: unknown } | undefined)?.statusCode;
-  if (typeof status === 'number') return RETRYABLE_STATUS_CODES.has(status);
-  const message = error instanceof Error ? error.message : '';
-  return RETRYABLE_MESSAGES.has(message);
-}
-
 function modelFailureReason(error: unknown): string {
   const status = (error as { statusCode?: unknown } | undefined)?.statusCode;
   if (typeof status === 'number') return `status ${status}`;
@@ -540,56 +519,73 @@ export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions)
 
 // Sends one single turn, falling back through the configured model chain when a
 // candidate is unavailable. Mirrors the Vegan-scan-app chain design: candidates
-// are tried in order, the result reports the model that actually served so
+// are tried in order, falling back to the next candidate on any model error
+// (including 400/404 when a model is not deployed/unlaunched, 500/503, 429, timeout,
+// invalid/empty response). The result reports the model that actually served so
 // reports never attribute a result to a model that failed, and exhaustion
 // throws an aggregated error the caller already converges to INCONCLUSIVE.
 //
-// Unlike that project, only transport-unavailable candidates fall back: a 4xx
-// (notably 400 for an unsupported parameter) propagates with its status so the
-// failure stays auditable instead of silently changing the request. Candidates
-// whose per-model profile is unconfigured are skipped without any request, so
-// an unknown model never turns into a guessed body.
+// Candidates whose per-model profile is unconfigured are skipped without any request,
+// so an unknown model never turns into a guessed body.
 export async function sendOpenAISingleTurnWithFallback(
   options: SendOpenAISingleTurnOptions,
 ): Promise<OpenAISingleTurnResult> {
   const env = options.env ?? process.env;
   // A missing or placeholder primary is a configuration failure, not a model
   // outage: it must not be silently satisfied by a fallback candidate.
-  const primary = options.modelId.trim();
+  const primary = options.modelId?.trim() ?? '';
   if (!primary || containsPlaceholder(primary)) throw new Error('model not configured');
+  const config = resolveOpenAIConfig(env, options.allowedOrigins ?? []);
+  const timeoutMs = options.timeoutMs ?? config.timeoutMs;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('OpenAI timeout invalid');
+
   const chain = resolveModelFallbackChain(options.modelId, env, options.modelRole);
+  if (chain.length === 0) throw new Error('model not configured');
+
   const attempts: string[] = [];
   let lastError: unknown;
   for (const [index, candidate] of chain.entries()) {
     const isLast = index === chain.length - 1;
     if (!resolveModelProfile(candidate, env)) {
-      attempts.push(`${candidate}: profile not configured`);
-      console.warn(`[PocketGuard] model ${candidate} skipped (profile not configured)${isLast ? '; chain exhausted, failing closed' : '; falling back'}`);
-      if (isLast) throw new Error(`model profile not configured (chain: ${chain.join(' -> ')})`);
+      attempts.push(`${candidate}: model profile not configured`);
+      console.warn(
+        `[PocketGuard] model ${candidate} skipped (profile not configured)${
+          isLast ? '; chain exhausted, failing closed' : '; falling back'
+        }`,
+      );
       continue;
     }
     try {
       const result = await sendOpenAISingleTurn({ ...options, modelId: candidate });
       if (attempts.length > 0) {
-        console.warn(`[PocketGuard] model ${candidate} served the request after: ${attempts.join('; ')}`);
+        console.warn(
+          `[PocketGuard] model ${candidate} served the request after: ${attempts.join('; ')}`,
+        );
       }
       return result;
     } catch (error) {
       lastError = error;
-      attempts.push(`${candidate}: ${modelFailureReason(error)}`);
       const reason = modelFailureReason(error);
-      if (!isRetryableModelError(error)) {
-        // Request/config problem: another model cannot fix it, so stop now and
-        // keep the status auditable.
-        console.warn(`[PocketGuard] model ${candidate} unavailable (${reason}); not a model outage, failing closed`);
-        throw error;
-      }
+      attempts.push(`${candidate}: ${reason}`);
       if (isLast) {
-        console.warn(`[PocketGuard] model ${candidate} unavailable (${reason}); chain exhausted, failing closed`);
-        throw error;
+        console.warn(
+          `[PocketGuard] model ${candidate} unavailable (${reason}); chain exhausted, failing closed`,
+        );
+      } else {
+        console.warn(
+          `[PocketGuard] model ${candidate} unavailable (${reason}); falling back`,
+        );
       }
-      console.warn(`[PocketGuard] model ${candidate} unavailable (${reason}); falling back`);
     }
   }
-  throw lastError instanceof Error ? lastError : new Error('OpenAI request failed');
+
+  const aggregatedError = new Error(
+    `All models failed [${chain.join(' → ')}]: ${attempts.join(' | ')}`,
+  );
+  if (lastError && typeof (lastError as { statusCode?: unknown }).statusCode === 'number') {
+    (aggregatedError as unknown as { statusCode: number }).statusCode = (
+      lastError as { statusCode: number }
+    ).statusCode;
+  }
+  throw aggregatedError;
 }

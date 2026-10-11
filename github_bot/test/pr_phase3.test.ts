@@ -611,6 +611,30 @@ export async function runPrPhase3Tests(): Promise<void> {
         assert.equal(denied.reviewsUsed, 0, 'job-capped claim consumes zero slots');
         assert.equal(state.created, 0, 'job-capped claim performs zero creates');
         assert.equal(state.updated, 0, 'job-capped claim performs zero updates');
+
+        // A long fallback chain multiplies the attempts a role may burn, so the
+        // same diff that fits without fallbacks must be refused once a chain is
+        // configured (budget accounts for chainLength x timeout per role).
+        const chained = await runClaimMode({
+          event: prEvent(),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'phase3-chain-run',
+            POCKETGUARD_JOB_STARTED_MS: jobStarted,
+            POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'second-model, third-model',
+            POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS: 'second-model, third-model',
+            POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS: 'second-model, third-model',
+          } as NodeJS.ProcessEnv,
+          githubClient: prClient(state),
+          writeStdout: () => undefined,
+          runGit: prGitStub(chunkedFiles()),
+        });
+        assert.equal(chained.claimed, false, 'chain-aware claim occupies nothing');
+        assert.match(chained.reason, /budget-exceeded/, 'chain-aware reason is explicit');
+        assert.equal(state.created, 0, 'chain-aware claim performs zero creates');
+        assert.equal(state.updated, 0, 'chain-aware claim performs zero updates');
       } finally {
         Date.now = realNow;
       }

@@ -105,6 +105,10 @@ function roleEffortEnvName(role: OpenAIModelRole): string {
   return `${roleEnvironmentNames[role]}_REASONING_EFFORT`;
 }
 
+function roleFallbackEnvName(role: OpenAIModelRole): string {
+  return `${roleEnvironmentNames[role]}_FALLBACKS`;
+}
+
 export function resolveRoleModel(role: OpenAIModelRole, env: OpenAIEnvironment): string {
   const modelId = env[roleEnvironmentNames[role]]?.trim() ?? '';
   if (!modelId || containsPlaceholder(modelId)) throw new Error('model not configured');
@@ -331,6 +335,8 @@ export interface SendOpenAISingleTurnOptions {
   maxOutputTokens?: number;
   timeoutMs?: number;
   allowedOrigins?: string[];
+  /** Role whose configured fallback list extends the chain; set by callers. */
+  modelRole?: OpenAIModelRole;
   /** An injection seam for offline callers and tests; omitted in production. */
   env?: OpenAIEnvironment;
 }
@@ -338,6 +344,66 @@ export interface SendOpenAISingleTurnOptions {
 export interface OpenAISingleTurnResult {
   content: string;
   modelId: string;
+}
+
+// Errors that justify trying the next model in the chain. A status code is
+// authoritative: only transport-ish statuses qualify, so a 400 (unsupported
+// parameter) or 401/403/404/422 still surfaces with its status and the
+// orchestrator converges to INCONCLUSIVE without silently retrying a different
+// request shape. Our own thrown messages cover network/abort and unusable
+// responses; every other message is a configuration failure that another model
+// cannot fix, so it propagates immediately.
+const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const RETRYABLE_MESSAGES = new Set([
+  'OpenAI request failed',
+  'OpenAI response invalid',
+  'OpenAI response empty',
+]);
+
+function isRetryableModelError(error: unknown): boolean {
+  const status = (error as { statusCode?: unknown } | undefined)?.statusCode;
+  if (typeof status === 'number') return RETRYABLE_STATUS_CODES.has(status);
+  const message = error instanceof Error ? error.message : '';
+  return RETRYABLE_MESSAGES.has(message);
+}
+
+function modelFailureReason(error: unknown): string {
+  const status = (error as { statusCode?: unknown } | undefined)?.statusCode;
+  if (typeof status === 'number') return `status ${status}`;
+  const message = error instanceof Error ? error.message : '';
+  return message || 'unknown error';
+}
+
+// Longest configured model chain across the three roles, used by callers that
+// must budget wall-clock time (a role may burn a whole chain before finishing).
+export function resolveMaxModelChainLength(env: OpenAIEnvironment): number {
+  const lengths = (['chief', 'android_sec', 'android_code'] as const)
+    .map((role) => resolveModelFallbackChain(`len-${role}`, env, role).length);
+  return Math.max(1, ...lengths);
+}
+
+// Ordered model candidates: primary first, then the role's fallbacks, then the
+// global list. Unset lists mean no fallback and the previous single-model
+// behaviour. There is no hardcoded preference list and no catalog tail: an
+// unlisted model stays unknown (fail closed) instead of being guessed.
+export function resolveModelFallbackChain(
+  modelId: string,
+  env: OpenAIEnvironment,
+  role?: OpenAIModelRole,
+): string[] {
+  const trimmed = modelId.trim();
+  const chain = !trimmed || containsPlaceholder(trimmed) ? [] : [trimmed];
+  const sources = [
+    role ? env[roleFallbackEnvName(role)] : undefined,
+    env.POCKETGUARD_MODEL_FALLBACKS,
+  ];
+  for (const raw of sources) {
+    for (const part of (raw ?? '').split(',')) {
+      const candidate = part.trim();
+      if (candidate && !containsPlaceholder(candidate) && !chain.includes(candidate)) chain.push(candidate);
+    }
+  }
+  return chain;
 }
 
 function errorWithStatus(status: number): Error & { statusCode: number } {
@@ -454,4 +520,60 @@ export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions)
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// Sends one single turn, falling back through the configured model chain when a
+// candidate is unavailable. Mirrors the Vegan-scan-app chain design: candidates
+// are tried in order, the result reports the model that actually served so
+// reports never attribute a result to a model that failed, and exhaustion
+// throws an aggregated error the caller already converges to INCONCLUSIVE.
+//
+// Unlike that project, only transport-unavailable candidates fall back: a 4xx
+// (notably 400 for an unsupported parameter) propagates with its status so the
+// failure stays auditable instead of silently changing the request. Candidates
+// whose per-model profile is unconfigured are skipped without any request, so
+// an unknown model never turns into a guessed body.
+export async function sendOpenAISingleTurnWithFallback(
+  options: SendOpenAISingleTurnOptions,
+): Promise<OpenAISingleTurnResult> {
+  const env = options.env ?? process.env;
+  // A missing or placeholder primary is a configuration failure, not a model
+  // outage: it must not be silently satisfied by a fallback candidate.
+  const primary = options.modelId.trim();
+  if (!primary || containsPlaceholder(primary)) throw new Error('model not configured');
+  const chain = resolveModelFallbackChain(options.modelId, env, options.modelRole);
+  const attempts: string[] = [];
+  let lastError: unknown;
+  for (const [index, candidate] of chain.entries()) {
+    const isLast = index === chain.length - 1;
+    if (!resolveModelProfile(candidate, env)) {
+      attempts.push(`${candidate}: profile not configured`);
+      console.warn(`[PocketGuard] model ${candidate} skipped (profile not configured)${isLast ? '; chain exhausted, failing closed' : '; falling back'}`);
+      if (isLast) throw new Error(`model profile not configured (chain: ${chain.join(' -> ')})`);
+      continue;
+    }
+    try {
+      const result = await sendOpenAISingleTurn({ ...options, modelId: candidate });
+      if (attempts.length > 0) {
+        console.warn(`[PocketGuard] model ${candidate} served the request after: ${attempts.join('; ')}`);
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      attempts.push(`${candidate}: ${modelFailureReason(error)}`);
+      const reason = modelFailureReason(error);
+      if (!isRetryableModelError(error)) {
+        // Request/config problem: another model cannot fix it, so stop now and
+        // keep the status auditable.
+        console.warn(`[PocketGuard] model ${candidate} unavailable (${reason}); not a model outage, failing closed`);
+        throw error;
+      }
+      if (isLast) {
+        console.warn(`[PocketGuard] model ${candidate} unavailable (${reason}); chain exhausted, failing closed`);
+        throw error;
+      }
+      console.warn(`[PocketGuard] model ${candidate} unavailable (${reason}); falling back`);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('OpenAI request failed');
 }

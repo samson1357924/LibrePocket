@@ -124,6 +124,19 @@ export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
 // remaining < need exits early with INCONCLUSIVE + chunkCoverageComplete:false
 // + completed reports + omission placeholders (or legacy INCONCLUSIVE when
 // nothing was completed) and never writes true. Fixed concurrency
+// Longest configured model fallback chain across the three review roles.
+// Mirrors the model client's chain composition without importing it: tag
+// and publish entry points must stay free of the OpenAI client so secrets never
+// reach those jobs. A role may burn a whole chain before it finishes, so
+// wall-clock budgets divide by this factor.
+function maxModelChainAttempts(env: NodeJS.ProcessEnv): number {
+  const count = (raw: string | undefined): number =>
+    (raw ?? '').split(',').map((part) => part.trim()).filter((part) => part !== '').length;
+  const chains = (['CHIEF', 'ANDROID_SEC', 'ANDROID_CODE'] as const).map((role) =>
+    1 + count(env[`POCKETGUARD_MODEL_${role}_FALLBACKS`]) + count(env.POCKETGUARD_MODEL_FALLBACKS));
+  return Math.max(1, ...chains);
+}
+
 // PR_CHUNK_CONCURRENCY runs orchestrateReview in parallel with index-sorted
 // synthesis; timeoutMs passes through min(420s, remaining/remainingWaves) so
 // slow roles abort via the transport timeout. chunkCoverageComplete is a
@@ -211,8 +224,12 @@ export function resolvePerChunkTimeoutMs(
   env: NodeJS.ProcessEnv | undefined,
   remainingMs: number,
   remainingWaves: number,
+  attemptFactor: number = 1,
 ): number {
   const waves = Number.isFinite(remainingWaves) && remainingWaves > 0 ? Math.max(1, Math.floor(remainingWaves)) : 1;
+  // A model can fall through a fallback chain, so one role may burn
+  // chainLength attempts before it is done. Budget per attempt, not per role.
+  const attempts = Number.isFinite(attemptFactor) && attemptFactor >= 1 ? Math.max(1, Math.floor(attemptFactor)) : 1;
   const remaining = Number.isFinite(remainingMs) ? Math.max(0, Math.floor(remainingMs)) : 0;
   const raw = env?.POCKETGUARD_CHUNK_TIMEOUT_MS?.trim() ?? '';
   let ceiling = MAX_PER_CHUNK_TIMEOUT_MS;
@@ -220,7 +237,7 @@ export function resolvePerChunkTimeoutMs(
     const parsed = Number(raw);
     if (Number.isFinite(parsed) && parsed > 0) ceiling = Math.min(MAX_PER_CHUNK_TIMEOUT_MS, Math.floor(parsed));
   }
-  return Math.max(1, Math.min(ceiling, Math.floor(remaining / waves)));
+  return Math.max(1, Math.min(ceiling, Math.floor(remaining / (waves * attempts))));
 }
 
 // Wall-time estimate for the remaining chunked work under fixed concurrency:
@@ -4175,7 +4192,11 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
               }
               const remainingChunks = total - nextIndex;
               const remainingWaves = Math.ceil(remainingChunks / PR_CHUNK_CONCURRENCY);
-              const timeoutMs = resolvePerChunkTimeoutMs(env, remainingMs, remainingWaves);
+              // Budget per model attempt: a role can burn a whole fallback chain
+              // before it finishes, otherwise one dead primary pushes the wave
+              // past the job deadline (P2 #2 regression).
+              const chainFactor = Math.max(1, maxModelChainAttempts(env));
+              const timeoutMs = resolvePerChunkTimeoutMs(env, remainingMs, remainingWaves, chainFactor);
               const needMs = timeoutMs + CHUNK_DEADLINE_SAVE_MARGIN_MS;
               try {
                 const jobRemainingText = jobRemainingMs === undefined ? 'n/a' : `${Math.max(0, Math.floor(jobRemainingMs))}ms`;

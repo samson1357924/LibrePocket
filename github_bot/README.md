@@ -73,6 +73,21 @@ repository secrets kept as a compatibility fallback (`vars.X || secrets.X` in
   is an alias for the global default. The resolved default backs every
   `reasoning` profile without an explicit effort (explicit `reasoning:high`,
   JSON maps, and builtin `gpt-5*` defaults).
+- `POCKETGUARD_MODEL_FALLBACKS` (optional comma-separated model chain in
+  priority order) and `POCKETGUARD_MODEL_<ROLE>_FALLBACKS` (optional per-role
+  chain). When a role's model is unavailable the next candidate is tried, so one
+  dead model does not fail the review; the chain is
+  `role model → role fallbacks → global fallbacks`. Unset means no fallback.
+
+Model fallback: a candidate falls through only on transport unavailability —
+network failure, response unusable, or an HTTP status in `408/429/500/502/503/504`.
+A `4xx` (notably `400` for an unsupported parameter) stops the chain with its
+status so the failure stays auditable instead of silently changing the request
+body, and the role still converges to `INCONCLUSIVE`. A candidate whose
+per-model profile is unconfigured is skipped without any request. Reports
+attribute `modelUsed` to the model that actually served the turn, so a fallback
+is never credited to the model that failed; when every candidate is exhausted
+the role fails closed.
 
 `POCKETGUARD_OPENAI_ORIGIN` is the exact-origin allowlist for `OPENAI_BASE_URL`; it is not a wildcard or a path prefix. `OPENAI_BASE_URL` must use
 `https:` with no credentials, query, or fragment, and requests use

@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
-  sendOpenAISingleTurn,
+  sendOpenAISingleTurnWithFallback,
   resolveRoleModel,
   type OpenAIEnvironment,
   type OpenAIModelRole,
@@ -51,7 +51,7 @@ export interface OrchestratorOptions {
   promptDirectory?: string;
   allowedOrigins?: string[];
   // Phase 3 (P2 #3): per-chunk timeout passthrough (fail-closed). When set,
-  // forwarded to every sendOpenAISingleTurn role call so slow roles abort via
+  // forwarded to every fallback-chain role call so slow roles abort via
   // the transport timeout instead of hanging the chunk wave. Omitted keeps
   // the send default (420s). Must be >0 when provided; invalid values throw
   // fail-closed (zero AI) via the send path.
@@ -239,8 +239,9 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
       `內文：${redactForModel(options.input.body)}`,
       ...options.input.comments.map((comment) => `留言：${redactForModel(comment)}`),
     ].join('\n\n');
-    const result = await sendOpenAISingleTurn({
+    const result = await sendOpenAISingleTurnWithFallback({
       modelId: modelUsed,
+      modelRole: 'chief',
       systemPrompt,
       userPrompt,
       maxOutputTokens: 1024,
@@ -344,14 +345,17 @@ export async function orchestrateReview(options: OrchestratorOptions): Promise<O
     try {
       modelUsed = resolveRoleModel(role, env);
       const systemPrompt = fs.readFileSync(path.join(promptDirectory, `${role}.md`), 'utf8');
-      const result = await sendOpenAISingleTurn({
+      const result = await sendOpenAISingleTurnWithFallback({
         modelId: modelUsed,
+        modelRole: role,
         systemPrompt,
         userPrompt: roleUserPrompt(role, options.changedFiles, options.diff, coverage),
         allowedOrigins: options.allowedOrigins,
         env,
         ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       });
+      // modelUsed follows the model that actually served the turn, so a fallback
+      // is attributed truthfully in reports.
       return parseRoleResponse(role, result.modelId, result.content);
     } catch {
       return { role, modelUsed: redactSensitiveText(modelUsed), verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [] };

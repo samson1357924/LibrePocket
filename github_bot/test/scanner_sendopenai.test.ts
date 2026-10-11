@@ -6,10 +6,12 @@ import {
 import {
   isReasoningNoneSupported,
   resolveDefaultReasoningEffort,
+  resolveModelFallbackChain,
   resolveModelProfile,
   resolveOpenAIConfig,
   resolveRoleModel,
   sendOpenAISingleTurn,
+  sendOpenAISingleTurnWithFallback,
 } from '../src/send_openai';
 import {
   coverageSummary,
@@ -1030,6 +1032,325 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         assert.equal(fetchCount, 0, 'unknown profile orchestrator must not send requests');
       } finally {
         globalThis.fetch = previous;
+      }
+    }
+
+    // --- Model fallback chain (Vegan-scan-app parity, fail-closed deltas). ---
+    {
+      // Chain composition: primary, then role fallbacks, then global, deduped,
+      // placeholders filtered. Unset lists mean no fallback at all.
+      assert.deepEqual(
+        resolveModelFallbackChain('primary-model', {
+          POCKETGUARD_MODEL_CHIEF: 'primary-model',
+          POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'b-model, c-model, primary-model, ${MISSING}',
+          POCKETGUARD_MODEL_FALLBACKS: 'c-model, d-model',
+        }, 'chief'),
+        ['primary-model', 'b-model', 'c-model', 'd-model'],
+        'chain keeps order, drops duplicates and placeholders',
+      );
+      assert.deepEqual(
+        resolveModelFallbackChain('primary-model', {}, 'chief'),
+        ['primary-model'],
+        'no configured fallbacks yields the previous single-model behaviour',
+      );
+
+      const mapEnv: Record<string, string> = {
+        OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL,
+        OPENAI_API_KEY: 'fake-key-for-fallback-probe',
+        POCKETGUARD_MODEL_PROFILES: JSON.stringify({
+          'primary-model': 'chat',
+          'second-model': 'chat',
+          'third-model': 'chat',
+        }),
+      };
+      const chainEnv = { ...mapEnv, POCKETGUARD_MODEL_FALLBACKS: 'second-model, third-model' };
+      const okResponse = (): Response => new Response(JSON.stringify({
+        output: [{ content: [{ type: 'output_text', text: 'ok' }] }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+      // Retryable status: primary 503 -> next model serves, and the result
+      // attributes the model that actually answered.
+      {
+        const models: string[] = [];
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async (_input, init) => {
+          models.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return models.length === 1
+            ? new Response('busy', { status: 503 })
+            : okResponse();
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.deepEqual(models, ['primary-model', 'second-model']);
+          assert.equal(result.modelId, 'second-model', 'result attributes the serving model');
+          assert.equal(result.content, 'ok');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // A 400 must not be retried: it carries its status and exactly one request.
+      {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => {
+          fetchCount += 1;
+          return new Response('bad parameter', { status: 400 });
+        }) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'primary-model',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: chainEnv,
+              timeoutMs: 1000,
+            }),
+            (error: { statusCode?: number }) => error?.statusCode === 400,
+          );
+          assert.equal(fetchCount, 1, 'a 400 surfaces instead of silently retrying');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // A candidate without a profile is skipped without any request; when every
+      // candidate is unconfigured the chain fails closed with zero requests.
+      {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => {
+          fetchCount += 1;
+          return okResponse();
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'unknown-primary',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: { ...mapEnv, POCKETGUARD_MODEL_FALLBACKS: 'second-model' },
+            timeoutMs: 1000,
+          });
+          assert.equal(fetchCount, 1, 'unconfigured primary sends nothing');
+          assert.equal(result.modelId, 'second-model');
+
+          fetchCount = 0;
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'unknown-primary',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: { ...mapEnv },
+              timeoutMs: 1000,
+            }),
+            /model profile not configured/,
+          );
+          assert.equal(fetchCount, 0, 'all-unconfigured chain fails closed without requests');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Exhaustion keeps the final error (with status) for the orchestrator.
+      {
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => new Response('busy', { status: 503 })) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'primary-model',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: chainEnv,
+              timeoutMs: 1000,
+            }),
+            (error: { statusCode?: number }) => error?.statusCode === 503,
+          );
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Orchestrator level: primary down for every role -> all INCONCLUSIVE and
+      // the reported model is the one that actually served (no false credit).
+      {
+        const roleEnv = {
+          ...chainEnv,
+          POCKETGUARD_MODEL_CHIEF: 'primary-model',
+          POCKETGUARD_MODEL_ANDROID_SEC: 'primary-model',
+          POCKETGUARD_MODEL_ANDROID_CODE: 'primary-model',
+        };
+        const previous = globalThis.fetch;
+        const models: string[] = [];
+        globalThis.fetch = (async (_input, init) => {
+          models.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return new Response('busy', { status: 503 });
+        }) as typeof fetch;
+        try {
+          const review = await orchestrateReview({
+            changedFiles: ['app/src/main/java/demo/Safe.kt'],
+            diff: 'diff --git a/app/src/main/java/demo/Safe.kt b/app/src/main/java/demo/Safe.kt',
+            coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
+            deterministicViolations: [],
+            env: roleEnv,
+            timeoutMs: 1000,
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+          });
+          assert.equal(review.verdict, 'INCONCLUSIVE');
+          assert.equal(review.roles.every((role) => role.verdict === 'INCONCLUSIVE'), true);
+          assert.equal(models.length, 9, 'three roles each walk the full chain');
+          // Roles run concurrently, so assert per-model coverage instead of order.
+          for (const model of ['primary-model', 'second-model', 'third-model']) {
+            assert.equal(models.filter((entry) => entry === model).length, 3,
+              `every role reaches ${model}`);
+          }
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Message-typed transport failures also fall through (no statusCode).
+      for (const failure of ['OpenAI request failed', 'OpenAI response invalid', 'OpenAI response empty'] as const) {
+        const models: string[] = [];
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async (_input, init) => {
+          const model = (JSON.parse(String(init?.body)) as { model: string }).model;
+          models.push(model);
+          // Only the first attempt fails, so the fallback candidate must serve.
+          if (models.length > 1) return okResponse();
+          if (failure === 'OpenAI request failed') throw new Error('network down');
+          if (failure === 'OpenAI response invalid') {
+            return new Response('not json', { status: 200, headers: { 'Content-Type': 'application/json' } });
+          }
+          return new Response(JSON.stringify({ output: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.deepEqual(models, ['primary-model', 'second-model'], `${failure} falls back`);
+          assert.equal(result.modelId, 'second-model');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // A rejected origin / unusable configuration is not a model outage: it
+      // stops the chain immediately with zero requests instead of walking the
+      // chain looking for a model that can bypass the allowlist.
+      {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => { fetchCount += 1; return okResponse(); }) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'primary-model',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: ['https://allowed-origin.test'],
+              env: { ...chainEnv, OPENAI_BASE_URL: 'https://disallowed-origin.test/v1' },
+              timeoutMs: 1000,
+            }),
+            /OpenAI configuration rejected/,
+          );
+          assert.equal(fetchCount, 0, 'configuration errors never touch the chain');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Non-400 4xx statuses also stop the chain (they are request problems,
+      // not model unavailability).
+      for (const status of [401, 403, 404, 409, 422]) {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => { fetchCount += 1; return new Response('nope', { status }); }) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'primary-model',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: chainEnv,
+              timeoutMs: 1000,
+            }),
+            (error: { statusCode?: number }) => error?.statusCode === status,
+          );
+          assert.equal(fetchCount, 1, `status ${status} stops the chain`);
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // A missing or placeholder primary is a configuration failure: no request
+      // is sent and no fallback candidate may satisfy it silently.
+      for (const primary of ['', '   ', '${MODEL}']) {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => { fetchCount += 1; return okResponse(); }) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: primary,
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: chainEnv,
+              timeoutMs: 1000,
+            }),
+            /model not configured/,
+          );
+          assert.equal(fetchCount, 0, `primary '${primary}' sends no request`);
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // t0 timeout on the primary falls through to the next candidate.
+      {
+        const models: string[] = [];
+        const previous = globalThis.fetch;
+        globalThis.fetch = ((_input: unknown, init: { signal?: AbortSignal }) => {
+          const attempt = models.push('attempt');
+          // Only the primary stalls; the next candidate answers after its own
+          // timeout window, proving each attempt is bounded independently.
+          if (attempt > 1) return Promise.resolve(okResponse());
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+          });
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 120,
+          });
+          assert.equal(models.length, 2, 'aborted primary falls back');
+          assert.equal(result.modelId, 'second-model');
+        } finally {
+          globalThis.fetch = previous;
+        }
       }
     }
   } finally {

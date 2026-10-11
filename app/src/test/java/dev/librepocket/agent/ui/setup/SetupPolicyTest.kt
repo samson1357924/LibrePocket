@@ -120,11 +120,17 @@ class ThrowingPolicy(private val error: Exception = IOException("POLICY_UNAVAILA
     }
 }
 
-/** KeyVault decorator counting putKey calls (single-write / replay assertions). */
+/** KeyVault decorator counting put/get/delete/has calls (single-write / replay assertions). */
 class CountingVault(
     private val delegate: KeyVault = EncryptedPrefsVault(InMemoryPrefs()),
 ) : KeyVault {
     var putKeys = 0
+        private set
+    var getKeys = 0
+        private set
+    var deleteKeys = 0
+        private set
+    var hasKeys = 0
         private set
 
     override suspend fun putKey(providerId: String, apiKey: CharArray) {
@@ -132,9 +138,20 @@ class CountingVault(
         delegate.putKey(providerId, apiKey)
     }
 
-    override suspend fun getKey(providerId: String): CharArray? = delegate.getKey(providerId)
-    override suspend fun deleteKey(providerId: String) = delegate.deleteKey(providerId)
-    override suspend fun hasKey(providerId: String): Boolean = delegate.hasKey(providerId)
+    // Returns the delegate's fresh copy directly; the TEST wipes the returned
+    // array (never the vault). Counting only — no extra copy here.
+    override suspend fun getKey(providerId: String): CharArray? {
+        getKeys++
+        return delegate.getKey(providerId)
+    }
+    override suspend fun deleteKey(providerId: String) {
+        deleteKeys++
+        delegate.deleteKey(providerId)
+    }
+    override suspend fun hasKey(providerId: String): Boolean {
+        hasKeys++
+        return delegate.hasKey(providerId)
+    }
 }
 
 /** KeyVault that blocks inside putKey so the test can race policy/edit/revision changes. */
@@ -146,6 +163,12 @@ class BlockingVault(
 ) : KeyVault {
     var putKeys = 0
         private set
+    var getKeys = 0
+        private set
+    var deleteKeys = 0
+        private set
+    var hasKeys = 0
+        private set
 
     override suspend fun putKey(providerId: String, apiKey: CharArray) {
         putKeys++
@@ -156,9 +179,79 @@ class BlockingVault(
         delegate.putKey(providerId, apiKey)
     }
 
-    override suspend fun getKey(providerId: String): CharArray? = delegate.getKey(providerId)
-    override suspend fun deleteKey(providerId: String) = delegate.deleteKey(providerId)
-    override suspend fun hasKey(providerId: String): Boolean = delegate.hasKey(providerId)
+    override suspend fun getKey(providerId: String): CharArray? {
+        getKeys++
+        return delegate.getKey(providerId)
+    }
+    override suspend fun deleteKey(providerId: String) {
+        deleteKeys++
+        delegate.deleteKey(providerId)
+    }
+    override suspend fun hasKey(providerId: String): Boolean {
+        hasKeys++
+        return delegate.hasKey(providerId)
+    }
+}
+
+/**
+ * Action-aware PolicyStore stub: per-action verdicts, recording every
+ * fresh action for key.read/key.write separation assertions.
+ *
+ * Mirrors ChatViewModel semantics in tests: only DENY blocks; ASK/ALLOW pass.
+ * Callers assert via [actions]/[freshCalls] that key.read was (or was not)
+ * consulted, and via vault counters that DENY blocked before backup.
+ */
+class MapActionPolicy(
+    private val byAction: Map<String, Verdict>,
+    private val default: Verdict = Verdict.ALLOW,
+) : PolicyStore {
+    var freshCalls = 0
+        private set
+    val actions = ArrayList<String>()
+    var lastAction: String? = null
+        private set
+    var lastResource: String? = null
+        private set
+
+    override fun evaluate(action: String, resource: String) =
+        PolicyDecision(byAction[action] ?: default, null, System.currentTimeMillis())
+
+    override suspend fun setRule(rule: PolicyRule) = Unit
+    override suspend fun removeRule(pattern: String) = Unit
+    override suspend fun listRules(): List<PolicyRule> = emptyList()
+
+    override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+        freshCalls++
+        actions.add(action)
+        lastAction = action
+        lastResource = resource
+        return PolicyDecision(byAction[action] ?: default, null, System.currentTimeMillis())
+    }
+}
+
+/** Throwing action-aware stub: one action throws, others return [fallback]. */
+class ThrowingActionPolicy(
+    private val throwAction: String,
+    private val error: Exception = IOException("POLICY_UNAVAILABLE"),
+    private val fallback: Verdict = Verdict.ALLOW,
+) : PolicyStore {
+    var freshCalls = 0
+        private set
+    val actions = ArrayList<String>()
+
+    override fun evaluate(action: String, resource: String) =
+        PolicyDecision(Verdict.DENY, null, System.currentTimeMillis())
+
+    override suspend fun setRule(rule: PolicyRule) = Unit
+    override suspend fun removeRule(pattern: String) = Unit
+    override suspend fun listRules(): List<PolicyRule> = emptyList()
+
+    override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+        freshCalls++
+        actions.add(action)
+        if (action == throwAction) throw error
+        return PolicyDecision(fallback, null, System.currentTimeMillis())
+    }
 }
 
 private class FailingSetupDataStore(
@@ -207,6 +300,33 @@ class NthGatedPolicy(
         }
         return PolicyDecision(verdict, null, System.currentTimeMillis())
     }
+}
+
+/**
+ * Programmable DataStore wrapper: delegates writes to [delegate] but fails
+ * the Nth [data] collections with [error].
+ *
+ * Models "revision read succeeded, metadata strict read transiently failed":
+ * EndpointStore.currentRevision() and snapshotStrict() each collect [data]
+ * once, while saveIfRevision/clear use updateData (never counted). Tests set
+ * [failAt] while the VM is blocked in putKey so only the post-put reads fail.
+ * Each [data] collection increments [collections] exactly once.
+ */
+private class SequenceDataStore(
+    private val delegate: DataStore<Preferences>,
+    @Volatile var failAt: Set<Int> = emptySet(),
+    private val error: IOException = IOException("DATASTORE_TRANSIENT"),
+) : DataStore<Preferences> {
+    val collections = java.util.concurrent.atomic.AtomicInteger(0)
+
+    override val data: Flow<Preferences> = flow {
+        val n = collections.incrementAndGet()
+        if (n in failAt) throw error
+        emit(delegate.data.first())
+    }
+
+    override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences =
+        delegate.updateData(transform)
 }
 
 /**
@@ -319,9 +439,10 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertFalse(vm.form.value.confirmKeyWrite)
         assertTrue(vm.form.value.saved)
-        // Policy checked three times: once before the dialog, once fresh before
-        // the write, once fresh after the write (stage2 second verification).
-        assertEquals(3, policy.freshCalls)
+        // Policy checked four times: once before the dialog, once fresh before
+        // the write, once for key.read before the backup, once fresh after the
+        // write (stage2 second verification + phase1 key.read gate).
+        assertEquals(4, policy.freshCalls)
         runBlocking {
             assertTrue(vault.hasKey("preset:openai"))
             assertTrue(store.hasMetadata())
@@ -337,8 +458,9 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertFalse(vm.form.value.confirmKeyWrite)
         assertTrue(vm.form.value.saved)
-        // Stage2: fresh check before AND after the vault write.
-        assertEquals(2, policy.freshCalls)
+        // Stage2 + phase1: fresh key.write check before AND key.read gate AND
+        // fresh key.write check after the vault write.
+        assertEquals(3, policy.freshCalls)
         runBlocking { assertTrue(vault.hasKey("preset:openai")) }
         runBlocking { assertTrue(store.hasMetadata()) }
     }
@@ -468,8 +590,9 @@ class SetupPolicyTest {
         vm.confirmKeyWriteSave()
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
-        // Stage2: confirm path does V1 + post-write V2.
-        assertEquals(4, policy.freshCalls)
+        // Stage2 + phase1: confirm path does V1 key.write + key.read gate +
+        // post-write V2 key.write.
+        assertEquals(5, policy.freshCalls)
         assertEquals(1, vault.putKeys)
         runBlocking {
             assertTrue(vault.hasKey("preset:anthropic"))
@@ -519,14 +642,15 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
         assertEquals(1, vault.putKeys)
-        // Stage2: V1 before dialog, V1 before write, V2 after write.
-        assertEquals(3, policy.freshCalls)
+        // Stage2 + phase1: V1 before dialog, V1 before write, key.read gate,
+        // V2 after write.
+        assertEquals(4, policy.freshCalls)
         // The consent was consumed by the first confirm: replaying does nothing,
         // not even a policy re-evaluation.
         vm.confirmKeyWriteSave()
         assertTrue(vm.form.value.saved)
         assertEquals(1, vault.putKeys)
-        assertEquals(3, policy.freshCalls)
+        assertEquals(4, policy.freshCalls)
     }
 
     // ---- Stage2: form fence + second policy check ----
@@ -605,8 +729,8 @@ class SetupPolicyTest {
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
         assertFalse(vm.form.value.saved)
         assertFalse(vm.form.value.confirmKeyWrite)
-        // V1 ALLOW + post-write V2 DENY.
-        assertEquals(2, policy.freshCalls)
+        // V1 ALLOW + key.read gate + post-write V2 DENY.
+        assertEquals(3, policy.freshCalls)
         assertEquals(1, vault.putKeys)
         runBlocking {
             assertFalse(store.hasMetadata())
@@ -633,7 +757,7 @@ class SetupPolicyTest {
         assertFalse(vm.form.value.saved)
         assertTrue(vm.form.value.confirmKeyWrite)
         assertNull(vm.form.value.errorCode)
-        assertEquals(2, policy.freshCalls)
+        assertEquals(3, policy.freshCalls)
         assertEquals(1, vault.putKeys)
         runBlocking {
             assertFalse(store.hasMetadata())
@@ -648,8 +772,8 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertFalse(vm.form.value.confirmKeyWrite)
         assertTrue(vm.form.value.saved)
-        // Confirm path re-evaluates fresh before and after its own write.
-        assertEquals(4, policy.freshCalls)
+        // Confirm path re-evaluates fresh before, key.read gate, and after its own write.
+        assertEquals(6, policy.freshCalls)
         assertEquals(2, vault.putKeys)
         runBlocking {
             assertTrue(vault.hasKey("preset:openai"))
@@ -672,7 +796,7 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertFalse(vm.form.value.confirmKeyWrite)
         assertTrue(vm.form.value.saved)
-        assertEquals(3, policy.freshCalls)
+        assertEquals(4, policy.freshCalls)
         assertEquals(1, vault.putKeys)
         runBlocking {
             assertTrue(vault.hasKey("preset:openai"))
@@ -715,7 +839,7 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
         assertFalse(vm.form.value.saved)
-        assertEquals(2, policy.freshCalls)
+        assertEquals(3, policy.freshCalls)
         assertEquals(1, vault.putKeys)
         runBlocking {
             assertFalse(store.hasMetadata())
@@ -759,13 +883,13 @@ class SetupPolicyTest {
         vmA.save()
         awaitSettled(vmA)
         assertTrue(vmA.form.value.saved)
-        assertEquals(2, policyA.freshCalls)
+        assertEquals(3, policyA.freshCalls)
         // B resumes: its stale null expectation must lose the CAS.
         releaseB.countDown()
         awaitSettled(vmB)
         assertEquals("POLICY_DENIED_KEY_WRITE", vmB.form.value.errorCode)
         assertFalse(vmB.form.value.saved)
-        assertEquals(2, policyB.freshCalls)
+        assertEquals(3, policyB.freshCalls)
         runBlocking {
             assertTrue(store.hasMetadata())
             assertEquals(1L, store.currentRevision())
@@ -814,13 +938,13 @@ class SetupPolicyTest {
         vmA.save()
         awaitSettled(vmA)
         assertTrue(vmA.form.value.saved)
-        assertEquals(2, policyA.freshCalls)
+        assertEquals(3, policyA.freshCalls)
         // B resumes: stale null loses the CAS but must not delete the winner.
         releaseB.countDown()
         awaitSettled(vmB)
         assertEquals("POLICY_DENIED_KEY_WRITE", vmB.form.value.errorCode)
         assertFalse(vmB.form.value.saved)
-        assertEquals(2, policyB.freshCalls)
+        assertEquals(3, policyB.freshCalls)
         // One put each, no delete/restore from the loser (pre-fix the loser
         // saw live == newKeyCopy and deleted the winner).
         assertEquals(1, vaultA.putKeys)
@@ -874,14 +998,14 @@ class SetupPolicyTest {
         vmA.save()
         awaitSettled(vmA)
         assertTrue(vmA.form.value.saved)
-        assertEquals(2, policyA.freshCalls)
+        assertEquals(3, policyA.freshCalls)
         runBlocking { assertEquals(2L, store.currentRevision()) }
         // B resumes: stale rev 1 loses the CAS but must not restore old over winner.
         releaseB.countDown()
         awaitSettled(vmB)
         assertEquals("POLICY_DENIED_KEY_WRITE", vmB.form.value.errorCode)
         assertFalse(vmB.form.value.saved)
-        assertEquals(2, policyB.freshCalls)
+        assertEquals(3, policyB.freshCalls)
         // One put each, no predecessor-restore from the loser (pre-fix the
         // loser saw live == newKeyCopy and overwrote the winner with old).
         assertEquals(1, vaultA.putKeys)
@@ -983,8 +1107,8 @@ class SetupPolicyTest {
         assertFalse(vm.form.value.confirmKeyWrite)
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
         assertFalse(vm.form.value.saved)
-        // V1 ALLOW + post-write V2 ASK; metadata never written.
-        assertEquals(2, policy.freshCalls)
+        // V1 ALLOW + key.read gate + post-write V2 ASK; metadata never written.
+        assertEquals(3, policy.freshCalls)
         assertEquals(1, vault.putKeys)
         runBlocking {
             assertFalse(store.hasMetadata())
@@ -1021,7 +1145,7 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
         assertFalse(vm.form.value.saved)
-        assertEquals(2, policy.freshCalls)
+        assertEquals(3, policy.freshCalls)
         // One put for the save attempt plus one for the ownership-checked
         // restore of the predecessor.
         assertEquals(2, vault.putKeys)
@@ -1071,7 +1195,7 @@ class SetupPolicyTest {
         // expectation: with a predecessor present, the key MUST survive.
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
         assertFalse(vm.form.value.saved)
-        assertEquals(2, policy.freshCalls)
+        assertEquals(3, policy.freshCalls)
         // One put for the save attempt plus one for the ownership-checked
         // restore of the predecessor (preseed bypassed this counter).
         assertEquals(2, vault.putKeys)
@@ -1085,7 +1209,9 @@ class SetupPolicyTest {
 
     @Test
     fun externalWriterInterleavingNeverDeletesForeignKey() {
-        val policy = NthGatedPolicy(Verdict.ALLOW, gateCall = 2)
+        // Phase1: V1 key.write (1) + key.read gate (2) + post-write V2 key.write
+        // (3, gated). The external writer lands while V2 is gated.
+        val policy = NthGatedPolicy(Verdict.ALLOW, gateCall = 3)
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         val vault = CountingVault(delegate)
         val (vm, _, store) = newVm(policy, vault)
@@ -1110,7 +1236,7 @@ class SetupPolicyTest {
         // never deleted).
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
         assertFalse(vm.form.value.saved)
-        assertEquals(2, policy.freshCalls)
+        assertEquals(3, policy.freshCalls)
         assertEquals(1, vault.putKeys)
         assertVaultKeyEquals(vault, "preset:openai", "sk-ext-key-789012")
         runBlocking {
@@ -1137,7 +1263,7 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
         assertFalse(vm.form.value.saved)
-        assertEquals(2, policy.freshCalls)
+        assertEquals(3, policy.freshCalls)
         assertEquals(1, vault.putKeys)
         runBlocking {
             assertFalse(vault.hasKey("preset:openai"))
@@ -1160,14 +1286,305 @@ class SetupPolicyTest {
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
-        // Two saves, two fresh evaluations each (pre-write V1 + post-write V2).
+        // Two saves, three fresh evaluations each
+        // (pre-write V1 key.write + key.read gate + post-write V2 key.write).
         assertEquals(2, vault.putKeys)
-        assertEquals(4, policy.freshCalls)
+        assertEquals(6, policy.freshCalls)
         assertVaultKeyEquals(vault, "preset:openai", "sk-new-key-abcdef")
         runBlocking {
             assertTrue(store.hasMetadata())
             assertEquals(2L, store.currentRevision())
             assertEquals(EndpointReadiness.READY, store.readiness(vault))
+        }
+    }
+
+    // ---- Phase1: strict read + key.read gate ----
+
+    @Test
+    fun keyReadDenyBlocksBeforeBackup() {
+        val policy = MapActionPolicy(mapOf("key.write" to Verdict.ALLOW, "key.read" to Verdict.DENY))
+        val vault = CountingVault()
+        val (vm, _, store) = newVm(policy, vault)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.save()
+        awaitSettled(vm)
+        assertEquals("POLICY_DENIED_KEY_READ", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertEquals(2, policy.freshCalls)
+        assertEquals(listOf("key.write", "key.read"), policy.actions)
+        runBlocking {
+            assertFalse(vault.hasKey("preset:openai"))
+            assertFalse(store.hasMetadata())
+        }
+    }
+
+    @Test
+    fun keyReadDenyBlocksConfirmPath() {
+        val policy = MapActionPolicy(mapOf("key.write" to Verdict.ASK, "key.read" to Verdict.DENY))
+        val vault = CountingVault()
+        val (vm, _, store) = newVm(policy, vault)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.confirmKeyWrite)
+        assertEquals(1, policy.freshCalls)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.getKeys)
+        vm.confirmKeyWriteSave()
+        awaitSettled(vm)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals("POLICY_DENIED_KEY_READ", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertEquals(3, policy.freshCalls)
+        assertEquals(listOf("key.write", "key.write", "key.read"), policy.actions)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.deleteKeys)
+        runBlocking {
+            assertFalse(vault.hasKey("preset:openai"))
+            assertFalse(store.hasMetadata())
+        }
+    }
+
+    @Test
+    fun keyReadThrowingFailsClosedToDeny() {
+        val policy = ThrowingActionPolicy(throwAction = "key.read", fallback = Verdict.ALLOW)
+        val vault = CountingVault()
+        val (vm, _, store) = newVm(policy, vault)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.save()
+        awaitSettled(vm)
+        assertEquals("POLICY_DENIED_KEY_READ", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertEquals(2, policy.freshCalls)
+        assertEquals(listOf("key.write", "key.read"), policy.actions)
+        runBlocking {
+            assertFalse(vault.hasKey("preset:openai"))
+            assertFalse(store.hasMetadata())
+        }
+    }
+
+    @Test
+    fun keyReadAskStillSaves() {
+        val policy = MapActionPolicy(mapOf("key.write" to Verdict.ALLOW, "key.read" to Verdict.ASK))
+        val vault = CountingVault()
+        val (vm, _, store) = newVm(policy, vault)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.saved)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals(3, policy.freshCalls)
+        assertEquals(listOf("key.write", "key.read", "key.write"), policy.actions)
+        assertEquals(1, vault.putKeys)
+        assertEquals(1, vault.getKeys)
+        assertEquals(0, vault.deleteKeys)
+        runBlocking {
+            assertTrue(vault.hasKey("preset:openai"))
+            assertTrue(store.hasMetadata())
+        }
+        assertVaultKeyEquals(vault, "preset:openai", "sk-test-key-123")
+    }
+
+    @Test
+    fun keyReadAllowRotationSucceeds() {
+        val policy = MapActionPolicy(mapOf("key.write" to Verdict.ALLOW, "key.read" to Verdict.ALLOW))
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val vault = CountingVault(delegate)
+        val (vm, _, store) = newVm(policy, vault)
+        runBlocking {
+            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            store.save(preseedConfig())
+            assertEquals(1L, store.currentRevision())
+        }
+        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.saved)
+        assertEquals(3, policy.freshCalls)
+        assertEquals(1, vault.putKeys)
+        assertEquals(1, vault.getKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertVaultKeyEquals(vault, "preset:openai", "sk-new-key-abcdef")
+        runBlocking {
+            assertEquals(2L, store.currentRevision())
+            assertEquals(EndpointReadiness.READY, store.readiness(vault))
+        }
+    }
+
+    @Test
+    fun casFalseMetadataTransientNoTouchWinnerSurvives() {
+        val dir = Files.createTempDirectory("setup-casstrict-test").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val delegateDs = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "casstrict.preferences_pb") },
+        )
+        val wrapper = SequenceDataStore(delegateDs)
+        val store = EndpointStore(wrapper)
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val policyA = MutablePolicy(Verdict.ALLOW)
+        val policyB = MutablePolicy(Verdict.ALLOW)
+        val enteredB = CountDownLatch(1)
+        val releaseB = CountDownLatch(1)
+        val vaultB = BlockingVault(delegate, enteredB, releaseB)
+        val vaultA = CountingVault(delegate)
+        val noProvider: (dev.librepocket.provider.ProviderConfig, dev.librepocket.provider.KeyProvider) -> LlmProvider =
+            { _, _ -> error("no provider needed") as LlmProvider }
+        val vmB = SetupViewModel(store, VaultSource { vaultB }, policyB, buildProvider = noProvider)
+        val vmA = SetupViewModel(store, VaultSource { vaultA }, policyA, buildProvider = noProvider)
+        vmB.onApiKeyChange("sk-same-key-abcdef")
+        vmB.save()
+        assertTrue(enteredB.await(10, TimeUnit.SECONDS))
+        vmA.onApiKeyChange("sk-same-key-abcdef")
+        vmA.save()
+        awaitSettled(vmA)
+        assertTrue(vmA.form.value.saved)
+        wrapper.failAt = setOf(wrapper.collections.get() + 1)
+        releaseB.countDown()
+        awaitSettled(vmB)
+        assertEquals("POLICY_DENIED_KEY_WRITE", vmB.form.value.errorCode)
+        assertFalse(vmB.form.value.saved)
+        assertEquals(3, policyA.freshCalls)
+        assertEquals(3, policyB.freshCalls)
+        assertEquals(0, vaultB.deleteKeys)
+        assertEquals(0, vaultA.deleteKeys)
+        runBlocking {
+            assertTrue(store.hasMetadata())
+            assertEquals(1L, store.currentRevision())
+            assertTrue(delegate.hasKey("preset:openai"))
+            assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+        }
+        assertVaultKeyEquals(delegate, "preset:openai", "sk-same-key-abcdef")
+    }
+
+    @Test
+    fun rollbackMetadataTransientFreshOrphanPreserved() {
+        val dir = Files.createTempDirectory("setup-rollback-fresh-test").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val delegateDs = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "rollback-fresh.preferences_pb") },
+        )
+        val wrapper = SequenceDataStore(delegateDs)
+        val store = EndpointStore(wrapper)
+        val policy = MutablePolicy(Verdict.ALLOW)
+        val vault = BlockingVault()
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = policy,
+            buildProvider = { _, _ -> error("no provider needed") as LlmProvider },
+        )
+        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.save()
+        assertTrue(vault.entered.await(10, TimeUnit.SECONDS))
+        runBlocking { store.clear() }
+        policy.verdict = Verdict.DENY
+        wrapper.failAt = setOf(wrapper.collections.get() + 2)
+        vault.release.countDown()
+        awaitSettled(vm)
+        assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertEquals(3, policy.freshCalls)
+        assertEquals(1, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertEquals(1, vault.getKeys)
+        runBlocking {
+            assertTrue(vault.hasKey("preset:openai"))
+            assertFalse(store.hasMetadata())
+        }
+    }
+
+    @Test
+    fun rollbackMetadataTransientHadKeyWinnerNotOverwritten() {
+        val dir = Files.createTempDirectory("setup-rollback-hadkey-test").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val delegateDs = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "rollback-hadkey.preferences_pb") },
+        )
+        val wrapper = SequenceDataStore(delegateDs)
+        val store = EndpointStore(wrapper)
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val policy = MutablePolicy(Verdict.ALLOW)
+        val vault = BlockingVault(delegate)
+        runBlocking {
+            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            store.save(preseedConfig())
+            assertEquals(1L, store.currentRevision())
+        }
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = policy,
+            buildProvider = { _, _ -> error("no provider needed") as LlmProvider },
+        )
+        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.save()
+        assertTrue(vault.entered.await(10, TimeUnit.SECONDS))
+        // External winner lands while our put is blocked: it advances rev 1
+        // -> 2 with foreign bytes. Our resumed put then unavoidably overwrites
+        // those bytes under the fixed alias (documented lost-update; staged
+        // alias will remove the backup scheme). Rollback must still not
+        // restore the predecessor over our own bytes on unknown store state.
+        runBlocking {
+            delegate.putKey("preset:openai", "sk-ext-key-789012".toCharArray())
+            store.save(preseedConfig(model = "m-ext"))
+        }
+        policy.verdict = Verdict.DENY
+        wrapper.failAt = setOf(wrapper.collections.get() + 2)
+        vault.release.countDown()
+        awaitSettled(vm)
+        assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertEquals(3, policy.freshCalls)
+        assertEquals(1, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+        // No-touch on transient metadata failure: our own bytes survive (not
+        // restored to old, not deleted). Lenient null would have taken the
+        // clearWinner delete path; strict failure preserves residue instead.
+        assertVaultKeyEquals(delegate, "preset:openai", "sk-new-key-abcdef")
+        runBlocking {
+            assertEquals("m-ext", store.observe().first()?.model)
+            assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+        }
+    }
+
+    @Test
+    fun legitClearStillDeletesOwnOrphan() {
+        val policy = MutablePolicy(Verdict.ALLOW)
+        val vault = BlockingVault()
+        val (vm, _, store) = newVm(policy, vault)
+        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.save()
+        assertTrue(vault.entered.await(10, TimeUnit.SECONDS))
+        runBlocking { store.clear() }
+        vault.release.countDown()
+        awaitSettled(vm)
+        assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertEquals(3, policy.freshCalls)
+        assertEquals(1, vault.putKeys)
+        assertEquals(2, vault.getKeys)
+        assertEquals(1, vault.deleteKeys)
+        runBlocking {
+            assertFalse(vault.hasKey("preset:openai"))
+            assertFalse(store.hasMetadata())
+            assertEquals(1L, store.currentRevision())
         }
     }
 }

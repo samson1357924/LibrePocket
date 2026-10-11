@@ -519,6 +519,22 @@ class SetupViewModel(
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
+        // 4b. key.read gate before ANY vault read (backup getKey). Mirrors
+        // ChatViewModel: only an explicit DENY blocks; ASK/ALLOW proceed (the
+        // key.read ASK was consented at setup). Read failures fail closed to
+        // DENY. Placed as close to the backup as possible to minimize the
+        // check-to-read TOCTOU window; dialog-only ASK paths return before
+        // here and are gated on their confirm attempt instead. Rollback's
+        // later vault re-reads inherit this verdict (no second policy lookup);
+        // the ownership re-read still touches a possibly-foreign slot but is
+        // atomicity-necessary, never logged, and recorded here. The staged /
+        // versioned vault alias follow-up will remove the backup scheme
+        // entirely (then this gate moves to the staged-slot read).
+        val r = freshVerdictOrDeny("key.read", providerId)
+        if (r == Verdict.DENY) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_READ")
+            return
+        }
         // 5. Vault write with a pre-put backup (stage3, fixed-alias short-term
         // scheme). Uses the entry snapshot (not live): key/identity edits
         // bump formRevision and are fenced above, so reaching here means the
@@ -699,9 +715,12 @@ class SetupViewModel(
                 // leaves our slot without a winner key, in which case the gated
                 // rollback below cleans our own orphan (never a restore).
                 // Store read failures fail closed to no-touch (preserve a
-                // possible winner).
+                // possible winner). STRICT read: observe() is lenient (folds
+                // transient failure to null) and must never authorize a
+                // delete; snapshotStrict() throws on failure so the catch below
+                // (true = protects slot) actually engages.
                 val winnerProtectsSlot = try {
-                    val meta = store.observe().first()
+                    val meta = store.snapshotStrict()
                     meta != null && meta.providerId == providerId
                 } catch (e: CancellationException) {
                     throw e
@@ -797,8 +816,17 @@ class SetupViewModel(
             }
             var clearWinner = false
             if (liveRev != expectedRevision) {
+                // STRICT metadata read: observe() is lenient (transient failure
+                // folds to null) and would misclassify a failure as a clear
+                // winner, authorizing an orphan delete of a possible live
+                // winner. snapshotStrict() throws instead, and ANY exception
+                // (outside Cancellation) below is no-touch. clearWinner is set
+                // ONLY on a healthy strict read confirming null or a different
+                // provider. Two-read window (revision then metadata) is known;
+                // stage 2 should use snapshotWithRevisionStrict() for a single
+                // emission (see EndpointStore).
                 val meta = try {
-                    store.observe().first()
+                    store.snapshotStrict()
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
@@ -816,6 +844,11 @@ class SetupViewModel(
                 clearWinner = true
             }
             val current = try {
+                // Ownership re-read: technically a key.read of a possibly
+                // foreign slot, but atomicity-necessary (check-then-act) and
+                // covered by the inherited backup-before key.read verdict above
+                // (no second policy lookup here for atomicity). Never logged;
+                // staged-alias follow-up removes the backup/rollback scheme.
                 vault().getKey(providerId)
             } catch (e: CancellationException) {
                 throw e

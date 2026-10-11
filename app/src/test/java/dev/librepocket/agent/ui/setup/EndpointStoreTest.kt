@@ -423,4 +423,48 @@ class EndpointStoreTest {
             assertEquals("PROVIDER_KEY_REF_MALFORMED", e.message)
         }
     }
+
+    @Test
+    fun snapshotStrictThrowsWhileObserveStaysLenient() = runBlocking {
+        val failing = EndpointStore(FailingDataStore())
+        // Lenient observe folds the failure to null (UI gate only).
+        assertNull(failing.observe().first())
+        // Strict read propagates fail-closed for destructive authorization.
+        try {
+            failing.snapshotStrict()
+            error("expected DATASTORE_UNAVAILABLE")
+        } catch (e: IOException) {
+            assertEquals("DATASTORE_UNAVAILABLE", e.message)
+        }
+        try {
+            failing.snapshotWithRevisionStrict()
+            error("expected DATASTORE_UNAVAILABLE")
+        } catch (e: IOException) {
+            assertEquals("DATASTORE_UNAVAILABLE", e.message)
+        }
+    }
+
+    @Test
+    fun snapshotStrictRoundTripMatchesObserve() = runBlocking {
+        val store = newStore()
+        assertNull(store.snapshotStrict())
+        val (freshCfg, freshRev) = store.snapshotWithRevisionStrict()
+        assertNull(freshCfg)
+        assertNull(freshRev)
+        store.save(sampleConfig())
+        assertEquals(sampleConfig().copy(configRevision = 1L), store.snapshotStrict())
+        assertEquals(sampleConfig().copy(configRevision = 1L), store.observe().first())
+        val (cfg, rev) = store.snapshotWithRevisionStrict()
+        assertEquals(1L, rev)
+        assertEquals(sampleConfig().copy(configRevision = 1L), cfg)
+        store.clear()
+        // Tombstone: strict and lenient agree on null config, strict still
+        // exposes the advancing raw revision in the pair (save 1 -> clear 2).
+        assertNull(store.snapshotStrict())
+        assertNull(store.observe().first())
+        val (clearedCfg, clearedRev) = store.snapshotWithRevisionStrict()
+        assertNull(clearedCfg)
+        assertEquals(2L, clearedRev)
+        assertEquals(2L, store.currentRevision())
+    }
 }

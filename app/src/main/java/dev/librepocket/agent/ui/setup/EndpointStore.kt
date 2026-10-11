@@ -104,29 +104,78 @@ class EndpointStore(
 ) {
     constructor(context: Context) : this(context.applicationContext.endpointDataStore)
 
+    /**
+     * Lenient UI read. Folds DataStore failures to `null` (via `catch`) and
+     * folds missing/partial metadata (including the post-[clear] tombstone) to
+     * `null`.
+     *
+     * ONLY for UI gate/[StateFlow] display ([readiness], [hasMetadata], gate).
+     * FORBIDDEN for deleteKey/restore authorization: destructive decisions MUST
+     * use [snapshotStrict] (or [snapshotWithRevisionStrict]), never this.
+     * Lenient `null` conflates transient failure with absent winner metadata
+     * and would mis-authorize an orphan delete.
+     */
     fun observe(): Flow<EndpointConfig?> = dataStore.data
         .catch { emit(emptyPreferences()) }
-        .map { prefs ->
-            val providerId = prefs[ENDPOINT_PROVIDER_ID_V1] ?: return@map null
-            val baseUrl = prefs[ENDPOINT_BASE_URL_V1] ?: return@map null
-            val apiKeyRef = prefs[ENDPOINT_API_KEY_REF_V1] ?: return@map null
-            val protocolName = prefs[ENDPOINT_PROTOCOL_V1] ?: return@map null
-            if (providerId.isBlank() || baseUrl.isBlank() || apiKeyRef.isBlank()) return@map null
-            val protocol = try {
-                ProviderProtocol.valueOf(protocolName)
-            } catch (_: IllegalArgumentException) {
-                return@map null
-            }
-            EndpointConfig(
-                providerId = providerId,
-                presetId = prefs[ENDPOINT_PRESET_ID_V1].orEmpty(),
-                label = prefs[ENDPOINT_LABEL_V1].orEmpty(),
-                baseUrl = baseUrl,
-                protocol = protocol,
-                model = prefs[ENDPOINT_MODEL_V1].orEmpty(),
-                apiKeyRef = apiKeyRef,
-                configRevision = prefs[ENDPOINT_CONFIG_REVISION_V1] ?: 0L,
-            )
+        .map { prefs -> parseConfig(prefs) }
+
+    private fun parseConfig(prefs: Preferences): EndpointConfig? {
+        val providerId = prefs[ENDPOINT_PROVIDER_ID_V1] ?: return null
+        val baseUrl = prefs[ENDPOINT_BASE_URL_V1] ?: return null
+        val apiKeyRef = prefs[ENDPOINT_API_KEY_REF_V1] ?: return null
+        val protocolName = prefs[ENDPOINT_PROTOCOL_V1] ?: return null
+        if (providerId.isBlank() || baseUrl.isBlank() || apiKeyRef.isBlank()) return null
+        val protocol = try {
+            ProviderProtocol.valueOf(protocolName)
+        } catch (_: IllegalArgumentException) {
+            return null
+        }
+        return EndpointConfig(
+            providerId = providerId,
+            presetId = prefs[ENDPOINT_PRESET_ID_V1].orEmpty(),
+            label = prefs[ENDPOINT_LABEL_V1].orEmpty(),
+            baseUrl = baseUrl,
+            protocol = protocol,
+            model = prefs[ENDPOINT_MODEL_V1].orEmpty(),
+            apiKeyRef = apiKeyRef,
+            configRevision = prefs[ENDPOINT_CONFIG_REVISION_V1] ?: 0L,
+        )
+    }
+
+    /**
+     * Strict read for destructive authorization (deleteKey/restore gating).
+     *
+     * Reads one `dataStore.data.first()` emission and parses directly WITHOUT
+     * `catch`: DataStore failures propagate fail-closed to the caller, which
+     * MUST treat any [Exception] ([CancellationException] rethrown) as
+     * no-touch. Unlike [observe], a transient failure never folds to `null`,
+     * so a missing-winner `null` is trustworthy (healthy read of absent
+     * metadata) rather than a failure masquerading as absent.
+     *
+     * Same level as [currentRevision]: raw, fail-closed, single emission.
+     */
+    suspend fun snapshotStrict(): EndpointConfig? = withContext(ioDispatcher) {
+        val prefs = dataStore.data.first()
+        parseConfig(prefs)
+    }
+
+    /**
+     * Strict single-emission read of revision + config together.
+     *
+     * Collects ONE `dataStore.data.first()` emission and derives both values
+     * from the same [Preferences] snapshot, eliminating the TOCTOU window
+     * between separate [currentRevision] + [snapshotStrict] collections (a
+     * concurrent writer landing between two reads could otherwise advance the
+     * revision after the first read but before the second).
+     *
+     * Fail-closed like [snapshotStrict]: no `catch`, failures propagate.
+     * Stage 1 callers still use the two-read sequence (documented window);
+     * stage 2 should migrate fenced paths to this.
+     */
+    suspend fun snapshotWithRevisionStrict(): Pair<EndpointConfig?, Long?> =
+        withContext(ioDispatcher) {
+            val prefs = dataStore.data.first()
+            parseConfig(prefs) to prefs[ENDPOINT_CONFIG_REVISION_V1]
         }
 
     /**

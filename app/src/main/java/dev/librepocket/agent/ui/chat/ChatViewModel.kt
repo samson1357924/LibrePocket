@@ -10,6 +10,7 @@ import dev.librepocket.chat.PolicyEvaluationException
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.ChatUiState
 import dev.librepocket.chat.ApprovalRequiredException
+import dev.librepocket.chat.InputTooLongException
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
@@ -773,6 +774,13 @@ class ChatViewModel(
                                 setNoticeIfCurrent(operationGeneration, "CHAT_SEND_DENIED")
                                 restoreOpForFailedSend(opId, "CHAT_SEND_DENIED")
                                 return@launch
+                            } catch (_: InputTooLongException) {
+                                // R4-4 admission fail-fast: single-turn input +
+                                // time block exceeds MAX_REQUEST_CHARS. Never
+                                // sent; keep the text recoverable (draft).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
+                                restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
+                                return@launch
                             }
                             if (verdict !is TurnStart.NeedsRecovery) {
                                 if (verdict is TurnStart.Started) {
@@ -981,6 +989,13 @@ class ChatViewModel(
                                 // controller; keep the text recoverable.
                                 setNoticeIfCurrent(operationGeneration, "CHAT_SEND_DENIED")
                                 restoreOpForFailedSend(opId, "CHAT_SEND_DENIED")
+                                return@launch
+                            } catch (_: InputTooLongException) {
+                                // R4-4 admission fail-fast: single-turn input +
+                                // time block exceeds MAX_REQUEST_CHARS. Never
+                                // sent; keep the text recoverable (draft).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
+                                restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
                                 return@launch
                             }
                             if (verdict !is TurnStart.NeedsRecovery) {

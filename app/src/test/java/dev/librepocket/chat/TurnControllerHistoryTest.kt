@@ -11,7 +11,12 @@ import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.StreamEvent
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
@@ -291,7 +296,7 @@ class TurnControllerHistoryTest {
         }
     }
 
-    @Test fun aggregateRequestContextCapNeverDiscardsLatestUserInput() {
+    @Test fun aggregateRequestContextCapRejectsSingleOversizeInputAtAdmission() {
         val provider = HistoryFakeProvider(doneOnce())
         var n = 0
         // History has 2 messages of 20,000 chars each = 40,000 chars.
@@ -299,26 +304,369 @@ class TurnControllerHistoryTest {
             ChatMessage(role = "user", text = "hist-0: " + "a".repeat(19990)),
             ChatMessage(role = "assistant", text = "hist-1: " + "b".repeat(19990)),
         )
+        val sink = PartialCapturingSink()
         val c = TurnController(
             provider = provider,
             policy = HistoryAllowPolicy(),
+            transcript = sink,
             dispatcher = Dispatchers.Default,
             sleeper = {},
             newId = { "single-${n++}" },
             initialHistory = historyList,
         )
         try {
-            // Latest user message alone is 105,000 chars (> MAX_REQUEST_CHARS)
+            // R4-4 strict invariant: a single-turn input that alone (plus the
+            // ephemeral "\n\n" + time block) exceeds MAX_REQUEST_CHARS is
+            // rejected at admission — never silently truncated, never sent.
             val hugeUserText = "huge-user: " + "z".repeat(105_000)
-            runBlocking { c.send(hugeUserText) }
-            val req = provider.seenRequests.single()
-            assertEquals(1, req.messages.size)
-            val onlyMsg = req.messages.single()
-            assertEquals("user", onlyMsg.role)
-            assertTrue(onlyMsg.text.startsWith(hugeUserText))
-            // Both history messages were trimmed, but the latest user input was NEVER discarded.
-            assertEquals(2, c.lastRequestTrimmedCount)
+            val failure = runCatching { runBlocking { c.send(hugeUserText) } }.exceptionOrNull()
+            assertTrue(
+                "oversize single input must be rejected with InputTooLongException, was $failure",
+                failure is InputTooLongException,
+            )
+            assertTrue("rejected input must stay an IllegalArgumentException", failure is IllegalArgumentException)
+            // No provider call, no trimming bookkeeping, no UI append.
+            assertTrue("no request may be emitted for rejected input", provider.seenRequests.isEmpty())
+            assertEquals(0, c.lastRequestTrimmedCount)
+            assertTrue(
+                "rejected input must not append a user row",
+                c.uiState.value.messages.none { it.role == "user" && it.text == hugeUserText },
+            )
+            assertTrue("no transcript failure row may be recorded", sink.failedThreeArg.isEmpty())
+
+            // Same fail-fast via startOrEnqueue (idle direct admission).
+            val directFailure =
+                runCatching { runBlocking { c.startOrEnqueue("q".repeat(100_000 + 1_000)) } }.exceptionOrNull()
+            assertTrue(directFailure is InputTooLongException)
+            assertTrue(provider.seenRequests.isEmpty())
+
+            // Same fail-fast via synchronous steer (busy or idle entry check).
+            val steerFailure = runCatching { c.steer("s".repeat(100_000 + 1_000)) }.exceptionOrNull()
+            assertTrue(steerFailure is InputTooLongException)
+            assertTrue(provider.seenRequests.isEmpty())
         } finally {
+            c.close()
+        }
+    }
+
+    @Test fun singleInputBoundaryFitsExactlyAtMaxMinusOverhead() {
+        // Deterministic overhead: fixed clock + fixed zone, no session line.
+        val fixedClock = java.time.Clock.fixed(
+            java.time.Instant.parse("2026-01-15T12:00:00Z"),
+            java.time.ZoneId.of("UTC"),
+        )
+        val zoneSupplier: () -> java.time.ZoneId = { java.time.ZoneId.of("UTC") }
+        val overhead = 2 + buildRuntimeTimeContext(fixedClock, "UTC", null, zoneSupplier).length
+        val maxText = TurnController.MAX_REQUEST_CHARS - overhead
+        assertTrue("test budget must be positive, overhead=$overhead", maxText > 0)
+
+        fun controllerFor(provider: HistoryFakeProvider): TurnController {
+            var n = 0
+            return TurnController(
+                provider = provider,
+                policy = HistoryAllowPolicy(),
+                dispatcher = Dispatchers.Default,
+                sleeper = {},
+                newId = { "bound-${n++}" },
+                clock = fixedClock,
+                userTimezone = "UTC",
+                sessionStart = null,
+                systemZone = zoneSupplier,
+            )
+        }
+
+        // Exactly at budget: accepted, strict sum <= MAX holds.
+        val okProvider = HistoryFakeProvider(doneOnce())
+        val ok = controllerFor(okProvider)
+        try {
+            val fitting = "w".repeat(maxText)
+            runBlocking { ok.send(fitting) }
+            val req = okProvider.seenRequests.single()
+            val total = req.messages.sumOf { it.text.length }
+            assertTrue("strict invariant: sum=$total <= MAX", total <= TurnController.MAX_REQUEST_CHARS)
+            assertEquals(maxText + overhead, total)
+        } finally {
+            ok.close()
+        }
+
+        // One char over: rejected at admission, nothing emitted.
+        val overProvider = HistoryFakeProvider(doneOnce())
+        val over = controllerFor(overProvider)
+        try {
+            val oneOver = "w".repeat(maxText + 1)
+            val failure = runCatching { runBlocking { over.send(oneOver) } }.exceptionOrNull()
+            assertTrue(failure is InputTooLongException)
+            assertTrue(overProvider.seenRequests.isEmpty())
+            assertEquals(0, over.lastRequestTrimmedCount)
+        } finally {
+            over.close()
+        }
+    }
+
+    @Test fun queuedOversizeInputFailsFastWithoutEnqueue() {
+        val gate = CompletableDeferred<Unit>()
+        val provider = HistoryFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "part"))
+                gate.await()
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        var n = 0
+        val c = TurnController(
+            provider = provider,
+            policy = HistoryAllowPolicy(),
+            dispatcher = Dispatchers.Default,
+            sleeper = {},
+            newId = { "queue-${n++}" },
+        )
+        val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        try {
+            val first = outer.async { c.send("first") }
+            // Wait until the first turn is actually in flight.
+            val end = System.currentTimeMillis() + 8_000
+            while (provider.seenRequests.isEmpty()) {
+                if (System.currentTimeMillis() > end) error("timed out waiting for in-flight turn")
+                Thread.sleep(10)
+            }
+            val oversize = "q".repeat(100_000 + 1_000)
+            val failure =
+                runCatching { runBlocking { c.startOrEnqueue(oversize, opId = 77) } }.exceptionOrNull()
+            assertTrue("busy oversize enqueue must fail fast, was $failure", failure is InputTooLongException)
+            assertEquals(0, c.uiState.value.pendingSteerCount)
+            assertTrue(c.drainQueued().isEmpty())
+            gate.complete(Unit)
+            runBlocking { first.await() }
+        } finally {
+            try { gate.complete(Unit) } catch (_: Exception) { }
+            outer.cancel()
+            c.close()
+        }
+    }
+
+    @Test fun promotionRevalidatesLengthAfterZoneGrowth() {
+        // Promotion race (R4-4): narrow zone passes admission into the FIFO,
+        // wide zone at promotion must reject via failPromotion (FIFO retained,
+        // no appendUser, no transcript start, no provider call).
+        val fixedClock = java.time.Clock.fixed(
+            java.time.Instant.parse("2026-01-15T12:00:00Z"),
+            java.time.ZoneId.of("UTC"),
+        )
+        var current: java.time.ZoneId = java.time.ZoneId.of("UTC")
+        val narrowZone = java.time.ZoneId.of("UTC")
+        val wideZone = java.time.ZoneId.of("America/Argentina/Buenos_Aires")
+        val narrowBlock = buildRuntimeTimeContext(fixedClock, null, null) { narrowZone }
+        val wideBlock = buildRuntimeTimeContext(fixedClock, null, null) { wideZone }
+        val overheadNarrow = 2 + narrowBlock.length
+        val overheadWide = 2 + wideBlock.length
+        assertTrue(
+            "wide zone must render a longer block (narrow=$overheadNarrow wide=$overheadWide)",
+            overheadWide > overheadNarrow,
+        )
+        // Exactly fits the narrow block, overshoots the wide block.
+        val followText = "p".repeat(TurnController.MAX_REQUEST_CHARS - overheadNarrow)
+        assertTrue(followText.length + overheadNarrow <= TurnController.MAX_REQUEST_CHARS)
+        assertTrue(followText.length + overheadWide > TurnController.MAX_REQUEST_CHARS)
+
+        val gate = CompletableDeferred<Unit>()
+        val provider = HistoryFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "part"))
+                gate.await()
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val startedTexts: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        val sink = object : TranscriptSink {
+            override suspend fun onTurnStarted(runId: String, text: String) { startedTexts.add(text) }
+            override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+            override suspend fun onTurnFailed(runId: String, error: String) = Unit
+            override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+            override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+            override suspend fun onSteerQueued(text: String) = Unit
+            override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
+            override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+        }
+        var n = 0
+        val c = TurnController(
+            provider = provider,
+            policy = HistoryAllowPolicy(),
+            transcript = sink,
+            dispatcher = Dispatchers.Default,
+            sleeper = {},
+            newId = { "promo-${n++}" },
+            clock = fixedClock,
+            userTimezone = null,
+            sessionStart = null,
+            systemZone = { current },
+        )
+        val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        try {
+            val first = outer.async { c.send("first") }
+            val end = System.currentTimeMillis() + 8_000
+            while (provider.seenRequests.isEmpty()) {
+                if (System.currentTimeMillis() > end) error("timed out waiting for in-flight turn")
+                Thread.sleep(10)
+            }
+            // Admitted while the zone is still narrow: passes admission, queued FIFO.
+            assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue(followText, opId = 99) })
+            assertEquals(1, c.uiState.value.pendingSteerCount)
+            // Grow the zone before the promotion handoff.
+            current = wideZone
+            gate.complete(Unit)
+            runBlocking { first.await() }
+            val end2 = System.currentTimeMillis() + 8_000
+            while (c.uiState.value.status != ChatStatus.ERROR) {
+                if (System.currentTimeMillis() > end2) error("timed out waiting for promotion rejection")
+                Thread.sleep(10)
+            }
+            assertEquals("input too long", c.uiState.value.error)
+            assertEquals(1, c.uiState.value.pendingSteerCount)
+            assertTrue(c.uiState.value.queuedRecoveryRequired)
+            // No follow-up provider call, no follow-up user row, no follow-up transcript start.
+            assertEquals(1, provider.streamCalls.get())
+            assertEquals(1, provider.seenRequests.size)
+            assertEquals(listOf("first"), c.uiState.value.messages.filter { it.role == "user" }.map { it.text })
+            assertEquals(listOf("first"), startedTexts.toList())
+            // failPromotion retains the FIFO for explicit recovery.
+            assertEquals(listOf(QueuedIntent(99L, followText)), c.drainQueued())
+        } finally {
+            try { gate.complete(Unit) } catch (_: Exception) { }
+            outer.cancel()
+            c.close()
+        }
+    }
+
+    @Test fun idleDirectStartRejectedWhenZoneGrowsDuringGate() {
+        // Gate-growth race (R4-4 second round): narrow zone passes admission,
+        // wide zone at the idle direct-start second lock must reject with
+        // InputTooLongException (no append, no provider call, FIFO retained empty).
+        val fixedClock = java.time.Clock.fixed(
+            java.time.Instant.parse("2026-01-15T12:00:00Z"),
+            java.time.ZoneId.of("UTC"),
+        )
+        var current: java.time.ZoneId = java.time.ZoneId.of("UTC")
+        val narrowZone = java.time.ZoneId.of("UTC")
+        val wideZone = java.time.ZoneId.of("America/Argentina/Buenos_Aires")
+        val narrowBlock = buildRuntimeTimeContext(fixedClock, null, null) { narrowZone }
+        val wideBlock = buildRuntimeTimeContext(fixedClock, null, null) { wideZone }
+        val overheadNarrow = 2 + narrowBlock.length
+        val overheadWide = 2 + wideBlock.length
+        assertTrue(
+            "wide zone must render a longer block (narrow=$overheadNarrow wide=$overheadWide)",
+            overheadWide > overheadNarrow,
+        )
+        val directText = "g".repeat(TurnController.MAX_REQUEST_CHARS - overheadNarrow)
+        assertTrue(directText.length + overheadNarrow <= TurnController.MAX_REQUEST_CHARS)
+        assertTrue(directText.length + overheadWide > TurnController.MAX_REQUEST_CHARS)
+
+        val provider = HistoryFakeProvider(doneOnce())
+        val startedTexts: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        val sink = object : TranscriptSink {
+            override suspend fun onTurnStarted(runId: String, text: String) { startedTexts.add(text) }
+            override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+            override suspend fun onTurnFailed(runId: String, error: String) = Unit
+            override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+            override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+            override suspend fun onSteerQueued(text: String) = Unit
+            override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
+            override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+        }
+        var n = 0
+        val c = TurnController(
+            provider = provider,
+            policy = HistoryAllowPolicy(),
+            transcript = sink,
+            dispatcher = Dispatchers.Default,
+            sleeper = {},
+            newId = { "gate-${n++}" },
+            clock = fixedClock,
+            userTimezone = null,
+            sessionStart = null,
+            systemZone = { current },
+        )
+        try {
+            // Flip narrow -> wide inside the gate window (after the fresh gate,
+            // before the second lock), so admission passes but the idle
+            // direct-start re-check must fail.
+            c.afterStartOrEnqueueGateForTest = { current = wideZone }
+            val failure =
+                runCatching { runBlocking { c.startOrEnqueue(directText, opId = 101) } }.exceptionOrNull()
+            assertTrue("idle direct start must fail fast, was $failure", failure is InputTooLongException)
+            // No append, no provider call, no transcript start.
+            assertTrue(provider.seenRequests.isEmpty())
+            assertEquals(0, provider.streamCalls.get())
+            assertTrue(c.uiState.value.messages.isEmpty())
+            assertTrue(startedTexts.isEmpty())
+            assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+            assertEquals(0, c.uiState.value.pendingSteerCount)
+            assertTrue(c.drainQueued().isEmpty())
+        } finally {
+            c.afterStartOrEnqueueGateForTest = null
+            c.close()
+        }
+    }
+
+    @Test fun startTurnSecondLockRejectedWhenZoneGrowsDuringGate() {
+        // Same gate-growth race via the legacy startTurn second lock: admission
+        // passes narrow, second lock must reject wide with no bump/append.
+        val fixedClock = java.time.Clock.fixed(
+            java.time.Instant.parse("2026-01-15T12:00:00Z"),
+            java.time.ZoneId.of("UTC"),
+        )
+        var current: java.time.ZoneId = java.time.ZoneId.of("UTC")
+        val narrowZone = java.time.ZoneId.of("UTC")
+        val wideZone = java.time.ZoneId.of("America/Argentina/Buenos_Aires")
+        val narrowBlock = buildRuntimeTimeContext(fixedClock, null, null) { narrowZone }
+        val wideBlock = buildRuntimeTimeContext(fixedClock, null, null) { wideZone }
+        val overheadNarrow = 2 + narrowBlock.length
+        val overheadWide = 2 + wideBlock.length
+        assertTrue(
+            "wide zone must render a longer block (narrow=$overheadNarrow wide=$overheadWide)",
+            overheadWide > overheadNarrow,
+        )
+        val directText = "h".repeat(TurnController.MAX_REQUEST_CHARS - overheadNarrow)
+        assertTrue(directText.length + overheadNarrow <= TurnController.MAX_REQUEST_CHARS)
+        assertTrue(directText.length + overheadWide > TurnController.MAX_REQUEST_CHARS)
+
+        val provider = HistoryFakeProvider(doneOnce())
+        val startedTexts: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        val sink = object : TranscriptSink {
+            override suspend fun onTurnStarted(runId: String, text: String) { startedTexts.add(text) }
+            override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+            override suspend fun onTurnFailed(runId: String, error: String) = Unit
+            override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+            override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+            override suspend fun onSteerQueued(text: String) = Unit
+            override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
+            override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+        }
+        var n = 0
+        val c = TurnController(
+            provider = provider,
+            policy = HistoryAllowPolicy(),
+            transcript = sink,
+            dispatcher = Dispatchers.Default,
+            sleeper = {},
+            newId = { "gate-st-${n++}" },
+            clock = fixedClock,
+            userTimezone = null,
+            sessionStart = null,
+            systemZone = { current },
+        )
+        try {
+            c.afterStartTurnGateForTest = { current = wideZone }
+            val failure =
+                runCatching { runBlocking { c.startTurn(directText) } }.exceptionOrNull()
+            assertTrue("startTurn second lock must fail fast, was $failure", failure is InputTooLongException)
+            assertTrue(provider.seenRequests.isEmpty())
+            assertEquals(0, provider.streamCalls.get())
+            assertTrue(c.uiState.value.messages.isEmpty())
+            assertTrue(startedTexts.isEmpty())
+            assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+            assertTrue(c.drainQueued().isEmpty())
+        } finally {
+            c.afterStartTurnGateForTest = null
             c.close()
         }
     }

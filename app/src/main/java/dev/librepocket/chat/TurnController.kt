@@ -145,6 +145,17 @@ internal fun applyHistoryCap(history: List<ChatMessage>, cap: HistoryWindowCap):
 class RecoveryRequiredException : IllegalStateException("queued turn recovery required before admission")
 
 /**
+ * Single-turn input (plus its ephemeral runtime time block) exceeds
+ * [TurnController.MAX_REQUEST_CHARS]. Thrown fail-fast at admission and at
+ * every post-gate second-lock / promotion re-validation, always before any
+ * append/transcript/activity bookkeeping on that path (no append, no bump, no
+ * transcript on throw). Subclasses
+ * [IllegalArgumentException] so existing pre-accept callers treat it as
+ * "not accepted, caller retains the text" with no API break.
+ */
+class InputTooLongException(message: String) : IllegalArgumentException(message)
+
+/**
  * Turn controller: per-turn [Flow] collection + retry orchestration +
  * single-flight guard + steer queue + cooperative cancel.
  *
@@ -290,8 +301,37 @@ class TurnController(
     const val MAX_IMAGES_PER_TURN = 4
 
     /**
-     * Aggregate request context char cap (R2-6). Equal to RoomSessionStore.MAX_TEXT_CHARS.
-     * Prevents unbounded payload explosion across large resumed history + live messages.
+     * Strict aggregate request context char cap (R2-6, R4-4).
+     * Equal to RoomSessionStore.MAX_TEXT_CHARS.
+     *
+     * Boundary invariant (not an absolute per-request guarantee): at every
+     * admission/handoff boundary the single-turn payload
+     * `text.length + 2 ("\n\n") + actual time-block length` is checked against
+     * [MAX_REQUEST_CHARS], including the ephemeral runtime time block
+     * (`"\n\n" + buildRuntimeTimeContext(...)`) suffixed to the last user copy.
+     * Image payload bytes are out of scope (never counted in `text.length`).
+     *
+     * Enforcement is admission fail-fast, never silent truncation of the
+     * current turn: any single-turn `text` with
+     * `text.length + 2 + actualTimeBlock.length > MAX_REQUEST_CHARS` is
+     * rejected with [InputTooLongException] with no append, no bump, and no
+     * transcript on the rejecting path.
+     * Multi-message overflow still trims oldest-first whole messages
+     * (observable via [TurnController.lastRequestTrimmedCount]); the last
+     * user message is only ever present because it individually fits at its
+     * admission boundary.
+     *
+     * Handoff re-validation keeps the boundary invariant across the gate/queue
+     * race — admission ([startTurn]/[startOrEnqueue]/[steer] pre-gate checks),
+     * post-gate second-lock re-checks ([startTurn] before bump/append,
+     * [startOrEnqueue] both the lost-race enqueue path before enqueue and the
+     * idle direct-start path before drain/bump/append), and a promotion peek
+     * ([hostedTurn] re-checks the FIFO head with [checkInputLengthOrThrow]
+     * before dequeue, `failPromotion("input too long")` retains the FIFO).
+     * The only remaining residual is the intra-turn retry rebuild race (fresh
+     * zone read per attempt in [runTurnLoop]): a zone that grows mid-turn can
+     * add at most the time-block delta to an already-admitted turn, surfaced
+     * at the next admission/promotion boundary.
      */
     const val MAX_REQUEST_CHARS = 100_000
   }
@@ -472,6 +512,7 @@ class TurnController(
    */
   suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): Job {
     require(text.isNotBlank()) { "text must not be blank" }
+    checkInputLengthOrThrow(text)
     val revisionAtAdmission = synchronized(lock) {
       check(!closed) { "controller is closed" }
       if (activeLocked() != null) {
@@ -486,6 +527,12 @@ class TurnController(
     afterStartTurnGateForTest?.invoke()
     val host = synchronized(lock) {
       check(!closed) { "controller is closed" }
+      // R4-4 second-lock re-validation: fresh zone read after the gate, before
+      // any bump/append/transcript. Length first (before busy/recovery) for
+      // fail-fast priority matching admission; throw is fail-closed (no append,
+      // no bump, no transcript) with InputTooLongException to the caller.
+      // Closed stays first (lifecycle seal); length still precedes busy/recovery.
+      checkInputLengthOrThrow(text)
       if (activeLocked() != null) {
         _uiState.update { it.copy(error = "busy: another turn is in flight") }
         throw IllegalStateException("already in flight")
@@ -571,6 +618,7 @@ class TurnController(
     opId: Long? = null,
   ): TurnStart {
     require(text.isNotBlank()) { "text must not be blank" }
+    checkInputLengthOrThrow(text)
     val revisionAtAdmission = synchronized(lock) {
       check(!closed) { "controller is closed" }
       if (activeLocked() != null) {
@@ -587,6 +635,11 @@ class TurnController(
     val host = synchronized(lock) {
       check(!closed) { "controller is closed" }
       if (activeLocked() != null) {
+        // Lost the race during the gate: re-validate length with the fresh
+        // zone before queueing, so a zone that grew during the gate cannot
+        // enqueue oversize work. Oversize throws like admission (no enqueue,
+        // no revision bump, no transcript); the caller retains the text.
+        checkInputLengthOrThrow(text)
         // Lost the race during the gate: queue instead of throwing, so the
         // caller still gets an explicit acceptance signal. Image turns are
         // the exception: QueuedIntent cannot preserve their image refs.
@@ -594,6 +647,12 @@ class TurnController(
         enqueueLocked(opId, text, images)
         return TurnStart.Queued
       }
+      // R4-4 idle direct-start re-validation: fresh zone read after the gate,
+      // before any bump/append/transcript. Must precede drainRecoveryLocked's
+      // bump/clear so the throw path has no append, no bump, no transcript and
+      // the FIFO is retained; caller receives InputTooLongException and retains
+      // the text.
+      checkInputLengthOrThrow(text)
       drainRecoveryLocked()?.let { return TurnStart.NeedsRecovery(it) }
       activityRevision++
       appendUser(text, opId)
@@ -631,6 +690,7 @@ class TurnController(
    */
   fun steer(text: String) {
     require(text.isNotBlank()) { "text must not be blank" }
+    checkInputLengthOrThrow(text)
     synchronized(lock) {
       check(!closed) { "controller is closed" }
       if (activeLocked() != null) {
@@ -660,6 +720,11 @@ class TurnController(
         }
       } catch (_: SecurityException) {
         retainSteerForRecovery(text, error = "denied by policy")
+      } catch (_: InputTooLongException) {
+        // Admission fail-fast (R4-4): never retain oversize text for
+        // recovery (no enqueue, no transcript, no activityRevision).
+        // The caller retains ownership; surface idle-only.
+        projectInputTooLongIdle()
       } catch (_: ApprovalRequiredException) {
         retainSteerForRecovery(text, error = "approval required")
       } catch (_: PolicyEvaluationException) {
@@ -789,6 +854,58 @@ class TurnController(
   /** Caller must hold [lock]. Direct starts cannot take ownership of recovery FIFO. */
   private fun checkNoQueuedRecoveryLocked() {
     if (steerQueue.isNotEmpty()) throw RecoveryRequiredException()
+  }
+
+  /**
+   * Admission fail-fast for R4-4 (boundary [MAX_REQUEST_CHARS] invariant).
+   *
+   * Rejects a single-turn [text] whose own payload alone — `text.length + 2
+   * ("\n\n") + actual [buildRuntimeTimeContext] block length` — already
+   * exceeds [MAX_REQUEST_CHARS]. Uses the actual block rendered with this
+   * controller's [clock]/[userTimezone]/[sessionStart]/[systemZone] (same
+   * overload [buildRequest] uses), so the check matches the emitted request
+   * without a fixed reserve that could flake across zones. Image bytes are
+   * never counted (out of scope, same as [buildRequest]).
+   *
+   * Must run before any gate/append/transcript/activity bookkeeping on its
+   * path: on throw nothing is appended, nothing is written, and
+   * [activityRevision] is untouched on that path. Callers retain the text (VM
+   * restores the draft).
+   *
+   * The same check re-validates every handoff: admission pre-gate checks,
+   * post-gate second-lock re-checks ([startTurn] before bump/append with
+   * length-before-busy fail-fast priority; [startOrEnqueue] both the
+   * lost-race enqueue path before enqueue and the idle direct-start path
+   * before drain/bump/append, FIFO retained on throw), and the promotion path
+   * peeking the FIFO head before dequeue (oversize retains the FIFO via
+   * `failPromotion("input too long")`). Intra-turn retry rebuilds in
+   * [runTurnLoop] re-read the zone per attempt; any growth there contributes
+   * only the time-block delta, the sole accepted residual.
+   */
+  private fun checkInputLengthOrThrow(text: String) {
+    val block = buildRuntimeTimeContext(clock, userTimezone, sessionStart, systemZone)
+    if (text.length + 2 + block.length > MAX_REQUEST_CHARS) {
+      throw InputTooLongException(
+        "input too long: text=${text.length} + timeBlock=${block.length} + 2 exceeds $MAX_REQUEST_CHARS",
+      )
+    }
+  }
+
+  /**
+   * Best-effort idle projection for an oversize legacy steer that only
+   * surfaced after the async hop (zone grew between the synchronous check
+   * and the async [startOrEnqueue] check). Intentionally side-effect free:
+   * no enqueue, no transcript write, no [activityRevision] bump — the text
+   * stays caller-owned. Only projects when idle so a live turn is never
+   * disturbed.
+   */
+  private fun projectInputTooLongIdle() {
+    synchronized(lock) {
+      if (closed || activeLocked() != null) return
+      val status = _uiState.value.status
+      if (status != ChatStatus.IDLE && status != ChatStatus.ERROR) return
+      _uiState.update { it.copy(status = ChatStatus.ERROR, error = "input too long") }
+    }
   }
 
   /** Retain an unaccepted steer and any transferred FIFO for explicit recovery. */
@@ -1085,6 +1202,18 @@ class TurnController(
       ) {
         if (inFlight === self) inFlight = null
         return
+      }
+      // Promotion re-validation (R4-4): peek the FIFO head with the fresh
+      // zone before dequeue. Oversize retains the FIFO via the existing
+      // failPromotion path (no appendUser, no transcript, no provider call).
+      val head = steerQueue.firstOrNull()
+      if (head != null) {
+        try {
+          checkInputLengthOrThrow(head.text)
+        } catch (_: InputTooLongException) {
+          failPromotion("input too long", self)
+          return
+        }
       }
       val next = steerQueue.removeFirstOrNull()
       if (next == null) {

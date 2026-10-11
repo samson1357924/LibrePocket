@@ -122,12 +122,12 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      // Minimal write: the sticky ledger's write scopes. The sticky quota
-      // ledger lives on the pull-request conversation. On a PR resource,
-      // GitHub's authorization check greps the PullRequests scope (the
-      // issues/PR comment endpoint sits in both the Issues and the Pull
-      // requests permission set), so `issues: write` alone yields 403 for
-      // `createComment`. No OpenAI secrets here.
+      # Minimal write: the sticky ledger's write scopes. The sticky quota
+      # ledger lives on the pull-request conversation. On a PR resource,
+      # GitHub's authorization check greps the PullRequests scope (the
+      # issues/PR comment endpoint sits in both the Issues and the Pull
+      # requests permission set), so `issues: write` alone yields 403 for
+      # `createComment`. No OpenAI secrets here.
       pull-requests: write
       issues: write
     outputs:

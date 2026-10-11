@@ -32,6 +32,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -129,6 +131,21 @@ class SetupViewModel(
     private val consentLock = Any()
     private var pendingConsent: KeyWriteConsent? = null
     private val consentNonces = AtomicLong(0L)
+
+    /**
+     * Serializes the save critical section ([executeKeyWrite] vault backup,
+     * put, re-verification, metadata CAS) against privileged [logout]
+     * teardown (vault delete + metadata clear) within this VM.
+     *
+     * Single-process only: this [Mutex] cannot fence a second process, a
+     * second ViewModel/store instance in tests, or any out-of-band vault
+     * writer. Cross-writer safety rests on the [EndpointStore.saveIfRevision]
+     * CAS plus the revision-gated [rollbackVaultIfOurs] (CAS loss leaves a
+     * same-provider save winner untouched; other aborts compare-before-
+     * restore/delete, never an unconditional delete). Never present this
+     * mutex as multi-writer safety.
+     */
+    private val saveMutex = Mutex()
 
     /** Test seam for racing an edit between mint success and dialog display. */
     internal var afterMintBeforeDialogForTest: (() -> Unit)? = null
@@ -356,8 +373,17 @@ class SetupViewModel(
      * Every side effect below ([KeyVault.putKey] + [EndpointStore.saveIfRevision])
      * is preceded by a fresh policy evaluation; DENY always wins, even when a
      * consent was minted earlier. Stage2 adds a form fence ([formRevision]) and
-     * a second post-write policy re-evaluation; aborts never delete live vault
-     * state (orphans left for stage3 vault reconciliation).
+     * a second post-write policy re-evaluation. Stage3 runs the whole
+     * [executeKeyWrite] critical section under [saveMutex] (same-VM save/logout
+     * serialization) and reconciles the vault on post-put aborts via the
+     * revision-gated [rollbackVaultIfOurs]: a pre-existing key is restored,
+     * a self-written orphan with no predecessor is deleted, and a foreign key
+     * observed in place is never touched. A trailing-CAS loss (`saveIfRevision`
+     * returns false) proves a concurrent winner advanced the revision, so a
+     * same-provider save winner is left untouched with no vault delete/restore
+     * (same-content bytes are indistinguishable by content alone); only a
+     * clear/unrelated winner falls through to a gated orphan delete. No abort
+     * path performs an unconditional vault delete.
      */
     private fun saveWithConsent(consent: KeyWriteConsent?) {
         val entryRevision = formRevision.get()
@@ -378,15 +404,20 @@ class SetupViewModel(
         }
         _form.value = cur.copy(saving = true, errorCode = null)
         viewModelScope.launch(Dispatchers.IO) {
-            try {
-                executeKeyWrite(cur, effectiveBaseUrl, consent, entryRevision)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: IllegalArgumentException) {
-                _form.value = _form.value.copy(saving = false, errorCode = e.message ?: "SETUP_SAVE_FAILED")
-            } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                _form.value = _form.value.copy(saving = false, errorCode = "SETUP_SAVE_FAILED")
+            // Same-VM serialization with privileged logout teardown. Held only
+            // for the duration of one save attempt: dialog-pending paths return
+            // (releasing the mutex) and the confirm tap re-acquires it.
+            saveMutex.withLock {
+                try {
+                    executeKeyWrite(cur, effectiveBaseUrl, consent, entryRevision)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: IllegalArgumentException) {
+                    _form.value = _form.value.copy(saving = false, errorCode = e.message ?: "SETUP_SAVE_FAILED")
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    _form.value = _form.value.copy(saving = false, errorCode = "SETUP_SAVE_FAILED")
+                }
             }
         }
     }
@@ -488,134 +519,360 @@ class SetupViewModel(
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
-        // 5. Vault write. Uses the entry snapshot (not live): key/identity edits
+        // 5. Vault write with a pre-put backup (stage3, fixed-alias short-term
+        // scheme). Uses the entry snapshot (not live): key/identity edits
         // bump formRevision and are fenced above, so reaching here means the
         // entry key is still current. Model may be stale (onModelChange does not
         // bump per #17 scope) but model is not consent identity and does not
         // affect key.write fencing; endpointConfigOf below shares this note.
+        //
+        // Trade-offs, stated honestly:
+        // - The backup extends the previous key's in-memory lifetime to the end
+        //   of this function; it is wiped in the `finally` below on every path
+        //   (success, abort, exception), never logged, and never placed in
+        //   SavedState or any persisted structure.
+        // - [EncryptedPrefsVault.putKey] wipes the array it is given, so the
+        //   comparison copy ([newKeyCopy]) is taken BEFORE the put; the put
+        //   input ([keyCopy]) is wiped by the vault with a defensive re-wipe
+        //   here.
+        // - Lost-update remains possible: an out-of-band write landing between
+        //   the backup read and our put is silently overwritten (unrecoverable
+        //   under a fixed alias), and one landing between the rollback re-read
+        //   and the rollback write can be clobbered. Same-VM saves are fenced
+        //   by [saveMutex] and metadata races by the trailing CAS, but
+        //   out-of-band writers require single-writer discipline by
+        //   documentation. The long-term fix is a staged/versioned vault alias
+        //   (write new key aside, CAS metadata, then retire the old alias),
+        //   tracked as a follow-up, not claimed here.
         val keyCopy = form.apiKey.trim().toCharArray()
+        val newKeyCopy = keyCopy.copyOf()
+        // Pre-existing key material for ownership-checked restore; null when
+        // this provider had no key. A read failure aborts fail-closed BEFORE
+        // any put: with unknown vault state we must not overwrite.
+        val backup: CharArray?
+        val hadKey: Boolean
         try {
-            try {
-                vault().putKey(providerId, keyCopy)
-            } catch (e: CancellationException) {
-                throw e
-            }
-        } finally {
-            keyCopy.fill('\u0000')
-        }
-        // 6. Second fresh evaluation AFTER the vault write, BEFORE metadata.
-        // A policy flip during putKey blocks the metadata write. This stage
-        // never deletes: the just-written key is left as an orphan for stage3
-        // vault reconciliation (no bestEffortDeleteKey/deleteKey here).
-        val v2 = freshVerdictOrDeny("key.write", providerId)
-        if (v2 == Verdict.DENY) {
-            // TODO(stage3): orphan key left in vault; stage3 must reconcile/delete on abort.
-            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-            return
-        }
-        // 7. Generation fence after the write: an edit racing putKey aborts
-        // the metadata write (orphan left for stage3).
-        if (entryRevision != formRevision.get()) {
-            // TODO(stage3): orphan key left in vault; stage3 must reconcile/delete on abort.
-            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-            return
-        }
-        // 8. Consent re-verification against live state (a stale/invalidated
-        // consent still blocks even when the second verdict is ALLOW).
-        if (consent != null) {
-            val live2 = _form.value
-            val liveBaseUrl2 = try {
-                effectiveBaseUrlOf(live2)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // TODO(stage3): orphan key left in vault.
-                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                return
-            }
-            if (!consentMatches(consent, live2, liveBaseUrl2)) {
-                // TODO(stage3): orphan key left in vault.
-                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                return
-            }
-        }
-        // 9. Trailing entry fence before the metadata CAS.
-        if (entryRevision != formRevision.get()) {
-            // TODO(stage3): orphan key left in vault.
-            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-            return
-        }
-        // 10. ALLOW->ASK flip during putKey (fresh path only): demand an
-        // explicit confirmation instead of persisting metadata. The orphan key
-        // stays (stage3 cleans); mint a fresh consent for the confirm tap.
-        if (v2 == Verdict.ASK && consent == null) {
-            val live3 = _form.value
-            val liveBaseUrl3 = try {
-                effectiveBaseUrlOf(live3)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // TODO(stage3): orphan key left in vault.
-                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                return
-            }
-            if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrl3, entryRevision)) {
-                // TODO(stage3): orphan key left in vault.
-                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                return
-            }
-            // Test seam: same mint->dialog window as the initial-ASK path.
-            afterMintBeforeDialogForTest?.invoke()
-            // Mint->dialog window fence (ALLOW->ASK flip path): an edit racing
-            // the mint must not revive the dialog. Re-verify before showing; on
-            // mismatch discard the just-minted consent and fail closed.
-            // Orphan from putKey stays (no deleteKey; stage3 reconciles).
-            if (entryRevision != formRevision.get()) {
-                takePendingConsent()
-                // TODO(stage3): orphan key left in vault.
-                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                return
-            }
-            // Do NOT save metadata and do NOT set saved=true here.
-            // TODO(stage3): orphan key left in vault; stage3 must reconcile on next outcome.
-            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
-            // Post-show fence: hide a stale dialog revived by an edit racing
-            // the dialog set (see initial-ASK path).
-            if (entryRevision != formRevision.get()) {
-                takePendingConsent()
-                // TODO(stage3): orphan key left in vault.
-                _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                return
-            }
-            return
-        }
-        // V2==ASK with a valid matching consent proceeds; V2==ALLOW proceeds
-        // (an invalidated consent above already blocked).
-        // Uses the entry snapshot: model may be stale (onModelChange does not
-        // bump formRevision per #17 scope) but model is not consent identity
-        // (consent binds providerId/baseUrl only), so staleness is out of scope
-        // and intentionally not fenced here. See keyCopy note at step 5.
-        val config = endpointConfigOf(form, effectiveBaseUrl, providerId)
-        val wrote = try {
-            store.saveIfRevision(config, expectedRevision)
+            backup = vault().getKey(providerId)
+            hadKey = backup != null
         } catch (e: CancellationException) {
-            throw e
-        } catch (e: IllegalArgumentException) {
-            // TODO(stage3): orphan key left in vault; stage3 must reconcile/delete on abort.
+            keyCopy.fill('\u0000')
+            newKeyCopy.fill('\u0000')
             throw e
         } catch (_: Exception) {
-            // TODO(stage3): orphan key left in vault.
+            keyCopy.fill('\u0000')
+            newKeyCopy.fill('\u0000')
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
-        if (!wrote) {
-            // CAS mismatch (concurrent clear/save advanced the revision):
-            // fail closed without deleting the orphan (stage3 reconciles).
-            // TODO(stage3): orphan key left in vault.
-            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-            return
+        try {
+            try {
+                try {
+                    vault().putKey(providerId, keyCopy)
+                } finally {
+                    keyCopy.fill('\u0000')
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // The put itself failed: the vault may still hold the old key
+                // (write rejected before storing) or, in a pathological
+                // backend, our bytes. The ownership check inside
+                // [rollbackVaultIfOurs] distinguishes the cases; on unknown
+                // vault state it leaves everything untouched.
+                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            // 6. Second fresh evaluation AFTER the vault write, BEFORE metadata.
+            // A policy flip during putKey blocks the metadata write; the
+            // just-written key is reconciled by [rollbackVaultIfOurs] (restore
+            // the predecessor, or delete our own orphan when there was none).
+            val v2 = freshVerdictOrDeny("key.write", providerId)
+            if (v2 == Verdict.DENY) {
+                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            // 7. Generation fence after the write: an edit racing putKey aborts
+            // the metadata write and reconciles the just-written key.
+            if (entryRevision != formRevision.get()) {
+                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            // 8. Consent re-verification against live state (a stale/invalidated
+            // consent still blocks even when the second verdict is ALLOW).
+            if (consent != null) {
+                val live2 = _form.value
+                val liveBaseUrl2 = try {
+                    effectiveBaseUrlOf(live2)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                if (!consentMatches(consent, live2, liveBaseUrl2)) {
+                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+            }
+            // 9. Trailing entry fence before the metadata CAS.
+            if (entryRevision != formRevision.get()) {
+                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            // 10. ALLOW->ASK flip during putKey (fresh path only): demand an
+            // explicit confirmation instead of persisting metadata. The
+            // just-written key is restored to its pre-put state first, so no
+            // orphan is left pending while the dialog is shown; the confirm tap
+            // performs a clean backup+put of its own.
+            if (v2 == Verdict.ASK && consent == null) {
+                val live3 = _form.value
+                val liveBaseUrl3 = try {
+                    effectiveBaseUrlOf(live3)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrl3, entryRevision)) {
+                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                // Test seam: same mint->dialog window as the initial-ASK path.
+                afterMintBeforeDialogForTest?.invoke()
+                // Mint->dialog window fence (ALLOW->ASK flip path): an edit racing
+                // the mint must not revive the dialog. Re-verify before showing; on
+                // mismatch discard the just-minted consent and fail closed.
+                if (entryRevision != formRevision.get()) {
+                    takePendingConsent()
+                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                // Do NOT save metadata and do NOT set saved=true here: restore
+                // the pre-put vault state, then ask for confirmation.
+                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+                // Post-show fence: hide a stale dialog revived by an edit racing
+                // the dialog set (see initial-ASK path). The vault is already
+                // restored, so only the dialog state needs hiding here.
+                if (entryRevision != formRevision.get()) {
+                    takePendingConsent()
+                    _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                return
+            }
+            // V2==ASK with a valid matching consent proceeds; V2==ALLOW proceeds
+            // (an invalidated consent above already blocked).
+            // Uses the entry snapshot: model may be stale (onModelChange does not
+            // bump formRevision per #17 scope) but model is not consent identity
+            // (consent binds providerId/baseUrl only), so staleness is out of scope
+            // and intentionally not fenced here. See keyCopy note at step 5.
+            val config = endpointConfigOf(form, effectiveBaseUrl, providerId)
+            val wrote = try {
+                store.saveIfRevision(config, expectedRevision)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: IllegalArgumentException) {
+                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                throw e
+            } catch (_: Exception) {
+                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (!wrote) {
+                // CAS mismatch: a concurrent winner advanced the revision. A
+                // same-content winner key is indistinguishable by content alone,
+                // so never blindly delete/restore here. A same-provider save
+                // winner may already hold our bytes in the vault: touch nothing
+                // and fail closed. Only a clear (or unrelated-provider) winner
+                // leaves our slot without a winner key, in which case the gated
+                // rollback below cleans our own orphan (never a restore).
+                // Store read failures fail closed to no-touch (preserve a
+                // possible winner).
+                val winnerProtectsSlot = try {
+                    val meta = store.observe().first()
+                    meta != null && meta.providerId == providerId
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    true
+                }
+                if (!winnerProtectsSlot) {
+                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                }
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+        } finally {
+            // Success path needs no rollback; every secret copy is wiped here.
+            newKeyCopy.fill('\u0000')
+            backup?.fill('\u0000')
         }
-        _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+    }
+
+    /**
+     * Ownership-checked vault reconciliation for post-put aborts (stage3).
+     *
+     * Re-reads the live vault entry and compares it against [newKeyCopy] (the
+     * pre-put copy of the key this attempt wrote; the put input itself was
+     * wiped by [KeyVault.putKey]):
+     * - live entry still equals what we wrote (still ours): restore [backup]
+     *   when [hadKey] (a predecessor existed), otherwise [KeyVault.deleteKey]
+     *   our own orphan;
+     * - live entry differs (an out-of-band writer already overwrote us), is
+     *   absent (someone deleted), or cannot be read (unknown vault state):
+     *   touch nothing, fail-closed. In particular this function NEVER issues an
+     *   unconditional `deleteKey(providerId)`, NEVER overwrites a foreign key,
+     *   and NEVER logs key material.
+     *
+     * P1 same-bytes hardening: content alone cannot distinguish a loser orphan
+     * from a winner same-content key, so every write is gated by
+     * [expectedRevision] (the [EndpointStore.currentRevision] snapshot taken
+     * before our put):
+     * - `currentRevision() == expectedRevision` (no winner): reconcile as above
+     *   (fresh start deletes the own orphan, rotation restores the predecessor);
+     * - revision advanced + metadata present for our [providerId] (save winner,
+     *   possibly same bytes): return BEFORE any vault read/write, leaving the
+     *   winner untouched. Same-content `orphan == winner` leaving is correct;
+     * - revision advanced + metadata absent or for a different provider (clear
+     *   winner or unrelated single-endpoint overwrite): no winner key occupies
+     *   our slot, so fall through to an ownership-checked DELETE (never a
+     *   restore — restoring would resurrect a key with no active endpoint).
+     * Revision/metadata read failures fail closed (no vault touch).
+     * CAS-false callers additionally skip this function entirely when a
+     * same-provider winner holds metadata (see the trailing-CAS branch); this
+     * gate is the defense-in-depth for V2 DENY / fence / exception aborts that
+     * have not yet proven a winner via CAS.
+     *
+     * Short-term fixed-alias scheme: the vault has a single slot per
+     * providerId, so restore is `putKey(backup)` and cleanup is a checked
+     * delete. Residual risks (no multi-writer safety is claimed):
+     * - an out-of-band write between our backup read and our put is already
+     *   overwritten before this runs (unrecoverable under a fixed alias);
+     * - an out-of-band write between the re-read below and the restore/delete
+     *   can still be clobbered (check-then-act race inside this function).
+     * Same-VM saves are serialized by [saveMutex]; anything out-of-band needs
+     * single-writer discipline by documentation. The durable fix is a
+     * staged/versioned vault alias (write aside, CAS metadata, retire old),
+     * tracked as a follow-up issue.
+     *
+     * Best-effort: vault failures are swallowed so the original abort reason
+     * (policy DENY, fence mismatch, CAS loss) stays the reported error.
+     * [CancellationException] is always rethrown, never swallowed.
+     *
+     * @param backup the pre-put key copy; NOT consumed here (the caller wipes
+     * it in `finally`). A defensive copy is passed to [KeyVault.putKey] because
+     * put wipes its input.
+     * @param expectedRevision the [EndpointStore.currentRevision] snapshot taken
+     * before our put (`null` = fresh). Compared with strict `==` so fresh `null`
+     * never conflates with dirty `0L`.
+     */
+    private suspend fun rollbackVaultIfOurs(
+        providerId: String,
+        newKeyCopy: CharArray,
+        backup: CharArray?,
+        hadKey: Boolean,
+        expectedRevision: Long?,
+    ) {
+        try {
+            val liveRev: Long? = try {
+                store.currentRevision()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Unknown store state: leave everything untouched (fail-closed).
+                return
+            }
+            var clearWinner = false
+            if (liveRev != expectedRevision) {
+                val meta = try {
+                    store.observe().first()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // Unknown store state: leave everything untouched (fail-closed).
+                    return
+                }
+                if (meta != null && meta.providerId == providerId) {
+                    // Save winner for our slot may hold a same-content key:
+                    // leave it untouched without even reading the vault.
+                    return
+                }
+                // Clear winner (no metadata) or unrelated single-endpoint
+                // overwrite: our slot holds no winner key, so an
+                // ownership-checked delete below is safe. Never restore here.
+                clearWinner = true
+            }
+            val current = try {
+                vault().getKey(providerId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Unknown vault state: leave everything untouched (fail-closed).
+                return
+            }
+            if (current == null) {
+                // Absent: nothing of ours to restore or clean (our put failed
+                // before storing, or someone already deleted). Never recreate.
+                return
+            }
+            try {
+                if (!current.contentEquals(newKeyCopy)) {
+                    // Foreign key already in place: never overwrite, never delete.
+                    return
+                }
+                // Still ours: restore the predecessor or clean our own orphan.
+                if (hadKey) {
+                    if (clearWinner) {
+                        // No active endpoint for our provider: delete the own
+                        // orphan instead of resurrecting the predecessor with
+                        // no metadata (which would leak a key).
+                        try {
+                            vault().deleteKey(providerId)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            // Best-effort: the abort error below stays authoritative.
+                        }
+                        return
+                    }
+                    val prev = backup ?: return
+                    try {
+                        vault().putKey(providerId, prev.copyOf())
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // Best-effort: the abort error below stays authoritative.
+                    }
+                } else {
+                    try {
+                        vault().deleteKey(providerId)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // Best-effort: the abort error below stays authoritative.
+                    }
+                }
+            } finally {
+                current.fill('\u0000')
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Best-effort reconciliation: never mask the abort reason.
+        }
     }
 
     /** Second tap of the key.write confirmation dialog: single-use, snapshot-bound. */
@@ -738,7 +995,15 @@ class SetupViewModel(
         }
     }
 
-    /** Logout: delete the vault key, then clear metadata (order matters). */
+    /**
+     * Logout: delete the vault key, then clear metadata (order matters).
+     *
+     * Privileged teardown: unconditional delete+clear, serialized against
+     * in-flight saves via [saveMutex] so a save's backup/put/rollback window
+     * cannot interleave with teardown in this VM. Cross-process writers are
+     * still fenced only by the metadata CAS and ownership checks, not by this
+     * mutex (see [saveMutex]).
+     */
     fun logout(onDone: () -> Unit = {}) {
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
@@ -746,18 +1011,26 @@ class SetupViewModel(
         modelRefreshJob = null
         modelRefreshGeneration.incrementAndGet()
         viewModelScope.launch(Dispatchers.IO) {
-            val config = try {
-                store.observe().first()
-            } catch (_: Exception) {
-                null
-            }
-            try {
-                if (config != null) vault().deleteKey(config.providerId)
-            } catch (_: Exception) {
-            }
-            try {
-                store.clear()
-            } catch (_: Exception) {
+            saveMutex.withLock {
+                val config = try {
+                    store.observe().first()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+                try {
+                    if (config != null) vault().deleteKey(config.providerId)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                }
+                try {
+                    store.clear()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                }
             }
             _form.value = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
             withContext(Dispatchers.Main) { onDone() }

@@ -545,6 +545,13 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     assert.equal(unknownTopLevelField.verdict, 'INCONCLUSIVE');
     assert.equal(unknownTopLevelField.roles.every((role) => role.verdict === 'INCONCLUSIVE'), true);
 
+    const reviewWithSummary = await runOrchestratorResponse(JSON.stringify({
+      verdict: 'APPROVE',
+      summary: 'Clean architecture and robust error handling.',
+      findings: [],
+    }));
+    assert.equal(reviewWithSummary.roles[0]?.summary, 'Clean architecture and robust error handling.');
+
     // P1 #3: per-model request profiles. Reasoning bodies carry
     // reasoning.effort and never temperature/top_p; chat bodies never carry
     // reasoning; the default body is otherwise minimal.

@@ -33,6 +33,7 @@ export interface RoleReview {
   // (minimal prompt change); android_sec/android_code prompts stay untouched
   // and their responses default to [] when the field is absent.
   suggestedLabels: string[];
+  summary?: string;
 }
 
 export interface OrchestratedReview {
@@ -136,7 +137,7 @@ function parseSuggestedLabelsStrict(value: unknown): string[] | undefined {
 
 function parseRoleResponse(role: OpenAIModelRole, modelUsed: string, content: string): RoleReview {
   const sanitizedModel = redactSensitiveText(modelUsed);
-  const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [] };
+  const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [], summary: '' };
   const parsed = parseJsonObject(content);
   if (
     !parsed ||
@@ -147,7 +148,14 @@ function parseRoleResponse(role: OpenAIModelRole, modelUsed: string, content: st
   if (!findings) return fallback;
   const suggestedLabels = parseSuggestedLabelsStrict(parsed.suggestedLabels);
   if (!suggestedLabels) return fallback;
-  return { role, modelUsed: sanitizedModel, verdict: parsed.verdict as ReviewVerdict, findings, suggestedLabels };
+  return {
+    role,
+    modelUsed: sanitizedModel,
+    verdict: parsed.verdict as ReviewVerdict,
+    findings,
+    suggestedLabels,
+    summary: typeof parsed.summary === 'string' ? redactSensitiveText(parsed.summary).slice(0, MAX_TEXT_LENGTH) : '',
+  };
 }
 
 function safeCoverage(coverage: ReviewCoverage): ReviewCoverage {
@@ -178,11 +186,11 @@ function roleUserPrompt(role: OpenAIModelRole, changedFiles: string[], diff: str
   const files = changedFiles.map((file) => redactSensitiveText(file));
   const tierZeroToThreeOmissions = coverage.omittedFiles.filter((file) => reviewTier(file) <= 3);
   return [
-    `審查角色：${role}`,
-    `變更檔案：${JSON.stringify(files)}`,
-    `覆蓋資訊：${JSON.stringify({ ...coverage, tierZeroToThreeOmissions })}`,
-    '以下內容可能不完整；不得將未提供內容視為已審查。請只回報具體且可由差異證實的發現。',
-    '變更差異：',
+    `Review role: ${role}`,
+    `Changed files: ${JSON.stringify(files)}`,
+    `Coverage: ${JSON.stringify({ ...coverage, tierZeroToThreeOmissions })}`,
+    'The content below may be incomplete; do not treat unprovided content as reviewed. Report only specific findings substantiated by the diff.',
+    'Diff:',
     diff,
   ].join('\n\n');
 }
@@ -235,9 +243,9 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
     // leave the runner in cleartext. Callers needing detection must scan the
     // ORIGINAL input before this call; scanning the redacted copy misses.
     const userPrompt = [
-      `標題：${redactForModel(options.input.title)}`,
-      `內文：${redactForModel(options.input.body)}`,
-      ...options.input.comments.map((comment) => `留言：${redactForModel(comment)}`),
+      `Title: ${redactForModel(options.input.title)}`,
+      `Body: ${redactForModel(options.input.body)}`,
+      ...options.input.comments.map((comment) => `Comment: ${redactForModel(comment)}`),
     ].join('\n\n');
     const result = await sendOpenAISingleTurnWithFallback({
       modelId: modelUsed,
@@ -312,9 +320,19 @@ export function synthesizeChunkedReview(
         .some((candidate) => candidate.verdict !== 'APPROVE'))) {
       verdict = 'INCONCLUSIVE';
     }
-    return { role, modelUsed, verdict, findings, suggestedLabels: [...new Set(parts.flatMap((entry) =>
-      entry.roles.filter((candidate) => candidate?.role === role)
-        .flatMap((candidate) => Array.isArray(candidate.suggestedLabels) ? candidate.suggestedLabels : [])))] };
+    const summaries = parts
+      .flatMap((entry) => entry.roles.filter((candidate) => candidate?.role === role).map((candidate) => candidate.summary).filter((s): s is string => typeof s === 'string' && s.trim().length > 0));
+    const summary = summaries.join('\n\n').slice(0, MAX_TEXT_LENGTH);
+    return {
+      role,
+      modelUsed,
+      verdict,
+      findings,
+      suggestedLabels: [...new Set(parts.flatMap((entry) =>
+        entry.roles.filter((candidate) => candidate?.role === role)
+          .flatMap((candidate) => Array.isArray(candidate.suggestedLabels) ? candidate.suggestedLabels : [])))],
+      summary,
+    };
   });
 
   const hasBlockingFinding = perChunk.some((entry) => entry?.verdict === 'NEEDS_CHANGES') ||

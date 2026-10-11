@@ -486,9 +486,9 @@ export async function runPrChunksTests(): Promise<void> {
         assert.deepEqual(reviewed.coverage.omittedFiles, []);
         assert.deepEqual(reviewed.coverage.truncatedFiles, []);
         assert.equal(counter.count, 3, 'single-turn runs 3 roles in parallel (got 3)');
-        const sticky = reviewComment(reviewed, [], '報告行');
-        assert.ok(sticky.includes('分段：單段'), 'single-turn sticky carries single segment line');
-        assert.ok(sticky.includes('判定：APPROVE'));
+        const sticky = reviewComment(reviewed, [], 'report line');
+        assert.ok(sticky.includes('Segments: single segment'), 'single-turn sticky carries single segment line');
+        assert.ok(sticky.includes('Verdict: APPROVE'));
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -650,8 +650,8 @@ export async function runPrChunksTests(): Promise<void> {
           });
           assert.equal(state.created, 0, 'missing-chunk publish creates no second comment');
           assert.equal(state.updated, 1, 'missing-chunk publish updates the same sticky');
-          assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'missing chunks fall back');
-          assert.ok(!state.comments[0].body.includes('判定：APPROVE'));
+          assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'missing chunks fall back');
+          assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'));
         }
         // Gate B: chunkCoverageComplete false → INCONCLUSIVE on the same sticky.
         {
@@ -679,7 +679,7 @@ export async function runPrChunksTests(): Promise<void> {
             githubClient: prClient(state),
           });
           assert.equal(state.updated, 1, 'incomplete-coverage publish updates the same sticky');
-          assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'incomplete chunk coverage falls back');
+          assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'incomplete chunk coverage falls back');
         }
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -742,8 +742,8 @@ export async function runPrChunksTests(): Promise<void> {
         assert.equal(parseReviewCountMarker(shared.comments[0]?.body ?? '', HEAD_SHA), 2, 're-review holds the 2nd slot');
         assert.equal(shared.comments.length, 1, 'single sticky across rounds');
         assert.equal(shared.comments[0]?.id, stickyId, 'same sticky ID updated in place');
-        assert.ok(shared.comments[0]?.body.includes('判定：APPROVE'), 'single-turn APPROVE publishes');
-        assert.ok(shared.comments[0]?.body.includes('分段：單段'), 'single-turn sticky carries single segment line');
+        assert.ok(shared.comments[0]?.body.includes('Verdict: APPROVE'), 'single-turn APPROVE publishes');
+        assert.ok(shared.comments[0]?.body.includes('Segments: single segment'), 'single-turn sticky carries single segment line');
         // Third round is quota-exhausted: claim refuses, budget stays 2.
         const denied = await runClaimMode({
           event: prEvent(),

@@ -10,6 +10,7 @@ import {
 import {
   areReviewReportsAvailable,
   isRepositoryOwner,
+  reviewComment,
   routeEvent,
   routeReviewFlags,
   runPublishMode,
@@ -375,7 +376,7 @@ export async function runCommentRunnerTests(): Promise<void> {
 
       type TestComment = { id: number; body: string; user: { login: string; type: string } };
       const humanMarkerBody = '<!-- PocketGuard-review --> human-authored marker';
-      const priorApproveBody = '<!-- PocketGuard-review -->\n\n## PocketGuard 審查\n\n**判定：APPROVE**\nold result';
+      const priorApproveBody = '<!-- PocketGuard-review -->\n\n## PocketGuard Review\n\n**Verdict: APPROVE**\nold result';
       const makePublishHarness = (options: {
         outputPath: string;
         jobResult?: string;
@@ -517,7 +518,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       const blockerPublishHarness = makePublishHarness({ outputPath: blockerOutputPath });
       await runPublishMode(blockerPublishHarness.context);
       const blockerPublishedBody = blockerPublishHarness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
-      assert.ok(blockerPublishedBody.includes('判定：NEEDS_CHANGES'),
+      assert.ok(blockerPublishedBody.includes('Verdict: NEEDS_CHANGES'),
         'the deterministic blocker artifact must pass strict publish validation');
       assert.equal(blockerPublishedBody.includes('schema or contents are invalid'), false);
 
@@ -527,8 +528,10 @@ export async function runCommentRunnerTests(): Promise<void> {
       assert.equal(successHarness.state.created, 0);
       assert.equal(successHarness.state.updated, 1, 'the existing bot sticky comment is updated');
       const successfulBody = successHarness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
-      assert.ok(successfulBody.includes('判定：APPROVE'));
-      assert.ok(successfulBody.includes(`審查的 head SHA：\`${HEAD_SHA}\``));
+      assert.ok(successfulBody.includes('Verdict: APPROVE'));
+      assert.ok(successfulBody.includes(`Reviewed head SHA: \`${HEAD_SHA}\``));
+      assert.ok(successfulBody.includes('### Summary'));
+      assert.ok(successfulBody.includes('### Findings & Recommendations'));
       assert.equal(successHarness.state.comments.find((comment) => comment.id === 8)?.body, humanMarkerBody);
       assert.equal(successHarness.state.existingLabels.includes('status:needs-decision'), false);
       assert.deepEqual(successHarness.state.existingLabels.filter((label) => label.startsWith('area:')).sort(), ['area:delivery']);
@@ -588,7 +591,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         const contradictoryHarness = makePublishHarness({ outputPath: contradictoryOutputPath });
         await runPublishMode(contradictoryHarness.context);
         const contradictoryBody = contradictoryHarness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
-        assert.ok(contradictoryBody.includes('判定：INCONCLUSIVE'),
+        assert.ok(contradictoryBody.includes('Verdict: INCONCLUSIVE'),
           `${contradictoryCoverage.name}: contradictory metadata must fall back to INCONCLUSIVE`);
         assert.ok(contradictoryBody.includes('schema or contents are invalid'),
           `${contradictoryCoverage.name}: reject contradictory coverage metadata`);
@@ -605,7 +608,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       await runPublishMode(identityFallbackHarness.context);
       assert.equal(identityFallbackHarness.state.updated, 1,
         'identity lookup failure still updates the bot-authored marker comment');
-      assert.ok(identityFallbackHarness.state.comments.find((comment) => comment.id === 7)?.body.includes('判定：APPROVE'));
+      assert.ok(identityFallbackHarness.state.comments.find((comment) => comment.id === 7)?.body.includes('Verdict: APPROVE'));
       assert.equal(identityFallbackHarness.state.comments.find((comment) => comment.id === 8)?.body, humanMarkerBody,
         'identity fallback must not mutate a human-authored marker comment');
 
@@ -638,9 +641,9 @@ export async function runCommentRunnerTests(): Promise<void> {
         assert.equal(harness.state.updated, 1, `${name}: update only the existing bot sticky comment`);
         assert.equal(harness.state.created, 0, `${name}: do not create a duplicate bot comment`);
         const botBody = harness.state.comments.find((comment) => comment.id === 7)?.body ?? '';
-        assert.ok(botBody.includes('判定：INCONCLUSIVE'), `${name}: explicitly show INCONCLUSIVE`);
+        assert.ok(botBody.includes('Verdict: INCONCLUSIVE'), `${name}: explicitly show INCONCLUSIVE`);
         assert.ok(botBody.includes(options.reason), `${name}: explain why the result is unavailable`);
-        assert.equal(botBody.includes('判定：APPROVE'), false, `${name}: never retain/publish the old approval`);
+        assert.equal(botBody.includes('Verdict: APPROVE'), false, `${name}: never retain/publish the old approval`);
         assert.equal(harness.state.comments.find((comment) => comment.id === 8)?.body, humanMarkerBody,
           `${name}: preserve the human-authored marker comment`);
         assert.ok(harness.state.existingLabels.includes('status:needs-decision'), `${name}: require maintainer decision`);
@@ -718,9 +721,9 @@ export async function runCommentRunnerTests(): Promise<void> {
       await runPublishMode(changedDuringLookup.context);
       const lookupFallbackBody = changedDuringLookup.state.comments.find((comment) => comment.id === 7)?.body ?? '';
       assert.equal(changedDuringLookup.state.commentWrites.length, 1);
-      assert.equal(changedDuringLookup.state.commentWrites.some((body) => body.includes('判定：APPROVE')), false,
+      assert.equal(changedDuringLookup.state.commentWrites.some((body) => body.includes('Verdict: APPROVE')), false,
         'a PR change during sticky-comment lookup must prevent publishing the old approval');
-      assert.ok(lookupFallbackBody.includes('判定：INCONCLUSIVE'));
+      assert.ok(lookupFallbackBody.includes('Verdict: INCONCLUSIVE'));
       assert.ok(lookupFallbackBody.includes('changed after review'));
       assert.deepEqual(changedDuringLookup.state.labels, [['status:needs-decision']],
         'a stale review during comment lookup may reconcile only the fallback status label');
@@ -737,9 +740,9 @@ export async function runCommentRunnerTests(): Promise<void> {
       const postUpdateFallbackBody = changedAfterCommentUpdate.state.comments.find((comment) => comment.id === 7)?.body ?? '';
       assert.equal(changedAfterCommentUpdate.state.updated, 2,
         'a PR change before normal label reconciliation overwrites the just-published approval');
-      assert.ok(changedAfterCommentUpdate.state.commentWrites[0].includes('判定：APPROVE'));
-      assert.ok(changedAfterCommentUpdate.state.commentWrites[1].includes('判定：INCONCLUSIVE'));
-      assert.ok(postUpdateFallbackBody.includes('判定：INCONCLUSIVE'));
+      assert.ok(changedAfterCommentUpdate.state.commentWrites[0].includes('Verdict: APPROVE'));
+      assert.ok(changedAfterCommentUpdate.state.commentWrites[1].includes('Verdict: INCONCLUSIVE'));
+      assert.ok(postUpdateFallbackBody.includes('Verdict: INCONCLUSIVE'));
       assert.deepEqual(changedAfterCommentUpdate.state.labels, [['status:needs-decision']],
         'a stale review before label reconciliation may reconcile only fallback status');
       assert.deepEqual(changedAfterCommentUpdate.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
@@ -752,7 +755,7 @@ export async function runCommentRunnerTests(): Promise<void> {
       });
       await runPublishMode(existingDecisionLabel.context);
       const existingDecisionBody = existingDecisionLabel.state.comments.find((comment) => comment.id === 7)?.body ?? '';
-      assert.ok(existingDecisionBody.includes('判定：INCONCLUSIVE'));
+      assert.ok(existingDecisionBody.includes('Verdict: INCONCLUSIVE'));
       assert.ok(existingDecisionLabel.state.existingLabels.includes('status:needs-decision'));
       assert.equal(existingDecisionLabel.state.operations.includes('list-labels'), true,
         'fallback reconciliation checks whether the decision label is already present');
@@ -809,9 +812,9 @@ export async function runCommentRunnerTests(): Promise<void> {
         'a failed fallback label add must fail visibly with generic text',
       );
       const failedDecisionBody = failedDecisionLabel.state.comments.find((comment) => comment.id === 7)?.body ?? '';
-      assert.ok(failedDecisionBody.includes('判定：INCONCLUSIVE'),
+      assert.ok(failedDecisionBody.includes('Verdict: INCONCLUSIVE'),
         'publish the inconclusive sticky comment before attempting the fallback label');
-      assert.equal(failedDecisionBody.includes('判定：APPROVE'), false);
+      assert.equal(failedDecisionBody.includes('Verdict: APPROVE'), false);
       assert.equal(failedDecisionLabel.state.existingLabels.includes('status:needs-decision'), false);
       assert.deepEqual(failedDecisionLabel.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
         ['area:docs', 'area:policy'], 'fallback label failure must not remove area labels');
@@ -830,7 +833,7 @@ export async function runCommentRunnerTests(): Promise<void> {
         'a valid review must fail generically when a desired label cannot be added',
       );
       assert.equal(failedReviewLabel.state.updated, 1, 'publish the valid review comment before label reconciliation');
-      assert.ok(failedReviewLabel.state.comments.find((comment) => comment.id === 7)?.body.includes('判定：APPROVE'));
+      assert.ok(failedReviewLabel.state.comments.find((comment) => comment.id === 7)?.body.includes('Verdict: APPROVE'));
       assert.equal(failedReviewLabel.state.existingLabels.includes('area:delivery'), false,
         'the failed label must not be represented as successfully applied');
 
@@ -883,11 +886,11 @@ export async function runCommentRunnerTests(): Promise<void> {
       });
       await runPublishMode(fallbackListFailure.context);
       const fallbackListFailureBody = fallbackListFailure.state.comments.find((comment) => comment.id === 7)?.body ?? '';
-      assert.ok(fallbackListFailureBody.includes('判定：INCONCLUSIVE'));
+      assert.ok(fallbackListFailureBody.includes('Verdict: INCONCLUSIVE'));
       assert.ok(fallbackListFailure.state.existingLabels.includes('status:needs-decision'),
         'fallback succeeds if the decision-label append succeeds despite a failed listing');
-      assert.deepEqual(fallbackListFailure.state.labels, [['status:needs-decision']],
-        'fallback adds only the maintainer decision label');
+      assert.deepEqual(fallbackListFailure.state.labels, [['security', 'status:needs-decision']],
+        'fallback adds deterministic title rules and maintainer decision label');
       assert.deepEqual(fallbackListFailure.state.existingLabels.filter((label) => label.startsWith('area:')).sort(),
         ['area:docs', 'area:policy'], 'fallback listing failure preserves existing area labels');
       assert.equal(fallbackListFailure.state.operations.includes('remove-label'), false);
@@ -1018,9 +1021,9 @@ export async function runCommentRunnerTests(): Promise<void> {
             fs.rmSync(path.join(dir, 'review-report.md'), { force: true });
             assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv), false, 'D-PR-1 missing md unavailable');
             const stickyBody = await publishPrAndReadSticky(dirOutput);
-            assert.ok(stickyBody.includes('判定：INCONCLUSIVE'), 'D-PR-1 INCONCLUSIVE');
-            assert.ok(!stickyBody.includes('判定：APPROVE'), 'D-PR-1 never APPROVE');
-            assert.ok(stickyBody.includes('報告：不可用'), 'D-PR-1 unavailable');
+            assert.ok(stickyBody.includes('Verdict: INCONCLUSIVE'), 'D-PR-1 INCONCLUSIVE');
+            assert.ok(!stickyBody.includes('Verdict: APPROVE'), 'D-PR-1 never APPROVE');
+            assert.ok(stickyBody.includes('Report: unavailable'), 'D-PR-1 unavailable');
             assert.ok(!stickyBody.includes('actions/runs/'), 'D-PR-1 no fake link');
           } finally {
             fs.rmSync(dir, { recursive: true, force: true });
@@ -1033,9 +1036,9 @@ export async function runCommentRunnerTests(): Promise<void> {
             fs.rmSync(path.join(dir, 'review-report.json'), { force: true });
             assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv), false, 'D-PR-2 missing json unavailable');
             const stickyBody = await publishPrAndReadSticky(dirOutput);
-            assert.ok(stickyBody.includes('判定：INCONCLUSIVE'));
-            assert.ok(!stickyBody.includes('判定：APPROVE'));
-            assert.ok(stickyBody.includes('報告：不可用'));
+            assert.ok(stickyBody.includes('Verdict: INCONCLUSIVE'));
+            assert.ok(!stickyBody.includes('Verdict: APPROVE'));
+            assert.ok(stickyBody.includes('Report: unavailable'));
             assert.ok(!stickyBody.includes('actions/runs/'));
           } finally {
             fs.rmSync(dir, { recursive: true, force: true });
@@ -1053,9 +1056,9 @@ export async function runCommentRunnerTests(): Promise<void> {
             fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
             assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: dirOutput } as NodeJS.ProcessEnv), false, `D-PR-3 tampered ${variant} unavailable`);
             const stickyBody = await publishPrAndReadSticky(dirOutput);
-            assert.ok(stickyBody.includes('判定：INCONCLUSIVE'), `D-PR-3 ${variant} INCONCLUSIVE`);
-            assert.ok(!stickyBody.includes('判定：APPROVE'));
-            assert.ok(stickyBody.includes('報告：不可用'));
+            assert.ok(stickyBody.includes('Verdict: INCONCLUSIVE'), `D-PR-3 ${variant} INCONCLUSIVE`);
+            assert.ok(!stickyBody.includes('Verdict: APPROVE'));
+            assert.ok(stickyBody.includes('Report: unavailable'));
             assert.ok(!stickyBody.includes('actions/runs/'));
           } finally {
             fs.rmSync(dir, { recursive: true, force: true });
@@ -1112,6 +1115,61 @@ export async function runCommentRunnerTests(): Promise<void> {
           } finally {
             fs.rmSync(dir, { recursive: true, force: true });
           }
+        }
+
+        // Unit test: reviewComment renders Summary and Findings & Recommendations in English
+        {
+          const customOutput: Parameters<typeof reviewComment>[0] = {
+            verdict: 'APPROVE',
+            headSha: HEAD_SHA,
+            baseSha: BASE_SHA,
+            coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 100 },
+            deterministicViolations: [],
+            areaLabels: [],
+            changedFiles: ['app/src/main/java/demo/A.kt'],
+            changedFilesComplete: true,
+            roles: [
+              {
+                role: 'chief',
+                modelUsed: 'test-model',
+                verdict: 'APPROVE',
+                summary: 'Overall architecture looks clean and modular.',
+                findings: [
+                  {
+                    severity: 'SUGGESTION',
+                    file: 'app/src/main/java/demo/A.kt',
+                    line: 10,
+                    issue: 'Variable name can be more descriptive',
+                    suggestion: 'Rename val x to val timeoutMs',
+                  },
+                ],
+              },
+              {
+                role: 'android_sec',
+                modelUsed: 'test-model',
+                verdict: 'APPROVE',
+                summary: 'No security boundary violations.',
+                findings: [],
+              },
+              {
+                role: 'android_code',
+                modelUsed: 'test-model',
+                verdict: 'APPROVE',
+                summary: '',
+                findings: [],
+              },
+            ],
+          };
+          const rendered = reviewComment(customOutput, ['area:delivery']);
+          assert.ok(rendered.includes('## PocketGuard Review'));
+          assert.ok(rendered.includes('**Verdict: APPROVE**'));
+          assert.ok(rendered.includes('### Summary'));
+          assert.ok(rendered.includes('- **chief**: Overall architecture looks clean and modular.'));
+          assert.ok(rendered.includes('- **android_sec**: No security boundary violations.'));
+          assert.ok(rendered.includes('### Findings & Recommendations'));
+          assert.ok(rendered.includes('- **SUGGESTION** [chief]'));
+          assert.ok(rendered.includes('Variable name can be more descriptive'));
+          assert.ok(rendered.includes('Recommendation: Rename val x to val timeoutMs'));
         }
       }
 

@@ -220,7 +220,7 @@ export async function runPhase2HTests(): Promise<void> {
           stickyId = state.comments[0].id;
           assert.ok(state.comments[0].body.includes('pocketguard-review-report'), 'success sticky names artifact');
           assert.ok(state.comments[0].body.includes('actions/runs/123456'), 'success sticky links run');
-          assert.ok(!state.comments[0].body.includes('報告：不可用'), 'success does not show unavailable');
+          assert.ok(!state.comments[0].body.includes('Report: unavailable'), 'success does not show unavailable');
         }
         // Failure: review job failed => INCONCLUSIVE + unavailable, no fake link.
         {
@@ -263,14 +263,14 @@ export async function runPhase2HTests(): Promise<void> {
             githubClient: client,
           });
           assert.equal(state.updated, 1);
-          assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'failure is INCONCLUSIVE');
-          assert.ok(state.comments[0].body.includes('報告：不可用'), 'failure shows unavailable');
+          assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'failure is INCONCLUSIVE');
+          assert.ok(state.comments[0].body.includes('Report: unavailable'), 'failure shows unavailable');
           assert.ok(!state.comments[0].body.includes('actions/runs/'), 'failure gives no fake link');
           void stickyId;
         }
         // formatReportLine unit: missing identity => unavailable, no fake URL.
         assert.equal(getReportRunUrl({} as NodeJS.ProcessEnv), undefined);
-        assert.ok(formatReportLine({} as NodeJS.ProcessEnv, true).includes('不可用'));
+        assert.ok(formatReportLine({} as NodeJS.ProcessEnv, true).includes('unavailable'));
         assert.ok((getReportRunUrl({ GITHUB_REPOSITORY: REPO, GITHUB_RUN_ID: '999' } as unknown as NodeJS.ProcessEnv) ?? '').includes('actions/runs/999'));
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -411,8 +411,8 @@ export async function runPhase2HTests(): Promise<void> {
         assert.equal(state.created, 0, 'chunk-failure publish creates no second comment');
         assert.equal(state.updated, 1, 'chunk-failure publish updates same sticky');
         assert.equal(state.comments[0].id, 21, 'same comment ID updated in place');
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'same sticky shows INCONCLUSIVE');
-        assert.ok(!state.comments[0].body.includes('判定：APPROVE'));
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'same sticky shows INCONCLUSIVE');
+        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'));
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -503,7 +503,7 @@ export async function runPhase2HTests(): Promise<void> {
           });
           assert.equal(state.comments.length, 1, 'single sticky throughout');
           assert.equal(state.comments[0].id, 33, 'same ID');
-          assert.ok(state.comments[0].body.includes('分段：'), 'sticky records chunk start/end');
+          assert.ok(state.comments[0].body.includes('Segments:'), 'sticky records chunk start/end');
         } finally {
           restore();
         }
@@ -529,7 +529,7 @@ export async function runPhase2HTests(): Promise<void> {
         assert.equal(chunk.body.length <= MAX_ISSUE_CHUNK_LENGTH, true, 'per-segment body cap');
         assert.ok(chunk.coveredLength === chunk.body.length + chunk.comments.reduce((s, c) => s + c.length, 0), 'real coveredLength proof');
       }
-      // Shared slice helper: body/comment共用.
+      // Shared slice helper: shared for body and comments.
       assert.deepEqual(sliceTextForChunk('abc', 2), ['ab', 'c']);
       assert.deepEqual(sliceTextForChunk('', 8000), []);
     }
@@ -922,7 +922,7 @@ export async function runPhase2HTests(): Promise<void> {
             assert.ok('verdict' in seg, 'T7 report segment verdict readable');
           }
           const reportMd = fs.readFileSync(path.join(tempDir, 'review-report.md'), 'utf8');
-          assert.ok(reportMd.includes('分段結果') || reportMd.includes('APPROVE') || reportMd.includes('NEEDS_CHANGES'), 'T7 markdown shows per-segment results');
+          assert.ok(reportMd.includes('Segment results') || reportMd.includes('APPROVE') || reportMd.includes('NEEDS_CHANGES'), 'T7 markdown shows per-segment results');
         } finally {
           restore();
         }
@@ -958,13 +958,13 @@ export async function runPhase2HTests(): Promise<void> {
         changedFilesComplete: true,
         suggestedLabels: [],
       };
-      const sticky = reviewComment(prOutput, [], '報告：不可用（審查報告未能產生或上傳失敗，請見 Actions 執行紀錄）。');
-      assert.ok(sticky.includes('省略'), 'T8 PR sticky carries omission note for 100+ findings');
+      const sticky = reviewComment(prOutput, [], 'Report: unavailable (review report could not be generated or failed to upload, see Actions run log).');
+      assert.ok(sticky.includes('omitted'), 'T8 PR sticky carries omission note for 100+ findings');
       assert.ok(sticky.length < 60000, `T8 PR sticky bounded (got ${sticky.length})`);
       // T8 extended (Phase 3 P2 #3): whole-sticky hard budget plus tail counts.
       assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `T8 PR sticky within total cap ${MAX_STICKY_TOTAL_LENGTH} (got ${sticky.length})`);
       assert.ok(sticky.length <= GITHUB_COMMENT_HARD_LIMIT, 'T8 PR sticky within GitHub hard limit');
-      assert.ok(sticky.includes('共100'), 'T8 tail carries total finding count');
+      assert.ok(sticky.includes('100 finding(s)'), 'T8 tail carries total finding count');
       assert.ok(sticky.includes('artifact'), 'T8 tail guides to the report artifact');
       // Issue sticky: long summary plus many segments stays bounded with notes.
       const issueOutput = {
@@ -993,10 +993,10 @@ export async function runPhase2HTests(): Promise<void> {
         chunkCoverageComplete: true,
         chunkCount: 15,
       };
-      const issueSticky = issueReviewComment(issueOutput, [], '報告：不可用（審查報告未能產生或上傳失敗，請見 Actions 執行紀錄）。');
-      assert.ok(issueSticky.includes('分段：'), 'T8 issue sticky carries chunk line with boundaries');
-      assert.ok(issueSticky.includes('省略'), 'T8 issue sticky carries omission note');
-      assert.ok(truncateStickyText('x'.repeat(100), 10).includes('省略'), 'T8 truncate helper notes omission');
+      const issueSticky = issueReviewComment(issueOutput, [], 'Report: unavailable (review report could not be generated or failed to upload, see Actions run log).');
+      assert.ok(issueSticky.includes('Segments:'), 'T8 issue sticky carries chunk line with boundaries');
+      assert.ok(issueSticky.includes('omitted'), 'T8 issue sticky carries omission note');
+      assert.ok(truncateStickyText('x'.repeat(100), 10).includes('omitted'), 'T8 truncate helper notes omission');
       assert.ok(issueSticky.length < 20000, `T8 issue sticky bounded (got ${issueSticky.length})`);
     }
 
@@ -1038,11 +1038,11 @@ export async function runPhase2HTests(): Promise<void> {
           role,
           findings: Array.from({ length: 20 }, (_, i) => mkLong(role, i)),
         }));
-        const sticky = reviewComment(prShape(roles), [], '報告行');
+        const sticky = reviewComment(prShape(roles), [], 'report line');
         assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-1 60 long findings within total cap (got ${sticky.length})`);
         assert.ok(sticky.length <= GITHUB_COMMENT_HARD_LIMIT, 'P3-1 within GitHub hard limit');
-        assert.ok(sticky.includes('省略'), 'P3-1 carries omission note');
-        assert.ok(sticky.includes('共60'), 'P3-1 tail carries total finding count');
+        assert.ok(sticky.includes('omitted'), 'P3-1 carries omission note');
+        assert.ok(sticky.includes('60 finding(s)'), 'P3-1 tail carries total finding count');
         assert.ok(sticky.includes('artifact'), 'P3-1 tail guides to artifact');
         // Per-item cap: no 2000-char raw run survives verbatim.
         assert.ok(!sticky.includes('x'.repeat(2000)), 'P3-1 single-item cap truncates long issues');
@@ -1057,10 +1057,10 @@ export async function runPhase2HTests(): Promise<void> {
           category: 'security' as const,
           message: `P3V-${i} ${'z'.repeat(2000)}`,
         }));
-        const sticky = reviewComment(prShape([{ role: 'chief', findings: [] }], violations), [], '報告行');
+        const sticky = reviewComment(prShape([{ role: 'chief', findings: [] }], violations), [], 'report line');
         assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-2 120 long violations within total cap (got ${sticky.length})`);
-        assert.ok(sticky.includes('省略'), 'P3-2 carries omission note');
-        assert.ok(sticky.includes('共120'), 'P3-2 tail carries total violation count');
+        assert.ok(sticky.includes('omitted'), 'P3-2 carries omission note');
+        assert.ok(sticky.includes('120 deterministic violation(s)'), 'P3-2 tail carries total violation count');
         assert.ok(!sticky.includes('z'.repeat(2000)), 'P3-2 single-item cap truncates long messages');
       }
 
@@ -1068,11 +1068,11 @@ export async function runPhase2HTests(): Promise<void> {
       {
         const dense = '`*_{}[]()#+-.!|<>\\'.repeat(200);
         const roles = [{ role: 'chief' as const, findings: [{ severity: 'BLOCK' as const, file: 'a*b_c[d](e)#f.kt', line: 1, issue: dense, suggestion: dense }] }];
-        const sticky = reviewComment(prShape(roles), [], '報告行');
+        const sticky = reviewComment(prShape(roles), [], 'report line');
         assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-3 escape-dense within total cap (got ${sticky.length})`);
         // Truncate->escape helper: raw cut first, escaped length accounted.
         const single = stickyField(dense, MAX_STICKY_ITEM_LENGTH);
-        assert.ok(single.includes('省略'), 'P3-3 helper notes omission for dense input');
+        assert.ok(single.includes('omitted'), 'P3-3 helper notes omission for dense input');
         assert.ok(single.includes('\\*'), 'P3-3 helper escapes markdown after truncation');
         assert.ok(!sticky.includes(dense), 'P3-3 raw dense run never lands verbatim');
       }
@@ -1088,13 +1088,13 @@ export async function runPhase2HTests(): Promise<void> {
           truncatedFiles: Array.from({ length: 25 }, (_, i) => `${'t'.repeat(250)}/truncated-${i}.kt`),
           originalLength: 999,
         };
-        const sticky = reviewComment(prShape(roles, [], coverage), [], '報告行');
+        const sticky = reviewComment(prShape(roles, [], coverage), [], 'report line');
         assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-4 long filenames within total cap (got ${sticky.length})`);
         assert.ok(!sticky.includes(longName), 'P3-4 full 500+ filename never lands verbatim');
-        assert.ok(sticky.includes('共30'), 'P3-4 omitted list carries total count');
-        assert.ok(sticky.includes('共25'), 'P3-4 truncated list carries total count');
-        assert.ok(sticky.includes(`示${MAX_STICKY_FILE_LIST_SHOWN}`), 'P3-4 file lists carry shown count');
-        assert.ok(sticky.includes('省略'), 'P3-4 file lists carry omission note');
+        assert.ok(sticky.includes('30 total'), 'P3-4 omitted list carries total count');
+        assert.ok(sticky.includes('25 total'), 'P3-4 truncated list carries total count');
+        assert.ok(sticky.includes(`${MAX_STICKY_FILE_LIST_SHOWN} shown`), 'P3-4 file lists carry shown count');
+        assert.ok(sticky.includes('omitted'), 'P3-4 file lists carry omission note');
       }
 
       // P3-5: BLOCK all kept, SUGGESTION dropped first, severity order held.
@@ -1119,7 +1119,7 @@ export async function runPhase2HTests(): Promise<void> {
           { role: 'android_sec' as const, findings: [...sugs.slice(30, 60), ...blocks.slice(2, 4)] },
           { role: 'android_code' as const, findings: [...sugs.slice(60), ...blocks.slice(4)] },
         ];
-        const sticky = reviewComment(prShape(roles), [], '報告行');
+        const sticky = reviewComment(prShape(roles), [], 'report line');
         assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-5 mixed severities within total cap (got ${sticky.length})`);
         for (let i = 0; i < 5; i += 1) {
           assert.ok(sticky.includes(`BLOCKKEEP${i}`), `P3-5 keeps BLOCK ${i}`);
@@ -1219,9 +1219,9 @@ export async function runPhase2HTests(): Promise<void> {
           const { sticky, created, updated } = await publishIssueAndReadSticky(artifactPath, title, body);
           assert.equal(created, 0, 'D-1 same sticky');
           assert.equal(updated, 1);
-          assert.ok(sticky.includes('判定：INCONCLUSIVE'), 'D-1 falls back to INCONCLUSIVE');
-          assert.ok(!sticky.includes('判定：APPROVE'), 'D-1 never APPROVE with unavailable');
-          assert.ok(sticky.includes('報告：不可用'), 'D-1 shows unavailable');
+          assert.ok(sticky.includes('Verdict: INCONCLUSIVE'), 'D-1 falls back to INCONCLUSIVE');
+          assert.ok(!sticky.includes('Verdict: APPROVE'), 'D-1 never APPROVE with unavailable');
+          assert.ok(sticky.includes('Report: unavailable'), 'D-1 shows unavailable');
           assert.ok(!sticky.includes('actions/runs/'), 'D-1 gives no fake link');
         } finally {
           fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1235,9 +1235,9 @@ export async function runPhase2HTests(): Promise<void> {
           fs.rmSync(path.join(tempDir, 'review-report.json'), { force: true });
           assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv), false, 'D-2 missing json is unavailable');
           const { sticky } = await publishIssueAndReadSticky(artifactPath, title, body);
-          assert.ok(sticky.includes('判定：INCONCLUSIVE'), 'D-2 INCONCLUSIVE');
-          assert.ok(!sticky.includes('判定：APPROVE'));
-          assert.ok(sticky.includes('報告：不可用'));
+          assert.ok(sticky.includes('Verdict: INCONCLUSIVE'), 'D-2 INCONCLUSIVE');
+          assert.ok(!sticky.includes('Verdict: APPROVE'));
+          assert.ok(sticky.includes('Report: unavailable'));
           assert.ok(!sticky.includes('actions/runs/'));
         } finally {
           fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1252,8 +1252,8 @@ export async function runPhase2HTests(): Promise<void> {
           fs.rmSync(path.join(tempDir, 'review-report.md'), { force: true });
           assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv), false, 'D-3 download loss is unavailable');
           const { sticky } = await publishIssueAndReadSticky(artifactPath, title, body);
-          assert.ok(sticky.includes('判定：INCONCLUSIVE'), 'D-3 download failure stays INCONCLUSIVE');
-          assert.ok(sticky.includes('報告：不可用'));
+          assert.ok(sticky.includes('Verdict: INCONCLUSIVE'), 'D-3 download failure stays INCONCLUSIVE');
+          assert.ok(sticky.includes('Report: unavailable'));
           assert.ok(!sticky.includes('actions/runs/'));
         } finally {
           fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1272,9 +1272,9 @@ export async function runPhase2HTests(): Promise<void> {
           fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
           assert.equal(areReviewReportsAvailable({ POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv), false, `D-4 tampered ${variant} is unavailable`);
           const { sticky } = await publishIssueAndReadSticky(artifactPath, title, body);
-          assert.ok(sticky.includes('判定：INCONCLUSIVE'), `D-4 tampered ${variant} stays INCONCLUSIVE`);
-          assert.ok(!sticky.includes('判定：APPROVE'));
-          assert.ok(sticky.includes('報告：不可用'));
+          assert.ok(sticky.includes('Verdict: INCONCLUSIVE'), `D-4 tampered ${variant} stays INCONCLUSIVE`);
+          assert.ok(!sticky.includes('Verdict: APPROVE'));
+          assert.ok(sticky.includes('Report: unavailable'));
           assert.ok(!sticky.includes('actions/runs/'));
         } finally {
           fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1504,8 +1504,8 @@ export async function runPhase2HTests(): Promise<void> {
         });
         assert.equal(state.created, 0, 'P2 swap publish creates no second comment');
         assert.equal(state.updated, 1, 'P2 swap publish updates same sticky');
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'P2 live swap falls back to INCONCLUSIVE');
-        assert.ok(!state.comments[0].body.includes('判定：APPROVE'), 'P2 live swap never APPROVE');
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'P2 live swap falls back to INCONCLUSIVE');
+        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'), 'P2 live swap never APPROVE');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -1609,8 +1609,8 @@ export async function runPhase2HTests(): Promise<void> {
         });
         assert.equal(state.created, 0, 'P2 forgery publish creates no second comment');
         assert.equal(state.updated, 1, 'P2 forgery publish updates same sticky');
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'P2 forged slice falls back to INCONCLUSIVE');
-        assert.ok(!state.comments[0].body.includes('判定：APPROVE'), 'P2 forged slice never APPROVE');
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'P2 forged slice falls back to INCONCLUSIVE');
+        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'), 'P2 forged slice never APPROVE');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }

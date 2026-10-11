@@ -138,7 +138,7 @@ function makeClient(state: FakeState): NonNullable<RunnerContext['githubClient']
 }
 
 function stickyBody(headSha: string, count: number): string {
-  return `<!-- PocketGuard-review -->\n\n## PocketGuard 審查\n\n**判定：APPROVE**\n${formatReviewCountMarker(headSha, count)}\n`;
+  return `<!-- PocketGuard-review -->\n\n## PocketGuard Review\n\n**Verdict: APPROVE**\n${formatReviewCountMarker(headSha, count)}\n`;
 }
 
 function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
@@ -1281,7 +1281,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
           githubClient: makeClient(state),
         });
         assert.equal(state.created, 1, 'a failed review still publishes the INCONCLUSIVE fallback');
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'));
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'));
         assert.ok(
           !state.comments[0].body.includes(formatReviewCountMarker(HEAD_SHA, 1)),
           'unstarted reviews never consume the per-SHA budget',
@@ -1456,8 +1456,8 @@ export async function runExecutionMatrixTests(): Promise<void> {
           assert.equal(publishState.created, 1, 'issue publish creates the single sticky');
           assert.equal(publishState.updated, 0);
           assert.ok(publishState.comments[0].body.includes('<!-- PocketGuard-review -->'), 'issue sticky carries the shared marker');
-          assert.ok(publishState.comments[0].body.includes('判定：APPROVE'), 'issue sticky shows the verdict');
-          assert.ok(publishState.comments[0].body.includes('修訂指紋'), 'issue sticky carries the revision fingerprint');
+          assert.ok(publishState.comments[0].body.includes('Verdict: APPROVE'), 'issue sticky shows the verdict');
+          assert.ok(publishState.comments[0].body.includes('Revision fingerprint'), 'issue sticky carries the revision fingerprint');
           assert.ok(publishState.operations.includes('add-labels') || publishState.operations.includes('list-labels'), 'issue publish reconciles labels');
           assert.ok(publishState.existingLabels.includes('security'));
 
@@ -1479,7 +1479,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
           });
           assert.equal(mismatchState.created, 1, 'mismatched issue artifact still uses a single sticky');
           assert.equal(mismatchState.updated, 0);
-          assert.ok(mismatchState.comments[0].body.includes('判定：INCONCLUSIVE'), 'stale issue artifact falls back to INCONCLUSIVE');
+          assert.ok(mismatchState.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'stale issue artifact falls back to INCONCLUSIVE');
           assert.ok(mismatchState.operations.includes('list-labels') || mismatchState.operations.includes('add-labels'));
         } finally {
           restore();
@@ -1699,6 +1699,23 @@ export async function runExecutionMatrixTests(): Promise<void> {
       assert.match(claimJob.slice(0, claimJob.indexOf('    steps:')), /issues:\s*write/,
         'claim-slot holds the minimal sticky write scope');
       assert.doesNotMatch(claimJob, /OPENAI_API_KEY/, 'claim-slot takes no OpenAI secrets');
+      for (const fallbackVar of [
+        'POCKETGUARD_MODEL_FALLBACKS',
+        'POCKETGUARD_MODEL_CHIEF_FALLBACKS',
+        'POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS',
+        'POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS',
+      ]) {
+        assert.match(
+          claimJob,
+          new RegExp(`${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`),
+          `claim-slot forwards ${fallbackVar}`,
+        );
+        assert.match(
+          trustedStep,
+          new RegExp(`${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`),
+          `review-send trusted step forwards ${fallbackVar}`,
+        );
+      }
       assert.match(reviewJob, /needs:\s*\[prepare-tag,\s*claim-slot\]/, 'review-send waits for the claim');
       assert.match(
         squashed(reviewJob.slice(0, reviewJob.indexOf('    steps:'))),

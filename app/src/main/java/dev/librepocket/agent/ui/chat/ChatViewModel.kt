@@ -186,6 +186,17 @@ class ChatViewModel(
     private val _historyOmittedCount = MutableStateFlow(0)
     val historyOmittedCount: StateFlow<Int> = _historyOmittedCount.asStateFlow()
 
+    /**
+     * R5-5: send-time per-request trim count, collected from the attached
+     * [ChatSession.requestTrimmedCount]. Load-time resume omission
+     * ([historyOmittedCount], DB tail cap) and this send-time trim are
+     * orthogonal counters — never summed, reset independently. Reset to 0 on
+     * every attach (new session starts untrimmed) and on lifecycle/endpoint
+     * invalidation (the owning session is detached).
+     */
+    private val _requestTrimmedCount = MutableStateFlow(0)
+    val requestTrimmedCount: StateFlow<Int> = _requestTrimmedCount.asStateFlow()
+
     val messages: StateFlow<List<UiMessage>> =
         combine(_history, _sessionState) { history, live ->
             history + live.messages.filter { it.role == "user" || it.role == "assistant" }
@@ -273,6 +284,7 @@ class ChatViewModel(
     private var currentBinding: EndpointSessionBinding? = null
     private var currentSessionGeneration: Long? = null
     private var sessionCollectJob: Job? = null
+    private var requestTrimCollectJob: Job? = null
     private var openJob: Job? = null
     // One-shot key.read consent (ASK path). Minted by [confirmKeyRead] from a
     // suspending context and taken by [authorizeEndpoint] on Main, so all
@@ -1686,6 +1698,10 @@ class ChatViewModel(
             // detach path).
             if (mismatched != null) detachAndFlushClose(mismatched)
             _sessionState.value = EMPTY_SESSION_STATE
+            // R5-5: the detached session's send-time trim no longer applies;
+            // zero now so a failed/slow replacement cannot leave a stale badge
+            // (mirrors invalidateForEndpointChange).
+            _requestTrimmedCount.value = 0
             absorbDrainedQueued(queuedBeforeReplace, fillInput = false, includePending = false)
         }
 
@@ -1893,6 +1909,9 @@ class ChatViewModel(
         // success included, so a stale "開啟歷史" never lingers).
         pendingOpen = null
         _pendingOpenSessionId.value = null
+        // R5-5: the new session starts untrimmed; clear any stale count from
+        // the detached incumbent before the live flow re-emits.
+        _requestTrimmedCount.value = 0
         sessionCollectJob?.cancel()
         sessionCollectJob = viewModelScope.launch {
             created.session.uiState.collect { state ->
@@ -1903,6 +1922,14 @@ class ChatViewModel(
                         reclaimQueuedRecovery(created.session, generation)
                     }
                     _sessionState.value = state
+                }
+            }
+        }
+        requestTrimCollectJob?.cancel()
+        requestTrimCollectJob = viewModelScope.launch {
+            created.session.requestTrimmedCount.collect { trimmed ->
+                if (isGenerationCurrent(generation) && currentSession === created.session) {
+                    _requestTrimmedCount.value = trimmed
                 }
             }
         }
@@ -2102,6 +2129,11 @@ class ChatViewModel(
         if (binding != null) snapshotLiveToHistory()
         releaseLiveAfterBoundedFlush()
         _sessionState.value = EMPTY_SESSION_STATE
+        // R5-5: the live session is detached on every endpoint change, so its
+        // send-time trim count no longer describes anything on screen. Reset
+        // unconditionally (unlike _history, which survives a non-null switch
+        // via snapshotLiveToHistory): the next attach re-emits from zero.
+        _requestTrimmedCount.value = 0
         if (binding == null) {
             _history.value = emptyList()
             _historyOmittedCount.value = 0
@@ -2234,6 +2266,9 @@ class ChatViewModel(
         if (clearChat) {
             _history.value = emptyList()
             _historyOmittedCount.value = 0
+            // R5-5: the owning session is detached; a later attach restarts
+            // the trim count from zero.
+            _requestTrimmedCount.value = 0
             _currentSessionId.value = null
             pendingOpen = null
             _pendingOpenSessionId.value = null
@@ -2618,6 +2653,8 @@ class ChatViewModel(
     private fun closeLive() {
         sessionCollectJob?.cancel()
         sessionCollectJob = null
+        requestTrimCollectJob?.cancel()
+        requestTrimCollectJob = null
         try {
             currentSession?.close()
         } catch (_: Exception) {
@@ -2654,6 +2691,8 @@ class ChatViewModel(
         if (currentSession === session) {
             sessionCollectJob?.cancel()
             sessionCollectJob = null
+            requestTrimCollectJob?.cancel()
+            requestTrimCollectJob = null
             currentSession = null
             currentBinding = null
             currentSessionGeneration = null

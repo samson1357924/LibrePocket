@@ -1,6 +1,11 @@
 package dev.librepocket.chat
 
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/** Shared zero trim flow for [ChatSession.requestTrimmedCount]'s default (read-only, safe to share). */
+private val ZeroRequestTrimmedCount: StateFlow<Int> = MutableStateFlow(0).asStateFlow()
 
 /**
  * Single-turn chat controller: send / stream / cancel / steering.
@@ -17,6 +22,15 @@ import kotlinx.coroutines.flow.StateFlow
 interface ChatSession {
   /** Messages for UI (collect; includes streaming placeholders). */
   val uiState: StateFlow<ChatUiState>
+
+  /**
+   * R5-5: send-time per-request trim count (oldest-first messages dropped to
+   * fit MAX_REQUEST_CHARS), published by the controller on every attempt.
+   * Distinct from load-time resume omission (DB tail cap): never summed with
+   * it. Default is a shared zero flow so test fakes stay source-compatible;
+   * production ([ChatSessionImpl]) overrides with the live controller flow.
+   */
+  val requestTrimmedCount: StateFlow<Int> get() = ZeroRequestTrimmedCount
 
   /** Send one user message and stream the reply. One in-flight turn at a time. */
   suspend fun send(text: String, images: List<ChatImageRef> = emptyList())

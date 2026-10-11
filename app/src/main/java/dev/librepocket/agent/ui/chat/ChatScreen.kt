@@ -133,6 +133,10 @@ fun ChatScreen(
     val currentSessionId by viewModel.currentSessionId.collectAsStateWithLifecycle()
     // S2: pending history open retained across ConfirmRequired (explicit resume target).
     val pendingOpenSid by viewModel.pendingOpenSessionId.collectAsStateWithLifecycle()
+    // R5-5: send-time per-request trim (oldest-first messages dropped to fit
+    // the request budget). Orthogonal to load-time resume omission; shown as
+    // a persistent badge, never summed with any other count.
+    val requestTrimmedCount by viewModel.requestTrimmedCount.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val streaming = session.status == ChatStatus.STREAMING
     var wasActive by remember { mutableStateOf(false) }
@@ -330,10 +334,13 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(messages.size, messages.lastOrNull()?.text?.length, session.status) {
+    LaunchedEffect(messages.size, messages.lastOrNull()?.text?.length, session.status, requestTrimmedCount) {
         if (messages.isNotEmpty()) {
             try {
-                listState.scrollToItem(messages.size - 1)
+                // R5-5: the request-trim badge (when visible) occupies list
+                // index 0, so the last message sits at messages.size, not
+                // messages.size - 1.
+                listState.scrollToItem(if (requestTrimmedCount > 0) messages.size else messages.size - 1)
             } catch (_: IllegalArgumentException) {
                 // List not laid out yet; next recomposition will settle.
             }
@@ -395,6 +402,18 @@ fun ChatScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                // R5-5: persistent request-trim badge pinned to the top of the
+                // history list (N > 0 only). bodySmall + onSurfaceVariant, same
+                // as the pending-steer badge below the list.
+                if (requestTrimmedCount > 0) {
+                    item(key = "request-trim-badge") {
+                        Text(
+                            text = "有 $requestTrimmedCount 則較早歷史未送出模型",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
                 items(messages, key = { it.id }) { msg ->
                     // M2：voice_output 關閉時隱藏朗讀鈕（與投影層同開關）；speaker
                     // 為 null（延遲建構）時直接不送引擎；引擎失敗經 onError

@@ -584,6 +584,18 @@ class TurnController(
    */
   val lastRequestTrimmedCount: Int get() = _lastRequestTrimmedCount.get()
 
+  /**
+   * R5-5: [lastRequestTrimmedCount] as a StateFlow, emitted synchronously in
+   * [buildRequest] alongside the AtomicInteger set (one emission per attempt,
+   * at most 4 per send — negligible cost; last attempt wins). Distinct from
+   * the load-time [droppedHistoryCount] (DB tail cap): this counts send-time
+   * per-request 100k-char trims. Never summed with resume omission; surfaced
+   * via ChatSession/VM as `requestTrimmedCount`. Rejections before any request
+   * (oversize input, UNKNOWN admission) leave the last emitted value untouched.
+   */
+  private val _requestTrimmedCount = MutableStateFlow(0)
+  val requestTrimmedCount: StateFlow<Int> = _requestTrimmedCount.asStateFlow()
+
   private var inFlight: Job? = null
   private val steerQueue: ArrayDeque<PendingSteer> = ArrayDeque()
   private var closed = false
@@ -2465,6 +2477,7 @@ class TurnController(
       dropCount++
     }
     _lastRequestTrimmedCount.set(dropCount)
+    _requestTrimmedCount.value = dropCount
     val finalMessages = if (dropCount > 0) base.drop(dropCount) else base
     return ChatRequest(model = model, messages = finalMessages)
     // NOTE (PR#1 scope-down): tools deliberately NOT attached here.

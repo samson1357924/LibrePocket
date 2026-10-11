@@ -576,6 +576,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
 
     const reasoningBody = await captureSingleTurnBody('gpt-5.2', openaiEnvironment);
     assert.deepEqual(reasoningBody.reasoning, { effort: 'high' });
+    assert.deepEqual(reasoningBody.include, ['reasoning.encrypted_content']);
     assert.equal(Object.hasOwn(reasoningBody, 'temperature'), false);
     assert.equal(Object.hasOwn(reasoningBody, 'top_p'), false);
     assert.equal(reasoningBody.model, 'gpt-5.2');
@@ -1348,6 +1349,33 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           });
           assert.equal(models.length, 2, 'aborted primary falls back');
           assert.equal(result.modelId, 'second-model');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Output shape compatibility (Vegan-scan-app parity): string content,
+      // direct output_text items, and reasoning blocks alongside message.
+      for (const [shapeName, payload] of [
+        ['message string', { output: [{ type: 'message', content: 'string message' }] }],
+        ['message text parts', { output: [{ type: 'reasoning', summary: [] }, { type: 'message', content: [{ type: 'text', text: 'text part' }] }] }],
+        ['direct output_text', { output: [{ type: 'output_text', text: 'direct output text' }] }],
+      ] as const) {
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.ok(result.content.length > 0, `${shapeName} extracts usable content`);
         } finally {
           globalThis.fetch = previous;
         }

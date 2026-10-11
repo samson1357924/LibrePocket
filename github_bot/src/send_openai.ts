@@ -420,12 +420,27 @@ function extractOutputText(payload: unknown): string {
   const pieces: string[] = [];
   for (const item of output) {
     if (!item || typeof item !== 'object') continue;
-    const content = (item as { content?: unknown }).content;
-    if (!Array.isArray(content)) continue;
-    for (const part of content) {
-      if (!part || typeof part !== 'object') continue;
-      const textPart = part as { type?: unknown; text?: unknown };
-      if (textPart.type === 'output_text' && typeof textPart.text === 'string') pieces.push(textPart.text);
+    const rec = item as Record<string, unknown>;
+    if (rec.type === 'message') {
+      if (typeof rec.content === 'string') {
+        pieces.push(rec.content);
+      } else if (Array.isArray(rec.content)) {
+        for (const part of rec.content) {
+          if (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string') {
+            pieces.push((part as { text: string }).text);
+          }
+        }
+      }
+    } else if (rec.type === 'output_text' && typeof rec.text === 'string') {
+      pieces.push(rec.text);
+    } else if (Array.isArray(rec.content)) {
+      for (const part of rec.content) {
+        if (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string') {
+          pieces.push((part as { text: string }).text);
+        }
+      }
+    } else if (typeof rec.text === 'string') {
+      pieces.push(rec.text);
     }
   }
   return pieces.join('');
@@ -475,6 +490,7 @@ export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions)
         throw new Error('reasoning effort excludes temperature/top_p');
       }
       body.reasoning = { effort: effort || resolveDefaultReasoningEffort(env) };
+      body.include = ['reasoning.encrypted_content'];
     }
   } else {
     // Non-reasoning: never send reasoning. Temperature/top_p are opt-in

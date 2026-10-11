@@ -1694,6 +1694,8 @@ export async function runExecutionMatrixTests(): Promise<void> {
         'review-send holds read-only issue metadata scope');
       assert.doesNotMatch(reviewJob.slice(0, reviewJob.indexOf('    steps:')), /:\s*write/,
         'review-send holds no write permission');
+      assert.match(claimJob.slice(0, claimJob.indexOf('    steps:')), /^\s*pull-requests:\s*write\s*$/m,
+        'claim-slot holds pull-requests:write for PR-conversation sticky writes');
       assert.match(claimJob.slice(0, claimJob.indexOf('    steps:')), /issues:\s*write/,
         'claim-slot holds the minimal sticky write scope');
       assert.doesNotMatch(claimJob, /OPENAI_API_KEY/, 'claim-slot takes no OpenAI secrets');

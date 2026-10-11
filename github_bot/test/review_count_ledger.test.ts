@@ -1721,9 +1721,18 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       assert.match(squashed(claimJob), /review_gate\s*==\s*'auto'/, 'claim schedules PR auto reviews');
       assert.match(squashed(claimJob), /review_gate\s*==\s*'manual'.*authorized\s*==\s*'true'/, 'claim gates manual reviews on authorization');
       assert.match(squashed(claimJob), /route_kind\s*==\s*'first-review'/, 'claim covers the issue-auto route');
-      // Minimal write: issues:write only in claim-slot and publish.
-      assert.match(claimJob.slice(0, claimJob.indexOf('    steps:')), /issues:\s*write/, 'claim-slot holds issues:write');
-      assert.match(publishJob.slice(0, publishJob.indexOf('    steps:')), /issues:\s*write/, 'publish holds issues:write');
+      const claimPerms = claimJob.slice(0, claimJob.indexOf('    steps:'));
+      const publishPerms = publishJob.slice(0, publishJob.indexOf('    steps:'));
+      // Minimal write: issues:write plus pull-requests:write in claim-slot and
+      // publish. The sticky ledger lives on the PR conversation; on that
+      // resource GitHub's authorization check greps the PullRequests scope,
+      // so a claim without it gets 403 on createComment (smoke PR #65).
+      // Anchored to YAML key lines so comments cannot satisfy the assertion.
+      assert.match(claimPerms, /^\s*pull-requests:\s*write\s*$/m, 'claim-slot holds pull-requests:write for PR-conversation sticky writes');
+      assert.doesNotMatch(claimPerms, /^\s*pull-requests:\s*read\s*$/m, 'claim-slot no longer reads-only on pull-requests');
+      assert.match(claimPerms, /^\s*issues:\s*write\s*$/m, 'claim-slot holds issues:write');
+      assert.match(publishPerms, /^\s*issues:\s*write\s*$/m, 'publish holds issues:write');
+      assert.match(publishPerms, /^\s*pull-requests:\s*write\s*$/m, 'publish holds pull-requests:write');
       assert.doesNotMatch(prepareJob.slice(0, prepareJob.indexOf('    steps:')), /issues:\s*write/, 'prepare-tag stays read-only');
       assert.doesNotMatch(reviewJob.slice(0, reviewJob.indexOf('    steps:')), /:\s*write/, 'review-send holds no write permission');
       // No OpenAI secrets and no fork checkout in the claim job.

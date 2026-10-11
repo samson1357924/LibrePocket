@@ -351,8 +351,10 @@ export async function runScannerSendOpenAITests(): Promise<void> {
   };
   try {
     let ordinaryRedirectMode: RequestInit['redirect'] | undefined;
+    let recordedHeaders: HeadersInit | undefined;
     globalThis.fetch = (async (_input, init) => {
       ordinaryRedirectMode = init?.redirect;
+      recordedHeaders = init?.headers;
       return new Response(JSON.stringify({
         output: [{ content: [{ type: 'output_text', text: 'review result' }] }],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -367,6 +369,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     });
     assert.deepEqual(result, { content: 'review result', modelId: FAKE_MODEL_ID });
     assert.equal(ordinaryRedirectMode, 'error');
+    const headerRecord = recordedHeaders as Record<string, string> | undefined;
+    assert.equal(headerRecord?.['User-Agent'], 'LibrePocket-Bot/1.0');
 
     const redirectTarget = 'https://redirect-target.test/receive';
     for (const status of [307, 308]) {

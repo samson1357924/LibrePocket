@@ -490,6 +490,7 @@ export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions)
         headers: {
           Authorization: `Bearer ${config.apiKey}`,
           'Content-Type': 'application/json',
+          'User-Agent': 'LibrePocket-Bot/1.0',
         },
         body: JSON.stringify(body),
         signal: controller.signal,

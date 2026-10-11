@@ -47,6 +47,15 @@ private const val HISTORY_PAGE = 200
 private const val HISTORY_LOAD_CAP = 2000
 
 /**
+ * R5-3: durable fork-snapshot copy budget. One slot is reserved for the
+ * head-anchored `model switched` marker row, so marker + copied prefix never
+ * exceeds [HISTORY_LOAD_CAP] (which equals
+ * [dev.librepocket.session.PrunePolicy.maxEventsPerSession], so a full
+ * snapshot would otherwise lose its head marker at the next prune sweep).
+ */
+private const val SWITCH_SNAPSHOT_COPY_CAP = HISTORY_LOAD_CAP - 1
+
+/**
  * Stage E: per-message char bound for model-context hydration. The write path
  * already caps a stored row at 100k chars ([RoomSessionStore.MAX_TEXT_CHARS]);
  * a single such row (~25k tokens at ~4 chars/token) must never reach the
@@ -846,7 +855,18 @@ class ChatSessionFactory(
      * an INTERRUPTED marker. Deliberately NOT marked: intentional-cancel
      * partials already own a final assistant row (`isPartial=1`), so they
      * replay as partial and never gain a marker; completed and failed turns
-     * likewise own theirs. Prune cannot cause false positives (it drops the
+     * likewise own theirs.
+     *
+     * R5-3 scope note: the "never gains a marker" guarantee above holds for
+     * the ledger that owns the terminal row. Before R5-3 the same-origin
+     * fork snapshot copied only the model projection (user/assistant,
+     * `!isPartial`), so a forked ledger lost its partials and terminal
+     * system marks and the reopen backfill mis-read the orphaned user row as
+     * stranded (false INTERRUPTED). R5-3 snapshots the UI replay/audit
+     * projection instead (see [loadSwitchSnapshotEvents]), restoring the
+     * guarantee for forked ledgers as well.
+     *
+     * Prune cannot cause false positives (it drops the
      * oldest rows first, and an assistant row always has a larger seq than
      * its user row, so prune can orphan assistants but never users).
      * Re-running is idempotent: a marked family owns its marker row and
@@ -949,16 +969,22 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
 /**
  * Raw-event form of [loadModelHistory]: the newest qualifying rows
  * (user/assistant, non-partial) up to [HISTORY_LOAD_CAP], oldest-first, via
- * the same backward paging. Single source of truth for the carried prefix so
- * the in-memory hydration and the R4-2 durable fork snapshot below always
- * agree on exactly which rows cross a same-origin model switch.
+ * the same backward paging. Source of truth for the in-memory model-context
+ * hydration only (see `open` / `ensureSession`): the R4-2 durable fork
+ * snapshot below deliberately does NOT reuse this set anymore (R5-3: it uses
+ * [loadSwitchSnapshotEvents], the UI replay/audit projection, so partials
+ * and terminal system marks survive a same-origin switch and the reopen
+ * backfill never mistakes a copied turn for a stranded one).
  *
  * Unlike [loadModelHistory], texts are NOT truncated here: truncation stays a
  * read-path concern ([cappedHistoryText] on hydrate), so a snapshot copy
  * preserves the stored bytes verbatim and the reopened session re-applies the
  * identical bound (idempotent). Family linkage (`runId` / `parentRunId` /
  * `attemptIndex` / `isFinal` / `createdAt`) is preserved verbatim so the
- * reopen backfill never mistakes a copied turn for a stranded one.
+ * reopen backfill never mistakes a copied turn for a stranded one — R5-3
+ * scope note: that linkage claim holds for this model projection only when
+ * the reader also owns the partial/mark rows; the durable snapshot carries
+ * them via [loadSwitchSnapshotEvents] instead.
  */
 internal suspend fun loadModelHistoryEvents(store: SessionStore, sessionId: String): List<TranscriptEvent> {
     val keptNewestFirst = ArrayList<TranscriptEvent>(HISTORY_LOAD_CAP)
@@ -969,6 +995,72 @@ internal suspend fun loadModelHistoryEvents(store: SessionStore, sessionId: Stri
         for (event in page) {
             if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
                 if (keptNewestFirst.size >= HISTORY_LOAD_CAP) break@outer
+                keptNewestFirst.add(event)
+            }
+        }
+        // Pages are newest-first with distinct seqs; the next window ends
+        // strictly below this page's minimum. A non-advancing store would
+        // spin forever, so fail closed instead.
+        val pageMin = page.minOf { it.seq }
+        if (pageMin >= beforeSeq) break
+        beforeSeq = pageMin
+        if (page.size < HISTORY_PAGE) break
+    }
+    return keptNewestFirst.asReversed()
+}
+
+/**
+ * R5-3: terminal `system` marks that close a logical family for
+ * [findDanglingRunIds] (exact-text match against the row's own `runId`,
+ * same rule as the backfill scan): `turn <runId> interrupted`,
+ * `turn <runId> cancelled`, and legacy `turn <runId> failed…` rows. Only
+ * these cross a same-origin fork — usage accounting rows
+ * (`usage input=… output=…`), `model switched …` fork markers, and
+ * `retry`/`tool`/`steer` notices never do (usage stays export/debug-only;
+ * each fork owns exactly one switch marker, never a copy; notices are
+ * neither replay nor terminal).
+ */
+internal fun isSwitchSnapshotTerminalMark(event: TranscriptEvent): Boolean {
+    if (event.kind != INTERRUPTED_MARKER_KIND) return false
+    return event.text == interruptedMarkerText(event.runId) ||
+        event.text == cancelledMarkerText(event.runId) ||
+        isLegacyFailureText(event.runId, event.text)
+}
+
+/**
+ * R5-3 durable fork-snapshot projection (UI replay/audit): the newest kept
+ * rows up to [SWITCH_SNAPSHOT_COPY_CAP], oldest-first, via the same backward
+ * paging. Keeps every `user`/`assistant` row INCLUDING partials (verbatim:
+ * `isPartial` / `failureReason` / `parentRunId` / `attemptIndex` / `isFinal` /
+ * `createdAt` preserved, `seq` reassigned on copy, texts never truncated —
+ * truncation stays a read-path concern via [cappedHistoryText] on hydrate)
+ * plus the terminal `system` marks above ([isSwitchSnapshotTerminalMark]).
+ *
+ * Hydration is intentionally split after R5-3: [loadModelHistoryEvents]
+ * stays the model-context projection (`!isPartial`, used by `open` /
+ * `ensureSession` and mirrored by `TurnController.buildRequest`'s live
+ * `!isPartial` filter, so the provider payload never sees a partial), while
+ * this function is the durable-snapshot projection (used only by
+ * [snapshotSwitchHistory]). Pre-restart model contexts still agree because
+ * reopen re-applies the same `!isPartial` filter to the copied rows.
+ *
+ * Counting basis: the copy budget covers the combined UI/audit set
+ * (`countHistoryEvents(includePartial=true)` user/assistant rows plus the
+ * terminal marks, which that COUNT excludes as `system` rows), newest-first,
+ * so a large ledger drops the oldest rows first. Marker + copy never exceeds
+ * [HISTORY_LOAD_CAP] (one slot reserved), matching the prune ceiling.
+ */
+internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: String): List<TranscriptEvent> {
+    val keptNewestFirst = ArrayList<TranscriptEvent>(SWITCH_SNAPSHOT_COPY_CAP)
+    var beforeSeq = Long.MAX_VALUE
+    outer@ while (keptNewestFirst.size < SWITCH_SNAPSHOT_COPY_CAP) {
+        val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
+        if (page.isEmpty()) break
+        for (event in page) {
+            val keep = (event.kind == "user" || event.kind == "assistant") ||
+                isSwitchSnapshotTerminalMark(event)
+            if (keep) {
+                if (keptNewestFirst.size >= SWITCH_SNAPSHOT_COPY_CAP) break@outer
                 keptNewestFirst.add(event)
             }
         }
@@ -1007,25 +1099,44 @@ internal fun modelSwitchMarkerWithheld(text: String): Boolean =
     isModelSwitchMarker(text) && text.contains("[history withheld: cross-provider-origin]")
 
 /**
- * R4-2 (Stage 4) durable fork snapshot: after a same-origin model switch
- * creates a fresh transcript session, persist the carried prefix INTO the new
- * session so a restart / `openSession(newId)` still sees the old context plus
- * the new turns. Cross-provider/origin forks persist only the marker (the old
- * rows are never forwarded to the new destination).
+ * R4-2 (Stage 4) durable fork snapshot, R5-3 projection: after a same-origin
+ * model switch creates a fresh transcript session, persist the carried prefix
+ * INTO the new session so a restart / `openSession(newId)` still sees the old
+ * context plus the new turns. Cross-provider/origin forks persist only the
+ * marker (the old rows are never forwarded to the new destination).
  *
  * Layout: the audit marker is row 1 (head-anchored so reopen rediscovers it
  * with one tiny bounded head scan after later turns), followed by the
- * [loadModelHistoryEvents] prefix oldest-first. Copied rows keep their family
- * linkage and `createdAt` verbatim; `seq` is reassigned by the store. The
- * copy is bounded by [HISTORY_LOAD_CAP] newest-first, exactly the set the
- * live session hydrated in memory, so pre- and post-restart model contexts
- * agree.
+ * [loadSwitchSnapshotEvents] UI replay/audit prefix oldest-first (every
+ * `user`/`assistant` row INCLUDING partials, verbatim `isPartial` /
+ * `failureReason` / `parentRunId` / `attemptIndex` / `isFinal` / `createdAt`,
+ * plus terminal `system` interrupted/cancelled/legacy-failure marks).
+ * Copied rows keep their family linkage and `createdAt` verbatim; `seq` is
+ * reassigned by the store; texts are stored verbatim (truncation stays a
+ * read-path concern via [cappedHistoryText] on hydrate). The copy is bounded
+ * newest-first to [SWITCH_SNAPSHOT_COPY_CAP] so marker + copy never exceeds
+ * [HISTORY_LOAD_CAP]; pre- and post-restart model contexts still agree
+ * because reopen re-applies the same `!isPartial` filter to the copied rows
+ * (provider payload unchanged).
+ *
+ * R5-3 fix: before R5-3 this copied [loadModelHistoryEvents] (the model
+ * projection, `!isPartial`), so a cancelled partial (`user` + terminal
+ * `assistant isPartial=1/isFinal=1`), a terminal failure (plus
+ * `failureReason`), and a backoff-gap cancel (`partial isFinal=0` + `retry`
+ * + `system cancelled`) all lost their terminals/marks; the reopen backfill
+ * then mis-read the orphaned user row as stranded and wrote a false
+ * INTERRUPTED marker. Copying the UI/audit projection preserves those rows,
+ * so [findDanglingRunIds] sees the same terminals in the fork as in the
+ * source. Deliberately NOT copied: usage accounting rows (`usage …`),
+ * `model switched …` markers (each fork owns exactly one, never a copy),
+ * and `retry`/`tool`/`steer` notices (neither replay nor terminal).
  *
  * Known limitation: prune is keep-newest
  * (`dev.librepocket.session.SessionDao.deleteEventsBeyondLimit` drops the
- * oldest rows first), so the head marker goes first; [HISTORY_LOAD_CAP]
- * (2000) equals [dev.librepocket.session.PrunePolicy.maxEventsPerSession]
- * (2000), so a full snapshot loses its marker at the next sweep.
+ * oldest rows first), so the head marker goes first; the marker + copy cap
+ * now equals [dev.librepocket.session.PrunePolicy.maxEventsPerSession]
+ * (2000), so a full snapshot only loses its marker when a LATER prune sweep
+ * drops the head (same as before, but one slot safer).
  * [hasWithheldSwitchMarker] only scans the head 16. A pruned marker only
  * drops the restart notice — the withhold itself is structural (rows never
  * copied), so isolation is unchanged; an `openSession` scan failure stays
@@ -1073,7 +1184,7 @@ internal suspend fun snapshotSwitchHistory(
     )
     if (historyWithheld) return 0
     var copied = 0
-    for (event in loadModelHistoryEvents(store, fromSessionId)) {
+    for (event in loadSwitchSnapshotEvents(store, fromSessionId)) {
         store.appendEvent(event.copy(seq = 0, sessionId = toSessionId))
         copied++
     }

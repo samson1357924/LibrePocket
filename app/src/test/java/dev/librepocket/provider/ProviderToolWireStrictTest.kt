@@ -416,24 +416,139 @@ class ProviderToolWireStrictTest {
     }
 
     @Test
-    fun chatImageContentIsArrayWithNoTopLevelText() {
+    fun chatAssistantImagesFailClosed() {
         val tc = ToolCall(id = "call_stage3c", name = "get_weather", argumentsJson = """{"city":"Taipei"}""")
         val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
-        val body = ChatCompletionsProvider(chatConfig(), { null }).buildBody(
-            ChatRequest(
-                model = "m",
-                messages = listOf(
-                    ChatMessage("assistant", "look", images = listOf(img), toolCalls = listOf(tc)),
-                    ChatMessage("tool", "sunny", toolCallId = tc.id),
+        // Finding B: assistant+images would emit OpenAI-unsupported
+        // {"role":"assistant","content":[{"type":"text"},{"type":"image_url"...}]},
+        // so buildBody fails closed instead of sending it.
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+                ChatRequest(
+                    model = "m",
+                    messages = listOf(
+                        ChatMessage("assistant", "look", images = listOf(img), toolCalls = listOf(tc)),
+                        ChatMessage("tool", "sunny", toolCallId = tc.id),
+                    ),
+                    tools = advTools(),
                 ),
-                tools = advTools(),
-            ),
+            )
+        }
+    }
+
+    @Test
+    fun responsesAssistantImagesFailClosed() {
+        val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(
+                    model = "m",
+                    messages = listOf(ChatMessage("assistant", "look", images = listOf(img))),
+                    tools = advTools(),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun anthropicAssistantImagesFailClosed() {
+        val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(
+                    model = "m",
+                    messages = listOf(ChatMessage("assistant", "look", images = listOf(img))),
+                    tools = advTools(),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun assistantImagesFailClosedOnAllAdapters() {
+        // Mirrors reasoningHistoryFailsClosedOnAllAdapters: one shared
+        // assistant+images history must be refused by every adapter.
+        val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
+        val messages = listOf(ChatMessage("assistant", "look", images = listOf(img)))
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = messages),
+            )
+        }
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = messages),
+            )
+        }
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = messages),
+            )
+        }
+    }
+
+    @Test
+    fun assistantImageGateRunsBeforeToolPairingValidation() {
+        // Orphan output alone would be TOOL_OUTPUT_ORPHAN_ID; with an
+        // assistant image the gate must win (proves second-line ordering,
+        // after the thinking gate and before validateToolPairing).
+        val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
+        val history = listOf(
+            ChatMessage("assistant", "look", images = listOf(img)),
+            ChatMessage("tool", "early", toolCallId = "call_b"),
+            ChatMessage("assistant", "", toolCalls = listOf(ToolCall("call_b", "t", "{}"))),
         )
-        val assistant = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
-            .first { it["role"]!!.jsonPrimitive.content == "assistant" }
-        assertFalse(assistant.containsKey("text"))
-        assertTrue(assistant["content"] is kotlinx.serialization.json.JsonArray)
-        assertTrue(assistant["tool_calls"]!!.jsonArray.size == 1)
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history),
+            )
+        }
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history),
+            )
+        }
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history),
+            )
+        }
+    }
+
+    @Test
+    fun assistantImageGateRunsAfterThinkingGate() {
+        // History carries both hasReasoning and assistant images: the
+        // thinking gate must win (proves thinking first, assistant-image
+        // second ordering in every adapter's buildBody).
+        val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
+        val history = listOf(
+            ChatMessage("assistant", "t", images = listOf(img), hasReasoning = true),
+        )
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history),
+            )
+        }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history),
+            )
+        }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history),
+            )
+        }
+    }
+
+    private fun expectFailWithCode(code: String, block: () -> String) {
+        try {
+            block()
+            fail("expected $code")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals(code, e.message)
+        }
     }
 
     @Test

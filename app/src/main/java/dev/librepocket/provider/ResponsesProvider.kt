@@ -89,6 +89,7 @@ class ResponsesProvider(
 
     internal fun buildBody(request: ChatRequest): String {
         requireNoReasoningHistory(request)
+        requireNoAssistantImages(request.messages)
         val sb = StringBuilder()
         sb.append("{\"model\":${q(request.model)},\"stream\":true,\"store\":false")
         request.maxTokens?.let { sb.append(",\"max_output_tokens\":$it") }

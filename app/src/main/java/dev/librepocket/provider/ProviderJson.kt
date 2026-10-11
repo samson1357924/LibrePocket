@@ -191,6 +191,36 @@ internal fun requireNoReasoningHistory(request: ChatRequest) {
     if (request.messages.any { it.hasReasoning }) throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
 }
 
+/**
+ * Finding B [P2] fail-closed gate: assistant messages must not carry images.
+ *
+ * Chat Completions emits `content[]` parts for any role with images, so an
+ * assistant+images history would send
+ * `{"role":"assistant","content":[{"type":"text"},{"type":"image_url"...}]}`
+ * which OpenAI does not support; Responses (`input_image`) and Anthropic
+ * (`image` source blocks) have the same gap for assistant-carried images.
+ * Production never hits this: [dev.librepocket.chat.TurnController.buildRequest]
+ * attaches images to the last user message only. The gate therefore changes
+ * zero production behavior and only refuses explicit test/scaffold histories.
+ *
+ * Gate ordering (every adapter's `buildBody`):
+ * 1. [requireNoReasoningHistory] (thinking) first,
+ * 2. this assistant-image gate second,
+ * 3. [validateToolPairing] third.
+ *
+ * Only `role == "assistant"` with non-empty `images` is rejected
+ * (`ProviderFailure(retryable=false, "ASSISTANT_IMAGES_NOT_SUPPORTED")`);
+ * user images still flow to the multimodal paths; system images keep the
+ * existing text-only convergence (silently dropped, unchanged here), and
+ * tool-output images keep their own `TOOL_OUTPUT_IMAGES_NOT_SUPPORTED`
+ * rejection inside [validateToolPairing].
+ */
+internal fun requireNoAssistantImages(messages: List<ChatMessage>) {
+    if (messages.any { it.role == "assistant" && it.images.isNotEmpty() }) {
+        throw ProviderFailure(false, "ASSISTANT_IMAGES_NOT_SUPPORTED")
+    }
+}
+
 /** Non-blank arguments must be a JSON object; blank means `{}` (filled by callers). */
 internal fun validateToolArgumentsObject(argumentsJson: String) {
     if (argumentsJson.isBlank()) return

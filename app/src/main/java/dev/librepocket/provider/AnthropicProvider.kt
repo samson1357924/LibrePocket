@@ -83,6 +83,7 @@ class AnthropicProvider(
 
     internal fun buildBody(request: ChatRequest): String {
         requireNoReasoningHistory(request)
+        requireNoAssistantImages(request.messages)
         val sb = StringBuilder()
         sb.append("{\"model\":${q(request.model)},\"stream\":true")
         sb.append(",\"max_tokens\":${request.maxTokens ?: DEFAULT_MAX_TOKENS}")

@@ -93,6 +93,7 @@ class ChatCompletionsProvider(
      */
     internal fun buildBody(request: ChatRequest): String {
         requireNoReasoningHistory(request)
+        requireNoAssistantImages(request.messages)
         val sb = StringBuilder()
         sb.append("{\"model\":${q(request.model)},\"stream\":true")
         request.maxTokens?.let { sb.append(",\"max_tokens\":$it") }

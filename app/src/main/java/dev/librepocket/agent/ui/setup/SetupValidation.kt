@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui.setup
 
 import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.provider.validateBaseUrl
+import java.util.UUID
 
 /**
  * Pure setup-input validation (unit-testable without Android).
@@ -15,19 +16,49 @@ object SetupValidation {
     /**
      * Per-operation staged vault alias for the versioned/staged commit scheme.
      *
-     * Form `<providerId>#staged-<nonce>` with a per-operation unique [nonce].
-     * `#` is legal: [dev.librepocket.keystore.EncryptedPrefsVault.requireValidProviderId]
+     * Form `<providerId>#staged-<suffix>` with a caller-supplied restart-unique
+     * [suffix] (see [newStagedSuffix]). `#` is legal:
+     * [dev.librepocket.keystore.EncryptedPrefsVault.requireValidProviderId]
      * rejects only blank/NUL, so the staged alias passes vault validation and
      * maps to the entry key `provider_key/<stagedAlias>`. Never derived from
-     * user input; [nonce] must be unique per save attempt PROCESS-wide (a
-     * per-ViewModel counter is insufficient: two ViewModels sharing one vault
-     * would mint identical staged aliases — see the process-wide sequence in
-     * `SetupViewModel`).
+     * user input.
+     *
+     * Uniqueness MUST be restart-unique, not merely process-wide monotonic: a
+     * process-local counter restarts at zero after a relaunch and re-mints
+     * `staged-1`, which then overwrites the previous round's committed live
+     * `staged-1` in place (and a later abort/retire deletes the live key =
+     * loss). The retire inequality guard (`oldAlias != stagedAlias`) also
+     * misfires across a restart when the alias is reused. Alias uniqueness
+     * therefore comes from the random suffix itself ([newStagedSuffix]), never
+     * from the DataStore CAS: the CAS still fences the single metadata slot
+     * (single-process only, documented on EndpointStore), but it cannot make
+     * two identical aliases distinct.
      */
-    fun stagedAlias(providerId: String, nonce: Long): String = "$providerId#staged-$nonce"
+    fun stagedAlias(providerId: String, suffix: String): String {
+        require(suffix.isNotBlank()) { "STAGED_SUFFIX_BLANK" }
+        require('\u0000' !in suffix && '\n' !in suffix && '\r' !in suffix) { "STAGED_SUFFIX_MALFORMED" }
+        return "$providerId#staged-$suffix"
+    }
+
+    /**
+     * Fresh restart-unique suffix: 8 lowercase hex chars from [UUID].
+     *
+     * 32 bits of randomness per attempt (collision ~2^-32 per pair, negligible
+     * for a single-user local save path); vault-safe (no blank/NUL/newline,
+     * so it passes [dev.librepocket.keystore.EncryptedPrefsVault.requireValidProviderId]).
+     * A process-local counter alone is NOT sufficient here (see [stagedAlias]).
+     */
+    fun newStagedSuffix(): String =
+        UUID.randomUUID().toString().replace("-", "").take(8).lowercase()
+
+    /** Mint a fresh restart-unique staged alias for one save attempt. */
+    fun newStagedAlias(providerId: String): String = stagedAlias(providerId, newStagedSuffix())
 
     /** Vault entry ref (`provider_key/...`) pointing at a staged alias. */
-    fun stagedApiKeyRef(providerId: String, nonce: Long): String = "provider_key/" + stagedAlias(providerId, nonce)
+    fun stagedApiKeyRef(providerId: String, suffix: String): String = "provider_key/" + stagedAlias(providerId, suffix)
+
+    /** Vault entry ref pointing at a freshly minted restart-unique staged alias. */
+    fun newStagedApiKeyRef(providerId: String): String = "provider_key/" + newStagedAlias(providerId)
 
     /**
      * Resolves the vault alias addressed by an endpoint [apiKeyRef]

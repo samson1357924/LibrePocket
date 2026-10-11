@@ -18,13 +18,31 @@ class SetupValidationTest {
 
     @Test
     fun stagedAliasIsPerOperationAndResolvesFromRef() {
-        val a = SetupValidation.stagedAlias("preset:openai", 1L)
-        val b = SetupValidation.stagedAlias("preset:openai", 2L)
+        val a = SetupValidation.stagedAlias("preset:openai", "abc123de")
+        val b = SetupValidation.stagedAlias("preset:openai", "f00dbabe")
         assertTrue(a != b)
         assertTrue(a.startsWith("preset:openai#staged-"))
-        assertEquals("provider_key/$a", SetupValidation.stagedApiKeyRef("preset:openai", 1L))
+        assertEquals("provider_key/$a", SetupValidation.stagedApiKeyRef("preset:openai", "abc123de"))
         assertEquals(a, SetupValidation.aliasFromRef("provider_key/$a"))
         assertEquals("preset:openai", SetupValidation.aliasFromRef("provider_key/preset:openai"))
+    }
+
+    @Test
+    fun newStagedAliasIsRestartUnique() {
+        // UUID suffix: every mint is distinct, even back-to-back in one
+        // process — a relaunch can therefore never re-mint a committed live
+        // alias (the counter-restart collision this replaces).
+        val seen = (1..32).map { SetupValidation.newStagedAlias("preset:openai") }.toSet()
+        assertEquals(32, seen.size)
+        for (alias in seen) {
+            assertTrue(alias.startsWith("preset:openai#staged-"))
+            val suffix = alias.removePrefix("preset:openai#staged-")
+            assertEquals(8, suffix.length)
+            assertTrue(suffix.all { it in '0'..'9' || it in 'a'..'f' })
+            // Vault-safe: no blank/NUL/newline (passes requireValidProviderId).
+            assertTrue(suffix.isNotBlank())
+            assertTrue('\u0000' !in suffix && '\n' !in suffix && '\r' !in suffix)
+        }
     }
 
     @Test

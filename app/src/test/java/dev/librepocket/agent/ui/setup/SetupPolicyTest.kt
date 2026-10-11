@@ -1748,4 +1748,110 @@ class SetupPolicyTest {
             assertEquals(1L, store.currentRevision())
         }
     }
+
+    @Test
+    fun restartMintNeverReusesCommittedLiveAlias() {
+        // Regression: a process-local counter nonce restarts at zero after a
+        // relaunch, so the second round's `put staged-1` overwrites the first
+        // round's already-committed live `staged-1` in place (and a later
+        // abort/retire then deletes live bytes = loss; the retire inequality
+        // guard also misfires when the alias is reused). Staged aliases must
+        // therefore be restart-unique (UUID suffix): with the counter scheme
+        // this test collides, with UUID it passes.
+        //
+        // Restart simulation: one shared store + one shared delegate vault, a
+        // first ViewModel commits round 1, then a NEW ViewModel instance on
+        // the SAME store/vault commits round 2 with a different key (the
+        // relaunch: fresh ViewModel, same persisted metadata + vault). A
+        // best-effort reflection reset of the legacy static counter (no-op now
+        // that the counter is gone) reproduces the restart-zeroing on the old
+        // code so the test collides there and passes here.
+        val dir = Files.createTempDirectory("setup-restart-nonce").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val store = EndpointStore(
+            PreferenceDataStoreFactory.create(
+                scope = scope,
+                produceFile = { java.io.File(dir, "restart-nonce.preferences_pb") },
+            ),
+        )
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val noProvider: (dev.librepocket.provider.ProviderConfig, dev.librepocket.provider.KeyProvider) -> LlmProvider =
+            { _, _ -> error("no provider needed") as LlmProvider }
+
+        // Round 1: fresh save commits staged-X; metadata points at X.
+        val policy1 = MutablePolicy(Verdict.ALLOW)
+        val vault1 = CountingVault(delegate)
+        val vm1 = SetupViewModel(store, VaultSource { vault1 }, policy1, buildProvider = noProvider)
+        vm1.onApiKeyChange("sk-first-key-AAAAAAAA")
+        vm1.save()
+        awaitSettled(vm1)
+        assertTrue(vm1.form.value.saved)
+        assertEquals(2, policy1.freshCalls)
+        val firstRef = runBlocking { store.observe().first()!!.apiKeyRef }
+        assertTrue(firstRef.startsWith("provider_key/preset:openai#staged-"))
+        val firstAlias = SetupValidation.aliasFromRef(firstRef)
+        assertVaultKeyEquals(delegate, firstAlias, "sk-first-key-AAAAAAAA")
+        runBlocking { assertEquals(1L, store.currentRevision()) }
+        // Fresh save retires nothing.
+        assertEquals(0, vault1.deleteKeys)
+
+        // Simulate process restart: zero the legacy static counter if it still
+        // exists (old code). On the UUID scheme there is no such field and
+        // this is a no-op — the second mint is distinct regardless.
+        try {
+            val candidates = listOfNotNull(
+                runCatching { SetupViewModel::class.java.getDeclaredField("stagedNonceSeq") }.getOrNull(),
+                runCatching {
+                    SetupViewModel::class.java.declaredClasses
+                        .firstOrNull { it.simpleName == "Companion" }
+                        ?.getDeclaredField("stagedNonceSeq")
+                }.getOrNull(),
+            )
+            for (f in candidates) {
+                f.isAccessible = true
+                val holder = if (java.lang.reflect.Modifier.isStatic(f.modifiers)) {
+                    null
+                } else {
+                    SetupViewModel::class.java.getField("Companion").get(null)
+                }
+                (f.get(holder) as? java.util.concurrent.atomic.AtomicLong)?.set(0L)
+            }
+        } catch (_: Exception) {
+            // No legacy counter (UUID scheme): nothing to reset.
+        }
+
+        // Round 2: NEW ViewModel on the SAME store/vault, different key.
+        val policy2 = MutablePolicy(Verdict.ALLOW)
+        val vault2 = CountingVault(delegate)
+        val vm2 = SetupViewModel(store, VaultSource { vault2 }, policy2, buildProvider = noProvider)
+        vm2.onApiKeyChange("sk-second-key-BBBBBBBB")
+        vm2.save()
+        awaitSettled(vm2)
+        assertTrue(vm2.form.value.saved)
+        assertEquals(2, policy2.freshCalls)
+        val secondRef = runBlocking { store.observe().first()!!.apiKeyRef }
+        assertTrue(secondRef.startsWith("provider_key/preset:openai#staged-"))
+        val secondAlias = SetupValidation.aliasFromRef(secondRef)
+
+        // Core restart-uniqueness: the second staged alias MUST differ from
+        // the committed live alias (counter+reset would mint it identical).
+        assertTrue("restart reused live staged alias: $secondAlias", firstAlias != secondAlias)
+        // No clobber: the second put went to its own alias, never overwrote
+        // the first live slot in place.
+        assertEquals(listOf(secondAlias), vault2.putIds)
+        assertFalse(vault2.putIds.contains(firstAlias))
+        // Old live correctly retired (deleted) after the commit — not
+        // overwritten, not leaked, and never the new live key.
+        assertEquals(listOf(firstAlias), vault2.deletedIds)
+        runBlocking {
+            assertEquals(2L, store.currentRevision())
+            assertEquals("provider_key/$secondAlias", store.observe().first()!!.apiKeyRef)
+            assertTrue(delegate.hasKey(secondAlias))
+            assertFalse(delegate.hasKey(firstAlias))
+            assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+        }
+        assertVaultKeyEquals(delegate, secondAlias, "sk-second-key-BBBBBBBB")
+    }
 }

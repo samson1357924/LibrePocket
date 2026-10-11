@@ -141,9 +141,13 @@ class SetupViewModel(
      * Single-process only: this [Mutex] cannot fence a second process, a
      * second ViewModel/store instance in tests, or any out-of-band vault
      * writer. Cross-writer safety rests on the [EndpointStore.saveIfRevision]
-     * CAS plus the staged alias scheme (a CAS loss leaves the winner's staged
-     * live key untouched; the loser only deletes its own per-operation staged
-     * alias, never a live slot). Never present this mutex as multi-writer safety.
+     * CAS plus the restart-unique staged alias scheme (a CAS loss leaves the
+     * winner's staged live key untouched; the loser only deletes its own
+     * per-operation restart-unique staged alias, never a live slot). Staged
+     * alias uniqueness itself holds across restarts and processes via the
+     * UUID suffix (see [SetupValidation.newStagedAlias]); only the metadata
+     * CAS remains single-process (documented on EndpointStore). Never present
+     * this mutex as multi-writer safety.
      */
     private val saveMutex = Mutex()
 
@@ -383,9 +387,12 @@ class SetupViewModel(
      * consent was minted earlier. Stage2 adds a form fence ([formRevision]) and
      * a second post-write policy re-evaluation. The whole [executeKeyWrite]
      * critical section runs under [saveMutex] (same-VM save/logout
-     * serialization). The vault commit uses a per-operation staged alias: the
-     * new key is written aside under
-     * `<providerId>#staged-<nonce>`, the metadata CAS swings `apiKeyRef` to
+     * serialization). The vault commit uses a per-operation restart-unique
+     * staged alias: the new key is written aside under
+     * `<providerId>#staged-<uuid8>` (see [SetupValidation.newStagedAlias];
+     * the suffix is random per attempt, never a process-local counter, so a
+     * relaunch can never re-mint an alias that collides with an already
+     * committed live alias), the metadata CAS swings `apiKeyRef` to
      * it, and only then is the previous live alias retired best-effort. A CAS
      * loss or any earlier abort deletes only the attempt's own staged alias
      * (known per-operation name, safe) and never touches a live slot, never
@@ -541,12 +548,17 @@ class SetupViewModel(
             return
         }
         // 5. Staged vault write (versioned-alias scheme). The new key is written
-        // aside under a per-operation staged alias and the live slot is NEVER
-        // overwritten here, so a concurrent writer's live key cannot be
-        // clobbered by our put, and no backup/restore of live key material is
-        // needed: there is no live read anywhere on this path, hence no
-        // key.read evaluation either (the backup scheme and its gate are gone
-        // by construction).
+        // aside under a per-operation restart-unique staged alias and the live
+        // slot is NEVER overwritten here, so a concurrent writer's live key
+        // cannot be clobbered by our put, and no backup/restore of live key
+        // material is needed: there is no live read anywhere on this path,
+        // hence no key.read evaluation either (the backup scheme and its gate
+        // are gone by construction). The alias comes from
+        // [SetupValidation.newStagedAlias] (UUID suffix, fresh per attempt):
+        // a process-local counter is deliberately NOT used because it
+        // restarts at zero after a relaunch and would re-mint the previous
+        // round's live alias, overwriting it in place (with a later abort or
+        // retire then deleting live bytes = loss).
         //
         // Trade-offs, stated honestly:
         // - Between the staged put and the metadata CAS, two keys briefly
@@ -561,8 +573,10 @@ class SetupViewModel(
         //   trailing CAS, but out-of-band writers still need single-writer
         //   discipline for endpoint identity: two writers still race on the
         //   single metadata slot (the loser fails closed), they just can no
-        //   longer destroy each other's key bytes. DataStore CAS is
-        //   single-process only (documented on EndpointStore).
+        //   longer destroy each other's key bytes. Staged alias uniqueness
+        //   holds across restarts and processes via the UUID suffix; only the
+        //   DataStore metadata CAS itself is single-process only (documented
+        //   on EndpointStore).
         // - [EncryptedPrefsVault.putKey] wipes the array it is given, so the
         //   put input ([keyCopy]) gets a defensive re-wipe here.
         // - Uses the entry snapshot (not live): key/identity edits bump
@@ -570,7 +584,7 @@ class SetupViewModel(
         //   key is still current. Model may be stale (onModelChange does not
         //   bump per #17 scope) but model is not consent identity and does not
         //   affect key.write fencing; endpointConfigOf below shares this note.
-        val stagedAlias = SetupValidation.stagedAlias(providerId, stagedNonceSeq.incrementAndGet())
+        val stagedAlias = SetupValidation.newStagedAlias(providerId)
         val stagedRef = "provider_key/$stagedAlias"
         val keyCopy = form.apiKey.trim().toCharArray()
         var stagedWritten = false
@@ -587,9 +601,10 @@ class SetupViewModel(
             }
         } catch (e: CancellationException) {
             // The staged put raced cancellation: the staged slot may or may not
-            // hold our bytes. The alias is ours alone (per-operation nonce) and
-            // was never published in metadata, so a NonCancellable best-effort
-            // delete is safe; live slots are never touched here.
+            // hold our bytes. The alias is ours alone (per-operation
+            // restart-unique UUID alias) and was never published in metadata,
+            // so a NonCancellable best-effort delete is safe; live slots are
+            // never touched here.
             try {
                 withContext(NonCancellable) { vault().deleteKey(stagedAlias) }
             } catch (_: Exception) {
@@ -696,9 +711,10 @@ class SetupViewModel(
             // bump formRevision per #17 scope) but model is not consent identity
             // (consent binds providerId/baseUrl only), so staleness is out of scope
             // and intentionally not fenced here. See keyCopy note at step 5.
-            // The metadata swings apiKeyRef to OUR staged alias (per-operation);
-            // the fixed deriveApiKeyRef form is kept only for backward-compatible
-            // reads of old metadata and in-memory (non-persisted) mapping.
+            // The metadata swings apiKeyRef to OUR staged alias (per-operation
+            // restart-unique); the fixed deriveApiKeyRef form is kept only for
+            // backward-compatible reads of old metadata and in-memory
+            // (non-persisted) mapping.
             val config = endpointConfigOf(form, effectiveBaseUrl, providerId, stagedRef)
             val wrote = try {
                 store.saveIfRevision(config, expectedRevision)
@@ -714,11 +730,12 @@ class SetupViewModel(
             }
             if (!wrote) {
                 // CAS mismatch: a concurrent winner advanced the revision. Our
-                // staged alias is ours alone (per-operation nonce) and was never
-                // published, so deleting it cannot harm the winner, whose
-                // metadata points at its own staged alias. No vault read, no
-                // content comparison, no live touch — different-key and
-                // same-bytes losers alike cannot corrupt the winner.
+                // staged alias is ours alone (per-operation restart-unique UUID)
+                // and was never published, so deleting it cannot harm the
+                // winner, whose metadata points at its own staged alias. No
+                // vault read, no content comparison, no live touch —
+                // different-key and same-bytes losers alike cannot corrupt the
+                // winner.
                 deleteStagedBestEffort(stagedAlias)
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
@@ -726,7 +743,10 @@ class SetupViewModel(
             committed = true
             // Post-commit retire of the previous live alias (best-effort, never
             // fails the save). Guarded by inequality with the just-committed
-            // staged alias, so the new live key is never deleted here. Runs in
+            // staged alias, so the new live key is never deleted here. The
+            // guard is sound across restarts because staged aliases are
+            // restart-unique (UUID): the fresh alias can never equal the
+            // previous live alias except on a ~2^-32 UUID collision. Runs in
             // the cancellable context (deliberately outside NonCancellable): if
             // cancellation lands here the previous alias may leak at rest
             // (documented orphan class, strictly better than loss); the new
@@ -749,8 +769,8 @@ class SetupViewModel(
                 // committed and then thrown, so verify against strict metadata
                 // first; unknown store state fails closed to no-touch (at-rest
                 // leak, never loss). A winner's staged live key can never equal
-                // our per-operation alias, so `false` (absent or pointing
-                // elsewhere) authorizes the delete.
+                // our per-operation restart-unique alias, so `false` (absent or
+                // pointing elsewhere) authorizes the delete.
                 val livePointsAtStaged = try {
                     withContext(NonCancellable) { store.snapshotStrict()?.apiKeyRef == stagedRef }
                 } catch (_: Exception) {
@@ -770,12 +790,15 @@ class SetupViewModel(
     /**
      * Best-effort delete of an attempt-owned staged alias.
      *
-     * Safe by construction: staged aliases are per-operation unique and never
-     * published before the metadata CAS, so no winner or live reader can
-     * reference them. Vault failures are swallowed so the original abort reason
-     * stays the reported error. [CancellationException] is always rethrown,
-     * never swallowed (cancellation cleanup uses the NonCancellable guarded
-     * paths in [executeKeyWrite] instead).
+     * Safe by construction: staged aliases are per-operation restart-unique
+     * (UUID suffix, see [SetupValidation.newStagedAlias]) and never published
+     * before the metadata CAS, so no winner or live reader can reference them
+     * — including across process restarts, where a counter-based alias would
+     * be re-minted and collide with a committed live key. Vault failures are
+     * swallowed so the original abort reason stays the reported error.
+     * [CancellationException] is always rethrown, never swallowed
+     * (cancellation cleanup uses the NonCancellable guarded paths in
+     * [executeKeyWrite] instead).
      */
     private suspend fun deleteStagedBestEffort(stagedAlias: String) {
         try {
@@ -1016,27 +1039,6 @@ class SetupViewModel(
     override fun onCleared() {
         modelRefreshJob?.cancel()
         super.onCleared()
-    }
-
-    companion object {
-        /**
-         * Process-wide staged-alias sequence.
-         *
-         * MUST be process-wide (not per-ViewModel like [consentNonces]): two
-         * ViewModel/store instances sharing one vault in this process (the
-         * cross-VM race the staged scheme exists to survive) would otherwise
-         * mint identical staged aliases and overwrite/delete each other's
-         * staged keys. Per-operation uniqueness within the process is what
-         * makes the loser's own-staged delete safe.
-         *
-         * Single-process scope only, like the DataStore CAS itself: a second
-         * OS process restarts its own sequence and could theoretically collide.
-         * That is the same trust boundary as [EndpointStore]'s single-process
-         * CAS (documented there), not a new claim — and a collision there
-         * still cannot corrupt a committed winner's bytes before the CAS, only
-         * (pathologically) retire/clean the same-named alias after it.
-         */
-        private val stagedNonceSeq = AtomicLong(0L)
     }
 }
 

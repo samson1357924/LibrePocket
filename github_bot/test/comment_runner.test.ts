@@ -366,13 +366,9 @@ export async function runCommentRunnerTests(): Promise<void> {
           ].join('\n');
         },
       });
-      // Phase 4 (P2 #2): diffs past MAX_DIFF_LENGTH are chunked with full
-      // coverage instead of truncated to INCONCLUSIVE. The OpenAI stub
-      // approves every chunk, so the fully-covered review approves.
+      // Single-turn review with 1,000,000 budget: diffs fit in single-turn review with full coverage.
       assert.equal(truncatedReview.verdict, 'APPROVE');
-      assert.ok(truncatedReview.chunks && truncatedReview.chunks.length >= 2, 'oversized diff splits into chunks');
-      assert.equal(truncatedReview.chunkCount, truncatedReview.chunks?.length);
-      assert.equal(truncatedReview.chunkCoverageComplete, true);
+      assert.equal(truncatedReview.chunks, undefined);
       assert.equal(truncatedReview.coverage.complete, true);
       assert.deepEqual(truncatedReview.coverage.truncatedFiles, []);
       assert.deepEqual(truncatedReview.coverage.omittedFiles, []);

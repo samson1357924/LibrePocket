@@ -24,13 +24,11 @@ import {
   type ReconcileScope,
 } from './label_manager';
 import {
-  buildReviewDiffChunks,
   collectFileDiffs,
   coverageSummary,
   filterReviewDiffFiles,
   MAX_CHANGED_FILES,
   MAX_DIFF_LENGTH,
-  MAX_PR_CHUNK_LENGTH,
   prioritizeFiles,
   truncateDiff,
   validateReviewDiffChunkReports,
@@ -1734,26 +1732,17 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
     // consumed job wall-clock) refuses instead of reserving a slot the review
     // job cannot finish; a missing jobStarted downgrades to configured.
     {
-      let chunkCount = 1;
       try {
-        const fileDiffs = collectFileDiffs(runGit, mergeBase, freshPullRequest.head.sha, changedFiles);
-        const reviewFiles = filterReviewDiffFiles(changedFiles).filter((file) => (fileDiffs.get(file) ?? '').length > 0);
-        if (reviewFiles.length > 0) {
-          try {
-            chunkCount = buildReviewDiffChunks(fileDiffs, changedFiles, MAX_PR_CHUNK_LENGTH).length;
-          } catch {
-            chunkCount = 1;
-          }
-        }
+        collectFileDiffs(runGit, mergeBase, freshPullRequest.head.sha, changedFiles);
       } catch {
         throw new Error('PocketGuard: diff pre-flight failed.');
       }
       const deadlineMs = resolveEffectiveReviewDeadlineMs(env, Date.now());
-      const waves = Math.max(1, Math.ceil(Math.max(1, chunkCount) / PR_CHUNK_CONCURRENCY));
+      const waves = 1;
       const perChunkShare = Math.floor(deadlineMs / waves);
       const perChunkTimeout = Math.min(MAX_PER_CHUNK_TIMEOUT_MS, perChunkShare);
       if (perChunkTimeout < MIN_VIABLE_PER_CHUNK_TIMEOUT_MS) {
-        return emit({ claimed: false, reviewsUsed: 0, reason: `budget-exceeded: chunkCount ${chunkCount} needs ${waves} wave(s) x ${MAX_PER_CHUNK_TIMEOUT_MS}ms over deadline ${deadlineMs}ms (share ${perChunkShare}ms < viable ${MIN_VIABLE_PER_CHUNK_TIMEOUT_MS}ms); fail-closed without occupying a slot`, issueNumber });
+        return emit({ claimed: false, reviewsUsed: 0, reason: `budget-exceeded: chunkCount 1 needs ${waves} wave(s) x ${MAX_PER_CHUNK_TIMEOUT_MS}ms over deadline ${deadlineMs}ms (share ${perChunkShare}ms < viable ${MIN_VIABLE_PER_CHUNK_TIMEOUT_MS}ms); fail-closed without occupying a slot`, issueNumber });
       }
     }
   } catch {
@@ -4125,314 +4114,84 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
           changedFilesComplete,
           suggestedLabels: [],
         };
-      } else if (!reviewDiff.coverage.complete && changedFilesComplete && reviewDiff.coverage.originalLength > MAX_DIFF_LENGTH) {
-        // Phase 4 (P2 #2) chunked path: the single-turn visible diff is
-        // incomplete but the changed list is complete and the full review
-        // length exceeds the single-turn budget, so every review character is
-        // partitioned into sequential MAX_PR_CHUNK_LENGTH chunks (prioritized
-        // file order, small files atomic, oversized files sliced at line
-        // boundaries) and each chunk takes a full orchestrateReview turn.
-        // Deterministic BLOCK already short-circuited above over the FULL
-        // diff (zero AI). Phase 3 (P2 #3): N chunks run under a whole-review
-        // effective deadline (t0 + min(configured POCKETGUARD_REVIEW_DEADLINE_MS,
-        // jobRemaining - UPLOAD_SKEW); trusted POCKETGUARD_JOB_STARTED_MS from
-        // the first review-send step, missing downgrades to configured) with
-        // fixed PR_CHUNK_CONCURRENCY waves, per-wave need estimation
-        // (effectiveRemaining < need exits early fail-closed), per-chunk
-        // timeoutMs passthrough min(420s, effectiveRemaining/remainingWaves), and a
-        // computed chunkCoverageComplete (any INCONCLUSIVE — including
-        // transport timeout/abort/deadline omission — forces false so the
-        // publish triple-gate falls back). Deadline exits save via
-        // saveReviewOutput (checkpoint artifact) as INCONCLUSIVE + false and
-        // never write true; omission is explicit via placeholders, never
-        // silent. Multi-chunk rounds consume exactly one claim-slot: counting
-        // happened in the claim job before review and publish only reconciles.
-        try {
-          const chunks = buildReviewDiffChunks(reviewDiff.fileDiffs, changedFiles, MAX_PR_CHUNK_LENGTH);
-          if (!verifyReviewDiffChunkCoverage(chunks, {
-            totalLength: reviewDiff.coverage.originalLength,
-            files: filterReviewDiffFiles(changedFiles),
-          })) {
-            throw new Error('PocketGuard: PR chunks do not fully cover the review diff.');
-          }
-          const { orchestrateReview, synthesizeChunkedReview } = await import('./orchestrator');
-          const restoreFetch = installOpenAIStub(env);
-          try {
-            // Phase 2 (P2 #2): effective budget min(configured, jobRemaining -
-            // UPLOAD_SKEW). t0 anchors the review clock; the deadline already
-            // embeds the job cap at start, and each wave re-takes
-            // min(reviewRemaining, liveJobRemaining - skew) so hosted setup
-            // overhead plus elapsed waves cannot overrun the 20min job.
-            const t0 = Date.now();
-            const effectiveMs = resolveEffectiveReviewDeadlineMs(env, t0);
-            const deadline = t0 + effectiveMs;
-            const total = chunks.length;
-            const reviewFiles = filterReviewDiffFiles(changedFiles);
-            type ChunkResult = Awaited<ReturnType<typeof orchestrateReview>>;
-            const perChunk: Array<ChunkResult | undefined> = new Array(total);
-            let nextIndex = 0;
-            let deadlineExited = false;
-            // Fixed-concurrency waves with per-wave need estimation. Waves are
-            // index-ordered; Promise.all preserves input order and results are
-            // re-sorted by index before synthesis so completion order never
-            // affects the merged verdict (verifiable aggregation).
-            while (nextIndex < total) {
-              const nowMs = Date.now();
-              const reviewRemainingMs = deadline - nowMs;
-              // Per-chunk live job cap: min(reviewRemaining, jobRemaining -
-              // skew); missing jobStarted keeps reviewRemaining (fail-closed
-              // downgrade to configured). jobRemainingText stays 'n/a' without
-              // a trusted start so logs distinguish the two modes.
-              const jobStartedMs = resolveJobStartedMs(env);
-              let jobRemainingMs: number | undefined;
-              let remainingMs = reviewRemainingMs;
-              if (jobStartedMs !== undefined) {
-                jobRemainingMs = REVIEW_JOB_TIMEOUT_MS - (nowMs - jobStartedMs) - REVIEW_JOB_UPLOAD_SKEW_MS;
-                remainingMs = Math.min(reviewRemainingMs, jobRemainingMs);
-              }
-              const remainingChunks = total - nextIndex;
-              const remainingWaves = Math.ceil(remainingChunks / PR_CHUNK_CONCURRENCY);
-              // Budget per model attempt: a role can burn a whole fallback chain
-              // before it finishes, otherwise one dead primary pushes the wave
-              // past the job deadline (P2 #2 regression).
-              const chainFactor = Math.max(1, maxModelChainAttempts(env));
-              const timeoutMs = resolvePerChunkTimeoutMs(env, remainingMs, remainingWaves, chainFactor);
-              const needMs = timeoutMs + CHUNK_DEADLINE_SAVE_MARGIN_MS;
-              try {
-                const jobRemainingText = jobRemainingMs === undefined ? 'n/a' : `${Math.max(0, Math.floor(jobRemainingMs))}ms`;
-                console.warn(`[PocketGuard] chunk progress ${nextIndex}/${total} remaining=${Math.max(0, Math.floor(remainingMs))}ms need=${needMs}ms timeout=${timeoutMs}ms jobRemaining=${jobRemainingText}`);
-              } catch {
-                // Logging never blocks review.
-              }
-              if (remainingMs < needMs) {
-                deadlineExited = true;
-                break;
-              }
-              const waveSize = Math.min(PR_CHUNK_CONCURRENCY, remainingChunks);
-              const waveIndices = Array.from({ length: waveSize }, (_, i) => nextIndex + i);
-              const waveResults = await Promise.all(waveIndices.map(async (chunkIdx) => {
-                const chunk = chunks[chunkIdx];
-                try {
-                  const review = await orchestrateReview({
-                    changedFiles: chunk.files,
-                    diff: redactForModel(chunk.diff),
-                    coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: chunk.coveredLength },
-                    deterministicViolations: [],
-                    env,
-                    allowedOrigins: parseAllowedOrigins(env),
-                    timeoutMs,
-                  });
-                  return { idx: chunkIdx, review };
-                } catch {
-                  // orchestrateReview is fail-closed internally (never throws
-                  // in practice); this guards a hung/broken import path with
-                  // an explicit transport INCONCLUSIVE so coverage computes
-                  // false instead of silently omitting the chunk.
-                  return {
-                    idx: chunkIdx,
-                    review: {
-                      verdict: 'INCONCLUSIVE' as const,
-                      roles: (['chief', 'android_sec', 'android_code'] as const).map((role) => ({
-                        role,
-                        modelUsed: 'unavailable',
-                        verdict: 'INCONCLUSIVE' as const,
-                        findings: [],
-                        suggestedLabels: [],
-                      })),
-                      coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: chunk.coveredLength },
-                      deterministicViolations: [],
-                    } satisfies ChunkResult,
-                  };
-                }
-              }));
-              waveResults.sort((left, right) => left.idx - right.idx);
-              for (const entry of waveResults) {
-                perChunk[entry.idx] = entry.review;
-              }
-              nextIndex += waveSize;
-            }
-            if (deadlineExited || nextIndex < total || perChunk.some((entry) => entry === undefined)) {
-              // Deadline/partial fail-closed: completed reports plus explicit
-              // omission placeholders for every unstarted chunk (same
-              // index/total/start/end/files spans, verdict INCONCLUSIVE) so
-              // nothing is silently omitted. Top-level coverage is false and
-              // the verdict is forced INCONCLUSIVE; never write true. When
-              // nothing completed, placeholders still cover all spans (valid
-              // shape, coverage false) rather than a silent empty set.
-              const completed = perChunk.map((entry, idx) => ({ entry, idx })).filter((item) => item.entry !== undefined);
-              void completed;
-              const chunkReports: ReviewDiffChunkReport[] = chunks.map((chunk) => {
-                const done = perChunk[chunk.index];
-                return {
-                  index: chunk.index,
-                  total: chunk.total,
-                  start: chunk.start,
-                  end: chunk.end,
-                  complete: true,
-                  coveredLength: chunk.coveredLength,
-                  files: [...chunk.files],
-                  verdict: (done?.verdict ?? 'INCONCLUSIVE') as RunnerVerdict,
-                };
-              });
-              // Computed value stays false: unstarted placeholders are
-              // INCONCLUSIVE by construction, and any transported INCONCLUSIVE
-              // among completed chunks also forces false via the helper.
-              const chunkCoverageComplete = false;
-              // Early fail-closed: the top-level verdict is forced INCONCLUSIVE
-              // with generic INCONCLUSIVE roles (no BLOCK/NEEDS findings) so
-              // the artifact stays schema-valid (validateReviewOutput
-              // recalculates INCONCLUSIVE) while per-chunk detail survives in
-              // chunks (completed verdicts plus omission placeholders). A
-              // partial review must never approve or claim needs-changes
-              // without full coverage; publish falls back on the same sticky.
-              const runnerRoles: RunnerReviewOutput['roles'] = ROLE_NAMES.map((role) => ({
-                role,
-                modelUsed: 'not-run',
-                verdict: 'INCONCLUSIVE' as RunnerVerdict,
-                findings: [],
-              }));
-              output = {
-                verdict: 'INCONCLUSIVE',
-                roles: runnerRoles,
-                coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: reviewDiff.coverage.originalLength },
-                deterministicViolations: scan.violations,
-                pullRequestNumber: target.pullRequest.number,
-                baseSha,
-                headSha,
-                headRepository: target.pullRequest.head.repo?.full_name ?? '',
-                areaLabels: resolveAreaLabelsFromPaths(changedFiles),
-                changedFiles,
-                changedFilesComplete,
-                suggestedLabels: [],
-                chunks: chunkReports,
-                chunkCoverageComplete,
-                chunkCount: chunkReports.length,
-              };
-            } else {
-              const done = perChunk.filter((entry): entry is ChunkResult => entry !== undefined);
-              const synthesized = synthesizeChunkedReview(done, {
-                coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: reviewDiff.coverage.originalLength },
-                deterministicViolations: scan.violations,
-              });
-              const mergedSuggested = [...new Set(synthesized.roles.flatMap((role) => role.suggestedLabels))];
-              const runnerRoles: RunnerReviewOutput['roles'] = synthesized.roles.map((role) => ({
-                role: role.role as ReviewRoleName,
-                modelUsed: role.modelUsed,
-                verdict: role.verdict as RunnerVerdict,
-                findings: role.findings.map((finding) => ({ ...finding })),
-              }));
-              let reviewVerdict = synthesized.verdict as RunnerVerdict;
-              if (hasUnknownAiLabels(mergedSuggested) && reviewVerdict === 'APPROVE') {
-                console.warn('[PocketGuard] Discarded unknown AI labels; downgrading review verdict to INCONCLUSIVE.');
-                reviewVerdict = 'INCONCLUSIVE';
-              }
-              // Per-chunk minimal retention: redacted proofs only (offsets,
-              // files, per-chunk verdict) — never chunk diff text.
-              const chunkReports: ReviewDiffChunkReport[] = chunks.map((chunk, idx) => ({
-                index: chunk.index,
-                total: chunk.total,
-                start: chunk.start,
-                end: chunk.end,
-                complete: true,
-                coveredLength: chunk.coveredLength,
-                files: [...chunk.files],
-                verdict: done[idx].verdict as RunnerVerdict,
-              }));
-              // Computed coverage: any transport/timeout INCONCLUSIVE forces
-              // false (publish triple-gate then falls back); never hardcode
-              // true. done[idx] order matches chunks order (index-sorted).
-              const chunkCoverageComplete = reviewVerdict === 'INCONCLUSIVE'
-                ? false
-                : computePrChunkCoverageComplete(chunkReports, {
-                  totalLength: reviewDiff.coverage.originalLength,
-                  files: reviewFiles,
-                  maxLength: MAX_PR_CHUNK_LENGTH,
-                });
-              // A synthesized INCONCLUSIVE (any chunk INCONCLUSIVE, including
-              // transport) is already false above without trusting spans
-              // alone; conclusive NEEDS_CHANGES/APPROVE still requires the
-              // span/file proof via the helper.
-              if (reviewVerdict !== 'INCONCLUSIVE' && !chunkCoverageComplete) reviewVerdict = 'INCONCLUSIVE';
-              output = {
-                verdict: reviewVerdict,
-                roles: runnerRoles,
-                coverage: synthesized.coverage,
-                deterministicViolations: synthesized.deterministicViolations,
-                pullRequestNumber: target.pullRequest.number,
-                baseSha,
-                headSha,
-                headRepository: target.pullRequest.head.repo?.full_name ?? '',
-                areaLabels: resolveAreaLabelsFromPaths(changedFiles),
-                changedFiles,
-                changedFilesComplete,
-                suggestedLabels: mergedSuggested,
-                chunks: chunkReports,
-                chunkCoverageComplete,
-                chunkCount: chunkReports.length,
-              };
-            }
-          } finally {
-            restoreFetch();
-          }
-        } catch {
+      } else {
+        const t0 = Date.now();
+        const effectiveMs = resolveEffectiveReviewDeadlineMs(env, t0);
+        let remainingMs = effectiveMs;
+        const jobStartedMs = resolveJobStartedMs(env);
+        if (jobStartedMs !== undefined) {
+          const jobRemainingMs = REVIEW_JOB_TIMEOUT_MS - (t0 - jobStartedMs) - REVIEW_JOB_UPLOAD_SKEW_MS;
+          remainingMs = Math.min(effectiveMs, jobRemainingMs);
+        }
+        const timeoutMs = resolvePerChunkTimeoutMs(env, remainingMs, 1);
+        const needMs = timeoutMs + CHUNK_DEADLINE_SAVE_MARGIN_MS;
+        if (remainingMs < needMs) {
+          const runnerRoles: RunnerReviewOutput['roles'] = ROLE_NAMES.map((role) => ({
+            role,
+            modelUsed: 'not-run',
+            verdict: 'INCONCLUSIVE',
+            findings: [],
+          }));
           output = {
-            ...genericReviewOutput(),
+            verdict: 'INCONCLUSIVE',
+            roles: runnerRoles,
+            coverage: reviewDiff.coverage,
+            deterministicViolations: scan.violations,
             pullRequestNumber: target.pullRequest.number,
             baseSha,
             headSha,
             headRepository: target.pullRequest.head.repo?.full_name ?? '',
-            coverage: reviewDiff.coverage,
-            deterministicViolations: scan.violations,
             areaLabels: resolveAreaLabelsFromPaths(changedFiles),
             changedFiles,
             changedFilesComplete,
             suggestedLabels: [],
           };
-        }
-      } else {
-        const { orchestrateReview } = await import('./orchestrator');
-        const restoreFetch = installOpenAIStub(env);
-        try {
-          const orchestrated = await orchestrateReview({
-            changedFiles,
-            diff: redactForModel(reviewDiff.diff),
-            coverage: reviewDiff.coverage,
-            deterministicViolations: scan.violations,
-            env,
-            allowedOrigins: parseAllowedOrigins(env),
-          });
-          const mergedSuggested = [...new Set(orchestrated.roles.flatMap((role) => role.suggestedLabels))];
-          const runnerRoles: RunnerReviewOutput['roles'] = orchestrated.roles.map((role) => ({
-            role: role.role as ReviewRoleName,
-            modelUsed: role.modelUsed,
-            verdict: role.verdict as RunnerVerdict,
-            findings: role.findings.map((finding) => ({ ...finding })),
-          }));
-          let reviewVerdict = orchestrated.verdict as RunnerVerdict;
-          // S5: illegal AI labels can never approve. Any unknown suggestion
-          // downgrades an APPROVE to INCONCLUSIVE (rules-only path at
-          // publish); NEEDS_CHANGES/INCONCLUSIVE stay as computed by the
-          // existing deterministic-BLOCK-first semantics.
-          if (hasUnknownAiLabels(mergedSuggested) && reviewVerdict === 'APPROVE') {
-            console.warn('[PocketGuard] Discarded unknown AI labels; downgrading review verdict to INCONCLUSIVE.');
-            reviewVerdict = 'INCONCLUSIVE';
+        } else {
+          const { orchestrateReview } = await import('./orchestrator');
+          const restoreFetch = installOpenAIStub(env);
+          try {
+            const orchestrated = await orchestrateReview({
+              changedFiles,
+              diff: redactForModel(reviewDiff.diff),
+              coverage: reviewDiff.coverage,
+              deterministicViolations: scan.violations,
+              env,
+              allowedOrigins: parseAllowedOrigins(env),
+              timeoutMs,
+            });
+            const mergedSuggested = [...new Set(orchestrated.roles.flatMap((role) => role.suggestedLabels))];
+            const runnerRoles: RunnerReviewOutput['roles'] = orchestrated.roles.map((role) => ({
+              role: role.role as ReviewRoleName,
+              modelUsed: role.modelUsed,
+              verdict: role.verdict as RunnerVerdict,
+              findings: role.findings.map((finding) => ({ ...finding })),
+            }));
+            let reviewVerdict = orchestrated.verdict as RunnerVerdict;
+            // S5: illegal AI labels can never approve. Any unknown suggestion
+            // downgrades an APPROVE to INCONCLUSIVE (rules-only path at
+            // publish); NEEDS_CHANGES/INCONCLUSIVE stay as computed by the
+            // existing deterministic-BLOCK-first semantics.
+            if (hasUnknownAiLabels(mergedSuggested) && reviewVerdict === 'APPROVE') {
+              console.warn('[PocketGuard] Discarded unknown AI labels; downgrading review verdict to INCONCLUSIVE.');
+              reviewVerdict = 'INCONCLUSIVE';
+            }
+            output = {
+              verdict: reviewVerdict,
+              roles: runnerRoles,
+              coverage: orchestrated.coverage,
+              deterministicViolations: orchestrated.deterministicViolations,
+              pullRequestNumber: target.pullRequest.number,
+              baseSha,
+              headSha,
+              headRepository: target.pullRequest.head.repo?.full_name ?? '',
+              areaLabels: resolveAreaLabelsFromPaths(changedFiles),
+              changedFiles,
+              changedFilesComplete,
+              suggestedLabels: mergedSuggested,
+            };
+          } finally {
+            restoreFetch();
           }
-          output = {
-            verdict: reviewVerdict,
-            roles: runnerRoles,
-            coverage: orchestrated.coverage,
-            deterministicViolations: orchestrated.deterministicViolations,
-            pullRequestNumber: target.pullRequest.number,
-            baseSha,
-            headSha,
-            headRepository: target.pullRequest.head.repo?.full_name ?? '',
-            areaLabels: resolveAreaLabelsFromPaths(changedFiles),
-            changedFiles,
-            changedFilesComplete,
-            suggestedLabels: mergedSuggested,
-          };
-        } finally {
-          restoreFetch();
         }
       }
     } catch {

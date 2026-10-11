@@ -228,7 +228,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
   ]);
 
   const boundaryDiffs: Record<string, string> = {
-    'app/src/main/java/example/First.kt': 'A'.repeat(119850),
+    'app/src/main/java/example/First.kt': 'A'.repeat(999850),
     'app/src/main/java/example/Second.kt': 'B'.repeat(1000),
   };
   const assembled = buildReviewDiff({
@@ -351,8 +351,10 @@ export async function runScannerSendOpenAITests(): Promise<void> {
   };
   try {
     let ordinaryRedirectMode: RequestInit['redirect'] | undefined;
+    let recordedHeaders: HeadersInit | undefined;
     globalThis.fetch = (async (_input, init) => {
       ordinaryRedirectMode = init?.redirect;
+      recordedHeaders = init?.headers;
       return new Response(JSON.stringify({
         output: [{ content: [{ type: 'output_text', text: 'review result' }] }],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -367,6 +369,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     });
     assert.deepEqual(result, { content: 'review result', modelId: FAKE_MODEL_ID });
     assert.equal(ordinaryRedirectMode, 'error');
+    const headerRecord = recordedHeaders as Record<string, string> | undefined;
+    assert.equal(headerRecord?.['User-Agent'], 'LibrePocket-Bot/1.0');
 
     const redirectTarget = 'https://redirect-target.test/receive';
     for (const status of [307, 308]) {
@@ -1097,27 +1101,29 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         }
       }
 
-      // A 400 must not be retried: it carries its status and exactly one request.
+      // Primary 400 (simulating unlaunched or undeployed model) automatically
+      // falls back to the second model and returns successfully.
       {
-        let fetchCount = 0;
+        const models: string[] = [];
         const previous = globalThis.fetch;
-        globalThis.fetch = (async () => {
-          fetchCount += 1;
-          return new Response('bad parameter', { status: 400 });
+        globalThis.fetch = (async (_input, init) => {
+          models.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return models.length === 1
+            ? new Response('model not deployed', { status: 400 })
+            : okResponse();
         }) as typeof fetch;
         try {
-          await assert.rejects(
-            sendOpenAISingleTurnWithFallback({
-              modelId: 'primary-model',
-              systemPrompt: 's',
-              userPrompt: 'u',
-              allowedOrigins: FAKE_ALLOWED_ORIGINS,
-              env: chainEnv,
-              timeoutMs: 1000,
-            }),
-            (error: { statusCode?: number }) => error?.statusCode === 400,
-          );
-          assert.equal(fetchCount, 1, 'a 400 surfaces instead of silently retrying');
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.deepEqual(models, ['primary-model', 'second-model']);
+          assert.equal(result.modelId, 'second-model', 'result attributes the serving model after 400 fallback');
+          assert.equal(result.content, 'ok');
         } finally {
           globalThis.fetch = previous;
         }
@@ -1162,10 +1168,16 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         }
       }
 
-      // Exhaustion keeps the final error (with status) for the orchestrator.
+      // Chain exhaustion: all candidates fail -> throws aggregated error without retrying.
       {
+        let fetchCount = 0;
+        const requestedModels: string[] = [];
         const previous = globalThis.fetch;
-        globalThis.fetch = (async () => new Response('busy', { status: 503 })) as typeof fetch;
+        globalThis.fetch = (async (_input, init) => {
+          fetchCount += 1;
+          requestedModels.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return new Response('busy', { status: 503 });
+        }) as typeof fetch;
         try {
           await assert.rejects(
             sendOpenAISingleTurnWithFallback({
@@ -1176,8 +1188,17 @@ export async function runScannerSendOpenAITests(): Promise<void> {
               env: chainEnv,
               timeoutMs: 1000,
             }),
-            (error: { statusCode?: number }) => error?.statusCode === 503,
+            (error: Error & { statusCode?: number }) => {
+              assert.match(error.message, /^All models failed/);
+              assert.ok(error.message.includes('primary-model'));
+              assert.ok(error.message.includes('second-model'));
+              assert.ok(error.message.includes('third-model'));
+              assert.equal(error.statusCode, 503);
+              return true;
+            },
           );
+          assert.equal(fetchCount, 3, 'each candidate is tried once with no extra retries');
+          assert.deepEqual(requestedModels, ['primary-model', 'second-model', 'third-model']);
         } finally {
           globalThis.fetch = previous;
         }
@@ -1277,25 +1298,29 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         }
       }
 
-      // Non-400 4xx statuses also stop the chain (they are request problems,
-      // not model unavailability).
-      for (const status of [401, 403, 404, 409, 422]) {
-        let fetchCount = 0;
+      // Primary failure on 404, 500, 503 (as well as 401, 403, 409, 422, 429)
+      // successfully falls back to the next candidate.
+      for (const status of [404, 500, 503, 401, 403, 409, 422, 429]) {
+        const models: string[] = [];
         const previous = globalThis.fetch;
-        globalThis.fetch = (async () => { fetchCount += 1; return new Response('nope', { status }); }) as typeof fetch;
+        globalThis.fetch = (async (_input, init) => {
+          models.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return models.length === 1
+            ? new Response('error', { status })
+            : okResponse();
+        }) as typeof fetch;
         try {
-          await assert.rejects(
-            sendOpenAISingleTurnWithFallback({
-              modelId: 'primary-model',
-              systemPrompt: 's',
-              userPrompt: 'u',
-              allowedOrigins: FAKE_ALLOWED_ORIGINS,
-              env: chainEnv,
-              timeoutMs: 1000,
-            }),
-            (error: { statusCode?: number }) => error?.statusCode === status,
-          );
-          assert.equal(fetchCount, 1, `status ${status} stops the chain`);
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.deepEqual(models, ['primary-model', 'second-model'], `status ${status} falls back`);
+          assert.equal(result.modelId, 'second-model');
+          assert.equal(result.content, 'ok');
         } finally {
           globalThis.fetch = previous;
         }

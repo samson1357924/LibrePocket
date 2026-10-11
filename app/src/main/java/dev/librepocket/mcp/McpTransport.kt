@@ -60,9 +60,11 @@ class McpTransport(
      * - 取消與否只以 coroutine Job（[ensureActive]）判斷，不以 `Call.isCanceled()` 判斷；
      * - 總 deadline = `withTimeoutOrNull(McpTimeouts.clamp)`（沿用既有常數），僅本層到期回 null（TIMEOUT）；
      *   父層 `withTimeout`/外部取消原樣透傳 `CancellationException`（不斷熔斷、不映射 TRANSPORT，見 [McpServer]）；
-     * - 成功 body 雙上限：[RESPONSE_MAX_BYTES] 位元組（傳輸層截斷探針）與
-     *   [RESPONSE_MAX_CHARS] 字元（相容舊 `take(64_000)`）；超量拋 [McpResponseTooLarge]，
+     * - 成功 body 雙上限：[RESPONSE_MAX_BYTES] 位元組與 [RESPONSE_MAX_CHARS] 字元
+     *   （相容舊 `take(64_000)`）；超量拋 [McpResponseTooLarge]，
      *   呼叫方映射 PROTOCOL + 計熔斷，絕不回截斷半 JSON 充 OK；
+     *   非 2xx 不讀 body（呼叫方只看 code）：先 cancel 再回 `code to null`，
+     *   保留 401/403→UNAUTHORIZED、其餘→TRANSPORT 語義，且 close() 不排空大 body；
      * - 其餘 `IOException` 透傳（呼叫方映射 TRANSPORT）。
      */
     @OptIn(InternalCoroutinesApi::class)
@@ -100,13 +102,26 @@ class McpTransport(
                     currentCoroutineContext().ensureActive()
                     call.execute().use { resp ->
                         val code = resp.code
-                        val text = readBoundedBody(resp.body) {
+                        if (code !in 200..299) {
+                            // 非 2xx：McpServer 只看 code（401/403→UNAUTHORIZED，其餘→TRANSPORT），
+                            // 不消費 body 文本；跳過成功-body 有界讀，否則超大 error body 會拋
+                            // McpResponseTooLarge 而抹掉 HTTP 狀態語義（誤判 PROTOCOL）。
+                            // 先 cancel 再回（use{} 離開即 close）：close() 不得排空未讀位元組，
+                            // 否則大 error body / 慢滴流會卡住 blocking IO 直到 deadline。
                             try {
                                 call.cancel()
                             } catch (_: Exception) {
                             }
+                            code to null
+                        } else {
+                            val text = readBoundedBody(resp.body) {
+                                try {
+                                    call.cancel()
+                                } catch (_: Exception) {
+                                }
+                            }
+                            code to text
                         }
-                        code to text
                     }
                 } catch (e: IOException) {
                     currentCoroutineContext().ensureActive()

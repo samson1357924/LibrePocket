@@ -585,6 +585,151 @@ class McpTransportCancelTest {
         }
     }
 
+    @Test fun errorBodySkippedWithoutLosingStatus() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 非 2xx 不跑成功-body 有界讀：超大 error body 直接回 (code, null)，
+            // 不拋 McpResponseTooLarge（否則抹掉 HTTP 狀態語義）。
+            web.enqueue(MockResponse().setResponseCode(401).setChunkedBody("x".repeat(300 * 1024), 8192))
+            web.enqueue(MockResponse().setResponseCode(500).setChunkedBody("y".repeat(300 * 1024), 8192))
+            val first = withTimeoutOrNull(5_000) {
+                McpTransport().postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+            }
+            assertNotNull("超大 401 必須即時回傳（不等 EOF 排空、不等 deadline）", first)
+            assertEquals(401, first!!.first)
+            assertNull("error body 必須跳過不讀（null text）", first.second)
+            val second = withTimeoutOrNull(5_000) {
+                McpTransport().postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+            }
+            assertNotNull("超大 500 必須即時回傳", second)
+            assertEquals(500, second!!.first)
+            assertNull("error body 必須跳過不讀（null text）", second.second)
+            assertEquals(2, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun serverOversized401KeepsUnauthorized() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // Review fixture：401 + 65,000 ASCII（位元組上限內、字元上限外）。
+            // 舊碼走字元超量拋 McpResponseTooLarge → 誤判 PROTOCOL；新碼跳過 error body → UNAUTHORIZED。
+            val body = "x".repeat(65_000)
+            assertTrue("fixture 必須超字元上限", body.length > McpTransport.RESPONSE_MAX_CHARS)
+            assertTrue("fixture 必須在位元組上限內（走字元分支）", body.toByteArray(Charsets.UTF_8).size < McpTransport.RESPONSE_MAX_BYTES)
+            web.enqueue(MockResponse().setResponseCode(401).setBody(body))
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t") }
+            assertNotNull("超大 401 必須回 UNAUTHORIZED（非 PROTOCOL/TRANSPORT/例外）", got)
+            assertEquals(McpStatus.UNAUTHORIZED, got!!.status)
+            assertNull("UNAUTHORIZED 不得帶 resultJson", got.resultJson)
+            assertEquals("401 必須計入熔斷失敗一次", 1, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun serverOversized403KeepsUnauthorized() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 403 與 401 同分支；用位元組超量（300KiB chunked）覆蓋另一條上限路徑。
+            web.enqueue(MockResponse().setResponseCode(403).setChunkedBody("x".repeat(300 * 1024), 8192))
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(10_000) { server.callTool("t") }
+            assertNotNull("超大 403 必須回 UNAUTHORIZED（非 PROTOCOL）", got)
+            assertEquals(McpStatus.UNAUTHORIZED, got!!.status)
+            assertNull("UNAUTHORIZED 不得帶 resultJson", got.resultJson)
+            assertEquals(1, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun serverOversized500KeepsTransport() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 500 + 300KiB：舊碼位元組超量拋 → 誤判 PROTOCOL；新碼跳過 → TRANSPORT。
+            web.enqueue(MockResponse().setResponseCode(500).setChunkedBody("y".repeat(300 * 1024), 8192))
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(10_000) { server.callTool("t") }
+            assertNotNull("超大 500 必須回 TRANSPORT（非 PROTOCOL）", got)
+            assertEquals(McpStatus.TRANSPORT, got!!.status)
+            assertNull("TRANSPORT 不得帶 resultJson", got.resultJson)
+            assertEquals(1, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun serverListOversizedErrorKeepsStatus() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // listTools 同驗：401（65k 字元路徑）→ UNAUTHORIZED；500（300KiB 位元組路徑）→ TRANSPORT。
+            // 兩呼叫用獨立 breaker（連續失敗 3 次即開路，避免互相干擾）。
+            web.enqueue(MockResponse().setResponseCode(401).setBody("a".repeat(65_000)))
+            web.enqueue(MockResponse().setResponseCode(500).setChunkedBody("b".repeat(300 * 1024), 8192))
+            val breaker1 = McpCircuitBreaker()
+            val server1 = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker1,
+            )
+            val first = withTimeoutOrNull(5_000) { server1.listTools() }
+            assertNotNull("超大 401 listTools 必須回 UNAUTHORIZED", first)
+            assertEquals(McpStatus.UNAUTHORIZED, first!!.status)
+            assertTrue(first.tools.isEmpty())
+            assertEquals(1, breaker1.failureCount())
+            assertFalse(breaker1.isOpen())
+            val breaker2 = McpCircuitBreaker()
+            val server2 = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker2,
+            )
+            val second = withTimeoutOrNull(10_000) { server2.listTools() }
+            assertNotNull("超大 500 listTools 必須回 TRANSPORT", second)
+            assertEquals(McpStatus.TRANSPORT, second!!.status)
+            assertTrue(second.tools.isEmpty())
+            assertEquals(1, breaker2.failureCount())
+            assertFalse(breaker2.isOpen())
+            assertEquals(2, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
     @Test fun totalDeadlineReturnsNullPromptly() = runBlocking {
         val web = MockWebServer()
         web.start()

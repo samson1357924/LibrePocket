@@ -25,7 +25,7 @@ interface ChatSession {
    * Start a turn and return once the text is accepted (fresh `chat.send`
    * policy passed, user message appended, STREAMING) without waiting for the
    * hosted turn to finish. A [CancellationException]/[SecurityException]/
-   * [IllegalStateException]/[IllegalArgumentException] before return means
+   * [IllegalStateException]/[IllegalArgumentException]/[TranscriptDurabilityException] before return means
    * the text was NOT accepted.
    */
   suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): kotlinx.coroutines.Job

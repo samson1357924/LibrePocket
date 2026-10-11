@@ -27,6 +27,7 @@ class ChatNoticeTextTest {
         assertEquals("找不到該會話，可能已被刪除。", chatNoticeText("UNKNOWN_SESSION"))
         assertEquals("端點已變更，本次未送出，請確認後重送。", chatNoticeText("SEND_CANCELLED_ENDPOINT_CHANGED"))
         assertEquals("輸入過長，本次未送出，請縮短後重試。", chatNoticeText("CHAT_INPUT_TOO_LONG"))
+        assertEquals("無法寫入對話紀錄，本次未送出，請稍後重試。", chatNoticeText("CHAT_STORE_UNAVAILABLE"))
     }
 
     @Test

@@ -1014,12 +1014,22 @@ internal fun modelSwitchMarkerWithheld(text: String): Boolean =
  * rows are never forwarded to the new destination).
  *
  * Layout: the audit marker is row 1 (head-anchored so reopen rediscovers it
- * with one tiny bounded scan even after later turns or pruning of the tail),
- * followed by the [loadModelHistoryEvents] prefix oldest-first. Copied rows
- * keep their family linkage and `createdAt` verbatim; `seq` is reassigned by
- * the store. The copy is bounded by [HISTORY_LOAD_CAP] newest-first, exactly
- * the set the live session hydrated in memory, so pre- and post-restart
- * model contexts agree.
+ * with one tiny bounded head scan after later turns), followed by the
+ * [loadModelHistoryEvents] prefix oldest-first. Copied rows keep their family
+ * linkage and `createdAt` verbatim; `seq` is reassigned by the store. The
+ * copy is bounded by [HISTORY_LOAD_CAP] newest-first, exactly the set the
+ * live session hydrated in memory, so pre- and post-restart model contexts
+ * agree.
+ *
+ * Known limitation: prune is keep-newest
+ * (`dev.librepocket.session.SessionDao.deleteEventsBeyondLimit` drops the
+ * oldest rows first), so the head marker goes first; [HISTORY_LOAD_CAP]
+ * (2000) equals [dev.librepocket.session.PrunePolicy.maxEventsPerSession]
+ * (2000), so a full snapshot loses its marker at the next sweep.
+ * [hasWithheldSwitchMarker] only scans the head 16. A pruned marker only
+ * drops the restart notice — the withhold itself is structural (rows never
+ * copied), so isolation is unchanged; an `openSession` scan failure stays
+ * "no marker", as before.
  *
  * Failure semantics: THROWS on store failure — the caller
  * ([dev.librepocket.agent.ui.chat.ChatViewModel.ensureSession]) treats the

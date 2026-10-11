@@ -304,7 +304,7 @@ export async function runStickyLabelTests(): Promise<void> {
           assert.equal(state.updated, 1, 'first claim plus publish write the sticky');
           const stickyId = state.comments[0].id;
           assert.ok(state.comments[0].body.includes('<!-- PocketGuard-review -->'));
-          assert.ok(state.comments[0].body.includes('判定：APPROVE'));
+          assert.ok(state.comments[0].body.includes('Verdict: APPROVE'));
           assert.ok(state.comments[0].body.includes(BASE_SHA.slice(0, 8)), 'PR sticky carries base SHA');
           assert.ok(state.comments[0].body.includes(HEAD_SHA.slice(0, 8)), 'PR sticky carries head SHA');
           assert.ok(state.existingLabels.includes('performance'), 'valid AI label is applied');
@@ -402,7 +402,7 @@ export async function runStickyLabelTests(): Promise<void> {
         assert.equal(publishState.created, 0, 'illegal AI publish creates no second comment');
         assert.equal(publishState.updated, 1, 'illegal AI publish updates the same sticky');
         assert.equal(publishState.comments.length, 1);
-        assert.ok(publishState.comments[0].body.includes('判定：INCONCLUSIVE'), 'illegal AI forces non-APPROVE');
+        assert.ok(publishState.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'illegal AI forces non-APPROVE');
         assert.ok(!publishState.existingLabels.includes('alien-label'), 'unknown labels never written');
         assert.ok(publishState.existingLabels.includes('bug'), 'manual labels preserved');
         void crafted;
@@ -457,8 +457,8 @@ export async function runStickyLabelTests(): Promise<void> {
           });
           assert.equal(publishState.created, 0, `${issueOnly}: creates no second comment`);
           assert.equal(publishState.updated, 1, `${issueOnly}: updates the same sticky`);
-          assert.ok(publishState.comments[0].body.includes('判定：INCONCLUSIVE'), `${issueOnly}: forces non-APPROVE`);
-          assert.ok(!publishState.comments[0].body.includes('判定：APPROVE'), `${issueOnly}: never APPROVE`);
+          assert.ok(publishState.comments[0].body.includes('Verdict: INCONCLUSIVE'), `${issueOnly}: forces non-APPROVE`);
+          assert.ok(!publishState.comments[0].body.includes('Verdict: APPROVE'), `${issueOnly}: never APPROVE`);
           assert.ok(!publishState.existingLabels.includes('priority:P1'), `${issueOnly}: priority never written from PR AI`);
           assert.ok(!publishState.existingLabels.includes('gate:release'), `${issueOnly}: gate never written from PR AI`);
           assert.ok(publishState.existingLabels.includes('bug'), `${issueOnly}: pre-existing manual bug preserved`);
@@ -487,7 +487,7 @@ export async function runStickyLabelTests(): Promise<void> {
           });
           assert.equal(publishState.created, 0, 'bug: creates no second comment');
           assert.equal(publishState.updated, 1, 'bug: updates the same sticky');
-          assert.ok(publishState.comments[0].body.includes('判定：APPROVE'), 'bug: restored PR type keeps APPROVE');
+          assert.ok(publishState.comments[0].body.includes('Verdict: APPROVE'), 'bug: restored PR type keeps APPROVE');
           assert.ok(publishState.existingLabels.includes('bug'), 'bug: written from PR AI after restore');
           assert.ok(publishState.existingLabels.includes('area:runtime'), 'bug: sibling area label written');
         }
@@ -538,7 +538,7 @@ export async function runStickyLabelTests(): Promise<void> {
         });
         assert.equal(publishState.created, 0);
         assert.equal(publishState.updated, 1);
-        assert.ok(publishState.comments[0].body.includes('判定：INCONCLUSIVE'));
+        assert.ok(publishState.comments[0].body.includes('Verdict: INCONCLUSIVE'));
         assert.ok(publishState.existingLabels.includes('bug'));
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -691,7 +691,7 @@ export async function runStickyLabelTests(): Promise<void> {
           assert.equal(state.comments.length, 1, 'opened/edited/comment share one sticky');
           assert.equal(state.updated, 2, 'edited + comment update the same sticky');
           assert.ok(state.comments[0].body.includes('<!-- PocketGuard-review -->'));
-          assert.ok(state.comments[0].body.includes('修訂指紋'));
+          assert.ok(state.comments[0].body.includes('Revision fingerprint'));
           assert.ok(state.existingLabels.includes('security'), 'deterministic title label applied');
           assert.ok(state.existingLabels.includes('area:docs'), 'valid AI label applied');
           assert.ok(state.existingLabels.includes('bug'), 'manual label preserved');
@@ -762,7 +762,7 @@ export async function runStickyLabelTests(): Promise<void> {
         assert.equal(staleState.created, 0);
         assert.equal(staleState.updated, 1);
         assert.equal(staleState.comments.length, 1);
-        assert.ok(staleState.comments[0].body.includes('判定：INCONCLUSIVE'));
+        assert.ok(staleState.comments[0].body.includes('Verdict: INCONCLUSIVE'));
 
         // Invalid schema (missing fingerprint).
         const invalidPath = path.join(tempDir, 'invalid.json');
@@ -777,7 +777,7 @@ export async function runStickyLabelTests(): Promise<void> {
         });
         assert.equal(invalidState.created, 0);
         assert.equal(invalidState.updated, 1);
-        assert.ok(invalidState.comments[0].body.includes('判定：INCONCLUSIVE'));
+        assert.ok(invalidState.comments[0].body.includes('Verdict: INCONCLUSIVE'));
 
         // Edit error.
         const errState = makeState({ updateThrows: true, comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }] });
@@ -964,8 +964,8 @@ export async function runStickyLabelTests(): Promise<void> {
         assert.ok(state.existingLabels.includes('area:docs'), 'deterministic area:docs is added despite review failure');
         assert.ok(state.existingLabels.includes('status:needs-decision'), 'status:needs-decision is added on fallback');
         assert.ok(state.existingLabels.includes('security'), 'title deterministic rule is preserved on fallback');
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'verdict is INCONCLUSIVE on fallback');
-        assert.equal(state.comments[0].body.includes('判定：APPROVE'), false, 'never pretend AI review approved');
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'verdict is INCONCLUSIVE on fallback');
+        assert.equal(state.comments[0].body.includes('Verdict: APPROVE'), false, 'never pretend AI review approved');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }

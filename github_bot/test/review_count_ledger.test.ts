@@ -195,7 +195,7 @@ function prOpenedEvent(headSha: string): Record<string, unknown> {
 }
 
 function stickyBodyFor(ledger: Map<string, number>): string {
-  let body = '<!-- PocketGuard-review -->\n\n## PocketGuard 審查\n\n**判定：APPROVE**\n';
+  let body = '<!-- PocketGuard-review -->\n\n## PocketGuard Review\n\n**Verdict: APPROVE**\n';
   const sorted = [...ledger.entries()].sort((l, r) => l[0].localeCompare(r[0]));
   for (const [sha, count] of sorted) body += `${formatReviewCountMarker(sha, count)}\n`;
   return body;
@@ -512,7 +512,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           githubClient: makeClient(state),
         });
         assert.equal(state.created, 1, 'claim created the single sticky; publish reuses it');
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'stale publishes a fallback');
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'stale publishes a fallback');
         assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_B), 1, 'current SHA keeps the claim');
         assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 0, 'stale artifact SHA is not counted by publish');
       } finally {
@@ -612,7 +612,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           githubClient: makeClient(state),
         });
         assert.equal(state.created, 1);
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'));
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'));
         assert.equal(ledgerOf(state.comments[0].body).size, 0, 'no marker for unstarted review');
 
         // Failed job result: same, no marker.
@@ -682,7 +682,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           } as NodeJS.ProcessEnv,
           githubClient: makeClient(state),
         });
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'missing artifact still publishes a fallback');
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'missing artifact still publishes a fallback');
         assert.equal(parseReviewCountMarker(state.comments[0].body, SHA_A), 1, 'missing artifact after claim keeps the slot');
 
         // Failed job result after a claim: same, the slot is never refunded.
@@ -1060,7 +1060,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       try {
         const seedLedger = new Map<string, number>([[SHA_A, 2]]);
         for (let i = 0; i < 500; i += 1) seedLedger.set(synthSha(i), 1);
-        const seedBody = buildStampedBody('<!-- PocketGuard-review -->\n\n## PocketGuard 審查\n', seedLedger, new Set(), undefined, undefined, undefined);
+        const seedBody = buildStampedBody('<!-- PocketGuard-review -->\n\n## PocketGuard Review\n', seedLedger, new Set(), undefined, undefined, undefined);
         assert.ok(seedBody.length <= GITHUB_COMMENT_HARD_LIMIT, `500-entry seed fits (got ${seedBody.length})`);
         const state = makeState({
           comments: [{ id: 7, body: seedBody, user: { login: 'pocketguard[bot]', type: 'Bot' } }],
@@ -1108,7 +1108,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
           assert.equal(reread.ledger.get(freshSha), 1, 'fresh SHA keeps its single claimed slot');
           for (let i = 0; i < 500; i += 1) assert.equal(reread.ledger.get(synthSha(i)), 1, `synthetic SHA ${i} readable`);
           assert.ok(reread.claims.has(`${freshSha}:run-big-1:1`), 'claim marker survives publish');
-          assert.ok(state.comments[0].body.includes('判定'), 'visible verdict preserved alongside the ledger');
+          assert.ok(state.comments[0].body.includes('Verdict'), 'visible verdict preserved alongside the ledger');
         }
         assert.equal(state.comments.length, 1, 'single sticky throughout');
       } finally {
@@ -1304,7 +1304,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       for (let i = 0; i < 5; i += 1) ledger.set(synthSha(i), 1);
       const claims = new Set<string>([`${SHA_A}:run-hf:1`]);
       const reserve = estimateStickyMetadataLength(ledger, claims);
-      const visible = reviewComment(output, [], '報告行', reserve);
+      const visible = reviewComment(output, [], 'report line', reserve);
       assert.ok(visible.length <= MAX_STICKY_TOTAL_LENGTH, `reserved visible stays in budget (got ${visible.length})`);
       const stamped = buildStampedBody(visible, ledger, claims, undefined, undefined, undefined);
       assert.ok(stamped.length <= GITHUB_COMMENT_HARD_LIMIT, `stamped heavy review fits (got ${stamped.length})`);
@@ -1315,8 +1315,8 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       assert.ok(verifyLedgerFooter(stamped, parseReviewCountLedger(stamped), parseReviewClaimSet(stamped)), 'footer verifies');
       assert.ok(stamped.includes('<!-- PocketGuard-review -->'), 'review marker intact');
       assert.ok(stamped.includes(SHA_A), 'head SHA metadata intact');
-      assert.ok(stamped.includes('共200項發現'), 'tail counts line intact');
-      assert.ok(stamped.includes('省略'), 'trimming is disclosed, not silent');
+      assert.ok(stamped.includes('200 finding(s)'), 'tail counts line intact');
+      assert.ok(stamped.includes('omitted'), 'trimming is disclosed, not silent');
       for (let i = 0; i < 5; i += 1) assert.ok(stamped.includes(`HFBLOCK${i}`), `BLOCK ${i} kept by priority`);
     }
 
@@ -1332,7 +1332,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       for (let i = 0; i < 300; i += 1) claims.add(`${synthSha(i)}:run-t15-${i}:1`);
       assert.equal(ledger.size, 301, '300 synthetic SHAs plus A');
       assert.equal(claims.size, 300, 'one claim per synthetic SHA');
-      const visibleBase = '<!-- PocketGuard-review -->\n\n## PocketGuard 審查\n';
+      const visibleBase = '<!-- PocketGuard-review -->\n\n## PocketGuard Review\n';
       const measured = buildStampedBodyWithLength(visibleBase, ledger, claims, undefined, undefined, undefined);
       assert.equal(measured.requiredLength, measured.body.length, 'requiredLength is exact');
       assert.equal(measured.fits, true, '300+300 stamped body fits the hard limit');
@@ -1418,7 +1418,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
         changedFilesComplete: true,
         suggestedLabels: [],
       };
-      const visible = reviewComment(output, [], '報告行', reserve);
+      const visible = reviewComment(output, [], 'report line', reserve);
       assert.ok(visible.length <= MAX_STICKY_TOTAL_LENGTH, `reserved visible stays in budget (got ${visible.length})`);
       const measured = buildStampedBodyWithLength(visible, ledger, claims, undefined, undefined, undefined);
       if (!measured.fits) {
@@ -1440,8 +1440,8 @@ export async function runReviewCountLedgerTests(): Promise<void> {
         const footer = parseLedgerFooter(stamped);
         assert.equal(footer!.counts, ledger.size, 'footer counts match the large ledger');
         assert.equal(footer!.claims, claims.size, 'footer claims match');
-        assert.ok(stamped.includes('共200項發現'), 'tail counts line intact');
-        assert.ok(stamped.includes('省略'), 'trimming is disclosed, not silent');
+        assert.ok(stamped.includes('200 finding(s)'), 'tail counts line intact');
+        assert.ok(stamped.includes('omitted'), 'trimming is disclosed, not silent');
         for (let i = 0; i < 5; i += 1) assert.ok(stamped.includes(`HFLBLOCK${i}`), `BLOCK ${i} kept by priority over SUGGESTION`);
       }
     }

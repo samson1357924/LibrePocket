@@ -439,7 +439,7 @@ export async function runPrPhase3Tests(): Promise<void> {
           githubClient: prClient(shared),
         });
         assert.equal(parseReviewCountMarker(shared.comments[0]?.body ?? '', HEAD_SHA), 1, 'timed-out claim still holds one slot (never refunded)');
-        assert.ok(shared.comments[0]?.body.includes('判定：INCONCLUSIVE'), 'timed-out publish falls back on the same sticky');
+        assert.ok(shared.comments[0]?.body.includes('Verdict: INCONCLUSIVE'), 'timed-out publish falls back on the same sticky');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }

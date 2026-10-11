@@ -348,8 +348,8 @@ export async function runStage4P2Tests(): Promise<void> {
         });
         assert.equal(state.created, 0, 'stale publish creates no second comment');
         assert.equal(state.updated, 1, 'stale publish updates the same sticky');
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'stale live content falls back');
-        assert.ok(!state.comments[0].body.includes('判定：APPROVE'));
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'stale live content falls back');
+        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'));
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -401,7 +401,7 @@ export async function runStage4P2Tests(): Promise<void> {
           githubClient: client,
         });
         assert.equal(state.updated, 1);
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'));
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'));
         assert.ok(state.comments[0].body.includes('could not be fetched'));
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -776,8 +776,8 @@ export async function runStage4P2Tests(): Promise<void> {
         });
         assert.equal(publishState.created, 0, 'same-missing publish creates no second comment');
         assert.equal(publishState.updated, 1, 'same-missing publish updates the same sticky');
-        assert.ok(publishState.comments[0].body.includes('判定：INCONCLUSIVE'), 'same missing falls back');
-        assert.ok(!publishState.comments[0].body.includes('判定：APPROVE'), 'same missing never approves');
+        assert.ok(publishState.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'same missing falls back');
+        assert.ok(!publishState.comments[0].body.includes('Verdict: APPROVE'), 'same missing never approves');
         assert.ok(
           publishState.comments[0].body.includes('freshness') || publishState.comments[0].body.includes('could not be fully fetched'),
           'fallback names unverifiable freshness',
@@ -857,8 +857,8 @@ export async function runStage4P2Tests(): Promise<void> {
         });
         assert.equal(state.created, 0, 'publish failure creates no second comment');
         assert.equal(state.updated, 1, 'publish failure updates the same sticky');
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'));
-        assert.ok(!state.comments[0].body.includes('判定：APPROVE'));
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'));
+        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'));
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -1147,8 +1147,8 @@ export async function runStage4P2Tests(): Promise<void> {
         });
         assert.equal(state.created, 0, 'tail collision creates no second comment');
         assert.equal(state.updated, 1, 'tail collision updates the same sticky');
-        assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'tail collision falls back');
-        assert.ok(!state.comments[0].body.includes('判定：APPROVE'), 'tail collision never approves');
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'tail collision falls back');
+        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'), 'tail collision never approves');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -1332,9 +1332,9 @@ export async function runStage4P2Tests(): Promise<void> {
         assert.equal(publishState.created, 0, 'same-mask stale creates no second comment');
         assert.equal(publishState.updated, 1, 'same-mask stale updates the same sticky');
         assert.equal(publishState.comments[0].id, 77, 'same comment ID updated in place');
-        assert.ok(publishState.comments[0].body.includes('判定：INCONCLUSIVE'), 'same-mask stale falls back');
-        assert.ok(!publishState.comments[0].body.includes('判定：APPROVE'), 'same-mask stale never approves');
-        assert.ok(publishState.comments[0].body.includes('修訂指紋'), 'sticky carries revision fingerprint');
+        assert.ok(publishState.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'same-mask stale falls back');
+        assert.ok(!publishState.comments[0].body.includes('Verdict: APPROVE'), 'same-mask stale never approves');
+        assert.ok(publishState.comments[0].body.includes('Revision fingerprint'), 'sticky carries revision fingerprint');
         assert.ok(!publishState.comments[0].body.includes('AlphaSecret123'), 'sticky omits raw secret A');
         assert.ok(!publishState.comments[0].body.includes('BetaSecret456'), 'sticky omits raw secret B');
         assert.ok(!publishState.comments[0].body.includes(secretA) && !publishState.comments[0].body.includes(secretB), 'sticky omits full raws');

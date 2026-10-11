@@ -165,7 +165,7 @@ function emptyDiffGitStub(): (args: string[]) => string {
 
 function seededStickyBody(): string {
   return buildStampedBody(
-    '<!-- PocketGuard-review -->\n\n## PocketGuard 審查\n\n**判定：APPROVE**\n',
+    '<!-- PocketGuard-review -->\n\n## PocketGuard Review\n\n**Verdict: APPROVE**\n',
     new Map([[SHA_B, 1]]),
     new Set(),
     undefined,

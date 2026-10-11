@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.keystore.EncryptedPrefsVault
+import dev.librepocket.keystore.KeyVault
 import dev.librepocket.provider.ProviderProtocol
 import java.io.IOException
 import java.nio.file.Files
@@ -199,6 +200,42 @@ class EndpointStoreTest {
 
         vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
         assertEquals(EndpointReadiness.READY, store.readiness(vault))
+    }
+
+    @Test
+    fun readinessResolvesLiveAliasFromRef() = runBlocking {
+        // Ref-driven: metadata committed through the staged scheme points at a
+        // per-operation alias; readiness must honor the ref, not providerId.
+        val store = newStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        val staged = "preset:openai#staged-7"
+        store.save(sampleConfig().copy(apiKeyRef = "provider_key/$staged"))
+        // Key under the fixed alias alone is NOT enough.
+        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        assertEquals(EndpointReadiness.NO_KEY, store.readiness(vault))
+        // Key under the staged alias addressed by the ref is READY.
+        vault.putKey(staged, "sk-test-key-123".toCharArray())
+        assertEquals(EndpointReadiness.READY, store.readiness(vault))
+    }
+
+    @Test
+    fun readinessMalformedRefFailsClosedWithoutVaultTouch() = runBlocking {
+        val store = newStore()
+        store.dataStore.edit { prefs ->
+            prefs[ENDPOINT_PROVIDER_ID_V1] = "preset:openai"
+            prefs[ENDPOINT_BASE_URL_V1] = "https://api.openai.com/v1"
+            prefs[ENDPOINT_PROTOCOL_V1] = "CHAT_COMPLETIONS"
+            prefs[ENDPOINT_API_KEY_REF_V1] = "sk-pasted-key-material"
+        }
+        var touched = false
+        val probe = object : KeyVault by EncryptedPrefsVault(InMemoryPrefs()) {
+            override suspend fun hasKey(providerId: String): Boolean {
+                touched = true
+                return false
+            }
+        }
+        assertEquals(EndpointReadiness.NO_KEY, store.readiness(probe))
+        assertFalse(touched)
     }
 
     // ---- Phase 1: CAS fencing ----

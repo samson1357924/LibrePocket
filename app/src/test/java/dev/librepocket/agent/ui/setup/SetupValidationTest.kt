@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui.setup
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SetupValidationTest {
@@ -13,6 +14,17 @@ class SetupValidationTest {
             "provider_key/preset:openai",
             SetupValidation.deriveApiKeyRef("preset:openai"),
         )
+    }
+
+    @Test
+    fun stagedAliasIsPerOperationAndResolvesFromRef() {
+        val a = SetupValidation.stagedAlias("preset:openai", 1L)
+        val b = SetupValidation.stagedAlias("preset:openai", 2L)
+        assertTrue(a != b)
+        assertTrue(a.startsWith("preset:openai#staged-"))
+        assertEquals("provider_key/$a", SetupValidation.stagedApiKeyRef("preset:openai", 1L))
+        assertEquals(a, SetupValidation.aliasFromRef("provider_key/$a"))
+        assertEquals("preset:openai", SetupValidation.aliasFromRef("provider_key/preset:openai"))
     }
 
     @Test

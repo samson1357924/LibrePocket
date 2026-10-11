@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -133,17 +134,16 @@ class SetupViewModel(
     private val consentNonces = AtomicLong(0L)
 
     /**
-     * Serializes the save critical section ([executeKeyWrite] vault backup,
-     * put, re-verification, metadata CAS) against privileged [logout]
-     * teardown (vault delete + metadata clear) within this VM.
+     * Serializes the save critical section ([executeKeyWrite] staged put,
+     * re-verification, metadata CAS, old-alias retire) against privileged
+     * [logout] teardown (vault delete + metadata clear) within this VM.
      *
      * Single-process only: this [Mutex] cannot fence a second process, a
      * second ViewModel/store instance in tests, or any out-of-band vault
      * writer. Cross-writer safety rests on the [EndpointStore.saveIfRevision]
-     * CAS plus the revision-gated [rollbackVaultIfOurs] (CAS loss leaves a
-     * same-provider save winner untouched; other aborts compare-before-
-     * restore/delete, never an unconditional delete). Never present this
-     * mutex as multi-writer safety.
+     * CAS plus the staged alias scheme (a CAS loss leaves the winner's staged
+     * live key untouched; the loser only deletes its own per-operation staged
+     * alias, never a live slot). Never present this mutex as multi-writer safety.
      */
     private val saveMutex = Mutex()
 
@@ -162,7 +162,15 @@ class SetupViewModel(
                     false
                 }
                 val hasKey = try {
-                    withContext(Dispatchers.IO) { vault().hasKey(config.providerId) }
+                    // Ref-driven: the live alias comes from metadata, never from
+                    // providerId (staged commits point at a per-operation alias).
+                    // Malformed refs fail closed to NoEndpoint without vault I/O.
+                    if (!config.apiKeyRef.startsWith("provider_key/")) {
+                        false
+                    } else {
+                        val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
+                        if (alias.isBlank()) false else withContext(Dispatchers.IO) { vault().hasKey(alias) }
+                    }
                 } catch (_: Exception) {
                     false
                 }
@@ -370,20 +378,19 @@ class SetupViewModel(
     /**
      * Shared save path. [consent] is non-null only for the dialog confirm tap,
      * which carries the one-shot consent minted by the earlier ASK evaluation.
-     * Every side effect below ([KeyVault.putKey] + [EndpointStore.saveIfRevision])
+     * Every side effect below (staged [KeyVault.putKey] + [EndpointStore.saveIfRevision])
      * is preceded by a fresh policy evaluation; DENY always wins, even when a
      * consent was minted earlier. Stage2 adds a form fence ([formRevision]) and
-     * a second post-write policy re-evaluation. Stage3 runs the whole
-     * [executeKeyWrite] critical section under [saveMutex] (same-VM save/logout
-     * serialization) and reconciles the vault on post-put aborts via the
-     * revision-gated [rollbackVaultIfOurs]: a pre-existing key is restored,
-     * a self-written orphan with no predecessor is deleted, and a foreign key
-     * observed in place is never touched. A trailing-CAS loss (`saveIfRevision`
-     * returns false) proves a concurrent winner advanced the revision, so a
-     * same-provider save winner is left untouched with no vault delete/restore
-     * (same-content bytes are indistinguishable by content alone); only a
-     * clear/unrelated winner falls through to a gated orphan delete. No abort
-     * path performs an unconditional vault delete.
+     * a second post-write policy re-evaluation. The whole [executeKeyWrite]
+     * critical section runs under [saveMutex] (same-VM save/logout
+     * serialization). The vault commit uses a per-operation staged alias: the
+     * new key is written aside under
+     * `<providerId>#staged-<nonce>`, the metadata CAS swings `apiKeyRef` to
+     * it, and only then is the previous live alias retired best-effort. A CAS
+     * loss or any earlier abort deletes only the attempt's own staged alias
+     * (known per-operation name, safe) and never touches a live slot, never
+     * restores a predecessor, and never reads a live key. No abort path
+     * performs an unconditional live delete.
      */
     private fun saveWithConsent(consent: KeyWriteConsent?) {
         val entryRevision = formRevision.get()
@@ -493,126 +500,122 @@ class SetupViewModel(
             }
             return
         }
-        // Fresh ALLOW direct-write path: snapshot the raw revision now for the
-        // trailing CAS. Consent path reuses consent.configRevision instead.
-        // Snapshot-then-fence: a revision-read failure or an edit racing the
-        // read fails closed before any vault side effect.
+        // Snapshot the revision AND the previous live alias in a single emission
+        // for the trailing CAS and the post-commit retire. Consent path reuses
+        // consent.configRevision but still requires the live revision to match
+        // it here (single-emission authoritative check). Snapshot-then-fence: a
+        // read failure or an edit racing the read fails closed before any vault
+        // side effect.
+        val snapshot = try {
+            store.snapshotWithRevisionStrict()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        val oldConfig = snapshot.first
+        val liveRev = snapshot.second
         val expectedRevision: Long? = if (consent != null) {
+            if (liveRev != consent.configRevision) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
             consent.configRevision
         } else {
-            val rev0 = try {
-                store.currentRevision()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                return
-            }
-            if (entryRevision != formRevision.get()) {
-                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                return
-            }
-            rev0
+            liveRev
+        }
+        // Previous live alias for post-commit retire (null on fresh start).
+        // Malformed refs resolve to null and are never retired.
+        val oldAlias: String? = oldConfig?.apiKeyRef
+            ?.takeIf { it.startsWith("provider_key/") }
+            ?.let { SetupValidation.aliasFromRef(it) }
+            ?.takeIf { it.isNotBlank() }
+        if (entryRevision != formRevision.get()) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
         }
         // 4. Fence again immediately before the vault write.
         if (entryRevision != formRevision.get()) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
-        // 4b. key.read gate before ANY vault read (backup getKey). Mirrors
-        // ChatViewModel: only an explicit DENY blocks; ASK/ALLOW proceed (the
-        // key.read ASK was consented at setup). Read failures fail closed to
-        // DENY. Placed as close to the backup as possible to minimize the
-        // check-to-read TOCTOU window; dialog-only ASK paths return before
-        // here and are gated on their confirm attempt instead. Rollback's
-        // later vault re-reads inherit this verdict (no second policy lookup);
-        // the ownership re-read still touches a possibly-foreign slot but is
-        // atomicity-necessary, never logged, and recorded here. The staged /
-        // versioned vault alias follow-up will remove the backup scheme
-        // entirely (then this gate moves to the staged-slot read).
-        val r = freshVerdictOrDeny("key.read", providerId)
-        if (r == Verdict.DENY) {
-            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_READ")
-            return
-        }
-        // 5. Vault write with a pre-put backup (stage3, fixed-alias short-term
-        // scheme). Uses the entry snapshot (not live): key/identity edits
-        // bump formRevision and are fenced above, so reaching here means the
-        // entry key is still current. Model may be stale (onModelChange does not
-        // bump per #17 scope) but model is not consent identity and does not
-        // affect key.write fencing; endpointConfigOf below shares this note.
+        // 5. Staged vault write (versioned-alias scheme). The new key is written
+        // aside under a per-operation staged alias and the live slot is NEVER
+        // overwritten here, so a concurrent writer's live key cannot be
+        // clobbered by our put, and no backup/restore of live key material is
+        // needed: there is no live read anywhere on this path, hence no
+        // key.read evaluation either (the backup scheme and its gate are gone
+        // by construction).
         //
         // Trade-offs, stated honestly:
-        // - The backup extends the previous key's in-memory lifetime to the end
-        //   of this function; it is wiped in the `finally` below on every path
-        //   (success, abort, exception), never logged, and never placed in
-        //   SavedState or any persisted structure.
+        // - Between the staged put and the metadata CAS, two keys briefly
+        //   coexist at rest (staged + previous live). On abort only the staged
+        //   alias is deleted; on success only the previous live alias is
+        //   retired. A crash between put and CAS (or between CAS and retire)
+        //   orphans a staged (or previous-live) key at rest: without a vault
+        //   list API it cannot be enumerated for GC, so it lingers encrypted
+        //   until a GC follow-up (list API) lands. At-rest leak is strictly
+        //   better than the fixed-alias loss it replaces.
+        // - Same-VM saves are fenced by [saveMutex] and metadata races by the
+        //   trailing CAS, but out-of-band writers still need single-writer
+        //   discipline for endpoint identity: two writers still race on the
+        //   single metadata slot (the loser fails closed), they just can no
+        //   longer destroy each other's key bytes. DataStore CAS is
+        //   single-process only (documented on EndpointStore).
         // - [EncryptedPrefsVault.putKey] wipes the array it is given, so the
-        //   comparison copy ([newKeyCopy]) is taken BEFORE the put; the put
-        //   input ([keyCopy]) is wiped by the vault with a defensive re-wipe
-        //   here.
-        // - Lost-update remains possible: an out-of-band write landing between
-        //   the backup read and our put is silently overwritten (unrecoverable
-        //   under a fixed alias), and one landing between the rollback re-read
-        //   and the rollback write can be clobbered. Same-VM saves are fenced
-        //   by [saveMutex] and metadata races by the trailing CAS, but
-        //   out-of-band writers require single-writer discipline by
-        //   documentation. The long-term fix is a staged/versioned vault alias
-        //   (write new key aside, CAS metadata, then retire the old alias),
-        //   tracked as a follow-up, not claimed here.
+        //   put input ([keyCopy]) gets a defensive re-wipe here.
+        // - Uses the entry snapshot (not live): key/identity edits bump
+        //   formRevision and are fenced above, so reaching here means the entry
+        //   key is still current. Model may be stale (onModelChange does not
+        //   bump per #17 scope) but model is not consent identity and does not
+        //   affect key.write fencing; endpointConfigOf below shares this note.
+        val stagedAlias = SetupValidation.stagedAlias(providerId, stagedNonceSeq.incrementAndGet())
+        val stagedRef = "provider_key/$stagedAlias"
         val keyCopy = form.apiKey.trim().toCharArray()
-        val newKeyCopy = keyCopy.copyOf()
-        // Pre-existing key material for ownership-checked restore; null when
-        // this provider had no key. A read failure aborts fail-closed BEFORE
-        // any put: with unknown vault state we must not overwrite.
-        val backup: CharArray?
-        val hadKey: Boolean
+        var stagedWritten = false
+        // Set once saveIfRevision reports true. The Cancellation handler below
+        // must not delete the staged alias after our own commit won: it is the
+        // new live key then.
+        var committed = false
         try {
-            backup = vault().getKey(providerId)
-            hadKey = backup != null
+            try {
+                vault().putKey(stagedAlias, keyCopy)
+                stagedWritten = true
+            } finally {
+                keyCopy.fill('\u0000')
+            }
         } catch (e: CancellationException) {
-            keyCopy.fill('\u0000')
-            newKeyCopy.fill('\u0000')
+            // The staged put raced cancellation: the staged slot may or may not
+            // hold our bytes. The alias is ours alone (per-operation nonce) and
+            // was never published in metadata, so a NonCancellable best-effort
+            // delete is safe; live slots are never touched here.
+            try {
+                withContext(NonCancellable) { vault().deleteKey(stagedAlias) }
+            } catch (_: Exception) {
+            }
             throw e
         } catch (_: Exception) {
-            keyCopy.fill('\u0000')
-            newKeyCopy.fill('\u0000')
+            // The put itself failed: best-effort delete the (possibly partial)
+            // staged entry, then abort. Live slots are never touched.
+            deleteStagedBestEffort(stagedAlias)
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
         try {
-            try {
-                try {
-                    vault().putKey(providerId, keyCopy)
-                } finally {
-                    keyCopy.fill('\u0000')
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // The put itself failed: the vault may still hold the old key
-                // (write rejected before storing) or, in a pathological
-                // backend, our bytes. The ownership check inside
-                // [rollbackVaultIfOurs] distinguishes the cases; on unknown
-                // vault state it leaves everything untouched.
-                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
-                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-                return
-            }
-            // 6. Second fresh evaluation AFTER the vault write, BEFORE metadata.
+            // 6. Second fresh evaluation AFTER the staged write, BEFORE metadata.
             // A policy flip during putKey blocks the metadata write; the
-            // just-written key is reconciled by [rollbackVaultIfOurs] (restore
-            // the predecessor, or delete our own orphan when there was none).
+            // just-written staged key is deleted (own alias, safe).
             val v2 = freshVerdictOrDeny("key.write", providerId)
             if (v2 == Verdict.DENY) {
-                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                deleteStagedBestEffort(stagedAlias)
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
             // 7. Generation fence after the write: an edit racing putKey aborts
-            // the metadata write and reconciles the just-written key.
+            // the metadata write and deletes the just-written staged key.
             if (entryRevision != formRevision.get()) {
-                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                deleteStagedBestEffort(stagedAlias)
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
@@ -625,27 +628,27 @@ class SetupViewModel(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
-                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    deleteStagedBestEffort(stagedAlias)
                     _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                     return
                 }
                 if (!consentMatches(consent, live2, liveBaseUrl2)) {
-                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    deleteStagedBestEffort(stagedAlias)
                     _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                     return
                 }
             }
             // 9. Trailing entry fence before the metadata CAS.
             if (entryRevision != formRevision.get()) {
-                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                deleteStagedBestEffort(stagedAlias)
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
             // 10. ALLOW->ASK flip during putKey (fresh path only): demand an
             // explicit confirmation instead of persisting metadata. The
-            // just-written key is restored to its pre-put state first, so no
-            // orphan is left pending while the dialog is shown; the confirm tap
-            // performs a clean backup+put of its own.
+            // just-written staged key is deleted first, so no orphan is left
+            // pending while the dialog is shown; the confirm tap performs a
+            // clean staged put of its own.
             if (v2 == Verdict.ASK && consent == null) {
                 val live3 = _form.value
                 val liveBaseUrl3 = try {
@@ -653,12 +656,12 @@ class SetupViewModel(
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
-                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    deleteStagedBestEffort(stagedAlias)
                     _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                     return
                 }
                 if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrl3, entryRevision)) {
-                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    deleteStagedBestEffort(stagedAlias)
                     _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                     return
                 }
@@ -669,17 +672,17 @@ class SetupViewModel(
                 // mismatch discard the just-minted consent and fail closed.
                 if (entryRevision != formRevision.get()) {
                     takePendingConsent()
-                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                    deleteStagedBestEffort(stagedAlias)
                     _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                     return
                 }
-                // Do NOT save metadata and do NOT set saved=true here: restore
-                // the pre-put vault state, then ask for confirmation.
-                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                // Do NOT save metadata and do NOT set saved=true here: delete
+                // the staged key, then ask for confirmation.
+                deleteStagedBestEffort(stagedAlias)
                 _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
                 // Post-show fence: hide a stale dialog revived by an edit racing
-                // the dialog set (see initial-ASK path). The vault is already
-                // restored, so only the dialog state needs hiding here.
+                // the dialog set (see initial-ASK path). The staged key is already
+                // deleted, so only the dialog state needs hiding here.
                 if (entryRevision != formRevision.get()) {
                     takePendingConsent()
                     _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
@@ -693,218 +696,94 @@ class SetupViewModel(
             // bump formRevision per #17 scope) but model is not consent identity
             // (consent binds providerId/baseUrl only), so staleness is out of scope
             // and intentionally not fenced here. See keyCopy note at step 5.
-            val config = endpointConfigOf(form, effectiveBaseUrl, providerId)
+            // The metadata swings apiKeyRef to OUR staged alias (per-operation);
+            // the fixed deriveApiKeyRef form is kept only for backward-compatible
+            // reads of old metadata and in-memory (non-persisted) mapping.
+            val config = endpointConfigOf(form, effectiveBaseUrl, providerId, stagedRef)
             val wrote = try {
                 store.saveIfRevision(config, expectedRevision)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: IllegalArgumentException) {
-                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                deleteStagedBestEffort(stagedAlias)
                 throw e
             } catch (_: Exception) {
-                rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
+                deleteStagedBestEffort(stagedAlias)
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
             if (!wrote) {
-                // CAS mismatch: a concurrent winner advanced the revision. A
-                // same-content winner key is indistinguishable by content alone,
-                // so never blindly delete/restore here. A same-provider save
-                // winner may already hold our bytes in the vault: touch nothing
-                // and fail closed. Only a clear (or unrelated-provider) winner
-                // leaves our slot without a winner key, in which case the gated
-                // rollback below cleans our own orphan (never a restore).
-                // Store read failures fail closed to no-touch (preserve a
-                // possible winner). STRICT read: observe() is lenient (folds
-                // transient failure to null) and must never authorize a
-                // delete; snapshotStrict() throws on failure so the catch below
-                // (true = protects slot) actually engages.
-                val winnerProtectsSlot = try {
-                    val meta = store.snapshotStrict()
-                    meta != null && meta.providerId == providerId
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    true
-                }
-                if (!winnerProtectsSlot) {
-                    rollbackVaultIfOurs(providerId, newKeyCopy, backup, hadKey, expectedRevision)
-                }
+                // CAS mismatch: a concurrent winner advanced the revision. Our
+                // staged alias is ours alone (per-operation nonce) and was never
+                // published, so deleting it cannot harm the winner, whose
+                // metadata points at its own staged alias. No vault read, no
+                // content comparison, no live touch — different-key and
+                // same-bytes losers alike cannot corrupt the winner.
+                deleteStagedBestEffort(stagedAlias)
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
+            committed = true
+            // Post-commit retire of the previous live alias (best-effort, never
+            // fails the save). Guarded by inequality with the just-committed
+            // staged alias, so the new live key is never deleted here. Runs in
+            // the cancellable context (deliberately outside NonCancellable): if
+            // cancellation lands here the previous alias may leak at rest
+            // (documented orphan class, strictly better than loss); the new
+            // live key always survives.
+            if (oldAlias != null && oldAlias != stagedAlias) {
+                try {
+                    vault().deleteKey(oldAlias)
+                } catch (e: CancellationException) {
+                    // Commit already won: swallow to report success and never
+                    // fall through to anything that deletes the new live key.
+                } catch (_: Exception) {
+                    // Best-effort: the save below stays authoritative.
+                }
+            }
             _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
-        } finally {
-            // Success path needs no rollback; every secret copy is wiped here.
-            newKeyCopy.fill('\u0000')
-            backup?.fill('\u0000')
+        } catch (e: CancellationException) {
+            if (stagedWritten && !committed) {
+                // Pre-commit cancellation: clean our own staged alias, but only
+                // when it is NOT the committed live key. The CAS may have
+                // committed and then thrown, so verify against strict metadata
+                // first; unknown store state fails closed to no-touch (at-rest
+                // leak, never loss). A winner's staged live key can never equal
+                // our per-operation alias, so `false` (absent or pointing
+                // elsewhere) authorizes the delete.
+                val livePointsAtStaged = try {
+                    withContext(NonCancellable) { store.snapshotStrict()?.apiKeyRef == stagedRef }
+                } catch (_: Exception) {
+                    null
+                }
+                if (livePointsAtStaged == false) {
+                    try {
+                        withContext(NonCancellable) { vault().deleteKey(stagedAlias) }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            throw e
         }
     }
 
     /**
-     * Ownership-checked vault reconciliation for post-put aborts (stage3).
+     * Best-effort delete of an attempt-owned staged alias.
      *
-     * Re-reads the live vault entry and compares it against [newKeyCopy] (the
-     * pre-put copy of the key this attempt wrote; the put input itself was
-     * wiped by [KeyVault.putKey]):
-     * - live entry still equals what we wrote (still ours): restore [backup]
-     *   when [hadKey] (a predecessor existed), otherwise [KeyVault.deleteKey]
-     *   our own orphan;
-     * - live entry differs (an out-of-band writer already overwrote us), is
-     *   absent (someone deleted), or cannot be read (unknown vault state):
-     *   touch nothing, fail-closed. In particular this function NEVER issues an
-     *   unconditional `deleteKey(providerId)`, NEVER overwrites a foreign key,
-     *   and NEVER logs key material.
-     *
-     * P1 same-bytes hardening: content alone cannot distinguish a loser orphan
-     * from a winner same-content key, so every write is gated by
-     * [expectedRevision] (the [EndpointStore.currentRevision] snapshot taken
-     * before our put):
-     * - `currentRevision() == expectedRevision` (no winner): reconcile as above
-     *   (fresh start deletes the own orphan, rotation restores the predecessor);
-     * - revision advanced + metadata present for our [providerId] (save winner,
-     *   possibly same bytes): return BEFORE any vault read/write, leaving the
-     *   winner untouched. Same-content `orphan == winner` leaving is correct;
-     * - revision advanced + metadata absent or for a different provider (clear
-     *   winner or unrelated single-endpoint overwrite): no winner key occupies
-     *   our slot, so fall through to an ownership-checked DELETE (never a
-     *   restore — restoring would resurrect a key with no active endpoint).
-     * Revision/metadata read failures fail closed (no vault touch).
-     * CAS-false callers additionally skip this function entirely when a
-     * same-provider winner holds metadata (see the trailing-CAS branch); this
-     * gate is the defense-in-depth for V2 DENY / fence / exception aborts that
-     * have not yet proven a winner via CAS.
-     *
-     * Short-term fixed-alias scheme: the vault has a single slot per
-     * providerId, so restore is `putKey(backup)` and cleanup is a checked
-     * delete. Residual risks (no multi-writer safety is claimed):
-     * - an out-of-band write between our backup read and our put is already
-     *   overwritten before this runs (unrecoverable under a fixed alias);
-     * - an out-of-band write between the re-read below and the restore/delete
-     *   can still be clobbered (check-then-act race inside this function).
-     * Same-VM saves are serialized by [saveMutex]; anything out-of-band needs
-     * single-writer discipline by documentation. The durable fix is a
-     * staged/versioned vault alias (write aside, CAS metadata, retire old),
-     * tracked as a follow-up issue.
-     *
-     * Best-effort: vault failures are swallowed so the original abort reason
-     * (policy DENY, fence mismatch, CAS loss) stays the reported error.
-     * [CancellationException] is always rethrown, never swallowed.
-     *
-     * @param backup the pre-put key copy; NOT consumed here (the caller wipes
-     * it in `finally`). A defensive copy is passed to [KeyVault.putKey] because
-     * put wipes its input.
-     * @param expectedRevision the [EndpointStore.currentRevision] snapshot taken
-     * before our put (`null` = fresh). Compared with strict `==` so fresh `null`
-     * never conflates with dirty `0L`.
+     * Safe by construction: staged aliases are per-operation unique and never
+     * published before the metadata CAS, so no winner or live reader can
+     * reference them. Vault failures are swallowed so the original abort reason
+     * stays the reported error. [CancellationException] is always rethrown,
+     * never swallowed (cancellation cleanup uses the NonCancellable guarded
+     * paths in [executeKeyWrite] instead).
      */
-    private suspend fun rollbackVaultIfOurs(
-        providerId: String,
-        newKeyCopy: CharArray,
-        backup: CharArray?,
-        hadKey: Boolean,
-        expectedRevision: Long?,
-    ) {
+    private suspend fun deleteStagedBestEffort(stagedAlias: String) {
         try {
-            val liveRev: Long? = try {
-                store.currentRevision()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // Unknown store state: leave everything untouched (fail-closed).
-                return
-            }
-            var clearWinner = false
-            if (liveRev != expectedRevision) {
-                // STRICT metadata read: observe() is lenient (transient failure
-                // folds to null) and would misclassify a failure as a clear
-                // winner, authorizing an orphan delete of a possible live
-                // winner. snapshotStrict() throws instead, and ANY exception
-                // (outside Cancellation) below is no-touch. clearWinner is set
-                // ONLY on a healthy strict read confirming null or a different
-                // provider. Two-read window (revision then metadata) is known;
-                // stage 2 should use snapshotWithRevisionStrict() for a single
-                // emission (see EndpointStore).
-                val meta = try {
-                    store.snapshotStrict()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    // Unknown store state: leave everything untouched (fail-closed).
-                    return
-                }
-                if (meta != null && meta.providerId == providerId) {
-                    // Save winner for our slot may hold a same-content key:
-                    // leave it untouched without even reading the vault.
-                    return
-                }
-                // Clear winner (no metadata) or unrelated single-endpoint
-                // overwrite: our slot holds no winner key, so an
-                // ownership-checked delete below is safe. Never restore here.
-                clearWinner = true
-            }
-            val current = try {
-                // Ownership re-read: technically a key.read of a possibly
-                // foreign slot, but atomicity-necessary (check-then-act) and
-                // covered by the inherited backup-before key.read verdict above
-                // (no second policy lookup here for atomicity). Never logged;
-                // staged-alias follow-up removes the backup/rollback scheme.
-                vault().getKey(providerId)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                // Unknown vault state: leave everything untouched (fail-closed).
-                return
-            }
-            if (current == null) {
-                // Absent: nothing of ours to restore or clean (our put failed
-                // before storing, or someone already deleted). Never recreate.
-                return
-            }
-            try {
-                if (!current.contentEquals(newKeyCopy)) {
-                    // Foreign key already in place: never overwrite, never delete.
-                    return
-                }
-                // Still ours: restore the predecessor or clean our own orphan.
-                if (hadKey) {
-                    if (clearWinner) {
-                        // No active endpoint for our provider: delete the own
-                        // orphan instead of resurrecting the predecessor with
-                        // no metadata (which would leak a key).
-                        try {
-                            vault().deleteKey(providerId)
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (_: Exception) {
-                            // Best-effort: the abort error below stays authoritative.
-                        }
-                        return
-                    }
-                    val prev = backup ?: return
-                    try {
-                        vault().putKey(providerId, prev.copyOf())
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {
-                        // Best-effort: the abort error below stays authoritative.
-                    }
-                } else {
-                    try {
-                        vault().deleteKey(providerId)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {
-                        // Best-effort: the abort error below stays authoritative.
-                    }
-                }
-            } finally {
-                current.fill('\u0000')
-            }
+            vault().deleteKey(stagedAlias)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            // Best-effort reconciliation: never mask the abort reason.
+            // Best-effort: the abort error below stays authoritative.
         }
     }
 
@@ -1029,13 +908,22 @@ class SetupViewModel(
     }
 
     /**
-     * Logout: delete the vault key, then clear metadata (order matters).
+     * Logout: delete the live vault key addressed by metadata, then clear
+     * metadata (order matters).
      *
      * Privileged teardown: unconditional delete+clear, serialized against
-     * in-flight saves via [saveMutex] so a save's backup/put/rollback window
+     * in-flight saves via [saveMutex] so a save's staged-put/CAS/retire window
      * cannot interleave with teardown in this VM. Cross-process writers are
-     * still fenced only by the metadata CAS and ownership checks, not by this
-     * mutex (see [saveMutex]).
+     * still fenced only by the metadata CAS, not by this mutex (see [saveMutex]).
+     *
+     * Ref-driven: the deleted alias is resolved from the snapshot's `apiKeyRef`
+     * (the staged live alias after a staged commit), never re-derived from
+     * `providerId`. Staged aliases from crashed saves (put-but-never-committed,
+     * or committed-but-never-retired, or cancelled mid-flight) are unknown here
+     * — without a vault list API they cannot be enumerated, so they linger
+     * encrypted at rest until a GC follow-up (list API) lands. Documented
+     * at-rest leak, strictly better than loss; in-flight aborts and cancels
+     * already delete their own staged alias, so the steady state has no residue.
      */
     fun logout(onDone: () -> Unit = {}) {
         formRevision.incrementAndGet()
@@ -1053,7 +941,11 @@ class SetupViewModel(
                     null
                 }
                 try {
-                    if (config != null) vault().deleteKey(config.providerId)
+                    val alias = config?.apiKeyRef
+                        ?.takeIf { it.startsWith("provider_key/") }
+                        ?.let { SetupValidation.aliasFromRef(it) }
+                        ?.takeIf { it.isNotBlank() }
+                    if (alias != null) vault().deleteKey(alias)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
@@ -1077,7 +969,12 @@ class SetupViewModel(
             ProviderCatalog.requirePreset(form.presetId).baseUrl
         }
 
-    private fun endpointConfigOf(form: SetupUiState, effectiveBaseUrl: String, providerId: String): EndpointConfig {
+    private fun endpointConfigOf(
+        form: SetupUiState,
+        effectiveBaseUrl: String,
+        providerId: String,
+        apiKeyRef: String,
+    ): EndpointConfig {
         val preset = ProviderCatalog.requirePreset(form.presetId)
         val protocol = if (form.presetId == ProviderCatalog.CUSTOM_ID) {
             dev.librepocket.provider.ProviderProtocol.CHAT_COMPLETIONS
@@ -1091,13 +988,16 @@ class SetupViewModel(
             baseUrl = effectiveBaseUrl,
             protocol = protocol,
             model = form.model.trim().ifEmpty { preset.defaultModel },
-            apiKeyRef = SetupValidation.deriveApiKeyRef(providerId),
+            apiKeyRef = apiKeyRef,
         )
     }
 
     private fun providerConfigOf(form: SetupUiState, effectiveBaseUrl: String): ProviderConfig {
         val providerId = SetupValidation.deriveProviderId(form.presetId)
-        return endpointConfigOf(form, effectiveBaseUrl, providerId).toProviderConfig()
+        // In-memory transport mapping only (never persisted): the fixed ref is
+        // a placeholder — the key itself travels via the KeyProvider closure.
+        return endpointConfigOf(form, effectiveBaseUrl, providerId, SetupValidation.deriveApiKeyRef(providerId))
+            .toProviderConfig()
     }
 
     private fun classifyTestError(e: ProviderFailure): String {
@@ -1116,6 +1016,27 @@ class SetupViewModel(
     override fun onCleared() {
         modelRefreshJob?.cancel()
         super.onCleared()
+    }
+
+    companion object {
+        /**
+         * Process-wide staged-alias sequence.
+         *
+         * MUST be process-wide (not per-ViewModel like [consentNonces]): two
+         * ViewModel/store instances sharing one vault in this process (the
+         * cross-VM race the staged scheme exists to survive) would otherwise
+         * mint identical staged aliases and overwrite/delete each other's
+         * staged keys. Per-operation uniqueness within the process is what
+         * makes the loser's own-staged delete safe.
+         *
+         * Single-process scope only, like the DataStore CAS itself: a second
+         * OS process restarts its own sequence and could theoretically collide.
+         * That is the same trust boundary as [EndpointStore]'s single-process
+         * CAS (documented there), not a new claim — and a collision there
+         * still cannot corrupt a committed winner's bytes before the CAS, only
+         * (pathologically) retire/clean the same-named alias after it.
+         */
+        private val stagedNonceSeq = AtomicLong(0L)
     }
 }
 

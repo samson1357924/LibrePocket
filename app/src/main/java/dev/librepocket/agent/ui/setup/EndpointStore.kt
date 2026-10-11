@@ -45,9 +45,16 @@ enum class EndpointReadiness {
  * Active BYOK endpoint metadata (single-endpoint MVP; multi-endpoint is P2).
  *
  * Never carries the plaintext key: the key itself lives in
- * [dev.librepocket.keystore.KeyVault] under [providerId], referenced here
- * only by [apiKeyRef] (form `provider_key/<...>`). [providerId] follows
- * `ProviderCatalog.fromPreset` convention (`preset:<presetId>`). The local
+ * [dev.librepocket.keystore.KeyVault] under the alias addressed by [apiKeyRef]
+ * (form `provider_key/<alias>`), resolved via
+ * [SetupValidation.aliasFromRef]. Fresh/legacy metadata points at the fixed
+ * live alias (`provider_key/<providerId>`); saves committed through the
+ * staged scheme point at a per-operation staged alias
+ * (`provider_key/<providerId>#staged-<nonce>`). Readers MUST resolve the alias
+ * from [apiKeyRef] and MUST NOT re-derive it from [providerId]: after a staged
+ * commit the live alias and the providerId-derived alias differ.
+ * [providerId] follows `ProviderCatalog.fromPreset` convention
+ * (`preset:<presetId>`). The local
  * [configRevision] is atomically advanced by [EndpointStore.save]/[clear] and
  * is for stale-session fencing, not endpoint identity or vault-write atomicity.
  */
@@ -202,6 +209,12 @@ class EndpointStore(
     /**
      * Gate verdict: metadata complete + baseUrl valid + [KeyVault] holds the key.
      * Network reachability is deliberately excluded (checked via listModels on demand).
+     *
+     * Ref-driven: the vault alias is resolved from `config.apiKeyRef` via
+     * [SetupValidation.aliasFromRef], never re-derived from `providerId`
+     * (staged commits point metadata at a per-operation alias). A missing
+     * prefix or blank alias fails closed to [EndpointReadiness.NO_KEY] without
+     * touching the vault.
      */
     suspend fun readiness(vault: KeyVault): EndpointReadiness {
         val config = try {
@@ -214,8 +227,11 @@ class EndpointStore(
         } catch (_: IllegalArgumentException) {
             return EndpointReadiness.INVALID_BASE_URL
         }
+        if (!config.apiKeyRef.startsWith("provider_key/")) return EndpointReadiness.NO_KEY
+        val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
+        if (alias.isBlank()) return EndpointReadiness.NO_KEY
         val hasKey = try {
-            vault.hasKey(config.providerId)
+            vault.hasKey(alias)
         } catch (_: Exception) {
             false
         }

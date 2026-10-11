@@ -86,7 +86,7 @@ function redactSensitiveText(value: string): string {
     .slice(0, MAX_TEXT_LENGTH);
 }
 
-function parseJsonObject(text: string): Record<string, unknown> | undefined {
+function tryParseObject(text: string): Record<string, unknown> | undefined {
   try {
     const parsed: unknown = JSON.parse(text);
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
@@ -97,15 +97,37 @@ function parseJsonObject(text: string): Record<string, unknown> | undefined {
   }
 }
 
-function parseFindings(value: unknown): ReviewFinding[] | undefined {
+export function parseJsonObject(text: string): Record<string, unknown> | undefined {
+  if (typeof text !== 'string') return undefined;
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+
+  const direct = tryParseObject(trimmed);
+  if (direct) return direct;
+
+  const codeBlockMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (codeBlockMatch && codeBlockMatch[1]) {
+    const fromCodeBlock = tryParseObject(codeBlockMatch[1].trim());
+    if (fromCodeBlock) return fromCodeBlock;
+  }
+
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    const fromBraces = tryParseObject(trimmed.slice(firstBrace, lastBrace + 1));
+    if (fromBraces) return fromBraces;
+  }
+
+  return undefined;
+}
+
+export function parseFindings(value: unknown): ReviewFinding[] | undefined {
+  if (value === undefined) return [];
   if (!Array.isArray(value)) return undefined;
   const result: ReviewFinding[] = [];
   for (const raw of value) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
     const finding = raw as Record<string, unknown>;
-    if (Object.keys(finding).some((key) => !['severity', 'file', 'line', 'issue', 'suggestion'].includes(key))) {
-      return undefined;
-    }
     if (
       !SEVERITIES.has(finding.severity as FindingSeverity) ||
       typeof finding.issue !== 'string' ||
@@ -126,7 +148,7 @@ function parseFindings(value: unknown): ReviewFinding[] | undefined {
   return result;
 }
 
-function parseSuggestedLabelsStrict(value: unknown): string[] | undefined {
+export function parseSuggestedLabelsStrict(value: unknown): string[] | undefined {
   if (value === undefined) return [];
   if (!Array.isArray(value)) return undefined;
   for (const entry of value) {
@@ -135,13 +157,12 @@ function parseSuggestedLabelsStrict(value: unknown): string[] | undefined {
   return [...(value as string[])];
 }
 
-function parseRoleResponse(role: OpenAIModelRole, modelUsed: string, content: string): RoleReview {
+export function parseRoleResponse(role: OpenAIModelRole, modelUsed: string, content: string): RoleReview {
   const sanitizedModel = redactSensitiveText(modelUsed);
   const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [], summary: '' };
   const parsed = parseJsonObject(content);
   if (
     !parsed ||
-    Object.keys(parsed).some((key) => !['verdict', 'summary', 'findings', 'suggestedLabels'].includes(key)) ||
     !VERDICTS.has(parsed.verdict as ReviewVerdict)
   ) return fallback;
   const findings = parseFindings(parsed.findings);

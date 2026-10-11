@@ -21,7 +21,13 @@ import {
   truncateDiff,
 } from '../src/review_diff';
 import { buildReviewDiff } from '../src/github_runner';
-import { orchestrateReview, triageIssue } from '../src/orchestrator';
+import {
+  orchestrateReview,
+  parseFindings,
+  parseJsonObject,
+  parseRoleResponse,
+  triageIssue,
+} from '../src/orchestrator';
 
 const FAKE_OPENAI_BASE_URL = ['https:', '', 'pocketguard-openai.test', 'v1'].join('/');
 const FAKE_ALLOWED_ORIGINS = [new URL(FAKE_OPENAI_BASE_URL).origin];
@@ -530,20 +536,192 @@ export async function runScannerSendOpenAITests(): Promise<void> {
       assert.equal(completeWithOmission.verdict, 'INCONCLUSIVE', omittedFile);
     }
 
+    // Robust JSON & auxiliary keys: extra fields in findings or top-level are tolerated and ignored.
     const unknownFindingField = await runOrchestratorResponse(JSON.stringify({
       verdict: 'APPROVE',
       findings: [{ severity: 'WARN', issue: 'Synthetic finding.', unexpected: true }],
     }));
-    assert.equal(unknownFindingField.verdict, 'INCONCLUSIVE');
-    assert.equal(unknownFindingField.roles.every((role) => role.findings.length === 0), true);
+    assert.equal(unknownFindingField.verdict, 'APPROVE');
+    assert.equal(unknownFindingField.roles.every((role) => role.findings.length === 1), true);
+    assert.equal(unknownFindingField.roles[0]?.findings[0]?.severity, 'WARN');
+    assert.equal(unknownFindingField.roles[0]?.findings[0]?.issue, 'Synthetic finding.');
+    assert.equal(Object.hasOwn(unknownFindingField.roles[0]?.findings[0] ?? {}, 'unexpected'), false);
 
     const unknownTopLevelField = await runOrchestratorResponse(JSON.stringify({
       verdict: 'APPROVE',
       findings: [],
       unexpected: true,
     }));
-    assert.equal(unknownTopLevelField.verdict, 'INCONCLUSIVE');
-    assert.equal(unknownTopLevelField.roles.every((role) => role.verdict === 'INCONCLUSIVE'), true);
+    assert.equal(unknownTopLevelField.verdict, 'APPROVE');
+    assert.equal(unknownTopLevelField.roles.every((role) => role.verdict === 'APPROVE'), true);
+
+    // Genuinely invalid finding severity still triggers fallback to INCONCLUSIVE.
+    const invalidFindingField = await runOrchestratorResponse(JSON.stringify({
+      verdict: 'APPROVE',
+      findings: [{ severity: 'INVALID', issue: 'Synthetic finding.' }],
+    }));
+    assert.equal(invalidFindingField.verdict, 'INCONCLUSIVE');
+    assert.equal(invalidFindingField.roles.every((role) => role.findings.length === 0), true);
+
+    // Markdown-wrapped codeblock response through orchestrator
+    const markdownOrchestrated = await runOrchestratorResponse([
+      'Review analysis:',
+      '```json',
+      JSON.stringify({
+        verdict: 'APPROVE',
+        summary: 'Opus markdown codeblock handled properly.',
+        findings: [{ severity: 'SUGGESTION', issue: 'Consider adding comments.', auxiliaryKey: 'ignored' }],
+        suggestedLabels: ['area:runtime'],
+        extraMeta: { pass: true },
+      }),
+      '```',
+      'End of review.',
+    ].join('\n'));
+    assert.equal(markdownOrchestrated.verdict, 'APPROVE');
+    assert.equal(markdownOrchestrated.roles[0]?.summary, 'Opus markdown codeblock handled properly.');
+    assert.equal(markdownOrchestrated.roles[0]?.findings.length, 1);
+    assert.equal(markdownOrchestrated.roles[0]?.findings[0]?.severity, 'SUGGESTION');
+    assert.equal(markdownOrchestrated.roles[0]?.findings[0]?.issue, 'Consider adding comments.');
+    assert.equal(Object.hasOwn(markdownOrchestrated.roles[0]?.findings[0] ?? {}, 'auxiliaryKey'), false);
+    assert.deepEqual(markdownOrchestrated.roles[0]?.suggestedLabels, ['area:runtime']);
+
+    // Direct unit tests for parseJsonObject and parseRoleResponse with realistic Opus shapes.
+    {
+      // 1. Direct parseJsonObject testing
+      assert.deepEqual(parseJsonObject('{"verdict":"APPROVE"}'), { verdict: 'APPROVE' });
+      assert.deepEqual(parseJsonObject('  \n{"verdict":"APPROVE"}\n  '), { verdict: 'APPROVE' });
+      assert.deepEqual(parseJsonObject('```json\n{"verdict":"APPROVE"}\n```'), { verdict: 'APPROVE' });
+      assert.deepEqual(parseJsonObject('```\n{"verdict":"APPROVE"}\n```'), { verdict: 'APPROVE' });
+      assert.deepEqual(parseJsonObject('```JSON\n{"verdict":"APPROVE"}\n```'), { verdict: 'APPROVE' });
+      assert.deepEqual(
+        parseJsonObject('Here is the review:\n```json\n{"verdict":"APPROVE"}\n```\nHope that helps!'),
+        { verdict: 'APPROVE' },
+      );
+      assert.deepEqual(
+        parseJsonObject('Some text before {"verdict":"APPROVE"} some text after'),
+        { verdict: 'APPROVE' },
+      );
+      assert.equal(parseJsonObject('not json at all'), undefined);
+      assert.equal(parseJsonObject(''), undefined);
+      assert.equal(parseJsonObject('[1, 2, 3]'), undefined);
+
+      // 2. Realistic Claude Opus 4.6 Thinking response shape
+      const realisticOpusResponse = [
+        'I have completed the review of the pull request changes.',
+        '',
+        '```json',
+        JSON.stringify({
+          verdict: 'NEEDS_CHANGES',
+          summary: 'Critical vulnerability detected in credential handling and missing boundary checks in file access.',
+          findings: [
+            {
+              severity: 'BLOCK',
+              file: 'app/src/main/java/dev/librepocket/keystore/KeyStoreManager.kt',
+              line: 42,
+              issue: 'Hardcoded secret encryption key in plaintext.',
+              suggestion: 'Use AndroidKeyStore provider to generate and retrieve hardware-backed keys.',
+              category: 'security',
+              rule: 'SEC-KEYSTORE-HARDCODED',
+              confidence: 'high',
+            },
+            {
+              severity: 'WARN',
+              file: 'app/src/main/java/dev/librepocket/tool/ToolDispatcher.kt',
+              line: 105,
+              issue: 'Unchecked execution boundary allows potential path traversal.',
+              suggestion: 'Validate canonical file paths against allowed root directories.',
+              category: 'integrity',
+              score: 8.5,
+            },
+          ],
+          suggestedLabels: ['status:needs-decision', 'security'],
+          analysis: 'The PR introduces significant security regressions that should be addressed before merging.',
+          overview: 'Overall code structure is clean but crypto implementation lacks hardware backing.',
+          scores: { security: 45, quality: 80 },
+        }, null, 2),
+        '```',
+        '',
+        'Please address the blocking findings before proceeding.',
+      ].join('\n');
+
+      const parsedOpus = parseRoleResponse('chief', 'cpa-claude-opus-4-6-thinking', realisticOpusResponse);
+      assert.equal(parsedOpus.verdict, 'NEEDS_CHANGES');
+      assert.equal(parsedOpus.role, 'chief');
+      assert.equal(parsedOpus.modelUsed, 'cpa-claude-opus-4-6-thinking');
+      assert.equal(
+        parsedOpus.summary,
+        'Critical vulnerability detected in credential handling and missing boundary checks in file access.',
+      );
+      assert.equal(parsedOpus.findings.length, 2);
+      assert.deepEqual(parsedOpus.findings[0], {
+        severity: 'BLOCK',
+        file: 'app/src/main/java/dev/librepocket/keystore/KeyStoreManager.kt',
+        line: 42,
+        issue: 'Hardcoded secret encryption key in plaintext.',
+        suggestion: 'Use AndroidKeyStore provider to generate and retrieve hardware-backed keys.',
+      });
+      assert.deepEqual(parsedOpus.findings[1], {
+        severity: 'WARN',
+        file: 'app/src/main/java/dev/librepocket/tool/ToolDispatcher.kt',
+        line: 105,
+        issue: 'Unchecked execution boundary allows potential path traversal.',
+        suggestion: 'Validate canonical file paths against allowed root directories.',
+      });
+      assert.deepEqual(parsedOpus.suggestedLabels, ['status:needs-decision', 'security']);
+      // Verify auxiliary keys were not leaked into the parsed role review
+      assert.equal(Object.hasOwn(parsedOpus, 'analysis'), false);
+      assert.equal(Object.hasOwn(parsedOpus, 'overview'), false);
+      assert.equal(Object.hasOwn(parsedOpus, 'scores'), false);
+      assert.equal(Object.hasOwn(parsedOpus.findings[0], 'category'), false);
+      assert.equal(Object.hasOwn(parsedOpus.findings[0], 'rule'), false);
+      assert.equal(Object.hasOwn(parsedOpus.findings[0], 'confidence'), false);
+
+      // 3. Minimal response: verdict only, missing summary, findings, suggestedLabels
+      const minimalParsed = parseRoleResponse('android_sec', 'cpa-claude-opus-4-6-thinking', '{"verdict":"APPROVE"}');
+      assert.equal(minimalParsed.verdict, 'APPROVE');
+      assert.equal(minimalParsed.summary, '');
+      assert.deepEqual(minimalParsed.findings, []);
+      assert.deepEqual(minimalParsed.suggestedLabels, []);
+
+      // 4. Code block without language tag
+      const noLangParsed = parseRoleResponse(
+        'android_code',
+        'cpa-claude-opus-4-6-thinking',
+        '```\n{"verdict":"INCONCLUSIVE","summary":"Need diff context","findings":[]}\n```',
+      );
+      assert.equal(noLangParsed.verdict, 'INCONCLUSIVE');
+      assert.equal(noLangParsed.summary, 'Need diff context');
+      assert.deepEqual(noLangParsed.findings, []);
+      assert.deepEqual(noLangParsed.suggestedLabels, []);
+
+      // 5. Fallback on invalid verdict
+      const invalidVerdictParsed = parseRoleResponse(
+        'chief',
+        'cpa-claude-opus-4-6-thinking',
+        '{"verdict":"LGTM","summary":"All good"}',
+      );
+      assert.equal(invalidVerdictParsed.verdict, 'INCONCLUSIVE');
+      assert.equal(invalidVerdictParsed.summary, '');
+      assert.deepEqual(invalidVerdictParsed.findings, []);
+
+      // 6. Fallback on invalid finding structure (e.g. invalid severity)
+      const invalidFindingParsed = parseRoleResponse(
+        'chief',
+        'cpa-claude-opus-4-6-thinking',
+        '{"verdict":"APPROVE","findings":[{"severity":"INVALID","issue":"bad"}]}',
+      );
+      assert.equal(invalidFindingParsed.verdict, 'INCONCLUSIVE');
+      assert.deepEqual(invalidFindingParsed.findings, []);
+
+      // 7. Fallback on invalid suggestedLabels type
+      const invalidLabelsParsed = parseRoleResponse(
+        'chief',
+        'cpa-claude-opus-4-6-thinking',
+        '{"verdict":"APPROVE","suggestedLabels":"not-an-array"}',
+      );
+      assert.equal(invalidLabelsParsed.verdict, 'INCONCLUSIVE');
+      assert.deepEqual(invalidLabelsParsed.suggestedLabels, []);
+    }
 
     const reviewWithSummary = await runOrchestratorResponse(JSON.stringify({
       verdict: 'APPROVE',

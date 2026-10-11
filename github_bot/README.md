@@ -79,15 +79,13 @@ repository secrets kept as a compatibility fallback (`vars.X || secrets.X` in
   dead model does not fail the review; the chain is
   `role model → role fallbacks → global fallbacks`. Unset means no fallback.
 
-Model fallback: a candidate falls through only on transport unavailability —
-network failure, response unusable, or an HTTP status in `408/429/500/502/503/504`.
-A `4xx` (notably `400` for an unsupported parameter) stops the chain with its
-status so the failure stays auditable instead of silently changing the request
-body, and the role still converges to `INCONCLUSIVE`. A candidate whose
-per-model profile is unconfigured is skipped without any request. Reports
-attribute `modelUsed` to the model that actually served the turn, so a fallback
-is never credited to the model that failed; when every candidate is exhausted
-the role fails closed.
+Model fallback: a candidate falls through on model or transport unavailability —
+network failure, timeout, unusable response, 4xx (such as 400 for undeployed/unlaunched
+models or unsupported parameters, 404, 429), or 5xx. The next candidate in the chain
+is tried in order. Candidates whose per-model profile is unconfigured are skipped
+without any request. Reports attribute `modelUsed` to the model that actually served
+the turn, so a fallback is never credited to the model that failed; when every candidate
+is exhausted, the role fails closed with an aggregated error preserving the final status code.
 
 `POCKETGUARD_OPENAI_ORIGIN` is the exact-origin allowlist for `OPENAI_BASE_URL`; it is not a wildcard or a path prefix. `OPENAI_BASE_URL` must use
 `https:` with no credentials, query, or fragment, and requests use
@@ -115,8 +113,7 @@ fail-closed). Builtin defaults cover `gpt-5*` as reasoning and
 `gpt-4o*`/`gpt-4.1*` as chat; any other model without an explicit profile
 fails closed (`model profile not configured`, no request sent) and the
 orchestrator converges to `INCONCLUSIVE` without retry, downgrade, or labels.
-A `400` for an unsupported parameter surfaces with its status code and follows
-the same fail-closed path. Fork quickstart: set the three model vars (and
+A `400` for an unsupported parameter or unmapped model triggers fallback to the next candidate in the chain; when all candidates are exhausted, it surfaces with its status code and follows the same fail-closed path. Fork quickstart: set the three model vars (and
 optionally `POCKETGUARD_MODEL_PROFILES`) on your fork, keep only
 `OPENAI_API_KEY` as a secret, and leave the URL/origin unset to use the
 official OpenAI defaults.
@@ -127,7 +124,7 @@ official OpenAI defaults.
 - The workflow checks out only the repository default branch. It never checks out a pull-request head. Same-repo reviews fetch immutable base/head commit IDs directly; fork reviews fetch the immutable base SHA plus exactly `+refs/pull/<N>/head` for the PR under review, then verify the fetched head resolves to the expected head SHA (SHA-pin against the webhook/`pulls.get` value). Any pin mismatch, fetch failure, or merge-base failure is fail-closed (`INCONCLUSIVE`, no OpenAI call). Fork code is never checked out, executed, or given credentials — it is only read as a diff.
 - Changed paths and per-file patches are computed from `git merge-base <base> <head>` to the head, never by comparing base and head trees directly: a PR that lags the default branch must not absorb main-only changes. The workflow checks out full history (`fetch-depth: 0`) so the base-side ancestry is present, and the runner issues an explicit `git fetch` (same-repo: `git fetch origin <base> <head>`; fork: `git fetch origin <base>` plus `git fetch origin +refs/pull/<N>/head`, no checkout of fork code) to obtain head objects. Any fetch or merge-base failure is fail-closed (`INCONCLUSIVE`, no OpenAI call) and never falls back to a direct base..head comparison. A changed-file list longer than `MAX_CHANGED_FILES` (3000, the local equivalent of the PR-files listing concept) is likewise incomplete and fail-closed.
 - Review output is single-turn per role; there is no model-controlled tool execution or retry loop.
-- Diff truncation and omitted files are recorded in coverage. An incomplete review, or an omitted tier 0–3 file, cannot be approved. A truncated key file also prevents complete coverage.
+- Diff truncation and omitted files are recorded in coverage. The PR diff budget `MAX_DIFF_LENGTH` is 1,000,000 characters, accommodating modern large-context models (272k ~ 1M tokens) in a clean single-turn review without fragmentation. An incomplete review, or an omitted tier 0–3 file, cannot be approved. A truncated key file also prevents complete coverage.
 - Deterministic checks inspect added content in the available diff; this is not a repository-wide or comprehensive secret scan. Secret detection is a bounded heuristic: it looks for exact supported key/token patterns on individual added lines and across at most three contiguous added lines from the same file and diff hunk. Multi-line candidates must be contiguous in the new file; context-separated additions are not joined, and surrounding source context is not reconstructed. Removed lines are not scanned, though they do not necessarily separate additions that are adjacent in the new file. Obfuscation, nonadjacent fragments, constructions spanning more than three lines, encoding, and semantic constructions can be missed. A miss must not be treated as evidence that a change contains no secret.
 - A deterministic `BLOCK` prevents the OpenAI review path from running; it does not make the heuristic a comprehensive secret scanner or establish that non-matching changes are safe. Secret-like text that is detected is redacted before model submission; generated output is sanitized before publication. Redaction is defense in depth, not a substitute for detection or a guarantee that an undetected value cannot be submitted.
 - Review artifacts (`pocketguard-review-report` with `review-output.json` + `review-report.md`/`review-report.json`) are retained for 30 days; the download step uses the same name/path (`github_bot`). The workflow's actions are pinned to full commit SHAs; update pins intentionally and keep the adjacent version comments accurate.

@@ -7,10 +7,12 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
 import okhttp3.EventListener
@@ -309,6 +311,102 @@ class McpTransportCancelTest {
             assertEquals("取消不得計入熔斷失敗", 0, breaker.failureCount())
             assertFalse(breaker.isOpen())
             assertEquals(2, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun parentDeadlinePropagatesInsteadOfNull() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        val signals = CallSignals()
+        try {
+            // 父層 withTimeout(800ms) 先於本層 15s 到期：必須拋 TimeoutCancellationException，
+            // 不得吞為 null（否則呼叫方誤判 TIMEOUT 並誤增熔斷）。
+            web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+            val start = System.nanoTime()
+            val outcome = runCatching {
+                withTimeout(800) {
+                    McpTransport(signaledClient(signals)).postJson(
+                        web.url("/").toString(),
+                        "sekret",
+                        "{}",
+                        McpTimeouts.DEFAULT_MS,
+                    )
+                }
+            }
+            val elapsedMs = (System.nanoTime() - start) / 1_000_000L
+            val failure = outcome.exceptionOrNull()
+            assertTrue(
+                "父層 deadline 必須透傳 TimeoutCancellationException（非 null），實際=$outcome",
+                failure is TimeoutCancellationException,
+            )
+            assertTrue("父層 deadline 應約 800ms 觸發（實際 ${elapsedMs}ms），不得等本層 15s", elapsedMs < 5_000L)
+            assertCallCancelled(signals, "父層 deadline")
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun serverParentDeadlineDoesNotTripBreaker() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            repeat(2) { web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE)) }
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            // listTools 父層 deadline：透傳、不計熔斷、不映射 TIMEOUT。
+            val listOutcome = runCatching {
+                withTimeout(800) { server.listTools(McpTimeouts.DEFAULT_MS) }
+            }
+            val listFailure = listOutcome.exceptionOrNull()
+            assertTrue(
+                "listTools 父層 deadline 必須透傳 TimeoutCancellationException，實際=$listOutcome",
+                listFailure is TimeoutCancellationException,
+            )
+            // callTool 父層 deadline：同上。
+            val callOutcome = runCatching {
+                withTimeout(800) { server.callTool("t", "{}", McpTimeouts.DEFAULT_MS) }
+            }
+            val callFailure = callOutcome.exceptionOrNull()
+            assertTrue(
+                "callTool 父層 deadline 必須透傳 TimeoutCancellationException，實際=$callOutcome",
+                callFailure is TimeoutCancellationException,
+            )
+            assertEquals("父層 deadline 不得計入熔斷失敗", 0, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+            assertEquals(2, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun serverOwnDeadlineMapsToTimeoutAndTripsBreaker() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 本層 deadline（MIN 15s）到期：回 TIMEOUT 且計入熔斷一次。
+            // 對照組：父層 deadline 測試必須拋例外且不計熔斷（見上兩測試）。
+            web.enqueue(MockResponse().setResponseCode(200).setBody("{\"jsonrpc\":\"2.0\"}").setBodyDelay(20, TimeUnit.SECONDS))
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(18_000) { server.listTools(McpTimeouts.MIN_MS) }
+            assertNotNull("本層 deadline 到期必須回 TIMEOUT（非 null/例外）", got)
+            assertEquals(McpStatus.TIMEOUT, got!!.status)
+            assertEquals("本層超時應計入熔斷失敗一次", 1, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+            assertEquals(1, web.requestCount)
         } finally {
             web.shutdown()
         }

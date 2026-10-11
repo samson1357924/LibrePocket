@@ -5,11 +5,10 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -49,8 +48,8 @@ class McpTransport(
      * - handler 自 `execute()` 前覆蓋到 body 消費完，`onCancelling=true` 使外部取消
      *   或總 deadline 到期立即 `call.cancel()` 中斷 blocking header/body IO，而非等其自然返回；
      * - 取消與否只以 coroutine Job（[ensureActive]）判斷，不以 `Call.isCanceled()` 判斷；
-     * - 總 deadline = `withTimeout(McpTimeouts.clamp)`（沿用既有常數），到期回 null（TIMEOUT）；
-     * - 外部取消透傳 `CancellationException`（不斷熔斷、不映射 TRANSPORT，見 [McpServer]）；
+     * - 總 deadline = `withTimeoutOrNull(McpTimeouts.clamp)`（沿用既有常數），僅本層到期回 null（TIMEOUT）；
+     *   父層 `withTimeout`/外部取消原樣透傳 `CancellationException`（不斷熔斷、不映射 TRANSPORT，見 [McpServer]）；
      * - 其餘 `IOException` 透傳（呼叫方映射 TRANSPORT）。
      */
     @OptIn(InternalCoroutinesApi::class)
@@ -69,42 +68,40 @@ class McpTransport(
             .header("Content-Type", "application/json")
             .build()
         val deadlineMs = McpTimeouts.clamp(timeoutMs)
-        try {
-            return withTimeout(deadlineMs) {
-                withContext(Dispatchers.IO) {
-                    val call = http.newCall(request)
-                    val job = currentCoroutineContext()[Job]
-                    val cancellation =
-                        job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
-                            if (cause != null) {
-                                try {
-                                    call.cancel()
-                                } catch (_: Exception) {
-                                }
+        // withTimeoutOrNull 僅將本層 deadline 到期轉為 null；父層 withTimeout/外部取消
+        // 以 TimeoutCancellationException/CancellationException 原樣傳播，不吞為 null。
+        return withTimeoutOrNull(deadlineMs) {
+            withContext(Dispatchers.IO) {
+                val call = http.newCall(request)
+                val job = currentCoroutineContext()[Job]
+                val cancellation =
+                    job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+                        if (cause != null) {
+                            try {
+                                call.cancel()
+                            } catch (_: Exception) {
                             }
                         }
-                    try {
-                        currentCoroutineContext().ensureActive()
-                        call.execute().use { resp ->
-                            val code = resp.code
-                            val text = readBoundedBody(resp.body) {
-                                try {
-                                    call.cancel()
-                                } catch (_: Exception) {
-                                }
-                            }
-                            code to text
-                        }
-                    } catch (e: IOException) {
-                        currentCoroutineContext().ensureActive()
-                        throw e
-                    } finally {
-                        cancellation?.dispose()
                     }
+                try {
+                    currentCoroutineContext().ensureActive()
+                    call.execute().use { resp ->
+                        val code = resp.code
+                        val text = readBoundedBody(resp.body) {
+                            try {
+                                call.cancel()
+                            } catch (_: Exception) {
+                            }
+                        }
+                        code to text
+                    }
+                } catch (e: IOException) {
+                    currentCoroutineContext().ensureActive()
+                    throw e
+                } finally {
+                    cancellation?.dispose()
                 }
             }
-        } catch (_: TimeoutCancellationException) {
-            return null
         }
     }
 }

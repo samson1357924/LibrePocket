@@ -22,6 +22,19 @@ WRAPPER="$ROOT/gradle/wrapper/gradle-wrapper.properties"
 fail=0
 report() { echo "docs_claim_check: $1"; fail=1; }
 
+# --- A0. Every checked-in workflow must be valid YAML and use # comments. ---
+# A syntax error silently disables a workflow (GitHub renames it to the file
+# path and stops triggering), so this fails closed before that reaches main.
+for wf in .github/workflows/*.yml; do
+  [ -f "$wf" ] || continue
+  if ! python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$wf" >/dev/null 2>&1; then
+    report "$wf is not valid YAML (workflow would be disabled)"
+  fi
+  if grep -nE '^[[:space:]]*//' "$wf" >/dev/null 2>&1; then
+    report "$wf uses // line comments (YAML only accepts #)"
+  fi
+done
+
 for f in "$WORKFLOW" "$TESTING" "$ENV_DOC" "$TOML" "$APP_BUILD" "$WRAPPER"; do
   if [ ! -f "$f" ]; then
     report "missing required file: $f"

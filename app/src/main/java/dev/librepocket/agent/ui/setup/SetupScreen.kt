@@ -156,7 +156,7 @@ fun SetupScreen(
 
         ExposedDropdownMenuBox(
             expanded = presetExpanded,
-            onExpandedChange = { presetExpanded = !presetExpanded },
+            onExpandedChange = { if (!state.saving) presetExpanded = !presetExpanded },
         ) {
             OutlinedTextField(
                 value = selectedPreset.label,
@@ -188,7 +188,7 @@ fun SetupScreen(
             value = state.baseUrl,
             onValueChange = viewModel::onBaseUrlChange,
             readOnly = !baseUrlEditable,
-            enabled = baseUrlEditable,
+            enabled = baseUrlEditable && !state.saving,
             label = { Text("伺服器位址") },
             supportingText = {
                 if (baseUrlEditable) Text("自訂位址必須是 https（本機/內網測試位址除外）。")
@@ -198,6 +198,8 @@ fun SetupScreen(
         )
 
         var modelExpanded by remember { mutableStateOf(false) }
+        // Stage2: model stays editable while saving (out of scope, see #17);
+        // only preset/baseUrl/apiKey are fenced by saving.
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -261,6 +263,7 @@ fun SetupScreen(
         OutlinedTextField(
             value = state.apiKey,
             onValueChange = viewModel::onApiKeyChange,
+            enabled = !state.saving,
             label = { Text("API Key") },
             placeholder = { Text("貼上你的金鑰") },
             modifier = Modifier.fillMaxWidth(),

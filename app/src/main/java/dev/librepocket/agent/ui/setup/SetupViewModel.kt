@@ -48,7 +48,8 @@ private data class KeyWriteConsent(
     val resource: String,
     val providerId: String,
     val baseUrl: String,
-    val configRevision: Long,
+    val configRevision: Long?,
+    val formRevision: Long,
     val nonce: Long,
 )
 
@@ -115,6 +116,12 @@ class SetupViewModel(
     val form: StateFlow<SetupUiState> = _form
     private val modelRefreshGeneration = AtomicLong(0L)
     private var modelRefreshJob: Job? = null
+    // Stage2 form fence: identity/key intent epoch. Bumped only by
+    // selectPreset/onBaseUrlChange/onApiKeyChange/prefillForEdit/logout.
+    // onModelChange/toggleShowKey deliberately do NOT bump (model edits are
+    // out of scope, see #17). All save-path TOCTOU checks compare the entry
+    // snapshot against this; any mismatch fails closed with POLICY_DENIED.
+    private val formRevision = AtomicLong(0L)
 
     // One-shot key.write consent (ASK path). Main-thread edits and the IO save
     // coroutine touch it from different threads; all access goes through
@@ -122,6 +129,9 @@ class SetupViewModel(
     private val consentLock = Any()
     private var pendingConsent: KeyWriteConsent? = null
     private val consentNonces = AtomicLong(0L)
+
+    /** Test seam for racing an edit between mint success and dialog display. */
+    internal var afterMintBeforeDialogForTest: (() -> Unit)? = null
 
     val gate: StateFlow<EndpointGate> = store.observe()
         .map { config ->
@@ -147,6 +157,7 @@ class SetupViewModel(
 
     fun selectPreset(presetId: String) {
         val preset = ProviderCatalog.preset(presetId) ?: return
+        formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
@@ -165,6 +176,7 @@ class SetupViewModel(
     }
 
     fun onBaseUrlChange(v: String) {
+        formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
@@ -185,6 +197,7 @@ class SetupViewModel(
     }
 
     fun onApiKeyChange(v: String) {
+        formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
@@ -210,6 +223,7 @@ class SetupViewModel(
      * Unknown presetIds fall back to custom with the stored URL editable.
      */
     fun prefillForEdit(config: EndpointConfig) {
+        formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
@@ -256,6 +270,8 @@ class SetupViewModel(
                 _form.value = _form.value.copy(testing = false, testModels = count)
             } catch (e: ProviderFailure) {
                 _form.value = _form.value.copy(testing = false, errorCode = classifyTestError(e))
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 _form.value = _form.value.copy(testing = false, errorCode = "TEST_FAILED")
             }
@@ -337,11 +353,21 @@ class SetupViewModel(
     /**
      * Shared save path. [consent] is non-null only for the dialog confirm tap,
      * which carries the one-shot consent minted by the earlier ASK evaluation.
-     * Every side effect below ([KeyVault.putKey] + [EndpointStore.save]) is
-     * preceded by a fresh policy evaluation; DENY always wins, even when a
-     * consent was minted earlier.
+     * Every side effect below ([KeyVault.putKey] + [EndpointStore.saveIfRevision])
+     * is preceded by a fresh policy evaluation; DENY always wins, even when a
+     * consent was minted earlier. Stage2 adds a form fence ([formRevision]) and
+     * a second post-write policy re-evaluation; aborts never delete live vault
+     * state (orphans left for stage3 vault reconciliation).
      */
     private fun saveWithConsent(consent: KeyWriteConsent?) {
+        val entryRevision = formRevision.get()
+        if (consent != null && consent.formRevision != entryRevision) {
+            // Stale consent replay (identity/key edited between mint and confirm
+            // tap, or cross-tap reuse): fail closed without touching saving or
+            // evaluating policy.
+            _form.value = _form.value.copy(errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
         val cur = _form.value
         if (cur.saving || cur.testing || cur.modelsLoading) return
         val effectiveBaseUrl = effectiveBaseUrlOf(cur)
@@ -353,10 +379,13 @@ class SetupViewModel(
         _form.value = cur.copy(saving = true, errorCode = null)
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                executeKeyWrite(cur, effectiveBaseUrl, consent)
+                executeKeyWrite(cur, effectiveBaseUrl, consent, entryRevision)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: IllegalArgumentException) {
                 _form.value = _form.value.copy(saving = false, errorCode = e.message ?: "SETUP_SAVE_FAILED")
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 _form.value = _form.value.copy(saving = false, errorCode = "SETUP_SAVE_FAILED")
             }
         }
@@ -366,34 +395,226 @@ class SetupViewModel(
         form: SetupUiState,
         effectiveBaseUrl: String,
         consent: KeyWriteConsent?,
+        entryRevision: Long,
     ) {
-        val providerId = SetupValidation.deriveProviderId(form.presetId)
-        // Fresh evaluation immediately before ANY side effect (TOCTOU guard).
-        val verdict = policy.evaluateFresh("key.write", providerId).verdict
-        if (verdict == Verdict.DENY) {
+        val providerId = try {
+            SetupValidation.deriveProviderId(form.presetId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
+        // 1. Fresh evaluation immediately before ANY side effect (TOCTOU guard).
+        // evaluateFresh failure fails closed to DENY.
+        val v1 = freshVerdictOrDeny("key.write", providerId)
+        if (v1 == Verdict.DENY) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // 2. Form fence before mint: an edit racing the first evaluation aborts.
+        if (entryRevision != formRevision.get()) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // 3. Consent path re-validates against the LATEST form (not the entry
+        // snapshot) so a key/URL edit racing the confirm tap is observed.
         if (consent != null) {
-            // The carried consent covers exactly one ASK. It must still match
-            // the endpoint snapshot; a changed identity fails closed.
-            if (!consentMatchesSnapshot(consent, form, effectiveBaseUrl)) {
+            val live = _form.value
+            val liveBaseUrl = try {
+                effectiveBaseUrlOf(live)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
-        } else if (verdict == Verdict.ASK) {
+            if (!consentMatches(consent, live, liveBaseUrl)) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+        } else if (v1 == Verdict.ASK) {
             // key.write defaults to ASK: one explicit confirmation per key.
-            mintKeyWriteConsent(providerId, effectiveBaseUrl)
+            if (!mintKeyWriteConsentGuarded(providerId, effectiveBaseUrl, entryRevision)) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            // Test seam: pause between mint success and dialog display so tests
+            // can race an edit into the mint->dialog window (Gated skeleton).
+            afterMintBeforeDialogForTest?.invoke()
+            // Mint->dialog window fence: an edit racing the mint must not
+            // revive the dialog. Re-verify before showing; on mismatch discard
+            // the just-minted consent and fail closed (no deleteKey).
+            if (entryRevision != formRevision.get()) {
+                takePendingConsent()
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
             _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+            // Post-show fence: an edit racing the dialog set must not leave a
+            // stale dialog. invalidateKeyWriteConsent() hides a shown dialog,
+            // but an edit landing between the pre-show check and this set would
+            // otherwise revive it; re-verify and hide again.
+            if (entryRevision != formRevision.get()) {
+                takePendingConsent()
+                _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
             return
         }
+        // Fresh ALLOW direct-write path: snapshot the raw revision now for the
+        // trailing CAS. Consent path reuses consent.configRevision instead.
+        // Snapshot-then-fence: a revision-read failure or an edit racing the
+        // read fails closed before any vault side effect.
+        val expectedRevision: Long? = if (consent != null) {
+            consent.configRevision
+        } else {
+            val rev0 = try {
+                store.currentRevision()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (entryRevision != formRevision.get()) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            rev0
+        }
+        // 4. Fence again immediately before the vault write.
+        if (entryRevision != formRevision.get()) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // 5. Vault write. Uses the entry snapshot (not live): key/identity edits
+        // bump formRevision and are fenced above, so reaching here means the
+        // entry key is still current. Model may be stale (onModelChange does not
+        // bump per #17 scope) but model is not consent identity and does not
+        // affect key.write fencing; endpointConfigOf below shares this note.
         val keyCopy = form.apiKey.trim().toCharArray()
         try {
-            vault().putKey(providerId, keyCopy)
+            try {
+                vault().putKey(providerId, keyCopy)
+            } catch (e: CancellationException) {
+                throw e
+            }
         } finally {
             keyCopy.fill('\u0000')
         }
-        store.save(endpointConfigOf(form, effectiveBaseUrl, providerId))
+        // 6. Second fresh evaluation AFTER the vault write, BEFORE metadata.
+        // A policy flip during putKey blocks the metadata write. This stage
+        // never deletes: the just-written key is left as an orphan for stage3
+        // vault reconciliation (no bestEffortDeleteKey/deleteKey here).
+        val v2 = freshVerdictOrDeny("key.write", providerId)
+        if (v2 == Verdict.DENY) {
+            // TODO(stage3): orphan key left in vault; stage3 must reconcile/delete on abort.
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // 7. Generation fence after the write: an edit racing putKey aborts
+        // the metadata write (orphan left for stage3).
+        if (entryRevision != formRevision.get()) {
+            // TODO(stage3): orphan key left in vault; stage3 must reconcile/delete on abort.
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // 8. Consent re-verification against live state (a stale/invalidated
+        // consent still blocks even when the second verdict is ALLOW).
+        if (consent != null) {
+            val live2 = _form.value
+            val liveBaseUrl2 = try {
+                effectiveBaseUrlOf(live2)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // TODO(stage3): orphan key left in vault.
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (!consentMatches(consent, live2, liveBaseUrl2)) {
+                // TODO(stage3): orphan key left in vault.
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+        }
+        // 9. Trailing entry fence before the metadata CAS.
+        if (entryRevision != formRevision.get()) {
+            // TODO(stage3): orphan key left in vault.
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // 10. ALLOW->ASK flip during putKey (fresh path only): demand an
+        // explicit confirmation instead of persisting metadata. The orphan key
+        // stays (stage3 cleans); mint a fresh consent for the confirm tap.
+        if (v2 == Verdict.ASK && consent == null) {
+            val live3 = _form.value
+            val liveBaseUrl3 = try {
+                effectiveBaseUrlOf(live3)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // TODO(stage3): orphan key left in vault.
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrl3, entryRevision)) {
+                // TODO(stage3): orphan key left in vault.
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            // Test seam: same mint->dialog window as the initial-ASK path.
+            afterMintBeforeDialogForTest?.invoke()
+            // Mint->dialog window fence (ALLOW->ASK flip path): an edit racing
+            // the mint must not revive the dialog. Re-verify before showing; on
+            // mismatch discard the just-minted consent and fail closed.
+            // Orphan from putKey stays (no deleteKey; stage3 reconciles).
+            if (entryRevision != formRevision.get()) {
+                takePendingConsent()
+                // TODO(stage3): orphan key left in vault.
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            // Do NOT save metadata and do NOT set saved=true here.
+            // TODO(stage3): orphan key left in vault; stage3 must reconcile on next outcome.
+            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+            // Post-show fence: hide a stale dialog revived by an edit racing
+            // the dialog set (see initial-ASK path).
+            if (entryRevision != formRevision.get()) {
+                takePendingConsent()
+                // TODO(stage3): orphan key left in vault.
+                _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            return
+        }
+        // V2==ASK with a valid matching consent proceeds; V2==ALLOW proceeds
+        // (an invalidated consent above already blocked).
+        // Uses the entry snapshot: model may be stale (onModelChange does not
+        // bump formRevision per #17 scope) but model is not consent identity
+        // (consent binds providerId/baseUrl only), so staleness is out of scope
+        // and intentionally not fenced here. See keyCopy note at step 5.
+        val config = endpointConfigOf(form, effectiveBaseUrl, providerId)
+        val wrote = try {
+            store.saveIfRevision(config, expectedRevision)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IllegalArgumentException) {
+            // TODO(stage3): orphan key left in vault; stage3 must reconcile/delete on abort.
+            throw e
+        } catch (_: Exception) {
+            // TODO(stage3): orphan key left in vault.
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        if (!wrote) {
+            // CAS mismatch (concurrent clear/save advanced the revision):
+            // fail closed without deleting the orphan (stage3 reconciles).
+            // TODO(stage3): orphan key left in vault.
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
         _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
     }
 
@@ -434,40 +655,92 @@ class SetupViewModel(
             consent
         }
 
-    /** Mint a consent bound to the endpoint identity + stored revision observed now. */
-    private suspend fun mintKeyWriteConsent(providerId: String, baseUrl: String) {
-        val consent = KeyWriteConsent(
-            action = "key.write",
-            resource = providerId,
-            providerId = providerId,
-            baseUrl = baseUrl,
-            configRevision = readConfigRevision(),
-            nonce = consentNonces.incrementAndGet(),
-        )
-        synchronized(consentLock) { pendingConsent = consent }
-    }
-
-    private suspend fun consentMatchesSnapshot(
-        consent: KeyWriteConsent,
-        form: SetupUiState,
-        effectiveBaseUrl: String,
-    ): Boolean {
-        if (consent.action != "key.write") return false
-        if (consent.resource != consent.providerId) return false
-        if (consent.providerId != SetupValidation.deriveProviderId(form.presetId)) return false
-        if (consent.baseUrl != effectiveBaseUrl) return false
-        return consent.configRevision == readConfigRevision()
-    }
-
-    private suspend fun readConfigRevision(): Long =
+    /** Fail-closed fresh evaluation: any read failure (except cancellation) is DENY. */
+    private suspend fun freshVerdictOrDeny(action: String, resource: String): Verdict {
         try {
-            store.observe().first()?.configRevision ?: 0L
+            return policy.evaluateFresh(action, resource).verdict
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
-            -1L
+            return Verdict.DENY
         }
+    }
+
+    /** Mint guarded by the form fence with TOCTOU-safe lock handoff. Read failures deny. */
+    private suspend fun mintKeyWriteConsentGuarded(providerId: String, baseUrl: String, entryRevision: Long): Boolean {
+        try {
+            if (entryRevision != formRevision.get()) return false
+            val rev: Long? = try {
+                store.currentRevision()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                return false
+            }
+            if (entryRevision != formRevision.get()) return false
+            val consent = KeyWriteConsent(
+                action = "key.write",
+                resource = providerId,
+                providerId = providerId,
+                baseUrl = baseUrl,
+                configRevision = rev,
+                formRevision = entryRevision,
+                nonce = consentNonces.incrementAndGet(),
+            )
+            synchronized(consentLock) {
+                // Re-verify inside the lock: an edit racing the revision read
+                // must not mint a consent bound to a stale generation.
+                if (entryRevision != formRevision.get()) return false
+                pendingConsent = consent
+            }
+            return true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return false
+        }
+    }
+
+    private suspend fun consentMatches(
+        consent: KeyWriteConsent,
+        liveForm: SetupUiState,
+        liveBaseUrl: String,
+    ): Boolean {
+        try {
+            if (consent.action != "key.write") return false
+            if (consent.resource != consent.providerId) return false
+            val liveProviderId = try {
+                SetupValidation.deriveProviderId(liveForm.presetId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                return false
+            }
+            if (consent.providerId != liveProviderId) return false
+            if (consent.baseUrl != liveBaseUrl) return false
+            // Front formRevision clamp: no edit before the revision read.
+            if (consent.formRevision != formRevision.get()) return false
+            val currentRev: Long? = try {
+                // Raw nullable revision: fresh null != dirty 0L; failures deny.
+                store.currentRevision()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                return false
+            }
+            // Back clamp: no edit during the revision read.
+            if (consent.formRevision != formRevision.get()) return false
+            return consent.configRevision == currentRev
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return false
+        }
+    }
 
     /** Logout: delete the vault key, then clear metadata (order matters). */
     fun logout(onDone: () -> Unit = {}) {
+        formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null

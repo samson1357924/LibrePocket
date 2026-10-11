@@ -87,7 +87,8 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  * reasoning events ([StreamEvent.ReasoningDelta] and
  * [StreamEvent.ReasoningPresent]) flagging it reasoning-sourced
  * ([UiMessage.hasReasoning], rebuilt into [ChatMessage.hasReasoning] so
- * follow-ups fail closed),
+ * tool-dependent / thinking-mode follow-ups fail closed while ordinary
+ * no-tools follow-ups continue),
  * and persisted as a payload-free `reasoning` marker event via
  * [TranscriptSink.onTurnSucceeded]/[TranscriptSink.onTurnCancelled] so
  * resume restores the flag,
@@ -769,7 +770,8 @@ class TurnController(
             is StreamEvent.TextDelta -> appendAssistantText(attemptRunId, event.delta)
             // Reasoning stays in the same assistant block: P1 keeps one visible
             // stream and never loses thinking content. The block is additionally
-            // flagged reasoning-sourced so follow-up rebuilds fail closed.
+            // flagged reasoning-sourced so tool-dependent / thinking-mode
+            // follow-up rebuilds fail closed (ordinary no-tools ones continue).
             is StreamEvent.ReasoningDelta -> {
               markAssistantReasoning(attemptRunId)
               appendAssistantText(attemptRunId, event.delta)
@@ -963,7 +965,8 @@ class TurnController(
   /**
    * Flags the attempt's assistant block as reasoning-sourced (idempotent).
    * Display text is untouched; the flag only rides [buildRequest] into
-   * [ChatMessage.hasReasoning] so adapters fail closed on the follow-up.
+   * [ChatMessage.hasReasoning] so adapters fail closed on a tool-dependent /
+   * thinking-mode follow-up (ordinary no-tools follow-ups continue).
    */
   private fun markAssistantReasoning(runId: String) {
     _uiState.update { s ->

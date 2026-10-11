@@ -1035,22 +1035,49 @@ class TurnControllerTest {
   }
 
   // ---- Finding A [P1]: reasoning origin must survive into history ----
+  //
+  // Stage 1 scoped gate: production TurnController.buildRequest always sends
+  // tools == [] / serverTools == [] / thinking == null, and UiMessage has no
+  // toolCalls field (ToolDone only merges a text marker), so a pure-chat
+  // follow-up whose history carries hasReasoning must succeed. The Fakes
+  // below mirror the production requireNoReasoningHistory semantics with the
+  // same toolDependent formula: only a tool-dependent turn with reasoning
+  // history throws.
 
-  @Test fun reasoningMarkedHistoryFailsClosedOnFollowUpWithoutHttp() {
-    // transportCalls counts actual sends; the fail-closed gate below must
-    // throw before it, mirroring requireNoReasoningHistory-before-transport.
+  private fun gateMirroringFake(
+    transportCalls: AtomicInteger,
+    firstRound: Flow<StreamEvent>,
+    followUp: Flow<StreamEvent>,
+  ): FakeLlmProvider = FakeLlmProvider { request ->
+    if (request.thinking != null) throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
+    val toolDependent = request.tools.isNotEmpty() || request.serverTools.isNotEmpty() ||
+      request.messages.any { it.toolCalls.isNotEmpty() || it.role == "tool" }
+    if (toolDependent && request.messages.any { it.hasReasoning }) {
+      throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
+    }
+    transportCalls.incrementAndGet()
+    if (request.messages.any { it.hasReasoning }) followUp else firstRound
+  }
+
+  @Test fun reasoningMarkedHistoryContinuesOnFollowUpWithoutHttp() {
+    // transportCalls counts actual sends; the scoped gate passes a no-tools
+    // follow-up, so both turns reach transport.
     val transportCalls = AtomicInteger(0)
-    val provider = FakeLlmProvider { request ->
-      if (request.messages.any { it.hasReasoning }) {
-        throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
-      }
-      transportCalls.incrementAndGet()
-      flow {
+    val provider = gateMirroringFake(
+      transportCalls,
+      firstRound = flow {
         emit(StreamEvent.ReasoningDelta(0, 1, "thought"))
+        // ToolDone only merges a "[tool:...]" text marker into the assistant
+        // block (no structural toolCalls on UiMessage): it must not arm the
+        // tool-dependent gate on the follow-up.
         emit(StreamEvent.ToolDone(0, "call_1", "lookup", "{\"q\":\"hi\"}"))
         emit(StreamEvent.Done("stop"))
-      }
-    }
+      },
+      followUp = flow {
+        emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+        emit(StreamEvent.Done("stop"))
+      },
+    )
     val c = controller(provider)
     runBlocking { c.send("first") }
     // Display keeps the existing merged behavior (no split-out block).
@@ -1062,39 +1089,99 @@ class TurnControllerTest {
     assertEquals(1, transportCalls.get())
 
     runBlocking { c.send("second") }
-    // The follow-up history carried the marker, so the gate threw before
-    // any transport: stream entered, HTTP never sent, turn failed closed.
-    assertEquals(1, transportCalls.get())
+    // The follow-up history carried the marker, but the turn is not
+    // tool-dependent, so the gate passed and transport sent again.
+    assertEquals(2, transportCalls.get())
     assertEquals(2, provider.streamCalls.get())
     assertTrue(provider.seenRequests.last().messages.any { it.hasReasoning })
-    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
-    val err = c.uiState.value.error
-    assertNotNull(err)
-    assertTrue(err!!.contains("THINKING_ROUND_TRIP_NOT_SUPPORTED"))
+    // Production ordinary-chat shape: no tools / serverTools / thinking,
+    // and no structural tool content in history (ToolDone only merged a
+    // text marker) — this is what keeps the scoped gate passing.
+    val last = provider.seenRequests.last()
+    assertTrue(last.tools.isEmpty())
+    assertTrue(last.serverTools.isEmpty())
+    assertNull(last.thinking)
+    assertTrue(last.messages.none { it.toolCalls.isNotEmpty() || it.role == "tool" })
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    assertEquals("second-answer", assistantsOf(c).last().text)
   }
 
-  @Test fun opaqueReasoningMarkerAloneFailsClosedOnFollowUp() {
+  @Test fun opaqueReasoningMarkerAloneContinuesOnFollowUp() {
     val transportCalls = AtomicInteger(0)
-    val provider = FakeLlmProvider { request ->
-      if (request.messages.any { it.hasReasoning }) {
-        throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
-      }
-      transportCalls.incrementAndGet()
-      flow {
+    val provider = gateMirroringFake(
+      transportCalls,
+      firstRound = flow {
         emit(StreamEvent.ReasoningPresent)
         emit(StreamEvent.TextDelta(0, 0, "answer"))
         emit(StreamEvent.Done("stop"))
-      }
-    }
+      },
+      followUp = flow {
+        emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+        emit(StreamEvent.Done("stop"))
+      },
+    )
     val c = controller(provider)
     runBlocking { c.send("first") }
     val first = assistantsOf(c).single()
     assertEquals("answer", first.text)
     assertTrue(first.hasReasoning)
     runBlocking { c.send("second") }
-    assertEquals(1, transportCalls.get())
-    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
-    assertTrue(c.uiState.value.error!!.contains("THINKING_ROUND_TRIP_NOT_SUPPORTED"))
+    assertEquals(2, transportCalls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertTrue(provider.seenRequests.last().messages.any { it.hasReasoning })
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    assertEquals("second-answer", assistantsOf(c).last().text)
+  }
+
+  @Test fun reasoningDeltaOnlyHistoryContinuesOnFollowUp() {
+    // Stage 1 acceptance: first round carries reasoning deltas only (no
+    // ToolDone at all); the ordinary follow-up question still succeeds.
+    val transportCalls = AtomicInteger(0)
+    val provider = gateMirroringFake(
+      transportCalls,
+      firstRound = flow {
+        emit(StreamEvent.ReasoningDelta(0, 1, "thought"))
+        emit(StreamEvent.TextDelta(0, 2, "answer"))
+        emit(StreamEvent.Done("stop"))
+      },
+      followUp = flow {
+        emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+        emit(StreamEvent.Done("stop"))
+      },
+    )
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    assertTrue(assistantsOf(c).single().hasReasoning)
+    runBlocking { c.send("second") }
+    assertEquals(2, transportCalls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertTrue(provider.seenRequests.last().messages.any { it.hasReasoning })
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+  }
+
+  @Test fun plainTwoTurnConversationSucceeds() {
+    // Stage 1 positive control (standard Fake, no reasoning anywhere):
+    // non-thinking no-tools two-turn conversation succeeds end to end.
+    val transportCalls = AtomicInteger(0)
+    val provider = FakeLlmProvider { _ ->
+      transportCalls.incrementAndGet()
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "answer"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    runBlocking { c.send("second") }
+    assertEquals(2, transportCalls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertFalse(provider.seenRequests.any { req -> req.messages.any { it.hasReasoning } })
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    assertEquals(2, assistantsOf(c).size)
   }
 
   // ---- Finding A follow-up: the reasoning flag must reach the transcript ----

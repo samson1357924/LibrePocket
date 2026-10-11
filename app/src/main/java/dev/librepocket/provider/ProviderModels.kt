@@ -12,8 +12,10 @@ enum class ProviderProtocol {
  * @param hasReasoning source marker only (no reasoning payload is carried):
  *   true means this history item came from a thinking/reasoning turn whose
  *   opaque payload (Responses reasoning items, Anthropic thinking/signature
- *   blocks) cannot be rebuilt statelessly. Adapters fail closed on true
- *   (see `requireNoReasoningHistory`). Defaults to false: zero behavior change.
+ *   blocks) cannot be rebuilt statelessly. Adapters fail closed on true only
+ *   on tool-dependent turns or when thinking mode is requested
+ *   (see `requireNoReasoningHistory`); ordinary no-tools follow-ups pass
+ *   through. Defaults to false: zero behavior change.
  */
 data class ChatMessage(
     val role: String, // "system" | "user" | "assistant" | "tool"

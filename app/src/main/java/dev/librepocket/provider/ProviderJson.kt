@@ -170,7 +170,8 @@ internal fun validateToolPairing(messages: List<ChatMessage>, allowChatBackfill:
 }
 
 /**
- * Stage 4 fail-closed gate: thinking/reasoning histories need opaque
+ * Stage 4 fail-closed gate (scoped: tool-dependent turns and thinking-mode
+ * requests only): thinking/reasoning histories need opaque
  * passthrough, not yet supported — refusing stateless resend.
  *
  * A stateless rebuild cannot faithfully carry opaque reasoning payloads:
@@ -179,16 +180,33 @@ internal fun validateToolPairing(messages: List<ChatMessage>, allowChatBackfill:
  * and Anthropic rebuilds only emit text + tool_use blocks (thinking /
  * signature blocks are dropped). Resending without them would silently
  * change the reasoning context, so every adapter calls this first in
- * `buildBody` — before any other validation — and throws
- * `ProviderFailure(retryable=false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")`
- * when `request.thinking != null` (thinking mode requested) or any message
- * carries `hasReasoning == true` (reasoning-sourced history, payload not
- * carried — marker only). Non-thinking histories (defaults) pass through
- * with zero behavior change.
+ * `buildBody` — before any other validation.
+ *
+ * Scoped (Stage 1 ordinary-chat regression fix): plain-text follow-ups
+ * must not fail. Production [dev.librepocket.chat.TurnController.buildRequest]
+ * always sends `tools == []`, `serverTools == []`, `thinking == null`, and
+ * `UiMessage` has no `toolCalls` field (`ToolDone` only merges a text
+ * marker), so a pure-chat history never carries structural tool content.
+ * The `hasReasoning` refusal therefore applies only when the turn is
+ * tool-dependent:
+ *
+ * - `request.thinking != null` (explicit thinking mode) always throws
+ *   `ProviderFailure(retryable=false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")`
+ *   (explicit-mode precheck, unconditional).
+ * - otherwise, only when `request.tools` / `request.serverTools` is
+ *   non-empty, or any message carries `toolCalls` / `role == "tool"`,
+ *   AND some message carries `hasReasoning == true`.
+ *
+ * Non-thinking, no-tools histories (defaults) pass through with zero
+ * behavior change.
  */
 internal fun requireNoReasoningHistory(request: ChatRequest) {
     if (request.thinking != null) throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
-    if (request.messages.any { it.hasReasoning }) throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
+    val toolDependent = request.tools.isNotEmpty() || request.serverTools.isNotEmpty() ||
+        request.messages.any { it.toolCalls.isNotEmpty() || it.role == "tool" }
+    if (toolDependent && request.messages.any { it.hasReasoning }) {
+        throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
+    }
 }
 
 /**
@@ -204,9 +222,10 @@ internal fun requireNoReasoningHistory(request: ChatRequest) {
  * zero production behavior and only refuses explicit test/scaffold histories.
  *
  * Gate ordering (every adapter's `buildBody`):
- * 1. [requireNoReasoningHistory] (thinking) first,
- * 2. this assistant-image gate second,
- * 3. [validateToolPairing] third.
+ * 1. [requireNoReasoningHistory] unconditional `thinking != null` precheck first,
+ * 2. [requireNoReasoningHistory] tool-dependent `hasReasoning` refusal second,
+ * 3. this assistant-image gate third,
+ * 4. [validateToolPairing] fourth.
  *
  * Only `role == "assistant"` with non-empty `images` is rejected
  * (`ProviderFailure(retryable=false, "ASSISTANT_IMAGES_NOT_SUPPORTED")`);

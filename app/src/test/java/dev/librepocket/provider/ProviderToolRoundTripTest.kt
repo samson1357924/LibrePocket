@@ -591,6 +591,26 @@ class ProviderToolRoundTripTest {
             ChatRequest(model = "m", messages = messages, tools = advTools()),
         )
 
+    // No-tools helpers: mirror the production ordinary-chat path
+    // (TurnController.buildRequest sends tools == [] / serverTools == []
+    // / thinking == null). Must stay separate from the advTools() helpers
+    // above, which intentionally carry tools and keep the gate armed.
+
+    private fun chatBodyOfNoTools(messages: List<ChatMessage>) =
+        ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+            ChatRequest(model = "m", messages = messages),
+        )
+
+    private fun responsesBodyOfNoTools(messages: List<ChatMessage>) =
+        ResponsesProvider(responsesConfig(), { null }).buildBody(
+            ChatRequest(model = "m", messages = messages),
+        )
+
+    private fun anthropicBodyOfNoTools(messages: List<ChatMessage>) =
+        AnthropicProvider(anthropicConfig(), { null }).buildBody(
+            ChatRequest(model = "m", messages = messages),
+        )
+
     private fun expectFailWithCode(code: String, block: () -> String) {
         try {
             block()
@@ -803,6 +823,26 @@ class ProviderToolRoundTripTest {
     }
 
     @Test
+    fun reasoningHistoryWithoutToolsContinuesOnAllAdapters() {
+        // Stage 1 ordinary-chat regression acceptance: a no-tools follow-up
+        // whose history carries a reasoning marker (production marker-only,
+        // no toolCalls / tool role / tools / serverTools / thinking) must
+        // build successfully on every adapter — the scoped gate only arms
+        // when the turn is tool-dependent.
+        val history = listOf(
+            ChatMessage("user", "hi"),
+            ChatMessage("assistant", "thinking trace", hasReasoning = true),
+            ChatMessage("user", "follow-up"),
+        )
+        val chat = strictObj(chatBodyOfNoTools(history))
+        assertEquals(3, chat["messages"]!!.jsonArray.size)
+        val responses = strictObj(responsesBodyOfNoTools(history))
+        assertEquals(3, responses["input"]!!.jsonArray.size)
+        val anthropic = strictObj(anthropicBodyOfNoTools(history))
+        assertEquals(3, anthropic["messages"]!!.jsonArray.size)
+    }
+
+    @Test
     fun thinkingRequestFailsClosedOnAllAdapters() {
         val messages = listOf(ChatMessage("user", "hi"))
         val thinking = ChatRequest(model = "m", messages = messages, thinking = ThinkingConfig())
@@ -829,6 +869,44 @@ class ProviderToolRoundTripTest {
         expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { chatBodyOf(history) }
         expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { responsesBodyOf(history) }
         expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") { anthropicBodyOf(history) }
+    }
+
+    @Test
+    fun serverToolsWithReasoningHistoryFailsClosedOnAllAdapters() {
+        // Hosted serverTools (web_search) also arms the tool-dependent
+        // gate: a reasoning-marked history with serverTools must fail
+        // closed even though tools == [] and no toolCalls / tool role.
+        val history = listOf(
+            ChatMessage("user", "hi"),
+            ChatMessage("assistant", "thinking trace", hasReasoning = true),
+        )
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+                ChatRequest(
+                    model = "m",
+                    messages = history,
+                    serverTools = listOf(ServerTool.WebSearch(WebSearchContextSize.MEDIUM)),
+                ),
+            )
+        }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(
+                    model = "m",
+                    messages = history,
+                    serverTools = listOf(ServerTool.WebSearch(WebSearchContextSize.MEDIUM)),
+                ),
+            )
+        }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(
+                    model = "m",
+                    messages = history,
+                    serverTools = listOf(ServerTool.WebSearch(WebSearchContextSize.MEDIUM)),
+                ),
+            )
+        }
     }
 
     @Test

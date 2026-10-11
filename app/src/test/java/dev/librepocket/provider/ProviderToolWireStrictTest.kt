@@ -517,26 +517,81 @@ class ProviderToolWireStrictTest {
 
     @Test
     fun assistantImageGateRunsAfterThinkingGate() {
-        // History carries both hasReasoning and assistant images: the
-        // thinking gate must win (proves thinking first, assistant-image
-        // second ordering in every adapter's buildBody).
+        // History carries both an explicit thinking-mode request and
+        // assistant images: the thinking gate must win (proves thinking
+        // first, assistant-image ordering in every adapter's buildBody).
         val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
         val history = listOf(
             ChatMessage("assistant", "t", images = listOf(img), hasReasoning = true),
         )
         expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
             ChatCompletionsProvider(chatConfig(), { null }).buildBody(
-                ChatRequest(model = "m", messages = history),
+                ChatRequest(model = "m", messages = history, thinking = ThinkingConfig()),
             )
         }
         expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
             ResponsesProvider(responsesConfig(), { null }).buildBody(
-                ChatRequest(model = "m", messages = history),
+                ChatRequest(model = "m", messages = history, thinking = ThinkingConfig()),
             )
         }
         expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
             AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history, thinking = ThinkingConfig()),
+            )
+        }
+    }
+
+    @Test
+    fun reasoningMarkerAloneNoLongerPreemptsAssistantImageGate() {
+        // Same history but no thinking mode and no tools: the scoped
+        // requireNoReasoningHistory gate passes (not tool-dependent), so
+        // the assistant-image gate wins — proving hasReasoning no longer
+        // preempts it on plain no-tools histories.
+        val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
+        val history = listOf(
+            ChatMessage("assistant", "t", images = listOf(img), hasReasoning = true),
+        )
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            ChatCompletionsProvider(chatConfig(), { null }).buildBody(
                 ChatRequest(model = "m", messages = history),
+            )
+        }
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history),
+            )
+        }
+        expectFailWithCode("ASSISTANT_IMAGES_NOT_SUPPORTED") {
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history),
+            )
+        }
+    }
+
+    @Test
+    fun toolDependentReasoningStillPreemptsAssistantImageGate() {
+        // Tool-dependent turn whose history carries both a reasoning
+        // marker and assistant images: the thinking gate must win
+        // (proves thinking still preempts images once the turn is
+        // tool-dependent — the scoped pass-through above only covers
+        // no-tools histories).
+        val img = ChatImage(byteArrayOf(1, 2, 3), "image/png")
+        val history = listOf(
+            ChatMessage("assistant", "t", images = listOf(img), hasReasoning = true),
+        )
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history, tools = advTools()),
+            )
+        }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history, tools = advTools()),
+            )
+        }
+        expectFailWithCode("THINKING_ROUND_TRIP_NOT_SUPPORTED") {
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history, tools = advTools()),
             )
         }
     }

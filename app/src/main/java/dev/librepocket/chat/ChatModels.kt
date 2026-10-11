@@ -21,8 +21,9 @@ data class UiMessage(
    * [dev.librepocket.provider.StreamEvent.ReasoningDelta] or opaque
    * [dev.librepocket.provider.StreamEvent.ReasoningPresent] was seen while
    * collecting it). Rebuilt into [dev.librepocket.provider.ChatMessage.hasReasoning]
-   * so follow-up requests fail closed instead of replaying a reasoning
-   * origin as plain text. Display text is unchanged (merged block).
+   * so tool-dependent / thinking-mode follow-up requests fail closed instead
+   * of replaying a reasoning origin as plain text (ordinary no-tools
+   * follow-ups continue). Display text is unchanged (merged block).
    *
    * In memory during the live turn; persisted as a payload-free `reasoning`
    * marker event (same runId, empty text — no reasoning content stored) by

@@ -1,8 +1,11 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import java.io.IOException
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -15,6 +18,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
+import okhttp3.Connection
 import okhttp3.EventListener
 import okhttp3.OkHttpClient
 import okhttp3.Response
@@ -41,13 +45,35 @@ class McpTransportCancelTest {
     private class CallSignals {
         val headers = CountDownLatch(1)
         val cancelled = CountDownLatch(1)
+        val canceledCount = AtomicInteger(0)
+        val acquired = CopyOnWriteArrayList<Connection>()
+        val releasedCount = AtomicInteger(0)
+        val callEndCount = AtomicInteger(0)
+        val callFailedCount = AtomicInteger(0)
         val listener = object : EventListener() {
             override fun responseHeadersEnd(call: Call, response: Response) {
                 headers.countDown()
             }
 
             override fun canceled(call: Call) {
+                canceledCount.incrementAndGet()
                 cancelled.countDown()
+            }
+
+            override fun connectionAcquired(call: Call, connection: Connection) {
+                acquired.add(connection)
+            }
+
+            override fun connectionReleased(call: Call, connection: Connection) {
+                releasedCount.incrementAndGet()
+            }
+
+            override fun callEnd(call: Call) {
+                callEndCount.incrementAndGet()
+            }
+
+            override fun callFailed(call: Call, ioe: IOException) {
+                callFailedCount.incrementAndGet()
             }
         }
     }
@@ -71,12 +97,13 @@ class McpTransportCancelTest {
     private suspend fun CoroutineScope.runCancellablePost(
         web: MockWebServer,
         signals: CallSignals,
+        shared: McpTransport,
         timeoutMs: Long,
         awaitInFlight: suspend () -> Unit,
     ): AtomicReference<Result<Pair<Int, String?>?>> {
         val outcome = AtomicReference<Result<Pair<Int, String?>?>>()
         val active = launch(Dispatchers.IO) {
-            outcome.set(runCatching { transport(signals).postJson(web.url("/").toString(), "sekret", "{}", timeoutMs) })
+            outcome.set(runCatching { shared.postJson(web.url("/").toString(), "sekret", "{}", timeoutMs) })
         }
         try {
             awaitInFlight()
@@ -113,13 +140,39 @@ class McpTransportCancelTest {
         )
     }
 
+    private suspend fun assertCallCancelledCount(signals: CallSignals, before: Int, context: String) {
+        val deadline = System.nanoTime() + 2_000_000_000L
+        while (signals.canceledCount.get() <= before && System.nanoTime() < deadline) {
+            withContext(Dispatchers.IO) { Thread.sleep(20) }
+        }
+        assertEquals("$context 必須呼叫實際 OkHttp Call.cancel() 一次", before + 1, signals.canceledCount.get())
+    }
+
+    private suspend fun takeRequestSync(web: MockWebServer, context: String) {
+        assertNotNull(
+            "$context 請求應已到達 server",
+            withContext(Dispatchers.IO) { web.takeRequest(3, TimeUnit.SECONDS) },
+        )
+    }
+
+    private fun assertTransportIdle(client: OkHttpClient, context: String) {
+        assertEquals("$context dispatcher 不得殘留 running call", 0, client.dispatcher.runningCallsCount())
+        assertEquals("$context dispatcher 不得殘留 queued call", 0, client.dispatcher.queuedCallsCount())
+        assertTrue(
+            "$context 連線池不得膨脹（connections=${client.connectionPool.connectionCount()}）",
+            client.connectionPool.connectionCount() <= 1,
+        )
+    }
+
     @Test fun cancelWhileWaitingHeadersCancelsCallAndPropagates() = runBlocking {
         val web = MockWebServer()
         web.start()
         val signals = CallSignals()
+        val client = signaledClient(signals)
+        val shared = McpTransport(client)
         try {
             web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
-            val outcome = runCancellablePost(web, signals, McpTimeouts.DEFAULT_MS) { awaitRequest(web) }
+            val outcome = runCancellablePost(web, signals, shared, McpTimeouts.DEFAULT_MS) { awaitRequest(web) }
             assertCancelledOutcome(outcome, "等 headers 取消")
             assertCallCancelled(signals, "等 headers 取消")
             assertEquals(1, web.requestCount)
@@ -132,9 +185,11 @@ class McpTransportCancelTest {
         val web = MockWebServer()
         web.start()
         val signals = CallSignals()
+        val client = signaledClient(signals)
+        val shared = McpTransport(client)
         try {
             web.enqueue(MockResponse().setBody("{\"jsonrpc\":\"2.0\"}").setBodyDelay(10, TimeUnit.SECONDS))
-            val outcome = runCancellablePost(web, signals, McpTimeouts.DEFAULT_MS) {
+            val outcome = runCancellablePost(web, signals, shared, McpTimeouts.DEFAULT_MS) {
                 assertTrue(
                     "headers 應先到達（取消發生在 body 讀取中）",
                     withContext(Dispatchers.IO) { signals.headers.await(3, TimeUnit.SECONDS) },
@@ -152,6 +207,8 @@ class McpTransportCancelTest {
         val web = MockWebServer()
         web.start()
         val signals = CallSignals()
+        val client = signaledClient(signals)
+        val shared = McpTransport(client)
         try {
             // 心跳式滴流：headers 立到，body 以 1KiB/s 滴 256KiB（約 256s，測試只取前段）。
             web.enqueue(
@@ -159,7 +216,7 @@ class McpTransportCancelTest {
                     .setChunkedBody("x".repeat(256 * 1024), 1024)
                     .throttleBody(1024, 1, TimeUnit.SECONDS),
             )
-            val outcome = runCancellablePost(web, signals, McpTimeouts.DEFAULT_MS) {
+            val outcome = runCancellablePost(web, signals, shared, McpTimeouts.DEFAULT_MS) {
                 assertTrue(
                     "headers 應先到達（取消發生在滴流讀取中）",
                     withContext(Dispatchers.IO) { signals.headers.await(3, TimeUnit.SECONDS) },
@@ -179,6 +236,9 @@ class McpTransportCancelTest {
         val web = MockWebServer()
         web.start()
         val signals = CallSignals()
+        // 同一 client/transport：健康 keep-alive 必須重用同一條 TCP（與取消後建新連線對照）。
+        val client = signaledClient(signals)
+        val shared = McpTransport(client)
         try {
             // terminal 回應但 socket 保持開啟（KEEP_OPEN）：必須不等 EOF 即回傳。
             val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false}}"
@@ -186,18 +246,28 @@ class McpTransportCancelTest {
                 web.enqueue(MockResponse().setResponseCode(200).setBody(body).setSocketPolicy(SocketPolicy.KEEP_OPEN))
             }
             val first = withTimeoutOrNull(5_000) {
-                transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                shared.postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
             }
             assertNotNull("terminal 回應必須在 socket 未關下即時回傳（不等 EOF）", first)
             assertEquals(200, first!!.first)
             assertEquals("terminal body 必須完整（非常態截斷）", body, first.second)
-            // 連線可重用：第二步同樣即時成功（無洩漏）。
+            assertTransportIdle(client, "terminal 首步後")
+            // 健康 keep-alive 重用：第二步重用同一條 pooled connection（成功 + 同一身份）。
+            val acquiredBefore = signals.acquired.size
             val second = withTimeoutOrNull(5_000) {
-                transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                shared.postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
             }
-            assertNotNull("取消/terminal 後連線必須可重用", second)
+            assertNotNull("同一傳輸第二步必須即時成功", second)
             assertEquals(200, second!!.first)
             assertEquals(2, web.requestCount)
+            assertTransportIdle(client, "keep-alive 重用後")
+            assertEquals("兩步各一次 connectionAcquired", acquiredBefore + 1, signals.acquired.size)
+            assertTrue(
+                "健康 keep-alive 必須重用同一條 connection（非新建）",
+                signals.acquired[0] === signals.acquired[1],
+            )
+            assertEquals("成功呼叫必須走 callEnd（非 callFailed）", 2, signals.callEndCount.get())
+            assertEquals("成功不得觸發 cancel", 0, signals.canceledCount.get())
         } finally {
             web.shutdown()
         }
@@ -207,20 +277,42 @@ class McpTransportCancelTest {
         val web = MockWebServer()
         web.start()
         val signals = CallSignals()
+        // 同一 client/transport 多輪 cancel → request：被取消的 socket 不得重用，
+        // 池不得膨脹，dispatcher 不得殘留。
+        val client = signaledClient(signals)
+        val shared = McpTransport(client)
         try {
-            web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
             val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":false}}"
-            web.enqueue(MockResponse().setResponseCode(200).setBody(body))
-            val outcome = runCancellablePost(web, signals, McpTimeouts.DEFAULT_MS) { awaitRequest(web) }
-            assertCancelledOutcome(outcome, "取消後重用")
-            assertCallCancelled(signals, "取消後重用")
-            // 同一 client 下一步成功：連線已釋放回池，無洩漏。
-            val retry = withTimeoutOrNull(5_000) {
-                transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+            repeat(3) { round ->
+                web.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+                web.enqueue(MockResponse().setResponseCode(200).setBody(body))
+                val acquiredBefore = signals.acquired.size
+                val canceledBefore = signals.canceledCount.get()
+                val outcome = runCancellablePost(web, signals, shared, McpTimeouts.DEFAULT_MS) { awaitRequest(web) }
+                assertCancelledOutcome(outcome, "第 ${round + 1} 輪取消")
+                assertCallCancelledCount(signals, canceledBefore, "第 ${round + 1} 輪取消")
+                assertTransportIdle(client, "第 ${round + 1} 輪取消後")
+                // 被取消呼叫已獲取一條 connection（NO_RESPONSE 下 TCP 已建；
+                // awaitRequest 取的是本輪請求——重用請求每次都顯式 take 排空，不取到舊輪殘留）。
+                assertEquals("取消呼叫必須已獲取 connection", acquiredBefore + 1, signals.acquired.size)
+                val cancelledConn = signals.acquired.last()
+                // 同一 transport 下一步成功：必須建新連線（被取消 socket 已關閉驅逐，不得重用）。
+                val retry = withTimeoutOrNull(5_000) {
+                    shared.postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                }
+                assertNotNull("第 ${round + 1} 輪取消後同一傳輸必須可發下一步", retry)
+                assertEquals(200, retry!!.first)
+                takeRequestSync(web, "第 ${round + 1} 輪重用")
+                assertTransportIdle(client, "第 ${round + 1} 輪重用後")
+                assertEquals("重用必須新獲取一條 connection", acquiredBefore + 2, signals.acquired.size)
+                assertTrue(
+                    "被取消的 socket 不得被重用（必須是新連線）",
+                    signals.acquired.last() !== cancelledConn,
+                )
             }
-            assertNotNull("取消後同一傳輸必須可發下一步", retry)
-            assertEquals(200, retry!!.first)
-            assertEquals(2, web.requestCount)
+            assertEquals("取消必須每次都走 Call.cancel()", 3, signals.canceledCount.get())
+            assertEquals(6, web.requestCount)
+            assertTransportIdle(client, "三輪後")
         } finally {
             web.shutdown()
         }

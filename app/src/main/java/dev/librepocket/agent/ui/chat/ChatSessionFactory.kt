@@ -473,10 +473,26 @@ class ChatSessionFactory(
      *
      * Stage G (R2-3) cross-provider/origin fail-closed: the prefix is only
      * hydrated when [isSameProviderOrigin] attributes the stored rows to the
-     * current endpoint's provider and origin. A different provider or host resumes
+     * current endpoint's provider and origin. A different provider or host
+     * resumes
      * with an empty model context ([CreatedSession.historyWithheld] = true) so
      * the old history is never forwarded to the new destination; the local display
      * replay and the INTERRUPTED backfill above stay provider-agnostic.
+     *
+     * Stage 5 (R4-1) cross-provider/origin fork: a mismatched resume never
+     * reuses the old transcript session. Instead it creates a fresh
+     * provider-owned session (same [create] provenance format
+     * `"${providerId}@${origin}/${model}"`, title inherited from the archived
+     * header), persists only the [snapshotSwitchHistory] withheld marker into
+     * it (old rows are never copied), backfills and binds the sink to the new
+     * id, and returns the new id with [CreatedSession.historyWithheld] = true.
+     * The old session is never written (read-only archive), so a forked
+     * ledger never mixes two recipients' rows going forward. Pre-R4-1
+     * ledgers that already mix rows from two recipients under one id are NOT
+     * migrated, split, or backfilled by this path: a same-origin reopen still
+     * hydrates the whole batch gated only by the header provenance, and
+     * mixed-row detection inside one ledger is a known gap. Same-origin
+     * resumes keep the legacy same-id path below unchanged.
      */
     override suspend fun open(
         endpoint: EndpointConfig,
@@ -501,17 +517,22 @@ class ChatSessionFactory(
         }
         require(meta != null) { "UNKNOWN_SESSION" }
         requireCurrentBinding(keyIsCurrent)
-        backfillInterrupted(store, sessionId)
         // Stage G (R2-3): cross-provider / cross-origin resume hydrates nothing.
-        // The local INTERRUPTED backfill above still runs (provider-agnostic transcript
-        // bookkeeping), but the stored rows only enter the model context when their
-        // provenance matches this endpoint's provider and normalized origin.
+        // Same-origin resumes run the local INTERRUPTED backfill below
+        // (provider-agnostic bookkeeping) and hydrate only on provenance
+        // match; cross-origin resumes return early to openForked(), which
+        // backfills only the NEW ledger while the old session stays a
+        // read-only archive.
         val sameOrigin = isSameProviderOrigin(meta.model, endpoint.providerId, config.baseUrl)
+        if (!sameOrigin) {
+            return openForked(store, endpoint, config, sessionId, meta, keyIsCurrent)
+        }
+        backfillInterrupted(store, sessionId)
         // Stage E: tail load (newest kept) with an exact dropped count; the
         // cap also travels as MaxMessages so TurnController.droppedHistoryCount
         // observes the same truncation (defense in depth: pre-trimmed prefix
         // makes the controller trim a no-op).
-        val loaded = if (sameOrigin) loadModelHistory(store, sessionId) else LoadedModelHistory(emptyList(), 0)
+        val loaded = loadModelHistory(store, sessionId)
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
         // S6 capture-boundary T1 recheck (see requireKeyReadAllowed):
@@ -543,7 +564,7 @@ class ChatSessionFactory(
                 openedSession,
                 endpoint.providerId,
                 model,
-                historyWithheld = !sameOrigin,
+                historyWithheld = false,
                 historyDroppedCount = loaded.droppedCount,
             )
         } catch (failure: Throwable) {
@@ -553,6 +574,114 @@ class ChatSessionFactory(
                 failure.addSuppressed(closeFailure)
             }
             credential.close()
+            throw failure
+        }
+    }
+
+    /**
+     * Stage 5 (R4-1) fork body for a cross-provider/origin [open]: the old
+     * transcript session stays a read-only archive (no backfill, no sink, no
+     * model-history read), and every new row lands in a fresh provider-owned
+     * session. Mirrors the [dev.librepocket.agent.ui.chat.ChatViewModel.ensureSession]
+     * cross-origin path (marker-only [snapshotSwitchHistory], never a copy).
+     * Pre-R4-1 already-mixed ledgers are out of scope here as well: this path
+     * never splits, migrates, or backfills the archived session, and mixed-row
+     * detection inside one ledger remains a known gap.
+     */
+    private suspend fun openForked(
+        store: SessionStore,
+        endpoint: EndpointConfig,
+        config: ProviderConfig,
+        oldSessionId: String,
+        oldMeta: dev.librepocket.session.SessionMeta,
+        keyIsCurrent: suspend () -> Boolean,
+    ): CreatedSession {
+        val model = modelFor(endpoint)
+        val credential = captureCredential(endpoint)
+        var session: ChatSession? = null
+        var forkedSessionId: String? = null
+        try {
+            requireCurrentBinding(keyIsCurrent)
+            // Fresh provider-owned ledger: title inherited, provenance stamped
+            // exactly like create() so the fork reopens same-origin later.
+            val newSessionId: String = withContext(NonCancellable + Dispatchers.IO) {
+                withTimeout(TRANSCRIPT_CREATE_TIMEOUT_MS) {
+                    store.createSession(
+                        oldMeta.title.take(30),
+                        "${endpoint.providerId}@${normalizeOrigin(config.baseUrl)}/$model",
+                    )
+                }
+            }
+            forkedSessionId = newSessionId
+            requireCurrentBinding(keyIsCurrent)
+            // Durable fork marker only (withheld, never a copy): lets a later
+            // openSession(newId) re-surface the withhold notice after restart.
+            // Best-effort — a bookkeeping failure must not fail the resume.
+            try {
+                val oldModelShort = oldMeta.model.substringAfterLast('/').takeIf { it.isNotEmpty() } ?: "unknown"
+                snapshotSwitchHistory(
+                    store,
+                    oldSessionId,
+                    newSessionId,
+                    oldModelShort,
+                    model,
+                    historyWithheld = true,
+                    nowMillis = clock.millis(),
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Degrades to an unmarked empty fork: isolation still holds,
+                // only the restart notice is lost.
+            }
+            // Backfill the NEW ledger only; the old session is never written.
+            backfillInterrupted(store, newSessionId)
+            requireCurrentBinding(keyIsCurrent)
+            val forkMeta = try {
+                store.getSession(newSessionId)
+            } catch (_: Exception) {
+                null
+            }
+            val sessionStart = forkMeta?.createdAt?.toInstantOrNull()
+            requireCurrentBinding(keyIsCurrent)
+            val openedSession = buildSession(
+                config,
+                model,
+                SessionTranscriptSink(store, newSessionId),
+                credential,
+                keyIsCurrent,
+                clock,
+                userTimezone,
+                systemZone,
+                sessionStart,
+                emptyList(),
+                HistoryWindowCap.MaxMessages(HISTORY_LOAD_CAP),
+            )
+            session = openedSession
+            requireCurrentBinding(keyIsCurrent)
+            return CreatedSession(
+                newSessionId,
+                openedSession,
+                endpoint.providerId,
+                model,
+                historyWithheld = true,
+                historyDroppedCount = 0,
+            )
+        } catch (failure: Throwable) {
+            try {
+                session?.close()
+            } catch (closeFailure: Throwable) {
+                failure.addSuppressed(closeFailure)
+            }
+            credential.close()
+            val orphan = forkedSessionId
+            if (orphan != null) {
+                try {
+                    deleteUnusedTranscriptSession(store, orphan)
+                } catch (cleanupFailure: Throwable) {
+                    failure.addSuppressed(cleanupFailure)
+                }
+            }
             throw failure
         }
     }

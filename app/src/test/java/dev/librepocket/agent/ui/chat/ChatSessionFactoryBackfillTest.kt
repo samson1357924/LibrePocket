@@ -160,7 +160,7 @@ class ChatSessionFactoryBackfillTest {
 
     @Test fun open_stageCRetrySuccessGainsNoMarkerAcrossTwoReopens() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "m")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(event(sid, "L", "user", "q"))
         transcripts.appendEvent(
             event(sid, "L", "assistant", "half", isPartial = true, failureReason = "boom", attemptIndex = 0),
@@ -190,7 +190,7 @@ class ChatSessionFactoryBackfillTest {
 
     @Test fun open_stageCRetryFailureGainsNoMarker() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "m")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(event(sid, "L", "user", "q"))
         transcripts.appendEvent(
             event(sid, "L", "assistant", "half", isPartial = true, failureReason = "boom", attemptIndex = 0),
@@ -220,7 +220,7 @@ class ChatSessionFactoryBackfillTest {
 
     @Test fun open_backfillsKillStrandedTurnWithReplayCompatibleMarker() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "m")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(event(sid, "done", "user", "q1"))
         transcripts.appendEvent(event(sid, "done", "assistant", "a1"))
         // Simulate a kill: user row acked, process died before any terminal row.
@@ -248,7 +248,7 @@ class ChatSessionFactoryBackfillTest {
 
     @Test fun open_backfillIsIdempotentAcrossReopens() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "m")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(event(sid, "stranded", "user", "q2"))
 
         val factory = factoryWith(transcripts, BackfillFakeProvider {

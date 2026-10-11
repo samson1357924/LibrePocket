@@ -299,7 +299,7 @@ class ChatWiringTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         val transcripts = dev.librepocket.session.FakeSessionStore()
-        val sessionId = transcripts.createSession("existing", "gpt-4o-mini")
+        val sessionId = transcripts.createSession("existing", "preset:openai@https://api.openai.com/gpt-4o-mini")
         // S1: direct open needs explicit ALLOW (fail-closed default).
         val factory = ChatSessionFactory(
             policy = allowKeyReadPolicy(),
@@ -338,7 +338,7 @@ class ChatWiringTest {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }
         val transcripts = dev.librepocket.session.FakeSessionStore()
-        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        val sid = runBlocking { transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini") }
         runBlocking {
             transcripts.appendEvent(
                 dev.librepocket.session.TranscriptEvent(
@@ -397,7 +397,7 @@ class ChatWiringTest {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }
         val transcripts = dev.librepocket.session.FakeSessionStore()
-        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        val sid = runBlocking { transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini") }
         runBlocking {
             transcripts.appendEvent(
                 dev.librepocket.session.TranscriptEvent(

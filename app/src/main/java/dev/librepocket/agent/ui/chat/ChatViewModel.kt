@@ -126,6 +126,20 @@ private data class ForkRead(
 )
 
 /**
+ * Stage 5 (R4-1) stale-fork cleanup decision for [ChatViewModel.openSession]:
+ * a cross-origin `open()` mints a fresh provider-owned transcript id inside
+ * the call, so a binding change that lands after the fork but before attach
+ * (the post-`open()` stale check) must roll that new row back
+ * (`deleteTranscriptRow = true`), or the empty fork (marker only) leaks into
+ * the session list. Same-id resumes reuse the archived row and must never
+ * delete it (`false`); storeless results (`sessionId == null`) likewise never
+ * delete. Mirrors `ensureSession`'s always-new `create()` row, which already
+ * discards with `deleteTranscriptRow = true`.
+ */
+internal fun shouldDeleteStaleFork(requestedSessionId: String, created: CreatedSession): Boolean =
+    created.sessionId != null && created.sessionId != requestedSessionId
+
+/**
  * Per-phase budget for the bounded pre-close ledger drain (Phase 2
  * conversation-ledger wiring): newChat / openSession / endpoint-switch /
  * transport-replace flush the detached live session before closing it, so
@@ -1238,6 +1252,12 @@ class ChatViewModel(
                         return@withLock
                     }
 
+                    // Stage 5 (R4-1): cross-origin open() forks to a new
+                    // provider-owned transcript id; the display replay above
+                    // intentionally still shows the archived rows (mirrors the
+                    // ensureSession endpoint-switch path), while the durable
+                    // ledger holds only the withheld marker + new turns. A
+                    // restart of the forked id then shows only its own rows.
                     _history.value = loaded.messages
                     _historyOmittedCount.value = loaded.droppedCount
                     attach(created, access.binding, creationGeneration)
@@ -1254,11 +1274,15 @@ class ChatViewModel(
                         // restart (the switch-time notice lived in the old
                         // process). The withhold itself is structural — the old
                         // rows were never copied — so a failed scan only drops
-                        // the notice, never leaks history.
+                        // the notice, never leaks history. Stage 5 (R4-1):
+                        // cross-origin open() forks to a new provider-owned id
+                        // (attach() already points _currentSessionId at it),
+                        // so scan the ATTACHED id, not the requested one.
                         try {
+                            val attachedId = created.sessionId ?: sessionId
                             val withheldFork = withContext(Dispatchers.IO) {
                                 val backing = sessions.storeOrNull()
-                                backing != null && hasWithheldSwitchMarker(backing, sessionId)
+                                backing != null && hasWithheldSwitchMarker(backing, attachedId)
                             }
                             if (withheldFork) "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD" else null
                         } catch (cancelled: CancellationException) {
@@ -1276,8 +1300,14 @@ class ChatViewModel(
             } finally {
                 val unattached = candidate
                 if (!attached && unattached != null) {
+                    // Stage 5 (R4-1) stale-fork cleanup: same-id resumes reuse
+                    // the archived row (never delete), but a cross-origin fork
+                    // minted a fresh id inside open() — a stale binding after
+                    // that must roll it back (see shouldDeleteStaleFork), or
+                    // the empty fork leaks into the session list.
+                    val deleteForkRow = shouldDeleteStaleFork(sessionId, unattached)
                     try {
-                        sessions.discardUnattached(unattached, deleteTranscriptRow = false)
+                        sessions.discardUnattached(unattached, deleteTranscriptRow = deleteForkRow)
                     } catch (cleanupFailure: Throwable) {
                         val originalCancellation = cancellation
                         if (originalCancellation != null) {

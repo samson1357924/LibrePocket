@@ -135,7 +135,7 @@ class ChatSessionFactoryStageFTest {
 
     @Test fun open_killDuringSleeperGainsExactlyOneMarkerAcrossTwoReopens() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "m")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         // Kill during the backoff sleeper: partial (non-final) + retry, no successor.
         transcripts.appendEvent(event(sid, "L", "user", "q"))
         transcripts.appendEvent(
@@ -160,7 +160,7 @@ class ChatSessionFactoryStageFTest {
 
     @Test fun open_killBetweenPartialAndNoticeGainsExactlyOneMarker() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "m")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         // Kill between the partial write and its retry notice: no retry row.
         transcripts.appendEvent(event(sid, "L", "user", "q"))
         transcripts.appendEvent(
@@ -183,7 +183,7 @@ class ChatSessionFactoryStageFTest {
 
     @Test fun open_retrySuccessControlGainsNoMarker() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "m")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(event(sid, "L", "user", "q"))
         transcripts.appendEvent(
             event(sid, "L", "assistant", "half", isPartial = true, failureReason = "boom", attemptIndex = 0, isFinal = false),
@@ -209,7 +209,7 @@ class ChatSessionFactoryStageFTest {
 
     @Test fun open_cancelMarkedFamilyGainsNoInterruptedMarker() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "m")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(event(sid, "L", "user", "q"))
         transcripts.appendEvent(
             event(sid, "L", "assistant", "half", isPartial = true, failureReason = "boom", attemptIndex = 0, isFinal = false),

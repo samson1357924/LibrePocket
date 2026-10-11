@@ -59,7 +59,16 @@ data class EndpointConfig(
     val protocol: ProviderProtocol,
     val model: String,
     val apiKeyRef: String,
-    /** Monotonic metadata revision, assigned atomically by [EndpointStore]. */
+    /**
+     * Monotonic metadata revision, assigned atomically by [EndpointStore].
+     *
+     * WARNING: fencing callers MUST source the expected revision from
+     * [EndpointStore.currentRevision()], never `observe().configRevision`.
+     * [observe] folds missing/partial metadata (including the post-clear
+     * tombstone) to `null`, and folds a missing revision key on present
+     * metadata to `0L`, so reusing its value conflates fresh `null` with
+     * dirty `0L` and loses the tombstone revision.
+     */
     val configRevision: Long = 0L,
 )
 
@@ -67,6 +76,27 @@ data class EndpointConfig(
  * Persists the active endpoint metadata. Shape mirrors
  * [dev.librepocket.policy.DataStorePolicyStore] conventions: dual constructors,
  * injectable [ioDispatcher], fail-closed reads.
+ *
+ * Revision model:
+ * - `null` means fresh: [ENDPOINT_CONFIG_REVISION_V1] was never written.
+ * - `0L` means a dirty/hand-written value (only reachable via a direct
+ *   `dataStore.edit` that bypasses [save]/[saveIfRevision]/[clear]/[clearIfRevision]);
+ *   it is distinct from fresh `null` and never produced by the store itself.
+ * - Every successful [save]/[saveIfRevision]/[clear]/[clearIfRevision] advances
+ *   the revision by exactly one via `Math.addExact`, so overflow fails closed with
+ *   [ArithmeticException] instead of wrapping.
+ *
+ * CAS notes:
+ * - [currentRevision] exposes the raw stored revision (including the value
+ *   across [clear], where [observe] folds to `null`); it never catches, so
+ *   DataStore failures propagate fail-closed to the caller.
+ * - [saveIfRevision]/[clearIfRevision] perform the compare-and-set inside a
+ *   single `dataStore.edit {}` transaction; a mismatch `return@edit`s without
+ *   writing and reports `false`. There is no distributed transaction with [KeyVault]:
+ *   callers (VM layer, phase 2) must coordinate metadata fencing with vault
+ *   writes/reads.
+ * - Single-process only; not safe across processes: DataStore is not
+ *   multi-process safe, so the CAS only fences threads/coroutines in this process.
  */
 class EndpointStore(
     internal val dataStore: DataStore<Preferences>,
@@ -98,6 +128,18 @@ class EndpointStore(
                 configRevision = prefs[ENDPOINT_CONFIG_REVISION_V1] ?: 0L,
             )
         }
+
+    /**
+     * Raw monotonic revision, or `null` when the key was never written (fresh).
+     *
+     * Unlike [observe] — which folds missing/partial metadata (including the
+     * post-[clear] tombstone) to `null` — this exposes the underlying
+     * [ENDPOINT_CONFIG_REVISION_V1] value so callers can fence stale sessions.
+     * Fail-closed: DataStore failures are NOT caught and propagate to the caller.
+     */
+    suspend fun currentRevision(): Long? = withContext(ioDispatcher) {
+        dataStore.data.map { prefs -> prefs[ENDPOINT_CONFIG_REVISION_V1] }.first()
+    }
 
     /** Metadata present (does NOT imply a usable endpoint; see [readiness]). */
     suspend fun hasMetadata(): Boolean = withContext(ioDispatcher) {
@@ -131,14 +173,14 @@ class EndpointStore(
         return if (hasKey) EndpointReadiness.READY else EndpointReadiness.NO_KEY
     }
 
+    /**
+     * Legacy unconditional write. Kept for tests / non-fencing paths only.
+     *
+     * New production code that needs stale-session fencing MUST use
+     * [saveIfRevision] with the revision observed at read time instead.
+     */
     suspend fun save(config: EndpointConfig) {
-        require(config.providerId.isNotBlank()) { "PROVIDER_ID_BLANK" }
-        require(config.baseUrl.isNotBlank()) { "BASE_URL_BLANK" }
-        require(config.apiKeyRef.isNotBlank()) { "PROVIDER_KEY_REF_BLANK" }
-        // Boundary guard: the ref must be a vault alias, never pasted key material.
-        require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
-        require('\n' !in config.apiKeyRef && '\r' !in config.apiKeyRef) { "PROVIDER_KEY_REF_MALFORMED" }
-        validateBaseUrl(config.baseUrl)
+        validateForSave(config)
         withContext(ioDispatcher) {
             dataStore.edit { prefs ->
                 prefs[ENDPOINT_PROVIDER_ID_V1] = config.providerId
@@ -154,6 +196,61 @@ class EndpointStore(
     }
 
     /**
+     * Atomic compare-and-set write. Single-process only; not safe across processes
+     * (DataStore is not multi-process safe).
+     *
+     * Validates exactly like [save], then inside a single `dataStore.edit {}`
+     * transaction compares the stored revision against [expectedRevision]:
+     * - mismatch → `return@edit` without writing anything, returns `false`
+     *   (the `edit` early-return does not advance the revision);
+     * - match → writes all fields and bumps to
+     *   `Math.addExact(expectedRevision ?: 0L, 1L)`, returns `true`.
+     *
+     * @param expectedRevision MUST come from [currentRevision()], never
+     * `observe().configRevision`: [observe] folds missing/partial metadata
+     * (including the post-[clear] tombstone) to `null` — losing the tombstone
+     * revision — and folds a missing revision key on present metadata to `0L`,
+     * so reusing its value conflates fresh `null` with dirty `0L` and can
+     * silently clobber a concurrent writer.
+     *
+     * `null` expected means "must be fresh" (key never written); a dirty
+     * hand-written `0L` does NOT equal fresh `null`. Fail-closed: validation
+     * failures, revision overflow ([ArithmeticException]), and DataStore
+     * failures propagate; only the expected contention path returns `false`.
+     */
+    suspend fun saveIfRevision(config: EndpointConfig, expectedRevision: Long?): Boolean {
+        validateForSave(config)
+        return withContext(ioDispatcher) {
+            var wrote = false
+            dataStore.edit { prefs ->
+                val actual = prefs[ENDPOINT_CONFIG_REVISION_V1]
+                if (actual != expectedRevision) {
+                    return@edit
+                }
+                prefs[ENDPOINT_PROVIDER_ID_V1] = config.providerId
+                prefs[ENDPOINT_PRESET_ID_V1] = config.presetId
+                prefs[ENDPOINT_LABEL_V1] = config.label
+                prefs[ENDPOINT_BASE_URL_V1] = config.baseUrl
+                prefs[ENDPOINT_PROTOCOL_V1] = config.protocol.name
+                prefs[ENDPOINT_MODEL_V1] = config.model
+                prefs[ENDPOINT_API_KEY_REF_V1] = config.apiKeyRef
+                prefs[ENDPOINT_CONFIG_REVISION_V1] = Math.addExact(expectedRevision ?: 0L, 1L)
+                wrote = true
+            }
+            wrote
+        }
+    }
+
+    /**
+     * Privileged unconditional clear. Only explicit logout may call this;
+     * stale callers are forbidden — use [clearIfRevision] for any fenced path.
+     *
+     * Intentionally asymmetric with [saveIfRevision]: logout is authoritative
+     * teardown that must always advance the revision (invalidating outstanding
+     * snapshots/consents), never fail with `false`. Fencing belongs on the
+     * write path; a stale logout must not silently no-op and leave metadata
+     * behind, so only the session owner reaching this privileged path may clear.
+     *
      * Clears metadata only. Callers rotating/logging out MUST also call
      * `KeyVault.deleteKey(providerId)` or orphan keys linger in EncryptedSharedPreferences.
      */
@@ -174,6 +271,58 @@ class EndpointStore(
         }
     }
 
+    /**
+     * Fenced clear. Single-process only; not safe across processes
+     * (DataStore is not multi-process safe).
+     *
+     * Compares the stored revision against [expectedRevision] inside a single
+     * `dataStore.edit {}` transaction: mismatch `return@edit`s without writing
+     * and returns `false`; match removes all metadata fields, bumps to
+     * `Math.addExact(expectedRevision ?: 0L, 1L)`, and returns `true`.
+     *
+     * @param expectedRevision MUST come from [currentRevision()], never
+     * `observe().configRevision`: [observe] folds the post-[clear] tombstone to
+     * `null`, so reusing its value loses the revision that must be fenced.
+     *
+     * Fail-closed: revision overflow ([ArithmeticException]) and DataStore
+     * failures propagate; only the expected contention path returns `false`.
+     * Like [clear], this removes metadata only — callers MUST also coordinate
+     * `KeyVault.deleteKey(providerId)` (no distributed transaction with the vault).
+     */
+    suspend fun clearIfRevision(expectedRevision: Long?): Boolean {
+        return withContext(ioDispatcher) {
+            var wrote = false
+            dataStore.edit { prefs ->
+                val actual = prefs[ENDPOINT_CONFIG_REVISION_V1]
+                if (actual != expectedRevision) {
+                    return@edit
+                }
+                prefs.remove(ENDPOINT_PROVIDER_ID_V1)
+                prefs.remove(ENDPOINT_PRESET_ID_V1)
+                prefs.remove(ENDPOINT_LABEL_V1)
+                prefs.remove(ENDPOINT_BASE_URL_V1)
+                prefs.remove(ENDPOINT_PROTOCOL_V1)
+                prefs.remove(ENDPOINT_MODEL_V1)
+                prefs.remove(ENDPOINT_API_KEY_REF_V1)
+                // Keep the revision across clear so a later endpoint cannot
+                // accidentally compare equal to a pre-clear snapshot.
+                prefs[ENDPOINT_CONFIG_REVISION_V1] = Math.addExact(expectedRevision ?: 0L, 1L)
+                wrote = true
+            }
+            wrote
+        }
+    }
+
     private fun nextRevision(current: Long?): Long =
         Math.addExact(current ?: 0L, 1L)
+
+    private fun validateForSave(config: EndpointConfig) {
+        require(config.providerId.isNotBlank()) { "PROVIDER_ID_BLANK" }
+        require(config.baseUrl.isNotBlank()) { "BASE_URL_BLANK" }
+        require(config.apiKeyRef.isNotBlank()) { "PROVIDER_KEY_REF_BLANK" }
+        // Boundary guard: the ref must be a vault alias, never pasted key material.
+        require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
+        require('\n' !in config.apiKeyRef && '\r' !in config.apiKeyRef) { "PROVIDER_KEY_REF_MALFORMED" }
+        validateBaseUrl(config.baseUrl)
+    }
 }

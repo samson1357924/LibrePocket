@@ -226,24 +226,200 @@ class McpTransportCancelTest {
         }
     }
 
-    @Test fun oversizedBodyStopsAtCapWithoutWaitingEof() = runBlocking {
+    @Test fun byteOverCapThrowsInsteadOfTruncatedOk() = runBlocking {
         val web = MockWebServer()
         web.start()
         val signals = CallSignals()
         try {
-            // 200KiB chunked body：讀到 64k 上限即 terminal，先 cancel 再關，不等 EOF。
-            web.enqueue(MockResponse().setResponseCode(200).setChunkedBody("y".repeat(200 * 1024), 1024))
+            // 300KiB chunked body（> 256KiB 位元組上限）：必須拋 McpResponseTooLarge，
+            // 先 cancel 再拋，不回截斷半 JSON；絕不映射 OK。
+            web.enqueue(MockResponse().setResponseCode(200).setChunkedBody("y".repeat(300 * 1024), 8192))
+            val outcome = withTimeoutOrNull(5_000) {
+                runCatching {
+                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                }
+            }
+            assertNotNull("超大 body 必須在 5s 內拋出（不等 EOF 排空）", outcome)
+            val failure = outcome!!.exceptionOrNull()
+            assertTrue("位元組超量必須拋 McpResponseTooLarge（非截斷 OK），實際=$outcome", failure is McpResponseTooLarge)
+            assertCallCancelled(signals, "位元組超量 terminal")
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun charOverCapThrowsInsteadOfTruncatedOk() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        val signals = CallSignals()
+        try {
+            // 200KiB ASCII（204800 位元組 < 256KiB，但 204800 字元 > 64k 字元上限）：
+            // 解碼後超量同樣拋 McpResponseTooLarge，不回截斷 JSON。
+            web.enqueue(MockResponse().setResponseCode(200).setChunkedBody("y".repeat(200 * 1024), 8192))
+            val outcome = withTimeoutOrNull(10_000) {
+                runCatching {
+                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                }
+            }
+            assertNotNull("字元超量必須拋出", outcome)
+            val failure = outcome!!.exceptionOrNull()
+            assertTrue("字元超量必須拋 McpResponseTooLarge（非截斷 OK），實際=$outcome", failure is McpResponseTooLarge)
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun cjkLegalJsonPreservedWithoutTruncation() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        val signals = CallSignals()
+        try {
+            // Review fixture：text = "繁".repeat(22000)，整體 JSON 約 22089 字元 / 66089 位元組。
+            // 舊 64k 位元組 cap 會在多位元組中間切開並誤報 OK；新雙上限（256KiB + 64k 字元）必須完整保留。
+            val cjk = "繁".repeat(22_000)
+            val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"$cjk\"}],\"isError\":false}}"
+            assertTrue("fixture 必須小於新雙上限（否則測錯分支）", body.toByteArray(Charsets.UTF_8).size < McpTransport.RESPONSE_MAX_BYTES)
+            assertTrue("fixture 必須小於字元上限", body.length < McpTransport.RESPONSE_MAX_CHARS)
+            web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val got = withTimeoutOrNull(5_000) {
                 transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
             }
-            assertNotNull("超大 body 必須在上限處 terminal 回傳", got)
+            assertNotNull("合法 CJK JSON 必須完整回傳", got)
             assertEquals(200, got!!.first)
-            assertEquals(
-                "超大 body 截斷至既有 64k 語義",
-                McpTransport.RESPONSE_MAX_BYTES.toInt(),
-                got.second?.length,
+            assertEquals("CJK JSON 必須逐字完整（無截斷、無 replacement character）", body, got.second)
+            assertFalse("完整回傳不得含 replacement character", got.second!!.contains("\uFFFD"))
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun emojiLegalJsonPreservedWithoutSplittingSurrogates() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        val signals = CallSignals()
+        try {
+            // emoji 4 bytes / 2 UTF-16 單位："😀".repeat(10000) = 20000 字元 / 40000 位元組。
+            // 舊 64k 位元組可容納但新測試確保 surrogate pair 不被切開；更大數量由位元組上限測試覆蓋。
+            val emoji = "😀".repeat(10_000)
+            val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"$emoji\"}],\"isError\":false}}"
+            web.enqueue(MockResponse().setResponseCode(200).setBody(body))
+            val got = withTimeoutOrNull(5_000) {
+                transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+            }
+            assertNotNull("合法 emoji JSON 必須完整回傳", got)
+            assertEquals(body, got!!.second)
+            assertFalse("不得含 replacement character", got.second!!.contains("\uFFFD"))
+            // Surrogate pair 完整：尾端不得是孤立 high/low surrogate。
+            val text = got.second!!
+            val last = text[text.length - 20]
+            assertFalse("不得以孤立 surrogate 結尾", Character.isHighSurrogate(last) && text.endsWith(last.toString()))
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun multibyteSplitNeverProducesReplacementCharacter() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        val signals = CallSignals()
+        try {
+            // 在 256KiB 邊界上切開 "繁"（3 bytes）：前綴 262143 個 'a' + "繁" = 262146 位元組。
+            // 第 262144 位元組正好是 "繁" 的首 byte；舊碼回截斷字串尾帶 U+FFFD，新碼必須拋。
+            val payload = "a".repeat((McpTransport.RESPONSE_MAX_BYTES - 1).toInt()) + "繁"
+            assertTrue("fixture 必須超位元組上限", payload.toByteArray(Charsets.UTF_8).size > McpTransport.RESPONSE_MAX_BYTES)
+            web.enqueue(MockResponse().setResponseCode(200).setChunkedBody(payload, 8192))
+            val outcome = withTimeoutOrNull(5_000) {
+                runCatching {
+                    transport(signals).postJson(web.url("/").toString(), "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                }
+            }
+            assertNotNull("邊界切開必須拋出（不等 EOF）", outcome)
+            val failure = outcome!!.exceptionOrNull()
+            assertTrue("邊界切開必須拋 McpResponseTooLarge（不得回含 U+FFFD 的截斷字串），實際=$outcome", failure is McpResponseTooLarge)
+            assertCallCancelled(signals, "邊界截斷 terminal")
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun serverTruncatedCallMapsToProtocolNotOk() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // tools/call 回超大 body：server 必須回 PROTOCOL + 計熔斷一次，絕不回 OK(null) 假成功。
+            web.enqueue(MockResponse().setResponseCode(200).setChunkedBody("z".repeat(300 * 1024), 8192))
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
             )
-            assertCallCancelled(signals, "超大 body terminal")
+            val got = withTimeoutOrNull(10_000) { server.callTool("t") }
+            assertNotNull("超量 callTool 必須回 PROTOCOL（非 null/例外/OK）", got)
+            assertEquals(McpStatus.PROTOCOL, got!!.status)
+            assertNull("PROTOCOL 不得帶 resultJson", got.resultJson)
+            assertEquals("截斷必須計入熔斷失敗一次", 1, breaker.failureCount())
+            assertFalse(breaker.isOpen())
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun serverCjkCallPreservesDataAndOk() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 同 cjk fixture：server 必須回 OK 且 resultJson 含完整 22000 個 "繁"，breaker 歸零。
+            val cjk = "繁".repeat(22_000)
+            val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"$cjk\"}],\"isError\":false}}"
+            web.enqueue(MockResponse().setResponseCode(200).setBody(body))
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t") }
+            assertNotNull("合法 CJK callTool 必須回 OK", got)
+            assertEquals(McpStatus.OK, got!!.status)
+            val resultJson = requireNotNull(got.resultJson) { "OK 必須帶 resultJson" }
+            assertTrue("resultJson 必須含完整 CJK（無截斷）", resultJson.contains(cjk))
+            assertFalse("不得含 replacement character", resultJson.contains("\uFFFD"))
+            assertEquals("成功不得計熔斷", 0, breaker.failureCount())
+            assertEquals(1, web.requestCount)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun serverIncompleteJsonMapsToProtocolNotOk() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 上限內但語法不完整的半 JSON（HTTP 200 完整送達、無傳輸錯誤）：
+            // parseCall 雙缺必須拋，server 回 PROTOCOL + 計熔斷，絕不回 OK(null) 假成功。
+            web.enqueue(MockResponse().setResponseCode(200).setBody("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":"))
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(5_000) { server.callTool("t") }
+            assertNotNull("半 JSON 必須回 PROTOCOL（非 null/例外/OK）", got)
+            assertEquals(McpStatus.PROTOCOL, got!!.status)
+            assertNull("PROTOCOL 不得帶 resultJson", got.resultJson)
+            assertEquals("半 JSON 必須計入熔斷失敗一次", 1, breaker.failureCount())
+            assertFalse(breaker.isOpen())
             assertEquals(1, web.requestCount)
         } finally {
             web.shutdown()

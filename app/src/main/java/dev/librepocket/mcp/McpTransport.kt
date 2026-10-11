@@ -39,8 +39,18 @@ class McpTransport(
             .retryOnConnectionFailure(false)
             .build()
 
-        /** 成功 body 上限：既有 `take(64_000)` 語義的有界讀版本（讀塊 8KiB 同級 provider）。 */
-        internal const val RESPONSE_MAX_BYTES = 64_000L
+        /**
+         * 成功 body 位元組安全上限：覆蓋既有 `take(64_000)` 字元語義的所有語言
+         * （64k 字元 × UTF-8 最大 4 bytes = 256KiB），讀塊 8KiB 同級 provider。
+         * 超量一律拋 [McpResponseTooLarge]（fail-closed），不回截斷 JSON。
+         */
+        internal const val RESPONSE_MAX_BYTES = 256L * 1024L
+
+        /**
+         * 成功 body 字元上限：相容既有 `.string()?.take(64_000)`（Kotlin UTF-16 單位）。
+         * 解碼後超量同樣拋 [McpResponseTooLarge]，避免半個 JSON 誤報 OK。
+         */
+        internal const val RESPONSE_MAX_CHARS = 64_000
     }
 
     /**
@@ -50,6 +60,9 @@ class McpTransport(
      * - 取消與否只以 coroutine Job（[ensureActive]）判斷，不以 `Call.isCanceled()` 判斷；
      * - 總 deadline = `withTimeoutOrNull(McpTimeouts.clamp)`（沿用既有常數），僅本層到期回 null（TIMEOUT）；
      *   父層 `withTimeout`/外部取消原樣透傳 `CancellationException`（不斷熔斷、不映射 TRANSPORT，見 [McpServer]）；
+     * - 成功 body 雙上限：[RESPONSE_MAX_BYTES] 位元組（傳輸層截斷探針）與
+     *   [RESPONSE_MAX_CHARS] 字元（相容舊 `take(64_000)`）；超量拋 [McpResponseTooLarge]，
+     *   呼叫方映射 PROTOCOL + 計熔斷，絕不回截斷半 JSON 充 OK；
      * - 其餘 `IOException` 透傳（呼叫方映射 TRANSPORT）。
      */
     @OptIn(InternalCoroutinesApi::class)
@@ -107,27 +120,49 @@ class McpTransport(
 }
 
 /**
- * 有界讀成功 body（至多 [McpTransport.RESPONSE_MAX_BYTES] 位元組）。
+ * 成功 body 超量信號（fail-closed）：位元組超 [McpTransport.RESPONSE_MAX_BYTES] 或
+ * 解碼字元超 [McpTransport.RESPONSE_MAX_CHARS] 時拋出。
  *
- * 64k 內位元組與既有 `.string()?.take(64_000)` 同值（同 contentType 解碼）；
- * 達上限即 terminal：先 cancel 再停讀關閉，不等 EOF、不排空剩餘位元組
- * （關閉時不再花時間丟棄未讀資料，同級 provider `readProviderErrorPrefix` 做法）。
+ * 訊息刻意不含 body 內容（不洩漏傳輸資料，稽核只記 id/status/latency）；
+ * [McpServer] 將其映射為 PROTOCOL + 計熔斷，不當 OK，不當 TRANSPORT。
+ */
+internal class McpResponseTooLarge(message: String) : IOException(message)
+
+/**
+ * 有界讀成功 body（雙上限，超量即拋 [McpResponseTooLarge]）。
+ *
+ * - 位元組上限 [McpTransport.RESPONSE_MAX_BYTES]：`Content-Length` 預檢 + 串流 `+1` 探針
+ *   區分恰好等 cap 的 EOF 與超量（同級 provider `readBoundedProviderBody` 做法）；
+ *   超量先 cancel 再拋，不等 EOF、不排空剩餘位元組；
+ * - 字元上限 [McpTransport.RESPONSE_MAX_CHARS]：完整解碼後檢查，相容舊
+ *   `.string()?.take(64_000)`；超量直接拋（此時 body 已讀到 EOF、連線可重用，無需 cancel）。
+ *
+ * 未截斷才解碼回傳：絕不在 UTF-8 多位元組中間切開，不產生 replacement character；
+ * 呼叫方永遠拿到完整 JSON 或明確例外，不會有半個 JSON 充 OK。
  */
 private fun readBoundedBody(body: ResponseBody?, cancelCall: () -> Unit): String? {
     if (body == null) return null
-    val cap = McpTransport.RESPONSE_MAX_BYTES
+    val byteCap = McpTransport.RESPONSE_MAX_BYTES
+    val charCap = McpTransport.RESPONSE_MAX_CHARS
+    if (body.contentLength() > byteCap) {
+        cancelCall()
+        throw McpResponseTooLarge("mcp: response body exceeds $byteCap bytes")
+    }
     val source = body.source()
     val bytes = Buffer()
-    var remaining = cap
+    var remaining = byteCap
     while (true) {
         val read = source.read(bytes, minOf(8 * 1024L, remaining + 1L))
         if (read == -1L) break
         if (read > remaining) {
             cancelCall()
-            val capped = bytes.readByteArray(cap)
-            return capped.toResponseBody(body.contentType()).string()
+            throw McpResponseTooLarge("mcp: response body exceeds $byteCap bytes")
         }
         remaining -= read
     }
-    return bytes.readByteArray().toResponseBody(body.contentType()).string()
+    val text = bytes.readByteArray().toResponseBody(body.contentType()).string()
+    if (text.length > charCap) {
+        throw McpResponseTooLarge("mcp: response body exceeds $charCap chars")
+    }
+    return text
 }

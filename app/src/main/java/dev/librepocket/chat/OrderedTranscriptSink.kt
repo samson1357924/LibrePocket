@@ -4,6 +4,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -350,6 +351,16 @@ class OrderedTranscriptSink(
       // was already attempted once its gate completes.
       reservation.prev?.await()
       beforeSendForTest?.invoke(reservation.ticket)
+      // R5-2: channel.send below does not suspend when capacity is available,
+      // so a close/cancel that landed while parked above would otherwise slip
+      // an entry into the channel after its owner gave up (the independent
+      // writer would then persist a ghost row). Revalidate liveness at the
+      // linearization point: no suspension happens between this check and the
+      // synchronous send, so a throw here provably means the entry never
+      // entered, and anything arriving later cannot interleave before it.
+      if (coroutineContext[Job]?.isCancelled == true) {
+        throw CancellationException("admission waiter cancelled before send")
+      }
       channel.send(Entry(runId, block, ack))
       sent.set(true)
     } catch (e: CancellationException) {

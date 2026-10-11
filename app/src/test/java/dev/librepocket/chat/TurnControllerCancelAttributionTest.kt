@@ -465,12 +465,16 @@ class TurnControllerCancelAttributionTest {
   }
 
   /**
-   * Finding 5 asymmetry lock: promotion follow-ups are host-durable (dequeue
-   * then write, no accept timeout). A user-row store failure after dequeue
-   * cannot be reclaimed via drainQueued and has no caller to retain it: the
-   * UI user row is kept with ERROR and the runId is INTERRUPTED-marked.
+   * R5-2 durable promotion: the follow-up user row is acked with
+   * [TurnController.ACCEPT_DURABLE_TIMEOUT_MS] BEFORE dequeue, and STREAMING
+   * is projected only after that ack. A user-row store failure therefore
+   * retains the FIFO for explicit recovery (still reclaimable via
+   * drainQueued, ERROR + queuedRecoveryRequired, runId INTERRUPTED-marked);
+   * the follow-up is never launched (single provider call) and no follow UI
+   * row is ever appended (nothing to roll back, unlike the old host-durable
+   * asymmetry where the dequeued text was lost).
    */
-  @Test fun promotionUserRowFailureIsHostDurableNotReclaimable() {
+  @Test fun promotionUserRowFailureRetainsFifoForRecovery() {
     val sink = CancelAttrSink()
     val enteredFirst = CountDownLatch(1)
     val releaseFirst = CompletableDeferred<Unit>()
@@ -518,23 +522,30 @@ class TurnControllerCancelAttributionTest {
         releaseFirst.complete(Unit)
         val host1 = (started as TurnStart.Started).host
         withTimeout(5_000) { host1.join() }
-        // The promotion attempt dequeues follow, fails its user-row write,
-        // and projects ERROR (host-durable, no caller retain).
+        // The promotion attempt fails its durable user-row await BEFORE
+        // dequeue, retains the FIFO, and projects ERROR (durable promotion:
+        // the intent stays caller-recoverable, the follow-up never launches).
         awaitTrue { c.uiState.value.status == ChatStatus.ERROR }
         withTimeout(5_000) { c.flushTranscript() }
       }
-      // Asymmetry: the dequeued follow-up is NOT reclaimable.
-      assertTrue("promotion failure must leave FIFO drained, not reclaimable", c.drainQueued().isEmpty())
+      // R5-2: the never-dequeued follow-up IS reclaimable. Assert the
+      // recovery signal BEFORE draining: drainQueued() hands ownership to the
+      // caller and clears the controller-side flag/count with it.
       assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals("transcript store unavailable", c.uiState.value.error)
+      assertTrue(c.uiState.value.queuedRecoveryRequired)
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertEquals(listOf(QueuedIntent(null, "follow")), c.drainQueued())
+      assertTrue(c.drainQueued().isEmpty())
       assertTrue(
-        "promotion UI row is kept (not rolled back like direct admissions)",
-        c.uiState.value.messages.any { it.role == "user" && it.text == "follow" },
+        "promotion failure must not append a follow UI row before the durable ack",
+        c.uiState.value.messages.none { it.role == "user" && it.text == "follow" },
       )
       assertTrue(
         "promotion user-row failure must be INTERRUPTED-marked",
         c.interruptedTranscriptRunIds().isNotEmpty(),
       )
-      assertEquals("follow must never reach the provider (failed before dispatch)", 1, provider.streamCalls.get())
+      assertEquals("follow must never reach the provider (failed before commit)", 1, provider.streamCalls.get())
     } finally {
       releaseFirst.complete(Unit)
       c.close()

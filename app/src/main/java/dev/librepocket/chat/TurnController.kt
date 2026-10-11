@@ -456,6 +456,17 @@ class TurnController(
    * (cancel-drain, closed-rollback, or durability-rollback).
    */
   private var admissionCancelRequestedId: String? = null
+  /**
+   * R5-2 promotion-scoped reservation (guarded by [lock]): the follow-up
+   * identity minted by the promotion peek, held across the durable user-row
+   * await. Deliberately separate from [pendingAdmission] (direct admissions):
+   * [close] drains only direct orphans, and [cancel]'s admission-window flag
+   * ([admissionCancelRequestedId]) stays direct — a promotion await is always
+   * covered by the still-active predecessor host, so cancel/close reach it by
+   * cancelling that host, never via these flags. Invariant: set only while
+   * the predecessor host is still the live in-flight job.
+   */
+  private var promotionPending: PendingAdmission? = null
   private var orphanDrainJob: Job? = null
 
   /**
@@ -488,8 +499,8 @@ class TurnController(
     val drain = writerScope.launch(NonCancellable) {
       try {
         // Stage 6: admission-path user rows are already durable before the
-        // host launches; re-writing would duplicate the runId. Only
-        // promotion-path orphans (never durably awaited) need the user row.
+        // host launches; re-writing would duplicate the runId. Only orphans
+        // whose durable await never completed need the user row here.
         if (!alreadyDurable) {
           orderedTranscript.onTurnStarted(pending.logicalTurnId, pending.text)
           durableUserRows.add(pending.logicalTurnId)
@@ -597,6 +608,9 @@ class TurnController(
 
   /** Test seam for pausing after follow-up policy approval, before handoff. */
   internal var afterFollowUpGateForTest: (() -> Unit)? = null
+
+  /** Test seam for pausing a promotion after its peek-reserve, before the durable await. */
+  internal var beforePromotionAwaitForTest: (() -> Unit)? = null
 
   /** Test seam for pausing after follow-up policy denial, before settlement. */
   internal var afterFollowUpDenyForTest: (() -> Unit)? = null
@@ -1846,21 +1860,21 @@ class TurnController(
     // Normal completion only: hand off at most one queued steer as a detached
     // follow-up turn, so send() returns after its own turn. The follow-up
     // gate runs BEFORE dequeue, so a deny leaves the queue intact (still
-    // reclaimable via drainQueued). The dequeue and complete follow-up handoff
-    // then share the teardown lock, so the intent is either drained or fully
-    // accepted; it cannot be stranded between the queue and transcript.
+    // reclaimable via drainQueued).
     //
-    // Promotion asymmetry (R4-3 review, documented): unlike direct admissions
-    // ([startTurn]/[startOrEnqueue], which durably await the user row with
-    // [ACCEPT_DURABLE_TIMEOUT_MS] BEFORE returning and fail closed with caller
-    // retain), the promotion follow-up below is host-durable — it dequeues
-    // first and writes the user row inside [runTurnLoop] with no timeout
-    // bound. A user-row store failure there lands in the [hostedTurn] catch
-    // above (ERROR, runId INTERRUPTED-marked): the text is already dequeued,
-    // so it has no caller to retain it and [drainQueued] cannot reclaim it.
-    // The UI user row is kept (not rolled back) and the turn stays ERROR until
-    // an explicit user resend; see the promotion-failure regression test that
-    // locks this asymmetry.
+    // R5-2 durable promotion: the peek and the commit no longer share one
+    // lock. Lock 1 only peeks the FIFO head and reserves the follow-up
+    // identity ([promotionPending] + WAITING_STEERED already projected above:
+    // no dequeue, no appendUser, no STREAMING); the user row is then durably
+    // awaited OUTSIDE the lock with [ACCEPT_DURABLE_TIMEOUT_MS] (same
+    // tri-state contract as direct admissions via [awaitUserRowDurable]);
+    // lock 2 dequeues, appends, projects STREAMING and launches ONLY after
+    // the ack. A process kill before the commit leaves the intent in the FIFO
+    // (still reclaimable via drainQueued); a store failure retains the FIFO
+    // with ERROR + queuedRecoveryRequired instead of losing dequeued text;
+    // UNKNOWN retains the FIFO with a pending error and never resends; a
+    // cancel/close win retains the FIFO with CANCELLED and never launches
+    // nor writes another ledger row here.
     beforeCompletionQueueCheckForTest?.invoke()
     val hasQueued = synchronized(lock) {
       if (closed || self?.isActive != true) {
@@ -1927,6 +1941,9 @@ class TurnController(
       return
     }
     afterFollowUpGateForTest?.invoke()
+    // Lock 1: peek + reserve only (no dequeue, no appendUser, no STREAMING yet).
+    val head: PendingSteer
+    val reservation: PendingAdmission
     synchronized(lock) {
       if (
         closed || self?.isActive != true || _uiState.value.status == ChatStatus.CANCELLED ||
@@ -1935,20 +1952,8 @@ class TurnController(
         if (inFlight === self) inFlight = null
         return
       }
-      // Promotion re-validation (R4-4): peek the FIFO head with the fresh
-      // zone before dequeue. Oversize retains the FIFO via the existing
-      // failPromotion path (no appendUser, no transcript, no provider call).
-      val head = steerQueue.firstOrNull()
-      if (head != null) {
-        try {
-          checkInputLengthOrThrow(head.text)
-        } catch (_: InputTooLongException) {
-          failPromotion("input too long", self)
-          return
-        }
-      }
-      val next = steerQueue.removeFirstOrNull()
-      if (next == null) {
+      val peeked = steerQueue.firstOrNull()
+      if (peeked == null) {
         // drainQueued() won after the fresh gate. Mirror the empty-queue
         // transition while preserving a racing close()'s CANCELLED state.
         if (inFlight === self) inFlight = null
@@ -1961,16 +1966,120 @@ class TurnController(
         }
         return
       }
-      activityRevision++
-      appendUser(next.text, next.opId)
-      _uiState.update { it.copy(status = ChatStatus.STREAMING, error = null, pendingSteerCount = steerQueue.size) }
-      // Follow-up owns a fresh logical id, also created before launch.
+      // Promotion re-validation (R4-4): peek the FIFO head with the fresh
+      // zone before any dequeue. Oversize retains the FIFO via the existing
+      // failPromotion path (no dequeue, no appendUser, no transcript, no
+      // provider call). Reentrant: failPromotion takes the same lock.
+      try {
+        checkInputLengthOrThrow(peeked.text)
+      } catch (_: InputTooLongException) {
+        failPromotion("input too long", self)
+        return
+      }
+      // Reserve only: mint the follow-up identity and hold the single-flight
+      // slot in the promotion-scoped field (NOT pendingAdmission — close()
+      // drains only direct orphans, and the direct cancel flag stays direct).
       val followLogicalId = newId()
       val followAttemptRef = AtomicReference(followLogicalId)
       val followAttemptIndexRef = AtomicInteger(0)
-      pendingAdmission = PendingAdmission(followLogicalId, next.text, next.images, followAttemptRef, followAttemptIndexRef)
-      val follow = scope.launch { hostedTurn(next.text, next.images, followLogicalId, followAttemptRef, followAttemptIndexRef) }
+      reservation = PendingAdmission(
+        followLogicalId, peeked.text, peeked.images, followAttemptRef, followAttemptIndexRef,
+      )
+      promotionPending = reservation
+      head = peeked
+    }
+    beforePromotionAwaitForTest?.invoke()
+    // Durable gate outside the lock (suspend must never hold the intrinsic
+    // monitor). STREAMING stays behind this ack: a kill before the commit
+    // below leaves the intent in the FIFO, reclaimable via drainQueued.
+    try {
+      when (awaitUserRowDurable(reservation.logicalTurnId, head.text)) {
+        DurableAdmission.ACKED -> Unit
+        DurableAdmission.NOT_ADMITTED -> {
+          synchronized(lock) {
+            if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+          }
+          failPromotion("transcript store unavailable", self)
+          return
+        }
+        DurableAdmission.UNKNOWN -> {
+          // Send proof true but ack timed out: the ghost may still
+          // late-commit, so never resend. Unlike direct admissions there is
+          // no caller to throw Pending to and no same-id claim that could
+          // coordinate the FIFO, so the intent stays queued with a pending
+          // error for explicit recovery (no ownership held, no resend).
+          synchronized(lock) {
+            if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+          }
+          failPromotion("transcript store pending", self)
+          return
+        }
+      }
+    } catch (e: CancellationException) {
+      // Our own wait cancelled (cancel()/close() won while parked): retain
+      // the FIFO for explicit recovery; failPromotion keeps closed/CANCELLED
+      // projections untouched and only clears the finished host slot.
+      synchronized(lock) {
+        if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+      }
+      failPromotion("turn admission cancelled", self)
+      return
+    } catch (_: TranscriptDurabilityException) {
+      // Fast store failure / seal race before any ack: never dequeued, so
+      // the FIFO is retained for explicit recovery (fail-closed like direct).
+      synchronized(lock) {
+        if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+      }
+      failPromotion("transcript store unavailable", self)
+      return
+    }
+    // Lock 2: commit. Dequeue + appendUser + STREAMING + launch ONLY now that
+    // the user row is durable ([runTurnLoop] skips the rewrite via
+    // [durableUserRows], so exactly one user row exists per logical turn).
+    synchronized(lock) {
+      if (
+        closed || self?.isActive != true || _uiState.value.status == ChatStatus.CANCELLED ||
+        _uiState.value.queuedRecoveryRequired
+      ) {
+        // Cancel/close won after the ack: never launch and never write another
+        // ledger row here (the acked user row stays as-is; an explicit retry
+        // mints a fresh id). Cancel wins retain the FIFO for explicit
+        // recovery and keep the CANCELLED projection; close wins drop the FIFO
+        // per the drain-before-close lifecycle contract (an already-acked row
+        // then survives as an orphan, marked INTERRUPTED on reopen).
+        if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+        if (inFlight === self) inFlight = null
+        return
+      }
+      val currentHead = steerQueue.firstOrNull()
+      if (currentHead == null || currentHead.opId != head.opId || currentHead.text != head.text) {
+        // drainQueued() stole the head mid-await: the drained caller owns the
+        // text now — never dequeue its successor by mistake. Mirror the
+        // empty-queue transition; the acked user row stays as-is.
+        if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+        if (inFlight === self) inFlight = null
+        _uiState.update { s ->
+          if (s.status == ChatStatus.STREAMING || s.status == ChatStatus.WAITING_STEERED) {
+            s.copy(status = ChatStatus.IDLE)
+          } else {
+            s
+          }
+        }
+        return
+      }
+      steerQueue.removeFirstOrNull()
+      activityRevision++
+      if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+      appendUser(currentHead.text, currentHead.opId)
+      _uiState.update { it.copy(status = ChatStatus.STREAMING, error = null, pendingSteerCount = steerQueue.size) }
+      // Follow-up owns the reserved logical id, also created before launch.
+      pendingAdmission = PendingAdmission(
+        reservation.logicalTurnId, currentHead.text, currentHead.images,
+        reservation.attemptRef, reservation.attemptIndexRef,
+      )
+      val follow = scope.launch { hostedTurn(currentHead.text, currentHead.images, reservation.logicalTurnId, reservation.attemptRef, reservation.attemptIndexRef) }
       inFlight = follow
+      val followLogicalId = reservation.logicalTurnId
       follow.invokeOnCompletion {
         synchronized(lock) {
           if (inFlight === follow) inFlight = null
@@ -2041,8 +2150,8 @@ class TurnController(
     // before launch). Stage 6: direct admissions ([startTurn]/[startOrEnqueue])
     // already durably acked it before returning Started (and recorded
     // [durableUserRows]), so the host skips it and starts from the first
-    // provider attempt; follow-up promotions (never durably awaited) still
-    // write it here. Retries add attempt records bound to that id and start
+    // provider attempt; follow-up promotions durably await it during the
+    // two-lock handoff (R5-2) and likewise skip the rewrite here. Retries add attempt records bound to that id and start
     // a new assistant block each; they never emit another user row. Direct
     // suspend calls (no fire-and-forget hop), so no snapshot copies are
     // needed: each write completes in call order. attemptRef always holds the

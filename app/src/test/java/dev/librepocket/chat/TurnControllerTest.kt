@@ -2451,6 +2451,98 @@ class TurnControllerTest {
     }
   }
 
+  @Test fun promotionProjectsStreamingOnlyAfterDurableUserRowAck() {
+    val firstTurnGate = CompletableDeferred<Unit>()
+    val promotionParked = CountDownLatch(1)
+    val releasePromotionAwait = CountDownLatch(1)
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    c.beforePromotionAwaitForTest = {
+      promotionParked.countDown()
+      check(releasePromotionAwait.await(30, TimeUnit.SECONDS))
+    }
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls.get() == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow", opId = 174) })
+      firstTurnGate.complete(Unit)
+      assertTrue("promotion did not reach its durable await", promotionParked.await(5, TimeUnit.SECONDS))
+      // R5-2 SIGKILL-window property: STREAMING stays behind the durable ack —
+      // the intent still sits in the FIFO, the UI waits, nothing launched.
+      assertEquals(ChatStatus.WAITING_STEERED, c.uiState.value.status)
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(1, provider.streamCalls.get())
+      releasePromotionAwait.countDown()
+      runBlocking { withTimeout(5_000) { first.join() } }
+      awaitTrue { c.uiState.value.status == ChatStatus.IDLE && usersOf(c).size == 2 }
+      assertEquals(listOf("first", "follow"), usersOf(c))
+      assertEquals(2, provider.streamCalls.get())
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      assertTrue(c.drainQueued().isEmpty())
+    } finally {
+      releasePromotionAwait.countDown()
+      firstTurnGate.complete(Unit)
+      outer.cancel()
+      c.close()
+    }
+  }
+
+  @Test fun closeDuringPromotionAwaitNeverLaunchesFollowUp() {
+    val firstTurnGate = CompletableDeferred<Unit>()
+    val promotionParked = CountDownLatch(1)
+    val releasePromotionAwait = CountDownLatch(1)
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = AllowPolicy(),
+      transcript = sink,
+      dispatcher = Dispatchers.Default,
+      newId = { "id-${n++}" },
+    )
+    c.beforePromotionAwaitForTest = {
+      promotionParked.countDown()
+      check(releasePromotionAwait.await(30, TimeUnit.SECONDS))
+    }
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls.get() == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow", opId = 75) })
+      firstTurnGate.complete(Unit)
+      assertTrue("promotion did not reach its durable await", promotionParked.await(5, TimeUnit.SECONDS))
+      // Close wins while the follow-up user row is still undurable: the
+      // intent is dropped by lifecycle contract (drain-before-close was
+      // skipped), but the follow-up must never launch nor append.
+      c.close()
+      releasePromotionAwait.countDown()
+      runBlocking { withTimeout(5_000) { first.join() } }
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(1, provider.streamCalls.get())
+      assertTrue(c.drainQueued().isEmpty())
+      assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+      assertEquals(listOf("first"), sink.started.map { it.second })
+    } finally {
+      releasePromotionAwait.countDown()
+      firstTurnGate.complete(Unit)
+      outer.cancel()
+      c.close()
+    }
+  }
+
   @Test fun cancelAfterSuccessfulPromotionCancelsFollowUpExactlyOnce() {
     val firstTurnGate = CompletableDeferred<Unit>()
     val gatePassed = CountDownLatch(1)

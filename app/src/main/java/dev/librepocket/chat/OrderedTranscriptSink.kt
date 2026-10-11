@@ -2,6 +2,7 @@ package dev.librepocket.chat
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -12,6 +13,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -76,13 +78,80 @@ class OrderedTranscriptSink(
   private val interrupted = java.util.Collections.synchronizedList(mutableListOf<String>())
   private val shutdownGuard = AtomicBoolean(false)
   /**
-   * Tail of the parked-overflow chain from [offerSteer]. Each parked send
-   * waits for its predecessor's admission attempt, so admissions match offer
-   * order no matter how the writer dispatcher schedules the parked bodies.
-   * [flush] awaits the tail, so a barrier can never overtake steers offered
-   * before the flush. Cleared when the chain drains (CAS keeps a newer tail).
+   * Stage 3 (R4-5) unified admission sequencer shared by every admission
+   * type (steer / core / notice / flush barrier).
+   *
+   * Each admission synchronously reserves one slot before its first suspend
+   * point: a monotonic ticket ([nextTicket]) plus a chain link
+   * ([admissionChain] tail swap) bundled in a single tiny synchronized
+   * section. The section never suspends and never touches the controller
+   * lock (lock order is always controller -> admissionLock, never reversed),
+   * so [offerSteer] stays non-suspending and lock-held callers cannot
+   * deadlock. Uncontended cost is one gate allocation plus two atomics;
+   * contended parking reuses the existing writerScope hop only.
+   *
+   * Admission attempts run strictly in reservation order: each holder awaits
+   * its predecessor's gate (completed once that predecessor *attempted* its
+   * channel send, never on persistence), attempts its own send, then
+   * completes its gate (waking exactly one successor) and CAS-clears the
+   * tail when still current. Gates always complete normally with Unit — even
+   * on cancellation, timeout, or seal — so an abandoned slot skips without
+   * sticking its successor. Completion precedes the CAS clear so a newcomer
+   * arriving between the two can never fast-path past an already-linked
+   * successor.
+   *
+   * A bare Mutex cannot do this: acquisition order is not arrival order and
+   * parked bodies still lose to direct sends. The synchronous link is the
+   * single linearization point for all types.
    */
-  private val overflowChain = AtomicReference<CompletableDeferred<Unit>?>(null)
+  private val admissionLock = Any()
+  private val nextTicket = AtomicLong(0)
+  private val admissionChain = AtomicReference<CompletableDeferred<Unit>?>(null)
+
+  private data class Admission(
+    val ticket: Long,
+    val prev: CompletableDeferred<Unit>?,
+    val gate: CompletableDeferred<Unit>,
+  )
+
+  /**
+   * Test-only hooks (internal, default null, no production effect).
+   *
+   * - [onAdmissionReservedForTest] runs synchronously right after the ticket
+   *   + chain link are reserved, still before the first suspend point, so a
+   *   test observing it knows a later arrival can no longer overtake.
+   * - [beforeSendForTest] runs after the predecessor gate completes and
+   *   before the channel send; tests suspend it on a gate to deterministically
+   *   widen the await -> send gap that pre-fix newcomers exploited.
+   */
+  internal var onAdmissionReservedForTest: ((Long) -> Unit)? = null
+  internal var beforeSendForTest: (suspend (Long) -> Unit)? = null
+
+  private fun reserveAdmission(): Admission {
+    val gate = CompletableDeferred<Unit>()
+    val ticket: Long
+    val prev: CompletableDeferred<Unit>?
+    synchronized(admissionLock) {
+      ticket = nextTicket.getAndIncrement()
+      prev = admissionChain.getAndSet(gate)
+    }
+    try {
+      onAdmissionReservedForTest?.invoke(ticket)
+    } catch (e: Throwable) {
+      releaseAdmission(gate)
+      throw e
+    }
+    return Admission(ticket, prev, gate)
+  }
+
+  private fun releaseAdmission(gate: CompletableDeferred<Unit>) {
+    try {
+      gate.complete(Unit)
+    } catch (_: Exception) {
+      // Idempotent best effort: a cancelled/completed gate still wakes.
+    }
+    admissionChain.compareAndSet(gate, null)
+  }
 
   private val writer: Job = writerScope.launch {
     try {
@@ -208,15 +277,19 @@ class OrderedTranscriptSink(
     writeOrdered { delegate.onUsage(runId, inputTokens, outputTokens) }
 
   /**
-   * Awaits any parked overflow steer admissions from [offerSteer].
-   * Ensures that steers offered before a subsequent writeCore, writeOrdered,
-   * or flush barrier enter the channel strictly ahead of it (R2-7).
+   * Awaits the unified admission tail until stable (no newer reservation).
+   * Used only by [flush] before it reserves its barrier slot: steers, cores,
+   * or notices offered while a previous tail was awaited join a newer gate
+   * that the first await did not cover, so the tail is re-read. Ends on a
+   * stable (same completed gate, whose send was already attempted) or empty
+   * chain. A reservation made after the barrier slot is taken is ordered
+   * behind the barrier, by construction.
    */
-  private suspend fun awaitParkedOverflow() {
-    var tail = overflowChain.get()
+  private suspend fun awaitAdmissionTail() {
+    var tail = admissionChain.get()
     while (tail != null) {
       tail.await()
-      val current = overflowChain.get()
+      val current = admissionChain.get()
       if (current == null || current === tail) break
       tail = current
     }
@@ -230,6 +303,11 @@ class OrderedTranscriptSink(
       markInterrupted(runId)
       throw CancellationException("transcript writer sealed")
     }
+    // Stage 3 (R4-5): reserve the admission slot synchronously, before the
+    // first suspend point and before registering pending marks, so a test
+    // observing pendingRunIds knows no later arrival can overtake this one.
+    // Every later admission links behind this gate.
+    val reservation = reserveAdmission()
     val ack = CompletableDeferred<Unit>()
     // Writer-side failure (teardown mid-entry, seal, drain timeout, or a
     // durable store error for this entry) completes this ack exceptionally;
@@ -244,11 +322,16 @@ class OrderedTranscriptSink(
     coreAcks[ack] = runId
     pendingCore.add(runId)
     try {
-      awaitParkedOverflow()
+      // Admission order, not resumption order: every smaller ticket's send
+      // was already attempted once its gate completes.
+      reservation.prev?.await()
+      beforeSendForTest?.invoke(reservation.ticket)
       channel.send(Entry(runId, block, ack))
     } catch (e: CancellationException) {
       // The caller was cancelled before admission: the entry never entered
-      // the channel, so drop the pending mark and propagate.
+      // the channel, so drop the pending mark and propagate. The gate is
+      // still completed normally by the finally below, skipping the slot
+      // without sticking the successor.
       coreAcks.remove(ack)
       pendingCore.remove(runId)
       throw e
@@ -259,6 +342,11 @@ class OrderedTranscriptSink(
       markInterrupted(runId)
       if (!ack.isCompleted) ack.completeExceptionally(e)
       throw e
+    } finally {
+      // Gate signals send *attempt*, not persistence: successors may attempt
+      // their sends as soon as this entry is buffered, while this waiter
+      // moves on to the durable ack below. Always completes normally.
+      releaseAdmission(reservation.gate)
     }
     try {
       ack.await()
@@ -290,48 +378,101 @@ class OrderedTranscriptSink(
     // No catch: admission failure is the caller's explicit signal.
     // CancellationException propagates to the cancelled caller, and
     // ClosedSendChannelException (sealed after shutdown) propagates to the
-    // caller instead of succeeding silently.
-    awaitParkedOverflow()
-    channel.send(Entry(runId = null, block))
+    // caller instead of succeeding silently. The finally still completes the
+    // gate normally so an abandoned slot never sticks its successor.
+    // Stage 3 (R4-5): same synchronous reservation as cores, so a waiting
+    // notice holds its place ahead of later arrivals.
+    val reservation = reserveAdmission()
+    try {
+      reservation.prev?.await()
+      beforeSendForTest?.invoke(reservation.ticket)
+      channel.send(Entry(runId = null, block))
+    } finally {
+      releaseAdmission(reservation.gate)
+    }
   }
 
   /**
    * Non-suspending steer enqueue for lock-held admission paths. Never drops
    * silently while open: a full channel parks the send on the writer scope,
-   * chained behind the previous parked send so admissions match offer order
-   * regardless of dispatcher scheduling (a mutex cannot do this: acquisition
-   * order is not offer order, and parked bodies still lose to direct sends).
+   * chained behind the previous admission (steer, core, notice, or barrier
+   * reservation) so admissions match reservation order regardless of
+   * dispatcher scheduling (a mutex cannot do this: acquisition order is not
+   * offer order, and parked bodies still lose to direct sends).
    *
    * Stage E: the fast path is only taken when no parked predecessor exists.
-   * A later offer arriving while the overflow chain is non-empty joins the
+   * A later offer arriving while the admission chain is non-empty joins the
    * same admission path (queued behind the tail) instead of trySend-ing past
    * it — otherwise a freed slot lets the newcomer overtake parked A,B
-   * (A,B,D,C reorder). Callers hold the controller lock, so the
-   * chain-check and the park below are mutually ordered with other offers;
-   * the synchronous getAndSet is the linearization point either way.
+   * (A,B,D,C reorder).
+   *
+   * Stage 3 (R4-5): the reservation now covers every admission type, not just
+   * steers. A core or notice that reserved before this offer is a
+   * predecessor this offer must await; conversely this offer's synchronous
+   * link stops a still-waiting core/notice predecessor's chain slot from
+   * looking empty to trySend. The synchronous link (ticket + getAndSet
+   * bundled) is the linearization point either way.
+   *
    * A seal race after shutdown drops here with no recovery
    * path (`close()` clears the controller FIFO, so there is no drainQueued
    * fallback for it).
    */
   fun offerSteer(text: String) {
     val entry = Entry(runId = null, block = { delegate.onSteerQueued(text) })
-    if (overflowChain.get() == null && channel.trySend(entry).isSuccess) return
-    val gate = CompletableDeferred<Unit>()
-    val prev = overflowChain.getAndSet(gate)
-    writerScope.launch {
+    // Synchronous, non-suspending reservation: the single linearization
+    // point. Only test hooks throw here, and reserveAdmission already
+    // released the slot on that path.
+    val reservation = reserveAdmission()
+    if (reservation.prev == null) {
+      // No predecessor: try immediate admission without parking.
+      if (channel.trySend(entry).isSuccess) {
+        releaseAdmission(reservation.gate)
+        return
+      }
+      // Buffer full: park. If already sealed, drop explicitly instead of
+      // parking behind a dead writer.
+      if (channel.isClosedForSend || writerDead.get() || !writerScope.isActive) {
+        releaseAdmission(reservation.gate)
+        return
+      }
+      val job = writerScope.launch {
+        try {
+          // No predecessor to await (prev == null by construction here).
+          beforeSendForTest?.invoke(reservation.ticket)
+          channel.send(entry)
+        } catch (e: CancellationException) {
+          throw e
+        } catch (_: ClosedSendChannelException) {
+          // Sealed after shutdown: no recovery path, drop explicitly.
+        } finally {
+          releaseAdmission(reservation.gate)
+        }
+      }
+      // Defensive: if the scope was cancelled under us and the body never
+      // runs, its finally never fires. The completion handler releases the
+      // idempotent gate so successors cannot stick.
+      job.invokeOnCompletion {
+        if (!reservation.gate.isCompleted) releaseAdmission(reservation.gate)
+      }
+      return
+    }
+    val job = writerScope.launch {
       try {
         // Admission order, not launch order: the predecessor's gate completes
         // once its send was attempted, so this send runs strictly after it.
-        prev?.await()
+        reservation.prev.await()
+        beforeSendForTest?.invoke(reservation.ticket)
         channel.send(entry)
       } catch (e: CancellationException) {
         throw e
       } catch (_: ClosedSendChannelException) {
         // Sealed after shutdown: no recovery path, drop explicitly.
       } finally {
-        gate.complete(Unit)
-        overflowChain.compareAndSet(gate, null)
+        releaseAdmission(reservation.gate)
       }
+    }
+    job.invokeOnCompletion {
+      if (!reservation.gate.isCompleted) releaseAdmission(reservation.gate)
     }
   }
 
@@ -346,31 +487,50 @@ class OrderedTranscriptSink(
    * marked interrupted. Callers requiring guaranteed durable persistence without
    * store failures should check [hasDurableFailures] or call [flushDurable].
    *
-   * Parked [offerSteer] sends offered before this call are awaited first via
-   * the overflow chain: without that, this barrier could be admitted ahead
-   * of their still-unscheduled sends and report a drain that missed them.
-   * Stage E: after awaiting the snapshot tail, the tail is re-read — a send
-   * parked while we awaited joins a newer gate that the first await did not
-   * cover. The loop ends on a stable (same completed gate, whose send was
-   * already attempted) or empty chain; a send offered after the barrier is
-   * admitted cannot be waited on, by construction.
+   * Admissions reserved before this call are awaited first via the unified
+   * chain: without that, this barrier could be admitted ahead of their
+   * still-unscheduled sends and report a drain that missed them. Stage E:
+   * after awaiting the snapshot tail, the tail is re-read — a send reserved
+   * while the tail was awaited joins a newer gate that the first await did
+   * not cover. The loop ends on a stable (same completed gate, whose send
+   * was already attempted) or empty chain.
+   *
+   * Stage 3 (R4-5): the barrier slot itself is reserved only after the tail
+   * is stable, at barrier-admission time rather than at flush entry. An
+   * entry-time ticket would linearize the barrier ahead of a concurrent
+   * arrival (B) that the stable-tail wait is required to include; a late
+   * ticket keeps the Stage E guarantee (every steer offered before the
+   * barrier is admitted drains first) while still serializing later arrivals
+   * behind the barrier. A timeout abandoning the reserved slot completes it
+   * normally so successors are never stuck.
    */
   suspend fun flush(timeoutMs: Long = DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
     try {
       return withTimeoutOrNull(timeoutMs) {
-        awaitParkedOverflow()
-        val barrier = CompletableDeferred<Unit>()
+        awaitAdmissionTail()
+        val reservation = reserveAdmission()
         try {
-          channel.send(Entry(runId = null, block = {}, barrier))
-        } catch (e: CancellationException) {
-          throw e
-        } catch (_: ClosedSendChannelException) {
-          // Sealed: instead of the barrier, wait for the writer to finish
-          // what was admitted pre-seal (still bounded by the same timeout).
-          writer.join()
-          return@withTimeoutOrNull
+          reservation.prev?.await()
+          val barrier = CompletableDeferred<Unit>()
+          beforeSendForTest?.invoke(reservation.ticket)
+          try {
+            channel.send(Entry(runId = null, block = {}, barrier))
+          } catch (_: ClosedSendChannelException) {
+            // Sealed: instead of the barrier, wait for the writer to finish
+            // what was admitted pre-seal (still bounded by the same timeout).
+            writer.join()
+            return@withTimeoutOrNull
+          }
+          // Release before the drain: the send was attempted, so successors
+          // may proceed while this caller waits. Idempotent with the finally
+          // below, which covers timeout/cancel abandonment paths.
+          releaseAdmission(reservation.gate)
+          barrier.await()
+        } finally {
+          // Always completes normally, including on timeout abandonment, so
+          // the chain never sticks.
+          releaseAdmission(reservation.gate)
         }
-        barrier.await()
       } != null
     } catch (e: CancellationException) {
       throw e

@@ -268,7 +268,7 @@ class OrderedTranscriptSinkTest {
 
   /**
    * R2-7: When the writer is blocked and the buffer is full (capacity=1),
-   * an offerSteer is parked in overflowChain. Subsequent writeCore and
+   * an offerSteer is parked in the admission chain. Subsequent writeCore and
    * writeOrdered calls must await the parked steer admission so that
    * the delegate receives events strictly in order (parked steer -> core -> notice).
    */
@@ -300,7 +300,7 @@ class OrderedTranscriptSinkTest {
           sink.offerSteer("blocker")
           // 2. Filler: buffer of capacity=1 is now full
           sink.offerSteer("filler")
-          // 3. Parked steer: buffer full, parked in overflowChain
+          // 3. Parked steer: buffer full, parked in the admission chain
           sink.offerSteer("parked-steer")
           kotlinx.coroutines.delay(100)
 
@@ -324,6 +324,156 @@ class OrderedTranscriptSinkTest {
           )
         }
       }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * Stage 3 (R4-5) A: parked steer C -> waiting core D -> later steer E must
+   * admit C,D,E. Pre-fix, D only snapshot-awaited the C tail without holding
+   * a slot: once C completed and cleared the chain, D sat in the await ->
+   * send resume gap while E saw an empty chain and fast-pathed past D
+   * (C,E,D). The [beforeSendForTest] hook deterministically widens D's gap;
+   * post-fix E links behind D's synchronously reserved gate either way.
+   */
+  @Test fun parkedTailWaitingCoreCannotBeOvertakenByLaterSteer() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val writerGate = CompletableDeferred<Unit>()
+      var isFirst = true
+      val delegate = object : SinkProbe() {
+        override suspend fun onSteerQueued(text: String) {
+          if (isFirst) {
+            isFirst = false
+            writerGate.await()
+          }
+          recorded.add(text)
+        }
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          recorded.add("core:$runId")
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 1)
+      val reservedTickets: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+      sink.onAdmissionReservedForTest = { reservedTickets.add(it) }
+      suspend fun awaitAdmission(what: String, timeoutMs: Long = 10_000, cond: () -> Boolean) {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (!cond()) {
+          if (System.currentTimeMillis() > end) throw AssertionError("timed out waiting for $what")
+          kotlinx.coroutines.delay(10)
+        }
+      }
+      runBlocking {
+        withTimeout(15_000) {
+          sink.offerSteer("blocker")
+          sink.offerSteer("filler")
+          sink.offerSteer("C")
+          // Let C's parked body pass its pre-send point and suspend in the
+          // full-channel send before D reserves (C sees a null hook here).
+          kotlinx.coroutines.delay(300)
+          val coreJob = async { sink.onTurnStarted("D-run", "d") }
+          awaitAdmission("D reservation + pending mark") {
+            reservedTickets.size >= 4 && sink.pendingRunIds().contains("D-run")
+          }
+          val dTicket = reservedTickets[3]
+          val gapEntered = CompletableDeferred<Unit>()
+          val gapRelease = CompletableDeferred<Unit>()
+          sink.beforeSendForTest = { ticket ->
+            if (ticket == dTicket) {
+              gapEntered.complete(Unit)
+              gapRelease.await()
+            }
+          }
+          // Admit C: D wakes from the C gate straight into the widened gap.
+          writerGate.complete(Unit)
+          gapEntered.await()
+          // Later arrival while D waits: must queue behind D, never trySend
+          // past it into the freed slot.
+          sink.offerSteer("E")
+          kotlinx.coroutines.delay(300)
+          gapRelease.complete(Unit)
+          coreJob.await()
+          assertTrue("flush must drain C,D,E", sink.flush())
+          assertEquals(
+            listOf("blocker", "filler", "C", "core:D-run", "E"),
+            delegate.recorded,
+          )
+        }
+      }
+      sink.onAdmissionReservedForTest = null
+      sink.beforeSendForTest = null
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * Stage 3 (R4-5) B: same three-stage arrival but the waiter is a notice
+   * (writeOrdered) and the newcomer is a steer. Notices hold a reservation
+   * exactly like cores, so the later steer still queues behind them.
+   */
+  @Test fun parkedTailWaitingNoticeCannotBeOvertakenByLaterSteer() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val writerGate = CompletableDeferred<Unit>()
+      var isFirst = true
+      val delegate = object : SinkProbe() {
+        override suspend fun onSteerQueued(text: String) {
+          if (isFirst) {
+            isFirst = false
+            writerGate.await()
+          }
+          recorded.add(text)
+        }
+        override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
+          recorded.add("notice:$runId")
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 1)
+      val reservedTickets: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+      sink.onAdmissionReservedForTest = { reservedTickets.add(it) }
+      suspend fun awaitAdmission(what: String, timeoutMs: Long = 10_000, cond: () -> Boolean) {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (!cond()) {
+          if (System.currentTimeMillis() > end) throw AssertionError("timed out waiting for $what")
+          kotlinx.coroutines.delay(10)
+        }
+      }
+      runBlocking {
+        withTimeout(15_000) {
+          sink.offerSteer("blocker")
+          sink.offerSteer("filler")
+          sink.offerSteer("C")
+          kotlinx.coroutines.delay(300)
+          val noticeJob = async { sink.onTurnRetried("N-run", 1, 3, 1000L) }
+          awaitAdmission("N reservation") { reservedTickets.size >= 4 }
+          val nTicket = reservedTickets[3]
+          val gapEntered = CompletableDeferred<Unit>()
+          val gapRelease = CompletableDeferred<Unit>()
+          sink.beforeSendForTest = { ticket ->
+            if (ticket == nTicket) {
+              gapEntered.complete(Unit)
+              gapRelease.await()
+            }
+          }
+          writerGate.complete(Unit)
+          gapEntered.await()
+          sink.offerSteer("E")
+          kotlinx.coroutines.delay(300)
+          gapRelease.complete(Unit)
+          noticeJob.await()
+          assertTrue("flush must drain C,N,E", sink.flush())
+          assertEquals(
+            listOf("blocker", "filler", "C", "notice:N-run", "E"),
+            delegate.recorded,
+          )
+        }
+      }
+      sink.onAdmissionReservedForTest = null
+      sink.beforeSendForTest = null
     } finally {
       exec.shutdown()
     }

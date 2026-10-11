@@ -11,8 +11,10 @@ import okhttp3.OkHttpClient
  *   `Accept: text/event-stream`, `"stream": true`; `max_tokens` required.
  * - `content_block_start/delta/stop` + `message_stop`; the provider keeps the
  *   native `content_block.index` as `blockIndex` (§3.5).
- * - `thinking_delta` -> [StreamEvent.ReasoningDelta]; signature/encrypted
- *   blocks are never displayed and never persisted (simply not emitted).
+ * - `thinking_delta` -> [StreamEvent.ReasoningDelta]; a thinking or
+ *   `redacted_thinking` block start and every `signature_delta` additionally
+ *   emit [StreamEvent.ReasoningPresent] (presence marker only). Signature /
+ *   encrypted payloads are never displayed and never persisted.
  * - Phase 2 history: assistant-carried calls ride `tool_use` blocks;
  *   tool turns ride `user` messages carrying `tool_result` blocks paired by
  *   `tool_use_id`. Every request self-contains the full pairing (stateless);
@@ -215,6 +217,11 @@ internal class AnthropicMapper(val round: Int = 0) {
                     b.toolName = cb.string("name").orEmpty()
                     out.add(StreamEvent.ToolDelta(index, b.toolId.ifEmpty { null }, b.toolName.ifEmpty { null }, ""))
                 }
+                if (kind == BlockKind.THINKING) {
+                    // Thinking / redacted_thinking block: reasoning origin with
+                    // no replayable payload — presence marker only.
+                    out.add(StreamEvent.ReasoningPresent)
+                }
                 blocks[index] = b
             }
             "content_block_delta" -> {
@@ -231,7 +238,7 @@ internal class AnthropicMapper(val round: Int = 0) {
                         val t = delta.string("thinking") ?: return emptyList()
                         out.add(StreamEvent.ReasoningDelta(round, index, t))
                     }
-                    "signature_delta" -> Unit // never displayed, never persisted
+                    "signature_delta" -> out.add(StreamEvent.ReasoningPresent) // presence marker only; never displayed, never persisted
                     "input_json_delta" -> {
                         val frag = delta.string("partial_json").orEmpty()
                         block.args.append(frag)

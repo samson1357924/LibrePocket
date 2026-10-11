@@ -6,6 +6,7 @@ import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ChatCompletionsProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderHttpConfig
@@ -1022,6 +1023,69 @@ class TurnControllerTest {
     assertTrue(body.contains("thought"))
     assertTrue(body.contains("-done"))
     assertFalse(assistantsOf(c).single().isPartial)
+  }
+
+  // ---- Finding A [P1]: reasoning origin must survive into history ----
+
+  @Test fun reasoningMarkedHistoryFailsClosedOnFollowUpWithoutHttp() {
+    // transportCalls counts actual sends; the fail-closed gate below must
+    // throw before it, mirroring requireNoReasoningHistory-before-transport.
+    val transportCalls = AtomicInteger(0)
+    val provider = FakeLlmProvider { request ->
+      if (request.messages.any { it.hasReasoning }) {
+        throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
+      }
+      transportCalls.incrementAndGet()
+      flow {
+        emit(StreamEvent.ReasoningDelta(0, 1, "thought"))
+        emit(StreamEvent.ToolDone(0, "call_1", "lookup", "{\"q\":\"hi\"}"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    // Display keeps the existing merged behavior (no split-out block).
+    val first = assistantsOf(c).single()
+    assertTrue(first.text.contains("thought"))
+    assertTrue(first.text.contains("lookup"))
+    assertTrue(first.hasReasoning)
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertEquals(1, transportCalls.get())
+
+    runBlocking { c.send("second") }
+    // The follow-up history carried the marker, so the gate threw before
+    // any transport: stream entered, HTTP never sent, turn failed closed.
+    assertEquals(1, transportCalls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertTrue(provider.seenRequests.last().messages.any { it.hasReasoning })
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    val err = c.uiState.value.error
+    assertNotNull(err)
+    assertTrue(err!!.contains("THINKING_ROUND_TRIP_NOT_SUPPORTED"))
+  }
+
+  @Test fun opaqueReasoningMarkerAloneFailsClosedOnFollowUp() {
+    val transportCalls = AtomicInteger(0)
+    val provider = FakeLlmProvider { request ->
+      if (request.messages.any { it.hasReasoning }) {
+        throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
+      }
+      transportCalls.incrementAndGet()
+      flow {
+        emit(StreamEvent.ReasoningPresent)
+        emit(StreamEvent.TextDelta(0, 0, "answer"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    val first = assistantsOf(c).single()
+    assertEquals("answer", first.text)
+    assertTrue(first.hasReasoning)
+    runBlocking { c.send("second") }
+    assertEquals(1, transportCalls.get())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(c.uiState.value.error!!.contains("THINKING_ROUND_TRIP_NOT_SUPPORTED"))
   }
 
   @Test fun toolDeltasAndDoneAreRecorded() {

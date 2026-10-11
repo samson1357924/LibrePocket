@@ -28,8 +28,9 @@ import okhttp3.OkHttpClient
  * - `response.completed` is the authoritative terminal; an empty `output`
  *   array recovers from already-streamed deltas (P1 simplification).
  * - `response.failed` / `response.incomplete` -> [StreamEvent.Failed].
- * - Opaque fields (encrypted reasoning etc.) stay in memory only and are
- *   never surfaced as events.
+ * - Opaque payloads (encrypted reasoning etc.) are never surfaced as text:
+ *   a `reasoning` output item only emits [StreamEvent.ReasoningPresent]
+ *   (presence marker, no payload).
  */
 class ResponsesProvider(
     private val config: ProviderConfig,
@@ -227,7 +228,13 @@ internal class ResponsesMapper(val round: Int = 0) {
                     out.add(StreamEvent.TextDelta(round, blockOf(root), ServerToolTranscript.webSearchMarker("started")))
                     return out
                 }
-                if (item.string("type") != "function_call") return emptyList()
+                if (item.string("type") != "function_call") {
+                    // Opaque reasoning items carry no replayable text: record
+                    // presence only, so history rebuilds fail closed instead of
+                    // replaying a reasoning origin as plain text.
+                    if (item.string("type") == "reasoning") out.add(StreamEvent.ReasoningPresent)
+                    return out
+                }
                 val itemId = root.string("item_id") ?: item.string("id") ?: ("item_" + UUID.randomUUID().toString().take(8))
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 item.string("call_id")?.takeIf { it.isNotEmpty() }?.let { if (agg.id.isEmpty()) agg.id = it }
@@ -247,7 +254,11 @@ internal class ResponsesMapper(val round: Int = 0) {
                     out.add(StreamEvent.TextDelta(round, blockOf(root), ServerToolTranscript.webSearchMarker("completed")))
                     return out
                 }
-                if (item.string("type") != "function_call") return emptyList()
+                if (item.string("type") != "function_call") {
+                    // Same opaque-reasoning presence rule as added (above).
+                    if (item.string("type") == "reasoning") out.add(StreamEvent.ReasoningPresent)
+                    return out
+                }
                 val itemId = root.string("item_id") ?: item.string("id") ?: return emptyList()
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 item.string("call_id")?.takeIf { it.isNotEmpty() }?.let { agg.id = it }

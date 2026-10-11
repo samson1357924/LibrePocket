@@ -16,6 +16,15 @@ data class UiMessage(
   val isPartial: Boolean,
   /** In-memory admission identity; not persisted or sent to the provider. */
   val operationId: Long? = null,
+  /**
+   * True when this assistant block is reasoning-sourced (visible
+   * [dev.librepocket.provider.StreamEvent.ReasoningDelta] or opaque
+   * [dev.librepocket.provider.StreamEvent.ReasoningPresent] was seen while
+   * collecting it). Rebuilt into [dev.librepocket.provider.ChatMessage.hasReasoning]
+   * so follow-up requests fail closed instead of replaying a reasoning
+   * origin as plain text. Display text is unchanged (merged block).
+   */
+  val hasReasoning: Boolean = false,
 )
 
 data class ChatUiState(

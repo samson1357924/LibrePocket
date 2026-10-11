@@ -83,7 +83,11 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  *
  * The controller consumes the unified [StreamEvent] union from [LlmProvider]
  * directly (no M3-local stub): [StreamEvent.TextDelta] and
- * [StreamEvent.ReasoningDelta] extend the current assistant block,
+ * [StreamEvent.ReasoningDelta] extend the current assistant block, with
+ * reasoning events ([StreamEvent.ReasoningDelta] and
+ * [StreamEvent.ReasoningPresent]) flagging it reasoning-sourced
+ * ([UiMessage.hasReasoning], rebuilt into [ChatMessage.hasReasoning] so
+ * follow-ups fail closed),
  * [StreamEvent.ToolDelta]/[StreamEvent.ToolDone] are aggregated and recorded
  * (marker text + [TranscriptSink.onToolDone]) so tool calls are never dropped,
  * [StreamEvent.Usage] is recorded ([TranscriptSink.onUsage] + [lastUsage]).
@@ -760,8 +764,15 @@ class TurnController(
           when (event) {
             is StreamEvent.TextDelta -> appendAssistantText(attemptRunId, event.delta)
             // Reasoning stays in the same assistant block: P1 keeps one visible
-            // stream and never loses thinking content.
-            is StreamEvent.ReasoningDelta -> appendAssistantText(attemptRunId, event.delta)
+            // stream and never loses thinking content. The block is additionally
+            // flagged reasoning-sourced so follow-up rebuilds fail closed.
+            is StreamEvent.ReasoningDelta -> {
+              markAssistantReasoning(attemptRunId)
+              appendAssistantText(attemptRunId, event.delta)
+            }
+            // Opaque reasoning marker: no visible text, only the source flag
+            // (covers reasoning origins with no replayable payload).
+            is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
             is StreamEvent.ToolDelta -> {
               toolArgText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
               event.idChunk?.let {
@@ -856,7 +867,7 @@ class TurnController(
   private fun buildRequest(images: List<ChatImageRef>): ChatRequest {
     val base = _uiState.value.messages
       .filter { !it.isPartial }
-      .map { ChatMessage(role = it.role, text = it.text) }
+      .map { ChatMessage(role = it.role, text = it.text, hasReasoning = it.hasReasoning) }
       .toMutableList()
     val loaded = runCatching { imageLoader(images) }.getOrDefault(emptyList())
     if (loaded.isNotEmpty()) {
@@ -939,6 +950,21 @@ class TurnController(
       s.copy(
         messages = s.messages.map { m ->
           if (m.id == runId && m.role == "assistant") m.copy(text = m.text + delta) else m
+        },
+      )
+    }
+  }
+
+  /**
+   * Flags the attempt's assistant block as reasoning-sourced (idempotent).
+   * Display text is untouched; the flag only rides [buildRequest] into
+   * [ChatMessage.hasReasoning] so adapters fail closed on the follow-up.
+   */
+  private fun markAssistantReasoning(runId: String) {
+    _uiState.update { s ->
+      s.copy(
+        messages = s.messages.map { m ->
+          if (m.id == runId && m.role == "assistant") m.copy(hasReasoning = true) else m
         },
       )
     }

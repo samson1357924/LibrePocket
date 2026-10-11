@@ -26,8 +26,10 @@ import org.junit.Test
  *   containment 覆蓋兩側）即拒（bare／絕對兩形 + 全鏈 Denied(BLACKLISTED) +
  *   零 spawn）；同目錄直連正規檔、中間 parent 可寫、bare 前序可寫污染命中、
  *   entry 判定拋異常一律拒；Stage1 窄化後 bare 命中後無關可寫不污染、絕對形
- *   與無關表項解耦（只驗所屬 parent）；Stage2 祖先可替換（searchDir 本體乾淨
- *   但 parent 可寫，整目錄 rename/replace）即拒；entry 全乾淨時 multicall／APEX 形／
+ *   與無關表項解耦（只驗所屬 parent 詞法側＋real 側）；Stage2 祖先可替換
+ *   （searchDir 本體乾淨但 parent 可寫，整目錄 rename/replace）即拒；Stage4
+ *   symlink searchDir 詞法 parent 可寫（alias 本體與 real 側全乾淨）即拒，
+ *   全乾淨 alias 形仍放行；entry 全乾淨時 multicall／APEX 形／
  *   usr 合併形放行不受影響；拒絕細項經 ResolveDeny 可觀測（不含 path）；
  * - 操作數 schema（`--opt=value`、短旗標合併、值槽、pattern 槽）維持既有嚴格語義；
  * - null 作用域的隱式 cwd bare fail-closed，且放行者 spawn 仍是固定路徑 + 乾淨 env；
@@ -1218,6 +1220,140 @@ class ShellTrustedExecTest {
         } finally {
             wparent.deleteRecursively()
             sysbin.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun symlinkSearchDir_lexicalParentWritable_rejectedBareAndAbsolute() {
+        // Stage4 Finding 2：searchDir 本身是 symlink（`wparent/alias -> prot`），
+        // alias 本體與 prot 側全乾淨，只有詞法 parent `wparent` 可寫。
+        // real-only 舊守衛只走 prot 側祖先會誤放行；詞法＋real 雙側守衛必須拒。
+        // searchDirs 與絕對 argv0 必須用詞法路徑（absolutePath），不可用
+        // canonicalPath（後者消解 symlink，測試退化成舊 parent 可寫形即 vacuous）。
+        val wparent = tempDir("s5-alias-wp")
+        val prot = tempDir("s5-alias-prot")
+        val scope = tempDir("s5-alias-scope")
+        try {
+            Files.createSymbolicLink(File(wparent, "alias").toPath(), prot.toPath())
+            val tool = executable(prot, "ls")
+            val aliasLexical = File(wparent, "alias").absolutePath
+            val protReal = prot.canonicalPath
+            // 詞法 walk 產出 absolutePath 形，real/canonical 比對用 canonicalPath；
+            // 兩形都認（Linux 上通常相同，跨平台防 vacuous）。
+            val wparentStrings = setOf(wparent.absolutePath, wparent.canonicalPath)
+            val roots = listOf(protReal)
+            // 僅詞法 parent 可寫；real 側（prot 及其祖先）全乾淨。
+            val lexicalParentWritable: (java.nio.file.Path) -> Boolean = { p ->
+                p.toString() in wparentStrings
+            }
+            assertTrue(
+                "premise: alias itself must be clean",
+                !ShellExecutables.isSearchDirUntrusted(aliasLexical, { _ -> false }),
+            )
+            assertTrue(
+                "premise: writable lexical parent must taint (real side stays clean)",
+                ShellExecutables.isSearchDirUntrusted(aliasLexical, lexicalParentWritable),
+            )
+            for (argv0 in listOf("ls", "$aliasLexical/ls")) {
+                assertNull(
+                    "$argv0 must not resolve",
+                    ShellExecutables.resolve(argv0, listOf(aliasLexical), roots, lexicalParentWritable),
+                )
+                val detailed = ShellExecutables.resolveDetailed(
+                    argv0,
+                    listOf(aliasLexical),
+                    roots,
+                    lexicalParentWritable,
+                )
+                assertTrue(
+                    "$argv0 expected SEARCH_DIR_UNTRUSTED, got $detailed",
+                    detailed is ShellExecutables.ResolveOutcome.Denied &&
+                        detailed.reason == ShellExecutables.ResolveDeny.SEARCH_DIR_UNTRUSTED,
+                )
+            }
+            // 對照：全乾淨即放行（同形，詞法側乾淨）。
+            val ok = ShellExecutables.resolve("ls", listOf(aliasLexical), roots, systemOwned)!!
+            assertEquals(tool.canonicalPath, ok.path)
+            val okAbs = ShellExecutables.resolve("$aliasLexical/ls", listOf(aliasLexical), roots, systemOwned)!!
+            assertEquals(tool.canonicalPath, okAbs.path)
+            // 全鏈：Denied(BLACKLISTED)+reason+零 spawn（bare／絕對兩形）。
+            // bare 不得含任何實體路徑；絕對僅允回顯使用者輸入的 argv0 本身。
+            run {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(aliasLexical),
+                    execAllowedRoots = roots,
+                    execIsWritable = lexicalParentWritable,
+                )
+                val r = shell.execute(listOf("ls", "-l"))
+                assertTrue("ls -> $r", r is ShellResult.Denied)
+                assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+                assertTrue("$r", r.message.contains("SEARCH_DIR_UNTRUSTED"))
+                assertFalse("$r", r.message.contains(protReal))
+                assertFalse("$r", r.message.contains(wparent.canonicalPath))
+                assertEquals(0, runner.calls)
+                assertEquals(null, runner.lastEnv)
+            }
+            run {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(aliasLexical),
+                    execAllowedRoots = roots,
+                    execIsWritable = lexicalParentWritable,
+                )
+                val argv = listOf("$aliasLexical/ls", "-l")
+                val r = shell.execute(argv)
+                assertTrue("$argv -> $r", r is ShellResult.Denied)
+                assertEquals("$argv", ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+                assertTrue("$argv -> $r", r.message.contains("SEARCH_DIR_UNTRUSTED"))
+                // 絕對回顯含 argv0 本身（wparent 前綴不可避免），僅斷言不含無關 real。
+                assertFalse("$argv -> $r", r.message.contains(protReal))
+                assertEquals("$argv must not spawn", 0, runner.calls)
+                assertEquals("$argv", null, runner.lastEnv)
+            }
+        } finally {
+            wparent.deleteRecursively()
+            prot.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun symlinkSearchDir_fullyClean_stillAllowed() {
+        // 正例鎖：同上 alias 形狀但全乾淨（systemOwned）時 bare／絕對皆放行＋全鏈 Ok，
+        // 防新詞法 walk 把乾淨 symlink searchDir 誤殺。
+        val wparent = tempDir("s5-alias-ok-wp")
+        val prot = tempDir("s5-alias-ok-prot")
+        val scope = tempDir("s5-alias-ok-scope")
+        try {
+            Files.createSymbolicLink(File(wparent, "alias").toPath(), prot.toPath())
+            val tool = executable(prot, "ls")
+            val aliasLexical = File(wparent, "alias").absolutePath
+            val roots = listOf(prot.canonicalPath)
+            val bare = ShellExecutables.resolve("ls", listOf(aliasLexical), roots, systemOwned)!!
+            assertEquals(tool.canonicalPath, bare.path)
+            val abs = ShellExecutables.resolve("$aliasLexical/ls", listOf(aliasLexical), roots, systemOwned)!!
+            assertEquals(tool.canonicalPath, abs.path)
+            for (argv in listOf(listOf("ls", "-l"), listOf("$aliasLexical/ls", "-l"))) {
+                val runner = CapRunner()
+                val shell = RestrictedShell(
+                    runner = runner,
+                    privateRoot = scope.absolutePath,
+                    execSearchDirs = listOf(aliasLexical),
+                    execAllowedRoots = roots,
+                    execIsWritable = systemOwned,
+                )
+                val r = shell.execute(argv)
+                assertTrue("$argv -> $r", r is ShellResult.Ok)
+                assertEquals("$argv", listOf(tool.canonicalPath, "-l"), runner.lastArgv)
+                assertEquals(ShellExecutables.CLEAN_ENV, runner.lastEnv)
+            }
+        } finally {
+            wparent.deleteRecursively()
+            prot.deleteRecursively()
             scope.deleteRecursively()
         }
     }

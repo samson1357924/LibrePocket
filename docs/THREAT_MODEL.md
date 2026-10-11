@@ -16,7 +16,7 @@
 - JSONL codec、transcript export/import 與 backup bundle 有程式碼實作，但目前沒有可供使用者完成 flavor 遷移的 export/import UI 流程。backup bundle 預設不帶 key；其 API 可顯式要求帶 key。不要把「系統備份排除 key 檔」解讀成所有 app-level export 都不可能包含 key。
 - `play`、`foss`、`github` 由不同 source set、manifest 與依賴組成。`foss`/`github` 含 accessibility service；該 service 不是 OS sandbox。Root、Shizuku、PRoot 同樣不等於隔離執行環境。
 - 工具 registry 有 41 個定義，但目前所有內建 `ToolDef.executionReady` 均為 false；模型可見的內建工具集合為空。高風險工具描述或 scaffold 不代表目前可執行能力。
-- 直接 shell 通道的可信 executable 解析（`ShellExecutables.resolve`，JVM 單測覆蓋、尚未經指定裝置/API 實跑驗證）：bare 只在受控搜尋目錄按固定順序找，不查宿主 `PATH`、不看 cwd；含分隔符 `argv[0]` 詞法父目錄須在可信表內；候選經 `toRealPath()` 固定後驗正規檔＋可執行、containment（快照＋系統實體前綴）、real 本體至根不可寫、lexical entry 至所屬 searchDir 不可寫、searchDir 本體及其祖先至根不可寫；任一失敗即拒且零 spawn。拒絕僅回 reason code（`SEARCH_DIR_UNTRUSTED`／`ENTRY_WRITABLE`／`REAL_WRITABLE`／`OUTSIDE_ROOTS` 等），不含任意 filesystem path。殘餘 TOCTOU（驗證至 spawn 非原子）、APEX/overlay 窮舉不能、舊 toolbox applet 語義未驗仍在；操作數路徑（`FileScope.decide` 詞法前綴、symlink/TOCTOU）屬另一邊界，見 #9，不因 executable resolver 改善而關閉。
+- 直接 shell 通道的可信 executable 解析（`ShellExecutables.resolve`，JVM 單測覆蓋、尚未經指定裝置/API 實跑驗證）：bare 只在受控搜尋目錄按固定順序找，不查宿主 `PATH`、不看 cwd；含分隔符 `argv[0]` 詞法父目錄須在可信表內；候選經 `toRealPath()` 固定後驗正規檔＋可執行、containment（快照＋系統實體前綴）、real 本體至根不可寫、lexical entry 至所屬 searchDir 不可寫、searchDir 本體及其詞法與 real 兩側祖先至根不可寫；任一失敗即拒且零 spawn。拒絕僅回 reason code（`SEARCH_DIR_UNTRUSTED`／`ENTRY_WRITABLE`／`REAL_WRITABLE`／`OUTSIDE_ROOTS` 等），不含任意 filesystem path。殘餘 TOCTOU（驗證至 spawn 非原子）、APEX/overlay 窮舉不能、舊 toolbox applet 語義未驗仍在；操作數路徑（`FileScope.decide` 詞法前綴、symlink/TOCTOU）屬另一邊界，見 #9，不因 executable resolver 改善而關閉。
 
 ## 主要資產、威脅主體與信任邊界
 

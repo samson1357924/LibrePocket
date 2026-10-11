@@ -39,13 +39,15 @@ import java.nio.file.Paths
  *   （lexical 相等或 real 相等即停；既有 usrMergeShape 正例保持綠）。
  *   toybox 合法形（entry != real）在 entry chain 全乾淨時放行不受影響；
  *   絕對 `argv[0]` 形走同一 [verifiedTarget] 同一閘，不分叉。
- * - searchDir 守衛（S5＋Stage2 Finding B，部署前提的 runtime 守衛）：
- *   驗本體 real 化後路徑及其祖先至 FS 根（含本體）：任一可寫／判定異常即
- *   不可信。Linux rename 語義下本體 0555 不代表可寫 parent 不能整目錄替換，
- *   故只驗本體不足；本守衛把「searchDir 及其祖先不可被 App 替換」變成執行時
- *   檢查。bare 按固定順序逐項驗（Stage1 窄化）：可寫項跳過（永不執行其候選），
+ * - searchDir 守衛（S5＋Stage2 Finding B＋Stage4 Finding 2，部署前提的 runtime 守衛）：
+ *   驗詞法形及 real 化後路徑兩側本體及其祖先至 FS 根（含本體，詞法側與 real 側
+ *   兩條 ancestor chain 皆驗）：任一可寫／判定異常即不可信。Linux rename 語義下
+ *   本體 0555 不代表可寫 parent 不能整目錄替換；且搜尋根本身是 symlink 時
+ *   （如 `wparent/alias -> prot`）real 化會丟失詞法前綴，只驗 real 側看不見可寫
+ *   的 `wparent`，故兩側都要驗。本守衛把「searchDir 及其兩側祖先不可被 App 替換」
+ *   變成執行時檢查。bare 按固定順序逐項驗（Stage1 窄化）：可寫項跳過（永不執行其候選），
  *   命中乾淨項時若前序出現過可寫項即拒（防 shadowing 混淆）；命中後無關可寫
- *   不污染。絕對 `argv[0]` 只驗所屬 parent 及其祖先。
+ *   不污染。絕對 `argv[0]` 只驗所屬 parent 詞法側＋real 側祖先。
  *   生產系統目錄及其祖先對 App 恆不可寫；exotic ROM 降級為拒，須回報擴表、
  *   不得放寬。宿主 fixture 在 `/tmp` 下時祖先可寫，單測須注入 `systemOwned`
  *   模擬裝置不可寫（與 entry/real 閘同式），真查即 fail-closed 拒。
@@ -446,40 +448,61 @@ object ShellExecutables {
     }
 
     /**
-     * 搜尋目錄是否不可信（本體或祖先可寫／判定異常／非法即 true，fail-closed）。
-     * 本體經 real 化後驗；祖先沿 realDir parent 逐層至 FS 根（含本體，見 Stage2
-     * Finding B：防整目錄 rename/replace——本體 0555 不代表可寫 parent 不能替換
-     * 整個 entry dir）。任一層 [isWritable] 回 true 即不可信；判定拋異常視為
-     * 可寫。步數上限 64，超限即不可信。
+     * 搜尋目錄是否不可信（詞法側或實側本體／祖先可寫／判定異常／非法即 true，
+     *   fail-closed）。兩側分別驗（見 Stage4 Finding 2）：
+     * - 詞法側：[dirNorm] 正規化形本體及其 lexical parent 逐層至 FS 根（含本體）。
+     *   搜尋根本身是 symlink 時（如 `wparent/alias -> prot`），real 化會丟失
+     *   詞法前綴（只剩 real 側），故必須另走詞法鏈，否則可寫的 `wparent` 永遠
+     *   看不見（Linux rename 語義下可整目錄置換 alias）。
+     * - 實側：[dirNorm] real 化後（存在即 `toRealPath`，否則退回詞法）本體及其
+     *   parent 逐層至 FS 根（含本體；Stage2 Finding B：防整目錄 rename/replace）。
+     *   任一層 [isWritable] 回 true 即不可信；判定拋異常視為可寫。
+     *   兩側各步數上限 64，超限即不可信。不存在節點走 [isWritable]（對不存在
+     *   回 false 即中性，不另拒；缺失候選後續由 [verifiedTarget] 以 NOT_FOUND 拒，
+     *   守衛層不改變「不存在目錄中性跳過」語義）。
      * 宿主 fixture 在 `/tmp` 下時祖先可寫，須經 [isWritable] 注入
      * `systemOwned` 模擬裝置不可寫（與 entry/real 閘同式）；真查即 fail-closed 拒。
      */
     fun isSearchDirUntrusted(dirNorm: String, isWritable: (Path) -> Boolean): Boolean {
         return try {
             if (dirNorm.isEmpty() || dirNorm.contains('\u0000')) return true
+            if (!ancestorsNonWritable(Paths.get(dirNorm), isWritable)) return true
             val realDir: Path = try {
                 val p = Paths.get(dirNorm)
                 if (Files.exists(p)) p.toRealPath() else p
             } catch (_: Exception) {
                 return true
             }
-            var cur: Path? = realDir
+            if (!ancestorsNonWritable(realDir, isWritable)) return true
+            false
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    /**
+     * 單鏈祖先是否全不可寫（[start] 本體及其 parent 至 FS 根；任一可寫／異常即
+     * false，fail-closed；步數上限 64；空鏈即 false）。
+     */
+    private fun ancestorsNonWritable(start: Path, isWritable: (Path) -> Boolean): Boolean {
+        return try {
+            var cur: Path? = start
             var steps = 0
             var seen = false
             while (cur != null) {
-                if (steps++ > 64) return true
+                if (steps++ > 64) return false
                 seen = true
                 val w = try {
                     isWritable(cur)
                 } catch (_: Exception) {
                     true
                 }
-                if (w) return true
+                if (w) return false
                 cur = cur.parent
             }
-            !seen
+            seen
         } catch (_: Exception) {
-            true
+            false
         }
     }
 
@@ -491,21 +514,21 @@ object ShellExecutables {
      *   （含 containment + real writability + S5 entry 閘，允許集見下，
      *   entryRoot 取 lexical parent；bare 與絕對同閘不分叉）；
      *   相對含 `/`（`./ls`、`chat/ls`）一律 null。
-     *   絕對形只驗其所屬 parent 及其祖先（[isSearchDirUntrusted]），不受其他
+     *   絕對形只驗其所屬 parent 詞法側＋real 側祖先（[isSearchDirUntrusted]），不受其他
      *   無關搜尋項污染；其他搜尋項可寫不影響乾淨絕對路徑（fail-closed 仍禁
-     *   執行可寫候選，見下）。entry 閘上界止於所屬 searchDir，其上祖先由本
-     *   searchDir 祖先檢查補足，故不擴 entry 上界至根。
+     *   執行可寫候選，見下）。entry 閘上界止於所屬 searchDir，其上詞法側＋real 側
+     *   祖先由本 searchDir 雙側祖先檢查補足，故不擴 entry 上界至根。
      * - bare：只在 [searchDirs]（預設 [TRUSTED_BIN_DIRS]，固定順序）內找；
      *   候選必須仍落在該 dir 下（當輪 `dirNorm` 即 entryRoot）。呼叫方不得傳入
      *   非受控目錄（產品碼一律用預設值；單測可注入暫存目錄；絕對 `argv[0]` 的
      *   詞法門同表覆寫，使絕對路徑的全鏈（validate → resolve → spawn）可在暫存
      *   fixture 下受測，而不必寫入系統目錄）。
-     * - searchDir 守衛（S5＋Stage2，部署前提的 runtime 守衛，Stage1 窄化）：
-     *   不再入口整表預檢。bare 按固定順序逐項驗本體＋祖先至根：可寫／判定異常項直接
+     * - searchDir 守衛（S5＋Stage2＋Stage4，部署前提的 runtime 守衛，Stage1 窄化）：
+     *   不再入口整表預檢。bare 按固定順序逐項驗詞法側＋real 側祖先至根：可寫／判定異常項直接
      *   跳過（永不執行其候選），命中乾淨項時若其前序出現過可寫項即整體拒
      *   （防 shadowing 混淆：可寫前序可植同名檔，雖本次未執行但搜尋順序已受
      *   污染）；命中項之後的無關可寫項不污染本次命中。絕對形只驗所屬 parent
-     *   及其祖先。仍不退回環境 `PATH`、不執行任何可寫候選。非法表項跳過（不執行），
+     *   詞法側＋real 側祖先。仍不退回環境 `PATH`、不執行任何可寫候選。非法表項跳過（不執行），
      *   不再整表拒。拒絕細項經 [ResolveDeny] 回報（僅 reason code，不含 path）。
      *   生產系統目錄及其祖先對 App 恆不可寫；exotic ROM 降級為拒，須回報擴表、不得放寬。
      * - containment 允許集：[allowedRoots] 非 null 即用（單測注入）；

@@ -1699,6 +1699,23 @@ export async function runExecutionMatrixTests(): Promise<void> {
       assert.match(claimJob.slice(0, claimJob.indexOf('    steps:')), /issues:\s*write/,
         'claim-slot holds the minimal sticky write scope');
       assert.doesNotMatch(claimJob, /OPENAI_API_KEY/, 'claim-slot takes no OpenAI secrets');
+      for (const fallbackVar of [
+        'POCKETGUARD_MODEL_FALLBACKS',
+        'POCKETGUARD_MODEL_CHIEF_FALLBACKS',
+        'POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS',
+        'POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS',
+      ]) {
+        assert.match(
+          claimJob,
+          new RegExp(`${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`),
+          `claim-slot forwards ${fallbackVar}`,
+        );
+        assert.match(
+          trustedStep,
+          new RegExp(`${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`),
+          `review-send trusted step forwards ${fallbackVar}`,
+        );
+      }
       assert.match(reviewJob, /needs:\s*\[prepare-tag,\s*claim-slot\]/, 'review-send waits for the claim');
       assert.match(
         squashed(reviewJob.slice(0, reviewJob.indexOf('    steps:'))),

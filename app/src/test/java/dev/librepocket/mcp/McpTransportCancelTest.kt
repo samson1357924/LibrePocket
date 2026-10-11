@@ -347,6 +347,73 @@ class McpTransportCancelTest {
         }
     }
 
+    @Test fun exactCapStallReturnsPromptlyWithoutWaitingDeadline() = runBlocking {
+        // 送滿位元組上限後 stall（不送 chunk 終止塊、不關 socket）：達 cap 立即拋，
+        // 不得為等第 257KiB 個位元組卡到總 deadline（DEFAULT 20s；舊 +1 探針行為）。
+        val cap = McpTransport.RESPONSE_MAX_BYTES.toInt()
+        val serverSocket = java.net.ServerSocket(0)
+        val port = serverSocket.localPort
+        val serverThread = Thread {
+            try {
+                val socket = serverSocket.accept()
+                socket.use { s ->
+                    s.soTimeout = 10_000
+                    val input = s.getInputStream()
+                    // 讀請求頭直到空行（小 body 已進 socket buffer，不細讀 body）。
+                    val header = java.io.ByteArrayOutputStream()
+                    var last4 = ByteArray(0)
+                    while (true) {
+                        val b = input.read()
+                        if (b == -1) break
+                        header.write(b)
+                        last4 = (last4 + b.toByte()).takeLast(4).toByteArray()
+                        if (last4.size == 4 &&
+                            last4[0] == '\r'.code.toByte() && last4[1] == '\n'.code.toByte() &&
+                            last4[2] == '\r'.code.toByte() && last4[3] == '\n'.code.toByte()
+                        ) break
+                        if (header.size() > 64 * 1024) break
+                    }
+                    val out = s.getOutputStream()
+                    out.write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                    out.flush()
+                    val chunk = "a".repeat(8192)
+                    var sent = 0
+                    while (sent < cap) {
+                        val n = minOf(8192, cap - sent)
+                        out.write((n.toString(16) + "\r\n").toByteArray(Charsets.US_ASCII))
+                        out.write(chunk.substring(0, n).toByteArray(Charsets.US_ASCII))
+                        out.write("\r\n".toByteArray(Charsets.US_ASCII))
+                        out.flush()
+                        sent += n
+                    }
+                    // stall：不送 terminal 0-chunk，不關，舊碼在此卡 probe 讀直到 deadline。
+                    Thread.sleep(10_000)
+                }
+            } catch (_: Exception) {
+            }
+        }
+        serverThread.isDaemon = true
+        serverThread.start()
+        try {
+            val start = System.nanoTime()
+            val outcome = withTimeoutOrNull(8_000) {
+                runCatching {
+                    McpTransport().postJson("http://127.0.0.1:$port/", "sekret", "{}", McpTimeouts.DEFAULT_MS)
+                }
+            }
+            val elapsedMs = (System.nanoTime() - start) / 1_000_000L
+            assertNotNull("達 cap stall 必須在 8s 內拋出（不等總 deadline 20s；舊碼此時仍卡在 probe 讀）", outcome)
+            val failure = outcome!!.exceptionOrNull()
+            assertTrue("stall 必須拋 McpResponseTooLarge，實際=$outcome", failure is McpResponseTooLarge)
+            assertTrue("必須不等總 deadline（實際 ${elapsedMs}ms）", elapsedMs < 8_000L)
+        } finally {
+            try {
+                serverSocket.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     @Test fun serverTruncatedCallMapsToProtocolNotOk() = runBlocking {
         val web = MockWebServer()
         web.start()

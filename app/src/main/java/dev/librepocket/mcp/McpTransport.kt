@@ -131,9 +131,12 @@ internal class McpResponseTooLarge(message: String) : IOException(message)
 /**
  * 有界讀成功 body（雙上限，超量即拋 [McpResponseTooLarge]）。
  *
- * - 位元組上限 [McpTransport.RESPONSE_MAX_BYTES]：`Content-Length` 預檢 + 串流 `+1` 探針
- *   區分恰好等 cap 的 EOF 與超量（同級 provider `readBoundedProviderBody` 做法）；
- *   超量先 cancel 再拋，不等 EOF、不排空剩餘位元組；
+ * - 位元組上限 [McpTransport.RESPONSE_MAX_BYTES]：`Content-Length` 預檢 +
+ *   `remaining > 0` 迴圈控制，達 cap 立即 cancel + 拋，不為區別「恰好等於 cap」
+ *   額外阻塞等第 257KiB 個位元組（同級 provider `readProviderErrorPrefix` 做法；
+ *   舊 `+1` 探針在 chunked 恰滿 cap 卻不送 EOF/終止塊時會卡到總 deadline）。
+ *   註：位元組達 cap 必同時超字元上限（256KiB 最少 65536 字元 > 64k，
+ *   全 4-byte emoji 情形），故達 cap 直接判超量無誤判；
  * - 字元上限 [McpTransport.RESPONSE_MAX_CHARS]：完整解碼後檢查，相容舊
  *   `.string()?.take(64_000)`；超量直接拋（此時 body 已讀到 EOF、連線可重用，無需 cancel）。
  *
@@ -151,14 +154,14 @@ private fun readBoundedBody(body: ResponseBody?, cancelCall: () -> Unit): String
     val source = body.source()
     val bytes = Buffer()
     var remaining = byteCap
-    while (true) {
-        val read = source.read(bytes, minOf(8 * 1024L, remaining + 1L))
+    while (remaining > 0L) {
+        val read = source.read(bytes, minOf(8 * 1024L, remaining))
         if (read == -1L) break
-        if (read > remaining) {
-            cancelCall()
-            throw McpResponseTooLarge("mcp: response body exceeds $byteCap bytes")
-        }
         remaining -= read
+    }
+    if (remaining == 0L) {
+        cancelCall()
+        throw McpResponseTooLarge("mcp: response body exceeds $byteCap bytes")
     }
     val text = bytes.readByteArray().toResponseBody(body.contentType()).string()
     if (text.length > charCap) {

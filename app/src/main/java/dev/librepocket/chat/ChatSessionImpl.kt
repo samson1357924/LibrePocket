@@ -93,6 +93,11 @@ class ChatSessionImpl(
 
   override fun steer(text: String) = controller.steer(text)
 
+  override suspend fun settlePendingAdmission(timeoutMs: Long): Boolean =
+    controller.settlePendingAdmission(timeoutMs)
+
+  override fun hasPendingAdmission(): Boolean = controller.hasPendingAdmission()
+
   override fun close() {
     controller.close()
     sessionScope.cancel()

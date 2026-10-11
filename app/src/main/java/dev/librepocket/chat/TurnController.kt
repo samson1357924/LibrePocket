@@ -37,6 +37,7 @@ import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
@@ -160,17 +161,54 @@ class InputTooLongException(message: String) : IllegalArgumentException(message)
  *
  * Thrown fail-closed when [TurnController.startTurn]/[TurnController.startOrEnqueue]
  * cannot durably persist the user row within
- * [TurnController.ACCEPT_DURABLE_TIMEOUT_MS] (store stall, delegate
- * IOException, or writer seal race). Deliberately NOT a [CancellationException]
+ * [TurnController.ACCEPT_DURABLE_TIMEOUT_MS] *without* the entry ever
+ * reaching the session channel (timeout-before-send), on a fast delegate
+ * IOException, or on a writer seal race. Deliberately NOT a [CancellationException]
  * so ViewModel admission loops treat it like [InputTooLongException]
  * (notice + draft restore via `restoreOpForFailedSend`, caller retains the
  * text for explicit retry) instead of propagating caller cancellation.
  * The logical id is already INTERRUPTED-marked via
- * [OrderedTranscriptSink.interruptedRunIds]; a later-unblocked writer may
- * still persist the abandoned entry as a ghost row, but it stays marked and
- * never reports false acceptance.
+ * [OrderedTranscriptSink.interruptedRunIds]; a later-unblocked writer cannot
+ * persist anything because nothing was sent.
+ *
+ * R5-1: timeout-after-send is NOT this exception — it is
+ * [TranscriptPendingException] (UNKNOWN/PENDING_COMMIT, ownership retained,
+ * same-opId resend blocked until settle). See [DurableAdmission].
  */
 class TranscriptDurabilityException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/**
+ * R5-1 (admission timeout late-commit): the user-row entry was buffered in
+ * the session channel ([OrderedTranscriptSink.onTurnStartedTracked] send
+ * proof true) but its durable ack did not arrive within
+ * [TurnController.ACCEPT_DURABLE_TIMEOUT_MS]. Fate is UNKNOWN: the
+ * independent writer may still late-commit it as a ghost row. The controller
+ * retains ownership (single-flight still held, same-opId admission blocked),
+ * keeps the optimistic UI row with `transcript store pending`, and settles in
+ * the background via bounded flush + ticket tracking: flush success without
+ * an INTERRUPTED mark claims the ghost (same logical id, no resend);
+ * INTERRUPTED/seal converts to [TranscriptDurabilityException] semantics
+ * (retryable). Deliberately distinct from [TranscriptDurabilityException] so
+ * the ViewModel projects `CHAT_STORE_PENDING` without `restoreOpForFailedSend`.
+ */
+class TranscriptPendingException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/**
+ * R5-1 admission-time durable fate for one user row.
+ *
+ * - [ACKED]: ack arrived in budget; `Started` is durable.
+ * - [NOT_ADMITTED]: entry never reached the channel (timeout-before-send),
+ *   fast delegate failure, or seal-before-send. Existing fail-closed rollback
+ *   semantics preserved (INTERRUPTED-marked, UI rolled back, immediately
+ *   retryable via [TranscriptDurabilityException]).
+ * - [UNKNOWN]: send proof true but ack timed out. Ownership retained
+ *   (PENDING_COMMIT); same-opId resend blocked until bounded settle.
+ */
+internal enum class DurableAdmission {
+  ACKED,
+  NOT_ADMITTED,
+  UNKNOWN,
+}
 
 /**
  * Turn controller: per-turn [Flow] collection + retry orchestration +
@@ -420,6 +458,28 @@ class TurnController(
   private var admissionCancelRequestedId: String? = null
   private var orphanDrainJob: Job? = null
 
+  /**
+   * R5-1 UNKNOWN/PENDING_COMMIT ownership (guarded by [lock], at most one:
+   * single-flight admits at most one pending user row). Retains the
+   * reservation + optimistic UI row + caller opId across the accept timeout so
+   * a late-committing ghost is claimed under the SAME logical id instead of
+   * being duplicated by an immediate same-opId resend.
+   */
+  private data class UnknownAdmission(
+    val reservation: PendingAdmission,
+    val uiMessageId: String,
+    val opId: Long?,
+  )
+  private var unknownAdmission: UnknownAdmission? = null
+  private var unknownSettleJob: Job? = null
+
+  /** Test seam forwarding to the sink's pre-send hook (NOT_ADMITTED simulation). */
+  internal var beforeAdmissionSendForTest: (suspend (Long) -> Unit)?
+    get() = orderedTranscript.beforeSendForTest
+    set(value) {
+      orderedTranscript.beforeSendForTest = value
+    }
+
   private fun drainOrphanLocked(pending: PendingAdmission): Job {
     if (pendingAdmission?.logicalTurnId == pending.logicalTurnId) {
       pendingAdmission = null
@@ -572,17 +632,39 @@ class TurnController(
   /**
    * Stage 6: durable user-row await shared by [startTurn]/[startOrEnqueue].
    * Bounded by [ACCEPT_DURABLE_TIMEOUT_MS] (suspend, never block — Room stays
-   * on IO). Success records [durableUserRows]; timeout/store/seal failure
-   * marks INTERRUPTED and throws [TranscriptDurabilityException] (fail-closed,
-   * non-cancellation so the ViewModel restores the draft). Caller
-   * cancellation (external, writer still live) propagates as-is after the
-   * same rollback+mark, so no ghost UI remains.
+   * on IO).
+   *
+   * R5-1 tri-state (send proof via
+   * [OrderedTranscriptSink.onTurnStartedTracked]):
+   * - ack in budget → [DurableAdmission.ACKED] (records [durableUserRows]);
+   * - timeout with send proof false, fast delegate failure, or seal → throws
+   *   [TranscriptDurabilityException] / returns [DurableAdmission.NOT_ADMITTED]
+   *   (fail-closed, INTERRUPTED-marked, existing rollback semantics);
+   * - timeout with send proof true → [DurableAdmission.UNKNOWN] (no
+   *   INTERRUPTED mark — the ghost may still late-commit; caller retains
+   *   ownership via [unknownAdmission]).
+   * Caller cancellation (external, writer still live) propagates as-is after
+   * the same rollback+mark, so no ghost UI remains.
    */
-  private suspend fun awaitUserRowDurable(logicalTurnId: String, text: String) {
-    val acked = try {
-      withTimeoutOrNull(acceptTimeoutMs) {
-        orderedTranscript.onTurnStarted(logicalTurnId, text)
+  private suspend fun awaitUserRowDurable(logicalTurnId: String, text: String): DurableAdmission {
+    val sent = AtomicBoolean(false)
+    try {
+      val acked = withTimeoutOrNull(acceptTimeoutMs) {
+        orderedTranscript.onTurnStartedTracked(logicalTurnId, text, sent)
       } != null
+      if (acked) {
+        durableUserRows.add(logicalTurnId)
+        return DurableAdmission.ACKED
+      }
+      // Bounded timeout: consult the send proof before claiming anything.
+      if (!sent.get()) {
+        try {
+          orderedTranscript.markInterrupted(logicalTurnId)
+        } catch (_: Exception) {
+        }
+        return DurableAdmission.NOT_ADMITTED
+      }
+      return DurableAdmission.UNKNOWN
     } catch (e: CancellationException) {
       if (orderedTranscript.isSealed()) {
         try {
@@ -596,6 +678,8 @@ class TurnController(
       } catch (_: Exception) {
       }
       throw e
+    } catch (e: TranscriptDurabilityException) {
+      throw e
     } catch (e: Exception) {
       try {
         orderedTranscript.markInterrupted(logicalTurnId)
@@ -603,16 +687,188 @@ class TurnController(
       }
       throw TranscriptDurabilityException("transcript store failed", e)
     }
-    if (!acked) {
+  }
+
+  /** Caller must hold [lock]. True when [opId] duplicates pending UNKNOWN ownership. */
+  private fun isUnknownDuplicateLocked(opId: Long?): Boolean {
+    val u = unknownAdmission ?: return false
+    // Same-opId resend is always a duplicate; a null opId (startTurn/legacy
+    // steer) cannot prove distinctness, so it is blocked conservatively.
+    if (opId == null || u.opId == null) return true
+    return opId == u.opId
+  }
+
+  /**
+   * Caller must hold [lock]. Throws [TranscriptPendingException] when [opId]
+   * would duplicate UNKNOWN ownership or an already-visible same-opId user
+   * row/queue entry while busy. Prevents the R5-1 double user row: the ghost
+   * (if any) already owns that opId.
+   */
+  private fun checkPendingDuplicateLocked(opId: Long?) {
+    if (isUnknownDuplicateLocked(opId)) {
+      throw TranscriptPendingException("transcript store pending")
+    }
+    if (opId != null && isBusyLocked()) {
+      if (_uiState.value.messages.any { it.role == "user" && it.operationId == opId }) {
+        throw TranscriptPendingException("duplicate admission for opId $opId")
+      }
+      if (steerQueue.any { it.opId == opId }) {
+        throw TranscriptPendingException("duplicate queued opId $opId")
+      }
+    }
+  }
+
+  /**
+   * R5-1: retain UNKNOWN ownership after a timeout-after-send. Keeps
+   * [pendingAdmission] (single-flight stays held), keeps the optimistic UI
+   * row, projects `transcript store pending`, and launches one bounded
+   * background settle (flush + ticket tracking, never blocks the UI).
+   * Caller must NOT hold [lock].
+   */
+  private fun enterUnknownAdmission(reservation: PendingAdmission, uiMessageId: String, opId: Long?) {
+    synchronized(lock) {
+      // Single-flight guarantees at most one UNKNOWN; a racing settle that
+      // already cleared must not be overwritten — but the waiter owns this
+      // reservation, so overwrite is the same reservation.
+      unknownAdmission = UnknownAdmission(reservation, uiMessageId, opId)
+      activityRevision++
+      _uiState.update { s ->
+        s.copy(status = ChatStatus.ERROR, error = "transcript store pending")
+      }
+    }
+    val job = writerScope.launch {
       try {
-        orderedTranscript.markInterrupted(logicalTurnId)
+        settlePendingAdmission(acceptTimeoutMs)
+      } catch (_: CancellationException) {
       } catch (_: Exception) {
       }
-      throw TranscriptDurabilityException(
-        "transcript store timed out after $acceptTimeoutMs ms",
+    }
+    synchronized(lock) {
+      unknownSettleJob = job
+    }
+    job.invokeOnCompletion {
+      synchronized(lock) {
+        if (unknownSettleJob === job) unknownSettleJob = null
+      }
+    }
+  }
+
+  /**
+   * R5-1 bounded settle for UNKNOWN ownership (ticket-tracked flush, never
+   * unbounded). Flush barrier is ordered behind the ghost send via the sink's
+   * admission chain, so `flushed && !interrupted` proves the ghost durable.
+   *
+   * - ghost durable → claim under the SAME logical id (adds [durableUserRows]
+   *   before the host starts so [runTurnLoop] skips a second user row;補 UI
+   *   idempotently; launches the host; no resend).
+   * - INTERRUPTED/sealed → convert to fail-closed (UI rolled back, ownership
+   *   released, same-opId retry becomes a fresh [TranscriptDurabilityException]
+   *   path).
+   * - flush timeout → still unknown: keep ownership, no false INTERRUPTED
+   *   mark; a later explicit retry re-settles.
+   *
+   * @return true when resolved (claimed or failed), false when still unknown.
+   */
+  suspend fun settlePendingAdmission(timeoutMs: Long = acceptTimeoutMs): Boolean {
+    val snapshot: UnknownAdmission = synchronized(lock) { unknownAdmission } ?: return true
+    val logicalTurnId = snapshot.reservation.logicalTurnId
+    if (orderedTranscript.interruptedRunIds().contains(logicalTurnId) || orderedTranscript.isSealed()) {
+      synchronized(lock) {
+        val cur = unknownAdmission ?: return true
+        if (cur.reservation.logicalTurnId != logicalTurnId) return true
+        convertUnknownToFailedLocked(cur, "transcript store unavailable")
+      }
+      return true
+    }
+    val flushed: Boolean = try {
+      orderedTranscript.flush(timeoutMs)
+    } catch (_: CancellationException) {
+      false
+    } catch (_: Exception) {
+      false
+    }
+    synchronized(lock) {
+      val cur = unknownAdmission ?: return true
+      if (cur.reservation.logicalTurnId != logicalTurnId) return true
+      if (orderedTranscript.interruptedRunIds().contains(logicalTurnId) || orderedTranscript.isSealed()) {
+        convertUnknownToFailedLocked(cur, "transcript store unavailable")
+        return true
+      }
+      if (!flushed) return false
+      // Admission-window cancel raced the late commit: drain a cancel terminal
+      // instead of ghost-launching (Finding 1, UNKNOWN variant).
+      if (admissionCancelRequestedId == logicalTurnId) {
+        admissionCancelRequestedId = null
+        unknownAdmission = null
+        durableUserRows.add(logicalTurnId)
+        val pending =
+          pendingAdmission?.takeIf { it.logicalTurnId == logicalTurnId } ?: cur.reservation
+        drainOrphanLocked(pending)
+        activityRevision++
+        _uiState.update { s ->
+          s.copy(
+            status = ChatStatus.CANCELLED,
+            pendingSteerCount = steerQueue.size,
+            queuedRecoveryRequired = steerQueue.isNotEmpty(),
+          )
+        }
+        return true
+      }
+      claimUnknownLocked(cur)
+      return true
+    }
+  }
+
+  /** R5-1: does an UNKNOWN ownership exist? (Test/VM seam.) */
+  fun hasPendingAdmission(): Boolean = synchronized(lock) { unknownAdmission != null }
+
+  /** Caller must hold [lock]. Claim the ghost: same id,補 UI, launch host, no resend. */
+  private fun claimUnknownLocked(unknown: UnknownAdmission) {
+    unknownAdmission = null
+    durableUserRows.add(unknown.reservation.logicalTurnId)
+    activityRevision++
+    val hasRow =
+      _uiState.value.messages.any { it.id == unknown.uiMessageId && it.role == "user" }
+    if (!hasRow) {
+      appendUser(unknown.reservation.text, unknown.opId)
+    }
+    _uiState.update { s ->
+      s.copy(status = ChatStatus.STREAMING, error = null, queuedRecoveryRequired = false)
+    }
+    val r = unknown.reservation
+    val job = scope.launch {
+      hostedTurn(r.text, r.images, r.logicalTurnId, r.attemptRef, r.attemptIndexRef)
+    }
+    inFlight = job
+    val lid = r.logicalTurnId
+    job.invokeOnCompletion {
+      synchronized(lock) {
+        if (inFlight === job) inFlight = null
+        val pending = pendingAdmission
+        if (pending?.logicalTurnId == lid) {
+          drainOrphanLocked(pending)
+        }
+      }
+    }
+  }
+
+  /** Caller must hold [lock]. Ghost confirmed failed/sealed: roll back, release, retryable. */
+  private fun convertUnknownToFailedLocked(unknown: UnknownAdmission, error: String) {
+    unknownAdmission = null
+    if (pendingAdmission?.logicalTurnId == unknown.reservation.logicalTurnId) {
+      pendingAdmission = null
+    }
+    if (admissionCancelRequestedId == unknown.reservation.logicalTurnId) {
+      admissionCancelRequestedId = null
+    }
+    activityRevision++
+    _uiState.update { s ->
+      s.copy(
+        messages = s.messages.filterNot { it.id == unknown.uiMessageId && it.role == "user" },
+        status = ChatStatus.ERROR,
+        error = error,
       )
     }
-    durableUserRows.add(logicalTurnId)
   }
 
   /**
@@ -708,7 +964,10 @@ class TurnController(
    * endpoint invalidation (R1) clear it only after this returns; a
    * [CancellationException]/[SecurityException]/[IllegalStateException]/
    * [TranscriptDurabilityException] before return means the text was NOT
-   * accepted and must stay recoverable. A [RecoveryRequiredException] means
+   * accepted and must stay recoverable. A [TranscriptPendingException] means
+   * UNKNOWN/PENDING_COMMIT (R5-1, timeout-after-send): ownership retained,
+   * same-opId resend blocked until bounded settle; the caller must NOT treat
+   * it as not-accepted and must NOT immediately resend. A [RecoveryRequiredException] means
    * queued recovery work must be drained before this direct admission can
    * proceed; this method never drains it. If recovery appears after the
    * initial admission lock, this attempt may already have passed a fresh
@@ -740,8 +999,20 @@ class TurnController(
   suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): Job {
     require(text.isNotBlank()) { "text must not be blank" }
     checkInputLengthOrThrow(text)
+    // R5-1: a still-unsettled UNKNOWN owns the single-flight slot. Settle
+    // boundedly (outside the lock) before deciding, so a late-committed ghost
+    // is claimed instead of duplicated.
+    if (synchronized(lock) { unknownAdmission != null }) {
+      try {
+        settlePendingAdmission(acceptTimeoutMs)
+      } catch (_: CancellationException) {
+        throw TranscriptPendingException("transcript store pending")
+      } catch (_: Exception) {
+      }
+    }
     val revisionAtAdmission = synchronized(lock) {
       check(!closed) { "controller is closed" }
+      checkPendingDuplicateLocked(null)
       if (isBusyLocked()) {
         _uiState.update { it.copy(error = "busy: another turn is in flight") }
         throw IllegalStateException("already in flight")
@@ -767,6 +1038,7 @@ class TurnController(
       // no bump, no transcript) with InputTooLongException to the caller.
       // Closed stays first (lifecycle seal); length still precedes busy/recovery.
       checkInputLengthOrThrow(text)
+      checkPendingDuplicateLocked(null)
       if (isBusyLocked()) {
         _uiState.update { it.copy(error = "busy: another turn is in flight") }
         throw IllegalStateException("already in flight")
@@ -786,10 +1058,26 @@ class TurnController(
       pendingAdmission = reservation
     }
     // Stage 6 durable gate (outside the lock): Started == durable user row.
+    // R5-1 tri-state: UNKNOWN retains ownership and throws Pending (no
+    // rollback, no INTERRUPTED mark); NOT_ADMITTED keeps fail-closed rollback.
     try {
-      awaitUserRowDurable(reservation.logicalTurnId, text)
+      when (awaitUserRowDurable(reservation.logicalTurnId, text)) {
+        DurableAdmission.ACKED -> Unit
+        DurableAdmission.NOT_ADMITTED -> {
+          rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+          throw TranscriptDurabilityException(
+            "transcript store timed out after $acceptTimeoutMs ms",
+          )
+        }
+        DurableAdmission.UNKNOWN -> {
+          enterUnknownAdmission(reservation, uiMessageId, null)
+          throw TranscriptPendingException("transcript store pending")
+        }
+      }
     } catch (e: CancellationException) {
       rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+      throw e
+    } catch (e: TranscriptPendingException) {
       throw e
     } catch (e: TranscriptDurabilityException) {
       rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
@@ -896,7 +1184,10 @@ class TurnController(
    * promotion-gate-failed intents to return to the caller before it retries
    * this admission. A [CancellationException]/[SecurityException]/
    * [IllegalStateException]/[TranscriptDurabilityException] before return
-   * means NOT accepted. Unlike [steer], the idle path never fire-and-forgets:
+   * means NOT accepted. A [TranscriptPendingException] means UNKNOWN (R5-1):
+   * the entry may already be in the channel — do NOT resend the same opId
+   * until [settlePendingAdmission] resolves (claimed under the same id, or
+   * converted to retryable). Unlike [steer], the idle path never fire-and-forgets:
    * callers always get an explicit acknowledgment.
    *
    * Stage 6 (R4-3): [TurnStart.Started] is durable — see [startTurn]. A
@@ -930,8 +1221,20 @@ class TurnController(
   ): TurnStart {
     require(text.isNotBlank()) { "text must not be blank" }
     checkInputLengthOrThrow(text)
+    // R5-1: same-opId duplicate of an unsettled UNKNOWN must not enqueue a
+    // second row. Settle boundedly first (outside the lock); if still
+    // unknown the guards below throw Pending.
+    if (synchronized(lock) { unknownAdmission != null }) {
+      try {
+        settlePendingAdmission(acceptTimeoutMs)
+      } catch (_: CancellationException) {
+        throw TranscriptPendingException("transcript store pending")
+      } catch (_: Exception) {
+      }
+    }
     val revisionAtAdmission = synchronized(lock) {
       check(!closed) { "controller is closed" }
+      checkPendingDuplicateLocked(opId)
       if (isBusyLocked()) {
         check(images.isEmpty()) { "cannot queue a turn with images; text and images remain caller-owned" }
         enqueueLocked(opId, text, images)
@@ -950,6 +1253,7 @@ class TurnController(
     val uiMessageId: String
     synchronized(lock) {
       check(!closed) { "controller is closed" }
+      checkPendingDuplicateLocked(opId)
       if (isBusyLocked()) {
         // Lost the race during the gate: re-validate length with the fresh
         // zone before queueing, so a zone that grew during the gate cannot
@@ -981,10 +1285,26 @@ class TurnController(
       pendingAdmission = reservation
     }
     // Stage 6 durable gate (outside the lock): Started == durable user row.
+    // R5-1 tri-state: UNKNOWN retains ownership and throws Pending (same-opId
+    // resend blocked until settle); NOT_ADMITTED keeps fail-closed rollback.
     try {
-      awaitUserRowDurable(reservation.logicalTurnId, text)
+      when (awaitUserRowDurable(reservation.logicalTurnId, text)) {
+        DurableAdmission.ACKED -> Unit
+        DurableAdmission.NOT_ADMITTED -> {
+          rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+          throw TranscriptDurabilityException(
+            "transcript store timed out after $acceptTimeoutMs ms",
+          )
+        }
+        DurableAdmission.UNKNOWN -> {
+          enterUnknownAdmission(reservation, uiMessageId, opId)
+          throw TranscriptPendingException("transcript store pending")
+        }
+      }
     } catch (e: CancellationException) {
       rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+      throw e
+    } catch (e: TranscriptPendingException) {
       throw e
     } catch (e: TranscriptDurabilityException) {
       rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
@@ -1084,6 +1404,22 @@ class TurnController(
         retainSteerForRecovery(text, error = "approval required")
       } catch (_: PolicyEvaluationException) {
         retainSteerForRecovery(text, error = "policy evaluation failed")
+      } catch (_: TranscriptPendingException) {
+        // R5-1 UNKNOWN: ownership retained by the pending admission (ghost may
+        // late-commit and be claimed under the same id). Do NOT retain as
+        // recovery — that would duplicate the opId on claim. Surface pending.
+        synchronized(lock) {
+          if (!isBusyLocked()) {
+            activityRevision++
+            _uiState.update { s ->
+              if (s.status == ChatStatus.IDLE || s.status == ChatStatus.ERROR) {
+                s.copy(status = ChatStatus.ERROR, error = "transcript store pending")
+              } else {
+                s
+              }
+            }
+          }
+        }
       } catch (_: TranscriptDurabilityException) {
         // Stage 6: admission-time durable failure (store stall/seal) never
         // loses the steer text; retain for explicit recovery like any other
@@ -1115,6 +1451,21 @@ class TurnController(
       closed = true
       activityRevision++
       steerQueue.clear()
+      // R5-1: an UNKNOWN waiter already threw Pending — nobody will finalize
+      // its pendingAdmission. Clear it (and the UNKNOWN ownership) here so no
+      // second user-row write can duplicate a late-committing ghost; the
+      // shutdown drain below settles the ghost entry itself (drained or
+      // INTERRUPTED-marked, never rewritten).
+      unknownSettleJob?.cancel()
+      unknownSettleJob = null
+      val unknown = unknownAdmission
+      unknownAdmission = null
+      if (unknown != null && pendingAdmission?.logicalTurnId == unknown.reservation.logicalTurnId) {
+        pendingAdmission = null
+      }
+      if (unknown != null && admissionCancelRequestedId == unknown.reservation.logicalTurnId) {
+        admissionCancelRequestedId = null
+      }
       val current = activeLocked()
       doomed = current
       val orphaned = pendingAdmission

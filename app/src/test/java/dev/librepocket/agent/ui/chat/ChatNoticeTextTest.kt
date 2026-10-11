@@ -28,6 +28,7 @@ class ChatNoticeTextTest {
         assertEquals("端點已變更，本次未送出，請確認後重送。", chatNoticeText("SEND_CANCELLED_ENDPOINT_CHANGED"))
         assertEquals("輸入過長，本次未送出，請縮短後重試。", chatNoticeText("CHAT_INPUT_TOO_LONG"))
         assertEquals("無法寫入對話紀錄，本次未送出，請稍後重試。", chatNoticeText("CHAT_STORE_UNAVAILABLE"))
+        assertEquals("對話紀錄寫入確認中，結果未定請勿重送。", chatNoticeText("CHAT_STORE_PENDING"))
     }
 
     @Test

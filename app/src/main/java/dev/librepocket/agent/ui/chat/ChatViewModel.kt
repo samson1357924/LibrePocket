@@ -12,6 +12,7 @@ import dev.librepocket.chat.ChatUiState
 import dev.librepocket.chat.ApprovalRequiredException
 import dev.librepocket.chat.InputTooLongException
 import dev.librepocket.chat.TranscriptDurabilityException
+import dev.librepocket.chat.TranscriptPendingException
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
@@ -818,6 +819,16 @@ class ChatViewModel(
                                 setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
                                 restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
                                 return@launch
+                            } catch (_: TranscriptPendingException) {
+                                // R5-1 UNKNOWN/PENDING_COMMIT (timeout-after-send):
+                                // ownership retained by the controller, same-opId
+                                // resend blocked until settle. Do NOT restore
+                                // (no draft, no retry yet); project pending and
+                                // flip on settle (claimed → accept, failed →
+                                // UNAVAILABLE retryable).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_PENDING")
+                                launchPendingSettleWaiter(opId, clean, handle, operationGeneration)
+                                return@launch
                             } catch (_: TranscriptDurabilityException) {
                                 // Stage 6 (R4-3) admission fail-closed: the user
                                 // row could not be durably persisted within the
@@ -1042,6 +1053,12 @@ class ChatViewModel(
                                 // sent; keep the text recoverable (draft).
                                 setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
                                 restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
+                                return@launch
+                            } catch (_: TranscriptPendingException) {
+                                // R5-1 UNKNOWN/PENDING_COMMIT: same as the steer
+                                // path above (no restore; settle waiter flips).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_PENDING")
+                                launchPendingSettleWaiter(opId, text, handle, operationGeneration)
                                 return@launch
                             } catch (_: TranscriptDurabilityException) {
                                 // Stage 6 (R4-3) admission fail-closed: same
@@ -2334,10 +2351,59 @@ class ChatViewModel(
         setInput(recoverable.text, recoverable.opId, recoverable.text, recoverable.recoverySequence)
         _notice.value = noticeValue
     }
+    /**
+     * R5-1 UNKNOWN settle waiter (bounded, never blocks the UI). The admission
+     * already threw [TranscriptPendingException] with ownership retained
+     * (pendingOps kept, no draft restore). This waiter drives one bounded
+     * [ChatSession.settlePendingAdmission] and flips the notice:
+     * - claimed (ghost durable, UI row present, no resend): drop the pending
+     *   op as accepted and clear a stale PENDING notice;
+     * - failed/sealed (row rolled back): restore as `CHAT_STORE_UNAVAILABLE`
+     *   (retryable, same restore semantics as fail-closed);
+     * - still unknown (flush timeout): keep PENDING; a later explicit retry
+     *   re-settles via the controller guard.
+     */
+    private fun launchPendingSettleWaiter(opId: Long, text: String, handle: SessionHandle, generation: Long) {
+        lifecycleScope.launch {
+            val settled: Boolean = try {
+                handle.created.session.settlePendingAdmission(SESSION_FLUSH_TIMEOUT_MS)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
+            }
+            if (!isHandleCurrent(handle) || !isGenerationCurrent(generation)) return@launch
+            if (!settled) return@launch
+            val state = try {
+                handle.created.session.uiState.value
+            } catch (_: Exception) {
+                null
+            }
+            val hasRow = state?.messages?.any { it.role == "user" && it.operationId == opId } == true
+            if (hasRow) {
+                // Claimed under the same id: the text is accepted, nothing to
+                // restore and nothing to resend. Mirror Started bookkeeping so
+                // a stale gate cannot steal Retry afterwards.
+                pendingOps.remove(opId)
+                if (retryableOp?.opId == opId) retryableOp = null
+                if (_notice.value == "CHAT_STORE_PENDING") _notice.value = null
+                drainNextRecoverableToInput()
+                return@launch
+            }
+            // No row: settle converted to fail-closed (or a racing close
+            // dropped it). Flip to retryable UNAVAILABLE; the text is retained
+            // for explicit retry, never auto-resent.
+            if (pendingOps.containsKey(opId)) {
+                setNoticeIfCurrent(generation, "CHAT_STORE_UNAVAILABLE")
+                restoreOpForFailedSend(opId, "CHAT_STORE_UNAVAILABLE")
+            } else if (_notice.value == "CHAT_STORE_PENDING") {
+                _notice.value = "CHAT_STORE_UNAVAILABLE"
+            }
+        }
+    }
 
     /** A stale gate restore cannot outrank a newer Started target or later retry attempt. */
-    private fun setRetryableIfNewer(op: PendingOp) {
-        val accepted = latestAcceptedStartedTarget
+    private fun setRetryableIfNewer(op: PendingOp) {        val accepted = latestAcceptedStartedTarget
         if (accepted != null && op.retryTargetEpoch < accepted.retryTargetEpoch) return
         val current = retryableOp
         if (current == null || op.retryTargetEpoch > current.retryTargetEpoch ||

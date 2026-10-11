@@ -304,10 +304,13 @@ class TurnControllerLedgerTest {
 
   @Test fun stalledStoreKeepsCloseFastAndMarksInterruptedExplicitly() {
     val gate = CompletableDeferred<Unit>()
-    val blockingSink = object : dev.librepocket.chat.TranscriptSink {
-      override suspend fun onTurnStarted(runId: String, text: String) {
-        gate.await()
-      }
+    // R5-1: NOT_ADMITTED stall simulated BEFORE the channel send (admission
+    // backpressure), so no ghost can late-commit: timeout-before-send stays
+    // fail-closed with an INTERRUPTED mark. Timeout-after-send (delegate
+    // stall) is now UNKNOWN/PENDING_COMMIT — covered by the R5-1 late-commit
+    // tests below.
+    val fastSink = object : dev.librepocket.chat.TranscriptSink {
+      override suspend fun onTurnStarted(runId: String, text: String) = Unit
       override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
       override suspend fun onTurnFailed(runId: String, error: String) = Unit
       override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
@@ -328,13 +331,14 @@ class TurnControllerLedgerTest {
         flow { emit(StreamEvent.Done("stop")) }
       },
       policy = LedgerAllowPolicy(),
-      transcript = blockingSink,
+      transcript = fastSink,
       dispatcher = Dispatchers.Default,
       sleeper = {},
       newId = { "stalled-${n++}" },
       // Stage 6: stall must fail-closed fast (not park 5s in tests).
       acceptTimeoutMs = 400L,
     )
+    c.beforeAdmissionSendForTest = { gate.await() }
     try {
       // Stage 6 (R4-3): a stalled user-row ack no longer returns Started.
       // It throws fail-closed (caller retains the text) and marks INTERRUPTED.
@@ -627,10 +631,11 @@ class TurnControllerLedgerTest {
   @Test
   fun stalledAdmissionFailsClosedWithoutLosingText() {
     val gate = CompletableDeferred<Unit>()
-    val blockingSink = object : dev.librepocket.chat.TranscriptSink {
-      override suspend fun onTurnStarted(runId: String, text: String) {
-        gate.await()
-      }
+    // R5-1: same NOT_ADMITTED treatment as above — stall BEFORE send so the
+    // timeout path keeps fail-closed rollback + INTERRUPTED mark. Delegate
+    // stalls (timeout-after-send) are now UNKNOWN; see R5-1 tests below.
+    val fastSink = object : dev.librepocket.chat.TranscriptSink {
+      override suspend fun onTurnStarted(runId: String, text: String) = Unit
       override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
       override suspend fun onTurnFailed(runId: String, error: String) = Unit
       override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
@@ -651,12 +656,13 @@ class TurnControllerLedgerTest {
         flow { emit(StreamEvent.Done("stop")) }
       },
       policy = LedgerAllowPolicy(),
-      transcript = blockingSink,
+      transcript = fastSink,
       dispatcher = Dispatchers.Default,
       sleeper = {},
       newId = { "stall-reverse-${n++}" },
       acceptTimeoutMs = 300L,
     )
+    c.beforeAdmissionSendForTest = { gate.await() }
     val text = "stall reverse retryable text"
     try {
       try {
@@ -678,6 +684,223 @@ class TurnControllerLedgerTest {
         withTimeout(5_000) { c.startOrEnqueue(text, opId = 77L) }
       }
       assertTrue("unblocked retry must admit", retry is TurnStart.Started)
+    } finally {
+      gate.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * R5-1 late-commit: writer already started the user-row delegate when the
+   * accept timeout fires (send proof true → UNKNOWN, not NOT_ADMITTED).
+   * The controller retains ownership: same-opId explicit retry is blocked
+   * (no second user row), the ghost late-commits, bounded settle claims it
+   * under the SAME logical id (no resend), and reopen sees exactly one user
+   * row with no false INTERRUPTED mark.
+   */
+  @Test
+  fun timeoutAfterSendLateCommitClaimsSingleUserRow() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val gate = CompletableDeferred<Unit>()
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        gate.await()
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = LedgerFakeProvider {
+        flow {
+          emit(StreamEvent.TextDelta(0, 0, "ok"))
+          emit(StreamEvent.Done("stop"))
+        }
+      },
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "ghost-${n++}" },
+      acceptTimeoutMs = 300L,
+    )
+    val text = "late commit text"
+    try {
+      // Writer has started (parked in the delegate gate) → timeout-after-send.
+      try {
+        runBlocking { c.startOrEnqueue(text, opId = 77L) }
+        fail("timeout-after-send must throw TranscriptPendingException, not return Started")
+      } catch (e: TranscriptPendingException) {
+        // Expected UNKNOWN/PENDING_COMMIT path.
+      }
+      // Ownership retained: UI row kept (not rolled back), still pending, and
+      // — critically — no false INTERRUPTED mark while fate is unknown.
+      assertTrue(c.hasPendingAdmission())
+      assertEquals(1, c.uiState.value.messages.count { it.role == "user" && it.text == text })
+      assertTrue(
+        "UNKNOWN must not mark INTERRUPTED before settle",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      assertTrue(
+        "ghost entry must be admitted (sent) and awaiting the writer",
+        c.pendingTranscriptRunIds().contains("ghost-1"),
+      )
+      assertTrue("ghost must not have persisted yet", store.events.none { it.kind == "user" })
+      // Explicit retry with the SAME opId before settle: blocked, no second row.
+      try {
+        runBlocking { c.startOrEnqueue(text, opId = 77L) }
+        fail("same-opId retry during UNKNOWN must throw TranscriptPendingException")
+      } catch (e: TranscriptPendingException) {
+        // Expected: no resend, no duplicate.
+      }
+      assertEquals(
+        "blocked retry must not append a second UI row",
+        1,
+        c.uiState.value.messages.count { it.role == "user" && it.text == text },
+      )
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      assertTrue("blocked retry must not persist a second row", store.events.none { it.kind == "user" })
+      // Late commit: unblock the writer, then drive bounded settle to claim.
+      gate.complete(Unit)
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.hasPendingAdmission()) {
+            c.settlePendingAdmission(500L)
+            delay(25)
+          }
+        }
+      }
+      // Claimed under the same logical id: no INTERRUPTED, single user row.
+      assertTrue(
+        "claimed ghost must not be INTERRUPTED",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      val users = store.events.filter { it.kind == "user" }
+      assertEquals("claimed ghost keeps exactly one user row", 1, users.size)
+      assertEquals(text, users.single().text)
+      assertEquals("ghost-1", users.single().runId)
+      // The claimed host runs the turn to completion (no resend of the row).
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.uiState.value.status != ChatStatus.IDLE) delay(10)
+        }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals(
+        "no duplicate user row after the claimed turn completes",
+        1,
+        store.events.count { it.kind == "user" },
+      )
+      assertEquals(
+        1,
+        c.uiState.value.messages.count { it.role == "user" && it.text == text },
+      )
+      // Reopen view: the logical family is complete (user + final assistant),
+      // so backfill must find nothing dangling and model history sees one user.
+      assertTrue(
+        "claimed family must not dangle",
+        dev.librepocket.agent.ui.chat.findDanglingRunIds(store.events).isEmpty(),
+      )
+      assertTrue(c.interruptedTranscriptRunIds().isEmpty())
+    } finally {
+      gate.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * R5-1 settle-failure: the ghost write is confirmed failed (delegate
+   * IOException → INTERRUPTED) or the writer is sealed. Bounded settle then
+   * converts UNKNOWN to fail-closed: UI rolled back, ownership released, and
+   * the same opId becomes retryable via [TranscriptDurabilityException]
+   * (later succeeding with exactly one row once the store recovers).
+   */
+  @Test
+  fun timeoutAfterSendSettleFailureBecomesRetryable() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val gate = CompletableDeferred<Unit>()
+    var failNext = true
+    val failingSink = object : TranscriptSink by inner {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        gate.await()
+        if (failNext) throw java.io.IOException("store down")
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = LedgerFakeProvider {
+        flow {
+          emit(StreamEvent.TextDelta(0, 0, "recovered"))
+          emit(StreamEvent.Done("stop"))
+        }
+      },
+      policy = LedgerAllowPolicy(),
+      transcript = failingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "settle-fail-${n++}" },
+      acceptTimeoutMs = 300L,
+    )
+    val text = "settle failure text"
+    try {
+      try {
+        runBlocking { c.startOrEnqueue(text, opId = 77L) }
+        fail("timeout-after-send must throw TranscriptPendingException")
+      } catch (e: TranscriptPendingException) {
+        // Expected UNKNOWN path.
+      }
+      assertTrue(c.hasPendingAdmission())
+      assertTrue(c.interruptedTranscriptRunIds().isEmpty())
+      // Confirm the failure: unblock so the delegate throws, then settle.
+      gate.complete(Unit)
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.hasPendingAdmission()) {
+            c.settlePendingAdmission(500L)
+            delay(25)
+          }
+        }
+      }
+      // Converted to fail-closed: row rolled back, INTERRUPTED explicit,
+      // ownership released for retry.
+      assertTrue(c.interruptedTranscriptRunIds().contains("settle-fail-1"))
+      assertTrue(
+        "failed settle must roll back the UI row",
+        c.uiState.value.messages.none { it.role == "user" && it.text == text },
+      )
+      assertEquals("transcript store unavailable", c.uiState.value.error)
+      // Same opId is retryable now: store still down → durability failure
+      // (NOT pending), never a silent second-row duplicate.
+      try {
+        runBlocking { withTimeout(5_000) { c.startOrEnqueue(text, opId = 77L) } }
+        fail("retry while store is down must throw TranscriptDurabilityException")
+      } catch (e: TranscriptDurabilityException) {
+        // Expected retryable fail-closed path.
+      }
+      assertTrue("failed retry must persist nothing", store.events.none { it.kind == "user" })
+      // Store recovers: the same opId admits exactly one row.
+      failNext = false
+      val retry = runBlocking {
+        withTimeout(5_000) { c.startOrEnqueue(text, opId = 77L) }
+      }
+      assertTrue("recovered retry must admit", retry is TurnStart.Started)
+      runBlocking {
+        (retry as TurnStart.Started).host.join()
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals(1, store.events.count { it.kind == "user" })
+      assertEquals(text, store.events.single { it.kind == "user" }.text)
+      // The pre-failure ghost id stays marked; the store-down retry id is
+      // marked too (its delegate write failed), but the recovered turn's id
+      // is clean.
+      assertTrue(c.interruptedTranscriptRunIds().contains("settle-fail-1"))
+      val recoveredRunId = store.events.single { it.kind == "user" }.runId
+      assertTrue(
+        "recovered turn must not be INTERRUPTED",
+        !c.interruptedTranscriptRunIds().contains(recoveredRunId),
+      )
     } finally {
       gate.complete(Unit)
       c.close()

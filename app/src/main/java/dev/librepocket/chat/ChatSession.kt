@@ -26,7 +26,10 @@ interface ChatSession {
    * policy passed, user message appended, STREAMING) without waiting for the
    * hosted turn to finish. A [CancellationException]/[SecurityException]/
    * [IllegalStateException]/[IllegalArgumentException]/[TranscriptDurabilityException] before return means
-   * the text was NOT accepted.
+   * the text was NOT accepted. A [TranscriptPendingException] means UNKNOWN
+   * (R5-1 timeout-after-send): ownership retained, do NOT immediately resend
+   * the same opId — await [settlePendingAdmission] (claimed under the same id
+   * without resend, or converted to retryable).
    */
   suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): kotlinx.coroutines.Job
 
@@ -104,6 +107,20 @@ interface ChatSession {
    * surfaced in [uiState].
    */
   fun steer(text: String)
+
+  /**
+   * R5-1 bounded settle for an UNKNOWN/PENDING_COMMIT admission
+   * (timeout-after-send). Ticket-tracked flush: success without an
+   * INTERRUPTED mark claims the ghost under the same id (no resend);
+   * INTERRUPTED/seal converts to retryable. Returns true when resolved
+   * (claimed, failed, or nothing pending), false when still unknown (flush
+   * timed out — keep ownership, no false mark; retry re-settles).
+   */
+  suspend fun settlePendingAdmission(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
+    true
+
+  /** R5-1: true while an UNKNOWN admission still owns the single-flight slot. */
+  fun hasPendingAdmission(): Boolean = false
 
   /** Release (close HTTP call, drop queue). */
   fun close()

@@ -198,6 +198,19 @@ class OrderedTranscriptSink(
   override suspend fun onTurnStarted(runId: String, text: String) =
     writeCore(runId) { delegate.onTurnStarted(runId, text) }
 
+
+  /**
+   * R5-1 send-proof admission: same as [onTurnStarted] but sets [sent] to
+   * true immediately after the channel send succeeds (before the durable-ack
+   * wait). Lets [TurnController] distinguish timeout-before-send
+   * (NOT_ADMITTED, never entered the channel) from timeout-after-send
+   * (UNKNOWN/PENDING_COMMIT, ghost may late-commit via the independent
+   * writer). Channel semantics unchanged: still a single ordered
+   * [channel.send] under the same admission ticket/chain.
+   */
+  suspend fun onTurnStartedTracked(runId: String, text: String, sent: AtomicBoolean) =
+    writeCoreTracked(runId, { delegate.onTurnStarted(runId, text) }, sent)
+
   override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean = false) =
     writeCore(runId) { delegate.onTurnSucceeded(runId, text, hasReasoning) }
 
@@ -297,6 +310,17 @@ class OrderedTranscriptSink(
 
   /** Core event: suspends until the single writer has run the delegate. */
   private suspend fun writeCore(runId: String, block: suspend () -> Unit) {
+    writeCoreTracked(runId, block, AtomicBoolean(false))
+  }
+
+  /**
+   * R5-1 tracked core write. Identical ordering/ack contract to [writeCore];
+   * additionally flips [sent] once the entry is buffered in [channel].
+   * A caller timeout with `sent == false` never entered the ledger
+   * (NOT_ADMITTED); with `sent == true` the independent writer may still
+   * persist it (UNKNOWN). No channel semantic change.
+   */
+  private suspend fun writeCoreTracked(runId: String, block: suspend () -> Unit, sent: AtomicBoolean) {
     // Fail fast behind a dead/sealed writer: never park unbounded with no
     // drainer. The mark keeps the interruption explicit.
     if (writerDead.get() || writer.isCompleted || channel.isClosedForSend) {
@@ -327,6 +351,7 @@ class OrderedTranscriptSink(
       reservation.prev?.await()
       beforeSendForTest?.invoke(reservation.ticket)
       channel.send(Entry(runId, block, ack))
+      sent.set(true)
     } catch (e: CancellationException) {
       // The caller was cancelled before admission: the entry never entered
       // the channel, so drop the pending mark and propagate. The gate is

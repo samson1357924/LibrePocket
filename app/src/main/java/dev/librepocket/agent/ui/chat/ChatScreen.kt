@@ -91,6 +91,7 @@ internal fun chatNoticeText(code: String): String =
         "CHAT_POLICY_UNAVAILABLE" -> "無法驗證對話權限，本次未送出，請稍後重試"
         "CHAT_INPUT_TOO_LONG" -> "輸入過長，本次未送出，請縮短後重試。"
         "CHAT_STORE_UNAVAILABLE" -> "無法寫入對話紀錄，本次未送出，請稍後重試。"
+        "CHAT_STORE_PENDING" -> "對話紀錄寫入確認中，結果未定請勿重送。"
         "CHAT_CANCELLED_RECOVERY" -> "對話已取消；尚未送出的排隊訊息已保留，請確認後手動送出。"
         "CHAT_QUEUE_RECOVERY_REQUIRED" -> "排隊中的訊息尚未送出，已保留，請確認後手動送出。"
         "UNKNOWN_SESSION" -> "找不到該會話，可能已被刪除。"

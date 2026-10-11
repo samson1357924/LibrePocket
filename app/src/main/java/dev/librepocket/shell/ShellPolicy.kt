@@ -200,18 +200,32 @@ object ShellPolicy {
 
     /**
      * 純函數校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ 白名單
-     * → find 高危謂詞 → 檔案域（絕對路徑經 [FileScope.decide]）。
-     * 呼叫方（[RestrictedShell]）必須先調此函數，拒絕時不得建子進程。
+     * → argv[0] 可信路徑門（同名不同路徑封堵，詞法；僅直接通道，
+     *   guest 跳過——guest argv[0] 是容器命名空間路徑）→ find 高危謂詞
+     * → 檔案域（絕對路徑經 [FileScope.decide]）。
+     * 呼叫方（[RestrictedShell]）必須先調此函數，拒絕時不得建子進程；
+     * 放行後仍須經 [ShellExecutables.resolve] 把 `argv[0]` 換成驗證後絕對路徑
+     * 再 spawn（本函數不管落地實體，純詞法）。
      *
      * @param allowedBinaries 白名單集合（預設 [ALLOWED_BINARIES]；S4
      *   `linux.exec` 傳聯集，黑名單/參數衛生/find 封堵/檔案域邏輯完全繼承，
      *   僅白名單放寬）。
+     * @param isGuest Guest 容器通道：true 時跳過 argv[0] 可信路徑門。
+     *   Guest argv[0] 是容器命名空間路徑（`proot -r rootfs` 下解析），
+     *   宿主可信目錄表（[ShellExecutables.TRUSTED_BIN_DIRS]）不適用
+     *   （如容器內 `/opt/jadx/bin/jadx`）；host-絕對路徑混淆另由執行入口
+     *   （`ProotExec` 經 `LinuxInboxStager.hostLinuxAbsoluteRef` /
+     *   `unstagedInboxRef`）在 validate 之前 fail-closed，本函數不代勞。
      * @param privateRoot App 私有域根；null 表示未配置作用域，
      *   此時任何絕對路徑參數一律拒絕，且隱式讀 cwd 的命令（ls/du/df/find/pwd
      *   無明確路徑時，grep -r 無檔案參數時）亦一律拒絕（fail-closed）。
      * @param safRoots 已授權 SAF 樹前綴。
      * @param flavor 風味：play 跨域一律拒絕；foss/github 跨域即使橋接已授權，
      *   直接 exec 仍拒絕（需改走 D09 橋，[FileScope.decide] 回 needsBridge）。
+     * @param trustedBinDirs `argv[0]` 詞法可信門的目錄表（預設
+     *   [ShellExecutables.TRUSTED_BIN_DIRS]；產品碼一律用預設值，單測可注入
+     *   暫存目錄以覆蓋絕對 `argv[0]` 的全鏈路徑，呼叫方須同步把同表傳給
+     *   [ShellExecutables.resolve] 的 `searchDirs`）。
      */
     fun validate(
         argv: List<String>,
@@ -221,6 +235,7 @@ object ShellPolicy {
         bridgeGranted: Boolean = false,
         allowedBinaries: Set<String> = ALLOWED_BINARIES,
         isGuest: Boolean = false,
+        trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
@@ -253,6 +268,24 @@ object ShellPolicy {
         }
         if (base !in allowedBinaries) {
             return Validation.Denied(ShellDeny.NOT_WHITELISTED, "not whitelisted: $base")
+        }
+        // argv[0] 可信路徑門（直接通道 PATH 劫持封堵，詞法無 IO，host-only）：
+        // 含 `/`/`\` 的寫法父目錄必須在可信系統目錄內，否則同名不同路徑的假
+        // 二進位（`/tmp/evil/ls`）可憑 basename 通過白名單；bare 由執行層經
+        // [ShellExecutables.resolve] 受控解析（不查 PATH、不看 cwd）。
+        // Guest 通道（isGuest=true）跳過此門：guest argv[0] 是容器命名空間
+        // 路徑（`proot -r rootfs` 下解析），宿主可信目錄表不適用
+        // （如 `/opt/jadx/bin/jadx`、`/opt/toolchain/bin/clang`）；
+        // host-絕對路徑混淆另由執行入口守衛 fail-closed，不在此判。
+        // 提權通道（validateElevated）依本次範圍維持原判，不在此改。
+        val rawArgv0 = argv[0].trim()
+        if (!isGuest && (rawArgv0.contains('/') || rawArgv0.contains('\\'))) {
+            if (!ShellExecutables.isTrustedAbsoluteArgv0(rawArgv0, trustedBinDirs)) {
+                return Validation.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "untrusted executable path: $rawArgv0",
+                )
+            }
         }
         // find 沙箱逃逸封堵：高危謂詞命中任一即拒絕（不建子進程）。
         if (base == "find") {

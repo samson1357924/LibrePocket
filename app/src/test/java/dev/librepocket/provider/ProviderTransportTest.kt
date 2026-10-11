@@ -1137,6 +1137,25 @@ class ProviderTransportTest {
                         )
                         assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
                         if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) {
+                            // Under-cap and exact-cap sizes are deterministic with
+                            // "Connection: close" (no pooled-drain race): production
+                            // sentinel probes -1 on exact-cap EOF, so consumed is
+                            // exact and the Call stays uncancelled.
+                            val expectedConsumed = size.toLong()
+                            assertEquals("$context consumed exact client-source bytes", expectedConsumed, signals.consumedBytes.get())
+                        } else {
+                            // Over-cap: sentinel probe consumes one overflow byte
+                            // (discarded, prefix stays capped); observed count may
+                            // be cap or cap+1 via OkHttp close-discard vs
+                            // cancelCall race, not a production over-read.
+                            val consumed = signals.consumedBytes.get()
+                            assertTrue(
+                                "$context consumed cap client-source bytes up to close-discard race (cap or cap+1), got $consumed",
+                                consumed == HTTP_ERROR_BODY_LIMIT_BYTES.toLong() ||
+                                    consumed == HTTP_ERROR_BODY_LIMIT_BYTES.toLong() + 1L,
+                            )
+                        }
+                        if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) {
                             assertFalse(
                                 "$context at-or-under-cap EOF leaves the Call uncancelled",
                                 withContext(Dispatchers.IO) { signals.calls.cancelled.await(1, TimeUnit.SECONDS) },
@@ -1188,6 +1207,24 @@ class ProviderTransportTest {
                             consumedBytes >= floorBytes,
                         )
                         assertReadWithinBudget(signals, HTTP_ERROR_BODY_LIMIT_BYTES, context)
+                        if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) {
+                            // Same determinism note as the listModels twin:
+                            // under-cap/exact-cap are exact with "Connection:
+                            // close"; exact-cap sentinel probes -1, uncancelled.
+                            val expectedConsumed = size.toLong()
+                            assertEquals("$context consumed exact client-source bytes", expectedConsumed, signals.consumedBytes.get())
+                        } else {
+                            // Same over-cap race as the listModels twin:
+                            // sentinel probe + OkHttp close-discard vs
+                            // cancelCall may add 1 byte; not a production
+                            // over-read (see budget assertion above).
+                            val consumed = signals.consumedBytes.get()
+                            assertTrue(
+                                "$context consumed cap client-source bytes up to close-discard race (cap or cap+1), got $consumed",
+                                consumed == HTTP_ERROR_BODY_LIMIT_BYTES.toLong() ||
+                                    consumed == HTTP_ERROR_BODY_LIMIT_BYTES.toLong() + 1L,
+                            )
+                        }
                         if (size <= HTTP_ERROR_BODY_LIMIT_BYTES) {
                             assertFalse(
                                 "$context at-or-under-cap EOF leaves the Call uncancelled",

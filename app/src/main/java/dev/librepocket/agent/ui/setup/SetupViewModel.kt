@@ -151,6 +151,13 @@ class SetupViewModel(
      */
     private val saveMutex = Mutex()
 
+    /**
+     * Test seam: the most recent save coroutine. Cancellation tests cancel this
+     * job to inject [CancellationException] at suspending gates (V1/V2/CAS).
+     * Production code never touches it; it is overwritten on every [save].
+     */
+    internal var lastSaveJobForTest: Job? = null
+
     /** Test seam for racing an edit between mint success and dialog display. */
     internal var afterMintBeforeDialogForTest: (() -> Unit)? = null
 
@@ -417,14 +424,25 @@ class SetupViewModel(
             return
         }
         _form.value = cur.copy(saving = true, errorCode = null)
-        viewModelScope.launch(Dispatchers.IO) {
+        lastSaveJobForTest = viewModelScope.launch(Dispatchers.IO) {
             // Same-VM serialization with privileged logout teardown. Held only
             // for the duration of one save attempt: dialog-pending paths return
             // (releasing the mutex) and the confirm tap re-acquires it.
+            // saveMutex.withLock releases on cancellation (verified); no extra
+            // handling needed here beyond unsticking `saving`.
             saveMutex.withLock {
                 try {
                     executeKeyWrite(cur, effectiveBaseUrl, consent, entryRevision)
                 } catch (e: CancellationException) {
+                    // Any cancel path (VM alive) must unstick saving and must
+                    // NOT mask the cancel with POLICY_DENIED. StateFlow copy is
+                    // non-suspending and safe under cancellation. Committed
+                    // cancels are already swallowed to saved=true inside
+                    // executeKeyWrite; only uncommitted/unknown cancels reach
+                    // here. Awaiting callers observe saving==false + rethrow.
+                    // (Dedicated SAVE_CANCELLED code is a UX follow-up; at
+                    // minimum never leave saving=true.)
+                    _form.value = _form.value.copy(saving = false)
                     throw e
                 } catch (e: IllegalArgumentException) {
                     _form.value = _form.value.copy(saving = false, errorCode = e.message ?: "SETUP_SAVE_FAILED")
@@ -587,15 +605,20 @@ class SetupViewModel(
         val stagedAlias = SetupValidation.newStagedAlias(providerId)
         val stagedRef = "provider_key/$stagedAlias"
         val keyCopy = form.apiKey.trim().toCharArray()
-        var stagedWritten = false
-        // Set once saveIfRevision reports true. The Cancellation handler below
-        // must not delete the staged alias after our own commit won: it is the
-        // new live key then.
-        var committed = false
+        // Explicit commit-state for cancellation compensation (P1-1 hardening):
+        // - vaultDirty: staged putKey succeeded (own staged bytes exist).
+        // - metadataCommitted: saveIfRevision returned true (staged is live).
+        // The Cancellation handler below compensates strictly by this state,
+        // verified against strict metadata when ambiguous (CAS threw Cancel
+        // after possibly committing, including TimeoutCancellation from
+        // withTimeout — also a CancellationException, never misjudged into a
+        // live rollback).
+        var vaultDirty = false
+        var metadataCommitted = false
         try {
             try {
                 vault().putKey(stagedAlias, keyCopy)
-                stagedWritten = true
+                vaultDirty = true
             } finally {
                 keyCopy.fill('\u0000')
             }
@@ -604,11 +627,13 @@ class SetupViewModel(
             // hold our bytes. The alias is ours alone (per-operation
             // restart-unique UUID alias) and was never published in metadata,
             // so a NonCancellable best-effort delete is safe; live slots are
-            // never touched here.
+            // never touched here. Bounded: single delete, no retry.
             try {
                 withContext(NonCancellable) { vault().deleteKey(stagedAlias) }
             } catch (_: Exception) {
             }
+            // VM alive: unstick saving, never mask cancel with POLICY_DENIED.
+            _form.value = _form.value.copy(saving = false)
             throw e
         } catch (_: Exception) {
             // The put itself failed: best-effort delete the (possibly partial)
@@ -740,7 +765,7 @@ class SetupViewModel(
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
-            committed = true
+            metadataCommitted = true
             // Post-commit retire of the previous live alias (best-effort, never
             // fails the save). Guarded by inequality with the just-committed
             // staged alias, so the new live key is never deleted here. The
@@ -750,38 +775,72 @@ class SetupViewModel(
             // the cancellable context (deliberately outside NonCancellable): if
             // cancellation lands here the previous alias may leak at rest
             // (documented orphan class, strictly better than loss); the new
-            // live key always survives.
+            // live key always survives. Retire-cancel leak is at-rest only and
+            // documented; saveMutex still releases on cancel (verified).
             if (oldAlias != null && oldAlias != stagedAlias) {
                 try {
                     vault().deleteKey(oldAlias)
                 } catch (e: CancellationException) {
                     // Commit already won: swallow to report success and never
                     // fall through to anything that deletes the new live key.
+                    // The old alias may leak at rest (no vault list API for GC).
                 } catch (_: Exception) {
                     // Best-effort: the save below stays authoritative.
                 }
             }
             _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
         } catch (e: CancellationException) {
-            if (stagedWritten && !committed) {
-                // Pre-commit cancellation: clean our own staged alias, but only
-                // when it is NOT the committed live key. The CAS may have
-                // committed and then thrown, so verify against strict metadata
-                // first; unknown store state fails closed to no-touch (at-rest
-                // leak, never loss). A winner's staged live key can never equal
-                // our per-operation restart-unique alias, so `false` (absent or
-                // pointing elsewhere) authorizes the delete.
-                val livePointsAtStaged = try {
+            if (!metadataCommitted) {
+                // Uncommitted or ambiguous (put-after / V2 / fence / CAS-threw-
+                // Cancel): the CAS may have committed and then thrown (including
+                // TimeoutCancellation), so verify against strict metadata FIRST
+                // in bounded NonCancellable context; unknown store state fails
+                // closed to no-touch (at-rest leak, never loss). Bounded: one
+                // strict read + at most one delete, no retry; read failure
+                // stops cleanup. A winner's staged live key can never equal our
+                // per-operation restart-unique alias, so `false` (absent or
+                // pointing elsewhere) authorizes deleting ONLY our own staged
+                // alias — live is never touched. `true` means the commit won
+                // despite the cancel: own staged is now live, must NOT delete;
+                // treat as success (swallow, report saved=true READY).
+                val livePointsAtStaged: Boolean? = try {
                     withContext(NonCancellable) { store.snapshotStrict()?.apiKeyRef == stagedRef }
+                } catch (_: CancellationException) {
+                    null
                 } catch (_: Exception) {
                     null
                 }
-                if (livePointsAtStaged == false) {
+                if (livePointsAtStaged == true) {
+                    _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                    return
+                }
+                if (livePointsAtStaged == false && vaultDirty) {
                     try {
                         withContext(NonCancellable) { vault().deleteKey(stagedAlias) }
                     } catch (_: Exception) {
                     }
                 }
+                // Confirmed-uncommitted (staged cleaned) or unknown (no-touch
+                // leak): unstick saving, never POLICY_DENIED-mask the cancel.
+                _form.value = _form.value.copy(saving = false)
+            } else {
+                // Committed (CAS true, then retire/success-mark cancelled):
+                // staged is live — NEVER delete. Re-confirm the commit is still
+                // in place (defensive: logout could have raced); only then
+                // swallow and report success. Read failure -> no-touch leak,
+                // unstick saving, rethrow (never rollback the new live key).
+                val stillCommitted: Boolean? = try {
+                    withContext(NonCancellable) { store.snapshotStrict()?.apiKeyRef == stagedRef }
+                } catch (_: CancellationException) {
+                    null
+                } catch (_: Exception) {
+                    null
+                }
+                if (stillCommitted == true) {
+                    _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                    return
+                }
+                _form.value = _form.value.copy(saving = false)
             }
             throw e
         }

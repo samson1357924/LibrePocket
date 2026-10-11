@@ -14,6 +14,7 @@ import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.session.SessionStore
+import dev.librepocket.session.TranscriptEvent
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -41,13 +42,19 @@ private val EMPTY_SESSION_STATE = ChatUiState(
 
 private const val HISTORY_PAGE = 200
 private const val HISTORY_CAP = 2000
+// Upper bound on raw events scanned by loadHistory. importJsonl can write a
+// session that bypasses the prune cap (bulk import preserves file seqs; prune
+// only trims on its own schedule), so an unbounded page-through could do
+// unbounded I/O and hold unbounded memory on open. Stop at the bound and
+// build messages from what was scanned.
+private const val HISTORY_SCAN_CAP = HISTORY_CAP * 4
 
 /**
  * Chat UI state holder wired to the real [ChatSession] plus the transcript store.
  *
  * Exposes replayed history ([messages] = stored history + live session messages),
  * the current transcript session id, and send/cancel/retry/new/open operations.
- * History kinds other than user/assistant (tool/steer/retry/system) are kept in
+ * History kinds other than user/assistant (tool/steer/retry/system/reasoning) are kept in
  * the store/export but hidden from the chat replay.
  */
 class ChatViewModel(
@@ -1503,18 +1510,48 @@ class ChatViewModel(
     private suspend fun loadHistory(sessionId: String): List<UiMessage>? {
         val backing: SessionStore = sessions.storeOrNull() ?: return emptyList()
         if (backing.getSession(sessionId) == null) return null
-        val out = ArrayList<UiMessage>()
+        // Phase 1: page through every event first. Reasoning markers
+        // (kind="reasoning", same runId, empty text) may land on a different
+        // page than their assistant event, so the marker runId set must be
+        // complete before any UiMessage is built.
+        val all = ArrayList<TranscriptEvent>()
         var afterSeq = 0L
-        while (out.size < HISTORY_CAP) {
+        while (all.size < HISTORY_SCAN_CAP) {
             val page = backing.loadEvents(sessionId, afterSeq, HISTORY_PAGE)
             if (page.isEmpty()) break
-            for (event in page) {
-                if (event.kind == "user" || event.kind == "assistant") {
-                    out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = false))
-                }
-                afterSeq = event.seq
+            // Respect the scan bound even when a page would overshoot it.
+            val room = HISTORY_SCAN_CAP - all.size
+            if (page.size > room) {
+                all.addAll(page.take(room))
+                break
             }
+            all.addAll(page)
+            afterSeq = page.last().seq
             if (page.size < HISTORY_PAGE) break
+        }
+        // Phase 2: rebuild messages. Marker events never render; an assistant
+        // event whose runId has a marker restores hasReasoning so resumed
+        // reasoning-origin turns still fail closed on follow-up. The cap
+        // still counts user/assistant messages only.
+        val reasoningRuns = all.asSequence()
+            .filter { it.kind == "reasoning" }
+            .map { it.runId }
+            .toSet()
+        val out = ArrayList<UiMessage>()
+        for (event in all) {
+            if (out.size >= HISTORY_CAP) break
+            when (event.kind) {
+                "user" -> out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = false))
+                "assistant" -> out.add(
+                    UiMessage(
+                        id = "hist-${event.seq}",
+                        role = event.kind,
+                        text = event.text,
+                        isPartial = false,
+                        hasReasoning = event.runId in reasoningRuns,
+                    ),
+                )
+            }
         }
         return out
     }

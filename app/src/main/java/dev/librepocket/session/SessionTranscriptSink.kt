@@ -12,6 +12,13 @@ import java.util.UUID
  * `retry` event, steer queued -> `steer` event, tool done -> `tool` event,
  * usage -> `system` event (accounting, P1 records only).
  *
+ * A reasoning-sourced turn (`hasReasoning == true`) appends one extra
+ * `reasoning` event with the same runId and empty text right after its
+ * `assistant` event: a payload-free marker (no reasoning content ever
+ * touches the store) that lets history replay restore
+ * [dev.librepocket.chat.UiMessage.hasReasoning] so resumed reasoning-origin
+ * turns still fail closed on follow-up instead of replaying as plain text.
+ *
  * The controller already calls these fire-and-forget with its own try/catch;
  * failures here must still never propagate, so every call guards its store
  * access as well. Text is redacted again by [RoomSessionStore] on write.
@@ -42,8 +49,9 @@ class SessionTranscriptSink(
         append(runId, "user", text)
     }
 
-    override suspend fun onTurnSucceeded(runId: String, text: String) {
+    override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
         append(runId, "assistant", text)
+        if (hasReasoning) append(runId, "reasoning", "")
     }
 
     override suspend fun onTurnFailed(runId: String, error: String) {
@@ -54,8 +62,9 @@ class SessionTranscriptSink(
         append(runId, "retry", "attempt $attempt/$maxAttempts after ${delayMs}ms")
     }
 
-    override suspend fun onTurnCancelled(runId: String, partialText: String) {
+    override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
         append(runId, "assistant", partialText)
+        if (hasReasoning) append(runId, "reasoning", "")
     }
 
     override suspend fun onSteerQueued(text: String) {

@@ -103,6 +103,9 @@ private class RecordingSink : TranscriptSink {
   data class Retried(val runId: String, val attempt: Int, val maxAttempts: Int, val delayMs: Long)
   val retried: MutableList<Retried> = Collections.synchronizedList(mutableListOf())
   val cancelled: MutableList<Pair<String, String>> = Collections.synchronizedList(mutableListOf())
+  /** Reasoning-source flags alongside [succeeded]/[cancelled] (same order). */
+  val succeededReasoning: MutableList<Boolean> = Collections.synchronizedList(mutableListOf())
+  val cancelledReasoning: MutableList<Boolean> = Collections.synchronizedList(mutableListOf())
   val steerQueued: MutableList<String> = Collections.synchronizedList(mutableListOf())
   data class Tool(val runId: String, val toolIndex: Int, val id: String, val name: String, val args: String)
   val tools: MutableList<Tool> = Collections.synchronizedList(mutableListOf())
@@ -110,12 +113,18 @@ private class RecordingSink : TranscriptSink {
   val usages: MutableList<Usage> = Collections.synchronizedList(mutableListOf())
 
   override suspend fun onTurnStarted(runId: String, text: String) { started.add(runId to text) }
-  override suspend fun onTurnSucceeded(runId: String, text: String) { succeeded.add(runId to text) }
+  override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
+    succeeded.add(runId to text)
+    succeededReasoning.add(hasReasoning)
+  }
   override suspend fun onTurnFailed(runId: String, error: String) { failed.add(runId to error) }
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
     retried.add(Retried(runId, attempt, maxAttempts, delayMs))
   }
-  override suspend fun onTurnCancelled(runId: String, partialText: String) { cancelled.add(runId to partialText) }
+  override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
+    cancelled.add(runId to partialText)
+    cancelledReasoning.add(hasReasoning)
+  }
   override suspend fun onSteerQueued(text: String) { steerQueued.add(text) }
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) {
     tools.add(Tool(runId, toolIndex, id, name, argumentsJson))
@@ -1086,6 +1095,60 @@ class TurnControllerTest {
     assertEquals(1, transportCalls.get())
     assertEquals(ChatStatus.ERROR, c.uiState.value.status)
     assertTrue(c.uiState.value.error!!.contains("THINKING_ROUND_TRIP_NOT_SUPPORTED"))
+  }
+
+  // ---- Finding A follow-up: the reasoning flag must reach the transcript ----
+
+  @Test fun reasoningTurnReportsHasReasoningToTranscript() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "answer-"))
+        emit(StreamEvent.ReasoningDelta(0, 1, "thought"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking { c.send("hi") }
+    awaitTrue { sink.succeeded.isNotEmpty() }
+    assertEquals(listOf(true), sink.succeededReasoning.toList())
+  }
+
+  @Test fun plainTurnReportsNoReasoningToTranscript() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "plain"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking { c.send("hi") }
+    awaitTrue { sink.succeeded.isNotEmpty() }
+    assertEquals(listOf(false), sink.succeededReasoning.toList())
+  }
+
+  @Test fun cancelledReasoningTurnReportsHasReasoningToTranscript() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ReasoningPresent)
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        awaitCancellation()
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val job = outer.async { c.send("hi") }
+      awaitTrue { assistantsOf(c).any { it.text == "partial" } }
+      c.cancel()
+      runBlocking { withTimeout(5000) { job.join() } }
+      awaitTrue { sink.cancelled.isNotEmpty() }
+      assertEquals(listOf(true), sink.cancelledReasoning.toList())
+    } finally {
+      outer.cancel()
+    }
   }
 
   @Test fun toolDeltasAndDoneAreRecorded() {

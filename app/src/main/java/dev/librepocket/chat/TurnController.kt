@@ -88,6 +88,9 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  * [StreamEvent.ReasoningPresent]) flagging it reasoning-sourced
  * ([UiMessage.hasReasoning], rebuilt into [ChatMessage.hasReasoning] so
  * follow-ups fail closed),
+ * and persisted as a payload-free `reasoning` marker event via
+ * [TranscriptSink.onTurnSucceeded]/[TranscriptSink.onTurnCancelled] so
+ * resume restores the flag,
  * [StreamEvent.ToolDelta]/[StreamEvent.ToolDone] are aggregated and recorded
  * (marker text + [TranscriptSink.onToolDone]) so tool calls are never dropped,
  * [StreamEvent.Usage] is recorded ([TranscriptSink.onUsage] + [lastUsage]).
@@ -593,7 +596,8 @@ class TurnController(
       // which may have moved on by the time the launched block runs.
       val cancelId = latestAssistantId()
       val cancelText = latestAssistantText()
-      fireTranscript { transcript.onTurnCancelled(cancelId, cancelText) }
+      val cancelReasoning = latestAssistantReasoning()
+      fireTranscript { transcript.onTurnCancelled(cancelId, cancelText, cancelReasoning) }
       throw e
     }
     // Normal completion only: hand off at most one queued steer as a detached
@@ -822,7 +826,8 @@ class TurnController(
       if (failure == null) {
         // Snapshot text: assistantTextOf reads uiState at execution time.
         val successText = assistantTextOf(attemptRunId)
-        fireTranscript { transcript.onTurnSucceeded(attemptRunId, successText) }
+        val successReasoning = assistantReasoningOf(attemptRunId)
+        fireTranscript { transcript.onTurnSucceeded(attemptRunId, successText, successReasoning) }
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
@@ -983,11 +988,19 @@ class TurnController(
   private fun assistantTextOf(runId: String): String =
     _uiState.value.messages.firstOrNull { it.id == runId }?.text.orEmpty()
 
+  /** Reasoning-source flag of one attempt's block (false when absent). */
+  private fun assistantReasoningOf(runId: String): Boolean =
+    _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.hasReasoning == true
+
   private fun latestAssistantId(): String =
     _uiState.value.messages.lastOrNull { it.role == "assistant" }?.id.orEmpty()
 
   private fun latestAssistantText(): String =
     _uiState.value.messages.lastOrNull { it.role == "assistant" }?.text.orEmpty()
+
+  /** Reasoning-source flag of the latest assistant block (false when absent). */
+  private fun latestAssistantReasoning(): Boolean =
+    _uiState.value.messages.lastOrNull { it.role == "assistant" }?.hasReasoning == true
 }
 
 /**

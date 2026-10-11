@@ -366,6 +366,166 @@ class ChatWiringTest {
     }
 
     @Test
+    fun openSessionRestoresReasoningMarker() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        runBlocking {
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "assistant", text = "a1", createdAt = 2L,
+                ),
+            )
+            // Payload-free resume marker for the reasoning-sourced turn.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "reasoning", text = "", createdAt = 3L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r2", kind = "user", text = "q2", createdAt = 4L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r2", kind = "assistant", text = "a2", createdAt = 5L,
+                ),
+            )
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 4 }
+        val replayed = vm.messages.value
+        // The marker restores the flag but never renders as a message.
+        assertEquals(listOf("q1", "a1", "q2", "a2"), replayed.map { it.text })
+        assertFalse(replayed[0].hasReasoning)
+        assertTrue(replayed[1].hasReasoning)
+        assertFalse(replayed[2].hasReasoning)
+        assertFalse(replayed[3].hasReasoning)
+    }
+
+    @Test
+    fun openSessionRestoresReasoningMarkerAcrossPages() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        runBlocking {
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "assistant", text = "a1", createdAt = 2L,
+                ),
+            )
+            // Push the marker onto a later page than its assistant event.
+            repeat(200) { i ->
+                transcripts.appendEvent(
+                    dev.librepocket.session.TranscriptEvent(
+                        sessionId = sid, runId = "fill-$i", kind = "system", text = "usage", createdAt = 3L,
+                    ),
+                )
+            }
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "reasoning", text = "", createdAt = 4L,
+                ),
+            )
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 2 }
+        assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
+        assertTrue(vm.messages.value[1].hasReasoning)
+    }
+
+    @Test
+    fun openSessionLegacyTranscriptWithoutMarkerRestoresFalse() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        runBlocking {
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+                ),
+            )
+            // Legacy row: written before the reasoning marker existed, so no
+            // marker follows even if the original turn was reasoning-sourced.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "assistant", text = "a1", createdAt = 2L,
+                ),
+            )
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 2 }
+        assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
+        assertFalse(vm.messages.value[0].hasReasoning)
+        assertFalse(vm.messages.value[1].hasReasoning)
+    }
+
+    @Test
     fun steerWhenIdleSends() {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }

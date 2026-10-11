@@ -23,6 +23,20 @@ data class UiMessage(
    * collecting it). Rebuilt into [dev.librepocket.provider.ChatMessage.hasReasoning]
    * so follow-up requests fail closed instead of replaying a reasoning
    * origin as plain text. Display text is unchanged (merged block).
+   *
+   * In memory during the live turn; persisted as a payload-free `reasoning`
+   * marker event (same runId, empty text — no reasoning content stored) by
+   * [dev.librepocket.session.SessionTranscriptSink], and restored on resume
+   * when history replay finds the marker. Defaults to false; only assistant
+   * blocks observed with reasoning events ever set it.
+   *
+   * Known limitation: transcripts written before the marker existed carry no
+   * marker, so resuming them restores hasReasoning=false even if the original
+   * turn was reasoning-sourced; only sessions written since this marker
+   * landed persist the flag. On this branch that is defense-in-depth only:
+   * resumed history is display state, never fed back into the provider
+   * request, so a missing flag cannot smuggle a reasoning origin into a
+   * follow-up as plain text.
    */
   val hasReasoning: Boolean = false,
 )

@@ -804,6 +804,101 @@ export function isStickyLedgerUnreadableError(error: unknown): boolean {
   return error instanceof Error && error.message.includes('sticky ledger unreadable during publish');
 }
 
+// Hosted claim-slot diagnostics (sanitized, never serializes the error).
+// publishStickyComment tags the failing write op plus the Octokit HTTP status
+// on the generic throw; classifyStickyWriteError recovers only those two
+// fields so callers can emit a fail-closed reason without leaking tokens,
+// headers, response bodies, or diffs. Only HTTP status, method/path resource
+// type (as op), PR number, SHA prefix, and run/attempt are ever recorded.
+export type StickyWriteOp = 'list' | 'create' | 'update' | 'auth';
+export interface StickyWriteErrorInfo {
+  op: StickyWriteOp;
+  status?: number;
+}
+
+function readOctokitStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const record = error as Record<string, unknown>;
+  const direct = record['status'];
+  if (typeof direct === 'number' && Number.isSafeInteger(direct) && direct >= 100 && direct <= 599) {
+    return direct;
+  }
+  const response = record['response'];
+  if (response && typeof response === 'object' && !Array.isArray(response)) {
+    const nested = (response as Record<string, unknown>)['status'];
+    if (typeof nested === 'number' && Number.isSafeInteger(nested) && nested >= 100 && nested <= 599) {
+      return nested;
+    }
+  }
+  return undefined;
+}
+
+export function classifyStickyWriteError(error: unknown): StickyWriteErrorInfo {
+  let op: StickyWriteOp | undefined;
+  let status: number | undefined;
+  if (error && typeof error === 'object' && !Array.isArray(error)) {
+    const record = error as Record<string, unknown>;
+    const rawOp = record['stickyOp'];
+    if (rawOp === 'list' || rawOp === 'create' || rawOp === 'update' || rawOp === 'auth') {
+      op = rawOp;
+    }
+    const rawStatus = record['stickyStatus'];
+    if (typeof rawStatus === 'number' && Number.isSafeInteger(rawStatus) && rawStatus >= 100 && rawStatus <= 599) {
+      status = rawStatus;
+    }
+    if (status === undefined) status = readOctokitStatus(error);
+    if (op === undefined) {
+      const cause = record['cause'];
+      if (cause && typeof cause === 'object' && !Array.isArray(cause)) {
+        const causeRecord = cause as Record<string, unknown>;
+        const causeOp = causeRecord['stickyOp'];
+        if (causeOp === 'list' || causeOp === 'create' || causeOp === 'update' || causeOp === 'auth') {
+          op = causeOp;
+        }
+        // Our own tag on the wrapped cause is read back with the same bounds
+        // as the top-level tag (an untagged cause still falls back to its
+        // Octokit status only).
+        const causeStatus = causeRecord['stickyStatus'];
+        if (
+          status === undefined &&
+          typeof causeStatus === 'number' &&
+          Number.isSafeInteger(causeStatus) &&
+          causeStatus >= 100 &&
+          causeStatus <= 599
+        ) {
+          status = causeStatus;
+        }
+        if (status === undefined) status = readOctokitStatus(cause);
+      }
+    }
+  } else {
+    status = readOctokitStatus(error);
+  }
+  if (op === undefined) op = 'update';
+  return status === undefined ? { op } : { op, status };
+}
+
+// Sanitized one-line error summary for stderr: message only (never headers,
+// response bodies, or diffs), token shapes redacted first, then sliced.
+export function sanitizeErrorSummary(error: unknown, maxLength = 200): string {
+  let raw: string;
+  if (error instanceof Error) raw = error.message;
+  else if (typeof error === 'string') raw = error;
+  else {
+    try {
+      raw = String(error);
+    } catch {
+      raw = 'unknown error';
+    }
+  }
+  let redacted = raw.replace(/gh[pousr]_[A-Za-z0-9_]+/g, '[redacted-token]');
+  redacted = redacted.replace(/Bearer\s+[^\s]+/gi, 'Bearer [redacted-token]');
+  redacted = redacted.replace(/[\r\n]+/g, ' ');
+  const limit = Number.isSafeInteger(Math.floor(maxLength)) && maxLength > 0 ? Math.floor(maxLength) : 200;
+  if (redacted.length > limit) redacted = redacted.slice(0, limit);
+  return redacted;
+}
+
 // True when the body carries sticky metadata that must never be truncated:
 // the review marker, count/claim ledger markers, or the ledger footer below.
 export function hasStickyMetadata(body: unknown): boolean {
@@ -1503,13 +1598,17 @@ const CLAIM_PLACEHOLDER_BODY = `${REVIEW_MARKER}\n\n## PocketGuard 審查\n\n**�
 export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimResult> {
   const env = context.env ?? process.env;
   const emit = (result: ClaimResult): ClaimResult => {
-    appendWorkflowOutputs(env, {
-      claimed: String(result.claimed),
-      ...(result.claimSha ? { claim_sha: result.claimSha } : {}),
-      reviews_used: String(result.reviewsUsed),
-      ...(result.issueNumber ? { issue_number: String(result.issueNumber) } : {}),
-      claim_reason: result.reason,
-    });
+    try {
+      appendWorkflowOutputs(env, {
+        claimed: String(result.claimed),
+        ...(result.claimSha ? { claim_sha: result.claimSha } : {}),
+        reviews_used: String(result.reviewsUsed),
+        ...(result.issueNumber ? { issue_number: String(result.issueNumber) } : {}),
+        claim_reason: result.reason,
+      });
+    } catch {
+      // Degraded: an unwritable GITHUB_OUTPUT must never block stdout JSON.
+    }
     stdout(context, `${JSON.stringify(result)}\n`);
     return result;
   };
@@ -1524,7 +1623,12 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
   if (!repository) {
     return emit({ claimed: false, reviewsUsed: 0, reason: 'quota-unknown: repository identity unavailable' });
   }
-  const target = await inspectTarget(context);
+  let target: Awaited<ReturnType<typeof inspectTarget>>;
+  try {
+    target = await inspectTarget(context);
+  } catch {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'unstarted: target inspection failed' });
+  }
   if (!target.issueNumber) {
     return emit({ claimed: false, reviewsUsed: 0, reason: 'unstarted: no issue number' });
   }
@@ -1696,7 +1800,7 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
     await publishStickyComment(client, repository, issueNumber, initialBody, buildFreshBody);
   } catch (error) {
     // Over-limit or mid-claim unreadable ledger: explicit failure with zero
-    // consumption (nothing was written). Genuine write failures still throw.
+    // consumption (nothing was written).
     if (isStickyLimitError(error) || isStickyLedgerUnreadableError(error)) {
       return emit({
         claimed: false,
@@ -1705,7 +1809,18 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
         issueNumber,
       });
     }
-    throw new Error('PocketGuard: failed to claim review slot.');
+    // Sanitized sticky-write diagnostics: resolve (never throw) with a
+    // fail-closed reason that carries only http-<status>-<op>. No tokens,
+    // headers, response bodies, or diffs are recorded.
+    const info = classifyStickyWriteError(error);
+    const label = info.status !== undefined ? `http-${info.status}-${info.op}` : `http-unknown-${info.op}`;
+    return emit({
+      claimed: false,
+      reviewsUsed: existing,
+      reason: `claim-failed: sticky write failed (${label}); fail-closed`,
+      issueNumber,
+      claimSha,
+    });
   }
   // Phase 1: the claim counts only when a re-read proves the marker survived
   // the write (no truncation, no lost race). Otherwise fail closed.
@@ -4821,9 +4936,11 @@ async function publishStickyComment(
     // The marker plus GitHub's bot author metadata provides a safe fallback.
   }
 
+  let currentOp: StickyWriteOp = 'list';
   try {
     let existing: GithubComment | undefined;
     for (let page = 1; ; page += 1) {
+      currentOp = 'list';
       const comments = await client.rest.issues.listComments({
         owner: repository.owner,
         repo: repository.repo,
@@ -4852,6 +4969,7 @@ async function publishStickyComment(
     }
     const currentBody = enforceGithubCommentLimit(resolvedBody);
     if (existing) {
+      currentOp = 'update';
       await client.rest.issues.updateComment({
         owner: repository.owner,
         repo: repository.repo,
@@ -4859,6 +4977,7 @@ async function publishStickyComment(
         body: currentBody,
       });
     } else {
+      currentOp = 'create';
       await client.rest.issues.createComment({
         owner: repository.owner,
         repo: repository.repo,
@@ -4868,10 +4987,20 @@ async function publishStickyComment(
     }
   } catch (error) {
     // Distinct fail-closed signals propagate so callers can keep the old
-    // ledger with zero writes; anything else stays a generic publish failure.
+    // ledger with zero writes; anything else stays a generic publish failure
+    // tagged with the sanitized op/status (no tokens, headers, bodies, diffs).
     // Do not leak API details, and do not let labels advertise an unpublished result.
     if (isStickyLimitError(error) || isStickyLedgerUnreadableError(error)) throw error;
-    throw new Error('PocketGuard: failed to publish review comment.');
+    let op: StickyWriteOp = currentOp;
+    if (error && typeof error === 'object' && !Array.isArray(error)) {
+      const rawOp = (error as Record<string, unknown>)['stickyOp'];
+      if (rawOp === 'list' || rawOp === 'create' || rawOp === 'update' || rawOp === 'auth') op = rawOp;
+    }
+    const status = readOctokitStatus(error);
+    const wrapped = new Error('PocketGuard: failed to publish review comment.');
+    (wrapped as unknown as Record<string, unknown>)['stickyOp'] = op;
+    if (status !== undefined) (wrapped as unknown as Record<string, unknown>)['stickyStatus'] = status;
+    throw wrapped;
   }
 }
 
@@ -5602,8 +5731,12 @@ async function main(): Promise<void> {
     if (mode === 'review') await runReviewEntryMode();
     if (mode === 'claim') await runClaimMode();
     if (mode === 'publish') await runPublishMode();
-  } catch {
-    process.stderr.write('PocketGuard: operation failed.\n');
+  } catch (error) {
+    // Sanitized summary only: message sliced to 200 chars after redacting
+    // token shapes (gh[pousr]_* and Bearer). Never serializes the error, and
+    // never logs headers, response bodies, or diffs. Still exits 1.
+    const summary = sanitizeErrorSummary(error, 200);
+    process.stderr.write(`PocketGuard: operation failed. ${summary}\n`);
     process.exitCode = 1;
   }
 }

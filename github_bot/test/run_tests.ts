@@ -9,6 +9,7 @@ import { runStage4P2Tests } from './stage4_p2.test';
 import { runPhase2HTests } from './phase2_h.test';
 import { runPrChunksTests } from './pr_chunks.test';
 import { runPrPhase3Tests } from './pr_phase3.test';
+import { runClaimDiagnosticsTests } from './claim_diagnostics.test';
 
 runLabelManagerTests()
   .then(() => runScannerSendOpenAITests())
@@ -23,6 +24,7 @@ runLabelManagerTests()
   .then(() => runPhase2HTests())
   .then(() => runPrChunksTests())
   .then(() => runPrPhase3Tests())
+  .then(() => runClaimDiagnosticsTests())
   .catch((error: unknown) => {
     console.error(error);
     process.exitCode = 1;

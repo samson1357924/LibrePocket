@@ -699,6 +699,72 @@ export async function runPrReviewTests(): Promise<void> {
       }
     }
 
+    // E2E (I1): a synthesis BLOCK quoting another hunk of the same file
+    // cannot tighten — the review converges to INCONCLUSIVE, never a
+    // misattributed NEEDS_CHANGES.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-crosshunk-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const fooName = 'app/src/main/java/demo/Foo.kt';
+        const fooDiff = [
+          `diff --git a/${fooName} b/${fooName}`,
+          `--- a/${fooName}`,
+          `+++ b/${fooName}`,
+          '@@ -10,2 +10,2 @@',
+          ' ctx10',
+          '+fun harmless() {}',
+          '@@ -100,2 +100,2 @@',
+          ' ctx100',
+          '+fun dangerousAction() {}',
+        ].join('\n');
+        const files = {
+          'app/src/main/AndroidManifest.xml': reviewFiles()['app/src/main/AndroidManifest.xml'],
+          [fooName]: fooDiff,
+        };
+        const rolePayload = {
+          verdict: 'APPROVE',
+          summary: 'fine',
+          findings: [{ severity: 'WARN', file: fooName, line: 10, issue: 'anchor check' }],
+          suggestedLabels: [],
+        };
+        const synthPayload = {
+          verdict: 'NEEDS_CHANGES',
+          summary: 'blocking',
+          findings: [{ severity: 'BLOCK', file: fooName, line: 10, issue: 'wrong hunk', evidence: 'fun dangerousAction() {}' }],
+        };
+        const previousFetch = globalThis.fetch;
+        globalThis.fetch = (async () => {
+          counter.count += 1;
+          const payload = counter.count <= 3 ? rolePayload : synthPayload;
+          return new Response(JSON.stringify({
+            output: [{ content: [{ type: 'output_text', text: JSON.stringify(payload) }] }],
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as typeof fetch;
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: {
+              ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+              POCKETGUARD_OUTPUT: artifactPath,
+            } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(files),
+          });
+        } finally {
+          globalThis.fetch = previousFetch;
+        }
+        assert.equal(counter.count, 4, 'both waves ran');
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'I1 cross-hunk evidence never tightens');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
     // E2E (F3): a budget too small for even one wave fails closed before any
     // model call (zero AI, INCONCLUSIVE).
     {

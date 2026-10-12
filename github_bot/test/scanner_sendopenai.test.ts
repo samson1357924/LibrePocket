@@ -1766,15 +1766,18 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           '+other file content here',
         ].join('\n')],
       ]);
-      const h2Scope = (violations: Array<{ ruleId: string; message: string; file?: string; line?: number }> = []) => ({
+      const h2Scope = (
+        violations: Array<{ ruleId: string; message: string; file?: string; line?: number }> = [],
+        shownByFile: Map<string, string> = new Map([['a.kt', ' context\n+quoted code here']]),
+      ) => ({
         fileDiffs: h2Diffs,
         allowedFiles: new Set(h2Diffs.keys()),
         violations,
+        shownByFile,
       });
       const usable = selectUsableBlockFindings(
         good?.findings ?? [],
         good?.evidences ?? [],
-        'diff with quoted code here inside',
         h2Scope(),
       );
       assert.equal(usable.length, 1, 'literally supported BLOCK is usable');
@@ -1782,7 +1785,6 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         selectUsableBlockFindings(
           good?.findings ?? [],
           ['missing quote'],
-          'unrelated diff',
           h2Scope(),
         ),
         [],
@@ -1919,7 +1921,6 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         selectUsableBlockFindings(
           good?.findings ?? [],
           ['short'],
-          'diff containing short inside',
           h2Scope(),
         ),
         [],
@@ -1929,7 +1930,6 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         selectUsableBlockFindings(
           [{ severity: 'WARN', issue: 'w' }],
           ['warn evidence in diff'],
-          'diff with warn evidence in diff inside',
           h2Scope(),
         ),
         [],
@@ -1937,7 +1937,6 @@ export async function runScannerSendOpenAITests(): Promise<void> {
       );
       // H2: evidence must bind to the finding's own file/line.
       {
-        const excerpt = 'diff with quoted code here inside\nother file content here';
         const blockInA = (file?: string, line?: number) => [{
           severity: 'BLOCK' as const,
           ...(file === undefined ? {} : { file }),
@@ -1950,25 +1949,24 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           selectUsableBlockFindings(
             blockInA('a.kt', 1),
             ['other file content here'],
-            excerpt,
-            h2Scope(),
+            h2Scope([], new Map([['a.kt', ' context\n+quoted code here']])),
           ),
           [],
           'H2 cross-file quote never tightens',
         );
         // Missing file, unknown file, out-of-range line.
         assert.deepEqual(
-          selectUsableBlockFindings(blockInA(undefined), ['quoted code here'], excerpt, h2Scope()),
+          selectUsableBlockFindings(blockInA(undefined), ['quoted code here'], h2Scope()),
           [],
           'H2 missing file never tightens',
         );
         assert.deepEqual(
-          selectUsableBlockFindings(blockInA('Nope.kt', 1), ['quoted code here'], excerpt, h2Scope()),
+          selectUsableBlockFindings(blockInA('Nope.kt', 1), ['quoted code here'], h2Scope()),
           [],
           'H2 unknown file never tightens',
         );
         assert.deepEqual(
-          selectUsableBlockFindings(blockInA('a.kt', 99), ['quoted code here'], excerpt, h2Scope()),
+          selectUsableBlockFindings(blockInA('a.kt', 99), ['quoted code here'], h2Scope()),
           [],
           'H2 out-of-range line never tightens',
         );
@@ -1978,15 +1976,14 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           selectUsableBlockFindings(
             blockInA('a.kt', 1),
             ['quoted code here'],
-            excerpt,
-            { fileDiffs: dupDiffs, allowedFiles: new Set(dupDiffs.keys()), violations: [] },
+            { fileDiffs: dupDiffs, allowedFiles: new Set(dupDiffs.keys()), violations: [], shownByFile: new Map([['x/a.kt', '+quoted code here']]) },
           ),
           [],
           'H2 ambiguous file never tightens',
         );
         // Lineless file-level binding still works.
         assert.equal(
-          selectUsableBlockFindings(blockInA('a.kt'), ['quoted code here'], excerpt, h2Scope()).length,
+          selectUsableBlockFindings(blockInA('a.kt'), ['quoted code here'], h2Scope()).length,
           1,
           'H2 lineless same-file quote tightens',
         );
@@ -1995,8 +1992,10 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           selectUsableBlockFindings(
             blockInA('a.kt', 1),
             ['violation quote here'],
-            'excerpt without the quote',
-            h2Scope([{ ruleId: 'SEC-1', message: 'violation quote here', file: 'a.kt', line: 1 }]),
+            h2Scope(
+              [{ ruleId: 'SEC-1', message: 'violation quote here', file: 'a.kt', line: 1 }],
+              new Map([['a.kt', 'unrelated shown text here']]),
+            ),
           ).length,
           1,
           'H2 same-file violation quote tightens',
@@ -2006,12 +2005,126 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           selectUsableBlockFindings(
             blockInA('a.kt', 1),
             ['violation quote here'],
-            'excerpt without the quote',
-            h2Scope([{ ruleId: 'SEC-1', message: 'violation quote here', file: 'b.kt' }]),
+            h2Scope(
+              [{ ruleId: 'SEC-1', message: 'violation quote here', file: 'b.kt' }],
+              new Map([['a.kt', 'unrelated shown text here']]),
+            ),
           ),
           [],
           'H2 cross-file violation never tightens',
         );
+        // I1: same-file cross-hunk quote never tightens for another hunk's line.
+        const twoHunk = new Map([['c.kt', [
+          'diff --git a/c.kt b/c.kt',
+          '--- a/c.kt',
+          '+++ b/c.kt',
+          '@@ -10,2 +10,2 @@',
+          ' ctx10',
+          '+harmless line here',
+          '@@ -100,2 +100,2 @@',
+          ' ctx100',
+          '+dangerousAction line here',
+        ].join('\n')]]);
+        const twoScope = (shown: string) => ({
+          fileDiffs: twoHunk,
+          allowedFiles: new Set(twoHunk.keys()),
+          violations: [],
+          shownByFile: new Map([['c.kt', shown]]),
+        });
+        const blockInC = (line?: number) => [{
+          severity: 'BLOCK' as const,
+          file: 'c.kt',
+          ...(line === undefined ? {} : { line }),
+          issue: 'i',
+        }];
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            blockInC(10),
+            ['dangerousAction line here'],
+            twoScope(' ctx10\n+harmless line here\n ctx100\n+dangerousAction line here'),
+          ),
+          [],
+          'I1 cross-hunk quote never tightens another hunk line',
+        );
+        assert.equal(
+          selectUsableBlockFindings(
+            blockInC(100),
+            ['dangerousAction line here'],
+            twoScope(' ctx10\n+harmless line here\n ctx100\n+dangerousAction line here'),
+          ).length,
+          1,
+          'I1 same-hunk quote tightens its own line',
+        );
+        // I1: duplicate quote shown only under another file never tightens.
+        const dupShown = new Map([
+          ['a.kt', ' context\n+quoted code here'],
+          ['b.kt', '+DUPLICATE-QUOTE here'],
+        ]);
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            [{ severity: 'BLOCK' as const, file: 'a.kt', line: 1, issue: 'i' }],
+            ['DUPLICATE-QUOTE here'],
+            { fileDiffs: h2Diffs, allowedFiles: new Set(h2Diffs.keys()), violations: [], shownByFile: dupShown },
+          ),
+          [],
+          'I1 duplicate quote shown only elsewhere never tightens',
+        );
+        // I1: builder attributes shown text per file (head sections plus
+        // snippet windows, header lines excluded).
+        {
+          const head2 = [
+            'diff --git a/h1.kt b/h1.kt',
+            '--- a/h1.kt',
+            '+++ b/h1.kt',
+            '@@ -1,1 +1,1 @@',
+            '+HEAD-ONE here',
+            'diff --git a/h2.kt b/h2.kt',
+            '--- a/h2.kt',
+            '+++ b/h2.kt',
+            '@@ -1,1 +1,1 @@',
+            '+HEAD-TWO here',
+          ].join('\n');
+          const map2 = new Map([
+            ['h1.kt', head2.split('diff --git a/h2.kt')[0]],
+            ['h2.kt', 'diff --git a/h2.kt b/h2.kt\n--- a/h2.kt\n+++ b/h2.kt\n@@ -1,1 +1,1 @@\n+HEAD-TWO here'],
+          ]);
+          const plan2 = buildSynthesisExcerpt({
+            diff: head2,
+            fileDiffs: map2,
+            anchors: [],
+            allowedFiles: new Set(map2.keys()),
+          });
+          const shown1 = plan2.shownByFile.get('h1.kt') ?? '';
+          const shown2 = plan2.shownByFile.get('h2.kt') ?? '';
+          assert.ok(shown1.includes('HEAD-ONE here'), 'I1 head attributes file one');
+          assert.ok(!shown1.includes('HEAD-TWO here'), 'I1 head does not leak file two');
+          assert.ok(shown2.includes('HEAD-TWO here'), 'I1 head attributes file two');
+          assert.ok(!shown2.includes('+++ b/h1.kt'), 'I1 diff headers excluded from shown');
+          // I1: unparseable (quoted-path) headers flush to unattributed —
+          // never credited to the previous file.
+          const qDiff = [
+            'diff --git a/q1.kt b/q1.kt',
+            '--- a/q1.kt',
+            '+++ b/q1.kt',
+            '@@ -1,1 +1,1 @@',
+            '+Q1-MARKER here',
+            'diff --git "a/sp ace.kt" "b/sp ace.kt"',
+            '--- "a/sp ace.kt"',
+            '+++ "b/sp ace.kt"',
+            '@@ -1,1 +1,1 @@',
+            '+QUOTED-SECRET here',
+          ].join('\n');
+          const qMap = new Map([['q1.kt', qDiff.split('diff --git "a/')[0]]]);
+          const qPlan = buildSynthesisExcerpt({
+            diff: qDiff,
+            fileDiffs: qMap,
+            anchors: [],
+            allowedFiles: new Set(qMap.keys()),
+          });
+          const qShown = qPlan.shownByFile.get('q1.kt') ?? '';
+          assert.ok(qShown.includes('Q1-MARKER here'), 'I1 quoted section keeps prior file');
+          assert.ok(!qShown.includes('QUOTED-SECRET here'), 'I1 quoted section never pollutes prior file');
+        }
       }
     }
 

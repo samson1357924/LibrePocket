@@ -477,24 +477,29 @@ export interface BlockEvidenceScope {
    * ruleId/message/file(/line) are read, so callers pass a narrow shape.
    */
   violations: Array<{ ruleId: string; message: string; file?: string; line?: number }>;
+  /**
+   * I1: per-file SHOWN text in model view (from buildSynthesisExcerpt).
+   * Diff quotes must appear in the finding file's own shown text — a quote
+   * that only appears in another file, or in an unshown tail, never counts.
+   */
+  shownByFile: ReadonlyMap<string, string>;
 }
 
 // Selects the BLOCK findings whose evidence quote is literally supported by
-// the reviewed input. H2: the quote must be attributable to the finding's
-// own file — a quote that only appears in another file is unusable even if
-// it is inside the excerpt. Diff quotes additionally require a valid line
-// (when given) and an excerpt hit (the excerpt is budgeted); same-file
-// deterministic violation quotes are fully rendered in the prompt, so they
-// suffice without an excerpt hit.
+// the reviewed input. H2/I1: the quote must be attributable to the finding's
+// own SHOWN text — a quote that only appears in another file, or only in an
+// unshown tail, is unusable. A given line must fall in an evidence-bearing
+// hunk of that file; same-file deterministic violation quotes are fully
+// rendered in the prompt, so they suffice without a shown hit.
 // Unsupported, missing, or trivial evidence is unusable: a BLOCK that cannot
 // be verified must never tighten the verdict on its own.
 export function selectUsableBlockFindings(
   findings: ReviewFinding[],
   evidences: string[],
-  diffExcerpt: string,
   scope: BlockEvidenceScope,
 ): ReviewFinding[] {
   const allowed = new Set([...scope.allowedFiles]);
+  const hunkText = (hunk: SynthesisHunk): string => hunk.bodyLines.join('\n');
   return findings.filter((finding, index) => {
     if (finding.severity !== 'BLOCK') return false;
     const evidence = (evidences[index] ?? '').trim();
@@ -507,14 +512,18 @@ export function selectUsableBlockFindings(
     const rawLine = finding.line;
     if (rawLine !== undefined && (typeof rawLine !== 'number' || !Number.isInteger(rawLine))) return false;
     const line = typeof rawLine === 'number' ? rawLine : undefined;
-    if (line !== undefined) {
-      const hunks = parseSynthesisHunks(redactedFile);
-      if (!hunks.some((hunk) => line >= hunk.newStart && line < hunk.newStart + hunk.newCount)) return false;
-    }
-    // Diff quotes must also be model-visible (the excerpt is budgeted).
-    if (redactedFile.includes(evidence) && diffExcerpt.includes(evidence)) return true;
+    // I1: candidate hunks are the ones actually bearing the quote; an
+    // evidence string spanning a hunk boundary falls back to file level
+    // (still gated on the shown hit below).
+    const hunks = parseSynthesisHunks(redactedFile);
+    const bearing = hunks.filter((hunk) => hunkText(hunk).includes(evidence));
+    const candidates = bearing.length > 0 ? bearing : hunks;
+    if (line !== undefined && !candidates.some((hunk) => line >= hunk.newStart && line < hunk.newStart + hunk.newCount)) return false;
+    // I1: the quote must sit in this file's SHOWN text, not merely somewhere
+    // in the merged excerpt or an unshown tail.
+    if ((scope.shownByFile.get(key) ?? '').includes(evidence)) return true;
     // Violation quotes are fully rendered in the prompt, so a same-file
-    // violation carrying the quote suffices without an excerpt hit.
+    // violation carrying the quote suffices without a shown hit.
     return scope.violations.some((violation) => {
       if (typeof violation.file !== 'string' || !violation.file) return false;
       if (resolveAnchorFile(scope.fileDiffs, violation.file) !== key) return false;
@@ -537,6 +546,12 @@ export interface SynthesisExcerptPlan {
   snippetCount: number;
   anchorsTotal: number;
   omittedAnchors: string[];
+  /**
+   * I1: per-file shown text in model view (re-redacted). Head sections are
+   * attributed by `diff --git` headers, snippets structurally by anchor key;
+   * diff/snippet header lines are excluded so bare paths never match.
+   */
+  shownByFile: Map<string, string>;
 }
 
 function normalizeAnchorFile(file: string): string {
@@ -617,6 +632,50 @@ export function buildSynthesisExcerpt(input: {
   const redactedFull = redactForModel(input.diff);
   const head = redactedFull.slice(0, SYNTHESIS_HEAD_EXCERPT_CHARS);
   const parts: string[] = [head];
+  // I1: per-file shown attribution. Snippets append structurally by anchor
+  // key (exact); head sections parse `diff --git` headers line-anchored
+  // (content lines like `+diff --git ...` never match). Unparseable sections
+  // (quoted/rename forms) stay unattributed: fail-closed, never credited.
+  const allowed = new Set([...input.allowedFiles]);
+  const shownParts = new Map<string, string[]>();
+  const appendShown = (key: string, lines: string[]): void => {
+    if (lines.length === 0) return;
+    const prev = shownParts.get(key);
+    // Re-redact: matches the model-view treatment of the excerpt itself.
+    const piece = redactForModel(lines.join('\n'));
+    shownParts.set(key, prev === undefined ? [piece] : [...prev, piece]);
+  };
+  {
+    let curKey: string | undefined;
+    let curLines: string[] = [];
+    let hunkSeen = false;
+    const flushHead = (): void => {
+      if (curKey !== undefined && curLines.length > 0) {
+        const prev = shownParts.get(curKey) ?? [];
+        shownParts.set(curKey, [...prev, redactForModel(curLines.join('\n'))]);
+      }
+      curLines = [];
+      hunkSeen = false;
+    };
+    for (const ln of head.split('\n')) {
+      if (ln.startsWith('diff --git ')) {
+        // Any `diff --git` line ends the previous section. Only the plain
+        // unquoted two-token form attributes; quoted/rename/truncated
+        // headers flush to unattributed (fail-closed, never credited to the
+        // previous file).
+        flushHead();
+        const header = /^diff --git (\S+) (\S+)$/.exec(ln);
+        const resolved = header ? resolveAnchorFile(input.fileDiffs, header[2]) : undefined;
+        curKey = resolved !== undefined && allowed.has(resolved) ? resolved : undefined;
+        continue;
+      }
+      if (curKey === undefined) continue;
+      if (!hunkSeen && /^(--- |\+\+\+ )/.test(ln)) continue;
+      if (ln.startsWith('@@')) hunkSeen = true;
+      curLines.push(ln);
+    }
+    flushHead();
+  }
   let budget = SYNTHESIS_DIFF_EXCERPT_CHARS - head.length;
   const seen = new Set<string>();
   const distinct = input.anchors.filter((a) => {
@@ -628,7 +687,6 @@ export function buildSynthesisExcerpt(input: {
   });
   const omitted: string[] = [];
   let snippets = 0;
-  const allowed = new Set([...input.allowedFiles]);
   const labelOf = (file: string, line: number | undefined): string => {
     // Omitted labels land in the prompt plan: keep them single-line and
     // bounded (anchors are model-controlled).
@@ -680,9 +738,12 @@ export function buildSynthesisExcerpt(input: {
       continue;
     }
     parts.push(chunk);
+    appendShown(key, windowed);
     budget -= chunk.length;
     snippets += 1;
   }
+  const shownByFile = new Map<string, string>();
+  for (const [key, pieces] of shownParts) shownByFile.set(key, pieces.join('\n'));
   return {
     excerpt: parts.join('\n'),
     fullLength: redactedFull.length,
@@ -690,6 +751,7 @@ export function buildSynthesisExcerpt(input: {
     snippetCount: snippets,
     anchorsTotal: distinct.length,
     omittedAnchors: omitted,
+    shownByFile,
   };
 }
 

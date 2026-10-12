@@ -760,6 +760,29 @@ export async function runPhase2HTests(): Promise<void> {
       ]) {
         assert.equal(isIssueCodeRefAllowed(bad), false, `F2 ${bad} rejected`);
       }
+      // G2 (review #77 new #2): per-segment sensitive words and
+      // double-extension whitewash are denied in any segment.
+      for (const bad of [
+        'secrets/config.yml', 'credentials/production.toml', '.secrets.yaml', 'config/.credentials.md',
+        'secrets/app.yml', 'app/my-secrets.yml', 'app/secret.txt', 'app/credential.toml',
+        '.ssh/config.txt', '.aws/config.txt', 'keys/tls.pem.txt', 'certs/server.key.yml',
+        'config/service_account.yml', 'npmrc.txt', '.secrets/app.yml', '.credentials/prod.toml',
+        'tests/secrets.yml', 'SECRETS/APP.YML', '.SECRETS.YAML', 'my-secrets.yml.orig.md',
+        '#secrets.yml#.txt', 'config/.credentials.md.bak.txt',
+      ]) {
+        assert.equal(isIssueCodeRefAllowed(bad), false, `G2 ${bad} rejected`);
+      }
+      // G2: separator-delimited tokens only — unrelated class names pass.
+      // (Basename-prefixed Credentials*/Secrets* stay denied by the older
+      // basename rule; fail-closed.)
+      for (const good of [
+        'app/src/main/java/demo/AuthTokenManager.kt', 'app/src/main/java/demo/TokenStore.kt',
+        'config/Safe.kt', 'app/src/main/java/demo/Keyboard.kt',
+        'secretsrotation/config.yml', 'app/src/main/java/demo/ssh_client.kt',
+        'app/src/main/java/demo/my_aws_helper.kt',
+      ]) {
+        assert.equal(isIssueCodeRefAllowed(good), true, `G2 ${good} allowed`);
+      }
       // F2: legitimate diagnosis paths stay allowed.
       for (const good of [
         'app/src/main/java/demo/Safe.kt', 'app/src/test/java/demo/SafeTest.kt',

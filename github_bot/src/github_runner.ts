@@ -2281,12 +2281,46 @@ const CODE_REF_DENY_DIR = /(^|\/)(\.git|build|\.gradle|\.idea)(\/|$)/i;
 const CODE_REF_DENY_KEYFILE = /[^/]*id_rsa[^/]*$|[^/]*id_ed25519[^/]*$/i;
 const CODE_REF_ALLOW_EXT = /\.(kt|java|kts|xml|toml|yml|yaml|md|txt|gradle|pro)$/i;
 
+// G2 (review #77 new #2): per-segment sensitive-word deny. The basename
+// rules above only see the last segment, so `secrets/config.yml` or
+// `.secrets.yaml` slipped through. Every segment (directories included) is
+// checked for a separator-delimited sensitive token, so `my-secrets.yml`,
+// `.credentials.md` and `secrets/` directories do not pass while embedded
+// non-delimited names like `secretsrotation` still do. (Basename-prefixed
+// `Credentials*`/`Secrets*` stay denied by the older basename rule above;
+// bare `npmrc` without a leading dot is newly denied here.) Documented
+// fail-closed cost:
+// prose like `docs/secrets-rotation.md` is denied too.
+const CODE_REF_DENY_SENSITIVE_WORD =
+  /(^|[.\-_~#])(secrets?|credentials?|service[-_]?accounts?|keystores?|truststores?|private[-_]?keys?|npmrc|pypirc)([.\-_~#]|$)/i;
+// `ssh`/`aws` match whole segments only (`ssh_client.kt` must pass while
+// `.ssh/config` must not).
+const CODE_REF_DENY_SENSITIVE_DIR = /^(ssh|aws)$/i;
+const CODE_REF_DENY_MIDDLE_EXT = new Set(['key', 'pem', 'p12', 'pfx', 'keystore', 'jks', 'ppk', 'asc']);
+
+function isCodeRefSensitivePath(normalized: string): boolean {
+  return normalized.split('/').some((segment) => {
+    const seg = segment.toLowerCase();
+    if (CODE_REF_DENY_SENSITIVE_DIR.test(seg.replace(/^\.+/, ''))) return true;
+    // Editor backup wrapping: strip outer #/~ / leading dots and interior
+    // .(bak|orig|old|tmp|swp|save|rej) so suffixed variants still match.
+    const stripped = seg.replace(/^[#~.]+/, '').replace(/[#~]+$/, '')
+      .replace(/(\.(bak|orig|old|tmp|swp|save|rej))+(?=\.|$)/g, '');
+    if (CODE_REF_DENY_SENSITIVE_WORD.test(seg) || CODE_REF_DENY_SENSITIVE_WORD.test(stripped)) return true;
+    // Double-extension whitewash (`tls.pem.txt`): an exact sensitive middle
+    // segment denies. Plain substring is NOT used so `Keyboard.kt` passes.
+    const parts = seg.split('.');
+    return parts.length > 2 && parts.slice(1, -1).some((part) => CODE_REF_DENY_MIDDLE_EXT.has(part));
+  });
+}
+
 function isCodeRefDenied(normalized: string): boolean {
   return CODE_REF_DENY_BASENAME.test(normalized)
     || CODE_REF_DENY_EXT.test(normalized)
     || CODE_REF_DENY_MINIFIED.test(normalized)
     || CODE_REF_DENY_DIR.test(normalized)
-    || CODE_REF_DENY_KEYFILE.test(normalized);
+    || CODE_REF_DENY_KEYFILE.test(normalized)
+    || isCodeRefSensitivePath(normalized);
 }
 export interface IssueCodeRef {
   path: string;

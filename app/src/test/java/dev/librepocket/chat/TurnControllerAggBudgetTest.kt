@@ -469,4 +469,134 @@ class TurnControllerAggBudgetTest {
       c.close()
     }
   }
+
+  // ---- Stage E: terminal-only ToolDone bills count + round total ----
+
+  @Test fun terminalOnlyToolDoneFloodTripsDistinctCountCap() {
+    // 65 terminal-only ToolDones with tiny payloads: per-call (~10 chars)
+    // and round total (~650 chars) both stay far under 1 MiB, so ONLY the
+    // 64-distinct cap can trip. (NOTE: the Stage E brief's literal "x20k"
+    // for this case would trip the round total first at ~17 tools instead
+    // of the count cap, so small args are used here to isolate the count
+    // scope; the 20k-args total isolation is covered by the next test.)
+    val provider = AggFakeProvider {
+      flow {
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT + 1) {
+          emit(StreamEvent.ToolDone(i, "id-$i", "n-$i", "{}"))
+        }
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = AggRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      val error = c.uiState.value.error.orEmpty()
+      assertTrue("typed overflow expected, got: $error", error.contains(TOOL_ARGS_TOO_LARGE))
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      var guard = 0
+      while (sink.failed.isEmpty()) {
+        if (++guard > 800) fail("timed out waiting for transcript failure")
+        Thread.sleep(10)
+      }
+      assertEquals(1, sink.failed.size)
+      assertTrue(
+        "transcript must carry the typed reason, got: ${sink.failed.single()}",
+        sink.failed.single().contains(TOOL_ARGS_TOO_LARGE),
+      )
+      Thread.sleep(500)
+      assertEquals(
+        "first 64 terminal-only ToolDones stay, got indexes: ${sink.tools.map { it.toolIndex }}",
+        MAX_TOOL_CALLS_PER_ATTEMPT,
+        sink.tools.size,
+      )
+      assertEquals(
+        (0 until MAX_TOOL_CALLS_PER_ATTEMPT).toSet(),
+        sink.tools.map { it.toolIndex }.toSet(),
+      )
+      assertTrue("tripping idx64 must leave no record", sink.tools.none { it.toolIndex == 64 })
+      val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
+      assertTrue("first ToolDone marker stays, got: ${body.take(80)}", body.contains("[tool:n-0 "))
+      assertFalse("tripping idx64 must leave no marker, got tail: ${body.takeLast(120)}", body.contains("[tool:n-64 "))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun terminalOnlyToolDonesTripRoundTotal() {
+    // 20 terminal-only ToolDones x 20k args: per-call (20k*3=60k) passes and
+    // count (20<64) passes, but the round total (400k chars*3=1.2M>1MiB)
+    // trips. Growth bills at ~20007-20009 chars each, so the 18th ToolDone
+    // (index 17) is the first to overflow: 17 retained (0..16).
+    val bigArgs = "x".repeat(20_000)
+    val provider = AggFakeProvider {
+      flow {
+        for (i in 0 until 20) emit(StreamEvent.ToolDone(i, "id-$i", "n-$i", bigArgs))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = AggRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      val error = c.uiState.value.error.orEmpty()
+      assertTrue("typed overflow expected, got: $error", error.contains(TOOL_ARGS_TOO_LARGE))
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      var guard = 0
+      while (sink.failed.isEmpty()) {
+        if (++guard > 800) fail("timed out waiting for transcript failure")
+        Thread.sleep(10)
+      }
+      assertEquals(1, sink.failed.size)
+      assertTrue(
+        "transcript must carry the typed reason, got: ${sink.failed.single()}",
+        sink.failed.single().contains(TOOL_ARGS_TOO_LARGE),
+      )
+      Thread.sleep(500)
+      assertEquals(
+        "only pre-overflow ToolDones survive, got ${sink.tools.size}: ${sink.tools.map { it.toolIndex }}",
+        17,
+        sink.tools.size,
+      )
+      assertEquals((0 until 17).toSet(), sink.tools.map { it.toolIndex }.toSet())
+      assertTrue("tripping idx17 must leave no record", sink.tools.none { it.toolIndex == 17 })
+      val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
+      assertTrue("first ToolDone marker stays, got: ${body.take(80)}", body.contains("[tool:n-0 "))
+      assertFalse("tripping idx17 must leave no marker", body.contains("[tool:n-17 "))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun fewTerminalOnlyToolDonesUnderBudgetsSucceed() {
+    val smallArgs = "y".repeat(1_000)
+    val provider = AggFakeProvider {
+      flow {
+        for (i in 0 until 3) emit(StreamEvent.ToolDone(i, "id-$i", "n-$i", smallArgs))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = AggRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+      assertEquals(null, c.uiState.value.error)
+      var guard = 0
+      while (sink.tools.size < 3) {
+        if (++guard > 800) fail("timed out waiting for tool records, got ${sink.tools.size}")
+        Thread.sleep(10)
+      }
+      Thread.sleep(300)
+      assertEquals(3, sink.tools.size)
+      assertEquals((0 until 3).toSet(), sink.tools.map { it.toolIndex }.toSet())
+      assertEquals(listOf(smallArgs, smallArgs, smallArgs), sink.tools.sortedBy { it.toolIndex }.map { it.args })
+      val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
+      for (i in 0 until 3) assertTrue("marker idx$i stays, got: ${body.take(120)}", body.contains("[tool:n-$i "))
+    } finally {
+      c.close()
+    }
+  }
 }

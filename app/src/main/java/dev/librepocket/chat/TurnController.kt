@@ -880,6 +880,9 @@ class TurnController(
             // the per-call budget before any marker/transcript side effect.
             // Throws typed AGG_TOO_LARGE; the try-path catch turns it into
             // the typed terminal without poison-adjacent records.
+            // Stage E invariant: NO total/count billing here — the delta path
+            // already billed both at collection time; re-adding would
+            // double-count.
             requireToolAggBudget(0, id.length + name.length + argsStr.length)
             appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
             fireTranscript { transcript.onToolDone(attemptRunId, index, id, name, argsStr) }
@@ -951,15 +954,32 @@ class TurnController(
               totalToolAggChars += toolIncoming
             }
             is StreamEvent.ToolDone -> {
-              // Final guard (Finding #4): a direct ToolDone that never went
-              // through delta budgeting must still fit the per-call budget
-              // before any marker/transcript side effect. Throws typed
+              // Terminal-only guard (Stage E): a direct ToolDone that never
+              // went through delta budgeting must still fit ALL budgets
+              // before any marker/transcript side effect. Per-call first,
+              // then distinct-index cap (BEFORE-insert), then round-total
+              // growth (candidate minus already-buffered delta bytes, floor
+              // 0 — delta-then-done never double-bills). Throws typed
               // AGG_TOO_LARGE; the catch below turns it into the typed
-              // terminal with no marker and no transcript record.
-              requireToolAggBudget(
-                0,
-                event.id.length + event.name.length + event.argumentsJson.length,
-              )
+              // terminal with no marker and no transcript record for the
+              // tripping index (already-emitted ToolDones stay).
+              // Duplicate ToolDone for an already-completed index is ignored
+              // outright: no second billing, no second record.
+              if (event.toolIndex in toolDoneSeen) return@collect
+              val toolDoneCandidate =
+                event.id.length + event.name.length + event.argumentsJson.length
+              requireToolAggBudget(0, toolDoneCandidate)
+              if (event.toolIndex !in distinctToolIndexes) {
+                requireToolCountBudget(distinctToolIndexes.size + 1)
+              }
+              val toolDoneBuffered =
+                (toolArgText[event.toolIndex]?.length ?: 0) +
+                  (toolIdText[event.toolIndex]?.length ?: 0) +
+                  (toolNameText[event.toolIndex]?.length ?: 0)
+              val toolDoneGrowth = (toolDoneCandidate - toolDoneBuffered).coerceAtLeast(0)
+              requireTotalToolAggBudget(totalToolAggChars, toolDoneGrowth)
+              distinctToolIndexes.add(event.toolIndex)
+              totalToolAggChars += toolDoneGrowth
               toolDoneSeen.add(event.toolIndex)
               appendAssistantText(attemptRunId, "\n[tool:${event.name} ${event.argumentsJson}]")
               fireTranscript {

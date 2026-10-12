@@ -170,6 +170,14 @@ class SetupViewModel(
      */
     internal var lastSaveJobForTest: Job? = null
 
+    /**
+     * Test seam: the most recent logout coroutine. Cancellation tests cancel
+     * this job to inject [CancellationException] at the clear gate
+     * (delete-then-clear window). Production code never touches it; it is
+     * overwritten on every [logout].
+     */
+    internal var lastLogoutJobForTest: Job? = null
+
     /** Test seam for racing an edit between mint success and dialog display. */
     internal var afterMintBeforeDialogForTest: (() -> Unit)? = null
 
@@ -1100,6 +1108,51 @@ class SetupViewModel(
     }
 
     /**
+     * Clear-phase probe outcome for the logout hardening below.
+     *
+     * Derived from a single strict re-read
+     * ([EndpointStore.snapshotWithRevisionStrict]) after the initial
+     * `clearIfRevision` threw: `COMMITTED` means the clear won despite the
+     * throw (ack-loss: metadata empty + revision advanced); `FAILED` means the
+     * clear did not happen (metadata still present + revision unchanged, or
+     * fresh tombstone still at the same revision); `STALE` means a concurrent
+     * winner advanced the revision with metadata present (must not retry);
+     * `UNKNOWN` means the re-read itself failed (no-touch).
+     */
+    private enum class LogoutClearProbe {
+        COMMITTED,
+        FAILED,
+        STALE,
+        UNKNOWN,
+    }
+
+    /**
+     * Strict single-emission classification of the clear outcome.
+     *
+     * Never throws: any read failure (including [CancellationException]) maps
+     * to [LogoutClearProbe.UNKNOWN]. Must be called inside
+     * `withContext(NonCancellable)` after a clear throw/cancel so the probe
+     * itself is not cancelled. Single `dataStore.data.first()` emission, no
+     * retry, no vault I/O.
+     */
+    private suspend fun probeLogoutClear(expectedRevision: Long?): LogoutClearProbe {
+        val after: Pair<EndpointConfig?, Long?> = try {
+            store.snapshotWithRevisionStrict()
+        } catch (_: CancellationException) {
+            return LogoutClearProbe.UNKNOWN
+        } catch (_: Exception) {
+            return LogoutClearProbe.UNKNOWN
+        }
+        val config = after.first
+        val revision = after.second
+        return if (config == null) {
+            if (revision != expectedRevision) LogoutClearProbe.COMMITTED else LogoutClearProbe.FAILED
+        } else {
+            if (revision == expectedRevision) LogoutClearProbe.FAILED else LogoutClearProbe.STALE
+        }
+    }
+
+    /**
      * Logout: delete the live vault key addressed by metadata, then fenced-clear
      * metadata via [EndpointStore.clearIfRevision] (delete-then-CAS order matters).
      *
@@ -1123,10 +1176,50 @@ class SetupViewModel(
      *   revision, AFTER the delete. A save committing between the delete and
      *   the CAS leaves the winner intact: the CAS returns false (only the
      *   stale predecessor was deleted — harmless), the winner metadata
-     *   survives, and logout reports `LOGOUT_STALE`, never success. A
-     *   CAS-transport failure reports `LOGOUT_CLEAR_FAILED`. Only a CAS win
-     *   resets the form and reports `onDone(true)`; every abort preserves the
-     *   form and only stamps `errorCode`.
+     *   survives, and logout reports `LOGOUT_STALE`, never success.
+     * - Clear-phase hardening (mirrors the save-side NonCancellable
+     *   strict-verify): when the initial `clearIfRevision` throws, the outcome
+     *   is classified by a single strict re-read in `NonCancellable` context
+     *   ([probeLogoutClear], one `dataStore.data.first()` emission, no vault
+     *   I/O):
+     *   - `COMMITTED` (metadata empty + revision advanced): the clear won
+     *     despite the throw (ack-loss: `apply` flushed but the ack was lost).
+     *     Report success — reset the form and call `onDone(true)`, never
+     *     `LOGOUT_CLEAR_FAILED`. Mirrors save committed-then-cancel.
+     *   - `FAILED` (metadata still present + revision unchanged): the clear
+     *     did not happen. Retry once with the SAME revision
+     *     (`clearIfRevision(expectedRev)` in `NonCancellable`, bounded single
+     *     attempt, no storm): `true` commits to success; `false` means a
+     *     winner slipped in — report `LOGOUT_STALE`; throw means the transport
+     *     is still broken — report `LOGOUT_CLEAR_FAILED` (retryable: the
+     *     metadata still points at the already-deleted alias, so a later
+     *     logout retry re-attempts the same fenced clear).
+     *   - `STALE` (metadata present + revision moved): a concurrent winner
+     *     committed; never retry (a retry would delete the winner's
+     *     metadata). Report `LOGOUT_STALE`.
+     *   - `UNKNOWN` (re-read failed): no-touch — no second delete, no second
+     *     clear, never report success. Report `LOGOUT_CLEAR_FAILED` with
+     *     `onDone(false)` (retryable once the store recovers).
+     *   Bounded: exactly one strict read + at most one retry clear; no loop,
+     *   no retry storm. Only a CAS win (initial, retry, or ack-loss
+     *   reclassification) resets the form and reports `onDone(true)`; every
+     *   abort preserves the form and only stamps `errorCode`.
+     * - Cancellation: a cancel landing inside `clearIfRevision` gets the same
+     *   strict classification in `NonCancellable`, but with cancel semantics:
+     *   `COMMITTED` swallows the cancel to success (reset form +
+     *   `onDone(true)`, mirroring save committed-then-cancel); `FAILED`,
+     *   `STALE`, and `UNKNOWN` rethrow without stamping any `errorCode` and
+     *   without calling [onDone] (no retry on the cancel path — a retry would
+     *   commit despite the cancel). A cancel before the clear (read/delete
+     *   window) likewise rethrows with no side-effect stamp.
+     *
+     * Memory-vs-durable note: the vault delete and the metadata clear are not
+     * a distributed transaction (see [dev.librepocket.keystore.EncryptedPrefsVault]
+     * durability docs). A crash between a still-unflushed (`apply`) vault
+     * delete and the metadata clear — or vice versa — splits the two stores
+     * across a restart; the revision still fences stale sessions, but orphan
+     * GC needs the long-term vault list/journal follow-up. This window is
+     * documented, not closed, in this phase.
      *
      * Privileged teardown, serialized against in-flight saves via [saveMutex]
      * so a save's staged-put/CAS/retire window cannot interleave with teardown
@@ -1147,12 +1240,16 @@ class SetupViewModel(
      * at-rest leak, strictly better than loss; in-flight aborts and cancels
      * already delete their own staged alias, so the steady state has no residue.
      *
-     * Cancellation ([CancellationException]) is always rethrown, like the save
+     * Cancellation ([CancellationException]) from the read/delete window — and
+     * from a non-committed clear — is always rethrown, like the save
      * path: no `errorCode` is stamped and [onDone] is not called.
      *
      * @param onDone called on [Dispatchers.Main] with `true` only when the
-     * teardown committed (delete + fenced clear); `false` with `errorCode` set
-     * otherwise. Never called when the logout coroutine itself is cancelled.
+     * teardown committed (delete + fenced clear, including ack-loss
+     * reclassification and committed-then-cancel swallow); `false` with
+     * `errorCode` set otherwise. Never called when the logout coroutine itself
+     * is cancelled (except the committed-then-cancel swallow, which completes
+     * normally and reports success).
      */
     fun logout(onDone: (Boolean) -> Unit = {}) {
         formRevision.incrementAndGet()
@@ -1160,9 +1257,10 @@ class SetupViewModel(
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         modelRefreshGeneration.incrementAndGet()
-        viewModelScope.launch(Dispatchers.IO) {
+        val job = viewModelScope.launch(Dispatchers.IO) {
             try {
                 var committed = false
+                var logoutError: String? = null
                 saveMutex.withLock {
                     val snapshot = try {
                         store.snapshotWithRevisionStrict()
@@ -1187,30 +1285,87 @@ class SetupViewModel(
                             return@withLock
                         }
                     }
-                    val cleared = try {
-                        store.clearIfRevision(expectedRevision)
+                    try {
+                        val cleared = store.clearIfRevision(expectedRevision)
+                        if (cleared) {
+                            committed = true
+                        } else {
+                            logoutError = "LOGOUT_STALE"
+                        }
                     } catch (e: CancellationException) {
-                        throw e
+                        // Cancel during the clear: same strict probe, cancel
+                        // semantics — COMMITTED swallows to success, everything
+                        // else rethrows with no code and no onDone. No retry on
+                        // the cancel path (a retry would commit despite cancel).
+                        // Bounded: single NonCancellable read, no second clear.
+                        val probe = withContext(NonCancellable) { probeLogoutClear(expectedRevision) }
+                        if (probe == LogoutClearProbe.COMMITTED) {
+                            committed = true
+                        } else {
+                            throw e
+                        }
                     } catch (_: Exception) {
-                        _form.value = _form.value.copy(errorCode = "LOGOUT_CLEAR_FAILED")
-                        return@withLock
+                        // Transport failure: strict probe in NonCancellable,
+                        // then at most one same-rev retry (bounded, no storm).
+                        val probe: LogoutClearProbe = try {
+                            withContext(NonCancellable) { probeLogoutClear(expectedRevision) }
+                        } catch (_: CancellationException) {
+                            LogoutClearProbe.UNKNOWN
+                        } catch (_: Exception) {
+                            LogoutClearProbe.UNKNOWN
+                        }
+                        when (probe) {
+                            LogoutClearProbe.COMMITTED -> {
+                                // Ack-loss: the clear won but the ack was lost.
+                                // Success, never CLEAR_FAILED.
+                                committed = true
+                            }
+                            LogoutClearProbe.STALE -> {
+                                logoutError = "LOGOUT_STALE"
+                            }
+                            LogoutClearProbe.UNKNOWN -> {
+                                logoutError = "LOGOUT_CLEAR_FAILED"
+                            }
+                            LogoutClearProbe.FAILED -> {
+                                val retried: Boolean? = try {
+                                    withContext(NonCancellable) { store.clearIfRevision(expectedRevision) }
+                                } catch (_: CancellationException) {
+                                    null
+                                } catch (_: Exception) {
+                                    null
+                                }
+                                when (retried) {
+                                    true -> committed = true
+                                    false -> logoutError = "LOGOUT_STALE"
+                                    null -> logoutError = "LOGOUT_CLEAR_FAILED"
+                                }
+                            }
+                        }
                     }
-                    if (!cleared) {
-                        _form.value = _form.value.copy(errorCode = "LOGOUT_STALE")
-                        return@withLock
+                    if (logoutError != null) {
+                        _form.value = _form.value.copy(errorCode = logoutError)
                     }
-                    committed = true
                 }
                 if (!committed) {
+                    // logoutError is already stamped inside the lock when set;
+                    // when the lock body returned early via the read/delete
+                    // aborts above, the stamp is likewise already applied. Only
+                    // stamp here if a code was chosen but not yet applied (all
+                    // paths above stamp eagerly, so this is a no-op guard).
                     withContext(Dispatchers.Main) { onDone(false) }
                     return@launch
                 }
                 _form.value = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
-                withContext(Dispatchers.Main) { onDone(true) }
+                // Committed-then-cancel swallow must still report success: the
+                // job was cancelled, so a plain Main dispatch would rethrow
+                // Cancel before onDone runs. NonCancellable preserves the
+                // save-side mirror (committed cancels report success).
+                withContext(NonCancellable + Dispatchers.Main) { onDone(true) }
             } catch (e: CancellationException) {
                 throw e
             }
         }
+        lastLogoutJobForTest = job
     }
 
     private fun effectiveBaseUrlOf(form: SetupUiState): String =

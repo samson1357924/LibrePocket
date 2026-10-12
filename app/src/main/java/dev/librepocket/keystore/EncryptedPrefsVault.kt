@@ -28,6 +28,35 @@ interface PrefBackend {
  *
  * Key rules (spec §7.2): trimmed before write, minimum length 8, blank rejected.
  * The caller's [CharArray] is wiped in `finally` after the write.
+ *
+ * Durability, stated honestly (phase 1: document only, do not change):
+ * - The product path ([AndroidEncryptedPrefs]) persists via `apply()` (async):
+ *   the in-memory SharedPreferences cache is updated synchronously, but the
+ *   fsync to disk happens later on a queued single-thread writer. An
+ *   in-process re-read (same process, before any restart) sees the new value,
+ *   which masks the gap; a process kill / device restart before the flush
+ *   loses the write. Concretely: a save whose staged `putKey` is still only in
+ *   memory when the metadata CAS commits reaches `READY` in-process but
+ *   restarts to `NO_KEY` (metadata points at a missing alias); a logout whose
+ *   `deleteKey` is still only in memory when the metadata clear commits looks
+ *   fully torn down in-process but restarts with the key bytes revived as an
+ *   unreferenced orphan (metadata gone, `hasKey` true). The plain-JVM
+ *   [InMemoryPrefs] used by unit tests is fully synchronous
+ *   (memory == durable) and therefore masks this gap — the `DeferredFlushPrefs`
+ *   model double in tests exists precisely to demonstrate both cases without
+ *   changing production behavior.
+ * - Switching `apply()` to `commit()` (synchronous fsync) only narrows the
+ *   window, it does not close it: there is still no distributed transaction
+ *   between the vault write and the DataStore metadata CAS, so a kill landing
+ *   between the two stores still splits them regardless of `commit()`. A
+ *   `commit()` switch additionally needs Robolectric coverage (it exercises
+ *   real SharedPreferences fsync semantics that plain-JVM fakes cannot prove),
+ *   so this phase deliberately keeps `apply()` and only documents the gap.
+ * - Long term (not this phase): a vault journal and/or a vault list API for
+ *   orphan GC. Listing is currently unavailable by design (no enumeration of
+ *   staged/live aliases), so crash orphans linger encrypted at rest until that
+ *   follow-up lands. At-rest leak is strictly better than loss; the revision
+ *   CAS still fences stale sessions across the window.
  */
 class EncryptedPrefsVault(private val backend: PrefBackend) : KeyVault {
 
@@ -76,7 +105,14 @@ class EncryptedPrefsVault(private val backend: PrefBackend) : KeyVault {
     }
 }
 
-/** Real [PrefBackend] over EncryptedSharedPreferences (product path). */
+/** Real [PrefBackend] over EncryptedSharedPreferences (product path).
+ *
+ * Uses `apply()` for both writes and deletes (see the durability note on
+ * [EncryptedPrefsVault]): memory-vs-durable gap is documented there and
+ * intentionally unchanged this phase. A future `commit()` switch must add
+ * Robolectric coverage and still cannot close the cross-store window without
+ * a journal/GC follow-up.
+ */
 class AndroidEncryptedPrefs(context: Context) : PrefBackend {
     private val prefs: SharedPreferences = run {
         val masterKey = MasterKey.Builder(context, EncryptedPrefsVault.MASTER_KEY_ALIAS)

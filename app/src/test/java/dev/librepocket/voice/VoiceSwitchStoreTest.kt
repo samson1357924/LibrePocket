@@ -15,12 +15,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -328,5 +334,152 @@ class VoiceSwitchStoreTest {
         assertEquals(loaded, second)
         // 對照：裸 Flow 每次訂閱 onStart 仍先發 LOADING（鎖定修復的因果）。
         assertEquals(VoiceSwitchSnapshot.LOADING, store.observeSwitches().first())
+    }
+
+    @Test
+    fun decideEffective_unknownDoesNotOverwriteKnown() {
+        // R6-1 純函數：未知不覆蓋已知，明確失敗照常穿透。
+        val loaded = VoiceSwitchSnapshot(
+            switches = mapOf(
+                VoiceTools.SWITCH_INPUT to true,
+                VoiceTools.SWITCH_OUTPUT to false,
+            ),
+            loaded = true,
+            loadFailed = false,
+        )
+        val failed = VoiceSwitchSnapshot(
+            switches = mapOf(
+                VoiceTools.SWITCH_INPUT to false,
+                VoiceTools.SWITCH_OUTPUT to false,
+            ),
+            loaded = true,
+            loadFailed = true,
+        )
+        // 重訂閱空窗 LOADING 不覆蓋已知 loaded。
+        assertEquals(loaded, VoiceSwitchSnapshot.decideEffective(loaded, VoiceSwitchSnapshot.LOADING))
+        // 冷啟動（previous 未 loaded）照常採用 incoming，保持 fail-closed 初值語義。
+        assertEquals(
+            VoiceSwitchSnapshot.LOADING,
+            VoiceSwitchSnapshot.decideEffective(VoiceSwitchSnapshot.LOADING, VoiceSwitchSnapshot.LOADING),
+        )
+        assertEquals(
+            loaded,
+            VoiceSwitchSnapshot.decideEffective(VoiceSwitchSnapshot.LOADING, loaded),
+        )
+        // 明確失敗必須穿透（覆蓋已知 loaded，不可黏住舊值）。
+        assertEquals(failed, VoiceSwitchSnapshot.decideEffective(loaded, failed))
+        // 已知失敗上的 LOADING 空窗：兩者皆 fail-closed，維持 previous 無閃斷差別。
+        assertEquals(failed, VoiceSwitchSnapshot.decideEffective(failed, VoiceSwitchSnapshot.LOADING))
+        // loaded→loaded（不同開關值）必須採用新值，不可卡死在舊值。
+        val loadedOff = loaded.copy(
+            switches = mapOf(
+                VoiceTools.SWITCH_INPUT to false,
+                VoiceTools.SWITCH_OUTPUT to false,
+            ),
+        )
+        assertEquals(loadedOff, VoiceSwitchSnapshot.decideEffective(loaded, loadedOff))
+    }
+
+    @Test
+    fun decideEffective_foldedOverGapSequenceNeverFlashes() {
+        // R6-1 序列級：loaded→LOADING（空窗）→loadFailed 的 fold，
+        // 中間態維持 loaded（門禁不閃斷），終態為明確失敗。
+        val loaded = VoiceSwitchSnapshot(
+            switches = mapOf(
+                VoiceTools.SWITCH_INPUT to true,
+                VoiceTools.SWITCH_OUTPUT to true,
+            ),
+            loaded = true,
+            loadFailed = false,
+        )
+        val failed = VoiceSwitchSnapshot(
+            switches = mapOf(
+                VoiceTools.SWITCH_INPUT to false,
+                VoiceTools.SWITCH_OUTPUT to false,
+            ),
+            loaded = true,
+            loadFailed = true,
+        )
+        val mid = listOf(loaded, VoiceSwitchSnapshot.LOADING)
+            .fold(VoiceSwitchSnapshot.LOADING, VoiceSwitchSnapshot::decideEffective)
+        assertEquals(loaded, mid)
+        val final = (mid.let { listOf(it, failed) })
+            .fold(mid, VoiceSwitchSnapshot::decideEffective)
+        assertEquals(failed, final)
+    }
+
+    @Test
+    fun resubscribeAfterTimeout_decideEffectiveKeepsLoadedThroughLoadingGap() = runTest {
+        // R6-1 回歸（JVM 純 Flow）：stateIn 暖到 loaded → advanceTimeBy 超過
+        // WhileSubscribed(5000) 超時 → 取消並重訂閱，第二次上游發射延遲
+        // （既有測試只覆蓋立即重訂閱，此處覆蓋慢路徑空窗）。
+        val loaded = VoiceSwitchSnapshot(
+            switches = mapOf(
+                VoiceTools.SWITCH_INPUT to true,
+                VoiceTools.SWITCH_OUTPUT to true,
+            ),
+            loaded = true,
+            loadFailed = false,
+        )
+        var subscriptions = 0
+        val upstream = flow {
+            val n = ++subscriptions
+            // 仿 Store onStart：每次新訂閱先發 LOADING。
+            emit(VoiceSwitchSnapshot.LOADING)
+            if (n == 1) {
+                emit(loaded)
+            } else {
+                // 第二次 DataStore 發射延遲：重訂閱空窗拉長。
+                delay(10_000)
+                emit(loaded)
+            }
+        }
+        val shared = upstream.stateIn(
+            // 不用 backgroundScope（experimental 且實測不由 advanceUntilIdle 驅動）：
+            // 以測試 dispatcher 自建 sharing scope，同 scheduler 可虛擬時間推進。
+            CoroutineScope(
+                coroutineContext[kotlin.coroutines.ContinuationInterceptor]
+                    as kotlinx.coroutines.CoroutineDispatcher + SupervisorJob(),
+            ).also { scopes.add(it) },
+            SharingStarted.WhileSubscribed(5000),
+            VoiceSwitchSnapshot.LOADING,
+        )
+        // 暖到 loaded（第一個 collector，返回後即取消收集）。
+        val warmed = ArrayList<VoiceSwitchSnapshot>()
+        val firstJob = launch { shared.collect { warmed.add(it) } }
+        advanceUntilIdle()
+        assertTrue(warmed.last().loaded)
+        firstJob.cancel()
+        firstJob.join()
+        // 超過 WhileSubscribed 超時，上游停止。
+        advanceTimeBy(5001)
+        runCurrent()
+        // 重訂閱：空窗內必先再見 LOADING（鎖定 loaded→LOADING 空窗形狀）。
+        val gapSeen = ArrayList<VoiceSwitchSnapshot>()
+        val gapJob = launch { shared.collect { gapSeen.add(it) } }
+        runCurrent()
+        assertTrue(
+            "expected LOADING gap after resubscribe, saw $gapSeen",
+            gapSeen.contains(VoiceSwitchSnapshot.LOADING),
+        )
+        // decideEffective 折疊空窗全程維持 loaded（門禁不閃斷）。
+        var effective = warmed.last()
+        for (snapshot in gapSeen) {
+            effective = VoiceSwitchSnapshot.decideEffective(effective, snapshot)
+            assertTrue("effective flashed to $effective on $snapshot", effective.loaded)
+            assertFalse(effective.loadFailed)
+        }
+        assertEquals(loaded, effective)
+        assertTrue(VoiceTools.inputEnabled(effective))
+        // 空窗結束（上游 loaded 到達）照常採用新值。
+        advanceTimeBy(10_000)
+        runCurrent()
+        assertEquals(loaded, gapSeen.last())
+        assertEquals(
+            loaded,
+            VoiceSwitchSnapshot.decideEffective(effective, gapSeen.last()),
+        )
+        gapJob.cancel()
+        gapJob.join()
     }
 }

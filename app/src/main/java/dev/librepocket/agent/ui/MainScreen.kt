@@ -35,8 +35,10 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -120,8 +122,20 @@ fun MainScreen(
         voiceStore.observeSwitches().stateIn(scope, SharingStarted.WhileSubscribed(5000), VoiceSwitchSnapshot.LOADING)
     }
     val voiceSnapshot by switchesFlow.collectAsStateWithLifecycle()
-    val voiceUiSwitches = if (voiceSnapshot.loaded && !voiceSnapshot.loadFailed) {
-        voiceSnapshot.switches
+    // R6-1: WhileSubscribed(5000) 逾時停上游後，重訂閱必經 onStart LOADING 首發射，
+    // DataStore 第二次發射若延遲即出現 loaded→LOADING 空窗（閃斷＋speaker 重建）。
+    // 顯示用值經 decideEffective 黏住最後有效快照：未知（LOADING）不覆蓋已知 loaded，
+    // 明確 loadFailed 照常穿透。lastVoiceEffective 以 SideEffect 同步（初值 LOADING
+    // 保持 fail-closed），避免在 remember 計算內寫 state。
+    var lastVoiceEffective by remember { mutableStateOf(VoiceSwitchSnapshot.LOADING) }
+    val voiceEffectiveSnapshot = remember(lastVoiceEffective, voiceSnapshot) {
+        VoiceSwitchSnapshot.decideEffective(lastVoiceEffective, voiceSnapshot)
+    }
+    if (voiceEffectiveSnapshot != lastVoiceEffective) {
+        SideEffect { lastVoiceEffective = voiceEffectiveSnapshot }
+    }
+    val voiceUiSwitches = if (voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed) {
+        voiceEffectiveSnapshot.switches
     } else {
         mapOf(VoiceTools.SWITCH_INPUT to false, VoiceTools.SWITCH_OUTPUT to false)
     }
@@ -314,7 +328,7 @@ fun MainScreen(
                             onOpenSettings = { goSetupForEdit() },
                             onTurnFinished = { sessionListViewModel.refresh() },
                             userSwitches = voiceUiSwitches,
-                            voiceSwitchLoadFailed = voiceSnapshot.loadFailed,
+                            voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,
                             ttsAcknowledged = ttsAcknowledged,
                             onTtsAcknowledged = {
                                 try {
@@ -344,10 +358,10 @@ fun MainScreen(
                                 privilegeAuditCount = privilegeState.auditCount()
                             },
                             privilegeAuditCount = privilegeAuditCount,
-                            voiceInputEnabled = VoiceTools.inputEnabled(voiceSnapshot),
-                            voiceOutputEnabled = VoiceTools.outputEnabled(voiceSnapshot),
-                            voiceSwitchesEnabled = voiceSnapshot.loaded && !voiceSnapshot.loadFailed,
-                            voiceLoadFailed = voiceSnapshot.loadFailed,
+                            voiceInputEnabled = VoiceTools.inputEnabled(voiceEffectiveSnapshot),
+                            voiceOutputEnabled = VoiceTools.outputEnabled(voiceEffectiveSnapshot),
+                            voiceSwitchesEnabled = voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed,
+                            voiceLoadFailed = voiceEffectiveSnapshot.loadFailed,
                             onVoiceInputSwitch = { enabled ->
                                 scope.launch {
                                     try {

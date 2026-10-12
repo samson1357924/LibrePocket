@@ -45,6 +45,27 @@ data class VoiceSwitchSnapshot(
     companion object {
         /** 首幀初始值：尚未讀到真相源，門禁一律關閉。 */
         val LOADING = VoiceSwitchSnapshot(emptyMap(), loaded = false, loadFailed = false)
+
+        /**
+         * 顯示用有效快照（R6-1）：未知不覆蓋已知，明確失敗照常穿透。
+         *
+         * - `incoming` 為 LOADING（`!loaded && !loadFailed`，即 WhileSubscribed(5000)
+         *   逾時停上游後重訂閱的 `onStart` 首發射）且 `previous.loaded` 時回
+         *   `previous`，避免已載入設定在重訂閱空窗閃斷；
+         * - 其餘照常採用 `incoming`：`loaded` 真值更新與 `loadFailed`
+         *   明確失敗皆穿透（失敗必須覆蓋已知，不可黏住舊值）。
+         * - 初值 LOADING（`previous.loaded=false`）時一律採用 `incoming`，
+         *   保持 fail-closed 冷啟動語義。
+         */
+        fun decideEffective(
+            previous: VoiceSwitchSnapshot,
+            incoming: VoiceSwitchSnapshot,
+        ): VoiceSwitchSnapshot =
+            if (!incoming.loaded && !incoming.loadFailed && previous.loaded) {
+                previous
+            } else {
+                incoming
+            }
     }
 }
 

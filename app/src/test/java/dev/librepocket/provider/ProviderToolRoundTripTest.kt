@@ -834,12 +834,18 @@ class ProviderToolRoundTripTest {
             ChatMessage("assistant", "thinking trace", hasReasoning = true),
             ChatMessage("user", "follow-up"),
         )
-        val chat = strictObj(chatBodyOfNoTools(history))
+        val chatBody = chatBodyOfNoTools(history)
+        val chat = strictObj(chatBody)
         assertEquals(3, chat["messages"]!!.jsonArray.size)
-        val responses = strictObj(responsesBodyOfNoTools(history))
+        assertTrue(chatBody.contains("thinking trace"))
+        val responsesBody = responsesBodyOfNoTools(history)
+        val responses = strictObj(responsesBody)
         assertEquals(3, responses["input"]!!.jsonArray.size)
-        val anthropic = strictObj(anthropicBodyOfNoTools(history))
+        assertTrue(responsesBody.contains("thinking trace"))
+        val anthropicBody = anthropicBodyOfNoTools(history)
+        val anthropic = strictObj(anthropicBody)
         assertEquals(3, anthropic["messages"]!!.jsonArray.size)
+        assertTrue(anthropicBody.contains("thinking trace"))
     }
 
     @Test

@@ -1516,7 +1516,10 @@ class ChatViewModel(
         // strings, worst case O(HISTORY_SCAN_CAP) entries, far smaller than full events.
         // Marker events never render; an assistant event whose runId has a marker
         // restores hasReasoning so resumed reasoning-origin turns still fail
-        // closed on follow-up. The message cap still counts user/assistant
+        // closed on tool-dependent / thinking-mode follow-ups (ordinary
+        // no-tools follow-ups continue). Resume history here is display-only
+        // (rebuilt UiMessages, never fed into provider requests), so the flag
+        // is defense-in-depth only. The message cap still counts user/assistant
         // messages only, while the scan bound counts raw scanned events.
         val out = ArrayList<UiMessage>()
         // Only already-emitted assistants, so a late marker can patch its flag.

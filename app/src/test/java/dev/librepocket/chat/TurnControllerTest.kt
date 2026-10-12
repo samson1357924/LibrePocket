@@ -8,6 +8,8 @@ import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ChatCompletionsProvider
+import dev.librepocket.provider.ResponsesProvider
+import dev.librepocket.provider.AnthropicProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderHttpConfig
 import dev.librepocket.provider.ProviderProtocol
@@ -1058,7 +1060,11 @@ class TurnControllerTest {
   // follow-up whose history carries hasReasoning must succeed. The Fakes
   // below mirror the production requireNoReasoningHistory semantics with the
   // same toolDependent formula: only a tool-dependent turn with reasoning
-  // history throws.
+  // history throws. They are drift-prone by construction; the authoritative
+  // proof that the real request shape passes the real adapters is
+  // realBuildRequestFeedsRealAdapters / opaqueRealBuildRequestFeedsRealAdapters
+  // below (real buildRequest product fed directly into the three real
+  // buildBody paths).
 
   private fun gateMirroringFake(
     transportCalls: AtomicInteger,
@@ -1198,6 +1204,124 @@ class TurnControllerTest {
     assertEquals(ChatStatus.IDLE, c.uiState.value.status)
     assertNull(c.uiState.value.error)
     assertEquals(2, assistantsOf(c).size)
+  }
+
+  // ---- Production integration: real buildRequest product feeds real adapters ----
+  //
+  // The gateMirroringFake above is drift-prone by construction. These two
+  // tests are authoritative: two real turns run through FakeLlmProvider, then
+  // seenRequests.last() (the real TurnController.buildRequest product, with
+  // its hasReasoning history) is fed directly into the three real adapter
+  // buildBody paths. Success plus retained assistant text proves the scoped
+  // gate passes the production shape on every wire.
+
+  private fun realChatConfig() = ProviderConfig(
+    id = "00000000-0000-0000-0000-00000000cc01",
+    label = "test",
+    baseUrl = "https://api.example.com/v1",
+    protocol = ProviderProtocol.CHAT_COMPLETIONS,
+    apiKeyRef = "provider_key/00000000-0000-0000-0000-00000000cc01",
+  )
+
+  private fun realResponsesConfig() = ProviderConfig(
+    id = "00000000-0000-0000-0000-00000000cc02",
+    label = "test",
+    baseUrl = "https://api.example.com/v1",
+    protocol = ProviderProtocol.RESPONSES,
+    apiKeyRef = "provider_key/00000000-0000-0000-0000-00000000cc02",
+  )
+
+  private fun realAnthropicConfig() = ProviderConfig(
+    id = "00000000-0000-0000-0000-00000000cc03",
+    label = "test",
+    baseUrl = "https://api.anthropic.com",
+    protocol = ProviderProtocol.ANTHROPIC,
+    apiKeyRef = "provider_key/00000000-0000-0000-0000-00000000cc03",
+  )
+
+  @Test fun realBuildRequestFeedsRealAdapters() {
+    val calls = AtomicInteger(0)
+    val provider = FakeLlmProvider { _ ->
+      flow {
+        if (calls.incrementAndGet() == 1) {
+          emit(StreamEvent.ReasoningDelta(0, 1, "thought-"))
+          emit(StreamEvent.TextDelta(0, 2, "answer"))
+          emit(StreamEvent.Done("stop"))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    assertEquals("thought-answer", assistantsOf(c).single().text)
+    assertTrue(assistantsOf(c).single().hasReasoning)
+    runBlocking { c.send("second") }
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    assertEquals("second-answer", assistantsOf(c).last().text)
+    val last = provider.seenRequests.last()
+    assertTrue(last.tools.isEmpty())
+    assertTrue(last.serverTools.isEmpty())
+    assertNull(last.thinking)
+    assertTrue(last.messages.any { it.hasReasoning })
+    assertTrue(last.messages.any { it.text.contains("thought-answer") })
+    val chatBody = ChatCompletionsProvider(realChatConfig(), { null }).buildBody(last)
+    val responsesBody = ResponsesProvider(realResponsesConfig(), { null }).buildBody(last)
+    val anthropicBody = AnthropicProvider(realAnthropicConfig(), { null }).buildBody(last)
+    assertTrue(chatBody.contains("thought-answer"))
+    assertTrue(responsesBody.contains("thought-answer"))
+    assertTrue(anthropicBody.contains("thought-answer"))
+  }
+
+  @Test fun opaqueRealBuildRequestFeedsRealAdapters() {
+    val calls = AtomicInteger(0)
+    val provider = FakeLlmProvider { _ ->
+      flow {
+        if (calls.incrementAndGet() == 1) {
+          emit(StreamEvent.ReasoningPresent)
+          emit(StreamEvent.TextDelta(0, 0, "opaque-answer"))
+          emit(StreamEvent.Done("stop"))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    assertEquals("opaque-answer", assistantsOf(c).single().text)
+    assertTrue(assistantsOf(c).single().hasReasoning)
+    runBlocking { c.send("second") }
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    val last = provider.seenRequests.last()
+    assertTrue(last.tools.isEmpty())
+    assertTrue(last.serverTools.isEmpty())
+    assertNull(last.thinking)
+    assertTrue(last.messages.any { it.hasReasoning })
+    val chatBody = ChatCompletionsProvider(realChatConfig(), { null }).buildBody(last)
+    val responsesBody = ResponsesProvider(realResponsesConfig(), { null }).buildBody(last)
+    val anthropicBody = AnthropicProvider(realAnthropicConfig(), { null }).buildBody(last)
+    assertTrue(chatBody.contains("opaque-answer"))
+    assertTrue(responsesBody.contains("opaque-answer"))
+    assertTrue(anthropicBody.contains("opaque-answer"))
+  }
+
+  @Test fun emptyReasoningDeltaStillSetsFlag() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ReasoningDelta(0, 1, ""))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("hi") }
+    val block = assistantsOf(c).single()
+    assertEquals("", block.text)
+    assertTrue(block.hasReasoning)
+    assertFalse(block.isPartial)
   }
 
   // ---- Finding A follow-up: the reasoning flag must reach the transcript ----

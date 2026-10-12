@@ -204,6 +204,11 @@ internal fun validateToolPairing(messages: List<ChatMessage>, allowChatBackfill:
  *
  * Non-thinking, no-tools histories (defaults) pass through with zero
  * behavior change.
+ *
+ * Trade-off: the no-tools pass-through accepts silent narrowing of opaque
+ * reasoning context (visible merged text is sent, opaque payloads are
+ * discarded) in exchange for keeping ordinary chat connected instead of
+ * failing it closed.
  */
 internal fun requireNoReasoningHistory(request: ChatRequest) {
     if (request.thinking != null) throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")

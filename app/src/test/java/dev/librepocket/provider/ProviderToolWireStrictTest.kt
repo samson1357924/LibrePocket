@@ -516,7 +516,7 @@ class ProviderToolWireStrictTest {
     }
 
     @Test
-    fun assistantImageGateRunsAfterThinkingGate() {
+    fun thinkingRequestPreemptsAssistantImageGate() {
         // History carries both an explicit thinking-mode request and
         // assistant images: the thinking gate must win (proves thinking
         // first, assistant-image ordering in every adapter's buildBody).

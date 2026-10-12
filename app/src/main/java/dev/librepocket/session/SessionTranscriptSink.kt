@@ -19,7 +19,14 @@ import java.util.UUID
  * into the assistant text and persist as usual (pre-existing behavior).
  * History replay restores
  * [dev.librepocket.chat.UiMessage.hasReasoning] so resumed reasoning-origin
- * turns still fail closed on follow-up instead of replaying as plain text.
+ * turns still fail closed on tool-dependent / thinking-mode follow-ups
+ * (ordinary no-tools follow-ups continue; see `requireNoReasoningHistory`).
+ * Resume history here is display-only (rebuilt UiMessages, never fed back
+ * into a provider request), so the restored flag is defense-in-depth only.
+ *
+ * The two appends (`assistant` + `reasoning`) are non-atomic: a crash
+ * between them loses the flag (fail-open to plain-text continuation);
+ * display-only, so no provider impact beyond the missing flag.
  *
  * The controller already calls these fire-and-forget with its own try/catch;
  * failures here must still never propagate, so every call guards its store

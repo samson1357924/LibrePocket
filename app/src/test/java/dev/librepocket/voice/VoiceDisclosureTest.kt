@@ -1,7 +1,6 @@
 package dev.librepocket.voice
 
 import dev.librepocket.tool.DenyReason
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -11,8 +10,20 @@ import org.junit.Test
  * - 引擎探測 [VoiceTts.hasEngine] fail-closed；
  * - 失敗話術 [VoiceTts.ttsFallbackMessage] 引用原因碼；
  * - 「本地引擎」已修正為系統引擎 + 引擎揭露文案一致；
- * - ChatScreen 朗讀接線（失敗通道 + 揭露文案 + 開關門禁）不斷言 Compose，
- *   只釘選原始碼接線（與 `VoiceSttTest` 的 B1 探測斷言同模式）。
+ * - Stage4：ChatScreen/Settings 接線的原始碼字串釘選已逐個處置——有行為測試
+ *   覆蓋者刪除（取代關係見下方「已刪除釘選」註記），僅無行為測試且難補者保留，
+ *   且每處保留均有脆弱性說明；本檔不剩無說明的 `readText().contains`。
+ *
+ * 已刪除釘選（Stage4，皆有取代，行為測試或保留釘選，見下）：
+ * - `chatScreen_noLongerClaimsLocalEngine` → 揭露文案語義由
+ *   `speakButtonDescription_disclosesSystemEngine` 覆蓋，ChatScreen 渲染該常數
+ *   的接線由保留的 `chatScreen_speakButtonUsesDisclosureCopy` 守住；
+ *   另由 `chatScreen_hasNoLocalEngineClaim` 做檔級否定守衛；
+ * - `speaker_failuresAreRoutedNotSilent` → 各 DETAIL 可觀察性由
+ *   `VoiceSpeakerLifecycleTest` 的 `initFailure_` / `noEngine_` /
+ *   `langUnavailable_` / `speakReturnError_` / `speakException_` /
+ *   `utteranceError_` / `listenerReturnError_` / `listenerException_` 系列覆蓋，
+ *   `AZURE_KEY_REF` 由 `AzureGateTest.azureKeyRef_isPinned` 覆蓋。
  */
 class VoiceDisclosureTest {
 
@@ -77,7 +88,12 @@ class VoiceDisclosureTest {
         assertTrue("msg=$msg", msg.contains("朗讀"))
     }
 
-    // ---- ChatScreen 接線（原始碼釘選） ----
+    // ---- ChatScreen/Settings 接線（原始碼釘選，僅保留無行為測試且難補者） ----
+    //
+    // 脆弱性說明（以下各保留處皆同）：JVM 單測看不到 Compose 渲染結果，只能做字串
+    // 包含檢查。重構（改名/搬檔/改寫法）易誤報，UI 斷線（如常數引用被手寫字串
+    // 取代但恰好仍含關鍵字）易漏報。保留理由：補 Compose 行為測試成本超出
+    // Stage4 範圍；刪除的釘選已在類註解列出取代關係。
 
     /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼。 */
     private fun findSource(vararg relPaths: String): java.io.File {
@@ -96,34 +112,47 @@ class VoiceDisclosureTest {
         "app/src/main/java/dev/librepocket/agent/ui/chat/ChatScreen.kt",
     ).readText()
 
-    @Test fun chatScreen_noLongerClaimsLocalEngine() {
-        assertFalse(chatScreen().contains("本地引擎"))
-    }
+    private fun manifest(): String = findSource(
+        "src/main/AndroidManifest.xml",
+        "app/src/main/AndroidManifest.xml",
+    ).readText()
 
     @Test fun chatScreen_speakButtonUsesDisclosureCopy() {
-        assertTrue(chatScreen().contains("VoiceTts.SPEAK_BUTTON_DESCRIPTION"))
+        // 脆弱性：見本節說明。接線不斷言渲染，只確認朗讀鈕的 contentDescription
+        // 引用共用常數而非手寫字串（釘完整賦值行，排除同名註解行的 nonce）；
+        // 常數內容語義由純 formatter 測試 `speakButtonDescription_disclosesSystemEngine` 覆蓋。
+        assertTrue(chatScreen().contains("contentDescription = VoiceTts.SPEAK_BUTTON_DESCRIPTION"))
     }
 
     @Test fun chatScreen_speakerFailureIsObservable() {
-        // VoiceSpeaker 的失敗通道接到 TTS 錯誤通道（UI 可顯示），不再靜默。
-        // #7：STT/TTS 已拆通道，失敗經 VoiceErrorState.onTtsFailure。
-        val src = chatScreen()
-        assertTrue(src.contains("onTtsFailure"))
+        // 脆弱性：見本節說明。ChatScreen 的 `onError → onTtsFailure` 接線無 Compose
+        // 行為測試行使（狀態機與 speaker 發射各自由 VoiceErrorStateTest 與
+        // VoiceSpeakerLifecycleTest 覆蓋），故保留此檔級守衛；刪掉接線時此測變紅。
+        assertTrue(chatScreen().contains("onTtsFailure"))
     }
 
     @Test fun chatScreen_speakStaysSwitchGated() {
-        // UI 直連仍受 voice_output 開關門禁（與投影層同 key；決策見 ARCHITECTURE）。
-        // #3：門禁判定已收斂進 VoiceTools.outputEnabled（同 key、同預設）。
-        val src = chatScreen()
-        assertTrue(src.contains("VoiceTools.outputEnabled"))
-        assertTrue(src.contains("showSpeak"))
+        // 脆弱性：見本節說明。ChatScreen 的開關門禁無 Compose 行為測試行使，
+        // 故保留此檔級守衛（釘完整賦值行，單關鍵字守不住單點刪除）；刪掉門禁時此測變紅。
+        assertTrue(chatScreen().contains("VoiceTools.outputEnabled"))
+        assertTrue(chatScreen().contains("showSpeak = outputEnabled"))
+    }
+
+    @Test fun chatScreen_hasNoLocalEngineClaim() {
+        // 脆弱性：見本節說明。檔級否定守衛：ChatScreen 不得出現「本地引擎」表述。
+        assertFalse(chatScreen().contains("本地引擎"))
     }
 
     @Test fun chatScreen_addsNoAudioPermission() {
+        // 脆弱性：見本節說明。否定式守衛（重構不易誤報）；肯定式權限不變量由
+        // `AzureGateTest.voiceTools_haveNoPermissionLiterals` 在 ToolRegistry 側覆蓋，
+        // 此處補 ChatScreen 檔級守衛（STT 走 RecognizerIntent 委託，不應出現錄音權限字樣）。
         assertFalse(chatScreen().contains("RECORD_AUDIO"))
     }
 
     @Test fun settings_voiceCardDisclosesEngineDependence() {
+        // 脆弱性：見本節說明。設定頁語音卡為手寫文案（未引用 ENGINE_DISCLOSURE 常數），
+        // 只能釘選關鍵字；文案語義變更需同步更新此測（屬已知脆弱，非行為保證）。
         val settings = findSource(
             "src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
             "app/src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
@@ -132,18 +161,14 @@ class VoiceDisclosureTest {
         assertFalse(settings.contains("本地引擎"))
     }
 
-    @Test fun speaker_failuresAreRoutedNotSilent() {
-        // Stage2：utterance onError 不再是 no-op；各失敗點皆有 DETAIL。
-        val speaker = findSource(
-            "src/main/java/dev/librepocket/voice/VoiceSpeaker.kt",
-            "app/src/main/java/dev/librepocket/voice/VoiceSpeaker.kt",
-        ).readText()
-        assertFalse(speaker.contains("override fun onError(utteranceId: String?) = Unit"))
-        assertFalse(speaker.contains("override fun onError(utteranceId: String?, errorCode: Int) = Unit"))
-        assertTrue(speaker.contains("DETAIL_INIT_FAILED"))
-        assertTrue(speaker.contains("DETAIL_NO_ENGINE"))
-        assertTrue(speaker.contains("DETAIL_LANG_UNAVAILABLE"))
-        assertTrue(speaker.contains("DETAIL_SPEAK_FAILED"))
-        assertEquals("azure_speech", VoiceTools.AZURE_KEY_REF)
+    @Test fun manifestDeclaresTtsServiceVisibility() {
+        // Stage1 manifest 修復的對應測試：TTS_SERVICE 可見性供 getEngines() 引擎探測；
+        // targetSdk 36 package-visibility 過濾下若缺此宣告，引擎表可能為空而被誤判 NO_ENGINE。
+        // 脆弱性：JVM 單測看不到合併後 manifest 與 PackageManager 行為，只能釘選
+        // 原始碼清單字串（與 `VoiceSttTest.manifestQueriesAction_isRecognizeSpeech` 同模式）；
+        // 真正的可見性行為需裝置實證。
+        assertTrue(
+            manifest().contains("<action android:name=\"android.intent.action.TTS_SERVICE\" />"),
+        )
     }
 }

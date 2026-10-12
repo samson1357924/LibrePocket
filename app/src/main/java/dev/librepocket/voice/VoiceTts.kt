@@ -29,7 +29,7 @@ object VoiceTts {
      * 系統引擎揭露（S2 鎖定）：朗讀走裝置安裝的系統語音引擎，
      * 離線能力與資料處理（是否送雲）取決於該引擎；本 app 不新增權限、
      * 不自建語音通道。[SPEAK_BUTTON_DESCRIPTION] 與設定頁語音卡引用同一語義，
-     * 單測釘選一致（見 `VoiceDisclosureTest`）。
+     * 文案語義由 `VoiceDisclosureTest` 的 formatter 斷言覆蓋。
      */
     const val ENGINE_DISCLOSURE = "系統語音引擎處理；資料傳輸取決於已安裝的引擎"
 

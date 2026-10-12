@@ -9,7 +9,6 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
@@ -57,16 +56,6 @@ class VoiceSwitchStore(
     fun observeTtsAcknowledged(): Flow<Boolean> = dataStore.data
         .catch { emit(emptyPreferences()) }
         .map { prefs -> prefs[VOICE_TTS_DISCLOSURE_ACK_KEY] ?: false }
-
-    suspend fun observeSwitchesSnapshot(): Map<String, Boolean> =
-        try {
-            withContext(ioDispatcher) { observeSwitches().first() }
-        } catch (_: Exception) {
-            mapOf(
-                VoiceTools.SWITCH_INPUT to VoiceTools.SWITCH_INPUT_DEFAULT,
-                VoiceTools.SWITCH_OUTPUT to VoiceTools.SWITCH_OUTPUT_DEFAULT,
-            )
-        }
 
     suspend fun setInputEnabled(enabled: Boolean) {
         withContext(ioDispatcher) {

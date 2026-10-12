@@ -169,6 +169,59 @@ class VoiceSpeakerLifecycleTest {
     }
 
     @Test
+    fun unknownEngineTable_maintainsOriginalFlowWithoutFailure() {
+        // getEngines() == null（查詢未知）：fail-open，維持原流程，不斷言失敗。
+        // 語義與拋錯分支一致（見 engineQueryThrow_maintainsOriginalFlowWithoutFailure）。
+        ControlledTextToSpeechShadow.forcedEngines = null
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        speaker.speak("pending before probe")
+        val shadow = currentTtsShadow()
+
+        initSuccessfully(shadow)
+        speaker.speak("after unknown-engine probe")
+
+        assertEquals(
+            listOf("pending before probe", "after unknown-engine probe"),
+            shadow.spokenTextList,
+        )
+        assertTrue(
+            "errors=$errors",
+            errors.none {
+                it.contains(VoiceTts.DETAIL_NO_ENGINE) || it.contains(VoiceTts.DETAIL_INIT_FAILED)
+            },
+        )
+        speaker.shutdown()
+    }
+
+    @Test
+    fun engineQueryThrow_maintainsOriginalFlowWithoutFailure() {
+        // getEngines() 拋錯：視為未知，走 null 同路（fail-open）。
+        // 生產碼 VoiceSpeaker.handleInitLocked 已有 try-catch（直接崩的防護即該 catch），
+        // 故不改生產碼，只在此鎖定語義：未知查詢不斷言失敗、不阻擋後續朗讀。
+        ControlledTextToSpeechShadow.throwOnGetEngines = true
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        speaker.speak("pending before probe")
+        val shadow = currentTtsShadow()
+
+        initSuccessfully(shadow)
+        speaker.speak("after throwing-engine probe")
+
+        assertEquals(
+            listOf("pending before probe", "after throwing-engine probe"),
+            shadow.spokenTextList,
+        )
+        assertTrue(
+            "errors=$errors",
+            errors.none {
+                it.contains(VoiceTts.DETAIL_NO_ENGINE) || it.contains(VoiceTts.DETAIL_INIT_FAILED)
+            },
+        )
+        speaker.shutdown()
+    }
+
+    @Test
     fun listenerReturnError_isWarningButSpeakerStaysUsable() {
         ControlledTextToSpeechShadow.forcedListenerResult = TextToSpeech.ERROR
         val errors = CopyOnWriteArrayList<String>()
@@ -585,7 +638,10 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
     }
 
     @Implementation
-    fun getEngines(): List<TextToSpeech.EngineInfo>? = forcedEngines
+    fun getEngines(): List<TextToSpeech.EngineInfo>? {
+        if (throwOnGetEngines) throw RuntimeException("fake engines query failure")
+        return forcedEngines
+    }
 
     @Implementation
     override fun __constructor__(
@@ -677,6 +733,9 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
         var forcedEngines: List<TextToSpeech.EngineInfo>? = null
 
         @Volatile
+        var throwOnGetEngines = false
+
+        @Volatile
         var forcedListenerResult: Int? = null
 
         @Volatile
@@ -694,6 +753,7 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
             throwOnSpeak = false
             failLanguageLookup = false
             forcedEngines = null
+            throwOnGetEngines = false
             forcedListenerResult = null
             throwOnListener = false
         }

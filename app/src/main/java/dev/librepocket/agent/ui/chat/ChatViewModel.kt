@@ -129,6 +129,37 @@ private data class ForkRead(
 )
 
 /**
+ * PG-S1: endpoint-switch fork fence outcome (ensureSession segment C).
+ * [read] is null when there is no previous session to fork from; otherwise
+ * it carries the ledger read for the caller to apply on Main.
+ * [wasStreaming]/[settleOk]/[durableOk] feed the durable snapshot fallback.
+ */
+private data class SettledFork(
+    val read: ForkRead?,
+    val wasStreaming: Boolean,
+    val settleOk: Boolean,
+    val durableOk: Boolean,
+)
+
+/**
+ * PG-S1: durable fork snapshot outcome (ensureSession segment E).
+ * The callee performs store I/O only and returns the verdict; the caller
+ * writes `_notice` on Main (keeps the four warn branches distinct for tests).
+ * Values: SKIPPED (null-gate defense, unreachable via ensureSession),
+ * CLEAN (snapshot copied, no warning), DANGLING_WARNED (streaming-settled
+ * but dangling families excluded), FENCE_FAILED_WARNED (settle/flush failed),
+ * BYTE_WARNED (byte over-budget abandon), FAILED_WARNED (batch threw).
+ */
+private enum class SnapshotOutcome {
+    SKIPPED,
+    CLEAN,
+    DANGLING_WARNED,
+    FENCE_FAILED_WARNED,
+    BYTE_WARNED,
+    FAILED_WARNED,
+}
+
+/**
  * Stage 5 (R4-1) stale-fork cleanup decision for [ChatViewModel.openSession]:
  * a cross-origin `open()` mints a fresh provider-owned transcript id inside
  * the call, so a binding change that lands after the fork but before attach
@@ -1686,6 +1717,310 @@ class ChatViewModel(
         return EndpointAccess.Ready(AuthorizedEndpoint(latest, binding, authorizedGeneration, allowAsk))
     }
 
+    /**
+     * PG-S1 segment C: settle the detached old ledger(s) BEFORE reading it,
+     * then load the fork inputs. Pure move of the ensureSession fence + read
+     * block (zero behavior change).
+     *
+     * Must be called with sessionMutex held. The caller holds the mutex across
+     * this call; this callee never takes it. [generation] is a value snapshot
+     * taken by the caller; the cancel re-park below uses that same snapshot
+     * (gen-stale means a concurrent clearChat discarded the history, so drop
+     * instead of resurrecting it). [providerId]/[baseUrl] are the endpoint
+     * identity snapshot (effective baseUrl via `toProviderConfig()` at the
+     * call site). The pending-ledger inputs are passed by value with one-time
+     * ownership (the caller already cleared the slots). Only store I/O plus
+     * the ledger settle run here; `_history`/`_notice` writes stay with the
+     * caller back on Main.
+     */
+    private suspend fun settleDetachedLedger(
+        generation: Long,
+        previousSessionId: String?,
+        providerId: String,
+        baseUrl: String,
+        fencedJob: Job?,
+        fencedSession: ChatSession?,
+        fencedWasStreaming: Boolean,
+        mismatchedForSettle: ChatSession?,
+        mismatchedWasStreaming: Boolean,
+    ): SettledFork {
+        val wasStreaming = mismatchedWasStreaming || fencedWasStreaming
+        var settleOk = true
+        var durableOk = true
+        val prevId = previousSessionId
+            ?: return SettledFork(null, wasStreaming, settleOk, durableOk)
+        // R6-3 (a): the fence locals above were destructively consumed
+        // before any suspension. If this IO section is lifecycle-cancelled,
+        // close still runs under NonCancellable but flushDurable throws
+        // CancellationException, the mutex releases, and the locals would
+        // be lost (next fork: no fence to join, wasStreaming evidence
+        // gone). So a cancellation before [fenceSettled] re-parks the
+        // unfinished ledger below — gen-current only (gen-stale means a
+        // concurrent clearChat discarded the history, so drop instead of
+        // resurrecting it).
+        var fenceSettled = false
+        val read = try {
+            withContext(Dispatchers.IO) {
+                // R6-3 fence: settle the old ledger(s) BEFORE reading it.
+                // Prior invalidate fence first (background close-then-flush),
+                // then the just-detached mismatched session (close-then-flush
+                // here). Each phase gets SESSION_FLUSH_TIMEOUT_MS (~2x total
+                // after close); a timeout or flushDurable==false degrades to
+                // the incomplete path instead of copying a dangling family.
+                if (fencedJob != null || fencedSession != null) {
+                    val fence = fencedJob
+                    if (fence != null) {
+                        val joined = try {
+                            withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { fence.join() } != null
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!joined) settleOk = false
+                    }
+                    val parked = fencedSession
+                    if (parked != null) {
+                        // The background job already closed+flushed; re-check
+                        // durability bounded (idempotent after seal).
+                        val durable = try {
+                            withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                parked.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
+                            } ?: false
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!durable) durableOk = false
+                    }
+                }
+                val detached = mismatchedForSettle
+                if (detached != null) {
+                    val ok = try {
+                        withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                            closeThenFlushDurable(detached, SESSION_FLUSH_TIMEOUT_MS)
+                        } ?: false
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        false
+                    }
+                    // closeThenFlushDurable returns flushDurable (drain AND no
+                    // durable failure); an outer timeout (null) and a false
+                    // both mean the ledger may still miss its terminal.
+                    if (!ok) {
+                        settleOk = false
+                        durableOk = false
+                    }
+                }
+                val store = sessions.storeOrNull()
+                // R6-3 (a): both settles above completed — a later cancel in
+                // the ledger read below needs no re-park (ledger durable, no
+                // dangling to fence); assigned before any further suspension,
+                // so the catch below sees the exact settle state.
+                fenceSettled = true
+                val previousMeta = store?.getSession(prevId)
+                val sameOrigin = previousMeta != null && isSameProviderOrigin(
+                    previousMeta.model,
+                    providerId,
+                    baseUrl,
+                )
+                val rep = loadHistory(prevId)
+                val hasHistory = (rep != null && rep.messages.isNotEmpty()) || (store != null && store.countHistoryEvents(prevId, includePartial = true) > 0)
+                val hist = if (sameOrigin) {
+                    loadModelHistory(checkNotNull(store), prevId).messages
+                } else {
+                    emptyList()
+                }
+                val withheld = !sameOrigin && hasHistory
+                ForkRead(
+                    rep,
+                    hist,
+                    withheld,
+                    ForkPrefix(
+                        oldModelShort = previousMeta?.model?.substringAfterLast('/')?.takeIf { it.isNotEmpty() } ?: "unknown",
+                        sameOrigin = sameOrigin,
+                        crossProviderWithheld = withheld,
+                    ),
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            // R6-3 (a): re-park the unfinished ledger so the next fork
+            // still fences it (see reparkUnsettledLedger). Back on Main
+            // here with the mutex still held — same confinement as the
+            // pendingLedger* fields. Gen-stale (concurrent clearChat):
+            // the history is gone, so drop and let the next fork start
+            // clean instead of joining an ancient job.
+            if (!fenceSettled && isGenerationCurrent(generation)) {
+                reparkUnsettledLedger(
+                    fencedJob,
+                    fencedSession,
+                    fencedWasStreaming,
+                    mismatchedForSettle,
+                    mismatchedWasStreaming,
+                )
+            }
+            throw cancelled
+        }
+        return SettledFork(read, wasStreaming, settleOk, durableOk)
+    }
+
+    /**
+     * PG-S1 segment E: durable fork snapshot into the new transcript session.
+     * Pure move of the ensureSession snapshot block (zero behavior change;
+     * the three notice branches are kept distinct, never merged).
+     *
+     * R4-2: persist the carried prefix into the new transcript session so
+     * restart/openSession(newId) still sees the old context plus the new
+     * turns. Best-effort by contract (see snapshotSwitchHistory): the live
+     * turn already carries initialHistory in memory, so a bookkeeping failure
+     * must not fail the send. Runs before attach, so snapshot rows always
+     * sort below the new turn's rows; the single-flight sessionMutex fences
+     * concurrent switches. A stale generation here rolls back through the
+     * discardUnattached path (Room cascades the snapshot).
+     * R5-4: the snapshot batch is atomic (marker + copies commit together or
+     * not at all), so a failure leaves zero snapshot rows — never a silent
+     * half prefix. The catch below best-effort appends one system incomplete
+     * marker and surfaces HISTORY_SNAPSHOT_INCOMPLETE (fail-open: the send
+     * still proceeds on the in-memory prefix).
+     * R6-3 streaming-switch fallback (C): the fence awaited the old ledger,
+     * but a streaming old turn (STREAMING/CANCELLED/WAITING projection,
+     * UNKNOWN admission, or pending cores) or a fence timeout /
+     * flushDurable==false means the ledger may still miss its terminal. Then
+     * the snapshot degrades: it skips dangling families (never copies an
+     * orphan user row that would gain a false INTERRUPTED on reopen) and
+     * rides one incomplete marker in the same atomic batch so the restart
+     * scan re-warns. A clean streaming switch whose terminal already settled
+     * copies the full family with no warning (exclude is a no-op without
+     * dangling).
+     *
+     * Must be called with sessionMutex held. The caller holds the mutex across
+     * this call; this callee never takes it. [forkProvenance] is passed whole
+     * (never split into Booleans). Only store I/O runs here; the caller maps
+     * the returned [SnapshotOutcome] to `_notice` on Main (testability) and
+     * keeps the post-snapshot generation gate.
+     */
+    private suspend fun durableSnapshotOrWarn(
+        previousSessionId: String?,
+        forkTargetId: String?,
+        forkProvenance: ForkPrefix?,
+        newModel: String,
+        wasStreaming: Boolean,
+        settleOk: Boolean,
+        durableOk: Boolean,
+    ): SnapshotOutcome {
+        val prevId = previousSessionId ?: return SnapshotOutcome.SKIPPED
+        val targetId = forkTargetId ?: return SnapshotOutcome.SKIPPED
+        val provenance = forkProvenance ?: return SnapshotOutcome.SKIPPED
+        val fenceFailed = !settleOk || !durableOk
+        val excludeDangling = wasStreaming || fenceFailed
+        val markIncomplete = fenceFailed
+        try {
+            withContext(Dispatchers.IO) {
+                val backing = sessions.storeOrNull()
+                if (backing != null) {
+                    snapshotSwitchHistory(
+                        backing,
+                        prevId,
+                        targetId,
+                        provenance.oldModelShort,
+                        newModel,
+                        provenance.crossProviderWithheld,
+                        excludeDanglingFamilies = excludeDangling,
+                        markIncomplete = markIncomplete,
+                    )
+                }
+            }
+            if (markIncomplete) {
+                // The batch rode the incomplete marker atomically, so
+                // the restart scan will re-warn; surface it now too
+                // (overrides a withhold notice: the copy itself is
+                // what degraded).
+                return SnapshotOutcome.FENCE_FAILED_WARNED
+            } else if (excludeDangling) {
+                // Streaming switch whose terminal settled (no fence
+                // failure) but whose prefix still dangled: the snapshot
+                // auto-marks incomplete when it drops a family (see
+                // snapshotSwitchHistory) — re-surface that warning
+                // without another scan on the hot path unless needed.
+                // Best-effort bounded head/tail scan: only the notice
+                // is at stake.
+                val droppedWarn = try {
+                    withContext(Dispatchers.IO) {
+                        val backing = sessions.storeOrNull()
+                        backing != null && hasIncompleteSnapshotMarker(backing, targetId)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    false
+                }
+                if (droppedWarn) return SnapshotOutcome.DANGLING_WARNED
+                return SnapshotOutcome.CLEAN
+            } else {
+                // R6-5 byte-abandon: a clean fence + non-streaming fork
+                // whose prefix blew SNAPSHOT_MAX_TOTAL_CHARS still rides
+                // the byte marker atomically (snapshotSwitchHistory
+                // returns prefix.size only, so 0 is ambiguous with a
+                // clean empty history) — bounded scan re-surfaces
+                // HISTORY_SNAPSHOT_INCOMPLETE live, never silent until
+                // restart. Same best-effort scan as the branch above:
+                // only the notice is at stake.
+                val byteWarn = try {
+                    withContext(Dispatchers.IO) {
+                        val backing = sessions.storeOrNull()
+                        backing != null && hasIncompleteSnapshotMarker(backing, targetId)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    false
+                }
+                if (byteWarn) return SnapshotOutcome.BYTE_WARNED
+                return SnapshotOutcome.CLEAN
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // R5-4: the atomic batch failed, so the fork holds zero
+            // snapshot rows (no silent half prefix). Mark it
+            // explicitly with one system incomplete row so the
+            // restart scan (hasIncompleteSnapshotMarker) can re-warn;
+            // surface HISTORY_SNAPSHOT_INCOMPLETE now (overrides a
+            // withhold notice: the copy itself is what failed). Both
+            // are best-effort bookkeeping — the live turn already
+            // carries the prefix in memory, so a marker failure here
+            // still must not fail the send (fail-open, degrades to
+            // pre-R4-2 durability: new rows only after a restart).
+            try {
+                withContext(Dispatchers.IO) {
+                    val backing = sessions.storeOrNull()
+                    if (backing != null) {
+                        backing.appendEvent(
+                            TranscriptEvent(
+                                sessionId = targetId,
+                                runId = "snapshot-incomplete-${java.util.UUID.randomUUID()}",
+                                kind = SNAPSHOT_INCOMPLETE_MARKER_KIND,
+                                text = snapshotIncompleteMarkerText(
+                                    provenance.oldModelShort,
+                                    newModel,
+                                ),
+                                createdAt = System.currentTimeMillis(),
+                            ),
+                        )
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Degrades to an unmarked fork: isolation still holds,
+                // only the restart notice is lost.
+            }
+            return SnapshotOutcome.FAILED_WARNED
+        }
+    }
+
     /** Single-flight construction. All mutable ViewModel state stays on Main. */
     private suspend fun ensureSession(
         authorized: AuthorizedEndpoint,
@@ -1778,127 +2113,22 @@ class ChatViewModel(
         val previousSessionId = _currentSessionId.value
         var initialHistory: List<ChatMessage> = emptyList()
         var fork: ForkPrefix? = null
-        // R6-3 fence outcome (set on IO before the read; read by the snapshot
-        // below). Locals confined to this single-flight invocation: assigning
-        // them inside the IO block below is sequential (no concurrent access).
-        var switchLedgerWasStreaming = mismatchedWasStreaming || fencedWasStreaming
-        var switchLedgerSettleOk = true
-        var switchLedgerDurableOk = true
-        if (previousSessionId != null) {
-            // R6-3 (a): the fence locals above were destructively consumed
-            // before any suspension. If this IO section is lifecycle-cancelled,
-            // close still runs under NonCancellable but flushDurable throws
-            // CancellationException, the mutex releases, and the locals would
-            // be lost (next fork: no fence to join, wasStreaming evidence
-            // gone). So a cancellation before [fenceSettled] re-parks the
-            // unfinished ledger below — gen-current only (gen-stale means a
-            // concurrent clearChat discarded the history, so drop instead of
-            // resurrecting it).
-            var fenceSettled = false
-            val read = try {
-            withContext(Dispatchers.IO) {
-                // R6-3 fence: settle the old ledger(s) BEFORE reading it.
-                // Prior invalidate fence first (background close-then-flush),
-                // then the just-detached mismatched session (close-then-flush
-                // here). Each phase gets SESSION_FLUSH_TIMEOUT_MS (~2x total
-                // after close); a timeout or flushDurable==false degrades to
-                // the incomplete path instead of copying a dangling family.
-                if (fencedJob != null || fencedSession != null) {
-                    val fence = fencedJob
-                    if (fence != null) {
-                        val joined = try {
-                            withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { fence.join() } != null
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
-                            false
-                        }
-                        if (!joined) switchLedgerSettleOk = false
-                    }
-                    val parked = fencedSession
-                    if (parked != null) {
-                        // The background job already closed+flushed; re-check
-                        // durability bounded (idempotent after seal).
-                        val durable = try {
-                            withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
-                                parked.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
-                            } ?: false
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
-                            false
-                        }
-                        if (!durable) switchLedgerDurableOk = false
-                    }
-                }
-                val detached = mismatchedForSettle
-                if (detached != null) {
-                    val ok = try {
-                        withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
-                            closeThenFlushDurable(detached, SESSION_FLUSH_TIMEOUT_MS)
-                        } ?: false
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        false
-                    }
-                    // closeThenFlushDurable returns flushDurable (drain AND no
-                    // durable failure); an outer timeout (null) and a false
-                    // both mean the ledger may still miss its terminal.
-                    if (!ok) {
-                        switchLedgerSettleOk = false
-                        switchLedgerDurableOk = false
-                    }
-                }
-                val store = sessions.storeOrNull()
-                // R6-3 (a): both settles above completed — a later cancel in
-                // the ledger read below needs no re-park (ledger durable, no
-                // dangling to fence); assigned before any further suspension,
-                // so the catch below sees the exact settle state.
-                fenceSettled = true
-                val previousMeta = store?.getSession(previousSessionId)
-                val sameOrigin = previousMeta != null && isSameProviderOrigin(
-                    previousMeta.model,
-                    endpoint.providerId,
-                    endpoint.toProviderConfig().baseUrl,
-                )
-                val rep = loadHistory(previousSessionId)
-                val hasHistory = (rep != null && rep.messages.isNotEmpty()) || (store != null && store.countHistoryEvents(previousSessionId, includePartial = true) > 0)
-                val hist = if (sameOrigin) {
-                    loadModelHistory(checkNotNull(store), previousSessionId).messages
-                } else {
-                    emptyList()
-                }
-                val withheld = !sameOrigin && hasHistory
-                ForkRead(
-                    rep,
-                    hist,
-                    withheld,
-                    ForkPrefix(
-                        oldModelShort = previousMeta?.model?.substringAfterLast('/')?.takeIf { it.isNotEmpty() } ?: "unknown",
-                        sameOrigin = sameOrigin,
-                        crossProviderWithheld = withheld,
-                    ),
-                )
-            }
-            } catch (cancelled: CancellationException) {
-                // R6-3 (a): re-park the unfinished ledger so the next fork
-                // still fences it (see reparkUnsettledLedger). Back on Main
-                // here with the mutex still held — same confinement as the
-                // pendingLedger* fields. Gen-stale (concurrent clearChat):
-                // the history is gone, so drop and let the next fork start
-                // clean instead of joining an ancient job.
-                if (!fenceSettled && isGenerationCurrent(generation)) {
-                    reparkUnsettledLedger(
-                        fencedJob,
-                        fencedSession,
-                        fencedWasStreaming,
-                        mismatchedForSettle,
-                        mismatchedWasStreaming,
-                    )
-                }
-                throw cancelled
-            }
+        // PG-S1: fence + read live in settleDetachedLedger (segment C); the
+        // outcome locals below are read by the snapshot call, never shared
+        // across segments as vars.
+        val settled = settleDetachedLedger(
+            generation,
+            previousSessionId,
+            endpoint.providerId,
+            endpoint.toProviderConfig().baseUrl,
+            fencedJob,
+            fencedSession,
+            fencedWasStreaming,
+            mismatchedForSettle,
+            mismatchedWasStreaming,
+        )
+        val read = settled.read
+        if (read != null) {
             if (!isGenerationCurrent(generation)) return@withLock null
             val afterHistory = readEndpoint()
             if (!isGenerationCurrent(generation)) return@withLock null
@@ -1938,137 +2168,29 @@ class ChatViewModel(
                 reconcileReadBinding(bindingOf(afterCreate))
                 return@withLock null
             }
-            // R4-2 durable fork snapshot: persist the carried prefix into the
-            // new transcript session so restart/openSession(newId) still sees
-            // the old context plus the new turns. Best-effort by contract
-            // (see snapshotSwitchHistory): the live turn already carries
-            // initialHistory in memory, so a bookkeeping failure must not
-            // fail the send. Runs before attach, so snapshot rows always sort
-            // below the new turn's rows; the single-flight sessionMutex fences
-            // concurrent switches. A stale generation here rolls back through
-            // the discardUnattached path below (Room cascades the snapshot).
-            // R5-4: the snapshot batch is atomic (marker + copies commit
-            // together or not at all), so a failure leaves zero snapshot rows
-            // — never a silent half prefix. The catch below best-effort
-            // appends one system incomplete marker and surfaces
-            // HISTORY_SNAPSHOT_INCOMPLETE (fail-open: the send still proceeds
-            // on the in-memory prefix).
-            // R6-3 streaming-switch fallback (C): the fence above awaited the
-            // old ledger, but a streaming old turn (STREAMING/CANCELLED/
-            // WAITING projection, UNKNOWN admission, or pending cores) or a
-            // fence timeout / flushDurable==false means the ledger may still
-            // miss its terminal. Then the snapshot degrades: it skips dangling
-            // families (never copies an orphan user row that would gain a
-            // false INTERRUPTED on reopen) and rides one incomplete marker in
-            // the same atomic batch so the restart scan re-warns. A clean
-            // streaming switch whose terminal already settled copies the full
-            // family with no warning (exclude is a no-op without dangling).
+            // PG-S1: durable fork snapshot lives in durableSnapshotOrWarn
+            // (segment E). Detail comments (R4-2/R5-4/R6-3) moved with it;
+            // the post-snapshot generation gate stays here by contract.
             val forkTargetId = created.sessionId
             val forkProvenance = fork
             if (forkTargetId != null && forkProvenance != null && previousSessionId != null) {
-                val fenceFailed = !switchLedgerSettleOk || !switchLedgerDurableOk
-                val excludeDangling = switchLedgerWasStreaming || fenceFailed
-                val markIncomplete = fenceFailed
-                try {
-                    withContext(Dispatchers.IO) {
-                        val backing = sessions.storeOrNull()
-                        if (backing != null) {
-                            snapshotSwitchHistory(
-                                backing,
-                                previousSessionId,
-                                forkTargetId,
-                                forkProvenance.oldModelShort,
-                                created.model,
-                                forkProvenance.crossProviderWithheld,
-                                excludeDanglingFamilies = excludeDangling,
-                                markIncomplete = markIncomplete,
-                            )
-                        }
-                    }
-                    if (markIncomplete) {
-                        // The batch rode the incomplete marker atomically, so
-                        // the restart scan will re-warn; surface it now too
-                        // (overrides a withhold notice: the copy itself is
-                        // what degraded).
-                        _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
-                    } else if (excludeDangling) {
-                        // Streaming switch whose terminal settled (no fence
-                        // failure) but whose prefix still dangled: the snapshot
-                        // auto-marks incomplete when it drops a family (see
-                        // snapshotSwitchHistory) — re-surface that warning
-                        // without another scan on the hot path unless needed.
-                        // Best-effort bounded head/tail scan: only the notice
-                        // is at stake.
-                        val droppedWarn = try {
-                            withContext(Dispatchers.IO) {
-                                val backing = sessions.storeOrNull()
-                                backing != null && hasIncompleteSnapshotMarker(backing, forkTargetId)
-                            }
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
-                            false
-                        }
-                        if (droppedWarn) _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
-                    } else {
-                        // R6-5 byte-abandon: a clean fence + non-streaming fork
-                        // whose prefix blew SNAPSHOT_MAX_TOTAL_CHARS still rides
-                        // the byte marker atomically (snapshotSwitchHistory
-                        // returns prefix.size only, so 0 is ambiguous with a
-                        // clean empty history) — bounded scan re-surfaces
-                        // HISTORY_SNAPSHOT_INCOMPLETE live, never silent until
-                        // restart. Same best-effort scan as the branch above:
-                        // only the notice is at stake.
-                        val byteWarn = try {
-                            withContext(Dispatchers.IO) {
-                                val backing = sessions.storeOrNull()
-                                backing != null && hasIncompleteSnapshotMarker(backing, forkTargetId)
-                            }
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
-                            false
-                        }
-                        if (byteWarn) _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    // R5-4: the atomic batch failed, so the fork holds zero
-                    // snapshot rows (no silent half prefix). Mark it
-                    // explicitly with one system incomplete row so the
-                    // restart scan (hasIncompleteSnapshotMarker) can re-warn;
-                    // surface HISTORY_SNAPSHOT_INCOMPLETE now (overrides a
-                    // withhold notice: the copy itself is what failed). Both
-                    // are best-effort bookkeeping — the live turn already
-                    // carries the prefix in memory, so a marker failure here
-                    // still must not fail the send (fail-open, degrades to
-                    // pre-R4-2 durability: new rows only after a restart).
-                    try {
-                        withContext(Dispatchers.IO) {
-                            val backing = sessions.storeOrNull()
-                            if (backing != null) {
-                                backing.appendEvent(
-                                    TranscriptEvent(
-                                        sessionId = forkTargetId,
-                                        runId = "snapshot-incomplete-${java.util.UUID.randomUUID()}",
-                                        kind = SNAPSHOT_INCOMPLETE_MARKER_KIND,
-                                        text = snapshotIncompleteMarkerText(
-                                            forkProvenance.oldModelShort,
-                                            created.model,
-                                        ),
-                                        createdAt = System.currentTimeMillis(),
-                                    ),
-                                )
-                            }
-                        }
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        // Degrades to an unmarked fork: isolation still holds,
-                        // only the restart notice is lost.
-                    }
-                    _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                val snapshotOutcome = durableSnapshotOrWarn(
+                    previousSessionId,
+                    forkTargetId,
+                    forkProvenance,
+                    created.model,
+                    settled.wasStreaming,
+                    settled.settleOk,
+                    settled.durableOk,
+                )
+                // Four warn branches stay distinct (never merged): each
+                // cause re-warns the same notice for a different reason.
+                when (snapshotOutcome) {
+                    SnapshotOutcome.FENCE_FAILED_WARNED -> _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    SnapshotOutcome.DANGLING_WARNED -> _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    SnapshotOutcome.BYTE_WARNED -> _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    SnapshotOutcome.FAILED_WARNED -> _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    SnapshotOutcome.CLEAN, SnapshotOutcome.SKIPPED -> Unit
                 }
                 if (!isGenerationCurrent(creationGeneration)) return@withLock null
             }

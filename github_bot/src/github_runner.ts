@@ -2266,10 +2266,10 @@ export function issueContentFingerprint(title: string, body: string, comments: s
 // default branch only (never a PR/issue-supplied ref, never executed).
 // Paths are validated literally (no traversal, no absolute paths, no
 // pathspec magic). F2: codeRefs use their own allowlist, independent of the
-// PR diff-review filter (whose must-include exceptions would override its
-// excludes). The denylist below is non-overridable and runs first; the
-// positive allowlist then limits reads to text source/config extensions;
-// the shared diff-review excludes remain as a final backstop. Returns
+// PR diff-review filter (whose must-include exceptions override its
+// non-hard-deny excludes). The denylist below is non-overridable and runs
+// first; the positive allowlist then limits reads to text source/config
+// extensions; the shared diff-review excludes remain as a final backstop. Returns
 // undefined when anything is invalid or any fetch fails, in which case the
 // caller keeps the first-round result.
 // Denylist uses prefix matching so backup copies (google-services.json.bak,

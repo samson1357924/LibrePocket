@@ -246,6 +246,11 @@ export async function runScannerSendOpenAITests(): Promise<void> {
       'proguard/debug.keystore', '.github/workflows/evil.keystore', 'app/key.pem',
       'config/server.key', 'certs/tls.p12', 'keys/code.pfx',
       'app/google-services.json.bak', 'config/local.properties.txt',
+      'tests/debug.keystore.bak', 'proguard/secret.key.bak',
+      '.github/workflows/evil.p12.bak', 'keys/tls.pem.txt',
+      'permissions/id_rsa', 'tests/credentials.json', 'tests/secret.asc',
+      'app/src/test/id_rsa.txt', 'config/keystore.properties',
+      'app/googleservice-info.plist', 'config/service-account-prod.json',
     ]) {
       assert.equal(isHardDeniedReviewFile(denied), true, `H1 hard-denies ${denied}`);
       assert.ok(!filterReviewDiffFiles([denied]).includes(denied), `H1 filters ${denied} despite must-include`);

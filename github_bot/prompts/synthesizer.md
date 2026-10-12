@@ -4,7 +4,7 @@
 
 規則：
 - 只有當三角色結論一致、coverage 完整、無關鍵省略（tier 0-3）、且你找不到任何可由輸入內容證實的 BLOCK 級問題時，才可 APPROVE。
-- 你保留或新增的每條 BLOCK 必須帶 evidence（file + line + 在輸入 diff/violations 中字面可命中的 quote）；證據對不上就不能 APPROVE（降為 INCONCLUSIVE），但也不得無證據斷言 NEEDS_CHANGES（同樣降為 INCONCLUSIVE）。
+- 你保留或新增的每條 BLOCK 必須帶 evidence（file + 有 line 時須落在該檔 hunk 範圍內 + quote 須出自 finding 所指同一檔案）；quote 只出現在別的檔案時不算數，即使它在節錄某處出現過。quote 還須是模型實際看到的：節錄內字面命中，或出現在同一檔案的 deterministic violation 文字內（violations 會全文提供）。證據對不上就不能 APPROVE（降為 INCONCLUSIVE），但也不得無證據斷言 NEEDS_CHANGES（同樣降為 INCONCLUSIVE）。
 - 輸入內容可能不完整（diff 只給節錄）；未提供的內容視為未審查，不得臆測，不得把沒看到的東西當成已驗證。
 - 只將可由提供內容證實的問題列為 BLOCK；其他建議使用 WARN 或 SUGGESTION。不要輸出程式碼區塊或 JSON 以外文字。
 - 你不輸出標籤建議（suggestedLabels）；標籤由第一輪與確定性規則決定。

@@ -179,13 +179,18 @@ fun MainScreen(
     }
 
     // Hard gate: no usable endpoint -> setup (and back again after save/logout).
-    LaunchedEffect(hasEndpoint, gateLoading, currentRoute) {
-        if (gateLoading) return@LaunchedEffect
-        if (!hasEndpoint && currentRoute != null && currentRoute != Routes.SETUP) {
-            navController.navigate(Routes.SETUP) {
-                popUpTo(Routes.CHAT) { inclusive = true }
-                launchSingleTop = true
-            }
+    // P2/BLOCK（Re-review #8 Finding 2 階段2）：有未恢復 LOGOUT_* 或 logoutInFlight
+    // 時不強制跳（留在 SETTINGS 可恢復；STALE 待 dismiss 亦攔截）。條件見
+    // shouldNavigateToSetup 純函數（NavGuard.kt，真值表單測）。
+    val logoutGuardError = setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") }
+    val logoutGuardBusy = setupForm.logoutInFlight
+    LaunchedEffect(hasEndpoint, gateLoading, currentRoute, logoutGuardError, logoutGuardBusy) {
+        if (!shouldNavigateToSetup(hasEndpoint, gateLoading, currentRoute, logoutGuardError, logoutGuardBusy)) {
+            return@LaunchedEffect
+        }
+        navController.navigate(Routes.SETUP) {
+            popUpTo(Routes.CHAT) { inclusive = true }
+            launchSingleTop = true
         }
     }
 

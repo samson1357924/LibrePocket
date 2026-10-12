@@ -329,14 +329,77 @@ fun SettingsScreen(
                 }
             }
             EndpointGate.NoEndpoint -> {
-                Text(
-                    "尚未設定 API 端點。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                Button(onClick = onEditEndpoint, modifier = Modifier.fillMaxWidth()) {
-                    Text("前往設定")
+                // NoEndpoint 恢復入口（Re-review #8 Finding 2 P2/BLOCK 階段2）：
+                // 部分清除（LOGOUT_CLEAR_FAILED：金鑰已刪、設定仍在）gate 已折疊為
+                // NoEndpoint；若只顯示「尚未設定」會丟失重試入口。有未恢復 LOGOUT_*
+                // 時改顯示 setupErrorText + 重試（可重試碼）/ STALE 僅關閉 + 取消；
+                // inFlight 時按鍵 disabled + spinner。無碼時保留原尚未設定文案。
+                // 恢復態隱藏「前往設定」（dismiss 回 fresh 後再出現），避免在元數據
+                // 仍殘留時進 Setup 預填陳舊值；重試/關閉才是此態的恢復入口。
+                val recoveryCode = logoutErrorCode?.takeIf { it.startsWith("LOGOUT_") }
+                if (recoveryCode == null) {
+                    Text(
+                        "尚未設定 API 端點。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = onEditEndpoint,
+                        enabled = !logoutInFlight,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("前往設定")
+                    }
+                } else {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = setupErrorText(recoveryCode),
+                            modifier = Modifier.padding(12.dp),
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    val isStale = recoveryCode == "LOGOUT_STALE"
+                    if (!isStale) {
+                        Button(
+                            onClick = onRetryLogout,
+                            enabled = !logoutInFlight,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            if (logoutInFlight) {
+                                CircularProgressIndicator(strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.padding(4.dp))
+                                Text("清除中…")
+                            } else {
+                                Text("重試清除")
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = onDismissLogoutError,
+                            enabled = !logoutInFlight,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("取消")
+                        }
+                    } else {
+                        // STALE：已有新的金鑰生效，不需重試，僅關閉待 dismiss
+                        //（導航守衛亦攔截，見 shouldNavigateToSetup）。
+                        OutlinedButton(
+                            onClick = onDismissLogoutError,
+                            enabled = !logoutInFlight,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("關閉")
+                        }
+                    }
                 }
             }
             EndpointGate.Loading -> {

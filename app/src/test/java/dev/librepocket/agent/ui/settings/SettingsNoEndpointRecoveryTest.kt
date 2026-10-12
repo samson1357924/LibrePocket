@@ -1,0 +1,153 @@
+package dev.librepocket.agent.ui.settings
+
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.unit.dp
+import dev.librepocket.agent.ui.setup.EndpointGate
+import dev.librepocket.agent.ui.setup.setupErrorText
+import org.junit.Assert.assertEquals
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+/**
+ * 階段2：NoEndpoint 恢復入口（Re-review #8 Finding 2 P2/BLOCK）。
+ *
+ * - `LOGOUT_CLEAR_FAILED`（部分清除，gate 已折疊 NoEndpoint）顯示恢復卡 +
+ *   重試可達，且不再顯示「尚未設定」文案（readyGate 反例）；
+ * - `LOGOUT_STALE`（已有新金鑰生效）無重試、僅關閉；
+ * - 無碼時保留原尚未設定文案（fresh 不變）；
+ * - inFlight 時按鍵 disabled + spinner。
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
+class SettingsNoEndpointRecoveryTest {
+
+    @get:Rule
+    val composeRule = createComposeRule()
+
+    private fun scrolledContent(content: @Composable () -> Unit) {
+        composeRule.setContent {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                content()
+            }
+        }
+    }
+
+    private fun onArea(text: String) =
+        composeRule.onNodeWithText(text).performScrollTo()
+
+    @Test
+    fun noEndpointClearFailedShowsRecoveryAndRetryReachesLogout() {
+        var logoutCalls = 0
+        scrolledContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.NoEndpoint,
+                onLogout = { logoutCalls++ },
+                logoutErrorCode = "LOGOUT_CLEAR_FAILED",
+            )
+        }
+        // 恢復卡文案可見，重試可達。
+        onArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
+        onArea("重試清除").assertIsDisplayed()
+        onArea("取消").assertIsDisplayed()
+        // readyGate 反例：恢復態不顯示「尚未設定」文案。
+        composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
+        composeRule.onAllNodesWithText("前往設定").assertCountEquals(0)
+        onArea("重試清除").performClick()
+        assertEquals(1, logoutCalls)
+    }
+
+    @Test
+    fun noEndpointStaleHasNoRetryOnlyDismiss() {
+        var logoutCalls = 0
+        var dismissed = 0
+        scrolledContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.NoEndpoint,
+                onLogout = { logoutCalls++ },
+                logoutErrorCode = "LOGOUT_STALE",
+                onDismissLogoutError = { dismissed++ },
+            )
+        }
+        // 新的金鑰文案可見，無重試，僅關閉。
+        onArea(setupErrorText("LOGOUT_STALE")).assertIsDisplayed()
+        composeRule.onAllNodesWithText("重試清除").assertCountEquals(0)
+        composeRule.onAllNodesWithText("確定清除").assertCountEquals(0)
+        onArea("關閉").assertIsDisplayed()
+        onArea("關閉").performClick()
+        assertEquals(1, dismissed)
+        assertEquals(0, logoutCalls)
+    }
+
+    @Test
+    fun noEndpointFreshUnchanged() {
+        scrolledContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.NoEndpoint,
+            )
+        }
+        // 無碼時保留原尚未設定文案 + 前往設定，無恢復鍵。
+        onArea("尚未設定 API 端點。").assertIsDisplayed()
+        onArea("前往設定").assertIsDisplayed()
+        composeRule.onAllNodesWithText("重試清除").assertCountEquals(0)
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
+    }
+
+    @Test
+    fun noEndpointInFlightDisablesAndShowsSpinner() {
+        scrolledContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.NoEndpoint,
+                logoutErrorCode = "LOGOUT_CLEAR_FAILED",
+                logoutInFlight = true,
+            )
+        }
+        onArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
+        onArea("清除中…").assertIsDisplayed()
+        composeRule.onNodeWithText("清除中…").assertIsNotEnabled()
+        onArea("取消").assertIsNotEnabled()
+    }
+
+    @Test
+    fun noEndpointRetryableCodesAllShowRetry() {
+        // READ/DELETE 失敗同為可重試碼（STALE 除外）：同一 content 內切碼驗證，
+        // 避免同一 test 內兩次 setContent（compose rule 單測只允許一次）。
+        var code by mutableStateOf("LOGOUT_READ_FAILED")
+        scrolledContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.NoEndpoint,
+                logoutErrorCode = code,
+            )
+        }
+        onArea(setupErrorText("LOGOUT_READ_FAILED")).assertIsDisplayed()
+        onArea("重試清除").assertIsDisplayed()
+        code = "LOGOUT_DELETE_FAILED"
+        composeRule.waitForIdle()
+        onArea(setupErrorText("LOGOUT_DELETE_FAILED")).assertIsDisplayed()
+        onArea("重試清除").assertIsDisplayed()
+    }
+}

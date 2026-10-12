@@ -19,6 +19,7 @@ import {
   resolveLabelsFromTitle,
   resolveReviewLabels,
   sanitizeLabels,
+  sanitizeIssueAiSuggestions,
   sanitizePrAiSuggestions,
   type GitHubLabelClient,
   type ReconcileScope,
@@ -3262,6 +3263,28 @@ function mergeRulesWithAiSuggestions(rulesLabels: string[], aiRawLabels: string[
   return { merged: sanitizeLabels([...rulesLabels, ...sanitizedAi]), sanitizedAi, hadUnknown };
 }
 
+// Issue-side merge: deterministic title rules plus AI suggestions converged
+// through the issue allowlist. Human-only labels (gate:*/verified statuses)
+// are discarded here; callers treat hadIllegal exactly like hadUnknown
+// (rules-only tags, never APPROVE). Deterministic labels are computed
+// without any AI input; the LLM only supplements labels no deterministic
+// rule can produce (see the taxonomy in label_manager.ts).
+function mergeIssueRulesWithAiSuggestions(
+  rulesLabels: string[],
+  aiRawLabels: string[],
+): { merged: string[]; hadIllegal: boolean } {
+  // sanitizeIssueAiSuggestions counts non-string entries as discarded, so no
+  // pre-filter here: every illegal entry (unknown, human-only, non-string)
+  // is counted. (Publish stays stricter: a non-string suggestedLabels entry
+  // invalidates the whole artifact fail-closed.)
+  const filtered = sanitizeIssueAiSuggestions(Array.isArray(aiRawLabels) ? aiRawLabels : []);
+  if (filtered.discardedCount > 0) {
+    // Never log raw label values (model-controlled); record only the count.
+    console.warn(`[PocketGuard] Discarded ${filtered.discardedCount} issue AI label(s) outside the convergence allowlist.`);
+  }
+  return { merged: sanitizeLabels([...rulesLabels, ...filtered.kept]), hadIllegal: filtered.discardedCount > 0 };
+}
+
 function saveIssueOutput(output: RunnerIssueOutput, context: RunnerContext): ReviewReportWriteResult {
   const env = context.env ?? process.env;
   const serialized = `${JSON.stringify(output, null, 2)}\n`;
@@ -3810,7 +3833,7 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
         perChunk.push(triaged);
       }
       const aiRaw = [...new Set(perChunk.flatMap((r) => Array.isArray(r.suggestedLabels) ? r.suggestedLabels : []))];
-      const { merged, hadUnknown } = mergeRulesWithAiSuggestions(issueRulesTags(title), aiRaw);
+      const { merged, hadIllegal } = mergeIssueRulesWithAiSuggestions(issueRulesTags(title), aiRaw);
       let verdict: RunnerVerdict;
       if (deterministicBlock) {
         verdict = 'NEEDS_CHANGES';
@@ -3821,8 +3844,8 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       } else {
         verdict = 'APPROVE';
       }
-      if (hadUnknown && verdict === 'APPROVE') verdict = 'INCONCLUSIVE';
-      const tags = hadUnknown
+      if (hadIllegal && verdict === 'APPROVE') verdict = 'INCONCLUSIVE';
+      const tags = hadIllegal
         ? sanitizeLabels([...issueRulesTags(title), ...(verdict !== 'APPROVE' ? ['status:needs-decision'] : [])])
         : sanitizeLabels([...merged, ...(verdict !== 'APPROVE' ? ['status:needs-decision'] : [])]);
       const summary = safeString(perChunk.map((r) => r.summary).filter(Boolean).join(' / ') || (verdict === 'APPROVE' ? 'chunked review complete.' : 'chunked review incomplete.'));
@@ -3848,7 +3871,9 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
           coveredLength: chunk.coveredLength,
           verdict: triaged.verdict,
           summary: safeString(triaged.summary, MAX_ISSUE_CHUNK_SUMMARY_LENGTH),
-          labels: sanitizeLabels(rawLabels.filter((entry): entry is string => typeof entry === 'string')),
+          // Converge per-chunk labels through the same issue allowlist so
+          // human-only suggestions never persist even in report artifacts.
+          labels: sanitizeIssueAiSuggestions(rawLabels).kept,
           segments: chunk.segments.map((s) => ({ ...s })),
           bodySha: chunk.bodySha,
           bodyRanges: chunk.bodyRanges.map((r) => ({ ...r })),
@@ -3898,13 +3923,13 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       allowedOrigins: parseAllowedOrigins(env),
     });
     const aiRaw = Array.isArray(triaged.suggestedLabels) ? triaged.suggestedLabels : [];
-    const { merged, hadUnknown } = mergeRulesWithAiSuggestions(issueRulesTags(title), aiRaw);
+    const { merged, hadIllegal } = mergeIssueRulesWithAiSuggestions(issueRulesTags(title), aiRaw);
     // Deterministic needs-decision for non-APPROVE cannot be cleared by AI.
     // Phase 2 (H): deterministic BLOCK forces NEEDS_CHANGES (never APPROVE).
     let verdict = triaged.verdict;
     if (deterministicBlock) verdict = 'NEEDS_CHANGES';
-    if (hadUnknown && verdict === 'APPROVE') verdict = 'INCONCLUSIVE';
-    const tags = hadUnknown
+    if (hadIllegal && verdict === 'APPROVE') verdict = 'INCONCLUSIVE';
+    const tags = hadIllegal
       ? sanitizeLabels([...issueRulesTags(title), ...(verdict !== 'APPROVE' ? ['status:needs-decision'] : [])])
       : sanitizeLabels([...merged, ...(verdict !== 'APPROVE' ? ['status:needs-decision'] : [])]);
     const output: RunnerIssueOutput = {
@@ -4988,7 +5013,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
           // slice ranges, order) alongside the fingerprint gate above, while
           // redacted coverage still uses the full* copies.
           else if (validated.chunks !== undefined && !verifyIssueChunkCoverage(validated.chunks, { title: currentFullTitle, body: currentFullBody, comments: currentFullComments, commentIds: currentRawCommentIds, rawComments: currentRawComments, rawBody: currentRawBody })) issueFallbackReason = 'the review output is unverifiable: issue chunk coverage does not match the current issue content.';
-          else if (hasUnknownAiLabels(validated.suggestedLabels)) issueFallbackReason = 'the AI label suggestions contain unknown labels; discarded.';
+          else if (sanitizeIssueAiSuggestions(Array.isArray(validated.suggestedLabels) ? validated.suggestedLabels : []).discardedCount > 0) issueFallbackReason = 'the AI label suggestions contain labels outside the issue allowlist; discarded.';
           // Phase 2 (H): full fingerprint re-verification for chunked APPROVE
           // already covered by the equality above; an APPROVE with chunks must
           // also carry complete per-segment schema (validated above).
@@ -5035,13 +5060,13 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       return;
     }
 
-    const { merged, hadUnknown } = mergeRulesWithAiSuggestions(rulesTitle, validated.suggestedLabels);
-    if (hadUnknown) {
+    const { merged, hadIllegal } = mergeIssueRulesWithAiSuggestions(rulesTitle, validated.suggestedLabels);
+    if (hadIllegal) {
       await publishStickyComment(
         client,
         repository,
         issueNumber,
-        issueInconclusiveComment(issueNumber, issueTitle, 'the AI label suggestions contain unknown labels; discarded.', currentFingerprint, formatReportLine(env, false)),
+        issueInconclusiveComment(issueNumber, issueTitle, 'the AI label suggestions contain labels outside the issue allowlist; discarded.', currentFingerprint, formatReportLine(env, false)),
       );
       const fallbackDesired = sanitizeLabels([...rulesTitle, 'status:needs-decision']);
       try {

@@ -469,7 +469,7 @@ export async function runStage4P2Tests(): Promise<void> {
             writeStdout: () => undefined,
           });
           assert.notEqual(reviewed.verdict, 'APPROVE', 'unknown labels force non-APPROVE');
-          assert.ok(warnings.some((w) => /Discarded 1 unknown AI label/.test(w)), 'discard is logged as a count');
+          assert.ok(warnings.some((w) => /Discarded 1 issue AI label/.test(w)), 'discard is logged as a count');
           assert.ok(warnings.every((w) => !w.includes(sentinel)), 'raw unknown label never enters the log');
         } finally {
           restore();

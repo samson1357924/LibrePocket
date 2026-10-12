@@ -150,6 +150,145 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
+    // H-1b: issue AI suggesting a human-only label (gate:*) is discarded and
+    // forces INCONCLUSIVE; allowlisted suggestions are kept.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-issue-gate-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'ok', suggestedLabels: ['bug', 'gate:live'] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'short body' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'short body' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'human-only AI label forces INCONCLUSIVE');
+          assert.ok(!reviewed.tags.includes('gate:live'), 'gate label never written');
+          assert.ok(!reviewed.tags.includes('bug'), 'tainted AI batch is discarded wholesale');
+          assert.ok(reviewed.tags.includes('status:needs-decision'), 'non-APPROVE carries needs-decision');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // H-1c: publish rejects a crafted APPROVE artifact whose suggestedLabels
+    // carry a human-only label (gate:*) — same sticky INCONCLUSIVE, never written.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-issue-gate-pub-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'ok', suggestedLabels: ['bug'] }]);
+        try {
+          const reviewState = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const reviewClient = issueClient(reviewState, { getTitle: 'gate-title', getBody: 'gate-body' });
+          await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'gate-title', body: 'gate-body' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: reviewClient,
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        const forged = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+        forged.suggestedLabels = ['gate:live'];
+        fs.writeFileSync(artifactPath, JSON.stringify(forged));
+        const applied: string[] = [];
+        const state = {
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const client = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: 'gate-title', body: 'gate-body' } }),
+              listComments: async (params: { page: number }) => {
+                void params;
+                return { data: state.comments };
+              },
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const c = state.comments.find((x) => x.id === params.comment_id);
+                if (c) c.body = params.body;
+                return {};
+              },
+              addLabels: async (params: { labels: string[] }) => { applied.push(...params.labels); return {}; },
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'gate-title', body: 'gate-body' } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_SERVER_URL: 'https://github.com',
+            GITHUB_RUN_ID: '123456',
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as unknown as NodeJS.ProcessEnv,
+          githubClient: client,
+        });
+        assert.equal(state.created, 0, 'forged-gate publish creates no second comment');
+        assert.equal(state.updated, 1, 'forged-gate publish updates the same sticky');
+        assert.ok(state.comments[0].body.includes('INCONCLUSIVE'), 'forged gate falls back');
+        assert.ok(!applied.includes('gate:live'), 'gate label never applied');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // H-1d: chunked issue triage with a human-only label in one chunk is
+    // discarded wholesale and forces INCONCLUSIVE; per-chunk report labels
+    // are converged through the same allowlist.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-issue-gate-chunked-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const bigBody = 'x'.repeat(9001);
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'c0 ok', suggestedLabels: ['bug'] },
+          { verdict: 'APPROVE', summary: 'c1 ok', suggestedLabels: ['gate:live'] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: bigBody });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: bigBody } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'chunked human-only label forces INCONCLUSIVE');
+          assert.ok(!reviewed.tags.includes('gate:live'), 'gate label never written');
+          assert.ok(Array.isArray(reviewed.chunks) && reviewed.chunks.length >= 2, 'body splits into chunks');
+          assert.ok(reviewed.chunks.every((c) => !c.labels.includes('gate:live')), 'per-chunk labels converged');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
     // H-2: link success vs failure branches (no fake link on failure).
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-link-'));

@@ -184,7 +184,10 @@ internal fun shouldDeleteStaleFork(requestedSessionId: String, created: CreatedS
  * endpoint-switch fork fences up to three such bounded waits in series on
  * IO — the prior parked fence join (~2x), its session re-flush (~2x), and
  * the just-detached close-then-flush (~2x) — so the single-flight mutex is
- * held up to ~6x this value (~30s) worst case before the snapshot read. The
+ * held up to ~6x this value (~30s) worst case before the snapshot read. A
+ * same-ID openSession reopen fences the same three waits (~6x) inside the
+ * mutex before its gated backfill; a different-ID open keeps the fast path
+ * (no fence: the backfill targets another ledger). The
  * UI never waits on any of it: VM state is detached synchronously and each
  * wait is bounded — a stalled store only delays the background close / the
  * next fork's snapshot, never user interaction. Mirrors
@@ -1279,6 +1282,28 @@ class ChatViewModel(
 
     /** Resume an existing transcript session (history replay + live binding). */
     fun openSession(sessionId: String) {
+        // R8-3 same-ID reopen fence: snapshot before invalidateLifecycle
+        // clears it. invalidate (clearChat=true) synchronously drops the
+        // fence slot and nulls _currentSessionId, so after it runs a reopen
+        // can no longer tell it targets the live ledger. Take one-time
+        // ownership of the fence slot here (mirrors the ensureSession
+        // consume); a different-ID reopen drops it (fast path: the backfill
+        // targets another ledger). A same-ID reopen detaches its live
+        // session now so the invalidate below does not launch a second
+        // concurrent teardown for it — the slow-path IO settles it exactly
+        // once, then reads, then backfills gated on the settle outcome.
+        val prevId: String? = _currentSessionId.value
+        val prevLive: ChatSession? = currentSession
+        val fencedJob0: Job? = pendingLedgerFence
+        val fencedSession0: ChatSession? = pendingLedgerSession
+        pendingLedgerFence = null
+        pendingLedgerSession = null
+        pendingLedgerWasStreaming = false
+        pendingLedgerOwnerSessionId = null
+        val isSameIdReopen = prevId != null && prevId == sessionId
+        if (isSameIdReopen && prevLive != null) {
+            cancelAndDetachSync(prevLive)
+        }
         invalidateLifecycle(clearChat = true)
         val requestedGeneration = lifecycleGeneration
         openJob = lifecycleScope.launch {
@@ -1286,17 +1311,26 @@ class ChatViewModel(
             var attached = false
             var cancellation: CancellationException? = null
             try {
-                val loaded = try {
-                    withContext(Dispatchers.IO) { loadHistory(sessionId) }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
+                // Fast path (different ID) preloads outside the mutex as
+                // before; the slow path reads AFTER its settle inside the
+                // mutex, so its snapshot can never see an orphan user row.
+                val fastLoaded: LoadedUiHistory? = if (!isSameIdReopen) {
+                    try {
+                        withContext(Dispatchers.IO) { loadHistory(sessionId) }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        null
+                    }
+                } else {
                     null
                 }
-                if (!isGenerationCurrent(requestedGeneration)) return@launch
-                if (loaded == null) {
-                    _notice.value = "UNKNOWN_SESSION"
-                    return@launch
+                if (!isSameIdReopen) {
+                    if (!isGenerationCurrent(requestedGeneration)) return@launch
+                    if (fastLoaded == null) {
+                        _notice.value = "UNKNOWN_SESSION"
+                        return@launch
+                    }
                 }
 
                 val access = when (val result = authorizeEndpoint(requestedGeneration)) {
@@ -1338,12 +1372,195 @@ class ChatViewModel(
                         return@withLock
                     }
 
+                    if (!isSameIdReopen) {
+                        val creationGeneration = requestedGeneration
+                        try {
+                            withContext(Dispatchers.IO) {
+                                candidate = sessions.open(
+                                    latest,
+                                    sessionId,
+                                    allowAsk = access.allowAsk,
+                                    keyIsCurrent = { isBindingCurrent(access.binding, creationGeneration) },
+                                    backfillInterrupted = true,
+                                )
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: CaptureDeniedException) {
+                            // S1/S6 (see the slow path below): burn a consent
+                            // minted between T0 and T1 so a T1 deny on open
+                            // leaves no residual slot for replay; only
+                            // CaptureDeniedException maps to POLICY_DENIED.
+                            takePendingKeyReadConsent()
+                            setNoticeIfCurrent(requestedGeneration, "POLICY_DENIED")
+                            return@withLock
+                        }
+                        val created = candidate ?: return@withLock
+                        if (!isGenerationCurrent(creationGeneration)) return@withLock
+                        val afterCreate = readEndpoint()
+                        if (!isGenerationCurrent(creationGeneration)) return@withLock
+                        if (bindingOf(afterCreate) != access.binding || afterCreate == null) {
+                            reconcileReadBinding(bindingOf(afterCreate))
+                            return@withLock
+                        }
+
+                        // Stage 5 (R4-1): cross-origin open() forks to a new
+                        // provider-owned transcript id; the display replay
+                        // above intentionally still shows the archived rows
+                        // (mirrors the ensureSession endpoint-switch path),
+                        // while the durable ledger holds only the withheld
+                        // marker + new turns. A restart of the forked id then
+                        // shows only its own rows.
+                        val fastHistory = checkNotNull(fastLoaded)
+                        _history.value = fastHistory.messages
+                        _historyOmittedCount.value = fastHistory.droppedCount
+                        attach(created, access.binding, creationGeneration)
+                        attached = true
+                        candidate = null
+                        // R6-3 (b): open loads the requested id's history —
+                        // not a fork of the previous ledger — so a fence
+                        // parked by an earlier endpoint-switch is stale for
+                        // every future fork. Drop it now (the pre-clear above
+                        // already dropped it via
+                        // invalidateLifecycle(clearChat=true); this covers the
+                        // attach window): otherwise the next fork would join
+                        // an ancient job, re-flush a long-sealed session, and
+                        // OR ancient wasStreaming into a new INCOMPLETE
+                        // decision. R8-2: the owner lineage goes with it.
+                        pendingLedgerFence = null
+                        pendingLedgerSession = null
+                        pendingLedgerWasStreaming = false
+                        pendingLedgerOwnerSessionId = null
+                        // Stage D: a cross-provider resume keeps the local
+                        // replay but withholds the model prefix; say so
+                        // visibly instead of resuming silently on a blank
+                        // context.
+                        _notice.value = if (created.historyWithheld) {
+                            "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                        } else {
+                            // R4-2: a cross-provider fork marker persisted in
+                            // this session re-surfaces the withhold notice
+                            // after a restart (the switch-time notice lived in
+                            // the old process). The withhold itself is
+                            // structural — the old rows were never copied — so
+                            // a failed scan only drops the notice, never leaks
+                            // history. Stage 5 (R4-1): cross-origin open()
+                            // forks to a new provider-owned id (attach()
+                            // already points _currentSessionId at it), so scan
+                            // the ATTACHED id, not the requested one. R5-4: a
+                            // failed fork snapshot outranks a clean withhold
+                            // — check the incomplete marker first so a
+                            // restart re-warns HISTORY_SNAPSHOT_INCOMPLETE
+                            // even when no withheld marker exists.
+                            try {
+                                val attachedId = created.sessionId ?: sessionId
+                                withContext(Dispatchers.IO) {
+                                    val backing = sessions.storeOrNull()
+                                    when {
+                                        backing == null -> null
+                                        hasIncompleteSnapshotMarker(backing, attachedId) ->
+                                            "HISTORY_SNAPSHOT_INCOMPLETE"
+                                        hasWithheldSwitchMarker(backing, attachedId) ->
+                                            "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                                        else -> null
+                                    }
+                                }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                null
+                            }
+                        }
+                        return@withLock
+                    }
+
+                    // R8-3 slow path (same ID): settle the same ledger
+                    // BEFORE reading it, bounded on IO under the
+                    // single-flight mutex (same three waits as the
+                    // endpoint-switch fork: prior fence join ~2x, parked
+                    // re-flush ~2x, just-detached close-then-flush ~2x).
+                    // Caller cancellation propagates; a timeout or
+                    // flushDurable==false degrades to defer (skip this
+                    // backfill, warn; the next open retries), never to a
+                    // false INTERRUPTED. Store throws swallow to false.
+                    var settleOk = true
+                    var durableOk = true
+                    withContext(Dispatchers.IO) {
+                        if (fencedJob0 != null) {
+                            val joined = try {
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { fencedJob0.join() } != null
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (!joined) settleOk = false
+                        }
+                        val parked = fencedSession0
+                        if (parked != null) {
+                            // The background job already closed+flushed;
+                            // re-check durability bounded (idempotent seal).
+                            val durable = try {
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                    parked.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
+                                } ?: false
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (!durable) durableOk = false
+                        }
+                        val detached = prevLive
+                        if (detached != null) {
+                            val ok = try {
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                    closeThenFlushDurable(detached, SESSION_FLUSH_TIMEOUT_MS)
+                                } ?: false
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                false
+                            }
+                            // closeThenFlushDurable returns flushDurable
+                            // (drain AND no durable failure); an outer
+                            // timeout (null) and a false both mean the ledger
+                            // may still miss its terminal.
+                            if (!ok) {
+                                settleOk = false
+                                durableOk = false
+                            }
+                        }
+                    }
+                    if (!isGenerationCurrent(requestedGeneration)) return@withLock
+                    val settledLoaded = try {
+                        withContext(Dispatchers.IO) { loadHistory(sessionId) }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (!isGenerationCurrent(requestedGeneration)) return@withLock
+                    if (settledLoaded == null) {
+                        _notice.value = "UNKNOWN_SESSION"
+                        return@withLock
+                    }
+                    // Gate ONLY the same-origin backfill: settleOk &&
+                    // durableOk backfills, otherwise this open skips it and
+                    // relies on the next open's retry (best-effort). The
+                    // cross-origin fork path always backfills its fresh
+                    // ledger and is never gated.
+                    val backfillNow = settleOk && durableOk
                     val creationGeneration = requestedGeneration
                     try {
                         withContext(Dispatchers.IO) {
-                            candidate = sessions.open(latest, sessionId, allowAsk = access.allowAsk) {
-                                isBindingCurrent(access.binding, creationGeneration)
-                            }
+                            candidate = sessions.open(
+                                latest,
+                                sessionId,
+                                allowAsk = access.allowAsk,
+                                keyIsCurrent = { isBindingCurrent(access.binding, creationGeneration) },
+                                backfillInterrupted = backfillNow,
+                            )
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
@@ -1373,8 +1590,8 @@ class ChatViewModel(
                     // ensureSession endpoint-switch path), while the durable
                     // ledger holds only the withheld marker + new turns. A
                     // restart of the forked id then shows only its own rows.
-                    _history.value = loaded.messages
-                    _historyOmittedCount.value = loaded.droppedCount
+                    _history.value = settledLoaded.messages
+                    _historyOmittedCount.value = settledLoaded.droppedCount
                     attach(created, access.binding, creationGeneration)
                     attached = true
                     candidate = null
@@ -1391,42 +1608,42 @@ class ChatViewModel(
                     pendingLedgerSession = null
                     pendingLedgerWasStreaming = false
                     pendingLedgerOwnerSessionId = null
-                    // Stage D: a cross-provider resume keeps the local replay
-                    // but withholds the model prefix; say so visibly instead
-                    // of resuming silently on a blank context.
-                    _notice.value = if (created.historyWithheld) {
-                        "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                    if (!backfillNow) {
+                        // Deferred backfill: the ledger may still miss its
+                        // terminal, so warn visibly (reuse: the restart scan
+                        // re-warns the same notice once the marker regime
+                        // settles) and hydrate what exists. The skipped
+                        // backfill is retried by the next open.
+                        _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
                     } else {
-                        // R4-2: a cross-provider fork marker persisted in this
-                        // session re-surfaces the withhold notice after a
-                        // restart (the switch-time notice lived in the old
-                        // process). The withhold itself is structural — the old
-                        // rows were never copied — so a failed scan only drops
-                        // the notice, never leaks history. Stage 5 (R4-1):
-                        // cross-origin open() forks to a new provider-owned id
-                        // (attach() already points _currentSessionId at it),
-                        // so scan the ATTACHED id, not the requested one.
-                        // R5-4: a failed fork snapshot outranks a clean
-                        // withhold — check the incomplete marker first so a
-                        // restart re-warns HISTORY_SNAPSHOT_INCOMPLETE even
-                        // when no withheld marker exists.
-                        try {
-                            val attachedId = created.sessionId ?: sessionId
-                            withContext(Dispatchers.IO) {
-                                val backing = sessions.storeOrNull()
-                                when {
-                                    backing == null -> null
-                                    hasIncompleteSnapshotMarker(backing, attachedId) ->
-                                        "HISTORY_SNAPSHOT_INCOMPLETE"
-                                    hasWithheldSwitchMarker(backing, attachedId) ->
-                                        "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
-                                    else -> null
+                        // Stage D: a cross-provider resume keeps the local replay
+                        // but withholds the model prefix; say so visibly instead
+                        // of resuming silently on a blank context.
+                        _notice.value = if (created.historyWithheld) {
+                            "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                        } else {
+                            // Same scan as the fast path above (R4-2/R5-4):
+                            // scan the ATTACHED id for a persisted incomplete
+                            // or withhold marker. A failed scan only drops the
+                            // notice, never leaks history.
+                            try {
+                                val attachedId = created.sessionId ?: sessionId
+                                withContext(Dispatchers.IO) {
+                                    val backing = sessions.storeOrNull()
+                                    when {
+                                        backing == null -> null
+                                        hasIncompleteSnapshotMarker(backing, attachedId) ->
+                                            "HISTORY_SNAPSHOT_INCOMPLETE"
+                                        hasWithheldSwitchMarker(backing, attachedId) ->
+                                            "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                                        else -> null
+                                    }
                                 }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                null
                             }
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (_: Exception) {
-                            null
                         }
                     }
                 }
@@ -1562,9 +1779,15 @@ class ChatViewModel(
                     val creationGeneration = pending.generation
                     try {
                         withContext(Dispatchers.IO) {
-                            candidate = sessions.open(latest, sessionId, allowAsk = access.allowAsk) {
-                                isBindingCurrent(access.binding, creationGeneration)
-                            }
+                            candidate = sessions.open(
+                                latest,
+                                sessionId,
+                                allowAsk = access.allowAsk,
+                                keyIsCurrent = { isBindingCurrent(access.binding, creationGeneration) },
+                                // Explicit resume: repair dangling rows like
+                                // the allowAsk-form default would.
+                                backfillInterrupted = true,
+                            )
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled

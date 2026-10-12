@@ -351,7 +351,47 @@ interface ChatSessionProvider {
         sessionId: String,
         allowAsk: Boolean = false,
         keyIsCurrent: suspend () -> Boolean = { true },
-    ): CreatedSession
+    ): CreatedSession = open(endpoint, sessionId, keyIsCurrent, true)
+
+    /**
+     * 3-arg compat: pre-R8-3 callers/fakes without the fence. Delegates
+     * fail-closed (allowAsk=false) with backfill on, matching the
+     * pre-fence default.
+     */
+    suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        keyIsCurrent: suspend () -> Boolean,
+    ): CreatedSession = open(endpoint, sessionId, false, keyIsCurrent)
+
+    /**
+     * R8-3 same-ID reopen fence: [backfillInterrupted] gates ONLY the
+     * same-origin resume backfill (dangling → INTERRUPTED marker). False
+     * skips this open's backfill (the next open retries, see
+     * backfillInterrupted best-effort); hydration still proceeds. The
+     * cross-origin fork path always backfills its fresh ledger. Default
+     * delegates to the 3-arg form (compat: pre-R8-3 fakes ignore the gate).
+     */
+    suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        keyIsCurrent: suspend () -> Boolean,
+        backfillInterrupted: Boolean,
+    ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+    /**
+     * Full union: key.read policy gate ([allowAsk]) AND the R8-3 backfill
+     * fence ([backfillInterrupted]) in one call. Production ViewModel open
+     * paths use this; the other overloads are compat shims that delegate
+     * here (production) or to fakes' narrower overrides (tests).
+     */
+    suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        allowAsk: Boolean,
+        keyIsCurrent: suspend () -> Boolean,
+        backfillInterrupted: Boolean,
+    ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
     suspend fun storeOrNull(): SessionStore?
 
@@ -523,13 +563,38 @@ class ChatSessionFactory(
      * migrated, split, or backfilled by this path: a same-origin reopen still
      * hydrates the whole batch gated only by the header provenance, and
      * mixed-row detection inside one ledger is a known gap. Same-origin
-     * resumes keep the legacy same-id path below unchanged.
+     * resumes keep the legacy same-id path below unchanged, except for the
+     * R8-3 [backfillInterrupted] gate (same-ID reopen defers the backfill
+     * when its pre-read settle failed).
      */
     override suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,
         allowAsk: Boolean,
         keyIsCurrent: suspend () -> Boolean,
+    ): CreatedSession = openImpl(endpoint, sessionId, allowAsk, keyIsCurrent, backfillInterrupted = true)
+
+    override suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        keyIsCurrent: suspend () -> Boolean,
+        backfillInterrupted: Boolean,
+    ): CreatedSession = openImpl(endpoint, sessionId, allowAsk = false, keyIsCurrent, backfillInterrupted)
+
+    override suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        allowAsk: Boolean,
+        keyIsCurrent: suspend () -> Boolean,
+        backfillInterrupted: Boolean,
+    ): CreatedSession = openImpl(endpoint, sessionId, allowAsk, keyIsCurrent, backfillInterrupted)
+
+    private suspend fun openImpl(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        allowAsk: Boolean,
+        keyIsCurrent: suspend () -> Boolean,
+        backfillInterrupted: Boolean,
     ): CreatedSession {
         val config = endpoint.toProviderConfig()
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
@@ -558,7 +623,14 @@ class ChatSessionFactory(
         if (!sameOrigin) {
             return openForked(store, endpoint, config, sessionId, meta, keyIsCurrent)
         }
-        backfillInterrupted(store, sessionId)
+        // R8-3: gated by the caller's same-ID settle outcome. False skips
+        // this backfill (a still-unsettled live turn must not gain a false
+        // INTERRUPTED); the next open retries (best-effort). Hydration below
+        // still proceeds. The fork path above always backfills its fresh
+        // ledger and is never gated.
+        if (backfillInterrupted) {
+            backfillInterrupted(store, sessionId)
+        }
         // Stage E: tail load (newest kept) with an exact dropped count; the
         // cap also travels as MaxMessages so TurnController.droppedHistoryCount
         // observes the same truncation (defense in depth: pre-trimmed prefix

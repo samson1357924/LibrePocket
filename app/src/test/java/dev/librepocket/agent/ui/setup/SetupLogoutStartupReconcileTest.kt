@@ -196,9 +196,9 @@ class SetupLogoutStartupReconcileTest {
             assertTrue(store.writePendingDeleteIfAbsent(PendingDelete("preset:openai", 1L, 1700000000000L)))
         }
         val vm = newVm(store, ThrowingDeleteVault(delegate))
-        val outcome = runBlocking { vm.reconcilePendingDelete() }
+        val (outcome, journal) = runBlocking { vm.reconcilePendingDeleteWithJournal() }
         assertEquals(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, outcome)
-        vm.onStartupReconcile(outcome)
+        vm.onStartupReconcile(outcome, journal)
         assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
         runBlocking {
             assertEquals("preset:openai", store.pendingDelete()?.alias)
@@ -240,7 +240,7 @@ class SetupLogoutStartupReconcileTest {
             )
             assertTrue("key survives UNKNOWN (no vault I/O)", delegate.hasKey("preset:openai"))
         }
-        vm.onStartupReconcile(outcome)
+        vm.onStartupReconcile(outcome, null)
         assertEquals("LOGOUT_UNKNOWN", vm.form.value.errorCode)
         val text = setupErrorText(vm.form.value.errorCode!!)
         assertFalse("neutral wording must not claim deleted: $text", text.contains("已刪除"))
@@ -271,7 +271,7 @@ class SetupLogoutStartupReconcileTest {
             assertEquals(1L, store.pendingDelete()?.revision)
             assertTrue("key survives UNKNOWN (no vault I/O)", delegate.hasKey("preset:openai"))
         }
-        vm.onStartupReconcile(outcome)
+        vm.onStartupReconcile(outcome, null)
         assertEquals("LOGOUT_UNKNOWN", vm.form.value.errorCode)
         val text = setupErrorText(vm.form.value.errorCode!!)
         assertFalse("neutral wording must not claim deleted: $text", text.contains("已刪除"))
@@ -286,33 +286,60 @@ class SetupLogoutStartupReconcileTest {
             SetupViewModel.PendingDeleteOutcome.NO_OP,
             runBlocking { vm.reconcilePendingDelete() },
         )
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP, null)
         assertNull(vm.form.value.errorCode)
         // COMMITTED 同為靜默（不寫、不清既有碼）。
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED, null)
         assertNull(vm.form.value.errorCode)
     }
 
     @Test
-    fun committedAndNoOpNeverClearExistingCode() {
-        // COMMITTED/NO_OP 永不清既有碼：預置 DELETE 碼後，兩者皆保留（提交
-        // 無需橫幅；與提交競態的既有碼由其持有者保留）。
-        val store = rawStore("startup-noop-retain")
+    fun committedClearsSameJournalCode() {
+        // Stage C C2：COMMITTED 攜帶與橫幅同源的 journal → 清碼 + 清 tag。
+        val store = rawStore("startup-committed-clears-same")
         val vm = newVm(store, CountingVault())
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED)
+        val journal = PendingDelete("preset:openai", 1L, 1700000000000L)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, journal, gateReady = false)
         assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED)
+        assertEquals(journal.format(), vm.form.value.logoutErrorSourceJournal)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED, journal, gateReady = false)
+        assertNull("COMMITTED with the same journal must clear the banner", vm.form.value.errorCode)
+        assertNull(vm.form.value.logoutErrorSourceJournal)
+    }
+
+    @Test
+    fun committedKeepsDifferentJournalCode() {
+        // Stage C C2：COMMITTED 攜帶不同 journal → 併發 teardown 的碼保留。
+        val store = rawStore("startup-committed-keeps-other")
+        val vm = newVm(store, CountingVault())
+        val journalJ1 = PendingDelete("preset:openai", 1L, 1700000000000L)
+        val journalJ2 = PendingDelete("preset:openai#staged-cccccccccccccccccccccccccccccccc", 2L, 1700000000001L)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, journalJ2, gateReady = false)
+        assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED, journalJ1, gateReady = false)
         assertEquals(
-            "COMMITTED must never clear a pre-existing LOGOUT_*",
+            "COMMITTED must never clear a banner sourced from another journal",
             "LOGOUT_DELETE_FAILED",
             vm.form.value.errorCode,
         )
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP)
+        assertEquals(journalJ2.format(), vm.form.value.logoutErrorSourceJournal)
+    }
+
+    @Test
+    fun noOpNeverClearsExistingCode() {
+        // NO_OP 永不清既有碼（無 journal、無身份，不做任何判斷）。
+        val store = rawStore("startup-noop-retain")
+        val vm = newVm(store, CountingVault())
+        val journal = PendingDelete("preset:openai", 1L, 1700000000000L)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, journal, gateReady = false)
+        assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP, null)
         assertEquals(
             "NO_OP must never clear a pre-existing LOGOUT_*",
             "LOGOUT_DELETE_FAILED",
             vm.form.value.errorCode,
         )
+        assertEquals(journal.format(), vm.form.value.logoutErrorSourceJournal)
     }
 
     @Test
@@ -330,11 +357,11 @@ class SetupLogoutStartupReconcileTest {
             assertEquals(2L, store.currentRevision())
         }
         val vm = newVm(store, CountingVault(delegate))
-        val outcome = runBlocking { vm.reconcilePendingDelete() }
+        val (outcome, journal) = runBlocking { vm.reconcilePendingDeleteWithJournal() }
         assertEquals(SetupViewModel.PendingDeleteOutcome.STALE, outcome)
         // gate 未 Ready（啟動時尚未解析）→ 顯式落碼（經 test seam 直接給決策
         // 輸入；生產入口讀 live gate，見 onStartupReconcile 無參版本）。
-        vm.onStartupReconcile(outcome, gateReady = false)
+        vm.onStartupReconcile(outcome, journal, gateReady = false)
         assertEquals("LOGOUT_STALE", vm.form.value.errorCode)
     }
 
@@ -353,11 +380,11 @@ class SetupLogoutStartupReconcileTest {
             assertEquals(2L, store.currentRevision())
         }
         val vm = newVm(store, CountingVault(delegate))
-        val outcome = runBlocking { vm.reconcilePendingDelete() }
+        val (outcome, journal) = runBlocking { vm.reconcilePendingDeleteWithJournal() }
         assertEquals(SetupViewModel.PendingDeleteOutcome.STALE, outcome)
         // gate 已 Ready（贏家活著）→ 靜默（經 test seam 直接給決策輸入，
         // 不收集 WhileSubscribed gate 流以免與 teardown 取消競態）。
-        vm.onStartupReconcile(outcome, gateReady = true)
+        vm.onStartupReconcile(outcome, journal, gateReady = true)
         assertNull("Ready gate stays silent on STALE", vm.form.value.errorCode)
     }
 }

@@ -103,7 +103,8 @@ class SetupLogoutDismissGuardTest {
             assertTrue(store.writePendingDeleteIfAbsent(PendingDelete("preset:openai", 1L, 1700000000000L)))
         }
         val vm = newVm(store, CountingVault(delegate))
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, gateReady = false)
+        val retainedJournal = PendingDelete("preset:openai", 1L, 1700000000000L)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, retainedJournal, gateReady = false)
         assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
         vm.clearLogoutError()
         assertNull(vm.form.value.errorCode)
@@ -115,20 +116,20 @@ class SetupLogoutDismissGuardTest {
             assertEquals("preset:openai", store.pendingDelete()?.alias)
         }
         // 重啟重 stamp：clear 後再 reconcile → 碼重現。
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, gateReady = false)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, retainedJournal, gateReady = false)
         assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
         vm.clearLogoutError()
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.FAILED, gateReady = false)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.FAILED, retainedJournal, gateReady = false)
         assertEquals("LOGOUT_CLEAR_FAILED", vm.form.value.errorCode)
         vm.clearLogoutError()
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.UNKNOWN, gateReady = false)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.UNKNOWN, null, gateReady = false)
         assertEquals("LOGOUT_UNKNOWN", vm.form.value.errorCode)
         // COMMITTED/NO_OP 不蓋碼（既有語義鎖定）：先清再給兩者，維持 null。
         vm.clearLogoutError()
         assertNull(vm.form.value.errorCode)
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED, gateReady = false)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED, null, gateReady = false)
         assertNull(vm.form.value.errorCode)
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP, gateReady = false)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP, null, gateReady = false)
         assertNull(vm.form.value.errorCode)
     }
 
@@ -142,7 +143,7 @@ class SetupLogoutDismissGuardTest {
             store.save(preseed())
         }
         val vm = newVm(store, CountingVault(delegate))
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.STALE, gateReady = false)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.STALE, null, gateReady = false)
         assertEquals("LOGOUT_STALE", vm.form.value.errorCode)
         runBlocking { assertNull(store.pendingDelete()) }
         vm.clearLogoutError()
@@ -170,9 +171,9 @@ class SetupLogoutDismissGuardTest {
         }
         val vault = CountingVault(delegate)
         val vm = newVm(store, vault)
-        val outcome = runBlocking { vm.reconcilePendingDelete() }
+        val (outcome, journal) = runBlocking { vm.reconcilePendingDeleteWithJournal() }
         assertEquals(SetupViewModel.PendingDeleteOutcome.STALE, outcome)
-        vm.onStartupReconcile(outcome, gateReady = false)
+        vm.onStartupReconcile(outcome, journal, gateReady = false)
         assertEquals("LOGOUT_STALE", vm.form.value.errorCode)
         // dismiss（僅 STALE 可達）→ journal 已丟，save 不被擋。
         vm.clearLogoutError()

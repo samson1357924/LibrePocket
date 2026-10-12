@@ -16,6 +16,7 @@ import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
 import java.io.IOException
 import java.nio.file.Files
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -144,9 +145,9 @@ class StartupReconcilePendingTest {
         val vm = newVm(rawStore("pending-noop"), EncryptedPrefsVault(InMemoryPrefs()))
         assertTrue(vm.startupReconcilePending.value)
         var seen: SetupViewModel.PendingDeleteOutcome? = null
-        val job = vm.launchPendingDeleteReconcile { outcome ->
+        val job = vm.launchPendingDeleteReconcile { outcome, journal ->
             seen = outcome
-            vm.onStartupReconcile(outcome)
+            vm.onStartupReconcile(outcome, journal)
         }
         runBlocking { withTimeout(10_000) { job.join() } }
         assertEquals(SetupViewModel.PendingDeleteOutcome.NO_OP, seen)
@@ -174,9 +175,9 @@ class StartupReconcilePendingTest {
         val vm = newVm(store, vault)
         var seen: SetupViewModel.PendingDeleteOutcome? = null
         // MainScreen onDone 等價：落碼 + 落定（pending 由 launch 的 finally 復位）。
-        val job = vm.launchPendingDeleteReconcile { outcome ->
+        val job = vm.launchPendingDeleteReconcile { outcome, journal ->
             seen = outcome
-            vm.onStartupReconcile(outcome)
+            vm.onStartupReconcile(outcome, journal)
         }
         runBlocking { withTimeout(10_000) { vault.deleteEntered.await() } }
         // 懸住期間：pending 仍 true；gate 早已折疊 NoEndpoint（journal 保留），
@@ -221,7 +222,7 @@ class StartupReconcilePendingTest {
             SetupViewModel.PendingDeleteOutcome.UNKNOWN to "LOGOUT_UNKNOWN",
             SetupViewModel.PendingDeleteOutcome.DELETE_FAILED to "LOGOUT_DELETE_FAILED",
         )) {
-            vm.onStartupReconcile(outcome, gateReady = false)
+            vm.onStartupReconcile(outcome, null, gateReady = false)
             assertEquals(code, vm.form.value.errorCode)
             assertFalse(shouldNavigateToSetup(false, false, Routes.CHAT, code, false))
             assertTrue("outcome=$outcome", shouldNavigateToSettings(false, false, Routes.CHAT, code, false))
@@ -234,12 +235,12 @@ class StartupReconcilePendingTest {
         // STALE → gate 未 Ready 時落碼待 dismiss（CHAT 導向 SETTINGS 關閉卡）；
         // gate 已 Ready（贏家活著）時靜默（有端點 → 兩守衛皆不決策）。
         val vm = newVm(rawStore("pending-stale"), EncryptedPrefsVault(InMemoryPrefs()))
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.STALE, gateReady = false)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.STALE, null, gateReady = false)
         assertEquals("LOGOUT_STALE", vm.form.value.errorCode)
         assertFalse(shouldNavigateToSetup(false, false, Routes.CHAT, "LOGOUT_STALE", false))
         assertTrue(shouldNavigateToSettings(false, false, Routes.CHAT, "LOGOUT_STALE", false))
         vm.clearLogoutError()
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.STALE, gateReady = true)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.STALE, null, gateReady = true)
         assertNull(vm.form.value.errorCode)
         assertFalse(shouldNavigateToSetup(true, false, Routes.CHAT, null, false))
         assertFalse(shouldNavigateToSettings(true, false, Routes.CHAT, null, false))
@@ -256,7 +257,7 @@ class StartupReconcilePendingTest {
             store.save(preseed())
         }
         val vm = newVm(store, EncryptedPrefsVault(InMemoryPrefs()))
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.STALE, gateReady = false)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.STALE, null, gateReady = false)
         assertEquals("LOGOUT_STALE", vm.form.value.errorCode)
         // CHAT 收到一次 SETTINGS 導向（關閉卡可達）。
         assertTrue(shouldNavigateToSettings(false, false, Routes.CHAT, "LOGOUT_STALE", false))
@@ -277,9 +278,10 @@ class StartupReconcilePendingTest {
     }
 
     @Test
-    fun cancelResetsPendingWithoutOnDone() {
-        // 取消語義：scope 取消導致未 onDone 時 finally 復位 pending，避免
-        // spinner 永留；取消不落碼、不調 onDone。
+    fun cancelJoinHandleKeepsWorkerAliveUntilSettle() {
+        // Stage C C1 join-handle 語義：回傳值是 `worker.join()` 等待柄，
+        // cancel 只停止等待、不殺 worker——fence 保持到 worker 落定；放行後
+        // onDone 照常發生、pending 落定。
         val store = rawStore("pending-cancel")
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
@@ -290,15 +292,34 @@ class StartupReconcilePendingTest {
         val vault = GatedDeleteVault(delegate = delegate, gateDelete = true)
         val vm = newVm(store, vault)
         var onDoneCalls = 0
-        val job = vm.launchPendingDeleteReconcile { onDoneCalls++ }
+        var seen: SetupViewModel.PendingDeleteOutcome? = null
+        val job = vm.launchPendingDeleteReconcile { outcome, journal ->
+            onDoneCalls++
+            seen = outcome
+            vm.onStartupReconcile(outcome, journal)
+        }
         runBlocking { withTimeout(10_000) { vault.deleteEntered.await() } }
         assertTrue(vm.startupReconcilePending.value)
         job.cancel()
-        runBlocking { withTimeout(10_000) { job.join() } }
+        runBlocking {
+            try {
+                withTimeout(10_000) { job.join() }
+            } catch (_: CancellationException) {
+                // Join handle cancel: expected, worker unaffected.
+            }
+        }
+        // Worker 存活：fence 仍 armed、vault 仍懸住。
+        assertTrue("cancel must not kill the shared worker", vm.startupReconcilePending.value)
         assertEquals(0, onDoneCalls)
-        assertFalse("cancel must settle the pending gate", vm.startupReconcilePending.value)
-        assertNull(vm.form.value.errorCode)
         vault.gateDelete = false
         vault.deleteRelease.complete(Unit)
+        // 放行後 worker 落定（此 handle 已取消不再等待；另起 join 確認落定）。
+        val settleEnd = System.currentTimeMillis() + 10_000
+        while (vm.startupReconcilePending.value) {
+            if (System.currentTimeMillis() > settleEnd) error("timed out waiting for worker settle")
+            Thread.sleep(10)
+        }
+        assertFalse(vm.startupReconcilePending.value)
+        runBlocking { assertNull(store.pendingDelete()) }
     }
 }

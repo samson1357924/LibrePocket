@@ -143,8 +143,8 @@ fun MainScreen(
     // instead of silent discard); a failure keeps the journal for the next
     // logout retry, never crashes UI.
     LaunchedEffect(Unit) {
-        setupViewModel.launchPendingDeleteReconcile { outcome ->
-            setupViewModel.onStartupReconcile(outcome)
+        setupViewModel.launchPendingDeleteReconcile { outcome, journal ->
+            setupViewModel.onStartupReconcile(outcome, journal)
         }
     }
 

@@ -94,6 +94,18 @@ data class SetupUiState(
     internal val modelRefreshRevision: Long = 0L,
     val confirmKeyWrite: Boolean = false,
     val errorCode: String? = null,
+    /**
+     * `LOGOUT_*` 橫幅的 journal 身份標籤（Stage C C2）。
+     *
+     * 由 [stampLogoutError] 與落碼的 `errorCode` 同步寫入：值為落碼當時
+     * replay／teardown 所持 journal 的 [PendingDelete.format] 原字串；無
+     * journal（`NO_OP`／`UNKNOWN`／未確認路徑）時為 null。`COMMITTED`
+     * replay 僅當此標籤與其攜帶 journal 相同才清碼（併發 teardown 的碼不
+     * 被誤清）；[clearLogoutError]、logout 入口 fresh 化與 logout 成功重置
+     * 連碼一起清。其他 `errorCode = null` 站點不碰此欄（殘留 tag 無害：
+     * 清除要求 `errorCode` 為 `LOGOUT_*` 且標籤非 null 相等）。
+     */
+    val logoutErrorSourceJournal: String? = null,
     val saved: Boolean = false,
 )
 
@@ -139,6 +151,22 @@ class SetupViewModel(
      */
     private val _startupReconcilePending = MutableStateFlow(true)
     val startupReconcilePending: StateFlow<Boolean> = _startupReconcilePending
+    /**
+     * 啟動 replay 單飛鎖（Stage C C1：解 premature unlock + fence 缺口）。
+     *
+     * 以下三者全程以此鎖保護（`LaunchedEffect` 在 Main、測試可併發）：
+     * - `startupWorker`：進行中的唯一 reconcile worker（無則 null；完成後
+     *   殘留 dead job，以 `isActive` 判定存活，不另清 null）；
+     * - `startupCallbacks`：排隊等待同一輪結果的 `onDone`（含首發者）；
+     * - `startupSettled`：已落定輪的 `(outcome, journal)` 快照——寫入先於
+     *   Main fan-out；重 launch 先查此快照（回放，無 I/O、不碰 pending），
+     *   再查 worker（重疊者入列拿 join handle）。logout 出口與 save 提交
+     *   經 [invalidateStartupSettled] 使其失效（否則 rotation 重播過期結果）。
+     */
+    private val startupLock = Any()
+    private var startupWorker: Job? = null
+    private val startupCallbacks = ArrayList<(PendingDeleteOutcome, PendingDelete?) -> Unit>()
+    private var startupSettled: Pair<PendingDeleteOutcome, PendingDelete?>? = null
     private val modelRefreshGeneration = AtomicLong(0L)
     private var modelRefreshJob: Job? = null
     // Stage2 form fence: identity/key intent epoch. Bumped only by
@@ -961,6 +989,10 @@ class SetupViewModel(
                     // Best-effort: the save below stays authoritative.
                 }
             }
+            // Stage C C1: the metadata generation moved (staged is live) — drop
+            // any cached startup-reconcile round so a rotation relaunch runs
+            // fresh I/O instead of replaying a stale outcome over the new state.
+            invalidateStartupSettled()
             _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
         } catch (e: CancellationException) {
             if (!metadataCommitted) {
@@ -988,6 +1020,7 @@ class SetupViewModel(
                     null
                 }
                 if (livePointsAtStaged == true) {
+                    invalidateStartupSettled()
                     _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
                     return
                 }
@@ -1017,6 +1050,7 @@ class SetupViewModel(
                     null
                 }
                 if (stillCommitted == true) {
+                    invalidateStartupSettled()
                     _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
                     return
                 }
@@ -1259,7 +1293,17 @@ class SetupViewModel(
      *
      * Bounded: one strict read + at most one retry clear; no loop, no storm.
      */
-    suspend fun reconcilePendingDelete(): PendingDeleteOutcome {
+    /**
+     * [reconcilePendingDelete] 的 journal-identity 攜帶版（Stage C C2）。
+     *
+     * 與 [reconcilePendingDelete] 同一核心，另回傳 replay 當時快照的 journal：
+     * 有 journal 的輪（`COMMITTED`／`DELETE_FAILED`／`FAILED`／`STALE`）攜帶
+     * 該 [PendingDelete]（供 [onStartupReconcile] 落碼／清碼的身份比對）；
+     * `NO_OP`／`UNKNOWN`（strict 重讀失敗或 journal 毀損，身份不可確認）攜帶
+     * null。取消語義與 [reconcilePendingDelete] 相同（`COMMITTED` 吞取消，
+     * 其餘重拋）。
+     */
+    internal suspend fun reconcilePendingDeleteWithJournal(): Pair<PendingDeleteOutcome, PendingDelete?> {
         return try {
             saveMutex.withLock {
                 val pending = try {
@@ -1268,9 +1312,9 @@ class SetupViewModel(
                     throw e
                 } catch (_: Exception) {
                     // Read failure OR malformed journal: no-touch, keep journal.
-                    return@withLock PendingDeleteOutcome.UNKNOWN
-                } ?: return@withLock PendingDeleteOutcome.NO_OP
-                runPendingDeleteLocked(pending)
+                    return@withLock PendingDeleteOutcome.UNKNOWN to null
+                } ?: return@withLock PendingDeleteOutcome.NO_OP to null
+                runPendingDeleteLocked(pending) to pending
             }
         } catch (e: CancellationException) {
             // runPendingDeleteLocked already swallowed the COMMITTED cancel to
@@ -1280,12 +1324,28 @@ class SetupViewModel(
         }
     }
 
+    suspend fun reconcilePendingDelete(): PendingDeleteOutcome =
+        reconcilePendingDeleteWithJournal().first
+
     /**
-     * Startup replay entry point: fire-and-forget [reconcilePendingDelete].
+     * Startup replay entry point: single-flight [reconcilePendingDeleteWithJournal].
+     *
+     * 語義（Stage C C1，全程 [startupLock] 保護）：
+     * 1. 已落定（[startupSettled] 非 null）：不碰 pending、不做 I/O，經
+     *    [Dispatchers.Main] 回放快照 `(outcome, journal)`（`STALE` 的
+     *    gateReady 仍由 [onStartupReconcile] 讀 live gate，保持新鮮）；
+     * 2. worker 進行中：呼叫方入列 `onDone`，回傳 `viewModelScope.launch {
+     *    worker.join() }` join handle——cancel 只停止等待，不殺 worker
+     *    （fence 保持到 worker 落定）；
+     * 3. 否則建唯一 worker：`_startupReconcilePending = true`（首發本已
+     *    true，重斷言無害）→ 跑 reconcile → 快照＋先寫 `startupSettled` 再
+     *    Main fan-out 全部 callbacks → `finally` 單點 `pending = false`
+     *   （所有 `onDone` 之後，保留先落碼後落定順序）。
      *
      * Never throws out of scope (failures report [PendingDeleteOutcome.UNKNOWN]
-     * via [onDone] on [Dispatchers.Main] and keep the journal for the next
-     * logout retry); a cancelled scope rethrows without calling [onDone].
+     * with a null journal via [onDone] on [Dispatchers.Main] and keep the
+     * journal for the next logout retry); a cancelled scope rethrows without
+     * calling [onDone].
      * Called once at composition from `MainScreen`, which MUST pass a non-empty
      * [onDone] (Stage 3 P2: [onStartupReconcile]) — a discarded outcome would
      * leave a retained journal (gate `NoEndpoint`) with no `errorCode` and no
@@ -1293,26 +1353,72 @@ class SetupViewModel(
      * everything else rethrows with no `onDone`).
      *
      * Stage B: [startupReconcilePending] stays `true` until [onDone] runs (all
-     * outcomes, including `NO_OP`) or this job is cancelled — the reset is in
-     * `finally` so a scope cancel never leaves the startup spinner stuck. The
-     * returned [Job] is only a test seam (cancel-injection, mirroring
-     * [lastSaveJobForTest]); production callers ignore it.
+     * outcomes, including `NO_OP`) or the worker/scope is cancelled — the reset
+     * is in `finally` so a scope cancel never leaves the startup spinner stuck.
+     * Cancelling the returned join handle alone does NOT reset (the worker
+     * continues for other joiners). The
+     * returned [Job] is only a join handle (or a settled-replay dispatch), never
+     * the worker itself: production callers ignore it; cancelling it never kills
+     * an in-flight worker, and its callback still participates in the fan-out
+     * (at-least-once; cancelling a waiter must not silently drop the outcome).
      */
-    fun launchPendingDeleteReconcile(onDone: (PendingDeleteOutcome) -> Unit): Job {
-        return viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val outcome = try {
-                    reconcilePendingDelete()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    PendingDeleteOutcome.UNKNOWN
+    fun launchPendingDeleteReconcile(
+        onDone: (PendingDeleteOutcome, PendingDelete?) -> Unit,
+    ): Job {
+        val worker: Job
+        synchronized(startupLock) {
+            // Settled check BEFORE the worker check: a finished round replays
+            // without I/O even if its (dead) job reference lingers.
+            val settled = startupSettled
+            if (settled != null) {
+                return viewModelScope.launch(Dispatchers.Main) {
+                    onDone(settled.first, settled.second)
                 }
-                withContext(Dispatchers.Main) { onDone(outcome) }
-            } finally {
-                _startupReconcilePending.value = false
+            }
+            startupCallbacks.add(onDone)
+            val active = startupWorker?.takeIf { it.isActive }
+            if (active != null) {
+                worker = active
+            } else {
+                _startupReconcilePending.value = true
+                val fresh = viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        val result = try {
+                            reconcilePendingDeleteWithJournal()
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            PendingDeleteOutcome.UNKNOWN to null
+                        }
+                        // Settled write BEFORE the Main fan-out, so any launch
+                        // landing after this point replays instead of fanning a
+                        // second round of I/O.
+                        val fanOut: List<(PendingDeleteOutcome, PendingDelete?) -> Unit> =
+                            synchronized(startupLock) {
+                                startupSettled = result
+                                val copy = startupCallbacks.toList()
+                                startupCallbacks.clear()
+                                copy
+                            }
+                        withContext(Dispatchers.Main) {
+                            fanOut.forEach { cb -> cb(result.first, result.second) }
+                        }
+                    } finally {
+                        _startupReconcilePending.value = false
+                    }
+                }
+                startupWorker = fresh
+                worker = fresh
             }
         }
+        // Join handle (first and reentrant callers alike): cancelling this
+        // stops waiting without touching the shared worker.
+        return viewModelScope.launch { worker.join() }
+    }
+
+    /** Drops the cached startup-reconcile outcome (logout exit / save commit). */
+    private fun invalidateStartupSettled() {
+        synchronized(startupLock) { startupSettled = null }
     }
 
     /**
@@ -1440,6 +1546,25 @@ class SetupViewModel(
         }
 
     /**
+     * Single choke point for every `LOGOUT_*` stamp (startup replay via
+     * [onStartupReconcile] and all logout paths below).
+     *
+     * Records the code AND the journal identity ([PendingDelete.format] raw
+     * string; null when the stamping context holds no journal) into
+     * `form.errorCode` + [SetupUiState.logoutErrorSourceJournal] in one
+     * emission, so a later `COMMITTED` replay can identity-clear only the
+     * banner sourced from its own journal (see [onStartupReconcile]).
+     * Overwrites unconditionally (failure/stale stamps always win); pure state
+     * copy, no I/O, safe from any dispatcher.
+     */
+    private fun stampLogoutError(code: String, journal: PendingDelete?) {
+        _form.value = _form.value.copy(
+            errorCode = code,
+            logoutErrorSourceJournal = journal?.format(),
+        )
+    }
+
+    /**
      * Startup replay result handler (Stage 3 P2): stamps a
      * [reconcilePendingDelete] outcome into `form.errorCode` so a retained
      * journal (gate `NoEndpoint`) stays recoverable from Settings instead of
@@ -1447,34 +1572,57 @@ class SetupViewModel(
      *
      * Runs on [Dispatchers.Main] as the `MainScreen` `onDone` (direct calls in
      * tests are equivalent — a plain state copy, no I/O):
-     * - `COMMITTED`/`NO_OP`: silent — writes nothing and never clears a
-     *   pre-existing `LOGOUT_*` (a committed teardown needs no banner; a
-     *   commit racing this stamp keeps its own code);
+     * - `COMMITTED`: journal-identity clear (Stage C C2) — clears a
+     *   pre-existing `LOGOUT_*` ONLY when [SetupUiState.logoutErrorSourceJournal]
+     *   equals this replay's journal ([PendingDelete.format]); a banner sourced
+     *   from a concurrent teardown's journal, a journal-less stamp, or any
+     *   non-`LOGOUT_*` code is kept. Never stamps;
+     * - `NO_OP`: silent — writes nothing and never clears (no journal, no identity);
      * - `STALE`: explicit decision — silent when [gate] is already `Ready`
      *   (the concurrent winner is live, nothing to dismiss), otherwise stamps
-     *   `LOGOUT_STALE` for the dismiss card;
+     *   `LOGOUT_STALE` for the dismiss card (overwrites + records the
+     *   superseded journal tag);
      * - `DELETE_FAILED`/`FAILED`/`UNKNOWN`: stamps per [reconcileOutcomeToLogout]
      *   (`LOGOUT_DELETE_FAILED` / `LOGOUT_CLEAR_FAILED` / neutral
      *   `LOGOUT_UNKNOWN`), which the Settings `NoEndpoint` recovery card
-     *   offers as retry (STALE excepted: dismiss only).
+     *   offers as retry (STALE excepted: dismiss only). Overwrites + records
+     *   the tag (`UNKNOWN` carries null: identity unconfirmed, so a later
+     *   `COMMITTED` conservatively keeps the banner for manual dismiss).
      *
      * Never touches `logoutInFlight` (startup replay is not a logout attempt);
      * cancellation never reaches here (rethrows with no `onDone`).
      */
-    fun onStartupReconcile(outcome: PendingDeleteOutcome) {
-        onStartupReconcile(outcome, gateReady = gate.value is EndpointGate.Ready)
+    fun onStartupReconcile(outcome: PendingDeleteOutcome, journal: PendingDelete?) {
+        onStartupReconcile(outcome, journal, gateReady = gate.value is EndpointGate.Ready)
     }
 
     /**
      * Test seam for the STALE gate decision above: the production entry reads
      * the live [gate], tests pass the decision input directly (collecting the
      * `WhileSubscribed` gate flow in a unit test races teardown cancellation).
+     * [journal] is the replay's journal snapshot (null for `NO_OP` and for
+     * read-path `UNKNOWN` whose journal could not be confirmed; clear-phase
+     * `UNKNOWN` carries the active `pending`, so a later `COMMITTED` of the
+     * same journal may clear its banner).
      */
-    internal fun onStartupReconcile(outcome: PendingDeleteOutcome, gateReady: Boolean) {
+    internal fun onStartupReconcile(
+        outcome: PendingDeleteOutcome,
+        journal: PendingDelete?,
+        gateReady: Boolean,
+    ) {
+        if (outcome == PendingDeleteOutcome.COMMITTED) {
+            val tag = journal?.format()
+            if (tag != null) {
+                val cur = _form.value
+                if (cur.errorCode?.startsWith("LOGOUT_") == true && cur.logoutErrorSourceJournal == tag) {
+                    _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
+                }
+            }
+            return
+        }
         val code: String? = when (outcome) {
-            PendingDeleteOutcome.COMMITTED,
-            PendingDeleteOutcome.NO_OP,
-            -> null
+            PendingDeleteOutcome.COMMITTED -> null // Unreachable (handled above).
+            PendingDeleteOutcome.NO_OP -> null
             PendingDeleteOutcome.STALE ->
                 if (gateReady) null else "LOGOUT_STALE"
             PendingDeleteOutcome.DELETE_FAILED -> "LOGOUT_DELETE_FAILED"
@@ -1482,7 +1630,7 @@ class SetupViewModel(
             PendingDeleteOutcome.UNKNOWN -> "LOGOUT_UNKNOWN"
         }
         if (code != null) {
-            _form.value = _form.value.copy(errorCode = code)
+            stampLogoutError(code, journal)
         }
     }
 
@@ -1669,7 +1817,7 @@ class SetupViewModel(
         // 持鎖前同步置 inFlight（仿 saving 入口語義）：排隊等鎖時被取消也能被
         // 外層 catch 復位。前次失敗碼在此清為 fresh attempt；失敗保留、成功
         // 重置、取消不蓋碼（見結尾與外層 catch）。
-        _form.value = _form.value.copy(logoutInFlight = true, errorCode = null)
+        _form.value = _form.value.copy(logoutInFlight = true, errorCode = null, logoutErrorSourceJournal = null)
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
@@ -1681,6 +1829,7 @@ class SetupViewModel(
             try {
                 var committed = false
                 var logoutError: String? = null
+                var logoutErrorJournal: PendingDelete? = null
                 saveMutex.withLock {
                     // Single-emission strict read: pending journal + config +
                     // revision from the same snapshot (no TOCTOU between them).
@@ -1689,7 +1838,7 @@ class SetupViewModel(
                     } catch (e: CancellationException) {
                         throw e
                     } catch (_: Exception) {
-                        _form.value = _form.value.copy(errorCode = "LOGOUT_READ_FAILED")
+                        stampLogoutError("LOGOUT_READ_FAILED", null)
                         return@withLock
                     }
                     val resumePending = state.first
@@ -1702,8 +1851,9 @@ class SetupViewModel(
                             reconcileOutcomeToLogout(runPendingDeleteLocked(resumePending))
                         committed = resumed
                         logoutError = resumeError
+                        logoutErrorJournal = resumePending
                         if (logoutError != null) {
-                            _form.value = _form.value.copy(errorCode = logoutError)
+                            stampLogoutError(logoutError, resumePending)
                         }
                         return@withLock
                     }
@@ -1725,7 +1875,7 @@ class SetupViewModel(
                         } catch (e: CancellationException) {
                             throw e
                         } catch (_: Exception) {
-                            _form.value = _form.value.copy(errorCode = "LOGOUT_DELETE_FAILED")
+                            stampLogoutError("LOGOUT_DELETE_FAILED", null)
                             return@withLock
                         }
                         val wroteJournal = try {
@@ -1761,9 +1911,14 @@ class SetupViewModel(
                                 // won, delete not yet attempted): neutral
                                 // retryable code, never CLEAR_FAILED ("already
                                 // deleted" requires a proven delete win).
-                                _form.value = _form.value.copy(errorCode = "LOGOUT_UNKNOWN")
+                                stampLogoutError("LOGOUT_UNKNOWN", null)
                                 return@withLock
                             }
+                            // Ack-loss with OUR journal provably present: the
+                            // teardown below owns this identity — track it so
+                            // failure stamps carry the tag (and a later
+                            // same-journal COMMITTED replay may clear them).
+                            writtenJournal = journal
                             true
                         }
                         if (!wroteJournal) {
@@ -1786,7 +1941,7 @@ class SetupViewModel(
                                 // Fenced-loss re-read failed before any delete:
                                 // unconfirmed, neutral retryable code (never
                                 // CLEAR_FAILED).
-                                _form.value = _form.value.copy(errorCode = "LOGOUT_UNKNOWN")
+                                stampLogoutError("LOGOUT_UNKNOWN", null)
                                 return@withLock
                             }
                             val snapshotRef = state.second?.apiKeyRef
@@ -1794,7 +1949,8 @@ class SetupViewModel(
                                 (snapshotRef != null && current.second?.apiKeyRef != snapshotRef)
                             if (generationMoved) {
                                 logoutError = "LOGOUT_STALE"
-                                _form.value = _form.value.copy(errorCode = logoutError)
+                                logoutErrorJournal = null
+                                stampLogoutError(logoutError, null)
                                 return@withLock
                             }
                             val presentJournal = current.first
@@ -1803,8 +1959,9 @@ class SetupViewModel(
                                     reconcileOutcomeToLogout(runPendingDeleteLocked(presentJournal))
                                 committed = resumed
                                 logoutError = resumeError
+                                logoutErrorJournal = presentJournal
                                 if (logoutError != null) {
-                                    _form.value = _form.value.copy(errorCode = logoutError)
+                                    stampLogoutError(logoutError, presentJournal)
                                 }
                                 return@withLock
                             }
@@ -1820,7 +1977,7 @@ class SetupViewModel(
                         } catch (e: CancellationException) {
                             throw e
                         } catch (_: Exception) {
-                            _form.value = _form.value.copy(errorCode = "LOGOUT_DELETE_FAILED")
+                            stampLogoutError("LOGOUT_DELETE_FAILED", writtenJournal)
                             return@withLock
                         }
                     }
@@ -1835,6 +1992,7 @@ class SetupViewModel(
                             // discard it without touching winner metadata.
                             writtenJournal?.let { discardSupersededJournal(it) }
                             logoutError = "LOGOUT_STALE"
+                            logoutErrorJournal = writtenJournal
                         }
                     } catch (e: CancellationException) {
                         // Cancel during the clear: same strict probe, cancel
@@ -1871,6 +2029,7 @@ class SetupViewModel(
                                 // superseded — discard without touching winner.
                                 writtenJournal?.let { discardSupersededJournal(it) }
                                 logoutError = "LOGOUT_STALE"
+                                logoutErrorJournal = writtenJournal
                             }
                             LogoutClearProbe.UNKNOWN -> {
                                 // Re-read failed: the clear may still have won
@@ -1879,6 +2038,7 @@ class SetupViewModel(
                                 // unproven — neutral retryable code with the
                                 // journal kept, never CLEAR_FAILED.
                                 logoutError = "LOGOUT_UNKNOWN"
+                                logoutErrorJournal = writtenJournal
                             }
                             LogoutClearProbe.FAILED -> {
                                 val retried: Boolean? = try {
@@ -1896,16 +2056,27 @@ class SetupViewModel(
                                         // goes, winner metadata stays.
                                         writtenJournal?.let { discardSupersededJournal(it) }
                                         logoutError = "LOGOUT_STALE"
+                                        logoutErrorJournal = writtenJournal
                                     }
-                                    null -> logoutError = "LOGOUT_CLEAR_FAILED"
+                                    null -> {
+                                        logoutError = "LOGOUT_CLEAR_FAILED"
+                                        logoutErrorJournal = writtenJournal
+                                    }
                                 }
                             }
                         }
                     }
                     if (logoutError != null) {
-                        _form.value = _form.value.copy(errorCode = logoutError)
+                        stampLogoutError(logoutError, logoutErrorJournal)
                     }
                 }
+                // Stage C C1: any logout terminal (success or failure) drops the
+                // cached startup-reconcile outcome — the metadata generation may
+                // have moved (commit, supersede, or discard), so a rotation
+                // relaunch must run fresh I/O instead of replaying a stale round.
+                // (Cancel rethrows before reaching here: the journal is kept and
+                // the cached round, if any, still describes it.)
+                invalidateStartupSettled()
                 if (!committed) {
                     // logoutError is already stamped inside the lock when set;
                     // when the lock body returned early via the read/delete
@@ -1943,7 +2114,7 @@ class SetupViewModel(
     fun clearLogoutError() {
         val cur = _form.value
         if (cur.errorCode?.startsWith("LOGOUT_") == true) {
-            _form.value = cur.copy(errorCode = null)
+            _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
         }
     }
 

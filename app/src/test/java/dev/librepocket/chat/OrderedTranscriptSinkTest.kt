@@ -5,11 +5,13 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -635,6 +637,74 @@ class OrderedTranscriptSinkTest {
           )
           sinkB.afterSendForTest = null
           sinkB.shutdown()?.join()
+        }
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * R14-1 mechanism proof: a timed-out shutdown closes the channel and clears
+   * pending while the writer is still inside a non-cancellable store block
+   * (the Room `runInTransaction` shape: no suspension point between first
+   * write and COMMIT). The observable state — sealed + pending empty + writer
+   * NOT completed — is real, so the backfill gate must conjoin writer
+   * completion before treating an expired outstanding teardown as dead.
+   */
+  @Test fun shutdownTimeoutWithBlockedCore_sealedEmptyButWriterIncomplete() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val entered = CompletableDeferred<Unit>()
+      val release = CompletableDeferred<Unit>()
+      val delegate = object : SinkProbe() {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          // Models the blocking store transaction: immune to
+          // writerScope.cancel(), resolves only via the test gate.
+          withContext(NonCancellable) {
+            entered.complete(Unit)
+            release.await()
+          }
+          recorded.add(runId)
+        }
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        try {
+          withTimeout(10_000) {
+            val admitted = async { sink.onTurnStarted("r14-late", "q") }
+            entered.await()
+            withTimeout(5_000) { while (sink.pendingRunIds().isEmpty()) delay(10) }
+            // Bounded shutdown times out on the blocked core: it clears pending
+            // and seals, but the writer stays inside the store block.
+            sink.shutdown(drainTimeoutMs = 50L)?.join()
+            assertTrue("timed-out shutdown must seal", sink.isSealed())
+            assertTrue(
+              "timed-out shutdown clears pending",
+              sink.pendingRunIds().isEmpty(),
+            )
+            assertFalse(
+              "writer still inside the store block must not read completed",
+              sink.isWriterCompleted(),
+            )
+            // Late COMMIT: the blocked store call lands after the seal, while
+            // the caller already observed the drain-timeout failure.
+            release.complete(Unit)
+            try {
+              withTimeout(5_000) { admitted.await() }
+              fail("timed-out admission must surface the drain-timeout failure")
+            } catch (_: CancellationException) {
+              // Caller-observed failure; the row still lands below.
+            }
+            withTimeout(5_000) { while (!sink.isWriterCompleted()) delay(10) }
+            assertTrue(sink.isWriterCompleted())
+            assertEquals(listOf("r14-late"), delegate.recorded)
+          }
+        } finally {
+          // Always unblock the writer so a failed assert cannot leak the
+          // single-thread executor (complete is idempotent).
+          release.complete(Unit)
         }
       }
     } finally {

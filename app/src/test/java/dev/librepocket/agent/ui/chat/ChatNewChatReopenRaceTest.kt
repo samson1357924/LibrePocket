@@ -3,23 +3,34 @@ package dev.librepocket.agent.ui.chat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.chat.ChatImageRef
+import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatStatus
+import dev.librepocket.chat.ChatUiState
+import dev.librepocket.chat.QueuedIntent
+import dev.librepocket.chat.TurnStart
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.session.FakeSessionStore
+import dev.librepocket.session.SessionStore
 import dev.librepocket.session.TranscriptEvent
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -336,5 +347,260 @@ class ChatNewChatReopenRaceTest {
             streamGate.complete(Unit)
             cleanupGate.complete(Unit)
         }
+    }
+
+    /**
+     * R14-1 residual shape: shutdown already finished (channel closed, pending
+     * drained) while the writer is still inside its blocking store block.
+     * The fake models exactly that observable state — sealed + pending empty
+     * + IDLE (no streaming evidence, so the fallback branch decides) + writer
+     * incomplete — with an instantly-completed fence (bounded teardown ran to
+     * completion, proving fence completion alone is not writer death).
+     *
+     * Fidelity note: durability and completion are tracked SEPARATELY. A
+     * timed-out shutdown poisoned durability via interrupt marks
+     * ([hasDurableFailures] stays true, [flushDurable] stays false) while the
+     * writer itself is still unresolved; only the late COMMIT/rollback flips
+     * [writerDone]. Binding them to one flag would walk an unreal
+     * settleOk&&durableOk path and hide the divergence.
+     */
+    private class R14SealedUnfinishedSession(
+        val writerDone: AtomicBoolean,
+    ) : ChatSession {
+        private val state = MutableStateFlow(
+            ChatUiState(emptyList(), ChatStatus.IDLE, 0, null),
+        )
+        override val uiState: StateFlow<ChatUiState> = state
+        override suspend fun send(text: String, images: List<ChatImageRef>) = Unit
+        override suspend fun startTurn(text: String, images: List<ChatImageRef>): Job =
+            Job().apply { complete() }
+
+        override suspend fun startOrEnqueue(
+            text: String,
+            images: List<ChatImageRef>,
+            opId: Long?,
+        ): TurnStart = TurnStart.Queued
+
+        override fun drainQueued(): List<QueuedIntent> = emptyList()
+        override fun cancel() = Unit
+        override suspend fun flush(timeoutMs: Long): Boolean = true
+        /** Timeout-poisoned: the interrupt mark never clears on this object. */
+        override fun hasDurableFailures(): Boolean = true
+        override suspend fun flushDurable(timeoutMs: Long): Boolean = false
+        override fun hasPendingAdmission(): Boolean = false
+        override fun pendingTranscriptRunIds(): List<String> = emptyList()
+        override fun isTranscriptSealed(): Boolean = true
+        override fun isTranscriptWriterCompleted(): Boolean = writerDone.get()
+        override fun steer(text: String) = Unit
+        override fun close() = Unit
+    }
+
+    private class R14IdleSession : ChatSession {
+        private val state = MutableStateFlow(
+            ChatUiState(emptyList(), ChatStatus.IDLE, 0, null),
+        )
+        override val uiState: StateFlow<ChatUiState> = state
+        override suspend fun send(text: String, images: List<ChatImageRef>) = Unit
+        override suspend fun startTurn(text: String, images: List<ChatImageRef>): Job =
+            Job().apply { complete() }
+
+        override suspend fun startOrEnqueue(
+            text: String,
+            images: List<ChatImageRef>,
+            opId: Long?,
+        ): TurnStart = TurnStart.Queued
+
+        override fun drainQueued(): List<QueuedIntent> = emptyList()
+        override fun cancel() = Unit
+        override suspend fun flush(timeoutMs: Long): Boolean = true
+        override suspend fun flushDurable(timeoutMs: Long): Boolean = true
+        override fun hasDurableFailures(): Boolean = false
+        override fun steer(text: String) = Unit
+        override fun close() = Unit
+    }
+
+    /** Fake provider: marks the ledger like the factory when gated, else attaches fakes. */
+    private class R14MarkingSessions(
+        val transcripts: FakeSessionStore,
+        val oldId: String,
+        val oldSession: ChatSession,
+        val newSession: ChatSession,
+    ) : ChatSessionProvider {
+        val backfillFlags = CopyOnWriteArrayList<Boolean>()
+        override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
+        override suspend fun storeOrNull(): SessionStore? = transcripts
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = error("unused")
+
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent, true)
+
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession {
+            check(sessionId == oldId) { "only old resume is used" }
+            backfillFlags.add(backfillInterrupted)
+            if (backfillInterrupted) {
+                val tail = transcripts.loadTailEvents(sessionId, BACKFILL_SCAN_LIMIT)
+                for (runId in findDanglingRunIds(tail)) {
+                    transcripts.appendEvent(
+                        TranscriptEvent(
+                            sessionId = sessionId,
+                            runId = runId,
+                            kind = INTERRUPTED_MARKER_KIND,
+                            text = interruptedMarkerText(runId),
+                            createdAt = 1L,
+                        ),
+                    )
+                }
+            }
+            val session: ChatSession = if (backfillFlags.size == 1) oldSession else newSession
+            return CreatedSession(oldId, session, endpoint.providerId, endpoint.model)
+        }
+    }
+
+    /**
+     * R14-1 positive: newChat parks the sealed-but-unfinished writer, the
+     * clock advances past the horizon with the fence already completed, and
+     * the FIRST reopen must still fence (slow path) and defer — never purge
+     * on sealed + pending-empty alone and fast-path a false INTERRUPTED.
+     * The late COMMIT then lands exactly once; double reopen stays clean.
+     */
+    @Test fun newChat_thenExpiredReopenSealedUnfinishedWriter_noFalseInterrupted() = runBlocking {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = FakeSessionStore()
+        val oldId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val writerDone = AtomicBoolean(false)
+        val oldSession = R14SealedUnfinishedSession(writerDone)
+        val sessions = R14MarkingSessions(transcripts, oldId, oldSession, R14IdleSession())
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        var fakeNow = 5_000_000L
+        onMain {
+            vm.backfillClockMs = { fakeNow }
+            vm.backfillBlockHorizonMs = 500L
+        }
+
+        // #1 attach: ledger empty, nothing to mark.
+        onMain { vm.openSession(oldId) }
+        awaitTrue { vm.currentSessionId.value == oldId }
+        assertEquals(listOf(true), sessions.backfillFlags.toList())
+
+        // The user row lands; the writer sits in the R14 shape (sealed +
+        // pending empty + IDLE + inside its blocking store block).
+        transcripts.appendEvent(event(oldId, "L", "user", "q-r14"))
+
+        // Park via newChat. The fake fence completes instantly (bounded
+        // teardown ran to completion) — pre-fix the expired entry was still
+        // purged on seal + empty alone.
+        onMain { vm.newChat() }
+        assertNull(vm.currentSessionId.value)
+
+        // Expire WITHOUT reopening: fence completed, writer unfinished.
+        fakeNow += 600L
+
+        // FIRST reopen after expiry: must fence (slow path) and defer, never
+        // fast-path a false INTERRUPTED while the COMMIT is still possible.
+        onMain { vm.openSession(oldId) }
+        awaitTrue(timeoutMs = 15000) { sessions.backfillFlags.size >= 2 }
+        awaitTrue(timeoutMs = 10000) { vm.currentSessionId.value == oldId }
+        assertEquals(listOf(true, false), sessions.backfillFlags.toList())
+        assertTrue(
+            "sealed-but-unfinished outstanding must not fast-path a false INTERRUPTED",
+            interruptedMarkers(transcripts, oldId).isEmpty(),
+        )
+
+        // Late COMMIT: the true terminal lands; the writer resolves.
+        transcripts.appendEvent(event(oldId, "L", "assistant", "a-final"))
+        writerDone.set(true)
+
+        // Second reopen: settled ledger attaches clean — no marker, exactly
+        // one terminal, no contradiction on double reopen.
+        onMain { vm.openSession(oldId) }
+        awaitTrue(timeoutMs = 15000) { sessions.backfillFlags.size >= 3 }
+        awaitTrue(timeoutMs = 10000) { vm.currentSessionId.value == oldId }
+        assertEquals(listOf(true, false, true), sessions.backfillFlags.toList())
+        assertTrue(interruptedMarkers(transcripts, oldId).isEmpty())
+        assertEquals(1, rows(transcripts, oldId).count { it.kind == "assistant" })
+        assertTrue(findDanglingRunIds(rows(transcripts, oldId)).isEmpty())
+        onMain { vm.openSession(oldId) }
+        awaitTrue(timeoutMs = 15000) { sessions.backfillFlags.size >= 4 }
+        awaitTrue(timeoutMs = 10000) { vm.currentSessionId.value == oldId }
+        assertEquals(listOf(true, false, true, true), sessions.backfillFlags.toList())
+        assertTrue(interruptedMarkers(transcripts, oldId).isEmpty())
+        assertEquals(1, rows(transcripts, oldId).count { it.kind == "assistant" })
+        assertTrue(findDanglingRunIds(rows(transcripts, oldId)).isEmpty())
+    }
+
+    /**
+     * R14-1 negative control: the same sealed-but-unfinished shape, but the
+     * writer resolves WITHOUT a terminal (genuine rollback). Expiry must then
+     * promote with exactly one correct INTERRUPTED — the fix retains
+     * ownership while unresolved but never over-retains a provably-dead turn.
+     */
+    @Test fun expiredSealedWriterResolvingWithoutTerminal_marksSingleInterrupted() = runBlocking {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = FakeSessionStore()
+        val oldId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val writerDone = AtomicBoolean(false)
+        val oldSession = R14SealedUnfinishedSession(writerDone)
+        val sessions = R14MarkingSessions(transcripts, oldId, oldSession, R14IdleSession())
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        var fakeNow = 6_000_000L
+        onMain {
+            vm.backfillClockMs = { fakeNow }
+            vm.backfillBlockHorizonMs = 500L
+        }
+
+        onMain { vm.openSession(oldId) }
+        awaitTrue { vm.currentSessionId.value == oldId }
+        transcripts.appendEvent(event(oldId, "L", "user", "q-r14-rollback"))
+        onMain { vm.newChat() }
+        assertNull(vm.currentSessionId.value)
+        fakeNow += 600L
+
+        // FIRST reopen while unresolved: defer, no mark.
+        onMain { vm.openSession(oldId) }
+        awaitTrue(timeoutMs = 15000) { sessions.backfillFlags.size >= 2 }
+        awaitTrue(timeoutMs = 10000) { vm.currentSessionId.value == oldId }
+        assertEquals(listOf(true, false), sessions.backfillFlags.toList())
+        assertTrue(interruptedMarkers(transcripts, oldId).isEmpty())
+
+        // Rollback: the writer resolves with no terminal ever landing.
+        writerDone.set(true)
+
+        // Expire the renewed block, then reopen: the genuinely stranded turn
+        // promotes with exactly one correct INTERRUPTED mark.
+        fakeNow += 600L
+        onMain { vm.openSession(oldId) }
+        awaitTrue(timeoutMs = 15000) { sessions.backfillFlags.size >= 3 }
+        awaitTrue(timeoutMs = 10000) { vm.currentSessionId.value == oldId }
+        assertEquals(listOf(true, false, true), sessions.backfillFlags.toList())
+        assertEquals(
+            "rolled-back turn must backfill exactly one correct INTERRUPTED",
+            1,
+            interruptedMarkers(transcripts, oldId).size,
+        )
+
+        // Idempotence: a further reopen must not mark twice.
+        onMain { vm.openSession(oldId) }
+        awaitTrue(timeoutMs = 15000) { sessions.backfillFlags.size >= 4 }
+        awaitTrue(timeoutMs = 10000) { vm.currentSessionId.value == oldId }
+        assertEquals(listOf(true, false, true, true), sessions.backfillFlags.toList())
+        assertEquals(
+            "the INTERRUPTED mark must stay exactly one",
+            1,
+            interruptedMarkers(transcripts, oldId).size,
+        )
     }
 }

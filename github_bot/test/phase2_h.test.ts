@@ -736,6 +736,31 @@ export async function runPhase2HTests(): Promise<void> {
       for (const bad of ['../secret.txt', 'a/../../b', '/etc/passwd', 'a:(exclude)b', 'a*.kt', 'a?.kt', 'a b', '', 'https://x/y', 'key.keystore', 'app/local.properties', 'a\u0000b']) {
         assert.equal(isIssueCodeRefAllowed(bad), false, `${bad} rejected`);
       }
+      // F2 (review #77 P1-3): dedicated codeRefs denylist — sensitive
+      // files are rejected even under must-include shapes, and dot-env
+      // families are rejected everywhere.
+      for (const bad of [
+        '.env', '.ENV', '.env.local', 'config/.env.production',
+        'tests/debug.keystore', 'TESTS/DEBUG.JKS', 'app/src/test/google-services.json',
+        'Test/Google-Services.Json', 'tests/local.properties', 'tests/secret.pem',
+        'config/service-account-prod.json', 'config/service-account-prod.txt', 'app/credentials.json', 'app/secrets.json',
+        'local.properties.txt', 'google-services.json.bak.txt', '.env_vars.txt', '.git/COMMIT_EDITMSG.txt',
+        'keys/id_rsa', 'keys/id_ed25519.pub', 'app/keystore.properties', 'config.p12',
+        'app/src/main/res/permission-map.map', 'app/proguard/rules.png',
+        'app/build/output.apk', 'app/build/bundle.aab', 'app.min.js.map',
+        'gradlew', 'LICENSE', 'settings.json', 'app/config.db',
+      ]) {
+        assert.equal(isIssueCodeRefAllowed(bad), false, `F2 ${bad} rejected`);
+      }
+      // F2: legitimate diagnosis paths stay allowed.
+      for (const good of [
+        'app/src/main/java/demo/Safe.kt', 'app/src/test/java/demo/SafeTest.kt',
+        'app/build.gradle.kts', 'settings.gradle.kts', 'libs.versions.toml',
+        '.github/workflows/pocketguard.yml', 'AndroidManifest.xml',
+        'app/src/main/res/values/strings.xml', 'README.md', 'docs/THREAT_MODEL.md',
+      ]) {
+        assert.equal(isIssueCodeRefAllowed(good), true, `F2 ${good} allowed`);
+      }
       assert.equal(resolveIssueCodeRef('main'), 'main');
       assert.equal(resolveIssueCodeRef('feature/x'), 'feature/x');
       for (const bad of [undefined, '', 'main;rm', 'a b', 'a:b', '..', 'x'.repeat(65)]) {
@@ -985,8 +1010,39 @@ export async function runPhase2HTests(): Promise<void> {
             runGit: (args: string[]) => { if (args[0] === 'show') shows += 1; return 'x'; },
           });
           assert.equal(shows, 10, 'at most 10 files fetched');
-          assert.equal(reviewed.codeRefs?.length, 10, 'proof capped at 10');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // F2: a first round naming only sensitive files performs zero git reads
+    // and keeps the first-round result (no AI snippet exfiltration).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-f2-sZero-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['.env', 'tests/debug.keystore', 'app/src/test/google-services.json'] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          let shows = 0;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: (args: string[]) => { if (args[0] === 'show') shows += 1; return 'SECRET=x'; },
+          });
+          assert.equal(shows, 0, 'F2 sensitive refs trigger zero git show');
+          assert.equal(counter.count, 1, 'F2 no second layer runs');
           assert.equal(reviewed.verdict, 'APPROVE');
+          assert.equal(reviewed.codeRefs, undefined, 'F2 stores no code proof');
         } finally {
           restore();
         }

@@ -2254,10 +2254,29 @@ export function issueContentFingerprint(title: string, body: string, comments: s
 // P6 second-layer code access: read-only file reads from the trusted
 // default branch only (never a PR/issue-supplied ref, never executed).
 // Paths are validated literally (no traversal, no absolute paths, no
-// pathspec magic) and must survive the same review-file filter as diffs, so
-// keystores, build outputs, and binaries are never fetched. Returns
+// pathspec magic). F2: codeRefs use their own allowlist, independent of the
+// PR diff-review filter (whose must-include exceptions would override its
+// excludes). The denylist below is non-overridable and runs first; the
+// positive allowlist then limits reads to text source/config extensions;
+// the shared diff-review excludes remain as a final backstop. Returns
 // undefined when anything is invalid or any fetch fails, in which case the
 // caller keeps the first-round result.
+// Denylist uses prefix matching so backup copies (google-services.json.bak,
+// local.properties.txt, .env_vars) are denied as well.
+const CODE_REF_DENY_BASENAME = /(^|\/)\.env[^/]*$|(^|\/)local\.properties[^/]*$|(^|\/)google-services\.json[^/]*$|(^|\/)googleservice-info\.plist[^/]*$|(^|\/)(credentials|secrets)\.json[^/]*$|(^|\/)service-account[^/]*$|(^|\/)keystore\.properties[^/]*$|(^|\/)\.(npmrc|pypirc)([./][^/]*)?$/i;
+const CODE_REF_DENY_EXT = /\.(keystore|jks|key|pem|p12|pfx|asc|apk|aab|png|jpe?g|webp|gif|mp4|map|lock|sqlite3?|db|realm)$/i;
+const CODE_REF_DENY_MINIFIED = /(^|\/)[^/]*\.min\.[^/]+$/i;
+const CODE_REF_DENY_DIR = /(^|\/)(\.git|build|\.gradle|\.idea)(\/|$)/i;
+const CODE_REF_DENY_KEYFILE = /[^/]*id_rsa[^/]*$|[^/]*id_ed25519[^/]*$/i;
+const CODE_REF_ALLOW_EXT = /\.(kt|java|kts|xml|toml|yml|yaml|md|txt|gradle|pro)$/i;
+
+function isCodeRefDenied(normalized: string): boolean {
+  return CODE_REF_DENY_BASENAME.test(normalized)
+    || CODE_REF_DENY_EXT.test(normalized)
+    || CODE_REF_DENY_MINIFIED.test(normalized)
+    || CODE_REF_DENY_DIR.test(normalized)
+    || CODE_REF_DENY_KEYFILE.test(normalized);
+}
 export interface IssueCodeRef {
   path: string;
   content: string;
@@ -2276,6 +2295,10 @@ export function isIssueCodeRefAllowed(rawPath: string): boolean {
   if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) return false;
   if (/[:*?[\](){}!$`'"\\\s]/.test(normalized)) return false;
   if (/[\u0000-\u001f\u007f]/.test(normalized)) return false;
+  // Denylist first (never overridable), then the positive allowlist, then
+  // the shared diff-review excludes as a final backstop.
+  if (isCodeRefDenied(normalized)) return false;
+  if (!CODE_REF_ALLOW_EXT.test(normalized)) return false;
   return filterReviewDiffFiles([normalized]).length === 1;
 }
 

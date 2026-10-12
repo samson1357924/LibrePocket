@@ -8,7 +8,9 @@ import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ProviderFailureCode
+import dev.librepocket.provider.SseFrameParser
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
 import dev.librepocket.provider.requireToolAggBudget
 import dev.librepocket.provider.requireToolCountBudget
 import dev.librepocket.provider.requireTotalToolAggBudget
@@ -980,7 +982,14 @@ class TurnController(
             }
           }
         }
-        flushPendingTools()
+        // Finding #3: a provider resource-exhausted Failed (typed AGG_TOO_LARGE
+        // code or overflow markers) must not flush poison-adjacent pending
+        // ToolDeltas; already-completed ToolDone records stay (emitted inline
+        // at collection time). Truncated fallback (failed == null) still
+        // flushes: isResourceExhausted(null) is false.
+        if (!isResourceExhausted(failed)) {
+          flushPendingTools()
+        }
         if (!done && failed == null) {
           failed = StreamEvent.Failed("truncated stream", retryable = true)
         }
@@ -1207,3 +1216,26 @@ internal fun defaultChatImageLoader(refs: List<ChatImageRef>): List<ChatImage> {
  * persistence, and logs; the raw message never leaves memory.
  */
 internal fun sanitizeError(raw: String): String = Redactor.redactError(raw)
+
+/**
+ * Stage D Finding #3: does a collected [StreamEvent.Failed] terminal signal
+ * provider-side resource exhaustion, so pending (never-`ToolDone`) tool
+ * fragments must be dropped instead of flushed?
+ *
+ * True when `failed.code` is the typed `AGG_TOO_LARGE` name propagated via
+ * [StreamEvent.Failed.code] (`streamingFlow` fills `ProviderFailure.code?.name`
+ * or infers it from the message; `pumpSse` sets it for SSE budget overflows),
+ * or — for legacy/message-only `Failed`s with `code == null` — when
+ * [failed.message] contains `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` /
+ * `SSE_LINE_TOO_LONG` case-insensitively (same markers as the classifier's
+ * fatal list). Null (truncated fallback, not yet failed) is never exhausted,
+ * and already-emitted `ToolDone` records are unaffected (written inline at
+ * collection time, not via the pending flush).
+ */
+internal fun isResourceExhausted(failed: StreamEvent.Failed?): Boolean {
+  if (failed == null) return false
+  if (failed.code?.equals(ProviderFailureCode.AGG_TOO_LARGE.name, ignoreCase = true) == true) return true
+  return failed.message.contains(TOOL_ARGS_TOO_LARGE, ignoreCase = true) ||
+    failed.message.contains(SseFrameParser.FRAME_TOO_LARGE_MESSAGE, ignoreCase = true) ||
+    failed.message.contains("SSE_LINE_TOO_LONG", ignoreCase = true)
+}

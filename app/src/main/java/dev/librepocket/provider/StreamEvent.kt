@@ -43,8 +43,18 @@ sealed interface StreamEvent {
     /** Terminal: success, carrying the finish reason. */
     data class Done(val finishReason: String) : StreamEvent
 
-    /** Terminal: failure. [retryable] tells the turn controller whether to retry. */
-    data class Failed(val message: String, val retryable: Boolean) : StreamEvent
+    /** Terminal: failure. [retryable] tells the turn controller whether to retry.
+     *
+     * [code] carries the typed provider-failure name (e.g. `"AGG_TOO_LARGE"`)
+     * when the failure originates from a typed `ProviderFailure` via the
+     * streaming transport; null for legacy/classified failures. The transport
+     * fills it in `streamingFlow` (`code?.name` or inferred from the
+     * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
+     * markers) and `pumpSse` sets it for SSE budget overflows. TurnController
+     * uses `code` plus the same message markers to suppress
+     * poison-adjacent pending-tool flushes without changing retry semantics.
+     */
+    data class Failed(val message: String, val retryable: Boolean, val code: String? = null) : StreamEvent
 
     /** Retry notice (attempt counter + wait); UI shows "retrying i/n...". */
     data class Retrying(val attempt: Int, val maxAttempts: Int, val delayMs: Long) : StreamEvent

@@ -57,4 +57,22 @@ class VoiceTtsConfirmState {
     fun clearAckWarning() {
         ackWriteFailed = false
     }
+
+    /**
+     * 確認寫入完成後的可朗讀判定（P2 競態防線，純函數）。
+     *
+     * 確認協程在 `confirm(ack)` 前記下 `outputGeneration`（見 ChatScreen 接線；
+     * `voice_output` 每次變更即 bump）；`ack` suspend 期間開關翻轉會先 dispose
+     * 舊 speaker 並清空 pending，恢復後若世代不符必須丟棄（不 speak、不清錯、
+     * 不碰 pending），否則會用已 dispose 的舊 speaker 朗讀，甚至清掉翻轉後的新 pending。
+     */
+    fun shouldSpeakAfterConfirm(capturedGeneration: Long, currentGeneration: Long): Boolean =
+        capturedGeneration == currentGeneration
+
+    /**
+     * 待朗讀清除判定（P2 身分防線，純函數）：只在當代 pending 與 capture
+     * 的文字身分相符時清除，避免清掉開關翻轉後的新待確認朗讀。
+     */
+    fun shouldClearPendingAfterConfirm(capturedText: String?, currentPendingText: String?): Boolean =
+        capturedText == currentPendingText
 }

@@ -12,7 +12,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
-internal val Context.voiceDataStore by preferencesDataStore(
+private val Context.voiceDataStore by preferencesDataStore(
     name = "librepocket_voice",
 )
 
@@ -35,6 +35,8 @@ internal val VOICE_TTS_DISCLOSURE_ACK_KEY = booleanPreferencesKey("voice_tts_dis
  *
  * 形狀沿用 [dev.librepocket.agent.ui.setup.EndpointStore] 慣例：雙建構子、
  * 可注入 [ioDispatcher]、讀取 fail-closed（讀錯回預設，不拋）。
+ * DataStore 主建構子供測試注入；同一底層檔案不可有兩個 active DataStore（見 VoiceSwitchStoreTest
+ * 註記），故同一檔案勿與 Context 建構子混用。
  */
 class VoiceSwitchStore(
     internal val dataStore: androidx.datastore.core.DataStore<androidx.datastore.preferences.core.Preferences>,

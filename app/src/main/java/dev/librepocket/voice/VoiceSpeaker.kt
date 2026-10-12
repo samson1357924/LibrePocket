@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
+import androidx.annotation.VisibleForTesting
 import dev.librepocket.tool.DenyReason
 import java.util.UUID
 
@@ -106,6 +107,7 @@ class VoiceSpeaker(
      * （如 `stop()`），用於確定性重現 validation→投遞窗口的交錯。生產路徑為 null；
      * 本體異常會被吞掉，避免壞掉引擎回呼執行緒。
      */
+    @VisibleForTesting
     @Volatile
     internal var preEmitHook: (() -> Unit)? = null
 
@@ -120,6 +122,13 @@ class VoiceSpeaker(
     private data class PendingSpeech(val text: String, val epoch: Long)
 
     init {
+        initializeEngine()
+    }
+
+    /**
+     * 引擎建構＋listener 掛載＋構造期延遲初始化回撥處理（由 [init] 呼叫；純搬移，行為不變）。
+     */
+    private fun initializeEngine() {
         val engine = TextToSpeech(context) { status ->
             val initErrors: List<String> = synchronized(lifecycleLock) {
                 val initializedEngine = tts

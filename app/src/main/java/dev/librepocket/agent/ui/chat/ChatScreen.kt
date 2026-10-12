@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -26,6 +27,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
@@ -47,6 +50,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -124,18 +128,26 @@ fun ChatScreen(
     // voice_output 關閉時清除（見 VoiceErrorState）。
     val context = LocalContext.current
     val voiceErrors = remember { VoiceErrorState() }
-    // #2 確認編排（await 寫入 → 按結果行動；寫入中禁用確認鈕防連打）。
+    // #2 確認編排（await 寫入 → 按結果行動；寫入中禁用確認鈕防連打），
+    // 兼 TTS 引擎回呼的主線程投遞（見 speaker 接線）。
     val ttsConfirm = remember { VoiceTtsConfirmState() }
     val confirmScope = rememberCoroutineScope()
     // #2 朗讀確認中文字（null 即無待確認朗讀；單一待確認位，後按覆蓋前按）。
     var pendingSpeakText by remember { mutableStateOf<String?>(null) }
+    // P2 確認競態世代：outputEnabled 每次變更即 bump（初次組合時與 prev 同值，不 bump；
+    // capture 皆發生在其後）。確認協程以此偵測 await 期間的開關翻轉，判定見
+    // VoiceTtsConfirmState.shouldSpeakAfterConfirm（純函數，JVM 可測）。
+    var outputGeneration by remember { mutableLongStateOf(0L) }
+    var prevOutputEnabled by remember { mutableStateOf(outputEnabled) }
     // M2 延遲建構：voice_output 關閉時不初始化 TTS 引擎（不佔系統服務）。
     val speaker: VoiceSpeaker? = remember(context, outputEnabled) {
         if (outputEnabled) {
             VoiceSpeaker(
                 context.applicationContext,
-                onError = { voiceErrors.onTtsFailure(it) },
-                onDone = { voiceErrors.onTtsSuccess() },
+                // P3：引擎回呼在 binder 執行緒：經主線程作用域投遞（仿 SetupViewModel
+                // logout 的 withContext(Dispatchers.Main)；VoiceSpeaker 層不動）。
+                onError = { msg -> confirmScope.launch { voiceErrors.onTtsFailure(msg) } },
+                onDone = { confirmScope.launch { voiceErrors.onTtsSuccess() } },
             )
         } else {
             null
@@ -146,6 +158,10 @@ fun ChatScreen(
     }
     // voice_output 關閉：TTS 通道消失，清 tts 錯誤、寫入失敗警告與待確認朗讀。
     LaunchedEffect(outputEnabled) {
+        if (outputEnabled != prevOutputEnabled) {
+            outputGeneration++
+            prevOutputEnabled = outputEnabled
+        }
         if (!outputEnabled) {
             voiceErrors.onOutputDisabled()
             ttsConfirm.clearAckWarning()
@@ -379,72 +395,91 @@ fun ChatScreen(
             }
         }
 
-        // #7 雙錯誤通道分別顯示（STT／TTS 各管各的，不互相清除）。
-        voiceErrors.sttError?.let {
-            Text(
-                text = it,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.padding(horizontal = 16.dp),
-            )
-        }
+        // #7＋#2 錯誤與確認區：高度上限＋內部可滾（仿 SetupScreen verticalScroll 先例；
+        // 小螢幕時保住底部輸入列；內容短時行為不變）。
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 240.dp)
+                .verticalScroll(rememberScrollState()),
+        ) {
+            // #7 雙錯誤通道分別顯示（STT／TTS 各管各的，不互相清除）。
+            voiceErrors.sttError?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
 
-        voiceErrors.ttsError?.let {
-            Text(
-                text = it,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.padding(horizontal = 16.dp),
-            )
-        }
+            voiceErrors.ttsError?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
 
-        // #2 朗讀內聯確認（首次可見揭露：視力用戶不需進設定頁即可看到；
-        // 既有朗讀鈕 contentDescription 保留）。確認鈕 await 寫入再行動：
-        // 成功／寫入失敗皆執行本次朗讀（寫入失敗另顯示 TTS_ACK_PERSIST_WARNING，
-        // 保持未確認，下次重問）；寫入中禁用確認鈕（連打防護，寫完恢復）；
-        // 取消鈕只清待朗讀文字，不碰錯誤。
-        pendingSpeakText?.let { text ->
-            Card(
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp),
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(
-                        text = VoiceTts.ttsConfirmMessage(),
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
-                                confirmScope.launch {
-                                    when (ttsConfirm.confirm(onTtsAcknowledged)) {
-                                        TtsConfirmDecision.SUPPRESSED -> Unit
-                                        else -> {
-                                            voiceErrors.onSpeakStarted()
-                                            speaker?.speak(text)
-                                            pendingSpeakText = null
+            // #2 朗讀內聯確認（首次可見揭露：視力用戶不需進設定頁即可看到；
+            // 既有朗讀鈕 contentDescription 保留）。確認鈕 await 寫入再行動：
+            // 成功／寫入失敗皆執行本次朗讀（寫入失敗另顯示 TTS_ACK_PERSIST_WARNING，
+            // 保持未確認，下次重問）；寫入中禁用確認鈕（連打防護，寫完恢復）；
+            // 取消鈕只清待朗讀文字，不碰錯誤。
+            pendingSpeakText?.let { text ->
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp),
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(
+                            text = VoiceTts.ttsConfirmMessage(),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    // P2：先 capture 當代 speaker＋文字＋世代；await 期間輸出開關
+                                    // 翻轉（世代不符）即丟棄（不 speak、不清錯、不碰 pending，
+                                    // 後者已由開關效應清空或屬翻轉後的新確認）。
+                                    val capturedSpeaker = speaker
+                                    val capturedGeneration = outputGeneration
+                                    confirmScope.launch {
+                                        when (ttsConfirm.confirm(onTtsAcknowledged)) {
+                                            TtsConfirmDecision.SUPPRESSED -> Unit
+                                            else -> {
+                                                if (!ttsConfirm.shouldSpeakAfterConfirm(capturedGeneration, outputGeneration)) {
+                                                    return@launch
+                                                }
+                                                voiceErrors.onSpeakStarted()
+                                                capturedSpeaker?.speak(text)
+                                                if (ttsConfirm.shouldClearPendingAfterConfirm(text, pendingSpeakText)) {
+                                                    pendingSpeakText = null
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                            },
-                            enabled = !ttsConfirm.confirming,
-                        ) { Text("朗讀") }
-                        TextButton(onClick = { pendingSpeakText = null }) { Text("取消") }
+                                },
+                                enabled = !ttsConfirm.confirming,
+                            ) { Text("朗讀") }
+                            TextButton(onClick = { pendingSpeakText = null }) { Text("取消") }
+                        }
                     }
                 }
             }
-        }
 
-        // ack 寫入失敗警告（內聯可見；下次確認成功或輸出關閉時清除）。
-        if (ttsConfirm.ackWriteFailed) {
-            Text(
-                text = VoiceTts.TTS_ACK_PERSIST_WARNING,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.padding(horizontal = 16.dp),
-            )
+            // ack 寫入失敗警告（內聯可見；下次確認成功或輸出關閉時清除）。
+            if (ttsConfirm.ackWriteFailed) {
+                Text(
+                    text = VoiceTts.TTS_ACK_PERSIST_WARNING,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
         }
 
         // Bottom input bar (ChatGPT/Gemini style).

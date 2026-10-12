@@ -457,6 +457,11 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     val isStale = recoveryCode == "LOGOUT_STALE"
                     val isReadRetry = recoveryCode == "LOGOUT_READ_RETRY"
+                    // Stage E：與 Ready 分支同步——retained 明確排除 READ_RETRY
+                    // （經上游 if/else 已不可達，防禦性：未來合併分支時亦不誤判
+                    // 為重試清除；Ready 分支 `isRetainedReadyError` 同式）。
+                    val isRetainedNoEndpointError = !isStale &&
+                        recoveryCode != "LOGOUT_READ_RETRY"
                     if (isReadRetry) {
                         // Stage D1 中性碼：非破壞性重試讀取，僅 [重試讀取]（無取消／無
                         // 重試清除／無關閉；enabled 綁 startupReconcilePending）。
@@ -473,10 +478,10 @@ fun SettingsScreen(
                                 Text("重試讀取")
                             }
                         }
-                    } else if (!isStale) {
+                    } else if (isRetainedNoEndpointError) {
                         // retained 碼（READ_FAILED/DELETE/CLEAR/UNKNOWN）：journal 可能保留，
                         // 只留重試清除，不給取消（journal 釋放前不給出口）。
-                        // Stage D1：READ_RETRY 已另分支，不在此。
+                        // Stage D1：READ_RETRY 已另分支，不在此（上游條件同步排除）。
                         Button(
                             onClick = onRetryLogout,
                             enabled = !logoutInFlight,

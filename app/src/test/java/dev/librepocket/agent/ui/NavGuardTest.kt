@@ -1,6 +1,10 @@
 package dev.librepocket.agent.ui
 
+import dev.librepocket.agent.ui.setup.PendingDelete
+import dev.librepocket.agent.ui.setup.PendingTeardownState
+import dev.librepocket.agent.ui.setup.SetupViewModel
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
@@ -96,27 +100,69 @@ class NavGuardTest {
     }
 
     /**
-     * Stage D2 派生碼行（R12 Finding 2 (b)）：`effectiveLogoutGuardError` 派生
-     * `LOGOUT_UNKNOWN`（無碼＋journal present＋非 inFlight）與既有 `LOGOUT_*`
-     * 一致走 SETTINGS、互斥不走 SETUP；在途抑制派生（`null` 走 fresh SETUP）。
+     * Stage E 四態派生碼行（R13 Finding P2/BLOCK）：
+     * - 無碼＋KnownPending＋非 inFlight → `LOGOUT_UNKNOWN`（重試清除），與既有
+     *   `LOGOUT_*` 一致走 SETTINGS、互斥不走 SETUP；
+     * - 無碼＋UnknownReadFailure／MalformedPending＋非 inFlight →
+     *   `LOGOUT_READ_RETRY`（D1 碼複用，重試讀取 only），同走 SETTINGS；
+     * - 在途抑制派生（`null` 走 fresh SETUP）；Absent 常態 null；
+     * - 有碼沿用（STALE 不被派生覆蓋，不論四態）。
      */
     @Test
     fun derivedUnknownBlocksSetupAndSteersToSettings() {
-        val derived = effectiveLogoutGuardError(null, pendingPresent = true, logoutInFlight = false)
+        val journal = PendingDelete("preset:openai", 1L, 1700000000001L)
+        val known = PendingTeardownState.KnownPending(journal)
+        val derived = effectiveLogoutGuardError(null, known, logoutInFlight = false)
         assertEquals("LOGOUT_UNKNOWN", derived)
         assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, derived, false))
         assertEquals(false, shouldNavigateToSetup(false, false, Routes.SETTINGS, derived, false))
         assertEquals(true, shouldNavigateToSettings(false, false, Routes.CHAT, derived, false))
         assertEquals(false, shouldNavigateToSettings(false, false, Routes.SETTINGS, derived, false))
+        // 未確認態：中性 READ_RETRY（D1 碼同一常數），同走 SETTINGS、不走 SETUP.
+        val retryUnknown = effectiveLogoutGuardError(
+            null,
+            PendingTeardownState.UnknownReadFailure,
+            logoutInFlight = false,
+        )
+        assertEquals(SetupViewModel.LOGOUT_READ_RETRY, retryUnknown)
+        assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, retryUnknown, false))
+        assertEquals(true, shouldNavigateToSettings(false, false, Routes.CHAT, retryUnknown, false))
+        val retryMalformed = effectiveLogoutGuardError(
+            null,
+            PendingTeardownState.MalformedPending,
+            logoutInFlight = false,
+        )
+        assertEquals(SetupViewModel.LOGOUT_READ_RETRY, retryMalformed)
+        assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, retryMalformed, false))
+        assertEquals(true, shouldNavigateToSettings(false, false, Routes.CHAT, retryMalformed, false))
+        // Absent 常態 null（fresh 走 SETUP）.
+        assertNull(
+            effectiveLogoutGuardError(null, PendingTeardownState.Absent, logoutInFlight = false),
+        )
         // 在途抑制：有效 null＋inFlight → 不決策（兩守衛皆 false）。
-        val suppressed = effectiveLogoutGuardError(null, pendingPresent = true, logoutInFlight = true)
+        val suppressed = effectiveLogoutGuardError(null, known, logoutInFlight = true)
         assertEquals(null, suppressed)
         assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, suppressed, true))
         assertEquals(false, shouldNavigateToSettings(false, false, Routes.CHAT, suppressed, true))
-        // 有碼沿用（STALE 不被派生覆蓋）。
+        assertNull(
+            effectiveLogoutGuardError(
+                null,
+                PendingTeardownState.UnknownReadFailure,
+                logoutInFlight = true,
+            ),
+        )
+        // 有碼沿用（STALE 不被派生覆蓋，不論四態）。
         assertEquals(
             "LOGOUT_STALE",
-            effectiveLogoutGuardError("LOGOUT_STALE", pendingPresent = true, logoutInFlight = false),
+            effectiveLogoutGuardError("LOGOUT_STALE", known, logoutInFlight = false),
+        )
+        assertEquals(
+            "LOGOUT_STALE",
+            effectiveLogoutGuardError(
+                "LOGOUT_STALE",
+                PendingTeardownState.UnknownReadFailure,
+                logoutInFlight = false,
+            ),
         )
     }
 }

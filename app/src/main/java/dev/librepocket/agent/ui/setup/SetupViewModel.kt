@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -313,19 +314,39 @@ class SetupViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), EndpointGate.Loading)
 
     /**
-     * Stage D2 跨 VM teardown 可觀測態（R12 Finding 2 P2/BLOCK (a)）。
+     * Stage E pending-domain re-read tick (R13 Finding P2/BLOCK, 方案 B).
      *
-     * 由 [EndpointStore.observePendingDelete] 派生（零 vault I/O，僅一
-     * Preferences key 讀；malformed／讀失敗皆為非 null present fail-closed，
-     * 見該函數）：第二 VM 在本 VM `NO_OP` 落定後寫入的 journal 在此發射，
-     * 即使本 VM `form.errorCode` 仍為 null。`MainScreen` 收集後傳入
-     * [dev.librepocket.agent.ui.StartupGateHost] 派生恢復態（
-     * [dev.librepocket.agent.ui.effectiveLogoutGuardError]）；safe reconcile
-     * 複用既有 [logout] resume 分支（同一 `runPendingDeleteLocked` 核心），
-     * 不新增 vault 路徑。`WhileSubscribed(5000)` 仿 [gate] 接線。
+     * [pendingTeardown] 的內層 [EndpointStore.observePendingDelete] 在 `catch`
+     * 發射後即完成（transient 失敗黏住）；每次 tick 遞增經 `flatMapLatest` 重建
+     * 內層收集、重讀 store——store 保持唯一真相源，無手動回寫（禁方案 A：手動
+     * 回寫會以 stale 蓋掉 concurrent 新 journal）。Bump 點與
+     * [invalidateStartupSettled] 對齊（retry／logout 入口／save 提交／logout
+     * 終端／probe generation-changed，見各呼叫處）：皆為 journal 存否可能變化
+     * 之處；settled 回放不 bump（零多讀）。成功 strict 讀不需額外回寫（tick
+     * 重建即重讀）。內層 `catch` 完成後需下次 tick 才恢復；漏 bump 只留
+     * phantom present（fail-closed：重試讀取，不靜默 fresh）。
      */
-    val pendingTeardown: StateFlow<PendingDelete?> = store.observePendingDelete()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+    private val pendingTick = MutableStateFlow(0L)
+
+    /**
+     * Stage E 四態 teardown domain（R13 P2/BLOCK；D2 `PendingDelete?` 升格）。
+     *
+     * 由 [EndpointStore.observePendingDelete] 經 [pendingTick] `flatMapLatest`
+     * 派生（零 vault I/O，僅一 Preferences key 讀）：第二 VM 在本 VM `NO_OP`
+     * 落定後寫入的 journal 在此發射為 [PendingTeardownState.KnownPending]，
+     * 即使本 VM `form.errorCode` 仍為 null；transient 讀失敗發射為
+     * [PendingTeardownState.UnknownReadFailure]（非 [PendingTeardownState.Absent]，
+     * 絕不誤報 fresh），毀損 journal 發射為
+     * [PendingTeardownState.MalformedPending]。`MainScreen` 收集後傳入
+     * [dev.librepocket.agent.ui.StartupGateHost] 派生恢復態（
+     * [dev.librepocket.agent.ui.effectiveLogoutGuardError]：confirmed 走
+     * retained 重試清除，unconfirmed 走重試讀取）；safe reconcile 複用既有
+     * [logout] resume 分支（同一 `runPendingDeleteLocked` 核心），不新增 vault
+     * 路徑。`WhileSubscribed(5000)` 仿 [gate] 接線。
+     */
+    val pendingTeardown: StateFlow<PendingTeardownState> = pendingTick
+        .flatMapLatest { store.observePendingDelete() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PendingTeardownState.Absent)
 
     fun selectPreset(presetId: String) {
         val preset = ProviderCatalog.preset(presetId) ?: return
@@ -1554,6 +1575,11 @@ class SetupViewModel(
                             replay = latest
                         } else {
                             startupSettled = null
+                            // Stage E probe-changed：generation 變化與 settled 失效對齊，
+                            // 同步 bump pending tick（新鮮 worker 的 strict 重讀兜底
+                            // outcome，tick 重建兜底 domain flow——內層 `catch` 完成
+                            // 後不重建即黏住 phantom present）。
+                            bumpPendingTick()
                             needFresh = true
                         }
                     }
@@ -1624,6 +1650,20 @@ class SetupViewModel(
     /** Drops the cached startup-reconcile outcome (logout exit / save commit). */
     private fun invalidateStartupSettled() {
         synchronized(startupLock) { startupSettled = null }
+        // Stage E: journal 存否可能變化處同步重讀 pending domain（bump 點與
+        // settled 失效對齊；settled 回放不經此處，故不 bump、零多讀）。
+        bumpPendingTick()
+    }
+
+    /**
+     * Stage E pending-domain re-read tick bump（[pendingTick] 用）。
+     *
+     * 非 suspend、執行緒安全（[update] 原子遞增）：IO／Main 皆可呼叫。僅重建
+     * [pendingTeardown] 內層收集（一次 DataStore 重讀，零 vault I/O）；冪等，
+     * 多 bump 一次只多一讀。
+     */
+    private fun bumpPendingTick() {
+        pendingTick.update { it + 1 }
     }
 
     /**
@@ -1872,7 +1912,8 @@ class SetupViewModel(
      * Stage D1 非破壞性重試讀取（中性碼 `LOGOUT_READ_RETRY` 專用恢復入口）。
      *
      * 語義：先經 [invalidateStartupSettled] 丟棄已落定輪（含 `UNKNOWN`+null 的
-     * 中性快照），再以 [launchPendingDeleteReconcile] 起唯一新鮮 worker；落定前
+     * 中性快照；Stage E 起同函數內同步 bump [pendingTick]，重建 domain flow 重讀），
+     * 再以 [launchPendingDeleteReconcile] 起唯一新鮮 worker；落定前
      * 的 rotation 重 launch 走既有 single-flight 入列拿 join handle（不跑第二份
      * I/O），落定後重 launch 回放該輪快照。預設 `onDone` 即 [onStartupReconcile]
      *（生產入口讀 live gate；測試可傳自訂回調以斷言 outcome／journal）。

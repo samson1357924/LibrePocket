@@ -71,8 +71,9 @@ fun MainScreen(
     // 登出失敗 Settings UI 可見（Re-review #7 Finding 2 階段2）：false 分支不導航
     // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
     val setupForm by setupViewModel.form.collectAsStateWithLifecycle()
-    // Stage D2 跨 VM journal domain state：第二 VM 寫入的 journal 在此 VM 無碼時
-    // 仍可觀測（presence），供派生恢復態（見 effectiveLogoutGuardError）。
+    // Stage E 四態 journal domain：第二 VM 寫入的 journal 在此 VM 無碼時
+    // 仍可觀測（KnownPending），供派生恢復態（見 effectiveLogoutGuardError）；
+    // transient 讀失敗／毀損為未確認態（重試讀取），絕不誤報 fresh。
     val pendingTeardown by setupViewModel.pendingTeardown.collectAsStateWithLifecycle()
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
@@ -178,7 +179,7 @@ fun MainScreen(
         },
         onEditEndpoint = { goSetupForEdit() },
         onDrawerOpened = { sessionListViewModel.refresh() },
-        // Stage D2：跨 VM journal 傳入 host 派生恢復態（單一來源純函數，見 NavGuard）。
+        // Stage E：四態 journal 傳入 host 派生恢復態（單一來源純函數，見 NavGuard）。
         pendingTeardown = pendingTeardown,
         chatContent = { padding ->
             ChatScreen(
@@ -246,13 +247,14 @@ fun MainScreen(
                         }
                     }
                 },
-                // Stage D2 派生恢復態（與 host 同一純函數單一來源）：無碼＋journal
-                // present＋非執行中 → LOGOUT_UNKNOWN（NoEndpoint 顯示 UNKNOWN 卡＋
-                // 重試清除，無 dismiss；STALE 等有碼沿用不動）。Safe reconcile 複用
-                // 既有 onLogout resume 分支（同一 runPendingDeleteLocked 核心）。
+                // Stage E 四態派生恢復態（與 host 同一純函數單一來源）：無碼＋KnownPending
+                // ＋非執行中 → LOGOUT_UNKNOWN（NoEndpoint 顯示 UNKNOWN 卡＋重試清除，
+                // 無 dismiss）；無碼＋Unknown／Malformed＋非執行中 → LOGOUT_READ_RETRY
+                // （重試讀取 only）；有碼沿用不動。Safe reconcile 複用既有 onLogout
+                // resume 分支（同一 runPendingDeleteLocked 核心）。
                 logoutErrorCode = effectiveLogoutGuardError(
                     setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") },
-                    pendingPresent = pendingTeardown != null,
+                    pendingTeardown = pendingTeardown,
                     logoutInFlight = setupForm.logoutInFlight,
                 ),
                 logoutInFlight = setupForm.logoutInFlight,

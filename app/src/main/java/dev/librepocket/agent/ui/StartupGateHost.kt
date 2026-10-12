@@ -41,7 +41,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import dev.librepocket.agent.ui.setup.EndpointGate
-import dev.librepocket.agent.ui.setup.PendingDelete
+import dev.librepocket.agent.ui.setup.PendingTeardownState
 import dev.librepocket.session.SessionMeta
 import kotlinx.coroutines.launch
 
@@ -63,8 +63,9 @@ import kotlinx.coroutines.launch
  * 回調傳入）。
  *
  * Stage D2（R12 Finding 2 (b)）：派生恢復態內聚單一來源——有效碼
- * `effectiveLogoutGuardError(logoutGuardError, pendingPresent, logoutInFlight)`
- * （見 `NavGuard.kt`；無碼＋journal present＋非執行中 → `LOGOUT_UNKNOWN`）
+ * `effectiveLogoutGuardError(logoutGuardError, pendingTeardown, logoutInFlight)`
+ * （見 `NavGuard.kt`；Stage E 四態：有碼沿用，無碼＋KnownPending＋非執行中 →
+ * `LOGOUT_UNKNOWN`，無碼＋Unknown／Malformed＋非執行中 → `LOGOUT_READ_RETRY`）
  * 代入雙守衛（nav 抑制＋CHAT→SETTINGS）、drawer 手勢與選單鍵門禁（恢復態啟用）；
  * `MainScreen` 另以同一純函數派生 `SettingsScreen` `recoveryCode`
  * （NoEndpoint 顯示 `LOGOUT_UNKNOWN` 卡＋重試清除，無 dismiss）。
@@ -89,11 +90,15 @@ internal fun StartupGateHost(
     settingsContent: @Composable (PaddingValues) -> Unit,
     setupContent: @Composable (PaddingValues, Boolean) -> Unit,
     /**
-     * Stage D2 跨 VM journal domain state（`SetupViewModel.pendingTeardown`
-     * 收集值；null＝確無 journal，非 null＝present，含 malformed／讀失敗
-     * sentinel）。僅 presence 參與派生（身份不作清除依據）。
+     * Stage E 四態 journal domain（`SetupViewModel.pendingTeardown`
+     * 收集值；[PendingTeardownState.Absent]＝確無 journal，
+     * [PendingTeardownState.KnownPending]＝已確認存在，
+     * [PendingTeardownState.UnknownReadFailure]／
+     * [PendingTeardownState.MalformedPending]＝未確認）。僅經
+     * [effectiveLogoutGuardError] 派生（confirmed 走 retained 重試清除，
+     * unconfirmed 走重試讀取）；身份不作清除依據。
      */
-    pendingTeardown: PendingDelete? = null,
+    pendingTeardown: PendingTeardownState = PendingTeardownState.Absent,
 ) {
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -110,11 +115,13 @@ internal fun StartupGateHost(
     // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
     val logoutGuardError = errorCode?.takeIf { it.startsWith("LOGOUT_") }
     val logoutGuardBusy = logoutInFlight
-    // Stage D2 派生恢復態（單一來源）：無碼＋journal present＋非執行中 →
-    // LOGOUT_UNKNOWN；有碼沿用（STALE 等不動）。有效值代入雙守衛與 drawer／選單。
+    // Stage E 四態派生恢復態（單一來源）：有碼沿用；無碼＋KnownPending＋非執行中 →
+    // LOGOUT_UNKNOWN（重試清除）；無碼＋Unknown／Malformed＋非執行中 →
+    // LOGOUT_READ_RETRY（重試讀取 only）；Absent／在途 → null（不決策）。
+    // 有效值代入雙守衛與 drawer／選單。
     val effectiveGuardError = effectiveLogoutGuardError(
         logoutGuardError,
-        pendingPresent = pendingTeardown != null,
+        pendingTeardown = pendingTeardown,
         logoutInFlight = logoutInFlight,
     )
 

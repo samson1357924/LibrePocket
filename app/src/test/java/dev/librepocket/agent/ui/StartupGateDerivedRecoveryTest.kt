@@ -26,6 +26,8 @@ import androidx.navigation.compose.rememberNavController
 import dev.librepocket.agent.ui.settings.SettingsScreen
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.PendingDelete
+import dev.librepocket.agent.ui.setup.PendingTeardownState
+import dev.librepocket.agent.ui.setup.SetupViewModel
 import dev.librepocket.agent.ui.setup.setupErrorText
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
@@ -38,12 +40,15 @@ import org.robolectric.annotation.Config
 
 /**
  * Stage D2（R12 Finding 2 (b)(c)）Host 接線：派生恢復態。
- *
- * `pendingTeardown`（`SetupViewModel.pendingTeardown` 收集值）經
- * [effectiveLogoutGuardError] 派生 `LOGOUT_UNKNOWN`（無碼＋present＋非 inFlight）
- * 後，雙守衛（nav 抑制＋CHAT→SETTINGS）、drawer 手勢與選單鍵門禁皆啟用；
+ * Stage E（R13 Finding P2/BLOCK）四態：`pendingTeardown`
+ * （`SetupViewModel.pendingTeardown` 收集值，[PendingTeardownState]）經
+ * [effectiveLogoutGuardError] 派生——KnownPending（已確認）→ `LOGOUT_UNKNOWN`，
+ * UnknownReadFailure／MalformedPending（未確認）→ `LOGOUT_READ_RETRY`
+ * （D1 碼複用，重試讀取 only）——無碼＋非 inFlight 後，雙守衛（nav 抑制＋
+ * CHAT→SETTINGS）、drawer 手勢與選單鍵門禁皆啟用；
  * `SettingsScreen` 經同一純函數（`MainScreen` 側）得 `recoveryCode`，NoEndpoint
- * 顯示 UNKNOWN 卡＋重試清除、無 dismiss。inFlight 抑制派生（執行中不決策）。
+ * 下 KnownPending 顯示 UNKNOWN 卡＋重試清除、未知態顯示 READ_RETRY 卡＋重試讀取、
+ * 皆無 dismiss。inFlight 抑制派生（執行中不決策）。
  * spinner 語義不變（`startupReconcilePending` 驅動）。
  */
 @RunWith(RobolectricTestRunner::class)
@@ -55,10 +60,11 @@ class StartupGateDerivedRecoveryTest {
     private class Harness {
         val gate = MutableStateFlow<EndpointGate>(EndpointGate.NoEndpoint)
         val pending = MutableStateFlow(false)
-        val pendingTeardown = MutableStateFlow<PendingDelete?>(null)
+        val pendingTeardown = MutableStateFlow<PendingTeardownState>(PendingTeardownState.Absent)
         val error = MutableStateFlow<String?>(null)
         val inFlight = MutableStateFlow(false)
         var logoutCalls = 0
+        var retryReadCalls = 0
         var dismissCalls = 0
         lateinit var nav: NavHostController
         val visited = mutableListOf<String?>()
@@ -76,7 +82,7 @@ class StartupGateDerivedRecoveryTest {
         // Settings 側 recoveryCode 同以有效值傳入（生產 MainScreen 同式）。
         val effective = effectiveLogoutGuardError(
             e?.takeIf { it.startsWith("LOGOUT_") },
-            pendingPresent = pt != null,
+            pendingTeardown = pt,
             logoutInFlight = b,
         )
         DisposableEffect(nav) {
@@ -114,6 +120,8 @@ class StartupGateDerivedRecoveryTest {
                         dismissCalls++
                         error.value = null
                     },
+                    onRetryStartupRead = { retryReadCalls++ },
+                    startupReconcilePending = p,
                 )
             },
             setupContent = { padding, _ ->
@@ -144,10 +152,10 @@ class StartupGateDerivedRecoveryTest {
 
     @Test
     fun derivedPresent_steersChatToSettingsWithRecovery() {
-        // 無碼＋J_B present＋非 inFlight → 有效 UNKNOWN：CHAT 直達 SETTINGS
+        // 無碼＋KnownPending(J_B)＋非 inFlight → 有效 UNKNOWN：CHAT 直達 SETTINGS
         //（SETUP 從未訪問）、選單 enabled、恢復卡＋重試清除 displayed、無關閉。
         val h = Harness()
-        h.pendingTeardown.value = journalB
+        h.pendingTeardown.value = PendingTeardownState.KnownPending(journalB)
         render(h)
         awaitRoute(h, Routes.SETTINGS)
         assertEquals(Routes.SETTINGS, currentRoute(h))
@@ -161,6 +169,47 @@ class StartupGateDerivedRecoveryTest {
         // 重試可達（safe reconcile 入口＝既有 onLogout）。
         composeRule.onNodeWithText("重試清除").performClick()
         composeRule.runOnIdle { assertEquals(1, h.logoutCalls) }
+    }
+
+    @Test
+    fun derivedUnknownFailure_showsRetryReadOnly() {
+        // Stage E 未知態：無碼＋UnknownReadFailure＋非 inFlight → 有效 READ_RETRY
+        // （D1 碼複用）：CHAT 直達 SETTINGS、選單 enabled；Settings 顯示重試讀取卡
+        // （D1 分支），絕無重試清除／取消／關閉；按鍵可達非破壞性重試讀取入口。
+        val h = Harness()
+        h.pendingTeardown.value = PendingTeardownState.UnknownReadFailure
+        render(h)
+        awaitRoute(h, Routes.SETTINGS)
+        assertEquals(Routes.SETTINGS, currentRoute(h))
+        composeRule.runOnIdle { assertTrue(h.visited.none { it == Routes.SETUP }) }
+        composeRule.onNodeWithContentDescription("選單").assertIsEnabled()
+        composeRule.onNodeWithText(setupErrorText(SetupViewModel.LOGOUT_READ_RETRY)).assertIsDisplayed()
+        composeRule.onNodeWithText("重試讀取").assertIsDisplayed()
+        composeRule.onAllNodesWithText("重試清除").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
+        // 重試讀取可達（非破壞性 reconcile-only 入口），不觸 logout。
+        composeRule.onNodeWithText("重試讀取").performClick()
+        composeRule.runOnIdle {
+            assertEquals(1, h.retryReadCalls)
+            assertEquals(0, h.logoutCalls)
+        }
+    }
+
+    @Test
+    fun derivedMalformed_showsRetryReadOnly() {
+        // Stage E 未知態（毀損）：無碼＋MalformedPending＋非 inFlight → 同走
+        // READ_RETRY 重試讀取分支（絕不給重試清除）。
+        val h = Harness()
+        h.pendingTeardown.value = PendingTeardownState.MalformedPending
+        render(h)
+        awaitRoute(h, Routes.SETTINGS)
+        composeRule.onNodeWithText(setupErrorText(SetupViewModel.LOGOUT_READ_RETRY)).assertIsDisplayed()
+        composeRule.onNodeWithText("重試讀取").assertIsDisplayed()
+        composeRule.onAllNodesWithText("重試清除").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
     }
 
     @Test
@@ -179,7 +228,7 @@ class StartupGateDerivedRecoveryTest {
         // present＋inFlight → 有效 null：不決策（CHAT 空轉，無 SETUP／SETTINGS）、
         // 選單 disabled；inFlight 結束才導向 SETTINGS.
         val h = Harness()
-        h.pendingTeardown.value = journalB
+        h.pendingTeardown.value = PendingTeardownState.KnownPending(journalB)
         h.inFlight.value = true
         render(h)
         composeRule.waitForIdle()
@@ -201,7 +250,7 @@ class StartupGateDerivedRecoveryTest {
         val h = Harness()
         render(h)
         awaitRoute(h, Routes.SETUP)
-        h.pendingTeardown.value = journalB
+        h.pendingTeardown.value = PendingTeardownState.KnownPending(journalB)
         composeRule.waitForIdle()
         assertEquals(Routes.SETUP, currentRoute(h))
         composeRule.onNodeWithContentDescription("選單").assertIsEnabled()
@@ -219,7 +268,7 @@ class StartupGateDerivedRecoveryTest {
         // spinner 語義不變：落定前全屏 spinner、守衛不決策；落定後派生直達 SETTINGS.
         val h = Harness()
         h.pending.value = true
-        h.pendingTeardown.value = journalB
+        h.pendingTeardown.value = PendingTeardownState.KnownPending(journalB)
         render(h)
         composeRule.onNodeWithTag("startupLoading").assertIsDisplayed()
         composeRule.runOnIdle {

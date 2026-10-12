@@ -42,9 +42,10 @@ import org.junit.Test
  * 不同 vault；複用既有 `CountingVault`／`ThrowingDeleteVault` 手法）：
  * - Bug 重現（修前：VM-A `NO_OP` 落定後 VM-B 留 `J_B`，VM-A `errorCode` null、
  *   `Setup==true`／`Settings==false`、save 被擋、relaunch 回放 `NO_OP`；修後：
- *   `pendingTeardown` 發射 `J_B`、派生 `LOGOUT_UNKNOWN` 下 `Setup==false`／
+ *   `pendingTeardown` 發射 `KnownPending(J_B)`、派生 `LOGOUT_UNKNOWN` 下 `Setup==false`／
  *   `Settings==true`、relaunch 新鮮 I/O 至 `COMMITTED`）；
- * - (a) 可觀測（`J_B`＋malformed 皆 present；讀失敗未知即 present）；
+ * - (a) 可觀測（`KnownPending(J_B)`；malformed 為 `MalformedPending` 非真 journal，
+ *   讀失敗為 `UnknownReadFailure` 未知即 present）；
  * - (b) 派生恢復態（純函數＋守衛真值表，Host／Settings 接線另見專檔）；
  * - Safe reconcile 至 `COMMITTED`（健康 vault、同源清碼、终態 fresh SETUP 可達、
  *   save 重試 `saved==true`＋READY）；
@@ -163,13 +164,17 @@ class SetupCrossVmJournalTest {
         awaitSaveSettled(vmA)
         assertFalse(vmA.form.value.saved)
         assertEquals("SAVE_BLOCKED_BY_TEARDOWN", vmA.form.value.errorCode)
-        // VM-A pendingTeardown 發射 J_B（(a) 可觀測，修後恢復基礎）。
+        // VM-A pendingTeardown 發射 KnownPending(J_B)（(a) 可觀測，修後恢復基礎）。
         val tornDown = runBlocking {
-            withTimeout(10_000) { vmA.pendingTeardown.first { it != null } }
+            withTimeout(10_000) { vmA.pendingTeardown.first { it is PendingTeardownState.KnownPending } }
         }
-        assertEquals(journalB, tornDown)
+        assertEquals(journalB, (tornDown as PendingTeardownState.KnownPending).pending)
         // 派生恢復態（(b)）：effective LOGOUT_UNKNOWN 下 Setup==false/Settings==true。
-        val effective = effectiveLogoutGuardError(null, pendingPresent = true, logoutInFlight = false)
+        val effective = effectiveLogoutGuardError(
+            null,
+            PendingTeardownState.KnownPending(journalB),
+            logoutInFlight = false,
+        )
         assertEquals("LOGOUT_UNKNOWN", effective)
         assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, effective, false))
         assertEquals(true, shouldNavigateToSettings(false, false, Routes.CHAT, effective, false))
@@ -191,8 +196,10 @@ class SetupCrossVmJournalTest {
     }
 
     @Test
-    fun pendingTeardown_malformedIsPresent() {
-        // 驗收 2 補充：malformed 亦 present（fail-closed，非 null）。
+    fun pendingTeardown_malformedIsUnconfirmed() {
+        // Stage E 改寫（sentinel→四態）：malformed 為 MalformedPending（非真
+        // journal——絕不是 KnownPending，身份不可用於 vault／clear 路徑），派生
+        // 走非破壞性重試讀取（D1 READ_RETRY 複用），絕不給重試清除。
         val store = rawStore("d2-malformed-present")
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
@@ -202,18 +209,25 @@ class SetupCrossVmJournalTest {
                 prefs[ENDPOINT_PENDING_DELETE_V1] = "v9|broken"
             }
         }
-        // Store 流：malformed 發射非 null sentinel（未知即 present）。
+        // Store 流：malformed 發射 MalformedPending（未確認即 present，fail-closed）。
         val observed = runBlocking {
-            withTimeout(10_000) { store.observePendingDelete().first { it != null } }
+            withTimeout(10_000) { store.observePendingDelete().first() }
         }
-        assertNotNull(observed)
-        assertEquals(PendingDelete.UNKNOWN_PRESENT, observed)
-        // VM 流：同樣 present（WhileSubscribed 初值 null，收集後發射）。
+        assertEquals(PendingTeardownState.MalformedPending, observed)
+        assertTrue(
+            "malformed must never pose as a real journal",
+            observed !is PendingTeardownState.KnownPending,
+        )
+        // VM 流：同樣未確認（WhileSubscribed 初值 Absent，收集後發射）。
         val vm = newVm(store, CountingVault(delegate))
         val tornDown = runBlocking {
-            withTimeout(10_000) { vm.pendingTeardown.first { it != null } }
+            withTimeout(10_000) { vm.pendingTeardown.first { it is PendingTeardownState.MalformedPending } }
         }
-        assertNotNull(tornDown)
+        assertEquals(PendingTeardownState.MalformedPending, tornDown)
+        // 派生非破壞性：中性 READ_RETRY（D1 碼複用），非 retained UNKNOWN。
+        val effective = effectiveLogoutGuardError(null, tornDown, logoutInFlight = false)
+        assertEquals(SetupViewModel.LOGOUT_READ_RETRY, effective)
+        assertFalse("malformed must never derive retry-clear", effective == "LOGOUT_UNKNOWN")
         // lenient observe 仍折疊（NoEndpoint），fence 仍擋 save（不同站點，不在此重斷）。
         runBlocking {
             assertNull(store.observe().first())
@@ -320,36 +334,74 @@ class SetupCrossVmJournalTest {
 
     @Test
     fun effectiveLogoutGuardError_truthTable() {
-        // 驗收 6 前半（純函數真值表，含 derived 碼行；NavGuard 互斥語義不變）：
-        // - 有碼沿用（STALE 等不動）；
-        // - 無碼＋present＋非 inFlight → LOGOUT_UNKNOWN；
+        // Stage E 四態真值表（純函數，含 derived 碼行；NavGuard 互斥語義不變）：
+        // - 有碼沿用（STALE 等不動，不論四態）；
+        // - 無碼＋KnownPending＋非 inFlight → LOGOUT_UNKNOWN（重試清除）；
+        // - 無碼＋UnknownReadFailure／MalformedPending＋非 inFlight →
+        //   LOGOUT_READ_RETRY（D1 碼複用，重試讀取 only）；
         // - inFlight 抑制派生（執行中不決策）；
-        // - 無 journal 常態 null（fresh 不變）。
+        // - Absent 常態 null（fresh 不變）。
+        val journal = PendingDelete("preset:openai", 1L, 1700000000001L)
+        val known = PendingTeardownState.KnownPending(journal)
         assertEquals(
             "LOGOUT_STALE",
-            effectiveLogoutGuardError("LOGOUT_STALE", pendingPresent = true, logoutInFlight = false),
+            effectiveLogoutGuardError("LOGOUT_STALE", known, logoutInFlight = false),
         )
         assertEquals(
             "LOGOUT_DELETE_FAILED",
-            effectiveLogoutGuardError("LOGOUT_DELETE_FAILED", pendingPresent = false, logoutInFlight = false),
+            effectiveLogoutGuardError(
+                "LOGOUT_DELETE_FAILED",
+                PendingTeardownState.Absent,
+                logoutInFlight = false,
+            ),
+        )
+        assertEquals(
+            "LOGOUT_STALE",
+            effectiveLogoutGuardError(
+                "LOGOUT_STALE",
+                PendingTeardownState.UnknownReadFailure,
+                logoutInFlight = false,
+            ),
         )
         assertEquals(
             "LOGOUT_UNKNOWN",
-            effectiveLogoutGuardError(null, pendingPresent = true, logoutInFlight = false),
+            effectiveLogoutGuardError(null, known, logoutInFlight = false),
+        )
+        assertEquals(
+            SetupViewModel.LOGOUT_READ_RETRY,
+            effectiveLogoutGuardError(null, PendingTeardownState.UnknownReadFailure, logoutInFlight = false),
+        )
+        assertEquals(
+            SetupViewModel.LOGOUT_READ_RETRY,
+            effectiveLogoutGuardError(null, PendingTeardownState.MalformedPending, logoutInFlight = false),
         )
         assertNull(
-            effectiveLogoutGuardError(null, pendingPresent = true, logoutInFlight = true),
+            effectiveLogoutGuardError(null, known, logoutInFlight = true),
         )
         assertNull(
-            effectiveLogoutGuardError(null, pendingPresent = false, logoutInFlight = false),
+            effectiveLogoutGuardError(null, PendingTeardownState.UnknownReadFailure, logoutInFlight = true),
         )
-        // derived 碼行：Setup 抑制＋CHAT→SETTINGS（與既有 LOGOUT_* 一致，互斥）.
-        val derived = effectiveLogoutGuardError(null, pendingPresent = true, logoutInFlight = false)
+        assertNull(
+            effectiveLogoutGuardError(null, PendingTeardownState.MalformedPending, logoutInFlight = true),
+        )
+        assertNull(
+            effectiveLogoutGuardError(null, PendingTeardownState.Absent, logoutInFlight = false),
+        )
+        // derived KnownPending 碼行：Setup 抑制＋CHAT→SETTINGS（與既有 LOGOUT_* 一致，互斥）.
+        val derived = effectiveLogoutGuardError(null, known, logoutInFlight = false)
         assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, derived, false))
         assertEquals(false, shouldNavigateToSetup(false, false, Routes.SETTINGS, derived, false))
         assertEquals(true, shouldNavigateToSettings(false, false, Routes.CHAT, derived, false))
         assertEquals(false, shouldNavigateToSettings(false, false, Routes.SETTINGS, derived, false))
         assertEquals(false, shouldNavigateToSettings(false, false, Routes.CHAT, derived, true))
+        // derived 未確認態同走 SETTINGS（重試讀取卡在 Settings），互斥不走 SETUP.
+        val derivedRetry = effectiveLogoutGuardError(
+            null,
+            PendingTeardownState.UnknownReadFailure,
+            logoutInFlight = false,
+        )
+        assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, derivedRetry, false))
+        assertEquals(true, shouldNavigateToSettings(false, false, Routes.CHAT, derivedRetry, false))
         // fresh 對照：無碼走 SETUP，不走 SETTINGS.
         assertEquals(true, shouldNavigateToSetup(false, false, Routes.CHAT, null, false))
         assertEquals(false, shouldNavigateToSettings(false, false, Routes.CHAT, null, false))

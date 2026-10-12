@@ -79,21 +79,6 @@ data class PendingDelete(
 
     companion object {
         /**
-         * Stage D2 fail-closed presence sentinel for [observePendingDelete].
-         *
-         * Malformed journals and DataStore read failures cannot be represented
-         * as a parsed [PendingDelete], yet folding them to `null` would hide a
-         * possibly-retained teardown (fail-open: gate `NoEndpoint` with no
-         * recovery, save blocked with no entry). They emit this non-null
-         * sentinel instead (unknown即present): presence (`!= null`) is the
-         * only contract — callers MUST NOT use its [format] for
-         * compare-and-delete or journal-identity clearing (safe reconcile
-         * reuses the strict snapshot + [runPendingDeleteLocked] core, never
-         * this sentinel identity).
-         */
-        val UNKNOWN_PRESENT = PendingDelete("__pending_delete_unknown__", null, 0L)
-
-        /**
          * Strict parse. Throws [IllegalStateException] on ANY malformed input
          * (wrong version, wrong arity, blank/`|`-bearing alias, non-numeric
          * rev/ts, negative ts). Callers MUST treat a throw as fail-closed
@@ -115,6 +100,32 @@ data class PendingDelete(
             return PendingDelete(alias, revision, ts)
         }
     }
+}
+
+/**
+ * Teardown domain state for the pending-delete journal (Stage E R13 P2/BLOCK).
+ *
+ * Four states replace the Stage D2 `UNKNOWN_PRESENT` sentinel (deleted: one
+ * shared non-null [PendingDelete] for malformed journals AND read failures, so
+ * a transient read failure with NO journal still derived `LOGOUT_UNKNOWN`
+ * retry-clear — phantom pending with a destructive-looking recovery):
+ * - [Absent]: healthy read, no journal — definitely nothing pending;
+ * - [KnownPending]: well-formed journal — confirmed present, resume it;
+ * - [MalformedPending]: non-null journal failing strict parse — present
+ *   fail-closed, never a usable journal identity (no vault/clear path may use
+ *   it for delete or compare-and-delete);
+ * - [UnknownReadFailure]: the DataStore read itself threw — presence unknown,
+ *   fail-closed as present (never [Absent]).
+ *
+ * Only [CancellationException][kotlinx.coroutines.CancellationException]
+ * propagates; every other read/parse failure folds to a non-absent state
+ * (fail-closed: folding to [Absent] would hide a retained journal).
+ */
+sealed interface PendingTeardownState {
+    data object Absent : PendingTeardownState
+    data class KnownPending(val pending: PendingDelete) : PendingTeardownState
+    data object UnknownReadFailure : PendingTeardownState
+    data object MalformedPending : PendingTeardownState
 }
 
 /** Usability verdict for the endpoint gate (log the code only, never key material). */
@@ -225,44 +236,52 @@ class EndpointStore(
         }
 
     /**
-     * Stage D2 cross-VM teardown domain state (R12 Finding 2 P2/BLOCK).
+     * Stage E four-state teardown domain read (R13 Finding P2/BLOCK).
      *
-     * Derives `Flow<PendingDelete?>` from the single
+     * Derives [PendingTeardownState] from the single
      * [ENDPOINT_PENDING_DELETE_V1] key (zero vault I/O):
-     * - absent → `null` (definitely no journal);
-     * - well-formed → parsed [PendingDelete];
-     * - malformed non-null → [PendingDelete.UNKNOWN_PRESENT] (present
-     *   fail-closed, never `null`);
-     * - DataStore read failure → [PendingDelete.UNKNOWN_PRESENT] via `catch`
-     *   (unknown即present — a `catch` folding to `null`/empty would hide a
+     * - absent → [PendingTeardownState.Absent];
+     * - well-formed → [PendingTeardownState.KnownPending];
+     * - malformed non-null → [PendingTeardownState.MalformedPending] (present
+     *   fail-closed, never a usable journal identity);
+     * - DataStore read failure → [PendingTeardownState.UnknownReadFailure] via
+     *   `catch` (unknown即present — a `catch` folding to `Absent` would hide a
      *   retained journal; only [CancellationException] rethrows).
      *
-     * Presence (`!= null`) is the only contract: a second VM writing a journal
-     * after this VM settled `NO_OP` surfaces here even though this VM's
-     * `form.errorCode` stays `null`. The derived recovery state
-     * ([dev.librepocket.agent.ui.effectiveLogoutGuardError]) and the
-     * generation-scoped relaunch below consume presence only; safe reconcile
-     * reuses the strict snapshot + `runPendingDeleteLocked` core (never this
-     * sentinel identity for vault/clear paths).
+     * The inner flow completes after a `catch` emission, so a transient
+     * failure sticks until the next collection: holder flows MUST re-collect
+     * to recover (see `SetupViewModel.pendingTeardown` tick — the store stays
+     * the single source of truth, no manual write-back). A missed re-collect
+     * only leaves phantom present (fail-closed — retry-read, never silent
+     * fresh).
+     *
+     * Presence is no longer one boolean: [PendingTeardownState.KnownPending]
+     * (confirmed) derives retained retry-clear recovery, while
+     * [PendingTeardownState.UnknownReadFailure] and
+     * [PendingTeardownState.MalformedPending] (unconfirmed) derive
+     * retry-read-only (see
+     * [dev.librepocket.agent.ui.effectiveLogoutGuardError]). Safe reconcile
+     * reuses the strict snapshot + `runPendingDeleteLocked` core (never a
+     * domain state for vault/clear paths).
      */
-    fun observePendingDelete(): Flow<PendingDelete?> = dataStore.data
+    fun observePendingDelete(): Flow<PendingTeardownState> = dataStore.data
         .map { prefs ->
             val raw = prefs[ENDPOINT_PENDING_DELETE_V1]
             if (raw == null) {
-                null
+                PendingTeardownState.Absent
             } else {
                 try {
-                    PendingDelete.parse(raw)
+                    PendingTeardownState.KnownPending(PendingDelete.parse(raw))
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
-                    PendingDelete.UNKNOWN_PRESENT
+                    PendingTeardownState.MalformedPending
                 }
             }
         }
         .catch { e ->
             if (e is CancellationException) throw e
-            emit(PendingDelete.UNKNOWN_PRESENT)
+            emit(PendingTeardownState.UnknownReadFailure)
         }
 
     private fun parseConfig(prefs: Preferences): EndpointConfig? {

@@ -1100,13 +1100,43 @@ class SetupViewModel(
     }
 
     /**
-     * Logout: delete the live vault key addressed by metadata, then clear
-     * metadata (order matters).
+     * Logout: delete the live vault key addressed by metadata, then fenced-clear
+     * metadata via [EndpointStore.clearIfRevision] (delete-then-CAS order matters).
      *
-     * Privileged teardown: unconditional delete+clear, serialized against
-     * in-flight saves via [saveMutex] so a save's staged-put/CAS/retire window
-     * cannot interleave with teardown in this VM. Cross-process writers are
-     * still fenced only by the metadata CAS, not by this mutex (see [saveMutex]).
+     * Strict cleanup contract:
+     * - The (config, revision) pair comes from a single
+     *   [EndpointStore.snapshotWithRevisionStrict] emission. A read failure
+     *   aborts before any side effect: no vault delete, no metadata clear, no
+     *   form reset; stamps `errorCode = LOGOUT_READ_FAILED` and reports
+     *   `onDone(false)`. A healthy `null` (read OK, no metadata) is strictly
+     *   distinguished from a read failure: the delete is skipped but
+     *   [EndpointStore.clearIfRevision] still runs to void outstanding
+     *   snapshots/consents, and success is reported on a CAS win.
+     * - Only an alias addressed by a well-formed `provider_key/` ref is
+     *   deleted (resolved via [SetupValidation.aliasFromRef], never re-derived
+     *   from `providerId`); malformed refs fail closed to skip-delete (still
+     *   CAS). [dev.librepocket.keystore.KeyVault.deleteKey] is idempotent
+     *   (missing key is a no-op remove), so retrying an already-applied delete
+     *   is safe; a delete failure aborts before the clear (metadata, key
+     *   bytes, and revision untouched) with `LOGOUT_DELETE_FAILED`.
+     * - The clear is fenced: `clearIfRevision(expectedRev)` with the snapshot
+     *   revision, AFTER the delete. A save committing between the delete and
+     *   the CAS leaves the winner intact: the CAS returns false (only the
+     *   stale predecessor was deleted — harmless), the winner metadata
+     *   survives, and logout reports `LOGOUT_STALE`, never success. A
+     *   CAS-transport failure reports `LOGOUT_CLEAR_FAILED`. Only a CAS win
+     *   resets the form and reports `onDone(true)`; every abort preserves the
+     *   form and only stamps `errorCode`.
+     *
+     * Privileged teardown, serialized against in-flight saves via [saveMutex]
+     * so a save's staged-put/CAS/retire window cannot interleave with teardown
+     * in this VM. Single-process only: this [Mutex] cannot fence a second
+     * process, a second ViewModel/store instance, or any out-of-band vault
+     * writer — cross-writer safety rests on the metadata CAS plus the
+     * restart-unique staged alias scheme (a stale logout only ever deletes its
+     * snapshot alias, never the winner's key). The DataStore CAS itself is
+     * single-process (documented on [EndpointStore]); never present this
+     * mutex as multi-writer safety.
      *
      * Ref-driven: the deleted alias is resolved from the snapshot's `apiKeyRef`
      * (the staged live alias after a staged commit), never re-derived from
@@ -1116,41 +1146,70 @@ class SetupViewModel(
      * encrypted at rest until a GC follow-up (list API) lands. Documented
      * at-rest leak, strictly better than loss; in-flight aborts and cancels
      * already delete their own staged alias, so the steady state has no residue.
+     *
+     * Cancellation ([CancellationException]) is always rethrown, like the save
+     * path: no `errorCode` is stamped and [onDone] is not called.
+     *
+     * @param onDone called on [Dispatchers.Main] with `true` only when the
+     * teardown committed (delete + fenced clear); `false` with `errorCode` set
+     * otherwise. Never called when the logout coroutine itself is cancelled.
      */
-    fun logout(onDone: () -> Unit = {}) {
+    fun logout(onDone: (Boolean) -> Unit = {}) {
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         modelRefreshGeneration.incrementAndGet()
         viewModelScope.launch(Dispatchers.IO) {
-            saveMutex.withLock {
-                val config = try {
-                    store.observe().first()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    null
-                }
-                try {
-                    val alias = config?.apiKeyRef
+            try {
+                var committed = false
+                saveMutex.withLock {
+                    val snapshot = try {
+                        store.snapshotWithRevisionStrict()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        _form.value = _form.value.copy(errorCode = "LOGOUT_READ_FAILED")
+                        return@withLock
+                    }
+                    val expectedRevision = snapshot.second
+                    val alias = snapshot.first?.apiKeyRef
                         ?.takeIf { it.startsWith("provider_key/") }
                         ?.let { SetupValidation.aliasFromRef(it) }
                         ?.takeIf { it.isNotBlank() }
-                    if (alias != null) vault().deleteKey(alias)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
+                    if (alias != null) {
+                        try {
+                            vault().deleteKey(alias)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            _form.value = _form.value.copy(errorCode = "LOGOUT_DELETE_FAILED")
+                            return@withLock
+                        }
+                    }
+                    val cleared = try {
+                        store.clearIfRevision(expectedRevision)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        _form.value = _form.value.copy(errorCode = "LOGOUT_CLEAR_FAILED")
+                        return@withLock
+                    }
+                    if (!cleared) {
+                        _form.value = _form.value.copy(errorCode = "LOGOUT_STALE")
+                        return@withLock
+                    }
+                    committed = true
                 }
-                try {
-                    store.clear()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {
+                if (!committed) {
+                    withContext(Dispatchers.Main) { onDone(false) }
+                    return@launch
                 }
+                _form.value = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
+                withContext(Dispatchers.Main) { onDone(true) }
+            } catch (e: CancellationException) {
+                throw e
             }
-            _form.value = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
-            withContext(Dispatchers.Main) { onDone() }
         }
     }
 

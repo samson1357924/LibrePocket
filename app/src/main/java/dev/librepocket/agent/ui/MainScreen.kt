@@ -349,9 +349,12 @@ fun MainScreen(
                             gate = gate,
                             onEditEndpoint = { goSetupForEdit() },
                             onLogout = {
-                                setupViewModel.logout()
-                                chatViewModel.newChat()
-                                sessionListViewModel.refresh()
+                                setupViewModel.logout { success ->
+                                    if (success) {
+                                        chatViewModel.newChat()
+                                        sessionListViewModel.refresh()
+                                    }
+                                }
                             },
                             onRevokePrivilege = {
                                 privilegeState.revoke()

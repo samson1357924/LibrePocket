@@ -18,6 +18,7 @@ import java.io.IOException
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -30,6 +31,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -202,6 +204,80 @@ class BlockingVault(
     override suspend fun hasKey(providerId: String): Boolean {
         hasKeys++
         return delegate.hasKey(providerId)
+    }
+}
+
+/**
+ * KeyVault whose deleteKey always throws: models a vault failure during
+ * logout teardown. Logout must abort before the metadata clear, so the
+ * metadata, key bytes, and revision stay untouched.
+ */
+class ThrowingDeleteVault(
+    private val delegate: KeyVault = EncryptedPrefsVault(InMemoryPrefs()),
+    private val error: Exception = IOException("VAULT_DELETE_FAILED"),
+) : KeyVault {
+    var deleteAttempts = 0
+        private set
+    /** Vault aliases passed to deleteKey, in order (recorded before throwing). */
+    val deletedIds = ArrayList<String>()
+
+    override suspend fun putKey(providerId: String, apiKey: CharArray) =
+        delegate.putKey(providerId, apiKey)
+    override suspend fun getKey(providerId: String): CharArray? =
+        delegate.getKey(providerId)
+    override suspend fun deleteKey(providerId: String) {
+        deleteAttempts++
+        deletedIds.add(providerId)
+        throw error
+    }
+    override suspend fun hasKey(providerId: String): Boolean =
+        delegate.hasKey(providerId)
+}
+
+/**
+ * KeyVault gating deleteKey entry via suspending deferreds (logout-stale
+ * window): the logout parks inside deleteKey after snapshotting, the test
+ * lets a save commit, then releases the logout into a CAS loss.
+ */
+class DeleteGatingLogoutVault(
+    private val delegate: KeyVault = EncryptedPrefsVault(InMemoryPrefs()),
+    val deleteEntered: CompletableDeferred<Unit> = CompletableDeferred(),
+    val deleteRelease: CompletableDeferred<Unit> = CompletableDeferred(),
+) : KeyVault {
+    var deleteKeys = 0
+        private set
+    /** Vault aliases passed to deleteKey, in order (recorded before gating). */
+    val deletedIds = ArrayList<String>()
+
+    override suspend fun putKey(providerId: String, apiKey: CharArray) =
+        delegate.putKey(providerId, apiKey)
+    override suspend fun getKey(providerId: String): CharArray? =
+        delegate.getKey(providerId)
+    override suspend fun deleteKey(providerId: String) {
+        deleteKeys++
+        deletedIds.add(providerId)
+        deleteEntered.complete(Unit)
+        deleteRelease.await()
+        delegate.deleteKey(providerId)
+    }
+    override suspend fun hasKey(providerId: String): Boolean =
+        delegate.hasKey(providerId)
+}
+
+/**
+ * DataStore whose reads always throw but counts writes: models a metadata
+ * read failure during logout. Logout must abort before any side effect, so
+ * [updateCalls] stays zero (no clear attempted).
+ */
+private class ReadFailingLogoutDataStore(
+    private val error: IOException = IOException("DATASTORE_UNAVAILABLE"),
+) : DataStore<Preferences> {
+    var updateCalls = 0
+        private set
+    override val data: Flow<Preferences> = flow { throw error }
+    override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+        updateCalls++
+        throw error
     }
 }
 
@@ -1711,12 +1787,13 @@ class SetupPolicyTest {
             assertEquals(EndpointReadiness.READY, store.readiness(vault))
         }
         var done = false
-        vm.logout { done = true }
+        vm.logout { done = it }
         val end = System.currentTimeMillis() + 8000
         while (!done || runBlocking { store.hasMetadata() }) {
             if (System.currentTimeMillis() > end) error("timed out waiting for logout")
             Thread.sleep(10)
         }
+        assertNull(vm.form.value.errorCode)
         runBlocking {
             assertFalse(store.hasMetadata())
             assertFalse(delegate.hasKey(liveAlias))
@@ -1724,6 +1801,139 @@ class SetupPolicyTest {
         }
         // Fresh save performed no delete; logout deleted exactly the live alias.
         assertEquals(listOf(liveAlias), vault.deletedIds)
+    }
+
+    @Test
+    fun logoutReadFailureAbortsWithoutSideEffects() {
+        // T-ReadFailure: the strict snapshot read throws. Logout must abort
+        // before any side effect: no vault delete, no metadata clear
+        // (updateData never called), no form reset, no success report.
+        val policy = MutablePolicy(Verdict.ALLOW)
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val vault = CountingVault(delegate)
+        val failing = ReadFailingLogoutDataStore()
+        val store = EndpointStore(failing)
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = policy,
+            buildProvider = { _, _ -> error("no provider needed") as LlmProvider },
+        )
+        vm.onApiKeyChange("unit-test-logout-read-fail-key")
+        val done = CompletableDeferred<Boolean>()
+        vm.logout { done.complete(it) }
+        val ok = runBlocking { withTimeout(10_000) { done.await() } }
+        assertFalse("read failure must not report success", ok)
+        assertEquals("LOGOUT_READ_FAILED", vm.form.value.errorCode)
+        // Abort preserves the form instead of resetting to a fresh state.
+        assertEquals("unit-test-logout-read-fail-key", vm.form.value.apiKey)
+        assertEquals(0, vault.deleteKeys)
+        assertTrue(vault.deletedIds.isEmpty())
+        assertEquals("no clear may be attempted after a read failure", 0, failing.updateCalls)
+    }
+
+    @Test
+    fun logoutDeleteFailureAbortsBeforeClear() {
+        // T-DeleteFailure: deleteKey throws. Logout must abort before the
+        // fenced clear: metadata, key bytes, and revision stay untouched,
+        // and failure (not success) is reported.
+        val policy = MutablePolicy(Verdict.ALLOW)
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val vault = ThrowingDeleteVault(delegate)
+        val (vm, _, store) = newVm(policy, vault)
+        vm.onApiKeyChange("fake-unit-logout-delete-fail-key-123")
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.saved)
+        // Fresh save performed no delete; the live key sits at a staged alias.
+        assertEquals(0, vault.deleteAttempts)
+        val liveAlias = SetupValidation.aliasFromRef(runBlocking { store.observe().first()!!.apiKeyRef })
+        assertTrue(liveAlias.startsWith("preset:openai#staged-"))
+        val revBefore = runBlocking { store.currentRevision() }
+        val done = CompletableDeferred<Boolean>()
+        vm.logout { done.complete(it) }
+        val ok = runBlocking { withTimeout(10_000) { done.await() } }
+        assertFalse("delete failure must not report success", ok)
+        assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
+        assertEquals("logout must attempt the live alias", listOf(liveAlias), vault.deletedIds)
+        runBlocking {
+            assertTrue("metadata must survive a delete failure", store.hasMetadata())
+            assertEquals(revBefore, store.currentRevision())
+            assertEquals(
+                "provider_key/$liveAlias",
+                store.observe().first()!!.apiKeyRef,
+            )
+            assertTrue(delegate.hasKey(liveAlias))
+            assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+        }
+        assertVaultKeyEquals(delegate, liveAlias, "fake-unit-logout-delete-fail-key-123")
+    }
+
+    @Test
+    fun logoutStaleLosesToConcurrentSave() {
+        // T-StaleFenced: L snapshots (A, rev1) and parks inside deleteKey(A);
+        // S commits B (rev2); L resumes into a CAS loss. L deleted only the
+        // stale predecessor (harmless — S already retired it), B metadata
+        // survives, and L reports STALE instead of success.
+        val dir = Files.createTempDirectory("setup-logout-stale").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val store = EndpointStore(
+            PreferenceDataStoreFactory.create(
+                scope = scope,
+                produceFile = { java.io.File(dir, "logout-stale.preferences_pb") },
+            ),
+        )
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            store.save(preseedConfig())
+            assertEquals(1L, store.currentRevision())
+        }
+        val noProvider: (dev.librepocket.provider.ProviderConfig, dev.librepocket.provider.KeyProvider) -> LlmProvider =
+            { _, _ -> error("no provider needed") as LlmProvider }
+        val logoutVault = DeleteGatingLogoutVault(delegate)
+        val vmLogout = SetupViewModel(
+            store,
+            VaultSource { logoutVault },
+            MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        val saveVault = CountingVault(delegate)
+        val vmSave = SetupViewModel(
+            store,
+            VaultSource { saveVault },
+            MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        val logoutDone = CompletableDeferred<Boolean>()
+        vmLogout.logout { logoutDone.complete(it) }
+        // L has snapshot (A, rev1) and is parked inside deleteKey(A).
+        runBlocking { withTimeout(10_000) { logoutVault.deleteEntered.await() } }
+        assertEquals(listOf("preset:openai"), logoutVault.deletedIds)
+        // S publishes B while L is parked (per-VM mutexes do not exclude
+        // cross-VM writers; the metadata CAS is the fence).
+        vmSave.onApiKeyChange("unit-test-winner-key-BBBBBBBB")
+        vmSave.save()
+        awaitSettled(vmSave)
+        assertTrue(vmSave.form.value.saved)
+        val winnerStaged = saveVault.putIds.single()
+        assertTrue(winnerStaged.startsWith("preset:openai#staged-"))
+        runBlocking { assertEquals(2L, store.currentRevision()) }
+        // Release L into the CAS loss.
+        logoutVault.deleteRelease.complete(Unit)
+        val ok = runBlocking { withTimeout(10_000) { logoutDone.await() } }
+        assertFalse("stale logout must not report success", ok)
+        assertEquals("LOGOUT_STALE", vmLogout.form.value.errorCode)
+        runBlocking {
+            assertEquals(2L, store.currentRevision())
+            val meta = store.observe().first()!!
+            assertEquals("provider_key/$winnerStaged", meta.apiKeyRef)
+            assertTrue("winner key must survive the stale logout", delegate.hasKey(winnerStaged))
+            assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+        }
+        assertVaultKeyEquals(delegate, winnerStaged, "unit-test-winner-key-BBBBBBBB")
     }
 
     @Test

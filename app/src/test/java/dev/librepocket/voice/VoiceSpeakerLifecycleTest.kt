@@ -678,6 +678,16 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
         if (throwOnSpeak) throw RuntimeException("fake speak failure")
         if (failSpeak) return TextToSpeech.ERROR
         val result = super.speak(text, queueMode, params, utteranceId)
+        if (callBackSynchronously && utteranceId != null) {
+            val listenerCopy = utteranceListener
+            if (listenerCopy != null) {
+                if (syncErrorOnFirstSpeak && utteranceIds.size == 1) {
+                    listenerCopy.onError(utteranceId, TextToSpeech.ERROR)
+                } else {
+                    listenerCopy.onDone(utteranceId)
+                }
+            }
+        }
         if (pauseAfterFirstSpeak && speakCalls.incrementAndGet() == 1) {
             firstSpeakEntered?.countDown()
             continueSpeaking?.await(5, TimeUnit.SECONDS)
@@ -741,6 +751,18 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
         @Volatile
         var throwOnListener = false
 
+        /**
+         * 同步重入開關：`speak` 內成功送入後立即同步回調對應 id
+         *（默認 onDone；[syncErrorOnFirstSpeak] 為 true 時首段改調 onError）。
+         * 沿用既有 forced* 靜態開關模式，用於重現引擎同步重入。
+         */
+        @Volatile
+        var callBackSynchronously = false
+
+        /** 搭配 [callBackSynchronously]：首段同步調 onError，其餘 onDone（2-chunk 錯誤保留案例）。 */
+        @Volatile
+        var syncErrorOnFirstSpeak = false
+
         fun resetControls() {
             initSynchronously = false
             pauseLanguageLookup = false
@@ -756,6 +778,8 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
             throwOnGetEngines = false
             forcedListenerResult = null
             throwOnListener = false
+            callBackSynchronously = false
+            syncErrorOnFirstSpeak = false
         }
     }
 }

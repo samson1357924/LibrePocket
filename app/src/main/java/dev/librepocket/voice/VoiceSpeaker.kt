@@ -32,8 +32,15 @@ import java.util.UUID
  * Request 級成功語義：同 request 多 chunk 時，任一 chunk onError 即標記整輪失敗並照常揭露，
  * 後續同輪 onDone 一律抑制（錯誤不被成功清除）；全 chunk 無失敗終結時，末個 onDone 才發一次
  * [onDone]。chunk 終結（去重通過的 onError／發射條件滿足的 onDone）在鎖內即移除追蹤條目，
- * 重複終結一律抑制；emit 前重新進鎖複查 `!terminal && epoch == speechEpoch`，
- * 擋下 validation 與投遞之間插入的 stop／shutdown。
+ * 重複終結一律抑制；report 路徑鎖內只做判定＋入隊（事件帶 id／epoch／種類），由單一串行投遞者在鎖外
+ * 依序投遞，投遞前在鎖內做最終複查（ERROR：`!terminal && epoch == speechEpoch`；
+ * DONE 另須 `!activeRequestFailed && activeRequestPending == 0`），不符丟棄，
+ * 把 validation→emit 的交錯窗口縮小至最終複查→emit 的極小區間（best-effort；
+ * 持鎖調 client 回調有死鎖風險，故不做原子保證）。
+ * 不變式：[activeRequestPending] == 當輪已追蹤條目數（[utteranceEpochs] 內當輪 epoch 條目數）；
+ * 先記賬後調用（登記＋pending++ 後才調 `engine.speak`），同步重入回調命中已登記條目，
+ * 提交中（[isSubmitting]）的 onDone 只更新計數不入隊，全同步完成時由提交收尾合成一次 DONE 入隊；
+ * 同步送入失敗在鎖內移除條目、pending--、failed=true 後回傳 SPEAK_FAILED（不留追蹤）。
  */
 class VoiceSpeaker(
     appContext: Context,
@@ -72,17 +79,43 @@ class VoiceSpeaker(
      * - [activeRequestPending]：當輪已送引擎、尚未終結的 chunk 計數。
      * 新 speak（[speakInternalLocked] 整表清除處）重置兩者；stop／shutdown／初始化失敗
      * 清表時同步歸零，避免殘留計數洩入下輪。
+     * 不變式：[activeRequestPending] == [utteranceEpochs] 內當輪 epoch 的條目數；
+     * 終結（去重通過的 onError／任何 onDone）在鎖內移除條目並 pending--（>0 才減，避免下溢）。
      */
     private var activeRequestFailed = false
     private var activeRequestPending = 0
 
     /**
-     * 測試用屏障鉤子：validation 通過後、emit 前複查前在鎖外執行呼叫端注入的動作
-     * （如 `stop()`），用於確定性重現 validation→emit 窗口的交錯。生產路徑為 null；
+     * 待投遞事件佇列與投遞器狀態（一律在 [lifecycleLock] 內讀寫）。
+     * - [emitQueue]：report 路徑判定通過後依序入隊（FIFO，單調）；
+     * - [isSubmitting]：[speakInternalLocked] chunk 序列提交中為 true，此時 report 只記賬不投遞，
+     *   投遞延後到提交收尾後由外層在鎖外統一 [drainQueue]（避免在持有外層鎖時調 client 回調）；
+     * - [isDraining]：單一串行投遞者互斥旗標，保證多執行緒下同一時間只有一個投遞者在鎖外依序 emit。
+     */
+    private val emitQueue = ArrayDeque<QueuedEmit>()
+    private var isSubmitting = false
+    private var isDraining = false
+
+    private enum class EmitKind { DONE, ERROR }
+
+    /** 投遞事件（[utteranceId] 為合成完成事件時是 `"__request_complete__"`，複查只看 [epoch]）。 */
+    private data class QueuedEmit(val kind: EmitKind, val epoch: Long, val utteranceId: String)
+
+    /**
+     * 測試用屏障鉤子：validation 通過後、最終複查前在鎖外執行呼叫端注入的動作
+     * （如 `stop()`），用於確定性重現 validation→投遞窗口的交錯。生產路徑為 null；
      * 本體異常會被吞掉，避免壞掉引擎回呼執行緒。
      */
     @Volatile
     internal var preEmitHook: (() -> Unit)? = null
+
+    /**
+     * 測試用延伸屏障鉤子：最終複查通過後、emit 前在鎖外執行呼叫端注入的動作，
+     * 用於確定性重現 複查→emit 窗口的交錯（投遞者在其後會再做一次最終複查才 emit）。
+     * 生產路徑為 null；語義與 [preEmitHook] 相同（異常吞掉）。
+     */
+    @Volatile
+    internal var postCheckHook: (() -> Unit)? = null
 
     private data class PendingSpeech(val text: String, val epoch: Long)
 
@@ -102,6 +135,7 @@ class VoiceSpeaker(
                 }
             }
             initErrors.forEach { emitError(it) }
+            drainQueue()
         }
         val listenerError: String?
         val deferredErrors: List<String>
@@ -136,6 +170,7 @@ class VoiceSpeaker(
         }
         if (listenerError != null) emitError(listenerError)
         deferredErrors.forEach { emitError(it) }
+        drainQueue()
     }
 
     /** 朗讀正文，交由 Android 系統 TTS；離線能力及資料處理取決於已安裝的語音引擎。 */
@@ -157,6 +192,8 @@ class VoiceSpeaker(
                 }
             }
         }
+        // 提交中同步重入回調已入隊（投遞延後到此）：先排空佇列（時序在前），再揭露同步送入失敗。
+        drainQueue()
         if (error != null) emitError(error)
     }
 
@@ -291,13 +328,17 @@ class VoiceSpeaker(
      * Caller holds [lifecycleLock] for the complete chunk sequence so stop cannot split it.
      *
      * 每段以實際傳給 `engine.speak` 的同一個 utteranceId 追蹤（utteranceId → 當前 epoch），
-     * 供遲到的 utterance onError 在同一臨界區內校驗。首段 QUEUE_FLUSH 會取代舊 utterance，
-     * 故先移除舊追蹤，使其遲到錯誤不再揭露，並重置當輪 request 級狀態
+     * 供遲到的 utterance 回呼在同一臨界區內校驗。首段 QUEUE_FLUSH 會取代舊 utterance，
+     * 故先移除舊追蹤，使其遲到回呼不再揭露，並重置當輪 request 級狀態
      * （[activeRequestFailed]／[activeRequestPending]）；新 speak 即新 epoch
-     * （[speechEpoch]++），使舊輪 validation 通過後、emit 前插入新 speak 的
-     * 交錯也被投遞時複查擋下。每段成功送入引擎即 pending++。
-     * 送入失敗的段不留追蹤（引擎不會為它回呼），但標記整輪失敗，
-     * 使同輪其他 chunk 的後續 onDone 被抑制（錯誤不被成功清除）。
+     * （[speechEpoch]++），使舊輪入隊後、投遞前插入新 speak 的交錯也被最終複查擋下。
+     *
+     * 先記賬後調用：每段先 `utteranceEpochs[id] = speechEpoch; activeRequestPending++`
+     * 再調 `engine.speak`，引擎同步重入 onDone／onError 時命中已登記條目（含本段計數）。
+     * 提交中（[isSubmitting] == true）的 onDone 只記賬（移除＋pending--）不入隊，
+     * 全段同步完成時由收尾合成一次 DONE 入隊，避免首段同步完成早發；
+     * onError 照常標失敗並入隊。同步送入失敗（拋錯／回傳 ERROR）在鎖內移除條目、
+     * pending--、failed=true 後回傳 SPEAK_FAILED（不留追蹤），剩餘未送段直接捨棄。
      */
     private fun speakInternalLocked(engine: TextToSpeech, text: String): String? {
         val chunks = try {
@@ -316,104 +357,188 @@ class VoiceSpeaker(
         speechEpoch++
         activeRequestFailed = false
         activeRequestPending = 0
-        chunks.forEachIndexed { index, chunk ->
-            val mode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-            val params = Bundle()
-            val utteranceId = "${UUID.randomUUID()}"
-            utteranceEpochs[utteranceId] = speechEpoch
-            val status = try {
-                engine.speak(chunk, mode, params, utteranceId)
-            } catch (_: Exception) {
-                utteranceEpochs.remove(utteranceId)
-                activeRequestFailed = true
-                return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED)
+        isSubmitting = true
+        try {
+            chunks.forEachIndexed { index, chunk ->
+                val mode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+                val params = Bundle()
+                val utteranceId = "${UUID.randomUUID()}"
+                utteranceEpochs[utteranceId] = speechEpoch
+                activeRequestPending++
+                val status = try {
+                    engine.speak(chunk, mode, params, utteranceId)
+                } catch (_: Exception) {
+                    utteranceEpochs.remove(utteranceId)
+                    if (activeRequestPending > 0) activeRequestPending--
+                    activeRequestFailed = true
+                    return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED)
+                }
+                if (status != TextToSpeech.SUCCESS) {
+                    utteranceEpochs.remove(utteranceId)
+                    if (activeRequestPending > 0) activeRequestPending--
+                    activeRequestFailed = true
+                    return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED)
+                }
             }
-            if (status != TextToSpeech.SUCCESS) {
-                utteranceEpochs.remove(utteranceId)
-                activeRequestFailed = true
-                return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED)
+        } finally {
+            isSubmitting = false
+            if (!activeRequestFailed && activeRequestPending == 0 && chunks.isNotEmpty()) {
+                emitQueue.addLast(QueuedEmit(EmitKind.DONE, speechEpoch, "__request_complete__"))
             }
-            activeRequestPending++
         }
         return null
     }
 
     /**
      * Utterance 失敗轉送失敗通道。同一臨界區內完成「id 存在＋epoch 相符＋未重複報錯」
-     * 校驗、標記整輪失敗、pending-- 與移除追蹤條目，emit 在鎖外。terminal 後、
-     * stop／shutdown 後（epoch 不符）、未知／空 id、同一 id 重複終結（條目已移除）
-     * 的遲到回呼一律不揭露。emit 前重新進鎖複查 `!terminal && epoch == speechEpoch`，
-     * 擋下 validation 與投遞之間插入的 stop／shutdown。
+     * 校驗、標記整輪失敗、pending--、移除追蹤條目與入隊；投遞由 [drainQueue] 在鎖外串行執行。
+     * terminal 後、stop／shutdown 後（epoch 不符）、未知／空 id、同一 id 重複終結（條目已移除）
+     * 的遲到回呼一律不入隊不揭露。提交中入隊的事件延後到提交收尾後才投遞，
+     * 投遞前最終複查詳見 [deliverQueuedEmit]。
      */
     private fun reportUtteranceError(utteranceId: String?) {
-        val epoch: Long? = synchronized(lifecycleLock) {
+        val enqueued = synchronized(lifecycleLock) {
             if (terminal) {
-                null
+                false
             } else if (utteranceId == null) {
-                null
+                false
             } else {
-                val stored = utteranceEpochs[utteranceId] ?: return@synchronized null
+                val stored = utteranceEpochs[utteranceId] ?: return@synchronized false
                 if (stored != speechEpoch) {
-                    null
+                    false
                 } else if (!reportedUtteranceIds.add(utteranceId)) {
-                    null
+                    false
                 } else {
                     utteranceEpochs.remove(utteranceId)
                     reportedUtteranceIds.remove(utteranceId)
                     activeRequestFailed = true
                     if (activeRequestPending > 0) activeRequestPending--
-                    stored
+                    emitQueue.addLast(QueuedEmit(EmitKind.ERROR, stored, utteranceId))
+                    true
                 }
             }
         }
-        if (epoch == null) return
-        runPreEmitHook()
-        val shouldEmit = synchronized(lifecycleLock) { !terminal && epoch == speechEpoch }
-        if (shouldEmit) {
-            emitError(VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED))
-        }
+        if (!enqueued) return
+        drainQueue()
     }
 
     /**
      * Utterance 完成轉送成功通道（request 級語義：整輪全 chunk 無失敗終結時，
-     * 末個 onDone 才發一次 [onDone]；整輪已有失敗即抑制，不清除錯誤）。
-     * 同一臨界區內完成「id 存在＋epoch 相符」校驗、pending-- 與移除追蹤條目，
-     * emit 在鎖外。terminal 後、stop／shutdown 後（epoch 不符）、未知／空 id、
-     * 同一 id 重複終結（條目已移除）的遲到回呼一律不發。emit 前複查 fence
-     * 與 [reportUtteranceError] 相同。
+     * 末個 onDone 才入隊一次；整輪已有失敗即抑制，不清除錯誤）。
+     * 同一臨界區內完成「id 存在＋epoch 相符」校驗、pending-- 與移除追蹤條目；
+     * 提交中只記賬不入隊（收尾合成一次，見 [speakInternalLocked]），非提交中僅當
+     * `!failed && pending == 0` 才入隊。terminal 後、stop／shutdown 後（epoch 不符）、
+     * 未知／空 id、同一 id 重複終結（條目已移除）的遲到回呼一律不入隊不發。
      */
     private fun reportUtteranceDone(utteranceId: String?) {
-        val decision: DoneDecision? = synchronized(lifecycleLock) {
+        val enqueued = synchronized(lifecycleLock) {
             if (terminal) {
-                null
+                false
             } else if (utteranceId == null) {
-                null
+                false
             } else {
-                val stored = utteranceEpochs[utteranceId] ?: return@synchronized null
+                val stored = utteranceEpochs[utteranceId] ?: return@synchronized false
                 if (stored != speechEpoch) {
-                    null
+                    false
                 } else {
                     utteranceEpochs.remove(utteranceId)
                     reportedUtteranceIds.remove(utteranceId)
                     if (activeRequestPending > 0) activeRequestPending--
-                    DoneDecision(stored, emit = !activeRequestFailed && activeRequestPending == 0)
+                    if (isSubmitting) {
+                        false
+                    } else if (activeRequestFailed || activeRequestPending != 0) {
+                        false
+                    } else {
+                        emitQueue.addLast(QueuedEmit(EmitKind.DONE, stored, utteranceId))
+                        true
+                    }
                 }
             }
         }
-        if (decision == null || !decision.emit) return
-        runPreEmitHook()
-        val shouldEmit = synchronized(lifecycleLock) { !terminal && decision.epoch == speechEpoch }
-        if (shouldEmit) {
-            emitDone()
+        if (!enqueued) return
+        drainQueue()
+    }
+
+    /**
+     * 單調投遞器：按入隊順序（FIFO）由單一串行投遞者在鎖外依序投遞，保證多執行緒下
+     * emit 不交錯、client 回調一律不持鎖。提交中（[isSubmitting]）直接返回延後，
+     * 由提交收尾後的外層在鎖外統一排空；投遞中（[isDraining]）的重入呼叫直接返回，
+     * 由外層迴圈順便帶走新入隊事件。空佇列直接返回。
+     */
+    private fun drainQueue() {
+        while (true) {
+            synchronized(lifecycleLock) {
+                if (isDraining) return
+                if (isSubmitting) return
+                if (emitQueue.isEmpty()) return
+                isDraining = true
+            }
+            try {
+                while (true) {
+                    val event: QueuedEmit? = synchronized(lifecycleLock) {
+                        if (isSubmitting) {
+                            null
+                        } else {
+                            emitQueue.removeFirstOrNull()
+                        }
+                    }
+                    if (event == null) break
+                    deliverQueuedEmit(event)
+                }
+            } finally {
+                synchronized(lifecycleLock) {
+                    isDraining = false
+                }
+            }
         }
     }
 
-    /** 鎖內判定的終結附帶 emit 許可（[epoch] 為回呼所屬輪次，供 emit 前複查）。 */
-    private data class DoneDecision(val epoch: Long, val emit: Boolean)
+    /**
+     * 單事件投遞：鎖外依序執行 `preEmitHook` → 鎖內最終複查 → 鎖外 `postCheckHook` →
+     * 鎖內再次複查 → 鎖外 emit；任一複查不符即丟棄。最終複查：
+     * ERROR 為 `!terminal && epoch == speechEpoch`；
+     * DONE 另須 `!activeRequestFailed && activeRequestPending == 0`
+     *（擋下複查後插入的 stop／shutdown／新 speak，以及併發錯誤反超）。
+     */
+    private fun deliverQueuedEmit(event: QueuedEmit) {
+        runPreEmitHook()
+        val firstPass = synchronized(lifecycleLock) { checkDispatchableLocked(event) }
+        if (!firstPass) return
+        runPostCheckHook()
+        val secondPass = synchronized(lifecycleLock) { checkDispatchableLocked(event) }
+        if (!secondPass) return
+        when (event.kind) {
+            EmitKind.ERROR ->
+                emitError(VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED))
+            EmitKind.DONE -> emitDone()
+        }
+    }
+
+    /** 鎖內最終複查（呼叫方持有 [lifecycleLock]）。 */
+    private fun checkDispatchableLocked(event: QueuedEmit): Boolean {
+        if (terminal) return false
+        if (event.epoch != speechEpoch) return false
+        if (event.kind == EmitKind.DONE) {
+            if (activeRequestFailed) return false
+            if (activeRequestPending != 0) return false
+        }
+        return true
+    }
 
     /** 執行測試屏障鉤子（鎖外；異常吞掉，避免壞掉引擎回呼執行緒）。 */
     private fun runPreEmitHook() {
         val hook = preEmitHook
+        if (hook != null) {
+            try {
+                hook()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** 執行延伸屏障鉤子（語義同 [runPreEmitHook]，覆蓋複查→emit 窗口）。 */
+    private fun runPostCheckHook() {
+        val hook = postCheckHook
         if (hook != null) {
             try {
                 hook()

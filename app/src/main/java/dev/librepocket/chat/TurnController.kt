@@ -2176,6 +2176,16 @@ class TurnController(
   /** Core runIds admitted and still awaiting the session writer. */
   fun pendingTranscriptRunIds(): List<String> = orderedTranscript.pendingRunIds()
 
+  /**
+   * R10-2 writer-dead proof: true once the session writer is sealed/torn
+   * down (later core writes fail fast instead of parking). The backfill gate
+   * consults this together with an empty pending set to promote an expired
+   * block whose ledger still dangles (terminal will never land → marking
+   * INTERRUPTED is correct); without this proof an expired-but-unsettled
+   * ledger keeps deferring.
+   */
+  fun isTranscriptSealed(): Boolean = orderedTranscript.isSealed()
+
   // ---- internals ----
 
   /** Caller must hold [lock]. Direct starts cannot take ownership of recovery FIFO. */

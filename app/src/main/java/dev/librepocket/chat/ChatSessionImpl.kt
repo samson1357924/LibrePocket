@@ -104,6 +104,9 @@ class ChatSessionImpl(
   /** R6-3: live pending core set for the streaming-switch fence (see [ChatSession.pendingTranscriptRunIds]). */
   override fun pendingTranscriptRunIds(): List<String> = controller.pendingTranscriptRunIds()
 
+  /** R10-2: live writer-sealed state for the backfill gate's expiry promotion proof. */
+  override fun isTranscriptSealed(): Boolean = controller.isTranscriptSealed()
+
   override fun close() {
     controller.close()
     sessionScope.cancel()

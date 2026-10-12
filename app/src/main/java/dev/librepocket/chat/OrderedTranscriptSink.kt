@@ -76,7 +76,35 @@ class OrderedTranscriptSink(
   private val coreAcks = ConcurrentHashMap<CompletableDeferred<Unit>, String>()
   /** Set once the writer exits (teardown or drain): later cores fail fast. */
   private val writerDead = AtomicBoolean(false)
+  /**
+   * Poison ordering (A1): every compound check-then-add on [interrupted] /
+   * [resolvedUndelivered] holds exactly one outer monitor — [poisonLock] —
+   * and never nests the two collection monitors. Inner
+   * `synchronizedList`/`synchronizedSet` self-locks are always leaf
+   * (poisonLock → self, never reversed, never both inners held at once:
+   * sequential contains/add only), so `interruptedRunIds` (single snapshot),
+   * [markInterrupted], [tryResolveUndelivered], and [sealWriter] share the
+   * global order resolved→interrupted under one lock and cannot deadlock.
+   */
+  private val poisonLock = Any()
   private val interrupted = java.util.Collections.synchronizedList(mutableListOf<String>())
+  /**
+   * R10-3 proven-undelivered ghosts: runIds that proved never-delivered via
+   * the flush-barrier non-delivery proof ([tryResolveUndelivered]) — the fuzzy
+   * send was attempted but the entry never entered the channel, so no ledger
+   * row was ever persisted. These are unadmitted/cancelled send attempts, NOT
+   * persisted-admission write failures: they stay visible via
+   * [interruptedRunIds] (true INTERRUPTED mark for the ghost id, convert +
+   * same-opId retry stay retryable) but never count toward
+   * [hasDurableFailures]/[flushDurable]. A later successful retry of the same
+   * op (fresh id) drains cleanly and [flushDurable] returns true again, while
+   * genuine store failures (delegate IOException, teardown mid-entry, seal)
+   * stay in [interrupted] and keep poisoning durability as before. Seal checks
+   * [resolvedUndelivered] under [poisonLock] before poisoning and skips an
+   * already-resolved ghost (never dual-poison); the seal/resolve winner is
+   * decided atomically by that same lock (see [tryResolveUndelivered]).
+   */
+  private val resolvedUndelivered = java.util.Collections.synchronizedSet(mutableSetOf<String>())
   private val shutdownGuard = AtomicBoolean(false)
   /**
    * Stage 3 (R4-5) unified admission sequencer shared by every admission
@@ -684,7 +712,7 @@ class OrderedTranscriptSink(
   /**
    * True if any admitted core event failed during persistence or was interrupted by teardown/timeout.
    */
-  fun hasDurableFailures(): Boolean = synchronized(interrupted) { interrupted.isNotEmpty() }
+  fun hasDurableFailures(): Boolean = synchronized(poisonLock) { interrupted.isNotEmpty() }
 
   /**
    * Suspends until every event admitted so far is persisted and verifies that
@@ -751,14 +779,31 @@ class OrderedTranscriptSink(
   fun isSealed(): Boolean = writerDead.get() || writer.isCompleted || channel.isClosedForSend
 
   /** Core runIds admitted but never acked (drain timeout / seal race). */
-  fun interruptedRunIds(): List<String> = synchronized(interrupted) { interrupted.toList() }
+  fun interruptedRunIds(): List<String> = synchronized(poisonLock) {
+    // Single outer lock, sequential leaf reads — never nests the two
+    // collection monitors (A1: no interrupted→resolved nesting).
+    interrupted.toList() + resolvedUndelivered.toList()
+  }
 
   internal fun markInterrupted(runId: String) {
-    pendingCore.remove(runId)
-    synchronized(interrupted) {
+    // R10-3: a proven-undelivered ghost resolved via tryResolveUndelivered
+    // must never become a global durable failure — not even through the ack
+    // handler below (the resolver fails the ghost ack exceptionally, which
+    // re-enters here). Keep it only in the resolved set. Atomic with
+    // tryResolve/seal under [poisonLock]: check-then-add has no gap.
+    synchronized(poisonLock) {
+      if (resolvedUndelivered.contains(runId)) {
+        pendingCore.remove(runId)
+        return
+      }
+      pendingCore.remove(runId)
       if (!interrupted.contains(runId)) interrupted.add(runId)
     }
   }
+
+  /** R10-3: true only for proven-undelivered ghosts (never counted durable-failed). */
+  internal fun isResolvedUndelivered(runId: String): Boolean =
+    synchronized(poisonLock) { resolvedUndelivered.contains(runId) }
 
   /** Fails every outstanding core ack for [runId] (drain-timeout orphans). */
   private fun failAcksFor(runId: String, cause: Throwable) {
@@ -777,14 +822,38 @@ class OrderedTranscriptSink(
    * still-pending after a successful barrier proves the fuzzy entry never
    * entered (writer only commits Entries it received). Atomically releases the
    * dangling ack so the ghost can never late-commit, records the true
-   * INTERRUPTED mark via the existing ack handler (+ explicit guarantee), and
-   * returns true. Already-cleared (delivered + claimed, or already resolved)
-   * returns false (idempotent); sealed returns false (seal wins, caller defers
-   * to the seal convert path).
+   * INTERRUPTED mark in the R10-3 resolved-undelivered set (visible via
+   * [interruptedRunIds] but never counted by [hasDurableFailures]/
+   * [flushDurable]), and returns true. Already-cleared (delivered + claimed)
+   * returns false (idempotent); an already-resolved ghost returns true without
+   * re-failing acks. A sealed writer returns false on the best-effort
+   * pre-check below — but that check is NOT the linearization point: when
+   * seal races resolve, the [poisonLock] check-then-add decides exactly one
+   * winner (resolve-first → seal skips via its resolved guard, no
+   * dual-poison; seal-first → this returns false and defers to the seal's
+   * INTERRUPTED mark, which is then the correct terminal-never-lands mark).
+   * A resolved ghost therefore never counts toward [hasDurableFailures] even
+   * under seal competition, while genuine failures still poison.
+   *
+   * R10-3 ordering: the id joins [resolvedUndelivered] BEFORE the ack is
+   * failed, so the ack handler ([markInterrupted]) observes it and skips the
+   * global durable-failure mark even under race. The
+   * `interrupted.contains` check and the `resolved.add` share [poisonLock]
+   * with [sealWriter]'s resolved-guard + poison, so the gap between them is
+   * atomic (A1/A2).
    */
   fun tryResolveUndelivered(runId: String): Boolean {
     if (isSealed()) return false
-    if (!pendingCore.remove(runId)) return false
+    if (!pendingCore.remove(runId)) {
+      // Idempotent: an already-resolved ghost is still a successful resolve
+      // for callers that re-settle, but must not re-fail acks.
+      return synchronized(poisonLock) { resolvedUndelivered.contains(runId) }
+    }
+    synchronized(poisonLock) {
+      if (interrupted.contains(runId)) return false
+      if (resolvedUndelivered.contains(runId)) return true
+      resolvedUndelivered.add(runId)
+    }
     for ((ack, id) in coreAcks.entries.toList()) {
       if (id == runId) {
         coreAcks.remove(ack)
@@ -797,9 +866,8 @@ class OrderedTranscriptSink(
         }
       }
     }
-    // Explicit guarantee alongside the 409 handler above (idempotent): the
-    // barrier proof makes this a true mark, never a false INTERRUPTED.
-    markInterrupted(runId)
+    // No global mark: the barrier proof makes this a proven never-delivered
+    // attempt (true mark in the resolved set above), never a durable failure.
     return true
   }
 
@@ -808,6 +876,9 @@ class OrderedTranscriptSink(
    * senders with [ClosedSendChannelException]), fails every outstanding core
    * ack, and drains orphan-buffered entries admitted but never consumed.
    * Bounded and non-suspending; later core writes fail fast via [writerDead].
+   * A2: both poison loops check [resolvedUndelivered] under [poisonLock]
+   * before touching [interrupted] — an already-resolved ghost is skipped
+   * (never dual-poisoned), while genuine failures still poison.
    */
   private fun sealWriter(cause: Throwable) {
     if (!writerDead.compareAndSet(false, true)) return
@@ -819,8 +890,10 @@ class OrderedTranscriptSink(
     for ((ack, runId) in coreAcks.entries.toList()) {
       coreAcks.remove(ack)
       pendingCore.remove(runId)
-      synchronized(interrupted) {
-        if (!interrupted.contains(runId)) interrupted.add(runId)
+      synchronized(poisonLock) {
+        if (!resolvedUndelivered.contains(runId) && !interrupted.contains(runId)) {
+          interrupted.add(runId)
+        }
       }
       try {
         if (!ack.isCompleted) ack.completeExceptionally(cause)
@@ -832,8 +905,10 @@ class OrderedTranscriptSink(
       val entry = channel.tryReceive().getOrNull() ?: break
       entry.runId?.let { runId ->
         pendingCore.remove(runId)
-        synchronized(interrupted) {
-          if (!interrupted.contains(runId)) interrupted.add(runId)
+        synchronized(poisonLock) {
+          if (!resolvedUndelivered.contains(runId) && !interrupted.contains(runId)) {
+            interrupted.add(runId)
+          }
         }
       }
       val ack = entry.ack

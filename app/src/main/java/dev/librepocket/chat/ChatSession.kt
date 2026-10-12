@@ -151,6 +151,17 @@ interface ChatSession {
    */
   fun pendingTranscriptRunIds(): List<String> = emptyList()
 
+  /**
+   * R10-2 writer-dead proof: true once the session writer is sealed/torn
+   * down. Default false so test fakes stay source-compatible; production
+   * ([ChatSessionImpl]) overrides with the live controller state. The
+   * backfill gate treats `isTranscriptSealed() && pending empty &&
+   * !hasPendingAdmission()` as proof the old writer can never land a late
+   * terminal, so an expired block may promote even while the ledger still
+   * dangles (marking INTERRUPTED is then correct, never a mis-mark).
+   */
+  fun isTranscriptSealed(): Boolean = false
+
   /** Release (close HTTP call, drop queue). */
   fun close()
 }

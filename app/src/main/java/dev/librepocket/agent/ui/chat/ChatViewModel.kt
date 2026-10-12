@@ -205,7 +205,11 @@ private const val SESSION_FLUSH_TIMEOUT_MS = 5_000L
  * bounded, never a permanent ban). 6x the flush budget (~30s) so a slow but
  * live writer has room to settle across consecutive reopens. Each forced
  * hold refreshes the deadline (idle-bounded: back-to-back premature reopens
- * keep sliding it); a restart inside the window drops the memory-only block,
+ * keep sliding it); R10-2 expiry still requires verifiable proof (ledger
+ * terminal or writer-dead via seal + empty pending) — the deadline alone
+ * never promotes an unsettled ledger, so the block can outlive the horizon
+ * while the old writer is provably alive (fail-closed defer, never a
+ * mis-mark). A restart inside the window drops the memory-only block,
  * so the first post-restart reopen of a still-dangling id may backfill early
  * (pre-existing behavior class, bounded by the same horizon).
  */
@@ -439,11 +443,26 @@ class ChatViewModel(
      * R10-1 helpers (Main, never take [sessionMutex] — callers inside
      * `withLock` already hold it; direct map access avoids deadlock).
      */
-    private fun purgeExpiredOutstanding(nowMs: Long = System.currentTimeMillis()) {
+    /**
+     * R10-2 monotonic clock seam for every backfill/outstanding deadline.
+     * Default is [System.nanoTime]-based (monotonic, immune to wall-clock
+     * jumps); tests inject a manual clock to shrink the horizon or simulate
+     * jumps deterministically. Wall-clock ([System.currentTimeMillis]) must
+     * never gate ledger promotion — a jump would unconditionally drop the
+     * block and mis-mark a still-live writer's turn.
+     */
+    internal var backfillClockMs: () -> Long = { System.nanoTime() / 1_000_000L }
+    /**
+     * R10-2 horizon seam (default [PENDING_BACKFILL_BLOCK_MS]). Tests shrink
+     * this to exercise expiry-while-writer-alive without waiting ~30s.
+     */
+    internal var backfillBlockHorizonMs: Long = PENDING_BACKFILL_BLOCK_MS
+
+    private fun purgeExpiredOutstanding(nowMs: Long = backfillClockMs()) {
         val it = outstandingTeardowns.entries.iterator()
         while (it.hasNext()) {
             val e = it.next()
-            if (nowMs - e.value.parkedAtMs >= PENDING_BACKFILL_BLOCK_MS) it.remove()
+            if (nowMs - e.value.parkedAtMs >= backfillBlockHorizonMs) it.remove()
         }
     }
     private fun rememberOutstandingTeardown(
@@ -455,7 +474,7 @@ class ChatViewModel(
         if (owner == null) return
         if (fence == null && session == null) return
         purgeExpiredOutstanding()
-        val nowMs = System.currentTimeMillis()
+        val nowMs = backfillClockMs()
         val existing = outstandingTeardowns[owner]
         if (existing == null) {
             outstandingTeardowns[owner] = OutstandingTeardown(fence, session, wasStreaming, nowMs)
@@ -494,14 +513,31 @@ class ChatViewModel(
      * parks its id here; a later open with a trivially-successful settle
      * (fresh idle live, old writer still alive) stays deferred while its
      * entry holds. Promotion deletes the entry (ledger proves no dangling
-     * family AND the detached live shows no pending evidence); deadline
-     * expiry deletes it too (bounded). Memory-only: a process restart drops
+     * family AND the detached live shows no pending evidence); R10-2 expiry
+     * no longer deletes it on clock alone — it promotes only on verifiable
+     * proof ([tryPromoteExpiredBlock]: ledger clean, or writer-dead proof via
+     * seal + empty pending) and otherwise renews the deadline and keeps
+     * deferring. Memory-only: a process restart drops
      * every entry (a durable marker would need a single-event delete for its
      * clear semantics — no SessionStore API — and the head-anchored scan
      * loses pruned markers anyway, so the marker stays a noted follow-up and
      * this block is the enforcement).
      */
     private var pendingBackfillBlock = HashMap<String, Long>()
+    /**
+     * R10-2 pending-writer identity for expiry promotion: sessionId → the
+     * unsettled old-writer session observed when the block was parked (the
+     * same-ID defer's [detached] live, which still owned the ledger then).
+     * A later expiry must not promote on wall-clock alone: it re-reads this
+     * writer's liveness (streaming/pending evidence, seal + empty pending) so
+     * a still-alive writer keeps deferring while a provably-dead writer may
+     * promote even with a dangling ledger (its terminal will never land, so
+     * marking INTERRUPTED is correct). Only entries with pending/streaming
+     * evidence are stored (a clean fresh-idle detached never overwrites the
+     * old writer); cleared together with the block on promotion/expiry-allow
+     * and on [onCleared]. Memory-only like the block.
+     */
+    private var pendingBackfillWriter = HashMap<String, ChatSession?>()
     // R2: unsent texts are owned per send/steer operation, never by a single
     // global String. Cleared only when the controller accepts that exact op
     // (startOrEnqueue Started/Queued verdict); pre-accept endpoint
@@ -1891,11 +1927,19 @@ class ChatViewModel(
                     // (flush-timeout vs flush-failure are indistinguishable
                     // here; only the ledger state tells them apart).
                     val detachedForGate = if (isSameIdReopen) prevLive else null
+                    // B4: slot evidence prefers the retained slot session over
+                    // the fresh detached live — a clean fresh-idle detached
+                    // must not shadow the true old-writer culprit. The gate
+                    // verifies both (plus stored + outstanding) and remembers
+                    // both, so a slot session distinct from stored and outside
+                    // the outstanding table is never missed.
+                    val slotEvidenceForGate = effectiveFencedSession ?: outstandingSession
                     val backfillNow = gateBackfillForSession(
                         sessionId,
                         settleOk,
                         durableOk,
                         detachedForGate,
+                        slotEvidenceForGate ?: detachedForGate,
                     )
                     val creationGeneration = requestedGeneration
                     try {
@@ -3858,17 +3902,25 @@ class ChatViewModel(
      * - `settleOk && durableOk` with no live block backfills (unchanged).
      * - `!backfillNow` (settle failed: flush-timeout means the old writer
      *   may still land its terminal late; flush-failure means it is sealed)
-     *   parks `block[sessionId] = now + [PENDING_BACKFILL_BLOCK_MS]` and
-     *   returns false. The caller still hydrates and warns
-     *   HISTORY_SNAPSHOT_INCOMPLETE; the next open retries.
+     *   parks `block[sessionId] = now + horizon` and returns false. The caller
+     *   still hydrates and warns HISTORY_SNAPSHOT_INCOMPLETE; the next open
+     *   retries.
      * - A later open with `backfillNow == true` but a live (unexpired) block
      *   is forced to false UNLESS promotion proves the ledger already
      *   terminal (no dangling family in the backfill window AND the detached
      *   live shows no pending evidence) — this is the second-reopen fix: a
      *   fresh idle live settles trivially while the old writer is still
      *   alive, and only the ledger state tells the two apart.
-     * - An expired block is dropped (bounded: the old writer is truly dead
-     *   or the process restarted its writer; never a permanent ban).
+     * - R10-2 expired block: NEVER promotes on the clock alone. Expiry runs
+     *   the verifiable promotion ([tryPromoteExpiredBlock]): ledger clean +
+     *   fresh live clean + old writer not alive + no live outstanding
+     *   teardown promotes (or writer-dead proof — sealed + pending empty —
+     *   promotes even with a dangling ledger, since its terminal will never
+     *   land and marking INTERRUPTED is then correct). Anything unverified
+     *   renews the deadline and defers again (fail-closed: the caller keeps
+     *   warning HISTORY_SNAPSHOT_INCOMPLETE). Deadlines use the monotonic
+     *   [backfillClockMs], never wall-clock, so a clock jump cannot prematurely
+     *   promote an unsettled ledger.
      *
      * Idempotent and fail-closed: a probe failure keeps the block until its
      * deadline. Caller cancellation propagates.
@@ -3878,13 +3930,22 @@ class ChatViewModel(
         settleOk: Boolean,
         durableOk: Boolean,
         detached: ChatSession?,
+        writerEvidence: ChatSession? = null,
     ): Boolean {
         var backfillNow = settleOk && durableOk
-        val nowMs = System.currentTimeMillis()
+        val nowMs = backfillClockMs()
         val blockedUntil = pendingBackfillBlock[sessionId]
         if (blockedUntil != null) {
             if (nowMs >= blockedUntil) {
-                pendingBackfillBlock.remove(sessionId)
+                if (tryPromoteExpiredBlock(sessionId, detached, writerEvidence)) {
+                    pendingBackfillBlock.remove(sessionId)
+                    pendingBackfillWriter.remove(sessionId)
+                } else {
+                    backfillNow = false
+                    pendingBackfillBlock[sessionId] = nowMs + backfillBlockHorizonMs
+                    rememberBlockWriter(sessionId, writerEvidence)
+                    rememberBlockWriter(sessionId, detached)
+                }
             } else if (backfillNow) {
                 val ledgerClean = try {
                     withContext(Dispatchers.IO) { probeLedgerHasNoDangling(sessionId) }
@@ -3893,18 +3954,166 @@ class ChatViewModel(
                 } catch (_: Exception) {
                     false
                 }
-                val liveClean = !isLedgerStreamingOrPending(detached)
+                // B1: re-read the fresh detached liveness AFTER the probe
+                // suspension — a new idle→streaming transition (fresh
+                // dangling) landing while the probe was suspended must not
+                // promote. Live-block verifies the fresh live only: the
+                // stored old writer may keep a stale STREAMING status after
+                // its terminal landed (pending empty, ledger clean), which
+                // must not shadow the ledger proof here — the stored writer
+                // is still fully verified on the expiry path below.
+                val liveClean = !isWriterAliveEvidence(detached)
                 if (ledgerClean && liveClean) {
                     pendingBackfillBlock.remove(sessionId)
+                    pendingBackfillWriter.remove(sessionId)
                 } else {
                     backfillNow = false
                 }
             }
         }
         if (!backfillNow) {
-            pendingBackfillBlock[sessionId] = nowMs + PENDING_BACKFILL_BLOCK_MS
+            pendingBackfillBlock[sessionId] = nowMs + backfillBlockHorizonMs
+            rememberBlockWriter(sessionId, writerEvidence)
+            rememberBlockWriter(sessionId, detached)
         }
         return backfillNow
+    }
+
+    /**
+     * R10-2 expiry promotion proof. Returns true only when the blocked ledger
+     * verifiably settled (or its writer verifiably can never settle):
+     * - the fresh [detached] live shows no streaming/pending evidence, AND
+     * - the slot evidence ([writerEvidence]: retained slot / outstanding
+     *   session, checked even when it differs from stored and sits outside
+     *   the outstanding table — B4) shows none, AND
+     * - no live outstanding teardown for [sessionId] is still settling, AND
+     * - the stored old writer (see [pendingBackfillWriter]) shows none, AND
+     * - either the ledger proves its terminal (no dangling family) OR a
+     *   stored/slot old writer is provably dead (sealed + pending empty, so
+     *   its terminal will never land and an INTERRUPTED mark is correct).
+     * B1: liveness is verified BEFORE the probe (fast fail) and re-verified
+     * AFTER it — a probe suspension window that lands a new dangling must
+     * not promote. B2: sealed-dead is decided FIRST: a stuck STREAMING
+     * status on a sealed writer never blocks the dead proof (dead is not
+     * alive). Anything else (probe failure, live writer, unknown writer
+     * with a still-dangling ledger) returns false so the caller renews the
+     * block and keeps deferring. Never throws (best-effort reads only);
+     * caller cancellation propagates from the ledger probe.
+     */
+    private suspend fun tryPromoteExpiredBlock(
+        sessionId: String,
+        detached: ChatSession?,
+        writerEvidence: ChatSession? = null,
+    ): Boolean {
+        // B2 first: dead is not alive — check liveness sealed-aware.
+        if (isWriterAliveEvidence(detached)) return false
+        if (writerEvidence !== detached && isWriterAliveEvidence(writerEvidence)) return false
+        run {
+            val s = pendingBackfillWriter[sessionId]
+            if (s !== detached && s !== writerEvidence && isWriterAliveEvidence(s)) return false
+        }
+        if (peekOutstandingLive(sessionId)) return false
+        val ledgerClean = try {
+            withContext(Dispatchers.IO) { probeLedgerHasNoDangling(sessionId) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+        // B1 post-probe re-verification: the probe suspended on IO while the
+        // mutex was held; a live transition in that window must fail closed.
+        if (isWriterAliveEvidence(detached)) return false
+        if (writerEvidence !== detached && isWriterAliveEvidence(writerEvidence)) return false
+        val stored = pendingBackfillWriter[sessionId]
+        if (stored !== detached && stored !== writerEvidence && isWriterAliveEvidence(stored)) {
+            return false
+        }
+        if (peekOutstandingLive(sessionId)) return false
+        if (ledgerClean) return true
+        if (stored != null && isWriterSealedDead(stored)) return true
+        if (writerEvidence !== stored && writerEvidence != null && isWriterSealedDead(writerEvidence)) {
+            return true
+        }
+        run {
+            purgeExpiredOutstanding()
+            val outstandingSession = outstandingTeardowns[sessionId]?.session
+            if (outstandingSession !== stored && outstandingSession !== writerEvidence &&
+                outstandingSession !== detached && outstandingSession != null &&
+                isWriterSealedDead(outstandingSession)
+            ) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * B2 sealed-aware liveness: a provably-dead writer (sealed + pending
+     * empty) is NOT alive, even when its uiState still sticks at STREAMING
+     * after the seal. Lets the expiry dead-proof stay reachable instead of
+     * being shadowed by the stuck status. Best-effort, never throws.
+     */
+    private fun isWriterAliveEvidence(session: ChatSession?): Boolean {
+        if (session == null) return false
+        if (isWriterSealedDead(session)) return false
+        return isLedgerStreamingOrPending(session)
+    }
+
+    /**
+     * R10-2 pending-writer identity store. Keeps the FIRST unsettled writer
+     * observed for [sessionId] until the block lifts: later renewals carry a
+     * fresh idle detached (which proves nothing about the old writer) and
+     * must not overwrite it. A null evidence keeps whatever exists.
+     * B3: the first store is filtered — only a writer with live
+     * streaming/pending evidence or a sealed writer is kept; a clean
+     * fresh-idle detached (unsealed + no evidence) proves nothing about the
+     * old writer and must not occupy the slot ahead of the true culprit.
+     */
+    private fun rememberBlockWriter(sessionId: String, evidence: ChatSession?) {
+        if (evidence == null) return
+        if (pendingBackfillWriter[sessionId] != null) return
+        val alive = try {
+            isLedgerStreamingOrPending(evidence)
+        } catch (_: Exception) {
+            false
+        }
+        val sealed = try {
+            evidence.isTranscriptSealed()
+        } catch (_: Exception) {
+            false
+        }
+        if (!alive && !sealed) return
+        pendingBackfillWriter[sessionId] = evidence
+    }
+
+    /** R10-2: peek without consuming — true while the same-id teardown still settles. */
+    private fun peekOutstandingLive(sessionId: String): Boolean {
+        purgeExpiredOutstanding()
+        val entry = outstandingTeardowns[sessionId] ?: return false
+        try {
+            if (entry.fence?.isCompleted == false) return true
+        } catch (_: Exception) {
+        }
+        // B2: a sealed-dead outstanding session is not live — its stuck
+        // STREAMING status must not shadow the expiry dead-proof.
+        try {
+            val s = entry.session
+            if (s != null && isWriterSealedDead(s)) return false
+            if (isLedgerStreamingOrPending(s)) return true
+        } catch (_: Exception) {
+        }
+        return false
+    }
+
+    /** R10-2 writer-dead proof: sealed AND no pending admission AND no unacked cores. Best-effort, never throws. */
+    private fun isWriterSealedDead(session: ChatSession): Boolean {
+        return try {
+            if (!session.isTranscriptSealed()) return false
+            if (session.hasPendingAdmission()) return false
+            session.pendingTranscriptRunIds().isEmpty()
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /**
@@ -4269,6 +4478,8 @@ class ChatViewModel(
         // R10-1: drop per-session outstanding teardowns (bounded; viewModelScope
         // teardown cancels their jobs anyway).
         outstandingTeardowns.clear()
+        // R10-2: drop pending-writer identity alongside the block it explains.
+        pendingBackfillWriter.clear()
         // Synchronous close only: background flush-then-close is infeasible
         // here (viewModelScope is cancelled on teardown), so closeLive()
         // relies on TurnController.close's internal bounded drain.

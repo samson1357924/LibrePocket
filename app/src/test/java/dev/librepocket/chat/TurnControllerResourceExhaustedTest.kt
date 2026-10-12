@@ -61,10 +61,10 @@ private class ResExhaustRecordingSink : TranscriptSink {
   val tools: MutableList<Tool> = Collections.synchronizedList(mutableListOf())
 
   override suspend fun onTurnStarted(runId: String, text: String) = Unit
-  override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+  override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
   override suspend fun onTurnFailed(runId: String, error: String) { failed.add(error) }
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-  override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+  override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
   override suspend fun onSteerQueued(text: String) = Unit
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) {
     tools.add(Tool(runId, toolIndex, id, name, argumentsJson))

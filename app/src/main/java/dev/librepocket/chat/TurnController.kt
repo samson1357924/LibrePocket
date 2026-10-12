@@ -916,7 +916,10 @@ class TurnController(
             // flagged reasoning-sourced so tool-dependent / thinking-mode
             // follow-up rebuilds fail closed (ordinary no-tools ones continue).
             // Single _uiState.update (text + flag) to avoid two full maps per delta.
-            is StreamEvent.ReasoningDelta -> appendReasoningDelta(attemptRunId, event.delta)
+            is StreamEvent.ReasoningDelta -> {
+              streamedTextDeltaCount++
+              appendReasoningDelta(attemptRunId, event.delta)
+            }
             // Opaque reasoning marker: no visible text, only the source flag
             // (covers reasoning origins with no replayable payload).
             is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
@@ -1218,6 +1221,9 @@ class TurnController(
    * empty append returned early).
    */
   private fun appendReasoningDelta(runId: String, delta: String) {
+    // Observable cost baseline (same as appendAssistantText): every delta is
+    // exactly one update; copies count prior text re-copied plus new chars.
+    val prior = _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
     _uiState.update { s ->
       s.copy(
         messages = s.messages.map { m ->
@@ -1225,6 +1231,8 @@ class TurnController(
         },
       )
     }
+    uiTextUpdateCount++
+    uiTextCopiedChars += prior + delta.length
   }
 
   private fun finalizeAssistant(runId: String) {

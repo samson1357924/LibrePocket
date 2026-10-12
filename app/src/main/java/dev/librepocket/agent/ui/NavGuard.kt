@@ -1,6 +1,19 @@
 package dev.librepocket.agent.ui
 
 /**
+ * 啟動落定前有效 loading（Stage B：R10 Finding 2 P2/UX）。
+ *
+ * replay 慢時 gate 可能已折疊 `NoEndpoint`（journal 保留）而落碼尚未發生；
+ * 此時若按 `gateLoading == false` 決策會先跳 Setup、失敗後又不導回 Settings。
+ * 落定前視同 loading：呼叫方把回傳值傳給兩守衛的 `gateLoading` 參數（loading
+ * 不決策，避免 FOUC），全屏 spinner 條件亦用此值。兩守衛簽名與語義不變。
+ */
+fun startupEffectiveLoading(
+    gateLoading: Boolean,
+    startupReconcilePending: Boolean,
+): Boolean = gateLoading || startupReconcilePending
+
+/**
  * 啟動導航守衛純條件（Re-review #8 Finding 2 P2/BLOCK 階段2）。
  *
  * 背景：登出部分清除（`LOGOUT_CLEAR_FAILED`：金鑰已刪、設定仍在）會把 gate

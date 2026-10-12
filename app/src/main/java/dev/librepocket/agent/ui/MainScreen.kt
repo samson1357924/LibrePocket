@@ -1,38 +1,7 @@
 package dev.librepocket.agent.ui
 
 import android.util.Log
-import androidx.compose.foundation.layout.Box
 import kotlinx.coroutines.CancellationException
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ChatBubbleOutline
-import androidx.compose.material.icons.filled.Key
-import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DrawerValue
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalDrawerSheet
-import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.NavigationDrawerItem
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -43,11 +12,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.compose.NavHost
-import androidx.navigation.compose.composable
-import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import dev.librepocket.agent.R
 import dev.librepocket.agent.ui.chat.ChatScreen
@@ -83,25 +50,24 @@ object Routes {
 //（DataStore 寫入只拋 Exception／CancellationException），CancellationException 照拋。
 private const val TAG = "MainScreen"
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
     sharedText: String? = null,
     onSharedConsumed: () -> Unit = {},
 ) {
     val navController = rememberNavController()
-    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val app = LocalContext.current.applicationContext as android.app.Application
     val chatViewModel: ChatViewModel = viewModel(factory = ChatViewModelFactory(app))
     val setupViewModel: SetupViewModel = viewModel(factory = SetupViewModelFactory(app))
     val sessionListViewModel: SessionListViewModel = viewModel(factory = SessionListViewModelFactory(app))
-    val backStack by navController.currentBackStackEntryAsState()
-    val currentRoute = backStack?.destination?.route
     val appName = stringResource(R.string.app_name)
     val gate by setupViewModel.gate.collectAsStateWithLifecycle()
     val hasEndpoint = gate is EndpointGate.Ready
-    val gateLoading = gate is EndpointGate.Loading
+    // Stage B（R10 Finding 2 P2/UX）：啟動 replay 落定前視同 loading 的合成與
+    // 守衛／spinner／drawer 接線只在 StartupGateHost 實現（單一來源，接線測直
+    // 接測該 host）；此處只收集狀態並傳入，不重算、不重抄。
+    val startupReconcilePending by setupViewModel.startupReconcilePending.collectAsStateWithLifecycle()
     // 登出失敗 Settings UI 可見（Re-review #7 Finding 2 階段2）：false 分支不導航
     // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
     val setupForm by setupViewModel.form.collectAsStateWithLifecycle()
@@ -182,43 +148,6 @@ fun MainScreen(
         }
     }
 
-    // Hard gate: no usable endpoint -> setup (and back again after save/logout).
-    // P2/BLOCK（Re-review #8 Finding 2 階段2）：有未恢復 LOGOUT_* 或 logoutInFlight
-    // 時不強制跳（留在 SETTINGS 可恢復；STALE 待 dismiss 亦攔截）。條件見
-    // shouldNavigateToSetup 純函數（NavGuard.kt，真值表單測）。
-    val logoutGuardError = setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") }
-    val logoutGuardBusy = setupForm.logoutInFlight
-    LaunchedEffect(hasEndpoint, gateLoading, currentRoute, logoutGuardError, logoutGuardBusy) {
-        if (!shouldNavigateToSetup(hasEndpoint, gateLoading, currentRoute, logoutGuardError, logoutGuardBusy)) {
-            return@LaunchedEffect
-        }
-        navController.navigate(Routes.SETUP) {
-            popUpTo(Routes.CHAT) { inclusive = true }
-            launchSingleTop = true
-        }
-    }
-
-    // 恢復導向（Stage 3 P2，可達性決策 (a)）：啟動 replay 失敗（LOGOUT_* +
-    // NoEndpoint）時把 CHAT 自動導向 SETTINGS 恢復卡，而非留在無端點 CHAT 空態；
-    // 與 SETUP 硬守衛互斥（有碼走此分支，無碼走 SETUP），條件見
-    // shouldNavigateToSettings 純函數。
-    LaunchedEffect(hasEndpoint, gateLoading, currentRoute, logoutGuardError, logoutGuardBusy) {
-        if (!shouldNavigateToSettings(hasEndpoint, gateLoading, currentRoute, logoutGuardError, logoutGuardBusy)) {
-            return@LaunchedEffect
-        }
-        navController.navigate(Routes.SETTINGS) {
-            popUpTo(Routes.CHAT) { inclusive = true }
-            launchSingleTop = true
-        }
-    }
-
-    // History list follows the drawer: refresh whenever it opens.
-    LaunchedEffect(drawerState.currentValue) {
-        if (drawerState.currentValue == DrawerValue.Open) {
-            sessionListViewModel.refresh()
-        }
-    }
-
     // Edit-entry helper: prefill the form with the live endpoint (key stays
     // blank) so "edit" never shows another preset's defaults.
     fun goSetupForEdit() {
@@ -227,224 +156,108 @@ fun MainScreen(
         navController.navigate(Routes.SETUP) { launchSingleTop = true }
     }
 
-    ModalNavigationDrawer(
-        drawerState = drawerState,
-        // Stage 3 P2 (a)：恢復態（LOGOUT_* + NoEndpoint）啟用 drawer 手勢，
-        // 否則停在 CHAT 的使用者到不了 SETTINGS 恢復卡。
-        gesturesEnabled = hasEndpoint || logoutGuardError != null,
-        drawerContent = {
-            ModalDrawerSheet {
-                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                Text(
-                    text = appName,
-                    modifier = Modifier.fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                NavigationDrawerItem(
-                    label = { Text("新對話") },
-                    selected = currentRoute == Routes.CHAT && currentSessionId == null,
-                    onClick = {
-                        chatViewModel.newChat()
-                        sessionListViewModel.refresh()
-                        navController.navigate(Routes.CHAT) {
-                            popUpTo(Routes.CHAT) { inclusive = false }
-                            launchSingleTop = true
-                        }
-                        scope.launch { drawerState.close() }
-                    },
-                    icon = { Icon(Icons.Filled.Add, contentDescription = null) },
-                )
-                if (sessions.isNotEmpty()) {
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
-                    Text(
-                        text = "歷史對話",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                    )
-                    sessions.take(20).forEach { meta ->
-                        NavigationDrawerItem(
-                            label = {
-                                Text(
-                                    text = meta.title.ifBlank { "(無標題)" },
-                                    maxLines = 1,
-                                )
-                            },
-                            selected = currentRoute == Routes.CHAT && currentSessionId == meta.sessionId,
-                            onClick = {
-                                scope.launch {
-                                    chatViewModel.openSession(meta.sessionId)
-                                    sessionListViewModel.refresh()
-                                    navController.navigate(Routes.CHAT) {
-                                        popUpTo(Routes.CHAT) { inclusive = false }
-                                        launchSingleTop = true
-                                    }
-                                    drawerState.close()
-                                }
-                            },
-                            icon = { Icon(Icons.Filled.ChatBubbleOutline, contentDescription = null) },
-                        )
-                    }
-                }
-                NavigationDrawerItem(
-                    label = { Text("API 設定") },
-                    selected = currentRoute == Routes.SETUP,
-                    onClick = {
-                        goSetupForEdit()
-                        scope.launch { drawerState.close() }
-                    },
-                    icon = { Icon(Icons.Filled.Key, contentDescription = null) },
-                )
-                NavigationDrawerItem(
-                    label = { Text("設定") },
-                    selected = currentRoute == Routes.SETTINGS,
-                    onClick = {
-                        navController.navigate(Routes.SETTINGS) { launchSingleTop = true }
-                        scope.launch { drawerState.close() }
-                    },
-                    icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
-                )
-                }
-            }
+    StartupGateHost(
+        gate = gate,
+        startupReconcilePending = startupReconcilePending,
+        errorCode = setupForm.errorCode,
+        logoutInFlight = setupForm.logoutInFlight,
+        navController = navController,
+        appName = appName,
+        sessions = sessions,
+        currentSessionId = currentSessionId,
+        onNewChat = {
+            chatViewModel.newChat()
+            sessionListViewModel.refresh()
         },
-    ) {
-        Scaffold(
-            topBar = {
-                TopAppBar(
-                    title = {
-                        Text(
-                            when (currentRoute) {
-                                Routes.SETTINGS -> "設定"
-                                Routes.SETUP -> if (hasEndpoint) "編輯端點" else "設定 API 金鑰"
-                                else -> appName
-                            },
-                        )
-                    },
-                    navigationIcon = {
-                        IconButton(
-                            // Stage 3 P2 (a)：恢復態啟用選單鍵（同 drawer 手勢）。
-                            onClick = { scope.launch { drawerState.open() } },
-                            enabled = hasEndpoint || logoutGuardError != null,
-                        ) {
-                            Icon(Icons.Filled.Menu, contentDescription = "選單")
+        onOpenSession = { sessionId ->
+            chatViewModel.openSession(sessionId)
+            sessionListViewModel.refresh()
+        },
+        onEditEndpoint = { goSetupForEdit() },
+        onDrawerOpened = { sessionListViewModel.refresh() },
+        chatContent = { padding ->
+            ChatScreen(
+                padding = padding,
+                viewModel = chatViewModel,
+                onOpenSettings = { goSetupForEdit() },
+                onTurnFinished = { sessionListViewModel.refresh() },
+                userSwitches = voiceUiSwitches,
+                voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,
+                ttsAcknowledged = ttsAcknowledged,
+                onTtsAcknowledged = {
+                    try {
+                        voiceStore.acknowledgeTtsDisclosure()
+                        true
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.w(TAG, "voice tts ack persist failed", e)
+                        false
+                    }
+                },
+            )
+        },
+        settingsContent = { padding ->
+            SettingsScreen(
+                padding = padding,
+                gate = gate,
+                onEditEndpoint = { goSetupForEdit() },
+                onLogout = {
+                    setupViewModel.logout { success ->
+                        if (success) {
+                            chatViewModel.newChat()
+                            sessionListViewModel.refresh()
                         }
-                    },
-                    actions = {
-                        if (currentRoute == Routes.CHAT) {
-                            IconButton(
-                                onClick = {
-                                    chatViewModel.newChat()
-                                    sessionListViewModel.refresh()
-                                },
-                            ) {
-                                Icon(Icons.Filled.Add, contentDescription = "新對話")
-                            }
+                    }
+                },
+                onRevokePrivilege = {
+                    privilegeState.revoke()
+                    privilegeAuditCount = privilegeState.auditCount()
+                },
+                privilegeAuditCount = privilegeAuditCount,
+                voiceInputEnabled = VoiceTools.inputEnabled(voiceEffectiveSnapshot),
+                voiceOutputEnabled = VoiceTools.outputEnabled(voiceEffectiveSnapshot),
+                voiceSwitchesEnabled = voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed,
+                voiceLoadFailed = voiceEffectiveSnapshot.loadFailed,
+                onVoiceInputSwitch = { enabled ->
+                    scope.launch {
+                        try {
+                            voiceStore.setInputEnabled(enabled)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "voice input switch persist failed", e)
                         }
-                    },
-                )
-            },
-        ) { padding ->
-            if (gateLoading) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(padding),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    CircularProgressIndicator()
-                }
-            } else {
-                NavHost(
-                    navController = navController,
-                    startDestination = Routes.CHAT,
-                ) {
-                    composable(Routes.CHAT) {
-                        ChatScreen(
-                            padding = padding,
-                            viewModel = chatViewModel,
-                            onOpenSettings = { goSetupForEdit() },
-                            onTurnFinished = { sessionListViewModel.refresh() },
-                            userSwitches = voiceUiSwitches,
-                            voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,
-                            ttsAcknowledged = ttsAcknowledged,
-                            onTtsAcknowledged = {
-                                try {
-                                    voiceStore.acknowledgeTtsDisclosure()
-                                    true
-                                } catch (e: CancellationException) {
-                                    throw e
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "voice tts ack persist failed", e)
-                                    false
-                                }
-                            },
-                        )
                     }
-                    composable(Routes.SETTINGS) {
-                        SettingsScreen(
-                            padding = padding,
-                            gate = gate,
-                            onEditEndpoint = { goSetupForEdit() },
-                            onLogout = {
-                                setupViewModel.logout { success ->
-                                    if (success) {
-                                        chatViewModel.newChat()
-                                        sessionListViewModel.refresh()
-                                    }
-                                }
-                            },
-                            onRevokePrivilege = {
-                                privilegeState.revoke()
-                                privilegeAuditCount = privilegeState.auditCount()
-                            },
-                            privilegeAuditCount = privilegeAuditCount,
-                            voiceInputEnabled = VoiceTools.inputEnabled(voiceEffectiveSnapshot),
-                            voiceOutputEnabled = VoiceTools.outputEnabled(voiceEffectiveSnapshot),
-                            voiceSwitchesEnabled = voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed,
-                            voiceLoadFailed = voiceEffectiveSnapshot.loadFailed,
-                            onVoiceInputSwitch = { enabled ->
-                                scope.launch {
-                                    try {
-                                        voiceStore.setInputEnabled(enabled)
-                                    } catch (e: CancellationException) {
-                                        throw e
-                                    } catch (e: Exception) {
-                                        Log.w(TAG, "voice input switch persist failed", e)
-                                    }
-                                }
-                            },
-                            onVoiceOutputSwitch = { enabled ->
-                                scope.launch {
-                                    try {
-                                        voiceStore.setOutputEnabled(enabled)
-                                    } catch (e: CancellationException) {
-                                        throw e
-                                    } catch (e: Exception) {
-                                        Log.w(TAG, "voice output switch persist failed", e)
-                                    }
-                                }
-                            },
-                            logoutErrorCode = setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") },
-                            logoutInFlight = setupForm.logoutInFlight,
-                            onDismissLogoutError = { setupViewModel.clearLogoutError() },
-                        )
+                },
+                onVoiceOutputSwitch = { enabled ->
+                    scope.launch {
+                        try {
+                            voiceStore.setOutputEnabled(enabled)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(TAG, "voice output switch persist failed", e)
+                        }
                     }
-                    composable(Routes.SETUP) {
-                        SetupScreen(
-                            padding = padding,
-                            isFirstRun = !hasEndpoint,
-                            onSaved = {
-                                navController.navigate(Routes.CHAT) {
-                                    popUpTo(Routes.SETUP) { inclusive = true }
-                                    launchSingleTop = true
-                                }
-                            },
-                            viewModel = setupViewModel,
-                        )
+                },
+                logoutErrorCode = setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") },
+                logoutInFlight = setupForm.logoutInFlight,
+                onDismissLogoutError = { setupViewModel.clearLogoutError() },
+            )
+        },
+        setupContent = { padding, isFirstRun ->
+            SetupScreen(
+                padding = padding,
+                isFirstRun = isFirstRun,
+                onSaved = {
+                    navController.navigate(Routes.CHAT) {
+                        popUpTo(Routes.SETUP) { inclusive = true }
+                        launchSingleTop = true
                     }
-                }
-            }
-        }
-    }
+                },
+                viewModel = setupViewModel,
+            )
+        },
+    )
 }

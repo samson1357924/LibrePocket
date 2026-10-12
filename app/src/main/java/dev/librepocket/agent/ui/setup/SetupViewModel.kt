@@ -127,6 +127,18 @@ class SetupViewModel(
 
     private val _form = MutableStateFlow(SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID)))
     val form: StateFlow<SetupUiState> = _form
+
+    /**
+     * 啟動 replay 落定閘（Stage B：R10 Finding 2 P2/UX）。
+     *
+     * 初值 `true`：[launchPendingDeleteReconcile] 的 `onDone`（成功／失敗皆含，
+     * 無 journal 的 `NO_OP` 亦落定）與取消落定後設 `false`（`finally`，避免
+     * spinner 永留）。`MainScreen` 以此視同 loading（見
+     * [dev.librepocket.agent.ui.startupEffectiveLoading]）：落定前兩導航守衛
+     * 不決策、全屏 spinner 覆蓋，避免 replay 慢時先跳 Setup 的 FOUC。
+     */
+    private val _startupReconcilePending = MutableStateFlow(true)
+    val startupReconcilePending: StateFlow<Boolean> = _startupReconcilePending
     private val modelRefreshGeneration = AtomicLong(0L)
     private var modelRefreshJob: Job? = null
     // Stage2 form fence: identity/key intent epoch. Bumped only by
@@ -1279,17 +1291,27 @@ class SetupViewModel(
      * leave a retained journal (gate `NoEndpoint`) with no `errorCode` and no
      * recovery entry. Cancellation semantics unchanged (COMMITTED swallows,
      * everything else rethrows with no `onDone`).
+     *
+     * Stage B: [startupReconcilePending] stays `true` until [onDone] runs (all
+     * outcomes, including `NO_OP`) or this job is cancelled — the reset is in
+     * `finally` so a scope cancel never leaves the startup spinner stuck. The
+     * returned [Job] is only a test seam (cancel-injection, mirroring
+     * [lastSaveJobForTest]); production callers ignore it.
      */
-    fun launchPendingDeleteReconcile(onDone: (PendingDeleteOutcome) -> Unit) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val outcome = try {
-                reconcilePendingDelete()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                PendingDeleteOutcome.UNKNOWN
+    fun launchPendingDeleteReconcile(onDone: (PendingDeleteOutcome) -> Unit): Job {
+        return viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val outcome = try {
+                    reconcilePendingDelete()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    PendingDeleteOutcome.UNKNOWN
+                }
+                withContext(Dispatchers.Main) { onDone(outcome) }
+            } finally {
+                _startupReconcilePending.value = false
             }
-            withContext(Dispatchers.Main) { onDone(outcome) }
         }
     }
 

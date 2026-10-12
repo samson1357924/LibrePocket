@@ -874,6 +874,11 @@ class TurnController(
             val name = toolNameText[index]?.toString().orEmpty().ifEmpty { "pending" }
             // Snapshot args string before async hop (StringBuilder keeps mutating).
             val argsStr = args.toString()
+            // Terminal guard (Finding #4): whole pending ToolDone must fit
+            // the per-call budget before any marker/transcript side effect.
+            // Throws typed AGG_TOO_LARGE; the try-path catch turns it into
+            // the typed terminal without poison-adjacent records.
+            requireToolAggBudget(0, id.length + name.length + argsStr.length)
             appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
             fireTranscript { transcript.onToolDone(attemptRunId, index, id, name, argsStr) }
           }
@@ -905,30 +910,54 @@ class TurnController(
               // The same budget additionally guards the per-attempt total
               // across all indexes, plus a distinct-index cap — all one
               // failure semantics.
-              val toolIncoming = event.argsChunk.length +
-                (event.idChunk?.length ?: 0) +
-                (event.nameChunk?.length ?: 0)
+              // Finding #5 first-chunk-wins: id/name winners are the first
+              // non-empty chunk only (same rule as ChatCompletionsMapper);
+              // repeats contribute 0 and are never appended. Args stay
+              // full-volume.
+              val bufferedArgs = toolArgText[event.toolIndex]?.length ?: 0
+              val bufferedId = toolIdText[event.toolIndex]?.length ?: 0
+              val bufferedName = toolNameText[event.toolIndex]?.length ?: 0
+              val idIncoming =
+                if (event.idChunk != null && event.idChunk.isNotEmpty() && bufferedId == 0) {
+                  event.idChunk.length
+                } else {
+                  0
+                }
+              val nameIncoming =
+                if (event.nameChunk != null && event.nameChunk.isNotEmpty() && bufferedName == 0) {
+                  event.nameChunk.length
+                } else {
+                  0
+                }
+              val toolIncoming = event.argsChunk.length + idIncoming + nameIncoming
               if (!distinctToolIndexes.contains(event.toolIndex)) {
                 requireToolCountBudget(distinctToolIndexes.size + 1)
                 distinctToolIndexes.add(event.toolIndex)
               }
               requireToolAggBudget(
-                (toolArgText[event.toolIndex]?.length ?: 0) +
-                  (toolIdText[event.toolIndex]?.length ?: 0) +
-                  (toolNameText[event.toolIndex]?.length ?: 0),
+                bufferedArgs + bufferedId + bufferedName,
                 toolIncoming,
               )
               requireTotalToolAggBudget(totalToolAggChars, toolIncoming)
               toolArgText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
-              event.idChunk?.let {
-                if (it.isNotEmpty()) toolIdText.getOrPut(event.toolIndex) { StringBuilder() }.append(it)
+              if (idIncoming > 0) {
+                toolIdText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.idChunk!!)
               }
-              event.nameChunk?.let {
-                if (it.isNotEmpty()) toolNameText.getOrPut(event.toolIndex) { StringBuilder() }.append(it)
+              if (nameIncoming > 0) {
+                toolNameText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.nameChunk!!)
               }
               totalToolAggChars += toolIncoming
             }
             is StreamEvent.ToolDone -> {
+              // Final guard (Finding #4): a direct ToolDone that never went
+              // through delta budgeting must still fit the per-call budget
+              // before any marker/transcript side effect. Throws typed
+              // AGG_TOO_LARGE; the catch below turns it into the typed
+              // terminal with no marker and no transcript record.
+              requireToolAggBudget(
+                0,
+                event.id.length + event.name.length + event.argumentsJson.length,
+              )
               toolDoneSeen.add(event.toolIndex)
               appendAssistantText(attemptRunId, "\n[tool:${event.name} ${event.argumentsJson}]")
               fireTranscript {

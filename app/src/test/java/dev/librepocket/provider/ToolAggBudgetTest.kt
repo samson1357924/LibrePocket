@@ -493,4 +493,105 @@ class ToolAggBudgetTest {
         assertEquals(3, dones.size)
         dones.forEach { assertEquals(2_000, it.argumentsJson.length) }
     }
+
+    // ---- Stage C Finding #4/#5: Responses overwrite guard + first-wins ----
+
+    @Test
+    fun responsesDoneReviewCounterexampleThrowsWithoutEmit() {
+        // Review counterexample: 200k id + 120k args + 60k name = 380k chars
+        // (x3 = 1.14 MiB) must fail as one terminal candidate, with no emit
+        // and no agg mutation.
+        val mapper = ResponsesMapper()
+        val bigId = "i".repeat(200_000)
+        val bigName = "n".repeat(60_000)
+        val bigArgs = "a".repeat(120_000)
+        val failure = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$bigId","name":"$bigName","arguments":"$bigArgs"}}""",
+            )
+        }
+        assertAggOverflow(failure)
+    }
+
+    @Test
+    fun responsesDoneOverwriteLegalEmitsNewValues() {
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.output_item.added","item_id":"it1","item":{"type":"function_call","call_id":"old-id","name":"old-name"}}""",
+        )
+        val out = mapper.mapPayload(
+            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"new-id","name":"new-name","arguments":"{}"}}""",
+        )
+        val done = out.filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals("new-id", done.id)
+        assertEquals("new-name", done.name)
+        assertEquals("{}", done.argumentsJson)
+    }
+
+    @Test
+    fun responsesDoneIgnoresFullWhenArgsPresentNoDoubleCount() {
+        // Deltas already hold 1k args; a hostile 400k terminal full must be
+        // ignored (not appended, not budgeted) when args are non-empty.
+        val mapper = ResponsesMapper()
+        mapper.mapPayload("""{"type":"response.function_call_arguments.delta","item_id":"it1","delta":"${"x".repeat(1_000)}"}""")
+        val big = "y".repeat(400_000)
+        val out = mapper.mapPayload(
+            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c1","name":"f","arguments":"$big"}}""",
+        )
+        val done = out.filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals(1_000, done.argumentsJson.length)
+        assertTrue(done.argumentsJson.all { it == 'x' })
+    }
+
+    @Test
+    fun responsesFailedDoneLeavesNoPoisonForFinish() {
+        // Legal delta first; oversized terminal throws without mutating agg;
+        // a later finishPendingTools path (via response.completed) must emit
+        // only the prior legal state, never the poisoned payload.
+        val mapper = ResponsesMapper()
+        mapper.mapPayload(
+            """{"type":"response.output_item.added","item_id":"it1","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
+        )
+        mapper.mapPayload("""{"type":"response.function_call_arguments.delta","item_id":"it1","delta":"{}"}""")
+        val bigId = "i".repeat(200_000)
+        // agg.args already "{}" so terminal arguments are ignored (useFull=false);
+        // overflow must come from metadata alone: 200k+150k+2=350002 chars > 349525.
+        val bigName = "n".repeat(150_000)
+        val bigArgs = "a".repeat(120_000)
+        try {
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$bigId","name":"$bigName","arguments":"$bigArgs"}}""",
+            )
+            fail("expected typed TOOL_ARGS_TOO_LARGE ProviderFailure")
+        } catch (e: ProviderFailure) {
+            assertAggOverflow(e)
+        }
+        // Poison never entered agg: completing the stream recovers the legal
+        // pending tool, not the oversized terminal.
+        val tail = mapper.mapPayload("""{"type":"response.completed","response":{"output":[]}}""")
+        val done = tail.filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals("c1", done.id)
+        assertEquals("f", done.name)
+        assertEquals("{}", done.argumentsJson)
+    }
+
+    @Test
+    fun responsesAddedResendMetadataStaysSingleCopy() {
+        // N=10000 resends of the same id/name must not throw and must not
+        // grow the aggregate (first-wins: incoming 0 once buffered).
+        val mapper = ResponsesMapper()
+        repeat(10_000) {
+            mapper.mapPayload(
+                """{"type":"response.output_item.added","item_id":"it1","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
+            )
+        }
+        mapper.mapPayload("""{"type":"response.function_call_arguments.delta","item_id":"it1","delta":"{}"}""")
+        val out = mapper.mapPayload(
+            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
+        )
+        val done = out.filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals("c1", done.id)
+        assertEquals("f", done.name)
+        assertEquals("{}", done.argumentsJson)
+    }
 }

@@ -404,4 +404,69 @@ class TurnControllerAggBudgetTest {
       // expected
     }
   }
+
+  // ---- Stage C Finding #4/#5: ToolDone guard + first-chunk-wins ----
+
+  @Test fun directOversizedToolDoneFailsTypedWithoutMarkerOrTranscript() {
+    val bigArgs = "x".repeat(400_000)
+    val provider = AggFakeProvider {
+      flow {
+        emit(StreamEvent.ToolDone(0, "c1", "f", bigArgs))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = AggRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      val error = c.uiState.value.error.orEmpty()
+      assertTrue("typed overflow expected, got: $error", error.contains(TOOL_ARGS_TOO_LARGE))
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      var guard = 0
+      while (sink.failed.isEmpty()) {
+        if (++guard > 800) fail("timed out waiting for transcript failure")
+        Thread.sleep(10)
+      }
+      assertTrue(
+        "transcript must carry the typed reason, got: ${sink.failed.single()}",
+        sink.failed.single().contains(TOOL_ARGS_TOO_LARGE),
+      )
+      Thread.sleep(300)
+      assertTrue("oversized ToolDone must leave no transcript record", sink.tools.isEmpty())
+      val body = c.uiState.value.messages.filter { it.role == "assistant" }.single().text
+      assertFalse("oversized ToolDone must leave no marker, got: ${body.take(80)}", body.contains("[tool:"))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun toolDeltaMetadataResendStaysSingleCopy() {
+    // N=10000 resends of the same id/name must not throw (first-wins:
+    // repeats contribute 0) and the flushed record keeps a single copy.
+    val provider = AggFakeProvider {
+      flow {
+        repeat(10_000) { emit(StreamEvent.ToolDelta(0, "c1", "f", "")) }
+        emit(StreamEvent.ToolDelta(0, null, null, "{}"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = AggRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+      var guard = 0
+      while (sink.tools.isEmpty()) {
+        if (++guard > 800) fail("timed out waiting for tool record")
+        Thread.sleep(10)
+      }
+      val tool = sink.tools.single()
+      assertEquals("c1", tool.id)
+      assertEquals("f", tool.name)
+      assertEquals("{}", tool.args)
+    } finally {
+      c.close()
+    }
+  }
 }

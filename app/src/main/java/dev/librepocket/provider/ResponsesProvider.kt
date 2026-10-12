@@ -201,6 +201,13 @@ internal class ResponsesMapper(val round: Int = 0) {
                 val addedIncoming =
                     (if (addedId != null && agg.id.isEmpty()) addedId.length else 0) +
                         (if (addedName != null && agg.name.isEmpty()) addedName.length else 0)
+                // First-wins candidate check BEFORE write-back: buffered id/name
+                // already present make the incoming side 0, so resends never
+                // grow the aggregate (Finding #5).
+                requireToolAggBudget(
+                    agg.id.length + agg.name.length + agg.args.length,
+                    addedIncoming,
+                )
                 requireTotalToolAggBudget(totalAggChars, addedIncoming)
                 if (addedId != null && agg.id.isEmpty()) agg.id = addedId
                 if (addedName != null && agg.name.isEmpty()) agg.name = addedName
@@ -230,27 +237,33 @@ internal class ResponsesMapper(val round: Int = 0) {
                 val itemId = root.string("item_id") ?: item.string("id") ?: return emptyList()
                 if (!callsByItem.containsKey(itemId)) requireToolCountBudget(callsByItem.size + 1)
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
-                // A terminal full payload overwrites id/name: only genuine
-                // growth counts toward the monotonic round total (never a
-                // decrement on ToolDone arrival).
-                val oldIdLen = agg.id.length
-                val oldNameLen = agg.name.length
-                item.string("call_id")?.takeIf { it.isNotEmpty() }?.let { agg.id = it }
-                item.string("name")?.takeIf { it.isNotEmpty() }?.let { agg.name = it }
-                val idNameGrowth = (agg.id.length - oldIdLen).coerceAtLeast(0) +
-                    (agg.name.length - oldNameLen).coerceAtLeast(0)
-                requireTotalToolAggBudget(totalAggChars, idNameGrowth)
-                totalAggChars += idNameGrowth
-                item.string("arguments")?.let { full ->
-                    if (agg.args.isEmpty() && full.isNotEmpty()) {
-                        // A single terminal payload is bounded like fragments.
-                        requireToolAggBudget(agg.id.length + agg.name.length, full.length)
-                        requireTotalToolAggBudget(totalAggChars, full.length)
-                        totalAggChars += full.length
-                        agg.args.append(full)
-                    }
-                }
-                if (agg.id.isEmpty()) agg.id = "call_" + UUID.randomUUID().toString().take(8)
+                // Finding #4: terminal full payloads arrive without prior delta
+                // budgeting, so validate the whole candidate ToolDone BEFORE
+                // any write-back. Read into locals; throw AGG_TOO_LARGE with
+                // no emit and no agg mutation on overflow.
+                val newId = item.string("call_id")?.takeIf { it.isNotEmpty() }
+                val newName = item.string("name")?.takeIf { it.isNotEmpty() }
+                val full = item.string("arguments")
+                // args non-empty => terminal full is ignored (no double-count);
+                // otherwise the single terminal payload IS the args.
+                val useFull = agg.args.isEmpty() && !full.isNullOrEmpty()
+                var effectiveId = newId ?: agg.id
+                val effectiveName = newName ?: agg.name
+                val effectiveArgsLen = if (useFull) full!!.length else agg.args.length
+                if (effectiveId.isEmpty()) effectiveId = "call_" + UUID.randomUUID().toString().take(8)
+                val candidateTotal = effectiveId.length + effectiveName.length + effectiveArgsLen
+                // Whole-ToolDone per-call guard: catches terminal-only
+                // oversized payloads (e.g. 200k id + 60k name + 120k args).
+                requireToolAggBudget(0, candidateTotal)
+                // Round-total monotonic growth (never a decrement on arrival).
+                val oldBuffered = agg.id.length + agg.name.length + agg.args.length
+                val growth = (candidateTotal - oldBuffered).coerceAtLeast(0)
+                requireTotalToolAggBudget(totalAggChars, growth)
+                // All guards passed: single write-back, then emit.
+                agg.id = effectiveId
+                agg.name = effectiveName
+                if (useFull) agg.args.append(full!!)
+                totalAggChars += growth
                 emittedToolIds.add(agg.toolIndex to agg.id)
                 out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))
             }
@@ -305,6 +318,9 @@ internal class ResponsesMapper(val round: Int = 0) {
         for ((_, agg) in callsByItem) {
             if (agg.args.isNotEmpty() || agg.name.isNotEmpty()) {
                 if (agg.id.isEmpty()) agg.id = "call_" + UUID.randomUUID().toString().take(8)
+                // Terminal guard (Finding #4): whole pending ToolDone must fit
+                // the per-call budget before emit; fail-closed typed throw.
+                requireToolAggBudget(0, agg.id.length + agg.name.length + agg.args.length)
                 // Avoid double-emitting tools already closed via output_item.done:
                 // callers track ToolDone ids; duplicates collapse downstream by
                 // (toolIndex, id). Only emit when never emitted — mappers own

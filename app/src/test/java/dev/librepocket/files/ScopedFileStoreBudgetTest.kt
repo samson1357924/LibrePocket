@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.nio.file.DirectoryStream
 import java.nio.file.Files
@@ -68,12 +69,28 @@ class ScopedFileStoreBudgetTest {
         assertBudgeted({ store.read("huge.bin") }, FileBudgetCode.READ_TOO_LARGE)
     }
 
-    @Test fun readGrownAfterLengthCheckStillRejected() {
-        // 權威判定是串流 sentinel 而非 length() 快篩：用剛好壓線的小上限，
-        // 內容超限即拒（覆蓋「檢查後變大」的等價路徑）。
+    @Test fun readSentinelRejectsGrowthAfterStat() {
+        // review P3：舊 readGrownAfterLengthCheckStillRejected 以 64B 檔 + maxBytes=63
+        // 在 length() 預檢即拋，只重複覆蓋第一層（readOverCapRejectedWithoutTruncation
+        // 已覆蓋），不能證明 stat 後成長時 sentinel 仍生效。
+        // 本測試真正走 sentinel 路徑：磁碟小檔（10B，預檢 10<=16 通過）但經接縫
+        // 注入大串流（64B，模擬檢查後成長），權威判定必須拋 READ_TOO_LARGE。
+        // 舊碼對照論證：若刪掉 sentinel 只留 precheck，同輸入預檢通過後會直接回傳
+        // 64B 而不拋 → assertBudgeted 內 fail() 觸發 → 本測試 FAIL，證明覆蓋第二層。
         val store = ScopedFileStore(tempRoot())
-        store.write("edge.bin", ByteArray(64))
-        assertBudgeted({ store.read("edge.bin", maxBytes = 63) }, FileBudgetCode.READ_TOO_LARGE)
+        store.write("small.txt", ByteArray(10) { 1 })
+        val grown = ByteArray(64) { 2 }
+        val e = assertBudgeted(
+            { store.read("small.txt", maxBytes = 16) { ByteArrayInputStream(grown) } },
+            FileBudgetCode.READ_TOO_LARGE,
+        )
+        assertTrue(e.message!!.contains("16"))
+        // 對照：同接縫、同上限、串流恰等於上限 → 合法 EOF，必須成功（防 sentinel 誤判）。
+        val exact = ByteArray(16) { 3 }
+        assertEquals(
+            16,
+            store.read("small.txt", maxBytes = 16) { ByteArrayInputStream(exact) }.size,
+        )
     }
 
     // ---- write：有界冪等比對 ----

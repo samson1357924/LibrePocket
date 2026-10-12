@@ -5,6 +5,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.io.InputStream
 import java.nio.file.DirectoryIteratorException
 import java.nio.file.DirectoryStream
 import java.nio.file.Files
@@ -192,8 +193,28 @@ class ScopedFileStore(val root: File) {
      * `length()` 快篩只是建議值；權威判定是串流中的 `cap+1` sentinel
      * （檔在檢查後變大仍會被擋下），恰等於上限視為合法 EOF。
      * 回傳前重驗鏈上無連結（見類註解 TOCTOU 說明；雙重替換仍為殘餘風險）。
+     *
+     * 測試接縫：實際經由 [read] internal 多載委派（`open` 預設為
+     * [defaultOpenRead]，行為不變）；測試可注入「小檔大流」工廠，使
+     * `length()` 預檢通過但串流超限，確定性命中 sentinel（見
+     * ScopedFileStoreBudgetTest.readSentinelRejectsGrowthAfterStat）。
      */
-    fun read(relativePath: String, maxBytes: Int = MAX_READ_BYTES): ByteArray {
+    fun read(relativePath: String, maxBytes: Int = MAX_READ_BYTES): ByteArray =
+        read(relativePath, maxBytes, ::defaultOpenRead)
+
+    /**
+     * 測試接縫多載（生產經由 [read] 委派，預設行為不變）。
+     *
+     * - [open]：預設為 [defaultOpenRead]（`FileInputStream` 直開）；測試可注入
+     *   任意 [InputStream] 工廠，模擬 stat 後成長（磁碟小檔、串流大內容），
+     *   證明預檢通過後 sentinel 仍拒絕。預檢、`cap+1` 串流上限與回傳前重驗
+     *   皆在此多載內，公開函數僅一行情委派，不分叉。
+     */
+    internal fun read(
+        relativePath: String,
+        maxBytes: Int,
+        open: (File) -> InputStream,
+    ): ByteArray {
         require(maxBytes >= 1) { "maxBytes must be >= 1" }
         val target = resolve(relativePath)
         if (!target.isFile) throw FileNotFoundException(relativePath)
@@ -204,7 +225,7 @@ class ScopedFileStore(val root: File) {
             )
         }
         val cap = maxBytes.toLong() + 1
-        val bytes = FileInputStream(target).use { input ->
+        val bytes = open(target).use { input ->
             val out = ByteArrayOutputStream(minOf(cap, READ_CHUNK_BYTES.toLong()).toInt())
             val buf = ByteArray(READ_CHUNK_BYTES)
             var total = 0L
@@ -227,6 +248,9 @@ class ScopedFileStore(val root: File) {
         ensureNoSymlinkChain(safe, relativePath)
         return bytes
     }
+
+    /** 生產預設的讀檔開流（直開 [FileInputStream]）。 */
+    private fun defaultOpenRead(file: File): InputStream = FileInputStream(file)
 
     fun exists(relativePath: String): Boolean {
         val target = resolve(relativePath)

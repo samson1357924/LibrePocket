@@ -16,12 +16,14 @@ Status contract (never misreport as pass):
 - ``PARTIAL`` — at least one XML file is unreadable; counts cover the
   readable subset only.
 - ``INCOMPLETE`` — files exist but the totals cannot be trusted:
-  ``tests == 0``, a suite counter is not an integer, or any suite
+  ``tests == 0``, a suite counter is not an integer, any nested
+  ``<testsuite>`` (outer counters alone cannot prove completeness, so
+  any nesting forces ``INCOMPLETE``), or any suite
   counter contradicts its per-case detail (including ``skipped``
   mismatches). Only outermost suites are counted: a ``<testsuite>``
   root counts itself, a ``<testsuites>`` root counts its direct
   ``<testsuite>`` children; nested ``<testsuite>`` elements are ignored
-  with a warning (not ``INCOMPLETE`` by itself).
+  with a warning.
 - ``NO_RESULTS`` — no ``TEST-*.xml`` files found at all.
 
 Size contract: GitHub discards a step summary larger than 1 MiB, so the
@@ -113,7 +115,9 @@ def parse_junit_xml(paths: list) -> JUnitSummary:
 
     Only outermost suites are counted (a ``<testsuite>`` root counts
     itself; a ``<testsuites>`` root counts its direct ``<testsuite>``
-    children) so nested suites are never double-counted. Every outer
+    children) so nested suites are never double-counted. Any nested
+    suite forces ``INCOMPLETE`` (outer counters alone cannot prove
+    completeness). Every outer
     suite is checked for exact equality between its counters and its
     direct ``<testcase>`` detail; any mismatch is ``INCOMPLETE``.
     """
@@ -149,6 +153,7 @@ def parse_junit_xml(paths: list) -> JUnitSummary:
                     "nested <testsuite> elements under suite %r in %s ignored; "
                     "outermost-only counting applied" % (suite_name, path)
                 )
+                inconsistent = True
             exp_tests = exp_failures = exp_errors = exp_skipped = 0
             for attr in ("tests", "failures", "errors", "skipped"):
                 before = len(summary.warnings)

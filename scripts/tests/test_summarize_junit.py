@@ -322,7 +322,10 @@ class SummarizeJunitHarness(unittest.TestCase):
         summary = parse_junit_xml([path])
         # Outermost-only: the inner suite must not be double-counted.
         self.assertEqual(summary.tests, 1)
-        self.assertEqual(summary.status, "PASS")
+        # Nested suites force INCOMPLETE: outer counters alone cannot
+        # prove completeness.
+        self.assertEqual(summary.status, "INCOMPLETE")
+        self.assertNotEqual(summary.status, "PASS")
         self.assertTrue(
             any(
                 "nested" in warning and "outermost-only" in warning
@@ -331,8 +334,106 @@ class SummarizeJunitHarness(unittest.TestCase):
             "nested-suite warning missing: %r" % (summary.warnings,),
         )
         text = render_summary(summary, "play")
-        self.assertIn("Status: PASS", text)
+        self.assertIn("INCOMPLETE", text)
+        self.assertNotIn("all executed tests passed", text)
         self.assertIn("| tests | 1 |", text)
+
+    def test_nested_inner_failure_is_incomplete_never_pass(self) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<testsuite name="outer" tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase classname="o.K" name="t"/>'
+            '<testsuite name="inner" tests="1" failures="1" errors="0" skipped="0">'
+            '<testcase classname="i.K" name="t">'
+            '<failure message="inner boom">stack</failure>'
+            "</testcase></testsuite></testsuite>"
+        )
+        path = _write(self.tmp / "TEST-nested-failure.xml", xml)
+        summary = parse_junit_xml([path])
+        self.assertEqual(summary.tests, 1)
+        self.assertEqual(summary.status, "INCOMPLETE")
+        self.assertNotEqual(summary.status, "PASS")
+        self.assertNotEqual(summary.status, "FAIL")
+        self.assertTrue(
+            any(
+                "nested" in warning and "outermost-only" in warning
+                for warning in summary.warnings
+            ),
+            "nested-suite warning missing: %r" % (summary.warnings,),
+        )
+        text = render_summary(summary, "play")
+        self.assertIn("INCOMPLETE", text)
+        self.assertNotIn("all executed tests passed", text)
+
+    def test_nested_inner_skipped_is_incomplete(self) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<testsuite name="outer" tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase classname="o.K" name="t"/>'
+            '<testsuite name="inner" tests="1" failures="0" errors="0" skipped="1">'
+            '<testcase classname="i.K" name="t"><skipped/></testcase>'
+            "</testsuite></testsuite>"
+        )
+        path = _write(self.tmp / "TEST-nested-skipped.xml", xml)
+        summary = parse_junit_xml([path])
+        self.assertEqual(summary.tests, 1)
+        self.assertEqual(summary.status, "INCOMPLETE")
+        self.assertNotEqual(summary.status, "PASS")
+        self.assertTrue(
+            any(
+                "nested" in warning and "outermost-only" in warning
+                for warning in summary.warnings
+            ),
+            "nested-suite warning missing: %r" % (summary.warnings,),
+        )
+
+    def test_nested_inner_error_is_incomplete(self) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<testsuite name="outer" tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase classname="o.K" name="t"/>'
+            '<testsuite name="inner" tests="1" failures="0" errors="1" skipped="0">'
+            '<testcase classname="i.K" name="t">'
+            '<error message="inner error">stack</error>'
+            "</testcase></testsuite></testsuite>"
+        )
+        path = _write(self.tmp / "TEST-nested-error.xml", xml)
+        summary = parse_junit_xml([path])
+        self.assertEqual(summary.tests, 1)
+        self.assertEqual(summary.status, "INCOMPLETE")
+        self.assertNotEqual(summary.status, "PASS")
+        self.assertTrue(
+            any(
+                "nested" in warning and "outermost-only" in warning
+                for warning in summary.warnings
+            ),
+            "nested-suite warning missing: %r" % (summary.warnings,),
+        )
+
+    def test_nested_under_testsuites_root_is_incomplete(self) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<testsuites>"
+            '<testsuite name="outer" tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase classname="o.K" name="t"/>'
+            '<testsuite name="inner" tests="1" failures="1" errors="0" skipped="0">'
+            '<testcase classname="i.K" name="t">'
+            '<failure message="inner boom">stack</failure>'
+            "</testcase></testsuite></testsuite>"
+            "</testsuites>"
+        )
+        path = _write(self.tmp / "TEST-nested-suites-root.xml", xml)
+        summary = parse_junit_xml([path])
+        self.assertEqual(summary.tests, 1)
+        self.assertEqual(summary.status, "INCOMPLETE")
+        self.assertNotEqual(summary.status, "PASS")
+        self.assertTrue(
+            any(
+                "nested" in warning and "outermost-only" in warning
+                for warning in summary.warnings
+            ),
+            "nested-suite warning missing: %r" % (summary.warnings,),
+        )
 
     def test_giant_warnings_never_exceed_budget(self) -> None:
         path = _write(self.tmp / "TEST-clean.xml", _passing_suite(tests=1))

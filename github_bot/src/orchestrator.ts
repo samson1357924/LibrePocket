@@ -558,8 +558,9 @@ function windowHunkLines(hunk: SynthesisHunk, targetLine: number | undefined, co
 }
 
 // F5: head sample + evidence-anchored snippets within the fixed total
-// budget. Anchors that cannot be resolved or no longer fit are recorded in
-// omittedAnchors (surfaced in the prompt plan) instead of silently dropped.
+// budget. Anchors that cannot be resolved, fall outside the review-eligible
+// set (G1), or no longer fit are recorded in omittedAnchors (surfaced in the
+// prompt plan) instead of silently dropped.
 export function buildSynthesisExcerpt(input: {
   diff: string;
   fileDiffs: Map<string, string>;

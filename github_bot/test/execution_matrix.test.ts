@@ -1742,7 +1742,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
           synthesis: { modelUsed: 'not-run', verdict: 'INCONCLUSIVE', skipped: true },
         }),
         undefined,
-        'F3 APPROVE paired with skipped synthesis rejects',
+        'F3/G4 APPROVE paired with skipped synthesis rejects',
       );
       assert.ok(
         validateReviewOutput({

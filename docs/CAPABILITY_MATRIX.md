@@ -29,7 +29,7 @@
 | Backup | manifest 設 `allowBackup=true`；XML rules 排除 key-specific paths | transcript、preferences、audit 都不會進入 Android backup |
 | ScopedFileStore | 根鏈+段鏈 NOFOLLOW 全驗（declared/implemented，未 wired）；單線程毒根/段內連結確定性拒絕 | 已消除併發 symlink escapes；JSONL 是 canonical store；有裝置實證 |
 | Direct shell executable | `ShellExecutables.resolve`＋`RestrictedShell` 有實作，正/負向 JVM 測試存在 | 已在指定裝置/API 實跑驗證（含 toybox/APEX、`isWritable` 真實語義）或可上線啟用 |
-| 語音 UI 手勢直連 | `ChatScreen` 直連系統引擎：使用者逐次手勢 + 同名開關（`voice_input`/`voice_output`）門禁；引擎失敗經 `voiceError` 可觀察；引擎資料處理已揭露 | 直連等同政策授權；模型可經工具鏈執行語音（模型側 `executionReady=false` 維持未啟用） |
+| 語音 UI 手勢直連 | `ChatScreen` 直連系統引擎：使用者逐次手勢 + DataStore 持久化同名開關（`voice_input`/`voice_output`，設定頁可切、關閉隱藏入口）；朗讀首次內聯確認（只問一次）；引擎失敗經分離的 `sttError`／`ttsError` 可觀察；引擎資料處理已揭露 | 直連等同政策授權；模型可經工具鏈執行語音（模型側 `executionReady=false` 維持未啟用） |
 
 `foss` 和 `github` 在某些 source/service 形狀上相似，不代表依賴、bridge 或能力相同。Flavor distribution/source-of-truth 見 [README](../README.md)、[Architecture](ARCHITECTURE.md) 與 [Threat Model](THREAT_MODEL.md)。
 

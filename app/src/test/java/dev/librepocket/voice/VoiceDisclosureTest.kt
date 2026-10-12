@@ -61,6 +61,22 @@ class VoiceDisclosureTest {
         assertFalse(VoiceTts.ENGINE_DISCLOSURE.contains("本地"))
     }
 
+    // ---- 首次揭露確認（#2 行為，不釘原始碼字串） ----
+
+    @Test fun unacknowledged_requiresInlineConfirmation() {
+        assertTrue(VoiceTts.requiresTtsConfirmation(false))
+    }
+
+    @Test fun acknowledged_skipsConfirmation() {
+        assertFalse(VoiceTts.requiresTtsConfirmation(true))
+    }
+
+    @Test fun confirmMessage_carriesEngineDisclosureSemantics() {
+        val msg = VoiceTts.ttsConfirmMessage()
+        assertTrue("msg=$msg", msg.contains(VoiceTts.ENGINE_DISCLOSURE))
+        assertTrue("msg=$msg", msg.contains("朗讀"))
+    }
+
     // ---- ChatScreen 接線（原始碼釘選） ----
 
     /** 單測工作目錄（模組 dir）出發，向上走最多 5 層找原始碼。 */
@@ -89,15 +105,17 @@ class VoiceDisclosureTest {
     }
 
     @Test fun chatScreen_speakerFailureIsObservable() {
-        // VoiceSpeaker 的失敗通道接到 voiceError（UI 可顯示），不再靜默。
+        // VoiceSpeaker 的失敗通道接到 TTS 錯誤通道（UI 可顯示），不再靜默。
+        // #7：STT/TTS 已拆通道，失敗經 VoiceErrorState.onTtsFailure。
         val src = chatScreen()
-        assertTrue(src.contains("onError = { voiceError = it }"))
+        assertTrue(src.contains("onTtsFailure"))
     }
 
     @Test fun chatScreen_speakStaysSwitchGated() {
         // UI 直連仍受 voice_output 開關門禁（與投影層同 key；決策見 ARCHITECTURE）。
+        // #3：門禁判定已收斂進 VoiceTools.outputEnabled（同 key、同預設）。
         val src = chatScreen()
-        assertTrue(src.contains("SWITCH_OUTPUT"))
+        assertTrue(src.contains("VoiceTools.outputEnabled"))
         assertTrue(src.contains("showSpeak"))
     }
 

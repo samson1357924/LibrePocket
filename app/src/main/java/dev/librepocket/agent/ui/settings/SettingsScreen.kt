@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui.settings
 
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -19,10 +20,12 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.automation.AutomationSettingsState
+import dev.librepocket.voice.VoiceTools
 
 @Composable
 fun SettingsScreen(
@@ -43,6 +46,15 @@ fun SettingsScreen(
     automation: AutomationSettingsState? = null,
     onAutomationSwitch: (Boolean) -> Unit = {},
     onOpenSystemA11y: () -> Unit = {},
+    /**
+     * #3 語音開關（DataStore 持久化，單一真相源見 `VoiceSwitchStore`）：
+     * 預設皆開；關閉即隱藏聊天頁對應入口（mic 鈕／朗讀鈕，與投影層同 key）。
+     * 形狀仿無障礙自動化開關（checked + onCheckedChange 回調）。
+     */
+    voiceInputEnabled: Boolean = VoiceTools.SWITCH_INPUT_DEFAULT,
+    voiceOutputEnabled: Boolean = VoiceTools.SWITCH_OUTPUT_DEFAULT,
+    onVoiceInputSwitch: (Boolean) -> Unit = {},
+    onVoiceOutputSwitch: (Boolean) -> Unit = {},
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
     Column(
@@ -117,6 +129,36 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        // #3 語音開關（仿無障礙開關模式）：關閉即隱藏聊天頁對應入口。
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "語音輸入",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Switch(
+                                checked = voiceInputEnabled,
+                                onCheckedChange = onVoiceInputSwitch,
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "語音輸出",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Switch(
+                                checked = voiceOutputEnabled,
+                                onCheckedChange = onVoiceOutputSwitch,
+                            )
+                        }
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))

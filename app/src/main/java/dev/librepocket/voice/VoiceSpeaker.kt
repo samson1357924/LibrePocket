@@ -13,7 +13,9 @@ import java.util.UUID
  *
  * - 引擎：Android [TextToSpeech] API；實際語音引擎由裝置安裝／設定提供，其離線能力與資料處理方式各異；
  * - 佇列：首段 `QUEUE_FLUSH`，後續 `QUEUE_ADD`；
- * - 進度：掛載 [UtteranceProgressListener]（onStart/onDone 為 no-op；onError 轉送 [onError] 失敗通道）；
+ * - 進度：掛載 [UtteranceProgressListener]（onStart 為 no-op；onDone 經 [onDone]
+ *   發成功信號（供 UI 清除 TTS 錯誤，見 `VoiceErrorState.onTtsSuccess`）；
+ *   onError 轉送 [onError] 失敗通道）；
  *   掛載回傳 ERROR 或拋錯時經 [onError] 發出 LISTENER_FAILED 警告（非同步朗讀失敗可能無法觀測），但不 fail-closed，引擎仍可用；
  * - 分段：[VoiceTts.split] 每段最多 4000 字；
  * - 語言：`zh-TW` → `zh-CN` → 第一個列出的 `zh` voice（見 [VoiceTts.resolveLocale]）。
@@ -32,6 +34,8 @@ class VoiceSpeaker(
     appContext: Context,
     private val maxChunk: Int = VoiceTts.MAX_CHUNK_CHARS,
     private val onError: (String) -> Unit = {},
+    /** utterance 完成信號（已知 id＋當輪 epoch 才發；遲到／未知／terminal 後不發）。 */
+    private val onDone: () -> Unit = {},
 ) {
 
     private val context: Context = appContext.applicationContext
@@ -80,7 +84,9 @@ class VoiceSpeaker(
                 val listenerStatus =
                     engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) = Unit
-                        override fun onDone(utteranceId: String?) = Unit
+                        override fun onDone(utteranceId: String?) {
+                            reportUtteranceDone(utteranceId)
+                        }
                         @Deprecated("Deprecated in Java")
                         override fun onError(utteranceId: String?) {
                             reportUtteranceError(utteranceId)
@@ -307,10 +313,40 @@ class VoiceSpeaker(
         }
     }
 
+    /**
+     * Utterance 完成轉送成功通道。同一臨界區內完成「id 存在＋epoch 相符」
+     * 校驗，emit 在鎖外。terminal 後、stop／shutdown 後（epoch 不符）、
+     * 未知／空 id 的遲到回呼一律不發（與 [reportUtteranceError] 同 fence；
+     * 清除為冪等，故不做同 id 去重）。
+     */
+    private fun reportUtteranceDone(utteranceId: String?) {
+        val shouldEmit = synchronized(lifecycleLock) {
+            if (terminal) {
+                false
+            } else if (utteranceId == null) {
+                false
+            } else {
+                val epoch = utteranceEpochs[utteranceId] ?: return@synchronized false
+                epoch == speechEpoch
+            }
+        }
+        if (shouldEmit) {
+            emitDone()
+        }
+    }
+
     /** 失敗通道出口（鎖外呼叫；listener 本體異常不回拋，避免壞掉引擎回呼執行緒）。 */
     private fun emitError(message: String) {
         try {
             onError(message)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 成功通道出口（語義同 [emitError]）。 */
+    private fun emitDone() {
+        try {
+            onDone()
         } catch (_: Exception) {
         }
     }

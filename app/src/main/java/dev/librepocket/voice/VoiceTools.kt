@@ -50,4 +50,16 @@ object VoiceTools {
 
     /** 送雲（Azure）前的正文收斂：雲端只收已遮罩文字。 */
     fun redactForCloud(text: String): String = Redactor.redact(text).text
+
+    /**
+     * UI 門禁共用判定（#3，Stage3）：與 `ToolRegistry` 投影同 key、同預設，
+     * 缺鍵即預設值。`ChatScreen` 與 `ProjectionContext` 皆經此讀開關，
+     * 開關關閉即隱藏對應入口。
+     */
+    fun inputEnabled(switches: Map<String, Boolean>): Boolean =
+        switches.getOrDefault(SWITCH_INPUT, SWITCH_INPUT_DEFAULT)
+
+    /** 見 [inputEnabled]（`voice_output` 預設開）。 */
+    fun outputEnabled(switches: Map<String, Boolean>): Boolean =
+        switches.getOrDefault(SWITCH_OUTPUT, SWITCH_OUTPUT_DEFAULT)
 }

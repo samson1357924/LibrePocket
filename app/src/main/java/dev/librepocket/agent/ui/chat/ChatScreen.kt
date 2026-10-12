@@ -62,6 +62,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.tool.DenyReason
+import dev.librepocket.voice.VoiceErrorState
 import dev.librepocket.voice.VoiceStt
 import dev.librepocket.voice.VoiceSpeaker
 import dev.librepocket.voice.VoiceTools
@@ -90,9 +91,13 @@ fun ChatScreen(
     onOpenSettings: () -> Unit = {},
     onTurnFinished: () -> Unit = {},
     // M2 語音開關（與 ProjectionContext 同源：同 key、同預設，缺鍵即預設值）。
-    // 呼叫方（持久化開關落地後）傳入使用者開關快照；預設空 map 即全預設值
-    // （voice_input/voice_output 預設開）。mic 鈕與朗讀鈕按此顯隱。
+    // 呼叫方（MainScreen 經 VoiceSwitchStore 持久化快照）傳入使用者開關；
+    // 預設空 map 即全預設值（voice_input/voice_output 預設開）。
+    // mic 鈕與朗讀鈕按此顯隱。
     userSwitches: Map<String, Boolean> = emptyMap(),
+    // #2 朗讀首次揭露確認（持久化，只問一次）：未確認前朗讀鈕先顯示內聯確認。
+    ttsAcknowledged: Boolean = false,
+    onTtsAcknowledged: () -> Unit = {},
 ) {
     val session by viewModel.sessionState.collectAsStateWithLifecycle()
     val messages by viewModel.messages.collectAsStateWithLifecycle()
@@ -103,23 +108,39 @@ fun ChatScreen(
     val streaming = session.status == ChatStatus.STREAMING
     var wasActive by remember { mutableStateOf(false) }
 
-    val inputEnabled = userSwitches.getOrDefault(VoiceTools.SWITCH_INPUT, VoiceTools.SWITCH_INPUT_DEFAULT)
-    val outputEnabled = userSwitches.getOrDefault(VoiceTools.SWITCH_OUTPUT, VoiceTools.SWITCH_OUTPUT_DEFAULT)
+    val inputEnabled = VoiceTools.inputEnabled(userSwitches)
+    val outputEnabled = VoiceTools.outputEnabled(userSwitches)
 
     // S2 系統 STT（優先）+ 系統 TTS（優先）：零新權限。
-    // TTS 引擎失敗（無引擎／初始化／語言／朗讀）經 speaker onError → voiceError 顯示。
+    // #7 雙錯誤通道（各管各的）：STT 失敗經 onSttFailure → sttError 顯示，
+    // STT 成功只清 sttError；TTS 引擎失敗（無引擎／初始化／語言／朗讀）
+    // 經 speaker onError → ttsError 顯示，新 speak 發起／TTS 成功／
+    // voice_output 關閉時清除（見 VoiceErrorState）。
     val context = LocalContext.current
-    var voiceError by remember { mutableStateOf<String?>(null) }
+    val voiceErrors = remember { VoiceErrorState() }
+    // #2 朗讀確認中文字（null 即無待確認朗讀；單一待確認位，後按覆蓋前按）。
+    var pendingSpeakText by remember { mutableStateOf<String?>(null) }
     // M2 延遲建構：voice_output 關閉時不初始化 TTS 引擎（不佔系統服務）。
     val speaker: VoiceSpeaker? = remember(context, outputEnabled) {
         if (outputEnabled) {
-            VoiceSpeaker(context.applicationContext, onError = { voiceError = it })
+            VoiceSpeaker(
+                context.applicationContext,
+                onError = { voiceErrors.onTtsFailure(it) },
+                onDone = { voiceErrors.onTtsSuccess() },
+            )
         } else {
             null
         }
     }
     DisposableEffect(speaker) {
         onDispose { speaker?.shutdown() }
+    }
+    // voice_output 關閉：TTS 通道消失，清 tts 錯誤與待確認朗讀。
+    LaunchedEffect(outputEnabled) {
+        if (!outputEnabled) {
+            voiceErrors.onOutputDisabled()
+            pendingSpeakText = null
+        }
     }
     val sttLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -128,10 +149,10 @@ fun ChatScreen(
             val candidates = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
             val text = VoiceStt.pickResult(candidates)
             if (text != null) {
-                voiceError = null
+                voiceErrors.onSttSuccess()
                 viewModel.prefill(text)
             } else {
-                voiceError = VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_EMPTY_RESULT)
+                voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_EMPTY_RESULT))
             }
         }
         // 非 OK（使用者取消）維持手動輸入，不報錯。
@@ -152,7 +173,7 @@ fun ChatScreen(
             } else {
                 VoiceStt.DETAIL_NO_SERVICE
             }
-            voiceError = VoiceStt.fallbackMessage(reason, detail)
+            voiceErrors.onSttFailure(VoiceStt.fallbackMessage(reason, detail))
             return
         }
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -163,7 +184,7 @@ fun ChatScreen(
         try {
             sttLauncher.launch(intent)
         } catch (_: Exception) {
-            voiceError = VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE)
+            voiceErrors.onSttFailure(VoiceStt.fallbackMessage(DenyReason.NO_PRIVILEGE, VoiceStt.DETAIL_NO_SERVICE))
         }
     }
 
@@ -234,11 +255,19 @@ fun ChatScreen(
             ) {
                 items(messages, key = { it.id }) { msg ->
                     // M2：voice_output 關閉時隱藏朗讀鈕（與投影層同開關）；speaker
-                    // 為 null（延遲建構）時 onSpeak 為 no-op；引擎失敗經 onError
-                    // 進 voiceError 顯示（見 VoiceSpeaker 失敗通道）。
+                    // 為 null（延遲建構）時直接不送引擎；引擎失敗經 onError
+                    // 進 ttsError 顯示（見 VoiceSpeaker 失敗通道）。
+                    // #2：未確認前先記下待朗讀文字、顯示內聯確認，確認後才 speak。
                     MessageBubble(
                         msg,
-                        onSpeak = { speaker?.speak(it) },
+                        onSpeak = {
+                            voiceErrors.onSpeakStarted()
+                            if (VoiceTts.requiresTtsConfirmation(ttsAcknowledged)) {
+                                pendingSpeakText = it
+                            } else {
+                                speaker?.speak(it)
+                            }
+                        },
                         showSpeak = outputEnabled,
                     )
                 }
@@ -338,13 +367,51 @@ fun ChatScreen(
             }
         }
 
-        voiceError?.let {
+        // #7 雙錯誤通道分別顯示（STT／TTS 各管各的，不互相清除）。
+        voiceErrors.sttError?.let {
             Text(
                 text = it,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(horizontal = 16.dp),
             )
+        }
+
+        voiceErrors.ttsError?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+        }
+
+        // #2 朗讀內聯確認（首次可見揭露：視力用戶不需進設定頁即可看到；
+        // 既有朗讀鈕 contentDescription 保留）。確認後持久化，只問一次。
+        pendingSpeakText?.let { text ->
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp),
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        text = VoiceTts.ttsConfirmMessage(),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                onTtsAcknowledged()
+                                pendingSpeakText = null
+                                speaker?.speak(text)
+                            },
+                        ) { Text("朗讀") }
+                        TextButton(onClick = { pendingSpeakText = null }) { Text("取消") }
+                    }
+                }
+            }
         }
 
         // Bottom input bar (ChatGPT/Gemini style).

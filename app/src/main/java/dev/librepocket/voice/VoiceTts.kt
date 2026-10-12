@@ -36,6 +36,20 @@ object VoiceTts {
     /** 朗讀鈕無障礙文案：動作 + 引擎揭露（ChatScreen 引用此常數，不手寫字串）。 */
     const val SPEAK_BUTTON_DESCRIPTION = "朗讀（" + ENGINE_DISCLOSURE + "）"
 
+    /**
+     * 首次朗讀內聯確認門（#2，Stage3）：尚未持久化確認前，朗讀鈕首次點擊
+     * 先顯示內聯可見確認（文案見 [ttsConfirmMessage]），確認後才送引擎；
+     * 確認狀態經 `VoiceSwitchStore` 持久化，只問一次。
+     */
+    fun requiresTtsConfirmation(acknowledged: Boolean): Boolean = !acknowledged
+
+    /**
+     * 內聯確認文案：引用 [ENGINE_DISCLOSURE] 同語義（ChatScreen 確認列用此，
+     * 不手寫字串；視力用戶不需進設定頁即可看到）。
+     */
+    fun ttsConfirmMessage(): String =
+        "朗讀由" + ENGINE_DISCLOSURE + "。確定要朗讀此則訊息嗎？"
+
     val PREFERRED_TW: Locale = Locale.forLanguageTag("zh-TW")
     val PREFERRED_CN: Locale = Locale.forLanguageTag("zh-CN")
 

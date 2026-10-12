@@ -60,6 +60,8 @@ import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
 import dev.librepocket.shell.PrivilegeBridgeState
+import dev.librepocket.voice.VoiceSwitchStore
+import dev.librepocket.voice.VoiceTools
 import kotlinx.coroutines.launch
 
 object Routes {
@@ -89,6 +91,13 @@ fun MainScreen(
     val gateLoading = gate is EndpointGate.Loading
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
+
+    // #3 語音開關真相源（VoiceSwitchStore，DataStore 持久化）：同一快照同時
+    // 餵給 ChatScreen 門禁（userSwitches）與設定頁開關顯示；tool 投影未來
+    // 接線時以前述同一 map 為 ProjectionContext.userSwitches（同 key、同預設）。
+    val voiceStore = remember(app) { VoiceSwitchStore(app) }
+    val voiceSwitches by voiceStore.observeSwitches().collectAsStateWithLifecycle(initialValue = emptyMap())
+    val ttsAcknowledged by voiceStore.observeTtsAcknowledged().collectAsStateWithLifecycle(initialValue = false)
 
     // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
@@ -271,6 +280,13 @@ fun MainScreen(
                             viewModel = chatViewModel,
                             onOpenSettings = { goSetupForEdit() },
                             onTurnFinished = { sessionListViewModel.refresh() },
+                            userSwitches = voiceSwitches,
+                            ttsAcknowledged = ttsAcknowledged,
+                            onTtsAcknowledged = {
+                                scope.launch {
+                                    runCatching { voiceStore.acknowledgeTtsDisclosure() }
+                                }
+                            },
                         )
                     }
                     composable(Routes.SETTINGS) {
@@ -288,6 +304,18 @@ fun MainScreen(
                                 privilegeAuditCount = privilegeState.auditCount()
                             },
                             privilegeAuditCount = privilegeAuditCount,
+                            voiceInputEnabled = VoiceTools.inputEnabled(voiceSwitches),
+                            voiceOutputEnabled = VoiceTools.outputEnabled(voiceSwitches),
+                            onVoiceInputSwitch = { enabled ->
+                                scope.launch {
+                                    runCatching { voiceStore.setInputEnabled(enabled) }
+                                }
+                            },
+                            onVoiceOutputSwitch = { enabled ->
+                                scope.launch {
+                                    runCatching { voiceStore.setOutputEnabled(enabled) }
+                                }
+                            },
                         )
                     }
                     composable(Routes.SETUP) {

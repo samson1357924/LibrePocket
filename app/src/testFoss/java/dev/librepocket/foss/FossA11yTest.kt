@@ -5,9 +5,11 @@ import dev.librepocket.agent.foss.FossAccessibilityService
 import dev.librepocket.agent.foss.FossGateDecision
 import dev.librepocket.automation.A11yAction
 import dev.librepocket.guard.ArbitrationCode
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /**
@@ -15,6 +17,18 @@ import org.junit.Test
  * 與 github 側同語義的仲裁前攔截 + 預設關。
  */
 class FossA11yTest {
+
+    @Before fun resetGlobalState() {
+        FossA11yState.switchOn = false
+        FossA11yState.serviceGranted = false
+        FossA11yState.clockMs = System::currentTimeMillis
+        FossA11yState.clearConfirmation()
+        FossA11yState.lastCompressed = emptyList()
+    }
+
+    @After fun tearDown() {
+        resetGlobalState()
+    }
 
     @Test fun paymentDeleteSendForceConfirm() {
         val pay = FossAccessibilityService.gateAction("幫我轉帳 500 元", A11yAction.Tap("n1"))

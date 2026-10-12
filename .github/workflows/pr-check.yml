@@ -49,7 +49,9 @@ jobs:
             policy:
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
+              - 'scripts/summarize_junit.py'
               - 'scripts/tests/test_apk_policy_check.py'
+              - 'scripts/tests/test_summarize_junit.py'
               - 'scripts/build_release.sh'
               - 'scripts/verify_release_apk.py'
               - 'scripts/release_artifact_stage.py'
@@ -101,14 +103,68 @@ jobs:
             *) echo "unknown flavor: ${{ matrix.flavor }}"; exit 1 ;;
           esac
 
+      # 報告（非 gate）：flaky 取證要在 run 頁面直接可見——不必下載 artifact、
+      # 不必翻 job log。這一步只讀 JUnit XML（app/build/test-results/**/TEST-*.xml），
+      # 把 tests/failures/errors/skipped 總數、失敗的「類別.方法」（含 assertion
+      # 摘要第一行）與 skipped 清單寫進 $GITHUB_STEP_SUMMARY。真正的 gate 是
+      # pr-gate job，所以本 step 任何情況都 exit 0（no XML → NO_RESULTS 說明略過；
+      # 解析異常 → 記訊息後照常結束），絕不因報告失敗變紅。狀態行只在
+      # unreadable==0、tests>0、failures==0、errors==0 且明細一致時宣告
+      # PASS；其餘為 FAIL/PARTIAL/INCOMPLETE/NO_RESULTS。輸出以 UTF-8 bytes
+      # 計維持在 900 KiB 預算內，超額截斷並註記 omitted 數量。
+      # 解析實作在 scripts/summarize_junit.py（純函式，可被單測匯入），此處只保留
+      # 薄呼叫層與原有 fallback（summary_parser_crashed_fallback）。
+      - name: Summarize Unit Test Results (${{ matrix.flavor }})
+        # always()：測試失敗時後續 step 預設會被跳過，而失敗恰恰是 needs
+        # summary 的時刻，所以必須無條件執行。
+        if: always()
+        env:
+          FLAVOR: ${{ matrix.flavor }}
+        run: |
+          # parser 自己崩潰（語法錯誤、BaseException、python3 不存在）時 run 頁面
+          # 不可完全空白：fallback 必須同時具備
+          #   1) [ -n "${GITHUB_STEP_SUMMARY:-}" ] guard——變數為空時 >> "" 在
+          #      bash -e 下會讓 step 變紅，等於新增 exit 非 0 路徑；
+          #   2) printf 自身 || true、function 呼叫再 || true——fallback 失敗
+          #      也不得弄紅本 step（報告功能壞掉不是 gate 失敗）。
+          summary_parser_crashed_fallback() {
+            echo "WARN: summary parser crashed (ignored; reporting only, not a gate)"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              printf '%s\n' \
+                "### Unit test summary — ${FLAVOR:-?} flavor" \
+                "" \
+                "> **Summary parser crashed** before it could write a unit-test summary — see this job's log for the parser error (reporting only; the real gate is pr-gate)." \
+                "" >>"${GITHUB_STEP_SUMMARY}" || true
+            fi
+          }
+
+          python3 scripts/summarize_junit.py || summary_parser_crashed_fallback || true
+          echo "unit-test summary done (report only — real gate is pr-gate)"
+
       - name: Upload Test Reports
-        # cancelled（超時被砍）時也要上傳，否則下次仍是盲修。
-        if: failure() || cancelled()
+        # always()：綠燈 run 也要留存，才能做「同一測試方法跨 run 失敗率」統計
+        # 與 re-run 的 attempt 1 vs 2 比對（flaky 取證）；cancelled（超時被砍）
+        # 同理，盡力上傳（best-effort）——超時或取消時 runner 可能在 step 完成前被殺，
+        # always() 保證被排入執行，不保證一定完成。
+        # JUnit XML（app/build/test-results/）是逐測試方法的結構化資料，必須與
+        # HTML 報告一起留存——只留 HTML 無法跨 run 比對。
+        if: always()
+        # 避免 GitHub Actions artifact 後端暫時性抖動（如 502/短暫中斷）把「測試全綠」
+        # 的 job 打成 failure 誤判為紅燈。上傳報告是取證輔助，不應成為新的 flake 來源。
+        # 真正的 gate 是 pr-gate job（評估 unit-tests 的執行結果，不依賴 artifact）。
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: unit-test-reports-${{ matrix.flavor }}
-          path: app/build/reports/tests/
-          retention-days: 7
+          # run_attempt 後綴：同一 run re-run 時不會撞到 v4 的 artifact 重名錯誤。
+          name: unit-test-reports-${{ matrix.flavor }}-attempt-${{ github.run_attempt }}
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+          retention-days: 14
+          # 不設定 if-no-files-found：預設值 warn 只會在檔案不存在（路徑漂移）時
+          # 印一條 warning，不會 fail action——只有 error 才會失敗。這裡刻意保留
+          # 預設 warn 的診斷訊號：若設 ignore 等於靜默壓制「報告沒上傳」的警告。
+          # setup 階段失敗的紅燈由 pr-gate 決定，warn 不會額外多開一盞紅燈。
 
   lint:
     name: Android Lint Check
@@ -153,7 +209,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run APK policy and release-identity harnesses (stdlib only)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py
 
   build-and-policy-gate:
     name: Build & Policy Gates

@@ -1,11 +1,13 @@
 package dev.librepocket.mcp
 
 import dev.librepocket.keystore.KeyVault
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -159,9 +161,10 @@ class McpFuseTest {
             val arg = "{\"q\":\"" + secretArg + "\"}"
             val r = s.callTool("search", arg)
             assertEquals(McpStatus.OK, r.status)
-            val req = web.takeRequest()
+            val req = web.takeRequest(5, TimeUnit.SECONDS)
+            assertNotNull("expected request within 5s", req)
             // Token 只走標頭。
-            assertEquals("Bearer sekret-token-1", req.getHeader("Authorization"))
+            assertEquals("Bearer sekret-token-1", req!!.getHeader("Authorization"))
             val body = req.body.readUtf8()
             assertFalse("token leaked into body", body.contains("sekret-token-1"))
             // 原參數不進稽核。
@@ -189,9 +192,11 @@ class McpFuseTest {
             assertEquals(McpStatus.OK, good.status)
             assertEquals(listOf("search"), good.tools.map { it.name })
             // 端點形狀：POST /mcp（Streamable HTTP，不走 SSE）。
-            val first = web.takeRequest()
-            val second = web.takeRequest()
-            for (req in listOf(first, second)) {
+            val first = web.takeRequest(5, TimeUnit.SECONDS)
+            assertNotNull("expected first request within 5s", first)
+            val second = web.takeRequest(5, TimeUnit.SECONDS)
+            assertNotNull("expected second request within 5s", second)
+            for (req in listOf(first!!, second!!)) {
                 assertEquals("/mcp", req.path?.substringBefore("?"))
                 assertEquals("POST", req.method)
             }

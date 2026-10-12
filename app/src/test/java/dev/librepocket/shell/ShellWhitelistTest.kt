@@ -107,6 +107,12 @@ class ShellWhitelistTest {
         // systemOwned 模擬裝置不可寫（宿主 fixture 屬主可寫，見 TrustedExec 註解）；
         // 守衛存活另由 writableFixture_* 負向控制證明，非假綠。
         // 需 host `/bin/sh`（與 multicall fixture 同約束）；缺失則硬紅非跳過。
+        // 閾值理由（合併我方 hardening）：sleep 120 與 kill 上限明顯分離，若 kill
+        // 迴歸為自然等待 elapsed 會遠超上限；10s 約為正常路徑（~0.5–1s：500ms
+        // waitFor + destroyForcibly + gobbler join 上限 2×5s，兩個 stream 依序
+        // join）的 10 倍，CI 高負載不誤殺，但 kill 退化到 grace 全滿（約 15.5s =
+        // 0.5s wait + 5s destroy wait + 2×5s gobbler join）會被擋下。下界 400ms
+        // 證明真等待超時而非瞬時假回（fixture 迴圈忽略參數，120 僅表意圖）。
         val bin = Files.createTempDirectory("sleep-bin").toFile()
         val scope = Files.createTempDirectory("sleep-scope").toFile()
         try {
@@ -130,11 +136,11 @@ class ShellWhitelistTest {
                 execIsWritable = systemOwned,
             )
             val startMs = System.currentTimeMillis()
-            val result = shell.execute(listOf("sleep", "30"), timeoutMs = 500L)
+            val result = shell.execute(listOf("sleep", "120"), timeoutMs = 500L)
             val elapsedMs = System.currentTimeMillis() - startMs
             assertTrue("expected TimedOut, got $result", result is ShellResult.TimedOut)
             assertTrue("must actually wait for timeout (no instant fake): ${elapsedMs}ms", elapsedMs >= 400L)
-            assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 15_000L)
+            assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 10_000L)
         } finally {
             bin.deleteRecursively()
             scope.deleteRecursively()

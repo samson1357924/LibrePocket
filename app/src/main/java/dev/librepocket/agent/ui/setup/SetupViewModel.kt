@@ -1121,6 +1121,201 @@ class SetupViewModel(
     }
 
     /**
+     * Outcome of a pending-delete journal replay ([reconcilePendingDelete]).
+     *
+     * - `NO_OP`: no journal present; nothing to do (no vault I/O, no clear).
+     * - `COMMITTED`: the vault delete won and the fenced clear committed (the
+     *   journal was removed atomically with the clear).
+     * - `FAILED`: known-not-committed (vault delete failed, or the clear threw
+     *   and the probe still sees metadata at the same revision, including a
+     *   failed bounded retry). The journal is KEPT for the next replay.
+     * - `STALE`: a concurrent winner advanced the revision; the superseded
+     *   journal was discarded (best-effort, metadata untouched) and the winner
+     *   survives.
+     * - `UNKNOWN`: the strict re-read itself failed (or the journal is
+     *   malformed): no-touch, journal kept.
+     */
+    enum class PendingDeleteOutcome {
+        NO_OP,
+        COMMITTED,
+        FAILED,
+        STALE,
+        UNKNOWN,
+    }
+
+    /**
+     * Replays a crash/cancel-orphaned logout teardown journal (phase 1,
+     * Re-review #8 Finding 1 P1). Shared by the startup path
+     * ([launchPendingDeleteReconcile], called once from `MainScreen`) and the
+     * logout resume path below.
+     *
+     * Serialized against in-flight saves/logouts via [saveMutex] (same-VM,
+     * single-process only — same limits as [saveMutex] document). Strict read
+     * of (journal, config, revision) first: no journal → [PendingDeleteOutcome.NO_OP]
+     * (no vault I/O, no clear); malformed journal or read failure →
+     * [PendingDeleteOutcome.UNKNOWN] with no side effects (fail-closed,
+     * journal kept). Otherwise the idempotent `deleteKey(journal.alias)` runs
+     * (a delete failure reports [PendingDeleteOutcome.FAILED] with the journal
+     * kept and no clear attempted), then the fenced
+     * `clearIfRevision(journal.revision)` — which removes the journal in the
+     * SAME atomic edit on a win — with the same bounded probe + single same-rev
+     * retry discipline as the logout clear phase below.
+     *
+     * Cancellation: [PendingDeleteOutcome.COMMITTED] swallows the cancel to
+     * success (the teardown won; mirrors save committed-then-cancel); every
+     * other outcome rethrows with the journal kept and no `errorCode` stamped
+     * (callers map outcomes to UI codes; this function itself never touches
+     * [_form]).
+     *
+     * Bounded: one strict read + at most one retry clear; no loop, no storm.
+     */
+    suspend fun reconcilePendingDelete(): PendingDeleteOutcome {
+        return try {
+            saveMutex.withLock {
+                val pending = try {
+                    store.snapshotDeleteStateStrict().first
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // Read failure OR malformed journal: no-touch, keep journal.
+                    return@withLock PendingDeleteOutcome.UNKNOWN
+                } ?: return@withLock PendingDeleteOutcome.NO_OP
+                runPendingDeleteLocked(pending)
+            }
+        } catch (e: CancellationException) {
+            // runPendingDeleteLocked already swallowed the COMMITTED cancel to
+            // success inside; anything reaching here is uncommitted (or queued
+            // before the lock): rethrow with the journal kept.
+            throw e
+        }
+    }
+
+    /**
+     * Startup replay entry point: fire-and-forget [reconcilePendingDelete].
+     *
+     * Never throws out of scope (failures report [PendingDeleteOutcome.UNKNOWN]
+     * via [onDone] on [Dispatchers.Main] and keep the journal for the next
+     * logout retry); a cancelled scope rethrows without calling [onDone].
+     * Called once at composition from `MainScreen`.
+     */
+    fun launchPendingDeleteReconcile(onDone: (PendingDeleteOutcome) -> Unit = {}) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val outcome = try {
+                reconcilePendingDelete()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                PendingDeleteOutcome.UNKNOWN
+            }
+            withContext(Dispatchers.Main) { onDone(outcome) }
+        }
+    }
+
+    /**
+     * Journal replay core. Callers MUST hold [saveMutex].
+     *
+     * Idempotent vault delete first ([KeyVault.deleteKey] is a no-op remove
+     * for missing keys, so replaying an already-applied delete is safe), then
+     * the fenced clear which removes the journal atomically on a win. Cancel
+     * semantics: a cancel that still committed swallows to
+     * [PendingDeleteOutcome.COMMITTED]; any other cancel rethrows with the
+     * journal kept. Never touches [_form] (callers map outcomes).
+     */
+    private suspend fun runPendingDeleteLocked(pending: PendingDelete): PendingDeleteOutcome {
+        try {
+            vault().deleteKey(pending.alias)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Delete failed: no clear attempted, journal kept for replay.
+            return PendingDeleteOutcome.FAILED
+        }
+        try {
+            if (store.clearIfRevision(pending.revision)) {
+                return PendingDeleteOutcome.COMMITTED
+            }
+            // CAS loss: a concurrent winner advanced the revision. The journal
+            // is superseded — discard it without touching winner metadata.
+            discardSupersededJournal()
+            return PendingDeleteOutcome.STALE
+        } catch (e: CancellationException) {
+            val probe = withContext(NonCancellable) { probeLogoutClear(pending.revision) }
+            if (probe == LogoutClearProbe.COMMITTED) {
+                return PendingDeleteOutcome.COMMITTED
+            }
+            throw e
+        } catch (_: Exception) {
+            val probe: LogoutClearProbe = try {
+                withContext(NonCancellable) { probeLogoutClear(pending.revision) }
+            } catch (_: CancellationException) {
+                LogoutClearProbe.UNKNOWN
+            } catch (_: Exception) {
+                LogoutClearProbe.UNKNOWN
+            }
+            return when (probe) {
+                LogoutClearProbe.COMMITTED -> PendingDeleteOutcome.COMMITTED
+                LogoutClearProbe.STALE -> {
+                    discardSupersededJournal()
+                    PendingDeleteOutcome.STALE
+                }
+                LogoutClearProbe.UNKNOWN -> PendingDeleteOutcome.UNKNOWN
+                LogoutClearProbe.FAILED -> {
+                    val retried: Boolean? = try {
+                        withContext(NonCancellable) { store.clearIfRevision(pending.revision) }
+                    } catch (_: CancellationException) {
+                        null
+                    } catch (_: Exception) {
+                        null
+                    }
+                    when (retried) {
+                        true -> PendingDeleteOutcome.COMMITTED
+                        false -> {
+                            discardSupersededJournal()
+                            PendingDeleteOutcome.STALE
+                        }
+                        // Retry transport still broken, but the probe already
+                        // established metadata-present-at-same-rev:
+                        // known-not-committed, journal kept.
+                        null -> PendingDeleteOutcome.FAILED
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Best-effort discard of a superseded journal (STALE path only).
+     *
+     * Removes ONLY the journal key: winner metadata and the revision survive
+     * byte-for-byte. A transport failure keeps the journal (the next replay
+     * re-classifies STALE and retries the discard); cancellation rethrows.
+     */
+    private suspend fun discardSupersededJournal() {
+        try {
+            store.removePendingDelete()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Retained for the next replay; the STALE report below still holds
+            // (the winner survived regardless of this best-effort cleanup).
+        }
+    }
+
+    /** Maps a resume-path reconcile outcome to (committed, errorCode). */
+    private fun reconcileOutcomeToLogout(outcome: PendingDeleteOutcome): Pair<Boolean, String?> =
+        when (outcome) {
+            PendingDeleteOutcome.COMMITTED -> true to null
+            PendingDeleteOutcome.STALE -> false to "LOGOUT_STALE"
+            // Resume-path FAILED/UNKNOWN collapse delete/clear failures to the
+            // retryable clear code (both keep the journal for the next replay;
+            // the fresh path below still distinguishes LOGOUT_DELETE_FAILED).
+            PendingDeleteOutcome.FAILED,
+            PendingDeleteOutcome.UNKNOWN,
+            PendingDeleteOutcome.NO_OP,
+            -> false to "LOGOUT_CLEAR_FAILED"
+        }
+
+    /**
      * Clear-phase probe outcome for the logout hardening below.
      *
      * Derived from a single strict re-read
@@ -1166,30 +1361,42 @@ class SetupViewModel(
     }
 
     /**
-     * Logout: delete the live vault key addressed by metadata, then fenced-clear
-     * metadata via [EndpointStore.clearIfRevision] (delete-then-CAS order matters).
+     * Logout: journal the teardown, delete the live vault key addressed by
+     * metadata, then fenced-clear metadata via [EndpointStore.clearIfRevision]
+     * (journal → delete → CAS order matters).
      *
      * Strict cleanup contract:
-     * - The (config, revision) pair comes from a single
-     *   [EndpointStore.snapshotWithRevisionStrict] emission. A read failure
-     *   aborts before any side effect: no vault delete, no metadata clear, no
-     *   form reset; stamps `errorCode = LOGOUT_READ_FAILED` and reports
-     *   `onDone(false)`. A healthy `null` (read OK, no metadata) is strictly
-     *   distinguished from a read failure: the delete is skipped but
+     * - The (journal, config, revision) triple comes from a single
+     *   [EndpointStore.snapshotDeleteStateStrict] emission. A read failure
+     *   (or a malformed journal) aborts before any side effect: no journal
+     *   write, no vault delete, no metadata clear, no form reset; stamps
+     *   `errorCode = LOGOUT_READ_FAILED` and reports `onDone(false)`. A
+     *   PRESENT journal resumes instead of starting over: the journal wins and
+     *   is never overwritten — the startup-shared [reconcilePendingDelete] core
+     *   replays it (idempotent delete + fenced clear). A healthy `null`
+     *   (read OK, no metadata, no journal) is strictly distinguished from a
+     *   read failure: the delete is skipped but
      *   [EndpointStore.clearIfRevision] still runs to void outstanding
      *   snapshots/consents, and success is reported on a CAS win.
      * - Only an alias addressed by a well-formed `provider_key/` ref is
      *   deleted (resolved via [SetupValidation.aliasFromRef], never re-derived
      *   from `providerId`); malformed refs fail closed to skip-delete (still
-     *   CAS). [dev.librepocket.keystore.KeyVault.deleteKey] is idempotent
+     *   CAS, no journal — there is no key to resume). An alias that cannot be
+     *   journaled (dirty `|`-bearing value) fails closed with
+     *   `LOGOUT_DELETE_FAILED` before any side effect.
+     *   [dev.librepocket.keystore.KeyVault.deleteKey] is idempotent
      *   (missing key is a no-op remove), so retrying an already-applied delete
      *   is safe; a delete failure aborts before the clear (metadata, key
-     *   bytes, and revision untouched) with `LOGOUT_DELETE_FAILED`.
+     *   bytes, and revision untouched) with `LOGOUT_DELETE_FAILED` — but the
+     *   journal is KEPT, so readers stay folded to `NO_KEY` and the next
+     *   startup/logout replays the teardown (the logout intent stands).
      * - The clear is fenced: `clearIfRevision(expectedRev)` with the snapshot
-     *   revision, AFTER the delete. A save committing between the delete and
+     *   revision, AFTER the delete, removing the journal in the SAME atomic
+     *   edit on a win. A save committing between the delete and
      *   the CAS leaves the winner intact: the CAS returns false (only the
-     *   stale predecessor was deleted — harmless), the winner metadata
-     *   survives, and logout reports `LOGOUT_STALE`, never success.
+     *   stale predecessor was deleted — harmless), the superseded journal is
+     *   discarded WITHOUT touching winner metadata, and logout reports
+     *   `LOGOUT_STALE`, never success.
      * - Clear-phase hardening (mirrors the save-side NonCancellable
      *   strict-verify): when the initial `clearIfRevision` throws, the outcome
      *   is classified by a single strict re-read in `NonCancellable` context
@@ -1223,16 +1430,23 @@ class SetupViewModel(
      *   `onDone(true)`, mirroring save committed-then-cancel); `FAILED`,
      *   `STALE`, and `UNKNOWN` rethrow without stamping any `errorCode` and
      *   without calling [onDone] (no retry on the cancel path — a retry would
-     *   commit despite the cancel). A cancel before the clear (read/delete
-     *   window) likewise rethrows with no side-effect stamp.
+     *   commit despite the cancel). A cancel between the delete and the clear
+     *   (or between the journal write and the delete) likewise rethrows with
+     *   the journal KEPT and no side-effect stamp: the teardown is resumable
+     *   by the next startup ([reconcilePendingDelete]) or logout, never
+     *   silently stranded. A cancel before any side effect (read/journal
+     *   window, or queued for [saveMutex]) likewise rethrows with no stamp.
      *
      * Memory-vs-durable note: the vault delete and the metadata clear are not
      * a distributed transaction (see [dev.librepocket.keystore.EncryptedPrefsVault]
-     * durability docs). A crash between a still-unflushed (`apply`) vault
-     * delete and the metadata clear — or vice versa — splits the two stores
-     * across a restart; the revision still fences stale sessions, but orphan
-     * GC needs the long-term vault list/journal follow-up. This window is
-     * documented, not closed, in this phase.
+     * durability docs). The same-file journal closes the crash window BETWEEN
+     * the vault delete and the metadata clear: a kill landing there restarts
+     * into a folded (`NO_KEY`/`NoEndpoint`) state whose journal the startup
+     * replay ([launchPendingDeleteReconcile]) completes — the revision still
+     * fences stale sessions throughout. Residual (long term, not this phase):
+     * save-side staged orphans (put-but-never-committed, committed-but-never-
+     * retired) still need a vault list API for GC; cross-process DataStore
+     * fencing is still single-process-only.
      *
      * Privileged teardown, serialized against in-flight saves via [saveMutex]
      * so a save's staged-put/CAS/retire window cannot interleave with teardown
@@ -1288,20 +1502,109 @@ class SetupViewModel(
                 var committed = false
                 var logoutError: String? = null
                 saveMutex.withLock {
-                    val snapshot = try {
-                        store.snapshotWithRevisionStrict()
+                    // Single-emission strict read: pending journal + config +
+                    // revision from the same snapshot (no TOCTOU between them).
+                    val state = try {
+                        store.snapshotDeleteStateStrict()
                     } catch (e: CancellationException) {
                         throw e
                     } catch (_: Exception) {
                         _form.value = _form.value.copy(errorCode = "LOGOUT_READ_FAILED")
                         return@withLock
                     }
-                    val expectedRevision = snapshot.second
-                    val alias = snapshot.first?.apiKeyRef
+                    val resumePending = state.first
+                    if (resumePending != null) {
+                        // An earlier teardown journaled but never finished
+                        // (crash/cancel, or a concurrent logout journaled
+                        // first): the journal wins — never overwrite it, resume
+                        // it via the startup-shared replay core.
+                        val (resumed, resumeError) =
+                            reconcileOutcomeToLogout(runPendingDeleteLocked(resumePending))
+                        committed = resumed
+                        logoutError = resumeError
+                        if (logoutError != null) {
+                            _form.value = _form.value.copy(errorCode = logoutError)
+                        }
+                        return@withLock
+                    }
+                    val expectedRevision = state.third
+                    val alias = state.second?.apiKeyRef
                         ?.takeIf { it.startsWith("provider_key/") }
                         ?.let { SetupValidation.aliasFromRef(it) }
                         ?.takeIf { it.isNotBlank() }
+                    var journalWritten = false
                     if (alias != null) {
+                        // 1. Journal BEFORE the vault delete (same-file atomic
+                        // edit, never overwrites): a crash/cancel in the
+                        // delete→clear window below stays resumable instead of
+                        // silently stranded. Construction validates (dirty
+                        // unjournalable aliases fail closed here, before any
+                        // side effect).
+                        val journal = try {
+                            PendingDelete(alias, expectedRevision, System.currentTimeMillis())
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            _form.value = _form.value.copy(errorCode = "LOGOUT_DELETE_FAILED")
+                            return@withLock
+                        }
+                        val wroteJournal = try {
+                            store.writePendingDeleteIfAbsent(journal)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            // Transport failure on the journal write: the
+                            // commit may still have won (ack-loss). Proceed
+                            // only when OUR journal is provably present;
+                            // otherwise abort with everything untouched (no
+                            // delete was attempted yet).
+                            val journalWon = try {
+                                withContext(NonCancellable) {
+                                    val current = store.pendingDelete()
+                                    current?.alias == alias && current.revision == expectedRevision
+                                }
+                            } catch (_: CancellationException) {
+                                false
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (!journalWon) {
+                                _form.value = _form.value.copy(errorCode = "LOGOUT_CLEAR_FAILED")
+                                return@withLock
+                            }
+                            true
+                        }
+                        if (!wroteJournal) {
+                            // A concurrent teardown journaled first (its alias
+                            // may differ): never overwrite — resume the
+                            // winner's journal; if it already finished (no
+                            // journal now), fall through to the fenced clear
+                            // below, which will fence stale as usual.
+                            val current = try {
+                                store.snapshotDeleteStateStrict().first
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                _form.value = _form.value.copy(errorCode = "LOGOUT_CLEAR_FAILED")
+                                return@withLock
+                            }
+                            if (current != null) {
+                                val (resumed, resumeError) =
+                                    reconcileOutcomeToLogout(runPendingDeleteLocked(current))
+                                committed = resumed
+                                logoutError = resumeError
+                                if (logoutError != null) {
+                                    _form.value = _form.value.copy(errorCode = logoutError)
+                                }
+                                return@withLock
+                            }
+                        } else {
+                            journalWritten = true
+                        }
+                        // 2. Idempotent vault delete. A failure aborts before
+                        // the clear with the journal KEPT: readers stay folded
+                        // to NO_KEY and the next startup/logout replays the
+                        // teardown (the logout intent stands).
                         try {
                             vault().deleteKey(alias)
                         } catch (e: CancellationException) {
@@ -1314,8 +1617,13 @@ class SetupViewModel(
                     try {
                         val cleared = store.clearIfRevision(expectedRevision)
                         if (cleared) {
+                            // Win removes metadata AND the journal atomically.
                             committed = true
                         } else {
+                            // CAS loss: a concurrent winner advanced the
+                            // revision. Our journal (if any) is superseded —
+                            // discard it without touching winner metadata.
+                            if (journalWritten) discardSupersededJournal()
                             logoutError = "LOGOUT_STALE"
                         }
                     } catch (e: CancellationException) {
@@ -1324,6 +1632,8 @@ class SetupViewModel(
                         // else rethrows with no code and no onDone. No retry on
                         // the cancel path (a retry would commit despite cancel).
                         // Bounded: single NonCancellable read, no second clear.
+                        // COMMITTED implies the journal left atomically with
+                        // the clear; otherwise it stays for replay.
                         val probe = withContext(NonCancellable) { probeLogoutClear(expectedRevision) }
                         if (probe == LogoutClearProbe.COMMITTED) {
                             committed = true
@@ -1347,6 +1657,9 @@ class SetupViewModel(
                                 committed = true
                             }
                             LogoutClearProbe.STALE -> {
+                                // Winner advanced: our journal (if any) is
+                                // superseded — discard without touching winner.
+                                if (journalWritten) discardSupersededJournal()
                                 logoutError = "LOGOUT_STALE"
                             }
                             LogoutClearProbe.UNKNOWN -> {
@@ -1362,7 +1675,13 @@ class SetupViewModel(
                                 }
                                 when (retried) {
                                     true -> committed = true
-                                    false -> logoutError = "LOGOUT_STALE"
+                                    false -> {
+                                        // A winner slipped in between the probe
+                                        // and the retry: superseded journal
+                                        // goes, winner metadata stays.
+                                        if (journalWritten) discardSupersededJournal()
+                                        logoutError = "LOGOUT_STALE"
+                                    }
                                     null -> logoutError = "LOGOUT_CLEAR_FAILED"
                                 }
                             }

@@ -482,8 +482,7 @@ class EndpointStoreTest {
     }
 
     @Test
-    fun snapshotStrictRoundTripMatchesObserve() = runBlocking {
-        val store = newStore()
+    fun snapshotStrictRoundTripMatchesObserve() = runBlocking {        val store = newStore()
         assertNull(store.snapshotStrict())
         val (freshCfg, freshRev) = store.snapshotWithRevisionStrict()
         assertNull(freshCfg)
@@ -502,6 +501,143 @@ class EndpointStoreTest {
         val (clearedCfg, clearedRev) = store.snapshotWithRevisionStrict()
         assertNull(clearedCfg)
         assertEquals(2L, clearedRev)
+        assertEquals(2L, store.currentRevision())
+    }
+
+    // ---- Phase 1: pending-delete journal ----
+
+    @Test
+    fun pendingDeleteFormatParseRoundTrip() {
+        val full = PendingDelete("preset:openai#staged-" + "c".repeat(32), 7L, 1700000000000L)
+        assertEquals(full, PendingDelete.parse(full.format()))
+        val freshNullRev = PendingDelete("preset:openai", null, 0L)
+        assertEquals("v1|preset:openai||0", freshNullRev.format())
+        assertEquals(freshNullRev, PendingDelete.parse(freshNullRev.format()))
+    }
+
+    @Test
+    fun pendingDeleteParseRejectsMalformed() {
+        for (raw in listOf(
+            "",
+            "garbage",
+            "v1|only-two",
+            "v1|a|1|2|extra",
+            "v2|preset:openai|1|2",
+            "v1||1|2",
+            "v1|   |1|2",
+            "v1|a|b|not-a-number",
+            "v1|preset:openai|x|1700000000000",
+            "v1|preset:openai|1|not-a-ts",
+            "v1|preset:openai|1|-1",
+            "v1|a|b|c|1|2",
+        )) {
+            try {
+                PendingDelete.parse(raw)
+                error("expected ENDPOINT_PENDING_DELETE_MALFORMED for $raw")
+            } catch (e: IllegalStateException) {
+                assertEquals("ENDPOINT_PENDING_DELETE_MALFORMED", e.message)
+            }
+        }
+        try {
+            PendingDelete("a|b", 1L, 0L)
+            error("expected PENDING_DELETE_ALIAS_MALFORMED")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("PENDING_DELETE_ALIAS_MALFORMED", e.message)
+        }
+    }
+
+    @Test
+    fun writePendingDeleteIfAbsentNeverOverwritesAndNeverBumpsRevision() = runBlocking {
+        val store = newStore()
+        store.save(sampleConfig())
+        assertEquals(1L, store.currentRevision())
+        assertTrue(store.writePendingDeleteIfAbsent(PendingDelete("preset:openai", 1L, 100L)))
+        assertEquals(1L, store.currentRevision())
+        // A concurrent teardown must not clobber the first journal.
+        assertFalse(store.writePendingDeleteIfAbsent(PendingDelete("other", 1L, 200L)))
+        assertEquals(PendingDelete("preset:openai", 1L, 100L), store.pendingDelete())
+        assertEquals(1L, store.currentRevision())
+        val (pending, config, rev) = store.snapshotDeleteStateStrict()
+        assertEquals(PendingDelete("preset:openai", 1L, 100L), pending)
+        assertEquals(sampleConfig().copy(configRevision = 1L), config)
+        assertEquals(1L, rev)
+    }
+
+    @Test
+    fun pendingFoldsLenientReadersButNotStrict() = runBlocking {
+        val store = newStore()
+        store.save(sampleConfig())
+        store.writePendingDeleteIfAbsent(PendingDelete("preset:openai", 1L, 100L))
+        // Lenient readers fold first-unavailable (even though the raw metadata
+        // is intact underneath).
+        assertNull(store.observe().first())
+        assertFalse(store.hasMetadata())
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
+        assertEquals(EndpointReadiness.NO_KEY, store.readiness(vault))
+        // Strict readers stay raw for fencing/reconcile.
+        assertEquals(sampleConfig().copy(configRevision = 1L), store.snapshotStrict())
+        assertEquals(1L, store.currentRevision())
+        assertEquals(PendingDelete("preset:openai", 1L, 100L), store.pendingDelete())
+    }
+
+    @Test
+    fun malformedPendingFoldsLenientReaders() = runBlocking {
+        val store = newStore()
+        store.save(sampleConfig())
+        store.dataStore.edit { prefs ->
+            prefs[ENDPOINT_PENDING_DELETE_V1] = "v9|broken"
+        }
+        assertNull(store.observe().first())
+        assertFalse(store.hasMetadata())
+        try {
+            store.pendingDelete()
+            error("expected ENDPOINT_PENDING_DELETE_MALFORMED")
+        } catch (e: IllegalStateException) {
+            assertEquals("ENDPOINT_PENDING_DELETE_MALFORMED", e.message)
+        }
+        try {
+            store.snapshotDeleteStateStrict()
+            error("expected ENDPOINT_PENDING_DELETE_MALFORMED")
+        } catch (e: IllegalStateException) {
+            assertEquals("ENDPOINT_PENDING_DELETE_MALFORMED", e.message)
+        }
+        // Raw metadata survives underneath the fold.
+        assertEquals(sampleConfig().copy(configRevision = 1L), store.snapshotStrict())
+        assertEquals(1L, store.currentRevision())
+    }
+
+    @Test
+    fun clearIfRevisionRemovesJournalOnWinKeepsOnLoss() = runBlocking {
+        val store = newStore()
+        store.save(sampleConfig())
+        store.writePendingDeleteIfAbsent(PendingDelete("preset:openai", 1L, 100L))
+        // Stale expectation loses without writing: journal AND metadata stay.
+        assertFalse(store.clearIfRevision(0L))
+        assertEquals(PendingDelete("preset:openai", 1L, 100L), store.pendingDelete())
+        assertEquals(1L, store.currentRevision())
+        // Win removes metadata and the journal in the same atomic edit.
+        assertTrue(store.clearIfRevision(1L))
+        assertNull(store.pendingDelete())
+        assertNull(store.observe().first())
+        assertEquals(2L, store.currentRevision())
+    }
+
+    @Test
+    fun clearRemovesJournalAndRemovePendingKeepsMetadata() = runBlocking {
+        val store = newStore()
+        store.save(sampleConfig())
+        store.writePendingDeleteIfAbsent(PendingDelete("preset:openai", 1L, 100L))
+        // STALE-path discard: only the journal goes, metadata + revision stay.
+        store.removePendingDelete()
+        assertNull(store.pendingDelete())
+        assertEquals(sampleConfig().copy(configRevision = 1L), store.observe().first())
+        assertEquals(1L, store.currentRevision())
+        // Authoritative clear resets the journal too.
+        store.writePendingDeleteIfAbsent(PendingDelete("preset:openai", 1L, 100L))
+        store.clear()
+        assertNull(store.pendingDelete())
+        assertNull(store.observe().first())
         assertEquals(2L, store.currentRevision())
     }
 }

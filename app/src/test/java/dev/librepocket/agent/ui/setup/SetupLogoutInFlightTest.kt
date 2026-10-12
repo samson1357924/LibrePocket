@@ -96,7 +96,7 @@ class SetupLogoutInFlightTest {
             realStore.save(inFlightPreseed())
             assertEquals(1L, realStore.currentRevision())
         }
-        val store = EndpointStore(LogoutClearFailingDataStore(raw))
+        val store = EndpointStore(LogoutClearFailingDataStore(raw, passThroughWrites = 1))
         val gating = DeleteGatingLogoutVault(delegate)
         val vm = SetupViewModel(
             store = store,

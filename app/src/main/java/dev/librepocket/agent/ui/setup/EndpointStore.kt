@@ -32,6 +32,70 @@ internal val ENDPOINT_PROTOCOL_V1 = stringPreferencesKey("endpoint_protocol_v1")
 internal val ENDPOINT_MODEL_V1 = stringPreferencesKey("endpoint_model_v1")
 internal val ENDPOINT_API_KEY_REF_V1 = stringPreferencesKey("endpoint_api_key_ref_v1")
 internal val ENDPOINT_CONFIG_REVISION_V1 = longPreferencesKey("endpoint_config_revision_v1")
+internal val ENDPOINT_PENDING_DELETE_V1 = stringPreferencesKey("endpoint_pending_delete_v1")
+
+/**
+ * Crash-resumable logout teardown journal (phase 1, Re-review #8 Finding 1 P1).
+ *
+ * Written by the logout path BEFORE `KeyVault.deleteKey(alias)`, removed
+ * atomically with the fenced metadata clear on success. A crash or cancel
+ * landing between the vault delete and the metadata clear leaves this journal
+ * behind; the next startup ([SetupViewModel.reconcilePendingDelete]) or logout
+ * retry replays it (idempotent delete + fenced clear) instead of silently
+ * keeping torn-down metadata nobody discovers.
+ *
+ * Wire format `"v1|<alias>|<rev>|<ts>"`, where `<rev>` is empty for a fresh
+ * `null` revision and `<ts>` is `System.currentTimeMillis()`. Parsing is
+ * strict: any malformed non-null value fails closed (throws
+ * [IllegalStateException], readers fold to unavailable, reconcile keeps the
+ * journal untouched). The alias MUST NOT contain `|` (construction rejects it;
+ * a dirty alias that cannot be journaled fails the logout closed before any
+ * side effect).
+ *
+ * The journal NEVER advances [ENDPOINT_CONFIG_REVISION_V1]: only
+ * [EndpointStore.save]/[saveIfRevision]/[clear]/[clearIfRevision] advance the
+ * revision, so saves can still CAS over a pending journal (the superseded
+ * journal is discarded by the STALE path without touching winner metadata).
+ */
+data class PendingDelete(
+    val alias: String,
+    val revision: Long?,
+    val timestampMs: Long,
+) {
+    init {
+        require(alias.isNotBlank()) { "PENDING_DELETE_ALIAS_BLANK" }
+        require('|' !in alias && '\n' !in alias && '\r' !in alias && '\u0000' !in alias) {
+            "PENDING_DELETE_ALIAS_MALFORMED"
+        }
+        require(timestampMs >= 0) { "PENDING_DELETE_TS_MALFORMED" }
+    }
+
+    fun format(): String = "v1|$alias|${revision?.toString() ?: ""}|$timestampMs"
+
+    companion object {
+        /**
+         * Strict parse. Throws [IllegalStateException] on ANY malformed input
+         * (wrong version, wrong arity, blank/`|`-bearing alias, non-numeric
+         * rev/ts, negative ts). Callers MUST treat a throw as fail-closed
+         * (no vault I/O, no metadata write, journal kept).
+         */
+        fun parse(raw: String): PendingDelete {
+            fun malformed(): Nothing = throw IllegalStateException("ENDPOINT_PENDING_DELETE_MALFORMED")
+            val parts = raw.split('|')
+            if (parts.size != 4 || parts[0] != "v1") malformed()
+            val alias = parts[1]
+            if (alias.isBlank() || '\n' in alias || '\r' in alias || '\u0000' in alias) malformed()
+            val revision = if (parts[2].isEmpty()) {
+                null
+            } else {
+                parts[2].toLongOrNull() ?: malformed()
+            }
+            val ts = parts[3].toLongOrNull() ?: malformed()
+            if (ts < 0) malformed()
+            return PendingDelete(alias, revision, ts)
+        }
+    }
+}
 
 /** Usability verdict for the endpoint gate (log the code only, never key material). */
 enum class EndpointReadiness {
@@ -117,6 +181,13 @@ class EndpointStore(
      * folds missing/partial metadata (including the post-[clear] tombstone) to
      * `null`.
      *
+     * A non-null [ENDPOINT_PENDING_DELETE_V1] journal (even a malformed one)
+     * also folds to `null`: a logout teardown is in flight (vault delete won,
+     * metadata clear pending) and the endpoint is conservatively unavailable
+     * until the next startup/logout replay resolves it. Fencing/reconcile
+     * readers MUST use [snapshotStrict]/[snapshotDeleteStateStrict]/
+     * [pendingDelete] instead of relying on this fold.
+     *
      * ONLY for UI gate/[StateFlow] display ([readiness], [hasMetadata], gate).
      * FORBIDDEN for deleteKey/restore authorization: destructive decisions MUST
      * use [snapshotStrict] (or [snapshotWithRevisionStrict]), never this.
@@ -125,7 +196,9 @@ class EndpointStore(
      */
     fun observe(): Flow<EndpointConfig?> = dataStore.data
         .catch { emit(emptyPreferences()) }
-        .map { prefs -> parseConfig(prefs) }
+        .map { prefs ->
+            if (prefs[ENDPOINT_PENDING_DELETE_V1] != null) null else parseConfig(prefs)
+        }
 
     private fun parseConfig(prefs: Preferences): EndpointConfig? {
         val providerId = prefs[ENDPOINT_PROVIDER_ID_V1] ?: return null
@@ -161,6 +234,11 @@ class EndpointStore(
      * metadata) rather than a failure masquerading as absent.
      *
      * Same level as [currentRevision]: raw, fail-closed, single emission.
+     *
+     * Does NOT fold a pending-delete journal: during a logout teardown the raw
+     * config (live alias + revision) stays visible here so the fencing and
+     * reconcile paths can authorize the delete and the trailing
+     * `clearIfRevision`. Lenient readers ([observe]) fold instead.
      */
     suspend fun snapshotStrict(): EndpointConfig? = withContext(ioDispatcher) {
         val prefs = dataStore.data.first()
@@ -176,6 +254,10 @@ class EndpointStore(
      * concurrent writer landing between two reads could otherwise advance the
      * revision after the first read but before the second).
      *
+     * Does NOT fold a pending-delete journal (see [snapshotDeleteStateStrict]
+     * for the journal-aware variant): fencing readers that need the live
+     * alias/revision during a teardown must see the raw values.
+     *
      * Fail-closed like [snapshotStrict]: no `catch`, failures propagate.
      * Stage 1 callers still use the two-read sequence (documented window);
      * stage 2 should migrate fenced paths to this.
@@ -185,6 +267,89 @@ class EndpointStore(
             val prefs = dataStore.data.first()
             parseConfig(prefs) to prefs[ENDPOINT_CONFIG_REVISION_V1]
         }
+
+    /**
+     * Strict single-emission read of the teardown journal.
+     *
+     * Returns `null` when no journal is present. A malformed non-null journal
+     * throws [IllegalStateException] (fail-closed: the caller MUST NOT touch
+     * the vault or metadata and MUST keep the journal). DataStore failures
+     * propagate like [snapshotStrict].
+     */
+    suspend fun pendingDelete(): PendingDelete? = withContext(ioDispatcher) {
+        val raw = dataStore.data.map { prefs -> prefs[ENDPOINT_PENDING_DELETE_V1] }.first()
+        raw?.let { PendingDelete.parse(it) }
+    }
+
+    /**
+     * Strict single-emission read of (journal, config, revision) together.
+     *
+     * All three values come from the SAME [Preferences] snapshot, so the
+     * logout/reconcile path cannot observe a journal from one generation
+     * against metadata from another. Fail-closed like [snapshotStrict]: no
+     * `catch` — DataStore failures AND malformed journals
+     * ([IllegalStateException]) propagate and the caller MUST abort without
+     * side effects.
+     */
+    suspend fun snapshotDeleteStateStrict(): Triple<PendingDelete?, EndpointConfig?, Long?> =
+        withContext(ioDispatcher) {
+            val prefs = dataStore.data.first()
+            val raw = prefs[ENDPOINT_PENDING_DELETE_V1]
+            Triple(
+                raw?.let { PendingDelete.parse(it) },
+                parseConfig(prefs),
+                prefs[ENDPOINT_CONFIG_REVISION_V1],
+            )
+        }
+
+    /**
+     * Atomically journals a pending teardown unless one is already present.
+     *
+     * Inside a single `dataStore.edit {}` transaction: a present journal (any
+     * non-null value) is NEVER overwritten — returns `false` fail-closed so
+     * the caller resumes the existing journal instead of clobbering it. Absent
+     * journal → writes [pending] (validated by construction, [format]) and
+     * returns `true`.
+     *
+     * Intentionally does NOT advance [ENDPOINT_CONFIG_REVISION_V1]: the journal
+     * is not a metadata generation, and bumping here would break the trailing
+     * `clearIfRevision(expectedRevision)` fence. Fail-closed: validation
+     * ([IllegalArgumentException]) and DataStore failures propagate; only the
+     * already-journaled contention path returns `false`.
+     */
+    suspend fun writePendingDeleteIfAbsent(pending: PendingDelete): Boolean {
+        // Validate before I/O (constructor already validated; format is pure).
+        pending.format()
+        return withContext(ioDispatcher) {
+            var wrote = false
+            dataStore.edit { prefs ->
+                if (prefs[ENDPOINT_PENDING_DELETE_V1] != null) {
+                    return@edit
+                }
+                prefs[ENDPOINT_PENDING_DELETE_V1] = pending.format()
+                wrote = true
+            }
+            wrote
+        }
+    }
+
+    /**
+     * Unconditionally removes the teardown journal WITHOUT touching metadata
+     * or the revision.
+     *
+     * ONLY for the STALE path: a concurrent winner advanced the revision, so
+     * the journal is superseded and must be discarded while the winner's
+     * metadata (and revision) survives byte-for-byte. Never use this to finish
+     * a teardown — the fenced clear ([clearIfRevision], which removes the
+     * journal atomically on a win) owns that.
+     */
+    suspend fun removePendingDelete() {
+        withContext(ioDispatcher) {
+            dataStore.edit { prefs ->
+                prefs.remove(ENDPOINT_PENDING_DELETE_V1)
+            }
+        }
+    }
 
     /**
      * Raw monotonic revision, or `null` when the key was never written (fresh).
@@ -211,6 +376,13 @@ class EndpointStore(
      * Gate verdict: metadata complete + baseUrl valid + [KeyVault] holds the key.
      * Network reachability is deliberately excluded (checked via listModels on demand).
      *
+     * A non-null pending-delete journal folds to [EndpointReadiness.NO_KEY]
+     * without touching the vault: the teardown already deleted (or is about to
+     * re-delete) the live bytes, so the endpoint is conservatively unusable
+     * until the replay resolves it. Malformed journals fold the same way
+     * (fail-closed). DataStore failures still fold to
+     * [EndpointReadiness.NO_ENDPOINT_METADATA].
+     *
      * Ref-driven: the vault alias is resolved from `config.apiKeyRef` via
      * [SetupValidation.aliasFromRef], never re-derived from `providerId`
      * (staged commits point metadata at a per-operation alias). A missing
@@ -218,11 +390,13 @@ class EndpointStore(
      * touching the vault.
      */
     suspend fun readiness(vault: KeyVault): EndpointReadiness {
-        val config = try {
-            withContext(ioDispatcher) { observe().first() }
+        val prefs = try {
+            withContext(ioDispatcher) { dataStore.data.first() }
         } catch (_: Exception) {
             return EndpointReadiness.NO_ENDPOINT_METADATA
-        } ?: return EndpointReadiness.NO_ENDPOINT_METADATA
+        }
+        if (prefs[ENDPOINT_PENDING_DELETE_V1] != null) return EndpointReadiness.NO_KEY
+        val config = parseConfig(prefs) ?: return EndpointReadiness.NO_ENDPOINT_METADATA
         try {
             validateBaseUrl(config.baseUrl)
         } catch (_: IllegalArgumentException) {
@@ -319,6 +493,9 @@ class EndpointStore(
      *
      * Clears metadata only. Callers rotating/logging out MUST also call
      * `KeyVault.deleteKey(providerId)` or orphan keys linger in EncryptedSharedPreferences.
+     *
+     * Also removes any [ENDPOINT_PENDING_DELETE_V1] journal: an unconditional
+     * clear is authoritative teardown and leaves no in-flight state behind.
      */
     suspend fun clear() {
         withContext(ioDispatcher) {
@@ -330,6 +507,7 @@ class EndpointStore(
                 prefs.remove(ENDPOINT_PROTOCOL_V1)
                 prefs.remove(ENDPOINT_MODEL_V1)
                 prefs.remove(ENDPOINT_API_KEY_REF_V1)
+                prefs.remove(ENDPOINT_PENDING_DELETE_V1)
                 // Keep the revision across logout so a later endpoint cannot
                 // accidentally compare equal to a pre-logout snapshot.
                 prefs[ENDPOINT_CONFIG_REVISION_V1] = nextRevision(prefs[ENDPOINT_CONFIG_REVISION_V1])
@@ -345,6 +523,12 @@ class EndpointStore(
      * `dataStore.edit {}` transaction: mismatch `return@edit`s without writing
      * and returns `false`; match removes all metadata fields, bumps to
      * `Math.addExact(expectedRevision ?: 0L, 1L)`, and returns `true`.
+     *
+     * On a win the [ENDPOINT_PENDING_DELETE_V1] journal is removed in the SAME
+     * atomic edit (logout teardown commits journal + metadata together); on a
+     * mismatch nothing is written and a superseded journal survives for the
+     * caller to discard via [removePendingDelete] (never by retrying here — a
+     * retry would delete the winner's metadata).
      *
      * @param expectedRevision MUST come from [currentRevision()], never
      * `observe().configRevision`: [observe] folds the post-[clear] tombstone to
@@ -370,6 +554,7 @@ class EndpointStore(
                 prefs.remove(ENDPOINT_PROTOCOL_V1)
                 prefs.remove(ENDPOINT_MODEL_V1)
                 prefs.remove(ENDPOINT_API_KEY_REF_V1)
+                prefs.remove(ENDPOINT_PENDING_DELETE_V1)
                 // Keep the revision across clear so a later endpoint cannot
                 // accidentally compare equal to a pre-clear snapshot.
                 prefs[ENDPOINT_CONFIG_REVISION_V1] = Math.addExact(expectedRevision ?: 0L, 1L)

@@ -1796,6 +1796,7 @@ class SetupPolicyTest {
         assertNull(vm.form.value.errorCode)
         runBlocking {
             assertFalse(store.hasMetadata())
+            assertNull("journal leaves atomically with the clear", store.pendingDelete())
             assertFalse(delegate.hasKey(liveAlias))
             assertEquals(2L, store.currentRevision())
         }
@@ -1834,9 +1835,11 @@ class SetupPolicyTest {
 
     @Test
     fun logoutDeleteFailureAbortsBeforeClear() {
-        // T-DeleteFailure: deleteKey throws. Logout must abort before the
-        // fenced clear: metadata, key bytes, and revision stay untouched,
-        // and failure (not success) is reported.
+        // T-DeleteFailure: deleteKey throws. Logout aborts before the
+        // fenced clear with LOGOUT_DELETE_FAILED — but the journal is KEPT
+        // (readers stay folded to NO_KEY) so the next startup/logout replay
+        // completes the teardown instead of silently stranding it. Metadata,
+        // key bytes, and revision stay untouched by the abort itself.
         val policy = MutablePolicy(Verdict.ALLOW)
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         val vault = ThrowingDeleteVault(delegate)
@@ -1857,16 +1860,37 @@ class SetupPolicyTest {
         assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
         assertEquals("logout must attempt the live alias", listOf(liveAlias), vault.deletedIds)
         runBlocking {
-            assertTrue("metadata must survive a delete failure", store.hasMetadata())
+            // Journal kept for replay: folded, but raw metadata still present
+            // at the same revision with key bytes intact.
+            val journal = store.pendingDelete()
+            assertEquals(liveAlias, journal?.alias)
+            assertEquals(revBefore, journal?.revision)
+            assertNull(store.observe().first())
+            assertFalse(store.hasMetadata())
+            assertEquals("provider_key/$liveAlias", store.snapshotStrict()!!.apiKeyRef)
             assertEquals(revBefore, store.currentRevision())
-            assertEquals(
-                "provider_key/$liveAlias",
-                store.observe().first()!!.apiKeyRef,
-            )
             assertTrue(delegate.hasKey(liveAlias))
-            assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+            assertEquals(EndpointReadiness.NO_KEY, store.readiness(delegate))
         }
         assertVaultKeyEquals(delegate, liveAlias, "fake-unit-logout-delete-fail-key-123")
+        // Replay with a healthy vault over the same delegate completes the
+        // teardown the abort left behind.
+        val fixedVault = CountingVault(delegate)
+        val vmReplay = SetupViewModel(
+            store,
+            VaultSource { fixedVault },
+            policy,
+            buildProvider = { _, _ -> error("no provider needed") as LlmProvider },
+        )
+        val outcome = runBlocking { vmReplay.reconcilePendingDelete() }
+        assertEquals(SetupViewModel.PendingDeleteOutcome.COMMITTED, outcome)
+        runBlocking {
+            assertNull(store.pendingDelete())
+            assertFalse(store.hasMetadata())
+            assertEquals((revBefore ?: 0L) + 1L, store.currentRevision())
+            assertFalse(delegate.hasKey(liveAlias))
+        }
+        assertEquals(listOf(liveAlias), fixedVault.deletedIds)
     }
 
     @Test
@@ -1932,6 +1956,10 @@ class SetupPolicyTest {
             assertEquals("provider_key/$winnerStaged", meta.apiKeyRef)
             assertTrue("winner key must survive the stale logout", delegate.hasKey(winnerStaged))
             assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+            assertNull(
+                "superseded journal is discarded without touching winner metadata",
+                store.pendingDelete(),
+            )
         }
         assertVaultKeyEquals(delegate, winnerStaged, "unit-test-winner-key-BBBBBBBB")
     }

@@ -169,6 +169,15 @@ fun MainScreen(
         }
     }
 
+    // Crash-resume (phase 1, Re-review #8 Finding 1 P1): a logout torn down
+    // between the vault delete and the metadata clear restarts with a pending
+    // journal (readers folded to NoEndpoint); replay it once at startup so the
+    // teardown completes instead of stranding metadata. Fire-and-forget: a
+    // failure keeps the journal for the next logout retry, never crashes UI.
+    LaunchedEffect(Unit) {
+        setupViewModel.launchPendingDeleteReconcile()
+    }
+
     // Hard gate: no usable endpoint -> setup (and back again after save/logout).
     LaunchedEffect(hasEndpoint, gateLoading, currentRoute) {
         if (gateLoading) return@LaunchedEffect

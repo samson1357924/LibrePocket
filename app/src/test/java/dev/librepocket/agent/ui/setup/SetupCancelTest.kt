@@ -150,9 +150,23 @@ class GatedUpdateDataStore(
     var commitThenGate: Boolean = false,
     val entered: CompletableDeferred<Unit> = CompletableDeferred(),
     val release: CompletableDeferred<Unit> = CompletableDeferred(),
+    /**
+     * Leading updates that pass straight to the delegate (ungated).
+     *
+     * Journal-phase tests set this to 1 so the pending-delete journal write
+     * (update #1) commits while the trailing metadata clear (update #2) parks
+     * at the gate — modelling "delete won, cancel before clear".
+     */
+    var updatesToPass: Int = 0,
 ) : DataStore<Preferences> {
     override val data: Flow<Preferences> get() = delegate.data
+    private var seenUpdates = 0
     override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
+        if (seenUpdates < updatesToPass) {
+            seenUpdates++
+            return delegate.updateData(transform)
+        }
+        seenUpdates++
         if (commitThenGate) {
             val result = delegate.updateData(transform)
             entered.complete(Unit)
@@ -821,8 +835,14 @@ class SetupCancelTest {
         assertTrue(vault.putIds.isEmpty())
         // Only the holder's pending delete is staged; no save-side staged alias.
         assertEquals(listOf("preset:openai"), vault.deletedIds)
-        assertTrue(store.hasMetadata())
-        assertEquals(beforeMeta, store.observe().first())
+        // The holder journaled before parking in deleteKey: lenient readers
+        // fold (unavailable) while the raw metadata stays fenced at the same
+        // revision and the key bytes are untouched (delete still parked).
+        assertEquals("preset:openai", store.pendingDelete()?.alias)
+        assertEquals(beforeRev, store.pendingDelete()?.revision)
+        assertFalse(store.hasMetadata())
+        assertNull(store.observe().first())
+        assertEquals(beforeMeta, store.snapshotStrict())
         assertEquals(beforeRev, store.currentRevision())
         cancelAssertVaultKeyEquals(delegate, "preset:openai", "unit-test-old-key-123456")
         // Release the holder and await logout teardown.

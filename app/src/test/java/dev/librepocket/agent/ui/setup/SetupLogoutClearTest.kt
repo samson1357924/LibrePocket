@@ -49,12 +49,23 @@ import org.junit.Test
 /** Read-OK / write-always-fails store: models clear-transport failure. */
 class LogoutClearFailingDataStore(
     private val delegate: DataStore<Preferences>,
+    /**
+     * Leading writes that pass straight to the delegate.
+     *
+     * Journal-phase tests set this to 1 so the pending-delete journal write
+     * succeeds while the trailing metadata clears keep failing — modelling a
+     * permanent clear-transport failure with the journal retained.
+     */
+    var passThroughWrites: Int = 0,
 ) : DataStore<Preferences> {
     var updateCalls = 0
         private set
     override val data: Flow<Preferences> get() = delegate.data
     override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
         updateCalls++
+        if (updateCalls <= passThroughWrites) {
+            return delegate.updateData(transform)
+        }
         throw IOException("CLEAR_TRANSPORT_FAILED")
     }
 }
@@ -62,12 +73,22 @@ class LogoutClearFailingDataStore(
 /** Ack-loss store: commits via delegate, then throws (flush won, ack lost). */
 class LogoutAckLossDataStore(
     private val delegate: DataStore<Preferences>,
+    /**
+     * Leading writes that commit cleanly without the post-commit throw.
+     *
+     * Journal-phase tests set this to 1 so the pending-delete journal write is
+     * clean while the trailing metadata clear exhibits ack-loss.
+     */
+    var cleanWrites: Int = 0,
 ) : DataStore<Preferences> {
     var updateCalls = 0
         private set
     override val data: Flow<Preferences> get() = delegate.data
     override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences {
         updateCalls++
+        if (updateCalls <= cleanWrites) {
+            return delegate.updateData(transform)
+        }
         val result = delegate.updateData(transform)
         throw IOException("ACK_LOSS_AFTER_COMMIT")
     }
@@ -176,10 +197,11 @@ class SetupLogoutClearTest {
 
     @Test
     fun logoutClearTransportFailure() {
-        // Read OK + updateData always throws: delete wins, clear fails twice
-        // (initial + one bounded same-rev retry), then CLEAR_FAILED with
-        // metadata surviving at the same rev, key explicitly deleted
-        // (NO_KEY), form preserved, no success.
+        // Read OK + journal write passes + clears always throw: delete wins,
+        // the initial clear and one bounded same-rev retry both fail, then
+        // CLEAR_FAILED with the journal RETAINED (folded readers: metadata
+        // hidden, NO_KEY), the key explicitly deleted, form preserved, no
+        // success. The next startup/logout replay completes the teardown.
         val (realStore, raw) = rawStore("setup-logout-clear-fail")
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         val vault = CountingVault(delegate)
@@ -189,7 +211,7 @@ class SetupLogoutClearTest {
             assertEquals(1L, realStore.currentRevision())
         }
         val revBefore = runBlocking { realStore.currentRevision() }
-        val failing = LogoutClearFailingDataStore(raw)
+        val failing = LogoutClearFailingDataStore(raw, passThroughWrites = 1)
         val store = EndpointStore(failing)
         val vm = SetupViewModel(
             store = store,
@@ -204,12 +226,18 @@ class SetupLogoutClearTest {
         val ok = awaitLogoutDone(done)
         assertFalse("clear transport failure must not report success", ok)
         assertEquals("LOGOUT_CLEAR_FAILED", vm.form.value.errorCode)
-        // Bounded: initial + exactly one retry, no storm.
-        assertEquals("bounded single retry", 2, failing.updateCalls)
+        // Bounded: journal write + initial clear + exactly one retry, no storm.
+        assertEquals("bounded single retry", 3, failing.updateCalls)
         runBlocking {
-            assertTrue("metadata must survive a clear failure", store.hasMetadata())
+            // Journal retained for replay: folded (observe null) but raw
+            // metadata still present at the same revision.
+            val journal = store.pendingDelete()
+            assertEquals("preset:openai", journal?.alias)
+            assertEquals(revBefore, journal?.revision)
+            assertNull(store.observe().first())
+            assertFalse(store.hasMetadata())
+            assertEquals("provider_key/preset:openai", store.snapshotStrict()!!.apiKeyRef)
             assertEquals(revBefore, store.currentRevision())
-            assertEquals("provider_key/preset:openai", store.observe().first()!!.apiKeyRef)
             // Key state explicit: delete succeeded before the clear, so the
             // live bytes are gone while metadata still points at the alias.
             assertFalse(delegate.hasKey("preset:openai"))
@@ -223,9 +251,11 @@ class SetupLogoutClearTest {
 
     @Test
     fun logoutCancelBetweenDeleteAndClear() {
-        // Gate the clear (before commit) + cancel: must rethrow with no code
-        // and no onDone. Strict probe classifies FAILED (metadata still
-        // present, rev unchanged); no retry on the cancel path.
+        // Gate the clear (journal write passes, delete wins, clear parks) +
+        // cancel: must rethrow with no code and no onDone. Strict probe
+        // classifies FAILED (metadata still present, rev unchanged); no retry
+        // on the cancel path. The journal is KEPT: readers stay folded and the
+        // next startup/logout replay completes the teardown.
         val dir = Files.createTempDirectory("setup-logout-cancel-clear").toFile()
         tmpDirs.add(dir)
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -234,17 +264,19 @@ class SetupLogoutClearTest {
             scope = scope,
             produceFile = { java.io.File(dir, "cancel-clear.preferences_pb") },
         )
-        val gated = GatedUpdateDataStore(raw)
-        val store = EndpointStore(gated)
+        // Preseed through the raw delegate so the gate counter below starts
+        // clean (update #1 = journal write passes, update #2 = clear parks).
+        val preseed = EndpointStore(raw)
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         val vault = CountingVault(delegate)
         runBlocking {
             delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
-            store.save(logoutClearPreseed())
-            assertEquals(1L, store.currentRevision())
+            preseed.save(logoutClearPreseed())
+            assertEquals(1L, preseed.currentRevision())
         }
-        val revBefore = runBlocking { store.currentRevision() }
-        gated.gateBeforeUpdate = true
+        val revBefore = runBlocking { preseed.currentRevision() }
+        val gated = GatedUpdateDataStore(raw, gateBeforeUpdate = true, updatesToPass = 1)
+        val store = EndpointStore(gated)
         val vm = SetupViewModel(
             store = store,
             vaultSource = VaultSource { vault },
@@ -264,11 +296,16 @@ class SetupLogoutClearTest {
         assertTrue("cancelled logout must end cancelled", job.isCancelled)
         assertNull("cancel must not stamp any errorCode", vm.form.value.errorCode)
         assertFalse("cancel must not call onDone", onDoneCalled)
-        // Classification: FAILED — metadata still present, rev unchanged.
         runBlocking {
-            assertTrue(store.hasMetadata())
+            // Journal kept for replay: folded, but raw metadata still present
+            // at the same revision.
+            val journal = store.pendingDelete()
+            assertEquals("preset:openai", journal?.alias)
+            assertEquals(revBefore, journal?.revision)
+            assertNull(store.observe().first())
+            assertFalse(store.hasMetadata())
+            assertEquals("provider_key/preset:openai", store.snapshotStrict()!!.apiKeyRef)
             assertEquals(revBefore, store.currentRevision())
-            assertEquals("provider_key/preset:openai", store.observe().first()!!.apiKeyRef)
             // Delete already won before the gate; clear never committed.
             assertFalse(delegate.hasKey("preset:openai"))
             assertEquals(EndpointReadiness.NO_KEY, store.readiness(delegate))
@@ -281,7 +318,8 @@ class SetupLogoutClearTest {
     fun logoutCommittedThenCancelReportsCommitted() {
         // Commit-then-gate + cancel: the clear won before the cancel, so the
         // NonCancellable probe classifies COMMITTED and swallows to success
-        // (mirrors save committed-then-cancel).
+        // (mirrors save committed-then-cancel). The journal leaves atomically
+        // with the clear.
         val dir = Files.createTempDirectory("setup-logout-committed-cancel").toFile()
         tmpDirs.add(dir)
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -290,17 +328,20 @@ class SetupLogoutClearTest {
             scope = scope,
             produceFile = { java.io.File(dir, "committed-cancel.preferences_pb") },
         )
-        val gated = GatedUpdateDataStore(raw)
-        val store = EndpointStore(gated)
+        // Preseed through the raw delegate so the gate counter below starts
+        // clean (update #1 = journal write passes, update #2 = clear commits
+        // then parks).
+        val preseed = EndpointStore(raw)
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         val vault = CountingVault(delegate)
         runBlocking {
             delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
-            store.save(logoutClearPreseed())
-            assertEquals(1L, store.currentRevision())
+            preseed.save(logoutClearPreseed())
+            assertEquals(1L, preseed.currentRevision())
         }
-        val revBefore = runBlocking { store.currentRevision() }
-        gated.commitThenGate = true
+        val revBefore = runBlocking { preseed.currentRevision() }
+        val gated = GatedUpdateDataStore(raw, commitThenGate = true, updatesToPass = 1)
+        val store = EndpointStore(gated)
         val vm = SetupViewModel(
             store = store,
             vaultSource = VaultSource { vault },
@@ -321,6 +362,7 @@ class SetupLogoutClearTest {
         assertNull(vm.form.value.errorCode)
         runBlocking {
             assertFalse(store.hasMetadata())
+            assertNull("journal leaves atomically with the clear", store.pendingDelete())
             assertEquals((revBefore ?: 0L) + 1L, store.currentRevision())
             assertFalse(delegate.hasKey("preset:openai"))
         }
@@ -343,7 +385,8 @@ class SetupLogoutClearTest {
             assertEquals(1L, realStore.currentRevision())
         }
         val revBefore = runBlocking { realStore.currentRevision() }
-        val ackLoss = LogoutAckLossDataStore(raw)
+        // Journal write commits cleanly; only the trailing clear is ack-loss.
+        val ackLoss = LogoutAckLossDataStore(raw, cleanWrites = 1)
         val store = EndpointStore(ackLoss)
         val vm = SetupViewModel(
             store = store,
@@ -356,10 +399,11 @@ class SetupLogoutClearTest {
         val ok = awaitLogoutDone(done)
         assertTrue("ack-loss after commit must report success, not CLEAR_FAILED", ok)
         assertNull(vm.form.value.errorCode)
-        // No retry for COMMITTED: exactly the initial attempt.
-        assertEquals(1, ackLoss.updateCalls)
+        // No retry for COMMITTED: journal write + exactly the initial clear.
+        assertEquals(2, ackLoss.updateCalls)
         runBlocking {
             assertFalse(store.hasMetadata())
+            assertNull("journal leaves atomically with the clear", store.pendingDelete())
             assertEquals((revBefore ?: 0L) + 1L, store.currentRevision())
             assertFalse(delegate.hasKey("preset:openai"))
         }

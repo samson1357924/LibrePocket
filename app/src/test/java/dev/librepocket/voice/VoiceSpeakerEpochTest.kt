@@ -138,6 +138,70 @@ class VoiceSpeakerEpochTest {
     }
 
     @Test
+    fun staleMainUiEvent_afterRebuild_isDiscarded() {
+        // R6-2 回歸：關→開重建撞號。A speak epoch e1→onError 排入 Main（未執行）
+        // →dispose A→建 B→B speak（epoch 必 ≠ e1）→flush A 舊 lambda→斷言丟棄，
+        // B 新事件正常應用。接線與 ChatScreen 同形（holder＋epoch-only 比對）。
+        val appliedErrors = CopyOnWriteArrayList<Pair<String, Long>>()
+        val holder = object { var speaker: VoiceSpeaker? = null }
+        fun newWiredSpeaker(): VoiceSpeaker {
+            val created = VoiceSpeaker(
+                ApplicationProvider.getApplicationContext<Context>(),
+                onError = { msg, epoch ->
+                    uiScope.launch {
+                        val current = holder.speaker
+                        if (current == null || !shouldApplyUiEvent(epoch, current.currentEpoch)) return@launch
+                        appliedErrors += msg to epoch
+                    }
+                },
+                onDone = { _ -> },
+            )
+            holder.speaker = created
+            return created
+        }
+
+        // A 輪：建→初始化→排空 init 事件→speak→utterance 失敗排入 Main（未執行）。
+        val speakerA = newWiredSpeaker()
+        val shadowA = currentTtsShadow()
+        initSuccessfully(shadowA)
+        mainDispatcher.scheduler.advanceUntilIdle()
+        appliedErrors.clear()
+        speakerA.speak("request A")
+        val utteranceA = requireNotNull(shadowA.utteranceIds.single())
+        val epochA = speakerA.currentEpoch
+        requireNotNull(shadowA.utteranceListener).onError(utteranceA, TextToSpeech.ERROR)
+        // A 的 Main lambda 尚在排隊：此時不 flush。
+
+        // dispose A→建 B（holder 先 null 再指向 B，模擬關→開重建）。
+        speakerA.shutdown()
+        holder.speaker = null
+        val speakerB = newWiredSpeaker()
+        val shadowB = currentTtsShadow()
+        initSuccessfully(shadowB)
+        speakerB.speak("request B")
+        val epochB = speakerB.currentEpoch
+        // 全域單調：B 新 epoch 必 ≠ A 舊 epoch（舊碼同進程從 0 起會撞號）。
+        assertTrue("rebuild epochs must differ: e1=$epochA e2=$epochB", epochA != epochB)
+
+        // flush A 舊 lambda：epoch 不符（＋holder 已指 B），必須丟棄。
+        mainDispatcher.scheduler.advanceUntilIdle()
+        assertTrue(
+            "stale A event (epoch=$epochA) must be discarded after rebuild: $appliedErrors",
+            appliedErrors.none { it.second == epochA },
+        )
+        appliedErrors.clear()
+
+        // B 新事件正常應用：B 輪失敗排入並執行，且攜當代 epoch。
+        val utteranceB = requireNotNull(shadowB.utteranceIds.last())
+        requireNotNull(shadowB.utteranceListener).onError(utteranceB, TextToSpeech.ERROR)
+        mainDispatcher.scheduler.advanceUntilIdle()
+        val speakFailures = appliedErrors.filter { it.first.contains(VoiceTts.DETAIL_SPEAK_FAILED) }
+        assertEquals("applied=$appliedErrors", 1, speakFailures.size)
+        assertEquals(speakerB.currentEpoch, speakFailures.single().second)
+        speakerB.shutdown()
+    }
+
+    @Test
     fun freshMainUiEvent_withoutNewSpeak_isApplied() {
         val appliedErrors = CopyOnWriteArrayList<Pair<String, Long>>()
         var speaker: VoiceSpeaker? = null

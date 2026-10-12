@@ -157,7 +157,8 @@ fun ChatScreen(
     //（舊 request 事件排入 Main 後、執行前若有新 speak 使 epoch 前進，即被擋下）。
     // remember 初始化器內拿不到自身（self-reference 不可寫），故不做實例比對、
     // 只比對 currentEpoch：舊實例事件由 shutdown terminal 在 speaker 層擋下
-    //（見 VoiceSpeaker），epoch-only 已足夠。holder 為 null（輸出關閉）時丟棄；
+    //（見 VoiceSpeaker），epoch-only 已足夠（epoch 全域單調，跨實例永不重疊）。
+    // holder 為 null（輸出關閉）時丟棄；
     // 直讀分支同步 onSpeakStarted 語義不變。
     val speakerHolder = remember { object { var speaker: VoiceSpeaker? = null } }
     val speaker: VoiceSpeaker? = remember(context, outputEnabled) {

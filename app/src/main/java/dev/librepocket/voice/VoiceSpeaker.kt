@@ -8,6 +8,7 @@ import android.speech.tts.Voice
 import androidx.annotation.VisibleForTesting
 import dev.librepocket.tool.DenyReason
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * S2 Android 系統 TTS 朗讀器。
@@ -82,7 +83,7 @@ class VoiceSpeaker(
     private var initFailureDetail: String? = null
     private var ready = false
     private var terminal = false
-    private var speechEpoch = 0L
+    private var speechEpoch = globalEpoch.incrementAndGet()
     private var pending: PendingSpeech? = null
 
     /**
@@ -93,12 +94,13 @@ class VoiceSpeaker(
      * （與 [speechEpoch] 同臨界區鏡像更新，無遺失更新），讀取側（Main dispatcher
      * 排隊的 UI lambda）免鎖即可見最新值；synchronized getter 會迫使 Main 執行緒
      * 與 binder 回呼執行緒競爭同一把鎖，無必要。5 處 bump 點（stop／shutdown／
-     * 初始化失敗×2／[speakInternalLocked]）皆有 `currentEpoch = speechEpoch` 鏡像。
+     * 初始化失敗×2／[speakInternalLocked]）皆有 `currentEpoch = speechEpoch` 鏡像，
+     * bump 值一律來自全域單調發號器（跨實例永不重疊，見 companion）。
      * 直接回調路徑（init／listener／speak 同步失敗）在鎖外 [emitError] 前，
      * 於鎖內快照當代 epoch 後傳入，避免鎖外重讀撕裂。
      */
     @Volatile
-    var currentEpoch: Long = 0L
+    var currentEpoch: Long = speechEpoch
         private set
 
     /**
@@ -154,6 +156,19 @@ class VoiceSpeaker(
     internal var postCheckHook: (() -> Unit)? = null
 
     private data class PendingSpeech(val text: String, val epoch: Long)
+
+    companion object {
+        /**
+         * 跨實例全域單調 epoch 發號器（R6-2：關→開重建撞號修復）。
+         *
+         * 每實例 [speechEpoch] 若從 0 起，A epoch1 事件排入 Main→dispose A→建 B→
+         * B speak epoch1→A 舊 lambda 誤通過 epoch-only 比對。故 5 處 bump 一律
+         * 在 [lifecycleLock] 內向此全域取號（`speechEpoch = globalEpoch.incrementAndGet()`），
+         * 同進程永不重疊（stride=1；Long 溢出需 9e18 次 bump，不可能）。
+         * 跨實例撞號不可能，subsumes instance token（故簽名不動，不另加實例 id）。
+         */
+        private val globalEpoch = AtomicLong(0)
+    }
 
     init {
         initializeEngine()
@@ -254,7 +269,7 @@ class VoiceSpeaker(
     fun stop() {
         synchronized(lifecycleLock) {
             if (terminal) return
-            speechEpoch++
+            speechEpoch = globalEpoch.incrementAndGet()
             currentEpoch = speechEpoch
             pending = null
             // 舊 utterance 已被 QUEUE_FLUSH 語義或引擎 stop 丟棄：遲到錯誤不再揭露。
@@ -275,7 +290,7 @@ class VoiceSpeaker(
             // Fence callbacks and future speak calls before invoking any engine methods.
             terminal = true
             ready = false
-            speechEpoch++
+            speechEpoch = globalEpoch.incrementAndGet()
             currentEpoch = speechEpoch
             pending = null
             utteranceEpochs.clear()
@@ -304,7 +319,7 @@ class VoiceSpeaker(
         if (status != TextToSpeech.SUCCESS) {
             initFailureDetail = VoiceTts.DETAIL_INIT_FAILED
             pending = null
-            speechEpoch++
+            speechEpoch = globalEpoch.incrementAndGet()
             currentEpoch = speechEpoch
             activeRequestFailed = false
             activeRequestPending = 0
@@ -322,7 +337,7 @@ class VoiceSpeaker(
         if (noEngine) {
             initFailureDetail = VoiceTts.DETAIL_NO_ENGINE
             pending = null
-            speechEpoch++
+            speechEpoch = globalEpoch.incrementAndGet()
             currentEpoch = speechEpoch
             activeRequestFailed = false
             activeRequestPending = 0
@@ -385,7 +400,7 @@ class VoiceSpeaker(
      * 供遲到的 utterance 回呼在同一臨界區內校驗。首段 QUEUE_FLUSH 會取代舊 utterance，
      * 故先移除舊追蹤，使其遲到回呼不再揭露，並重置當輪 request 級狀態
      * （[activeRequestFailed]／[activeRequestPending]）；新 speak 即新 epoch
-     * （[speechEpoch]++），使舊輪入隊後、投遞前插入新 speak 的交錯也被最終複查擋下。
+     * （向全域取號），使舊輪入隊後、投遞前插入新 speak 的交錯也被最終複查擋下。
      *
      * 先記賬後調用：每段先 `utteranceEpochs[id] = speechEpoch; activeRequestPending++`
      * 再調 `engine.speak`，引擎同步重入 onDone／onError 時命中已登記條目（含本段計數）。
@@ -404,7 +419,7 @@ class VoiceSpeaker(
             return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED)
         }
         utteranceEpochs.clear()
-        speechEpoch++
+        speechEpoch = globalEpoch.incrementAndGet()
         currentEpoch = speechEpoch
         activeRequestFailed = false
         activeRequestPending = 0

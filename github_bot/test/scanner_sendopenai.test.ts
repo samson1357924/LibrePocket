@@ -16,6 +16,7 @@ import {
 import {
   coverageSummary,
   filterReviewDiffFiles,
+  isHardDeniedReviewFile,
   MAX_DIFF_LENGTH,
   prioritizeFiles,
   truncateDiff,
@@ -236,6 +237,28 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     'app/src/test/assets/screenshot.png',
     'app/src/test/java/example/SampleTest.kt',
   ]);
+    // H1: secret/key material is hard-denied even under must-include
+    // shapes (test dirs, permission/proguard substrings, workflows).
+    for (const denied of [
+      'tests/debug.keystore', 'TESTS/DEBUG.JKS', 'app/src/test/google-services.json',
+      'Test/Google-Services.Json', 'tests/local.properties', 'app/src/test/local.properties',
+      '.env', 'config/.env.local', '.env.production', 'permissions/debug.keystore',
+      'proguard/debug.keystore', '.github/workflows/evil.keystore', 'app/key.pem',
+      'config/server.key', 'certs/tls.p12', 'keys/code.pfx',
+      'app/google-services.json.bak', 'config/local.properties.txt',
+    ]) {
+      assert.equal(isHardDeniedReviewFile(denied), true, `H1 hard-denies ${denied}`);
+      assert.ok(!filterReviewDiffFiles([denied]).includes(denied), `H1 filters ${denied} despite must-include`);
+    }
+    // H1: legitimate must-includes survive.
+    for (const kept of [
+      'app/src/main/AndroidManifest.xml', 'app/build.gradle.kts', 'app/build/proguard-rules.pro',
+      '.github/workflows/ci.yml', 'app/src/test/java/example/SampleTest.kt',
+      'app/src/test/assets/screenshot.png',
+    ]) {
+      assert.equal(isHardDeniedReviewFile(kept), false, `H1 keeps ${kept}`);
+      assert.ok(filterReviewDiffFiles([kept]).includes(kept), `H1 retains ${kept}`);
+    }
 
   const boundaryDiffs: Record<string, string> = {
     'app/src/main/java/example/First.kt': 'A'.repeat(999850),

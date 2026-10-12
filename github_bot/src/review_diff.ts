@@ -4,8 +4,23 @@ export const MAX_DIFF_LENGTH = 1000000;
 // beyond this the changed-path list is treated as incomplete (fail-closed).
 export const MAX_CHANGED_FILES = 3000;
 
-// MUST NOT exclude AndroidManifest.xml, permissions, *.gradle.kts, ProGuard files,
-// .github/workflows, or tests.
+// H1: secret/key material is hard-denied BEFORE the must-include rules
+// below, so `tests/debug.keystore` or `app/src/test/google-services.json`
+// can never ride a test/permission/proguard exception back into the
+// model-visible diff. MUST NOT exclude AndroidManifest.xml, permissions,
+// *.gradle.kts, ProGuard files, .github/workflows, or tests — except through
+// this hard-deny list.
+export const HARD_DENY_REVIEW_PATTERNS = [
+  '**/.env*',
+  '**/local.properties*',
+  '**/google-services.json*',
+  '**/*.keystore',
+  '**/*.jks',
+  '**/*.key',
+  '**/*.pem',
+  '**/*.p12',
+  '**/*.pfx',
+] as const;
 export const DEFAULT_GIT_DIFF_EXCLUDES = [
   '*.lock',
   '**/gradle.lockfile',
@@ -80,6 +95,13 @@ function globToRegExp(glob: string): RegExp {
 }
 
 const EXCLUDE_PATTERNS = DEFAULT_GIT_DIFF_EXCLUDES.map(globToRegExp);
+const HARD_DENY_REVIEW_COMPILED = HARD_DENY_REVIEW_PATTERNS.map(globToRegExp);
+
+/** Non-overridable: secret/key files are never model-visible, must-include or not. */
+export function isHardDeniedReviewFile(rawPath: string): boolean {
+  if (!rawPath || typeof rawPath !== 'string') return false;
+  return HARD_DENY_REVIEW_COMPILED.some((pattern) => pattern.test(normalizePath(rawPath)));
+}
 
 function isMustIncludeReviewFile(file: string): boolean {
   const normalized = normalizePath(file).toLowerCase();
@@ -98,6 +120,7 @@ export function filterReviewDiffFiles(changedFiles: string[]): string[] {
   return changedFiles.filter((rawPath) => {
     if (!rawPath || typeof rawPath !== 'string') return false;
     const file = normalizePath(rawPath);
+    if (isHardDeniedReviewFile(file)) return false;
     if (isMustIncludeReviewFile(file)) return true;
     return !EXCLUDE_PATTERNS.some((pattern) => pattern.test(file));
   });

@@ -378,7 +378,7 @@ sealed interface StreamEvent {
 - `data: [DONE]`（Chat）為流結束標記，不做 JSON 解析。
 - UTF-8 按位元組流解碼，不得按 Char 切分（多位元組字元跨 chunk 時緩衝未完成位元組）。
 - 單行上限 1 MiB（防惡意服務端撐爆內存；超限 → `Failed(retryable=false, "SSE_LINE_TOO_LONG")`）。
-- 單事件 `data:` 總量上限 1 MiB（沿用單行預算，非新數字；防多小行堆疊攻擊——每行合法但合併超限 → `Failed(retryable=false, "SSE_FRAME_TOO_LONG")`，與單行超限／`SSE_TRUNCATED` 斷線區分）。
+- 單事件 `data:` 總量上限 1 MiB（沿用單行預算，非新數字；防多小行堆疊攻擊——每行合法但合併超限 → `Failed(retryable=false, "SSE_FRAME_TOO_LARGE")`，與單行超限／`SSE_TRUNCATED` 斷線區分）。
 - 空行 = 事件邊界；無 `event:` 欄位時按 payload 內容嗅探（Chat/Responses/Anthropic 各自 try-parse，順序見實現）。
 
 ### 3.5 Block 身份規則

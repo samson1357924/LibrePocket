@@ -182,7 +182,7 @@ class SseFrameParser {
                 // Small-line stacking guard: each line is legal on its own,
                 // but the joined event payload shares the single-line memory
                 // budget. Latch (never silently drop the excess).
-                if ((pendingChars.toLong() + value.length.toLong()) * 3L > MAX_FRAME_BYTES) {
+                if ((pendingChars.toLong() + value.length.toLong() + pendingData.size.toLong()) * 3L > MAX_FRAME_BYTES) {
                     frameTooLong = true
                     pendingEvent = null
                     pendingData.clear()

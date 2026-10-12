@@ -27,12 +27,15 @@ import org.robolectric.annotation.Config
  * 階段3：產品容器可滾（Re-review #8 Finding 3）——直寫 setContent，
  * [performScrollTo] 證明產品 [SettingsScreen] root Column 本身可滾
  *（外包可滾容器已移除；與產品 scroll 嵌套會觸發無限約束崩潰，故必須直寫）。
+ * Stage A（R10 Finding 1 P2/BLOCK 方案 B 立即止血）：
+ * retained 碼（READ/DELETE/CLEAR/UNKNOWN，journal 可能保留）只留重試、無取消；
+ * 僅 STALE（journal 已丟棄）留關閉。
  *
  * - `LOGOUT_CLEAR_FAILED`（部分清除，gate 已折疊 NoEndpoint）顯示恢復卡 +
  *   重試可達，且不再顯示「尚未設定」文案（readyGate 反例）；
  * - `LOGOUT_STALE`（已有新金鑰生效）無重試、僅關閉；
  * - 無碼時保留原尚未設定文案（fresh 不變）；
- * - inFlight 時按鍵 disabled + spinner。
+ * - inFlight 時可見按鍵 disabled + spinner（retained 無取消鍵）。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -58,10 +61,11 @@ class SettingsNoEndpointRecoveryTest {
                 logoutErrorCode = "LOGOUT_CLEAR_FAILED",
             )
         }
-        // 恢復卡文案可見，重試可達。
+        // 恢復卡文案可見，重試可達；Stage A：retained 碼無取消/關閉出口。
         onArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
-        onArea("取消").assertIsDisplayed()
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         // readyGate 反例：恢復態不顯示「尚未設定」文案。
         composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
         composeRule.onAllNodesWithText("前往設定").assertCountEquals(0)
@@ -121,13 +125,16 @@ class SettingsNoEndpointRecoveryTest {
         onArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
         onArea("清除中…").assertIsDisplayed()
         onArea("清除中…").assertIsNotEnabled()
-        onArea("取消").assertIsNotEnabled()
+        // Stage A：retained 碼無取消/關閉鍵，僅重試（執行中 disabled + spinner）。
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
     }
 
     @Test
     fun noEndpointRetryableCodesAllShowRetry() {
         // READ/DELETE 失敗同為可重試碼（STALE 除外）：同一 content 內切碼驗證，
         // 避免同一 test 內兩次 setContent（compose rule 單測只允許一次）。
+        // Stage A：兩碼皆無取消出口。
         var code by mutableStateOf("LOGOUT_READ_FAILED")
         composeRule.setContent {
             SettingsScreen(
@@ -138,9 +145,13 @@ class SettingsNoEndpointRecoveryTest {
         }
         onArea(setupErrorText("LOGOUT_READ_FAILED")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         code = "LOGOUT_DELETE_FAILED"
         composeRule.waitForIdle()
         onArea(setupErrorText("LOGOUT_DELETE_FAILED")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
     }
 }

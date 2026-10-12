@@ -68,11 +68,21 @@ fun SettingsScreen(
     /**
      * 登出失敗碼（僅 `LOGOUT_*` 顯示；呼叫方由 form.errorCode 過濾傳入）。
      * 非 null 即顯示失敗卡；失敗不自動關 dialog（見 [showConfirmLogout]）。
+     *
+     * Stage A（R10 Finding 1 P2/BLOCK，方案 B 立即止血）：retained 碼
+     * （`LOGOUT_READ_FAILED`／`LOGOUT_DELETE_FAILED`／`LOGOUT_CLEAR_FAILED`／
+     * `LOGOUT_UNKNOWN`，journal 可能保留）不可 dismiss——journal 釋放前不給出口，
+     * 同次執行無其他入口，故不暗示可稍後處理；僅 `LOGOUT_STALE`（journal 已丟棄，
+     * save 不被擋）可關閉。
      */
     logoutErrorCode: String? = null,
-    /** 登出執行中：確認/重試/取消三鍵皆 disabled，確認/重試鍵轉 spinner 防重點。 */
+    /** 登出執行中：可見按鍵皆 disabled，確認/重試鍵轉 spinner 防重點。 */
     logoutInFlight: Boolean = false,
-    /** 關閉失敗卡（取消語義：不調 logout）。 */
+    /**
+     * 關閉失敗卡（不調 logout）。
+     *
+     * 僅初始確認（無碼）與 `LOGOUT_STALE` 可達；retained 碼無 dismiss 入口。
+     */
     onDismissLogoutError: () -> Unit = {},
     /** 重試登出；預設複用 [onLogout]。 */
     onRetryLogout: () -> Unit = onLogout,
@@ -287,6 +297,10 @@ fun SettingsScreen(
                     // 登出失敗卡：文案複用 Setup 共享映射；CLEAR_FAILED 說明部分
                     // 狀態（金鑰已刪、設定仍在→重試）。gate NoEndpoint 原因重構
                     // 不在此做（follow-up：區分 CLEAR_FAILED 導致的 NO_KEY）。
+                    // Stage A（R10 Finding 1 P2/BLOCK，方案 B）：retained 碼
+                    // （STALE 以外全部 LOGOUT_*）journal 釋放前不給出口，只留重試；
+                    // 僅 STALE（journal 已丟棄）留關閉；無碼初始確認才有取消。
+                    // 結構性 follow-up（方案 A：journal domain state 驅動）另行處理。
                     logoutErrorCode?.let { code ->
                         Card(
                             colors = CardDefaults.cardColors(
@@ -303,41 +317,55 @@ fun SettingsScreen(
                         }
                         Spacer(modifier = Modifier.height(8.dp))
                     }
-                    // 確認即重試同一動作：失敗不關 dialog，原文案轉「重試清除」。
-                    Button(
-                        onClick = onRetryLogout,
-                        enabled = !logoutInFlight,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        if (logoutInFlight) {
-                            CircularProgressIndicator(strokeWidth = 2.dp)
-                            Spacer(modifier = Modifier.padding(4.dp))
-                            Text("清除中…")
-                        } else {
-                            Text(if (logoutErrorCode == null) "確定清除" else "重試清除")
+                    val isStaleReadyError = logoutErrorCode == "LOGOUT_STALE"
+                    val isRetainedReadyError = logoutErrorCode != null && !isStaleReadyError
+                    // STALE 不需重試，僅關閉；retained 只留重試（無取消，不暗示稍後處理，
+                    // 同次執行無其他入口）；無碼初始確認維持確定清除 + 取消。
+                    if (!isStaleReadyError) {
+                        // 確認即重試同一動作：失敗不關 dialog，原文案轉「重試清除」。
+                        Button(
+                            onClick = onRetryLogout,
+                            enabled = !logoutInFlight,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            if (logoutInFlight) {
+                                CircularProgressIndicator(strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.padding(4.dp))
+                                Text("清除中…")
+                            } else {
+                                Text(if (logoutErrorCode == null) "確定清除" else "重試清除")
+                            }
+                        }
+                        if (!isRetainedReadyError) {
+                            Spacer(modifier = Modifier.height(8.dp))
                         }
                     }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    // 取消語義：只關 dialog + 清失敗碼，絕不調 logout。
-                    OutlinedButton(
-                        onClick = {
-                            confirmLogout = false
-                            onDismissLogoutError()
-                        },
-                        enabled = !logoutInFlight,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("取消")
+                    if (!isRetainedReadyError) {
+                        // 取消/關閉語義：只關 dialog + 清失敗碼，絕不調 logout。
+                        // retained 碼無此鍵（journal 釋放前不給出口）。
+                        OutlinedButton(
+                            onClick = {
+                                confirmLogout = false
+                                onDismissLogoutError()
+                            },
+                            enabled = !logoutInFlight,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(if (isStaleReadyError) "關閉" else "取消")
+                        }
                     }
                 }
             }
             EndpointGate.NoEndpoint -> {
                 // NoEndpoint 恢復入口（Re-review #8 Finding 2 P2/BLOCK 階段2；
-                // Stage 3 P2：DELETE 失敗與中性 UNKNOWN 同為可重試碼）：
+                // Stage 3 P2：DELETE 失敗與中性 UNKNOWN 同為可重試碼；
+                // Stage A R10 Finding 1 P2/BLOCK 方案 B 立即止血）：
                 // 部分清除（LOGOUT_CLEAR_FAILED：金鑰已刪、設定仍在）gate 已折疊為
                 // NoEndpoint；若只顯示「尚未設定」會丟失重試入口。有未恢復 LOGOUT_*
-                // 時改顯示 setupErrorText + 重試（可重試碼）/ STALE 僅關閉 + 取消；
-                // inFlight 時按鍵 disabled + spinner。無碼時保留原尚未設定文案。
+                // 時改顯示 setupErrorText + 重試（retained 碼僅重試，無取消：
+                // journal 釋放前不給出口，同次執行無其他入口，故不暗示稍後處理）/
+                // STALE 僅關閉（journal 已丟棄，save 不被擋）；
+                // inFlight 時可見按鍵 disabled + spinner。無碼時保留原尚未設定文案。
                 // 恢復態隱藏「前往設定」（dismiss 回 fresh 後再出現），避免在元數據
                 // 仍殘留時進 Setup 預填陳舊值；重試/關閉才是此態的恢復入口。
                 val recoveryCode = logoutErrorCode?.takeIf { it.startsWith("LOGOUT_") }
@@ -372,6 +400,8 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     val isStale = recoveryCode == "LOGOUT_STALE"
                     if (!isStale) {
+                        // retained 碼（READ/DELETE/CLEAR/UNKNOWN）：journal 可能保留，
+                        // 只留重試清除，不給取消（journal 釋放前不給出口）。
                         Button(
                             onClick = onRetryLogout,
                             enabled = !logoutInFlight,
@@ -384,14 +414,6 @@ fun SettingsScreen(
                             } else {
                                 Text("重試清除")
                             }
-                        }
-                        Spacer(modifier = Modifier.height(8.dp))
-                        OutlinedButton(
-                            onClick = onDismissLogoutError,
-                            enabled = !logoutInFlight,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text("取消")
                         }
                     } else {
                         // STALE：已有新的金鑰生效，不需重試，僅關閉待 dismiss

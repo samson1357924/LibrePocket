@@ -21,6 +21,7 @@ import org.robolectric.annotation.Config
 
 /**
  * Stage 3 P2 啟動失敗恢復可達（決策 (a) 的 Settings 側）：
+ * Stage A（R10 Finding 1 P2/BLOCK 方案 B）：retained 碼只留重試、無取消。
  *
  * - `NoEndpoint` + `LOGOUT_DELETE_FAILED`（delete 未證勝）→ 恢復卡 + 重試可達；
  * - `NoEndpoint` + `LOGOUT_UNKNOWN`（中性碼）→ 恢復卡 + 重試可達，且文案不含
@@ -51,7 +52,8 @@ class StartupFailRecoveryTest {
         }
         onArea(setupErrorText("LOGOUT_DELETE_FAILED")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
-        onArea("取消").assertIsDisplayed()
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
         onArea("重試清除").performClick()
         assertEquals(1, logoutCalls)
@@ -72,7 +74,8 @@ class StartupFailRecoveryTest {
         }
         onArea(text).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
-        onArea("取消").assertIsDisplayed()
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
         onArea("重試清除").performClick()
         assertEquals(1, logoutCalls)

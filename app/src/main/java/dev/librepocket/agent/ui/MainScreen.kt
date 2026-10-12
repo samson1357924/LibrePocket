@@ -102,6 +102,9 @@ fun MainScreen(
     val gate by setupViewModel.gate.collectAsStateWithLifecycle()
     val hasEndpoint = gate is EndpointGate.Ready
     val gateLoading = gate is EndpointGate.Loading
+    // 登出失敗 Settings UI 可見（Re-review #7 Finding 2 階段2）：false 分支不導航
+    // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
+    val setupForm by setupViewModel.form.collectAsStateWithLifecycle()
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
 
@@ -387,6 +390,9 @@ fun MainScreen(
                                     }
                                 }
                             },
+                            logoutErrorCode = setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") },
+                            logoutInFlight = setupForm.logoutInFlight,
+                            onDismissLogoutError = { setupViewModel.clearLogoutError() },
                         )
                     }
                     composable(Routes.SETUP) {

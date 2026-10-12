@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
@@ -24,6 +25,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.librepocket.agent.ui.setup.EndpointGate
+import dev.librepocket.agent.ui.setup.setupErrorText
 import dev.librepocket.automation.AutomationSettingsState
 import dev.librepocket.voice.VoiceTools
 import dev.librepocket.voice.VoiceTts
@@ -61,8 +63,21 @@ fun SettingsScreen(
     voiceLoadFailed: Boolean = false,
     onVoiceInputSwitch: (Boolean) -> Unit = {},
     onVoiceOutputSwitch: (Boolean) -> Unit = {},
+    /**
+     * 登出失敗碼（僅 `LOGOUT_*` 顯示；呼叫方由 form.errorCode 過濾傳入）。
+     * 非 null 即顯示失敗卡；失敗不自動關 dialog（見 [showConfirmLogout]）。
+     */
+    logoutErrorCode: String? = null,
+    /** 登出執行中：確認/重試/取消三鍵皆 disabled，確認/重試鍵轉 spinner 防重點。 */
+    logoutInFlight: Boolean = false,
+    /** 關閉失敗卡（取消語義：不調 logout）。 */
+    onDismissLogoutError: () -> Unit = {},
+    /** 重試登出；預設複用 [onLogout]。 */
+    onRetryLogout: () -> Unit = onLogout,
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
+    // 失敗不自動關 dialog：error 存續即重現確認態（confirm 已手動關閉又回來也一樣）。
+    val showConfirmLogout = confirmLogout || logoutErrorCode != null
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -252,7 +267,7 @@ fun SettingsScreen(
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                 }
-                if (!confirmLogout) {
+                if (!showConfirmLogout) {
                     OutlinedButton(
                         onClick = { confirmLogout = true },
                         modifier = Modifier.fillMaxWidth(),
@@ -266,14 +281,50 @@ fun SettingsScreen(
                         color = MaterialTheme.colorScheme.error,
                     )
                     Spacer(modifier = Modifier.height(8.dp))
+                    // 登出失敗卡：文案複用 Setup 共享映射；CLEAR_FAILED 說明部分
+                    // 狀態（金鑰已刪、設定仍在→重試）。gate NoEndpoint 原因重構
+                    // 不在此做（follow-up：區分 CLEAR_FAILED 導致的 NO_KEY）。
+                    logoutErrorCode?.let { code ->
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                text = setupErrorText(code),
+                                modifier = Modifier.padding(12.dp),
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+                    // 確認即重試同一動作：失敗不關 dialog，原文案轉「重試清除」。
                     Button(
-                        onClick = {
-                            confirmLogout = false
-                            onLogout()
-                        },
+                        onClick = onRetryLogout,
+                        enabled = !logoutInFlight,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text("確定清除")
+                        if (logoutInFlight) {
+                            CircularProgressIndicator(strokeWidth = 2.dp)
+                            Spacer(modifier = Modifier.padding(4.dp))
+                            Text("清除中…")
+                        } else {
+                            Text(if (logoutErrorCode == null) "確定清除" else "重試清除")
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    // 取消語義：只關 dialog + 清失敗碼，絕不調 logout。
+                    OutlinedButton(
+                        onClick = {
+                            confirmLogout = false
+                            onDismissLogoutError()
+                        },
+                        enabled = !logoutInFlight,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("取消")
                     }
                 }
             }

@@ -76,6 +76,15 @@ data class SetupUiState(
     val apiKey: String = "",
     val showKey: Boolean = false,
     val saving: Boolean = false,
+    /**
+     * 登出執行中（Settings UI 可見，Re-review #7 Finding 2 階段2）。
+     *
+     * 由 [logout] 在進入持鎖前同步置 true（仿 [saving] 語義），成功經整表重置、
+     * 失敗經結尾復位、取消經外層 catch 復位；任何路徑皆不留 true。
+     * 與 [saving] 獨立：save/logout 以 [saveMutex] 序列化，兩者可同時為
+     * 「對方持鎖、己方排隊」。
+     */
+    val logoutInFlight: Boolean = false,
     val testing: Boolean = false,
     val testModels: Int? = null,
     val modelOptions: List<String> = emptyList(),
@@ -1250,14 +1259,27 @@ class SetupViewModel(
      * `errorCode` set otherwise. Never called when the logout coroutine itself
      * is cancelled (except the committed-then-cancel swallow, which completes
      * normally and reports success).
+     *
+     * UI 可見性（Re-review #7 Finding 2 階段2）：入口同步置
+     * `form.logoutInFlight = true`（持鎖前，仿 saving 語義；執行中再調忽略），
+     * 成功經整表重置、失敗經結尾復位、取消（含排隊取消）經外層 catch 復位；
+     * 失敗保留 `errorCode` 由 Settings 顯示（[clearLogoutError] 關閉），成功重置。
      */
     fun logout(onDone: (Boolean) -> Unit = {}) {
+        // VM 層防重點：執行中再調直接忽略（UI 層另以 disabled + spinner 防連點）。
+        if (_form.value.logoutInFlight) return
+        // 持鎖前同步置 inFlight（仿 saving 入口語義）：排隊等鎖時被取消也能被
+        // 外層 catch 復位。前次失敗碼在此清為 fresh attempt；失敗保留、成功
+        // 重置、取消不蓋碼（見結尾與外層 catch）。
+        _form.value = _form.value.copy(logoutInFlight = true, errorCode = null)
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         modelRefreshGeneration.incrementAndGet()
         val job = viewModelScope.launch(Dispatchers.IO) {
+            // try-catch 在 withLock 之外（仿 save）：排隊等鎖時被取消（lambda
+            // 未進入）仍能復位 inFlight；僅內層 catch 會漏此窗口。
             try {
                 var committed = false
                 var logoutError: String? = null
@@ -1352,6 +1374,8 @@ class SetupViewModel(
                     // aborts above, the stamp is likewise already applied. Only
                     // stamp here if a code was chosen but not yet applied (all
                     // paths above stamp eagerly, so this is a no-op guard).
+                    // 結尾復位 inFlight（保留 errorCode 供 Settings 顯示）。
+                    _form.value = _form.value.copy(logoutInFlight = false)
                     withContext(Dispatchers.Main) { onDone(false) }
                     return@launch
                 }
@@ -1361,11 +1385,28 @@ class SetupViewModel(
                 // Cancel before onDone runs. NonCancellable preserves the
                 // save-side mirror (committed cancels report success).
                 withContext(NonCancellable + Dispatchers.Main) { onDone(true) }
-            } catch (e: CancellationException) {
+            } catch (e: Exception) {
+                // 取消（含排隊等鎖時被取消、lambda 未進入）與任何未預期異常皆
+                // 先復位 inFlight 再重拋：取消不蓋 errorCode、不調 onDone（既有
+                // 語義）；未預期異常亦不發明新碼，只保證 spinner 不卡死。
+                _form.value = _form.value.copy(logoutInFlight = false)
                 throw e
             }
         }
         lastLogoutJobForTest = job
+    }
+
+    /**
+     * 關閉登出失敗卡（Settings 取消語義：不調 logout）。
+     *
+     * 僅清除 `LOGOUT_*` 碼，其他碼（如 save 驗證碼）保留；inFlight 中調用只清
+     * 碼、不影響執行（執行中取消鍵本就 disabled，此為防禦性語義）。
+     */
+    fun clearLogoutError() {
+        val cur = _form.value
+        if (cur.errorCode?.startsWith("LOGOUT_") == true) {
+            _form.value = cur.copy(errorCode = null)
+        }
     }
 
     private fun effectiveBaseUrlOf(form: SetupUiState): String =

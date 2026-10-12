@@ -2010,6 +2010,26 @@ class ChatViewModel(
                             false
                         }
                         if (droppedWarn) _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    } else {
+                        // R6-5 byte-abandon: a clean fence + non-streaming fork
+                        // whose prefix blew SNAPSHOT_MAX_TOTAL_CHARS still rides
+                        // the byte marker atomically (snapshotSwitchHistory
+                        // returns prefix.size only, so 0 is ambiguous with a
+                        // clean empty history) — bounded scan re-surfaces
+                        // HISTORY_SNAPSHOT_INCOMPLETE live, never silent until
+                        // restart. Same best-effort scan as the branch above:
+                        // only the notice is at stake.
+                        val byteWarn = try {
+                            withContext(Dispatchers.IO) {
+                                val backing = sessions.storeOrNull()
+                                backing != null && hasIncompleteSnapshotMarker(backing, forkTargetId)
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (byteWarn) _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -2702,7 +2722,8 @@ class ChatViewModel(
     }
 
     /** A stale gate restore cannot outrank a newer Started target or later retry attempt. */
-    private fun setRetryableIfNewer(op: PendingOp) {        val accepted = latestAcceptedStartedTarget
+    private fun setRetryableIfNewer(op: PendingOp) {
+        val accepted = latestAcceptedStartedTarget
         if (accepted != null && op.retryTargetEpoch < accepted.retryTargetEpoch) return
         val current = retryableOp
         if (current == null || op.retryTargetEpoch > current.retryTargetEpoch ||

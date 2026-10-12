@@ -56,6 +56,24 @@ private const val HISTORY_LOAD_CAP = 2000
 private const val SWITCH_SNAPSHOT_COPY_CAP = HISTORY_LOAD_CAP - 1
 
 /**
+ * R6-5: aggregate char budget for one durable fork-snapshot prefix. Bounds
+ * the total [dev.librepocket.session.TranscriptEvent.text] chars carried by
+ * [loadSwitchSnapshotEvents] to newest-first `min(1999 rows, 2M chars)`:
+ * without it a full 1999-row prefix of max-size rows
+ * ([RoomSessionStore.MAX_TEXT_CHARS] per-row bound) materializes ~200M chars
+ * (~400MB UTF-16, plus a Redactor copy) in one read and one store batch.
+ * 2M chars (~1/10 of [RoomSessionStore.EXPORT_MAX_BYTES] nominal — chars
+ * are UTF-16 code units vs UTF-8 bytes, so the ratio is approximate —, ~20x
+ * [TurnController.MAX_REQUEST_CHARS], ~100 full
+ * [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] rows) covers ~50-100 normal turns, so
+ * ordinary sessions never trip it; an over-budget prefix is abandoned whole
+ * (zero rows + incomplete marker, never a truncated half prefix — see
+ * [snapshotSwitchHistory]). Chars are UTF-16 code units (`String.length`),
+ * the same unit as every other bound here.
+ */
+internal const val SNAPSHOT_MAX_TOTAL_CHARS = 2_000_000
+
+/**
  * Stage E: per-message char bound for model-context hydration. The write path
  * already caps a stored row at 100k chars ([RoomSessionStore.MAX_TEXT_CHARS]);
  * a single such row (~25k tokens at ~4 chars/token) must never reach the
@@ -1028,10 +1046,24 @@ internal fun isSwitchSnapshotTerminalMark(event: TranscriptEvent): Boolean {
 }
 
 /**
+ * R6-5: bounded fork-snapshot load result. [events] is the newest-kept
+ * qualifying prefix, oldest-first; [droppedByBytes] is the exact number of
+ * older qualifying rows excluded by [SNAPSHOT_MAX_TOTAL_CHARS] (0 when the
+ * prefix fit — row-cap drops stay silent as before and are NOT counted
+ * here). Counted in the same backward scan (transient pages only, bounded by
+ * the prune ceiling), never a second query.
+ */
+internal data class SwitchSnapshotLoad(
+    val events: List<TranscriptEvent>,
+    val droppedByBytes: Int,
+)
+
+/**
  * R5-3 durable fork-snapshot projection (UI replay/audit): the newest kept
- * rows up to [SWITCH_SNAPSHOT_COPY_CAP], oldest-first, via the same backward
- * paging. Keeps every `user`/`assistant` row INCLUDING partials (verbatim:
- * `isPartial` / `failureReason` / `parentRunId` / `attemptIndex` / `isFinal` /
+ * rows up to [SWITCH_SNAPSHOT_COPY_CAP] AND [SNAPSHOT_MAX_TOTAL_CHARS] total
+ * chars (R6-5 dual budget), oldest-first, via the same backward paging. Keeps
+ * every `user`/`assistant` row INCLUDING partials (verbatim: `isPartial` /
+ * `failureReason` / `parentRunId` / `attemptIndex` / `isFinal` /
  * `createdAt` preserved, `seq` reassigned on copy, texts never truncated —
  * truncation stays a read-path concern via [cappedHistoryText] on hydrate)
  * plus the terminal `system` marks above ([isSwitchSnapshotTerminalMark]).
@@ -1044,25 +1076,47 @@ internal fun isSwitchSnapshotTerminalMark(event: TranscriptEvent): Boolean {
  * [snapshotSwitchHistory]). Pre-restart model contexts still agree because
  * reopen re-applies the same `!isPartial` filter to the copied rows.
  *
- * Counting basis: the copy budget covers the combined UI/audit set
+ * Counting basis: the row budget covers the combined UI/audit set
  * (`countHistoryEvents(includePartial=true)` user/assistant rows plus the
  * terminal marks, which that COUNT excludes as `system` rows), newest-first,
- * so a large ledger drops the oldest rows first. Marker + copy never exceeds
- * [HISTORY_LOAD_CAP] (one slot reserved), matching the prune ceiling.
+ * so a large ledger drops the oldest rows first (silent, as before). The
+ * char budget accumulates the same newest-first order and stops the prefix
+ * at the first row that would overflow [SNAPSHOT_MAX_TOTAL_CHARS] — that row
+ * and every older qualifying row is reported via [SwitchSnapshotLoad.droppedByBytes]
+ * (counted in the same scan, transient pages only) so the caller abandons
+ * the whole prefix instead of copying a half (see [snapshotSwitchHistory]).
+ * Marker + copy never exceeds [HISTORY_LOAD_CAP] (one slot reserved),
+ * matching the prune ceiling.
  */
-internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: String): List<TranscriptEvent> {
+internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: String): SwitchSnapshotLoad {
     val keptNewestFirst = ArrayList<TranscriptEvent>(SWITCH_SNAPSHOT_COPY_CAP)
+    var totalChars = 0L
+    var droppedByBytes = 0
+    var byteCapped = false
     var beforeSeq = Long.MAX_VALUE
-    outer@ while (keptNewestFirst.size < SWITCH_SNAPSHOT_COPY_CAP) {
+    outer@ while (true) {
         val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
         if (page.isEmpty()) break
         for (event in page) {
             val keep = (event.kind == "user" || event.kind == "assistant") ||
                 isSwitchSnapshotTerminalMark(event)
-            if (keep) {
-                if (keptNewestFirst.size >= SWITCH_SNAPSHOT_COPY_CAP) break@outer
-                keptNewestFirst.add(event)
+            if (!keep) continue
+            if (byteCapped) {
+                // Budget already blown: count only (transient page row, never
+                // retained) so the caller can abandon honestly.
+                droppedByBytes++
+                continue
             }
+            if (keptNewestFirst.size >= SWITCH_SNAPSHOT_COPY_CAP) break@outer
+            if (totalChars + event.text.length > SNAPSHOT_MAX_TOTAL_CHARS) {
+                // Newest-first accumulate, over budget stops here: this row
+                // and every older qualifying row drops (counted below).
+                byteCapped = true
+                droppedByBytes++
+                continue
+            }
+            keptNewestFirst.add(event)
+            totalChars += event.text.length
         }
         // Pages are newest-first with distinct seqs; the next window ends
         // strictly below this page's minimum. A non-advancing store would
@@ -1072,7 +1126,7 @@ internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: St
         beforeSeq = pageMin
         if (page.size < HISTORY_PAGE) break
     }
-    return keptNewestFirst.asReversed()
+    return SwitchSnapshotLoad(keptNewestFirst.asReversed(), droppedByBytes)
 }
 
 /** Marker kind for an R4-2 model-switch fork: hidden from chat replay, kept in export. */
@@ -1127,6 +1181,10 @@ private const val SNAPSHOT_INCOMPLETE_SCAN_LIMIT = 16
  * - `"dangling excluded"`: the copy succeeded minus dropped dangling
  *   families ([snapshotSwitchHistory] auto-marks when a family is skipped),
  *   so "copy failed" would mislead — the rows landed, one family didn't.
+ * - `"byte budget exceeded"` (R6-5): the prefix blew
+ *   [SNAPSHOT_MAX_TOTAL_CHARS], so the copy carries zero rows (all-or-nothing
+ *   abandon, never a truncated half prefix) plus this marker in the same
+ *   atomic batch.
  */
 internal fun snapshotIncompleteMarkerText(oldModel: String, newModel: String, reason: String = "copy failed"): String =
     "snapshot incomplete $oldModel -> $newModel [history incomplete: $reason]"
@@ -1144,9 +1202,9 @@ internal fun isSnapshotIncompleteMarker(text: String): Boolean =
  * prefix with the marker trailing it (tail). Best-effort callers swallow
  * failures as "no marker" (only the notice is at stake). The scan matches
  * only the `snapshot incomplete ` prefix, so every [reason] cause
- * (`copy failed` / `ledger unsettled` / `dangling excluded`, see
- * [snapshotIncompleteMarkerText]) re-warns the same notice — causes are not
- * distinguished here by design.
+ * (`copy failed` / `ledger unsettled` / `dangling excluded` /
+ * `byte budget exceeded`, see [snapshotIncompleteMarkerText]) re-warns the
+ * same notice — causes are not distinguished here by design.
  */
 internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId: String): Boolean {
     val head = store.loadEvents(sessionId, 0, SNAPSHOT_INCOMPLETE_SCAN_LIMIT)
@@ -1171,7 +1229,10 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * Copied rows keep their family linkage and `createdAt` verbatim; `seq` is
  * reassigned by the store; texts are stored verbatim (truncation stays a
  * read-path concern via [cappedHistoryText] on hydrate). The copy is bounded
- * newest-first to [SWITCH_SNAPSHOT_COPY_CAP] so marker + copy never exceeds
+ * newest-first to [SWITCH_SNAPSHOT_COPY_CAP] rows AND
+ * [SNAPSHOT_MAX_TOTAL_CHARS] total chars (R6-5: an over-budget prefix is
+ * abandoned whole — zero rows + incomplete marker, never a half prefix, see
+ * below), so marker + copy never exceeds
  * [HISTORY_LOAD_CAP]; pre- and post-restart model contexts still agree
  * because reopen re-applies the same `!isPartial` filter to the copied rows
  * (provider payload unchanged).
@@ -1238,7 +1299,20 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * so the second pass is a no-op. The 100k per-row store bound applies as on
  * any other write.
  *
- * @return number of history rows copied (0 when withheld).
+ * @return number of history rows copied (0 when withheld or byte-abandoned).
+ *
+ * R6-5 aggregate byte cap (no schema change): the prefix load now enforces
+ * `min(1999 rows, [SNAPSHOT_MAX_TOTAL_CHARS] chars)` newest-first. When the
+ * char budget excludes any row (`droppedByBytes > 0`) the copy carries ZERO
+ * rows and rides one system incomplete row (reason `"byte budget exceeded"`)
+ * in the same atomic batch — a truncated half prefix risks a family split
+ * (orphan-head user row that the reopen backfill would mis-stamp as
+ * INTERRUPTED), so the over-budget fork degrades to
+ * pre-R4-2 (new rows only) with the same HISTORY_SNAPSHOT_INCOMPLETE
+ * re-warning as every other incomplete cause (no new notice kind;
+ * [hasIncompleteSnapshotMarker] is prefix-based and cause-agnostic).
+ * Row-cap drops stay silent as before (legacy contract, frozen); the new
+ * char cap adopts fail-loud instead.
  *
  * R6-3 streaming-switch hardening (no schema change):
  * - [excludeDanglingFamilies]: when true, families that dangle inside the
@@ -1276,20 +1350,41 @@ internal suspend fun snapshotSwitchHistory(
     // snapshot-rollback on the fake). The marker rides inside the same batch
     // so a marker-write failure also leaves zero rows — never a marker-only
     // or half-copied ledger.
-    val loaded = if (historyWithheld) emptyList() else loadSwitchSnapshotEvents(store, fromSessionId)
-    // R6-3: drop orphan families before the copy (see above). Withheld forks
-    // already copy zero rows, so this is a no-op there.
-    val prefix: List<TranscriptEvent> = if (excludeDanglingFamilies && loaded.isNotEmpty()) {
-        val dangling = findDanglingRunIds(loaded).toSet()
-        if (dangling.isEmpty()) loaded else loaded.filterNot { familyOf(it) in dangling }
+    val snapshot = if (historyWithheld) {
+        SwitchSnapshotLoad(emptyList(), 0)
     } else {
-        loaded
+        loadSwitchSnapshotEvents(store, fromSessionId)
     }
-    val droppedDangling = loaded.size - prefix.size
-    val incomplete = markIncomplete || droppedDangling > 0
+    // R6-5 byte-budget abandon (all-or-nothing, never a half prefix): when
+    // the char budget excluded any row, the copy carries ZERO rows — a
+    // truncated half prefix risks a family split (orphan-head user row the
+    // reopen backfill would mis-stamp as INTERRUPTED), so the over-budget
+    // fork degrades to pre-R4-2 (new rows only) with one incomplete marker,
+    // exactly like a failed copy. Withheld forks already carry zero rows.
+    val byteAbandoned = snapshot.droppedByBytes > 0
+    val carried: List<TranscriptEvent> = if (byteAbandoned) emptyList() else snapshot.events
+    // R6-3: drop orphan families before the copy (see above). Withheld and
+    // byte-abandoned forks already copy zero rows, so this is a no-op there.
+    val prefix: List<TranscriptEvent> = if (excludeDanglingFamilies && carried.isNotEmpty()) {
+        val dangling = findDanglingRunIds(carried).toSet()
+        if (dangling.isEmpty()) carried else carried.filterNot { familyOf(it) in dangling }
+    } else {
+        carried
+    }
+    val droppedDangling = carried.size - prefix.size
+    val incomplete = markIncomplete || droppedDangling > 0 || byteAbandoned
     // R6-3 cause tag (see snapshotIncompleteMarkerText): a fence failure
     // outranks a drop — when both hold, the ledger may miss its terminal.
-    val incompleteReason = if (markIncomplete) "ledger unsettled" else "dangling excluded"
+    // A byte abandon outranks a dangling drop (the two are mutually exclusive
+    // anyway: an abandoned prefix never reaches the family filter).
+    val incompleteReason =
+        if (markIncomplete) {
+            "ledger unsettled"
+        } else if (byteAbandoned) {
+            "byte budget exceeded"
+        } else {
+            "dangling excluded"
+        }
     val batch = ArrayList<TranscriptEvent>(prefix.size + 2)
     batch.add(
         TranscriptEvent(

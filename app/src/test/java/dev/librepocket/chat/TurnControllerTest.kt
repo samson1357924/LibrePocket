@@ -2876,4 +2876,89 @@ class TurnControllerTest {
       c.close()
     }
   }
+
+  /**
+   * Round 10 H1 PromoAwait drain guard: while the promotion reservation holds
+   * (promotionPending set, no UNKNOWN yet — Lock-1 already minted the follow
+   * id and the await may have sent it) the FIFO head is NOT reclaimable:
+   * drainQueued() throws TranscriptPendingException and drainRecoveryLocked()
+   * returns null, with the head retained. Releasing the await commits via
+   * Lock-2 normally with exactly one follow row and one provider call.
+   */
+  @Test fun promotionAwaitWindowBlocksDrainAndCommitsSingleRowAfterRelease() {
+    val firstTurnGate = CompletableDeferred<Unit>()
+    val promotionParked = CountDownLatch(1)
+    val releasePromotionAwait = CountDownLatch(1)
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = AllowPolicy(),
+      transcript = sink,
+      dispatcher = Dispatchers.Default,
+      newId = { "h1-${n++}" },
+    )
+    c.beforePromotionAwaitForTest = {
+      promotionParked.countDown()
+      check(releasePromotionAwait.await(30, TimeUnit.SECONDS))
+    }
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls.get() == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow", opId = 181L) })
+      firstTurnGate.complete(Unit)
+      assertTrue("promotion did not reach its durable await", promotionParked.await(5, TimeUnit.SECONDS))
+      // PromoAwait window: reservation held, no UNKNOWN ownership yet.
+      assertFalse(c.hasPendingAdmission())
+      val promotionPendingField =
+        TurnController::class.java.getDeclaredField("promotionPending").apply { isAccessible = true }
+      val unknownField =
+        TurnController::class.java.getDeclaredField("unknownAdmission").apply { isAccessible = true }
+      assertNotNull(promotionPendingField.get(c))
+      assertNull(unknownField.get(c))
+      // The head is NOT reclaimable in this window.
+      try {
+        c.drainQueued()
+        fail("drainQueued during PromoAwait must throw TranscriptPendingException")
+      } catch (_: TranscriptPendingException) {
+        // Expected: Lock-1 already minted the follow id.
+      }
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertFalse(c.uiState.value.queuedRecoveryRequired)
+      val drainRecovery =
+        TurnController::class.java.getDeclaredMethod("drainRecoveryLocked").apply { isAccessible = true }
+      assertNull(drainRecovery.invoke(c))
+      assertEquals("blocked reclaim must retain the head", 1, c.uiState.value.pendingSteerCount)
+      assertEquals(ChatStatus.WAITING_STEERED, c.uiState.value.status)
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(1, provider.streamCalls.get())
+      // Release: Lock-2 commits normally — single follow row, single launch.
+      releasePromotionAwait.countDown()
+      runBlocking { withTimeout(5_000) { first.join() } }
+      awaitTrue { c.uiState.value.status == ChatStatus.IDLE && usersOf(c).size == 2 }
+      assertEquals(listOf("first", "follow"), usersOf(c))
+      assertEquals(1, usersOf(c).count { it == "follow" })
+      assertEquals("follow must reach the provider exactly once", 2, provider.streamCalls.get())
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      assertTrue(c.drainQueued().isEmpty())
+      assertEquals(
+        "Lock-2 commit keeps exactly one follow ledger row (no resend duplicate)",
+        1,
+        sink.started.count { it.second == "follow" },
+      )
+      assertEquals(2, sink.started.size)
+    } finally {
+      releasePromotionAwait.countDown()
+      firstTurnGate.complete(Unit)
+      outer.cancel()
+      c.close()
+    }
+  }
 }

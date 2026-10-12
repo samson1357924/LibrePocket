@@ -1724,4 +1724,220 @@ class TurnControllerLedgerTest {
       c.close()
     }
   }
+
+  /**
+   * Round 10 M1-direct: writer blocked + long drain — a direct waiter sealed
+   * before its durable await resolves must never rebuild UNKNOWN. Close wins
+   * the race: the waiter observes the seal on its bounded wait, rolls back
+   * the optimistic UI row and throws TranscriptDurabilityException (retryable
+   * fail-closed, not Pending-blocked), with hasPendingAdmission() false.
+   */
+  @OptIn(DelicateCoroutinesApi::class)
+  @Test
+  fun closeDuringDirectAwaitNeverRebuildsUnknownAfterSeal() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val writerGate = CompletableDeferred<Unit>()
+    val delegateEntered = AtomicBoolean(false)
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        delegateEntered.set(true)
+        writerGate.await()
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    val provider = LedgerFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "m1direct-${n++}" },
+      acceptTimeoutMs = 2_000L,
+    )
+    val text = "m1 direct sealed text"
+    val opId = 911L
+    try {
+      val deferred = GlobalScope.async(Dispatchers.Default) {
+        c.startOrEnqueue(text, opId = opId)
+      }
+      // The entry is admitted (writer owns it, sent == true) and the waiter is
+      // parked in ack.await — still uncompleted, fate still open.
+      runBlocking {
+        withTimeout(5_000) { while (!delegateEntered.get()) delay(10) }
+        withTimeout(5_000) { while (c.pendingTranscriptRunIds().isEmpty()) delay(10) }
+      }
+      assertFalse("admission must still be parked in ack.await", deferred.isCompleted)
+      // Long drain keeps the shutdown behind the blocked writer, so the waiter
+      // observes the seal on its bounded wait (not via a drain-timeout
+      // interrupt that could mask the M1 path).
+      c.close(drainTimeoutMs = 8_000L)
+      val failure = runBlocking {
+        withTimeout(10_000) {
+          try {
+            deferred.await()
+            null
+          } catch (e: Exception) {
+            e
+          }
+        }
+      }
+      assertTrue(
+        "sealed waiter must throw TranscriptDurabilityException, got $failure",
+        failure is TranscriptDurabilityException,
+      )
+      assertFalse("sealed waiter must not rebuild UNKNOWN", c.hasPendingAdmission())
+      assertTrue(
+        "sealed waiter must roll back the optimistic UI row",
+        c.uiState.value.messages.none { it.role == "user" && it.text == text },
+      )
+      assertEquals("transcript store unavailable", c.uiState.value.error)
+      assertTrue(
+        "ghost must not have persisted while the writer is blocked",
+        store.events.none { it.kind == "user" },
+      )
+      assertEquals("sealed admission must never launch", 0, provider.streamCalls.get())
+      // Release the writer: the orphan ghost drains (at most one row), still
+      // no host launch, still no UNKNOWN.
+      writerGate.complete(Unit)
+      val drained = runBlocking { withTimeout(10_000) { c.flushTranscript() } }
+      assertTrue("drain must complete after the writer unblocks", drained)
+      assertFalse(c.hasPendingAdmission())
+      assertTrue(
+        "orphan ghost survives as at most one row (no duplicate, no launch)",
+        store.events.count { it.kind == "user" } <= 1,
+      )
+      assertEquals("sealed admission must never launch", 0, provider.streamCalls.get())
+      assertTrue(
+        "rolled-back row stays rolled back after the drain",
+        c.uiState.value.messages.none { it.role == "user" && it.text == text },
+      )
+    } finally {
+      writerGate.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * Round 10 M1-promotion: the follow ghost send completed (writer owns the
+   * entry, await parked post-send-pre-flag) before close seals. The host
+   * fuzzy-CE must go through failPromotion — never rebuild UNKNOWN
+   * (hasPendingAdmission() false) — with no follow launch and no second row.
+   * Assertions run after the host join while the writer is still blocked, so
+   * no background settle can mask the fail-closed path.
+   */
+  @OptIn(DelicateCoroutinesApi::class)
+  @Test
+  fun closeDuringPromotionGhostSendFailsClosedWithoutUnknown() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val firstGate = CompletableDeferred<Unit>()
+    val followStoreGate = CompletableDeferred<Unit>()
+    val ghostEntered = AtomicBoolean(false)
+    val followText = "follow-M1-sealed"
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        if (text == followText) {
+          ghostEntered.set(true)
+          followStoreGate.await()
+        }
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    val provider = LedgerFakeProvider { request ->
+      flow {
+        val lastUser = request.messages.lastOrNull { it.role == "user" }?.text ?: ""
+        if (lastUser.contains("first")) firstGate.await()
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "m1promo-${n++}" },
+      acceptTimeoutMs = 10_000L,
+    )
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    val afterSendEntered = AtomicBoolean(false)
+    val hookRelease = CompletableDeferred<Unit>()
+    try {
+      val first = outer.async { c.send("first") }
+      runBlocking {
+        withTimeout(5_000) { while (provider.streamCalls.get() != 1) delay(10) }
+      }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue(followText, opId = 912L) })
+      // Park ONLY the promotion ghost post-send-pre-flag (deterministic proxy
+      // for the suspended-send CE flag shape: attempted true, sent false,
+      // admitted) — installed in beforePromotionAwait so the predecessor's own
+      // core writes never hit this global hook.
+      c.beforePromotionAwaitForTest = {
+        c.afterAdmissionSendForTest = { _ ->
+          afterSendEntered.set(true)
+          hookRelease.await()
+        }
+      }
+      firstGate.complete(Unit)
+      // Ghost send completed: the channel send returned (writer owns the entry,
+      // parked in the delegate) and the await is parked post-send-pre-flag.
+      runBlocking {
+        withTimeout(5_000) { while (!afterSendEntered.get()) delay(10) }
+        withTimeout(5_000) { while (!ghostEntered.get()) delay(10) }
+        withTimeout(5_000) { while (c.pendingTranscriptRunIds().isEmpty()) delay(10) }
+      }
+      assertFalse("promotion must be parked in the post-send hook", first.isCompleted)
+      // Seal under a long drain while the ghost is in flight: the host
+      // fuzzy-CE must fail closed via failPromotion, never rebuild UNKNOWN.
+      c.close(drainTimeoutMs = 8_000L)
+      runBlocking { withTimeout(5_000) { first.join() } }
+      // Join-then-assert while the writer is still blocked: the ghost is still
+      // writer-owned and unclaimed, so no settle/claim can mask the path.
+      assertFalse("sealed promotion must not rebuild UNKNOWN", c.hasPendingAdmission())
+      assertTrue(
+        "ghost must still be writer-owned behind the blocked writer",
+        c.pendingTranscriptRunIds().isNotEmpty(),
+      )
+      assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+      assertTrue(c.drainQueued().isEmpty())
+      assertEquals(listOf("first"), c.uiState.value.messages.filter { it.role == "user" }.map { it.text })
+      assertEquals("sealed promotion must never launch the follow-up", 1, provider.streamCalls.get())
+      assertTrue(
+        "ghost must not have persisted while the writer is blocked",
+        store.events.none { it.kind == "user" && it.text == followText },
+      )
+      // Release the writer: the orphan ghost drains (at most one row), still
+      // no follow launch, still no UNKNOWN.
+      followStoreGate.complete(Unit)
+      hookRelease.complete(Unit)
+      val drained = runBlocking { withTimeout(10_000) { c.flushTranscript() } }
+      assertTrue("drain must complete after the writer unblocks", drained)
+      assertFalse(c.hasPendingAdmission())
+      assertTrue(
+        "acked ghost survives as at most one orphan row (no duplicate, no follow-up launch)",
+        store.events.count { it.kind == "user" && it.text == followText } <= 1,
+      )
+      assertEquals("sealed promotion must never launch the follow-up", 1, provider.streamCalls.get())
+      assertEquals(listOf("first"), c.uiState.value.messages.filter { it.role == "user" }.map { it.text })
+      assertTrue(c.drainQueued().isEmpty())
+    } finally {
+      firstGate.complete(Unit)
+      followStoreGate.complete(Unit)
+      hookRelease.complete(Unit)
+      c.afterAdmissionSendForTest = null
+      c.beforePromotionAwaitForTest = null
+      outer.cancel()
+      c.close()
+    }
+  }
 }

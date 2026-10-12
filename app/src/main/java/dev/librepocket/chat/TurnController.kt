@@ -727,7 +727,8 @@ class TurnController(
    * - `unknownAdmission`: at most one UNKNOWN/PENDING_COMMIT ownership
    *   (direct: `isPromotion == false`, with optimistic UI row; promotion:
    *   `isPromotion == true`, no optimistic row yet, predecessor [Job] kept in
-   *   `host`). Set only by [enterUnknownAdmission]; cleared only by claim /
+   *   `host`). Set only by [enterUnknownAdmission] (seal-guarded: returns false
+   *   and installs nothing when [closed]); cleared only by claim /
    *   convert / cancel-drain / [close], always under the logicalTurnId identity
    *   guard except the [close] seal, which clears unconditionally.
    * - `promotionPending`: Lock-1 promotion reservation (follow-up identity
@@ -750,6 +751,11 @@ class TurnController(
    *                          ├─ACK────▶ Active(predecessor → follow handoff)
    *                          ├─NOT_ADMITTED(proven never-attempted timeout/CE or seal)─▶ no launch,
    *                          │                 FIFO retained, ERROR (predecessor terminal already recorded)
+   *                          ├─drain guard (Round 10 H1): drainQueued() throws Pending and
+   *                          │                 drainRecoveryLocked() returns null while PromoAwait holds —
+   *                          │                 the head is NOT reclaimable until ACK/settle
+   *                          ├─close─▶ Idle (FIFO dropped per drain-before-close; no post-seal
+   *                          │                 UNKNOWN rebuild — Round 10 M1 fail-closed)
    *                          └─UNKNOWN(timeout-fuzzy or CE-fuzzy R8-1: attempted regardless
    *                                        of sent)──▶ UnknownPromo(unknown[isPromotion], promotionPending
    *                                        cleared at handoff; predecessor host may still
@@ -791,6 +797,9 @@ class TurnController(
    * 5. After [close] seals, both `unknownAdmission` and `promotionPending` are
    *    null (single-monotone seal: close drains direct orphans and clears the
    *    promotion reservation explicitly as well as via the waiter path).
+   *    Round 10 M1: the seal is monotone — [enterUnknownAdmission] never
+   *    rebuilds UNKNOWN after [closed] (returns false; waiters take the
+   *    fail-closed convert/rollback path instead).
    */
   private fun isBusyLocked(): Boolean =
     activeLocked() != null || pendingAdmission != null || unknownAdmission != null || promotionPending != null
@@ -925,7 +934,15 @@ class TurnController(
    * from [promotionPending] to [unknownAdmission] (same id, head opId kept)
    * and the FIFO head stays queued with `queuedRecoveryRequired = false`
    * (pending, not reclaimable) until settle claims or converts.
+   * Round 10 M1: seal-guarded — when [closed] is already true the ownership
+   * is NOT rebuilt (Invariant 5 single-monotone seal). Returns false so the
+   * waiter takes the fail-closed path instead (direct: rollback +
+   * [TranscriptDurabilityException]; promotion: clear [promotionPending] +
+   * [failPromotion]). A close racing the install (set after this returns true)
+   * is still cleared by [close] as before; only post-seal rebuild is blocked.
    * Caller must NOT hold [lock].
+   *
+   * @return true when UNKNOWN ownership was installed, false when sealed.
    */
   private fun enterUnknownAdmission(
     reservation: PendingAdmission,
@@ -933,8 +950,12 @@ class TurnController(
     opId: Long?,
     isPromotion: Boolean = false,
     host: Job? = null,
-  ) {
+  ): Boolean {
     synchronized(lock) {
+      // Round 10 M1: never rebuild UNKNOWN after the seal. The background
+      // settle's seal pre-check ([settlePendingAdmission]) already converts
+      // promptly, so no new ownership is needed here.
+      if (closed) return false
       // Single-flight guarantees at most one UNKNOWN; a racing settle that
       // already cleared must not be overwritten — but the waiter owns this
       // reservation, so overwrite is the same reservation.
@@ -970,6 +991,7 @@ class TurnController(
         if (unknownSettleJob === job) unknownSettleJob = null
       }
     }
+    return true
   }
 
   /**
@@ -1531,7 +1553,11 @@ class TurnController(
           )
         }
         DurableAdmission.UNKNOWN -> {
-          enterUnknownAdmission(reservation, uiMessageId, null)
+          // Round 10 M1: sealed after the await — never rebuild UNKNOWN.
+          if (!enterUnknownAdmission(reservation, uiMessageId, null)) {
+            rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+            throw TranscriptDurabilityException("controller is closed")
+          }
           throw TranscriptPendingException("transcript store pending")
         }
       }
@@ -1547,7 +1573,12 @@ class TurnController(
         rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
         throw e
       }
-      enterUnknownAdmission(reservation, uiMessageId, null)
+      // Round 10 M1: sealed after the await — fail closed instead of
+      // resurrecting UNKNOWN (Invariant 5).
+      if (!enterUnknownAdmission(reservation, uiMessageId, null)) {
+        rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+        throw TranscriptDurabilityException("controller is closed", e)
+      }
       throw TranscriptPendingException("transcript store pending", e)
     } catch (e: TranscriptPendingException) {
       throw e
@@ -1805,7 +1836,11 @@ class TurnController(
           )
         }
         DurableAdmission.UNKNOWN -> {
-          enterUnknownAdmission(reservation, uiMessageId, opId)
+          // Round 10 M1: sealed after the await — never rebuild UNKNOWN.
+          if (!enterUnknownAdmission(reservation, uiMessageId, opId)) {
+            rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+            throw TranscriptDurabilityException("controller is closed")
+          }
           throw TranscriptPendingException("transcript store pending")
         }
       }
@@ -1817,7 +1852,11 @@ class TurnController(
         rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
         throw e
       }
-      enterUnknownAdmission(reservation, uiMessageId, opId)
+      // Round 10 M1: sealed after the await — fail closed (Invariant 5).
+      if (!enterUnknownAdmission(reservation, uiMessageId, opId)) {
+        rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+        throw TranscriptDurabilityException("controller is closed", e)
+      }
       throw TranscriptPendingException("transcript store pending", e)
     } catch (e: TranscriptPendingException) {
       throw e
@@ -1971,6 +2010,17 @@ class TurnController(
     // orphan user row with no cancel-terminal (reopen marks it INTERRUPTED).
     // Confirmed NOT_ADMITTED/unavailable FIFO stays reclaimable as before;
     // only the UNKNOWN-fated head is excepted.
+    // Round 10 H1: the promotion-await window (promotionPending set, no UNKNOWN
+    // yet) throws the same TranscriptPendingException from drainQueued() /
+    // returns null from drainRecoveryLocked() — Lock-1 already minted the
+    // follow id and the await may have sent it, so the head is NOT reclaimable
+    // until the await ACKs (Lock-2 commit) or settles (UNKNOWN claim/convert).
+    // Drain-then-close callers treat the throw as empty-equivalent (catch →
+    // emptyList) exactly like UNKNOWN. Round 10 M1: waiters that observe the
+    // seal after their await never rebuild UNKNOWN ([enterUnknownAdmission]
+    // returns false when closed) — direct waiters roll back + throw
+    // TranscriptDurabilityException, promotion waiters clear promotionPending +
+    // failPromotion — so Invariant 5 (no post-seal UNKNOWN) holds.
     val doomed: Job?
     val orphanJob: Job?
     synchronized(lock) {
@@ -2221,9 +2271,14 @@ class TurnController(
    * in the channel (ghost) — it is NOT definitely un-written, so it must not
    * be transferred for resend. Return null (no recovery) and let the caller
    * hit the Pending guard instead.
+   * Round 10 H1: the promotion-await window ([promotionPending] set,
+   * [unknownAdmission] still null) holds the same hazard — Lock-1 already
+   * minted the follow id and the await may have sent it — so it returns null
+   * exactly like UNKNOWN. The head stays queued until the await ACKs (Lock-2
+   * commit) or settles (UNKNOWN claim/convert).
    */
   private fun drainRecoveryLocked(): List<QueuedIntent>? {
-    if (unknownAdmission != null) return null
+    if (unknownAdmission != null || promotionPending != null) return null
     if (steerQueue.isEmpty()) return null
     val out = steerQueue.map { QueuedIntent(it.opId, it.text) }
     activityRevision++
@@ -2243,11 +2298,17 @@ class TurnController(
    * id). Throw [TranscriptPendingException] instead of handing it out, so a
    * racing reclaim cannot duplicate the ghost on retry. Confirmed
    * NOT_ADMITTED/unavailable FIFO stays reclaimable as before.
+   * Round 10 H1: the promotion-await window ([promotionPending] set, no UNKNOWN
+   * yet) throws the same [TranscriptPendingException] — Lock-1 already minted
+   * the follow id and the await may have sent it, so handing out the head
+   * would let the await ACK (ghost durable) and the drained retry (fresh id)
+   * write two user rows. Drain-then-close callers already treat this throw as
+   * empty-equivalent (catch → emptyList) like the UNKNOWN case.
    */
   fun drainQueued(): List<QueuedIntent> {
     synchronized(lock) {
       if (steerQueue.isEmpty()) return emptyList()
-      if (unknownAdmission != null) throw TranscriptPendingException("transcript store pending")
+      if (unknownAdmission != null || promotionPending != null) throw TranscriptPendingException("transcript store pending")
       val out = steerQueue.map { QueuedIntent(it.opId, it.text) }
       activityRevision++
       steerQueue.clear()
@@ -2555,7 +2616,15 @@ class TurnController(
           // match), keep the FIFO head queued with pending (NOT recovery) and
           // settle in the background (claim = Lock-2 commit, convert =
           // unavailable + reclaimable). FIFO is not reclaimable until settle.
-          enterUnknownAdmission(reservation, null, head.opId, isPromotion = true, host = self)
+          // Round 10 M1: sealed after the await — never rebuild UNKNOWN
+          // (Invariant 5); fail closed via failPromotion instead.
+          if (!enterUnknownAdmission(reservation, null, head.opId, isPromotion = true, host = self)) {
+            synchronized(lock) {
+              if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+            }
+            failPromotion("controller is closed", self)
+            return
+          }
           return
         }
       }
@@ -2576,7 +2645,14 @@ class TurnController(
         failPromotion("turn admission cancelled", self)
         return
       }
-      enterUnknownAdmission(reservation, null, head.opId, isPromotion = true, host = self)
+      // Round 10 M1: sealed after the await — never rebuild UNKNOWN.
+      if (!enterUnknownAdmission(reservation, null, head.opId, isPromotion = true, host = self)) {
+        synchronized(lock) {
+          if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+        }
+        failPromotion("controller is closed", self)
+        return
+      }
       return
     } catch (_: TranscriptDurabilityException) {
       // Fast store failure / seal race before any ack: never dequeued, so
@@ -2607,9 +2683,11 @@ class TurnController(
       }
       val currentHead = steerQueue.firstOrNull()
       if (currentHead == null || currentHead.opId != head.opId || currentHead.text != head.text) {
-        // drainQueued() stole the head mid-await: the drained caller owns the
-        // text now — never dequeue its successor by mistake. Mirror the
-        // empty-queue transition; the acked user row stays as-is.
+        // Round 10 H1: drainQueued() can no longer steal the head mid-await
+        // (it throws Pending while promotionPending holds), so this is only the
+        // close-cleared edge: the drained/closed caller owns the outcome now —
+        // never dequeue its successor by mistake. Mirror the empty-queue
+        // transition; the acked user row stays as-is (orphan on close).
         if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
         if (inFlight === self) inFlight = null
         _uiState.update { s ->

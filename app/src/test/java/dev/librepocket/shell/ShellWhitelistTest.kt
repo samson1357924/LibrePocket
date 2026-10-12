@@ -91,12 +91,15 @@ class ShellWhitelistTest {
     @Test fun timeoutKillsSleep() {
         val shell = RestrictedShell()
         val startMs = System.currentTimeMillis()
-        val result = shell.execute(listOf("sleep", "30"), timeoutMs = 500L)
+        val result = shell.execute(listOf("sleep", "120"), timeoutMs = 500L)
         val elapsedMs = System.currentTimeMillis() - startMs
         assertTrue("expected TimedOut, got $result", result is ShellResult.TimedOut)
-        // CI 環境高負載時行程啟動與 SIGKILL 調度可能顯著延遲，放寬至 30s（仍小於被執行的 sleep 30s，
-        // 核心契約在於確認 shell 確實攔截超時並終止行程）。
-        assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 30_000L)
+        // 閾值理由：正常 kill 路徑約 0.5–1s（500ms waitFor + destroyForcibly +
+        // gobbler join 上限 2×5s，兩個 stream 依序 join）；sleep 120 與 kill 上限明顯分離，若 kill 迴歸為
+        // 自然等待，elapsed 會遠超上限。10s 約為正常路徑的 10 倍，CI 高負載不誤殺，
+        // 但 kill 退化到 grace 全滿（約 15.5s = 0.5s wait + 5s destroy wait + 2×5s gobbler join）會被擋下。不設下界斷言
+        // （CI 調度抖動易 flake）。生產碼未動。
+        assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 10_000L)
     }
 
     @Test fun outputTruncatedAtCap() {

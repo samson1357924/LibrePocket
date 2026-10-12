@@ -42,6 +42,8 @@ import java.util.UUID
  * 先記賬後調用（登記＋pending++ 後才調 `engine.speak`），同步重入回調命中已登記條目，
  * 提交中（[isSubmitting]）的 onDone 只更新計數不入隊，全同步完成時由提交收尾合成一次 DONE 入隊；
  * 同步送入失敗在鎖內移除條目、pending--、failed=true 後回傳 SPEAK_FAILED（不留追蹤）。
+ * 維護註記：追蹤／聚合／投遞狀態暫留本類（抽 UtteranceTracker 為已知後續重構，
+ * 需保持現有併發測試全綠才可動）。
  *
  * UI 身分（R5-2）：[QueuedEmit.epoch] 只在 speaker 內部消耗、從未進回調參數，
  * Main dispatcher 排隊的 UI lambda 無身分檢查，舊事件可覆蓋新 request。

@@ -452,10 +452,22 @@ class SetupCrossVmJournalTest {
                 false,
             ),
         )
-        // 異源 J_C 抑制：不以後來世代冒充舊卡，亦不觸 J_C（J_C 屬其持有者恢復域）。
+        // Stage G F1 異源 J_C 攜帶：舊四參抑制 `null`（J_C 屬其持有者恢復域，不冒充舊卡）；
+        // 新派生攜 `("LOGOUT_UNKNOWN", J_C)`（碼固定中性，不沿用舊 DELETE_FAILED）。
+        // 舊真值表不動（仍 null）；新派生鎖定攜帶＋在途／Absent／未確認／STALE 保留見下。
         assertNull(
             effectiveLogoutGuardError("LOGOUT_DELETE_FAILED", tagA, knownC, logoutInFlight = false),
         )
+        run {
+            val carried = dev.librepocket.agent.ui.effectiveLogoutRecovery(
+                "LOGOUT_DELETE_FAILED",
+                tagA,
+                knownC,
+                logoutInFlight = false,
+            )
+            assertEquals("LOGOUT_UNKNOWN", carried.effectiveCode)
+            assertEquals(journalC, carried.retryJournal)
+        }
         // 未確認保留（fail-closed 不對稱：未知可能掩蓋本源，禁隱藏）。
         assertEquals(
             "LOGOUT_DELETE_FAILED",

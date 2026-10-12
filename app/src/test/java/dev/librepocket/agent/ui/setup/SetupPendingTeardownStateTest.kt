@@ -241,7 +241,9 @@ class SetupPendingTeardownStateTest {
         runBlocking {
             withTimeout(10_000) { vm.pendingTeardown.first { it is PendingTeardownState.Absent } }
         }
-        // 按下重試讀取 → NO_OP → 中性碼清除（他碼不動語義另見 D1 既有測試）。
+        // 按下重試讀取 → NO_OP → 中性碼清除（Stage G F2 起 tag-null READ_FAILED／
+        // UNKNOWN 亦清，見 D1 新測試與 StageG 驗收；帶 tag／STALE／DELETE／CLEAR-null
+        // 仍不清，他碼語義另見 D1 既有測試）。
         var seen2: Pair<SetupViewModel.PendingDeleteOutcome, PendingDelete?>? = null
         val job2 = vm.retryStartupReconcile { outcome, journal ->
             seen2 = outcome to journal

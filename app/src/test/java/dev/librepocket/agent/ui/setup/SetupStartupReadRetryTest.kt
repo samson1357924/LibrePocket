@@ -306,10 +306,15 @@ class SetupStartupReadRetryTest {
 
     @Test
     fun neutralOnlyClear_neverTouchesOtherLogoutCodes() {
-        // 驗收 4 補充（VM 側）：NO_OP／COMMITTED-null 僅清中性碼，他碼不動。
+        // 驗收 4 補充（VM 側）：Stage G F2 前 NO_OP／COMMITTED-null 僅清中性碼；
+        // F2 後 NO_OP 擴大清 tag-null 未確認碼（READ_FAILED-null／UNKNOWN-null），
+        // COMMITTED 分支不同步擴大（仍僅清中性碼；下次 NO_OP 收斂，保 C2 同源不變式）。
+        // 帶 tag retained（DELETE／CLEAR／UNKNOWN+J）、STALE（無論 tag）、
+        // DELETE_FAILED-null（2226 dirty-alias）／CLEAR_FAILED-null（alias-null）
+        // 皆不清（殘留 follow-up，見鎖定）。
         val vm = newVm(rawStore("d1-noop-keeps-other"), CountingVault())
         val journal = PendingDelete("preset:openai", 1L, 1700000000000L)
-        // onStartup 產物的三 retained 碼：NO_OP／COMMITTED-null 皆不清除。
+        // onStartup 產物的帶 tag retained 碼：NO_OP／COMMITTED-null 皆不清除。
         val retained = listOf(
             SetupViewModel.PendingDeleteOutcome.DELETE_FAILED to "LOGOUT_DELETE_FAILED",
             SetupViewModel.PendingDeleteOutcome.FAILED to "LOGOUT_CLEAR_FAILED",
@@ -335,7 +340,9 @@ class SetupStartupReadRetryTest {
         vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED, null, gateReady = false)
         assertEquals("LOGOUT_UNKNOWN", vm.form.value.errorCode)
         vm.clearLogoutError()
-        // logout 路徑的 READ_FAILED（retained、重試清除）同樣不被 NO_OP 清除：
+        // logout 路徑的 READ_FAILED-null（tag null 未確認碼）：Stage G F2 起 NO_OP 顯式
+        // 清除（回 fresh；純 state 清除，真 pending 由 observation 獨立重現）；
+        // COMMITTED-null 不同步擴大（仍保留，下次 NO_OP 收斂）。
         // 以 read-failing store 跑一次 logout 取得真實 READ_FAILED，再給 NO_OP。
         val rawReadFail = rawStore("d1-noop-keeps-readfailed")
         val delegateReadFail = EncryptedPrefsVault(InMemoryPrefs())
@@ -349,11 +356,28 @@ class SetupStartupReadRetryTest {
         readFailVm.logout { readDone.complete(it) }
         assertEquals(false, runBlocking { withTimeout(10_000) { readDone.await() } })
         assertEquals("LOGOUT_READ_FAILED", readFailVm.form.value.errorCode)
+        assertNull(readFailVm.form.value.logoutErrorSourceJournal)
         readFailVm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP, null, gateReady = false)
-        assertEquals("LOGOUT_READ_FAILED", readFailVm.form.value.errorCode)
-        readFailVm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED, null, gateReady = false)
-        assertEquals("LOGOUT_READ_FAILED", readFailVm.form.value.errorCode)
-        // 中性碼兩去向皆清。
+        assertNull("F2: NO_OP must clear tag-null READ_FAILED", readFailVm.form.value.errorCode)
+        assertNull(readFailVm.form.value.logoutErrorSourceJournal)
+        // COMMITTED-null 不清 READ_FAILED-null（對照：重建 READ_FAILED 再給 COMMITTED-null）。
+        val rawReadFail2 = rawStore("d1-committed-keeps-readfailed")
+        val delegateReadFail2 = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegateReadFail2.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            rawReadFail2.save(preseed())
+        }
+        val readFailStore2 = EndpointStore(D1StrictReadFailingDataStore(rawReadFail2.dataStore, failReads = 10))
+        val readFailVm2 = newVm(readFailStore2, CountingVault(delegateReadFail2))
+        val readDone2 = CompletableDeferred<Boolean>()
+        readFailVm2.logout { readDone2.complete(it) }
+        assertEquals(false, runBlocking { withTimeout(10_000) { readDone2.await() } })
+        assertEquals("LOGOUT_READ_FAILED", readFailVm2.form.value.errorCode)
+        readFailVm2.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED, null, gateReady = false)
+        assertEquals("COMMITTED-null must never clear READ_FAILED", "LOGOUT_READ_FAILED", readFailVm2.form.value.errorCode)
+        // UNKNOWN-null（tag null 未確認碼）：NO_OP 清，COMMITTED-null 不清。
+        // read-path UNKNOWN-null 落 READ_RETRY（非 UNKNOWN）；logout 未確認
+        // UNKNOWN-null 變體（見 2226 對照）由新驗收檔覆蓋；此處鎖定中性碼兩去向。
         vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.UNKNOWN, null, gateReady = false)
         assertEquals(SetupViewModel.LOGOUT_READ_RETRY, vm.form.value.errorCode)
         vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP, null, gateReady = false)

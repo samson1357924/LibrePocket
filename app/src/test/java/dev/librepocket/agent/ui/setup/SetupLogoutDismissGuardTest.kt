@@ -128,6 +128,8 @@ class SetupLogoutDismissGuardTest {
         assertEquals("LOGOUT_UNKNOWN", vm.form.value.errorCode)
         assertEquals(retainedJournal.format(), vm.form.value.logoutErrorSourceJournal)
         // COMMITTED/NO_OP 不蓋碼（既有語義鎖定）：先清再給兩者，維持 null。
+        // Stage G F2 補充：此處為已清 null 態（非 tag-null 未確認碼），故兩者皆維持 null；
+        // tag-null READ_FAILED／UNKNOWN 由 NO_OP 清除的語義由新驗收檔覆蓋（見 StageG）。
         vm.clearLogoutError()
         assertNull(vm.form.value.errorCode)
         vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.COMMITTED, null, gateReady = false)

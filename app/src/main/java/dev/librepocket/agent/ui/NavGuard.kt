@@ -1,5 +1,6 @@
 package dev.librepocket.agent.ui
 
+import dev.librepocket.agent.ui.setup.PendingDelete
 import dev.librepocket.agent.ui.setup.PendingTeardownState
 
 /**
@@ -120,6 +121,75 @@ fun effectiveLogoutGuardError(
         PendingTeardownState.Absent -> null
         PendingTeardownState.UnknownReadFailure,
         PendingTeardownState.MalformedPending -> logoutGuardError
+    }
+}
+
+/**
+ * Stage G 攜身份派生恢復態（R15 F1：F1 派生攜帶有效身份）。
+ *
+ * 回傳 `(effectiveCode, retryJournal)`：`effectiveCode` 為 UI/導航決策用有效碼
+ * （沿用舊 [effectiveLogoutGuardError] 四參語義，惟異源 `J_C` 由隱藏改為攜帶），
+ * `retryJournal` 為重試目標身份（`MainScreen.onRetryLogout` 直接使用，不再讀
+ * `form.logoutErrorSourceJournal`；提交仍經 `retryPendingDelete` 快照比對，禁盲
+ * replay）。
+ *
+ * 規則（依序，`inFlight=true` 恆 `(null, null)`）：
+ * - `code == null` → 沿用今日（`tag` 忽略）：`KnownPending(J)` →
+ *   `("LOGOUT_UNKNOWN", J)`；`UnknownReadFailure`／`MalformedPending` →
+ *   `("LOGOUT_READ_RETRY", null)`；`Absent` → `(null, null)`；
+ * - `code != null`＋`tag == null` → 沿用 `(code, null)`（含 D1 中性
+ *   `LOGOUT_READ_RETRY`，無源可比對）；
+ * - `code != null`＋`tag != null`：
+ *   - `LOGOUT_STALE` → 恆顯 `("LOGOUT_STALE", null)`（dismiss-only，無破壞性重試）；
+ *   - `LOGOUT_READ_RETRY` → 沿用 `(code, null)`（中性碼同 `tag-null` 行，不轉
+ *     `UNKNOWN`；舊真值表保留）；
+ *   - `KnownPending(J)` 且 `J.format() == tag` → 同源沿用 `(code, J)`；
+ *   - `KnownPending(J_C)` 且 `J_C.format() != tag` → `("LOGOUT_UNKNOWN", J_C)`
+ *    （碼固定中性 `UNKNOWN`，不沿用舊 `DELETE_FAILED`；`J_C` 屬其持有者恢復域，
+ *     舊卡不冒充、亦不觸 `J_C` 以外）；
+ *   - `Absent` → `(null, null)`（抑制 stale 回落；真清卡靠 `retryPendingDelete`
+ *     終端同源清）；
+ *   - `UnknownReadFailure`／`MalformedPending` → 保留舊碼 `(code, null)`
+ *    （fail-closed 不對稱：未知可能掩蓋本源，禁隱藏；重試走
+ *     `retryPendingDelete`→`ReadUnknown`→重試讀取，絕不進清除）。
+ *
+ * 純函數、無副作用。
+ */
+data class LogoutRecovery(
+    val effectiveCode: String?,
+    val retryJournal: PendingDelete?,
+)
+
+fun effectiveLogoutRecovery(
+    logoutGuardError: String?,
+    logoutErrorSourceJournal: String?,
+    pendingTeardown: PendingTeardownState,
+    logoutInFlight: Boolean,
+): LogoutRecovery {
+    if (logoutInFlight) return LogoutRecovery(null, null)
+    if (logoutGuardError == null) {
+        return when (pendingTeardown) {
+            is PendingTeardownState.KnownPending ->
+                LogoutRecovery("LOGOUT_UNKNOWN", pendingTeardown.pending)
+            PendingTeardownState.UnknownReadFailure,
+            PendingTeardownState.MalformedPending ->
+                LogoutRecovery("LOGOUT_READ_RETRY", null)
+            PendingTeardownState.Absent -> LogoutRecovery(null, null)
+        }
+    }
+    if (logoutErrorSourceJournal == null) return LogoutRecovery(logoutGuardError, null)
+    if (logoutGuardError == "LOGOUT_STALE") return LogoutRecovery(logoutGuardError, null)
+    if (logoutGuardError == "LOGOUT_READ_RETRY") return LogoutRecovery(logoutGuardError, null)
+    return when (pendingTeardown) {
+        is PendingTeardownState.KnownPending ->
+            if (pendingTeardown.pending.format() == logoutErrorSourceJournal) {
+                LogoutRecovery(logoutGuardError, pendingTeardown.pending)
+            } else {
+                LogoutRecovery("LOGOUT_UNKNOWN", pendingTeardown.pending)
+            }
+        PendingTeardownState.Absent -> LogoutRecovery(null, null)
+        PendingTeardownState.UnknownReadFailure,
+        PendingTeardownState.MalformedPending -> LogoutRecovery(logoutGuardError, null)
     }
 }
 

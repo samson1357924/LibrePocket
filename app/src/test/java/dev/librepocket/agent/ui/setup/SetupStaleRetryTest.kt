@@ -305,8 +305,9 @@ class SetupStaleRetryTest {
         // 舊卡退場：報 STALE(expected tag，防與 J_C COMMITTED 混淆)。
         assertEquals("LOGOUT_STALE", vm.form.value.errorCode)
         assertEquals(journalA.format(), vm.form.value.logoutErrorSourceJournal)
-        // 派生抑制：舊 STALE 恆顯（dismiss 可達），舊 DELETE 假設已被覆寫；
-        // 異源 J_C 不派生（pure 只隱藏，真清卡靠終端已報 STALE）。
+        // 派生：舊 STALE 恆顯（dismiss 可達，舊／新一致 `(STALE, null)`）；
+        // Stage G F1 異源 J_C 由隱藏改攜帶：舊 `null`（pure 只隱藏，真清卡靠終端已報
+        // STALE），新 `("LOGOUT_UNKNOWN", J_C)`（碼固定中性，不沿用舊 DELETE_FAILED）。
         assertEquals(
             "LOGOUT_STALE",
             effectiveLogoutGuardError(
@@ -316,6 +317,16 @@ class SetupStaleRetryTest {
                 logoutInFlight = false,
             ),
         )
+        run {
+            val staleCarried = dev.librepocket.agent.ui.effectiveLogoutRecovery(
+                "LOGOUT_STALE",
+                journalA.format(),
+                PendingTeardownState.KnownPending(journalC),
+                logoutInFlight = false,
+            )
+            assertEquals("LOGOUT_STALE", staleCarried.effectiveCode)
+            assertNull(staleCarried.retryJournal)
+        }
         assertNull(
             effectiveLogoutGuardError(
                 "LOGOUT_DELETE_FAILED",
@@ -324,6 +335,16 @@ class SetupStaleRetryTest {
                 logoutInFlight = false,
             ),
         )
+        run {
+            val carried = dev.librepocket.agent.ui.effectiveLogoutRecovery(
+                "LOGOUT_DELETE_FAILED",
+                journalA.format(),
+                PendingTeardownState.KnownPending(journalC),
+                logoutInFlight = false,
+            )
+            assertEquals("LOGOUT_UNKNOWN", carried.effectiveCode)
+            assertEquals(journalC, carried.retryJournal)
+        }
     }
 
     @Test

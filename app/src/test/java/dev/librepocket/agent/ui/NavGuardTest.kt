@@ -242,7 +242,9 @@ class NavGuardTest {
                 logoutInFlight = false,
             ),
         )
-        // 異源 J_C 抑制（不以後來世代冒充舊卡，亦不觸 J_C）。
+        // Stage G F1 異源 J_C 攜帶（舊四參隱藏 `null`；新派生攜有效身份
+        // `("LOGOUT_UNKNOWN", J_C)`，碼固定中性，不沿用舊 DELETE_FAILED）。
+        // 舊 overload 真值表不動（仍 `null`，見下對照）；新派生鎖定攜帶。
         assertNull(
             effectiveLogoutGuardError(
                 "LOGOUT_DELETE_FAILED",
@@ -251,14 +253,26 @@ class NavGuardTest {
                 logoutInFlight = false,
             ),
         )
-        assertNull(
-            effectiveLogoutGuardError(
+        run {
+            val carried = effectiveLogoutRecovery(
+                "LOGOUT_DELETE_FAILED",
+                tagA,
+                knownC,
+                logoutInFlight = false,
+            )
+            assertEquals("LOGOUT_UNKNOWN", carried.effectiveCode)
+            assertEquals(journalC, carried.retryJournal)
+        }
+        run {
+            val carriedUnknown = effectiveLogoutRecovery(
                 "LOGOUT_UNKNOWN",
                 tagA,
                 knownC,
                 logoutInFlight = false,
-            ),
-        )
+            )
+            assertEquals("LOGOUT_UNKNOWN", carriedUnknown.effectiveCode)
+            assertEquals(journalC, carriedUnknown.retryJournal)
+        }
         // 未確認保留舊碼（fail-closed 不對稱：未知可能掩蓋本源）。
         assertEquals(
             "LOGOUT_DELETE_FAILED",

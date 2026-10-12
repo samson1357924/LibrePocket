@@ -1863,7 +1863,11 @@ class SetupViewModel(
      *   journal）；其他 `LOGOUT_*` 仍走同源比對，絕不誤清；
      * - `NO_OP`: silent — writes nothing and never clears (no journal, no identity).
      *   Stage D1 例外：現行碼為 [LOGOUT_READ_RETRY] 時顯式清除（重試確認真無
-     *   journal）；其他 `LOGOUT_*` 仍永不清；
+     *   journal）；Stage G F2 擴大：現碼為 `LOGOUT_READ_FAILED`／`LOGOUT_UNKNOWN`
+     *   且 tag==null（無源未確認碼）亦清（回 fresh；STALE 無論 tag 皆不清；
+     *   `LOGOUT_DELETE_FAILED`／`LOGOUT_CLEAR_FAILED` 不動，含 2226／alias-null
+     *   null 變體殘留）；其他帶 tag `LOGOUT_*` 仍永不清；`COMMITTED` 分支不同步
+     *   擴大（下次 NO_OP 收斂；保 C2 同源不變式）；
      * - `STALE`: explicit decision — silent when [gate] is already `Ready`
      *   (the concurrent winner is live, nothing to dismiss), otherwise stamps
      *   `LOGOUT_STALE` for the dismiss card (overwrites + records the
@@ -1895,9 +1899,10 @@ class SetupViewModel(
      * same journal may clear its banner).
      *
      * Stage D1: read-path `UNKNOWN` (journal==null) maps to [LOGOUT_READ_RETRY],
-     * clear-phase `UNKNOWN` (journal!=null) keeps `LOGOUT_UNKNOWN`. `NO_OP` and
-     * `COMMITTED` gain a neutral-only clear path (current code is
-     * [LOGOUT_READ_RETRY] → clear; other `LOGOUT_*` untouched).
+     * clear-phase `UNKNOWN` (journal!=null) keeps `LOGOUT_UNKNOWN`. `NO_OP`
+     * clears [LOGOUT_READ_RETRY] and tag-null `LOGOUT_READ_FAILED` /
+     * `LOGOUT_UNKNOWN` (proven no journal; other `LOGOUT_*` untouched);
+     * `COMMITTED` keeps the same-origin-only rule.
      */
     internal fun onStartupReconcile(
         outcome: PendingDeleteOutcome,
@@ -1923,9 +1928,27 @@ class SetupViewModel(
         }
         if (outcome == PendingDeleteOutcome.NO_OP) {
             // Stage D1: NO_OP proves truly no journal — clear the neutral code only.
-            // All other LOGOUT_* (retained or stale) stay silent as before.
+            // Stage G F2: NO_OP 分支擴大——現碼為 READ_RETRY 照舊清；現碼為
+            // READ_FAILED／UNKNOWN 且 tag==null（無源可比對的未確認碼）亦清
+            // （errorCode＋tag 同清，回 fresh 確認態：確定清除＋取消）。
+            // 安全性：清除純 state；真 pending 由 observation（pendingTeardown）
+            // 派生獨立重現（見 F1 派生），不依賴此碼；清除後若新 J_new 出現，
+            // 下次觀察即重現 UNKNOWN＋J_new。
+            // 排除：STALE 無論 tag 皆不清（dismiss-only，需顯式關閉）；
+            // DELETE_FAILED／CLEAR_FAILED 不動——含 2226 dirty-alias
+            // DELETE_FAILED-null（PendingDelete 構造失敗，無 journal 可比對）
+            // 與 alias-null CLEAR_FAILED-null（無 alias 跳過 journal，直進
+            // clear 失敗，無 journal 可比對）兩 null 變體：留殘留 follow-up，
+            // 此處故意不清（見單測殘留鎖定）。
+            // COMMITTED 分支不同步擴大（下次 NO_OP 收斂；保 C2 同源不變式）。
             val cur = _form.value
             if (cur.errorCode == LOGOUT_READ_RETRY) {
+                _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
+                return
+            }
+            if ((cur.errorCode == "LOGOUT_READ_FAILED" || cur.errorCode == "LOGOUT_UNKNOWN") &&
+                cur.logoutErrorSourceJournal == null
+            ) {
                 _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
             }
             return

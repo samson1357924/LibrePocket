@@ -80,6 +80,14 @@ fun SettingsScreen(
      * 重試清除／無關閉；enabled 綁 [startupReconcilePending]，非 [logoutInFlight]）。
      */
     logoutErrorCode: String? = null,
+    /**
+     * Stage G F1 已派生重試目標身份（`MainScreen` 由 `effectiveLogoutRecovery`
+     * 同源計算的 `retryJournal.format()`；null 表無特定目標）。
+     *
+     * 僅作重試 targeting 顯示（retained 重試清除鍵上方小字）；提交仍經
+     * `retryPendingDelete` 快照比對（禁盲 replay），此欄不作清除依據。
+     */
+    logoutRetryJournal: String? = null,
     /** 登出執行中：可見按鍵皆 disabled，確認/重試鍵轉 spinner 防重點。 */
     logoutInFlight: Boolean = false,
     /**
@@ -375,8 +383,19 @@ fun SettingsScreen(
                         // STALE 不需重試，僅關閉；retained 只留重試（無取消，不暗示稍後處理，
                         // 同次執行無其他入口）；無碼初始確認維持確定清除 + 取消。
                         if (!isStaleReadyError) {
+                            // Stage G F1：重試 targeting 顯示身份（已派生 `logoutRetryJournal`；
+                            // 提交仍快照比對，禁盲 replay）。fresh（無碼）無目標顯示。
+                            if (isRetainedReadyError && logoutRetryJournal != null) {
+                                Text(
+                                    "重試目標：$logoutRetryJournal",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
                             // fresh 確定清除走 onLogout（全新 logout），retained 重試清除
-                            // 走 onRetryLogout（帶 tag 同源回放；tag null 不進此分支）。
+                            // 走 onRetryLogout（Stage G 起帶顯示身份同源回放；Absent 抑制
+                            // 回 fresh 時走 onLogout 不變）。
                             Button(
                                 onClick = if (logoutErrorCode == null) onLogout else onRetryLogout,
                                 enabled = !logoutInFlight,
@@ -483,6 +502,15 @@ fun SettingsScreen(
                         // retained 碼（READ_FAILED/DELETE/CLEAR/UNKNOWN）：journal 可能保留，
                         // 只留重試清除，不給取消（journal 釋放前不給出口）。
                         // Stage D1：READ_RETRY 已另分支，不在此（上游條件同步排除）。
+                        // Stage G F1：重試 targeting 顯示身份（同 Ready 分支；提交仍快照比對）。
+                        if (logoutRetryJournal != null) {
+                            Text(
+                                "重試目標：$logoutRetryJournal",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
                         Button(
                             onClick = onRetryLogout,
                             enabled = !logoutInFlight,

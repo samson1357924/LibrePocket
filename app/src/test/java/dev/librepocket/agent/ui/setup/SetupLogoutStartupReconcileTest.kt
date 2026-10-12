@@ -335,7 +335,9 @@ class SetupLogoutStartupReconcileTest {
 
     @Test
     fun noOpNeverClearsExistingCode() {
-        // NO_OP 永不清既有碼（無 journal、無身份，不做任何判斷）。
+        // Stage G F2 前：NO_OP 永不清既有碼；F2 後：NO_OP 清 tag-null 未確認碼
+        // （READ_FAILED-null／UNKNOWN-null／READ_RETRY），但帶 tag retained
+        // （此處 DELETE_FAILED+J）仍永不清（C2 同源不變式；COMMITTED 亦不同步擴大）。
         val store = rawStore("startup-noop-retain")
         val vm = newVm(store, CountingVault())
         val journal = PendingDelete("preset:openai", 1L, 1700000000000L)

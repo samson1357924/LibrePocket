@@ -73,7 +73,7 @@ fun MainScreen(
     // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
     val setupForm by setupViewModel.form.collectAsStateWithLifecycle()
     // Stage E 四態 journal domain：第二 VM 寫入的 journal 在此 VM 無碼時
-    // 仍可觀測（KnownPending），供派生恢復態（見 effectiveLogoutGuardError）；
+    // 仍可觀測（KnownPending），供派生恢復態（見 effectiveLogoutRecovery）；
     // transient 讀失敗／毀損為未確認態（重試讀取），絕不誤報 fresh。
     val pendingTeardown by setupViewModel.pendingTeardown.collectAsStateWithLifecycle()
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
@@ -207,6 +207,15 @@ fun MainScreen(
             )
         },
         settingsContent = { padding ->
+            // Stage G F1 顯示身份即提交身份：此輪 composition 的派生快照即為
+            // `SettingsScreen` 顯示的有效碼＋重試目標；`onRetryLogout` 直接讀此快照
+            // 的 `retryJournal`（漂移後仍重試顯示的 `J_C`，終端快照比對即 `StaleGone`）。
+            val displayedRecovery = effectiveLogoutRecovery(
+                setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") },
+                setupForm.logoutErrorSourceJournal,
+                pendingTeardown = pendingTeardown,
+                logoutInFlight = setupForm.logoutInFlight,
+            )
             SettingsScreen(
                 padding = padding,
                 gate = gate,
@@ -256,35 +265,32 @@ fun MainScreen(
                 // （重試讀取 only）；有碼沿用不動。Stage F 四參抑制 stale 回落
                 // （同源沿用、Absent／異源 J_C 隱藏、未確認保留舊碼；STALE 恆顯；
                 // 真正清卡靠 retry 終端，見 NavGuard 真值表）。
+                // Stage G F1：派生攜帶有效身份——有效碼＋重試目標同源計算
+                // （`effectiveLogoutRecovery`）：同源 `(code, J)`、異源 `J_C` 攜
+                // `("LOGOUT_UNKNOWN", J_C)`（碼固定中性，不沿用舊 DELETE_FAILED）、
+                // Absent 抑制 `(null, null)`、未確認保留 `(code, null)`、STALE 恆顯
+                // `(STALE, null)`；`SettingsScreen` 收已派生值（有效碼＋重試身份顯示），
+                // 重試 targeting 用顯示身份、提交仍快照比對（禁盲 replay）。
                 // Safe reconcile 走重試清除入口（`retryPendingDelete`，同一
                 // `runPendingDeleteLocked` 核心）；全新登出確認仍走 `onLogout`
                 // fresh-only。
-                logoutErrorCode = effectiveLogoutGuardError(
-                    setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") },
-                    setupForm.logoutErrorSourceJournal,
-                    pendingTeardown = pendingTeardown,
-                    logoutInFlight = setupForm.logoutInFlight,
-                ),
+                logoutErrorCode = displayedRecovery.effectiveCode,
+                logoutRetryJournal = displayedRecovery.retryJournal?.format(),
                 logoutInFlight = setupForm.logoutInFlight,
                 onDismissLogoutError = { setupViewModel.clearLogoutError() },
-                // Stage F 重試清除（兩顆：Ready retained＋NoEndpoint retained）改綁
-                // `retryPendingDelete`（帶 `logoutErrorSourceJournal.parse` 身份；
-                // stale 絕不回退全新 destructive logout）。parse 失敗（tag null／
-                // 毀損）走重試讀取（不進 logout）；`ReadUnknown` 亦轉重試讀取；
+                // Stage G F1 重試 targeting（兩顆：Ready retained＋NoEndpoint retained）讀
+                // 派生的 `retryJournal`（非 form tag）：`J`／`J_C` 非 null → 直接
+                // `retryPendingDelete(target)`（顯示身份即提交身份，終端仍快照比對，
+                // 漂移即 `StaleGone`，禁盲 replay）；`null`＋有碼 → 今日分流
+                // （`form.tag.parse`：tag null／毀損 → 重試讀取；`ReadUnknown` 亦轉
+                // 重試讀取）；`null`＋無碼 fresh → 不到此分支（新鮮確認鍵走 `onLogout`
+                // 不變，見 `SettingsScreen` 按鍵分流）。
                 // `Replayed(COMMITTED)` 比照登出成功清會話。
                 onRetryLogout = {
-                    val tagRaw = setupViewModel.form.value.logoutErrorSourceJournal
-                    val expected: PendingDelete? = try {
-                        tagRaw?.let { PendingDelete.parse(it) }
-                    } catch (_: Exception) {
-                        null
-                    }
-                    if (expected == null) {
-                        setupViewModel.retryStartupReconcile { outcome, journal ->
-                            setupViewModel.onStartupReconcile(outcome, journal)
-                        }
-                    } else {
-                        setupViewModel.retryPendingDelete(expected) { result ->
+                    // 讀顯示快照的 `retryJournal`（非 form tag；漂移後仍為顯示的 `J_C`）。
+                    val target = displayedRecovery.retryJournal
+                    if (target != null) {
+                        setupViewModel.retryPendingDelete(target) { result ->
                             when (result) {
                                 is SetupViewModel.RetryResult.Replayed -> {
                                     if (result.outcome == SetupViewModel.PendingDeleteOutcome.COMMITTED) {
@@ -300,6 +306,38 @@ fun MainScreen(
                                 }
                             }
                         }
+                    } else if (displayedRecovery.effectiveCode != null) {
+                        val tagRaw = setupViewModel.form.value.logoutErrorSourceJournal
+                        val expected: PendingDelete? = try {
+                            tagRaw?.let { PendingDelete.parse(it) }
+                        } catch (_: Exception) {
+                            null
+                        }
+                        if (expected == null) {
+                            setupViewModel.retryStartupReconcile { outcome, journal ->
+                                setupViewModel.onStartupReconcile(outcome, journal)
+                            }
+                        } else {
+                            setupViewModel.retryPendingDelete(expected) { result ->
+                                when (result) {
+                                    is SetupViewModel.RetryResult.Replayed -> {
+                                        if (result.outcome == SetupViewModel.PendingDeleteOutcome.COMMITTED) {
+                                            chatViewModel.newChat()
+                                            sessionListViewModel.refresh()
+                                        }
+                                    }
+                                    is SetupViewModel.RetryResult.StaleGone -> Unit
+                                    is SetupViewModel.RetryResult.ReadUnknown -> {
+                                        setupViewModel.retryStartupReconcile { outcome, journal ->
+                                            setupViewModel.onStartupReconcile(outcome, journal)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // fresh（Absent 抑制等派生 null）：重試鍵不可達（新鮮確認鍵走
+                        // onLogout），此分支不觸任何副作用，防盲目回退全新 logout。
                     }
                 },
                 // Stage D1：中性碼重試讀取（reconcile-only，絕不調 logout；

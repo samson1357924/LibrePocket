@@ -152,6 +152,9 @@ internal class ResponsesMapper(val round: Int = 0) {
 
     private val callsByItem = LinkedHashMap<String, AggCall>()
     private var nextToolIndex = 0
+    // Per-attempt whole-round total across all item_ids (Finding #1),
+    // monotonic: ToolDone arrivals never decrement it.
+    private var totalAggChars = 0
     private var usage: StreamEvent.Usage? = null
     private var terminal: StreamEvent? = null
     var terminalReached: Boolean = false
@@ -191,19 +194,30 @@ internal class ResponsesMapper(val round: Int = 0) {
                 }
                 if (item.string("type") != "function_call") return emptyList()
                 val itemId = root.string("item_id") ?: item.string("id") ?: ("item_" + UUID.randomUUID().toString().take(8))
+                if (!callsByItem.containsKey(itemId)) requireToolCountBudget(callsByItem.size + 1)
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
-                item.string("call_id")?.takeIf { it.isNotEmpty() }?.let { if (agg.id.isEmpty()) agg.id = it }
-                item.string("name")?.takeIf { it.isNotEmpty() }?.let { if (agg.name.isEmpty()) agg.name = it }
+                val addedId = item.string("call_id")?.takeIf { it.isNotEmpty() }
+                val addedName = item.string("name")?.takeIf { it.isNotEmpty() }
+                val addedIncoming =
+                    (if (addedId != null && agg.id.isEmpty()) addedId.length else 0) +
+                        (if (addedName != null && agg.name.isEmpty()) addedName.length else 0)
+                requireTotalToolAggBudget(totalAggChars, addedIncoming)
+                if (addedId != null && agg.id.isEmpty()) agg.id = addedId
+                if (addedName != null && agg.name.isEmpty()) agg.name = addedName
+                totalAggChars += addedIncoming
                 out.add(StreamEvent.ToolDelta(agg.toolIndex, agg.id.ifEmpty { null }, agg.name.ifEmpty { null }, ""))
             }
             "response.function_call_arguments.delta" -> {
                 val itemId = root.string("item_id") ?: return emptyList()
+                if (!callsByItem.containsKey(itemId)) requireToolCountBudget(callsByItem.size + 1)
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 val frag = root.string("delta").orEmpty()
                 // Fail-closed: a hostile stream of tiny fragments must not
                 // grow one call's aggregate without bound (typed, non-retryable).
                 requireToolAggBudget(agg.id.length + agg.name.length + agg.args.length, frag.length)
+                requireTotalToolAggBudget(totalAggChars, frag.length)
                 agg.args.append(frag)
+                totalAggChars += frag.length
                 out.add(StreamEvent.ToolDelta(agg.toolIndex, null, null, frag))
             }
             "response.output_item.done" -> {
@@ -214,13 +228,25 @@ internal class ResponsesMapper(val round: Int = 0) {
                 }
                 if (item.string("type") != "function_call") return emptyList()
                 val itemId = root.string("item_id") ?: item.string("id") ?: return emptyList()
+                if (!callsByItem.containsKey(itemId)) requireToolCountBudget(callsByItem.size + 1)
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
+                // A terminal full payload overwrites id/name: only genuine
+                // growth counts toward the monotonic round total (never a
+                // decrement on ToolDone arrival).
+                val oldIdLen = agg.id.length
+                val oldNameLen = agg.name.length
                 item.string("call_id")?.takeIf { it.isNotEmpty() }?.let { agg.id = it }
                 item.string("name")?.takeIf { it.isNotEmpty() }?.let { agg.name = it }
+                val idNameGrowth = (agg.id.length - oldIdLen).coerceAtLeast(0) +
+                    (agg.name.length - oldNameLen).coerceAtLeast(0)
+                requireTotalToolAggBudget(totalAggChars, idNameGrowth)
+                totalAggChars += idNameGrowth
                 item.string("arguments")?.let { full ->
                     if (agg.args.isEmpty() && full.isNotEmpty()) {
                         // A single terminal payload is bounded like fragments.
                         requireToolAggBudget(agg.id.length + agg.name.length, full.length)
+                        requireTotalToolAggBudget(totalAggChars, full.length)
+                        totalAggChars += full.length
                         agg.args.append(full)
                     }
                 }

@@ -7,8 +7,10 @@ import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.MAX_TOOL_CALLS_PER_ATTEMPT
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
@@ -71,6 +73,10 @@ private class AggRecordingSink : TranscriptSink {
  * - per-call tool aggregation overflow is a typed non-retryable terminal
  *   (`TOOL_ARGS_TOO_LARGE`): no retry of the poisoned stream, no
  *   poison-adjacent tool records, failed fragment stays partial;
+ * - Finding #1: the same typed terminal guards the per-attempt whole-round
+ *   tool total (many small ToolDeltas across many indexes) and the
+ *   distinct-index cap (at most `MAX_TOOL_CALLS_PER_ATTEMPT` tool indexes per
+ *   attempt), with the same no-retry / no-poison-record behavior;
  * - UI-update cost counters observe every delta (batching downgraded to
  *   counters + KDoc TODO until on-device measurements justify a threshold);
  * - [HistoryWindowCap] windows only the outgoing request copy (Unbounded by
@@ -131,6 +137,128 @@ class TurnControllerAggBudgetTest {
       val assistants = c.uiState.value.messages.filter { it.role == "assistant" }
       assertEquals(1, assistants.size)
       assertTrue("failed attempt keeps its fragment partial", assistants.single().isPartial)
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun manyDistinctToolIndexesFailTypedWithoutRetry() {
+    val provider = AggFakeProvider {
+      flow {
+        for (i in 0 until 1000) emit(StreamEvent.ToolDelta(i, "id-$i", "n-$i", "x"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = AggRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      val error = c.uiState.value.error.orEmpty()
+      assertTrue("typed overflow expected, got: $error", error.contains(TOOL_ARGS_TOO_LARGE))
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      var guard = 0
+      while (sink.failed.isEmpty()) {
+        if (++guard > 800) fail("timed out waiting for transcript failure")
+        Thread.sleep(10)
+      }
+      assertEquals(1, sink.failed.size)
+      assertTrue(
+        "transcript must carry the typed reason, got: ${sink.failed.single()}",
+        sink.failed.single().contains(TOOL_ARGS_TOO_LARGE),
+      )
+      Thread.sleep(300)
+      assertTrue("no poison-adjacent tool records may be persisted", sink.tools.isEmpty())
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun totalAcrossToolIndexesFailsTypedWithoutRetry() {
+    // 4 indexes x 120 x ~1k chars = ~483k total (trips); per-index ~121k
+    // stays under the per-call budget, so only the attempt total can trip.
+    val provider = AggFakeProvider {
+      flow {
+        repeat(120) {
+          for (t in 0 until 4) emit(StreamEvent.ToolDelta(t, "id-$t", "n-$t", "y".repeat(1_000)))
+        }
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = AggRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      val error = c.uiState.value.error.orEmpty()
+      assertTrue("typed overflow expected, got: $error", error.contains(TOOL_ARGS_TOO_LARGE))
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      var guard = 0
+      while (sink.failed.isEmpty()) {
+        if (++guard > 800) fail("timed out waiting for transcript failure")
+        Thread.sleep(10)
+      }
+      assertEquals(1, sink.failed.size)
+      assertTrue(
+        "transcript must carry the typed reason, got: ${sink.failed.single()}",
+        sink.failed.single().contains(TOOL_ARGS_TOO_LARGE),
+      )
+      Thread.sleep(300)
+      assertTrue("no poison-adjacent tool records may be persisted", sink.tools.isEmpty())
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun distinctToolCountCapBoundary() {
+    val provider = AggFakeProvider()
+    provider.handler = {
+      flow {
+        // First turn stays within the cap; the second turn adds exactly one
+        // more distinct index. Both turns use 1-char fragments so only the
+        // distinct-index cap can trip, never a char budget.
+        val n = if (provider.streamCalls.get() == 1) MAX_TOOL_CALLS_PER_ATTEMPT else MAX_TOOL_CALLS_PER_ATTEMPT + 1
+        for (i in 0 until n) emit(StreamEvent.ToolDelta(i, null, null, "x"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    try {
+      runBlocking { c.send("first") }
+      assertEquals(1, provider.streamCalls.get())
+      assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+      assertEquals(null, c.uiState.value.error)
+      runBlocking { c.send("second") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      val error = c.uiState.value.error.orEmpty()
+      assertTrue("typed overflow expected, got: $error", error.contains(TOOL_ARGS_TOO_LARGE))
+      assertEquals("cap overflow must not retry", 2, provider.streamCalls.get())
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun fewToolsUnderBudgetsAccumulateNormally() {
+    val frag = "y".repeat(1_000)
+    val provider = AggFakeProvider {
+      flow {
+        for (t in 0 until 3) repeat(2) { emit(StreamEvent.ToolDelta(t, "id-$t", "n-$t", frag)) }
+        for (t in 0 until 3) emit(StreamEvent.ToolDone(t, "id-$t", "n-$t", frag + frag))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = AggRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      var guard = 0
+      while (sink.tools.size < 3) {
+        if (++guard > 800) fail("timed out waiting for tool records")
+        Thread.sleep(10)
+      }
+      val args = sink.tools.sortedBy { it.toolIndex }.map { it.args }
+      assertEquals(listOf(frag + frag, frag + frag, frag + frag), args)
+      assertEquals(null, c.uiState.value.error)
     } finally {
       c.close()
     }

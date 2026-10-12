@@ -19,6 +19,13 @@ import org.junit.Test
  * malformed payloads (ignored) and clean-EOF truncation (`SSE_TRUNCATED`,
  * retryable). Nothing is silently truncated.
  *
+ * Finding #1 adds the per-attempt whole-round total
+ * ([requireTotalToolAggBudget]) and the distinct-tool cap
+ * ([MAX_TOOL_CALLS_PER_ATTEMPT]/[requireToolCountBudget]) with identical
+ * failure semantics: many small calls, each under its own per-call budget,
+ * still trip the shared 1 MiB total, and a distinct-index flood trips the
+ * count cap.
+ *
  * Boundary math: the char→byte estimate is ×3, so with a 1 MiB budget
  * 349525 chars (×3 = 1048575) still fit while one more char overflows.
  */
@@ -199,5 +206,291 @@ class ToolAggBudgetTest {
         } finally {
             server.shutdown()
         }
+    }
+
+    // ---- Finding #1: whole-round total + distinct-index cap ----
+
+    private fun assertAggOverflow(e: ProviderFailure) {
+        assertEquals(TOOL_ARGS_TOO_LARGE, e.message)
+        assertFalse(e.retryable)
+        assertEquals(ProviderFailureCode.AGG_TOO_LARGE, e.code)
+    }
+
+    @Test
+    fun requireTotalToolAggBudgetSharesExactBoundary() {
+        requireTotalToolAggBudget(349_525, 0)
+        requireTotalToolAggBudget(0, 0)
+        val over = toolFailureOf { requireTotalToolAggBudget(349_525, 1) }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun requireToolCountBudgetBoundary() {
+        requireToolCountBudget(1)
+        requireToolCountBudget(MAX_TOOL_CALLS_PER_ATTEMPT)
+        val over = toolFailureOf { requireToolCountBudget(MAX_TOOL_CALLS_PER_ATTEMPT + 1) }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun chatCompletionsManyDistinctToolsTripCountCapTyped() {
+        // The distinct-index count cap trips first at 65 (before any char
+        // total); the char-total path is covered by TotalAcross below.
+        val mapper = ChatCompletionsMapper()
+        val frag = "y".repeat(4_000)
+        var asserted = false
+        for (i in 0 until 1_000) {
+            val payload = """{"choices":[{"delta":{"tool_calls":[{"index":$i,"id":"c$i","function":{"name":"f$i","arguments":"$frag"}}]}}]}"""
+            try {
+                mapper.mapPayload(payload)
+            } catch (e: ProviderFailure) {
+                if (!asserted) {
+                    assertAggOverflow(e)
+                    asserted = true
+                    break
+                }
+            }
+        }
+        assertTrue("1000 distinct 4k-char tools must trip the attempt budget", asserted)
+    }
+
+    @Test
+    fun chatCompletionsDistinctCountCapBoundary() {
+        val mapper = ChatCompletionsMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            mapper.mapPayload(
+                """{"choices":[{"delta":{"tool_calls":[{"index":$i,"function":{"arguments":"x"}}]}}]}""",
+            )
+        }
+        // 65 one-char fragments total 65 chars: only the distinct-index cap can trip.
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"choices":[{"delta":{"tool_calls":[{"index":$MAX_TOOL_CALLS_PER_ATTEMPT,"function":{"arguments":"x"}}]}}]}""",
+            )
+        }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun chatCompletionsTotalAcrossToolsTripsTyped() {
+        // 4 tools x 30 x 4k chars = 480k total (trips); per-tool 120k stays
+        // under the per-call budget, so only the attempt total can trip.
+        val mapper = ChatCompletionsMapper()
+        val frag = "y".repeat(4_000)
+        var asserted = false
+        for (r in 0 until 30) {
+            for (t in 0 until 4) {
+                try {
+                    mapper.mapPayload(
+                        """{"choices":[{"delta":{"tool_calls":[{"index":$t,"function":{"arguments":"$frag"}}]}}]}""",
+                    )
+                } catch (e: ProviderFailure) {
+                    if (!asserted) {
+                        assertAggOverflow(e)
+                        asserted = true
+                        break
+                    }
+                }
+            }
+            if (asserted) break
+        }
+        assertTrue("4 x 30 x 4k-char fragments must exceed the round total", asserted)
+    }
+
+    @Test
+    fun chatCompletionsFewToolsUnderTotalAccumulateUnchanged() {
+        val mapper = ChatCompletionsMapper()
+        val frag = "y".repeat(1_000)
+        for (t in 0 until 3) {
+            repeat(2) {
+                mapper.mapPayload(
+                    """{"choices":[{"delta":{"tool_calls":[{"index":$t,"id":"c$t","function":{"name":"f$t","arguments":"$frag"}}]}}]}""",
+                )
+            }
+        }
+        val dones = mapper.finish().filterIsInstance<StreamEvent.ToolDone>()
+        assertEquals(3, dones.size)
+        dones.forEach { assertEquals(2_000, it.argumentsJson.length) }
+    }
+
+    @Test
+    fun responsesManyDistinctToolsTripCountCapTyped() {
+        // The distinct-index count cap trips first at 65 (before any char
+        // total); the char-total path is covered by TotalAcross below.
+        val mapper = ResponsesMapper()
+        val frag = "x".repeat(4_000)
+        var asserted = false
+        for (i in 0 until 1_000) {
+            try {
+                mapper.mapPayload(
+                    """{"type":"response.function_call_arguments.delta","item_id":"it$i","delta":"$frag"}""",
+                )
+            } catch (e: ProviderFailure) {
+                if (!asserted) {
+                    assertAggOverflow(e)
+                    asserted = true
+                    break
+                }
+            }
+        }
+        assertTrue("1000 distinct 4k-char items must trip the attempt budget", asserted)
+    }
+
+    @Test
+    fun responsesDistinctCountCapBoundary() {
+        val mapper = ResponsesMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            mapper.mapPayload(
+                """{"type":"response.function_call_arguments.delta","item_id":"it$i","delta":"x"}""",
+            )
+        }
+        // 65 one-char fragments total 65 chars: only the distinct-index cap can trip.
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.function_call_arguments.delta","item_id":"it$MAX_TOOL_CALLS_PER_ATTEMPT","delta":"x"}""",
+            )
+        }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun responsesTotalAcrossToolsTripsTyped() {
+        // 4 items x 30 x 4k chars = 480k total (trips); per-item 120k stays
+        // under the per-call budget, so only the attempt total can trip.
+        val mapper = ResponsesMapper()
+        val frag = "x".repeat(4_000)
+        var asserted = false
+        for (r in 0 until 30) {
+            for (t in 0 until 4) {
+                try {
+                    mapper.mapPayload(
+                        """{"type":"response.function_call_arguments.delta","item_id":"it$t","delta":"$frag"}""",
+                    )
+                } catch (e: ProviderFailure) {
+                    if (!asserted) {
+                        assertAggOverflow(e)
+                        asserted = true
+                        break
+                    }
+                }
+            }
+            if (asserted) break
+        }
+        assertTrue("4 x 30 x 4k-char fragments must exceed the round total", asserted)
+    }
+
+    @Test
+    fun responsesFewToolsUnderTotalAccumulateUnchanged() {
+        val mapper = ResponsesMapper()
+        val frag = "x".repeat(1_000)
+        for (t in 0 until 3) {
+            repeat(2) {
+                mapper.mapPayload(
+                    """{"type":"response.function_call_arguments.delta","item_id":"it$t","delta":"$frag"}""",
+                )
+            }
+        }
+        val dones = mapper.finish().filterIsInstance<StreamEvent.ToolDone>()
+        assertEquals(3, dones.size)
+        dones.forEach { assertEquals(2_000, it.argumentsJson.length) }
+    }
+
+    @Test
+    fun anthropicManyDistinctToolsTripCountCapTyped() {
+        // The distinct-index count cap trips first at 65 (before any char
+        // total); the char-total path is covered by TotalAcross below.
+        val mapper = AnthropicMapper()
+        val frag = "z".repeat(4_000)
+        var asserted = false
+        for (i in 0 until 1_000) {
+            try {
+                mapper.mapPayload(
+                    """{"type":"content_block_start","index":$i,"content_block":{"type":"tool_use","id":"t$i","name":"n"}}""",
+                )
+                mapper.mapPayload(
+                    """{"type":"content_block_delta","index":$i,"delta":{"type":"input_json_delta","partial_json":"$frag"}}""",
+                )
+            } catch (e: ProviderFailure) {
+                if (!asserted) {
+                    assertAggOverflow(e)
+                    asserted = true
+                    break
+                }
+            }
+        }
+        assertTrue("1000 distinct 4k-char tool blocks must trip the attempt budget", asserted)
+    }
+
+    @Test
+    fun anthropicDistinctCountCapBoundary() {
+        val mapper = AnthropicMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$i,"content_block":{"type":"tool_use","id":"t$i","name":"n"}}""",
+            )
+        }
+        // 64 tiny tool blocks total far below any char budget: only the count cap can trip.
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$MAX_TOOL_CALLS_PER_ATTEMPT,"content_block":{"type":"tool_use","id":"tN","name":"n"}}""",
+            )
+        }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun anthropicTotalAcrossToolsTripsTyped() {
+        // 4 blocks x 30 x 4k chars = 480k total (trips); per-block 120k stays
+        // under the per-call budget, so only the attempt total can trip.
+        val mapper = AnthropicMapper()
+        for (t in 0 until 4) {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$t,"content_block":{"type":"tool_use","id":"t$t","name":"n"}}""",
+            )
+        }
+        val frag = "z".repeat(4_000)
+        var asserted = false
+        for (r in 0 until 30) {
+            for (t in 0 until 4) {
+                try {
+                    mapper.mapPayload(
+                        """{"type":"content_block_delta","index":$t,"delta":{"type":"input_json_delta","partial_json":"$frag"}}""",
+                    )
+                } catch (e: ProviderFailure) {
+                    if (!asserted) {
+                        assertAggOverflow(e)
+                        asserted = true
+                        break
+                    }
+                }
+            }
+            if (asserted) break
+        }
+        assertTrue("4 x 30 x 4k-char fragments must exceed the round total", asserted)
+    }
+
+    @Test
+    fun anthropicFewToolsUnderTotalAccumulateUnchanged() {
+        val mapper = AnthropicMapper()
+        val frag = "z".repeat(1_000)
+        for (t in 0 until 3) {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$t,"content_block":{"type":"tool_use","id":"t$t","name":"n$t"}}""",
+            )
+        }
+        repeat(2) {
+            for (t in 0 until 3) {
+                mapper.mapPayload(
+                    """{"type":"content_block_delta","index":$t,"delta":{"type":"input_json_delta","partial_json":"$frag"}}""",
+                )
+            }
+        }
+        val dones = ArrayList<StreamEvent.ToolDone>()
+        for (t in 0 until 3) {
+            mapper.mapPayload("""{"type":"content_block_stop","index":$t}""")
+                .filterIsInstanceTo(dones)
+        }
+        assertEquals(3, dones.size)
+        dones.forEach { assertEquals(2_000, it.argumentsJson.length) }
     }
 }

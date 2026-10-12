@@ -31,7 +31,8 @@ internal enum class ProviderFailureCode {
     TOO_LARGE,
     /**
      * A streaming aggregate exceeded its memory budget (per-tool-call
-     * ToolDelta fragments or one SSE event's total `data:` payload).
+     * ToolDelta fragments, the per-attempt whole-round tool total, the
+     * distinct-tool count, or one SSE event's total `data:` payload).
      * Always pairs with a distinct non-retryable message
      * (`TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE`), never silent
      * truncation, and never a retry of the poisoned stream.

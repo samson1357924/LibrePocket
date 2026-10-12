@@ -10,6 +10,8 @@ import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.provider.requireToolAggBudget
+import dev.librepocket.provider.requireToolCountBudget
+import dev.librepocket.provider.requireTotalToolAggBudget
 import dev.librepocket.redact.Redactor
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -172,7 +174,13 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  * Aggregation budget: ToolDelta fragments (args/id/name) for one tool index
  * share one memory budget (see `MAX_TOOL_CALL_AGG_BYTES`); exceeding it ends
  * the attempt with typed non-retryable `TOOL_ARGS_TOO_LARGE` (never silent
- * truncation, never a retry of the poisoned stream).
+ * truncation, never a retry of the poisoned stream). The same budget is
+ * additionally enforced as a per-attempt whole-round total across ALL tool
+ * indexes (see `requireTotalToolAggBudget`: many small calls, each under its
+ * own budget, still trip the shared 1 MiB total), plus a distinct-tool cap
+ * (see `MAX_TOOL_CALLS_PER_ATTEMPT` / `requireToolCountBudget`). All three
+ * scopes share one failure semantics; the round total is monotonic per
+ * attempt (`ToolDone` arrivals never decrement it).
  *
  * UI update cost: every visible delta still performs one UI update (streaming
  * visibility and cancel snapshots depend on it), so no batching cadence is
@@ -853,6 +861,12 @@ class TurnController(
       val toolIdText = mutableMapOf<Int, StringBuilder>()
       val toolNameText = mutableMapOf<Int, StringBuilder>()
       val toolDoneSeen = mutableSetOf<Int>()
+      // Per-attempt whole-round tool total + distinct-index set (Finding #1):
+      // many small ToolDeltas across many indexes must still trip the shared
+      // budget. Monotonic within the attempt (ToolDone arrivals never
+      // decrement it); retries start a fresh attempt with fresh counters.
+      var totalToolAggChars = 0
+      val distinctToolIndexes = mutableSetOf<Int>()
       fun flushPendingTools() {
         for ((index, args) in toolArgText) {
           if (index !in toolDoneSeen) {
@@ -888,14 +902,23 @@ class TurnController(
               // without bound. Throws typed non-retryable TOOL_ARGS_TOO_LARGE
               // (never silent truncation); the catch below skips the pending
               // flush so poison-adjacent fragments are never recorded.
+              // The same budget additionally guards the per-attempt total
+              // across all indexes, plus a distinct-index cap — all one
+              // failure semantics.
+              val toolIncoming = event.argsChunk.length +
+                (event.idChunk?.length ?: 0) +
+                (event.nameChunk?.length ?: 0)
+              if (!distinctToolIndexes.contains(event.toolIndex)) {
+                requireToolCountBudget(distinctToolIndexes.size + 1)
+                distinctToolIndexes.add(event.toolIndex)
+              }
               requireToolAggBudget(
                 (toolArgText[event.toolIndex]?.length ?: 0) +
                   (toolIdText[event.toolIndex]?.length ?: 0) +
                   (toolNameText[event.toolIndex]?.length ?: 0),
-                event.argsChunk.length +
-                  (event.idChunk?.length ?: 0) +
-                  (event.nameChunk?.length ?: 0),
+                toolIncoming,
               )
+              requireTotalToolAggBudget(totalToolAggChars, toolIncoming)
               toolArgText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
               event.idChunk?.let {
                 if (it.isNotEmpty()) toolIdText.getOrPut(event.toolIndex) { StringBuilder() }.append(it)
@@ -903,6 +926,7 @@ class TurnController(
               event.nameChunk?.let {
                 if (it.isNotEmpty()) toolNameText.getOrPut(event.toolIndex) { StringBuilder() }.append(it)
               }
+              totalToolAggChars += toolIncoming
             }
             is StreamEvent.ToolDone -> {
               toolDoneSeen.add(event.toolIndex)

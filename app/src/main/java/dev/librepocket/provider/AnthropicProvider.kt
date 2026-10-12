@@ -154,6 +154,12 @@ internal class AnthropicMapper(val round: Int = 0) {
     }
 
     private val blocks = LinkedHashMap<Int, Block>()
+    // Per-attempt whole-round tool total across all block indexes (Finding
+    // #1), monotonic: content_block_stop arrivals never decrement it.
+    private var totalAggChars = 0
+    // Distinct TOOL-kind blocks (TEXT/THINKING/OTHER blocks are not tools and
+    // stay outside the count cap; replacement at one index adjusts the count).
+    private var toolBlockCount = 0
     private var inputTokens: Int? = null
     private var outputTokens: Int? = null
     private var stopReason: String? = null
@@ -188,9 +194,17 @@ internal class AnthropicMapper(val round: Int = 0) {
                 }
                 val b = Block(kind)
                 if (kind == BlockKind.TOOL) {
+                    if (blocks[index]?.kind != BlockKind.TOOL) {
+                        requireToolCountBudget(toolBlockCount + 1)
+                        toolBlockCount++
+                    }
                     b.toolId = cb.string("id").orEmpty()
                     b.toolName = cb.string("name").orEmpty()
+                    requireTotalToolAggBudget(totalAggChars, b.toolId.length + b.toolName.length)
+                    totalAggChars += b.toolId.length + b.toolName.length
                     out.add(StreamEvent.ToolDelta(index, b.toolId.ifEmpty { null }, b.toolName.ifEmpty { null }, ""))
+                } else if (blocks[index]?.kind == BlockKind.TOOL) {
+                    toolBlockCount--
                 }
                 blocks[index] = b
             }
@@ -210,10 +224,13 @@ internal class AnthropicMapper(val round: Int = 0) {
                     }
                     "signature_delta" -> Unit // never displayed, never persisted
                     "input_json_delta" -> {
+                        if (block.kind != BlockKind.TOOL) return emptyList()
                         val frag = delta.string("partial_json").orEmpty()
                         // Fail-closed aggregation budget (typed, non-retryable).
                         requireToolAggBudget(block.toolId.length + block.toolName.length + block.args.length, frag.length)
+                        requireTotalToolAggBudget(totalAggChars, frag.length)
                         block.args.append(frag)
+                        totalAggChars += frag.length
                         out.add(StreamEvent.ToolDelta(index, null, null, frag))
                     }
                 }

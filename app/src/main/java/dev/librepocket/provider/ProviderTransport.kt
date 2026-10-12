@@ -26,7 +26,19 @@ import okio.BufferedSink
 import okio.Buffer
 
 /** Internal transport failure; [retryable] comes from [ProviderErrorClassifier] unless a typed code applies. */
-internal enum class ProviderFailureCode { TOO_LARGE }
+internal enum class ProviderFailureCode {
+    /** Bounded finite body (model list) exceeded its byte budget. */
+    TOO_LARGE,
+    /**
+     * A streaming aggregate exceeded its memory budget (per-tool-call
+     * ToolDelta fragments, the per-attempt whole-round tool total, the
+     * distinct-tool count, or one SSE event's total `data:` payload).
+     * Always pairs with a distinct non-retryable message
+     * (`TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE`), never silent
+     * truncation, and never a retry of the poisoned stream.
+     */
+    AGG_TOO_LARGE,
+}
 
 internal class ProviderFailure(
     val retryable: Boolean,
@@ -34,6 +46,27 @@ internal class ProviderFailure(
     cause: Throwable? = null,
     val code: ProviderFailureCode? = null,
 ) : IOException(message, cause)
+
+/**
+ * Infer the typed failure-code name from a provider-failure message when
+ * [ProviderFailure.code] is absent (legacy throws or message-only paths).
+ * Matches the aggregation/SSE overflow markers case-insensitively, consistent
+ * with [ProviderErrorClassifier]'s fatal markers; returns
+ * `AGG_TOO_LARGE`'s name on a hit, null otherwise. Never infers `TOO_LARGE`
+ * (finite model-list budget) here: streaming callers only need the
+ * aggregation/SSE code for [StreamEvent.Failed.code] propagation.
+ */
+internal fun inferAggFailureCodeName(message: String?): String? {
+    val lower = message?.lowercase().orEmpty()
+    return if (lower.contains("tool_args_too_large") ||
+        lower.contains("sse_frame_too_large") ||
+        lower.contains("sse_line_too_long")
+    ) {
+        ProviderFailureCode.AGG_TOO_LARGE.name
+    } else {
+        null
+    }
+}
 
 private const val MODEL_LIST_RESPONSE_MAX_BYTES = 1024 * 1024
 private const val HTTP_ERROR_BODY_MAX_BYTES = 16 * 1024
@@ -311,12 +344,22 @@ internal suspend fun pumpSse(
                             break
                         }
                     }
-                    if (parser.lineTooLong && !protocolTerminalReached) {
-                        throw ProviderFailure(false, "SSE_LINE_TOO_LONG")
+                    if (!protocolTerminalReached) {
+                        if (parser.lineTooLong) {
+                            throw ProviderFailure(false, "SSE_LINE_TOO_LONG", code = ProviderFailureCode.AGG_TOO_LARGE)
+                        }
+                        if (parser.frameTooLong) {
+                            throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+                        }
                     }
                 }
-                if (parser.lineTooLong && !protocolTerminalReached) {
-                    throw ProviderFailure(false, "SSE_LINE_TOO_LONG")
+                if (!protocolTerminalReached) {
+                    if (parser.lineTooLong) {
+                        throw ProviderFailure(false, "SSE_LINE_TOO_LONG", code = ProviderFailureCode.AGG_TOO_LARGE)
+                    }
+                    if (parser.frameTooLong) {
+                        throw ProviderFailure(false, SseFrameParser.FRAME_TOO_LARGE_MESSAGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+                    }
                 }
             }
         } catch (e: IOException) {
@@ -340,6 +383,13 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * Provider stream plumbing: exactly one attempt, with upstream failures
  * classified into one terminal event. `catch` preserves Flow exception
  * transparency for failures thrown by the downstream collector.
+ *
+ * `code` propagation (Stage D): a [ProviderFailure] becomes
+ * [StreamEvent.Failed] with `code = e.code?.name ?: inferAggFailureCodeName(e.message)`,
+ * so aggregation/SSE budget overflows (`AGG_TOO_LARGE` with distinct
+ * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
+ * messages) stay typed end-to-end for TurnController's pending-flush guard.
+ * Other branches keep `code = null` (legacy/classified failures).
  */
 internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit): Flow<StreamEvent> =
     flow(block)
@@ -347,7 +397,13 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
             currentCoroutineContext().ensureActive()
             when (e) {
                 is CancellationException -> throw e
-                is ProviderFailure -> emit(StreamEvent.Failed(redactedError(e.message ?: "PROVIDER_FAILED"), e.retryable))
+                is ProviderFailure -> emit(
+                    StreamEvent.Failed(
+                        redactedError(e.message ?: "PROVIDER_FAILED"),
+                        e.retryable,
+                        e.code?.name ?: inferAggFailureCodeName(e.message),
+                    ),
+                )
                 is IllegalArgumentException -> emit(
                     StreamEvent.Failed(redactedError("PROVIDER_BAD_REQUEST", e.message), retryable = false),
                 )

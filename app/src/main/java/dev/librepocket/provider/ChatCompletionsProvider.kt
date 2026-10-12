@@ -211,6 +211,11 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     private var blockIndex = 0
     private var lastKind: Kind? = null
     private val tools = LinkedHashMap<Int, AggCall>()
+    // Per-attempt whole-round total across all tool indexes (Finding #1):
+    // many small calls, each under its own per-call budget, must still trip
+    // the shared 1 MiB budget. Monotonic within the attempt (ToolDones are
+    // generated here at finish(), never decremented).
+    private var totalAggChars = 0
     private var finishReason: String? = null
     private var usage: StreamEvent.Usage? = null
     private var sawDone = false
@@ -249,15 +254,25 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
             if (toolCalls != null) {
                 for (tc in toolCalls) {
                     val index = tc.int("index") ?: 0
+                    if (!tools.containsKey(index)) requireToolCountBudget(tools.size + 1)
                     val agg = tools.getOrPut(index) { AggCall() }
                     switchTo(Kind.TOOL)
                     val idChunk = tc.string("id")?.takeIf { it.isNotEmpty() }
-                    if (idChunk != null && agg.id.isEmpty()) agg.id = idChunk
                     val fn = tc.obj("function")
                     val nameChunk = fn?.string("name")?.takeIf { it.isNotEmpty() }
-                    if (nameChunk != null && agg.name.isEmpty()) agg.name = nameChunk
                     val argsChunk = fn?.string("arguments").orEmpty()
+                    // Fail-closed aggregation budget (no silent truncation):
+                    // id/name winners are first-chunk-wins, so only genuinely
+                    // appended fragments count toward the incoming side.
+                    val incoming = argsChunk.length +
+                        (if (idChunk != null && agg.id.isEmpty()) idChunk.length else 0) +
+                        (if (nameChunk != null && agg.name.isEmpty()) nameChunk.length else 0)
+                    requireToolAggBudget(agg.id.length + agg.name.length + agg.args.length, incoming)
+                    requireTotalToolAggBudget(totalAggChars, incoming)
+                    if (idChunk != null && agg.id.isEmpty()) agg.id = idChunk
+                    if (nameChunk != null && agg.name.isEmpty()) agg.name = nameChunk
                     agg.args.append(argsChunk)
+                    totalAggChars += incoming
                     out.add(StreamEvent.ToolDelta(index, idChunk, nameChunk, argsChunk))
                 }
             }

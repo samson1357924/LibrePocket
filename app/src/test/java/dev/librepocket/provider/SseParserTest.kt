@@ -85,6 +85,92 @@ class SseParserTest {
     }
 
     @Test
+    fun stackedSmallLinesLatchFrameBudgetNotLine() {
+        // Small-line stacking attack: 300 individually-legal (~4 KiB) data
+        // lines in one event. No line trips the per-line cap, but the joined
+        // payload (~1.2 M chars) trips the per-event total. Typed distinctly
+        // from a single-line breach (lineTooLong stays false).
+        val p = SseFrameParser()
+        val line = "data: " + "q".repeat(4_096) + "\n"
+        val frames = p.feed(buildString {
+            repeat(300) { append(line) }
+            append("\n")
+        })
+        assertTrue("stacked event must latch the frame budget", p.frameTooLong)
+        assertFalse("stacking must not masquerade as a single-line breach", p.lineTooLong)
+        assertTrue(frames.isEmpty())
+        assertTrue(p.flush().isEmpty())
+        // Sticky: later bytes are dropped, never parsed.
+        assertTrue(p.feed("data: late\n\n").isEmpty())
+        assertTrue(p.frameTooLong)
+    }
+
+    @Test
+    fun frameTotalExactCapStillDispatchesAndResetsPerEvent() {
+        // Values 174762 + 174762 + 1 separator = 349525 joined chars x3 = 1048575 fits.
+        val p = SseFrameParser()
+        val frames = p.feed("data: " + "a".repeat(174_762) + "\ndata: " + "b".repeat(174_762) + "\n\n")
+        assertFalse(p.frameTooLong)
+        assertEquals(1, frames.size)
+        assertEquals("a".repeat(174_762) + "\n" + "b".repeat(174_762), frames[0].data)
+        // The budget is per event: the next event starts fresh.
+        val next = p.feed("data: ok\n\n") + p.flush()
+        assertFalse(p.frameTooLong)
+        assertEquals(listOf("ok"), next.map { it.data })
+    }
+
+    @Test
+    fun frameTotalCountsSeparatorOverBudget() {
+        // Joined (174762 + 174763 + 1 separator = 349526) x3 = 1048578 > 1 MiB: latch.
+        val p = SseFrameParser()
+        val frames = p.feed("data: " + "a".repeat(174_762) + "\ndata: " + "b".repeat(174_763) + "\n\n")
+        assertTrue("separator must count toward the frame budget", p.frameTooLong)
+        assertFalse(p.lineTooLong)
+        assertTrue(frames.isEmpty())
+        assertTrue(p.flush().isEmpty())
+    }
+
+    @Test
+    fun manyEmptyDataLinesLatchFrameBudget() {
+        // 400k empty data lines: values are 0 chars but "\n" separators accumulate.
+        val p = SseFrameParser()
+        val frames = p.feed(buildString {
+            repeat(400_000) { append("data:\n") }
+            append("\n")
+        })
+        assertTrue("empty lines must still latch via separators", p.frameTooLong)
+        assertFalse(p.lineTooLong)
+        assertTrue(frames.isEmpty())
+        assertTrue(p.flush().isEmpty())
+        // Sticky: later bytes are dropped, never parsed.
+        assertTrue(p.feed("data: late\n\n").isEmpty())
+        assertTrue(p.frameTooLong)
+    }
+
+    @Test
+    fun singleCharLinesBoundaryDispatchThenLatch() {
+        // 174763 x 1-char lines: joined 174763 + 174762 separators = 349525 x3 = 1048575 fits.
+        val fit = SseFrameParser()
+        val fitFrames = fit.feed(buildString {
+            repeat(174_763) { append("data: x\n") }
+            append("\n")
+        })
+        assertFalse(fit.frameTooLong)
+        assertEquals(1, fitFrames.size)
+        assertEquals(349_525, fitFrames[0].data.length)
+        // One more 1-char line tips over: joined 349527 x3 = 1048581 > 1 MiB.
+        val over = SseFrameParser()
+        val overFrames = over.feed(buildString {
+            repeat(174_764) { append("data: x\n") }
+            append("\n")
+        })
+        assertTrue("174764 single-char lines must latch", over.frameTooLong)
+        assertFalse(over.lineTooLong)
+        assertTrue(overFrames.isEmpty())
+        assertTrue(over.flush().isEmpty())
+    }
+
+    @Test
     fun realCaptureFixtureSurvivesOddChunking() {
         val bytes = resourceBytes("sse/chat-basic.txt")
         val whole = SseFrameParser().let { it.feed(bytes) + it.flush() }

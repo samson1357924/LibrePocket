@@ -65,6 +65,8 @@ import dev.librepocket.shell.PrivilegeBridgeState
 import dev.librepocket.voice.VoiceSwitchStore
 import dev.librepocket.voice.VoiceSwitchSnapshot
 import dev.librepocket.voice.VoiceTools
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 object Routes {
@@ -105,15 +107,27 @@ fun MainScreen(
     // tool 投影未來接線時以 VoiceTools.projectionSwitches 同一快照轉 map 為
     // ProjectionContext.userSwitches（失敗態視為關，同 key、同預設）。
     val voiceStore = remember(app) { VoiceSwitchStore(app) }
-    val voiceSnapshot by voiceStore.observeSwitches().collectAsStateWithLifecycle(
-        initialValue = VoiceSwitchSnapshot.LOADING,
-    )
+    // R5-1: remember + stateIn 快取，防重組重建 Flow 身分導致 collectAsStateWithLifecycle
+    // 以 Flow 為 key 重收：裸 observeSwitches() 每次訂閱 onStart 先發 LOADING，
+    // 重組即閃斷已載入設定、speaker 重建、朗讀中斷。stateIn 把上游轉為 composition
+    // 綁定的單一 StateFlow（WhileSubscribed(5000) 快取 loaded 值撐過短暫無訂閱空窗）；
+    // Store 側 onStart LOADING 保留給真正 cold start，不動生產語義。後人勿改回內聯
+    // voiceStore.observeSwitches().collectAsStateWithLifecycle(...)。
+    val switchesFlow = remember(voiceStore, scope) {
+        voiceStore.observeSwitches().stateIn(scope, SharingStarted.WhileSubscribed(5000), VoiceSwitchSnapshot.LOADING)
+    }
+    val voiceSnapshot by switchesFlow.collectAsStateWithLifecycle()
     val voiceUiSwitches = if (voiceSnapshot.loaded && !voiceSnapshot.loadFailed) {
         voiceSnapshot.switches
     } else {
         mapOf(VoiceTools.SWITCH_INPUT to false, VoiceTools.SWITCH_OUTPUT to false)
     }
-    val ttsAcknowledged by voiceStore.observeTtsAcknowledged().collectAsStateWithLifecycle(initialValue = false)
+    // R5-1: ack 同 pattern，只為穩定 Flow 身分（其上游重收本就只重發當前值，
+    // 無 LOADING 閃斷）；初值 false 保持未確認語義。勿改回內聯。
+    val ackFlow = remember(voiceStore, scope) {
+        voiceStore.observeTtsAcknowledged().stateIn(scope, SharingStarted.WhileSubscribed(5000), false)
+    }
+    val ttsAcknowledged by ackFlow.collectAsStateWithLifecycle()
 
     // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。

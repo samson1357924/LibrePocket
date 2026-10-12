@@ -16,8 +16,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -277,5 +279,31 @@ class VoiceSwitchStoreTest {
         scopes.forEach { it.cancel() }
         scopes.forEach { it.coroutineContext[Job]?.join() }
         assertTrue(newStore(dir).observeTtsAcknowledged().first())
+    }
+
+    @Test
+    fun sharedSwitches_resubscribeSeesCachedLoadedNotLoading() = runBlocking {
+        // R5-1 回歸（helper 級，測共享包裝語義；UI 層 remember 身分由 MainScreen 側保證）：
+        // MainScreen 曾在組合內聯調 observeSwitches() 建新 Flow，collectAsStateWithLifecycle
+        // 以 Flow 為 key，重組即重收，onStart 每次先發 LOADING → 已載入設定閃斷。
+        // 修復＝ remember + stateIn(WhileSubscribed(5000)) 快取 loaded 值；Store 側
+        // onStart LOADING 保留給真正 cold start（生產語義不動）。
+        val store = newStore()
+        val sharingScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        scopes.add(sharingScope)
+        val shared = store.observeSwitches().stateIn(
+            sharingScope,
+            SharingStarted.WhileSubscribed(5000),
+            VoiceSwitchSnapshot.LOADING,
+        )
+        // 暖到 loaded（此 first 即第一個 collector，返回後即取消收集）。
+        val loaded = shared.first { it.loaded }
+        assertFalse(loaded.loadFailed)
+        // 第二個 collector 立即重收：應直見快取 loaded，而非 LOADING。
+        val second = shared.first()
+        assertTrue(second.loaded)
+        assertEquals(loaded, second)
+        // 對照：裸 Flow 每次訂閱 onStart 仍先發 LOADING（鎖定修復的因果）。
+        assertEquals(VoiceSwitchSnapshot.LOADING, store.observeSwitches().first())
     }
 }

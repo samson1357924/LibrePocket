@@ -165,13 +165,14 @@ class VoiceDisclosureTest {
     }
 
     @Test fun settings_voiceCardDisclosesEngineDependence() {
-        // 脆弱性：見本節說明。設定頁語音卡為手寫文案（未引用 ENGINE_DISCLOSURE 常數），
-        // 只能釘選關鍵字；文案語義變更需同步更新此測（屬已知脆弱，非行為保證）。
+        // 脆弱性：見本節說明。接線不斷言渲染，只確認設定頁語音卡引用共用常數
+        // 而非手寫引擎依賴文案；常數內容語義由純 formatter 測試
+        // `speakButtonDescription_disclosesSystemEngine` 覆蓋。
         val settings = findSource(
             "src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
             "app/src/main/java/dev/librepocket/agent/ui/settings/SettingsScreen.kt",
         ).readText()
-        assertTrue(settings.contains("取決於"))
+        assertTrue(settings.contains("VoiceTts.ENGINE_DISCLOSURE"))
         assertFalse(settings.contains("本地引擎"))
     }
 

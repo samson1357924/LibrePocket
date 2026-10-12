@@ -68,11 +68,10 @@ class VoiceSpeaker(
     private var pending: PendingSpeech? = null
 
     /**
-     * 已送引擎的 utterance 追蹤（utteranceId → 送出時的 [speechEpoch]）與
-     * 已揭露集合（同 id 只報一次）。一律在 [lifecycleLock] 內讀寫。
+     * 已送引擎的 utterance 追蹤（utteranceId → 送出時的 [speechEpoch]）。
+     * 一律在 [lifecycleLock] 內讀寫；移除條目即去重（重複同 id 終結命中不到條目即抑制）。
      */
     private val utteranceEpochs = mutableMapOf<String, Long>()
-    private val reportedUtteranceIds = mutableSetOf<String>()
 
     /**
      * 當輪 request 級狀態（[lifecycleLock] 內讀寫）：
@@ -214,9 +213,7 @@ class VoiceSpeaker(
             speechEpoch++
             pending = null
             // 舊 utterance 已被 QUEUE_FLUSH 語義或引擎 stop 丟棄：遲到錯誤不再揭露。
-            val evicted = utteranceEpochs.keys.toSet()
             utteranceEpochs.clear()
-            reportedUtteranceIds.removeAll(evicted)
             activeRequestFailed = false
             activeRequestPending = 0
             try {
@@ -236,7 +233,6 @@ class VoiceSpeaker(
             speechEpoch++
             pending = null
             utteranceEpochs.clear()
-            reportedUtteranceIds.clear()
             activeRequestFailed = false
             activeRequestPending = 0
             val engine = tts ?: return
@@ -354,16 +350,12 @@ class VoiceSpeaker(
         val chunks = try {
             VoiceTts.split(text, maxChunk)
         } catch (_: Exception) {
-            val evicted = utteranceEpochs.keys.toSet()
             utteranceEpochs.clear()
-            reportedUtteranceIds.removeAll(evicted)
             activeRequestFailed = true
             activeRequestPending = 0
             return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED)
         }
-        val evicted = utteranceEpochs.keys.toSet()
         utteranceEpochs.clear()
-        reportedUtteranceIds.removeAll(evicted)
         speechEpoch++
         activeRequestFailed = false
         activeRequestPending = 0
@@ -400,7 +392,7 @@ class VoiceSpeaker(
     }
 
     /**
-     * Utterance 失敗轉送失敗通道。同一臨界區內完成「id 存在＋epoch 相符＋未重複報錯」
+     * Utterance 失敗轉送失敗通道。同一臨界區內完成「id 存在＋epoch 相符」
      * 校驗、標記整輪失敗、pending--、移除追蹤條目與入隊；投遞由 [drainQueue] 在鎖外串行執行。
      * terminal 後、stop／shutdown 後（epoch 不符）、未知／空 id、同一 id 重複終結（條目已移除）
      * 的遲到回呼一律不入隊不揭露。提交中入隊的事件延後到提交收尾後才投遞，
@@ -416,11 +408,8 @@ class VoiceSpeaker(
                 val stored = utteranceEpochs[utteranceId] ?: return@synchronized false
                 if (stored != speechEpoch) {
                     false
-                } else if (!reportedUtteranceIds.add(utteranceId)) {
-                    false
                 } else {
                     utteranceEpochs.remove(utteranceId)
-                    reportedUtteranceIds.remove(utteranceId)
                     activeRequestFailed = true
                     if (activeRequestPending > 0) activeRequestPending--
                     emitQueue.addLast(QueuedEmit(EmitKind.ERROR, stored, utteranceId))
@@ -452,7 +441,6 @@ class VoiceSpeaker(
                     false
                 } else {
                     utteranceEpochs.remove(utteranceId)
-                    reportedUtteranceIds.remove(utteranceId)
                     if (activeRequestPending > 0) activeRequestPending--
                     if (isSubmitting) {
                         false

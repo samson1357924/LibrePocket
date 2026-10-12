@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.automation.AutomationSettingsState
 import dev.librepocket.voice.VoiceTools
+import dev.librepocket.voice.VoiceTts
 
 @Composable
 fun SettingsScreen(
@@ -123,7 +124,7 @@ fun SettingsScreen(
                         Text(
                             "語音輸入走系統辨識、語音輸出走系統朗讀，不新增任何權限；" +
                                 "麥克風音檔只駐留記憶體、不落地存檔；辨識正文寫入紀錄前會先遮罩敏感內容；" +
-                                "系統朗讀由已安裝的語音引擎處理，其離線能力與資料傳輸取決於該引擎。",
+                                "系統朗讀由" + VoiceTts.ENGINE_DISCLOSURE + "，離線能力因引擎而異。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

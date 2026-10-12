@@ -2197,8 +2197,21 @@ class TurnController(
    * block whose ledger still dangles (terminal will never land → marking
    * INTERRUPTED is correct); without this proof an expired-but-unsettled
    * ledger keeps deferring.
+   *
+   * R14-1: seal alone is NOT the dead proof (see
+   * [OrderedTranscriptSink.isWriterCompleted]) — the gate conjoins
+   * [isTranscriptWriterCompleted].
    */
   fun isTranscriptSealed(): Boolean = orderedTranscript.isSealed()
+
+  /**
+   * R14-1 writer-completion proof: true only once the session writer can no
+   * longer execute a store block (writer joined or writer-dead flag set in
+   * its own finally). Conjoined with [isTranscriptSealed], empty
+   * [pendingTranscriptRunIds] and no [hasPendingAdmission] before an expired
+   * outstanding teardown may be treated as dead.
+   */
+  fun isTranscriptWriterCompleted(): Boolean = orderedTranscript.isWriterCompleted()
 
   // ---- internals ----
 

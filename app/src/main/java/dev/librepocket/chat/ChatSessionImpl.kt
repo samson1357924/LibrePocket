@@ -107,6 +107,9 @@ class ChatSessionImpl(
   /** R10-2: live writer-sealed state for the backfill gate's expiry promotion proof. */
   override fun isTranscriptSealed(): Boolean = controller.isTranscriptSealed()
 
+  /** R14-1: live writer-completion state for the backfill gate's expiry dead proof. */
+  override fun isTranscriptWriterCompleted(): Boolean = controller.isTranscriptWriterCompleted()
+
   override fun close() {
     controller.close()
     sessionScope.cancel()

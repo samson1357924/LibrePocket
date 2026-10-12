@@ -117,6 +117,8 @@ private class ExpiryDeadSession : ChatSession {
     override fun hasPendingAdmission(): Boolean = false
     override fun pendingTranscriptRunIds(): List<String> = emptyList()
     override fun isTranscriptSealed(): Boolean = true
+    /** Truly-dead writer model: its block resolved, so the R14-1 completion conjunct holds. */
+    override fun isTranscriptWriterCompleted(): Boolean = true
     override fun steer(text: String) = Unit
     override fun close() = Unit
 }
@@ -171,6 +173,8 @@ private class ExpiryStuckSealedSession : ChatSession {
     override fun hasPendingAdmission(): Boolean = false
     override fun pendingTranscriptRunIds(): List<String> = emptyList()
     override fun isTranscriptSealed(): Boolean = true
+    /** Stuck-status but truly-dead writer model: the R14-1 completion conjunct holds. */
+    override fun isTranscriptWriterCompleted(): Boolean = true
     override fun steer(text: String) = Unit
     override fun close() = Unit
 }

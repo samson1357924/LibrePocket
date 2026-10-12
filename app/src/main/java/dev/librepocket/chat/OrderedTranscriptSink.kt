@@ -773,6 +773,22 @@ class OrderedTranscriptSink(
   fun pendingRunIds(): List<String> = pendingCore.toList()
 
   /**
+   * R14-1 writer-completion proof: true only once the session writer can no
+   * longer execute a store block. The writer runs `entry.block()` with no
+   * pre-block cancellation gate, and a blocking delegate (Room
+   * `runInTransaction`) has no suspension point between its first write and
+   * COMMIT, so `isSealed()` (which is also true on a bare `channel.close()`)
+   * plus an emptied pending set does NOT prove a late terminal is
+   * impossible — a timed-out shutdown clears pending via [markInterrupted]
+   * and closes the channel while the writer is still inside `block()`.
+   * `writer.isCompleted` (or [writerDead], set in the writer's own finally)
+   * proves the in-flight block resolved (committed or rolled back), so the
+   * backfill gate conjoins this with seal + empty pending before treating an
+   * expired outstanding teardown as dead.
+   */
+  fun isWriterCompleted(): Boolean = writer.isCompleted || writerDead.get()
+
+  /**
    * True once the writer is sealed/torn down: later core writes fail fast
    * (fail-fast `CancellationException` or [ClosedSendChannelException]) instead
    * of parking unbounded behind a dead writer. Mirrors the [writeCore]

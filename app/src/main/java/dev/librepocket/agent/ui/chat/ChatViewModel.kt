@@ -484,8 +484,10 @@ class ChatViewModel(
      * writer may still commit its terminal. Fail-closed: any uncertainty
      * keeps the entry (renew, never purge).
      * - Unfinished fence → live (the background close-then-flush still runs).
-     * - Sealed-dead session (sealed + no pending) → dead: its terminal will
-     *   never land, so a later backfill of its dangling turn is correct.
+     * - Sealed-dead session (sealed + no pending + writer completed) → dead:
+     *   its terminal can never land late, so a later backfill of its dangling
+     *   turn is correct. Seal + empty pending WITHOUT writer completion is
+     *   still live (R14-1: timed-out shutdown shape).
      * - Streaming/pending evidence → live.
      * - Unsealed session with no fence completion proof → live (a stalled
      *   delegate / non-cancellable terminal persistence may still commit
@@ -516,8 +518,21 @@ class ChatViewModel(
         // Unsealed without session-side evidence: only a completed fence
         // proves the teardown ran to completion. No fence (or an unreadable
         // fence) means no completion proof — keep the entry.
+        // R14-1: a sealed session here is NOT dead (sealed-dead above already
+        // returned false, i.e. the writer has not completed) — a timed-out
+        // shutdown seals and empties pending while the writer is still inside
+        // a blocking store block, so keep ownership. Unsealed + pending-empty
+        // implies no in-flight block (an in-flight core always occupies
+        // pendingCore until the writer's own finally; only the sealed
+        // shutdown path clears it early), so a completed fence still proves
+        // completion there. Seal reads fail closed (kept).
         return try {
-            entry.fence == null
+            if (entry.fence == null) return true
+            try {
+                s.isTranscriptSealed()
+            } catch (_: Exception) {
+                true
+            }
         } catch (_: Exception) {
             true
         }
@@ -586,7 +601,8 @@ class ChatViewModel(
      * unsettled old-writer session observed when the block was parked (the
      * same-ID defer's [detached] live, which still owned the ledger then).
      * A later expiry must not promote on wall-clock alone: it re-reads this
-     * writer's liveness (streaming/pending evidence, seal + empty pending) so
+     * writer's liveness (streaming/pending evidence, seal + empty pending +
+     *   writer completion) so
      * a still-alive writer keeps deferring while a provably-dead writer may
      * promote even with a dangling ledger (its terminal will never land, so
      * marking INTERRUPTED is correct). Only entries with pending/streaming
@@ -3971,7 +3987,8 @@ class ChatViewModel(
      * - R10-2 expired block: NEVER promotes on the clock alone. Expiry runs
      *   the verifiable promotion ([tryPromoteExpiredBlock]): ledger clean +
      *   fresh live clean + old writer not alive + no live outstanding
-     *   teardown promotes (or writer-dead proof — sealed + pending empty —
+     *   teardown promotes (or writer-dead proof — sealed + pending empty +
+     *   writer completed (R14-1) —
      *   promotes even with a dangling ledger, since its terminal will never
      *   land and marking INTERRUPTED is then correct). Anything unverified
      *   renews the deadline and defers again (fail-closed: the caller keeps
@@ -4046,7 +4063,8 @@ class ChatViewModel(
      * - no live outstanding teardown for [sessionId] is still settling, AND
      * - the stored old writer (see [pendingBackfillWriter]) shows none, AND
      * - either the ledger proves its terminal (no dangling family) OR a
-     *   stored/slot old writer is provably dead (sealed + pending empty, so
+     *   stored/slot old writer is provably dead (sealed + pending empty +
+     *   writer completed, so
      *   its terminal will never land and an INTERRUPTED mark is correct).
      * B1: liveness is verified BEFORE the probe (fast fail) and re-verified
      * AFTER it — a probe suspension window that lands a new dangling must
@@ -4106,7 +4124,8 @@ class ChatViewModel(
 
     /**
      * B2 sealed-aware liveness: a provably-dead writer (sealed + pending
-     * empty) is NOT alive, even when its uiState still sticks at STREAMING
+     * empty + writer completed, see [isWriterSealedDead]) is NOT alive, even
+     * when its uiState still sticks at STREAMING
      * after the seal. Lets the expiry dead-proof stay reachable instead of
      * being shadowed by the stuck status. Best-effort, never throws.
      */
@@ -4163,11 +4182,21 @@ class ChatViewModel(
     }
 
     /** R10-2 writer-dead proof: sealed AND no pending admission AND no unacked cores. Best-effort, never throws. */
+    /**
+     * R14-1 fourth conjunct: the writer itself must have completed
+     * ([ChatSession.isTranscriptWriterCompleted]). Seal + empty pending
+     * alone is observable right after a timed-out shutdown (channel closed,
+     * pending cleared via interrupt marks) while the writer is still inside
+     * a blocking store block whose COMMIT may still land — treating that
+     * state as dead writes a false INTERRUPTED. Unknown/completed-proof
+     * failures stay fail-closed (false → entry kept).
+     */
     private fun isWriterSealedDead(session: ChatSession): Boolean {
         return try {
             if (!session.isTranscriptSealed()) return false
             if (session.hasPendingAdmission()) return false
-            session.pendingTranscriptRunIds().isEmpty()
+            if (session.pendingTranscriptRunIds().isNotEmpty()) return false
+            session.isTranscriptWriterCompleted()
         } catch (_: Exception) {
             false
         }

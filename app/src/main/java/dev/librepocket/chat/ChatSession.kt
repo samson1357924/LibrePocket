@@ -159,8 +159,22 @@ interface ChatSession {
    * !hasPendingAdmission()` as proof the old writer can never land a late
    * terminal, so an expired block may promote even while the ledger still
    * dangles (marking INTERRUPTED is then correct, never a mis-mark).
+   *
+   * R14-1: seal alone is NOT that proof — a timed-out shutdown closes the
+   * channel (sealed) and empties pending while the writer is still inside a
+   * blocking store block — so the gate additionally requires
+   * [isTranscriptWriterCompleted].
    */
   fun isTranscriptSealed(): Boolean = false
+
+  /**
+   * R14-1 writer-completion proof: true only once the session writer can no
+   * longer execute a store block. Default false (fail-closed: unknown
+   * writers keep their outstanding ownership) so test fakes stay
+   * source-compatible; production ([ChatSessionImpl]) overrides with the
+   * live controller state.
+   */
+  fun isTranscriptWriterCompleted(): Boolean = false
 
   /** Release (close HTTP call, drop queue). */
   fun close()

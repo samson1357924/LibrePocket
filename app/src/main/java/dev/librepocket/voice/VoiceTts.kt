@@ -20,6 +20,7 @@ object VoiceTts {
     /** TTS 失敗細分碼（隨 [ttsFallbackMessage] 原文引用，見 `VoiceStt.DETAIL_*` 對稱）。 */
     const val DETAIL_NO_ENGINE = "NO_ENGINE"
     const val DETAIL_INIT_FAILED = "INIT_FAILED"
+    const val DETAIL_LISTENER_FAILED = "LISTENER_FAILED"
     const val DETAIL_LANG_UNAVAILABLE = "LANG_UNAVAILABLE"
     const val DETAIL_SPEAK_FAILED = "SPEAK_FAILED"
 

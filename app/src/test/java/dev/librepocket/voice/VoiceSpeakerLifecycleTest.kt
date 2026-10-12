@@ -144,6 +144,67 @@ class VoiceSpeakerLifecycleTest {
     }
 
     @Test
+    fun noEngine_laterSpeakKeepsOriginalDetail() {
+        ControlledTextToSpeechShadow.forcedEngines = emptyList()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        speaker.speak("pending before probe")
+        val shadow = currentTtsShadow()
+
+        initSuccessfully(shadow)
+        speaker.speak("after no-engine failure")
+
+        assertTrue(shadow.spokenTextList.isEmpty())
+        assertEquals(2, errors.size)
+        assertTrue(
+            "errors=$errors",
+            errors.all {
+                it.contains(VoiceTts.DETAIL_NO_ENGINE) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        assertTrue(
+            "errors=$errors",
+            errors.none { it.contains(VoiceTts.DETAIL_INIT_FAILED) },
+        )
+    }
+
+    @Test
+    fun listenerReturnError_isWarningButSpeakerStaysUsable() {
+        ControlledTextToSpeechShadow.forcedListenerResult = TextToSpeech.ERROR
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+
+        assertTrue(
+            "errors=$errors",
+            errors.any {
+                it.contains(VoiceTts.DETAIL_LISTENER_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        speaker.speak("hi after listener warning")
+        assertEquals(listOf("hi after listener warning"), shadow.spokenTextList)
+    }
+
+    @Test
+    fun listenerException_isWarningButSpeakerStaysUsable() {
+        ControlledTextToSpeechShadow.throwOnListener = true
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+
+        assertTrue(
+            "errors=$errors",
+            errors.any {
+                it.contains(VoiceTts.DETAIL_LISTENER_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        speaker.speak("hi after listener exception")
+        assertEquals(listOf("hi after listener exception"), shadow.spokenTextList)
+    }
+
+    @Test
     fun speakReturnError_isObservable() {
         ControlledTextToSpeechShadow.failSpeak = true
         val errors = CopyOnWriteArrayList<String>()
@@ -371,6 +432,12 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
 
     @Implementation
     fun setOnUtteranceProgressListener(listener: UtteranceProgressListener?): Int {
+        if (throwOnListener) throw RuntimeException("fake listener failure")
+        val forced = forcedListenerResult
+        if (forced != null) {
+            if (forced == TextToSpeech.SUCCESS) utteranceListener = listener
+            return forced
+        }
         utteranceListener = listener
         return TextToSpeech.SUCCESS
     }
@@ -466,6 +533,12 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
         @Volatile
         var forcedEngines: List<TextToSpeech.EngineInfo>? = null
 
+        @Volatile
+        var forcedListenerResult: Int? = null
+
+        @Volatile
+        var throwOnListener = false
+
         fun resetControls() {
             initSynchronously = false
             pauseLanguageLookup = false
@@ -478,6 +551,8 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
             throwOnSpeak = false
             failLanguageLookup = false
             forcedEngines = null
+            forcedListenerResult = null
+            throwOnListener = false
         }
     }
 }

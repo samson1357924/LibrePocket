@@ -14,13 +14,14 @@ import java.util.UUID
  * - 引擎：Android [TextToSpeech] API；實際語音引擎由裝置安裝／設定提供，其離線能力與資料處理方式各異；
  * - 佇列：首段 `QUEUE_FLUSH`，後續 `QUEUE_ADD`；
  * - 進度：掛載 [UtteranceProgressListener]（onStart/onDone 為 no-op；onError 轉送 [onError] 失敗通道）；
+ *   掛載回傳 ERROR 或拋錯時經 [onError] 發出 LISTENER_FAILED 警告（非同步朗讀失敗可能無法觀測），但不 fail-closed，引擎仍可用；
  * - 分段：[VoiceTts.split] 每段最多 4000 字；
  * - 語言：`zh-TW` → `zh-CN` → 第一個列出的 `zh` voice（見 [VoiceTts.resolveLocale]）。
  *
- * 初始化為非同步：[speak] 在成功回呼前只保留最新待播文字。初始化失敗時清除待播文字；本類別不提供重新初始化引擎的 API。
+ * 初始化為非同步：[speak] 在成功回呼前只保留最新待播文字。初始化失敗時清除待播文字並記下原始 detail（NO_ENGINE／INIT_FAILED），後續 [speak] 沿用該 detail 揭露；本類別不提供重新初始化引擎的 API。
  *
  * 可觀察性（Stage2）：引擎可用性探測（[VoiceTts.hasEngine]，空引擎表視為初始化失敗，
- * fail-closed）與初始化／語言／朗讀／utterance 失敗一律經 [onError] 揭露，
+ * fail-closed）與初始化／listener 掛載／語言／朗讀／utterance 失敗一律經 [onError] 揭露，
  * 不再靜默吞錯。Listener 在鎖外呼叫；lifecycle 語義（epoch/pending/terminal
  * fence）與 Stage1 一致。
  */
@@ -37,7 +38,7 @@ class VoiceSpeaker(
     private var tts: TextToSpeech? = null
     private var deferredInitStatus: Int? = null
     private var initCallbackHandled = false
-    private var initializationFailed = false
+    private var initFailureDetail: String? = null
     private var ready = false
     private var terminal = false
     private var speechEpoch = 0L
@@ -62,26 +63,36 @@ class VoiceSpeaker(
             }
             if (initError != null) emitError(initError)
         }
-        val deferredError: String? = synchronized(lifecycleLock) {
-            try {
-                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) = Unit
-                    override fun onDone(utteranceId: String?) = Unit
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(utteranceId: String?) {
-                        reportUtteranceError()
-                    }
-                    override fun onError(utteranceId: String?, errorCode: Int) {
-                        reportUtteranceError()
-                    }
-                })
+        val listenerError: String?
+        val deferredError: String?
+        synchronized(lifecycleLock) {
+            listenerError = try {
+                val listenerStatus =
+                    engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String?) = Unit
+                        override fun onDone(utteranceId: String?) = Unit
+                        @Deprecated("Deprecated in Java")
+                        override fun onError(utteranceId: String?) {
+                            reportUtteranceError()
+                        }
+                        override fun onError(utteranceId: String?, errorCode: Int) {
+                            reportUtteranceError()
+                        }
+                    })
+                if (listenerStatus == TextToSpeech.ERROR) {
+                    VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_LISTENER_FAILED)
+                } else {
+                    null
+                }
             } catch (_: Exception) {
+                VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_LISTENER_FAILED)
             }
             tts = engine
             val callbackStatus = deferredInitStatus
             deferredInitStatus = null
-            if (callbackStatus != null) handleInitLocked(engine, callbackStatus) else null
+            deferredError = if (callbackStatus != null) handleInitLocked(engine, callbackStatus) else null
         }
+        if (listenerError != null) emitError(listenerError)
         if (deferredError != null) emitError(deferredError)
     }
 
@@ -90,9 +101,10 @@ class VoiceSpeaker(
         if (text.isBlank()) return
         val error: String? = synchronized(lifecycleLock) {
             if (terminal) return
-            if (initializationFailed) {
-                // 初始化已失敗：本次朗讀不會送引擎，經失敗通道揭露（不再靜默）。
-                VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_INIT_FAILED)
+            val failureDetail = initFailureDetail
+            if (failureDetail != null) {
+                // 初始化已失敗：本次朗讀不會送引擎，沿用原始 detail 揭露（不再靜默）。
+                VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, failureDetail)
             } else {
                 val engine = tts ?: return
                 if (!ready) {
@@ -144,7 +156,7 @@ class VoiceSpeaker(
         if (terminal || initCallbackHandled) return null
         initCallbackHandled = true
         if (status != TextToSpeech.SUCCESS) {
-            initializationFailed = true
+            initFailureDetail = VoiceTts.DETAIL_INIT_FAILED
             pending = null
             speechEpoch++
             return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_INIT_FAILED)
@@ -159,7 +171,7 @@ class VoiceSpeaker(
             false
         }
         if (noEngine) {
-            initializationFailed = true
+            initFailureDetail = VoiceTts.DETAIL_NO_ENGINE
             pending = null
             speechEpoch++
             return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_NO_ENGINE)

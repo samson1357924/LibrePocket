@@ -454,17 +454,26 @@ class TurnController(
    * durable, skipped there) and returns a cancelled host instead of
    * ghost-launching. Guarded by [lock]; cleared by whichever waiter path wins
    * (cancel-drain, closed-rollback, or durability-rollback).
+   *
+   * R6-1: reused for the promotion UNKNOWN window (predecessor host already
+   * completed, [pendingAdmission] null, [unknownAdmission.isPromotion] true).
+   * [cancel] records the promotion reservation id here; [settlePendingAdmission]
+   * and [claimPromotionUnknownLocked] observe it and abort the launch
+   * (convert-like, FIFO retained, no second ledger row).
    */
   private var admissionCancelRequestedId: String? = null
   /**
    * R5-2 promotion-scoped reservation (guarded by [lock]): the follow-up
    * identity minted by the promotion peek, held across the durable user-row
    * await. Deliberately separate from [pendingAdmission] (direct admissions):
-   * [close] drains only direct orphans, and [cancel]'s admission-window flag
-   * ([admissionCancelRequestedId]) stays direct — a promotion await is always
+   * [close] drains only direct orphans, and a promotion await is always
    * covered by the still-active predecessor host, so cancel/close reach it by
-   * cancelling that host, never via these flags. Invariant: set only while
-   * the predecessor host is still the live in-flight job.
+   * cancelling that host — except the promotion UNKNOWN window (predecessor
+   * already completed, ownership moved to [unknownAdmission]): there [cancel]
+   * reuses [admissionCancelRequestedId] for the promotion id. Invariant: set
+   * only while the predecessor host is still the live in-flight job, or
+   * transiently until [enterUnknownAdmission] moves it (cleared explicitly by
+   * [close] as well as the async waiter path).
    */
   private var promotionPending: PendingAdmission? = null
   private var orphanDrainJob: Job? = null
@@ -475,11 +484,19 @@ class TurnController(
    * reservation + optimistic UI row + caller opId across the accept timeout so
    * a late-committing ghost is claimed under the SAME logical id instead of
    * being duplicated by an immediate same-opId resend.
+   *
+   * R6-1: promotion UNKNOWN reuses the same slot. Direct admissions carry a
+   * non-null [uiMessageId] (optimistic row already appended); promotions have
+   * no optimistic row yet so [uiMessageId] is null and [isPromotion] is true
+   * with the predecessor [host] for inFlight bookkeeping. Claim then performs
+   * the Lock-2 commit (dequeue + append + launch) instead of the direct claim.
    */
   private data class UnknownAdmission(
     val reservation: PendingAdmission,
-    val uiMessageId: String,
+    val uiMessageId: String?,
     val opId: Long?,
+    val isPromotion: Boolean = false,
+    val host: Job? = null,
   )
   private var unknownAdmission: UnknownAdmission? = null
   private var unknownSettleJob: Job? = null
@@ -651,9 +668,14 @@ class TurnController(
    * [pendingAdmission] is set before the first suspend (durable await) and
    * cleared only on failure or host entry, so a concurrent admission arriving
    * during the await must queue/throw instead of starting a second turn.
+   * R6-1: [unknownAdmission] (direct or promotion UNKNOWN) and
+   * [promotionPending] (promotion await window) also hold the slot, so a
+   * promotion ghost cannot be duplicated by a racing direct admission or
+   * reclaimed by drain while its fate is still unknown.
    * Caller must hold [lock].
    */
-  private fun isBusyLocked(): Boolean = activeLocked() != null || pendingAdmission != null
+  private fun isBusyLocked(): Boolean =
+    activeLocked() != null || pendingAdmission != null || unknownAdmission != null || promotionPending != null
 
   /**
    * Stage 6: durable user-row await shared by [startTurn]/[startOrEnqueue].
@@ -749,17 +771,39 @@ class TurnController(
    * [pendingAdmission] (single-flight stays held), keeps the optimistic UI
    * row, projects `transcript store pending`, and launches one bounded
    * background settle (flush + ticket tracking, never blocks the UI).
+   * R6-1: promotion callers pass `uiMessageId = null` (no optimistic row yet),
+   * `isPromotion = true` and the predecessor [host]; the reservation moves
+   * from [promotionPending] to [unknownAdmission] (same id, head opId kept)
+   * and the FIFO head stays queued with `queuedRecoveryRequired = false`
+   * (pending, not reclaimable) until settle claims or converts.
    * Caller must NOT hold [lock].
    */
-  private fun enterUnknownAdmission(reservation: PendingAdmission, uiMessageId: String, opId: Long?) {
+  private fun enterUnknownAdmission(
+    reservation: PendingAdmission,
+    uiMessageId: String?,
+    opId: Long?,
+    isPromotion: Boolean = false,
+    host: Job? = null,
+  ) {
     synchronized(lock) {
       // Single-flight guarantees at most one UNKNOWN; a racing settle that
       // already cleared must not be overwritten — but the waiter owns this
       // reservation, so overwrite is the same reservation.
-      unknownAdmission = UnknownAdmission(reservation, uiMessageId, opId)
+      if (isPromotion && promotionPending?.logicalTurnId == reservation.logicalTurnId) {
+        promotionPending = null
+      }
+      unknownAdmission = UnknownAdmission(reservation, uiMessageId, opId, isPromotion, host)
       activityRevision++
       _uiState.update { s ->
-        s.copy(status = ChatStatus.ERROR, error = "transcript store pending")
+        s.copy(
+          status = ChatStatus.ERROR,
+          error = "transcript store pending",
+          pendingSteerCount = steerQueue.size,
+          // UNKNOWN means fate unknown: never project recovery (which means
+          // "definitely not written, safe to resend"). Recovery is only for
+          // confirmed NOT_ADMITTED/unavailable.
+          queuedRecoveryRequired = false,
+        )
       }
     }
     val job = writerScope.launch {
@@ -802,7 +846,11 @@ class TurnController(
       synchronized(lock) {
         val cur = unknownAdmission ?: return true
         if (cur.reservation.logicalTurnId != logicalTurnId) return true
-        convertUnknownToFailedLocked(cur, "transcript store unavailable")
+        if (cur.isPromotion) {
+          convertPromotionUnknownToFailedLocked(cur, "transcript store unavailable")
+        } else {
+          convertUnknownToFailedLocked(cur, "transcript store unavailable")
+        }
       }
       return true
     }
@@ -817,13 +865,47 @@ class TurnController(
       val cur = unknownAdmission ?: return true
       if (cur.reservation.logicalTurnId != logicalTurnId) return true
       if (orderedTranscript.interruptedRunIds().contains(logicalTurnId) || orderedTranscript.isSealed()) {
-        convertUnknownToFailedLocked(cur, "transcript store unavailable")
+        if (cur.isPromotion) {
+          convertPromotionUnknownToFailedLocked(cur, "transcript store unavailable")
+        } else {
+          convertUnknownToFailedLocked(cur, "transcript store unavailable")
+        }
         return true
       }
       if (!flushed) return false
-      // Admission-window cancel raced the late commit: drain a cancel terminal
-      // instead of ghost-launching (Finding 1, UNKNOWN variant).
+      // Admission-window cancel raced the late commit: direct admissions drain
+      // a cancel terminal instead of ghost-launching (Finding 1, UNKNOWN
+      // variant). Promotion UNKNOWN takes the convert-like branch below
+      // (FIFO retained, no second ledger row, no launch) — see
+      // [claimPromotionUnknownLocked].
       if (admissionCancelRequestedId == logicalTurnId) {
+        if (cur.isPromotion) {
+          // R6-1 promotion-UNKNOWN cancel wins: the ghost already proved
+          // durable via the flush above, but the user pressed cancel, so never
+          // launch and never write another ledger row here (no dequeue, no
+          // append, no drainOrphan cancel-terminal — unlike the direct branch
+          // there is no optimistic UI row to keep and no pendingAdmission to
+          // drain). Retain the never-dequeued FIFO for explicit recovery
+          // (ERROR + queuedRecoveryRequired, reclaimable via drainQueued like
+          // the NOT_ADMITTED path); the acked ghost survives as an orphan
+          // (no cancel-terminal; reopen marks it INTERRUPTED).
+          admissionCancelRequestedId = null
+          unknownAdmission = null
+          if (promotionPending?.logicalTurnId == logicalTurnId) promotionPending = null
+          val host = cur.host
+          if (host != null && inFlight === host) inFlight = null
+          durableUserRows.add(logicalTurnId)
+          activityRevision++
+          _uiState.update { s ->
+            s.copy(
+              status = ChatStatus.ERROR,
+              error = "turn admission cancelled",
+              pendingSteerCount = steerQueue.size,
+              queuedRecoveryRequired = steerQueue.isNotEmpty(),
+            )
+          }
+          return true
+        }
         admissionCancelRequestedId = null
         unknownAdmission = null
         durableUserRows.add(logicalTurnId)
@@ -840,7 +922,11 @@ class TurnController(
         }
         return true
       }
-      claimUnknownLocked(cur)
+      if (cur.isPromotion) {
+        claimPromotionUnknownLocked(cur)
+      } else {
+        claimUnknownLocked(cur)
+      }
       return true
     }
   }
@@ -893,6 +979,152 @@ class TurnController(
         messages = s.messages.filterNot { it.id == unknown.uiMessageId && it.role == "user" },
         status = ChatStatus.ERROR,
         error = error,
+      )
+    }
+  }
+
+  /**
+   * R6-1: promotion UNKNOWN claim — the Lock-2 commit for a late-committed
+   * ghost. Dequeues the still-queued head only when it still matches
+   * (opId + text, like Lock 2), appends the user row, records durability
+   * BEFORE launch (so [runTurnLoop] skips a second row), projects STREAMING
+   * and launches the follow-up host with the SAME logical id (no resend).
+   * The predecessor [Job] already completed; [inFlight] is atomically replaced
+   * self → follow. Caller must hold [lock].
+   *
+   * Cancel/close mirror Lock-2: a CANCELLED projection or a matching
+   * [admissionCancelRequestedId] (see [cancel] promotion-UNKNOWN branch) aborts
+   * the launch with the convert-like transition (FIFO retained, ERROR +
+   * reclaimable, no ledger write); [closed] drops the FIFO per the
+   * drain-before-close contract (acked ghost survives as an orphan, no
+   * cancel-terminal — reopen marks it INTERRUPTED). The steal/close paths add
+   * [durableUserRows] for the orphan so a later retry with a fresh id never
+   * rewrites it.
+   */
+  private fun claimPromotionUnknownLocked(unknown: UnknownAdmission) {
+    unknownAdmission = null
+    if (promotionPending?.logicalTurnId == unknown.reservation.logicalTurnId) {
+      promotionPending = null
+    }
+    // R6-1 cancel wins after the ack while settle was parked (mirrors the
+    // Lock-2 `status == CANCELLED` guard; the flag covers the promotion
+    // UNKNOWN window where [cancel] ran with no active host). Never launch and
+    // never write another ledger row here (no dequeue, no append, no
+    // drainOrphan): retain the FIFO for explicit recovery like
+    // [convertPromotionUnknownToFailedLocked]. The acked ghost survives as an
+    // orphan (no cancel-terminal; reopen marks it INTERRUPTED).
+    if (
+      admissionCancelRequestedId == unknown.reservation.logicalTurnId ||
+      _uiState.value.status == ChatStatus.CANCELLED
+    ) {
+      if (admissionCancelRequestedId == unknown.reservation.logicalTurnId) {
+        admissionCancelRequestedId = null
+      }
+      val host = unknown.host
+      if (host != null && inFlight === host) inFlight = null
+      durableUserRows.add(unknown.reservation.logicalTurnId)
+      activityRevision++
+      _uiState.update { s ->
+        s.copy(
+          status = ChatStatus.ERROR,
+          error = "turn admission cancelled",
+          pendingSteerCount = steerQueue.size,
+          queuedRecoveryRequired = steerQueue.isNotEmpty(),
+        )
+      }
+      return
+    }
+    // Close won after the ack while settle was parked: never launch and never
+    // write another row here (close already dropped the FIFO per the
+    // drain-before-close contract; the acked ghost survives as an orphan, no
+    // cancel-terminal — reopen marks it INTERRUPTED). Note: via settle this
+    // branch is almost unreachable (close cancels the settle job and clears
+    // ownership first); it only fires when the flush already proved the ghost
+    // durable in the same locked section after close slipped in.
+    if (closed) {
+      val host = unknown.host
+      if (host != null && inFlight === host) inFlight = null
+      return
+    }
+    val currentHead = steerQueue.firstOrNull()
+    if (currentHead == null || currentHead.opId != unknown.opId || currentHead.text != unknown.reservation.text) {
+      // Head stolen mid-settle (drain is blocked while UNKNOWN, so this is
+      // only the close-cleared or a racing-drain edge): mirror the Lock-2
+      // drain-steal transition. The acked ghost stays as-is (orphan).
+      val host = unknown.host
+      if (host != null && inFlight === host) inFlight = null
+      durableUserRows.add(unknown.reservation.logicalTurnId)
+      _uiState.update { s ->
+        if (s.status == ChatStatus.STREAMING || s.status == ChatStatus.WAITING_STEERED || s.status == ChatStatus.ERROR) {
+          s.copy(status = ChatStatus.IDLE, error = null)
+        } else {
+          s
+        }
+      }
+      return
+    }
+    steerQueue.removeFirstOrNull()
+    activityRevision++
+    durableUserRows.add(unknown.reservation.logicalTurnId)
+    appendUser(currentHead.text, currentHead.opId)
+    _uiState.update {
+      it.copy(
+        status = ChatStatus.STREAMING,
+        error = null,
+        pendingSteerCount = steerQueue.size,
+        queuedRecoveryRequired = false,
+      )
+    }
+    pendingAdmission = PendingAdmission(
+      unknown.reservation.logicalTurnId, currentHead.text, currentHead.images,
+      unknown.reservation.attemptRef, unknown.reservation.attemptIndexRef,
+    )
+    val follow = scope.launch {
+      hostedTurn(
+        currentHead.text, currentHead.images,
+        unknown.reservation.logicalTurnId, unknown.reservation.attemptRef, unknown.reservation.attemptIndexRef,
+      )
+    }
+    inFlight = follow
+    val followLogicalId = unknown.reservation.logicalTurnId
+    follow.invokeOnCompletion {
+      synchronized(lock) {
+        if (inFlight === follow) inFlight = null
+        val pending = pendingAdmission
+        if (pending?.logicalTurnId == followLogicalId) {
+          drainOrphanLocked(pending)
+        }
+      }
+    }
+  }
+
+  /**
+   * R6-1: promotion UNKNOWN convert — the ghost is confirmed failed/sealed.
+   * Retains the never-dequeued FIFO for explicit recovery (ERROR +
+   * `transcript store unavailable` + queuedRecoveryRequired, reclaimable via
+   * [drainQueued] like the NOT_ADMITTED path), releases ownership so the same
+   * opId becomes retryable. Caller must hold [lock].
+   */
+  private fun convertPromotionUnknownToFailedLocked(unknown: UnknownAdmission, error: String) {
+    unknownAdmission = null
+    if (promotionPending?.logicalTurnId == unknown.reservation.logicalTurnId) {
+      promotionPending = null
+    }
+    // R6-1: a promotion-UNKNOWN cancel flag (see [cancel]) must not leak when
+    // the ghost is confirmed failed/sealed — seal wins, flag cleared like the
+    // direct convert path.
+    if (admissionCancelRequestedId == unknown.reservation.logicalTurnId) {
+      admissionCancelRequestedId = null
+    }
+    val host = unknown.host
+    if (host != null && inFlight === host) inFlight = null
+    activityRevision++
+    _uiState.update {
+      it.copy(
+        status = ChatStatus.ERROR,
+        error = error,
+        pendingSteerCount = steerQueue.size,
+        queuedRecoveryRequired = steerQueue.isNotEmpty(),
       )
     }
   }
@@ -1167,7 +1399,13 @@ class TurnController(
    * abandons its launch and drains a cancel terminal instead of
    * ghost-launching (accepted-then-cancelled: ledger keeps the durable user
    * row + cancel mark, UI keeps the row, caller gets an already-cancelled
-   * host). No join, no IO.
+   * host). R6-1: a cancel in the promotion UNKNOWN window (predecessor
+   * already completed, no active host, [pendingAdmission] null, promotion
+   * [unknownAdmission] pending) likewise records [admissionCancelRequestedId]
+   * for the promotion reservation id and projects CANCELLED; the background
+   * settle observes it and aborts the follow-up launch (convert-like: FIFO
+   * retained, ERROR + reclaimable, no second ledger row, no provider call).
+   * No join, no IO.
    */
   fun cancel() {
     synchronized(lock) {
@@ -1185,17 +1423,40 @@ class TurnController(
         current.cancel()
         return
       }
-      val pending = pendingAdmission ?: return
-      if (admissionCancelRequestedId == pending.logicalTurnId) return
-      admissionCancelRequestedId = pending.logicalTurnId
-      activityRevision++
-      _uiState.update {
-        it.copy(
-          status = ChatStatus.CANCELLED,
-          pendingSteerCount = steerQueue.size,
-          queuedRecoveryRequired = steerQueue.isNotEmpty(),
-        )
+      val pending = pendingAdmission
+      if (pending != null) {
+        if (admissionCancelRequestedId == pending.logicalTurnId) return
+        admissionCancelRequestedId = pending.logicalTurnId
+        activityRevision++
+        _uiState.update {
+          it.copy(
+            status = ChatStatus.CANCELLED,
+            pendingSteerCount = steerQueue.size,
+            queuedRecoveryRequired = steerQueue.isNotEmpty(),
+          )
+        }
+        return
       }
+      // R6-1 promotion UNKNOWN window: no active host and no direct pending,
+      // but a promotion ghost still owns the slot. Without this flag the
+      // later settle would claim and launch a follow-up provider call despite
+      // the user pressing cancel (Lock-2 checks CANCELLED, direct UNKNOWN
+      // settle checks the flag — claimPromotion must see the same signal).
+      val unknown = unknownAdmission
+      if (unknown != null && unknown.isPromotion) {
+        if (admissionCancelRequestedId == unknown.reservation.logicalTurnId) return
+        admissionCancelRequestedId = unknown.reservation.logicalTurnId
+        activityRevision++
+        _uiState.update {
+          it.copy(
+            status = ChatStatus.CANCELLED,
+            pendingSteerCount = steerQueue.size,
+            queuedRecoveryRequired = steerQueue.isNotEmpty(),
+          )
+        }
+        return
+      }
+      return
     }
     // No join, no IO: return immediately so the UI stops within 200ms.
   }
@@ -1470,6 +1731,18 @@ class TurnController(
     // suspension on its Main-confined path, so nothing slips between them
     // there. Callers that must keep unstarted work (endpoint-switch recovery)
     // drain it explicitly via drainQueued() BEFORE close().
+    //
+    // R6-1 UNKNOWN exception to drain-before-close: while an UNKNOWN ownership
+    // is pending, drainQueued() throws TranscriptPendingException (the queued
+    // head may already be in the channel as a ghost — handing it out would
+    // duplicate it on retry), so an endpoint-switch caller that drains-then-
+    // closes sees an empty-equivalent and proceeds to close(). Close then drops
+    // the FIFO head and clears the UNKNOWN ownership here; the head disappears
+    // from the outbox (not reclaimable via the recovery box) while the acked
+    // ghost — if the flush later proves it — survives in the ledger as an
+    // orphan user row with no cancel-terminal (reopen marks it INTERRUPTED).
+    // Confirmed NOT_ADMITTED/unavailable FIFO stays reclaimable as before;
+    // only the UNKNOWN-fated head is excepted.
     val doomed: Job?
     val orphanJob: Job?
     synchronized(lock) {
@@ -1482,6 +1755,11 @@ class TurnController(
       // second user-row write can duplicate a late-committing ghost; the
       // shutdown drain below settles the ghost entry itself (drained or
       // INTERRUPTED-marked, never rewritten).
+      // R6-1: also clear promotionPending explicitly (promotion await window).
+      // The async waiter catch would clear it eventually, but without an
+      // explicit clear a racing admission could briefly observe a stale
+      // reservation via isBusyLocked() after the seal.
+      promotionPending = null
       unknownSettleJob?.cancel()
       unknownSettleJob = null
       val unknown = unknownAdmission
@@ -1709,8 +1987,15 @@ class TurnController(
     orderedTranscript.offerSteer(text)
   }
 
-  /** Caller must hold [lock]; idle residual FIFO is transferred atomically. */
+  /**
+   * Caller must hold [lock]; idle residual FIFO is transferred atomically.
+   * R6-1: while an UNKNOWN ownership is pending the FIFO head may already be
+   * in the channel (ghost) — it is NOT definitely un-written, so it must not
+   * be transferred for resend. Return null (no recovery) and let the caller
+   * hit the Pending guard instead.
+   */
   private fun drainRecoveryLocked(): List<QueuedIntent>? {
+    if (unknownAdmission != null) return null
     if (steerQueue.isEmpty()) return null
     val out = steerQueue.map { QueuedIntent(it.opId, it.text) }
     activityRevision++
@@ -1724,10 +2009,17 @@ class TurnController(
    * queue order and clears the FIFO without starting anything. The caller
    * owns them afterwards: surface for explicit user recovery, never
    * auto-resend. Safe to call on a closed controller (drains the remainder).
+   *
+   * R6-1: while an UNKNOWN ownership is pending the queued head is NOT
+   * reclaimable — its fate is unknown (ghost may late-commit under the same
+   * id). Throw [TranscriptPendingException] instead of handing it out, so a
+   * racing reclaim cannot duplicate the ghost on retry. Confirmed
+   * NOT_ADMITTED/unavailable FIFO stays reclaimable as before.
    */
   fun drainQueued(): List<QueuedIntent> {
     synchronized(lock) {
       if (steerQueue.isEmpty()) return emptyList()
+      if (unknownAdmission != null) throw TranscriptPendingException("transcript store pending")
       val out = steerQueue.map { QueuedIntent(it.opId, it.text) }
       activityRevision++
       steerQueue.clear()
@@ -2015,15 +2307,14 @@ class TurnController(
           return
         }
         DurableAdmission.UNKNOWN -> {
-          // Send proof true but ack timed out: the ghost may still
-          // late-commit, so never resend. Unlike direct admissions there is
-          // no caller to throw Pending to and no same-id claim that could
-          // coordinate the FIFO, so the intent stays queued with a pending
-          // error for explicit recovery (no ownership held, no resend).
-          synchronized(lock) {
-            if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
-          }
-          failPromotion("transcript store pending", self)
+          // R6-1: timeout-after-send with the ghost possibly late-committing.
+          // Same contract as direct UNKNOWN: retain ownership under the SAME
+          // logical id (reservation moves promotionPending → unknownAdmission,
+          // head opId kept for the same-opId resend block + Lock-2 dequeue
+          // match), keep the FIFO head queued with pending (NOT recovery) and
+          // settle in the background (claim = Lock-2 commit, convert =
+          // unavailable + reclaimable). FIFO is not reclaimable until settle.
+          enterUnknownAdmission(reservation, null, head.opId, isPromotion = true, host = self)
           return
         }
       }

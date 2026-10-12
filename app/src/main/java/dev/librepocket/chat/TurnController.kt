@@ -887,6 +887,16 @@ class TurnController(
     } catch (e: TranscriptDurabilityException) {
       throw e
     } catch (e: Exception) {
+      // L1: consult the send proof like the CE path. A post-send hook
+      // failure (send attempted, ack still pending — fuzzy, the entry may
+      // already be with the writer) maps to UNKNOWN, never NOT_ADMITTED:
+      // return UNKNOWN so the caller retains ownership under the same id
+      // (settle claims or converts). Only proven pre-send (send never
+      // attempted) and post-ack delegate failures (sent == true) stay
+      // fail-closed with the INTERRUPTED mark + Durability below.
+      if (!sent.get() && sendAttempted.get()) {
+        return DurableAdmission.UNKNOWN
+      }
       try {
         orderedTranscript.markInterrupted(logicalTurnId)
       } catch (_: Exception) {
@@ -1022,6 +1032,9 @@ class TurnController(
    *   mark; a later explicit retry re-settles.
    *
    * @return true when resolved (claimed or failed), false when still unknown.
+   * M2: caller cancellation is never swallowed — a caller-cancelled settle
+   * rethrows CancellationException directly (never TranscriptPendingException);
+   * false only means the bounded flush timed out with ownership retained.
    */
   suspend fun settlePendingAdmission(timeoutMs: Long = acceptTimeoutMs): Boolean {
     val snapshot: UnknownAdmission = synchronized(lock) { unknownAdmission } ?: return true
@@ -1040,7 +1053,14 @@ class TurnController(
     }
     val flushed: Boolean = try {
       orderedTranscript.flush(timeoutMs)
-    } catch (_: CancellationException) {
+    } catch (e: CancellationException) {
+      // M2: a caller-cancelled settle must propagate — swallowing it as
+      // "still unknown" hides the caller's own cancellation from the
+      // startTurn/startOrEnqueue pre-settle path (which would misreport
+      // Pending). Only the flush timeout (null → false, no throw) stays
+      // unknown. A background settle cancelled by close() only fires after
+      // ownership was cleared, so rethrow there is benign.
+      if (coroutineContext[Job]?.isCancelled == true) throw e
       false
     } catch (_: Exception) {
       false
@@ -1257,6 +1277,10 @@ class TurnController(
     if (closed) {
       val host = unknown.host
       if (host != null && inFlight === host) inFlight = null
+      // L2: record durability like the steal path above so doc/code agree —
+      // the acked ghost survives as an orphan (reopen marks it INTERRUPTED)
+      // and a later retry with a fresh id never rewrites it.
+      durableUserRows.add(unknown.reservation.logicalTurnId)
       return
     }
     val currentHead = steerQueue.firstOrNull()
@@ -1477,11 +1501,13 @@ class TurnController(
     checkInputLengthOrThrow(text)
     // R5-1: a still-unsettled UNKNOWN owns the single-flight slot. Settle
     // boundedly (outside the lock) before deciding, so a late-committed ghost
-    // is claimed instead of duplicated.
+    // is claimed instead of duplicated. M2: a caller-cancelled settle
+    // rethrows CE (never Pending) so the VM does not misread it as UNKNOWN.
     if (synchronized(lock) { unknownAdmission != null }) {
       try {
         settlePendingAdmission(acceptTimeoutMs)
-      } catch (_: CancellationException) {
+      } catch (e: CancellationException) {
+        if (coroutineContext[Job]?.isCancelled == true) throw e
         throw TranscriptPendingException("transcript store pending")
       } catch (_: Exception) {
       }
@@ -1758,11 +1784,13 @@ class TurnController(
     checkInputLengthOrThrow(text)
     // R5-1: same-opId duplicate of an unsettled UNKNOWN must not enqueue a
     // second row. Settle boundedly first (outside the lock); if still
-    // unknown the guards below throw Pending.
+    // unknown the guards below throw Pending. M2: caller-cancelled settle
+    // rethrows CE (never Pending) like startTurn.
     if (synchronized(lock) { unknownAdmission != null }) {
       try {
         settlePendingAdmission(acceptTimeoutMs)
-      } catch (_: CancellationException) {
+      } catch (e: CancellationException) {
+        if (coroutineContext[Job]?.isCancelled == true) throw e
         throw TranscriptPendingException("transcript store pending")
       } catch (_: Exception) {
       }
@@ -2179,7 +2207,12 @@ class TurnController(
    * peeking the FIFO head before dequeue (oversize retains the FIFO via
    * `failPromotion("input too long")`). Intra-turn retry rebuilds in
    * [runTurnLoop] re-read the zone per attempt; any growth there contributes
-   * only the time-block delta, the sole accepted residual.
+   * only the time-block delta. L3: the settle-claim window
+   * ([settlePendingAdmission] claims a ghost admitted moments earlier
+   * without re-checking) is the same accepted-residual class — a zone that
+   * grows during the bounded flush adds at most the time-block delta to an
+   * already-admitted turn, surfaced at the next admission/promotion
+   * boundary.
    */
   private fun checkInputLengthOrThrow(text: String) {
     val block = buildRuntimeTimeContext(clock, userTimezone, sessionStart, systemZone)

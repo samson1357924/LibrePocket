@@ -129,6 +129,10 @@ interface ChatSession {
    * INTERRUPTED/seal converts to retryable. Returns true when resolved
    * (claimed, failed, or nothing pending), false when still unknown (flush
    * timed out — keep ownership, no false mark; retry re-settles).
+   *
+   * M2: caller cancellation is never swallowed — a caller-cancelled settle
+   * rethrows CancellationException directly (never TranscriptPendingException);
+   * false only means the bounded flush timed out with ownership retained.
    */
   suspend fun settlePendingAdmission(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
     true

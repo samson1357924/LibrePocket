@@ -41,7 +41,8 @@ private const val TRANSCRIPT_CREATE_TIMEOUT_MS = 5_000L
 private const val HISTORY_PAGE = 200
 
 /**
- * Snapshot/history row budgets (zero behavior change; single home for the
+ * Snapshot/history row budgets (centralizes the caps introduced by Stage E /
+ * R6-5; new behavior relative to main — single home for the
  * three related caps). Dual budget for one durable fork-snapshot prefix,
  * newest-first: `min(1999 rows, 2M UTF-16 chars)` — [SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP]
  * rows and [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS] chars

@@ -11,6 +11,16 @@
 >
 > **Target scope:** provider BYOK, minimum chat loop, session persistence, policy model, and local tests. Agent tool execution, GUI, terminal, MCP, memory, and cloud sync were originally scoped as later work. “No app-managed cloud sync” does not mean Android Auto Backup is disabled.
 
+### Current 行為補充（conversation-ledger；以程式為準）
+
+- **6 個 `CHAT_*` notice 碼**（見 `ChatScreen.chatNoticeText`／`ChatViewModel`）：`CHAT_SEND_DENIED`、`CHAT_APPROVAL_REQUIRED`、`CHAT_POLICY_UNAVAILABLE`、`CHAT_INPUT_TOO_LONG`、`CHAT_STORE_UNAVAILABLE` 皆為 NOT accepted（本次未送出，呼叫者保留文字；`INPUT_TOO_LONG` 為 100k 邊界 fail-fast）；`CHAT_STORE_PENDING` 為 UNKNOWN／PENDING_COMMIT（見下）。
+- **UNKNOWN／settle（勿重送）：** `TranscriptPendingException` 表示超時送後 fate 未定；ownership 保留，同 opId 重送被擋，直到 `TurnController.settlePendingAdmission` 以同一邏輯 id 認領（claim）或轉失敗可重試（convert）。呼叫者收到 PENDING 時必須 NOT 重送。
+- **request-trim badge（與 load-time 正交、不相加）：** `TurnController.lastRequestTrimmedCount`／`requestTrimmedCount` 計算送出時為塞入 100k 單請求預算而自頭丟棄的整訊息數；與載入時 DB tail cap 的 `droppedHistoryCount` 正交，兩者永不相加，僅以前者作持久 badge。
+- **snapshot 雙預算＋abandon：** `SnapshotBudget` 為 `min(1999 rows, 2M UTF-16 chars)`（`HISTORY_LOAD_CAP=2000` 留一格給 `model switched` marker）；超預算前綴整批放棄（zero rows＋incomplete marker，永不寫截半前綴），結果為 `SKIPPED／CLEAN／DANGLING_WARNED／FENCE_FAILED_WARNED／BYTE_WARNED／FAILED_WARNED` 六態。
+- **fence／deferred 預算：** 每相 `SESSION_FLUSH_TIMEOUT_MS=5s`；flush-then-close 至多約 2x，endpoint-switch／同 id reopen fence 至多約 6x（約 30s）；同 id reopen 的 deferred-backfill 阻擋期 `PENDING_BACKFILL_BLOCK_MS` 為 6x（約 30s，promotion 證明 terminal 可提前解）。
+- **`droppedHistoryCount` combined 語義：** `buildRequest` 合併 tail-loaded capped prefix＋已結算非 partial live 後，對 combined 套 `historyCap` 整訊息 oldest-first 截斷，`droppedHistoryCount = combined − base`（`Unbounded` 時為 0）。
+- **row／byte 不對稱：** 快照 2M 以 `String.length`（UTF-16 code units）計，匯出上限 `EXPORT_MAX_BYTES=20MB` 以 UTF-8 bytes 計，兩者比例僅為約略（名目約 1/10）；單列上限 `MAX_TEXT_CHARS=100k chars`。
+
 ---
 
 ## 1. 模組劃分與 Package / 類 / 介面簽名

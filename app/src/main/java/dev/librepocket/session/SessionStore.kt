@@ -34,9 +34,12 @@ data class SessionMeta(
  * keep `runId=logicalTurnId`. Persisted as nullable `parentRunId TEXT` /
  * nullable `attemptIndex INTEGER` via Migration 2→3 (ALTER ADD COLUMN only).
  * [findDanglingRunIds][dev.librepocket.agent.ui.chat.findDanglingRunIds]
- * groups by logical family (`parentRunId ?: runId`): any assistant row in the
- * family (completed or partial-failed, including retried partials) completes
- * the family, so a retry→success turn is never mis-marked INTERRUPTED.
+ * groups by logical family (`parentRunId ?: runId`): pre-Stage F rule, any
+ * assistant row in the family (completed or partial-failed, including
+ * retried partials) completed the family, so a retry→success turn was never
+ * mis-marked INTERRUPTED. Since Stage F only final rows close a family —
+ * see Stage F below — this paragraph states the pre-F semantics; the
+ * implementation follows Stage F.
  *
  * Stage F (implemented): [isFinal] distinguishes a logical-turn final result
  * from a per-attempt intermediate partial. Success, terminal-failure and

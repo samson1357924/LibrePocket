@@ -25,6 +25,7 @@ import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -994,8 +995,11 @@ class TurnControllerLedgerTest {
       assertTrue(c.pendingTranscriptRunIds().contains("cancel-after-1"))
       assertTrue("ghost must not have persisted yet", store.events.none { it.kind == "user" })
       // Same-opId explicit retry is blocked (no second row) until settle.
+      // M2: the pre-settle parks the full accept budget behind the still-gated
+      // writer, so the harness bound must exceed it — otherwise the bound
+      // itself fires a caller-cancel (now correctly CE, never Pending).
       try {
-        runBlocking { withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) } }
+        runBlocking { withTimeout(15_000) { c.startOrEnqueue(text, opId = opId) } }
         fail("same-opId retry during UNKNOWN must throw TranscriptPendingException")
       } catch (e: TranscriptPendingException) {
         // Expected: no resend, no duplicate.
@@ -1046,6 +1050,186 @@ class TurnControllerLedgerTest {
       )
       assertTrue(c.interruptedTranscriptRunIds().isEmpty())
       assertEquals("claimed host runs exactly once, no resend", 1, provider.streamCalls.get())
+    } finally {
+      gate.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * M2: settle must not swallow the caller's own cancellation as "still
+   * unknown". A caller-cancelled settle rethrows CancellationException (never
+   * Pending); a bounded flush timeout still returns false with ownership
+   * retained.
+   */
+  @OptIn(DelicateCoroutinesApi::class)
+  @Test
+  fun settleCallerCancelRethrowsCancellationExceptionAndTimeoutStaysUnknown() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val gate = CompletableDeferred<Unit>()
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        gate.await()
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    val provider = LedgerFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "m2settle-${n++}" },
+      // Small budget installs UNKNOWN fast via timeout-after-send.
+      acceptTimeoutMs = 500L,
+    )
+    val text = "m2 settle caller cancel"
+    try {
+      val deferred = GlobalScope.async(Dispatchers.Default) {
+        c.startOrEnqueue(text, opId = null)
+      }
+      try {
+        runBlocking { withTimeout(5_000) { deferred.await() } }
+        fail("timeout-after-send must throw TranscriptPendingException")
+      } catch (e: TranscriptPendingException) {
+        // Expected UNKNOWN install.
+      }
+      assertTrue(c.hasPendingAdmission())
+      // Flush timeout still returns false with ownership retained.
+      val stillUnknown = runBlocking { c.settlePendingAdmission(300L) }
+      assertFalse("flush timeout must stay unknown (false)", stillUnknown)
+      assertTrue(c.hasPendingAdmission())
+      // Caller-cancelled settle rethrows CancellationException (never Pending).
+      val settleJob = GlobalScope.async(Dispatchers.Default) {
+        c.settlePendingAdmission(10_000L)
+      }
+      runBlocking {
+        // Let the settle park inside flush (writer still gated).
+        delay(300)
+      }
+      assertFalse("settle must still be parked in flush", settleJob.isCompleted)
+      settleJob.cancel()
+      try {
+        runBlocking { withTimeout(5_000) { settleJob.await() } }
+        fail("caller-cancelled settle must throw CancellationException, not return")
+      } catch (e: TranscriptPendingException) {
+        fail("caller-cancelled settle must not map to Pending, got $e")
+      } catch (e: CancellationException) {
+        // Expected: the caller's own cancellation propagates.
+      }
+      assertTrue("cancelled settle must retain ownership", c.hasPendingAdmission())
+    } finally {
+      gate.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * M2 pre-settle boundary: with UNKNOWN already installed (gated writer) a
+   * same-opId retry whose harness bound is smaller than [acceptTimeoutMs]
+   * cancels the caller while the pre-settle parks the full accept budget
+   * behind the still-gated writer. The caller's own cancellation must surface
+   * as CancellationException (here [TimeoutCancellationException]) — never
+   * [TranscriptPendingException] — with ownership retained and no second UI
+   * row. True M2 regression: the pre-M2 pre-settle mapped every CE to Pending
+   * (this test fails there), the M2 rethrow keeps CE (passes here).
+   */
+  @OptIn(DelicateCoroutinesApi::class)
+  @Test
+  fun preSettleCallerCancelRethrowsCancellationExceptionNotPending() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val gate = CompletableDeferred<Unit>()
+    val delegateEntered = AtomicBoolean(false)
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        delegateEntered.set(true)
+        gate.await()
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    val provider = LedgerFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "m2presettle-${n++}" },
+      // Large budget excludes the timeout path: UNKNOWN is installed via an
+      // external cancel after send, and only the harness bound fires below.
+      acceptTimeoutMs = 10_000L,
+    )
+    val text = "m2 pre-settle caller cancel"
+    val opId = 103L
+    try {
+      // Install UNKNOWN via external cancel after the channel send (send proof
+      // true): fast and deterministic, no accept-budget wait.
+      val deferred = GlobalScope.async(Dispatchers.Default) {
+        c.startOrEnqueue(text, opId = opId)
+      }
+      runBlocking {
+        withTimeout(5_000) {
+          while (!delegateEntered.get()) delay(10)
+        }
+        withTimeout(5_000) {
+          while (!c.pendingTranscriptRunIds().contains("m2presettle-1")) delay(10)
+        }
+      }
+      assertFalse("admission must still be parked in ack.await", deferred.isCompleted)
+      deferred.cancel()
+      try {
+        runBlocking {
+          withTimeout(5_000) { deferred.await() }
+        }
+        fail("caller cancel after send must throw TranscriptPendingException, not return Started")
+      } catch (e: TranscriptPendingException) {
+        // Expected UNKNOWN install.
+      } catch (e: CancellationException) {
+        fail("caller cancel after send must not surface CancellationException, got $e")
+      }
+      assertTrue(c.hasPendingAdmission())
+      assertEquals(1, c.uiState.value.messages.count { it.role == "user" && it.text == text })
+      // Pre-settle boundary: the harness bound (500ms) is far smaller than the
+      // accept budget (10s), so it fires the caller-cancel while the pre-settle
+      // is still parked in flush behind the gated writer.
+      try {
+        runBlocking {
+          withTimeout(500L) { c.startOrEnqueue(text, opId = opId) }
+        }
+        fail("pre-settle caller-cancel must throw CancellationException, not return")
+      } catch (e: TranscriptPendingException) {
+        fail("pre-settle caller-cancel must not map to Pending, got $e")
+      } catch (e: TimeoutCancellationException) {
+        // Expected: the caller's own cancellation propagates (M2 rethrow).
+      }
+      // Ownership retained: still pending, still one UI row, never INTERRUPTED.
+      assertTrue("cancelled pre-settle must retain ownership", c.hasPendingAdmission())
+      assertEquals(
+        "cancelled pre-settle must not append a second UI row",
+        1,
+        c.uiState.value.messages.count { it.role == "user" && it.text == text },
+      )
+      assertTrue(
+        "cancelled pre-settle must not mark INTERRUPTED",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      assertTrue(c.pendingTranscriptRunIds().contains("m2presettle-1"))
+      assertTrue("ghost must not have persisted yet", store.events.none { it.kind == "user" })
     } finally {
       gate.complete(Unit)
       c.close()
@@ -1250,8 +1434,11 @@ class TurnControllerLedgerTest {
       assertEquals(1, c.uiState.value.messages.count { it.role == "user" && it.text == text })
       val ghost = c.pendingTranscriptRunIds().single()
       // Same-opId explicit retry is blocked (no second row) until settle.
+      // M2: the pre-settle parks the full accept budget behind the still-gated
+      // writer, so the harness bound must exceed it — otherwise the bound
+      // itself fires a caller-cancel (now correctly CE, never Pending).
       try {
-        runBlocking { withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) } }
+        runBlocking { withTimeout(15_000) { c.startOrEnqueue(text, opId = opId) } }
         fail("same-opId retry during UNKNOWN must throw TranscriptPendingException")
       } catch (e: TranscriptPendingException) {
         // Expected: no resend, no duplicate.
@@ -1417,7 +1604,10 @@ class TurnControllerLedgerTest {
         // Expected: ownership retained, no steal.
       }
       try {
-        runBlocking { withTimeout(5_000) { c.startOrEnqueue(followText, opId = 901L) } }
+        // M2: the pre-settle parks the full accept budget behind the still-gated
+        // writer, so the harness bound must exceed it — otherwise the bound
+        // itself fires a caller-cancel (now correctly CE, never Pending).
+        runBlocking { withTimeout(15_000) { c.startOrEnqueue(followText, opId = 901L) } }
         fail("same-opId retry during promotion UNKNOWN must throw TranscriptPendingException")
       } catch (_: TranscriptPendingException) {
         // Expected: ghost already owns opId 901.

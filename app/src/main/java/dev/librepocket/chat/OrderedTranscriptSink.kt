@@ -468,6 +468,17 @@ class OrderedTranscriptSink(
       markInterrupted(runId)
       if (!ack.isCompleted) ack.completeExceptionally(e)
       throw e
+    } catch (e: Exception) {
+      // L1: test-seam hook failure (production hooks are null). Pre-send
+      // (!sendInvoked) proves the entry never entered: drop the pending mark
+      // and ack like the CE pre-send path. Post-send (send invoked) is fuzzy
+      // like the CE race: retain both for the writer/settle, never mark here;
+      // the caller maps `sent == false && sendAttempted == true` to UNKNOWN.
+      if (!sendInvoked) {
+        coreAcks.remove(ack)
+        pendingCore.remove(runId)
+      }
+      throw e
     } finally {
       // Gate signals send *attempt*, not persistence: successors may attempt
       // their sends as soon as this entry is buffered, while this waiter

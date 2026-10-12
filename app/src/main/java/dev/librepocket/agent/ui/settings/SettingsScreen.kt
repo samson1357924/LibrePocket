@@ -375,9 +375,10 @@ fun SettingsScreen(
                         // STALE 不需重試，僅關閉；retained 只留重試（無取消，不暗示稍後處理，
                         // 同次執行無其他入口）；無碼初始確認維持確定清除 + 取消。
                         if (!isStaleReadyError) {
-                            // 確認即重試同一動作：失敗不關 dialog，原文案轉「重試清除」。
+                            // fresh 確定清除走 onLogout（全新 logout），retained 重試清除
+                            // 走 onRetryLogout（帶 tag 同源回放；tag null 不進此分支）。
                             Button(
-                                onClick = onRetryLogout,
+                                onClick = if (logoutErrorCode == null) onLogout else onRetryLogout,
                                 enabled = !logoutInFlight,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {

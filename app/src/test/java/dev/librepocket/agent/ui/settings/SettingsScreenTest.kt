@@ -242,4 +242,49 @@ class SettingsScreenTest {
         assertEquals(1, retryCalls)
         assertEquals(0, dismissed)
     }
+
+    /**
+     * BLOCKING 回歸：fresh「確定清除」走 onLogout（全新 logout），不被劫持為
+     * onRetryLogout（生產接線形狀：雙傳 onLogout＋onRetryLogout）。
+     */
+    @Test
+    fun freshConfirmGoesToLogoutNotRetry() {
+        var logoutCalls = 0
+        var retryCalls = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                onLogout = { logoutCalls++ },
+                onRetryLogout = { retryCalls++ },
+                logoutErrorCode = null,
+            )
+        }
+        onLogoutArea("登出（清除金鑰）").performClick()
+        onLogoutArea("確定清除").performClick()
+        assertEquals(1, logoutCalls)
+        assertEquals(0, retryCalls)
+    }
+
+    /**
+     * BLOCKING 回歸對側：retained「重試清除」走 onRetryLogout（同源回放），
+     * 不回退全新 onLogout。
+     */
+    @Test
+    fun retainedRetryGoesToRetryNotLogout() {
+        var logoutCalls = 0
+        var retryCalls = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                onLogout = { logoutCalls++ },
+                onRetryLogout = { retryCalls++ },
+                logoutErrorCode = "LOGOUT_DELETE_FAILED",
+            )
+        }
+        onLogoutArea("重試清除").performClick()
+        assertEquals(0, logoutCalls)
+        assertEquals(1, retryCalls)
+    }
 }

@@ -1350,6 +1350,42 @@ class SetupViewModel(
     }
 
     /**
+     * Stage F 重試清除結果（R14 Finding P2/BLOCK：stale 恢復鍵回退全新 destructive logout）。
+     *
+     * 三態（sealed interface）：
+     * - [Replayed]：快照 journal 與 `expected` 同源（`format()` 相等），已經同一
+     *   `runPendingDeleteLocked` 核心回放；攜帶該輪 `(outcome, journal)`（`journal`
+     *   即 `expected`，供同源清碼比對）。`COMMITTED` 為成功（整表重置）；
+     *   `DELETE_FAILED`／`FAILED`／`UNKNOWN` 帶 tag 落碼（見
+     *   [reconcileOutcomeToLogout]）；內部 `STALE`（快照同源但 clear 時贏家滑入）
+     *   不以 `Replayed(STALE)` 回報，轉 [StaleGone]（贏家存活，舊卡以 `STALE`
+     *   退場）。
+     * - [StaleGone]：期望的 journal 已不在（`pending == null` 且 rev 已進，或
+     *   `pending == J_C ≠ expected`，或快照同源但內部 `STALE`，或 `pending == null`
+     *   且 `rev == expected` 的生產不可達）：`pending == null` 與
+     *   `pending == J_C ≠ expected` 兩子路徑零 vault I/O、零 metadata 寫、零
+     *   journal 寫／刪（含 `J_C` 絕不 `DISCARD`）；快照同源但內部 `STALE`
+     *   子路徑已做一次冪等 `deleteKey(expected.alias)`＋一次條件 discard
+     *  （贏家 metadata／rev 不動）；`config == null` 時同源靜默清卡，
+     *   `config != null` 時報 `LOGOUT_STALE` 待 dismiss（tag 記 `expected`，防與
+     *   `J_C COMMITTED` 混淆）；絕不回退 fresh（禁全新 destructive logout）。
+     * - [ReadUnknown]：快照拋（含毀損 `IllegalStateException` 與 DataStore 讀失敗）：
+     *   零寫入／零 vault I/O（不碰 vault／metadata／journal；snapshot 讀已發生），
+     *   不進清除，走重試讀取
+     *  （`retryStartupReconcile`）；舊卡保留。
+     */
+    sealed interface RetryResult {
+        data class Replayed(
+            val outcome: PendingDeleteOutcome,
+            val journal: PendingDelete?,
+        ) : RetryResult
+
+        data object StaleGone : RetryResult
+
+        data object ReadUnknown : RetryResult
+    }
+
+    /**
      * Replays a crash/cancel-orphaned logout teardown journal (phase 1,
      * Re-review #8 Finding 1 P1). Shared by the startup path
      * ([launchPendingDeleteReconcile], called once from `MainScreen`) and the
@@ -2112,6 +2148,11 @@ class SetupViewModel(
      * `form.logoutInFlight = true`（持鎖前，仿 saving 語義；執行中再調忽略），
      * 成功經整表重置、失敗經結尾復位、取消（含排隊取消）經外層 catch 復位；
      * 失敗保留 `errorCode` 由 Settings 顯示（[clearLogoutError] 關閉），成功重置。
+     *
+     * Stage F（R14 P2/BLOCK）：此入口收斂為 fresh-only（全新登出確認專用）。
+     * Retained 重試一律走 [retryPendingDelete]（帶 `expected` 身份比對，stale 絕不
+     * 回退全新 destructive logout）；此函數為相容保留既有 resume 行為，新呼叫方
+     * 不得依賴它做 stale 重試（UI 已改綁，見 `MainScreen`）。
      */
     fun logout(onDone: (Boolean) -> Unit = {}) {
         // VM 層防重點：執行中再調直接忽略（UI 層另以 disabled + spinner 防連點）。
@@ -2411,6 +2452,173 @@ class SetupViewModel(
             }
         }
         lastLogoutJobForTest = job
+    }
+
+    /**
+     * Stage F 重試清除入口（R14 Finding P2/BLOCK：stale 恢復鍵回退全新 destructive logout）。
+     *
+     * `logout(onDone)` 保留簽名但收斂為 fresh-only（全新登出確認專用：Ready 初始
+     * 確定清除；仍相容既有 resume 行為，惟新重試一律走此入口）；兩顆重試清除鍵
+     * （Ready retained＋NoEndpoint retained）改調此入口，並傳
+     * `form.logoutErrorSourceJournal.parse`——parse 失敗（tag null／毀損）走
+     * `retryStartupReconcile`（重試讀取），不進 `logout()`（見 `MainScreen`）。
+     *
+     * 全程 `saveMutex` 內單 `snapshotDeleteStateStrict` 判定（零 TOCTOU）：
+     * - `pending != null && format == expected` → `runPendingDeleteLocked` 回放，
+     *   經 [reconcileOutcomeToLogout] 映射：`COMMITTED` 成功整表重置；
+     *   `DELETE_FAILED`／`FAILED`／`UNKNOWN` 帶 tag（`expected`）落碼；
+     *   內部 `STALE`（快照同源但贏家滑入，discard 已在核心內完成）轉 `StaleGone`
+     *   ＋報 `LOGOUT_STALE(expected tag)`。取消沿用（`COMMITTED` swallow，
+     *   餘重拋，無碼、無 `onDone`）。
+     * - `pending == null`（rev 已進或生產不可達的 `rev == expected`）→ `StaleGone`：
+     *   不碰 vault／metadata／journal；`config == null` 同源靜默清卡，
+     *   `config != null` 報 `LOGOUT_STALE(expected tag)` 待 dismiss；絕不回退
+     *   fresh（禁全新 journal→delete→clear）。
+     * - `pending == J_C ≠ expected` → `StaleGone`：絕不 `runPendingDeleteLocked(J_C)`、
+     *   不寫／刪／清／`DISCARD C`；報 `STALE(expected tag)`（防與 `J_C COMMITTED`
+     *   混淆）；舊卡退場（覆寫）。
+     * - 快照拋／毀損（`IllegalStateException` 含）→ `ReadUnknown`：零 I/O，走
+     *   重試讀取，不進清除；舊卡保留。
+     *
+     * `logoutInFlight` 由兩入口共用（互斥＋同取消語義）；同
+     * `invalidateStartupSettled()`（含 `bumpPendingTick()`）＋`lastLogoutJobForTest`
+     * 縫；終端失效。成功（`Replayed(COMMITTED)`）經 `NonCancellable＋Main` 報
+     * （committed-then-cancel swallow 鏡像 save／logout）；餘經 `Main` 報；
+     * 取消重拋（`inFlight` 復位，無碼、無 `onDone`）。
+     *
+     * 不改 D1 中性碼／清除、映射大體、取消語義、generation probe；不做 timeout。
+     *
+     * @param expected 重試對象的 journal 身份（呼叫方由
+     * `form.logoutErrorSourceJournal.parse` 取得；此函數不做 parse，parse 失敗
+     * 由呼叫方分流重試讀取）。
+     * @param onDone 在 `Dispatchers.Main` 回報（`COMMITTED` 經 `NonCancellable`）；
+     * 取消不回報。
+     */
+    fun retryPendingDelete(
+        expected: PendingDelete,
+        onDone: (RetryResult) -> Unit = {},
+    ) {
+        // 與 logout() 共用互斥：執行中再調直接忽略（UI 另以 disabled＋spinner 防連點）。
+        if (_form.value.logoutInFlight) return
+        // 持鎖前同步置 inFlight（仿 logout 入口）：排隊等鎖時被取消亦能被外層
+        // catch 復位。與 logout() 不同：此處不清 errorCode／tag——終端同源清／報
+        // STALE 需比對現碼（入口清會丟失身份，使 Absent 同源清永不命中）。
+        _form.value = _form.value.copy(logoutInFlight = true)
+        // 入口即失效 settled（同 logout：journal 存否可能變化處同步重讀 pending
+        // domain；bump 含於 invalidate 內）。
+        invalidateStartupSettled()
+        formRevision.incrementAndGet()
+        invalidateKeyWriteConsent()
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
+        modelRefreshGeneration.incrementAndGet()
+        val job = viewModelScope.launch(Dispatchers.IO) {
+            // try-catch 在 withLock 之外（仿 save／logout）：排隊等鎖時被取消仍復位。
+            try {
+                var result: RetryResult? = null
+                var replayedCommitted = false
+                saveMutex.withLock {
+                    val state = try {
+                        store.snapshotDeleteStateStrict()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // 快照拋／毀損 → ReadUnknown：零 I/O，不進清除，舊卡保留。
+                        result = RetryResult.ReadUnknown
+                        return@withLock
+                    }
+                    val pending = state.first
+                    val config = state.second
+                    if (pending != null && pending.format() == expected.format()) {
+                        val outcome = runPendingDeleteLocked(pending)
+                        when (outcome) {
+                            PendingDeleteOutcome.COMMITTED -> {
+                                result = RetryResult.Replayed(outcome, expected)
+                                replayedCommitted = true
+                            }
+                            PendingDeleteOutcome.STALE -> {
+                                // 內部 STALE：贏家滑入（discard 已在核心內完成）。
+                                // 轉 StaleGone＋報 STALE(expected tag)（贏家存活假設；
+                                // 若極端 config null 亦以 STALE 報，待下次重讀收斂，
+                                // 絕不回退 fresh）。
+                                stampLogoutError("LOGOUT_STALE", expected)
+                                result = RetryResult.StaleGone
+                            }
+                            PendingDeleteOutcome.NO_OP -> {
+                                // 生產不可達（pending 非 null 不應回 NO_OP）：
+                                // fail-closed 視同 StaleGone，同源靜默清（禁 fresh）。
+                                clearStaleCardSameOrigin(expected)
+                                result = RetryResult.StaleGone
+                            }
+                            PendingDeleteOutcome.DELETE_FAILED,
+                            PendingDeleteOutcome.FAILED,
+                            PendingDeleteOutcome.UNKNOWN -> {
+                                val (_, code) = reconcileOutcomeToLogout(outcome)
+                                stampLogoutError(
+                                    code ?: "LOGOUT_UNKNOWN",
+                                    expected,
+                                )
+                                result = RetryResult.Replayed(outcome, expected)
+                            }
+                        }
+                        return@withLock
+                    }
+                    if (pending == null) {
+                        // 期望已不在：rev 已進（B COMMITTED＋save）或不可達的
+                        // rev==expected——一律 StaleGone，禁回退 fresh。
+                        if (config == null) {
+                            clearStaleCardSameOrigin(expected)
+                        } else {
+                            stampLogoutError("LOGOUT_STALE", expected)
+                        }
+                        result = RetryResult.StaleGone
+                        return@withLock
+                    }
+                    // pending == J_C ≠ expected：絕不回放 J_C、不寫／刪／清／
+                    // DISCARD C；報 STALE(expected tag)，舊卡退場（覆寫）。
+                    stampLogoutError("LOGOUT_STALE", expected)
+                    result = RetryResult.StaleGone
+                }
+                // 終端失效（同 logout：generation 可能已動，rotation 須 fresh I/O；
+                // cancel 在此前重拋，走不到此處，惟入口失效已棄舊輪）。
+                invalidateStartupSettled()
+                val final = result ?: RetryResult.ReadUnknown
+                if (replayedCommitted) {
+                    _form.value = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
+                    withContext(NonCancellable + Dispatchers.Main) { onDone(final) }
+                    return@launch
+                }
+                _form.value = _form.value.copy(logoutInFlight = false)
+                withContext(Dispatchers.Main) { onDone(final) }
+            } catch (e: Exception) {
+                // 取消（含排隊）與未預期異常皆先復位 inFlight 再重拋：取消不蓋碼、
+                // 不調 onDone（沿用 logout 取消語義）；COMMITTED 已在核心內
+                // swallow 成功，不到此處。
+                _form.value = _form.value.copy(logoutInFlight = false)
+                throw e
+            }
+        }
+        lastLogoutJobForTest = job
+    }
+
+    /**
+     * Stale 同源靜默清卡（`retryPendingDelete` `StaleGone`＋`config == null` 用）。
+     *
+     * 僅當現碼為中性 `LOGOUT_READ_RETRY`（tag null，重試已證無 journal）或現碼為
+     * `LOGOUT_*` 且其源 tag 與 `expected` 相同才清（併發 teardown 的碼不被誤清；
+     * 他碼不動）；`logoutInFlight` 不動（呼叫方終端統一復位）。
+     */
+    private fun clearStaleCardSameOrigin(expected: PendingDelete) {
+        val cur = _form.value
+        if (cur.errorCode == LOGOUT_READ_RETRY) {
+            _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
+            return
+        }
+        if (cur.errorCode?.startsWith("LOGOUT_") == true &&
+            cur.logoutErrorSourceJournal == expected.format()
+        ) {
+            _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
+        }
     }
 
     /**

@@ -236,8 +236,9 @@ class SetupCrossVmJournalTest {
 
     @Test
     fun safeReconcileToCommittedViaLogout_clearsJournalAndUnblocksSave() {
-        // 驗收 4：VM-A 健康 vault 經既有 onLogout resume J_B 至 COMMITTED（同一
-        // runPendingDeleteLocked 核心，不新增 vault 路徑；落碼／清碼走既有語義）。
+        // 驗收 4（Stage F 遷移）：VM-A 健康 vault 經新入口 `retryPendingDelete(J)`
+        // 至 COMMITTED（同一 runPendingDeleteLocked 核心，不新增 vault 路徑；
+        // 落碼／清碼走既有語義；`logout()` 已收斂 fresh-only，新重試禁走它）。
         val store = rawStore("d2-safe-reconcile")
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         val journal = PendingDelete("preset:openai", 1L, 1700000000000L)
@@ -252,11 +253,16 @@ class SetupCrossVmJournalTest {
         vmA.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, journal, gateReady = false)
         assertEquals("LOGOUT_DELETE_FAILED", vmA.form.value.errorCode)
         assertEquals(journal.format(), vmA.form.value.logoutErrorSourceJournal)
-        // Safe reconcile 入口：複用 onLogout（見 present journal 走 resume 分支）。
+        // Safe reconcile 新入口：帶 expected 身份比對回放（同源 COMMITTED）。
         assertNull(vmA.lastLogoutJobForTest)
-        val done = CompletableDeferred<Boolean>()
-        vmA.logout { done.complete(it) }
-        assertTrue("healthy logout resume must commit", runBlocking { withTimeout(10_000) { done.await() } })
+        val done = CompletableDeferred<SetupViewModel.RetryResult>()
+        vmA.retryPendingDelete(journal) { done.complete(it) }
+        val result = runBlocking { withTimeout(10_000) { done.await() } }
+        assertTrue("healthy retry must replay to COMMITTED, was $result", result is SetupViewModel.RetryResult.Replayed)
+        assertEquals(
+            SetupViewModel.PendingDeleteOutcome.COMMITTED,
+            (result as SetupViewModel.RetryResult.Replayed).outcome,
+        )
         // COMMITTED 攜 J_B 語義：journal 空、rev+1、同源清碼（整表重置，碼＋tag 空）。
         runBlocking {
             assertNull(store.pendingDelete())
@@ -405,5 +411,93 @@ class SetupCrossVmJournalTest {
         // fresh 對照：無碼走 SETUP，不走 SETTINGS.
         assertEquals(true, shouldNavigateToSetup(false, false, Routes.CHAT, null, false))
         assertEquals(false, shouldNavigateToSettings(false, false, Routes.CHAT, null, false))
+    }
+
+    @Test
+    fun effectiveLogoutGuardError_staleSuppressionCrossVm() {
+        // Stage F 跨 VM 抑制（R14）：舊卡 tag 與現態比對——同源沿用、Absent／異源
+        // J_C 隱藏（防 stale 回退全新 destructive logout）、未確認保留舊碼、
+        // STALE 恆顯；在途恆 null。純隱藏，真清卡靠 retry 終端。
+        val journalA = PendingDelete("preset:openai", 1L, 1700000000000L)
+        val journalC = PendingDelete("preset:openai#staged-" + "c".repeat(32), 3L, 1800000000000L)
+        val tagA = journalA.format()
+        val knownA = PendingTeardownState.KnownPending(journalA)
+        val knownC = PendingTeardownState.KnownPending(journalC)
+        // 同源沿用（重試清除可達，經新入口同源回放）。
+        assertEquals(
+            "LOGOUT_DELETE_FAILED",
+            effectiveLogoutGuardError("LOGOUT_DELETE_FAILED", tagA, knownA, logoutInFlight = false),
+        )
+        // Absent 抑制：舊重試鍵隱藏（fresh 導向，不給 stale 重試清除）。
+        assertNull(
+            effectiveLogoutGuardError(
+                "LOGOUT_DELETE_FAILED",
+                tagA,
+                PendingTeardownState.Absent,
+                logoutInFlight = false,
+            ),
+        )
+        assertEquals(
+            true,
+            shouldNavigateToSetup(
+                false,
+                false,
+                Routes.CHAT,
+                effectiveLogoutGuardError(
+                    "LOGOUT_DELETE_FAILED",
+                    tagA,
+                    PendingTeardownState.Absent,
+                    logoutInFlight = false,
+                ),
+                false,
+            ),
+        )
+        // 異源 J_C 抑制：不以後來世代冒充舊卡，亦不觸 J_C（J_C 屬其持有者恢復域）。
+        assertNull(
+            effectiveLogoutGuardError("LOGOUT_DELETE_FAILED", tagA, knownC, logoutInFlight = false),
+        )
+        // 未確認保留（fail-closed 不對稱：未知可能掩蓋本源，禁隱藏）。
+        assertEquals(
+            "LOGOUT_DELETE_FAILED",
+            effectiveLogoutGuardError(
+                "LOGOUT_DELETE_FAILED",
+                tagA,
+                PendingTeardownState.UnknownReadFailure,
+                logoutInFlight = false,
+            ),
+        )
+        assertEquals(
+            "LOGOUT_UNKNOWN",
+            effectiveLogoutGuardError(
+                "LOGOUT_UNKNOWN",
+                tagA,
+                PendingTeardownState.MalformedPending,
+                logoutInFlight = false,
+            ),
+        )
+        // STALE 恆顯（dismiss-only，Absent／J_C 下仍可關閉）。
+        assertEquals(
+            "LOGOUT_STALE",
+            effectiveLogoutGuardError(
+                "LOGOUT_STALE",
+                tagA,
+                PendingTeardownState.Absent,
+                logoutInFlight = false,
+            ),
+        )
+        assertEquals(
+            "LOGOUT_STALE",
+            effectiveLogoutGuardError("LOGOUT_STALE", tagA, knownC, logoutInFlight = false),
+        )
+        // 舊三參委託不變（tag null 沿用）。
+        assertEquals(
+            effectiveLogoutGuardError("LOGOUT_DELETE_FAILED", knownC, logoutInFlight = false),
+            effectiveLogoutGuardError(
+                "LOGOUT_DELETE_FAILED",
+                null,
+                knownC,
+                logoutInFlight = false,
+            ),
+        )
     }
 }

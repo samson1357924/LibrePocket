@@ -68,6 +68,7 @@ class StartupGateWiringTest {
         val error = MutableStateFlow<String?>(null)
         val inFlight = MutableStateFlow(false)
         var logoutCalls = 0
+        var retryLogoutCalls = 0
         lateinit var nav: NavHostController
         val visited = mutableListOf<String?>()
     }
@@ -110,6 +111,8 @@ class StartupGateWiringTest {
                     logoutErrorCode = e,
                     logoutInFlight = b,
                     onDismissLogoutError = { error.value = null },
+                    // Stage F：重試清除獨立於全新登出（生產改綁 `retryPendingDelete`）。
+                    onRetryLogout = { retryLogoutCalls++ },
                 )
             },
             setupContent = { padding, _ ->
@@ -237,9 +240,12 @@ class StartupGateWiringTest {
         awaitRoute(h, Routes.SETTINGS)
         composeRule.onNodeWithText(setupErrorText("LOGOUT_DELETE_FAILED")).assertIsDisplayed()
         composeRule.onNodeWithText("重試清除").assertIsDisplayed()
-        // 重試回調可達（生產 SettingsScreen 接線）。
+        // 重試回調可達（Stage F：獨立重試入口，禁回退全新 `onLogout`）。
         composeRule.onNodeWithText("重試清除").performClick()
-        composeRule.runOnIdle { assertEquals(1, h.logoutCalls) }
+        composeRule.runOnIdle {
+            assertEquals(1, h.retryLogoutCalls)
+            assertEquals(0, h.logoutCalls)
+        }
     }
 
     @Test

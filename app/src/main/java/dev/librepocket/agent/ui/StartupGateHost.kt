@@ -63,9 +63,10 @@ import kotlinx.coroutines.launch
  * 回調傳入）。
  *
  * Stage D2（R12 Finding 2 (b)）：派生恢復態內聚單一來源——有效碼
- * `effectiveLogoutGuardError(logoutGuardError, pendingTeardown, logoutInFlight)`
+ * `effectiveLogoutGuardError(logoutGuardError, logoutErrorSourceJournal, pendingTeardown, logoutInFlight)`
  * （見 `NavGuard.kt`；Stage E 四態：有碼沿用，無碼＋KnownPending＋非執行中 →
- * `LOGOUT_UNKNOWN`，無碼＋Unknown／Malformed＋非執行中 → `LOGOUT_READ_RETRY`）
+ * `LOGOUT_UNKNOWN`，無碼＋Unknown／Malformed＋非執行中 → `LOGOUT_READ_RETRY`；
+ * Stage F 四參抑制 stale 回落，見該函數 KDoc 真值表）
  * 代入雙守衛（nav 抑制＋CHAT→SETTINGS）、drawer 手勢與選單鍵門禁（恢復態啟用）；
  * `MainScreen` 另以同一純函數派生 `SettingsScreen` `recoveryCode`
  * （NoEndpoint 顯示 `LOGOUT_UNKNOWN` 卡＋重試清除，無 dismiss）。
@@ -99,6 +100,14 @@ internal fun StartupGateHost(
      * unconfirmed 走重試讀取）；身份不作清除依據。
      */
     pendingTeardown: PendingTeardownState = PendingTeardownState.Absent,
+    /**
+     * Stage F stale 抑制標籤（`form.logoutErrorSourceJournal` 原字串；null 表無源）。
+     *
+     * 與 [errorCode] 同源傳入 [effectiveLogoutGuardError] 四參派生：同源 retained
+     * 沿用，`Absent`／異源 `J_C` 抑制回落（純隱藏），未確認保留舊碼；真正清卡靠
+     * `retryPendingDelete` 終端。舊三參呼叫（tag null）行為不變。
+     */
+    logoutErrorSourceJournal: String? = null,
 ) {
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -119,8 +128,10 @@ internal fun StartupGateHost(
     // LOGOUT_UNKNOWN（重試清除）；無碼＋Unknown／Malformed＋非執行中 →
     // LOGOUT_READ_RETRY（重試讀取 only）；Absent／在途 → null（不決策）。
     // 有效值代入雙守衛與 drawer／選單。
+    // Stage F：改傳 tag（四參抑制 stale 回落；pure 只隱藏，真清卡靠 retry 終端）。
     val effectiveGuardError = effectiveLogoutGuardError(
         logoutGuardError,
+        logoutErrorSourceJournal,
         pendingTeardown = pendingTeardown,
         logoutInFlight = logoutInFlight,
     )

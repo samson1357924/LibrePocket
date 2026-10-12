@@ -24,6 +24,7 @@ import dev.librepocket.agent.ui.chat.SessionListViewModel
 import dev.librepocket.agent.ui.chat.SessionListViewModelFactory
 import dev.librepocket.agent.ui.settings.SettingsScreen
 import dev.librepocket.agent.ui.setup.EndpointGate
+import dev.librepocket.agent.ui.setup.PendingDelete
 import dev.librepocket.agent.ui.setup.SetupScreen
 import dev.librepocket.agent.ui.setup.SetupViewModel
 import dev.librepocket.agent.ui.setup.SetupViewModelFactory
@@ -181,6 +182,8 @@ fun MainScreen(
         onDrawerOpened = { sessionListViewModel.refresh() },
         // Stage E：四態 journal 傳入 host 派生恢復態（單一來源純函數，見 NavGuard）。
         pendingTeardown = pendingTeardown,
+        // Stage F：stale 抑制標籤同源傳入（四參派生；pure 只隱藏，真清卡靠 retry 終端）。
+        logoutErrorSourceJournal = setupForm.logoutErrorSourceJournal,
         chatContent = { padding ->
             ChatScreen(
                 padding = padding,
@@ -250,15 +253,55 @@ fun MainScreen(
                 // Stage E 四態派生恢復態（與 host 同一純函數單一來源）：無碼＋KnownPending
                 // ＋非執行中 → LOGOUT_UNKNOWN（NoEndpoint 顯示 UNKNOWN 卡＋重試清除，
                 // 無 dismiss）；無碼＋Unknown／Malformed＋非執行中 → LOGOUT_READ_RETRY
-                // （重試讀取 only）；有碼沿用不動。Safe reconcile 複用既有 onLogout
-                // resume 分支（同一 runPendingDeleteLocked 核心）。
+                // （重試讀取 only）；有碼沿用不動。Stage F 四參抑制 stale 回落
+                // （同源沿用、Absent／異源 J_C 隱藏、未確認保留舊碼；STALE 恆顯；
+                // 真正清卡靠 retry 終端，見 NavGuard 真值表）。
+                // Safe reconcile 走重試清除入口（`retryPendingDelete`，同一
+                // `runPendingDeleteLocked` 核心）；全新登出確認仍走 `onLogout`
+                // fresh-only。
                 logoutErrorCode = effectiveLogoutGuardError(
                     setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") },
+                    setupForm.logoutErrorSourceJournal,
                     pendingTeardown = pendingTeardown,
                     logoutInFlight = setupForm.logoutInFlight,
                 ),
                 logoutInFlight = setupForm.logoutInFlight,
                 onDismissLogoutError = { setupViewModel.clearLogoutError() },
+                // Stage F 重試清除（兩顆：Ready retained＋NoEndpoint retained）改綁
+                // `retryPendingDelete`（帶 `logoutErrorSourceJournal.parse` 身份；
+                // stale 絕不回退全新 destructive logout）。parse 失敗（tag null／
+                // 毀損）走重試讀取（不進 logout）；`ReadUnknown` 亦轉重試讀取；
+                // `Replayed(COMMITTED)` 比照登出成功清會話。
+                onRetryLogout = {
+                    val tagRaw = setupViewModel.form.value.logoutErrorSourceJournal
+                    val expected: PendingDelete? = try {
+                        tagRaw?.let { PendingDelete.parse(it) }
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (expected == null) {
+                        setupViewModel.retryStartupReconcile { outcome, journal ->
+                            setupViewModel.onStartupReconcile(outcome, journal)
+                        }
+                    } else {
+                        setupViewModel.retryPendingDelete(expected) { result ->
+                            when (result) {
+                                is SetupViewModel.RetryResult.Replayed -> {
+                                    if (result.outcome == SetupViewModel.PendingDeleteOutcome.COMMITTED) {
+                                        chatViewModel.newChat()
+                                        sessionListViewModel.refresh()
+                                    }
+                                }
+                                is SetupViewModel.RetryResult.StaleGone -> Unit
+                                is SetupViewModel.RetryResult.ReadUnknown -> {
+                                    setupViewModel.retryStartupReconcile { outcome, journal ->
+                                        setupViewModel.onStartupReconcile(outcome, journal)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
                 // Stage D1：中性碼重試讀取（reconcile-only，絕不調 logout；
                 // enabled 綁 startupReconcilePending，見 SettingsScreen）。
                 onRetryStartupRead = {

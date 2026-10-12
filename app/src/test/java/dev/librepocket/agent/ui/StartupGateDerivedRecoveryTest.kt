@@ -64,6 +64,7 @@ class StartupGateDerivedRecoveryTest {
         val error = MutableStateFlow<String?>(null)
         val inFlight = MutableStateFlow(false)
         var logoutCalls = 0
+        var retryLogoutCalls = 0
         var retryReadCalls = 0
         var dismissCalls = 0
         lateinit var nav: NavHostController
@@ -120,6 +121,9 @@ class StartupGateDerivedRecoveryTest {
                         dismissCalls++
                         error.value = null
                     },
+                    // Stage F：重試清除改綁新入口（生產 `retryPendingDelete`；此處以
+                    // 獨立計數斷言與全新 `onLogout` 分流，防 stale 回退全新）。
+                    onRetryLogout = { retryLogoutCalls++ },
                     onRetryStartupRead = { retryReadCalls++ },
                     startupReconcilePending = p,
                 )
@@ -166,9 +170,12 @@ class StartupGateDerivedRecoveryTest {
         composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
         composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
-        // 重試可達（safe reconcile 入口＝既有 onLogout）。
+        // 重試可達（Stage F 新入口＝獨立 `onRetryLogout`，禁回退全新 `onLogout`）。
         composeRule.onNodeWithText("重試清除").performClick()
-        composeRule.runOnIdle { assertEquals(1, h.logoutCalls) }
+        composeRule.runOnIdle {
+            assertEquals(1, h.retryLogoutCalls)
+            assertEquals(0, h.logoutCalls)
+        }
     }
 
     @Test
@@ -260,7 +267,10 @@ class StartupGateDerivedRecoveryTest {
         awaitRoute(h, Routes.SETTINGS)
         composeRule.onNodeWithText(setupErrorText("LOGOUT_UNKNOWN")).assertIsDisplayed()
         composeRule.onNodeWithText("重試清除").performClick()
-        composeRule.runOnIdle { assertEquals(1, h.logoutCalls) }
+        composeRule.runOnIdle {
+            assertEquals(1, h.retryLogoutCalls)
+            assertEquals(0, h.logoutCalls)
+        }
     }
 
     @Test

@@ -165,4 +165,156 @@ class NavGuardTest {
             ),
         )
     }
+
+    /**
+     * Stage F 四參抑制真值表（R14 P2/BLOCK：stale 恢復鍵回退全新 destructive logout）。
+     *
+     * - 無碼沿用今日派生（tag 忽略）；有碼＋tag null 沿用；
+     * - 有碼＋tag 非 null：同源沿用、Absent 隱藏、異源 J_C 隱藏、未確認保留舊碼；
+     * - `LOGOUT_STALE`（dismiss-only）任何態皆沿用；在途恆 null。
+     * 純隱藏，真清卡靠 `retryPendingDelete` 終端（見 `SetupStaleRetryTest`）。
+     */
+    @Test
+    fun fourArgSuppressionTruthTable() {
+        val journalA = PendingDelete("preset:openai", 1L, 1700000000000L)
+        val journalC = PendingDelete("preset:openai#staged-" + "c".repeat(32), 3L, 1800000000000L)
+        val tagA = journalA.format()
+        val knownA = PendingTeardownState.KnownPending(journalA)
+        val knownC = PendingTeardownState.KnownPending(journalC)
+        // 無碼沿用今日派生（tag 忽略）。
+        assertEquals(
+            "LOGOUT_UNKNOWN",
+            effectiveLogoutGuardError(null, tagA, knownA, logoutInFlight = false),
+        )
+        assertEquals(
+            "LOGOUT_UNKNOWN",
+            effectiveLogoutGuardError(null, null, knownA, logoutInFlight = false),
+        )
+        assertNull(
+            effectiveLogoutGuardError(null, tagA, PendingTeardownState.Absent, logoutInFlight = false),
+        )
+        // 有碼＋tag null 沿用（中性 READ_RETRY 含）。
+        assertEquals(
+            SetupViewModel.LOGOUT_READ_RETRY,
+            effectiveLogoutGuardError(
+                SetupViewModel.LOGOUT_READ_RETRY,
+                null,
+                PendingTeardownState.Absent,
+                logoutInFlight = false,
+            ),
+        )
+        assertEquals(
+            "LOGOUT_DELETE_FAILED",
+            effectiveLogoutGuardError(
+                "LOGOUT_DELETE_FAILED",
+                null,
+                knownC,
+                logoutInFlight = false,
+            ),
+        )
+        // 同源沿用。
+        assertEquals(
+            "LOGOUT_DELETE_FAILED",
+            effectiveLogoutGuardError("LOGOUT_DELETE_FAILED", tagA, knownA, logoutInFlight = false),
+        )
+        assertEquals(
+            "LOGOUT_CLEAR_FAILED",
+            effectiveLogoutGuardError("LOGOUT_CLEAR_FAILED", tagA, knownA, logoutInFlight = false),
+        )
+        assertEquals(
+            "LOGOUT_UNKNOWN",
+            effectiveLogoutGuardError("LOGOUT_UNKNOWN", tagA, knownA, logoutInFlight = false),
+        )
+        // Absent 抑制（stale 回落隱藏）。
+        assertNull(
+            effectiveLogoutGuardError(
+                "LOGOUT_DELETE_FAILED",
+                tagA,
+                PendingTeardownState.Absent,
+                logoutInFlight = false,
+            ),
+        )
+        assertNull(
+            effectiveLogoutGuardError(
+                "LOGOUT_CLEAR_FAILED",
+                tagA,
+                PendingTeardownState.Absent,
+                logoutInFlight = false,
+            ),
+        )
+        // 異源 J_C 抑制（不以後來世代冒充舊卡，亦不觸 J_C）。
+        assertNull(
+            effectiveLogoutGuardError(
+                "LOGOUT_DELETE_FAILED",
+                tagA,
+                knownC,
+                logoutInFlight = false,
+            ),
+        )
+        assertNull(
+            effectiveLogoutGuardError(
+                "LOGOUT_UNKNOWN",
+                tagA,
+                knownC,
+                logoutInFlight = false,
+            ),
+        )
+        // 未確認保留舊碼（fail-closed 不對稱：未知可能掩蓋本源）。
+        assertEquals(
+            "LOGOUT_DELETE_FAILED",
+            effectiveLogoutGuardError(
+                "LOGOUT_DELETE_FAILED",
+                tagA,
+                PendingTeardownState.UnknownReadFailure,
+                logoutInFlight = false,
+            ),
+        )
+        assertEquals(
+            "LOGOUT_DELETE_FAILED",
+            effectiveLogoutGuardError(
+                "LOGOUT_DELETE_FAILED",
+                tagA,
+                PendingTeardownState.MalformedPending,
+                logoutInFlight = false,
+            ),
+        )
+        // STALE 恆顯（dismiss-only，任何態皆沿用）。
+        assertEquals(
+            "LOGOUT_STALE",
+            effectiveLogoutGuardError(
+                "LOGOUT_STALE",
+                tagA,
+                PendingTeardownState.Absent,
+                logoutInFlight = false,
+            ),
+        )
+        assertEquals(
+            "LOGOUT_STALE",
+            effectiveLogoutGuardError("LOGOUT_STALE", tagA, knownC, logoutInFlight = false),
+        )
+        assertEquals(
+            "LOGOUT_STALE",
+            effectiveLogoutGuardError(
+                "LOGOUT_STALE",
+                tagA,
+                PendingTeardownState.UnknownReadFailure,
+                logoutInFlight = false,
+            ),
+        )
+        // 在途抑制（四參亦然）。
+        assertNull(
+            effectiveLogoutGuardError("LOGOUT_DELETE_FAILED", tagA, knownA, logoutInFlight = true),
+        )
+        assertNull(
+            effectiveLogoutGuardError("LOGOUT_STALE", tagA, knownA, logoutInFlight = true),
+        )
+        assertNull(
+            effectiveLogoutGuardError(null, tagA, knownA, logoutInFlight = true),
+        )
+        // 舊三參委託（tag null 語義不變）。
+        assertEquals(
+            effectiveLogoutGuardError("LOGOUT_DELETE_FAILED", knownC, logoutInFlight = false),
+            effectiveLogoutGuardError("LOGOUT_DELETE_FAILED", null, knownC, logoutInFlight = false),
+        )
+    }
 }

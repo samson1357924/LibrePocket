@@ -41,37 +41,32 @@ private const val TRANSCRIPT_CREATE_TIMEOUT_MS = 5_000L
 private const val HISTORY_PAGE = 200
 
 /**
- * Stored-events bound mirrored from the display replay: model context never
- * hydrates more rows than the UI would show.
- */
-private const val HISTORY_LOAD_CAP = 2000
-
-/**
- * R5-3: durable fork-snapshot copy budget. One slot is reserved for the
- * head-anchored `model switched` marker row, so marker + copied prefix never
- * exceeds [HISTORY_LOAD_CAP] (which equals
+ * Snapshot/history row budgets (zero behavior change; single home for the
+ * three related caps). Dual budget for one durable fork-snapshot prefix,
+ * newest-first: `min(1999 rows, 2M UTF-16 chars)` — [SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP]
+ * rows and [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS] chars
+ * ([dev.librepocket.session.TranscriptEvent.text] `String.length` units, the
+ * same unit as every other bound here). Marker + copy never exceeds
+ * [SnapshotBudget.HISTORY_LOAD_CAP] (one slot reserved for the head-anchored
+ * `model switched` marker), which equals
  * [dev.librepocket.session.PrunePolicy.maxEventsPerSession], so a full
- * snapshot would otherwise lose its head marker at the next prune sweep).
+ * snapshot would otherwise lose its head marker at the next prune sweep.
+ * 2M chars is ~1/10 of [RoomSessionStore.EXPORT_MAX_BYTES] nominal (chars
+ * are UTF-16 code units vs UTF-8 bytes, so the ratio is approximate), ~20x
+ * [TurnController.MAX_REQUEST_CHARS] and ~100 full
+ * [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] rows, covering ~50-100 normal turns
+ * so ordinary sessions never trip it. Without the char cap a full 1999-row
+ * prefix of max-size rows ([RoomSessionStore.MAX_TEXT_CHARS] per-row bound)
+ * materializes ~200M chars (~400MB UTF-16, plus a Redactor copy) in one read
+ * and one store batch; an over-budget prefix is abandoned whole (zero rows +
+ * incomplete marker, never a truncated half prefix — see
+ * [snapshotSwitchHistory]).
  */
-private const val SWITCH_SNAPSHOT_COPY_CAP = HISTORY_LOAD_CAP - 1
-
-/**
- * R6-5: aggregate char budget for one durable fork-snapshot prefix. Bounds
- * the total [dev.librepocket.session.TranscriptEvent.text] chars carried by
- * [loadSwitchSnapshotEvents] to newest-first `min(1999 rows, 2M chars)`:
- * without it a full 1999-row prefix of max-size rows
- * ([RoomSessionStore.MAX_TEXT_CHARS] per-row bound) materializes ~200M chars
- * (~400MB UTF-16, plus a Redactor copy) in one read and one store batch.
- * 2M chars (~1/10 of [RoomSessionStore.EXPORT_MAX_BYTES] nominal — chars
- * are UTF-16 code units vs UTF-8 bytes, so the ratio is approximate —, ~20x
- * [TurnController.MAX_REQUEST_CHARS], ~100 full
- * [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] rows) covers ~50-100 normal turns, so
- * ordinary sessions never trip it; an over-budget prefix is abandoned whole
- * (zero rows + incomplete marker, never a truncated half prefix — see
- * [snapshotSwitchHistory]). Chars are UTF-16 code units (`String.length`),
- * the same unit as every other bound here.
- */
-internal const val SNAPSHOT_MAX_TOTAL_CHARS = 2_000_000
+internal object SnapshotBudget {
+    internal const val HISTORY_LOAD_CAP = 2000
+    internal const val SWITCH_SNAPSHOT_COPY_CAP = HISTORY_LOAD_CAP - 1
+    internal const val SNAPSHOT_MAX_TOTAL_CHARS = 2_000_000
+}
 
 /**
  * Stage E: per-message char bound for model-context hydration. The write path
@@ -591,7 +586,7 @@ class ChatSessionFactory(
                 systemZone,
                 sessionStart,
                 loaded.messages,
-                HistoryWindowCap.MaxMessages(HISTORY_LOAD_CAP),
+                HistoryWindowCap.MaxMessages(SnapshotBudget.HISTORY_LOAD_CAP),
             )
             session = openedSession
             requireCurrentBinding(keyIsCurrent)
@@ -691,7 +686,7 @@ class ChatSessionFactory(
                 systemZone,
                 sessionStart,
                 emptyList(),
-                HistoryWindowCap.MaxMessages(HISTORY_LOAD_CAP),
+                HistoryWindowCap.MaxMessages(SnapshotBudget.HISTORY_LOAD_CAP),
             )
             session = openedSession
             requireCurrentBinding(keyIsCurrent)
@@ -966,7 +961,7 @@ class ChatSessionFactory(
 
 /**
  * Restored model-context prefix, Stage E tail semantics: the newest
- * qualifying rows (user/assistant, non-partial) up to [HISTORY_LOAD_CAP],
+ * qualifying rows (user/assistant, non-partial) up to [SnapshotBudget.HISTORY_LOAD_CAP],
  * oldest-first, via backward paging (memory O(cap), never O(session);
  * sparse seqs safe). Partial rows are excluded from model context (they
  * replay in the UI flagged, but must never read as completed answers —
@@ -995,7 +990,7 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
 
 /**
  * Raw-event form of [loadModelHistory]: the newest qualifying rows
- * (user/assistant, non-partial) up to [HISTORY_LOAD_CAP], oldest-first, via
+ * (user/assistant, non-partial) up to [SnapshotBudget.HISTORY_LOAD_CAP], oldest-first, via
  * the same backward paging. Source of truth for the in-memory model-context
  * hydration only (see `open` / `ensureSession`): the R4-2 durable fork
  * snapshot below deliberately does NOT reuse this set anymore (R5-3: it uses
@@ -1014,14 +1009,14 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
  * them via [loadSwitchSnapshotEvents] instead.
  */
 internal suspend fun loadModelHistoryEvents(store: SessionStore, sessionId: String): List<TranscriptEvent> {
-    val keptNewestFirst = ArrayList<TranscriptEvent>(HISTORY_LOAD_CAP)
+    val keptNewestFirst = ArrayList<TranscriptEvent>(SnapshotBudget.HISTORY_LOAD_CAP)
     var beforeSeq = Long.MAX_VALUE
-    outer@ while (keptNewestFirst.size < HISTORY_LOAD_CAP) {
+    outer@ while (keptNewestFirst.size < SnapshotBudget.HISTORY_LOAD_CAP) {
         val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
         if (page.isEmpty()) break
         for (event in page) {
             if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
-                if (keptNewestFirst.size >= HISTORY_LOAD_CAP) break@outer
+                if (keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) break@outer
                 keptNewestFirst.add(event)
             }
         }
@@ -1057,7 +1052,7 @@ internal fun isSwitchSnapshotTerminalMark(event: TranscriptEvent): Boolean {
 /**
  * R6-5: bounded fork-snapshot load result. [events] is the newest-kept
  * qualifying prefix, oldest-first; [droppedByBytes] is the exact number of
- * older qualifying rows excluded by [SNAPSHOT_MAX_TOTAL_CHARS] (0 when the
+ * older qualifying rows excluded by [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS] (0 when the
  * prefix fit — row-cap drops stay silent as before and are NOT counted
  * here). Counted in the same backward scan (transient pages only, bounded by
  * the prune ceiling), never a second query.
@@ -1069,7 +1064,7 @@ internal data class SwitchSnapshotLoad(
 
 /**
  * R5-3 durable fork-snapshot projection (UI replay/audit): the newest kept
- * rows up to [SWITCH_SNAPSHOT_COPY_CAP] AND [SNAPSHOT_MAX_TOTAL_CHARS] total
+ * rows up to [SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP] AND [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS] total
  * chars (R6-5 dual budget), oldest-first, via the same backward paging. Keeps
  * every `user`/`assistant` row INCLUDING partials (verbatim: `isPartial` /
  * `failureReason` / `parentRunId` / `attemptIndex` / `isFinal` /
@@ -1090,15 +1085,15 @@ internal data class SwitchSnapshotLoad(
  * terminal marks, which that COUNT excludes as `system` rows), newest-first,
  * so a large ledger drops the oldest rows first (silent, as before). The
  * char budget accumulates the same newest-first order and stops the prefix
- * at the first row that would overflow [SNAPSHOT_MAX_TOTAL_CHARS] — that row
+ * at the first row that would overflow [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS] — that row
  * and every older qualifying row is reported via [SwitchSnapshotLoad.droppedByBytes]
  * (counted in the same scan, transient pages only) so the caller abandons
  * the whole prefix instead of copying a half (see [snapshotSwitchHistory]).
- * Marker + copy never exceeds [HISTORY_LOAD_CAP] (one slot reserved),
+ * Marker + copy never exceeds [SnapshotBudget.HISTORY_LOAD_CAP] (one slot reserved),
  * matching the prune ceiling.
  */
 internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: String): SwitchSnapshotLoad {
-    val keptNewestFirst = ArrayList<TranscriptEvent>(SWITCH_SNAPSHOT_COPY_CAP)
+    val keptNewestFirst = ArrayList<TranscriptEvent>(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP)
     var totalChars = 0L
     var droppedByBytes = 0
     var byteCapped = false
@@ -1116,8 +1111,8 @@ internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: St
                 droppedByBytes++
                 continue
             }
-            if (keptNewestFirst.size >= SWITCH_SNAPSHOT_COPY_CAP) break@outer
-            if (totalChars + event.text.length > SNAPSHOT_MAX_TOTAL_CHARS) {
+            if (keptNewestFirst.size >= SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP) break@outer
+            if (totalChars + event.text.length > SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS) {
                 // Newest-first accumulate, over budget stops here: this row
                 // and every older qualifying row drops (counted below).
                 byteCapped = true
@@ -1191,7 +1186,7 @@ private const val SNAPSHOT_INCOMPLETE_SCAN_LIMIT = 16
  *   families ([snapshotSwitchHistory] auto-marks when a family is skipped),
  *   so "copy failed" would mislead — the rows landed, one family didn't.
  * - `"byte budget exceeded"` (R6-5): the prefix blew
- *   [SNAPSHOT_MAX_TOTAL_CHARS], so the copy carries zero rows (all-or-nothing
+ *   [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS], so the copy carries zero rows (all-or-nothing
  *   abandon, never a truncated half prefix) plus this marker in the same
  *   atomic batch.
  */
@@ -1238,11 +1233,11 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * Copied rows keep their family linkage and `createdAt` verbatim; `seq` is
  * reassigned by the store; texts are stored verbatim (truncation stays a
  * read-path concern via [cappedHistoryText] on hydrate). The copy is bounded
- * newest-first to [SWITCH_SNAPSHOT_COPY_CAP] rows AND
- * [SNAPSHOT_MAX_TOTAL_CHARS] total chars (R6-5: an over-budget prefix is
+ * newest-first to [SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP] rows AND
+ * [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS] total chars (R6-5: an over-budget prefix is
  * abandoned whole — zero rows + incomplete marker, never a half prefix, see
  * below), so marker + copy never exceeds
- * [HISTORY_LOAD_CAP]; pre- and post-restart model contexts still agree
+ * [SnapshotBudget.HISTORY_LOAD_CAP]; pre- and post-restart model contexts still agree
  * because reopen re-applies the same `!isPartial` filter to the copied rows
  * (provider payload unchanged).
  *
@@ -1311,7 +1306,7 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * @return number of history rows copied (0 when withheld or byte-abandoned).
  *
  * R6-5 aggregate byte cap (no schema change): the prefix load now enforces
- * `min(1999 rows, [SNAPSHOT_MAX_TOTAL_CHARS] chars)` newest-first. When the
+ * `min(1999 rows, [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS] chars)` newest-first. When the
  * char budget excludes any row (`droppedByBytes > 0`) the copy carries ZERO
  * rows and rides one system incomplete row (reason `"byte budget exceeded"`)
  * in the same atomic batch — a truncated half prefix risks a family split

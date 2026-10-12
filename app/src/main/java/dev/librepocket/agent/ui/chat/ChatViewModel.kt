@@ -1960,7 +1960,7 @@ class ChatViewModel(
                 return SnapshotOutcome.CLEAN
             } else {
                 // R6-5 byte-abandon: a clean fence + non-streaming fork
-                // whose prefix blew SNAPSHOT_MAX_TOTAL_CHARS still rides
+                // whose prefix blew SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS still rides
                 // the byte marker atomically (snapshotSwitchHistory
                 // returns prefix.size only, so 0 is ambiguous with a
                 // clean empty history) — bounded scan re-surfaces

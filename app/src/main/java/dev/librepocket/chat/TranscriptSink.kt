@@ -137,6 +137,13 @@ interface TranscriptSink {
    * (`turn <logicalTurnId> cancelled`, `isFinal=1`) bound to the logical
    * family instead — hidden from the chat replay, visible in export, and a
    * terminal for [findDanglingRunIds][dev.librepocket.agent.ui.chat.findDanglingRunIds].
+   * Idempotent exact-text pattern (same as the INTERRUPTED marker): the mark
+   * text must equal `cancelledMarkerText(logicalTurnId)` with
+   * `runId == logicalTurnId`, so reopen treats it as the family terminal (no
+   * false INTERRUPTED, second open adds zero rows). This sink never dedups —
+   * a repeated call rewrites the mark; idempotency rests on the controller
+   * dedup plus the backfill skip. See also
+   * [interruptedMarkerText][dev.librepocket.agent.ui.chat.interruptedMarkerText].
    * Durable core event. The default forwards to the attempt-bound cancel
    * terminal (second assistant) so existing fakes keep compiling and keep
    * their assertions; production ([dev.librepocket.session.SessionTranscriptSink])

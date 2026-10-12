@@ -232,6 +232,14 @@ class SessionTranscriptSink(
         }
     }
 
+    /**
+     * Backoff-gap cancel mark: one `system`-kind final row with the idempotent
+     * exact-text `turn <logicalTurnId> cancelled` (same pattern as
+     * [dev.librepocket.agent.ui.chat.interruptedMarkerText]; reopen treats it
+     * as the family terminal, so no false INTERRUPTED and a second open adds
+     * zero rows). This sink never dedups — a repeated call rewrites the mark;
+     * idempotency rests on the controller dedup plus the backfill skip.
+     */
     override suspend fun onLogicalTurnCancelled(
         logicalTurnId: String,
         attemptRunId: String,

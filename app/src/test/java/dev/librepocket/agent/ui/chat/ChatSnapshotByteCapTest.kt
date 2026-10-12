@@ -164,7 +164,7 @@ class ChatSnapshotByteCapTest {
         val store = FakeSessionStore()
         val oldId = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
         // 100 complete turns x 100k chars = 200 rows / 20M chars: rows far
-        // below the 1999 row cap while bytes blow the 2M aggregate cap. One
+        // below the SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP row cap (1999) while bytes blow the 2M aggregate cap. One
         // shared 100k instance keeps the test heap small (lengths still sum
         // to 20M, which is what the budget measures).
         val huge = "x".repeat(100_000)
@@ -176,7 +176,7 @@ class ChatSnapshotByteCapTest {
         val loaded = loadSwitchSnapshotEvents(store, oldId)
         // Bounded: newest-first prefix within both budgets, oldest dropped.
         assertTrue(loaded.events.size < 200)
-        assertTrue(loaded.events.sumOf { it.text.length } <= SNAPSHOT_MAX_TOTAL_CHARS)
+        assertTrue(loaded.events.sumOf { it.text.length } <= SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS)
         assertEquals(200 - loaded.events.size, loaded.droppedByBytes)
         assertTrue(loaded.droppedByBytes > 0)
         // Pin the arithmetic: 2M / 100k rows fit, the 21st overflows.
@@ -211,7 +211,7 @@ class ChatSnapshotByteCapTest {
         val store = FakeSessionStore()
         val oldId = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
         // Oldest: one max-size row; then 999 small turns. 2000 qualifying rows
-        // exceed the 1999 row cap (HISTORY_LOAD_CAP - 1) while total chars
+        // exceed the SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP row cap (SnapshotBudget.HISTORY_LOAD_CAP - 1) while total chars
         // (~120k) stay far below the byte cap: newest-first must drop exactly
         // the oldest (huge) row, with no byte marker.
         store.appendEvent(event(oldId, "hold", "user", "x".repeat(100_000)))
@@ -222,16 +222,16 @@ class ChatSnapshotByteCapTest {
         }
 
         val loaded = loadSwitchSnapshotEvents(store, oldId)
-        assertEquals(1999, loaded.events.size)
+        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP, loaded.events.size)
         assertEquals(0, loaded.droppedByBytes)
-        assertTrue(loaded.events.sumOf { it.text.length } <= SNAPSHOT_MAX_TOTAL_CHARS)
+        assertTrue(loaded.events.sumOf { it.text.length } <= SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS)
         assertTrue(loaded.events.none { it.text.length == 100_000 })
         assertEquals("a-old", loaded.events.first().text)
         assertEquals("a-998", loaded.events.last().text)
 
         val newId = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o")
         val copied = snapshotSwitchHistory(store, oldId, newId, "gpt-4o-mini", "gpt-4o", false)
-        assertEquals(1999, copied)
+        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP, copied)
         assertTrue(!hasIncompleteSnapshotMarker(store, newId))
         val forked = rows(store, newId)
         assertEquals(2000, forked.size)
@@ -249,12 +249,12 @@ class ChatSnapshotByteCapTest {
         }
 
         val loaded = loadSwitchSnapshotEvents(store, oldId)
-        assertEquals(1999, loaded.events.size)
+        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP, loaded.events.size)
         assertEquals(0, loaded.droppedByBytes)
 
         val newId = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o")
         val copied = snapshotSwitchHistory(store, oldId, newId, "gpt-4o-mini", "gpt-4o", false)
-        assertEquals(1999, copied)
+        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP, copied)
         assertTrue(!hasIncompleteSnapshotMarker(store, newId))
         val forked = rows(store, newId)
         assertEquals(2000, forked.size)
@@ -283,7 +283,7 @@ class ChatSnapshotByteCapTest {
         assertNull(vm.notice.value)
 
         // Blow the byte budget directly in the store: 12 turns x 100k x 2 =
-        // 2.4M chars over the 2M cap, rows (26) far below the 1999 row cap.
+        // 2.4M chars over the 2M cap, rows (26) far below the SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP row cap (1999).
         // The live turn stays IDLE (clean fence, non-streaming). One shared
         // instance keeps the heap small; the budget measures lengths.
         val huge = "x".repeat(100_000)

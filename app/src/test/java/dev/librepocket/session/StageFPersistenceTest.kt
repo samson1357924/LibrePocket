@@ -6,9 +6,24 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.sqlite.db.SupportSQLiteOpenHelper
 import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
+import dev.librepocket.agent.ui.chat.ChatSessionFactory
+import dev.librepocket.agent.ui.chat.SessionStoreSource
+import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.cancelledMarkerText
+import dev.librepocket.agent.ui.chat.findDanglingRunIds
+import dev.librepocket.agent.ui.setup.EndpointConfig
+import dev.librepocket.keystore.EncryptedPrefsVault
+import dev.librepocket.keystore.InMemoryPrefs
+import dev.librepocket.policy.InMemoryPolicyStore
+import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderProtocol
+import dev.librepocket.provider.StreamEvent
 import java.io.File
 import java.nio.file.Files
 import java.util.UUID
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -334,4 +349,69 @@ class StageFPersistenceTest {
         assertEquals("turn L2 cancelled", rows[5].text)
         assertTrue(rows[5].isFinal)
     }
+
+    /**
+     * PG-S4 backoff-gap cancel reopen (pure JVM, [FakeSessionStore]): seed
+     * user + non-final failed partial + retry notice + one
+     * [SessionTranscriptSink.onLogicalTurnCancelled] system mark, then reopen
+     * via [ChatSessionFactory.open] — the family must read terminal (exactly
+     * one assistant row and one `turn L cancelled` mark, no INTERRUPTED, no
+     * dangling), and a second open must add zero rows.
+     */
+    @Test fun backoffGapCancelMark_reopenSeesTerminalAndSecondOpenAddsZero() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val sink = SessionTranscriptSink(store, sid) { 1L }
+        sink.onTurnStarted("L", "q")
+        sink.onTurnFailed("A1", "half", "boom", "L", 0, false)
+        sink.onTurnRetried("L", 1, 3, 0L)
+        sink.onLogicalTurnCancelled("L", "A1", "half", 0)
+
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource {
+                val vault = EncryptedPrefsVault(InMemoryPrefs())
+                vault.putKey("preset:openai", "test-key-12345678".toCharArray())
+                vault
+            },
+            buildProvider = { _, _ -> StageFCancelReopenProvider() },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = store
+            },
+        )
+        val endpoint = EndpointConfig(
+            providerId = "preset:openai",
+            presetId = "openai",
+            label = "OpenAI",
+            baseUrl = "https://api.openai.com/v1",
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            model = "gpt-4o-mini",
+            apiKeyRef = "provider_key/preset:openai",
+        )
+        val first = factory.open(endpoint, sid)
+        try {
+            val afterFirst = store.events.filter { it.sessionId == sid }.sortedBy { it.seq }
+            assertEquals(1, afterFirst.count { it.kind == "assistant" })
+            assertEquals(1, afterFirst.count { it.kind == "system" && it.text == cancelledMarkerText("L") })
+            assertTrue(afterFirst.none { it.kind == "system" && it.text.endsWith("interrupted") })
+            assertTrue(findDanglingRunIds(afterFirst).isEmpty())
+        } finally {
+            first.session.close()
+        }
+        val sizeAfterFirst = store.events.count { it.sessionId == sid }
+        val second = factory.open(endpoint, sid)
+        try {
+            val afterSecond = store.events.filter { it.sessionId == sid }.sortedBy { it.seq }
+            assertEquals(sizeAfterFirst, afterSecond.size)
+            assertTrue(findDanglingRunIds(afterSecond).isEmpty())
+        } finally {
+            second.session.close()
+        }
+    }
+}
+
+private class StageFCancelReopenProvider : LlmProvider {
+    override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
+    override fun stream(request: ChatRequest): Flow<StreamEvent> = emptyFlow()
+    override suspend fun listModels(): List<String> = emptyList()
 }

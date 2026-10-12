@@ -192,6 +192,171 @@ class SummarizeJunitHarness(unittest.TestCase):
         else:
             self.fail("truncated skipped ident line missing")
 
+    def test_tests_overclaim_is_incomplete(self) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<testsuite name="com.example.Over" tests="5" failures="0" errors="0" skipped="0">'
+            '<testcase classname="com.example.Over" name="test0"/>'
+            '<testcase classname="com.example.Over" name="test1"/>'
+            "</testsuite>"
+        )
+        path = _write(self.tmp / "TEST-over.xml", xml)
+        summary = parse_junit_xml([path])
+        self.assertEqual(summary.status, "INCOMPLETE")
+        self.assertNotEqual(summary.status, "PASS")
+        self.assertTrue(
+            any(
+                "inconsistent" in warning
+                and "tests=5" in warning
+                and "com.example.Over" in warning
+                for warning in summary.warnings
+            ),
+            "per-suite tests warning missing: %r" % (summary.warnings,),
+        )
+        text = render_summary(summary, "play")
+        self.assertIn("INCOMPLETE", text)
+        self.assertNotIn("all executed tests passed", text)
+
+    def test_tests_underclaim_is_incomplete(self) -> None:
+        cases = "".join(
+            '<testcase classname="com.example.Under" name="test%d"/>' % index
+            for index in range(3)
+        )
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<testsuite name="com.example.Under" tests="1" failures="0" errors="0" skipped="0">'
+            "%s</testsuite>" % cases
+        )
+        path = _write(self.tmp / "TEST-under.xml", xml)
+        summary = parse_junit_xml([path])
+        self.assertEqual(summary.status, "INCOMPLETE")
+        self.assertTrue(
+            any(
+                "inconsistent" in warning
+                and "tests=1" in warning
+                for warning in summary.warnings
+            ),
+            "per-suite tests warning missing: %r" % (summary.warnings,),
+        )
+        text = render_summary(summary, "foss")
+        self.assertIn("INCOMPLETE", text)
+
+    def test_skipped_counter_mismatch_is_incomplete(self) -> None:
+        scenarios = [
+            (
+                "over",
+                '<testsuite name="com.example.SkipOver" tests="2" failures="0" errors="0" skipped="2">'
+                '<testcase classname="com.example.SkipOver" name="test0"/>'
+                '<testcase classname="com.example.SkipOver" name="test1"/>'
+                "</testsuite>",
+                "skipped=2",
+            ),
+            (
+                "partial",
+                '<testsuite name="com.example.SkipPartial" tests="2" failures="0" errors="0" skipped="2">'
+                '<testcase classname="com.example.SkipPartial" name="test0"><skipped/></testcase>'
+                '<testcase classname="com.example.SkipPartial" name="test1"/>'
+                "</testsuite>",
+                "skipped=2",
+            ),
+            (
+                "reverse",
+                '<testsuite name="com.example.SkipReverse" tests="1" failures="0" errors="0" skipped="0">'
+                '<testcase classname="com.example.SkipReverse" name="test0"><skipped/></testcase>'
+                "</testsuite>",
+                "skipped=0",
+            ),
+        ]
+        for label, suite_xml, marker in scenarios:
+            with self.subTest(scenario=label):
+                path = _write(
+                    self.tmp / ("TEST-skip-%s.xml" % label),
+                    '<?xml version="1.0" encoding="UTF-8"?>' + suite_xml,
+                )
+                summary = parse_junit_xml([path])
+                self.assertEqual(summary.status, "INCOMPLETE", label)
+                self.assertNotEqual(summary.status, "PASS", label)
+                self.assertTrue(
+                    any(
+                        "inconsistent" in warning and marker in warning
+                        for warning in summary.warnings
+                    ),
+                    "per-suite skipped warning missing %s: %r"
+                    % (label, summary.warnings),
+                )
+
+    def test_failures_underreport_is_incomplete_not_fail(self) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<testsuite name="com.example.Under" tests="2" failures="2" errors="0" skipped="0">'
+            '<testcase classname="com.example.Under" name="fails">'
+            '<failure message="boom">stack</failure></testcase>'
+            '<testcase classname="com.example.Under" name="passes"/>'
+            "</testsuite>"
+        )
+        path = _write(self.tmp / "TEST-underreport.xml", xml)
+        summary = parse_junit_xml([path])
+        self.assertEqual(summary.status, "INCOMPLETE")
+        self.assertNotEqual(summary.status, "FAIL")
+        self.assertNotEqual(summary.status, "PASS")
+        self.assertTrue(
+            any(
+                "inconsistent" in warning and "failures+errors=2" in warning
+                for warning in summary.warnings
+            ),
+            "per-suite failures warning missing: %r" % (summary.warnings,),
+        )
+        text = render_summary(summary, "github")
+        self.assertIn("INCOMPLETE", text)
+
+    def test_nested_suites_count_outermost_only(self) -> None:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<testsuite name="outer" tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase classname="o.K" name="t"/>'
+            '<testsuite name="inner" tests="1" failures="0" errors="0" skipped="0">'
+            '<testcase classname="i.K" name="t"/>'
+            "</testsuite></testsuite>"
+        )
+        path = _write(self.tmp / "TEST-nested.xml", xml)
+        summary = parse_junit_xml([path])
+        # Outermost-only: the inner suite must not be double-counted.
+        self.assertEqual(summary.tests, 1)
+        self.assertEqual(summary.status, "PASS")
+        self.assertTrue(
+            any(
+                "nested" in warning and "outermost-only" in warning
+                for warning in summary.warnings
+            ),
+            "nested-suite warning missing: %r" % (summary.warnings,),
+        )
+        text = render_summary(summary, "play")
+        self.assertIn("Status: PASS", text)
+        self.assertIn("| tests | 1 |", text)
+
+    def test_giant_warnings_never_exceed_budget(self) -> None:
+        path = _write(self.tmp / "TEST-clean.xml", _passing_suite(tests=1))
+        summary = parse_junit_xml([path])
+        summary.warnings.append("W" * (2 * 1024 * 1024))
+        text = render_summary(summary, "play")
+        size = len(text.encode("utf-8"))
+        self.assertLessEqual(size, SUMMARY_BUDGET_BYTES, "rendered bytes: %d" % size)
+        # A single oversized warning is truncated per-line, not dropped wholesale.
+        for line in text.splitlines():
+            if line.startswith("- "):
+                self.assertLessEqual(len(line) - 2, MAX_SUMMARY_LINE + 1)
+
+        crowded = parse_junit_xml([path])
+        crowded.warnings.extend("warning-%04d-%s" % (i, "x" * 290) for i in range(5000))
+        crowded_text = render_summary(crowded, "f" * 5000)
+        crowded_size = len(crowded_text.encode("utf-8"))
+        self.assertLessEqual(
+            crowded_size, SUMMARY_BUDGET_BYTES, "rendered bytes: %d" % crowded_size
+        )
+        self.assertIn("omitted ", crowded_text)
+        self.assertIn("warning(s); see XML artifact", crowded_text)
+        self.assertIn("### Unit test summary — ", crowded_text.splitlines()[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

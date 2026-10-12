@@ -216,13 +216,16 @@ class StartupReconcilePendingTest {
     @Test
     fun failedAndUnknownOutcomesSteerToSettings() {
         // slowReplay 參數化：FAILED/UNKNOWN 皆到 SETTINGS（STALE 另計）。
+        // Stage D1：UNKNOWN 需攜 journal（clear-phase）才落 LOGOUT_UNKNOWN；
+        // read-path UNKNOWN+null 改落 READ_RETRY（另由新驗收檔覆蓋，此處鎖定 retained 側）。
         val vm = newVm(rawStore("pending-failed-unknown"), EncryptedPrefsVault(InMemoryPrefs()))
-        for ((outcome, code) in listOf(
-            SetupViewModel.PendingDeleteOutcome.FAILED to "LOGOUT_CLEAR_FAILED",
-            SetupViewModel.PendingDeleteOutcome.UNKNOWN to "LOGOUT_UNKNOWN",
-            SetupViewModel.PendingDeleteOutcome.DELETE_FAILED to "LOGOUT_DELETE_FAILED",
+        val retainedJournal = PendingDelete("preset:openai", 1L, 1700000000000L)
+        for ((outcome, journal, code) in listOf(
+            Triple(SetupViewModel.PendingDeleteOutcome.FAILED, null, "LOGOUT_CLEAR_FAILED"),
+            Triple(SetupViewModel.PendingDeleteOutcome.UNKNOWN, retainedJournal, "LOGOUT_UNKNOWN"),
+            Triple(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, null, "LOGOUT_DELETE_FAILED"),
         )) {
-            vm.onStartupReconcile(outcome, null, gateReady = false)
+            vm.onStartupReconcile(outcome, journal, gateReady = false)
             assertEquals(code, vm.form.value.errorCode)
             assertFalse(shouldNavigateToSetup(false, false, Routes.CHAT, code, false))
             assertTrue("outcome=$outcome", shouldNavigateToSettings(false, false, Routes.CHAT, code, false))

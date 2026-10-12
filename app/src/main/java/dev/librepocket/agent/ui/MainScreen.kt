@@ -244,6 +244,14 @@ fun MainScreen(
                 logoutErrorCode = setupForm.errorCode?.takeIf { it.startsWith("LOGOUT_") },
                 logoutInFlight = setupForm.logoutInFlight,
                 onDismissLogoutError = { setupViewModel.clearLogoutError() },
+                // Stage D1：中性碼重試讀取（reconcile-only，絕不調 logout；
+                // enabled 綁 startupReconcilePending，見 SettingsScreen）。
+                onRetryStartupRead = {
+                    setupViewModel.retryStartupReconcile { outcome, journal ->
+                        setupViewModel.onStartupReconcile(outcome, journal)
+                    }
+                },
+                startupReconcilePending = startupReconcilePending,
             )
         },
         setupContent = { padding, isFirstRun ->

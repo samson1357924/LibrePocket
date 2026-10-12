@@ -217,6 +217,8 @@ class SetupLogoutStartupReconcileTest {
     fun startupReplayUnknownSurfacesNeutralCode() {
         // malformed journal：UNKNOWN、零 vault I/O；啟動落中性碼（非 CLEAR，
         // 文案不含「已刪除」）。journal 原樣保留、key 仍在。
+        // Stage D1：read-path UNKNOWN（journal=null）改落 LOGOUT_READ_RETRY
+        // （非 LOGOUT_UNKNOWN；後者僅用於 clear-phase UNKNOWN+J）。
         val store = rawStore("startup-replay-unknown")
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
@@ -241,15 +243,19 @@ class SetupLogoutStartupReconcileTest {
             assertTrue("key survives UNKNOWN (no vault I/O)", delegate.hasKey("preset:openai"))
         }
         vm.onStartupReconcile(outcome, null)
-        assertEquals("LOGOUT_UNKNOWN", vm.form.value.errorCode)
+        assertEquals(SetupViewModel.LOGOUT_READ_RETRY, vm.form.value.errorCode)
+        assertNull(vm.form.value.logoutErrorSourceJournal)
         val text = setupErrorText(vm.form.value.errorCode!!)
         assertFalse("neutral wording must not claim deleted: $text", text.contains("已刪除"))
+        assertFalse("neutral wording must not claim residual: $text", text.contains("殘留"))
     }
 
     @Test
     fun startupReplayStrictReadFailureSurfacesUnknownWithRetention() {
         // strict 重讀拋（snapshotDeleteStateStrict throw）：UNKNOWN、零 vault
-        // I/O、journal 保留、key 仍在、啟動落 LOGOUT_UNKNOWN（非 CLEAR）。
+        // I/O、journal 保留、key 仍在。
+        // Stage D1：首輪 read-path UNKNOWN+null 落 LOGOUT_READ_RETRY（非 CLEAR、
+        // 非 LOGOUT_UNKNOWN）；重試升級 retained 由新驗收檔覆蓋。
         val raw = rawStore("startup-replay-read-fail")
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
@@ -272,9 +278,11 @@ class SetupLogoutStartupReconcileTest {
             assertTrue("key survives UNKNOWN (no vault I/O)", delegate.hasKey("preset:openai"))
         }
         vm.onStartupReconcile(outcome, null)
-        assertEquals("LOGOUT_UNKNOWN", vm.form.value.errorCode)
+        assertEquals(SetupViewModel.LOGOUT_READ_RETRY, vm.form.value.errorCode)
+        assertNull(vm.form.value.logoutErrorSourceJournal)
         val text = setupErrorText(vm.form.value.errorCode!!)
         assertFalse("neutral wording must not claim deleted: $text", text.contains("已刪除"))
+        assertFalse("neutral wording must not claim residual: $text", text.contains("殘留"))
     }
 
     @Test

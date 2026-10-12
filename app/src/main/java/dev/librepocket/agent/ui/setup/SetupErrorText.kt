@@ -3,8 +3,9 @@ package dev.librepocket.agent.ui.setup
 /**
  * 共享錯誤文案（SetupScreen 與 SettingsScreen 共用）。
  *
- * 由 SetupScreen 私有 `errorText` 抽出，原映射逐字保留；新增 LOGOUT_* 五碼
- * （登出失敗 Settings UI 可見，Re-review #7 Finding 2；Stage 3 P2 拆分）：
+ * 由 SetupScreen 私有 `errorText` 抽出，原映射逐字保留；新增 LOGOUT_* 六碼
+ * （登出失敗 Settings UI 可見，Re-review #7 Finding 2；Stage 3 P2 拆分；
+ * Stage D1 新增 `LOGOUT_READ_RETRY` 中性碼）：
  * - `LOGOUT_READ_FAILED`：讀取失敗，未動任何狀態（未刪、未清），可重試。
  * - `LOGOUT_DELETE_FAILED`：刪金鑰失敗，端點設定未清（金鑰仍可能在 vault，
  *   禁寫「已刪除」），可重試。
@@ -13,7 +14,13 @@ package dev.librepocket.agent.ui.setup
  *   讀 NO_KEY），重試以完成清除。未證勝的 delete 失敗一律用
  *   `LOGOUT_DELETE_FAILED`，未確認的用 `LOGOUT_UNKNOWN`。
  * - `LOGOUT_UNKNOWN`：未能確認清除結果（strict 重讀失敗或 journal 毀損，零
- *   vault I/O）：殘留待清理，可重試；文案禁寫「已刪除」。
+ *   vault I/O）：殘留待清理，可重試；文案禁寫「已刪除」。Stage D1 起僅用於
+ *   clear-phase `UNKNOWN`（攜 journal）與 logout 路徑；read-path `UNKNOWN`
+ *  （journal=null）改用 `LOGOUT_READ_RETRY`。
+ * - `LOGOUT_READ_RETRY`（Stage D1）：啟動時讀取清除狀態失敗，未做任何變更，
+ *   可重試讀取。僅用於啟動 replay read-path `UNKNOWN`（journal=null）：
+ *   零 vault I/O、未刪未清；文案禁寫「已刪除」／「殘留待清理」。重試為非破壞性
+ *   reconcile-only（`retryStartupReconcile`），絕不調 `logout()`。
  * - `LOGOUT_STALE`：已有新的金鑰生效（併發 save 贏了 CAS），本次登出已過期，
  *   不需重試。
  * - `SAVE_BLOCKED_BY_TEARDOWN`：有待清理的登出狀態擋下本次儲存（未寫入任何
@@ -35,6 +42,7 @@ fun setupErrorText(code: String): String = when (code) {
     "LOGOUT_DELETE_FAILED" -> "刪除本機金鑰失敗，端點設定未清除，請重試。"
     "LOGOUT_CLEAR_FAILED" -> "部分清除：本機金鑰已刪除、但端點設定仍在，請重試以完成清除。"
     "LOGOUT_UNKNOWN" -> "未能確認清除結果，殘留待清理，請重試。"
+    "LOGOUT_READ_RETRY" -> "啟動時讀取清除狀態失敗，未做任何變更，請重試讀取。"
     "LOGOUT_STALE" -> "已有新的金鑰生效，本次登出已過期，不需重試。"
     "SAVE_BLOCKED_BY_TEARDOWN" -> "有待清理的登出狀態，請重試。"
     else -> "儲存失敗（$code），請重試。"

@@ -116,14 +116,17 @@ class SetupLogoutDismissGuardTest {
             assertEquals("preset:openai", store.pendingDelete()?.alias)
         }
         // 重啟重 stamp：clear 後再 reconcile → 碼重現。
+        // Stage D1：UNKNOWN 分流——此處用 clear-phase UNKNOWN+J（retained）
+        // 鎖定舊語義；read-path UNKNOWN+null（中性 READ_RETRY）由新驗收檔覆蓋。
         vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.DELETE_FAILED, retainedJournal, gateReady = false)
         assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
         vm.clearLogoutError()
         vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.FAILED, retainedJournal, gateReady = false)
         assertEquals("LOGOUT_CLEAR_FAILED", vm.form.value.errorCode)
         vm.clearLogoutError()
-        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.UNKNOWN, null, gateReady = false)
+        vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.UNKNOWN, retainedJournal, gateReady = false)
         assertEquals("LOGOUT_UNKNOWN", vm.form.value.errorCode)
+        assertEquals(retainedJournal.format(), vm.form.value.logoutErrorSourceJournal)
         // COMMITTED/NO_OP 不蓋碼（既有語義鎖定）：先清再給兩者，維持 null。
         vm.clearLogoutError()
         assertNull(vm.form.value.errorCode)

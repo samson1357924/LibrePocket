@@ -201,6 +201,16 @@ class SetupViewModel(
          * POLICY_DENIED without touching the vault.
          */
         internal const val MAX_STAGED_MINT_ATTEMPTS = 5
+        /**
+         * Stage D1 中性碼：啟動 replay read-path `UNKNOWN`（journal=null）專用。
+         *
+         * `LOGOUT_` 前綴以相容既有 `takeIf { startsWith("LOGOUT_") }`（MainScreen／
+         * StartupGateHost）與 NavGuard `startsWith` 守衛；文案見 [setupErrorText]，
+         * 禁寫「已刪除」／「殘留待清理」。與 `LOGOUT_READ_FAILED`（logout 路徑讀失敗，
+         * retained、重試清除）嚴格區分：此碼為非破壞性重試讀取（[retryStartupReconcile]），
+         * 絕不調 `logout()`。
+         */
+        const val LOGOUT_READ_RETRY = "LOGOUT_READ_RETRY"
     }
 
     /**
@@ -1589,18 +1599,26 @@ class SetupViewModel(
      *   pre-existing `LOGOUT_*` ONLY when [SetupUiState.logoutErrorSourceJournal]
      *   equals this replay's journal ([PendingDelete.format]); a banner sourced
      *   from a concurrent teardown's journal, a journal-less stamp, or any
-     *   non-`LOGOUT_*` code is kept. Never stamps;
-     * - `NO_OP`: silent — writes nothing and never clears (no journal, no identity);
+     *   non-`LOGOUT_*` code is kept. Never stamps. Stage D1 例外：現行碼為
+     *   [LOGOUT_READ_RETRY]（sourceJournal==null 的中性碼）時，任何 `COMMITTED`
+     *  （同源或 null-tag）皆顯式清除該中性碼（重試證明 teardown 已完成或根本無
+     *   journal）；其他 `LOGOUT_*` 仍走同源比對，絕不誤清；
+     * - `NO_OP`: silent — writes nothing and never clears (no journal, no identity).
+     *   Stage D1 例外：現行碼為 [LOGOUT_READ_RETRY] 時顯式清除（重試確認真無
+     *   journal）；其他 `LOGOUT_*` 仍永不清；
      * - `STALE`: explicit decision — silent when [gate] is already `Ready`
      *   (the concurrent winner is live, nothing to dismiss), otherwise stamps
      *   `LOGOUT_STALE` for the dismiss card (overwrites + records the
-     *   superseded journal tag);
-     * - `DELETE_FAILED`/`FAILED`/`UNKNOWN`: stamps per [reconcileOutcomeToLogout]
-     *   (`LOGOUT_DELETE_FAILED` / `LOGOUT_CLEAR_FAILED` / neutral
-     *   `LOGOUT_UNKNOWN`), which the Settings `NoEndpoint` recovery card
-     *   offers as retry (STALE excepted: dismiss only). Overwrites + records
-     *   the tag (`UNKNOWN` carries null: identity unconfirmed, so a later
-     *   `COMMITTED` conservatively keeps the banner for manual dismiss).
+     *   superseded journal tag, including overwriting [LOGOUT_READ_RETRY]);
+     * - `DELETE_FAILED`/`FAILED`: stamps per [reconcileOutcomeToLogout]
+     *   (`LOGOUT_DELETE_FAILED` / `LOGOUT_CLEAR_FAILED`), which the Settings
+     *   `NoEndpoint` recovery card offers as retry (STALE excepted: dismiss only).
+     *   Overwrites + records the tag (including upgrading [LOGOUT_READ_RETRY]);
+     * - `UNKNOWN`: Stage D1 分流 — journal==null（read-path：strict 重讀失敗或
+     *   journal 毀損，身份不可確認）落中性 [LOGOUT_READ_RETRY]（tag null，未刪
+     *   未清，僅重試讀取）；journal!=null（clear-phase：clear 拋後 probe 重讀亦
+     *   失敗，攜 active pending）維持中性 retained `LOGOUT_UNKNOWN`（tag 非 null）。
+     *   兩者文案皆禁寫「已刪除」；前者禁寫「殘留待清理」。
      *
      * Never touches `logoutInFlight` (startup replay is not a logout attempt);
      * cancellation never reaches here (rethrows with no `onDone`).
@@ -1617,6 +1635,11 @@ class SetupViewModel(
      * read-path `UNKNOWN` whose journal could not be confirmed; clear-phase
      * `UNKNOWN` carries the active `pending`, so a later `COMMITTED` of the
      * same journal may clear its banner).
+     *
+     * Stage D1: read-path `UNKNOWN` (journal==null) maps to [LOGOUT_READ_RETRY],
+     * clear-phase `UNKNOWN` (journal!=null) keeps `LOGOUT_UNKNOWN`. `NO_OP` and
+     * `COMMITTED` gain a neutral-only clear path (current code is
+     * [LOGOUT_READ_RETRY] → clear; other `LOGOUT_*` untouched).
      */
     internal fun onStartupReconcile(
         outcome: PendingDeleteOutcome,
@@ -1625,26 +1648,69 @@ class SetupViewModel(
     ) {
         if (outcome == PendingDeleteOutcome.COMMITTED) {
             val tag = journal?.format()
+            val cur = _form.value
+            if (cur.errorCode == LOGOUT_READ_RETRY) {
+                // Stage D1: retry proved the teardown done (or truly no journal) —
+                // clear the neutral code regardless of the COMMITTED tag identity.
+                // Other LOGOUT_* codes still require same-tag match below.
+                _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
+                return
+            }
             if (tag != null) {
-                val cur = _form.value
                 if (cur.errorCode?.startsWith("LOGOUT_") == true && cur.logoutErrorSourceJournal == tag) {
                     _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
                 }
             }
             return
         }
+        if (outcome == PendingDeleteOutcome.NO_OP) {
+            // Stage D1: NO_OP proves truly no journal — clear the neutral code only.
+            // All other LOGOUT_* (retained or stale) stay silent as before.
+            val cur = _form.value
+            if (cur.errorCode == LOGOUT_READ_RETRY) {
+                _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
+            }
+            return
+        }
         val code: String? = when (outcome) {
             PendingDeleteOutcome.COMMITTED -> null // Unreachable (handled above).
-            PendingDeleteOutcome.NO_OP -> null
+            PendingDeleteOutcome.NO_OP -> null // Unreachable (handled above).
             PendingDeleteOutcome.STALE ->
                 if (gateReady) null else "LOGOUT_STALE"
             PendingDeleteOutcome.DELETE_FAILED -> "LOGOUT_DELETE_FAILED"
             PendingDeleteOutcome.FAILED -> "LOGOUT_CLEAR_FAILED"
-            PendingDeleteOutcome.UNKNOWN -> "LOGOUT_UNKNOWN"
+            PendingDeleteOutcome.UNKNOWN -> if (journal == null) LOGOUT_READ_RETRY else "LOGOUT_UNKNOWN"
         }
         if (code != null) {
             stampLogoutError(code, journal)
         }
+    }
+
+    /**
+     * Stage D1 非破壞性重試讀取（中性碼 `LOGOUT_READ_RETRY` 專用恢復入口）。
+     *
+     * 語義：先經 [invalidateStartupSettled] 丟棄已落定輪（含 `UNKNOWN`+null 的
+     * 中性快照），再以 [launchPendingDeleteReconcile] 起唯一新鮮 worker；落定前
+     * 的 rotation 重 launch 走既有 single-flight 入列拿 join handle（不跑第二份
+     * I/O），落定後重 launch 回放該輪快照。預設 `onDone` 即 [onStartupReconcile]
+     *（生產入口讀 live gate；測試可傳自訂回調以斷言 outcome／journal）。
+     *
+     * 非破壞性：只跑 reconcile（strict 讀＋必要時 idempotent delete＋fenced clear），
+     * 絕不調 [logout]（不寫新 journal、不刪 snapshot 外的 key、不碰 [saveMutex]
+     * 外的狀態）；不碰 `logoutInFlight`；重試結果由 [onStartupReconcile] 處理：
+     * 有 journal（`DELETE_FAILED`／`FAILED`／`UNKNOWN`+J）升級 retained（帶 tag），
+     * `NO_OP` 或 `COMMITTED` 顯式清除中性碼（他碼不動），`STALE` 走既有映射。
+     *
+     * UI 綁定：呼叫方以 [startupReconcilePending] 驅動按鍵 enabled（pending 中
+     * disabled＋spinner），不得綁 `logoutInFlight`（重試讀取非登出執行）。
+     */
+    fun retryStartupReconcile(
+        onDone: (PendingDeleteOutcome, PendingDelete?) -> Unit = { outcome, journal ->
+            onStartupReconcile(outcome, journal)
+        },
+    ): Job {
+        invalidateStartupSettled()
+        return launchPendingDeleteReconcile(onDone)
     }
 
     /**

@@ -3212,12 +3212,6 @@ class ChatViewModel(
         val total = backing.countHistoryEvents(sessionId, includePartial = true)
         val dropped = (total - out.size).coerceAtLeast(0)
         return LoadedUiHistory(out.asReversed(), dropped)
-            if (page.size < HISTORY_PAGE) break
-        }
-        // Exact omitted-row total via one filtered COUNT (O(1) memory).
-        val total = backing.countHistoryEvents(sessionId, includePartial = true)
-        val dropped = (total - keptNewestFirst.size).coerceAtLeast(0)
-        return LoadedUiHistory(keptNewestFirst.asReversed(), dropped)
     }
 
     override fun onCleared() {

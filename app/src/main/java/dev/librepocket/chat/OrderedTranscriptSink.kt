@@ -257,13 +257,6 @@ class OrderedTranscriptSink(
     hasReasoning: Boolean,
   ) = writeCore(runId) { delegate.onTurnCancelled(runId, partialText, parentRunId, attemptIndex, hasReasoning) }
 
-  override suspend fun onTurnCancelled(
-    runId: String,
-    partialText: String,
-    parentRunId: String?,
-    attemptIndex: Int?,
-  ) = writeCore(runId) { delegate.onTurnCancelled(runId, partialText, parentRunId, attemptIndex) }
-
   override suspend fun onLogicalTurnCancelled(
     logicalTurnId: String,
     attemptRunId: String,

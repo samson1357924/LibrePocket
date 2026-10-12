@@ -2828,19 +2828,37 @@ class ChatSessionLifecycleTest {
             val live = sessions.awaitCreated(1)
             // Flush Main: op1's deny→stash continuation was queued before
             // this barrier, so after it the outbox deterministically holds
-            // op1 and retryableOp is op1 (not op2). The box await below would
-            // otherwise pass vacuously on op2's restore alone.
+            // op1. Retry keeps newer-wins priority (setRetryableIfNewer), so
+            // its target is the box-tagged op2 rather than the stashed op1;
+            // the box await below would otherwise pass vacuously on op2's
+            // restore alone.
             chatMain.run { }
             // First op denies into the occupied box: stashed, not deleted.
             withTimeout(5_000) { vm.input.first { it == "same" } }
+            // R13: prove BOTH denials completed before retrying. The input
+            // gate above can be satisfied by op2's restore alone; only op1's
+            // stash into the occupied box raises recovery 0→1, so this gate
+            // is the deterministic proof that op1 is parked in the outbox.
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
             assertTrue(live.sent.isEmpty())
 
             deny.set(false)
-            // Retry sends one intent; the box keeps the other identical text.
+            // Retry adopts the box-tagged (newer) intent under its own opId
+            // and clears the box synchronously; the stashed twin drains back
+            // only after the admitted turn's host completes. Gate the box
+            // assert on that drain — asserting immediately after `sent`
+            // appears races host.join/drain and flakes by scheduling. The two
+            // texts are identical by design (string equality must never drive
+            // ownership), so target correctness is proven structurally below:
+            // exactly one admission, the twin preserved in the box, and both
+            // delivered after the explicit send — any cross-consume would
+            // surface as loss or duplication.
             chatMain.run { vm.retry() }
             withTimeout(5_000) {
                 while (live.sent.isEmpty()) delay(1)
             }
+            assertEquals(listOf("same"), live.sent.toList())
+            withTimeout(5_000) { vm.input.first { it == "same" } }
             assertEquals(listOf("same"), live.sent.toList())
             assertEquals("same", vm.input.value)
             withTimeout(5_000) { live.sendFinished.await() }

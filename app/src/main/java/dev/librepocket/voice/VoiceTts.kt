@@ -10,7 +10,8 @@ import java.util.Locale
  * - 分段上限 [MAX_CHUNK_CHARS] = 4000 字（`TextToSpeech.speak` 長文截斷防線）；
  * - 語言回退鏈：`zh-TW` → `zh-CN` → 列出 voices 找 `zh` 前綴。
  * - 失敗話術：[ttsFallbackMessage]（與 [VoiceStt.fallbackMessage] 對稱，
- *   原因碼原文引用）；引擎探測：[hasEngine]。
+ *   原因碼原文引用）；缺中文語料走非失敗的降級提醒
+ *   [ttsLanguageWarningMessage]（不以「做不到」開頭）；引擎探測：[hasEngine]。
  */
 object VoiceTts {
 
@@ -72,6 +73,25 @@ object VoiceTts {
             detail = detail,
             alternative = VoiceTools.FALLBACK_TTS_HINT,
             needFromUser = "直接看螢幕上的文字",
+        )
+
+    /**
+     * 缺中文語料的降級提醒（非播放失敗，不以「做不到」開頭）：
+     * 引擎可用、朗讀仍會繼續，只是腔調可能非中文。
+     * 仍帶原因碼／細分碼以便觀測（與失敗通道同格式前綴）。
+     */
+    const val LANG_FALLBACK_HINT = "語音可能非中文腔，但會繼續用系統語音朗讀"
+
+    fun ttsLanguageWarningMessage(
+        reason: DenyReason,
+        detail: String = DETAIL_LANG_UNAVAILABLE,
+    ): String =
+        S1bFallback.warning(
+            what = "語音輸出（$detail）",
+            reason = reason,
+            detail = detail,
+            hint = LANG_FALLBACK_HINT,
+            needFromUser = "直接聽朗讀，必要時看螢幕上的文字",
         )
 
     /**

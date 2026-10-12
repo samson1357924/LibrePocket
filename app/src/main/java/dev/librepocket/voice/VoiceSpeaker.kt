@@ -21,9 +21,12 @@ import java.util.UUID
  * 初始化為非同步：[speak] 在成功回呼前只保留最新待播文字。初始化失敗時清除待播文字並記下原始 detail（NO_ENGINE／INIT_FAILED），後續 [speak] 沿用該 detail 揭露；本類別不提供重新初始化引擎的 API。
  *
  * 可觀察性（Stage2）：引擎可用性探測（[VoiceTts.hasEngine]，空引擎表視為初始化失敗，
- * fail-closed）與初始化／listener 掛載／語言／朗讀／utterance 失敗一律經 [onError] 揭露，
- * 不再靜默吞錯。Listener 在鎖外呼叫；lifecycle 語義（epoch/pending/terminal
- * fence）與 Stage1 一致。
+ * fail-closed）與初始化／listener 掛載／朗讀／utterance 失敗一律經 [onError] 揭露，
+ * 不再靜默吞錯。缺中文語料走非失敗的降級提醒（[VoiceTts.ttsLanguageWarningMessage]，
+ * 不以「做不到」開頭，仍標 ready 繼續朗讀）；初始化時語言提醒與待播朗讀失敗
+ * 會各別發出（警告在前、失敗在後），不互相覆蓋。Listener 在鎖外呼叫；lifecycle 語義（epoch/pending/terminal
+ * fence）與 Stage1 一致；utterance 回呼以 utteranceId＋epoch 追蹤，
+ * stop／shutdown 後的遲到錯誤與重複同 id 錯誤不揭露。
  */
 class VoiceSpeaker(
     appContext: Context,
@@ -44,11 +47,18 @@ class VoiceSpeaker(
     private var speechEpoch = 0L
     private var pending: PendingSpeech? = null
 
+    /**
+     * 已送引擎的 utterance 追蹤（utteranceId → 送出時的 [speechEpoch]）與
+     * 已揭露集合（同 id 只報一次）。一律在 [lifecycleLock] 內讀寫。
+     */
+    private val utteranceEpochs = mutableMapOf<String, Long>()
+    private val reportedUtteranceIds = mutableSetOf<String>()
+
     private data class PendingSpeech(val text: String, val epoch: Long)
 
     init {
         val engine = TextToSpeech(context) { status ->
-            val initError: String? = synchronized(lifecycleLock) {
+            val initErrors: List<String> = synchronized(lifecycleLock) {
                 val initializedEngine = tts
                 if (initializedEngine == null) {
                     // TextToSpeech is allowed to call back from its constructor. Defer that result
@@ -56,15 +66,15 @@ class VoiceSpeaker(
                     if (!initCallbackHandled && deferredInitStatus == null) {
                         deferredInitStatus = status
                     }
-                    null
+                    emptyList()
                 } else {
                     handleInitLocked(initializedEngine, status)
                 }
             }
-            if (initError != null) emitError(initError)
+            initErrors.forEach { emitError(it) }
         }
         val listenerError: String?
-        val deferredError: String?
+        val deferredErrors: List<String>
         synchronized(lifecycleLock) {
             listenerError = try {
                 val listenerStatus =
@@ -73,10 +83,10 @@ class VoiceSpeaker(
                         override fun onDone(utteranceId: String?) = Unit
                         @Deprecated("Deprecated in Java")
                         override fun onError(utteranceId: String?) {
-                            reportUtteranceError()
+                            reportUtteranceError(utteranceId)
                         }
                         override fun onError(utteranceId: String?, errorCode: Int) {
-                            reportUtteranceError()
+                            reportUtteranceError(utteranceId)
                         }
                     })
                 if (listenerStatus == TextToSpeech.ERROR) {
@@ -90,10 +100,10 @@ class VoiceSpeaker(
             tts = engine
             val callbackStatus = deferredInitStatus
             deferredInitStatus = null
-            deferredError = if (callbackStatus != null) handleInitLocked(engine, callbackStatus) else null
+            deferredErrors = if (callbackStatus != null) handleInitLocked(engine, callbackStatus) else emptyList()
         }
         if (listenerError != null) emitError(listenerError)
-        if (deferredError != null) emitError(deferredError)
+        deferredErrors.forEach { emitError(it) }
     }
 
     /** 朗讀正文，交由 Android 系統 TTS；離線能力及資料處理取決於已安裝的語音引擎。 */
@@ -124,6 +134,10 @@ class VoiceSpeaker(
             if (terminal) return
             speechEpoch++
             pending = null
+            // 舊 utterance 已被 QUEUE_FLUSH 語義或引擎 stop 丟棄：遲到錯誤不再揭露。
+            val evicted = utteranceEpochs.keys.toSet()
+            utteranceEpochs.clear()
+            reportedUtteranceIds.removeAll(evicted)
             try {
                 tts?.stop()
             } catch (_: Exception) {
@@ -140,6 +154,8 @@ class VoiceSpeaker(
             ready = false
             speechEpoch++
             pending = null
+            utteranceEpochs.clear()
+            reportedUtteranceIds.clear()
             val engine = tts ?: return
             try {
                 engine.stop()
@@ -152,14 +168,19 @@ class VoiceSpeaker(
         }
     }
 
-    private fun handleInitLocked(engine: TextToSpeech, status: Int): String? {
-        if (terminal || initCallbackHandled) return null
+    /**
+     * 初始化回呼本體（呼叫方持有 [lifecycleLock]；回傳待揭露訊息，
+     * 呼叫方在鎖外依序發出）。語言降級提醒與待播朗讀失敗各別回傳、
+     * 互不覆蓋（警告在前、失敗在後）。
+     */
+    private fun handleInitLocked(engine: TextToSpeech, status: Int): List<String> {
+        if (terminal || initCallbackHandled) return emptyList()
         initCallbackHandled = true
         if (status != TextToSpeech.SUCCESS) {
             initFailureDetail = VoiceTts.DETAIL_INIT_FAILED
             pending = null
             speechEpoch++
-            return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_INIT_FAILED)
+            return listOf(VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_INIT_FAILED))
         }
 
         // 引擎可用性探測：引擎表為空即無可用引擎，視為初始化失敗（fail-closed）。
@@ -174,10 +195,10 @@ class VoiceSpeaker(
             initFailureDetail = VoiceTts.DETAIL_NO_ENGINE
             pending = null
             speechEpoch++
-            return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_NO_ENGINE)
+            return listOf(VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_NO_ENGINE))
         }
 
-        val langError = applyLanguage(engine)
+        val langWarning = applyLanguage(engine)
         ready = true
         val queued = pending
         pending = null
@@ -185,11 +206,11 @@ class VoiceSpeaker(
         if (queued != null && queued.epoch == speechEpoch) {
             speakError = speakInternalLocked(engine, queued.text)
         }
-        return langError ?: speakError
+        return listOfNotNull(langWarning, speakError)
     }
 
     /**
-     * 語言回退套用；失敗回錯誤話術（呼叫方在鎖外經 [onError] 揭露），
+     * 語言回退套用；缺中文語料回降級提醒（非播放失敗，呼叫方在鎖外經 [onError] 揭露），
      * 仍標 `ready`（lifecycle 語義不變：引擎可用，缺中文語料仍可送引擎）。
      */
     private fun applyLanguage(engine: TextToSpeech): String? {
@@ -211,47 +232,77 @@ class VoiceSpeaker(
             } catch (_: Exception) {
                 emptyList()
             },
-        ) ?: return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_LANG_UNAVAILABLE)
+        ) ?: return VoiceTts.ttsLanguageWarningMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_LANG_UNAVAILABLE)
         val applied = try {
             engine.setLanguage(resolved)
         } catch (_: Exception) {
-            return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_LANG_UNAVAILABLE)
+            return VoiceTts.ttsLanguageWarningMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_LANG_UNAVAILABLE)
         }
         return when (applied) {
             TextToSpeech.LANG_AVAILABLE,
             TextToSpeech.LANG_COUNTRY_AVAILABLE,
             TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE,
             -> null
-            else -> VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_LANG_UNAVAILABLE)
+            else -> VoiceTts.ttsLanguageWarningMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_LANG_UNAVAILABLE)
         }
     }
 
-    /** Caller holds [lifecycleLock] for the complete chunk sequence so stop cannot split it. */
+    /**
+     * Caller holds [lifecycleLock] for the complete chunk sequence so stop cannot split it.
+     *
+     * 每段以實際傳給 `engine.speak` 的同一個 utteranceId 追蹤（utteranceId → 當前 epoch），
+     * 供遲到的 utterance onError 在同一臨界區內校驗。首段 QUEUE_FLUSH 會取代舊 utterance，
+     * 故先移除舊追蹤，使其遲到錯誤不再揭露。送入失敗的段不留追蹤（引擎不會為它回呼）。
+     */
     private fun speakInternalLocked(engine: TextToSpeech, text: String): String? {
         val chunks = try {
             VoiceTts.split(text, maxChunk)
         } catch (_: Exception) {
             return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED)
         }
+        val evicted = utteranceEpochs.keys.toSet()
+        utteranceEpochs.clear()
+        reportedUtteranceIds.removeAll(evicted)
         chunks.forEachIndexed { index, chunk ->
             val mode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
             val params = Bundle()
+            val utteranceId = "${UUID.randomUUID()}"
+            utteranceEpochs[utteranceId] = speechEpoch
             val status = try {
-                engine.speak(chunk, mode, params, "${UUID.randomUUID()}")
+                engine.speak(chunk, mode, params, utteranceId)
             } catch (_: Exception) {
+                utteranceEpochs.remove(utteranceId)
                 return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED)
             }
             if (status != TextToSpeech.SUCCESS) {
+                utteranceEpochs.remove(utteranceId)
                 return VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED)
             }
         }
         return null
     }
 
-    /** Utterance 失敗轉送失敗通道；terminal 後的遲到回呼不揭露（fence 語義不變）。 */
-    private fun reportUtteranceError() {
-        val suppressed = synchronized(lifecycleLock) { terminal }
-        if (!suppressed) {
+    /**
+     * Utterance 失敗轉送失敗通道。同一臨界區內完成「id 存在＋epoch 相符＋未重複報錯」
+     * 校驗與標記，emit 在鎖外。terminal 後、stop／shutdown 後（epoch 不符）、
+     * 未知／空 id、同一 id 重複的遲到回呼一律不揭露。
+     */
+    private fun reportUtteranceError(utteranceId: String?) {
+        val shouldEmit = synchronized(lifecycleLock) {
+            if (terminal) {
+                false
+            } else if (utteranceId == null) {
+                false
+            } else {
+                val epoch = utteranceEpochs[utteranceId] ?: return@synchronized false
+                if (epoch != speechEpoch) {
+                    false
+                } else {
+                    reportedUtteranceIds.add(utteranceId)
+                }
+            }
+        }
+        if (shouldEmit) {
             emitError(VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED))
         }
     }

@@ -248,14 +248,13 @@ class VoiceSpeakerLifecycleTest {
         val speaker = newSpeaker(onError = { errors += it })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
 
-        val listener = requireNotNull(shadow.utteranceListener)
-        listener.onError("u1", TextToSpeech.ERROR)
-        @Suppress("DEPRECATION")
-        listener.onError("u1")
+        requireNotNull(shadow.utteranceListener).onError(utteranceId, TextToSpeech.ERROR)
 
         assertEquals(
-            2,
+            1,
             errors.count {
                 it.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.contains("NO_PRIVILEGE")
             },
@@ -264,8 +263,141 @@ class VoiceSpeakerLifecycleTest {
     }
 
     @Test
+    fun utteranceError_unknownId_isSuppressed() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError("never-submitted-id", TextToSpeech.ERROR)
+        @Suppress("DEPRECATION")
+        listener.onError("never-submitted-id")
+        @Suppress("DEPRECATION")
+        listener.onError(null)
+
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+        speaker.shutdown()
+    }
+
+    @Test
+    fun utteranceError_duplicateId_isDeduped() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+        @Suppress("DEPRECATION")
+        listener.onError(utteranceId)
+
+        assertEquals(
+            1,
+            errors.count {
+                it.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        speaker.shutdown()
+    }
+
+    @Test
+    fun utteranceError_afterStop_isSuppressed() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        speaker.stop()
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+        @Suppress("DEPRECATION")
+        listener.onError(utteranceId)
+
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+        speaker.shutdown()
+    }
+
+    @Test
+    fun utteranceError_afterShutdown_isSuppressed() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        speaker.shutdown()
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+        @Suppress("DEPRECATION")
+        listener.onError(utteranceId)
+
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+    }
+
+    @Test
+    fun utteranceError_withRealChunkUtteranceId_isObservableEndToEnd() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            maxChunk = 3,
+            onError = { errors += it },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("abcdef")
+
+        assertEquals(listOf("abc", "def"), shadow.spokenTextList)
+        assertEquals(2, shadow.utteranceIds.size)
+        val secondId = requireNotNull(shadow.utteranceIds[1])
+        assertTrue(secondId.isNotBlank())
+        requireNotNull(shadow.utteranceListener).onError(secondId, TextToSpeech.ERROR)
+
+        assertEquals(
+            1,
+            errors.count {
+                it.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        speaker.shutdown()
+    }
+
+    @Test
+    fun initLanguageWarningAndPendingSpeakFailure_bothEmittedWarningFirst() {
+        ControlledTextToSpeechShadow.failLanguageLookup = true
+        ControlledTextToSpeechShadow.failSpeak = true
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { errors += it })
+        speaker.speak("pending before init")
+        val shadow = currentTtsShadow()
+
+        initSuccessfully(shadow)
+
+        assertTrue(shadow.spokenTextList.isEmpty())
+        assertEquals("errors=$errors", 2, errors.size)
+        assertTrue(
+            "errors=$errors",
+            errors[0].contains(VoiceTts.DETAIL_LANG_UNAVAILABLE) &&
+                errors[0].contains("NO_PRIVILEGE") &&
+                errors[0].contains(VoiceTts.LANG_FALLBACK_HINT),
+        )
+        assertFalse("errors=$errors", errors[0].contains("做不到"))
+        assertTrue(
+            "errors=$errors",
+            errors[1].contains(VoiceTts.DETAIL_SPEAK_FAILED) && errors[1].contains("NO_PRIVILEGE"),
+        )
+        speaker.shutdown()
+    }
+
+    @Test
     fun langUnavailable_isObservableButSpeakerStaysReady() {
-        // 預設 shadow 無中文語料時：揭露 LANG_UNAVAILABLE，但 ready 語義不變（仍可朗讀）。
+        // 缺中文語料走降級提醒（非播放失敗：不以「做不到」開頭），但 ready 語義不變（仍可朗讀）。
         ControlledTextToSpeechShadow.failLanguageLookup = true
         val errors = CopyOnWriteArrayList<String>()
         val speaker = newSpeaker(onError = { errors += it })
@@ -278,9 +410,17 @@ class VoiceSpeakerLifecycleTest {
         assertTrue(
             "errors=$errors",
             errors.any {
-                it.contains(VoiceTts.DETAIL_LANG_UNAVAILABLE) && it.contains("NO_PRIVILEGE")
+                it.contains(VoiceTts.DETAIL_LANG_UNAVAILABLE) &&
+                    it.contains("NO_PRIVILEGE") &&
+                    it.contains(VoiceTts.LANG_FALLBACK_HINT) &&
+                    !it.contains("做不到")
             },
         )
+        assertTrue(
+            "errors=$errors",
+            errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) },
+        )
+        speaker.shutdown()
     }
 
     @Test
@@ -426,6 +566,8 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
     val stopEntered = CountDownLatch(1)
     val events = CopyOnWriteArrayList<String>()
     val queueModes = CopyOnWriteArrayList<Int>()
+    /** 實際傳給 `speak` 的 utteranceId（與引擎收到為同一套，供真實 id 端到端斷言）。 */
+    val utteranceIds = CopyOnWriteArrayList<String?>()
 
     @Volatile
     var utteranceListener: UtteranceProgressListener? = null
@@ -476,6 +618,7 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
     ): Int {
         events += "speak:$text"
         queueModes += queueMode
+        utteranceIds += utteranceId
         if (throwOnSpeak) throw RuntimeException("fake speak failure")
         if (failSpeak) return TextToSpeech.ERROR
         val result = super.speak(text, queueMode, params, utteranceId)

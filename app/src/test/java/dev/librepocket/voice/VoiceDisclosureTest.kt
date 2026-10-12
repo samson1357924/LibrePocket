@@ -29,6 +29,14 @@ class VoiceDisclosureTest {
 
     // ---- 失敗話術 ----
 
+    @Test fun ttsLanguageWarning_isDowngradeNotFailure() {
+        val msg = VoiceTts.ttsLanguageWarningMessage(DenyReason.NO_PRIVILEGE)
+        assertTrue("msg=$msg", msg.contains("NO_PRIVILEGE"))
+        assertTrue("msg=$msg", msg.contains(VoiceTts.DETAIL_LANG_UNAVAILABLE))
+        assertTrue("msg=$msg", msg.contains(VoiceTts.LANG_FALLBACK_HINT))
+        assertFalse("msg=$msg", msg.contains("做不到"))
+    }
+
     @Test fun ttsFallbackMessage_quotesReasonCode() {
         for (detail in listOf(
             VoiceTts.DETAIL_NO_ENGINE,

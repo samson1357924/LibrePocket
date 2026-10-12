@@ -65,6 +65,13 @@ export const MAX_REVIEWS_PER_SHA = 2;
 // APPROVE, deterministic BLOCK may still NEEDS_CHANGES). Truncated reviews
 // carry honest shown/total counts; issues never consume the PR quota.
 export const MAX_ISSUE_CONTEXT_LENGTH = 20000;
+// P6 two-layer diagnosis budgets: at most 10 default-branch files, 6000
+// chars each, 30000 chars total. Over-budget files are truncated (the
+// truncation flag travels in the snippet header); any fetch failure aborts the second layer (the first-round
+// result stands).
+export const MAX_ISSUE_CODE_FILES = 10;
+export const MAX_ISSUE_CODE_CHARS_PER_FILE = 6000;
+export const MAX_ISSUE_CODE_TOTAL_CHARS = 30000;
 export const MAX_STICKY_SUMMARY_LENGTH = 2000;
 export const MAX_STICKY_FINDINGS_PER_ROLE = 20;
 // Phase 3 (P2 #3): whole-sticky hard budget. GitHub issue/PR comments reject
@@ -2175,6 +2182,13 @@ export interface RunnerIssueOutput {
     shownComments: number;
     totalComments: number;
   };
+  // P6 proof of the second-layer code read: default-branch paths reviewed
+  // with shown/total chars. Absent when the second layer never ran.
+  codeRefs?: Array<{
+    path: string;
+    shownChars: number;
+    totalChars: number;
+  }>;
 }
 
 function issueRulesTags(title: string): string[] {
@@ -2235,6 +2249,81 @@ export function issueContentFingerprint(title: string, body: string, comments: s
   }
   const normalized = JSON.stringify(payload);
   return createHash('sha256').update(normalized, 'utf8').digest('hex');
+}
+
+// P6 second-layer code access: read-only file reads from the trusted
+// default branch only (never a PR/issue-supplied ref, never executed).
+// Paths are validated literally (no traversal, no absolute paths, no
+// pathspec magic) and must survive the same review-file filter as diffs, so
+// keystores, build outputs, and binaries are never fetched. Returns
+// undefined when anything is invalid or any fetch fails, in which case the
+// caller keeps the first-round result.
+export interface IssueCodeRef {
+  path: string;
+  content: string;
+  truncated: boolean;
+  totalChars: number;
+}
+
+export function isIssueCodeRefAllowed(rawPath: string): boolean {
+  if (typeof rawPath !== 'string') return false;
+  const trimmed = rawPath.trim();
+  if (!trimmed || trimmed.length > 256) return false;
+  if (trimmed.startsWith('/') || trimmed.startsWith('\\')) return false;
+  const normalized = trimmed.replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!normalized) return false;
+  const segments = normalized.split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) return false;
+  if (/[:*?[\](){}!$`'"\\\s]/.test(normalized)) return false;
+  if (/[\u0000-\u001f\u007f]/.test(normalized)) return false;
+  return filterReviewDiffFiles([normalized]).length === 1;
+}
+
+export function resolveIssueCodeRef(ref: unknown): string | undefined {
+  if (typeof ref !== 'string') return undefined;
+  const trimmed = ref.trim();
+  if (!trimmed || trimmed.length > 64) return undefined;
+  // Defense in depth: the ref comes from trusted event metadata, but a
+  // leading dash/dot/slash must never reach git as a potential option.
+  if (/^[-+./]/.test(trimmed)) return undefined;
+  if (!/^[A-Za-z0-9_.\-/]+$/.test(trimmed) || trimmed.includes('..')) return undefined;
+  return trimmed;
+}
+
+export function fetchIssueCodeRefs(
+  runGit: (args: string[]) => string,
+  ref: unknown,
+  paths: string[],
+): IssueCodeRef[] | undefined {
+  const branch = resolveIssueCodeRef(ref);
+  if (!branch) return undefined;
+  const out: IssueCodeRef[] = [];
+  let total = 0;
+  // The 10-file cap applies before allowlist filtering: a list whose first
+  // 10 entries are all illegal skips the second layer (fail-closed).
+  for (const raw of paths.slice(0, MAX_ISSUE_CODE_FILES)) {
+    if (!isIssueCodeRefAllowed(raw)) {
+      // Never log raw paths: they are model-controlled.
+      console.warn('[PocketGuard] Discarded 1 issue code reference outside the allowlist.');
+      continue;
+    }
+    const normalized = raw.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+    let text: string;
+    try {
+      text = runGit(['show', `${branch}:${normalized}`]);
+    } catch {
+      return undefined;
+    }
+    if (!text) return undefined;
+    const redacted = redactForModel(text);
+    const remaining = Math.max(0, MAX_ISSUE_CODE_TOTAL_CHARS - total);
+    const budget = Math.min(MAX_ISSUE_CODE_CHARS_PER_FILE, remaining);
+    const content = redacted.length > budget ? redacted.slice(0, budget) : redacted;
+    out.push({ path: normalized, content, truncated: redacted.length > content.length, totalChars: redacted.length });
+    total += content.length;
+    if (total >= MAX_ISSUE_CODE_TOTAL_CHARS) break;
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 // Deterministic BLOCK for issues (fail-closed NEEDS_CHANGES even when the
@@ -2403,6 +2492,7 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
       },
       findings: [],
       ...(issue.truncation ? { truncation: issue.truncation } : {}),
+      ...(issue.codeRefs ? { codeRefs: issue.codeRefs } : {}),
       tags: issue.tags,
       summary: issue.summary,
       time,
@@ -2568,7 +2658,7 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   if (
-    Object.keys(raw).some((key) => !['verdict', 'issueNumber', 'title', 'tags', 'summary', 'suggestedLabels', 'fingerprint', 'commentsComplete', 'truncation'].includes(key)) ||
+    Object.keys(raw).some((key) => !['verdict', 'issueNumber', 'title', 'tags', 'summary', 'suggestedLabels', 'fingerprint', 'commentsComplete', 'truncation', 'codeRefs'].includes(key)) ||
     !['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE'].includes(String(raw.verdict)) ||
     !Number.isSafeInteger(raw.issueNumber) || Number(raw.issueNumber) < 1 ||
     typeof raw.title !== 'string' || typeof raw.summary !== 'string' ||
@@ -2610,6 +2700,30 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
   // (truncated content cannot approve); a forged combination is rejected so
   // publish can never show APPROVE next to a Truncated line.
   if (truncation && raw.verdict === 'APPROVE') return undefined;
+  // Optional second-layer proof: validated paths with sane counts. Malformed
+  // proofs reject; a present proof never lifts any gate.
+  let codeRefs: RunnerIssueOutput['codeRefs'];
+  if (raw.codeRefs !== undefined) {
+    if (!Array.isArray(raw.codeRefs) || raw.codeRefs.length === 0 || raw.codeRefs.length > MAX_ISSUE_CODE_FILES) return undefined;
+    const refs: NonNullable<RunnerIssueOutput['codeRefs']> = [];
+    let shownTotal = 0;
+    for (const entry of raw.codeRefs) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
+      const ref = entry as Record<string, unknown>;
+      if (
+        Object.keys(ref).some((key) => !['path', 'shownChars', 'totalChars'].includes(key)) ||
+        typeof ref.path !== 'string' || !isIssueCodeRefAllowed(ref.path) ||
+        !Number.isSafeInteger(ref.shownChars) || Number(ref.shownChars) < 0 ||
+        !Number.isSafeInteger(ref.totalChars) || Number(ref.totalChars) < 0 ||
+        Number(ref.shownChars) > Number(ref.totalChars) ||
+        Number(ref.shownChars) > MAX_ISSUE_CODE_CHARS_PER_FILE
+      ) return undefined;
+      shownTotal += Number(ref.shownChars);
+      refs.push({ path: ref.path, shownChars: Number(ref.shownChars), totalChars: Number(ref.totalChars) });
+    }
+    if (shownTotal > MAX_ISSUE_CODE_TOTAL_CHARS) return undefined;
+    codeRefs = refs;
+  }
   return {
     verdict: raw.verdict as RunnerVerdict,
     issueNumber: Number(raw.issueNumber),
@@ -2622,6 +2736,7 @@ export function validateIssueOutput(value: unknown): RunnerIssueOutput | undefin
     fingerprint: raw.fingerprint,
     commentsComplete: raw.commentsComplete,
     ...(truncation ? { truncation } : {}),
+    ...(codeRefs ? { codeRefs } : {}),
   };
 }
 
@@ -3036,17 +3151,68 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
   }
   const restoreFetch = installOpenAIStub(env);
   try {
-    const { triageIssue } = await import('./orchestrator');
+    const { triageIssue, diagnoseIssue } = await import('./orchestrator');
     const triaged = await triageIssue({
       input: { title: built.title, body: built.body, comments: built.comments },
       env,
       allowedOrigins: parseAllowedOrigins(env),
     });
-    const aiRaw = Array.isArray(triaged.suggestedLabels) ? triaged.suggestedLabels : [];
+    // P6 second layer: when the first round names readable files and the
+    // verdict is not already fixed, fetch them read-only from the trusted
+    // default branch and diagnose with code. The final verdict is the
+    // stricter of both rounds; labels union before the allowlist gate.
+    // Anything invalid (bad ref/paths, fetch failure, diagnosis failure)
+    // keeps the first-round result.
+    let roundVerdict = triaged.verdict;
+    let roundSummary = triaged.summary;
+    let aiRaw = Array.isArray(triaged.suggestedLabels) ? triaged.suggestedLabels : [];
+    let codeRefsProof: RunnerIssueOutput['codeRefs'];
+    if (!deterministicBlock && triaged.verdict !== 'NEEDS_CHANGES' && triaged.codeRefs.length > 0) {
+      const runGit = context.runGit ?? defaultGit;
+      const snippets = fetchIssueCodeRefs(runGit, event.repository?.default_branch, triaged.codeRefs);
+      if (snippets) {
+        codeRefsProof = snippets.map((snippet) => ({
+          path: snippet.path,
+          shownChars: snippet.content.length,
+          totalChars: snippet.totalChars,
+        }));
+        const diagnosed = await diagnoseIssue({
+          input: {
+            title: built.title,
+            body: built.body,
+            comments: built.comments,
+            firstRoundVerdict: triaged.verdict,
+            firstRoundSummary: triaged.summary,
+            codeRefs: snippets.map((snippet) => ({
+              path: snippet.path,
+              content: snippet.content,
+              truncated: snippet.truncated,
+              totalChars: snippet.totalChars,
+            })),
+          },
+          env,
+          allowedOrigins: parseAllowedOrigins(env),
+        });
+        const strictness: Record<RunnerVerdict, number> = { NEEDS_CHANGES: 2, INCONCLUSIVE: 1, APPROVE: 0 };
+        // A failed diagnosis (ok:false) never changes the first-round
+        // result; only a successful diagnosis combines stricter-wins.
+        if (!diagnosed.ok) {
+          // Keep round one entirely.
+        } else if (strictness[diagnosed.verdict] > strictness[roundVerdict]) {
+          roundVerdict = diagnosed.verdict;
+          if (diagnosed.summary) roundSummary = diagnosed.summary;
+        } else if (diagnosed.verdict === roundVerdict && diagnosed.summary) {
+          roundSummary = diagnosed.summary;
+        }
+        if (diagnosed.ok && Array.isArray(diagnosed.suggestedLabels)) {
+          aiRaw = [...aiRaw, ...diagnosed.suggestedLabels.filter((entry): entry is string => typeof entry === 'string')];
+        }
+      }
+    }
     const { merged, hadIllegal } = mergeIssueRulesWithAiSuggestions(issueRulesTags(title), aiRaw);
     // Deterministic needs-decision for non-APPROVE cannot be cleared by AI.
     // Phase 2 (H): deterministic BLOCK forces NEEDS_CHANGES (never APPROVE).
-    let verdict = triaged.verdict;
+    let verdict = roundVerdict;
     if (deterministicBlock) verdict = 'NEEDS_CHANGES';
     if (hadIllegal && verdict === 'APPROVE') verdict = 'INCONCLUSIVE';
     const tags = hadIllegal
@@ -3057,10 +3223,11 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       issueNumber,
       title: safeString(title),
       tags,
-      summary: triaged.summary,
+      summary: safeString(roundSummary),
       suggestedLabels: aiRaw.filter((entry): entry is string => typeof entry === 'string'),
       fingerprint,
       commentsComplete: built.commentsComplete,
+      ...(codeRefsProof ? { codeRefs: codeRefsProof } : {}),
     };
     saveIssueOutput(output, context);
     return output;
@@ -3831,6 +3998,9 @@ export function issueReviewComment(output: RunnerIssueOutput, appliedLabels: str
   const truncationLine = output.truncation
     ? `Truncated: showing ${output.truncation.shownChars}/${output.truncation.totalChars} chars, ${output.truncation.shownComments}/${output.truncation.totalComments} comments (${output.truncation.totalChars - output.truncation.shownChars} chars omitted)`
     : 'Segments: single segment (complete)';
+  const codeLine = output.codeRefs && output.codeRefs.length > 0
+    ? truncateStickyText(`Code: ${output.codeRefs.length} file(s) reviewed (${output.codeRefs.map((ref) => ref.path).join(', ')})`, 500)
+    : undefined;
   const boundedSummary = truncateStickyText(output.summary || '', MAX_STICKY_SUMMARY_LENGTH);
   const issueBody = [
     REVIEW_MARKER,
@@ -3844,6 +4014,7 @@ export function issueReviewComment(output: RunnerIssueOutput, appliedLabels: str
     `Label decision: ${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join(', ') : 'none'}`,
     `Revision fingerprint: \`${output.fingerprint}\``,
     truncationLine,
+    ...(codeLine ? [escapeMarkdown(codeLine)] : []),
     `Updated: ${updatedAt}`,
     reportLine ?? formatReportLine(process.env, false),
     '',

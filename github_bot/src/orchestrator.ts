@@ -229,6 +229,10 @@ export interface IssueTriageResult {
   // record). Missing field defaults to []; a present-but-invalid field falls
   // back to INCONCLUSIVE with [].
   suggestedLabels: string[];
+  // P6: default-branch file paths the model wants read for diagnosis.
+  // Missing field defaults to [] (no second round); a present-but-invalid
+  // field falls back to INCONCLUSIVE like any other schema violation.
+  codeRefs: string[];
 }
 
 export interface TriageIssueOptions {
@@ -251,8 +255,19 @@ export interface TriageIssueOptions {
 // any failure (missing config, transport, or schema) falls back to
 // INCONCLUSIVE with an empty summary and no suggestions; callers pair it
 // with rules-only tags.
+export function parseIssueCodeRefs(value: unknown): string[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return undefined;
+  const refs: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || !entry.trim()) return undefined;
+    refs.push(entry.trim());
+  }
+  return refs;
+}
+
 export async function triageIssue(options: TriageIssueOptions): Promise<IssueTriageResult> {
-  const fallback: IssueTriageResult = { verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [] };
+  const fallback: IssueTriageResult = { verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [], codeRefs: [] };
   try {
     const env = options.env ?? process.env;
     const promptDirectory = options.promptDirectory ?? path.resolve(__dirname, '../prompts');
@@ -281,16 +296,19 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
     const parsed = parseJsonObject(result.content);
     if (
       !parsed ||
-      Object.keys(parsed).some((key) => !['verdict', 'summary', 'suggestedLabels'].includes(key)) ||
+      Object.keys(parsed).some((key) => !['verdict', 'summary', 'suggestedLabels', 'codeRefs'].includes(key)) ||
       !VERDICTS.has(parsed.verdict as ReviewVerdict) ||
       typeof parsed.summary !== 'string'
     ) return fallback;
     const suggestedLabels = parseSuggestedLabelsStrict(parsed.suggestedLabels);
     if (!suggestedLabels) return fallback;
+    const codeRefs = parseIssueCodeRefs(parsed.codeRefs);
+    if (!codeRefs) return fallback;
     return {
       verdict: parsed.verdict as ReviewVerdict,
       summary: redactSensitiveText(parsed.summary).slice(0, MAX_TEXT_LENGTH),
       suggestedLabels,
+      codeRefs,
     };
   } catch {
     return fallback;
@@ -477,5 +495,94 @@ export async function synthesizeReview(options: SynthesizeReviewOptions): Promis
     return parseSynthesisResponse(result.modelId, result.content) ?? { ok: false, modelUsed: redactSensitiveText(result.modelId), verdict: 'INCONCLUSIVE', findings: [], evidences: [], summary: '' };
   } catch {
     return { ok: false, modelUsed: redactSensitiveText(modelUsed), verdict: 'INCONCLUSIVE', findings: [], evidences: [], summary: '' };
+  }
+}
+
+// P6 second-layer issue diagnosis: runs only when the first-round triage
+// names readable default-branch files. The diagnosis sees the same issue
+// text plus the fetched code; its verdict is combined stricter-wins with the
+// first round by the caller. Any failure (missing config, transport, or
+// schema) falls back to INCONCLUSIVE so the caller keeps the first-round
+// result; a diagnosis never loosens on its own.
+export interface IssueCodeSnippet {
+  path: string;
+  content: string;
+  truncated: boolean;
+  totalChars: number;
+}
+
+export interface IssueDiagnosisInput extends IssueTriageInput {
+  firstRoundVerdict: ReviewVerdict;
+  firstRoundSummary: string;
+  codeRefs: IssueCodeSnippet[];
+}
+
+export interface IssueDiagnosis {
+  ok: boolean;
+  verdict: ReviewVerdict;
+  summary: string;
+  suggestedLabels: string[];
+}
+
+export interface DiagnoseIssueOptions {
+  input: IssueDiagnosisInput;
+  env?: OpenAIEnvironment;
+  promptDirectory?: string;
+  allowedOrigins?: string[];
+  timeoutMs?: number;
+}
+
+function diagnosisUserPrompt(input: IssueDiagnosisInput): string {
+  const code = input.codeRefs.map((ref) =>
+    [
+      `File: ${ref.path} (${ref.content.length}/${ref.totalChars} chars${ref.truncated ? ', truncated' : ''})`,
+      ref.content,
+    ].join('\n'),
+  );
+  return [
+    `Title: ${redactForModel(input.title)}`,
+    `Body: ${redactForModel(input.body)}`,
+    ...input.comments.map((comment) => `Comment: ${redactForModel(comment)}`),
+    `First-round verdict: ${input.firstRoundVerdict}`,
+    `First-round summary: ${redactForModel(input.firstRoundSummary)}`,
+    'Code excerpts (read-only, may be truncated; unprovided content is unreviewed):',
+    ...code,
+  ].join('\n\n');
+}
+
+export async function diagnoseIssue(options: DiagnoseIssueOptions): Promise<IssueDiagnosis> {
+  const fallback: IssueDiagnosis = { ok: false, verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [] };
+  try {
+    const env = options.env ?? process.env;
+    const promptDirectory = options.promptDirectory ?? path.resolve(__dirname, '../prompts');
+    const modelUsed = resolveRoleModel('architecture', env);
+    const systemPrompt = fs.readFileSync(path.join(promptDirectory, 'issue_diagnose.md'), 'utf8');
+    const result = await sendOpenAISingleTurnWithFallback({
+      modelId: modelUsed,
+      modelRole: 'architecture',
+      systemPrompt,
+      userPrompt: diagnosisUserPrompt(options.input),
+      maxOutputTokens: 1024,
+      allowedOrigins: options.allowedOrigins,
+      env,
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    });
+    const parsed = parseJsonObject(result.content);
+    if (
+      !parsed ||
+      Object.keys(parsed).some((key) => !['verdict', 'summary', 'suggestedLabels'].includes(key)) ||
+      !VERDICTS.has(parsed.verdict as ReviewVerdict) ||
+      typeof parsed.summary !== 'string'
+    ) return fallback;
+    const suggestedLabels = parseSuggestedLabelsStrict(parsed.suggestedLabels);
+    if (!suggestedLabels) return fallback;
+    return {
+      ok: true,
+      verdict: parsed.verdict as ReviewVerdict,
+      summary: redactSensitiveText(parsed.summary).slice(0, MAX_TEXT_LENGTH),
+      suggestedLabels,
+    };
+  } catch {
+    return fallback;
   }
 }

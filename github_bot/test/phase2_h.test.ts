@@ -9,10 +9,12 @@ import {
   getReportRunUrl,
   issueContentFingerprint,
   issueReviewComment,
+  isIssueCodeRefAllowed,
   reviewComment,
   runIssueReviewMode,
   runPublishMode,
   runClaimMode,
+  resolveIssueCodeRef,
   stickyField,
   truncateStickyText,
   validateIssueOutput,
@@ -452,6 +454,274 @@ export async function runPhase2HTests(): Promise<void> {
           assert.equal(counter.count, 0, 'truncated BLOCK makes zero AI calls');
           assert.ok(reviewed.truncation, 'truncated BLOCK carries proof');
           assert.ok(reviewed.summary.includes('showing'), 'BLOCK summary states truncation');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: code reference guards (traversal, absolute, magic, secrets).
+    {
+      assert.equal(isIssueCodeRefAllowed('app/src/main/java/demo/Safe.kt'), true);
+      assert.equal(isIssueCodeRefAllowed('app/build.gradle.kts'), true);
+      assert.equal(isIssueCodeRefAllowed('.github/workflows/pocketguard.yml'), true);
+      assert.equal(isIssueCodeRefAllowed('AndroidManifest.xml'), true);
+      for (const bad of ['../secret.txt', 'a/../../b', '/etc/passwd', 'a:(exclude)b', 'a*.kt', 'a?.kt', 'a b', '', 'https://x/y', 'key.keystore', 'app/local.properties', 'a\u0000b']) {
+        assert.equal(isIssueCodeRefAllowed(bad), false, `${bad} rejected`);
+      }
+      assert.equal(resolveIssueCodeRef('main'), 'main');
+      assert.equal(resolveIssueCodeRef('feature/x'), 'feature/x');
+      for (const bad of [undefined, '', 'main;rm', 'a b', 'a:b', '..', 'x'.repeat(65)]) {
+        assert.equal(resolveIssueCodeRef(bad), undefined, `${String(bad)} rejected`);
+      }
+    }
+
+    // P6: second-layer diagnosis tightens with code evidence.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p6-tighten-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const gitCalls: string[][] = [];
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'looks fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+          { verdict: 'NEEDS_CHANGES', summary: 'code confirms the bug', suggestedLabels: ['bug'] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 'crash', getBody: 'app crashes on launch' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 'crash', body: 'app crashes on launch' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: (args: string[]) => { gitCalls.push(args); return 'class Safe { fun start() = TODO() }'; },
+          });
+          assert.equal(reviewed.verdict, 'NEEDS_CHANGES', 'code-grounded diagnosis tightens');
+          assert.equal(counter.count, 2, 'two layers ran');
+          assert.ok(gitCalls.some((args) => args[0] === 'show' && args[1] === 'main:app/src/main/java/demo/Safe.kt'), 'read-only show on the default branch');
+          assert.deepEqual(reviewed.codeRefs, [{ path: 'app/src/main/java/demo/Safe.kt', shownChars: 35, totalChars: 35 }], 'code proof persisted');
+          assert.ok(reviewed.tags.includes('bug'), 'second-layer labels union');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: second layer confirms APPROVE; failures and illegal paths keep round one.
+    for (const shape of [
+      {
+        label: 'confirm',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        second: { verdict: 'APPROVE', summary: 'code is fine', suggestedLabels: [] },
+        git: 'class Safe {}',
+        expectVerdict: 'APPROVE',
+        expectCalls: 2,
+        expectSummary: 'code is fine',
+      },
+      {
+        label: 'transport-failure',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        second: null,
+        git: 'class Safe {}',
+        expectVerdict: 'APPROVE',
+        expectCalls: 2,
+      },
+      {
+        label: 'illegal-path',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['../secret.txt'] },
+        second: { verdict: 'NEEDS_CHANGES', summary: 'must not run', suggestedLabels: [] },
+        git: 'class Safe {}',
+        expectVerdict: 'APPROVE',
+        expectCalls: 1,
+      },
+      {
+        label: 'empty-file',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        second: { verdict: 'NEEDS_CHANGES', summary: 'must not run', suggestedLabels: [] },
+        git: '',
+        expectVerdict: 'APPROVE',
+        expectCalls: 1,
+      },
+    ] as const) {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-p6-${shape.label}-`));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const previousFetch = globalThis.fetch;
+        let idx = 0;
+        const payloads = shape.second ? [shape.first, shape.second] : [shape.first];
+        globalThis.fetch = (async () => {
+          counter.count += 1;
+          if (!shape.second && counter.count >= 2) throw new Error('second layer down');
+          const payload = idx < payloads.length ? payloads[idx] : payloads[payloads.length - 1];
+          idx += 1;
+          return new Response(JSON.stringify({
+            output: [{ content: [{ type: 'output_text', text: JSON.stringify(payload) }] }],
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as typeof fetch;
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: () => shape.git,
+          });
+          assert.equal(reviewed.verdict, shape.expectVerdict, `P6 ${shape.label} keeps round one`);
+          assert.equal(counter.count, shape.expectCalls, `P6 ${shape.label} call count`);
+          if ('expectSummary' in shape) {
+            assert.equal(reviewed.summary, shape.expectSummary, `P6 ${shape.label} ties follow the fresher summary`);
+          }
+        } finally {
+          globalThis.fetch = previousFetch;
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: second layer is skipped when the first verdict is already fixed
+    // (NEEDS), blocked deterministically, or the ref is missing.
+    for (const shape of [
+      {
+        label: 'needs-first',
+        title: 't',
+        body: 'b',
+        first: { verdict: 'NEEDS_CHANGES', summary: 'needs work', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        eventRepo: { full_name: REPO, default_branch: 'main' },
+      },
+      {
+        label: 'deterministic-block',
+        title: 'leak',
+        body: `token ghp_${'A'.repeat(20)}`,
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        eventRepo: { full_name: REPO, default_branch: 'main' },
+      },
+      {
+        label: 'missing-ref',
+        title: 't',
+        body: 'b',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        eventRepo: { full_name: REPO },
+      },
+    ] as const) {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-p6-skip-${shape.label}-`));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [shape.first]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: shape.title, getBody: shape.body });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: shape.eventRepo, issue: { number: 7, title: shape.title, body: shape.body } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: () => { throw new Error('must not read code'); },
+          });
+          assert.equal(counter.count, 1, `P6 ${shape.label} runs only the first layer`);
+          assert.equal(reviewed.codeRefs, undefined, `P6 ${shape.label} stores no code proof`);
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: a successful second layer never loosens; ties follow the fresher summary.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p6-noloosen-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'INCONCLUSIVE', summary: 'unclear', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+          { verdict: 'APPROVE', summary: 'actually fine', suggestedLabels: [] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: () => 'class Safe {}',
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'second layer never loosens');
+          assert.equal(reviewed.summary, 'unclear', 'a looser second layer never rewrites the summary');
+          assert.equal(counter.count, 2, 'both layers ran');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: malformed codeRefs fail the strict triage schema (fail-closed).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p6-badrefs-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: 'not-an-array' },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: () => 'x',
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'malformed codeRefs fail closed');
+          assert.equal(counter.count, 1, 'only the first layer ran');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: code reference count is capped at 10 files.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p6-cap-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const refs = Array.from({ length: 11 }, (_, i) => `app/src/main/java/demo/File${i}.kt`);
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: refs },
+          { verdict: 'APPROVE', summary: 'code fine', suggestedLabels: [] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          let shows = 0;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: (args: string[]) => { if (args[0] === 'show') shows += 1; return 'x'; },
+          });
+          assert.equal(shows, 10, 'at most 10 files fetched');
+          assert.equal(reviewed.codeRefs?.length, 10, 'proof capped at 10');
+          assert.equal(reviewed.verdict, 'APPROVE');
         } finally {
           restore();
         }

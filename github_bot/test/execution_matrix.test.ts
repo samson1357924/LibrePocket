@@ -1646,6 +1646,17 @@ export async function runExecutionMatrixTests(): Promise<void> {
         undefined,
         'shown past total rejects',
       );
+      const codeProof = [{ path: 'app/src/main/java/demo/Safe.kt', shownChars: 35, totalChars: 35 }];
+      assert.ok(
+        validateIssueOutput({ ...truncatedBase, verdict: 'APPROVE', commentsComplete: true, codeRefs: codeProof }),
+        'code proof validates on complete artifacts',
+      );
+      assert.equal(validateIssueOutput({ ...truncatedBase, codeRefs: [] }), undefined, 'empty code proof rejects');
+      assert.equal(
+        validateIssueOutput({ ...truncatedBase, codeRefs: [{ path: '../x', shownChars: 1, totalChars: 1 }] }),
+        undefined,
+        'illegal code path rejects',
+      );
     }
 
     // validateReviewOutput: pre-rename artifacts carrying the retired

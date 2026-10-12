@@ -1205,7 +1205,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           env: orchestratorEnv,
           allowedOrigins: FAKE_ALLOWED_ORIGINS,
         });
-        assert.deepEqual(triaged, { verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [] });
+        assert.deepEqual(triaged, { verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [], codeRefs: [] });
       } finally {
         globalThis.fetch = previous;
       }

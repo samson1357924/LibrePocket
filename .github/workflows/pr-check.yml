@@ -49,9 +49,7 @@ jobs:
             policy:
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
-              - 'scripts/summarize_junit.py'
               - 'scripts/tests/test_apk_policy_check.py'
-              - 'scripts/tests/test_summarize_junit.py'
               - 'scripts/build_release.sh'
               - 'scripts/verify_release_apk.py'
               - 'scripts/release_artifact_stage.py'
@@ -107,13 +105,8 @@ jobs:
       # 不必翻 job log。這一步只讀 JUnit XML（app/build/test-results/**/TEST-*.xml），
       # 把 tests/failures/errors/skipped 總數、失敗的「類別.方法」（含 assertion
       # 摘要第一行）與 skipped 清單寫進 $GITHUB_STEP_SUMMARY。真正的 gate 是
-      # pr-gate job，所以本 step 任何情況都 exit 0（no XML → NO_RESULTS 說明略過；
-      # 解析異常 → 記訊息後照常結束），絕不因報告失敗變紅。狀態行只在
-      # unreadable==0、tests>0、failures==0、errors==0 且明細一致時宣告
-      # PASS；其餘為 FAIL/PARTIAL/INCOMPLETE/NO_RESULTS。輸出以 UTF-8 bytes
-      # 計維持在 900 KiB 預算內，超額截斷並註記 omitted 數量。
-      # 解析實作在 scripts/summarize_junit.py（純函式，可被單測匯入），此處只保留
-      # 薄呼叫層與原有 fallback（summary_parser_crashed_fallback）。
+      # pr-gate job，所以本 step 任何情況都 exit 0（no XML → 一句說明略過；
+      # 解析異常 → 記訊息後照常結束），絕不因報告失敗變紅。
       - name: Summarize Unit Test Results (${{ matrix.flavor }})
         # always()：測試失敗時後續 step 預設會被跳過，而失敗恰恰是 needs
         # summary 的時刻，所以必須無條件執行。
@@ -127,6 +120,8 @@ jobs:
           #      bash -e 下會讓 step 變紅，等於新增 exit 非 0 路徑；
           #   2) printf 自身 || true、function 呼叫再 || true——fallback 失敗
           #      也不得弄紅本 step（報告功能壞掉不是 gate 失敗）。
+          # function 放在 heredoc 起始行的 || 分支：heredoc 體從下一物理行開始收集，
+          # 不能在這行之後跨行寫 { ... }（群組內容會被 heredoc 吞掉、語法錯誤）。
           summary_parser_crashed_fallback() {
             echo "WARN: summary parser crashed (ignored; reporting only, not a gate)"
             if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
@@ -138,7 +133,115 @@ jobs:
             fi
           }
 
-          python3 scripts/summarize_junit.py || summary_parser_crashed_fallback || true
+          python3 - <<'PY' || summary_parser_crashed_fallback || true
+          import glob
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          SUMMARY_PATH = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          FLAVOR = os.environ.get("FLAVOR", "?")
+          # GitHub 每個 step summary 上限 1 MiB；超過會整份丟棄並只印
+          # "upload aborted" annotation——巨型 assertion 訊息（base64/JSON
+          # 比對）必須截斷，否則整個摘要靜默消失。
+          MAX_SUMMARY_LINE = 300
+          LINES = []
+
+          def emit(text=""):
+              print(text)
+              LINES.append(text)
+
+          def flush():
+              # 寫 summary 檔失敗只進 log，不反過來弄紅本 step。
+              if not SUMMARY_PATH:
+                  return
+              try:
+                  with open(SUMMARY_PATH, "a", encoding="utf-8") as fh:
+                      fh.write("\n".join(LINES) + "\n")
+              except OSError as exc:
+                  print("warning: cannot append GITHUB_STEP_SUMMARY: %s" % exc)
+
+          def first_line(text):
+              for line in (text or "").splitlines():
+                  line = line.strip()
+                  if line:
+                      # 單行截斷：避免一行幾 MB 的比對訊息把 run summary 撐過
+                      # 1 MiB 上限（超限 GitHub 整份丟棄，摘要全部看不到）。
+                      if len(line) > MAX_SUMMARY_LINE:
+                          return line[:MAX_SUMMARY_LINE] + "…"
+                      return line
+              return ""
+
+          def main():
+              paths = sorted(glob.glob("app/build/test-results/**/TEST-*.xml", recursive=True))
+              if not paths:
+                  emit("### Unit test summary — %s flavor" % FLAVOR)
+                  emit("")
+                  emit("No `app/build/test-results/**/TEST-*.xml` found — likely the "
+                       "setup/compile stage failed before tests ran. Summary skipped "
+                       "(reporting only, not a gate).")
+                  return
+
+              tests = failures = errors = skipped = 0
+              failed, skipped_cases, unreadable = [], [], 0
+
+              for path in paths:
+                  try:
+                      root = ET.parse(path).getroot()
+                  except Exception as exc:  # noqa: BLE001 — reporting must never fail
+                      unreadable += 1
+                      print("warning: unreadable %s: %s" % (path, exc))
+                      continue
+                  for suite in root.iter("testsuite"):
+                      tests += int(suite.get("tests", 0) or 0)
+                      failures += int(suite.get("failures", 0) or 0)
+                      errors += int(suite.get("errors", 0) or 0)
+                      skipped += int(suite.get("skipped", 0) or 0)
+                      for case in suite.findall("testcase"):
+                          ident = "%s.%s" % (case.get("classname", "?"), case.get("name", "?"))
+                          bad = case.find("failure")
+                          if bad is None:
+                              bad = case.find("error")
+                          if bad is not None:
+                              summary = first_line(bad.get("message")) or first_line(bad.text)
+                              failed.append((ident, summary or "(no message)"))
+                          elif case.find("skipped") is not None:
+                              skipped_cases.append(ident)
+
+              emit("### Unit test summary — %s flavor" % FLAVOR)
+              emit("")
+              emit("| metric | count |")
+              emit("| --- | ---: |")
+              emit("| tests | %d |" % tests)
+              emit("| failures | %d |" % failures)
+              emit("| errors | %d |" % errors)
+              emit("| skipped | %d |" % skipped)
+              emit("")
+              emit("Scanned %d JUnit XML file(s)%s." % (
+                  len(paths),
+                  ", %d unreadable" % unreadable if unreadable else ""))
+              emit("")
+              emit("**Failed tests (%d):**" % len(failed))
+              if failed:
+                  for ident, summary in failed:
+                      emit("- `%s` — %s" % (ident, summary))
+              else:
+                  emit("_none — all executed tests passed._")
+              emit("")
+              emit("**Skipped tests (%d):**" % len(skipped_cases))
+              if skipped_cases:
+                  for ident in skipped_cases:
+                      emit("- `%s`" % ident)
+              else:
+                  emit("_none._")
+
+          try:
+              main()
+          except Exception as exc:  # noqa: BLE001 — 絕不 exit 非 0，這不是 gate
+              emit("summary step error (ignored, reporting only): %r" % exc)
+          flush()
+          sys.exit(0)
+          PY
           echo "unit-test summary done (report only — real gate is pr-gate)"
 
       - name: Upload Test Reports
@@ -209,7 +312,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run APK policy and release-identity harnesses (stdlib only)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py
 
   build-and-policy-gate:
     name: Build & Policy Gates

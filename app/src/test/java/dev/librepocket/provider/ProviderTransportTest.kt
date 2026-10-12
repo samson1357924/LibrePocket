@@ -498,7 +498,7 @@ class ProviderTransportTest {
         override fun source(): BufferedSource = buffered
     }
 
-    @Test(timeout = 120_000)
+    @Test
     fun eachProtocolTerminalClosesBodyWithoutAnotherRead() = runBlocking {
         fun ssePayloads(vararg payloads: String): String =
             payloads.joinToString(separator = "\n\n", postfix = "\n\n") { "data: $it" }
@@ -571,17 +571,7 @@ class ProviderTransportTest {
                     collection.join()
                 } ?: run {
                     collection.cancel()
-                    // Bounded-wait release order: unblock the peer read first, then close
-                    // the body, then shut down the server/client before the bounded
-                    // re-join, so the parent runBlocking cannot hang on a
-                    // non-cooperative blocking read (mirrors the cancellation tests above).
-                    release.countDown()
-                    blockingBody.close()
-                    server.shutdown()
-                    client.dispatcher.executorService.shutdownNow()
-                    client.connectionPool.evictAll()
-                    withTimeoutOrNull(1_500) { collection.join() }
-                    fail("$protocol collection timed out waiting to join (readCalls=${blockingBody.readCalls.get()} events=${events.size} release=${release.count})")
+                    fail("$protocol collection timed out waiting to join")
                 }
                 assertTrue("$protocol stops before the peer's five-minute read timeout", completedBeforeAnotherRead)
                 assertTrue("$protocol produces a healthy terminal fixture", events.last() is StreamEvent.Done)

@@ -961,9 +961,7 @@ class PolicyCiGateControl(unittest.TestCase):
         for required in (
             "scripts/play_policy_check.sh",
             "scripts/apk_policy_inspect.py",
-            "scripts/summarize_junit.py",
             "scripts/tests/test_apk_policy_check.py",
-            "scripts/tests/test_summarize_junit.py",
             ".github/workflows/pr-check.yml",
         ):
             with self.subTest(path=required):
@@ -975,8 +973,6 @@ class PolicyCiGateControl(unittest.TestCase):
             ["scripts/apk_policy_inspect.py"],
             ["scripts/tests/test_apk_policy_check.py"],
             ["scripts/apk_policy_inspect.py", "scripts/tests/test_apk_policy_check.py"],
-            ["scripts/summarize_junit.py"],
-            ["scripts/tests/test_summarize_junit.py"],
             [".github/workflows/pr-check.yml"],
         ):
             with self.subTest(diff=tuple(diff)):
@@ -994,11 +990,6 @@ class PolicyCiGateControl(unittest.TestCase):
         )
         self.assertFalse(matched, "docs-only diff must leave policy=false")
 
-    def test_unit_summary_step_uses_extracted_parser_with_fallback(self) -> None:
-        workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("python3 scripts/summarize_junit.py", workflow)
-        self.assertIn("summary_parser_crashed_fallback", workflow)
-
     def test_pr_gate_requires_policy_harness(self) -> None:
         workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("policy-harness", workflow)
@@ -1009,12 +1000,11 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/tests/test_apk_policy_check.py",
             "scripts/tests/test_release_artifact_verifier.py",
             "scripts/tests/test_build_release_identity.py",
-            "scripts/tests/test_summarize_junit.py",
         ):
             with self.subTest(test_path=test_path):
                 self.assertIn(test_path, workflow)
         self.assertIn(
-            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py",
+            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py",
             workflow,
         )
 

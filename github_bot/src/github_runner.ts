@@ -113,7 +113,7 @@ export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
 // and publish entry points must stay free of the OpenAI client so secrets never
 // reach those jobs. A role may burn a whole chain before it finishes, so
 // wall-clock budgets divide by this factor.
-function maxModelChainAttempts(env: NodeJS.ProcessEnv): number {
+export function maxModelChainAttempts(env: NodeJS.ProcessEnv): number {
   const count = (raw: string | undefined): number =>
     (raw ?? '').split(',').map((part) => part.trim()).filter((part) => part !== '').length;
   const chains = (['ARCHITECTURE', 'ANDROID_SEC', 'ANDROID_CODE'] as const).map((role) =>

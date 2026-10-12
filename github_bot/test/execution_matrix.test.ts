@@ -8,6 +8,7 @@ import {
   isAllowedForkFetchRefspec,
   MAX_ISSUE_CONTEXT_LENGTH,
   MAX_REVIEWS_PER_SHA,
+  maxModelChainAttempts,
   formatReviewCountMarker,
   parseReviewCountMarker,
   readStickyReviewCount,
@@ -1840,6 +1841,20 @@ export async function runExecutionMatrixTests(): Promise<void> {
           `review-send trusted step forwards ${fallbackVar}`,
         );
       }
+      // Renamed role: model/profile/effort forward new names with legacy
+      // CHIEF fallback so existing settings keep working.
+      for (const vars of [
+        ['POCKETGUARD_MODEL_ARCHITECTURE', 'POCKETGUARD_MODEL_CHIEF'],
+        ['POCKETGUARD_MODEL_ARCHITECTURE_PROFILE', 'POCKETGUARD_MODEL_CHIEF_PROFILE'],
+        ['POCKETGUARD_MODEL_ARCHITECTURE_REASONING_EFFORT', 'POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT'],
+      ] as const) {
+        const [fresh, legacy] = vars;
+        assert.match(
+          trustedStep,
+          new RegExp(`${fresh}:\\s*\\$\\{\\{\\s*vars\\.${fresh}\\s*\\|\\|\\s*vars\\.${legacy}\\s*\\|\\|\\s*secrets\\.${fresh}\\s*\\|\\|\\s*secrets\\.${legacy}\\s*\\}\\}`),
+          `review-send trusted step forwards ${fresh} with legacy fallback`,
+        );
+      }
       assert.match(reviewJob, /needs:\s*\[prepare-tag,\s*claim-slot\]/, 'review-send waits for the claim');
       assert.match(
         squashed(reviewJob.slice(0, reviewJob.indexOf('    steps:'))),
@@ -1847,6 +1862,18 @@ export async function runExecutionMatrixTests(): Promise<void> {
         'review-send requires the approved claim for pull-request reviews',
       );
       assert.equal(MAX_REVIEWS_PER_SHA, 2, 'budget constant matches the specified two reviews per SHA');
+      // Chain budget counts the legacy CHIEF fallbacks so the wall-clock
+      // budget never underestimates during the rename transition.
+      assert.equal(maxModelChainAttempts({} as NodeJS.ProcessEnv), 1, 'empty env budgets one attempt');
+      assert.equal(
+        maxModelChainAttempts({
+          POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS: 'a, b',
+          POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'b, c',
+          POCKETGUARD_MODEL_FALLBACKS: 'd',
+        } as NodeJS.ProcessEnv),
+        6,
+        'new + legacy + global fallbacks all counted (budget overestimates dedup, fail-closed)',
+      );
     }
   } finally {
     globalThis.fetch = previousFetch;

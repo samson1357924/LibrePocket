@@ -247,6 +247,83 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
+    // H-1e: publish rejects a forged APPROVE artifact carrying retired chunk
+    // fields — same sticky INCONCLUSIVE, never written.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-issue-forgechunk-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] }]);
+        try {
+          const reviewState = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const reviewClient = issueClient(reviewState, { getTitle: 'fc-title', getBody: 'fc-body' });
+          await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'fc-title', body: 'fc-body' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: reviewClient,
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        const forged = {
+          ...JSON.parse(fs.readFileSync(artifactPath, 'utf8')),
+          chunks: [{ index: 0, total: 1 }],
+          chunkCoverageComplete: true,
+          chunkCount: 1,
+        } as Record<string, unknown>;
+        fs.writeFileSync(artifactPath, JSON.stringify(forged));
+        const applied: string[] = [];
+        const state = {
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const client = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: 'fc-title', body: 'fc-body' } }),
+              listComments: async (params: { page: number }) => {
+                void params;
+                return { data: state.comments };
+              },
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const c = state.comments.find((x) => x.id === params.comment_id);
+                if (c) c.body = params.body;
+                return {};
+              },
+              addLabels: async (params: { labels: string[] }) => { applied.push(...params.labels); return {}; },
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'fc-title', body: 'fc-body' } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_SERVER_URL: 'https://github.com',
+            GITHUB_RUN_ID: '123456',
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as unknown as NodeJS.ProcessEnv,
+          githubClient: client,
+        });
+        assert.equal(state.created, 0, 'forged-chunk publish creates no second comment');
+        assert.equal(state.updated, 1, 'forged-chunk publish updates the same sticky');
+        assert.ok(state.comments[0].body.includes('INCONCLUSIVE'), 'forged chunks fall back');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
     // H-2: link success vs failure branches (no fake link on failure).
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-link-'));

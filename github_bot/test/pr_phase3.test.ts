@@ -2,9 +2,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { MAX_PR_CHUNK_LENGTH } from '../src/review_diff';
 import {
-  computePrChunkCoverageComplete,
   DEFAULT_REVIEW_DEADLINE_MS,
   estimateChunkedReviewMs,
   MAX_PER_CHUNK_TIMEOUT_MS,
@@ -37,10 +35,10 @@ function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     OPENAI_BASE_URL: TEST_BASE_URL,
     OPENAI_API_KEY: 'fake-openai-key',
     POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-    POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+    POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
     POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
     POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-    POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+    POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
     ...extra,
   } as NodeJS.ProcessEnv;
 }
@@ -51,7 +49,7 @@ function prEvent(): Record<string, unknown> {
     repository: { full_name: REPO },
     pull_request: {
       number: 41,
-      title: 'phase3 chunks',
+      title: 'phase3 deadlines',
       base: { sha: BASE_SHA, ref: 'main' },
       head: { sha: HEAD_SHA, ref: 'topic', repo: { full_name: REPO } },
     },
@@ -73,7 +71,7 @@ function bigFileDiff(name: string, lines: number): string {
   return fileDiff(name, body);
 }
 
-function chunkedFiles(): Record<string, string> {
+function reviewFiles(): Record<string, string> {
   return {
     'app/src/main/AndroidManifest.xml': fileDiff('app/src/main/AndroidManifest.xml', ['+<manifest />']),
     'app/src/main/java/demo/Safe.kt': fileDiff('app/src/main/java/demo/Safe.kt', ['+class Safe']),
@@ -145,7 +143,7 @@ function installImmediateApprove(counter: { count: number }): () => void {
 // fails closed to INCONCLUSIVE instead of hanging the wave.
 function installRoleDelayStub(
   counter: { count: number },
-  opts: { chiefDelayMs: number; otherDelayMs?: number },
+  opts: { architectureDelayMs: number; otherDelayMs?: number },
 ): () => void {
   const previousFetch = globalThis.fetch;
   globalThis.fetch = (async (_input: unknown, init?: { signal?: AbortSignal; body?: unknown }) => {
@@ -157,8 +155,8 @@ function installRoleDelayStub(
     } catch {
       model = '';
     }
-    const isChief = model.includes('chief');
-    const delay = isChief ? opts.chiefDelayMs : (opts.otherDelayMs ?? 0);
+    const isArchitecture = model.includes('architecture');
+    const delay = isArchitecture ? opts.architectureDelayMs : (opts.otherDelayMs ?? 0);
     const signal = init?.signal;
     if (delay > 0) {
       await new Promise<void>((resolve, reject) => {
@@ -208,23 +206,6 @@ export async function runPrPhase3Tests(): Promise<void> {
       );
       assert.equal(estimateChunkedReviewMs(18, 126666, 2), 9 * 126666, 'estimate is waves x timeout under concurrency');
       assert.equal(estimateChunkedReviewMs(1, 420_000, 2), 420_000, 'single chunk needs one wave');
-      // Computed coverage: any INCONCLUSIVE (including transport) forces false.
-      assert.equal(
-        computePrChunkCoverageComplete([
-          { index: 0, total: 2, start: 0, end: 5, complete: true, coveredLength: 5, files: ['a'], verdict: 'APPROVE' },
-          { index: 1, total: 2, start: 5, end: 10, complete: true, coveredLength: 5, files: ['a'], verdict: 'INCONCLUSIVE' },
-        ], { totalLength: 10, files: ['a'], maxLength: MAX_PR_CHUNK_LENGTH }),
-        false,
-        'transport INCONCLUSIVE forces coverage false',
-      );
-      assert.equal(
-        computePrChunkCoverageComplete([
-          { index: 0, total: 1, start: 0, end: 5, complete: true, coveredLength: 5, files: ['a'], verdict: 'NEEDS_CHANGES' },
-        ], { totalLength: 5, files: ['a'], maxLength: MAX_PR_CHUNK_LENGTH }),
-        true,
-        'conclusive NEEDS_CHANGES keeps coverage true',
-      );
-      assert.equal(computePrChunkCoverageComplete([], { totalLength: 0, files: [] }), false, 'empty set never covers');
     }
 
     // Unit: Phase 2 (P2 #2) trusted job wall-clock (no I/O, fake clock).
@@ -279,14 +260,14 @@ export async function runPrPhase3Tests(): Promise<void> {
       );
     }
 
-    // E2E: slow chief role times out via timeoutMs passthrough (fake fetch
+    // E2E: slow architecture role times out via timeoutMs passthrough (fake fetch
     // delay + abort), verdict INCONCLUSIVE with computed coverage false.
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-phase3-slow-'));
       try {
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
-        const restore = installRoleDelayStub(counter, { chiefDelayMs: 1000 });
+        const restore = installRoleDelayStub(counter, { architectureDelayMs: 1000 });
         let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
         try {
           reviewed = await runReviewMode({
@@ -298,13 +279,12 @@ export async function runPrPhase3Tests(): Promise<void> {
             } as NodeJS.ProcessEnv,
             githubClient: prClient({ comments: [], created: 0, updated: 0 }),
             writeStdout: () => undefined,
-            runGit: prGitStub(chunkedFiles()),
+            runGit: prGitStub(reviewFiles()),
           });
         } finally {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'slow role timeout forces INCONCLUSIVE');
-        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
         assert.equal(counter.count, 3, `slow roles still attempted transport (got ${counter.count})`);
         // Checkpoint artifact: deadline/timeout exit saves INCONCLUSIVE.
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
@@ -336,13 +316,12 @@ export async function runPrPhase3Tests(): Promise<void> {
             } as NodeJS.ProcessEnv,
             githubClient: prClient({ comments: [], created: 0, updated: 0 }),
             writeStdout: () => undefined,
-            runGit: prGitStub(chunkedFiles()),
+            runGit: prGitStub(reviewFiles()),
           });
         } finally {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'deadline exit forces INCONCLUSIVE');
-        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
         assert.equal(counter.count, 0, 'deadline exit starts zero chunk turns when remaining < need');
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
         assert.equal(artifact.verdict, 'INCONCLUSIVE', 'deadline exit checkpoints the artifact');
@@ -353,7 +332,7 @@ export async function runPrPhase3Tests(): Promise<void> {
     }
 
     // E2E: fixed-concurrency aggregation is index-sorted and deterministic
-    // across repeated runs (same stubs, same verdict/roles/chunks).
+    // across repeated runs (same stubs, same verdict/roles).
     {
       const runOnce = async (artifactPath: string): Promise<Awaited<ReturnType<typeof runReviewMode>>> => {
         const counter = { count: 0 };
@@ -364,7 +343,7 @@ export async function runPrPhase3Tests(): Promise<void> {
             env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
             githubClient: prClient({ comments: [], created: 0, updated: 0 }),
             writeStdout: () => undefined,
-            runGit: prGitStub(chunkedFiles()),
+            runGit: prGitStub(reviewFiles()),
           });
         } finally {
           restore();
@@ -376,8 +355,6 @@ export async function runPrPhase3Tests(): Promise<void> {
         const second = await runOnce(path.join(tempDir, 'second-output.json'));
         assert.equal(first.verdict, 'APPROVE', 'single-turn full coverage may APPROVE');
         assert.equal(second.verdict, first.verdict, 'repeated runs agree on verdict');
-        assert.equal(first.chunks, undefined, 'single-turn has no chunks');
-        assert.equal(second.chunks, undefined, 'single-turn has no chunks');
         assert.deepEqual(second.roles, first.roles, 'repeated runs agree on merged roles');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -400,12 +377,12 @@ export async function runPrPhase3Tests(): Promise<void> {
           } as NodeJS.ProcessEnv,
           githubClient: prClient(shared),
           writeStdout: () => undefined,
-          runGit: prGitStub(chunkedFiles()),
+          runGit: prGitStub(reviewFiles()),
         });
         assert.equal(claimed.claimed, true, 'timeout run still claims one slot before AI');
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
-        const restore = installRoleDelayStub(counter, { chiefDelayMs: 1000 });
+        const restore = installRoleDelayStub(counter, { architectureDelayMs: 1000 });
         let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
         try {
           reviewed = await runReviewMode({
@@ -418,13 +395,12 @@ export async function runPrPhase3Tests(): Promise<void> {
             } as NodeJS.ProcessEnv,
             githubClient: prClient(shared),
             writeStdout: () => undefined,
-            runGit: prGitStub(chunkedFiles()),
+            runGit: prGitStub(reviewFiles()),
           });
         } finally {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'timed-out review stays INCONCLUSIVE');
-        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
         await runPublishMode({
           event: prEvent(),
           env: {
@@ -460,7 +436,7 @@ export async function runPrPhase3Tests(): Promise<void> {
         } as NodeJS.ProcessEnv,
         githubClient: prClient(state),
         writeStdout: () => undefined,
-        runGit: prGitStub(chunkedFiles()),
+        runGit: prGitStub(reviewFiles()),
       });
       assert.equal(denied.claimed, false, 'over-budget pre-check claims nothing');
       assert.match(denied.reason, /budget-exceeded/, 'over-budget reason is explicit');
@@ -473,7 +449,7 @@ export async function runPrPhase3Tests(): Promise<void> {
 
     // E2E: hosted slow-setup smoke (Phase 2 P2 #2 direction). A 2min setup
     // offset (jobStarted 2min before review t0) shrinks the effective budget
-    // to 1020000ms but still completes conclusive chunks (APPROVE + true).
+    // to 1020000ms but still completes a conclusive single-turn review.
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-phase3-setup2min-'));
       const frozenNow = 2_000_000_000_000;
@@ -501,15 +477,15 @@ export async function runPrPhase3Tests(): Promise<void> {
             } as NodeJS.ProcessEnv,
             githubClient: prClient({ comments: [], created: 0, updated: 0 }),
             writeStdout: () => undefined,
-            runGit: prGitStub(chunkedFiles()),
+            runGit: prGitStub(reviewFiles()),
           });
         } finally {
           restore();
         }
         assert.equal(reviewed.verdict, 'APPROVE', '2min setup smoke still approves single-turn');
         assert.equal(reviewed.coverage.complete, true, '2min setup smoke computes complete coverage');
-        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
-        assert.equal(counter.count, 3, `2min setup smoke attempted 3 roles (got ${counter.count})`);
+        assert.equal(counter.count, 4, `2min setup smoke attempted 3 roles plus synthesis (got ${counter.count})`);
+        assert.equal(reviewed.synthesis?.verdict, 'APPROVE', 'synthesis confirms APPROVE');
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
         assert.equal(artifact.verdict, 'APPROVE', '2min setup smoke checkpoints APPROVE');
       } finally {
@@ -546,13 +522,12 @@ export async function runPrPhase3Tests(): Promise<void> {
             } as NodeJS.ProcessEnv,
             githubClient: prClient({ comments: [], created: 0, updated: 0 }),
             writeStdout: () => undefined,
-            runGit: prGitStub(chunkedFiles()),
+            runGit: prGitStub(reviewFiles()),
           });
         } finally {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'exhausted job exits INCONCLUSIVE');
-        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
         assert.equal(counter.count, 0, 'exhausted job starts zero chunk turns (job cap, not review clock)');
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
         assert.equal(artifact.verdict, 'INCONCLUSIVE', 'exhausted job checkpoints INCONCLUSIVE');
@@ -563,8 +538,8 @@ export async function runPrPhase3Tests(): Promise<void> {
     }
 
     // E2E: claim pre-flight uses the same effective formula (Phase 2 P2 #2).
-    // A job with only ~9s of effective budget cannot cover 1 wave
-    // (share 9000ms < viable 10000ms) so it claims nothing with zero
+    // A job with only ~9s of effective budget cannot cover 2 waves x 1
+    // attempt (share 4500ms < viable 10000ms) so it claims nothing with zero
     // writes; without a job start the same tiny configured budget also
     // refuses (missing downgrades fail-closed to configured).
     {
@@ -589,7 +564,7 @@ export async function runPrPhase3Tests(): Promise<void> {
           } as NodeJS.ProcessEnv,
           githubClient: prClient(state),
           writeStdout: () => undefined,
-          runGit: prGitStub(chunkedFiles()),
+          runGit: prGitStub(reviewFiles()),
         });
         assert.equal(denied.claimed, false, 'job-capped claim occupies nothing');
         assert.match(denied.reason, /budget-exceeded/, 'job-capped reason is explicit');
@@ -608,13 +583,13 @@ export async function runPrPhase3Tests(): Promise<void> {
             GITHUB_TOKEN: 'fake-token',
             POCKETGUARD_RUN_ID: 'phase3-chain-run',
             POCKETGUARD_JOB_STARTED_MS: jobStarted,
-            POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'second-model, third-model',
+            POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS: 'second-model, third-model',
             POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS: 'second-model, third-model',
             POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS: 'second-model, third-model',
           } as NodeJS.ProcessEnv,
           githubClient: prClient(state),
           writeStdout: () => undefined,
-          runGit: prGitStub(chunkedFiles()),
+          runGit: prGitStub(reviewFiles()),
         });
         assert.equal(chained.claimed, false, 'chain-aware claim occupies nothing');
         assert.match(chained.reason, /budget-exceeded/, 'chain-aware reason is explicit');

@@ -8,6 +8,7 @@ import {
   isAllowedForkFetchRefspec,
   MAX_ISSUE_CONTEXT_LENGTH,
   MAX_REVIEWS_PER_SHA,
+  maxModelChainAttempts,
   formatReviewCountMarker,
   parseReviewCountMarker,
   readStickyReviewCount,
@@ -19,6 +20,7 @@ import {
   runReviewMode,
   runTagMode,
   validateIssueOutput,
+  validateReviewOutput,
   type RunnerContext,
 } from '../src/github_runner';
 
@@ -149,10 +151,10 @@ function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     OPENAI_BASE_URL: TEST_BASE_URL,
     OPENAI_API_KEY: 'fake-openai-key',
     POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-    POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+    POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
     POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
     POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-    POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+    POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
     ...extra,
   } as NodeJS.ProcessEnv;
 }
@@ -969,6 +971,32 @@ export async function runExecutionMatrixTests(): Promise<void> {
       assert.equal(parseReviewCountMarker(state.comments[0].body, HEAD_SHA), 1);
     }
 
+    // F4 (review #77 P1-2): the claim budgets two waves times the full
+    // fallback chain — a 61-attempt chain over the default deadline refuses
+    // instead of occupying a slot the review cannot finish.
+    {
+      const state = makeState();
+      const fallbacks = Array.from({ length: 60 }, (_, i) => `fb${i}`).join(', ');
+      const claimed = await runClaimMode({
+        event: prOpenedEvent(),
+        env: {
+          GITHUB_EVENT_NAME: 'pull_request_target',
+          GITHUB_REPOSITORY: REPO,
+          GITHUB_TOKEN: 'fake-token',
+          POCKETGUARD_RUN_ID: 'f4-long-chain-1',
+          POCKETGUARD_MODEL_FALLBACKS: fallbacks,
+        } as NodeJS.ProcessEnv,
+        githubClient: makeClient(state),
+        writeStdout: () => undefined,
+        runGit: safeGitStub(),
+      });
+      assert.equal(claimed.claimed, false, 'F4 over-budget chain claims nothing');
+      assert.match(claimed.reason, /budget-exceeded/);
+      assert.match(claimed.reason, /61 attempt/);
+      assert.equal(state.created, 0, 'F4 refusal creates nothing');
+      assert.equal(state.updated, 0, 'F4 refusal updates nothing');
+    }
+
     // Quota unknown (fail-closed): listComments throw closes all three
     // stages with zero OpenAI and an untouched sticky.
     {
@@ -1039,7 +1067,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
         headSha: HEAD_SHA,
         headRepository: REPO,
         roles: [
-          { role: 'chief', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
+          { role: 'architecture', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
           { role: 'android_sec', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
           { role: 'android_code', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
         ],
@@ -1347,7 +1375,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
     }
 
     // Issue execution: opened, edited, and human comments each take one
-    // chief single-turn; issues are never counted.
+    // architecture single-turn; issues are never counted.
     {
       const issueOpened = {
         action: 'opened',
@@ -1620,6 +1648,182 @@ export async function runExecutionMatrixTests(): Promise<void> {
       undefined,
       'unknown verdicts reject',
     );
+    // Truncation proof shape: valid proofs pass on non-APPROVE artifacts;
+    // APPROVE never carries a proof; malformed proofs reject.
+    {
+      const proof = { shownChars: 8004, totalChars: 20005, shownComments: 0, totalComments: 0 };
+      const truncatedBase = {
+        verdict: 'INCONCLUSIVE',
+        issueNumber: 7,
+        title: 't',
+        tags: [],
+        summary: 's',
+        suggestedLabels: [],
+        fingerprint: 'a'.repeat(64),
+        commentsComplete: false,
+      };
+      assert.ok(validateIssueOutput({ ...truncatedBase, truncation: proof }), 'valid proof validates');
+      assert.equal(
+        validateIssueOutput({ ...truncatedBase, verdict: 'APPROVE', commentsComplete: true, truncation: proof }),
+        undefined,
+        'APPROVE never carries a truncation proof',
+      );
+      assert.equal(
+        validateIssueOutput({ ...truncatedBase, truncation: { ...proof, shownChars: proof.totalChars + 1 } }),
+        undefined,
+        'shown past total rejects',
+      );
+      const codeProof = [{ path: 'app/src/main/java/demo/Safe.kt', shownChars: 35, totalChars: 35 }];
+      assert.ok(
+        validateIssueOutput({ ...truncatedBase, verdict: 'APPROVE', commentsComplete: true, codeRefs: codeProof }),
+        'code proof validates on complete artifacts',
+      );
+      assert.equal(validateIssueOutput({ ...truncatedBase, codeRefs: [] }), undefined, 'empty code proof rejects');
+      assert.equal(
+        validateIssueOutput({ ...truncatedBase, codeRefs: [{ path: '../x', shownChars: 1, totalChars: 1 }] }),
+        undefined,
+        'illegal code path rejects',
+      );
+    }
+
+    // validateReviewOutput: pre-rename artifacts carrying the retired
+    // 'chief' role are rejected (fail-closed INCONCLUSIVE downstream).
+    {
+      const roleReview = (role: string) => ({ role, modelUsed: 'm', verdict: 'APPROVE', findings: [] });
+      const baseArtifact = {
+        verdict: 'INCONCLUSIVE',
+        pullRequestNumber: 7,
+        baseSha: BASE_SHA,
+        headSha: HEAD_SHA,
+        headRepository: REPO,
+        roles: [roleReview('architecture'), roleReview('android_sec'), roleReview('android_code')],
+        coverage: { complete: false, omittedFiles: [], truncatedFiles: [], originalLength: 0 },
+        deterministicViolations: [],
+        areaLabels: [],
+        changedFiles: [],
+        changedFilesComplete: false,
+      };
+      assert.ok(validateReviewOutput(baseArtifact), 'renamed roles validate');
+      assert.equal(
+        validateReviewOutput({
+          ...baseArtifact,
+          roles: [roleReview('chief'), roleReview('android_sec'), roleReview('android_code')],
+        }),
+        undefined,
+        'retired chief role rejects',
+      );
+      assert.ok(
+        validateReviewOutput({
+          ...baseArtifact,
+          synthesis: { modelUsed: 'm', verdict: 'APPROVE', summary: 'confirmed' },
+        }),
+        'well-formed synthesis validates',
+      );
+      assert.equal(
+        validateReviewOutput({
+          ...baseArtifact,
+          synthesis: { modelUsed: 'm', verdict: 'MAYBE' },
+        }),
+        undefined,
+        'malformed synthesis verdict rejects',
+      );
+      assert.equal(
+        validateReviewOutput({
+          ...baseArtifact,
+          synthesis: { modelUsed: 'm', verdict: 'APPROVE', extra: 1 },
+        }),
+        undefined,
+        'unknown synthesis keys reject',
+      );
+      assert.equal(
+        validateReviewOutput({
+          ...baseArtifact,
+          verdict: 'APPROVE',
+          synthesis: { modelUsed: 'not-run', verdict: 'INCONCLUSIVE', skipped: true },
+        }),
+        undefined,
+        'F3/G4 APPROVE paired with skipped synthesis rejects',
+      );
+      assert.ok(
+        validateReviewOutput({
+          ...baseArtifact,
+          verdict: 'INCONCLUSIVE',
+          synthesis: { modelUsed: 'not-run', verdict: 'INCONCLUSIVE', skipped: true },
+        }),
+        'F3 INCONCLUSIVE with skipped synthesis validates',
+      );
+      // G4 (review #77 new #4): unconfirmed APPROVE artifacts reject —
+      // missing synthesis, non-APPROVE synthesis verdict, or skipped.
+      const cleanArtifactLikeApprove = (): Record<string, unknown> => ({
+        ...baseArtifact,
+        verdict: 'APPROVE',
+        coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
+        changedFilesComplete: true,
+      });
+      const confirmedSynthesis = { modelUsed: 'm', verdict: 'APPROVE' };
+      assert.ok(
+        validateReviewOutput({ ...cleanArtifactLikeApprove(), synthesis: confirmedSynthesis }),
+        'G4 confirmed APPROVE validates',
+      );
+      assert.ok(
+        validateReviewOutput({
+          ...cleanArtifactLikeApprove(),
+          synthesis: { modelUsed: 'm', verdict: 'APPROVE', skipped: false },
+        }),
+        'G4 confirmed APPROVE with skipped:false validates',
+      );
+      for (const [label, synthesis] of [
+        ['missing', undefined],
+        ['INCONCLUSIVE', { modelUsed: 'm', verdict: 'INCONCLUSIVE' }],
+        ['INCONCLUSIVE-skipped-false', { modelUsed: 'm', verdict: 'INCONCLUSIVE', skipped: false }],
+        ['NEEDS_CHANGES', { modelUsed: 'm', verdict: 'NEEDS_CHANGES' }],
+        ['APPROVE-skipped', { modelUsed: 'not-run', verdict: 'APPROVE', skipped: true }],
+      ] as const) {
+        const artifact = { ...cleanArtifactLikeApprove() };
+        if (synthesis === undefined) delete (artifact as Record<string, unknown>).synthesis;
+        else (artifact as Record<string, unknown>).synthesis = synthesis;
+        assert.equal(
+          validateReviewOutput(artifact),
+          undefined,
+          `G4 unconfirmed APPROVE (${label}) rejects`,
+        );
+      }
+      // G4: non-APPROVE verdicts are unaffected by synthesis shape.
+      assert.ok(
+        validateReviewOutput({ ...cleanArtifactLikeApprove(), verdict: 'NEEDS_CHANGES' }),
+        'G4 NEEDS_CHANGES without synthesis validates',
+      );
+      // Strictness direction: a stored verdict stricter than the
+      // recalculation is accepted as stored (downgrades survive publish);
+      // a stored verdict looser than the recalculation is rejected.
+      {
+        const cleanArtifact = {
+          ...baseArtifact,
+          verdict: 'APPROVE',
+          coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
+          changedFilesComplete: true,
+        };
+        const downgraded = validateReviewOutput({
+          ...cleanArtifact,
+          verdict: 'INCONCLUSIVE',
+          synthesis: { modelUsed: 'm', verdict: 'INCONCLUSIVE' },
+        });
+        assert.equal(downgraded?.verdict, 'INCONCLUSIVE', 'stricter stored verdict is preserved');
+        assert.equal(
+          validateReviewOutput({
+            ...cleanArtifact,
+            roles: [
+              { role: 'architecture', modelUsed: 'm', verdict: 'NEEDS_CHANGES', findings: [] },
+              { role: 'android_sec', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
+              { role: 'android_code', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
+            ],
+            verdict: 'APPROVE',
+          }),
+          undefined,
+          'looser stored verdict rejects',
+        );
+      }
+    }
 
     // Workflow wiring: route-driven gates, quota outputs, and the quota mutex note.
     {
@@ -1701,19 +1905,38 @@ export async function runExecutionMatrixTests(): Promise<void> {
       assert.doesNotMatch(claimJob, /OPENAI_API_KEY/, 'claim-slot takes no OpenAI secrets');
       for (const fallbackVar of [
         'POCKETGUARD_MODEL_FALLBACKS',
-        'POCKETGUARD_MODEL_CHIEF_FALLBACKS',
+        'POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS',
         'POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS',
         'POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS',
       ]) {
+        // Renamed role: the architecture entries additionally forward the
+        // deprecated CHIEF names so existing settings keep working.
+        const expected = fallbackVar === 'POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS'
+          ? `${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*vars\\.POCKETGUARD_MODEL_CHIEF_FALLBACKS\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.POCKETGUARD_MODEL_CHIEF_FALLBACKS\\s*\\}\\}`
+          : `${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`;
         assert.match(
           claimJob,
-          new RegExp(`${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`),
+          new RegExp(expected),
           `claim-slot forwards ${fallbackVar}`,
         );
         assert.match(
           trustedStep,
-          new RegExp(`${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`),
+          new RegExp(expected),
           `review-send trusted step forwards ${fallbackVar}`,
+        );
+      }
+      // Renamed role: model/profile/effort forward new names with legacy
+      // CHIEF fallback so existing settings keep working.
+      for (const vars of [
+        ['POCKETGUARD_MODEL_ARCHITECTURE', 'POCKETGUARD_MODEL_CHIEF'],
+        ['POCKETGUARD_MODEL_ARCHITECTURE_PROFILE', 'POCKETGUARD_MODEL_CHIEF_PROFILE'],
+        ['POCKETGUARD_MODEL_ARCHITECTURE_REASONING_EFFORT', 'POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT'],
+      ] as const) {
+        const [fresh, legacy] = vars;
+        assert.match(
+          trustedStep,
+          new RegExp(`${fresh}:\\s*\\$\\{\\{\\s*vars\\.${fresh}\\s*\\|\\|\\s*vars\\.${legacy}\\s*\\|\\|\\s*secrets\\.${fresh}\\s*\\|\\|\\s*secrets\\.${legacy}\\s*\\}\\}`),
+          `review-send trusted step forwards ${fresh} with legacy fallback`,
         );
       }
       assert.match(reviewJob, /needs:\s*\[prepare-tag,\s*claim-slot\]/, 'review-send waits for the claim');
@@ -1723,6 +1946,18 @@ export async function runExecutionMatrixTests(): Promise<void> {
         'review-send requires the approved claim for pull-request reviews',
       );
       assert.equal(MAX_REVIEWS_PER_SHA, 2, 'budget constant matches the specified two reviews per SHA');
+      // Chain budget counts the legacy CHIEF fallbacks so the wall-clock
+      // budget never underestimates during the rename transition.
+      assert.equal(maxModelChainAttempts({} as NodeJS.ProcessEnv), 1, 'empty env budgets one attempt');
+      assert.equal(
+        maxModelChainAttempts({
+          POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS: 'a, b',
+          POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'b, c',
+          POCKETGUARD_MODEL_FALLBACKS: 'd',
+        } as NodeJS.ProcessEnv),
+        6,
+        'new + legacy + global fallbacks all counted (budget overestimates dedup, fail-closed)',
+      );
     }
   } finally {
     globalThis.fetch = previousFetch;

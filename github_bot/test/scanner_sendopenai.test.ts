@@ -16,16 +16,21 @@ import {
 import {
   coverageSummary,
   filterReviewDiffFiles,
+  isHardDeniedReviewFile,
   MAX_DIFF_LENGTH,
   prioritizeFiles,
   truncateDiff,
 } from '../src/review_diff';
 import { buildReviewDiff } from '../src/github_runner';
 import {
+  buildSynthesisExcerpt,
+  extractSynthesisEvidence,
   orchestrateReview,
   parseFindings,
   parseJsonObject,
   parseRoleResponse,
+  parseSynthesisResponse,
+  selectUsableBlockFindings,
   triageIssue,
 } from '../src/orchestrator';
 
@@ -232,6 +237,35 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     'app/src/test/assets/screenshot.png',
     'app/src/test/java/example/SampleTest.kt',
   ]);
+    // H1: secret/key material is hard-denied even under must-include
+    // shapes (test dirs, permission/proguard substrings, workflows).
+    for (const denied of [
+      'tests/debug.keystore', 'TESTS/DEBUG.JKS', 'app/src/test/google-services.json',
+      'Test/Google-Services.Json', 'tests/local.properties', 'app/src/test/local.properties',
+      '.env', 'config/.env.local', '.env.production', 'permissions/debug.keystore',
+      'proguard/debug.keystore', '.github/workflows/evil.keystore', 'app/key.pem',
+      'config/server.key', 'certs/tls.p12', 'keys/code.pfx',
+      'app/google-services.json.bak', 'config/local.properties.txt',
+      'tests/debug.keystore.bak', 'proguard/secret.key.bak',
+      '.github/workflows/evil.p12.bak', 'keys/tls.pem.txt',
+      'permissions/id_rsa', 'tests/credentials.json', 'tests/secret.asc',
+      'app/src/test/id_rsa.txt', 'config/keystore.properties',
+      'app/googleservice-info.plist', 'config/service-account-prod.json',
+      'keys/secret.asc.bak', 'keys/x.ppk.bak', 'keys/x.ppk.txt', 'APP/SECRET.ASC.BAK',
+      'config/service-account-prod.json.bak', 'config/service-account-prod.json.txt',
+    ]) {
+      assert.equal(isHardDeniedReviewFile(denied), true, `H1 hard-denies ${denied}`);
+      assert.ok(!filterReviewDiffFiles([denied]).includes(denied), `H1 filters ${denied} despite must-include`);
+    }
+    // H1: legitimate must-includes survive.
+    for (const kept of [
+      'app/src/main/AndroidManifest.xml', 'app/build.gradle.kts', 'app/build/proguard-rules.pro',
+      '.github/workflows/ci.yml', 'app/src/test/java/example/SampleTest.kt',
+      'app/src/test/assets/screenshot.png',
+    ]) {
+      assert.equal(isHardDeniedReviewFile(kept), false, `H1 keeps ${kept}`);
+      assert.ok(filterReviewDiffFiles([kept]).includes(kept), `H1 retains ${kept}`);
+    }
 
   const boundaryDiffs: Record<string, string> = {
     'app/src/main/java/example/First.kt': 'A'.repeat(999850),
@@ -330,6 +364,82 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     );
   }
   assert.throws(() => resolveRoleModel('android_sec', {}), /model not configured/);
+  // Rename compat: deprecated POCKETGUARD_MODEL_CHIEF* env names still serve
+  // the architecture role while the new names are unset; new names win.
+  assert.equal(resolveRoleModel('architecture', { POCKETGUARD_MODEL_CHIEF: 'legacy-model' }), 'legacy-model');
+  assert.equal(
+    resolveRoleModel('architecture', {
+      POCKETGUARD_MODEL_ARCHITECTURE: 'new-model',
+      POCKETGUARD_MODEL_CHIEF: 'legacy-model',
+    }),
+    'new-model',
+  );
+  assert.deepEqual(
+    resolveModelFallbackChain(
+      'primary',
+      { POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'legacy-fb', POCKETGUARD_MODEL_FALLBACKS: 'global-fb' },
+      'architecture',
+    ),
+    ['primary', 'legacy-fb', 'global-fb'],
+  );
+  assert.deepEqual(
+    resolveModelProfile('legacy-profiled', {
+      POCKETGUARD_MODEL_CHIEF: 'legacy-profiled',
+      POCKETGUARD_MODEL_CHIEF_PROFILE: 'chat',
+    }),
+    { kind: 'chat' },
+  );
+  assert.deepEqual(
+    resolveModelProfile('legacy-reasoning', {
+      POCKETGUARD_MODEL_CHIEF: 'legacy-reasoning',
+      POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning',
+      POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT: 'low',
+    }),
+    { kind: 'reasoning', effort: 'low' },
+  );
+  // New names win over legacy ones; placeholders count as unconfigured.
+  assert.equal(
+    resolveRoleModel('architecture', {
+      POCKETGUARD_MODEL_ARCHITECTURE: '${MODEL}',
+      POCKETGUARD_MODEL_CHIEF: 'legacy-model',
+    }),
+    'legacy-model',
+  );
+  assert.deepEqual(
+    resolveModelFallbackChain(
+      'primary',
+      {
+        POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS: 'new-fb, shared-fb',
+        POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'shared-fb, legacy-fb',
+        POCKETGUARD_MODEL_FALLBACKS: 'legacy-fb, global-fb',
+      },
+      'architecture',
+    ),
+    ['primary', 'new-fb', 'shared-fb', 'legacy-fb', 'global-fb'],
+  );
+  assert.deepEqual(
+    resolveModelProfile('both-profiled', {
+      POCKETGUARD_MODEL_ARCHITECTURE: 'both-profiled',
+      POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: 'chat',
+      POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:low',
+    }),
+    { kind: 'chat' },
+  );
+  assert.deepEqual(
+    resolveModelProfile('placeholder-primary', {
+      POCKETGUARD_MODEL_ARCHITECTURE: 'placeholder-primary',
+      POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: '${PROFILE}',
+      POCKETGUARD_MODEL_CHIEF_PROFILE: 'chat',
+    }),
+    { kind: 'chat' },
+  );
+  assert.equal(
+    resolveModelProfile('placeholder-both', {
+      POCKETGUARD_MODEL_ARCHITECTURE: 'placeholder-both',
+      POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: '${PROFILE}',
+    }),
+    undefined,
+  );
   // Fork onboarding defaults: an unset base URL falls back to the official
   // endpoint and an empty allowlist falls back to the official origin.
   const defaultedConfig = resolveOpenAIConfig({ OPENAI_API_KEY: 'fake-key' }, []);
@@ -467,7 +577,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
 
     const orchestratorEnv = {
       ...openaiEnvironment,
-      POCKETGUARD_MODEL_CHIEF: FAKE_MODEL_ID,
+      POCKETGUARD_MODEL_ARCHITECTURE: FAKE_MODEL_ID,
       POCKETGUARD_MODEL_ANDROID_SEC: FAKE_MODEL_ID,
       POCKETGUARD_MODEL_ANDROID_CODE: FAKE_MODEL_ID,
     };
@@ -644,9 +754,9 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         'Please address the blocking findings before proceeding.',
       ].join('\n');
 
-      const parsedOpus = parseRoleResponse('chief', 'cpa-claude-opus-4-6-thinking', realisticOpusResponse);
+      const parsedOpus = parseRoleResponse('architecture', 'cpa-claude-opus-4-6-thinking', realisticOpusResponse);
       assert.equal(parsedOpus.verdict, 'NEEDS_CHANGES');
-      assert.equal(parsedOpus.role, 'chief');
+      assert.equal(parsedOpus.role, 'architecture');
       assert.equal(parsedOpus.modelUsed, 'cpa-claude-opus-4-6-thinking');
       assert.equal(
         parsedOpus.summary,
@@ -696,7 +806,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
 
       // 5. Fallback on invalid verdict
       const invalidVerdictParsed = parseRoleResponse(
-        'chief',
+        'architecture',
         'cpa-claude-opus-4-6-thinking',
         '{"verdict":"LGTM","summary":"All good"}',
       );
@@ -706,7 +816,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
 
       // 6. Fallback on invalid finding structure (e.g. invalid severity)
       const invalidFindingParsed = parseRoleResponse(
-        'chief',
+        'architecture',
         'cpa-claude-opus-4-6-thinking',
         '{"verdict":"APPROVE","findings":[{"severity":"INVALID","issue":"bad"}]}',
       );
@@ -715,7 +825,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
 
       // 7. Fallback on invalid suggestedLabels type
       const invalidLabelsParsed = parseRoleResponse(
-        'chief',
+        'architecture',
         'cpa-claude-opus-4-6-thinking',
         '{"verdict":"APPROVE","suggestedLabels":"not-an-array"}',
       );
@@ -792,8 +902,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     // temperature/top_p.
     const noneEnv = {
       ...openaiEnvironment,
-      POCKETGUARD_MODEL_CHIEF: 'gpt-5.2',
-      POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+      POCKETGUARD_MODEL_ARCHITECTURE: 'gpt-5.2',
+      POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: 'reasoning:none',
     };
     assert.deepEqual(resolveModelProfile('gpt-5.2', noneEnv), { kind: 'reasoning', effort: 'none' });
     const noneBody = await captureSingleTurnBody('gpt-5.2', noneEnv);
@@ -815,8 +925,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     {
       const none55Env = {
         ...openaiEnvironment,
-        POCKETGUARD_MODEL_CHIEF: 'gpt-5.5',
-        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+        POCKETGUARD_MODEL_ARCHITECTURE: 'gpt-5.5',
+        POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: 'reasoning:none',
       };
       assert.deepEqual(resolveModelProfile('gpt-5.5', none55Env), { kind: 'reasoning', effort: 'none' });
       const none55Body = await captureSingleTurnBody('gpt-5.5', none55Env);
@@ -861,8 +971,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     for (const effort of ['None', 'NONE', ' nOnE ']) {
       const caseEnv = {
         ...openaiEnvironment,
-        POCKETGUARD_MODEL_CHIEF: 'gpt-5.2',
-        POCKETGUARD_MODEL_CHIEF_PROFILE: `reasoning:${effort}`,
+        POCKETGUARD_MODEL_ARCHITECTURE: 'gpt-5.2',
+        POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: `reasoning:${effort}`,
       };
       assert.deepEqual(resolveModelProfile('gpt-5.2', caseEnv), { kind: 'reasoning', effort: effort.trim() });
       const caseBody = await captureSingleTurnBody('gpt-5.2', caseEnv);
@@ -879,8 +989,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     {
       const unsupportedCaseEnv = {
         ...openaiEnvironment,
-        POCKETGUARD_MODEL_CHIEF: 'o3-mini',
-        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:NONE',
+        POCKETGUARD_MODEL_ARCHITECTURE: 'o3-mini',
+        POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: 'reasoning:NONE',
       };
       assert.equal(resolveModelProfile('o3-mini', unsupportedCaseEnv), undefined, 'o3-mini + NONE is undefined');
     }
@@ -905,8 +1015,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
 
       const upperEnv = {
         ...openaiEnvironment,
-        POCKETGUARD_MODEL_CHIEF: 'GPT-5.2',
-        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+        POCKETGUARD_MODEL_ARCHITECTURE: 'GPT-5.2',
+        POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: 'reasoning:none',
       };
       assert.deepEqual(resolveModelProfile('GPT-5.2', upperEnv), { kind: 'reasoning', effort: 'none' });
       const upperBody = await captureSingleTurnBody('GPT-5.2', upperEnv);
@@ -959,8 +1069,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     {
       const unsupportedEnv = {
         ...openaiEnvironment,
-        POCKETGUARD_MODEL_CHIEF: 'o3-mini',
-        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+        POCKETGUARD_MODEL_ARCHITECTURE: 'o3-mini',
+        POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: 'reasoning:none',
       };
       assert.equal(resolveModelProfile('o3-mini', unsupportedEnv), undefined, 'o3-mini + none is undefined');
       const previous = globalThis.fetch;
@@ -993,8 +1103,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     {
       const chatNoneEnv = {
         ...openaiEnvironment,
-        POCKETGUARD_MODEL_CHIEF: 'gpt-4o',
-        POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:none',
+        POCKETGUARD_MODEL_ARCHITECTURE: 'gpt-4o',
+        POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: 'reasoning:none',
       };
       assert.equal(resolveModelProfile('gpt-4o', chatNoneEnv), undefined, 'gpt-4o + none is undefined');
       const previous = globalThis.fetch;
@@ -1054,8 +1164,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     // Per-role profile override with a custom effort.
     const perRoleEnv = {
       ...openaiEnvironment,
-      POCKETGUARD_MODEL_CHIEF: 'gpt-5.2',
-      POCKETGUARD_MODEL_CHIEF_PROFILE: 'reasoning:medium',
+      POCKETGUARD_MODEL_ARCHITECTURE: 'gpt-5.2',
+      POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: 'reasoning:medium',
     };
     const perRoleBody = await captureSingleTurnBody('gpt-5.2', perRoleEnv);
     assert.deepEqual(perRoleBody.reasoning, { effort: 'medium' });
@@ -1126,7 +1236,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           env: orchestratorEnv,
           allowedOrigins: FAKE_ALLOWED_ORIGINS,
         });
-        assert.deepEqual(triaged, { verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [] });
+        assert.deepEqual(triaged, { verdict: 'INCONCLUSIVE', summary: '', suggestedLabels: [], codeRefs: [] });
       } finally {
         globalThis.fetch = previous;
       }
@@ -1210,7 +1320,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           deterministicViolations: [],
           env: {
             ...openaiEnvironment,
-            POCKETGUARD_MODEL_CHIEF: 'unknown-model-xyz',
+            POCKETGUARD_MODEL_ARCHITECTURE: 'unknown-model-xyz',
             POCKETGUARD_MODEL_ANDROID_SEC: 'unknown-model-xyz',
             POCKETGUARD_MODEL_ANDROID_CODE: 'unknown-model-xyz',
           },
@@ -1231,15 +1341,15 @@ export async function runScannerSendOpenAITests(): Promise<void> {
       // placeholders filtered. Unset lists mean no fallback at all.
       assert.deepEqual(
         resolveModelFallbackChain('primary-model', {
-          POCKETGUARD_MODEL_CHIEF: 'primary-model',
-          POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'b-model, c-model, primary-model, ${MISSING}',
+          POCKETGUARD_MODEL_ARCHITECTURE: 'primary-model',
+          POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS: 'b-model, c-model, primary-model, ${MISSING}',
           POCKETGUARD_MODEL_FALLBACKS: 'c-model, d-model',
-        }, 'chief'),
+        }, 'architecture'),
         ['primary-model', 'b-model', 'c-model', 'd-model'],
         'chain keeps order, drops duplicates and placeholders',
       );
       assert.deepEqual(
-        resolveModelFallbackChain('primary-model', {}, 'chief'),
+        resolveModelFallbackChain('primary-model', {}, 'architecture'),
         ['primary-model'],
         'no configured fallbacks yields the previous single-model behaviour',
       );
@@ -1384,6 +1494,33 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           );
           assert.equal(fetchCount, 3, 'each candidate is tried once with no extra retries');
           assert.deepEqual(requestedModels, ['primary-model', 'second-model', 'third-model']);
+
+      // F4: an already-passed deadline fails closed before any request.
+      {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => {
+          fetchCount += 1;
+          return okResponse();
+        }) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'primary-model',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: chainEnv,
+              timeoutMs: 1000,
+              deadlineMs: Date.now() - 1,
+            }),
+            /review deadline exceeded/,
+          );
+          assert.equal(fetchCount, 0, 'expired deadline sends nothing');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
         } finally {
           globalThis.fetch = previous;
         }
@@ -1394,7 +1531,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
       {
         const roleEnv = {
           ...chainEnv,
-          POCKETGUARD_MODEL_CHIEF: 'primary-model',
+          POCKETGUARD_MODEL_ARCHITECTURE: 'primary-model',
           POCKETGUARD_MODEL_ANDROID_SEC: 'primary-model',
           POCKETGUARD_MODEL_ANDROID_CODE: 'primary-model',
         };
@@ -1594,6 +1731,402 @@ export async function runScannerSendOpenAITests(): Promise<void> {
   } finally {
     globalThis.fetch = originalFetch;
   }
+
+    // Synthesis response parsing is strict: unknown top-level keys reject,
+    // evidence is extracted index-aligned for the runner's support check.
+    {
+      const good = parseSynthesisResponse('m', JSON.stringify({
+        verdict: 'NEEDS_CHANGES',
+        summary: 's',
+        findings: [{ severity: 'BLOCK', file: 'a.kt', line: 1, issue: 'i', evidence: 'quoted code here' }],
+      }));
+      assert.ok(good?.ok);
+      assert.deepEqual(good?.evidences, ['quoted code here']);
+      assert.equal(
+        parseSynthesisResponse('m', JSON.stringify({ verdict: 'APPROVE', summary: 's', findings: [], extra: 1 })),
+        undefined,
+        'unknown synthesis keys reject',
+      );
+      assert.deepEqual(extractSynthesisEvidence('not json'), undefined);
+      // H2 fixtures: a.kt carries the quote in a line-1-covering hunk.
+      const h2Diffs = new Map([
+        ['a.kt', [
+          'diff --git a/a.kt b/a.kt',
+          '--- a/a.kt',
+          '+++ b/a.kt',
+          '@@ -1,2 +1,2 @@',
+          ' context',
+          '+quoted code here',
+        ].join('\n')],
+        ['b.kt', [
+          'diff --git a/b.kt b/b.kt',
+          '--- a/b.kt',
+          '+++ b/b.kt',
+          '@@ -1,1 +1,1 @@',
+          '+other file content here',
+        ].join('\n')],
+      ]);
+      const h2Scope = (
+        violations: Array<{ ruleId: string; message: string; file?: string; line?: number }> = [],
+        shownByFile: Map<string, string> = new Map([['a.kt', ' context\n+quoted code here']]),
+      ) => ({
+        fileDiffs: h2Diffs,
+        allowedFiles: new Set(h2Diffs.keys()),
+        violations,
+        shownByFile,
+      });
+      const usable = selectUsableBlockFindings(
+        good?.findings ?? [],
+        good?.evidences ?? [],
+        h2Scope(),
+      );
+      assert.equal(usable.length, 1, 'literally supported BLOCK is usable');
+      assert.deepEqual(
+        selectUsableBlockFindings(
+          good?.findings ?? [],
+          ['missing quote'],
+          h2Scope(),
+        ),
+        [],
+        'unsupported evidence is unusable',
+      );
+
+      // G1 wiring: the raw per-file map carries excluded files while
+      // the eligible set does not.
+      {
+        const patches: Record<string, string> = {
+          'app/src/main/java/demo/Safe.kt': [
+            'diff --git a/app/src/main/java/demo/Safe.kt b/app/src/main/java/demo/Safe.kt',
+            '--- a/app/src/main/java/demo/Safe.kt',
+            '+++ b/app/src/main/java/demo/Safe.kt',
+            '@@ -1,1 +1,1 @@',
+            '+class Safe',
+          ].join('\n'),
+          'app/local.properties': [
+            'diff --git a/app/local.properties b/app/local.properties',
+            '--- a/app/local.properties',
+            '+++ b/app/local.properties',
+            '@@ -1,1 +1,1 @@',
+            '+sdk.dir=/opt/x',
+          ].join('\n'),
+        };
+        const built = buildReviewDiff(
+          { runGit: (args: string[]) => patches[args[args.length - 1]] ?? '' } as never,
+          'a'.repeat(40),
+          'b'.repeat(40),
+          Object.keys(patches),
+        );
+        assert.ok(built.fileDiffs.has('app/local.properties'), 'G1 raw map carries the excluded patch');
+        assert.ok(!built.visibleFiles.includes('app/local.properties'), 'G1 eligible set excludes it');
+        assert.ok(built.visibleFiles.includes('app/src/main/java/demo/Safe.kt'), 'G1 eligible set keeps review files');
+        assert.ok(built.diff.includes('class Safe'), 'G1 visible diff keeps review files');
+        assert.ok(!built.diff.includes('sdk.dir'), 'G1 visible diff drops the excluded patch');
+      }
+
+      // F5: head sample + evidence-anchored snippets within the fixed
+      // budget; tail anchors stay verifiable, omissions are recorded.
+      {
+        const headPath = 'app/src/main/java/demo/Head.kt';
+        const tailPath = 'app/src/main/java/demo/Tail.kt';
+        const headDiff = [
+          'diff --git a/app/src/main/java/demo/Head.kt b/app/src/main/java/demo/Head.kt',
+          '--- a/app/src/main/java/demo/Head.kt',
+          '+++ b/app/src/main/java/demo/Head.kt',
+          '@@ -1,3 +1,3 @@',
+          ' context-a',
+          '+HEAD-MARKER-ADDED',
+          ' context-b',
+        ].join('\n');
+        const tailHunk = ['@@ -1,5 +1,5 @@', ' t0', '+TAIL-MARKER-ADDED', ' t1', ' t2', ' t3'].join('\n');
+        const tailDiff = [
+          'diff --git a/app/src/main/java/demo/Tail.kt b/app/src/main/java/demo/Tail.kt',
+          '--- a/app/src/main/java/demo/Tail.kt',
+          '+++ b/app/src/main/java/demo/Tail.kt',
+          tailHunk,
+        ].join('\n');
+        const fileDiffs = new Map([[headPath, headDiff], [tailPath, tailDiff]]);
+        const built = buildSynthesisExcerpt({
+          diff: `${headDiff}\n${tailDiff}`,
+          fileDiffs,
+          anchors: [{ file: tailPath, line: 2 }],
+          allowedFiles: new Set(fileDiffs.keys()),
+        });
+        assert.ok(built.excerpt.includes('HEAD-MARKER-ADDED'), 'F5 head sample kept');
+        assert.ok(built.excerpt.includes('TAIL-MARKER-ADDED'), 'F5 tail anchor snippet included');
+        assert.ok(built.excerpt.includes('evidence snippet: app/src/main/java/demo/Tail.kt'), 'F5 snippet labeled');
+        assert.ok(built.excerpt.length <= 12000, 'F5 excerpt within budget');
+        assert.equal(built.snippetCount, 1, 'F5 one snippet');
+        assert.equal(built.anchorsTotal, 1, 'F5 one anchor');
+        assert.deepEqual(built.omittedAnchors, [], 'F5 nothing omitted');
+        // Unknown and ambiguous anchors are recorded omitted, never silent.
+        const built2 = buildSynthesisExcerpt({
+          diff: headDiff,
+          fileDiffs,
+          anchors: [{ file: 'Nope.kt', line: 1 }, { file: 'Tail.kt' }, { file: tailPath, line: 99 }],
+          allowedFiles: new Set(fileDiffs.keys()),
+        });
+        assert.equal(built2.snippetCount, 1, 'F5 resolvable anchor still emitted');
+        assert.equal(built2.omittedAnchors.length, 2, 'F5 unknown + out-of-range anchors omitted');
+        assert.ok(built2.omittedAnchors.some((a) => a.includes('Nope.kt')), 'F5 unknown recorded');
+        // True ambiguity (same basename in two files) resolves to nothing.
+        const dupDiffs = new Map([
+          ['app/src/main/java/demo/Same.kt', headDiff],
+          ['app/src/test/java/demo/Same.kt', tailDiff],
+        ]);
+        const built3 = buildSynthesisExcerpt({
+          diff: headDiff,
+          allowedFiles: new Set(dupDiffs.keys()),
+          fileDiffs: dupDiffs,
+          anchors: [{ file: 'Same.kt' }],
+        });
+        assert.equal(built3.snippetCount, 0, 'F5 ambiguous anchor emits nothing');
+        assert.equal(built3.omittedAnchors.length, 1, 'F5 ambiguity recorded omitted');
+        // G1: deliberately excluded files stay excluded through anchors.
+        const secretDiff = [
+          'diff --git a/app/local.properties b/app/local.properties',
+          '--- a/app/local.properties',
+          '+++ b/app/local.properties',
+          '@@ -1,2 +1,2 @@',
+          ' sdk.dir=/opt/old',
+          '+sdk.dir=/opt/G1-EXCLUDED-MARKER',
+        ].join('\n');
+        const g1Diffs = new Map([
+          ['app/src/main/java/demo/Head.kt', headDiff],
+          ['app/local.properties', secretDiff],
+        ]);
+        const g1Allowed = new Set(filterReviewDiffFiles([...g1Diffs.keys()]));
+        assert.ok(!g1Allowed.has('app/local.properties'), 'G1 local.properties is review-excluded');
+        const built4 = buildSynthesisExcerpt({
+          diff: headDiff,
+          fileDiffs: g1Diffs,
+          anchors: [{ file: 'app/local.properties', line: 2 }, { file: 'app/src/main/java/demo/Head.kt' }],
+          allowedFiles: g1Allowed,
+        });
+        assert.equal(built4.snippetCount, 1, 'G1 only the allowed anchor emits');
+        assert.equal(built4.omittedAnchors.length, 1, 'G1 excluded anchor recorded omitted');
+        assert.ok(!built4.excerpt.includes('G1-EXCLUDED-MARKER'), 'G1 excluded patch never enters the excerpt');
+        // G1: short-name anchors resolving only to an excluded file are
+        // blocked the same way.
+        const built5 = buildSynthesisExcerpt({
+          diff: headDiff,
+          fileDiffs: g1Diffs,
+          anchors: [{ file: 'local.properties', line: 2 }],
+          allowedFiles: g1Allowed,
+        });
+        assert.equal(built5.snippetCount, 0, 'G1 short-name excluded anchor emits nothing');
+        assert.ok(!built5.excerpt.includes('G1-EXCLUDED-MARKER'), 'G1 short-name excluded patch never enters');
+        assert.ok(built4.excerpt.includes('HEAD-MARKER-ADDED'), 'G1 allowed anchor still snippeted');
+      }
+      assert.deepEqual(
+        selectUsableBlockFindings(
+          good?.findings ?? [],
+          ['short'],
+          h2Scope(),
+        ),
+        [],
+        'trivial evidence never supports',
+      );
+      assert.deepEqual(
+        selectUsableBlockFindings(
+          [{ severity: 'WARN', issue: 'w' }],
+          ['warn evidence in diff'],
+          h2Scope(),
+        ),
+        [],
+        'non-BLOCK never usable for tightening',
+      );
+      // H2: evidence must bind to the finding's own file/line.
+      {
+        const blockInA = (file?: string, line?: number) => [{
+          severity: 'BLOCK' as const,
+          ...(file === undefined ? {} : { file }),
+          ...(line === undefined ? {} : { line }),
+          issue: 'i',
+        }];
+        // Reviewer counterexample (Danger.kt/Safe.kt shape): quote lives
+        // only in b.kt, finding says a.kt.
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            blockInA('a.kt', 1),
+            ['other file content here'],
+            h2Scope([], new Map([['a.kt', ' context\n+quoted code here']])),
+          ),
+          [],
+          'H2 cross-file quote never tightens',
+        );
+        // Missing file, unknown file, out-of-range line.
+        assert.deepEqual(
+          selectUsableBlockFindings(blockInA(undefined), ['quoted code here'], h2Scope()),
+          [],
+          'H2 missing file never tightens',
+        );
+        assert.deepEqual(
+          selectUsableBlockFindings(blockInA('Nope.kt', 1), ['quoted code here'], h2Scope()),
+          [],
+          'H2 unknown file never tightens',
+        );
+        assert.deepEqual(
+          selectUsableBlockFindings(blockInA('a.kt', 99), ['quoted code here'], h2Scope()),
+          [],
+          'H2 out-of-range line never tightens',
+        );
+        // Ambiguous short name resolves to nothing.
+        const dupDiffs = new Map([['x/a.kt', h2Diffs.get('a.kt') ?? ''], ['y/a.kt', h2Diffs.get('b.kt') ?? '']]);
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            blockInA('a.kt', 1),
+            ['quoted code here'],
+            { fileDiffs: dupDiffs, allowedFiles: new Set(dupDiffs.keys()), violations: [], shownByFile: new Map([['x/a.kt', '+quoted code here']]) },
+          ),
+          [],
+          'H2 ambiguous file never tightens',
+        );
+        // Lineless file-level binding still works.
+        assert.equal(
+          selectUsableBlockFindings(blockInA('a.kt'), ['quoted code here'], h2Scope()).length,
+          1,
+          'H2 lineless same-file quote tightens',
+        );
+        // Same-file violation carries a quote the excerpt omits.
+        assert.equal(
+          selectUsableBlockFindings(
+            blockInA('a.kt', 1),
+            ['violation quote here'],
+            h2Scope(
+              [{ ruleId: 'SEC-1', message: 'violation quote here', file: 'a.kt', line: 1 }],
+              new Map([['a.kt', 'unrelated shown text here']]),
+            ),
+          ).length,
+          1,
+          'H2 same-file violation quote tightens',
+        );
+        // Cross-file violation never tightens.
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            blockInA('a.kt', 1),
+            ['violation quote here'],
+            h2Scope(
+              [{ ruleId: 'SEC-1', message: 'violation quote here', file: 'b.kt' }],
+              new Map([['a.kt', 'unrelated shown text here']]),
+            ),
+          ),
+          [],
+          'H2 cross-file violation never tightens',
+        );
+        // I1: same-file cross-hunk quote never tightens for another hunk's line.
+        const twoHunk = new Map([['c.kt', [
+          'diff --git a/c.kt b/c.kt',
+          '--- a/c.kt',
+          '+++ b/c.kt',
+          '@@ -10,2 +10,2 @@',
+          ' ctx10',
+          '+harmless line here',
+          '@@ -100,2 +100,2 @@',
+          ' ctx100',
+          '+dangerousAction line here',
+        ].join('\n')]]);
+        const twoScope = (shown: string) => ({
+          fileDiffs: twoHunk,
+          allowedFiles: new Set(twoHunk.keys()),
+          violations: [],
+          shownByFile: new Map([['c.kt', shown]]),
+        });
+        const blockInC = (line?: number) => [{
+          severity: 'BLOCK' as const,
+          file: 'c.kt',
+          ...(line === undefined ? {} : { line }),
+          issue: 'i',
+        }];
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            blockInC(10),
+            ['dangerousAction line here'],
+            twoScope(' ctx10\n+harmless line here\n ctx100\n+dangerousAction line here'),
+          ),
+          [],
+          'I1 cross-hunk quote never tightens another hunk line',
+        );
+        assert.equal(
+          selectUsableBlockFindings(
+            blockInC(100),
+            ['dangerousAction line here'],
+            twoScope(' ctx10\n+harmless line here\n ctx100\n+dangerousAction line here'),
+          ).length,
+          1,
+          'I1 same-hunk quote tightens its own line',
+        );
+        // I1: duplicate quote shown only under another file never tightens.
+        const dupShown = new Map([
+          ['a.kt', ' context\n+quoted code here'],
+          ['b.kt', '+DUPLICATE-QUOTE here'],
+        ]);
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            [{ severity: 'BLOCK' as const, file: 'a.kt', line: 1, issue: 'i' }],
+            ['DUPLICATE-QUOTE here'],
+            { fileDiffs: h2Diffs, allowedFiles: new Set(h2Diffs.keys()), violations: [], shownByFile: dupShown },
+          ),
+          [],
+          'I1 duplicate quote shown only elsewhere never tightens',
+        );
+        // I1: builder attributes shown text per file (head sections plus
+        // snippet windows, header lines excluded).
+        {
+          const head2 = [
+            'diff --git a/h1.kt b/h1.kt',
+            '--- a/h1.kt',
+            '+++ b/h1.kt',
+            '@@ -1,1 +1,1 @@',
+            '+HEAD-ONE here',
+            'diff --git a/h2.kt b/h2.kt',
+            '--- a/h2.kt',
+            '+++ b/h2.kt',
+            '@@ -1,1 +1,1 @@',
+            '+HEAD-TWO here',
+          ].join('\n');
+          const map2 = new Map([
+            ['h1.kt', head2.split('diff --git a/h2.kt')[0]],
+            ['h2.kt', 'diff --git a/h2.kt b/h2.kt\n--- a/h2.kt\n+++ b/h2.kt\n@@ -1,1 +1,1 @@\n+HEAD-TWO here'],
+          ]);
+          const plan2 = buildSynthesisExcerpt({
+            diff: head2,
+            fileDiffs: map2,
+            anchors: [],
+            allowedFiles: new Set(map2.keys()),
+          });
+          const shown1 = plan2.shownByFile.get('h1.kt') ?? '';
+          const shown2 = plan2.shownByFile.get('h2.kt') ?? '';
+          assert.ok(shown1.includes('HEAD-ONE here'), 'I1 head attributes file one');
+          assert.ok(!shown1.includes('HEAD-TWO here'), 'I1 head does not leak file two');
+          assert.ok(shown2.includes('HEAD-TWO here'), 'I1 head attributes file two');
+          assert.ok(!shown2.includes('+++ b/h1.kt'), 'I1 diff headers excluded from shown');
+          // I1: unparseable (quoted-path) headers flush to unattributed —
+          // never credited to the previous file.
+          const qDiff = [
+            'diff --git a/q1.kt b/q1.kt',
+            '--- a/q1.kt',
+            '+++ b/q1.kt',
+            '@@ -1,1 +1,1 @@',
+            '+Q1-MARKER here',
+            'diff --git "a/sp ace.kt" "b/sp ace.kt"',
+            '--- "a/sp ace.kt"',
+            '+++ "b/sp ace.kt"',
+            '@@ -1,1 +1,1 @@',
+            '+QUOTED-SECRET here',
+          ].join('\n');
+          const qMap = new Map([['q1.kt', qDiff.split('diff --git "a/')[0]]]);
+          const qPlan = buildSynthesisExcerpt({
+            diff: qDiff,
+            fileDiffs: qMap,
+            anchors: [],
+            allowedFiles: new Set(qMap.keys()),
+          });
+          const qShown = qPlan.shownByFile.get('q1.kt') ?? '';
+          assert.ok(qShown.includes('Q1-MARKER here'), 'I1 quoted section keeps prior file');
+          assert.ok(!qShown.includes('QUOTED-SECRET here'), 'I1 quoted section never pollutes prior file');
+        }
+      }
+    }
 
   console.log('[PocketGuard scanner/OpenAI tests] All tests passed.');
 }

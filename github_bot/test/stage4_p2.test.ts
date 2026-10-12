@@ -36,10 +36,10 @@ function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     OPENAI_BASE_URL: TEST_BASE_URL,
     OPENAI_API_KEY: 'fake-openai-key',
     POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-    POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+    POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
     POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
     POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-    POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+    POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
     ...extra,
   } as NodeJS.ProcessEnv;
 }
@@ -469,7 +469,7 @@ export async function runStage4P2Tests(): Promise<void> {
             writeStdout: () => undefined,
           });
           assert.notEqual(reviewed.verdict, 'APPROVE', 'unknown labels force non-APPROVE');
-          assert.ok(warnings.some((w) => /Discarded 1 unknown AI label/.test(w)), 'discard is logged as a count');
+          assert.ok(warnings.some((w) => /Discarded 1 issue AI label/.test(w)), 'discard is logged as a count');
           assert.ok(warnings.every((w) => !w.includes(sentinel)), 'raw unknown label never enters the log');
         } finally {
           restore();

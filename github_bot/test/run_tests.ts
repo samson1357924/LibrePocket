@@ -7,7 +7,7 @@ import { runStickyLabelTests } from './sticky_labels.test';
 import { runMergeBaseTests } from './merge_base.test';
 import { runStage4P2Tests } from './stage4_p2.test';
 import { runPhase2HTests } from './phase2_h.test';
-import { runPrChunksTests } from './pr_chunks.test';
+import { runPrReviewTests } from './pr_review.test';
 import { runPrPhase3Tests } from './pr_phase3.test';
 import { runClaimDiagnosticsTests } from './claim_diagnostics.test';
 
@@ -22,7 +22,7 @@ runLabelManagerTests()
   .then(() => runMergeBaseTests())
   .then(() => runStage4P2Tests())
   .then(() => runPhase2HTests())
-  .then(() => runPrChunksTests())
+  .then(() => runPrReviewTests())
   .then(() => runPrPhase3Tests())
   .then(() => runClaimDiagnosticsTests())
   .catch((error: unknown) => {

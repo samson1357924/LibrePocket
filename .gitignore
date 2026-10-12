@@ -16,6 +16,8 @@
 local.properties
 # Release signing: keystores + passwords must NEVER be committed.
 .env
+.env.*
+google-services.json
 /keystores/
 *.jks
 *.p12

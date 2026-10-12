@@ -147,10 +147,10 @@ function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     OPENAI_BASE_URL: TEST_BASE_URL,
     OPENAI_API_KEY: 'fake-openai-key',
     POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-    POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+    POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
     POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
     POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-    POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+    POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
     ...extra,
   } as NodeJS.ProcessEnv;
 }
@@ -1270,7 +1270,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
 
     // --- Test 14 (Phase 1): heavy findings trim the summary, never metadata. ---
     {
-      const roles = ['chief', 'android_sec', 'android_code'] as const;
+      const roles = ['architecture', 'android_sec', 'android_code'] as const;
       const output = {
         verdict: 'NEEDS_CHANGES' as const,
         pullRequestNumber: 41,
@@ -1388,7 +1388,7 @@ export async function runReviewCountLedgerTests(): Promise<void> {
       const claims = new Set<string>([`${SHA_A}:run-hflarge:1`]);
       const reserve = estimateStickyMetadataLength(ledger, claims);
       assert.ok(reserve > 20000, `large ledger reserves headroom (got ${reserve})`);
-      const roles = ['chief', 'android_sec', 'android_code'] as const;
+      const roles = ['architecture', 'android_sec', 'android_code'] as const;
       const output = {
         verdict: 'NEEDS_CHANGES' as const,
         pullRequestNumber: 41,

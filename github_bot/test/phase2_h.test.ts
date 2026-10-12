@@ -4,31 +4,23 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   areReviewReportsAvailable,
-  buildIssueChunks,
   enforceGithubCommentLimit,
   formatReportLine,
   getReportRunUrl,
   issueContentFingerprint,
   issueReviewComment,
-  rawSliceHash,
+  isIssueCodeRefAllowed,
   reviewComment,
   runIssueReviewMode,
   runPublishMode,
   runClaimMode,
-  sliceTextForChunk,
+  resolveIssueCodeRef,
   stickyField,
   truncateStickyText,
-  validateIssueChunk,
-  validateIssueChunkReport,
-  validateIssueChunkReports,
-  validateIssueChunks,
   validateIssueOutput,
-  verifyIssueChunkCoverage,
   writeReviewReports,
   REVIEW_REPORT_WRITE_ERROR,
   GITHUB_COMMENT_HARD_LIMIT,
-  MAX_ISSUE_CHUNK_LENGTH,
-  MAX_ISSUE_CHUNK_SUMMARY_LENGTH,
   MAX_STICKY_FILE_LIST_SHOWN,
   MAX_STICKY_ITEM_LENGTH,
   MAX_STICKY_TOTAL_LENGTH,
@@ -47,10 +39,10 @@ function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     OPENAI_BASE_URL: TEST_BASE_URL,
     OPENAI_API_KEY: 'fake-openai-key',
     POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-    POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+    POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
     POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
     POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-    POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+    POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
     ...extra,
   } as NodeJS.ProcessEnv;
 }
@@ -145,6 +137,440 @@ export async function runPhase2HTests(): Promise<void> {
         } finally {
           restore();
         }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // H-1b: issue AI suggesting a human-only label (gate:*) is discarded and
+    // forces INCONCLUSIVE; allowlisted suggestions are kept.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-issue-gate-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'ok', suggestedLabels: ['bug', 'gate:live'] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'short body' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: 'short body' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'human-only AI label forces INCONCLUSIVE');
+          assert.ok(!reviewed.tags.includes('gate:live'), 'gate label never written');
+          assert.ok(!reviewed.tags.includes('bug'), 'tainted AI batch is discarded wholesale');
+          assert.ok(reviewed.tags.includes('status:needs-decision'), 'non-APPROVE carries needs-decision');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // H-1c: publish rejects a crafted APPROVE artifact whose suggestedLabels
+    // carry a human-only label (gate:*) — same sticky INCONCLUSIVE, never written.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-issue-gate-pub-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'ok', suggestedLabels: ['bug'] }]);
+        try {
+          const reviewState = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const reviewClient = issueClient(reviewState, { getTitle: 'gate-title', getBody: 'gate-body' });
+          await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'gate-title', body: 'gate-body' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: reviewClient,
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        const forged = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+        forged.suggestedLabels = ['gate:live'];
+        fs.writeFileSync(artifactPath, JSON.stringify(forged));
+        const applied: string[] = [];
+        const state = {
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const client = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: 'gate-title', body: 'gate-body' } }),
+              listComments: async (params: { page: number }) => {
+                void params;
+                return { data: state.comments };
+              },
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const c = state.comments.find((x) => x.id === params.comment_id);
+                if (c) c.body = params.body;
+                return {};
+              },
+              addLabels: async (params: { labels: string[] }) => { applied.push(...params.labels); return {}; },
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'gate-title', body: 'gate-body' } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_SERVER_URL: 'https://github.com',
+            GITHUB_RUN_ID: '123456',
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as unknown as NodeJS.ProcessEnv,
+          githubClient: client,
+        });
+        assert.equal(state.created, 0, 'forged-gate publish creates no second comment');
+        assert.equal(state.updated, 1, 'forged-gate publish updates the same sticky');
+        assert.ok(state.comments[0].body.includes('INCONCLUSIVE'), 'forged gate falls back');
+        assert.ok(!applied.includes('gate:live'), 'gate label never applied');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // H-1e: publish rejects a forged APPROVE artifact carrying retired chunk
+    // fields — same sticky INCONCLUSIVE, never written.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-issue-forgechunk-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] }]);
+        try {
+          const reviewState = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const reviewClient = issueClient(reviewState, { getTitle: 'fc-title', getBody: 'fc-body' });
+          await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'fc-title', body: 'fc-body' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: reviewClient,
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        const forged = {
+          ...JSON.parse(fs.readFileSync(artifactPath, 'utf8')),
+          chunks: [{ index: 0, total: 1 }],
+          chunkCoverageComplete: true,
+          chunkCount: 1,
+        } as Record<string, unknown>;
+        fs.writeFileSync(artifactPath, JSON.stringify(forged));
+        const applied: string[] = [];
+        const state = {
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const client = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: 'fc-title', body: 'fc-body' } }),
+              listComments: async (params: { page: number }) => {
+                void params;
+                return { data: state.comments };
+              },
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const c = state.comments.find((x) => x.id === params.comment_id);
+                if (c) c.body = params.body;
+                return {};
+              },
+              addLabels: async (params: { labels: string[] }) => { applied.push(...params.labels); return {}; },
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'fc-title', body: 'fc-body' } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_SERVER_URL: 'https://github.com',
+            GITHUB_RUN_ID: '123456',
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as unknown as NodeJS.ProcessEnv,
+          githubClient: client,
+        });
+        assert.equal(state.created, 0, 'forged-chunk publish creates no second comment');
+        assert.equal(state.updated, 1, 'forged-chunk publish updates the same sticky');
+        assert.ok(state.comments[0].body.includes('INCONCLUSIVE'), 'forged chunks fall back');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // F1 (review #77 P1-1): fresh budget-truncation publishes the honest
+    // verdict/counts instead of the generic unverifiable fallback.
+    for (const shape of [
+      {
+        label: 'truncated-inconclusive',
+        title: 'long',
+        body: `prefix ${'y'.repeat(20001)}`,
+        expectVerdict: 'INCONCLUSIVE',
+        expectBlockWord: false,
+      },
+      {
+        label: 'truncated-block',
+        title: 'leak',
+        body: `leaked token ghp_${'A'.repeat(20)} plus padding ${'x'.repeat(9000)}`,
+        expectVerdict: 'NEEDS_CHANGES',
+        expectBlockWord: true,
+      },
+    ] as const) {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-f1-${shape.label}-`));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'must not run', suggestedLabels: [] }]);
+        try {
+          const reviewState = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: shape.title, body: shape.body } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: issueClient(reviewState, { getTitle: shape.title, getBody: shape.body }),
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(counter.count, 0, `F1 ${shape.label} review makes zero AI calls`);
+        const applied: string[] = [];
+        const state = {
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const client = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: shape.title, body: shape.body } }),
+              listComments: async (params: { page: number }) => {
+                void params;
+                return { data: state.comments };
+              },
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const c = state.comments.find((x) => x.id === params.comment_id);
+                if (c) c.body = params.body;
+                return {};
+              },
+              addLabels: async (params: { labels: string[] }) => { applied.push(...params.labels); return {}; },
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: shape.title, body: shape.body } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_SERVER_URL: 'https://github.com',
+            GITHUB_RUN_ID: '123456',
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as unknown as NodeJS.ProcessEnv,
+          githubClient: client,
+        });
+        const sticky = state.comments[0].body;
+        assert.equal(state.created, 0, `F1 ${shape.label} creates no second comment`);
+        assert.equal(state.updated, 1, `F1 ${shape.label} updates the same sticky`);
+        assert.ok(sticky.includes(`Verdict: ${shape.expectVerdict}`), `F1 ${shape.label} keeps its verdict`);
+        assert.ok(sticky.includes('Truncated: showing'), `F1 ${shape.label} shows honest counts`);
+        assert.ok(!sticky.includes('Verdict: APPROVE'), `F1 ${shape.label} never approves`);
+        assert.ok(!sticky.includes('Review result unavailable'), `F1 ${shape.label} is not the generic fallback`);
+        if (shape.expectBlockWord) assert.ok(sticky.toLowerCase().includes('blocking'), 'truncated BLOCK keeps its signal');
+        assert.ok(applied.includes('status:needs-decision'), `F1 ${shape.label} keeps the decision label`);
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // F1: transport failure (no proof) and stale truncation keep the generic
+    // fallback with no Truncated line and no APPROVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-f1-generic-'));
+      try {
+        const liveTitle = 'long';
+        const liveBody = `prefix ${'y'.repeat(20001)}`;
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'must not run', suggestedLabels: [] }]);
+        try {
+          const reviewState = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: liveTitle, body: liveBody } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: issueClient(reviewState, { getTitle: liveTitle, getBody: liveBody }),
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        const base = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+        const runPublishWithArtifact = async (artifact: unknown, lt: string, lb: string) => {
+          fs.writeFileSync(artifactPath, JSON.stringify(artifact));
+          const state = {
+            comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+            created: 0,
+            updated: 0,
+          };
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: lt, body: lb } }),
+                listComments: async (params: { page: number }) => {
+                  void params;
+                  return { data: state.comments };
+                },
+                createComment: async () => { state.created += 1; return {}; },
+                updateComment: async (params: { comment_id: number; body: string }) => {
+                  state.updated += 1;
+                  const c = state.comments.find((x) => x.id === params.comment_id);
+                  if (c) c.body = params.body;
+                  return {};
+                },
+                addLabels: async () => ({}),
+                listLabelsOnIssue: async () => ({ data: [] }),
+                removeLabel: async () => ({}),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          await runPublishMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: lt, body: lb } },
+            env: {
+              GITHUB_EVENT_NAME: 'issues',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_SERVER_URL: 'https://github.com',
+              GITHUB_RUN_ID: '123456',
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: artifactPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+            } as unknown as NodeJS.ProcessEnv,
+            githubClient: client,
+          });
+          return state.comments[0].body;
+        };
+        // Transport failure shape: no truncation proof.
+        const { truncation: _dropped, ...noProof } = base;
+        void _dropped;
+        const fetchFailSticky = await runPublishWithArtifact(
+          { ...noProof, verdict: 'INCONCLUSIVE', summary: 'the issue comments could not be fully fetched from GitHub; review freshness could not be verified.', commentsComplete: false },
+          liveTitle,
+          liveBody,
+        );
+        assert.ok(fetchFailSticky.includes('Review result unavailable'), 'fetch failure keeps the generic fallback');
+        assert.ok(!fetchFailSticky.includes('Truncated: showing'), 'fetch failure shows no counts');
+        assert.ok(!fetchFailSticky.includes('Verdict: APPROVE'), 'fetch failure never approves');
+        // Forged APPROVE carrying a truncation proof is rejected by the
+        // schema gate and keeps the generic fallback (never APPROVE).
+        const forgedApproveSticky = await runPublishWithArtifact(
+          { ...base, verdict: 'APPROVE', commentsComplete: false },
+          liveTitle,
+          liveBody,
+        );
+        assert.ok(forgedApproveSticky.includes('Review result unavailable'), 'forged APPROVE+truncation keeps the generic fallback');
+        assert.ok(!forgedApproveSticky.includes('Truncated: showing'), 'forged APPROVE+truncation shows no counts');
+        assert.ok(!forgedApproveSticky.includes('Verdict: APPROVE'), 'forged APPROVE never publishes');
+        // Zero-fingerprint truncation keeps the generic fallback.
+        const zeroFpSticky = await runPublishWithArtifact(
+          { ...base, fingerprint: '0'.repeat(64) },
+          liveTitle,
+          liveBody,
+        );
+        assert.ok(zeroFpSticky.includes('Review result unavailable'), 'zero fingerprint keeps the generic fallback');
+        assert.ok(!zeroFpSticky.includes('Truncated: showing'), 'zero fingerprint shows no counts');
+        // G3 (review #77 new #3): the current read's transport failure
+        // (listComments throws on the fresh re-read, same body) keeps the
+        // generic fallback even though the fingerprint still matches on
+        // empty comment sets. The later sticky write succeeds, isolating
+        // the re-read failure from the write path.
+        {
+          const g3state = {
+            comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+            created: 0,
+            updated: 0,
+          };
+          let listCalls = 0;
+          const g3client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: liveTitle, body: liveBody } }),
+                listComments: async (params: { page: number }) => {
+                  listCalls += 1;
+                  if (listCalls === 1) throw new Error('synthetic list failure');
+                  void params;
+                  return { data: g3state.comments };
+                },
+                createComment: async () => { g3state.created += 1; return {}; },
+                updateComment: async (params: { comment_id: number; body: string }) => {
+                  g3state.updated += 1;
+                  const c = g3state.comments.find((x) => x.id === params.comment_id);
+                  if (c) c.body = params.body;
+                  return {};
+                },
+                addLabels: async () => ({}),
+                listLabelsOnIssue: async () => ({ data: [] }),
+                removeLabel: async () => ({}),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          fs.writeFileSync(artifactPath, JSON.stringify(base));
+          await runPublishMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: liveTitle, body: liveBody } },
+            env: {
+              GITHUB_EVENT_NAME: 'issues',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_SERVER_URL: 'https://github.com',
+              GITHUB_RUN_ID: '123456',
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: artifactPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+            } as unknown as NodeJS.ProcessEnv,
+            githubClient: g3client,
+          });
+          const g3sticky = g3state.comments[0].body;
+          assert.ok(g3sticky.includes('Review result unavailable'), 'G3 current transport failure keeps the generic fallback');
+          assert.ok(!g3sticky.includes('Truncated: showing'), 'G3 shows no stale counts as current');
+          assert.ok(!g3sticky.includes('Verdict: APPROVE'), 'G3 never approves');
+        }
+        // Stale truncation: live content changed after review.
+        const staleSticky = await runPublishWithArtifact(base, liveTitle, `${liveBody} edited`);
+        assert.ok(staleSticky.includes('Review result unavailable'), 'stale truncation keeps the generic fallback');
+        assert.ok(!staleSticky.includes('Truncated: showing'), 'stale truncation shows no old counts as current');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -277,14 +703,15 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // H-3: 20001-char body chunking with full coverage may APPROVE (minimal retention).
+    // H-3: 20001-char body is truncated with honest counts and stays
+    // INCONCLUSIVE with zero AI (deterministic BLOCK may NEEDS_CHANGES).
     {
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-chunk20001-'));
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-trunc20001-'));
       try {
         const longBody = 'x'.repeat(20001);
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
-        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'chunk ok', suggestedLabels: [] }]);
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'must not run', suggestedLabels: [] }]);
         try {
           const client = {
             rest: {
@@ -301,33 +728,24 @@ export async function runPhase2HTests(): Promise<void> {
             githubClient: client,
             writeStdout: () => undefined,
           });
-          assert.equal(reviewed.verdict, 'APPROVE', '20001-char chunked full coverage may APPROVE');
-          assert.equal(reviewed.commentsComplete, true);
-          assert.ok(reviewed.chunks && reviewed.chunks.length >= 3, `20001 body splits into >=3 chunks (got ${reviewed.chunks?.length})`);
-          assert.equal(reviewed.chunkCount, reviewed.chunks?.length);
-          assert.equal(reviewed.chunkCoverageComplete, true);
-          // Minimal retention: redacted proofs only, never full text.
-          const validated = validateIssueChunkReports(reviewed.chunks);
-          assert.ok(validated, 'chunk reports pass per-segment schema');
-          for (const report of reviewed.chunks ?? []) {
-            assert.ok(validateIssueChunkReport(report), 'each chunk report validates');
-            assert.ok(report.start < report.end, 'start<end recorded');
-            assert.equal(report.complete, true, 'complete recorded');
-            assert.equal(report.verdict, 'APPROVE', 'per-segment verdict readable');
-            assert.ok(report.summary.length <= MAX_ISSUE_CHUNK_SUMMARY_LENGTH, 'per-segment summary truncated');
-            assert.ok(!('body' in (report as unknown as Record<string, unknown>)), 'no full chunk body in artifact');
-            assert.ok(!('comments' in (report as unknown as Record<string, unknown>)), 'no full chunk comments in artifact');
-          }
-          assert.ok(counter.count >= 3, `per-chunk triage ran (got ${counter.count})`);
-          // Fingerprint covers the full body (no tail collision).
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', '20001-char body never approves');
+          assert.equal(reviewed.commentsComplete, false);
+          assert.equal(counter.count, 0, 'truncated content makes zero AI calls');
+          assert.deepEqual(reviewed.truncation, {
+            shownChars: 4 + 8000,
+            totalChars: 4 + 20001,
+            shownComments: 0,
+            totalComments: 0,
+          }, 'honest truncation counts recorded');
+          assert.ok(reviewed.summary.includes('truncated'), 'summary states truncation');
+          assert.ok(reviewed.summary.includes('8004/20005'), 'summary carries shown/total counts');
+          // Fingerprint still covers the full body (no tail collision).
           const expectedFp = issueContentFingerprint('long', longBody, []);
-          // Note: runIssueReviewMode uses cleanForModel(title/body); plain
-          // x-strings survive redaction unchanged, so the hash matches.
           assert.equal(reviewed.fingerprint, expectedFp, 'full fingerprint verified');
-          assert.ok(MAX_ISSUE_CHUNK_LENGTH === 8000, 'chunk budget constant');
-          // Artifact file carries the same minimal proofs.
+          // Artifact carries the truncation proof and no chunk fields.
           const persisted = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
-          assert.ok(Array.isArray(persisted.chunks) && (persisted.chunks as unknown[]).length >= 3, 'artifact carries chunk reports');
+          assert.deepEqual(persisted.truncation, reviewed.truncation, 'artifact carries truncation proof');
+          assert.ok(!('chunks' in persisted), 'no chunk fields in artifact');
         } finally {
           restore();
         }
@@ -336,174 +754,35 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // H-4: any single chunk failure => INCONCLUSIVE on the same sticky (same ID).
+    // H-3b: truncated content with a deterministic BLOCK still yields
+    // NEEDS_CHANGES with zero AI and carries the truncation proof.
     {
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-chunkfail-'));
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-truncblock-'));
       try {
-        const longBody = 'y'.repeat(20001);
+        const secretBody = `leaked token ghp_${'A'.repeat(20)} plus padding ${'x'.repeat(9000)}`;
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
-        // Chunk 2 returns an invalid schema (fallback INCONCLUSIVE).
-        const restore = installQueuedOpenAI(counter, [
-          { verdict: 'APPROVE', summary: 'c0 ok', suggestedLabels: [] },
-          { verdict: 'APPROVE', summary: 'c1 bad', suggestedLabels: 'not-an-array' },
-          { verdict: 'APPROVE', summary: 'c2 ok', suggestedLabels: [] },
-        ]);
-        let reviewed!: Awaited<ReturnType<typeof runIssueReviewMode>>;
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'must not run', suggestedLabels: [] }]);
         try {
-          const reviewClient = {
+          const client = {
             rest: {
               users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
               issues: {
-                get: async () => ({ data: { number: 7, title: 'long', body: longBody } }),
-                listComments: async () => ({ data: [] }),
-              },
-            },
-          } as unknown as NonNullable<RunnerContext['githubClient']>;
-          reviewed = await runIssueReviewMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'long', body: longBody } },
-            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
-            githubClient: reviewClient,
-            writeStdout: () => undefined,
-          });
-        } finally {
-          restore();
-        }
-        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'any chunk failure forces INCONCLUSIVE');
-        assert.ok(counter.count >= 3, 'all chunks attempted');
-        // Publish reuses the same sticky ID (no second comment).
-        const state = {
-          comments: [{ id: 21, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
-          created: 0,
-          updated: 0,
-        };
-        const publishClient = {
-          rest: {
-            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
-            issues: {
-              get: async () => ({ data: { number: 7, title: 'long', body: longBody } }),
-              listComments: async () => ({ data: state.comments }),
-              createComment: async () => { state.created += 1; return {}; },
-              updateComment: async (params: { comment_id: number; body: string }) => {
-                state.updated += 1;
-                const c = state.comments.find((x) => x.id === params.comment_id);
-                if (c) c.body = params.body;
-                return {};
-              },
-              addLabels: async () => ({}),
-              listLabelsOnIssue: async () => ({ data: [] }),
-              removeLabel: async () => ({}),
-            },
-          },
-        } as unknown as NonNullable<RunnerContext['githubClient']>;
-        await runPublishMode({
-          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'long', body: longBody } },
-          env: {
-            GITHUB_EVENT_NAME: 'issues',
-            GITHUB_REPOSITORY: REPO,
-            GITHUB_TOKEN: 'fake-token',
-            POCKETGUARD_OUTPUT: artifactPath,
-            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
-            POCKETGUARD_TAG_LABELS: '[]',
-          } as NodeJS.ProcessEnv,
-          githubClient: publishClient,
-        });
-        assert.equal(state.created, 0, 'chunk-failure publish creates no second comment');
-        assert.equal(state.updated, 1, 'chunk-failure publish updates same sticky');
-        assert.equal(state.comments[0].id, 21, 'same comment ID updated in place');
-        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'same sticky shows INCONCLUSIVE');
-        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'));
-      } finally {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      }
-    }
-
-    // H-5: multi-chunk single slot (claim semantics untouched; single sticky).
-    {
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-slot-'));
-      try {
-        const longBody = 'z'.repeat(20001);
-        const artifactPath = path.join(tempDir, 'review-output.json');
-        const counter = { count: 0 };
-        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'ok', suggestedLabels: [] }]);
-        try {
-          const reviewClient = {
-            rest: {
-              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
-              issues: {
-                get: async () => ({ data: { number: 7, title: 'long', body: longBody } }),
+                get: async () => ({ data: { number: 7, title: 'leak', body: secretBody } }),
                 listComments: async () => ({ data: [] }),
               },
             },
           } as unknown as NonNullable<RunnerContext['githubClient']>;
           const reviewed = await runIssueReviewMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'long', body: longBody } },
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'leak', body: secretBody } },
             env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
-            githubClient: reviewClient,
+            githubClient: client,
             writeStdout: () => undefined,
           });
-          assert.ok((reviewed.chunkCount ?? 0) >= 3, 'multi chunks in one round');
-          assert.ok(counter.count >= 3, 'multi OpenAI turns in one round');
-          // Issues never consume the PR review budget: claim stays no-op.
-          const claimClient = {
-            rest: {
-              pulls: { get: async () => { throw new Error('unreachable for issues'); } },
-              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
-              issues: {
-                listComments: async () => ({ data: [] }),
-                createComment: async () => ({}),
-                updateComment: async () => ({}),
-              },
-            },
-          } as unknown as NonNullable<RunnerContext['githubClient']>;
-          const claimed = await runClaimMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'long', body: longBody } },
-            env: { GITHUB_EVENT_NAME: 'issues', GITHUB_REPOSITORY: REPO, GITHUB_TOKEN: 'fake-token' } as NodeJS.ProcessEnv,
-            githubClient: claimClient,
-            writeStdout: () => undefined,
-          });
-          assert.equal(claimed.claimed, false, 'multi-chunk issue still counts zero slots');
-          assert.equal(claimed.reviewsUsed, 0);
-          // Publish keeps a single sticky (same ID) with chunk coverage noted.
-          const state = {
-            comments: [{ id: 33, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
-            created: 0,
-            updated: 0,
-          };
-          const publishClient = {
-            rest: {
-              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
-              issues: {
-                get: async () => ({ data: { number: 7, title: 'long', body: longBody } }),
-                listComments: async () => ({ data: state.comments }),
-                createComment: async () => { state.created += 1; return {}; },
-                updateComment: async (params: { comment_id: number; body: string }) => {
-                  state.updated += 1;
-                  const c = state.comments.find((x) => x.id === params.comment_id);
-                  if (c) c.body = params.body;
-                  return {};
-                },
-                addLabels: async () => ({}),
-                listLabelsOnIssue: async () => ({ data: [] }),
-                removeLabel: async () => ({}),
-              },
-            },
-          } as unknown as NonNullable<RunnerContext['githubClient']>;
-          await runPublishMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'long', body: longBody } },
-            env: {
-              GITHUB_EVENT_NAME: 'issues',
-              GITHUB_REPOSITORY: REPO,
-              GITHUB_TOKEN: 'fake-token',
-              POCKETGUARD_OUTPUT: artifactPath,
-              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
-              POCKETGUARD_TAG_LABELS: '[]',
-            } as NodeJS.ProcessEnv,
-            githubClient: publishClient,
-          });
-          assert.equal(state.comments.length, 1, 'single sticky throughout');
-          assert.equal(state.comments[0].id, 33, 'same ID');
-          assert.ok(state.comments[0].body.includes('Segments:'), 'sticky records chunk start/end');
+          assert.equal(reviewed.verdict, 'NEEDS_CHANGES', 'truncated BLOCK still needs changes');
+          assert.equal(counter.count, 0, 'truncated BLOCK makes zero AI calls');
+          assert.ok(reviewed.truncation, 'truncated BLOCK carries proof');
+          assert.ok(reviewed.summary.includes('showing'), 'BLOCK summary states truncation');
         } finally {
           restore();
         }
@@ -512,30 +791,356 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // H-6: chunk builder unit (start/end/complete/coveredLength, full coverage).
+    // P6: code reference guards (traversal, absolute, magic, secrets).
     {
-      const fullBody = 'x'.repeat(20001);
-      const chunks = buildIssueChunks('t', fullBody, []);
-      assert.ok(chunks.length >= 3, 'builder splits 20001 body');
-      assert.ok(validateIssueChunks(chunks, { title: 't', body: fullBody, comments: [] }), 'builder output validates with full coverage');
-      assert.ok(verifyIssueChunkCoverage(chunks, { title: 't', body: fullBody, comments: [] }), 'coverage helper confirms no overlap/no omission');
-      const totalSpan = chunks[chunks.length - 1].end - chunks[0].start;
-      assert.ok(totalSpan > 20001, 'offsets cover title+body');
-      for (let i = 1; i < chunks.length; i += 1) {
-        assert.equal(chunks[i].start, chunks[i - 1].end, 'no gaps between chunks');
+      assert.equal(isIssueCodeRefAllowed('app/src/main/java/demo/Safe.kt'), true);
+      assert.equal(isIssueCodeRefAllowed('app/build.gradle.kts'), true);
+      assert.equal(isIssueCodeRefAllowed('.github/workflows/pocketguard.yml'), true);
+      assert.equal(isIssueCodeRefAllowed('AndroidManifest.xml'), true);
+      for (const bad of ['../secret.txt', 'a/../../b', '/etc/passwd', 'a:(exclude)b', 'a*.kt', 'a?.kt', 'a b', '', 'https://x/y', 'key.keystore', 'app/local.properties', 'a\u0000b']) {
+        assert.equal(isIssueCodeRefAllowed(bad), false, `${bad} rejected`);
       }
-      for (const chunk of chunks) {
-        assert.ok(validateIssueChunk(chunk), 'each chunk validates per-segment caps');
-        assert.equal(chunk.body.length <= MAX_ISSUE_CHUNK_LENGTH, true, 'per-segment body cap');
-        assert.ok(chunk.coveredLength === chunk.body.length + chunk.comments.reduce((s, c) => s + c.length, 0), 'real coveredLength proof');
+      // F2 (review #77 P1-3): dedicated codeRefs denylist — sensitive
+      // files are rejected even under must-include shapes, and dot-env
+      // families are rejected everywhere.
+      for (const bad of [
+        '.env', '.ENV', '.env.local', 'config/.env.production',
+        'tests/debug.keystore', 'TESTS/DEBUG.JKS', 'app/src/test/google-services.json',
+        'Test/Google-Services.Json', 'tests/local.properties', 'tests/secret.pem',
+        'config/service-account-prod.json', 'config/service-account-prod.txt', 'app/credentials.json', 'app/credentials.txt', 'app/secrets.json', 'app/secrets.md',
+        'local.properties.txt', 'google-services.json.bak.txt', '.env_vars.txt', '.git/COMMIT_EDITMSG.txt',
+        'keys/id_rsa', 'keys/id_ed25519.pub', 'app/keystore.properties', 'config.p12',
+        'app/src/main/res/permission-map.map', 'app/proguard/rules.png',
+        'app/build/output.apk', 'app/build/bundle.aab', 'app.min.js.map',
+        'gradlew', 'LICENSE', 'settings.json', 'app/config.db',
+      ]) {
+        assert.equal(isIssueCodeRefAllowed(bad), false, `F2 ${bad} rejected`);
       }
-      // Shared slice helper: shared for body and comments.
-      assert.deepEqual(sliceTextForChunk('abc', 2), ['ab', 'c']);
-      assert.deepEqual(sliceTextForChunk('', 8000), []);
+      // G2 (review #77 new #2): per-segment sensitive words and
+      // double-extension whitewash are denied in any segment.
+      for (const bad of [
+        'secrets/config.yml', 'credentials/production.toml', '.secrets.yaml', 'config/.credentials.md',
+        'secrets/app.yml', 'app/my-secrets.yml', 'app/secret.txt', 'app/credential.toml',
+        '.ssh/config.txt', '.aws/config.txt', 'keys/tls.pem.txt', 'certs/server.key.yml',
+        'config/service_account.yml', 'npmrc.txt', '.secrets/app.yml', '.credentials/prod.toml',
+        'tests/secrets.yml', 'SECRETS/APP.YML', '.SECRETS.YAML', 'my-secrets.yml.orig.md',
+        '#secrets.yml#.txt', 'config/.credentials.md.bak.txt',
+      ]) {
+        assert.equal(isIssueCodeRefAllowed(bad), false, `G2 ${bad} rejected`);
+      }
+      // G2: separator-delimited tokens only — unrelated class names pass.
+      // (Basename-prefixed Credentials*/Secrets* stay denied by the older
+      // basename rule; fail-closed.)
+      for (const good of [
+        'app/src/main/java/demo/AuthTokenManager.kt', 'app/src/main/java/demo/TokenStore.kt',
+        'config/Safe.kt', 'app/src/main/java/demo/Keyboard.kt',
+        'secretsrotation/config.yml', 'app/src/main/java/demo/ssh_client.kt',
+        'app/src/main/java/demo/my_aws_helper.kt',
+      ]) {
+        assert.equal(isIssueCodeRefAllowed(good), true, `G2 ${good} allowed`);
+      }
+      // F2: legitimate diagnosis paths stay allowed.
+      for (const good of [
+        'app/src/main/java/demo/Safe.kt', 'app/src/test/java/demo/SafeTest.kt',
+        'app/build.gradle.kts', 'settings.gradle.kts', 'libs.versions.toml',
+        '.github/workflows/pocketguard.yml', 'AndroidManifest.xml',
+        'app/src/main/res/values/strings.xml', 'README.md', 'docs/THREAT_MODEL.md',
+      ]) {
+        assert.equal(isIssueCodeRefAllowed(good), true, `F2 ${good} allowed`);
+      }
+      assert.equal(resolveIssueCodeRef('main'), 'main');
+      assert.equal(resolveIssueCodeRef('feature/x'), 'feature/x');
+      for (const bad of [undefined, '', 'main;rm', 'a b', 'a:b', '..', 'x'.repeat(65)]) {
+        assert.equal(resolveIssueCodeRef(bad), undefined, `${String(bad)} rejected`);
+      }
     }
 
-    // T1: body 8001/15000 enters chunked path with full AI coverage.
-    for (const [label, bodyLen, minChunks] of [['8001', 8001, 2], ['15000', 15000, 2]] as const) {
+    // P6: second-layer diagnosis tightens with code evidence.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p6-tighten-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const gitCalls: string[][] = [];
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'looks fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+          { verdict: 'NEEDS_CHANGES', summary: 'code confirms the bug', suggestedLabels: ['bug'] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 'crash', getBody: 'app crashes on launch' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 'crash', body: 'app crashes on launch' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: (args: string[]) => { gitCalls.push(args); return 'class Safe { fun start() = TODO() }'; },
+          });
+          assert.equal(reviewed.verdict, 'NEEDS_CHANGES', 'code-grounded diagnosis tightens');
+          assert.equal(counter.count, 2, 'two layers ran');
+          assert.ok(gitCalls.some((args) => args[0] === 'show' && args[1] === 'main:app/src/main/java/demo/Safe.kt'), 'read-only show on the default branch');
+          assert.deepEqual(reviewed.codeRefs, [{ path: 'app/src/main/java/demo/Safe.kt', shownChars: 35, totalChars: 35 }], 'code proof persisted');
+          assert.ok(reviewed.tags.includes('bug'), 'second-layer labels union');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: second layer confirms APPROVE; failures and illegal paths keep round one.
+    for (const shape of [
+      {
+        label: 'confirm',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        second: { verdict: 'APPROVE', summary: 'code is fine', suggestedLabels: [] },
+        git: 'class Safe {}',
+        expectVerdict: 'APPROVE',
+        expectCalls: 2,
+        expectSummary: 'code is fine',
+      },
+      {
+        label: 'transport-failure',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        second: null,
+        git: 'class Safe {}',
+        expectVerdict: 'APPROVE',
+        expectCalls: 2,
+      },
+      {
+        label: 'illegal-path',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['../secret.txt'] },
+        second: { verdict: 'NEEDS_CHANGES', summary: 'must not run', suggestedLabels: [] },
+        git: 'class Safe {}',
+        expectVerdict: 'APPROVE',
+        expectCalls: 1,
+      },
+      {
+        label: 'empty-file',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        second: { verdict: 'NEEDS_CHANGES', summary: 'must not run', suggestedLabels: [] },
+        git: '',
+        expectVerdict: 'APPROVE',
+        expectCalls: 1,
+      },
+    ] as const) {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-p6-${shape.label}-`));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const previousFetch = globalThis.fetch;
+        let idx = 0;
+        const payloads = shape.second ? [shape.first, shape.second] : [shape.first];
+        globalThis.fetch = (async () => {
+          counter.count += 1;
+          if (!shape.second && counter.count >= 2) throw new Error('second layer down');
+          const payload = idx < payloads.length ? payloads[idx] : payloads[payloads.length - 1];
+          idx += 1;
+          return new Response(JSON.stringify({
+            output: [{ content: [{ type: 'output_text', text: JSON.stringify(payload) }] }],
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as typeof fetch;
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: () => shape.git,
+          });
+          assert.equal(reviewed.verdict, shape.expectVerdict, `P6 ${shape.label} keeps round one`);
+          assert.equal(counter.count, shape.expectCalls, `P6 ${shape.label} call count`);
+          if ('expectSummary' in shape) {
+            assert.equal(reviewed.summary, shape.expectSummary, `P6 ${shape.label} ties follow the fresher summary`);
+          }
+        } finally {
+          globalThis.fetch = previousFetch;
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: second layer is skipped when the first verdict is already fixed
+    // (NEEDS), blocked deterministically, or the ref is missing.
+    for (const shape of [
+      {
+        label: 'needs-first',
+        title: 't',
+        body: 'b',
+        first: { verdict: 'NEEDS_CHANGES', summary: 'needs work', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        eventRepo: { full_name: REPO, default_branch: 'main' },
+      },
+      {
+        label: 'deterministic-block',
+        title: 'leak',
+        body: `token ghp_${'A'.repeat(20)}`,
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        eventRepo: { full_name: REPO, default_branch: 'main' },
+      },
+      {
+        label: 'missing-ref',
+        title: 't',
+        body: 'b',
+        first: { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+        eventRepo: { full_name: REPO },
+      },
+    ] as const) {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-p6-skip-${shape.label}-`));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [shape.first]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: shape.title, getBody: shape.body });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: shape.eventRepo, issue: { number: 7, title: shape.title, body: shape.body } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: () => { throw new Error('must not read code'); },
+          });
+          assert.equal(counter.count, 1, `P6 ${shape.label} runs only the first layer`);
+          assert.equal(reviewed.codeRefs, undefined, `P6 ${shape.label} stores no code proof`);
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: a successful second layer never loosens; ties follow the fresher summary.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p6-noloosen-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'INCONCLUSIVE', summary: 'unclear', suggestedLabels: [], codeRefs: ['app/src/main/java/demo/Safe.kt'] },
+          { verdict: 'APPROVE', summary: 'actually fine', suggestedLabels: [] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: () => 'class Safe {}',
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'second layer never loosens');
+          assert.equal(reviewed.summary, 'unclear', 'a looser second layer never rewrites the summary');
+          assert.equal(counter.count, 2, 'both layers ran');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: malformed codeRefs fail the strict triage schema (fail-closed).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p6-badrefs-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: 'not-an-array' },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: () => 'x',
+          });
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'malformed codeRefs fail closed');
+          assert.equal(counter.count, 1, 'only the first layer ran');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // P6: code reference count is capped at 10 files.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p6-cap-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const refs = Array.from({ length: 11 }, (_, i) => `app/src/main/java/demo/File${i}.kt`);
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: refs },
+          { verdict: 'APPROVE', summary: 'code fine', suggestedLabels: [] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          let shows = 0;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: (args: string[]) => { if (args[0] === 'show') shows += 1; return 'x'; },
+          });
+          assert.equal(shows, 10, 'at most 10 files fetched');
+          assert.equal(reviewed.codeRefs?.length, 10, 'proof capped at 10');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // F2: a first round naming only sensitive files performs zero git reads
+    // and keeps the first-round result (no AI snippet exfiltration).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-f2-sZero-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', suggestedLabels: [], codeRefs: ['.env', 'tests/debug.keystore', 'app/src/test/google-services.json'] },
+        ]);
+        try {
+          const state = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          const client = issueClient(state, { getTitle: 't', getBody: 'b' });
+          let shows = 0;
+          const reviewed = await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO, default_branch: 'main' }, issue: { number: 7, title: 't', body: 'b' } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: (args: string[]) => { if (args[0] === 'show') shows += 1; return 'SECRET=x'; },
+          });
+          assert.equal(shows, 0, 'F2 sensitive refs trigger zero git show');
+          assert.equal(counter.count, 1, 'F2 no second layer runs');
+          assert.equal(reviewed.verdict, 'APPROVE');
+          assert.equal(reviewed.codeRefs, undefined, 'F2 stores no code proof');
+        } finally {
+          restore();
+        }
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // T1: body 8001/15000 is truncated and stays INCONCLUSIVE with zero AI.
+    for (const [label, bodyLen] of [['8001', 8001], ['15000', 15000]] as const) {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-h-t1-${label}-`));
       try {
         const body = 'x'.repeat(bodyLen);
@@ -558,12 +1163,11 @@ export async function runPhase2HTests(): Promise<void> {
             githubClient: client,
             writeStdout: () => undefined,
           });
-          assert.equal(reviewed.verdict, 'APPROVE', `T1 body ${label} chunked may APPROVE`);
-          assert.equal(reviewed.commentsComplete, true, `T1 body ${label} fully covered`);
-          assert.ok((reviewed.chunkCount ?? 0) >= minChunks, `T1 body ${label} splits into >=${minChunks} chunks`);
-          assert.ok(counter.count >= minChunks, `T1 body ${label} ran per-chunk triage`);
-          assert.ok(validateIssueChunkReports(reviewed.chunks), `T1 body ${label} reports validate`);
-          assert.ok(verifyIssueChunkCoverage(reviewed.chunks ?? [], { title: 't1', body, comments: [] }), `T1 body ${label} no overlap/no omission`);
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', `T1 body ${label} never approves`);
+          assert.equal(reviewed.commentsComplete, false, `T1 body ${label} incomplete`);
+          assert.equal(counter.count, 0, `T1 body ${label} makes zero AI calls`);
+          assert.equal(reviewed.truncation?.totalChars, 2 + bodyLen, `T1 body ${label} total recorded`);
+          assert.equal(reviewed.truncation?.shownChars, 2 + 8000, `T1 body ${label} shown capped at 8000`);
         } finally {
           restore();
         }
@@ -597,7 +1201,7 @@ export async function runPhase2HTests(): Promise<void> {
           });
           assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'T1 fetch failure stays INCONCLUSIVE');
           assert.equal(counter.count, 0, 'T1 fetch failure makes zero AI calls');
-          assert.equal(reviewed.chunks, undefined, 'T1 fetch failure stores no chunks');
+          assert.equal(reviewed.truncation, undefined, 'T1 fetch failure stores no truncation proof');
         } finally {
           restore();
         }
@@ -606,82 +1210,35 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // T2: single comment 2001 enters chunk; 9001 fine-cuts into 2 segments each <=8000.
-    {
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t2-2001-'));
+    // T2: single comment 2001/9001 is truncated and stays INCONCLUSIVE.
+    for (const [label, commentLen] of [['2001', 2001], ['9001', 9001]] as const) {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-h-t2-${label}-`));
       try {
-        const commentBody = 'c'.repeat(2001);
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
-        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 't2 2001 ok', suggestedLabels: [] }]);
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: `t2 ${label} ok`, suggestedLabels: [] }]);
         try {
+          const longComment = 'e'.repeat(commentLen);
           const client = {
             rest: {
               users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
               issues: {
-                get: async () => ({ data: { number: 7, title: 't2', body: 'short' } }),
-                listComments: async () => ({ data: [{ id: 1, body: commentBody, user: { login: 'human', type: 'User' } }] }),
+                get: async () => ({ data: { number: 7, title: 't2', body: 'b' } }),
+                listComments: async () => ({ data: [{ id: 3, body: longComment, user: { login: 'human', type: 'User' } }] }),
               },
             },
           } as unknown as NonNullable<RunnerContext['githubClient']>;
           const reviewed = await runIssueReviewMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't2', body: 'short' } },
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't2', body: 'b' } },
             env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
             githubClient: client,
             writeStdout: () => undefined,
           });
-          assert.equal(reviewed.verdict, 'APPROVE', 'T2 single 2001 comment chunked may APPROVE');
-          assert.ok((reviewed.chunkCount ?? 0) >= 1, 'T2 single 2001 enters chunked path');
-          assert.ok(counter.count >= 1, 'T2 single 2001 ran AI with full coverage');
-        } finally {
-          restore();
-        }
-      } finally {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      }
-    }
-    {
-      // Builder-level fine cut: 0 body + single 9001 comment => 2 segments each <=8000.
-      const single = 'c'.repeat(9001);
-      const chunks = buildIssueChunks('', single, []);
-      // Note: buildIssueChunks(title, body, comments); comment-only uses comments array.
-      const commentChunks = buildIssueChunks('t', '', [`human：${single}`]);
-      assert.equal(commentChunks.length, 2, 'T2 9001 comment-only splits into 2 segments');
-      for (const chunk of commentChunks) {
-        assert.ok(validateIssueChunk(chunk), 'T2 each fine-cut segment validates');
-        for (const c of chunk.comments) {
-          assert.ok(c.length <= MAX_ISSUE_CHUNK_LENGTH, 'T2 each comment slice <=8000');
-        }
-        const joined = chunk.body.length + (chunk.comments.length > 0 ? (chunk.body.length > 0 ? 2 : 0) + chunk.comments.join('\n\n').length : 0);
-        assert.ok(joined <= MAX_ISSUE_CHUNK_LENGTH, 'T2 per-segment budget holds');
-      }
-      assert.ok(verifyIssueChunkCoverage(commentChunks, { title: 't', body: '', comments: [`human：${single}`] }), 'T2 9001 coverage no overlap/no omission');
-      void chunks;
-      // End-to-end: 0 body + 9001 comment triages with full coverage.
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t2-9001-'));
-      try {
-        const artifactPath = path.join(tempDir, 'review-output.json');
-        const counter = { count: 0 };
-        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 't2 9001 ok', suggestedLabels: [] }]);
-        try {
-          const client = {
-            rest: {
-              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
-              issues: {
-                get: async () => ({ data: { number: 7, title: 't2', body: '' } }),
-                listComments: async () => ({ data: [{ id: 2, body: 'c'.repeat(9001), user: { login: 'human', type: 'User' } }] }),
-              },
-            },
-          } as unknown as NonNullable<RunnerContext['githubClient']>;
-          const reviewed = await runIssueReviewMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't2', body: '' } },
-            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
-            githubClient: client,
-            writeStdout: () => undefined,
-          });
-          assert.equal(reviewed.verdict, 'APPROVE', 'T2 0-body + 9001 comment may APPROVE');
-          assert.ok((reviewed.chunkCount ?? 0) >= 2, 'T2 9001 end-to-end splits into >=2');
-          assert.ok(counter.count >= 2, 'T2 9001 ran per-segment triage');
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', `T2 comment ${label} never approves`);
+          assert.equal(counter.count, 0, `T2 comment ${label} makes zero AI calls`);
+          assert.equal(reviewed.truncation?.totalComments, 1);
+          assert.equal(reviewed.truncation?.shownComments, 1, 'comment kept but cut');
+          assert.ok((reviewed.truncation?.totalChars ?? 0) > (reviewed.truncation?.shownChars ?? 0), 'chars omitted recorded');
         } finally {
           restore();
         }
@@ -690,7 +1247,7 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // T3: multi-comment total 20001+ enters chunked path with full coverage.
+    // T3: multi-comment total past budget is truncated and stays INCONCLUSIVE.
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t3-'));
       try {
@@ -718,10 +1275,10 @@ export async function runPhase2HTests(): Promise<void> {
             githubClient: client,
             writeStdout: () => undefined,
           });
-          assert.equal(reviewed.verdict, 'APPROVE', 'T3 multi-comment 20001+ may APPROVE');
-          assert.ok((reviewed.chunkCount ?? 0) >= 3, 'T3 splits multi-comment total into >=3');
-          assert.ok(counter.count >= 3, 'T3 ran per-chunk triage over all comments');
-          assert.ok(validateIssueChunkReports(reviewed.chunks), 'T3 reports validate');
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'T3 multi-comment over budget never approves');
+          assert.equal(counter.count, 0, 'T3 makes zero AI calls');
+          assert.ok((reviewed.truncation?.shownComments ?? 11) < 11, 'T3 dropped comments recorded');
+          assert.equal(reviewed.truncation?.totalComments, 11);
         } finally {
           restore();
         }
@@ -730,7 +1287,7 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // T4: 0 body + long comment enters chunked path.
+    // T4: 0 body + long comment is truncated and stays INCONCLUSIVE.
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t4-'));
       try {
@@ -754,9 +1311,8 @@ export async function runPhase2HTests(): Promise<void> {
             githubClient: client,
             writeStdout: () => undefined,
           });
-          assert.equal(reviewed.verdict, 'APPROVE', 'T4 0-body + long comment may APPROVE');
-          assert.ok((reviewed.chunkCount ?? 0) >= 1, 'T4 enters chunked path');
-          assert.ok(counter.count >= 1, 'T4 ran AI with full coverage');
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'T4 0-body + long comment never approves');
+          assert.equal(counter.count, 0, 'T4 makes zero AI calls');
         } finally {
           restore();
         }
@@ -765,164 +1321,65 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // T5: boundaries — body 8000 single-turn vs 8001 chunked; total 20000 single-turn vs 20001 chunked.
-    {
-      // Body 8000 stays single-turn (no chunks field).
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t5-8000-'));
+    // T5: boundaries — body 8000 and total 20000 stay single-turn;
+    // body 8001 and total 20001 truncate to INCONCLUSIVE with zero AI.
+    for (const shape of [
+      { label: 'body-8000', title: 't5', body: 'x'.repeat(8000), comments: [], complete: true },
+      { label: 'body-8001', title: 't5', body: 'x'.repeat(8001), comments: [], complete: false },
+      {
+        label: 'total-20000',
+        title: 't5',
+        body: 'x'.repeat(8000),
+        comments: [
+          ...Array.from({ length: 4 }, (_, i) => ({ id: 10 + i, body: 'y'.repeat(1992), user: { login: 'human', type: 'User' } })),
+          ...Array.from({ length: 2 }, (_, i) => ({ id: 14 + i, body: 'y'.repeat(1997), user: { login: 'human', type: 'User' } })),
+        ],
+        complete: true,
+      },
+      {
+        label: 'total-20001',
+        title: 't5',
+        body: 'x'.repeat(8000),
+        comments: [
+          ...Array.from({ length: 4 }, (_, i) => ({ id: 10 + i, body: 'y'.repeat(1992), user: { login: 'human', type: 'User' } })),
+          { id: 14, body: 'y'.repeat(1997), user: { login: 'human', type: 'User' } },
+          { id: 15, body: 'y'.repeat(1998), user: { login: 'human', type: 'User' } },
+        ],
+        complete: false,
+      },
+    ] as const) {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-h-t5-${shape.label}-`));
       try {
-        const body = 'x'.repeat(8000);
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
-        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 't5 8000 ok', suggestedLabels: [] }]);
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: `t5 ${shape.label} ok`, suggestedLabels: [] }]);
         try {
           const client = {
             rest: {
               users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
               issues: {
-                get: async () => ({ data: { number: 7, title: 't5', body } }),
-                listComments: async () => ({ data: [] }),
+                get: async () => ({ data: { number: 7, title: shape.title, body: shape.body } }),
+                listComments: async () => ({ data: shape.comments }),
               },
             },
           } as unknown as NonNullable<RunnerContext['githubClient']>;
           const reviewed = await runIssueReviewMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't5', body } },
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: shape.title, body: shape.body } },
             env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
             githubClient: client,
             writeStdout: () => undefined,
           });
-          assert.equal(reviewed.chunks, undefined, 'T5 body 8000 stays single-turn');
-          assert.equal(counter.count, 1, 'T5 body 8000 runs one triage turn');
-        } finally {
-          restore();
-        }
-      } finally {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      }
-    }
-    {
-      // Total exactly 20000 stays single-turn; 20001 chunks.
-      const makeComments = (lastBodyLen: number): Array<{ id: number; body: string; user: { login: string; type: string } }> => {
-        const list = Array.from({ length: 9 }, (_, i) => ({
-          id: 200 + i,
-          body: 'c'.repeat(2000),
-          user: { login: 'human', type: 'User' },
-        }));
-        list.push({ id: 299, body: 'c'.repeat(lastBodyLen), user: { login: 'human', type: 'User' } });
-        return list;
-      };
-      // 9 * (6+2000) + (6+1939) = 18054 + 1945 = 19999 comment chars; + title 1 = 20000 total.
-      for (const [label, lastLen, expectChunked] of [['20000', 1939, false], ['20001', 1940, true]] as const) {
-        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-h-t5-${label}-`));
-        try {
-          const artifactPath = path.join(tempDir, 'review-output.json');
-          const counter = { count: 0 };
-          const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: `t5 ${label}`, suggestedLabels: [] }]);
-          try {
-            const many = makeComments(lastLen);
-            const client = {
-              rest: {
-                users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
-                issues: {
-                  get: async () => ({ data: { number: 7, title: 't', body: '' } }),
-                  listComments: async () => ({ data: many }),
-                },
-              },
-            } as unknown as NonNullable<RunnerContext['githubClient']>;
-            const reviewed = await runIssueReviewMode({
-              event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't', body: '' } },
-              env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
-              githubClient: client,
-              writeStdout: () => undefined,
-            });
-            if (expectChunked) {
-              assert.ok(reviewed.chunks && reviewed.chunks.length >= 2, `T5 total ${label} chunks`);
-              assert.ok(counter.count >= 2, `T5 total ${label} ran per-chunk triage`);
-            } else {
-              assert.equal(reviewed.chunks, undefined, `T5 total ${label} stays single-turn`);
-              assert.equal(counter.count, 1, `T5 total ${label} runs one turn`);
-            }
-          } finally {
-            restore();
+          if (shape.complete) {
+            assert.equal(reviewed.verdict, 'APPROVE', `T5 ${shape.label} single-turn may APPROVE`);
+            assert.equal(reviewed.commentsComplete, true);
+            assert.equal(reviewed.truncation, undefined, `T5 ${shape.label} stores no truncation proof`);
+            assert.equal(counter.count, 1, `T5 ${shape.label} runs one triage turn`);
+          } else {
+            assert.equal(reviewed.verdict, 'INCONCLUSIVE', `T5 ${shape.label} never approves`);
+            assert.equal(reviewed.commentsComplete, false);
+            assert.equal(counter.count, 0, `T5 ${shape.label} makes zero AI calls`);
+            assert.ok(reviewed.truncation, `T5 ${shape.label} records truncation`);
           }
-        } finally {
-          fs.rmSync(tempDir, { recursive: true, force: true });
-        }
-      }
-    }
-
-    // T6: source coverage — no overlap, no omission across title/body/comments.
-    {
-      const title = 't6-title';
-      const body = 'b'.repeat(9000);
-      const comments = [`human：${'c'.repeat(3000)}`, `human：${'d'.repeat(9001)}`, `human：short`];
-      const chunks = buildIssueChunks(title, body, comments);
-      assert.ok(validateIssueChunks(chunks, { title, body, comments }), 'T6 full coverage validates');
-      assert.ok(verifyIssueChunkCoverage(chunks, { title, body, comments }), 'T6 helper confirms coverage');
-      // No duplication: concatenated bodies equal full body exactly once.
-      assert.equal(chunks.map((c) => c.body).join(''), body, 'T6 body covered exactly once');
-      const flatLen = chunks.flatMap((c) => c.comments).reduce((s, c) => s + c.length, 0);
-      assert.equal(flatLen, comments.reduce((s, c) => s + c.length, 0), 'T6 comments covered exactly once');
-      // No gaps: offsets chain continuously from 0.
-      assert.equal(chunks[0].start, 0, 'T6 starts at title');
-      for (let i = 1; i < chunks.length; i += 1) {
-        assert.equal(chunks[i].start, chunks[i - 1].end, 'T6 no gaps');
-        assert.ok(chunks[i].start < chunks[i].end, 'T6 positive span');
-      }
-      // Tampered coverage is rejected: drop a chunk => invalid.
-      assert.equal(validateIssueChunks(chunks.slice(1), { title, body, comments }), undefined, 'T6 omission rejected');
-      // Overlapping span is rejected.
-      const overlapped = chunks.map((c) => ({ ...c }));
-      if (overlapped.length >= 2) {
-        overlapped[1] = { ...overlapped[1], start: overlapped[0].start };
-        assert.equal(validateIssueChunks(overlapped), undefined, 'T6 overlap rejected');
-      }
-    }
-
-    // T7: artifact carries readable per-segment verdicts (JSON + Markdown reports).
-    {
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-t7-'));
-      try {
-        const body = 'x'.repeat(8001);
-        const artifactPath = path.join(tempDir, 'review-output.json');
-        const counter = { count: 0 };
-        const restore = installQueuedOpenAI(counter, [
-          { verdict: 'APPROVE', summary: 'seg0 fine', suggestedLabels: [] },
-          { verdict: 'NEEDS_CHANGES', summary: 'seg1 blocking', suggestedLabels: [] },
-        ]);
-        try {
-          const client = {
-            rest: {
-              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
-              issues: {
-                get: async () => ({ data: { number: 7, title: 't7', body } }),
-                listComments: async () => ({ data: [] }),
-              },
-            },
-          } as unknown as NonNullable<RunnerContext['githubClient']>;
-          const reviewed = await runIssueReviewMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 't7', body } },
-            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
-            githubClient: client,
-            writeStdout: () => undefined,
-          });
-          assert.ok(reviewed.chunks && reviewed.chunks.length >= 2, 'T7 splits for per-segment verdicts');
-          const verdicts = (reviewed.chunks ?? []).map((c) => c.verdict);
-          assert.ok(verdicts.includes('APPROVE') && verdicts.includes('NEEDS_CHANGES'), 'T7 per-segment verdicts differ and are readable');
-          const persisted = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
-          const persistedChunks = persisted.chunks as Array<Record<string, unknown>>;
-          assert.ok(Array.isArray(persistedChunks) && persistedChunks.length >= 2, 'T7 artifact chunks readable');
-          for (const seg of persistedChunks) {
-            assert.ok('verdict' in seg && 'summary' in seg && 'labels' in seg, 'T7 artifact segment carries verdict/summary/labels');
-            assert.ok(!('body' in seg) && !('comments' in seg), 'T7 artifact segment omits full text');
-          }
-          const reportJson = JSON.parse(fs.readFileSync(path.join(tempDir, 'review-report.json'), 'utf8')) as Record<string, unknown>;
-          const segments = (reportJson.segments ?? reportJson.chunks) as Array<Record<string, unknown>>;
-          assert.ok(Array.isArray(segments) && segments.length >= 2, 'T7 report carries per-segment results');
-          for (const seg of segments) {
-            assert.ok('verdict' in seg, 'T7 report segment verdict readable');
-          }
-          const reportMd = fs.readFileSync(path.join(tempDir, 'review-report.md'), 'utf8');
-          assert.ok(reportMd.includes('Segment results') || reportMd.includes('APPROVE') || reportMd.includes('NEEDS_CHANGES'), 'T7 markdown shows per-segment results');
         } finally {
           restore();
         }
@@ -947,7 +1404,7 @@ export async function runPhase2HTests(): Promise<void> {
         headSha: 'b'.repeat(40),
         headRepository: REPO,
         roles: [
-          { role: 'chief' as const, modelUsed: 'm', verdict: 'NEEDS_CHANGES' as const, findings: manyFindings.slice(0, 40) },
+          { role: 'architecture' as const, modelUsed: 'm', verdict: 'NEEDS_CHANGES' as const, findings: manyFindings.slice(0, 40) },
           { role: 'android_sec' as const, modelUsed: 'm', verdict: 'APPROVE' as const, findings: manyFindings.slice(40, 70) },
           { role: 'android_code' as const, modelUsed: 'm', verdict: 'APPROVE' as const, findings: manyFindings.slice(70) },
         ],
@@ -966,35 +1423,20 @@ export async function runPhase2HTests(): Promise<void> {
       assert.ok(sticky.length <= GITHUB_COMMENT_HARD_LIMIT, 'T8 PR sticky within GitHub hard limit');
       assert.ok(sticky.includes('100 finding(s)'), 'T8 tail carries total finding count');
       assert.ok(sticky.includes('artifact'), 'T8 tail guides to the report artifact');
-      // Issue sticky: long summary plus many segments stays bounded with notes.
+      // Issue sticky: long summary plus truncation proof stays bounded.
       const issueOutput = {
-        verdict: 'APPROVE' as const,
+        verdict: 'INCONCLUSIVE' as const,
         issueNumber: 7,
         title: 't8',
         tags: [],
         summary: 's'.repeat(5000),
         suggestedLabels: [],
         fingerprint: 'a'.repeat(64),
-        commentsComplete: true,
-        chunks: Array.from({ length: 15 }, (_, i) => ({
-          index: i,
-          total: 15,
-          start: i * 100,
-          end: (i + 1) * 100,
-          complete: true,
-          coveredLength: 90,
-          verdict: 'APPROVE' as const,
-          summary: `seg ${i}`,
-          labels: [],
-          segments: [],
-          bodySha: 'b'.repeat(64),
-          bodyRanges: [],
-        })),
-        chunkCoverageComplete: true,
-        chunkCount: 15,
+        commentsComplete: false,
+        truncation: { shownChars: 8004, totalChars: 20005, shownComments: 0, totalComments: 0 },
       };
       const issueSticky = issueReviewComment(issueOutput, [], 'Report: unavailable (review report could not be generated or failed to upload, see Actions run log).');
-      assert.ok(issueSticky.includes('Segments:'), 'T8 issue sticky carries chunk line with boundaries');
+      assert.ok(issueSticky.includes('Truncated: showing 8004/20005 chars, 0/0 comments'), 'T8 issue sticky carries honest truncation line');
       assert.ok(issueSticky.includes('omitted'), 'T8 issue sticky carries omission note');
       assert.ok(truncateStickyText('x'.repeat(100), 10).includes('omitted'), 'T8 truncate helper notes omission');
       assert.ok(issueSticky.length < 20000, `T8 issue sticky bounded (got ${issueSticky.length})`);
@@ -1007,7 +1449,7 @@ export async function runPhase2HTests(): Promise<void> {
       assert.equal(MAX_STICKY_TOTAL_LENGTH, 50000, 'P3 total budget leaves 65536 headroom');
       assert.equal(GITHUB_COMMENT_HARD_LIMIT, 65536, 'P3 fail-safe matches the GitHub limit');
       const prShape = (
-        roles: Array<{ role: 'chief' | 'android_sec' | 'android_code'; findings: Array<{ severity: 'BLOCK' | 'WARN' | 'SUGGESTION'; file?: string; line?: number; issue: string; suggestion?: string }> }>,
+        roles: Array<{ role: 'architecture' | 'android_sec' | 'android_code'; findings: Array<{ severity: 'BLOCK' | 'WARN' | 'SUGGESTION'; file?: string; line?: number; issue: string; suggestion?: string }> }>,
         violations: Array<{ ruleId: string; severity: 'BLOCK' | 'WARN'; category: 'security' | 'reliability'; message: string }> = [],
         coverage: { complete: boolean; omittedFiles: string[]; truncatedFiles: string[]; originalLength: number } = { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
       ): Parameters<typeof reviewComment>[0] => ({
@@ -1034,7 +1476,7 @@ export async function runPhase2HTests(): Promise<void> {
           issue: `P3LONG-${tag}-${i} ${'x'.repeat(2000)}`,
           suggestion: `fix-${tag}-${i} ${'y'.repeat(2000)}`,
         });
-        const roles = (['chief', 'android_sec', 'android_code'] as const).map((role) => ({
+        const roles = (['architecture', 'android_sec', 'android_code'] as const).map((role) => ({
           role,
           findings: Array.from({ length: 20 }, (_, i) => mkLong(role, i)),
         }));
@@ -1057,7 +1499,7 @@ export async function runPhase2HTests(): Promise<void> {
           category: 'security' as const,
           message: `P3V-${i} ${'z'.repeat(2000)}`,
         }));
-        const sticky = reviewComment(prShape([{ role: 'chief', findings: [] }], violations), [], 'report line');
+        const sticky = reviewComment(prShape([{ role: 'architecture', findings: [] }], violations), [], 'report line');
         assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-2 120 long violations within total cap (got ${sticky.length})`);
         assert.ok(sticky.includes('omitted'), 'P3-2 carries omission note');
         assert.ok(sticky.includes('120 deterministic violation(s)'), 'P3-2 tail carries total violation count');
@@ -1067,7 +1509,7 @@ export async function runPhase2HTests(): Promise<void> {
       // P3-3: escape-dense text is truncated->escaped and accounted post-escape.
       {
         const dense = '`*_{}[]()#+-.!|<>\\'.repeat(200);
-        const roles = [{ role: 'chief' as const, findings: [{ severity: 'BLOCK' as const, file: 'a*b_c[d](e)#f.kt', line: 1, issue: dense, suggestion: dense }] }];
+        const roles = [{ role: 'architecture' as const, findings: [{ severity: 'BLOCK' as const, file: 'a*b_c[d](e)#f.kt', line: 1, issue: dense, suggestion: dense }] }];
         const sticky = reviewComment(prShape(roles), [], 'report line');
         assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-3 escape-dense within total cap (got ${sticky.length})`);
         // Truncate->escape helper: raw cut first, escaped length accounted.
@@ -1081,7 +1523,7 @@ export async function runPhase2HTests(): Promise<void> {
       {
         const longName = `${'d'.repeat(300)}/${'e'.repeat(300)}.kt`;
         assert.ok(longName.length > 500, 'P3-4 fixture really exceeds 500 chars');
-        const roles = [{ role: 'chief' as const, findings: [{ severity: 'WARN' as const, file: longName, line: 7, issue: 'name check', suggestion: 'rename' }] }];
+        const roles = [{ role: 'architecture' as const, findings: [{ severity: 'WARN' as const, file: longName, line: 7, issue: 'name check', suggestion: 'rename' }] }];
         const coverage = {
           complete: false,
           omittedFiles: Array.from({ length: 30 }, (_, i) => `${'o'.repeat(250)}/omitted-${i}.kt`),
@@ -1115,7 +1557,7 @@ export async function runPhase2HTests(): Promise<void> {
         }));
         // Interleave roles so input order alone would not keep BLOCKs first.
         const roles = [
-          { role: 'chief' as const, findings: [...sugs.slice(0, 30), ...blocks.slice(0, 2)] },
+          { role: 'architecture' as const, findings: [...sugs.slice(0, 30), ...blocks.slice(0, 2)] },
           { role: 'android_sec' as const, findings: [...sugs.slice(30, 60), ...blocks.slice(2, 4)] },
           { role: 'android_code' as const, findings: [...sugs.slice(60), ...blocks.slice(4)] },
         ];
@@ -1334,113 +1776,11 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
-    // P2 #4: per-slice RAW binding (segments + bodySha/bodyRanges). Generation
-    // and publish compare content/order against the RAW snapshot; reports
-    // carry only hash/ranges/verdict and keep redaction.
+    // Fingerprint gate: live content change after review falls back to
+    // INCONCLUSIVE on the same sticky (full RAW fingerprint, no tail collision).
     {
-      // Positive: builder emits segments; full+RAW validation passes.
-      const title = 'p2-title';
-      const body = 'p2-body';
-      const comments = ['human：AAA', 'human：BBB'];
-      const ids = [11, 22];
-      const full = { title, body, comments, commentIds: ids, rawComments: comments, rawBody: body };
-      const chunks = buildIssueChunks(title, body, comments, { rawBody: body, rawComments: comments, rawCommentIds: ids });
-      assert.ok(chunks.length >= 1, 'P2 builder emits chunks');
-      for (const c of chunks) {
-        assert.ok(validateIssueChunk(c), 'P2 each chunk validates');
-        assert.ok(Array.isArray(c.segments) && c.segments.length === 2, 'P2 chunk carries per-slice segments');
-        assert.ok(/^[0-9a-f]{64}$/.test(c.bodySha), 'P2 bodySha is hex');
-        assert.ok(Array.isArray(c.bodyRanges), 'P2 bodyRanges present');
-        for (const s of c.segments) {
-          assert.ok(s.commentId === 11 || s.commentId === 22, 'P2 segment carries comment ID');
-          assert.ok(s.commentIndex === 0 || s.commentIndex === 1, 'P2 segment carries comment index');
-          assert.ok(s.sliceEnd > s.sliceStart && s.sliceEnd - s.sliceStart <= MAX_ISSUE_CHUNK_LENGTH, 'P2 slice range bounded');
-          assert.ok(/^[0-9a-f]{64}$/.test(s.sha256), 'P2 slice sha is hex');
-          assert.ok(s.end >= s.start, 'P2 global range ordered');
-        }
-      }
-      assert.ok(validateIssueChunks(chunks, full), 'P2 builder output validates with RAW snapshot');
-      assert.equal(verifyIssueChunkCoverage(chunks, full), true, 'P2 coverage helper confirms RAW binding');
-      // Reports validate against live RAW too and carry no plaintext.
-      const fakeReports = chunks.map((c) => ({
-        index: c.index,
-        total: c.total,
-        start: c.start,
-        end: c.end,
-        complete: true,
-        coveredLength: c.coveredLength,
-        verdict: 'APPROVE' as const,
-        summary: 'ok',
-        labels: [] as string[],
-        segments: c.segments.map((s) => ({ ...s })),
-        bodySha: c.bodySha,
-        bodyRanges: c.bodyRanges.map((r) => ({ ...r })),
-      }));
-      assert.ok(validateIssueChunkReports(fakeReports, full), 'P2 reports validate with RAW snapshot');
-      assert.equal(verifyIssueChunkCoverage(fakeReports, full), true, 'P2 report coverage confirms RAW binding');
-      assert.ok(validateIssueOutput({
-        verdict: 'APPROVE', issueNumber: 7, title, tags: [], summary: 'ok',
-        suggestedLabels: [], fingerprint: 'a'.repeat(64), commentsComplete: true,
-        chunks: fakeReports, chunkCoverageComplete: true, chunkCount: fakeReports.length,
-      }), 'P2 output with segments validates (segments schema)');
-      // Only hash/ranges/verdict: raw secret never persists in bindings.
-      {
-        const secretRaw = ['human：api_key supersecret123'];
-        const secretRed = ['human：api_key [REDACTED CREDENTIAL]'];
-        const sc = buildIssueChunks(title, body, secretRed, { rawBody: body, rawComments: secretRaw, rawCommentIds: [31] });
-        assert.ok(validateIssueChunks(sc, { title, body, comments: secretRed, commentIds: [31], rawComments: secretRaw, rawBody: body }), 'P2 secret binding validates');
-        const blob = JSON.stringify(sc);
-        assert.ok(!blob.includes('supersecret123'), 'P2 bindings carry no raw secret');
-        const segSha = sc.flatMap((c) => c.segments)[0].sha256;
-        assert.equal(segSha, rawSliceHash(secretRaw[0]), 'P2 slice sha binds RAW (not the redacted mask)');
-      }
-
-      // Negative: same-length char swap (lengths add up, content differs).
-      {
-        const swappedRaw = ['human：AAB', 'human：BBB'];
-        const swappedFull = { ...full, rawComments: swappedRaw };
-        assert.equal(validateIssueChunks(chunks, swappedFull), undefined, 'P2 same-length swap rejected by validate');
-        assert.equal(verifyIssueChunkCoverage(chunks, swappedFull), false, 'P2 same-length swap rejected by verify');
-        assert.equal(validateIssueChunkReports(fakeReports, swappedFull), undefined, 'P2 same-length swap rejected by report validate');
-        assert.equal(verifyIssueChunkCoverage(fakeReports, swappedFull), false, 'P2 same-length swap rejected by report verify');
-      }
-
-      // Negative: swapped comment order (ids + order mismatch).
-      {
-        const orderFull = {
-          title, body,
-          comments: [comments[1], comments[0]],
-          commentIds: [ids[1], ids[0]],
-          rawComments: [comments[1], comments[0]],
-          rawBody: body,
-        };
-        assert.equal(validateIssueChunks(chunks, orderFull), undefined, 'P2 comment reorder rejected by validate');
-        assert.equal(verifyIssueChunkCoverage(chunks, orderFull), false, 'P2 comment reorder rejected by verify');
-        assert.equal(validateIssueChunkReports(fakeReports, orderFull), undefined, 'P2 comment reorder rejected by report validate');
-      }
-
-      // Negative: duplicated slice (artifact tamper).
-      {
-        const dup = chunks.map((c) => ({
-          ...c,
-          comments: [...c.comments],
-          segments: c.segments.map((s) => ({ ...s })),
-          bodyRanges: c.bodyRanges.map((r) => ({ ...r })),
-        }));
-        dup[0].segments = [dup[0].segments[0], dup[0].segments[0], ...dup[0].segments.slice(1)];
-        assert.equal(validateIssueChunks(dup, full), undefined, 'P2 duplicated slice rejected by validate');
-        assert.equal(verifyIssueChunkCoverage(dup, full), false, 'P2 duplicated slice rejected by verify');
-      }
-    }
-
-    // P2 #4 publish double gate: live same-length swap falls back to
-    // INCONCLUSIVE on the same sticky (segment hashes + fingerprint gate).
-    {
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p2-segswap-'));
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p2-stale-'));
       try {
-        const bodyA = `${'x'.repeat(8000)}A`;
-        const bodyB = `${'x'.repeat(8000)}B`;
-        assert.equal(bodyA.length, bodyB.length, 'P2 swap keeps length');
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
         const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'p2 ok', suggestedLabels: [] }]);
@@ -1449,20 +1789,18 @@ export async function runPhase2HTests(): Promise<void> {
             rest: {
               users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
               issues: {
-                get: async () => ({ data: { number: 7, title: 'p2', body: bodyA } }),
+                get: async () => ({ data: { number: 7, title: 'p2', body: 'body before' } }),
                 listComments: async () => ({ data: [] }),
               },
             },
           } as unknown as NonNullable<RunnerContext['githubClient']>;
           const reviewed = await runIssueReviewMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2', body: bodyA } },
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2', body: 'body before' } },
             env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
             githubClient: reviewClient,
             writeStdout: () => undefined,
           });
-          assert.equal(reviewed.verdict, 'APPROVE', 'P2 review may APPROVE before swap');
-          assert.ok(reviewed.chunks && reviewed.chunks.length >= 2, 'P2 review is chunked');
-          assert.ok(reviewed.chunks.every((c) => Array.isArray(c.segments) && typeof c.bodySha === 'string'), 'P2 artifact carries bindings');
+          assert.equal(reviewed.verdict, 'APPROVE', 'review may APPROVE before the edit');
         } finally {
           restore();
         }
@@ -1475,7 +1813,7 @@ export async function runPhase2HTests(): Promise<void> {
           rest: {
             users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
             issues: {
-              get: async () => ({ data: { number: 7, title: 'p2', body: bodyB } }),
+              get: async () => ({ data: { number: 7, title: 'p2', body: 'body after' } }),
               listComments: async () => ({ data: state.comments }),
               createComment: async () => { state.created += 1; return {}; },
               updateComment: async (params: { comment_id: number; body: string }) => {
@@ -1491,7 +1829,7 @@ export async function runPhase2HTests(): Promise<void> {
           },
         } as unknown as NonNullable<RunnerContext['githubClient']>;
         await runPublishMode({
-          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2', body: bodyB } },
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2', body: 'body after' } },
           env: {
             GITHUB_EVENT_NAME: 'issues',
             GITHUB_REPOSITORY: REPO,
@@ -1502,69 +1840,54 @@ export async function runPhase2HTests(): Promise<void> {
           } as NodeJS.ProcessEnv,
           githubClient: publishClient,
         });
-        assert.equal(state.created, 0, 'P2 swap publish creates no second comment');
-        assert.equal(state.updated, 1, 'P2 swap publish updates same sticky');
-        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'P2 live swap falls back to INCONCLUSIVE');
-        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'), 'P2 live swap never APPROVE');
+        assert.equal(state.created, 0, 'stale publish creates no second comment');
+        assert.equal(state.updated, 1, 'stale publish updates same sticky');
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'live edit falls back to INCONCLUSIVE');
+        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'), 'stale content never APPROVE');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
     }
 
-    // P2 #4 segment gate isolates artifact tamper: live content unchanged
-    // (fingerprint still matches) but a forged slice hash falls back to
-    // INCONCLUSIVE on the same sticky.
+    // Truncation-proof gate: a forged truncation proof (shown > total)
+    // invalidates the artifact and falls back to INCONCLUSIVE on the same
+    // sticky, even when the live content is unchanged.
     {
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p2-segtamper-'));
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-p2-trunctamper-'));
       try {
-        const bodyC = `${'y'.repeat(8000)}C`;
+        const longBody = 'z'.repeat(9001);
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
-        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'p2 tamper ok', suggestedLabels: [] }]);
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'must not run', suggestedLabels: [] }]);
         try {
           const reviewClient = {
             rest: {
               users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
               issues: {
-                get: async () => ({ data: { number: 7, title: 'p2t', body: bodyC } }),
-                listComments: async () => ({ data: [{ id: 61, body: 'human note', user: { login: 'human', type: 'User' } }] }),
+                get: async () => ({ data: { number: 7, title: 'p2t', body: longBody } }),
+                listComments: async () => ({ data: [] }),
               },
             },
           } as unknown as NonNullable<RunnerContext['githubClient']>;
           const reviewed = await runIssueReviewMode({
-            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2t', body: bodyC } },
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2t', body: longBody } },
             env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
             githubClient: reviewClient,
             writeStdout: () => undefined,
           });
-          assert.equal(reviewed.verdict, 'APPROVE', 'P2 tamper setup may APPROVE');
-          assert.ok(reviewed.chunks && reviewed.chunks.length >= 1, 'P2 tamper setup is chunked');
+          assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'truncated setup stays INCONCLUSIVE');
+          assert.ok(reviewed.truncation, 'truncated setup carries proof');
         } finally {
           restore();
         }
-        // Forge one slice hash (keep valid hex + schema so only the live
-        // binding mismatches, not the schema gate).
+        // Forge the proof (shown past total); schema still parses as an
+        // object, so only the proof validation must catch it.
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
-        const achunks = artifact.chunks as Array<Record<string, unknown>>;
-        let forged = false;
-        for (const ch of achunks) {
-          const segs = ch.segments as Array<Record<string, unknown>>;
-          if (Array.isArray(segs) && segs.length > 0) {
-            const sha = String(segs[0].sha256);
-            segs[0].sha256 = sha.slice(0, 63) + (sha[63] === '0' ? '1' : '0');
-            forged = true;
-            break;
-          }
-        }
-        if (!forged) {
-          const first = achunks[0] as Record<string, unknown>;
-          const sha = String(first.bodySha);
-          first.bodySha = sha.slice(0, 63) + (sha[63] === '0' ? '1' : '0');
-        }
+        const proof = { ...(artifact.truncation as Record<string, unknown>) };
+        proof.shownChars = (proof.totalChars as number) + 1;
+        artifact.truncation = proof;
         fs.writeFileSync(artifactPath, JSON.stringify(artifact, null, 2));
-        // Schema still holds (valid hex), so validateIssueOutput passes — the
-        // publish live binding is what must catch the forgery.
-        assert.ok(validateIssueOutput(JSON.parse(fs.readFileSync(artifactPath, 'utf8'))), 'P2 forged artifact keeps schema');
+        assert.equal(validateIssueOutput(JSON.parse(fs.readFileSync(artifactPath, 'utf8'))), undefined, 'forged proof fails validation');
         const state = {
           comments: [{ id: 52, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
           created: 0,
@@ -1574,14 +1897,8 @@ export async function runPhase2HTests(): Promise<void> {
           rest: {
             users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
             issues: {
-              get: async () => ({ data: { number: 7, title: 'p2t', body: bodyC } }),
-              listComments: async (params: { page: number }) => {
-                void params;
-                // First call is the publish fingerprint/segment re-read (live
-                // human comment); sticky lookup reuses the same array since
-                // the bot sticky is filtered from the RAW snapshot by author.
-                return { data: [{ id: 61, body: 'human note', user: { login: 'human', type: 'User' } }, ...state.comments] };
-              },
+              get: async () => ({ data: { number: 7, title: 'p2t', body: longBody } }),
+              listComments: async () => ({ data: state.comments }),
               createComment: async () => { state.created += 1; return {}; },
               updateComment: async (params: { comment_id: number; body: string }) => {
                 state.updated += 1;
@@ -1596,7 +1913,7 @@ export async function runPhase2HTests(): Promise<void> {
           },
         } as unknown as NonNullable<RunnerContext['githubClient']>;
         await runPublishMode({
-          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2t', body: bodyC } },
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: 'p2t', body: longBody } },
           env: {
             GITHUB_EVENT_NAME: 'issues',
             GITHUB_REPOSITORY: REPO,
@@ -1607,10 +1924,9 @@ export async function runPhase2HTests(): Promise<void> {
           } as NodeJS.ProcessEnv,
           githubClient: publishClient,
         });
-        assert.equal(state.created, 0, 'P2 forgery publish creates no second comment');
-        assert.equal(state.updated, 1, 'P2 forgery publish updates same sticky');
-        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'P2 forged slice falls back to INCONCLUSIVE');
-        assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'), 'P2 forged slice never APPROVE');
+        assert.equal(state.created, 0, 'forgery publish creates no second comment');
+        assert.equal(state.updated, 1, 'forgery publish updates same sticky');
+        assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'forged proof falls back to INCONCLUSIVE');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }

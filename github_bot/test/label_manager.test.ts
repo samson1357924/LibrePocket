@@ -16,6 +16,7 @@ import {
   isBotOwnedTransitionRemoval,
   isManagedByBot,
   isMutexLabel,
+  isIssueAiSuggestibleLabel,
   isPrAiSuggestibleLabel,
   normalizeLabelName,
   parseReviewReport,
@@ -25,6 +26,7 @@ import {
   resolveReviewLabels,
   resolveTimelineBotWrittenLabels,
   sanitizeLabels,
+  sanitizeIssueAiSuggestions,
   sanitizePrAiSuggestions,
   warnOnMutexCoexistence,
   type GitHubLabelClient,
@@ -314,6 +316,19 @@ ${reportWith('A security flaw remains.')}`);
     const prFiltered = sanitizePrAiSuggestions(['area:runtime', 'security', 'priority:P1', 'gate:release', 'bug', 'alien-label']);
     assert.deepEqual(prFiltered.kept, ['area:runtime', 'bug', 'security']);
     assert.equal(prFiltered.discardedCount, 3, 'priority/gate/alien discarded for PR; bug kept');
+  }
+  // Issue convergence: gate/verified statuses stay discarded (human-only)
+  // while priority/area/semantic labels are kept.
+  {
+    for (const issueAllowed of ['area:runtime', 'security', 'performance', 'type:tracking', 'status:needs-decision', 'priority:P1', 'priority:P2', 'bug', 'enhancement', 'documentation']) {
+      assert.equal(isIssueAiSuggestibleLabel(issueAllowed), true, issueAllowed);
+    }
+    for (const humanOnly of ['gate:live', 'gate:release', 'status:verified-main', 'status:partial', 'status:latent']) {
+      assert.equal(isIssueAiSuggestibleLabel(humanOnly), false, `${humanOnly} stays human-only`);
+    }
+    const issueFiltered = sanitizeIssueAiSuggestions(['area:runtime', 'priority:P1', 'bug', 'gate:live', 'status:verified-main', 'alien-label', 42 as unknown as string]);
+    assert.deepEqual(issueFiltered.kept, ['area:runtime', 'bug', 'priority:P1']);
+    assert.equal(issueFiltered.discardedCount, 4, 'gate/verified/alien/non-string discarded for issues');
   }
   // P1+P2 coexistence: both survive, only a warning, never auto-removal.
   {

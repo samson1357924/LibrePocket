@@ -698,6 +698,63 @@ export function sanitizePrAiSuggestions(candidates: string[]): { kept: string[];
   return { kept: Array.from(kept).sort(), discardedCount };
 }
 
+// Label taxonomy (deterministic-first contract):
+// - Fully deterministic (never needs LLM): area:* on PRs (path-derived),
+//   status:needs-decision (verdict/coverage/fallback), configured
+//   POCKETGUARD_TAG_LABELS, type:tracking/security/performance from titles.
+// - Hybrid (deterministic authoritative, LLM supplements by union only):
+//   security/performance from verdicts and BLOCK findings.
+// - LLM-only (no deterministic producer exists): bug/enhancement/
+//   documentation (intent), priority:P1/P2 (urgency, issues only),
+//   area:* on issues (no diff path to derive from).
+// - Human-only (neither side may write): gate:*, verified statuses,
+//   accessibility/run-instrumented and the remaining triage labels.
+
+/** True when a canonical issue AI suggestion may be written by the bot. */
+export function isIssueAiSuggestibleLabel(canonicalLabel: string): boolean {
+  if (!canonicalLabel || typeof canonicalLabel !== 'string') return false;
+  const lower = canonicalLabel.trim().toLowerCase();
+  if (!lower) return false;
+  if (lower.startsWith('area:')) return true;
+  return (
+    lower === 'security' ||
+    lower === 'performance' ||
+    lower === 'type:tracking' ||
+    lower === 'status:needs-decision' ||
+    lower === 'priority:p1' ||
+    lower === 'priority:p2' ||
+    lower === 'bug' ||
+    lower === 'enhancement' ||
+    lower === 'documentation'
+  );
+}
+
+/**
+ * Filters raw issue AI suggestions through the issue convergence allowlist.
+ * Returns kept (issue-writable canonical) plus discarded count. Unknown
+ * labels plus human-only labels (gate:* and verified statuses) are discarded;
+ * callers must force non-APPROVE when discarded > 0. Raw values are never
+ * logged (prompt-injection safe). priority:P1/P2 stay issue-only by
+ * construction (the PR filter rejects them).
+ */
+export function sanitizeIssueAiSuggestions(candidates: string[]): { kept: string[]; discardedCount: number } {
+  const kept = new Set<string>();
+  let discardedCount = 0;
+  for (const raw of candidates) {
+    if (typeof raw !== 'string') {
+      discardedCount += 1;
+      continue;
+    }
+    const canonical = normalizeLabelName(raw);
+    if (!canonical || !isIssueAiSuggestibleLabel(canonical)) {
+      discardedCount += 1;
+      continue;
+    }
+    kept.add(canonical);
+  }
+  return { kept: Array.from(kept).sort(), discardedCount };
+}
+
 // P2 #4 bot-owned transition groups (Owner decision, Phase 4): within these
 // mutex groups the bot may move its own prior write (P1→P2,
 // bug→enhancement) when the desired set carries a different peer of the same

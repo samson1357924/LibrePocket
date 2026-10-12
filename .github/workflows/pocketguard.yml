@@ -99,10 +99,10 @@ jobs:
     # no OpenAI secrets and never checks out fork code: the checkout stays
     # on the default branch for the bot code only, and the head SHA is
     # pinned via a trusted pulls.get read.
-    # Phase 3 (P2 #3) claim budget: the TS pre-flight estimates chunkCount via
-    # the read-only diff (collectFileDiffs plus MAX_PR_CHUNK_LENGTH partition)
-    # and refuses when waves x timeout cannot fit the review deadline
-    # (POCKETGUARD_REVIEW_DEADLINE_MS, default 20min minus margin; per-chunk
+    # Phase 3 (P2 #3) claim budget: the TS pre-flight verifies the diff via
+    # the read-only diff (collectFileDiffs) and refuses when waves x timeout
+    # cannot fit the review deadline
+    # (POCKETGUARD_REVIEW_DEADLINE_MS, default 20min minus margin; per-wave
     # share below the viable minimum claims nothing with zero writes, never
     # occupying a slot). A granted claim whose later review times out still
     # holds its slot (never refunded).
@@ -166,7 +166,7 @@ jobs:
           POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
           POCKETGUARD_QUOTA_SHA: ${{ needs.prepare-tag.outputs.quota_head_sha }}
           POCKETGUARD_MODEL_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_FALLBACKS || secrets.POCKETGUARD_MODEL_FALLBACKS }}
-          POCKETGUARD_MODEL_CHIEF_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_CHIEF_FALLBACKS || secrets.POCKETGUARD_MODEL_CHIEF_FALLBACKS }}
+          POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS || vars.POCKETGUARD_MODEL_CHIEF_FALLBACKS || secrets.POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS || secrets.POCKETGUARD_MODEL_CHIEF_FALLBACKS }}
           POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS || secrets.POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS }}
           POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS || secrets.POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS }}
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=claim
@@ -191,7 +191,7 @@ jobs:
     # (needs.claim-slot.outputs.claimed == 'true'); without its own approved
     # claim the run makes zero OpenAI calls. The claim-slot job is a no-op
     # success for issues, so the issue-auto route needs no claimed check.
-    # Phase 3 (P2 #3) N-chunk safety: the TS review runs chunked PR diffs
+    # Phase 3 (P2 #3) wave safety: the TS review runs review waves
     # under t0 + effectiveDeadline = min(configured
     # POCKETGUARD_REVIEW_DEADLINE_MS (default 20min minus 60s margin for
     # artifact/upload), jobRemaining - 60s skew) with jobRemaining =
@@ -200,13 +200,11 @@ jobs:
     # records POCKETGUARD_JOB_STARTED_MS into $GITHUB_ENV (trusted
     # workflow-defined wall-clock, never PR content) and both review steps
     # receive it via env; a missing value downgrades to the configured
-    # deadline fail-closed. Fixed concurrency 2, per-wave need estimation
-    # (effectiveRemaining < need exits early fail-closed), per-chunk timeoutMs passthrough min(420s,
+    # deadline fail-closed. The three roles run in parallel, per-wave need
+    # estimation (effectiveRemaining < need exits early fail-closed), per-wave timeoutMs passthrough min(420s,
     # effectiveRemaining/remainingWaves, optional POCKETGUARD_CHUNK_TIMEOUT_MS
-    # override for tests), and a computed chunkCoverageComplete (any
-    # transport/timeout/deadline INCONCLUSIVE forces false; publish gates on
-    # true). Deadline exits save INCONCLUSIVE + false artifacts (checkpoint)
-    # with completed reports plus omission placeholders, never true and never
+    # override for tests). Deadline exits save INCONCLUSIVE artifacts (checkpoint)
+    # with completed reports, never true and never
     # silent.
     if: >-
       (needs.prepare-tag.outputs.target == 'pull-request' &&
@@ -281,7 +279,7 @@ jobs:
         # for distinction. Only this step receives OpenAI secrets. The
         # checkout stays on the default branch; fork code is never checked
         # out or executed. POCKETGUARD_JOB_STARTED_MS (first step, trusted)
-        # caps chunked reviews via the TS effective deadline.
+        # caps reviews via the TS effective deadline.
         if: >-
           (steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||
           (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
@@ -295,20 +293,20 @@ jobs:
           POCKETGUARD_OUTPUT: review-output.json
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          POCKETGUARD_MODEL_CHIEF: ${{ vars.POCKETGUARD_MODEL_CHIEF || secrets.POCKETGUARD_MODEL_CHIEF }}
+          POCKETGUARD_MODEL_ARCHITECTURE: ${{ vars.POCKETGUARD_MODEL_ARCHITECTURE || vars.POCKETGUARD_MODEL_CHIEF || secrets.POCKETGUARD_MODEL_ARCHITECTURE || secrets.POCKETGUARD_MODEL_CHIEF }}
           POCKETGUARD_MODEL_ANDROID_SEC: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC || secrets.POCKETGUARD_MODEL_ANDROID_SEC }}
           POCKETGUARD_MODEL_ANDROID_CODE: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE || secrets.POCKETGUARD_MODEL_ANDROID_CODE }}
           POCKETGUARD_MODEL_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_FALLBACKS || secrets.POCKETGUARD_MODEL_FALLBACKS }}
-          POCKETGUARD_MODEL_CHIEF_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_CHIEF_FALLBACKS || secrets.POCKETGUARD_MODEL_CHIEF_FALLBACKS }}
+          POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS || vars.POCKETGUARD_MODEL_CHIEF_FALLBACKS || secrets.POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS || secrets.POCKETGUARD_MODEL_CHIEF_FALLBACKS }}
           POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS || secrets.POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS }}
           POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS || secrets.POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS }}
           POCKETGUARD_MODEL_PROFILES: ${{ vars.POCKETGUARD_MODEL_PROFILES || secrets.POCKETGUARD_MODEL_PROFILES }}
           POCKETGUARD_MODEL_PROFILE: ${{ vars.POCKETGUARD_MODEL_PROFILE || secrets.POCKETGUARD_MODEL_PROFILE }}
-          POCKETGUARD_MODEL_CHIEF_PROFILE: ${{ vars.POCKETGUARD_MODEL_CHIEF_PROFILE || secrets.POCKETGUARD_MODEL_CHIEF_PROFILE }}
+          POCKETGUARD_MODEL_ARCHITECTURE_PROFILE: ${{ vars.POCKETGUARD_MODEL_ARCHITECTURE_PROFILE || vars.POCKETGUARD_MODEL_CHIEF_PROFILE || secrets.POCKETGUARD_MODEL_ARCHITECTURE_PROFILE || secrets.POCKETGUARD_MODEL_CHIEF_PROFILE }}
           POCKETGUARD_MODEL_ANDROID_SEC_PROFILE: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC_PROFILE || secrets.POCKETGUARD_MODEL_ANDROID_SEC_PROFILE }}
           POCKETGUARD_MODEL_ANDROID_CODE_PROFILE: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE_PROFILE || secrets.POCKETGUARD_MODEL_ANDROID_CODE_PROFILE }}
           POCKETGUARD_REASONING_EFFORT: ${{ vars.POCKETGUARD_REASONING_EFFORT || secrets.POCKETGUARD_REASONING_EFFORT }}
-          POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT: ${{ vars.POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT || secrets.POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT }}
+          POCKETGUARD_MODEL_ARCHITECTURE_REASONING_EFFORT: ${{ vars.POCKETGUARD_MODEL_ARCHITECTURE_REASONING_EFFORT || vars.POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT || secrets.POCKETGUARD_MODEL_ARCHITECTURE_REASONING_EFFORT || secrets.POCKETGUARD_MODEL_CHIEF_REASONING_EFFORT }}
           POCKETGUARD_MODEL_ANDROID_SEC_REASONING_EFFORT: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC_REASONING_EFFORT || secrets.POCKETGUARD_MODEL_ANDROID_SEC_REASONING_EFFORT }}
           POCKETGUARD_MODEL_ANDROID_CODE_REASONING_EFFORT: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE_REASONING_EFFORT || secrets.POCKETGUARD_MODEL_ANDROID_CODE_REASONING_EFFORT }}
           POCKETGUARD_OPENAI_ORIGIN: ${{ vars.POCKETGUARD_OPENAI_ORIGIN || secrets.POCKETGUARD_OPENAI_ORIGIN }}
@@ -319,7 +317,7 @@ jobs:
         # above — including missing/empty/non-'true' authorized, unreadable
         # diffs (SHA-pin or fetch failure), and non-issue routes — runs the
         # generic INCONCLUSIVE path with no OpenAI secrets. It receives the
-        # same trusted POCKETGUARD_JOB_STARTED_MS so chunked INCONCLUSIVE
+        # same trusted POCKETGUARD_JOB_STARTED_MS so INCONCLUSIVE
         # checkpoints share the job cap.
         if: >-
           !((steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||

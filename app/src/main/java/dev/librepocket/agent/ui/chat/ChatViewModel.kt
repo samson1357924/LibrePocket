@@ -426,10 +426,13 @@ class ChatViewModel(
      * false INTERRUPTED while the old writer is still alive. An unrelated id
      * never waits (fast path unchanged). Entries are consumed by the slow
      * settle (success/timeout/dead all remove; failure parks
-     * [pendingBackfillBlock] per R9-3), expired entries are purged on every
-     * park/consult (bounded by [PENDING_BACKFILL_BLOCK_MS], same horizon as
-     * the block: an old writer past the horizon is truly dead), and
-     * [onCleared] drops the whole table. Never assume "discarded binding =
+     * [pendingBackfillBlock] per R9-3), overdue entries are proof-gated on
+     * every park/consult (R11-1): an entry past [PENDING_BACKFILL_BLOCK_MS]
+     * is removed only with writer-dead/clean proof (fence completed AND
+     * session null or sealed-dead); a still-unsettled entry slides its
+     * deadline instead of being erased, so a clock deadline bounds UI
+     * waiting but never erases ownership while a commit is still possible —
+     * and [onCleared] drops the whole table. Never assume "discarded binding =
      * old ledger never reopens".
      */
     private data class OutstandingTeardown(
@@ -462,7 +465,61 @@ class ChatViewModel(
         val it = outstandingTeardowns.entries.iterator()
         while (it.hasNext()) {
             val e = it.next()
-            if (nowMs - e.value.parkedAtMs >= backfillBlockHorizonMs) it.remove()
+            if (nowMs - e.value.parkedAtMs < backfillBlockHorizonMs) continue
+            // R11-1: never erase a still-unsettled teardown on clock alone.
+            // A deadline may bound waiting/UI responsiveness, but must not
+            // erase ownership while a commit is still possible. Overdue-but-
+            // live entries slide their deadline (same renew semantics as
+            // pendingBackfillBlock); only provably-dead/clean entries are
+            // removed.
+            if (isOutstandingEntryLive(e.value)) {
+                e.value.parkedAtMs = nowMs
+            } else {
+                it.remove()
+            }
+        }
+    }
+    /**
+     * R11-1 liveness for the outstanding table: true while the detached
+     * writer may still commit its terminal. Fail-closed: any uncertainty
+     * keeps the entry (renew, never purge).
+     * - Unfinished fence → live (the background close-then-flush still runs).
+     * - Sealed-dead session (sealed + no pending) → dead: its terminal will
+     *   never land, so a later backfill of its dangling turn is correct.
+     * - Streaming/pending evidence → live.
+     * - Unsealed session with no fence completion proof → live (a stalled
+     *   delegate / non-cancellable terminal persistence may still commit
+     *   despite bounded caller waits and empty session-side flags).
+     * - Fence completed + session null or sealed-dead → dead.
+     * Best-effort reads only, never throws.
+     */
+    private fun isOutstandingEntryLive(entry: OutstandingTeardown): Boolean {
+        try {
+            if (entry.fence?.isCompleted == false) return true
+        } catch (_: Exception) {
+            return true
+        }
+        val s = entry.session
+        if (s == null) {
+            // No session left: with the fence finished (or absent) no writer
+            // remains to commit. An unfinished fence already returned true.
+            return false
+        }
+        try {
+            if (isWriterSealedDead(s)) return false
+        } catch (_: Exception) {
+        }
+        try {
+            if (isLedgerStreamingOrPending(s)) return true
+        } catch (_: Exception) {
+        }
+        // Unsealed without session-side evidence: only a completed fence
+        // proves the teardown ran to completion. No fence (or an unreadable
+        // fence) means no completion proof — keep the entry.
+        return try {
+            entry.fence == null
+        } catch (_: Exception) {
+            true
         }
     }
     private fun rememberOutstandingTeardown(

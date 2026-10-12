@@ -263,4 +263,78 @@ class ChatNewChatReopenRaceTest {
             cleanupGate.complete(Unit)
         }
     }
+
+    /**
+     * R11-1: newChat parks the live writer, then the clock advances past the
+     * horizon BEFORE the first reopen. Pre-fix [purgeExpiredOutstanding]
+     * erased the entry on elapsed time alone → the first reopen lost its
+     * outstanding ownership, took the fast path with backfill=true, and marked
+     * a false INTERRUPTED while the old writer was still alive; the late true
+     * terminal then contradicted it. Post-fix an overdue-but-live entry slides
+     * its deadline (never erased on clock alone), so the first reopen still
+     * fences via the slow path and defers — no marker before the late terminal.
+     */
+    @Test fun newChat_thenExpiredFirstReopen_noFalseInterrupted() = runBlocking {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = FakeSessionStore()
+        val streamGate = CompletableDeferred<Unit>()
+        val cleanupGate = CompletableDeferred<Unit>()
+        val vm = chatViewModels.own(
+            ChatViewModel(store, factoryWith(transcripts, RaceStreamingProvider(streamGate, cleanupGate)), InMemoryPolicyStore()),
+        )
+        try {
+            var fakeNow = 1_000_000L
+            onMain {
+                vm.backfillClockMs = { fakeNow }
+                vm.backfillBlockHorizonMs = 500L
+            }
+            onMain { vm.sendDirect("q-cancel") }
+            awaitTrue { vm.currentSessionId.value != null }
+            val s1 = vm.currentSessionId.value!!
+            awaitTrue { vm.messages.value.any { it.text == "half-cancelled" } }
+
+            // Park the live writer via newChat (no backfill block yet — the
+            // block is only installed by a failed settle).
+            onMain { vm.newChat() }
+            assertNull(vm.currentSessionId.value)
+
+            // Advance past the horizon WITHOUT reopening: the parked teardown
+            // is still alive (old writer gated). Pre-fix this purge erased it.
+            fakeNow += 600L
+
+            // First reopen after expiry: must still fence (slow path) and defer,
+            // never fast-path a false INTERRUPTED.
+            onMain { vm.openSession(s1) }
+            delay(800)
+            assertTrue(
+                "expired-but-live outstanding must not fast-path a false INTERRUPTED",
+                interruptedMarkers(transcripts, s1).isEmpty(),
+            )
+
+            // Late true terminal lands exactly once; a second reopen attaches it.
+            cleanupGate.complete(Unit)
+            streamGate.complete(Unit)
+            awaitTrue(timeoutMs = 15000) { vm.currentSessionId.value == s1 }
+            awaitTrue(timeoutMs = 15000) {
+                rows(transcripts, s1).count { it.kind == "assistant" } == 1
+            }
+            assertTrue(interruptedMarkers(transcripts, s1).isEmpty())
+            assertTrue(findDanglingRunIds(rows(transcripts, s1)).isEmpty())
+            assertEquals(1, rows(transcripts, s1).count { it.kind == "assistant" })
+
+            // Double reopen stays clean.
+            onMain { vm.openSession(s1) }
+            awaitTrue(timeoutMs = 15000) { vm.currentSessionId.value == s1 }
+            assertTrue(interruptedMarkers(transcripts, s1).isEmpty())
+            onMain { vm.openSession(s1) }
+            awaitTrue(timeoutMs = 15000) { vm.currentSessionId.value == s1 }
+            assertTrue(interruptedMarkers(transcripts, s1).isEmpty())
+            assertEquals(1, rows(transcripts, s1).count { it.kind == "assistant" })
+            assertTrue(findDanglingRunIds(rows(transcripts, s1)).isEmpty())
+        } finally {
+            streamGate.complete(Unit)
+            cleanupGate.complete(Unit)
+        }
+    }
 }

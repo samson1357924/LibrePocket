@@ -435,6 +435,7 @@ object ProviderErrorClassifier {
 | RETRYABLE | 連接中斷、讀超時、提前 EOF、HTTP 408/409/425/429/5xx（除 501）、`SSE_TRUNCATED` | `true` |
 | FATAL | 401/403（認證）、402/402變體（額度/計費）、400/422（協議格式）、證書錯誤（SSLHandshake）、`IMAGE_TOO_LARGE`、`SSE_LINE_TOO_LONG`、`SSE_FRAME_TOO_LARGE`、`TOOL_ARGS_TOO_LARGE`、URL/協議配置錯 | `false` |
 | 啟發式 | body 含 `insufficient_quota|billing|invalid_api_key|unauthorized|image_too_large|sse_line_too_long|sse_frame_too_large|tool_args_too_large`（大小寫無關） → FATAL；含 `rate_limit|overloaded|timeout|temporarily` → RETRYABLE | — |
+- 型別化交叉引用（Current）：聚合／SSE 預算溢出另以型別化 `ProviderFailureCode.AGG_TOO_LARGE`（`ProviderFailure.code`／`StreamEvent.Failed.code`，見 §3.4 事件預算）傳遞，與上表 body 標記同義（`isResourceExhausted` 認 code 亦認 marker）。
 
 ### 5.3 重試語義
 

@@ -390,6 +390,35 @@ class TurnControllerAggBudgetTest {
     )
   }
 
+  @Test fun maxCharsExactCapKeepsSingleMessageWhole() {
+    // Boundary pin for applyHistoryCap's strict `>` break: a single message
+    // exactly equal to the cap is kept whole (never split), so nothing drops.
+    val provider = AggFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "r1"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider, historyCap = HistoryWindowCap.MaxChars(2))
+    try {
+      runBlocking { c.send("q1") }
+      // Settled ["q1"(2)] exactly equals the cap: kept whole, dropped 0.
+      val first = provider.seenRequests.last()
+      assertEquals(1, first.messages.size)
+      assertTrue(first.messages[0].text.startsWith("q1"))
+      assertEquals(0, c.droppedHistoryCount)
+      runBlocking { c.send("q2") }
+      // Settled ["q1"(2), "r1"(2), "q2"(2)]: newest-first keeps "q2"(2),
+      // then 2 + 2 > 2 breaks — only the newest survives, dropped 2.
+      val second = provider.seenRequests.last()
+      assertEquals(1, second.messages.size)
+      assertTrue(second.messages[0].text.startsWith("q2"))
+      assertEquals(2, c.droppedHistoryCount)
+    } finally {
+      c.close()
+    }
+  }
+
   @Test fun windowRejectsNonPositiveBudgets() {
     try {
       HistoryWindowCap.MaxMessages(0)

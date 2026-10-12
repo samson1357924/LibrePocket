@@ -303,8 +303,9 @@ class TurnController(
    * Chars copied by immutable UI text updates (prior block length + delta
    * length per write, tool markers included). This is the quadratic term a
    * future throttle must cut; exact under the controller's single-writer
-   * discipline (prior read-then-update is precise only with one writer;
-   * future multi-writer must recompute inside update{} or accept approx).
+   * discipline (no concurrent writers, so the committed snapshot read by the
+   * final CAS attempt is the true prior; a future multi-writer needs CAS
+   * conflict handling or must accept approximate counters).
    */
   var uiTextCopiedChars: Long = 0
     private set
@@ -1184,9 +1185,13 @@ class TurnController(
 
   private fun appendAssistantText(runId: String, delta: String) {
     if (delta.isEmpty()) return
-    // Single-writer: prior read-then-update is exact; multi-writer must recompute inside update{} or accept approx.
-    val prior = _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
+    // Single-writer: prior is read from the CAS snapshot s, so a retried
+    // lambda still commits the last attempt's value. The update{} lambda may
+    // re-run on contention, so counter side effects stay outside update{} and
+    // execute exactly once per committed write.
+    var prior = 0
     _uiState.update { s ->
+      prior = s.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
       s.copy(
         messages = s.messages.map { m ->
           if (m.id == runId && m.role == "assistant") m.copy(text = m.text + delta) else m
@@ -1227,9 +1232,12 @@ class TurnController(
   private fun appendReasoningDelta(runId: String, delta: String) {
     // Observable cost baseline (same as appendAssistantText): every delta is
     // exactly one update; copies count prior text re-copied plus new chars.
-    // Single-writer: prior read-then-update is exact; multi-writer must recompute inside update{} or accept approx.
-    val prior = _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
+    // Prior is read from the CAS snapshot s (atomic: the committed attempt's
+    // value). The update{} lambda may re-run on contention, so counter side
+    // effects stay outside update{} and execute exactly once per write.
+    var prior = 0
     _uiState.update { s ->
+      prior = s.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
       s.copy(
         messages = s.messages.map { m ->
           if (m.id == runId && m.role == "assistant") m.copy(text = m.text + delta, hasReasoning = true) else m

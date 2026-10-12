@@ -64,6 +64,7 @@ class SseFrameParser {
      * Buffered `data:` value chars for the current event. The ×3 factor
      * estimates bytes with the same worst-case CJK heuristic as the line
      * cap, so the comparison against [MAX_FRAME_BYTES] holds on every path.
+     * Join separators count too: one `"\n"` per already-buffered line.
      */
     private var pendingChars = 0
 
@@ -182,6 +183,10 @@ class SseFrameParser {
                 // Small-line stacking guard: each line is legal on its own,
                 // but the joined event payload shares the single-line memory
                 // budget. Latch (never silently drop the excess).
+                // Separator accounting: joinToString("\n") inserts one "\n"
+                // per already-buffered line, so pendingData.size is exactly
+                // the separator count after adding this line (N old lines +
+                // 1 new line -> N separators); it must be inside the x3.
                 if ((pendingChars.toLong() + value.length.toLong() + pendingData.size.toLong()) * 3L > MAX_FRAME_BYTES) {
                     frameTooLong = true
                     pendingEvent = null

@@ -37,7 +37,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-private const val JEV_BODY_LIMIT_BYTES = 32_768
+private const val JEV_BODY_LIMIT_BYTES = JevClient.MAX_BODY_CHARS
 private const val JEV_READ_AHEAD_ALLOWANCE_BYTES = 2 * 8 * 1024
 
 /** Regression coverage for Jev bounded POST reads and Job-judged cancellation. */
@@ -76,7 +76,7 @@ class JevClientTest {
         private val countingInterceptor = object : Interceptor {
             override fun intercept(chain: Interceptor.Chain): Response {
                 val response = chain.proceed(chain.request())
-                val delegate = response.body ?: return response
+                val delegate = response.body
                 val counted = object : ResponseBody() {
                     private val countedSource: BufferedSource = object : ForwardingSource(delegate.source()) {
                         override fun read(sink: Buffer, byteCount: Long): Long {
@@ -419,6 +419,49 @@ class JevClientTest {
                 "response headers arrive before the body stall",
                 withContext(Dispatchers.IO) { signals.headers.await(3, TimeUnit.SECONDS) },
             )
+            assertTrue(
+                "OkHttp Call.cancel was invoked",
+                withContext(Dispatchers.IO) { signals.cancelled.await(3, TimeUnit.SECONDS) },
+            )
+            assertEquals(1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun noulTimeoutBeforeHeadersMapsToTimeoutAndCancelsCall() = runBlocking {
+        val server = MockWebServer()
+        val signals = CallSignals()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+            val client = OkHttpClient.Builder()
+                .readTimeout(5, TimeUnit.MINUTES)
+                .eventListener(signals.listener)
+                .build()
+            val base = server.url("/").toString().trimEnd('/')
+            val timeoutMs = 250L
+            val start = System.currentTimeMillis()
+            // Hang guard only: the passing path returns via internal timeoutMs (~250ms);
+            // reaching the 10s bound means the inner withTimeout handler regressed.
+            val res: NoulResult = try {
+                withTimeout(10_000) {
+                    JevClient(base, FakeVault(), http = client)
+                        .gate(
+                            "alarm.create",
+                            ScoreResult(0.2f, listOf("LOW"), JevStatus.OK, 1),
+                            JevContext(SideEffect.READ, "alarm", "goal"),
+                            timeoutMs = timeoutMs,
+                        )
+                }
+            } catch (e: CancellationException) {
+                throw AssertionError("pre-headers stall must map to TIMEOUT, not leak CancellationException", e)
+            }
+            val elapsed = System.currentTimeMillis() - start
+            assertEquals(JevStatus.TIMEOUT, res.status)
+            assertTrue("pre-headers timeout falls back to confirm", res.needConfirm)
+            assertTrue("pre-headers timeout returns far before the 5min socket timeout, elapsed=$elapsed", elapsed < 5_000)
             assertTrue(
                 "OkHttp Call.cancel was invoked",
                 withContext(Dispatchers.IO) { signals.cancelled.await(3, TimeUnit.SECONDS) },

@@ -108,6 +108,235 @@ class VoiceSpeakerDoneTest {
         assertTrue(doneCalls.isEmpty())
     }
 
+    @Test
+    fun multiChunk_errorThenDone_errorRetainedAndDoneSuppressed() {
+        val doneCalls = CopyOnWriteArrayList<Unit>()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            maxChunk = 3,
+            onError = { errors += it },
+            onDone = { doneCalls += Unit },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("abcdef")
+        assertEquals(2, shadow.utteranceIds.size)
+        val firstId = requireNotNull(shadow.utteranceIds[0])
+        val secondId = requireNotNull(shadow.utteranceIds[1])
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError(firstId, TextToSpeech.ERROR)
+        listener.onDone(secondId)
+
+        assertEquals(
+            1,
+            errors.count { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) },
+        )
+        assertTrue(doneCalls.isEmpty())
+        speaker.shutdown()
+    }
+
+    @Test
+    fun multiChunk_doneThenError_errorEmittedAndDoneSuppressed() {
+        val doneCalls = CopyOnWriteArrayList<Unit>()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            maxChunk = 3,
+            onError = { errors += it },
+            onDone = { doneCalls += Unit },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("abcdef")
+        assertEquals(2, shadow.utteranceIds.size)
+        val firstId = requireNotNull(shadow.utteranceIds[0])
+        val secondId = requireNotNull(shadow.utteranceIds[1])
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onDone(secondId)
+        listener.onError(firstId, TextToSpeech.ERROR)
+
+        assertEquals(
+            1,
+            errors.count { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) },
+        )
+        assertTrue(doneCalls.isEmpty())
+        speaker.shutdown()
+    }
+
+    @Test
+    fun multiChunk_allDone_emitsDoneExactlyOnce() {
+        val doneCalls = CopyOnWriteArrayList<Unit>()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            maxChunk = 3,
+            onError = { errors += it },
+            onDone = { doneCalls += Unit },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("abcdef")
+        assertEquals(2, shadow.utteranceIds.size)
+        val firstId = requireNotNull(shadow.utteranceIds[0])
+        val secondId = requireNotNull(shadow.utteranceIds[1])
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onDone(firstId)
+        assertTrue(doneCalls.isEmpty())
+        listener.onDone(secondId)
+
+        assertEquals(1, doneCalls.size)
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+        speaker.shutdown()
+    }
+
+    @Test
+    fun sameId_errorThenDone_secondIsSuppressedAndErrorRetained() {
+        val doneCalls = CopyOnWriteArrayList<Unit>()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            onError = { errors += it },
+            onDone = { doneCalls += Unit },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+        listener.onDone(utteranceId)
+
+        assertEquals(
+            1,
+            errors.count { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) },
+        )
+        assertTrue(doneCalls.isEmpty())
+        speaker.shutdown()
+    }
+
+    @Test
+    fun sameId_doneThenError_secondIsSuppressed() {
+        val doneCalls = CopyOnWriteArrayList<Unit>()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            onError = { errors += it },
+            onDone = { doneCalls += Unit },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onDone(utteranceId)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+
+        assertEquals(1, doneCalls.size)
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+        speaker.shutdown()
+    }
+
+    @Test
+    fun duplicateDone_isSuppressedToExactlyOne() {
+        val doneCalls = CopyOnWriteArrayList<Unit>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            onDone = { doneCalls += Unit },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onDone(utteranceId)
+        listener.onDone(utteranceId)
+
+        assertEquals(1, doneCalls.size)
+        speaker.shutdown()
+    }
+
+    @Test
+    fun errorValidationThenStop_beforeEmit_isSuppressed() {
+        val doneCalls = CopyOnWriteArrayList<Unit>()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            onError = { errors += it },
+            onDone = { doneCalls += Unit },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        speaker.preEmitHook = { speaker.stop() }
+        try {
+            requireNotNull(shadow.utteranceListener).onError(utteranceId, TextToSpeech.ERROR)
+        } finally {
+            speaker.preEmitHook = null
+        }
+
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+        assertTrue(doneCalls.isEmpty())
+        speaker.shutdown()
+    }
+
+    @Test
+    fun doneValidationThenStop_beforeEmit_isSuppressed() {
+        val doneCalls = CopyOnWriteArrayList<Unit>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            onDone = { doneCalls += Unit },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        speaker.preEmitHook = { speaker.stop() }
+        try {
+            requireNotNull(shadow.utteranceListener).onDone(utteranceId)
+        } finally {
+            speaker.preEmitHook = null
+        }
+
+        assertTrue(doneCalls.isEmpty())
+        speaker.shutdown()
+    }
+
+    @Test
+    fun errorValidationThenNewSpeak_beforeEmit_isSuppressed() {
+        val doneCalls = CopyOnWriteArrayList<Unit>()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            onError = { errors += it },
+            onDone = { doneCalls += Unit },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        speaker.preEmitHook = { speaker.speak("new request") }
+        try {
+            requireNotNull(shadow.utteranceListener).onError(utteranceId, TextToSpeech.ERROR)
+        } finally {
+            speaker.preEmitHook = null
+        }
+
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+        assertTrue(doneCalls.isEmpty())
+        speaker.shutdown()
+    }
+
     private fun currentTtsShadow(): ControlledTextToSpeechShadow {
         val engine = requireNotNull(ShadowTextToSpeech.getLastTextToSpeechInstance())
         return Shadows.shadowOf(engine) as ControlledTextToSpeechShadow

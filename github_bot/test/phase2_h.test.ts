@@ -324,6 +324,194 @@ export async function runPhase2HTests(): Promise<void> {
       }
     }
 
+    // F1 (review #77 P1-1): fresh budget-truncation publishes the honest
+    // verdict/counts instead of the generic unverifiable fallback.
+    for (const shape of [
+      {
+        label: 'truncated-inconclusive',
+        title: 'long',
+        body: `prefix ${'y'.repeat(20001)}`,
+        expectVerdict: 'INCONCLUSIVE',
+        expectBlockWord: false,
+      },
+      {
+        label: 'truncated-block',
+        title: 'leak',
+        body: `leaked token ghp_${'A'.repeat(20)} plus padding ${'x'.repeat(9000)}`,
+        expectVerdict: 'NEEDS_CHANGES',
+        expectBlockWord: true,
+      },
+    ] as const) {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pocketguard-f1-${shape.label}-`));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'must not run', suggestedLabels: [] }]);
+        try {
+          const reviewState = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: shape.title, body: shape.body } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: issueClient(reviewState, { getTitle: shape.title, getBody: shape.body }),
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(counter.count, 0, `F1 ${shape.label} review makes zero AI calls`);
+        const applied: string[] = [];
+        const state = {
+          comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+          created: 0,
+          updated: 0,
+        };
+        const client = {
+          rest: {
+            users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+            issues: {
+              get: async () => ({ data: { number: 7, title: shape.title, body: shape.body } }),
+              listComments: async (params: { page: number }) => {
+                void params;
+                return { data: state.comments };
+              },
+              createComment: async () => { state.created += 1; return {}; },
+              updateComment: async (params: { comment_id: number; body: string }) => {
+                state.updated += 1;
+                const c = state.comments.find((x) => x.id === params.comment_id);
+                if (c) c.body = params.body;
+                return {};
+              },
+              addLabels: async (params: { labels: string[] }) => { applied.push(...params.labels); return {}; },
+              listLabelsOnIssue: async () => ({ data: [] }),
+              removeLabel: async () => ({}),
+            },
+          },
+        } as unknown as NonNullable<RunnerContext['githubClient']>;
+        await runPublishMode({
+          event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: shape.title, body: shape.body } },
+          env: {
+            GITHUB_EVENT_NAME: 'issues',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_SERVER_URL: 'https://github.com',
+            GITHUB_RUN_ID: '123456',
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_OUTPUT: artifactPath,
+            POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+            POCKETGUARD_TAG_LABELS: '[]',
+          } as unknown as NodeJS.ProcessEnv,
+          githubClient: client,
+        });
+        const sticky = state.comments[0].body;
+        assert.equal(state.created, 0, `F1 ${shape.label} creates no second comment`);
+        assert.equal(state.updated, 1, `F1 ${shape.label} updates the same sticky`);
+        assert.ok(sticky.includes(`Verdict: ${shape.expectVerdict}`), `F1 ${shape.label} keeps its verdict`);
+        assert.ok(sticky.includes('Truncated: showing'), `F1 ${shape.label} shows honest counts`);
+        assert.ok(!sticky.includes('Verdict: APPROVE'), `F1 ${shape.label} never approves`);
+        assert.ok(!sticky.includes('Review result unavailable'), `F1 ${shape.label} is not the generic fallback`);
+        if (shape.expectBlockWord) assert.ok(sticky.toLowerCase().includes('blocking'), 'truncated BLOCK keeps its signal');
+        assert.ok(applied.includes('status:needs-decision'), `F1 ${shape.label} keeps the decision label`);
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // F1: transport failure (no proof) and stale truncation keep the generic
+    // fallback with no Truncated line and no APPROVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-f1-generic-'));
+      try {
+        const liveTitle = 'long';
+        const liveBody = `prefix ${'y'.repeat(20001)}`;
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'must not run', suggestedLabels: [] }]);
+        try {
+          const reviewState = { comments: [] as Array<{ id: number; body: string; user: { login: string; type: string } }>, created: 0, updated: 0 };
+          await runIssueReviewMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: liveTitle, body: liveBody } },
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'issues' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: issueClient(reviewState, { getTitle: liveTitle, getBody: liveBody }),
+            writeStdout: () => undefined,
+          });
+        } finally {
+          restore();
+        }
+        const base = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+        const runPublishWithArtifact = async (artifact: unknown, lt: string, lb: string) => {
+          fs.writeFileSync(artifactPath, JSON.stringify(artifact));
+          const state = {
+            comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+            created: 0,
+            updated: 0,
+          };
+          const client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: lt, body: lb } }),
+                listComments: async (params: { page: number }) => {
+                  void params;
+                  return { data: state.comments };
+                },
+                createComment: async () => { state.created += 1; return {}; },
+                updateComment: async (params: { comment_id: number; body: string }) => {
+                  state.updated += 1;
+                  const c = state.comments.find((x) => x.id === params.comment_id);
+                  if (c) c.body = params.body;
+                  return {};
+                },
+                addLabels: async () => ({}),
+                listLabelsOnIssue: async () => ({ data: [] }),
+                removeLabel: async () => ({}),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          await runPublishMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: lt, body: lb } },
+            env: {
+              GITHUB_EVENT_NAME: 'issues',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_SERVER_URL: 'https://github.com',
+              GITHUB_RUN_ID: '123456',
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: artifactPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+            } as unknown as NodeJS.ProcessEnv,
+            githubClient: client,
+          });
+          return state.comments[0].body;
+        };
+        // Transport failure shape: no truncation proof.
+        const { truncation: _dropped, ...noProof } = base;
+        void _dropped;
+        const fetchFailSticky = await runPublishWithArtifact(
+          { ...noProof, verdict: 'INCONCLUSIVE', summary: 'the issue comments could not be fully fetched from GitHub; review freshness could not be verified.', commentsComplete: false },
+          liveTitle,
+          liveBody,
+        );
+        assert.ok(fetchFailSticky.includes('Review result unavailable'), 'fetch failure keeps the generic fallback');
+        assert.ok(!fetchFailSticky.includes('Truncated: showing'), 'fetch failure shows no counts');
+        assert.ok(!fetchFailSticky.includes('Verdict: APPROVE'), 'fetch failure never approves');
+        // Forged APPROVE carrying a truncation proof is rejected by the
+        // schema gate and keeps the generic fallback (never APPROVE).
+        const forgedApproveSticky = await runPublishWithArtifact(
+          { ...base, verdict: 'APPROVE', commentsComplete: false },
+          liveTitle,
+          liveBody,
+        );
+        assert.ok(forgedApproveSticky.includes('Review result unavailable'), 'forged APPROVE+truncation keeps the generic fallback');
+        assert.ok(!forgedApproveSticky.includes('Truncated: showing'), 'forged APPROVE+truncation shows no counts');
+        assert.ok(!forgedApproveSticky.includes('Verdict: APPROVE'), 'forged APPROVE never publishes');
+        // Stale truncation: live content changed after review.
+        const staleSticky = await runPublishWithArtifact(base, liveTitle, `${liveBody} edited`);
+        assert.ok(staleSticky.includes('Review result unavailable'), 'stale truncation keeps the generic fallback');
+        assert.ok(!staleSticky.includes('Truncated: showing'), 'stale truncation shows no old counts as current');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
     // H-2: link success vs failure branches (no fake link on failure).
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-h-link-'));

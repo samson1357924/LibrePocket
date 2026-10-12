@@ -4042,6 +4042,46 @@ function issueInconclusiveComment(issueNumber: number, title: string, reason: st
   ].join('\n');
 }
 
+// F1 (review #77 P1-1): honest-truncation fallback. The transport read
+// completed but the content exceeded the model-input budget, so review mode
+// stored commentsComplete=false with a validated truncation proof. When the
+// proof is fresh (artifact fingerprint matches the current full-RAW
+// fingerprint) this renderer preserves the verdict (INCONCLUSIVE or
+// deterministic NEEDS_CHANGES — never APPROVE), the bounded summary, and
+// the shown/total counts instead of collapsing everything into a generic
+// "unverifiable" line. Transport failures (no proof), forged proofs
+// (rejected by validateIssueOutput), and stale content keep the generic
+// fallback below.
+function issueTruncatedComment(
+  output: RunnerIssueOutput,
+  appliedLabels: string[],
+  reason: string,
+  reportLine?: string,
+): string {
+  const verdict = output.verdict === 'NEEDS_CHANGES' ? 'NEEDS_CHANGES' : 'INCONCLUSIVE';
+  const truncationLine = output.truncation
+    ? `Truncated: showing ${output.truncation.shownChars}/${output.truncation.totalChars} chars, ${output.truncation.shownComments}/${output.truncation.totalComments} comments (${output.truncation.totalChars - output.truncation.shownChars} chars omitted)`
+    : 'Segments: single segment (complete)';
+  const boundedSummary = truncateStickyText(output.summary || '', MAX_STICKY_SUMMARY_LENGTH);
+  return [
+    REVIEW_MARKER,
+    '',
+    '## PocketGuard Issue Review',
+    '',
+    `**Verdict: ${verdict}**`,
+    `Issue: #${output.issueNumber} ${escapeMarkdown(output.title)}`,
+    `Summary: ${escapeMarkdown(boundedSummary) || '(No summary)'}`,
+    ...(boundedSummary.length < (output.summary || '').length ? ['(Summary partially omitted; see report artifact for full content)'] : []),
+    `Label decision: ${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join(', ') : 'none'}`,
+    `Revision fingerprint: \`${safeString(output.fingerprint, 100)}\``,
+    truncationLine,
+    `Note: ${safeString(reason, 300)}`,
+    `Updated: ${new Date().toISOString()}`,
+    reportLine ?? formatReportLine(process.env, false),
+    '',
+  ].join('\n');
+}
+
 function eventCommentAllowed(target: ReviewTarget, eventName: string): boolean {
   if (eventName === 'pull_request_target') return target.target === 'pull-request';
   return target.target === 'pull-request' && isCommentCommandAllowed(target.command, 'pull-request');
@@ -4374,14 +4414,30 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       // Phase 2 (H) reports: failure shows unavailable + INCONCLUSIVE with no
       // fake link (single sticky ID updated in place via buildStampedBody path
       // inside publishStickyComment).
+      // F1: honest-truncation branch — a fresh budget-truncation proof keeps
+      // its verdict/summary/counts; everything else keeps the generic fallback.
+      const fallbackDesiredEarly = sanitizeLabels([...rulesTitle, 'status:needs-decision']);
+      const honestTruncated = validated
+        && validated.commentsComplete === false
+        && validated.truncation !== undefined
+        && (validated.verdict === 'INCONCLUSIVE' || validated.verdict === 'NEEDS_CHANGES')
+        && /^[0-9a-f]{64}$/.test(validated.fingerprint)
+        && validated.fingerprint === currentFingerprint
+        && issueFallbackReason !== undefined
+        && issueFallbackReason.includes('not fully fetched during review')
+        ? validated
+        : undefined;
       const fallbackReportLine = formatReportLine(env, false);
+      const honestReportLine = formatReportLine(env, areReviewReportsAvailable(env));
       await publishStickyComment(
         client,
         repository,
         issueNumber,
-        issueInconclusiveComment(issueNumber, issueTitle, issueFallbackReason ?? 'a valid review result was unavailable.', fallbackFingerprint, fallbackReportLine),
+        honestTruncated
+          ? issueTruncatedComment(honestTruncated, fallbackDesiredEarly, issueFallbackReason ?? 'the issue content exceeded the review budget and was truncated.', honestReportLine)
+          : issueInconclusiveComment(issueNumber, issueTitle, issueFallbackReason ?? 'a valid review result was unavailable.', fallbackFingerprint, fallbackReportLine),
       );
-      const fallbackDesired = sanitizeLabels([...rulesTitle, 'status:needs-decision']);
+      const fallbackDesired = fallbackDesiredEarly;
       try {
         const reconciliation = await reconcileBotLabelsSafely({
           client,

@@ -548,6 +548,82 @@ export async function runPrReviewTests(): Promise<void> {
       }
     }
 
+    // E2E (F5): the synthesis excerpt carries evidence-anchored tail
+    // snippets (not just a head slice), and silent findings truncation is
+    // surfaced as shown/total counts.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-evidence-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const tailName = 'app/src/main/java/demo/Big.kt';
+        const tailBody = Array.from({ length: 2500 }, (_, i) => `+line ${i} ${'y'.repeat(40)}`);
+        const tailDiff = [
+          `diff --git a/${tailName} b/${tailName}`,
+          `--- a/${tailName}`,
+          `+++ b/${tailName}`,
+          '@@ -1,1 +1,2500 @@',
+          ...tailBody,
+        ].join('\n');
+        const files = {
+          'app/src/main/AndroidManifest.xml': reviewFiles()['app/src/main/AndroidManifest.xml'],
+          'app/src/main/java/demo/Safe.kt': reviewFiles()['app/src/main/java/demo/Safe.kt'],
+          [tailName]: tailDiff,
+        };
+        const extraWarns = Array.from({ length: 20 }, (_, i) => ({ severity: 'WARN', issue: `nit ${i}` }));
+        const rolePayload = {
+          verdict: 'APPROVE',
+          summary: 'fine',
+          findings: [
+            { severity: 'WARN', file: 'app/src/main/java/demo/Big.kt', line: 2400, issue: 'tail check' },
+            ...extraWarns,
+          ],
+          suggestedLabels: [],
+        };
+        const synthPayload = { verdict: 'APPROVE', summary: 'confirmed', findings: [] };
+        const seenBodies: string[] = [];
+        const previousFetch = globalThis.fetch;
+        globalThis.fetch = (async (_input, init) => {
+          counter.count += 1;
+          seenBodies.push(String((init as { body?: unknown })?.body ?? ''));
+          const payload = counter.count <= 3 ? rolePayload : synthPayload;
+          return new Response(JSON.stringify({
+            output: [{ content: [{ type: 'output_text', text: JSON.stringify(payload) }] }],
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as typeof fetch;
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: {
+              ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+              POCKETGUARD_OUTPUT: artifactPath,
+            } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(files),
+          });
+        } finally {
+          globalThis.fetch = previousFetch;
+        }
+        assert.equal(counter.count, 4, 'both waves ran');
+        assert.equal(reviewed.verdict, 'APPROVE', 'synthesis confirmed');
+        assert.equal(seenBodies.length, 4, 'four model calls captured');
+        const synthInput = seenBodies[3];
+        assert.ok(synthInput.includes('+line 2399'), 'F5 synthesis sees the tail hunk window');
+        assert.ok(
+          synthInput.includes('evidence snippet: app/src/main/java/demo/Big.kt (around line 2400)'),
+          'F5 snippet labeled with anchor',
+        );
+        assert.ok(synthInput.includes('20/21'), 'F5 findings truncation surfaced as shown/total');
+        assert.ok(synthInput.includes('Excerpt plan:'), 'F5 excerpt plan header present');
+        assert.ok(!synthInput.includes('+line 2499'), 'F5 does not dump the whole tail file');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
     // E2E (F3): a budget too small for even one wave fails closed before any
     // model call (zero AI, INCONCLUSIVE).
     {

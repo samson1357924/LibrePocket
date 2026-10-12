@@ -3448,7 +3448,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
             suggestedLabels: [],
           };
         } else {
-          const { orchestrateReview, synthesizeReview, SYNTHESIS_DIFF_EXCERPT_CHARS, SYNTHESIS_MAX_APPENDED_FINDINGS, selectUsableBlockFindings } = await import('./orchestrator');
+          const { orchestrateReview, synthesizeReview, SYNTHESIS_MAX_APPENDED_FINDINGS, buildSynthesisExcerpt, selectUsableBlockFindings } = await import('./orchestrator');
           const restoreFetch = installOpenAIStub(env);
           try {
             // P4 two-wave budget: the first wave runs the 3 parallel roles,
@@ -3496,21 +3496,48 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
               reviewVerdict = 'INCONCLUSIVE';
             }
             // P4 synthesis guard: a first-round APPROVE is stored only after
-            // the architecture synthesis confirms it (or tightens with
-            // evidenced BLOCK findings). Any other first-round verdict is
-            // already strict enough and skips synthesis. A failed synthesis
-            // never stores APPROVE.
+            // the architecture synthesis confirms it over the evidence-scoped
+            // excerpt (F5: shown content only, never a full re-review) or
+            // tightens with evidenced BLOCK findings. Any other first-round
+            // verdict is already strict enough and skips synthesis. A failed
+            // synthesis never stores APPROVE.
             let synthesis: RunnerReviewOutput['synthesis'];
             if (reviewVerdict === 'APPROVE' && canTwoWaves) {
-              const redactedDiff = redactForModel(reviewDiff.diff);
-              const excerpt = redactedDiff.length > SYNTHESIS_DIFF_EXCERPT_CHARS
-                ? redactedDiff.slice(0, SYNTHESIS_DIFF_EXCERPT_CHARS)
-                : redactedDiff;
+              // F5: head sample + evidence-anchored snippets (verbatim
+              // substrings, so the literal evidence check below still
+              // applies) instead of a fixed head-only slice that could not
+              // verify tail findings.
+              const synthesisAnchors = [
+                ...orchestrated.roles.flatMap((role) => role.findings
+                  .filter((finding) => typeof finding.file === 'string' && finding.file.trim())
+                  .map((finding) => ({
+                    file: finding.file as string,
+                    ...(typeof finding.line === 'number' ? { line: finding.line } : {}),
+                  }))),
+                ...orchestrated.deterministicViolations
+                  .filter((violation) => typeof violation.file === 'string' && violation.file)
+                  .map((violation) => ({
+                    file: violation.file as string,
+                    ...(typeof violation.line === 'number' ? { line: violation.line } : {}),
+                  })),
+              ];
+              const synthesisBuilt = buildSynthesisExcerpt({
+                diff: reviewDiff.diff,
+                fileDiffs: reviewDiff.fileDiffs,
+                anchors: synthesisAnchors,
+              });
+              const excerpt = synthesisBuilt.excerpt;
               const synth = await synthesizeReview({
                 firstRound: orchestrated,
                 diffExcerpt: excerpt,
-                diffTruncated: redactedDiff.length > excerpt.length,
+                diffTruncated: synthesisBuilt.fullLength > excerpt.length,
                 originalLength: reviewDiff.coverage.originalLength,
+                excerptPlan: {
+                  headChars: synthesisBuilt.headChars,
+                  snippetCount: synthesisBuilt.snippetCount,
+                  anchorsTotal: synthesisBuilt.anchorsTotal,
+                  omittedAnchors: synthesisBuilt.omittedAnchors,
+                },
                 env,
                 allowedOrigins: parseAllowedOrigins(env),
                 timeoutMs: waveTimeout,
@@ -3541,7 +3568,9 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
                 const violationTexts = orchestrated.deterministicViolations.map(
                   (violation) => `${violation.ruleId} ${violation.message} ${violation.file ?? ''}`,
                 );
-                const usable = selectUsableBlockFindings(synth.findings, synth.evidences, excerpt, violationTexts)
+                // F5 nit: synthesizeReview re-redacts defensively, so check
+                // support against the same model-view text the model saw.
+                const usable = selectUsableBlockFindings(synth.findings, synth.evidences, redactForModel(excerpt), violationTexts)
                   .slice(0, SYNTHESIS_MAX_APPENDED_FINDINGS)
                   .map((finding) => ({ ...finding }));
                 const architectureRole = runnerRoles.find((role) => role.role === 'architecture');

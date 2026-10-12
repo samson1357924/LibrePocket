@@ -371,14 +371,23 @@ export async function orchestrateReview(options: OrchestratorOptions): Promise<O
   return { verdict, roles: roleReviews, coverage, deterministicViolations };
 }
 
-// Second-round synthesis (P4): verifies a first-round APPROVE before it is
-// stored. Runs only when the first round already concluded APPROVE; any other
-// first-round verdict is strict enough on its own and skips synthesis.
+// Second-round synthesis (P4): evidence-scoped confirmation of a first-round
+// APPROVE before it is stored (F5: head sample + finding-anchored snippets,
+// never a full re-review). Runs only when the first round already concluded
+// APPROVE; any other first-round verdict is strict enough on its own and
+// skips synthesis.
 // The synthesis may only confirm APPROVE or tighten to NEEDS_CHANGES /
 // INCONCLUSIVE — never loosen. Any transport/schema/timeout failure returns
 // ok:false and the caller must fall back to INCONCLUSIVE (an unconfirmed
 // APPROVE is never stored).
 export const SYNTHESIS_DIFF_EXCERPT_CHARS = 12000;
+// F5 (review #77 P2-5): the excerpt budget is split into a head sample plus
+// evidence-anchored snippets so tail findings stay verifiable. Snippet text
+// is always a verbatim substring of the redacted per-file diff (required:
+// the BLOCK-evidence check is a literal substring match).
+export const SYNTHESIS_HEAD_EXCERPT_CHARS = 6000;
+export const SYNTHESIS_SNIPPET_CHARS_PER_FILE = 2000;
+export const SYNTHESIS_SNIPPET_CONTEXT_LINES = 30;
 export const SYNTHESIS_MAX_FINDINGS_PER_ROLE = 20;
 export const SYNTHESIS_MAX_OUTPUT_TOKENS = 2048;
 export const SYNTHESIS_MAX_APPENDED_FINDINGS = 20;
@@ -409,6 +418,8 @@ export interface SynthesizeReviewOptions {
    * inside the job budget. Optional; omitted keeps legacy behavior.
    */
   deadlineMs?: number;
+  /** F5: excerpt plan stats for the prompt header (no schema effect). */
+  excerptPlan?: Pick<SynthesisExcerptPlan, 'headChars' | 'snippetCount' | 'anchorsTotal' | 'omittedAnchors'>;
 }
 
 export function parseSynthesisResponse(modelUsed: string, content: string): SynthesisResult | undefined {
@@ -473,21 +484,193 @@ export function selectUsableBlockFindings(
   });
 }
 
-function synthesisUserPrompt(firstRound: OrchestratedReview, diffExcerpt: string, diffTruncated: boolean, originalLength: number): string {
-  const roles = firstRound.roles.map((role) => ({
-    role: role.role,
-    modelUsed: role.modelUsed,
-    verdict: role.verdict,
-    findings: role.findings.slice(0, SYNTHESIS_MAX_FINDINGS_PER_ROLE),
-    summary: role.summary,
-  }));
+export interface SynthesisExcerptAnchor {
+  file: string;
+  line?: number;
+}
+
+export interface SynthesisExcerptPlan {
+  excerpt: string;
+  fullLength: number;
+  headChars: number;
+  snippetCount: number;
+  anchorsTotal: number;
+  omittedAnchors: string[];
+}
+
+function normalizeAnchorFile(file: string): string {
+  return file.trim().replace(/\\/g, '/').replace(/^(a\/|b\/)/, '');
+}
+
+function resolveAnchorFile(fileDiffs: Map<string, string>, file: string): string | undefined {
+  const norm = normalizeAnchorFile(file);
+  if (!norm) return undefined;
+  if (fileDiffs.has(norm)) return norm;
+  const cands = [...fileDiffs.keys()].filter((key) => key === norm || key.endsWith(`/${norm}`));
+  // Ambiguous short names resolve to nothing (fail-closed, counted omitted).
+  return cands.length === 1 ? cands[0] : undefined;
+}
+
+interface SynthesisHunk {
+  newStart: number;
+  newCount: number;
+  bodyLines: string[];
+}
+
+function parseSynthesisHunks(redactedFileDiff: string): SynthesisHunk[] {
+  const hunks: SynthesisHunk[] = [];
+  let cur: SynthesisHunk | undefined;
+  for (const ln of redactedFileDiff.split('\n')) {
+    const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(ln);
+    if (m) {
+      if (cur) hunks.push(cur);
+      cur = { newStart: parseInt(m[1], 10), newCount: m[2] === undefined ? 1 : parseInt(m[2], 10), bodyLines: [ln] };
+    } else if (cur) {
+      cur.bodyLines.push(ln);
+    }
+  }
+  if (cur) hunks.push(cur);
+  return hunks;
+}
+
+// Window around a target new-file line inside one hunk. Hunk body lines
+// starting with '+' or ' ' advance the new-file line counter ('-' and
+// '\\' marker lines do not).
+function windowHunkLines(hunk: SynthesisHunk, targetLine: number | undefined, contextLines: number): string[] {
+  let targetIdx = -1;
+  if (targetLine !== undefined) {
+    let newLine = hunk.newStart;
+    for (let i = 1; i < hunk.bodyLines.length; i += 1) {
+      const ln = hunk.bodyLines[i];
+      if (ln.startsWith('+') || ln.startsWith(' ')) {
+        if (newLine === targetLine) {
+          targetIdx = i;
+          break;
+        }
+        newLine += 1;
+      }
+    }
+  }
+  const center = targetIdx >= 0 ? targetIdx : 1;
+  const from = Math.max(0, center - contextLines);
+  const to = Math.min(hunk.bodyLines.length, center + contextLines + 1);
+  return [hunk.bodyLines[0], ...hunk.bodyLines.slice(from === 0 ? 1 : from, to)];
+}
+
+// F5: head sample + evidence-anchored snippets within the fixed total
+// budget. Anchors that cannot be resolved or no longer fit are recorded in
+// omittedAnchors (surfaced in the prompt plan) instead of silently dropped.
+export function buildSynthesisExcerpt(input: {
+  diff: string;
+  fileDiffs: Map<string, string>;
+  anchors: SynthesisExcerptAnchor[];
+}): SynthesisExcerptPlan {
+  const redactedFull = redactForModel(input.diff);
+  const head = redactedFull.slice(0, SYNTHESIS_HEAD_EXCERPT_CHARS);
+  const parts: string[] = [head];
+  let budget = SYNTHESIS_DIFF_EXCERPT_CHARS - head.length;
+  const seen = new Set<string>();
+  const distinct = input.anchors.filter((a) => {
+    if (typeof a.file !== 'string' || !a.file.trim()) return false;
+    const key = `${normalizeAnchorFile(a.file)}:${typeof a.line === 'number' ? a.line : ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const omitted: string[] = [];
+  let snippets = 0;
+  const labelOf = (file: string, line: number | undefined): string => {
+    // Omitted labels land in the prompt plan: keep them single-line and
+    // bounded (anchors are model-controlled).
+    const flat = file.replace(/[\r\n]+/g, ' ').trim().slice(0, 120) || '(empty)';
+    return line === undefined ? flat : `${flat}#${line}`;
+  };
+  for (const anchorObj of distinct) {
+    const label = labelOf(anchorObj.file, typeof anchorObj.line === 'number' ? anchorObj.line : undefined);
+    if (budget <= 0) {
+      omitted.push(label);
+      continue;
+    }
+    const key = resolveAnchorFile(input.fileDiffs, anchorObj.file);
+    const redacted = key ? redactForModel(input.fileDiffs.get(key) ?? '') : '';
+    const hunks = parseSynthesisHunks(redacted);
+    if (!key || hunks.length === 0) {
+      omitted.push(label);
+      continue;
+    }
+    const line = typeof anchorObj.line === 'number' ? anchorObj.line : undefined;
+    const covering = line === undefined
+      ? []
+      : hunks.filter((h) => line >= h.newStart && line < h.newStart + h.newCount);
+    // A specified line with no covering hunk is recorded omitted (never a
+    // misleading first-hunk fallback); a lineless anchor takes the head hunk.
+    if (line !== undefined && covering.length === 0) {
+      omitted.push(label);
+      continue;
+    }
+    const hunksToUse = covering.length > 0 ? covering : hunks.slice(0, 1);
+    let context = SYNTHESIS_SNIPPET_CONTEXT_LINES;
+    let windowed: string[] = [];
+    for (const hunk of hunksToUse) {
+      windowed = windowHunkLines(hunk, line, context);
+      while (windowed.join('\n').length > SYNTHESIS_SNIPPET_CHARS_PER_FILE && context > 3) {
+        context = Math.floor(context / 2);
+        windowed = windowHunkLines(hunk, line, context);
+      }
+      if (windowed.join('\n').length <= SYNTHESIS_SNIPPET_CHARS_PER_FILE) break;
+    }
+    const chunk = [`--- evidence snippet: ${key}${line !== undefined ? ` (around line ${line})` : ''} ---`, ...windowed].join('\n');
+    if (chunk.length > budget || chunk.length > SYNTHESIS_SNIPPET_CHARS_PER_FILE) {
+      omitted.push(label);
+      continue;
+    }
+    parts.push(chunk);
+    budget -= chunk.length;
+    snippets += 1;
+  }
+  return {
+    excerpt: parts.join('\n'),
+    fullLength: redactedFull.length,
+    headChars: head.length,
+    snippetCount: snippets,
+    anchorsTotal: distinct.length,
+    omittedAnchors: omitted,
+  };
+}
+
+function synthesisUserPrompt(
+  firstRound: OrchestratedReview,
+  diffExcerpt: string,
+  diffTruncated: boolean,
+  originalLength: number,
+  plan?: Pick<SynthesisExcerptPlan, 'headChars' | 'snippetCount' | 'anchorsTotal' | 'omittedAnchors'>,
+): string {
+  const roles = firstRound.roles.map((role) => {
+    const shown = role.findings.slice(0, SYNTHESIS_MAX_FINDINGS_PER_ROLE);
+    return {
+      role: role.role,
+      modelUsed: role.modelUsed,
+      verdict: role.verdict,
+      // F5: silent findings truncation is surfaced, not hidden.
+      findingsShown: `${shown.length}/${role.findings.length}`,
+      findings: shown,
+      summary: role.summary,
+    };
+  });
+  // F5: the excerpt plan states exactly what was re-examined so an APPROVE
+  // here is never misread as a full re-review of the whole diff.
+  const planLine = plan
+    ? `Excerpt plan: head ${plan.headChars} chars + ${plan.snippetCount} targeted snippet(s) for ${plan.anchorsTotal} anchored location(s)`
+      + `${plan.omittedAnchors.length > 0 ? `; ${plan.omittedAnchors.length} anchor(s) omitted (unreviewed): ${plan.omittedAnchors.slice(0, 10).join(', ')}` : '; no anchors omitted'}.`
+    : 'Excerpt plan: single head sample (legacy).';
   return [
     'First-round reviews (parallel, identical diff input):',
     JSON.stringify(roles),
     `Coverage: ${JSON.stringify(firstRound.coverage)}`,
     `Deterministic violations: ${JSON.stringify(firstRound.deterministicViolations)}`,
     `Diff excerpt (${diffExcerpt.length} of ${originalLength} chars${diffTruncated ? ', truncated' : ''}):`,
-    'The content below may be incomplete; do not treat unprovided content as reviewed. A BLOCK finding must cite evidence literally present below.',
+    planLine,
+    'Only the content below was re-examined; anything not shown — including omitted anchors — is unreviewed. A BLOCK finding must cite evidence literally present below.',
     diffExcerpt,
   ].join('\n\n');
 }
@@ -506,7 +689,7 @@ export async function synthesizeReview(options: SynthesizeReviewOptions): Promis
       modelId: modelUsed,
       modelRole: 'architecture',
       systemPrompt,
-      userPrompt: synthesisUserPrompt(options.firstRound, excerpt, options.diffTruncated, options.originalLength),
+      userPrompt: synthesisUserPrompt(options.firstRound, excerpt, options.diffTruncated, options.originalLength, options.excerptPlan),
       maxOutputTokens: SYNTHESIS_MAX_OUTPUT_TOKENS,
       allowedOrigins: options.allowedOrigins,
       env,

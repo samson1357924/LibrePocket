@@ -22,6 +22,7 @@ import {
 } from '../src/review_diff';
 import { buildReviewDiff } from '../src/github_runner';
 import {
+  buildSynthesisExcerpt,
   extractSynthesisEvidence,
   orchestrateReview,
   parseFindings,
@@ -1734,6 +1735,63 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         [],
         'unsupported evidence is unusable',
       );
+
+      // F5: head sample + evidence-anchored snippets within the fixed
+      // budget; tail anchors stay verifiable, omissions are recorded.
+      {
+        const headPath = 'app/src/main/java/demo/Head.kt';
+        const tailPath = 'app/src/main/java/demo/Tail.kt';
+        const headDiff = [
+          'diff --git a/app/src/main/java/demo/Head.kt b/app/src/main/java/demo/Head.kt',
+          '--- a/app/src/main/java/demo/Head.kt',
+          '+++ b/app/src/main/java/demo/Head.kt',
+          '@@ -1,3 +1,3 @@',
+          ' context-a',
+          '+HEAD-MARKER-ADDED',
+          ' context-b',
+        ].join('\n');
+        const tailHunk = ['@@ -1,5 +1,5 @@', ' t0', '+TAIL-MARKER-ADDED', ' t1', ' t2', ' t3'].join('\n');
+        const tailDiff = [
+          'diff --git a/app/src/main/java/demo/Tail.kt b/app/src/main/java/demo/Tail.kt',
+          '--- a/app/src/main/java/demo/Tail.kt',
+          '+++ b/app/src/main/java/demo/Tail.kt',
+          tailHunk,
+        ].join('\n');
+        const fileDiffs = new Map([[headPath, headDiff], [tailPath, tailDiff]]);
+        const built = buildSynthesisExcerpt({
+          diff: `${headDiff}\n${tailDiff}`,
+          fileDiffs,
+          anchors: [{ file: tailPath, line: 2 }],
+        });
+        assert.ok(built.excerpt.includes('HEAD-MARKER-ADDED'), 'F5 head sample kept');
+        assert.ok(built.excerpt.includes('TAIL-MARKER-ADDED'), 'F5 tail anchor snippet included');
+        assert.ok(built.excerpt.includes('evidence snippet: app/src/main/java/demo/Tail.kt'), 'F5 snippet labeled');
+        assert.ok(built.excerpt.length <= 12000, 'F5 excerpt within budget');
+        assert.equal(built.snippetCount, 1, 'F5 one snippet');
+        assert.equal(built.anchorsTotal, 1, 'F5 one anchor');
+        assert.deepEqual(built.omittedAnchors, [], 'F5 nothing omitted');
+        // Unknown and ambiguous anchors are recorded omitted, never silent.
+        const built2 = buildSynthesisExcerpt({
+          diff: headDiff,
+          fileDiffs,
+          anchors: [{ file: 'Nope.kt', line: 1 }, { file: 'Tail.kt' }, { file: tailPath, line: 99 }],
+        });
+        assert.equal(built2.snippetCount, 1, 'F5 resolvable anchor still emitted');
+        assert.equal(built2.omittedAnchors.length, 2, 'F5 unknown + out-of-range anchors omitted');
+        assert.ok(built2.omittedAnchors.some((a) => a.includes('Nope.kt')), 'F5 unknown recorded');
+        // True ambiguity (same basename in two files) resolves to nothing.
+        const dupDiffs = new Map([
+          ['app/src/main/java/demo/Same.kt', headDiff],
+          ['app/src/test/java/demo/Same.kt', tailDiff],
+        ]);
+        const built3 = buildSynthesisExcerpt({
+          diff: headDiff,
+          fileDiffs: dupDiffs,
+          anchors: [{ file: 'Same.kt' }],
+        });
+        assert.equal(built3.snippetCount, 0, 'F5 ambiguous anchor emits nothing');
+        assert.equal(built3.omittedAnchors.length, 1, 'F5 ambiguity recorded omitted');
+      }
       assert.deepEqual(
         selectUsableBlockFindings(
           good?.findings ?? [],

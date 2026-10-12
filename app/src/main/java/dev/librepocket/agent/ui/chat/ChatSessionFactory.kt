@@ -315,19 +315,22 @@ data class CreatedSession(
 private fun Long.toInstantOrNull(): Instant? =
     if (this > 0) runCatching { Instant.ofEpochMilli(this) }.getOrNull() else null
 
-/**
- * S6 capture-boundary denial: T1 `key.read` DENY or evaluation failure.
- *
- * Extends [SecurityException] (never [CancellationException]) so the chat
- * ViewModel can distinguish a policy denial at the vault gate from a stale
- * binding cancellation: cancellations still propagate as
- * [CancellationException] and stay silent, while this maps to a visible
- * `POLICY_DENIED` restore with zero vault reads.
- */
 class CaptureDeniedException(message: String = "ENDPOINT_BINDING_STALE") : SecurityException(message)
 
-/** Injectable session-construction boundary used by the chat lifecycle tests. */
+/** Injectable session-construction boundary used by the chat lifecycle tests.
+ *
+ * Implementors must override at least one [create] form.
+ * The two defaults delegate to each other; overriding neither
+ * recurses infinitely (StackOverflowError at runtime).
+ * Canonical form is the 4-arg one (production caller ChatViewModel.kt:1289 uses it).
+ */
 interface ChatSessionProvider {
+    /**
+     * Implementors must override at least one [create] form.
+     * The two defaults delegate to each other; overriding neither
+     * recurses infinitely (StackOverflowError at runtime).
+     * Canonical form is the 4-arg one (production caller ChatViewModel.kt:1289 uses it).
+     */
     suspend fun create(
         endpoint: EndpointConfig,
         title: String,
@@ -336,6 +339,12 @@ interface ChatSessionProvider {
         keyIsCurrent: suspend () -> Boolean = { true },
     ): CreatedSession = create(endpoint, title, keyIsCurrent)
 
+    /**
+     * Implementors must override at least one [create] form.
+     * The two defaults delegate to each other; overriding neither
+     * recurses infinitely (StackOverflowError at runtime).
+     * Canonical form is the 4-arg one (production caller ChatViewModel.kt:1289 uses it).
+     */
     suspend fun create(
         endpoint: EndpointConfig,
         title: String,

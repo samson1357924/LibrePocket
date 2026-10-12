@@ -16,7 +16,7 @@ import java.util.UUID
  * - 進度：掛載 [UtteranceProgressListener]（onStart 為 no-op；onDone 經 [onDone]
  *   發成功信號（供 UI 清除 TTS 錯誤，見 `VoiceErrorState.onTtsSuccess`）；
  *   onError 轉送 [onError] 失敗通道）；
- *   掛載回傳 ERROR 或拋錯時經 [onError] 發出 LISTENER_FAILED 警告（非同步朗讀失敗可能無法觀測），但不 fail-closed，引擎仍可用；
+ *   掛載回傳 ERROR 或拋錯時經 [onError] 發出 LISTENER_FAILED 錯誤提醒（非同步朗讀失敗可能無法觀測），但不 fail-closed，引擎仍可用；
  * - 分段：[VoiceTts.split] 每段最多 4000 字；
  * - 語言：`zh-TW` → `zh-CN` → 第一個列出的 `zh` voice（見 [VoiceTts.resolveLocale]）。
  *

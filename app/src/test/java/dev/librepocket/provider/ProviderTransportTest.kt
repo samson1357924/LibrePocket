@@ -34,8 +34,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -498,6 +502,64 @@ class ProviderTransportTest {
         override fun source(): BufferedSource = buffered
     }
 
+    /** Stage B red-path teardown (test-only): one close with its own deadline. */
+    private data class BoundedTeardownStep(
+        val name: String,
+        val timeoutMs: Long,
+        val run: suspend () -> Unit,
+    )
+
+    private enum class CollectionRejoinOutcome { JOINED, STILL_ALIVE }
+
+    private data class CollectionRejoinResult(
+        val outcome: CollectionRejoinOutcome,
+        val rejoined: Boolean,
+        val stillActive: Boolean,
+        val notes: List<String>,
+    )
+
+    /**
+     * Runs one teardown step on Dispatchers.IO under its own deadline. A raw
+     * blocking close on the caller's thread would pin it so the deadline could
+     * never fire; per-step Throwable diagnostics (MockWebServer surfaces
+     * AssertionError, not IOException) are collected, never silently swallowed.
+     */
+    private suspend fun boundedTeardownStep(step: BoundedTeardownStep): String? {
+        val verdict: String = withTimeoutOrNull(step.timeoutMs) {
+            withContext(Dispatchers.IO) {
+                try {
+                    step.run()
+                    "ok"
+                } catch (e: CancellationException) {
+                    throw e // Never swallow the step deadline itself.
+                } catch (e: Throwable) {
+                    "${step.name} threw ${e::class.java.simpleName}: ${e.message}"
+                }
+            }
+        } ?: "${step.name} timed out after ${step.timeoutMs}ms"
+        return if (verdict == "ok") null else verdict
+    }
+
+    /**
+     * Runs each teardown step (one stuck step never skips the rest), then
+     * rejoins [collection] under [rejoinTimeoutMs] so a non-cooperative
+     * still-alive collector stays observable instead of hanging the parent.
+     */
+    private suspend fun boundedCleanupAndRejoin(
+        collection: Job,
+        steps: List<BoundedTeardownStep>,
+        rejoinTimeoutMs: Long = 1_500,
+    ): CollectionRejoinResult {
+        val notes = mutableListOf<String>()
+        for (step in steps) boundedTeardownStep(step)?.let(notes::add)
+        val rejoined = withTimeoutOrNull(rejoinTimeoutMs) {
+            collection.join()
+            true
+        } ?: false
+        val outcome = if (rejoined) CollectionRejoinOutcome.JOINED else CollectionRejoinOutcome.STILL_ALIVE
+        return CollectionRejoinResult(outcome, rejoined, collection.isActive, notes.toList())
+    }
+
     @Test(timeout = 120_000)
     fun eachProtocolTerminalClosesBodyWithoutAnotherRead() = runBlocking {
         fun ssePayloads(vararg payloads: String): String =
@@ -541,6 +603,12 @@ class ProviderTransportTest {
             val server = MockWebServer()
             val release = CountDownLatch(1)
             val blockingBody = OpenAfterPayloadBody(payload, release)
+            // Detached scope (per iteration): the collection is not a
+            // runBlocking child, so fail() in the red path need not wait for a
+            // non-cooperative blocking read to unwind.
+            val collectionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            var collection: Job? = null
+            var redPathReported = false
             server.start()
             try {
                 server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream"))
@@ -561,27 +629,55 @@ class ProviderTransportTest {
                     )
                 }
                 var events: List<StreamEvent> = emptyList()
-                val collection = launch { events = provider.stream(request()).toList() }
+                val active = collectionScope.launch { events = provider.stream(request()).toList() }
+                collection = active
                 val completedBeforeAnotherRead = withTimeoutOrNull(2_000) {
-                    collection.join()
+                    active.join()
                     true
                 } ?: false
                 if (!completedBeforeAnotherRead) release.countDown()
                 withTimeoutOrNull(5_000L) {
-                    collection.join()
+                    active.join()
                 } ?: run {
-                    collection.cancel()
-                    // Bounded-wait release order: unblock the peer read first, then close
-                    // the body, then shut down the server/client before the bounded
-                    // re-join, so the parent runBlocking cannot hang on a
-                    // non-cooperative blocking read (mirrors the cancellation tests above).
+                    // Red path only (green 2s/5s verdicts below untouched):
+                    // non-blocking release first (cancel + peer latch), then
+                    // each close on Dispatchers.IO under its own deadline — a
+                    // bare server.shutdown() blocks (~5s per queue on its idle
+                    // latch) and would pin this thread so the re-join deadline
+                    // could never fire. Shutdown 2s keeps a healthy local
+                    // close (normally ms) affordable; body-close/client 1s are
+                    // pure backstops over non-blocking calls. Step diagnostics
+                    // are merged into the fail(), never silently swallowed.
+                    // events.size is a diagnostic snapshot only, never asserted.
+                    active.cancel()
                     release.countDown()
-                    blockingBody.close()
-                    server.shutdown()
-                    client.dispatcher.executorService.shutdownNow()
-                    client.connectionPool.evictAll()
-                    withTimeoutOrNull(1_500) { collection.join() }
-                    fail("$protocol collection timed out waiting to join (readCalls=${blockingBody.readCalls.get()} events=${events.size} release=${release.count})")
+                    val cleanup = boundedCleanupAndRejoin(
+                        active,
+                        steps = listOf(
+                            BoundedTeardownStep("body-close", 1_000) { blockingBody.close() },
+                            BoundedTeardownStep("server-shutdown", 2_000) { server.shutdown() },
+                            BoundedTeardownStep("client-teardown", 1_000) {
+                                client.dispatcher.executorService.shutdownNow()
+                                client.connectionPool.evictAll()
+                            },
+                        ),
+                    )
+                    active.cancel()
+                    collectionScope.cancel()
+                    if (!cleanup.rejoined) {
+                        println(
+                            "STILL-ALIVE $protocol readCalls=${blockingBody.readCalls.get()} " +
+                                "events=${events.size} release=${release.count} " +
+                                "isActive=${cleanup.stillActive} notes=${cleanup.notes}",
+                        )
+                    }
+                    redPathReported = true
+                    fail(
+                        "$protocol collection timed out waiting to join " +
+                            "(readCalls=${blockingBody.readCalls.get()} events=${events.size} " +
+                            "release=${release.count} rejoined=${cleanup.rejoined} " +
+                            "isActive=${cleanup.stillActive} notes=${cleanup.notes})",
+                    )
                 }
                 assertTrue("$protocol stops before the peer's five-minute read timeout", completedBeforeAnotherRead)
                 assertTrue("$protocol produces a healthy terminal fixture", events.last() is StreamEvent.Done)
@@ -600,9 +696,76 @@ class ProviderTransportTest {
                 assertNotNull(recorded)
                 assertTrue(recorded!!.path.orEmpty().endsWith(route))
             } finally {
+                collection?.cancel()
                 release.countDown()
-                server.shutdown()
+                // Bounded like the red path: a raw shutdown() here could pin
+                // the test thread past the JUnit timeout with no diagnostics.
+                val shutdownNote = boundedTeardownStep(
+                    BoundedTeardownStep("server-shutdown", 2_000) { server.shutdown() },
+                )
+                collectionScope.cancel()
+                if (shutdownNote != null) {
+                    println("CLEANUP-NOTE $protocol $shutdownNote")
+                    // The red path already carries shutdown diagnostics in its
+                    // fail(); a second throw here must not mask it.
+                    if (!redPathReported) throw AssertionError("CLEANUP-FAIL $protocol $shutdownNote")
+                }
             }
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun boundedCleanupAndRejoinReportsStillAliveForNonCooperativeCollection() = runBlocking {
+        // Fault injection: no MockWebServer, no five-minute readTimeout — a
+        // hanging flow in a detached scope must surface as STILL_ALIVE in
+        // ~2s (1.5s re-join deadline + overhead), never hang the suite.
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val hanging = scope.launch { awaitCancellation() }
+        try {
+            val startedNs = System.nanoTime()
+            val result = boundedCleanupAndRejoin(hanging, steps = emptyList())
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNs)
+            assertEquals(CollectionRejoinOutcome.STILL_ALIVE, result.outcome)
+            assertFalse("hanging collection never rejoins", result.rejoined)
+            assertTrue("hanging collection stays observable ($result)", result.stillActive)
+            assertTrue(
+                "still-alive verdict waits out the re-join deadline, took ${elapsedMs}ms",
+                elapsedMs >= 1_000,
+            )
+            assertTrue(
+                "still-alive verdict stays second-scale, took ${elapsedMs}ms",
+                elapsedMs < 30_000,
+            )
+        } finally {
+            hanging.cancel()
+            withTimeoutOrNull(1_500) { hanging.join() }
+            scope.cancel()
+        }
+    }
+
+    @Test(timeout = 60_000)
+    fun boundedCleanupAndRejoinJoinsCooperativeCollectionAndRecordsStepDiagnostics() = runBlocking {
+        // Cooperative control: instant join, plus a throwing step
+        // (AssertionError, like MockWebServer.shutdown failures) recorded as
+        // diagnostics instead of escaping or masking the verdict.
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val quick = scope.launch { /* completes immediately */ }
+        try {
+            val result = boundedCleanupAndRejoin(
+                quick,
+                steps = listOf(
+                    BoundedTeardownStep("failing-close", 1_000) { throw AssertionError("boom") },
+                ),
+            )
+            assertEquals(CollectionRejoinOutcome.JOINED, result.outcome)
+            assertTrue("cooperative collection rejoins", result.rejoined)
+            assertEquals(
+                listOf("failing-close threw AssertionError: boom"),
+                result.notes,
+            )
+        } finally {
+            quick.cancel()
+            scope.cancel()
         }
     }
 

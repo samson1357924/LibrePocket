@@ -1621,6 +1621,32 @@ export async function runExecutionMatrixTests(): Promise<void> {
       undefined,
       'unknown verdicts reject',
     );
+    // Truncation proof shape: valid proofs pass on non-APPROVE artifacts;
+    // APPROVE never carries a proof; malformed proofs reject.
+    {
+      const proof = { shownChars: 8004, totalChars: 20005, shownComments: 0, totalComments: 0 };
+      const truncatedBase = {
+        verdict: 'INCONCLUSIVE',
+        issueNumber: 7,
+        title: 't',
+        tags: [],
+        summary: 's',
+        suggestedLabels: [],
+        fingerprint: 'a'.repeat(64),
+        commentsComplete: false,
+      };
+      assert.ok(validateIssueOutput({ ...truncatedBase, truncation: proof }), 'valid proof validates');
+      assert.equal(
+        validateIssueOutput({ ...truncatedBase, verdict: 'APPROVE', commentsComplete: true, truncation: proof }),
+        undefined,
+        'APPROVE never carries a truncation proof',
+      );
+      assert.equal(
+        validateIssueOutput({ ...truncatedBase, truncation: { ...proof, shownChars: proof.totalChars + 1 } }),
+        undefined,
+        'shown past total rejects',
+      );
+    }
 
     // validateReviewOutput: pre-rename artifacts carrying the retired
     // 'chief' role are rejected (fail-closed INCONCLUSIVE downstream).

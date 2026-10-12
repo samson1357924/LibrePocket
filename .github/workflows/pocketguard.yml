@@ -279,7 +279,7 @@ jobs:
         # for distinction. Only this step receives OpenAI secrets. The
         # checkout stays on the default branch; fork code is never checked
         # out or executed. POCKETGUARD_JOB_STARTED_MS (first step, trusted)
-        # caps chunked reviews via the TS effective deadline.
+        # caps reviews via the TS effective deadline.
         if: >-
           (steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||
           (steps.gate.outputs.target == 'issue' && steps.gate.outputs.should_review == 'true' &&
@@ -317,7 +317,7 @@ jobs:
         # above — including missing/empty/non-'true' authorized, unreadable
         # diffs (SHA-pin or fetch failure), and non-issue routes — runs the
         # generic INCONCLUSIVE path with no OpenAI secrets. It receives the
-        # same trusted POCKETGUARD_JOB_STARTED_MS so chunked INCONCLUSIVE
+        # same trusted POCKETGUARD_JOB_STARTED_MS so INCONCLUSIVE
         # checkpoints share the job cap.
         if: >-
           !((steps.gate.outputs.diff_safe == 'true' && steps.gate.outputs.authorized == 'true') ||

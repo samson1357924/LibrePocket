@@ -236,9 +236,9 @@ export interface TriageIssueOptions {
   env?: OpenAIEnvironment;
   promptDirectory?: string;
   allowedOrigins?: string[];
-  // Phase 3 (P2 #3): timeout passthrough for symmetry (issue chunks stay
-  // sequential; follow-up PR waves use OrchestratorOptions.timeoutMs).
-  // Omitted keeps the send default.
+  // Phase 3 (P2 #3): timeout passthrough (E2E uses short timeouts to force
+  // transport aborts without waiting the 420s default). Omitted keeps
+  // the send default.
   timeoutMs?: number;
 }
 

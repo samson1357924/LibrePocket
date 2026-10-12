@@ -814,15 +814,17 @@ class TurnController(
    * - ack in budget → [DurableAdmission.ACKED] (records [durableUserRows]);
    * - timeout with send proof false, fast delegate failure, or seal → throws
    *   [TranscriptDurabilityException] / returns [DurableAdmission.NOT_ADMITTED]
-   *   (fail-closed, INTERRUPTED-marked, existing rollback semantics);
+   *   (fail-closed, existing rollback semantics; proven never-attempted ids
+   *   are visible-but-not-durable-failed per R11-2, never global poison);
    * - timeout with send proof true → [DurableAdmission.UNKNOWN] (no
    *   INTERRUPTED mark — the ghost may still late-commit; caller retains
    *   ownership via [unknownAdmission]).
    * R6-2 caller cancellation consults the same send proof ([sent] is
    * caller-owned so the outer catch can distinguish): external cancel with
-   * `sent == false` keeps NOT_ADMITTED semantics (INTERRUPTED-marked here,
-   * rollback + rethrow CE outside, immediately retryable); external cancel
-   * with `sent == true` does NOT mark here — the outer catch retains UNKNOWN
+   * proven never-attempted (`!sent && !sendAttempted`) keeps NOT_ADMITTED
+   * semantics (R11-2 visible-but-not-durable-failed mark here, rollback +
+   * rethrow CE outside, immediately retryable); external cancel with send
+   * attempted does NOT mark here — the outer catch retains UNKNOWN
    * ownership (no rollback) and throws [TranscriptPendingException] like the
    * timeout-after-send path. Seal races keep the old fail-closed mapping
    * (INTERRUPTED-marked [TranscriptDurabilityException]).
@@ -852,10 +854,13 @@ class TurnController(
       // R8-6 tri-state: proven-not-admitted (send never attempted) stays
       // fail-closed; fuzzy (send attempted, ack still pending — the ghost may
       // late-commit) is UNKNOWN like the timeout-after-send path.
+      // R11-2: a proven never-attempted id never entered the channel, so it
+      // is not an admitted write failure — record it visible-but-not-
+      // durable-failed (never poisons flushDurable for the later retry).
       if (!sent.get()) {
         if (!sendAttempted.get()) {
           try {
-            orderedTranscript.markInterrupted(logicalTurnId)
+            orderedTranscript.markNeverAdmitted(logicalTurnId)
           } catch (_: Exception) {
           }
           return DurableAdmission.NOT_ADMITTED
@@ -877,9 +882,11 @@ class TurnController(
       // outer catch retains UNKNOWN ownership instead.
       // R8-6: the same split consults the attempt proof — a CE racing a
       // suspended send (sent false, attempt true) is fuzzy, never NOT_ADMITTED.
+      // R11-2: proven never-attempted uses the non-poison mark (visible via
+      // interruptedRunIds, never counted by hasDurableFailures/flushDurable).
       if (!sent.get() && !sendAttempted.get()) {
         try {
-          orderedTranscript.markInterrupted(logicalTurnId)
+          orderedTranscript.markNeverAdmitted(logicalTurnId)
         } catch (_: Exception) {
         }
       }
@@ -893,12 +900,19 @@ class TurnController(
       // return UNKNOWN so the caller retains ownership under the same id
       // (settle claims or converts). Only proven pre-send (send never
       // attempted) and post-ack delegate failures (sent == true) stay
-      // fail-closed with the INTERRUPTED mark + Durability below.
+      // fail-closed with Durability below.
+      // R11-2: proven pre-send never entered the channel, so it uses the
+      // non-poison mark (visible, never counted by hasDurableFailures);
+      // only a sent (admitted) failure poisons durability.
       if (!sent.get() && sendAttempted.get()) {
         return DurableAdmission.UNKNOWN
       }
       try {
-        orderedTranscript.markInterrupted(logicalTurnId)
+        if (!sent.get() && !sendAttempted.get()) {
+          orderedTranscript.markNeverAdmitted(logicalTurnId)
+        } else {
+          orderedTranscript.markInterrupted(logicalTurnId)
+        }
       } catch (_: Exception) {
       }
       throw TranscriptDurabilityException("transcript store failed", e)

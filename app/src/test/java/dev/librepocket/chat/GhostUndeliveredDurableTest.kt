@@ -644,4 +644,172 @@ class GhostUndeliveredDurableTest {
         )
         assertTrue("hammer workers must not throw: $errors", errors.isEmpty())
     }
+
+    /**
+     * R11-2 timeout path: a proven never-attempted admission (send never
+     * invoked, timeout before send) is NOT an admitted write failure, so it
+     * must stay visible for its own id without poisoning [hasDurableFailures]/
+     * `flushDurable`. A successful same-session retry afterwards drains clean.
+     * Pre-fix the first id stayed in `interrupted` forever and every later
+     * `flushDurable()` returned false (spurious HISTORY_SNAPSHOT_INCOMPLETE).
+     */
+    @Test fun controllerNeverAdmittedTimeoutRetryKeepsFlushDurableClean() {
+        val store = GhostDelayStore()
+        val inner = SessionTranscriptSink(store, store.sessionId)
+        val provider = GhostFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        var n = 0
+        val c = TurnController(
+            provider = provider,
+            policy = GhostAllowPolicy(),
+            transcript = inner,
+            dispatcher = Dispatchers.Default,
+            sleeper = {},
+            newId = { "r11-never-${n++}" },
+            acceptTimeoutMs = 400L,
+        )
+        val gate = CompletableDeferred<Unit>()
+        c.beforeAdmissionSendForTest = { gate.await() }
+        val text = "never-admitted timeout text"
+        val opId = 911L
+        try {
+            try {
+                runBlocking { c.startOrEnqueue(text, opId = opId) }
+                fail("proven never-attempted timeout must throw TranscriptDurabilityException")
+            } catch (e: TranscriptDurabilityException) {
+                // Expected fail-closed NOT_ADMITTED path.
+            }
+            assertTrue(c.pendingTranscriptRunIds().isEmpty())
+            assertTrue(
+                "never-admitted id stays visible",
+                c.interruptedTranscriptRunIds().contains("r11-never-1"),
+            )
+            assertFalse(
+                "proven never-attempted must not count as a durable failure",
+                c.hasDurableFailures(),
+            )
+            gate.complete(Unit)
+            c.beforeAdmissionSendForTest = null
+            val retry = runBlocking {
+                withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) }
+            }
+            assertTrue("retry after never-admitted timeout must admit", retry is TurnStart.Started)
+            runBlocking {
+                (retry as TurnStart.Started).host.join()
+                withTimeout(5_000) { c.flushTranscript() }
+            }
+            val users = store.events.filter { it.kind == "user" }
+            assertEquals("retry keeps exactly one user row", 1, users.size)
+            assertEquals(text, users.single().text)
+            val retryId = users.single().runId
+            assertTrue(
+                "never-admitted ghost stays marked",
+                c.interruptedTranscriptRunIds().contains("r11-never-1"),
+            )
+            assertTrue(
+                "retry id must not carry a false INTERRUPTED mark",
+                !c.interruptedTranscriptRunIds().contains(retryId),
+            )
+            assertFalse(
+                "retry must leave durability clean",
+                c.hasDurableFailures(),
+            )
+            runBlocking {
+                withTimeout(5_000) { assertTrue(c.flushDurable()) }
+            }
+        } finally {
+            gate.complete(Unit)
+            c.beforeAdmissionSendForTest = null
+            c.close()
+        }
+    }
+
+    /**
+     * R11-2 cancel path: external cancel parked before the channel send
+     * (proven never-attempted) rethrows CE and stays retryable — likewise
+     * without poisoning durability for the later retry.
+     */
+    @OptIn(DelicateCoroutinesApi::class)
+    @Test fun controllerNeverAdmittedCancelRetryKeepsFlushDurableClean() {
+        val store = GhostDelayStore()
+        val inner = SessionTranscriptSink(store, store.sessionId)
+        val provider = GhostFakeProvider {
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        var n = 0
+        val c = TurnController(
+            provider = provider,
+            policy = GhostAllowPolicy(),
+            transcript = inner,
+            dispatcher = Dispatchers.Default,
+            sleeper = {},
+            newId = { "r11-cancel-${n++}" },
+            acceptTimeoutMs = 10_000L,
+        )
+        val gate = CompletableDeferred<Unit>()
+        val entered = AtomicBoolean(false)
+        c.beforeAdmissionSendForTest = {
+            entered.set(true)
+            gate.await()
+        }
+        val text = "never-admitted cancel text"
+        val opId = 912L
+        try {
+            val deferred = GlobalScope.async(Dispatchers.Default) {
+                c.startOrEnqueue(text, opId = opId)
+            }
+            runBlocking {
+                withTimeout(5_000) { while (!entered.get()) delay(10) }
+            }
+            Thread.sleep(200)
+            assertFalse("admission must still be parked before send", deferred.isCompleted)
+            deferred.cancel()
+            try {
+                runBlocking {
+                    withTimeout(5_000) { deferred.await() }
+                }
+                fail("before-send cancel must throw CancellationException")
+            } catch (e: TranscriptPendingException) {
+                fail("before-send cancel must not become UNKNOWN/Pending, got $e")
+            } catch (e: CancellationException) {
+                // Expected NOT_ADMITTED path.
+            }
+            assertFalse(c.hasPendingAdmission())
+            assertTrue(c.pendingTranscriptRunIds().isEmpty())
+            assertTrue(
+                "never-admitted id stays visible",
+                c.interruptedTranscriptRunIds().contains("r11-cancel-1"),
+            )
+            assertFalse(
+                "proven never-attempted cancel must not count as a durable failure",
+                c.hasDurableFailures(),
+            )
+            gate.complete(Unit)
+            c.beforeAdmissionSendForTest = null
+            val retry = runBlocking {
+                withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) }
+            }
+            assertTrue("retry after never-admitted cancel must admit", retry is TurnStart.Started)
+            runBlocking {
+                (retry as TurnStart.Started).host.join()
+                withTimeout(5_000) { c.flushTranscript() }
+            }
+            assertEquals(1, store.events.count { it.kind == "user" })
+            assertFalse(c.hasDurableFailures())
+            runBlocking {
+                withTimeout(5_000) { assertTrue(c.flushDurable()) }
+            }
+        } finally {
+            gate.complete(Unit)
+            c.beforeAdmissionSendForTest = null
+            c.close()
+        }
+    }
 }

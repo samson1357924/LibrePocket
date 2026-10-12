@@ -103,6 +103,9 @@ class OrderedTranscriptSink(
    * [resolvedUndelivered] under [poisonLock] before poisoning and skips an
    * already-resolved ghost (never dual-poison); the seal/resolve winner is
    * decided atomically by that same lock (see [tryResolveUndelivered]).
+   * R11-2: proven never-attempted admissions ([markNeverAdmitted]: the send
+   * was never invoked, so non-delivery is provable without a barrier) share
+   * this set and semantics — visible but never a durable failure.
    */
   private val resolvedUndelivered = java.util.Collections.synchronizedSet(mutableSetOf<String>())
   private val shutdownGuard = AtomicBoolean(false)
@@ -804,6 +807,24 @@ class OrderedTranscriptSink(
   /** R10-3: true only for proven-undelivered ghosts (never counted durable-failed). */
   internal fun isResolvedUndelivered(runId: String): Boolean =
     synchronized(poisonLock) { resolvedUndelivered.contains(runId) }
+
+  /**
+   * R11-2 proven never-attempted admission: the channel send was never
+   * invoked (`!sent && !sendAttempted`), so the entry provably never entered
+   * the channel and no ledger row was ever persisted. Records the id as
+   * visible-but-not-durable-failed (same set and semantics as the R10-3
+   * barrier-resolved ghosts): [interruptedRunIds] still reports it, but
+   * [hasDurableFailures]/[flushDurable] never count it, so a later successful
+   * retry of the same op on the same live session drains cleanly. Never
+   * clears or moves a genuine admitted failure already in [interrupted].
+   */
+  internal fun markNeverAdmitted(runId: String) {
+    synchronized(poisonLock) {
+      if (interrupted.contains(runId)) return
+      pendingCore.remove(runId)
+      if (!resolvedUndelivered.contains(runId)) resolvedUndelivered.add(runId)
+    }
+  }
 
   /** Fails every outstanding core ack for [runId] (drain-timeout orphans). */
   private fun failAcksFor(runId: String, cause: Throwable) {

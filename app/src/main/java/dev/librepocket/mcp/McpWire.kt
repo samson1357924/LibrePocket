@@ -63,7 +63,9 @@ internal object McpWire {
         val content = rawField(json, "content")
         val result = rawField(json, "result")
         // 內存消費用：優先保留 content，否則整個 result；調用方用後即丟，不寫盤。
-        return ((content ?: result)?.take(32_768)) to isError
+        // 上限由傳輸層雙上限保證（64k 字元內完整 JSON）：此處不靜默 take，
+        // content/result 雙缺（截斷半 JSON）必須拋 PROTOCOL，不回 OK(null) 假成功。
+        return ((content ?: result) ?: throw IllegalArgumentException("mcp: missing result.content")) to isError
     }
 
     class McpToolFailure(message: String) : IllegalArgumentException(message)

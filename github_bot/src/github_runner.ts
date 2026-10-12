@@ -3609,17 +3609,21 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
                 };
               } else if (synth.verdict === 'NEEDS_CHANGES') {
                 // Tighten only with evidenced BLOCK findings: the evidence
-                // quote must literally appear in the reviewed excerpt or a
-                // deterministic violation, otherwise the dissent is
+                // quote must literally appear in the finding's own file (valid
+                // line when given) and be model-visible (excerpt or same-file
+                // deterministic violation), otherwise the dissent is
                 // unverifiable and the review falls back to INCONCLUSIVE.
                 // An APPROVE verdict carrying BLOCK findings is likewise
                 // contradictory and can never be stored.
-                const violationTexts = orchestrated.deterministicViolations.map(
-                  (violation) => `${violation.ruleId} ${violation.message} ${violation.file ?? ''}`,
-                );
                 // F5 nit: synthesizeReview re-redacts defensively, so check
                 // support against the same model-view text the model saw.
-                const usable = selectUsableBlockFindings(synth.findings, synth.evidences, redactForModel(excerpt), violationTexts)
+                // H2: evidence must bind to the finding's own file/line;
+                // cross-file quotes never tighten.
+                const usable = selectUsableBlockFindings(synth.findings, synth.evidences, redactForModel(excerpt), {
+                  fileDiffs: allowedSynthesisDiffs,
+                  allowedFiles: allowedSynthesisFiles,
+                  violations: orchestrated.deterministicViolations,
+                })
                   .slice(0, SYNTHESIS_MAX_APPENDED_FINDINGS)
                   .map((finding) => ({ ...finding }));
                 const architectureRole = runnerRoles.find((role) => role.role === 'architecture');

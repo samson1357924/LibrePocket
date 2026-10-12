@@ -1718,11 +1718,34 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         'unknown synthesis keys reject',
       );
       assert.deepEqual(extractSynthesisEvidence('not json'), undefined);
+      // H2 fixtures: a.kt carries the quote in a line-1-covering hunk.
+      const h2Diffs = new Map([
+        ['a.kt', [
+          'diff --git a/a.kt b/a.kt',
+          '--- a/a.kt',
+          '+++ b/a.kt',
+          '@@ -1,2 +1,2 @@',
+          ' context',
+          '+quoted code here',
+        ].join('\n')],
+        ['b.kt', [
+          'diff --git a/b.kt b/b.kt',
+          '--- a/b.kt',
+          '+++ b/b.kt',
+          '@@ -1,1 +1,1 @@',
+          '+other file content here',
+        ].join('\n')],
+      ]);
+      const h2Scope = (violations: Array<{ ruleId: string; message: string; file?: string; line?: number }> = []) => ({
+        fileDiffs: h2Diffs,
+        allowedFiles: new Set(h2Diffs.keys()),
+        violations,
+      });
       const usable = selectUsableBlockFindings(
         good?.findings ?? [],
         good?.evidences ?? [],
         'diff with quoted code here inside',
-        ['rule message'],
+        h2Scope(),
       );
       assert.equal(usable.length, 1, 'literally supported BLOCK is usable');
       assert.deepEqual(
@@ -1730,7 +1753,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           good?.findings ?? [],
           ['missing quote'],
           'unrelated diff',
-          ['unrelated violation'],
+          h2Scope(),
         ),
         [],
         'unsupported evidence is unusable',
@@ -1867,7 +1890,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           good?.findings ?? [],
           ['short'],
           'diff containing short inside',
-          [],
+          h2Scope(),
         ),
         [],
         'trivial evidence never supports',
@@ -1877,11 +1900,89 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           [{ severity: 'WARN', issue: 'w' }],
           ['warn evidence in diff'],
           'diff with warn evidence in diff inside',
-          [],
+          h2Scope(),
         ),
         [],
         'non-BLOCK never usable for tightening',
       );
+      // H2: evidence must bind to the finding's own file/line.
+      {
+        const excerpt = 'diff with quoted code here inside\nother file content here';
+        const blockInA = (file?: string, line?: number) => [{
+          severity: 'BLOCK' as const,
+          ...(file === undefined ? {} : { file }),
+          ...(line === undefined ? {} : { line }),
+          issue: 'i',
+        }];
+        // Reviewer counterexample (Danger.kt/Safe.kt shape): quote lives
+        // only in b.kt, finding says a.kt.
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            blockInA('a.kt', 1),
+            ['other file content here'],
+            excerpt,
+            h2Scope(),
+          ),
+          [],
+          'H2 cross-file quote never tightens',
+        );
+        // Missing file, unknown file, out-of-range line.
+        assert.deepEqual(
+          selectUsableBlockFindings(blockInA(undefined), ['quoted code here'], excerpt, h2Scope()),
+          [],
+          'H2 missing file never tightens',
+        );
+        assert.deepEqual(
+          selectUsableBlockFindings(blockInA('Nope.kt', 1), ['quoted code here'], excerpt, h2Scope()),
+          [],
+          'H2 unknown file never tightens',
+        );
+        assert.deepEqual(
+          selectUsableBlockFindings(blockInA('a.kt', 99), ['quoted code here'], excerpt, h2Scope()),
+          [],
+          'H2 out-of-range line never tightens',
+        );
+        // Ambiguous short name resolves to nothing.
+        const dupDiffs = new Map([['x/a.kt', h2Diffs.get('a.kt') ?? ''], ['y/a.kt', h2Diffs.get('b.kt') ?? '']]);
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            blockInA('a.kt', 1),
+            ['quoted code here'],
+            excerpt,
+            { fileDiffs: dupDiffs, allowedFiles: new Set(dupDiffs.keys()), violations: [] },
+          ),
+          [],
+          'H2 ambiguous file never tightens',
+        );
+        // Lineless file-level binding still works.
+        assert.equal(
+          selectUsableBlockFindings(blockInA('a.kt'), ['quoted code here'], excerpt, h2Scope()).length,
+          1,
+          'H2 lineless same-file quote tightens',
+        );
+        // Same-file violation carries a quote the excerpt omits.
+        assert.equal(
+          selectUsableBlockFindings(
+            blockInA('a.kt', 1),
+            ['violation quote here'],
+            'excerpt without the quote',
+            h2Scope([{ ruleId: 'SEC-1', message: 'violation quote here', file: 'a.kt', line: 1 }]),
+          ).length,
+          1,
+          'H2 same-file violation quote tightens',
+        );
+        // Cross-file violation never tightens.
+        assert.deepEqual(
+          selectUsableBlockFindings(
+            blockInA('a.kt', 1),
+            ['violation quote here'],
+            'excerpt without the quote',
+            h2Scope([{ ruleId: 'SEC-1', message: 'violation quote here', file: 'b.kt' }]),
+          ),
+          [],
+          'H2 cross-file violation never tightens',
+        );
+      }
     }
 
   console.log('[PocketGuard scanner/OpenAI tests] All tests passed.');

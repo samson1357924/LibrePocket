@@ -465,22 +465,63 @@ export function extractSynthesisEvidence(content: string): string[] | undefined 
 // evidence never supports a BLOCK finding.
 export const MIN_SYNTHESIS_EVIDENCE_LENGTH = 8;
 
+// File scope for BLOCK-evidence verification (H2): quotes must be
+// attributable to the finding's own file/line, not merely present anywhere.
+export interface BlockEvidenceScope {
+  /** Redacted-view source of truth: per-file diffs keyed by repo path. */
+  fileDiffs: Map<string, string>;
+  /** Review-eligible file set (G1): excluded files never support BLOCK. */
+  allowedFiles: ReadonlySet<string> | readonly string[];
+  /**
+   * Structured deterministic violations (same-file fallback only). Only
+   * ruleId/message/file(/line) are read, so callers pass a narrow shape.
+   */
+  violations: Array<{ ruleId: string; message: string; file?: string; line?: number }>;
+}
+
 // Selects the BLOCK findings whose evidence quote is literally supported by
-// the reviewed input (diff excerpt or deterministic violation text).
+// the reviewed input. H2: the quote must be attributable to the finding's
+// own file — a quote that only appears in another file is unusable even if
+// it is inside the excerpt. Diff quotes additionally require a valid line
+// (when given) and an excerpt hit (the excerpt is budgeted); same-file
+// deterministic violation quotes are fully rendered in the prompt, so they
+// suffice without an excerpt hit.
 // Unsupported, missing, or trivial evidence is unusable: a BLOCK that cannot
 // be verified must never tighten the verdict on its own.
 export function selectUsableBlockFindings(
   findings: ReviewFinding[],
   evidences: string[],
   diffExcerpt: string,
-  violationTexts: string[],
+  scope: BlockEvidenceScope,
 ): ReviewFinding[] {
+  const allowed = new Set([...scope.allowedFiles]);
   return findings.filter((finding, index) => {
     if (finding.severity !== 'BLOCK') return false;
     const evidence = (evidences[index] ?? '').trim();
     if (evidence.length < MIN_SYNTHESIS_EVIDENCE_LENGTH) return false;
-    if (diffExcerpt.includes(evidence)) return true;
-    return violationTexts.some((text) => typeof text === 'string' && text.includes(evidence));
+    const file = typeof finding.file === 'string' ? finding.file.trim() : '';
+    if (!file) return false;
+    const key = resolveAnchorFile(scope.fileDiffs, file);
+    if (!key || !allowed.has(key)) return false;
+    const redactedFile = redactForModel(scope.fileDiffs.get(key) ?? '');
+    const rawLine = finding.line;
+    if (rawLine !== undefined && (typeof rawLine !== 'number' || !Number.isInteger(rawLine))) return false;
+    const line = typeof rawLine === 'number' ? rawLine : undefined;
+    if (line !== undefined) {
+      const hunks = parseSynthesisHunks(redactedFile);
+      if (!hunks.some((hunk) => line >= hunk.newStart && line < hunk.newStart + hunk.newCount)) return false;
+    }
+    // Diff quotes must also be model-visible (the excerpt is budgeted).
+    if (redactedFile.includes(evidence) && diffExcerpt.includes(evidence)) return true;
+    // Violation quotes are fully rendered in the prompt, so a same-file
+    // violation carrying the quote suffices without an excerpt hit.
+    return scope.violations.some((violation) => {
+      if (typeof violation.file !== 'string' || !violation.file) return false;
+      if (resolveAnchorFile(scope.fileDiffs, violation.file) !== key) return false;
+      // Match rule text only: a bare file path (>=8 chars) must not count
+      // as supporting evidence on its own.
+      return `${violation.ruleId} ${violation.message}`.includes(evidence);
+    });
   });
 }
 

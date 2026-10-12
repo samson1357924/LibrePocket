@@ -1,14 +1,9 @@
 package dev.librepocket.agent.ui.settings
 
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -21,6 +16,7 @@ import androidx.compose.ui.unit.dp
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.agent.ui.setup.setupErrorText
+import dev.librepocket.automation.AutomationSettingsState
 import dev.librepocket.provider.ProviderProtocol
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -32,6 +28,8 @@ import org.robolectric.annotation.Config
 
 /**
  * 階段2：logout 失敗 Settings UI 可見（Re-review #7 Finding 2）。
+ * 階段3：產品容器可滾（Re-review #8 Finding 3）——直寫 setContent，
+ * [performScrollTo] 證明產品 [SettingsScreen] root Column 本身可滾。
  *
  * Robolectric + compose rule（unit source set）：失敗顯示 + 重試可達、
  * inFlight disabled + spinner、取消零調用、失敗不關 dialog（保持/重現）。
@@ -56,18 +54,11 @@ class SettingsScreenTest {
     )
 
     /**
-     * Robolectric 活動視口小，Settings 整頁（產品不滾動）底部登出區會落在可視
-     * 區外：觸控點不到、assertIsDisplayed 失敗。測試 harness 在外包一層可滾動
-     * 容器（產品佈局不動），用 [performScrollTo] 把目標滾入可視區再互動/斷言。
+     * 階段3：直寫產品 [SettingsScreen]（外包可滾容器已移除）。
+     * Robolectric 活動視口小，底部登出區落在可視區外時，
+     * [performScrollTo] 必須經產品 root Column 的 verticalScroll 滾入；
+     * 產品未加 scroll 前此 helper 即紅（無可滾容器），加後轉綠。
      */
-    private fun scrolledContent(content: @Composable () -> Unit) {
-        composeRule.setContent {
-            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                content()
-            }
-        }
-    }
-
     private fun onLogoutArea(text: String) =
         composeRule.onNodeWithText(text).performScrollTo()
 
@@ -75,7 +66,7 @@ class SettingsScreenTest {
     fun logoutFailureKeepsDialogAndRetryReachesLogout() {
         var error: String? by mutableStateOf(null)
         var logoutCalls = 0
-        scrolledContent {
+        composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = readyGate(),
@@ -94,7 +85,7 @@ class SettingsScreenTest {
         onLogoutArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
         onLogoutArea("重試清除").assertIsDisplayed()
         // 重試可達：再調一次 logout。
-        composeRule.onNodeWithText("重試清除").performClick()
+        onLogoutArea("重試清除").performClick()
         assertEquals(2, logoutCalls)
         onLogoutArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
     }
@@ -102,7 +93,7 @@ class SettingsScreenTest {
     @Test
     fun logoutErrorAloneReopensConfirm() {
         // 失敗碼存續即重現確認態（內部 confirm 旗標為 false 的 fresh 組合也一樣）。
-        scrolledContent {
+        composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = readyGate(),
@@ -117,7 +108,7 @@ class SettingsScreenTest {
 
     @Test
     fun logoutInFlightDisablesAllButtonsAndShowsSpinner() {
-        scrolledContent {
+        composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = readyGate(),
@@ -127,7 +118,7 @@ class SettingsScreenTest {
         }
         onLogoutArea("清除中…").assertIsDisplayed()
         // 確認/重試鍵與取消鍵皆 disabled，防重點。
-        composeRule.onNodeWithText("清除中…").assertIsNotEnabled()
+        onLogoutArea("清除中…").assertIsNotEnabled()
         onLogoutArea("取消").assertIsNotEnabled()
         onLogoutArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
     }
@@ -136,7 +127,7 @@ class SettingsScreenTest {
     fun cancelNeverCallsLogout() {
         var logoutCalls = 0
         var dismissed = 0
-        scrolledContent {
+        composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = readyGate(),
@@ -163,5 +154,80 @@ class SettingsScreenTest {
         assertTrue(setupErrorText("LOGOUT_CLEAR_FAILED").contains("部分清除"))
         assertTrue(setupErrorText("LOGOUT_CLEAR_FAILED").contains("重試"))
         assertTrue(setupErrorText("LOGOUT_STALE").contains("新的金鑰"))
+    }
+
+    /**
+     * 階段3 最高棧鎖定（Re-review #8 Finding 3）：
+     * Ready + automation 非 null + CLEAR_FAILED 為全頁最高組合
+     *（端點卡/語音卡/提權卡/自動化卡/失敗卡全在），直寫產品容器，
+     * 重試/取消/無障礙設定三入口皆須可滾入可視區且可點。
+     */
+    @Test
+    fun tallestStackAllActionsReachable() {
+        var retryCalls = 0
+        var dismissed = 0
+        var a11yClicks = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                automation = AutomationSettingsState(
+                    switchOn = false,
+                    serviceGranted = false,
+                    effective = false,
+                ),
+                logoutErrorCode = "LOGOUT_CLEAR_FAILED",
+                onRetryLogout = { retryCalls++ },
+                onDismissLogoutError = { dismissed++ },
+                onOpenSystemA11y = { a11yClicks++ },
+            )
+        }
+        // 三入口皆 displayed（經產品容器 scrollTo 滾入）。
+        onLogoutArea("前往系統無障礙設定").assertIsDisplayed()
+        onLogoutArea("重試清除").assertIsDisplayed()
+        onLogoutArea("取消").assertIsDisplayed()
+        // 三入口皆可點。
+        onLogoutArea("前往系統無障礙設定").performClick()
+        onLogoutArea("重試清除").performClick()
+        onLogoutArea("取消").performClick()
+        assertEquals(1, a11yClicks)
+        assertEquals(1, retryCalls)
+        assertEquals(1, dismissed)
+    }
+
+    /**
+     * 最高棧大字體變體：fontScale=1.3 下內容更高，仍須全可達。
+     * 方法級 @Config 覆寫字體比例（sdk 沿用類級 33）。
+     */
+    @Test
+    @Config(sdk = [33], fontScale = 1.3f)
+    fun tallestStackLargeFontStillReachable() {
+        var retryCalls = 0
+        var dismissed = 0
+        var a11yClicks = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                automation = AutomationSettingsState(
+                    switchOn = false,
+                    serviceGranted = false,
+                    effective = false,
+                ),
+                logoutErrorCode = "LOGOUT_CLEAR_FAILED",
+                onRetryLogout = { retryCalls++ },
+                onDismissLogoutError = { dismissed++ },
+                onOpenSystemA11y = { a11yClicks++ },
+            )
+        }
+        onLogoutArea("前往系統無障礙設定").assertIsDisplayed()
+        onLogoutArea("重試清除").assertIsDisplayed()
+        onLogoutArea("取消").assertIsDisplayed()
+        onLogoutArea("前往系統無障礙設定").performClick()
+        onLogoutArea("重試清除").performClick()
+        onLogoutArea("取消").performClick()
+        assertEquals(1, a11yClicks)
+        assertEquals(1, retryCalls)
+        assertEquals(1, dismissed)
     }
 }

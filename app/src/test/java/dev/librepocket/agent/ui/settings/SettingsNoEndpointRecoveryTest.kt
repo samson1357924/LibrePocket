@@ -1,14 +1,9 @@
 package dev.librepocket.agent.ui.settings
 
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -29,6 +24,9 @@ import org.robolectric.annotation.Config
 
 /**
  * 階段2：NoEndpoint 恢復入口（Re-review #8 Finding 2 P2/BLOCK）。
+ * 階段3：產品容器可滾（Re-review #8 Finding 3）——直寫 setContent，
+ * [performScrollTo] 證明產品 [SettingsScreen] root Column 本身可滾
+ *（外包可滾容器已移除；與產品 scroll 嵌套會觸發無限約束崩潰，故必須直寫）。
  *
  * - `LOGOUT_CLEAR_FAILED`（部分清除，gate 已折疊 NoEndpoint）顯示恢復卡 +
  *   重試可達，且不再顯示「尚未設定」文案（readyGate 反例）；
@@ -43,21 +41,16 @@ class SettingsNoEndpointRecoveryTest {
     @get:Rule
     val composeRule = createComposeRule()
 
-    private fun scrolledContent(content: @Composable () -> Unit) {
-        composeRule.setContent {
-            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                content()
-            }
-        }
-    }
-
+    /**
+     * 階段3：直寫產品 [SettingsScreen]（外包可滾容器已移除，見類 KDoc）。
+     */
     private fun onArea(text: String) =
         composeRule.onNodeWithText(text).performScrollTo()
 
     @Test
     fun noEndpointClearFailedShowsRecoveryAndRetryReachesLogout() {
         var logoutCalls = 0
-        scrolledContent {
+        composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = EndpointGate.NoEndpoint,
@@ -80,7 +73,7 @@ class SettingsNoEndpointRecoveryTest {
     fun noEndpointStaleHasNoRetryOnlyDismiss() {
         var logoutCalls = 0
         var dismissed = 0
-        scrolledContent {
+        composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = EndpointGate.NoEndpoint,
@@ -101,7 +94,7 @@ class SettingsNoEndpointRecoveryTest {
 
     @Test
     fun noEndpointFreshUnchanged() {
-        scrolledContent {
+        composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = EndpointGate.NoEndpoint,
@@ -117,7 +110,7 @@ class SettingsNoEndpointRecoveryTest {
 
     @Test
     fun noEndpointInFlightDisablesAndShowsSpinner() {
-        scrolledContent {
+        composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = EndpointGate.NoEndpoint,
@@ -127,7 +120,7 @@ class SettingsNoEndpointRecoveryTest {
         }
         onArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
         onArea("清除中…").assertIsDisplayed()
-        composeRule.onNodeWithText("清除中…").assertIsNotEnabled()
+        onArea("清除中…").assertIsNotEnabled()
         onArea("取消").assertIsNotEnabled()
     }
 
@@ -136,7 +129,7 @@ class SettingsNoEndpointRecoveryTest {
         // READ/DELETE 失敗同為可重試碼（STALE 除外）：同一 content 內切碼驗證，
         // 避免同一 test 內兩次 setContent（compose rule 單測只允許一次）。
         var code by mutableStateOf("LOGOUT_READ_FAILED")
-        scrolledContent {
+        composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = EndpointGate.NoEndpoint,

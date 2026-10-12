@@ -54,8 +54,12 @@ internal val ENDPOINT_PENDING_DELETE_V1 = stringPreferencesKey("endpoint_pending
  *
  * The journal NEVER advances [ENDPOINT_CONFIG_REVISION_V1]: only
  * [EndpointStore.save]/[saveIfRevision]/[clear]/[clearIfRevision] advance the
- * revision, so saves can still CAS over a pending journal (the superseded
- * journal is discarded by the STALE path without touching winner metadata).
+ * revision. A present journal BLOCKS [saveIfRevision] fail-closed inside the
+ * same atomic edit (Stage 2 P2 atomic fence): saves can no longer CAS over a
+ * pending teardown and silently strand it — the blocked save reports
+ * `false`, writes nothing, and the caller must reconcile-then-retry instead.
+ * (The legacy unconditional [EndpointStore.save] still overwrites; it is kept
+ * for tests / non-fencing paths only.)
  */
 data class PendingDelete(
     val alias: String,
@@ -164,7 +168,11 @@ data class EndpointConfig(
  *   DataStore failures propagate fail-closed to the caller.
  * - [saveIfRevision]/[clearIfRevision] perform the compare-and-set inside a
  *   single `dataStore.edit {}` transaction; a mismatch `return@edit`s without
- *   writing and reports `false`. There is no distributed transaction with [KeyVault]:
+ *   writing and reports `false`. [saveIfRevision] additionally requires the
+ *   teardown journal to be absent in the SAME edit (Stage 2 P2 fence), and the
+ *   fenced [writePendingDeleteIfAbsent] overload requires the metadata
+ *   generation to still match — so neither a save nor a stale logout can slip
+ *   past the other's in-flight state. There is no distributed transaction with [KeyVault]:
  *   callers (VM layer, phase 2) must coordinate metadata fencing with vault
  *   writes/reads.
  * - Single-process only; not safe across processes: DataStore is not
@@ -311,6 +319,11 @@ class EndpointStore(
      * journal → writes [pending] (validated by construction, [format]) and
      * returns `true`.
      *
+     * This overload checks journal absence ONLY (no revision/ref fencing):
+     * kept for tests/preseed. Production logout MUST use the fenced overload
+     * below so a stale snapshot cannot journal over — and temporarily mask —
+     * a newer generation's committed metadata.
+     *
      * Intentionally does NOT advance [ENDPOINT_CONFIG_REVISION_V1]: the journal
      * is not a metadata generation, and bumping here would break the trailing
      * `clearIfRevision(expectedRevision)` fence. Fail-closed: validation
@@ -324,6 +337,61 @@ class EndpointStore(
             var wrote = false
             dataStore.edit { prefs ->
                 if (prefs[ENDPOINT_PENDING_DELETE_V1] != null) {
+                    return@edit
+                }
+                prefs[ENDPOINT_PENDING_DELETE_V1] = pending.format()
+                wrote = true
+            }
+            wrote
+        }
+    }
+
+    /**
+     * Fenced journal write (Stage 2 P2 atomic fence, scheme B).
+     *
+     * Like the absent-only overload, but additionally requires the stored
+     * metadata generation to still match the caller's snapshot: inside the
+     * SAME single `dataStore.edit {}` transaction the write proceeds only when
+     * the journal is absent AND `prefs[ENDPOINT_CONFIG_REVISION_V1] ==
+     * [expectedRevision]` AND ([expectedRef] is null OR
+     * `prefs[ENDPOINT_API_KEY_REF_V1] == [expectedRef]`). Any mismatch
+     * `return@edit`s with `false` — nothing is written, so a stale logout
+     * whose snapshot predates a winner's commit can neither journal over it
+     * nor (via the lenient fold) temporarily mask the winner as unavailable.
+     * A present journal (any non-null value, including malformed) likewise
+     * returns `false` and is never overwritten.
+     *
+     * @param expectedRevision MUST come from the same snapshot emission as the
+     * journal absence check ([snapshotDeleteStateStrict]), never a stale
+     * re-read: the fence only holds against the generation observed at
+     * snapshot time.
+     * @param expectedRef the snapshot's raw `apiKeyRef` (e.g.
+     * `provider_key/<alias>`), or null to fence on the revision only.
+     *
+     * Fail-closed: [pending] validation ([IllegalArgumentException]) and
+     * DataStore failures propagate; only the expected contention paths
+     * (already-journaled, revision/ref moved) return `false`. The caller MUST
+     * treat `false` as STALE-or-superseded (re-snapshot; report STALE and skip
+     * the vault delete when the generation moved, resume the present journal
+     * otherwise) — never as "retry the write".
+     */
+    suspend fun writePendingDeleteIfAbsent(
+        pending: PendingDelete,
+        expectedRevision: Long?,
+        expectedRef: String? = null,
+    ): Boolean {
+        // Validate before I/O (constructor already validated; format is pure).
+        pending.format()
+        return withContext(ioDispatcher) {
+            var wrote = false
+            dataStore.edit { prefs ->
+                if (prefs[ENDPOINT_PENDING_DELETE_V1] != null) {
+                    return@edit
+                }
+                if (prefs[ENDPOINT_CONFIG_REVISION_V1] != expectedRevision) {
+                    return@edit
+                }
+                if (expectedRef != null && prefs[ENDPOINT_API_KEY_REF_V1] != expectedRef) {
                     return@edit
                 }
                 prefs[ENDPOINT_PENDING_DELETE_V1] = pending.format()
@@ -475,11 +543,21 @@ class EndpointStore(
      * (DataStore is not multi-process safe).
      *
      * Validates exactly like [save], then inside a single `dataStore.edit {}`
-     * transaction compares the stored revision against [expectedRevision]:
-     * - mismatch → `return@edit` without writing anything, returns `false`
-     *   (the `edit` early-return does not advance the revision);
-     * - match → writes all fields and bumps to
+     * transaction requires BOTH that no teardown journal is present AND that
+     * the stored revision matches [expectedRevision]:
+     * - present journal (ANY non-null [ENDPOINT_PENDING_DELETE_V1] value,
+     *   including malformed) → `return@edit` without writing anything,
+     *   returns `false` (blocked: a logout teardown owns the endpoint until
+     *   the journal is reconciled; the caller must reconcile-then-retry, never
+     *   overwrite or discard the journal here);
+     * - revision mismatch → `return@edit` without writing anything, returns
+     *   `false` (the `edit` early-return does not advance the revision);
+     * - both clear → writes all fields and bumps to
      *   `Math.addExact(expectedRevision ?: 0L, 1L)`, returns `true`.
+     *
+     * The journal check and the revision compare share the one atomic edit, so
+     * a journal landing between the caller's snapshot and this CAS still fails
+     * closed (no save-then-mask window).
      *
      * @param expectedRevision MUST come from [currentRevision()], never
      * `observe().configRevision`: [observe] folds missing/partial metadata
@@ -491,13 +569,17 @@ class EndpointStore(
      * `null` expected means "must be fresh" (key never written); a dirty
      * hand-written `0L` does NOT equal fresh `null`. Fail-closed: validation
      * failures, revision overflow ([ArithmeticException]), and DataStore
-     * failures propagate; only the expected contention path returns `false`.
+     * failures propagate; only the expected contention paths (journal present,
+     * revision moved) return `false`.
      */
     suspend fun saveIfRevision(config: EndpointConfig, expectedRevision: Long?): Boolean {
         validateForSave(config)
         return withContext(ioDispatcher) {
             var wrote = false
             dataStore.edit { prefs ->
+                if (prefs[ENDPOINT_PENDING_DELETE_V1] != null) {
+                    return@edit
+                }
                 val actual = prefs[ENDPOINT_CONFIG_REVISION_V1]
                 if (actual != expectedRevision) {
                     return@edit

@@ -11,6 +11,8 @@ package dev.librepocket.agent.ui.setup
  *   重試以完成清除。
  * - `LOGOUT_STALE`：已有新的金鑰生效（併發 save 贏了 CAS），本次登出已過期，
  *   不需重試。
+ * - `SAVE_BLOCKED_BY_TEARDOWN`：有待清理的登出狀態擋下本次儲存（未寫入任何
+ *   資料，可重試；重試前由 reconcile 解決該登出狀態）。
  */
 fun setupErrorText(code: String): String = when (code) {
     "SETUP_UNKNOWN_PRESET" -> "未知的供應商，請重新選擇。"
@@ -28,5 +30,6 @@ fun setupErrorText(code: String): String = when (code) {
     "LOGOUT_DELETE_FAILED" -> "刪除本機金鑰失敗，端點設定未清除，請重試。"
     "LOGOUT_CLEAR_FAILED" -> "部分清除：本機金鑰已刪除、但端點設定仍在，請重試以完成清除。"
     "LOGOUT_STALE" -> "已有新的金鑰生效，本次登出已過期，不需重試。"
+    "SAVE_BLOCKED_BY_TEARDOWN" -> "有待清理的登出狀態，請重試。"
     else -> "儲存失敗（$code），請重試。"
 }

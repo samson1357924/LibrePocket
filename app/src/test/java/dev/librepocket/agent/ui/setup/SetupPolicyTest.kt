@@ -1894,11 +1894,13 @@ class SetupPolicyTest {
     }
 
     @Test
-    fun logoutStaleLosesToConcurrentSave() {
-        // T-StaleFenced: L snapshots (A, rev1) and parks inside deleteKey(A);
-        // S commits B (rev2); L resumes into a CAS loss. L deleted only the
-        // stale predecessor (harmless — S already retired it), B metadata
-        // survives, and L reports STALE instead of success.
+    fun saveBlockedByInFlightLogoutThenLogoutCommits() {
+        // Stage 2 P2 fence: L snapshots (A, rev1), journals J_A, and parks
+        // inside deleteKey(A); S's save is BLOCKED by the in-flight teardown
+        // (saved=false + SAVE_BLOCKED_BY_TEARDOWN, no staged vault write,
+        // A/rev1/J_A untouched) instead of committing over the journal into a
+        // saved-yet-unavailable state. L then resumes into a CAS win: the
+        // teardown commits and reports success.
         val dir = Files.createTempDirectory("setup-logout-stale").toFile()
         tmpDirs.add(dir)
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -1933,35 +1935,36 @@ class SetupPolicyTest {
         )
         val logoutDone = CompletableDeferred<Boolean>()
         vmLogout.logout { logoutDone.complete(it) }
-        // L has snapshot (A, rev1) and is parked inside deleteKey(A).
+        // L has snapshot (A, rev1), journaled J_A, and is parked inside deleteKey(A).
         runBlocking { withTimeout(10_000) { logoutVault.deleteEntered.await() } }
         assertEquals(listOf("preset:openai"), logoutVault.deletedIds)
-        // S publishes B while L is parked (per-VM mutexes do not exclude
-        // cross-VM writers; the metadata CAS is the fence).
+        // S attempts B while L's teardown is in flight: blocked fail-closed
+        // (early journal fence — before any staged vault write).
         vmSave.onApiKeyChange("unit-test-winner-key-BBBBBBBB")
         vmSave.save()
         awaitSettled(vmSave)
-        assertTrue(vmSave.form.value.saved)
-        val winnerStaged = saveVault.putIds.single()
-        assertTrue(winnerStaged.startsWith("preset:openai#staged-"))
-        runBlocking { assertEquals(2L, store.currentRevision()) }
-        // Release L into the CAS loss.
+        assertFalse(vmSave.form.value.saved)
+        assertEquals("SAVE_BLOCKED_BY_TEARDOWN", vmSave.form.value.errorCode)
+        assertEquals("blocked before any staged vault write", 0, saveVault.putKeys)
+        assertTrue(saveVault.deletedIds.isEmpty())
+        runBlocking {
+            assertEquals("provider_key/preset:openai", store.snapshotStrict()!!.apiKeyRef)
+            assertEquals(1L, store.currentRevision())
+            assertEquals("preset:openai", store.pendingDelete()?.alias)
+            assertNull(store.observe().first())
+        }
+        // Release L into the CAS win (no winner committed while parked: S was
+        // blocked, so the revision is still rev1).
         logoutVault.deleteRelease.complete(Unit)
         val ok = runBlocking { withTimeout(10_000) { logoutDone.await() } }
-        assertFalse("stale logout must not report success", ok)
-        assertEquals("LOGOUT_STALE", vmLogout.form.value.errorCode)
+        assertTrue("uncontended teardown commits", ok)
+        assertNull(vmLogout.form.value.errorCode)
         runBlocking {
+            assertNull(store.pendingDelete())
+            assertFalse(store.hasMetadata())
             assertEquals(2L, store.currentRevision())
-            val meta = store.observe().first()!!
-            assertEquals("provider_key/$winnerStaged", meta.apiKeyRef)
-            assertTrue("winner key must survive the stale logout", delegate.hasKey(winnerStaged))
-            assertEquals(EndpointReadiness.READY, store.readiness(delegate))
-            assertNull(
-                "superseded journal is discarded without touching winner metadata",
-                store.pendingDelete(),
-            )
+            assertFalse(delegate.hasKey("preset:openai"))
         }
-        assertVaultKeyEquals(delegate, winnerStaged, "unit-test-winner-key-BBBBBBBB")
     }
 
     @Test

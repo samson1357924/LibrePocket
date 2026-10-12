@@ -570,17 +570,32 @@ class SetupViewModel(
         // consent.configRevision but still requires the live revision to match
         // it here (single-emission authoritative check). Snapshot-then-fence: a
         // read failure or an edit racing the read fails closed before any vault
-        // side effect.
+        // side effect. The teardown journal rides the SAME emission (Stage 2
+        // P2): a present journal blocks the save fail-closed here — before any
+        // vault write — and the trailing CAS re-fences atomically, so a journal
+        // landing between this snapshot and the CAS still fails closed below.
         val snapshot = try {
-            store.snapshotWithRevisionStrict()
+            store.snapshotDeleteStateStrict()
         } catch (e: CancellationException) {
             throw e
+        } catch (e: IllegalStateException) {
+            // Malformed teardown journal: fail closed as teardown-blocked (no
+            // vault write, no metadata write, journal kept for reconcile).
+            _form.value = _form.value.copy(saving = false, errorCode = "SAVE_BLOCKED_BY_TEARDOWN")
+            return
         } catch (_: Exception) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
-        val oldConfig = snapshot.first
-        val liveRev = snapshot.second
+        if (snapshot.first != null) {
+            // A logout teardown owns the endpoint until its journal is
+            // reconciled: no vault write, no metadata write, revision and
+            // journal untouched. The caller reconciles then retries.
+            _form.value = _form.value.copy(saving = false, errorCode = "SAVE_BLOCKED_BY_TEARDOWN")
+            return
+        }
+        val oldConfig = snapshot.second
+        val liveRev = snapshot.third
         val expectedRevision: Long? = if (consent != null) {
             if (liveRev != consent.configRevision) {
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
@@ -883,15 +898,30 @@ class SetupViewModel(
                 return
             }
             if (!wrote) {
-                // CAS mismatch: a concurrent winner advanced the revision. Our
-                // staged alias is ours alone (per-operation restart-unique UUID)
-                // and was never published, so deleting it cannot harm the
-                // winner, whose metadata points at its own staged alias. No
-                // vault read, no content comparison, no live touch —
-                // different-key and same-bytes losers alike cannot corrupt the
-                // winner.
+                // CAS mismatch: a concurrent winner advanced the revision, OR a
+                // teardown journal landed between our snapshot and the CAS (the
+                // store-level journal fence turns that into a loss — no
+                // save-then-mask window). Distinguish via a journal re-read: a
+                // present-or-malformed journal reports the retryable
+                // teardown-blocked code (journal kept, reconcile-then-retry);
+                // pure revision contention keeps the existing denial. Either
+                // way only the attempt's own staged alias is deleted — the
+                // winner (whose metadata points at its own staged alias) and
+                // the journal are untouched.
                 deleteStagedBestEffort(stagedAlias)
-                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                val blockedByTeardown: Boolean = try {
+                    store.pendingDelete() != null
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    // Malformed journal or unreadable store: fail closed
+                    // toward the teardown-blocked code (retryable, no writes).
+                    true
+                }
+                _form.value = _form.value.copy(
+                    saving = false,
+                    errorCode = if (blockedByTeardown) "SAVE_BLOCKED_BY_TEARDOWN" else "POLICY_DENIED_KEY_WRITE",
+                )
                 return
             }
             metadataCommitted = true
@@ -934,8 +964,12 @@ class SetupViewModel(
                 // alias — live is never touched. `true` means the commit won
                 // despite the cancel: own staged is now live, must NOT delete;
                 // treat as success (swallow, report saved=true READY).
+                // Confirmed-uncommitted (staged cleaned) or unknown (no-touch
+                // leak): unstick saving, never POLICY_DENIED-mask the cancel.
+                // Journal-aware: a journal landing over the commit refuses
+                // success (the teardown owns the outcome now).
                 val livePointsAtStaged: Boolean? = try {
-                    withContext(NonCancellable) { store.snapshotStrict()?.apiKeyRef == stagedRef }
+                    withContext(NonCancellable) { probeStagedCommit(stagedRef) }
                 } catch (_: CancellationException) {
                     null
                 } catch (_: Exception) {
@@ -958,10 +992,13 @@ class SetupViewModel(
                 // Committed (CAS true, then retire/success-mark cancelled):
                 // staged is live — NEVER delete. Re-confirm the commit is still
                 // in place (defensive: logout could have raced); only then
-                // swallow and report success. Read failure -> no-touch leak,
-                // unstick saving, rethrow (never rollback the new live key).
+                // swallow and report success. Journal-aware: a teardown journal
+                // in flight refuses success even when the ref still matches
+                // (the live key may already be deleted). Read failure ->
+                // no-touch leak, unstick saving, rethrow (never rollback the
+                // new live key).
                 val stillCommitted: Boolean? = try {
-                    withContext(NonCancellable) { store.snapshotStrict()?.apiKeyRef == stagedRef }
+                    withContext(NonCancellable) { probeStagedCommit(stagedRef) }
                 } catch (_: CancellationException) {
                     null
                 } catch (_: Exception) {
@@ -997,6 +1034,41 @@ class SetupViewModel(
             throw e
         } catch (_: Exception) {
             // Best-effort: the abort error below stays authoritative.
+        }
+    }
+
+    /**
+     * Journal-aware commit probe for the cancellation compensation below.
+     *
+     * Must be called inside `withContext(NonCancellable)` (callers own that).
+     * Returns `true` only when the metadata still points at [stagedRef] AND no
+     * teardown journal is in flight; `false` when the metadata provably points
+     * elsewhere (our staged alias was never published — safe to clean up);
+     * `null` when the outcome is unknown (read failure, malformed journal, or
+     * a journal in flight OVER our commit — the teardown may already have
+     * deleted the live key, so no-touch: never swallow to success, never
+     * delete).
+     *
+     * A plain `snapshotStrict()?.apiKeyRef == stagedRef` check would swallow a
+     * committed-then-journaled cancel to `saved=true` while lenient readers
+     * fold to unavailable (key deleted, clear pending) — this probe refuses
+     * success whenever a journal is present.
+     */
+    private suspend fun probeStagedCommit(stagedRef: String): Boolean? {
+        try {
+            val state = store.snapshotDeleteStateStrict()
+            if (state.first != null) {
+                // Journal in flight: a ref mismatch still proves our staged
+                // alias was never published (safe cleanup); a match is
+                // ambiguous (our commit may be torn down) → no-touch.
+                return if (state.second?.apiKeyRef == stagedRef) null else false
+            }
+            return state.second?.apiKeyRef == stagedRef
+        } catch (_: CancellationException) {
+            return null
+        } catch (_: Exception) {
+            // Includes the malformed-journal throw: no-touch.
+            return null
         }
     }
 
@@ -1384,6 +1456,13 @@ class SetupViewModel(
      *   read failure: the delete is skipped but
      *   [EndpointStore.clearIfRevision] still runs to void outstanding
      *   snapshots/consents, and success is reported on a CAS win.
+     * - The journal write itself is fenced (Stage 2 P2): it lands only when
+     *   the stored generation still matches the snapshot (revision AND raw
+     *   `apiKeyRef`). A loss therefore means either a concurrent teardown
+     *   journaled first (generation still ours → resume its journal, never
+     *   overwrite) or a winner advanced the metadata after our snapshot
+     *   (generation moved → `LOGOUT_STALE` with NO vault delete: the snapshot
+     *   alias is a predecessor and the winner must never be masked).
      * - Only an alias addressed by a well-formed `provider_key/` ref is
      *   deleted (resolved via [SetupValidation.aliasFromRef], never re-derived
      *   from `providerId`); malformed refs fail closed to skip-delete (still
@@ -1555,7 +1634,15 @@ class SetupViewModel(
                             return@withLock
                         }
                         val wroteJournal = try {
-                            store.writePendingDeleteIfAbsent(journal)
+                            // Fenced (Stage 2 P2): the write lands only when
+                            // the generation still matches our snapshot, so a
+                            // stale logout can neither journal over nor mask a
+                            // winner that committed after we snapshotted.
+                            store.writePendingDeleteIfAbsent(
+                                journal,
+                                expectedRevision,
+                                state.second?.apiKeyRef,
+                            )
                         } catch (e: CancellationException) {
                             throw e
                         } catch (_: Exception) {
@@ -1581,22 +1668,37 @@ class SetupViewModel(
                             true
                         }
                         if (!wroteJournal) {
-                            // A concurrent teardown journaled first (its alias
-                            // may differ): never overwrite — resume the
-                            // winner's journal; if it already finished (no
-                            // journal now), fall through to the fenced clear
-                            // below, which will fence stale as usual.
+                            // Fenced journal loss (Stage 2 P2): either a
+                            // concurrent teardown journaled first (generation
+                            // still ours → resume its journal, never
+                            // overwrite), or a winner advanced the metadata
+                            // after our snapshot (generation moved → STALE: no
+                            // vault delete — our snapshot alias is a
+                            // predecessor and the winner must never be masked
+                            // or touched — and report LOGOUT_STALE). If the
+                            // journal is already gone but the generation is
+                            // still ours, fall through to the fenced clear
+                            // below, which fences stale as usual.
                             val current = try {
-                                store.snapshotDeleteStateStrict().first
+                                store.snapshotDeleteStateStrict()
                             } catch (e: CancellationException) {
                                 throw e
                             } catch (_: Exception) {
                                 _form.value = _form.value.copy(errorCode = "LOGOUT_CLEAR_FAILED")
                                 return@withLock
                             }
-                            if (current != null) {
+                            val snapshotRef = state.second?.apiKeyRef
+                            val generationMoved = current.third != expectedRevision ||
+                                (snapshotRef != null && current.second?.apiKeyRef != snapshotRef)
+                            if (generationMoved) {
+                                logoutError = "LOGOUT_STALE"
+                                _form.value = _form.value.copy(errorCode = logoutError)
+                                return@withLock
+                            }
+                            val presentJournal = current.first
+                            if (presentJournal != null) {
                                 val (resumed, resumeError) =
-                                    reconcileOutcomeToLogout(runPendingDeleteLocked(current))
+                                    reconcileOutcomeToLogout(runPendingDeleteLocked(presentJournal))
                                 committed = resumed
                                 logoutError = resumeError
                                 if (logoutError != null) {

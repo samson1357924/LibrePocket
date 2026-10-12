@@ -404,4 +404,261 @@ class SetupLogoutJournalTest {
         // R1 deleted only the stale predecessor alias, never the winner slot.
         assertEquals(listOf("preset:openai"), vault.deletedIds)
     }
+
+    private fun awaitSaveSettled(vm: SetupViewModel, timeoutMs: Long = 8000) {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (vm.form.value.saving) {
+            if (System.currentTimeMillis() > end) error("timed out waiting for save")
+            Thread.sleep(10)
+        }
+    }
+
+    @Test
+    fun saveBlockedByPresentJournalFailsClosed() {
+        // Stage 2 P2: preseed A + J_A → save 擋下 fail-closed：saved=false +
+        // blocked 碼、staged 已清（早期圍欄：未寫 vault）、metadata 仍 A、
+        // revision 不動、journal 保留、readiness NO_KEY。
+        val raw = rawDelegate("stage2-save-blocked")
+        val store = EndpointStore(raw)
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val journalA = PendingDelete("preset:openai", 1L, 1700000000000L)
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            store.save(journalPreseed())
+            assertEquals(1L, store.currentRevision())
+            assertTrue(store.writePendingDeleteIfAbsent(journalA))
+        }
+        val vault = CountingVault(delegate)
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        awaitSaveSettled(vm)
+        assertFalse(vm.form.value.saved)
+        assertEquals("SAVE_BLOCKED_BY_TEARDOWN", vm.form.value.errorCode)
+        assertEquals("有待清理的登出狀態，請重試。", setupErrorText("SAVE_BLOCKED_BY_TEARDOWN"))
+        runBlocking {
+            assertEquals("early fence: no staged vault write", 0, vault.putKeys)
+            assertEquals("provider_key/preset:openai", store.snapshotStrict()!!.apiKeyRef)
+            assertEquals(1L, store.currentRevision())
+            assertEquals(journalA, store.pendingDelete())
+            assertNull(store.observe().first())
+            assertEquals(EndpointReadiness.NO_KEY, store.readiness(delegate))
+            assertTrue(delegate.hasKey("preset:openai"))
+        }
+    }
+
+    @Test
+    fun staleLogoutJournalWriteFencedAfterWinnerCommits() {
+        // Stage 2 P2 雙 VM：L 快照 rev1 後 park 在 journal write；S 提交 B 到
+        // rev2；放行 L → fenced write 回 false、不做 vault delete、observe 全程
+        // B、L 報 LOGOUT_STALE、readiness(B)==READY。
+        val raw = rawDelegate("stage2-stale-logout-fenced")
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            EndpointStore(raw).save(journalPreseed())
+        }
+        val gated = GatedUpdateDataStore(raw, gateBeforeUpdate = true, updatesToPass = 0)
+        val storeL = EndpointStore(gated)
+        val vaultL = CountingVault(delegate)
+        val vmL = SetupViewModel(
+            store = storeL,
+            vaultSource = VaultSource { vaultL },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        val done = CompletableDeferred<Boolean>()
+        vmL.logout { done.complete(it) }
+        runBlocking { withTimeout(10_000) { gated.entered.await() } }
+        val storeS = EndpointStore(raw)
+        val vaultS = CountingVault(delegate)
+        val vmS = SetupViewModel(
+            store = storeS,
+            vaultSource = VaultSource { vaultS },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vmS.onApiKeyChange("unit-test-winner-key-BBBBBBBB")
+        vmS.save()
+        awaitSaveSettled(vmS)
+        assertTrue(vmS.form.value.saved)
+        runBlocking { assertEquals(2L, storeS.currentRevision()) }
+        gated.release.complete(Unit)
+        val ok = runBlocking { withTimeout(10_000) { done.await() } }
+        assertFalse(ok)
+        assertEquals("LOGOUT_STALE", vmL.form.value.errorCode)
+        assertEquals("stale logout performs no vault delete", 0, vaultL.deleteKeys)
+        assertTrue(vaultL.deletedIds.isEmpty())
+        runBlocking {
+            val winnerRef = storeS.observe().first()!!.apiKeyRef
+            assertTrue(winnerRef.startsWith("provider_key/preset:openai#staged-"))
+            assertNull("stale journal never lands", storeS.pendingDelete())
+            assertEquals(2L, storeS.currentRevision())
+            assertEquals(EndpointReadiness.READY, storeS.readiness(delegate))
+        }
+    }
+
+    @Test
+    fun saveJournalRaceBetweenSnapshotAndCasFailsClosed() {
+        // Stage 2 P2 barrier：save park 在 CAS 前，期間寫入 J_A，放行後原子圍欄
+        // 擋下：saved=false、blocked 碼、staged 已清、journal 保留、metadata 仍
+        // A、revision 不動。
+        val raw = rawDelegate("stage2-save-journal-race")
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val healthy = EndpointStore(raw)
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            healthy.save(journalPreseed())
+            assertEquals(1L, healthy.currentRevision())
+        }
+        val gated = GatedUpdateDataStore(raw, gateBeforeUpdate = true, updatesToPass = 0)
+        val store = EndpointStore(gated)
+        val vault = CountingVault(delegate)
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        runBlocking { withTimeout(10_000) { gated.entered.await() } }
+        val journalA = PendingDelete("preset:openai", 1L, 1700000000000L)
+        runBlocking { assertTrue(healthy.writePendingDeleteIfAbsent(journalA)) }
+        gated.release.complete(Unit)
+        awaitSaveSettled(vm)
+        assertFalse(vm.form.value.saved)
+        assertEquals("SAVE_BLOCKED_BY_TEARDOWN", vm.form.value.errorCode)
+        val staged = vault.putIds.single()
+        runBlocking {
+            assertEquals(listOf(staged), vault.deletedIds)
+            assertFalse(delegate.hasKey(staged))
+            assertEquals(journalA, healthy.pendingDelete())
+            assertEquals("provider_key/preset:openai", healthy.snapshotStrict()!!.apiKeyRef)
+            assertEquals(1L, healthy.currentRevision())
+            assertNull(healthy.observe().first())
+        }
+    }
+
+    @Test
+    fun malformedJournalBlocksSaveFailClosed() {
+        // Stage 2 P2：手寫 v9|broken → save 擋下 fail-closed：saved=false +
+        // blocked 碼、無 vault 寫入、metadata/revision 不動、journal 原樣保留。
+        val raw = rawDelegate("stage2-malformed-blocks-save")
+        val store = EndpointStore(raw)
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            store.save(journalPreseed())
+            store.dataStore.edit { prefs ->
+                prefs[ENDPOINT_PENDING_DELETE_V1] = "v9|broken"
+            }
+        }
+        val vault = CountingVault(delegate)
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        awaitSaveSettled(vm)
+        assertFalse(vm.form.value.saved)
+        assertEquals("SAVE_BLOCKED_BY_TEARDOWN", vm.form.value.errorCode)
+        runBlocking {
+            assertEquals(0, vault.putKeys)
+            assertEquals("v9|broken", store.dataStore.data.first()[ENDPOINT_PENDING_DELETE_V1])
+            assertEquals("provider_key/preset:openai", store.snapshotStrict()!!.apiKeyRef)
+            assertEquals(1L, store.currentRevision())
+            assertNull(store.observe().first())
+            assertEquals(EndpointReadiness.NO_KEY, store.readiness(delegate))
+        }
+    }
+
+    @Test
+    fun blockedSaveReconcileThenRetryReachesReady() {
+        // Stage 2 P2 拒絕後行為：blocked save → reconcile 解決 journal → 重試
+        // save → saved=true + READY。
+        val raw = rawDelegate("stage2-reconcile-retry")
+        val store = EndpointStore(raw)
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            store.save(journalPreseed())
+            assertTrue(store.writePendingDeleteIfAbsent(PendingDelete("preset:openai", 1L, 1700000000000L)))
+        }
+        val vault = CountingVault(delegate)
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        awaitSaveSettled(vm)
+        assertFalse(vm.form.value.saved)
+        assertEquals("SAVE_BLOCKED_BY_TEARDOWN", vm.form.value.errorCode)
+        val outcome = runBlocking { vm.reconcilePendingDelete() }
+        assertEquals(SetupViewModel.PendingDeleteOutcome.COMMITTED, outcome)
+        vm.save()
+        awaitSaveSettled(vm)
+        assertTrue(vm.form.value.saved)
+        runBlocking {
+            val ref = store.observe().first()!!.apiKeyRef
+            assertTrue(ref.startsWith("provider_key/preset:openai#staged-"))
+            assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+        }
+    }
+
+    @Test
+    fun cancelParkedAtCasWithJournalLandedNeverReportsSuccess() {
+        // Stage 2 P2 cancel 感知：save park 在 CAS，期間 journal 落下，cancel
+        // 不得 swallow 成 saved=true（journal 在途即拒絕成功、只清自己的
+        // staged、journal/metadata/revision 原樣保留）。
+        val raw = rawDelegate("stage2-cancel-journal")
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val healthy = EndpointStore(raw)
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            healthy.save(journalPreseed())
+        }
+        val gated = GatedUpdateDataStore(raw, gateBeforeUpdate = true, updatesToPass = 0)
+        val store = EndpointStore(gated)
+        val vault = CountingVault(delegate)
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        runBlocking { withTimeout(10_000) { gated.entered.await() } }
+        val staged = vault.putIds.single()
+        val journalA = PendingDelete("preset:openai", 1L, 1700000000000L)
+        runBlocking { assertTrue(healthy.writePendingDeleteIfAbsent(journalA)) }
+        val job = vm.lastSaveJobForTest ?: error("no save job")
+        runBlocking {
+            job.cancel()
+            job.join()
+        }
+        assertTrue(job.isCancelled)
+        assertFalse(vm.form.value.saving)
+        assertFalse(vm.form.value.saved)
+        assertNull(vm.form.value.errorCode)
+        runBlocking {
+            assertEquals(listOf(staged), vault.deletedIds)
+            assertFalse(delegate.hasKey(staged))
+            assertEquals(journalA, healthy.pendingDelete())
+            assertEquals("provider_key/preset:openai", healthy.snapshotStrict()!!.apiKeyRef)
+            assertEquals(1L, healthy.currentRevision())
+        }
+    }
 }

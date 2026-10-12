@@ -30,7 +30,8 @@ import okhttp3.OkHttpClient
  * - `response.failed` / `response.incomplete` -> [StreamEvent.Failed].
  * - Opaque payloads (encrypted reasoning etc.) are never surfaced as text:
  *   a `reasoning` output item only emits [StreamEvent.ReasoningPresent]
- *   (presence marker, no payload).
+ *   (presence marker, no payload). Visible reasoning deltas still surface as
+ *   [StreamEvent.ReasoningDelta]; only opaque items skip text conversion.
  */
 class ResponsesProvider(
     private val config: ProviderConfig,

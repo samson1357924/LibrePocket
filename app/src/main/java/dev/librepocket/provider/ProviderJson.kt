@@ -1,5 +1,6 @@
 package dev.librepocket.provider
 
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -32,6 +33,10 @@ internal fun toolSchemaElement(schemaJson: String) = try {
     }
 } catch (e: ProviderFailure) {
     throw e
+} catch (e: SerializationException) {
+    // SerializationException extends IllegalArgumentException in kotlinx-serialization 1.10.0;
+    // catch first so a future upstream hierarchy change still maps correctly.
+    throw ProviderFailure(false, "TOOL_SCHEMA_INVALID")
 } catch (e: IllegalArgumentException) {
     throw ProviderFailure(false, "TOOL_SCHEMA_INVALID")
 }
@@ -248,6 +253,10 @@ internal fun validateToolArgumentsObject(argumentsJson: String) {
         if (el !is JsonObject) throw ProviderFailure(false, "TOOL_ARGUMENTS_MUST_BE_OBJECT")
     } catch (e: ProviderFailure) {
         throw e
+    } catch (e: SerializationException) {
+        // SerializationException extends IllegalArgumentException in kotlinx-serialization 1.10.0;
+        // catch first so a future upstream hierarchy change still maps correctly.
+        throw ProviderFailure(false, "TOOL_ARGUMENTS_INVALID")
     } catch (e: IllegalArgumentException) {
         throw ProviderFailure(false, "TOOL_ARGUMENTS_INVALID")
     }
@@ -265,6 +274,10 @@ internal fun toolInputElement(argumentsJson: String) = try {
     }
 } catch (e: ProviderFailure) {
     throw e
+} catch (e: SerializationException) {
+    // SerializationException extends IllegalArgumentException in kotlinx-serialization 1.10.0;
+    // catch first so a future upstream hierarchy change still maps correctly.
+    throw ProviderFailure(false, "TOOL_ARGUMENTS_INVALID")
 } catch (e: IllegalArgumentException) {
     throw ProviderFailure(false, "TOOL_ARGUMENTS_INVALID")
 }

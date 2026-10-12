@@ -14,8 +14,10 @@ import java.util.UUID
  *
  * A reasoning-sourced turn (`hasReasoning == true`) appends one extra
  * `reasoning` event with the same runId and empty text right after its
- * `assistant` event: a payload-free marker (no reasoning content ever
- * touches the store) that lets history replay restore
+ * `assistant` event: the marker itself is empty (flag-only; no reasoning
+ * payload touches the store), but visible reasoning deltas remain merged
+ * into the assistant text and persist as usual (pre-existing behavior).
+ * History replay restores
  * [dev.librepocket.chat.UiMessage.hasReasoning] so resumed reasoning-origin
  * turns still fail closed on follow-up instead of replaying as plain text.
  *

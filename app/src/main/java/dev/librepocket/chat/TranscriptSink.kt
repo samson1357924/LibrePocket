@@ -15,8 +15,10 @@ interface TranscriptSink {
   /**
    * @param hasReasoning true when the finished assistant block is
    *   reasoning-sourced (see [UiMessage.hasReasoning]); sinks persist it as
-   *   a payload-free marker so resume restores the flag instead of replaying
-   *   a reasoning origin as plain text.
+   *   a payload-free marker (marker itself empty, flag-only) so resume
+   *   restores the flag instead of replaying a reasoning origin as plain
+   *   text. Visible reasoning deltas remain merged into the assistant text
+   *   and persist as usual (pre-existing behavior).
    */
   suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean = false)
   suspend fun onTurnFailed(runId: String, error: String)

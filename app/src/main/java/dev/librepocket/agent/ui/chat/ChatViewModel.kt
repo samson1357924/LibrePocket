@@ -1510,48 +1510,62 @@ class ChatViewModel(
     private suspend fun loadHistory(sessionId: String): List<UiMessage>? {
         val backing: SessionStore = sessions.storeOrNull() ?: return emptyList()
         if (backing.getSession(sessionId) == null) return null
-        // Phase 1: page through every event first. Reasoning markers
-        // (kind="reasoning", same runId, empty text) may land on a different
-        // page than their assistant event, so the marker runId set must be
-        // complete before any UiMessage is built.
-        val all = ArrayList<TranscriptEvent>()
+        // Single-pass streaming replay: pages are consumed as they arrive. out
+        // text stays O(HISTORY_CAP); runIdToIndex stays O(CAP) with one index
+        // per emitted assistant; pendingMarkers holds only orphan runId short
+        // strings, worst case O(HISTORY_SCAN_CAP) entries, far smaller than full events.
+        // Marker events never render; an assistant event whose runId has a marker
+        // restores hasReasoning so resumed reasoning-origin turns still fail
+        // closed on follow-up. The message cap still counts user/assistant
+        // messages only, while the scan bound counts raw scanned events.
+        val out = ArrayList<UiMessage>()
+        // Only already-emitted assistants, so a late marker can patch its flag.
+        val runIdToIndex = HashMap<String, Int>()
+        // Markers seen before their assistant (reorder / cross-page tolerance).
+        val pendingMarkers = HashSet<String>()
+        var scanned = 0
         var afterSeq = 0L
-        while (all.size < HISTORY_SCAN_CAP) {
+        outer@ while (scanned < HISTORY_SCAN_CAP) {
             val page = backing.loadEvents(sessionId, afterSeq, HISTORY_PAGE)
             if (page.isEmpty()) break
-            // Respect the scan bound even when a page would overshoot it.
-            val room = HISTORY_SCAN_CAP - all.size
-            if (page.size > room) {
-                all.addAll(page.take(room))
-                break
+            for (event in page) {
+                if (scanned >= HISTORY_SCAN_CAP) break@outer
+                scanned++
+                when (event.kind) {
+                    "user" -> if (out.size < HISTORY_CAP) {
+                        out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = false))
+                    }
+                    "assistant" -> if (out.size < HISTORY_CAP) {
+                        val flagged = pendingMarkers.remove(event.runId)
+                        out.add(
+                            UiMessage(
+                                id = "hist-${event.seq}",
+                                role = event.kind,
+                                text = event.text,
+                                isPartial = false,
+                                hasReasoning = flagged,
+                            ),
+                        )
+                        runIdToIndex.putIfAbsent(event.runId, out.size - 1)
+                    }
+                    "reasoning" -> {
+                        val idx = runIdToIndex[event.runId]
+                        if (idx != null) {
+                            val cur = out[idx]
+                            if (!cur.hasReasoning) out[idx] = cur.copy(hasReasoning = true)
+                        } else if (out.size < HISTORY_CAP) {
+                            // out still has room, so a later assistant may consume
+                            // this marker. When out is full no further assistant
+                            // appends happen, so buffering would leave a dead entry.
+                            pendingMarkers.add(event.runId)
+                        }
+                    }
+                }
             }
-            all.addAll(page)
             afterSeq = page.last().seq
             if (page.size < HISTORY_PAGE) break
-        }
-        // Phase 2: rebuild messages. Marker events never render; an assistant
-        // event whose runId has a marker restores hasReasoning so resumed
-        // reasoning-origin turns still fail closed on follow-up. The cap
-        // still counts user/assistant messages only.
-        val reasoningRuns = all.asSequence()
-            .filter { it.kind == "reasoning" }
-            .map { it.runId }
-            .toSet()
-        val out = ArrayList<UiMessage>()
-        for (event in all) {
-            if (out.size >= HISTORY_CAP) break
-            when (event.kind) {
-                "user" -> out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = false))
-                "assistant" -> out.add(
-                    UiMessage(
-                        id = "hist-${event.seq}",
-                        role = event.kind,
-                        text = event.text,
-                        isPartial = false,
-                        hasReasoning = event.runId in reasoningRuns,
-                    ),
-                )
-            }
+            // When out is full no further appends happen, but scanning continues
+            // to SCAN_CAP/EOF so late markers still patch already-emitted flags.
         }
         return out
     }

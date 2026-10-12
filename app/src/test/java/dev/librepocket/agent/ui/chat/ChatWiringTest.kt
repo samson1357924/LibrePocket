@@ -428,6 +428,57 @@ class ChatWiringTest {
     }
 
     @Test
+    fun openSessionRestoresMarkerArrivingBeforeAssistant() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        runBlocking {
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+                ),
+            )
+            // Marker persisted before its assistant event: loadHistory buffers
+            // it in pendingMarkers until the assistant arrives.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "reasoning", text = "", createdAt = 2L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "assistant", text = "a1", createdAt = 3L,
+                ),
+            )
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 2 }
+        val replayed = vm.messages.value
+        // The early marker restores the flag but never renders as a message.
+        assertEquals(listOf("q1", "a1"), replayed.map { it.text })
+        assertFalse(replayed[0].hasReasoning)
+        assertTrue(replayed[1].hasReasoning)
+    }
+
+    @Test
     fun openSessionRestoresReasoningMarkerAcrossPages() {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }

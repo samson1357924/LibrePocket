@@ -89,9 +89,11 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  * ([UiMessage.hasReasoning], rebuilt into [ChatMessage.hasReasoning] so
  * tool-dependent / thinking-mode follow-ups fail closed while ordinary
  * no-tools follow-ups continue),
- * and persisted as a payload-free `reasoning` marker event via
+ * and persisted as a payload-free `reasoning` marker event (marker itself
+ * empty, flag-only) via
  * [TranscriptSink.onTurnSucceeded]/[TranscriptSink.onTurnCancelled] so
- * resume restores the flag,
+ * resume restores the flag. Visible reasoning deltas remain merged into the
+ * assistant text and persist as usual (pre-existing behavior),
  * [StreamEvent.ToolDelta]/[StreamEvent.ToolDone] are aggregated and recorded
  * (marker text + [TranscriptSink.onToolDone]) so tool calls are never dropped,
  * [StreamEvent.Usage] is recorded ([TranscriptSink.onUsage] + [lastUsage]).

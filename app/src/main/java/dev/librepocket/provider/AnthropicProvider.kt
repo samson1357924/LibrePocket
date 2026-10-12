@@ -155,6 +155,10 @@ class AnthropicProvider(
                     parts.add(anthropicToolUseJson(tc))
                 }
             }
+            // Defense-in-depth: a user-empty message is unreachable in production
+            // (non-blank admission plus the ephemeral time block always add text, and
+            // StripAll needs supportsImages=false while production always passes true),
+            // but an empty assistant history entry is reachable, so the guard stays.
             if (parts.isEmpty()) throw ProviderFailure(false, "ANTHROPIC_EMPTY_CONTENT")
             sb.append("{\"role\":${q(m.role)},\"content\":[${parts.joinToString(",")}]}")
         }

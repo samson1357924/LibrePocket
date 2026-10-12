@@ -251,6 +251,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
       'permissions/id_rsa', 'tests/credentials.json', 'tests/secret.asc',
       'app/src/test/id_rsa.txt', 'config/keystore.properties',
       'app/googleservice-info.plist', 'config/service-account-prod.json',
+      'keys/secret.asc.bak', 'keys/x.ppk.bak', 'keys/x.ppk.txt', 'APP/SECRET.ASC.BAK',
+      'config/service-account-prod.json.bak', 'config/service-account-prod.json.txt',
     ]) {
       assert.equal(isHardDeniedReviewFile(denied), true, `H1 hard-denies ${denied}`);
       assert.ok(!filterReviewDiffFiles([denied]).includes(denied), `H1 filters ${denied} despite must-include`);

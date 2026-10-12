@@ -1236,7 +1236,7 @@ class SetupViewModel(
             }
             // CAS loss: a concurrent winner advanced the revision. The journal
             // is superseded — discard it without touching winner metadata.
-            discardSupersededJournal()
+            discardSupersededJournal(pending)
             return PendingDeleteOutcome.STALE
         } catch (e: CancellationException) {
             val probe = withContext(NonCancellable) { probeLogoutClear(pending.revision) }
@@ -1255,7 +1255,7 @@ class SetupViewModel(
             return when (probe) {
                 LogoutClearProbe.COMMITTED -> PendingDeleteOutcome.COMMITTED
                 LogoutClearProbe.STALE -> {
-                    discardSupersededJournal()
+                    discardSupersededJournal(pending)
                     PendingDeleteOutcome.STALE
                 }
                 LogoutClearProbe.UNKNOWN -> PendingDeleteOutcome.UNKNOWN
@@ -1270,7 +1270,7 @@ class SetupViewModel(
                     when (retried) {
                         true -> PendingDeleteOutcome.COMMITTED
                         false -> {
-                            discardSupersededJournal()
+                            discardSupersededJournal(pending)
                             PendingDeleteOutcome.STALE
                         }
                         // Retry transport still broken, but the probe already
@@ -1284,15 +1284,21 @@ class SetupViewModel(
     }
 
     /**
-     * Best-effort discard of a superseded journal (STALE path only).
+     * Best-effort conditional discard of a superseded journal (STALE path only).
      *
-     * Removes ONLY the journal key: winner metadata and the revision survive
-     * byte-for-byte. A transport failure keeps the journal (the next replay
-     * re-classifies STALE and retries the discard); cancellation rethrows.
+     * Removes ONLY the journal key via
+     * [EndpointStore.removePendingDeleteIfMatches]: the discard is a single-edit
+     * compare-and-delete against [expected], so a journal recreated for a newer
+     * generation between the STALE classification and this discard is kept
+     * (mismatch writes nothing — no ABA delete of the replacement) while the
+     * STALE report below still holds either way. Winner metadata and the
+     * revision survive byte-for-byte on a match. A transport failure keeps the
+     * journal (the next replay re-classifies STALE and retries the discard);
+     * cancellation rethrows.
      */
-    private suspend fun discardSupersededJournal() {
+    private suspend fun discardSupersededJournal(expected: PendingDelete) {
         try {
-            store.removePendingDelete()
+            store.removePendingDeleteIfMatches(expected)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -1532,7 +1538,7 @@ class SetupViewModel(
                         ?.takeIf { it.startsWith("provider_key/") }
                         ?.let { SetupValidation.aliasFromRef(it) }
                         ?.takeIf { it.isNotBlank() }
-                    var journalWritten = false
+                    var writtenJournal: PendingDelete? = null
                     if (alias != null) {
                         // 1. Journal BEFORE the vault delete (same-file atomic
                         // edit, never overwrites): a crash/cancel in the
@@ -1561,7 +1567,7 @@ class SetupViewModel(
                             val journalWon = try {
                                 withContext(NonCancellable) {
                                     val current = store.pendingDelete()
-                                    current?.alias == alias && current.revision == expectedRevision
+                                    current == journal
                                 }
                             } catch (_: CancellationException) {
                                 false
@@ -1599,7 +1605,7 @@ class SetupViewModel(
                                 return@withLock
                             }
                         } else {
-                            journalWritten = true
+                            writtenJournal = journal
                         }
                         // 2. Idempotent vault delete. A failure aborts before
                         // the clear with the journal KEPT: readers stay folded
@@ -1623,7 +1629,7 @@ class SetupViewModel(
                             // CAS loss: a concurrent winner advanced the
                             // revision. Our journal (if any) is superseded —
                             // discard it without touching winner metadata.
-                            if (journalWritten) discardSupersededJournal()
+                            writtenJournal?.let { discardSupersededJournal(it) }
                             logoutError = "LOGOUT_STALE"
                         }
                     } catch (e: CancellationException) {
@@ -1659,7 +1665,7 @@ class SetupViewModel(
                             LogoutClearProbe.STALE -> {
                                 // Winner advanced: our journal (if any) is
                                 // superseded — discard without touching winner.
-                                if (journalWritten) discardSupersededJournal()
+                                writtenJournal?.let { discardSupersededJournal(it) }
                                 logoutError = "LOGOUT_STALE"
                             }
                             LogoutClearProbe.UNKNOWN -> {
@@ -1679,7 +1685,7 @@ class SetupViewModel(
                                         // A winner slipped in between the probe
                                         // and the retry: superseded journal
                                         // goes, winner metadata stays.
-                                        if (journalWritten) discardSupersededJournal()
+                                        writtenJournal?.let { discardSupersededJournal(it) }
                                         logoutError = "LOGOUT_STALE"
                                     }
                                     null -> logoutError = "LOGOUT_CLEAR_FAILED"

@@ -334,14 +334,49 @@ class EndpointStore(
     }
 
     /**
+     * Conditional discard of a superseded teardown journal (STALE path only).
+     *
+     * Inside a single `dataStore.edit {}` transaction compares the stored
+     * [ENDPOINT_PENDING_DELETE_V1] raw string against [expected]
+     * ([PendingDelete.format]): match → removes ONLY the journal key (winner
+     * metadata and the revision survive byte-for-byte) and returns `true`;
+     * mismatch (journal already replaced by a newer generation, or already
+     * gone) → writes nothing and returns `false`.
+     *
+     * Raw-string compare covers alias+revision+timestamp, so a journal
+     * recreated for a newer generation — even with the same alias+revision —
+     * never compare-equals a stale predecessor (no ABA delete of the
+     * replacement). Fail-closed: [expected] validation
+     * ([IllegalArgumentException]) and DataStore failures propagate; only the
+     * expected already-replaced contention path returns `false`.
+     */
+    suspend fun removePendingDeleteIfMatches(expected: PendingDelete): Boolean {
+        val expectedRaw = expected.format()
+        return withContext(ioDispatcher) {
+            var removed = false
+            dataStore.edit { prefs ->
+                if (prefs[ENDPOINT_PENDING_DELETE_V1] != expectedRaw) {
+                    return@edit
+                }
+                prefs.remove(ENDPOINT_PENDING_DELETE_V1)
+                removed = true
+            }
+            removed
+        }
+    }
+
+    /**
      * Unconditionally removes the teardown journal WITHOUT touching metadata
      * or the revision.
      *
-     * ONLY for the STALE path: a concurrent winner advanced the revision, so
-     * the journal is superseded and must be discarded while the winner's
-     * metadata (and revision) survives byte-for-byte. Never use this to finish
-     * a teardown — the fenced clear ([clearIfRevision], which removes the
-     * journal atomically on a win) owns that.
+     * WARNING: production MUST NOT call this — the unconditional remove can
+     * ABA-delete a journal recreated for a newer generation between the
+     * STALE classification and the discard. Kept for tests only; STALE
+     * callers MUST use [removePendingDeleteIfMatches] (single-edit
+     * compare-and-delete) so a superseded discard never deletes a newer
+     * generation's journal. Never use this to finish a teardown either — the
+     * fenced clear ([clearIfRevision], which removes the journal atomically
+     * on a win) owns that.
      */
     suspend fun removePendingDelete() {
         withContext(ioDispatcher) {
@@ -527,7 +562,7 @@ class EndpointStore(
      * On a win the [ENDPOINT_PENDING_DELETE_V1] journal is removed in the SAME
      * atomic edit (logout teardown commits journal + metadata together); on a
      * mismatch nothing is written and a superseded journal survives for the
-     * caller to discard via [removePendingDelete] (never by retrying here — a
+     * caller to discard via [removePendingDeleteIfMatches] (never by retrying here — a
      * retry would delete the winner's metadata).
      *
      * @param expectedRevision MUST come from [currentRevision()], never

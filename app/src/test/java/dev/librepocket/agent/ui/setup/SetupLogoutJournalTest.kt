@@ -14,6 +14,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -338,6 +339,69 @@ class SetupLogoutJournalTest {
             assertFalse("stale predecessor re-delete is harmless", delegate.hasKey("preset:openai"))
             assertEquals(EndpointReadiness.READY, store.readiness(delegate))
         }
+        assertEquals(listOf("preset:openai"), vault.deletedIds)
+    }
+
+    @Test
+    fun staleDiscardAfterJournalRecreatedKeepsReplacement() {
+        // ABA: R1 replays J_A and parks inside clearIfRevision (after the
+        // idempotent delete won); a newer generation — replay J_A to
+        // COMMITTED, save winner metadata B, journal J_B — lands between
+        // R1's CAS-loss and R1's discard. The conditional discard must keep
+        // J_B: the outcome is still STALE, but the replacement journal,
+        // winner metadata, and revision survive byte-for-byte.
+        val raw = rawDelegate("logout-journal-aba-keep")
+        val preseed = EndpointStore(raw)
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val winnerAlias = "preset:openai#staged-" + "b".repeat(32)
+        val journalA = PendingDelete("preset:openai", 1L, 1700000000000L)
+        val journalB = PendingDelete(winnerAlias, 3L, 1800000000000L)
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            delegate.putKey(winnerAlias, "unit-test-winner-key-BBBBBBBB".toCharArray())
+            preseed.save(journalPreseed())
+            assertEquals(1L, preseed.currentRevision())
+            assertTrue(preseed.writePendingDeleteIfAbsent(journalA))
+        }
+        // updatesToPass = 0: R1's clearIfRevision (update #1) parks at the
+        // gate BEFORE touching the delegate, so the winner below writes via
+        // the raw delegate with the gate counter untouched (no counting
+        // flake); the parked update holds no DataStore lock, so no deadlock.
+        val gated = GatedUpdateDataStore(raw, gateBeforeUpdate = true, updatesToPass = 0)
+        val store = EndpointStore(gated)
+        val vault = CountingVault(delegate)
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        val r1Scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(r1Scope)
+        val r1 = r1Scope.async { vm.reconcilePendingDelete() }
+        runBlocking { withTimeout(10_000) { gated.entered.await() } }
+        val healthy = EndpointStore(raw)
+        runBlocking {
+            assertTrue(healthy.clearIfRevision(1L))
+            assertEquals(2L, healthy.currentRevision())
+            healthy.save(journalPreseed(model = "m-new").copy(apiKeyRef = "provider_key/$winnerAlias"))
+            assertEquals(3L, healthy.currentRevision())
+            assertTrue(healthy.writePendingDeleteIfAbsent(journalB))
+        }
+        gated.release.complete(Unit)
+        val outcome = runBlocking { withTimeout(10_000) { r1.await() } }
+        assertEquals(SetupViewModel.PendingDeleteOutcome.STALE, outcome)
+        runBlocking {
+            assertEquals("replacement journal survives the stale discard", journalB, healthy.pendingDelete())
+            assertEquals(3L, healthy.currentRevision())
+            assertEquals("provider_key/$winnerAlias", healthy.snapshotStrict()!!.apiKeyRef)
+            assertEquals("m-new", healthy.snapshotStrict()!!.model)
+            // Lenient readers stay folded while the replacement is in flight.
+            assertNull(healthy.observe().first())
+            assertTrue("winner key survives", delegate.hasKey(winnerAlias))
+            assertFalse("stale predecessor re-delete is harmless", delegate.hasKey("preset:openai"))
+        }
+        // R1 deleted only the stale predecessor alias, never the winner slot.
         assertEquals(listOf("preset:openai"), vault.deletedIds)
     }
 }

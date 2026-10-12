@@ -640,4 +640,52 @@ class EndpointStoreTest {
         assertNull(store.observe().first())
         assertEquals(2L, store.currentRevision())
     }
+
+    @Test
+    fun removePendingDeleteIfMatchesKeepsNewerJournal() = runBlocking {
+        val store = newStore()
+        store.save(sampleConfig())
+        val journalA = PendingDelete("preset:openai", 1L, 100L)
+        assertTrue(store.writePendingDeleteIfAbsent(journalA))
+        // A newer generation replaces the journal (direct overwrite stands in
+        // for the production clear-win + re-journal sequence, which
+        // writePendingDeleteIfAbsent never performs by design) and advances
+        // the revision.
+        val journalB = PendingDelete("preset:openai", 2L, 200L)
+        store.dataStore.edit { prefs ->
+            prefs[ENDPOINT_PENDING_DELETE_V1] = journalB.format()
+        }
+        store.save(sampleConfig().copy(model = "gpt-4o-mini-v2"))
+        assertEquals(2L, store.currentRevision())
+        // Stale discard of J_A is a mismatch: J_B, metadata, revision stay.
+        assertFalse(store.removePendingDeleteIfMatches(journalA))
+        assertEquals(journalB, store.pendingDelete())
+        assertEquals(sampleConfig().copy(model = "gpt-4o-mini-v2", configRevision = 2L), store.snapshotStrict())
+        assertEquals(2L, store.currentRevision())
+        // Matching discard removes only the journal.
+        assertTrue(store.removePendingDeleteIfMatches(journalB))
+        assertNull(store.pendingDelete())
+        assertEquals(sampleConfig().copy(model = "gpt-4o-mini-v2", configRevision = 2L), store.snapshotStrict())
+        assertEquals(2L, store.currentRevision())
+    }
+
+    @Test
+    fun conditionalRemoveSameAliasRevDifferentTsIsMismatch() = runBlocking {
+        val store = newStore()
+        store.save(sampleConfig())
+        val written = PendingDelete("preset:openai", 1L, 100L)
+        assertTrue(store.writePendingDeleteIfAbsent(written))
+        // Same alias+revision but a different timestamp is a different
+        // generation: must NOT delete.
+        assertFalse(store.removePendingDeleteIfMatches(PendingDelete("preset:openai", 1L, 101L)))
+        assertEquals(written, store.pendingDelete())
+        assertEquals(1L, store.currentRevision())
+        // Matching discard wins; a repeat against the now-absent journal is a
+        // mismatch (never throws, never writes).
+        assertTrue(store.removePendingDeleteIfMatches(written))
+        assertNull(store.pendingDelete())
+        assertFalse(store.removePendingDeleteIfMatches(written))
+        assertEquals(sampleConfig().copy(configRevision = 1L), store.snapshotStrict())
+        assertEquals(1L, store.currentRevision())
+    }
 }

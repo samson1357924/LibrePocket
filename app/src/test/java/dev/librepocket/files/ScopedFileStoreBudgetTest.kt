@@ -6,7 +6,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import java.io.File
+import java.nio.file.DirectoryStream
 import java.nio.file.Files
+import java.nio.file.Path
 
 /**
  * #16 ScopedFileStore 預算測試：read size budget、write 有界比對、
@@ -191,6 +193,170 @@ class ScopedFileStoreBudgetTest {
         // 零預算必超時（確定性觸發，不靠 sleep）。
         assertBudgeted({ store.list(deadlineMs = 0) }, FileBudgetCode.LIST_TIMEOUT)
         assertEquals(listOf("a.txt"), store.list(deadlineMs = 10_000))
+    }
+
+    // ---- list：階段二 lazy 列舉上限 + visited-entry deadline ----
+
+    @Test fun listSingleDirFarExceedsCapFailsFast() {
+        val root = tempRoot()
+        val store = ScopedFileStore(root)
+        // 單一目錄 500 檔、cap 8：第 maxEntries+1 筆即拋 LIST_TOO_MANY。
+        // 實作以 DirectoryStream 逐項遍歷，不一次配置整個目錄陣列
+        //（無 listFiles 全量；見 ScopedFileStore.list KDoc 資源保證）。
+        repeat(500) { i -> File(root, "f$i.txt").writeText("x") }
+        assertBudgeted({ store.list(maxEntries = 8) }, FileBudgetCode.LIST_TOO_MANY)
+        // 恰滿合法對照：cap 足夠時全量可見，且排序穩定。
+        val all = store.list(maxEntries = 500)
+        assertEquals(500, all.size)
+        assertEquals(all.sorted(), all)
+    }
+
+    @Test fun listIgnoredEntriesStillEnforceDeadline() {
+        val root = tempRoot()
+        val store = ScopedFileStore(root)
+        // 大量被忽略 entry、無普通檔：deadline 須以 visited-entry 計數觸發，
+        // 不以收錄檔數為準；零預算確定性超時，不靠 sleep。
+        // 注意：本測試起手檢查即拋，新舊碼皆過，僅作迴歸；visited-entry 證明見
+        // listIgnoredEntriesVisitedCountTriggersTimeoutWithFakeClock。
+        repeat(300) { i -> File(root, ".lp-stale-$i.tmp").writeText("stale") }
+        assertBudgeted({ store.list(deadlineMs = 0) }, FileBudgetCode.LIST_TIMEOUT)
+        // 對照：充足預算下被忽略 entry 不被收錄，回空表。
+        assertEquals(emptyList<String>(), store.list(deadlineMs = 10_000))
+    }
+
+    @Test fun listIgnoredEntriesVisitedCountTriggersTimeoutWithFakeClock() {
+        // 阻擋項 1 回歸：deterministic fake clock 證明 visited-entry（含略過者）修復。
+        // 舊邏輯僅計收錄檔（accepted=0 → 無 periodic 檢查，僅起手+返回，見舊碼 noteProgress），
+        // 同 fake 下必回空表 → 本測試在舊碼 FAIL；新碼在 256 處 LIST_TIMEOUT → PASS。
+        // 全程無 sleep、無 wall-clock，每次 nowNanos 呼叫前進固定 1ms。
+        val root = tempRoot()
+        val store = ScopedFileStore(root)
+        repeat(300) { i -> File(root, ".lp-stale-$i.tmp").writeText("stale") }
+        val stepNanos = 1_000_000L
+        fun freshFake(): () -> Long {
+            var t = 0L
+            return { t += stepNanos; t }
+        }
+        fun defaultFactory(dir: File): DirectoryStream<Path>? {
+            return try {
+                Files.newDirectoryStream(dir.toPath())
+            } catch (_: Exception) {
+                null
+            }
+        }
+        // deadlineMs=3 → deadlineNanos=1ms+3ms=4ms。
+        // 呼叫序：calc(t=1)→起手(t=2,2-4<0不過)→128(t=3,不過)→256(t=4,4-4>=0拋)。
+        // 舊碼同場景僅 calc+起手+返回共 3 ticks(t=3<4)，不拋 → FAIL，證明區分度。
+        assertBudgeted(
+            {
+                store.list(
+                    "",
+                    ScopedFileStore.MAX_LIST_ENTRIES,
+                    ScopedFileStore.MAX_LIST_DEPTH,
+                    3L,
+                    freshFake(),
+                    ::defaultFactory,
+                )
+            },
+            FileBudgetCode.LIST_TIMEOUT,
+        )
+        // 對照：充足預算同 fake 下回空表（被略過者不收錄），證明超時源於預算而非列舉錯誤。
+        // deadlineMs=10 → deadline=11ms，5 ticks(t=5<11)不過，全走完 300 個略過 entry。
+        assertEquals(
+            emptyList<String>(),
+            store.list(
+                "",
+                ScopedFileStore.MAX_LIST_ENTRIES,
+                ScopedFileStore.MAX_LIST_DEPTH,
+                10L,
+                freshFake(),
+                ::defaultFactory,
+            ),
+        )
+    }
+
+    @Test fun listSingleDirFailsFastWithoutFullIteration() {
+        // 阻擋項 2 回歸（b）：可注入 stream 工廠計數，證明未全量配置、fail-fast。
+        // 500 檔、cap 8：第 maxEntries+1 筆即拋，next() 應恰 9 次、開流僅 base 一次，
+        // 遠小於 500；若重引入全量配置或掃完全部才拋，nextCount 必 >>9 → FAIL。
+        val root = tempRoot()
+        val store = ScopedFileStore(root)
+        repeat(500) { i -> File(root, "f$i.txt").writeText("x") }
+        var openCount = 0
+        var nextCount = 0
+        fun countingFactory(dir: File): DirectoryStream<Path>? {
+            openCount++
+            val real = Files.newDirectoryStream(dir.toPath())
+            return object : DirectoryStream<Path> by real {
+                override fun iterator(): MutableIterator<Path> {
+                    val it = real.iterator()
+                    return object : MutableIterator<Path> by it {
+                        override fun next(): Path {
+                            nextCount++
+                            return it.next()
+                        }
+                    }
+                }
+            }
+        }
+        assertBudgeted(
+            {
+                store.list(
+                    "",
+                    8,
+                    ScopedFileStore.MAX_LIST_DEPTH,
+                    ScopedFileStore.LIST_DEADLINE_MS,
+                    System::nanoTime,
+                    ::countingFactory,
+                )
+            },
+            FileBudgetCode.LIST_TOO_MANY,
+        )
+        assertEquals("should open only base dir", 1, openCount)
+        assertEquals("should stop at maxEntries+1", 9, nextCount)
+        assertTrue("must not iterate all 500 (got $nextCount)", nextCount < 500)
+    }
+
+    @Test fun listImplementationDoesNotUseEagerListFiles() {
+        // 阻擋項 2 回歸（a）：靜態約束，主列舉禁全量配置 API。
+        // 實作僅以 newDirectoryStream 逐項遍歷；若重引入 .listFiles( 即 FAIL。
+        // 註解提及舊語義用無點形式（listFiles)，不觸發；此處僅掃除註解後的程式碼。
+        val source = findScopedFileStoreSource()
+            ?: fail("cannot locate ScopedFileStore.kt from user.dir=${System.getProperty("user.dir")}").let {
+                throw AssertionError("unreachable")
+            }
+        val codeOnly = stripComments(source.readText())
+        val hits = Regex("""\.listFiles\s*\(""").findAll(codeOnly).toList()
+        assertTrue(
+            "ScopedFileStore.list must stay lazy (no .listFiles(), found ${hits.size})",
+            hits.isEmpty(),
+        )
+    }
+
+    private fun findScopedFileStoreSource(): File? {
+        val userDir = File(System.getProperty("user.dir") ?: ".")
+        var cur: File? = userDir
+        repeat(6) {
+            val c = cur ?: return@repeat
+            val a = File(c, "app/src/main/java/dev/librepocket/files/ScopedFileStore.kt")
+            if (a.isFile) return a
+            val b = File(c, "src/main/java/dev/librepocket/files/ScopedFileStore.kt")
+            if (b.isFile) return b
+            cur = c.parentFile
+        }
+        val fallback = File(
+            "/tmp/opencode/LibrePocket-fix-filestore-budget/app/src/main/java/dev/librepocket/files/ScopedFileStore.kt",
+        )
+        return if (fallback.isFile) fallback else null
+    }
+
+    private fun stripComments(src: String): String {
+        var s = src.replace(Regex("""(?s)/\*.*?\*/"""), "")
+        s = s.lines().joinToString("\n") { line ->
+            val idx = line.indexOf("//")
+            if (idx >= 0) line.substring(0, idx) else line
+        }
+        return s
     }
 
     // ---- list：symlink 環守衛 ----

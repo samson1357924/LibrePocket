@@ -146,11 +146,11 @@ fun ChatScreen(
     // session 三者全等才朗讀。speakToken 每次新建／失效遞增，使舊確認協程失效。
     var pendingSpeak by remember { mutableStateOf<PendingSpeak?>(null) }
     var speakToken by remember { mutableLongStateOf(0L) }
-    // P2 確認競態世代：outputEnabled 每次變更即 bump（初次組合時與 prev 同值，不 bump；
-    // capture 皆發生在其後）。確認協程以此偵測 await 期間的開關翻轉，判定見
+    // P2 確認競態世代：outputEnabled 每次變更即 bump（首幀 hasPrev 為 false，
+    // 不 bump；capture 皆發生在其後）。確認協程以此偵測 await 期間的開關翻轉，判定見
     // VoiceTtsConfirmState.shouldSpeakAfterConfirm（純函數，JVM 可測）。
     var outputGeneration by remember { mutableLongStateOf(0L) }
-    var prevOutputEnabled by remember { mutableStateOf(outputEnabled) }
+    val (prevOutputEnabled, hasPrevOutput) = rememberPrevious(outputEnabled)
     // M2 延遲建構：voice_output 關閉時不初始化 TTS 引擎（不佔系統服務）。
     // R5-2 Main 投遞 epoch fence：speaker 回調（binder 執行緒）攜事件 epoch，
     // 經主線程作用域投遞時以 shouldApplyUiEvent 比對當代 currentEpoch，不符丟棄
@@ -193,9 +193,8 @@ fun ChatScreen(
     // voice_output 關閉：TTS 通道消失，清 tts 錯誤、寫入失敗警告與待確認朗讀
     //（token 遞增使 suspend 中的舊確認協程失效，恢復後丟棄不 speak）。
     LaunchedEffect(outputEnabled) {
-        if (outputEnabled != prevOutputEnabled) {
+        if (hasPrevOutput && outputEnabled != prevOutputEnabled) {
             outputGeneration++
-            prevOutputEnabled = outputEnabled
         }
         if (!outputEnabled) {
             voiceErrors.onOutputDisabled()
@@ -205,12 +204,11 @@ fun ChatScreen(
         }
     }
     // 新對話不卸載 ChatScreen：session 切換即清待確認朗讀並使舊 token 失效，
-    // 否則殘留 pending 會跨會話朗讀。初次組合與 current 同值時不動
-    //（仿 outputGeneration 的 prev 比對）。
-    var prevSessionId by remember { mutableStateOf(currentSessionId) }
+    // 否則殘留 pending 會跨會話朗讀。首幀 hasPrev 為 false，不動
+    //（與 outputGeneration 同判定形狀）。
+    val (prevSessionId, hasPrevSession) = rememberPrevious(currentSessionId)
     LaunchedEffect(currentSessionId) {
-        if (currentSessionId != prevSessionId) {
-            prevSessionId = currentSessionId
+        if (hasPrevSession && currentSessionId != prevSessionId) {
             speakToken++
             pendingSpeak = null
         }

@@ -267,6 +267,29 @@ class VoiceSwitchStoreTest {
     }
 
     @Test
+    fun ttsAck_readFailureIo_defaultsUnacknowledged() = runBlocking {
+        // ack 鏡像 observeSwitches：IOException 降級為預設未確認，不拋。
+        assertFalse(throwingStore().observeTtsAcknowledged().first())
+    }
+
+    @Test
+    fun ttsAck_nonIoException_isRethrown() = runBlocking {
+        // ack 鏡像 observeSwitches：非 IOException 照拋，不靜默成預設值。
+        val broken = object : DataStore<Preferences> {
+            override val data: Flow<Preferences> = flow { throw IllegalStateException("injected ack non-io failure") }
+            override suspend fun updateData(transform: suspend (Preferences) -> Preferences): Preferences {
+                throw IllegalStateException("injected ack non-io failure")
+            }
+        }
+        try {
+            VoiceSwitchStore(broken).observeTtsAcknowledged().first()
+            fail("expected IllegalStateException to propagate")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message!!.contains("injected ack non-io failure"))
+        }
+    }
+
+    @Test
     fun disclosureAck_defaultsFalseAndPersists() = runBlocking {
         val dir = Files.createTempDirectory("voice-test").toFile().also { tmpDirs.add(it) }
         val first = newStore(dir)

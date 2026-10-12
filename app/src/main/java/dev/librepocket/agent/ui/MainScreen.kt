@@ -76,6 +76,9 @@ object Routes {
 }
 
 // 語音持久化寫入失敗的可觀測性（仿 TurnController 類名字串 TAG 的 Log.w 先例）。
+// R5-3 語義收斂：寫入失敗處理以 try/catch(Exception) 取代 runCatching（後者接
+// Throwable）：Error 照常放行（不吞 VirtualMachineError 等），實務與舊語義無差別
+//（DataStore 寫入只拋 Exception／CancellationException），CancellationException 照拋。
 private const val TAG = "MainScreen"
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -314,12 +317,15 @@ fun MainScreen(
                             voiceSwitchLoadFailed = voiceSnapshot.loadFailed,
                             ttsAcknowledged = ttsAcknowledged,
                             onTtsAcknowledged = {
-                                runCatching { voiceStore.acknowledgeTtsDisclosure() }
-                                    .onFailure { e ->
-                                        if (e is CancellationException) throw e
-                                        Log.w(TAG, "voice tts ack persist failed", e)
-                                    }
-                                    .isSuccess
+                                try {
+                                    voiceStore.acknowledgeTtsDisclosure()
+                                    true
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "voice tts ack persist failed", e)
+                                    false
+                                }
                             },
                         )
                     }
@@ -344,20 +350,24 @@ fun MainScreen(
                             voiceLoadFailed = voiceSnapshot.loadFailed,
                             onVoiceInputSwitch = { enabled ->
                                 scope.launch {
-                                    runCatching { voiceStore.setInputEnabled(enabled) }
-                                        .onFailure { e ->
-                                            if (e is CancellationException) throw e
-                                            Log.w(TAG, "voice input switch persist failed", e)
-                                        }
+                                    try {
+                                        voiceStore.setInputEnabled(enabled)
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "voice input switch persist failed", e)
+                                    }
                                 }
                             },
                             onVoiceOutputSwitch = { enabled ->
                                 scope.launch {
-                                    runCatching { voiceStore.setOutputEnabled(enabled) }
-                                        .onFailure { e ->
-                                            if (e is CancellationException) throw e
-                                            Log.w(TAG, "voice output switch persist failed", e)
-                                        }
+                                    try {
+                                        voiceStore.setOutputEnabled(enabled)
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "voice output switch persist failed", e)
+                                    }
                                 }
                             },
                         )

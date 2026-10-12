@@ -114,9 +114,24 @@ class VoiceSwitchStore(
         }
         .onStart { emit(VoiceSwitchSnapshot.LOADING) }
 
-    /** 朗讀首次揭露是否已確認（只問一次；預設 false）。 */
+    /**
+     * 朗讀首次揭露是否已確認（只問一次；預設 false）。
+     *
+     * 例外語義鏡像 [observeSwitches]：僅 [IOException] 降級為預設值（未確認）並
+     * Log.w；其餘例外——含 CancellationException——照常拋，避免把取消或程式錯誤
+     * 靜默成預設值。
+     */
     fun observeTtsAcknowledged(): Flow<Boolean> = dataStore.data
-        .catch { emit(emptyPreferences()) }
+        .catch { e ->
+            if (e is IOException) {
+                runCatching {
+                    Log.w(TAG, "voice tts ack read failed, default unacknowledged", e)
+                }
+                emit(emptyPreferences())
+            } else {
+                throw e
+            }
+        }
         .map { prefs -> prefs[VOICE_TTS_DISCLOSURE_ACK_KEY] ?: false }
 
     suspend fun setInputEnabled(enabled: Boolean) {

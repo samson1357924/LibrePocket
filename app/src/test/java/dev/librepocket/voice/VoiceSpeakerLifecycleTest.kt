@@ -3,6 +3,7 @@ package dev.librepocket.voice
 import android.content.Context
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.test.core.app.ApplicationProvider
 import java.lang.management.ManagementFactory
 import java.util.concurrent.CopyOnWriteArrayList
@@ -100,6 +101,386 @@ class VoiceSpeakerLifecycleTest {
         speaker.speak("after failed initialization")
 
         assertTrue(shadow.spokenTextList.isEmpty())
+    }
+
+    @Test
+    fun initFailure_isObservableAndLaterSpeakStaysObservable() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        speaker.speak("pending before failure")
+        val shadow = currentTtsShadow()
+
+        requireNotNull(shadow.onInitListener).onInit(TextToSpeech.ERROR)
+        speaker.speak("after failed initialization")
+
+        assertTrue(shadow.spokenTextList.isEmpty())
+        assertEquals(2, errors.size)
+        assertTrue(
+            "errors=$errors",
+            errors.all {
+                it.contains(VoiceTts.DETAIL_INIT_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+    }
+
+    @Test
+    fun noEngine_isObservableAndFailClosed() {
+        ControlledTextToSpeechShadow.forcedEngines = emptyList()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        speaker.speak("pending before probe")
+        val shadow = currentTtsShadow()
+
+        initSuccessfully(shadow)
+        speaker.speak("after no-engine failure")
+
+        assertTrue(shadow.spokenTextList.isEmpty())
+        assertTrue(
+            "errors=$errors",
+            errors.any {
+                it.contains(VoiceTts.DETAIL_NO_ENGINE) && it.contains("NO_PRIVILEGE")
+            },
+        )
+    }
+
+    @Test
+    fun noEngine_laterSpeakKeepsOriginalDetail() {
+        ControlledTextToSpeechShadow.forcedEngines = emptyList()
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        speaker.speak("pending before probe")
+        val shadow = currentTtsShadow()
+
+        initSuccessfully(shadow)
+        speaker.speak("after no-engine failure")
+
+        assertTrue(shadow.spokenTextList.isEmpty())
+        assertEquals(2, errors.size)
+        assertTrue(
+            "errors=$errors",
+            errors.all {
+                it.contains(VoiceTts.DETAIL_NO_ENGINE) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        assertTrue(
+            "errors=$errors",
+            errors.none { it.contains(VoiceTts.DETAIL_INIT_FAILED) },
+        )
+    }
+
+    @Test
+    fun unknownEngineTable_maintainsOriginalFlowWithoutFailure() {
+        // getEngines() == null（查詢未知）：fail-open，維持原流程，不斷言失敗。
+        // 語義與拋錯分支一致（見 engineQueryThrow_maintainsOriginalFlowWithoutFailure）。
+        ControlledTextToSpeechShadow.forcedEngines = null
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        speaker.speak("pending before probe")
+        val shadow = currentTtsShadow()
+
+        initSuccessfully(shadow)
+        speaker.speak("after unknown-engine probe")
+
+        assertEquals(
+            listOf("pending before probe", "after unknown-engine probe"),
+            shadow.spokenTextList,
+        )
+        assertTrue(
+            "errors=$errors",
+            errors.none {
+                it.contains(VoiceTts.DETAIL_NO_ENGINE) || it.contains(VoiceTts.DETAIL_INIT_FAILED)
+            },
+        )
+        speaker.shutdown()
+    }
+
+    @Test
+    fun engineQueryThrow_maintainsOriginalFlowWithoutFailure() {
+        // getEngines() 拋錯：視為未知，走 null 同路（fail-open）。
+        // 生產碼 VoiceSpeaker.handleInitLocked 已有 try-catch（直接崩的防護即該 catch），
+        // 故不改生產碼，只在此鎖定語義：未知查詢不斷言失敗、不阻擋後續朗讀。
+        ControlledTextToSpeechShadow.throwOnGetEngines = true
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        speaker.speak("pending before probe")
+        val shadow = currentTtsShadow()
+
+        initSuccessfully(shadow)
+        speaker.speak("after throwing-engine probe")
+
+        assertEquals(
+            listOf("pending before probe", "after throwing-engine probe"),
+            shadow.spokenTextList,
+        )
+        assertTrue(
+            "errors=$errors",
+            errors.none {
+                it.contains(VoiceTts.DETAIL_NO_ENGINE) || it.contains(VoiceTts.DETAIL_INIT_FAILED)
+            },
+        )
+        speaker.shutdown()
+    }
+
+    @Test
+    fun listenerReturnError_isWarningButSpeakerStaysUsable() {
+        ControlledTextToSpeechShadow.forcedListenerResult = TextToSpeech.ERROR
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+
+        assertTrue(
+            "errors=$errors",
+            errors.any {
+                it.contains(VoiceTts.DETAIL_LISTENER_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        speaker.speak("hi after listener warning")
+        assertEquals(listOf("hi after listener warning"), shadow.spokenTextList)
+    }
+
+    @Test
+    fun listenerException_isWarningButSpeakerStaysUsable() {
+        ControlledTextToSpeechShadow.throwOnListener = true
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+
+        assertTrue(
+            "errors=$errors",
+            errors.any {
+                it.contains(VoiceTts.DETAIL_LISTENER_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        speaker.speak("hi after listener exception")
+        assertEquals(listOf("hi after listener exception"), shadow.spokenTextList)
+    }
+
+    @Test
+    fun speakReturnError_isObservable() {
+        ControlledTextToSpeechShadow.failSpeak = true
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+
+        speaker.speak("hello")
+
+        assertTrue(shadow.spokenTextList.isEmpty())
+        assertTrue(
+            "errors=$errors",
+            errors.any {
+                it.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+    }
+
+    @Test
+    fun speakException_isObservable() {
+        ControlledTextToSpeechShadow.throwOnSpeak = true
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+
+        speaker.speak("hello")
+
+        assertTrue(shadow.spokenTextList.isEmpty())
+        assertTrue(
+            "errors=$errors",
+            errors.any {
+                it.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+    }
+
+    @Test
+    fun utteranceError_isObservable() {
+        val errors = CopyOnWriteArrayList<String>()
+        val errorEpochs = CopyOnWriteArrayList<Pair<String, Long>>()
+        val speaker = newSpeaker(onError = { msg, epoch -> errors += msg; errorEpochs += msg to epoch })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        requireNotNull(shadow.utteranceListener).onError(utteranceId, TextToSpeech.ERROR)
+
+        assertEquals(
+            1,
+            errors.count {
+                it.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        // R5-2：朗讀失敗攜事件 epoch；無新 speak 推進時即為當代 epoch。
+        val speakFailures = errorEpochs.filter {
+            it.first.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.first.contains("NO_PRIVILEGE")
+        }
+        assertEquals(1, speakFailures.size)
+        assertEquals(speaker.currentEpoch, speakFailures.single().second)
+        speaker.shutdown()
+    }
+
+    @Test
+    fun utteranceError_unknownId_isSuppressed() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError("never-submitted-id", TextToSpeech.ERROR)
+        @Suppress("DEPRECATION")
+        listener.onError("never-submitted-id")
+        @Suppress("DEPRECATION")
+        listener.onError(null)
+
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+        speaker.shutdown()
+    }
+
+    @Test
+    fun utteranceError_duplicateId_isDeduped() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+        @Suppress("DEPRECATION")
+        listener.onError(utteranceId)
+
+        assertEquals(
+            1,
+            errors.count {
+                it.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        speaker.shutdown()
+    }
+
+    @Test
+    fun utteranceError_afterStop_isSuppressed() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        speaker.stop()
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+        @Suppress("DEPRECATION")
+        listener.onError(utteranceId)
+
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+        speaker.shutdown()
+    }
+
+    @Test
+    fun utteranceError_afterShutdown_isSuppressed() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("hello")
+        val utteranceId = requireNotNull(shadow.utteranceIds.single())
+
+        speaker.shutdown()
+        val listener = requireNotNull(shadow.utteranceListener)
+        listener.onError(utteranceId, TextToSpeech.ERROR)
+        @Suppress("DEPRECATION")
+        listener.onError(utteranceId)
+
+        assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
+    }
+
+    @Test
+    fun utteranceError_withRealChunkUtteranceId_isObservableEndToEnd() {
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = VoiceSpeaker(
+            ApplicationProvider.getApplicationContext<Context>(),
+            maxChunk = 3,
+            onError = { msg, _ -> errors += msg },
+        )
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+        speaker.speak("abcdef")
+
+        assertEquals(listOf("abc", "def"), shadow.spokenTextList)
+        assertEquals(2, shadow.utteranceIds.size)
+        val secondId = requireNotNull(shadow.utteranceIds[1])
+        assertTrue(secondId.isNotBlank())
+        requireNotNull(shadow.utteranceListener).onError(secondId, TextToSpeech.ERROR)
+
+        assertEquals(
+            1,
+            errors.count {
+                it.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.contains("NO_PRIVILEGE")
+            },
+        )
+        speaker.shutdown()
+    }
+
+    @Test
+    fun initLanguageWarningAndPendingSpeakFailure_bothEmittedWarningFirst() {
+        ControlledTextToSpeechShadow.failLanguageLookup = true
+        ControlledTextToSpeechShadow.failSpeak = true
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        speaker.speak("pending before init")
+        val shadow = currentTtsShadow()
+
+        initSuccessfully(shadow)
+
+        assertTrue(shadow.spokenTextList.isEmpty())
+        assertEquals("errors=$errors", 2, errors.size)
+        assertTrue(
+            "errors=$errors",
+            errors[0].contains(VoiceTts.DETAIL_LANG_UNAVAILABLE) &&
+                errors[0].contains("NO_PRIVILEGE") &&
+                errors[0].contains(VoiceTts.LANG_FALLBACK_HINT),
+        )
+        assertFalse("errors=$errors", errors[0].contains("做不到"))
+        assertTrue(
+            "errors=$errors",
+            errors[1].contains(VoiceTts.DETAIL_SPEAK_FAILED) && errors[1].contains("NO_PRIVILEGE"),
+        )
+        speaker.shutdown()
+    }
+
+    @Test
+    fun langUnavailable_isObservableButSpeakerStaysReady() {
+        // 缺中文語料走降級提醒（非播放失敗：不以「做不到」開頭），但 ready 語義不變（仍可朗讀）。
+        ControlledTextToSpeechShadow.failLanguageLookup = true
+        val errors = CopyOnWriteArrayList<String>()
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
+        val shadow = currentTtsShadow()
+        initSuccessfully(shadow)
+
+        speaker.speak("hi")
+
+        assertEquals(listOf("hi"), shadow.spokenTextList)
+        assertTrue(
+            "errors=$errors",
+            errors.any {
+                it.contains(VoiceTts.DETAIL_LANG_UNAVAILABLE) &&
+                    it.contains("NO_PRIVILEGE") &&
+                    it.contains(VoiceTts.LANG_FALLBACK_HINT) &&
+                    !it.contains("做不到")
+            },
+        )
+        assertTrue(
+            "errors=$errors",
+            errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) },
+        )
+        speaker.shutdown()
     }
 
     @Test
@@ -222,8 +603,8 @@ class VoiceSpeakerLifecycleTest {
         }
     }
 
-    private fun newSpeaker(): VoiceSpeaker =
-        VoiceSpeaker(ApplicationProvider.getApplicationContext<Context>())
+    private fun newSpeaker(onError: (String, Long) -> Unit = { _, _ -> }): VoiceSpeaker =
+        VoiceSpeaker(ApplicationProvider.getApplicationContext<Context>(), onError = onError)
 
     private fun currentTtsShadow(): ControlledTextToSpeechShadow {
         val engine = requireNotNull(ShadowTextToSpeech.getLastTextToSpeechInstance())
@@ -245,6 +626,29 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
     val stopEntered = CountDownLatch(1)
     val events = CopyOnWriteArrayList<String>()
     val queueModes = CopyOnWriteArrayList<Int>()
+    /** 實際傳給 `speak` 的 utteranceId（與引擎收到為同一套，供真實 id 端到端斷言）。 */
+    val utteranceIds = CopyOnWriteArrayList<String?>()
+
+    @Volatile
+    var utteranceListener: UtteranceProgressListener? = null
+
+    @Implementation
+    fun setOnUtteranceProgressListener(listener: UtteranceProgressListener?): Int {
+        if (throwOnListener) throw RuntimeException("fake listener failure")
+        val forced = forcedListenerResult
+        if (forced != null) {
+            if (forced == TextToSpeech.SUCCESS) utteranceListener = listener
+            return forced
+        }
+        utteranceListener = listener
+        return TextToSpeech.SUCCESS
+    }
+
+    @Implementation
+    fun getEngines(): List<TextToSpeech.EngineInfo>? {
+        if (throwOnGetEngines) throw RuntimeException("fake engines query failure")
+        return forcedEngines
+    }
 
     @Implementation
     override fun __constructor__(
@@ -264,6 +668,7 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
             languageLookupEntered?.countDown()
             continueLanguageLookup?.await(5, TimeUnit.SECONDS)
         }
+        if (failLanguageLookup) return TextToSpeech.LANG_NOT_SUPPORTED
         return super.isLanguageAvailable(locale)
     }
 
@@ -276,7 +681,20 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
     ): Int {
         events += "speak:$text"
         queueModes += queueMode
+        utteranceIds += utteranceId
+        if (throwOnSpeak) throw RuntimeException("fake speak failure")
+        if (failSpeak) return TextToSpeech.ERROR
         val result = super.speak(text, queueMode, params, utteranceId)
+        if (callBackSynchronously && utteranceId != null) {
+            val listenerCopy = utteranceListener
+            if (listenerCopy != null) {
+                if (syncErrorOnFirstSpeak && utteranceIds.size == 1) {
+                    listenerCopy.onError(utteranceId, TextToSpeech.ERROR)
+                } else {
+                    listenerCopy.onDone(utteranceId)
+                }
+            }
+        }
         if (pauseAfterFirstSpeak && speakCalls.incrementAndGet() == 1) {
             firstSpeakEntered?.countDown()
             continueSpeaking?.await(5, TimeUnit.SECONDS)
@@ -319,6 +737,39 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
         @Volatile
         var continueLanguageLookup: CountDownLatch? = null
 
+        @Volatile
+        var failSpeak = false
+
+        @Volatile
+        var throwOnSpeak = false
+
+        @Volatile
+        var failLanguageLookup = false
+
+        @Volatile
+        var forcedEngines: List<TextToSpeech.EngineInfo>? = null
+
+        @Volatile
+        var throwOnGetEngines = false
+
+        @Volatile
+        var forcedListenerResult: Int? = null
+
+        @Volatile
+        var throwOnListener = false
+
+        /**
+         * 同步重入開關：`speak` 內成功送入後立即同步回調對應 id
+         *（默認 onDone；[syncErrorOnFirstSpeak] 為 true 時首段改調 onError）。
+         * 沿用既有 forced* 靜態開關模式，用於重現引擎同步重入。
+         */
+        @Volatile
+        var callBackSynchronously = false
+
+        /** 搭配 [callBackSynchronously]：首段同步調 onError，其餘 onDone（2-chunk 錯誤保留案例）。 */
+        @Volatile
+        var syncErrorOnFirstSpeak = false
+
         fun resetControls() {
             initSynchronously = false
             pauseLanguageLookup = false
@@ -327,6 +778,15 @@ class ControlledTextToSpeechShadow : ShadowTextToSpeech() {
             continueSpeaking = null
             languageLookupEntered = null
             continueLanguageLookup = null
+            failSpeak = false
+            throwOnSpeak = false
+            failLanguageLookup = false
+            forcedEngines = null
+            throwOnGetEngines = false
+            forcedListenerResult = null
+            throwOnListener = false
+            callBackSynchronously = false
+            syncErrorOnFirstSpeak = false
         }
     }
 }

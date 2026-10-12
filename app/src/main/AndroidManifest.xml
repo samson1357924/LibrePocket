@@ -16,10 +16,16 @@
          queries 僅宣告可見性，供 PackageManager 解析辨識服務；
          action 必須是 RECOGNIZE_SPEECH（與 VoiceStt.ACTION 同字面值），
          不可用 RecognitionService（服務類名，非 intent action，解析不到）；
-         無服務時 ChatScreen 降級手動輸入（NO_PRIVILEGE）。 -->
+         無服務時 ChatScreen 降級手動輸入（NO_PRIVILEGE）。
+         S2 系統語音輸出：TTS_SERVICE 可見性供 getEngines() 引擎探測；
+         targetSdk 36 package-visibility 過濾下若缺此宣告，引擎表可能為空
+         而被誤判 NO_ENGINE。 -->
     <queries>
         <intent>
             <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
     </queries>
 

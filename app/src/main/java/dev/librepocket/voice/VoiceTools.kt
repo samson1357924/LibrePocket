@@ -19,6 +19,10 @@ import dev.librepocket.redact.Redactor
  *   前一律走 [Redactor.redact]（該類寫路徑已全覆蓋，此處再收斂一次）；
  * - 音檔不落地：麥克風音訊只駐留記憶體，絕不寫檔；
  * - 送雲（Azure）前再 redact 一次，設定頁明示此行為。
+ * - 系統 TTS 手勢路徑採明確揭露（逐則點按 + 引擎揭露文案，
+ *   見 [VoiceTts.SPEAK_BUTTON_DESCRIPTION][dev.librepocket.voice.VoiceTts]），
+ *   不做送引擎前 redact（避免朗讀遮罩 token；可見原文即使用者點按的當則訊息）；
+ *   雲端（Azure）自動上傳路徑維持送雲前 redact（[redactForCloud]）。
  */
 object VoiceTools {
 
@@ -46,4 +50,42 @@ object VoiceTools {
 
     /** 送雲（Azure）前的正文收斂：雲端只收已遮罩文字。 */
     fun redactForCloud(text: String): String = Redactor.redact(text).text
+
+    /**
+     * UI 門禁共用判定（#3，Stage3）：與 `ToolRegistry` 投影同 key、同預設，
+     * 缺鍵即預設值。`ChatScreen` 與 `ProjectionContext` 皆經此讀開關，
+     * 開關關閉即隱藏對應入口。
+     */
+    fun inputEnabled(switches: Map<String, Boolean>): Boolean =
+        switches.getOrDefault(SWITCH_INPUT, SWITCH_INPUT_DEFAULT)
+
+    /** 見 [inputEnabled]（`voice_output` 預設開）。 */
+    fun outputEnabled(switches: Map<String, Boolean>): Boolean =
+        switches.getOrDefault(SWITCH_OUTPUT, SWITCH_OUTPUT_DEFAULT)
+
+    /**
+     * 快照門禁（R4-2 三態）：載入完成且未失敗才看開關值；loading／讀錯一律關閉
+     * （fail-closed，不經產品預設開）。`MainScreen` 餵 `ChatScreen` 前與設定頁
+     * 開關顯示皆經此判定。
+     */
+    fun inputEnabled(snapshot: VoiceSwitchSnapshot): Boolean =
+        snapshot.loaded && !snapshot.loadFailed && inputEnabled(snapshot.switches)
+
+    /** 見 [inputEnabled]（快照三態門禁，`voice_output` 側）。 */
+    fun outputEnabled(snapshot: VoiceSwitchSnapshot): Boolean =
+        snapshot.loaded && !snapshot.loadFailed && outputEnabled(snapshot.switches)
+
+    /**
+     * 投影用開關（R4-2）：同一快照在 loadFailed 時兩鍵視為關（fail-closed），
+     * 避免 UI 隱藏但 tool 仍可用的分叉；loading 態照常回 map（缺鍵即產品預設）。
+     * Tool 側無 UI 等待語義（投影為純函數、無首幀概念，且語音工具現階段皆
+     * `executionReady=false` 不進模型名單），故 loading 沿用既有預設而不等待。
+     * 未來投影接線時以此結果為 `ProjectionContext(userSwitches=...)`。
+     */
+    fun projectionSwitches(snapshot: VoiceSwitchSnapshot): Map<String, Boolean> =
+        if (snapshot.loadFailed) {
+            snapshot.switches + mapOf(SWITCH_INPUT to false, SWITCH_OUTPUT to false)
+        } else {
+            snapshot.switches
+        }
 }

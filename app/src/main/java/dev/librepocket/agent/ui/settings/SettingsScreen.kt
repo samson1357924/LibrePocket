@@ -2,6 +2,7 @@ package dev.librepocket.agent.ui.settings
 
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -19,10 +20,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.librepocket.agent.ui.setup.EndpointGate
 import dev.librepocket.automation.AutomationSettingsState
+import dev.librepocket.voice.VoiceTools
+import dev.librepocket.voice.VoiceTts
 
 @Composable
 fun SettingsScreen(
@@ -43,6 +47,20 @@ fun SettingsScreen(
     automation: AutomationSettingsState? = null,
     onAutomationSwitch: (Boolean) -> Unit = {},
     onOpenSystemA11y: () -> Unit = {},
+    /**
+     * #3 語音開關（DataStore 持久化，單一真相源見 `VoiceSwitchStore`）：
+     * 預設皆開；關閉即隱藏聊天頁對應入口（mic 鈕／朗讀鈕，與投影層同 key）。
+     * 形狀仿無障礙自動化開關（checked + onCheckedChange 回調）。
+     * R4-2 三態：[voiceSwitchesEnabled] 為 `loaded && !loadFailed`（loading／
+     * 失敗態禁用開關，避免在未知真相源上寫入）；[voiceLoadFailed] 時另顯示
+     * 一行讀取問題提示。
+     */
+    voiceInputEnabled: Boolean = VoiceTools.SWITCH_INPUT_DEFAULT,
+    voiceOutputEnabled: Boolean = VoiceTools.SWITCH_OUTPUT_DEFAULT,
+    voiceSwitchesEnabled: Boolean = true,
+    voiceLoadFailed: Boolean = false,
+    onVoiceInputSwitch: (Boolean) -> Unit = {},
+    onVoiceOutputSwitch: (Boolean) -> Unit = {},
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
     Column(
@@ -105,7 +123,8 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             "語音輸入走系統辨識、語音輸出走系統朗讀，不新增任何權限；" +
-                                "麥克風音檔只駐留記憶體、不落地存檔；辨識正文寫入紀錄前會先遮罩敏感內容。",
+                                "麥克風音檔只駐留記憶體、不落地存檔；辨識正文寫入紀錄前會先遮罩敏感內容；" +
+                                "系統朗讀由" + VoiceTts.ENGINE_DISCLOSURE + "，離線能力因引擎而異。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -116,6 +135,55 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        // R4-2 三態提示（沿用既有文字樣式；失敗態開關不可撥，
+                        // 避免在未知真相源上寫入）。
+                        if (voiceLoadFailed) {
+                            Text(
+                                "語音設定讀取失敗，開關暫時停用。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        } else if (!voiceSwitchesEnabled) {
+                            Text(
+                                "語音設定讀取中…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+                        // #3 語音開關（仿無障礙開關模式）：關閉即隱藏聊天頁對應入口。
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "語音輸入",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Switch(
+                                checked = voiceInputEnabled,
+                                onCheckedChange = onVoiceInputSwitch,
+                                enabled = voiceSwitchesEnabled,
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "語音輸出",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Switch(
+                                checked = voiceOutputEnabled,
+                                onCheckedChange = onVoiceOutputSwitch,
+                                enabled = voiceSwitchesEnabled,
+                            )
+                        }
                     }
                 }
                 Spacer(modifier = Modifier.height(8.dp))

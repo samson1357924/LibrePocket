@@ -1,6 +1,8 @@
 package dev.librepocket.agent.ui
 
+import android.util.Log
 import androidx.compose.foundation.layout.Box
+import kotlinx.coroutines.CancellationException
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -33,8 +35,10 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -60,6 +64,11 @@ import dev.librepocket.chat.ChatStatus
 import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
 import dev.librepocket.shell.PrivilegeBridgeState
+import dev.librepocket.voice.VoiceSwitchStore
+import dev.librepocket.voice.VoiceSwitchSnapshot
+import dev.librepocket.voice.VoiceTools
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 object Routes {
@@ -67,6 +76,12 @@ object Routes {
     const val SETTINGS = "settings"
     const val SETUP = "setup"
 }
+
+// 語音持久化寫入失敗的可觀測性（仿 TurnController 類名字串 TAG 的 Log.w 先例）。
+// R5-3 語義收斂：寫入失敗處理以 try/catch(Exception) 取代 runCatching（後者接
+// Throwable）：Error 照常放行（不吞 VirtualMachineError 等），實務與舊語義無差別
+//（DataStore 寫入只拋 Exception／CancellationException），CancellationException 照拋。
+private const val TAG = "MainScreen"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -89,6 +104,47 @@ fun MainScreen(
     val gateLoading = gate is EndpointGate.Loading
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
+
+    // #3 語音開關真相源（VoiceSwitchStore，DataStore 持久化）：R4-2 三態快照
+    // （loading／loaded／loadFailed）。UI 門禁 fail-closed：`!loaded || loadFailed`
+    // 時傳全關 map（沿用 outputEnabled=false 同路徑：mic／朗讀入口隱藏、VoiceSpeaker
+    // 不建構）；loadFailed 另經 voiceSwitchLoadFailed 在聊天頁顯示一行讀取問題提示；
+    // tool 投影未來接線時以 VoiceTools.projectionSwitches 同一快照轉 map 為
+    // ProjectionContext.userSwitches（失敗態視為關，同 key、同預設）。
+    val voiceStore = remember(app) { VoiceSwitchStore(app) }
+    // R5-1: remember + stateIn 快取，防重組重建 Flow 身分導致 collectAsStateWithLifecycle
+    // 以 Flow 為 key 重收：裸 observeSwitches() 每次訂閱 onStart 先發 LOADING，
+    // 重組即閃斷已載入設定、speaker 重建、朗讀中斷。stateIn 把上游轉為 composition
+    // 綁定的單一 StateFlow（WhileSubscribed(5000) 快取 loaded 值撐過短暫無訂閱空窗）；
+    // Store 側 onStart LOADING 保留給真正 cold start，不動生產語義。後人勿改回內聯
+    // voiceStore.observeSwitches().collectAsStateWithLifecycle(...)。
+    val switchesFlow = remember(voiceStore, scope) {
+        voiceStore.observeSwitches().stateIn(scope, SharingStarted.WhileSubscribed(5000), VoiceSwitchSnapshot.LOADING)
+    }
+    val voiceSnapshot by switchesFlow.collectAsStateWithLifecycle()
+    // R6-1: WhileSubscribed(5000) 逾時停上游後，重訂閱必經 onStart LOADING 首發射，
+    // DataStore 第二次發射若延遲即出現 loaded→LOADING 空窗（閃斷＋speaker 重建）。
+    // 顯示用值經 decideEffective 黏住最後有效快照：未知（LOADING）不覆蓋已知 loaded，
+    // 明確 loadFailed 照常穿透。lastVoiceEffective 以 SideEffect 同步（初值 LOADING
+    // 保持 fail-closed），避免在 remember 計算內寫 state。
+    var lastVoiceEffective by remember { mutableStateOf(VoiceSwitchSnapshot.LOADING) }
+    val voiceEffectiveSnapshot = remember(lastVoiceEffective, voiceSnapshot) {
+        VoiceSwitchSnapshot.decideEffective(lastVoiceEffective, voiceSnapshot)
+    }
+    if (voiceEffectiveSnapshot != lastVoiceEffective) {
+        SideEffect { lastVoiceEffective = voiceEffectiveSnapshot }
+    }
+    val voiceUiSwitches = if (voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed) {
+        voiceEffectiveSnapshot.switches
+    } else {
+        mapOf(VoiceTools.SWITCH_INPUT to false, VoiceTools.SWITCH_OUTPUT to false)
+    }
+    // R5-1: ack 同 pattern，只為穩定 Flow 身分（其上游重收本就只重發當前值，
+    // 無 LOADING 閃斷）；初值 false 保持未確認語義。勿改回內聯。
+    val ackFlow = remember(voiceStore, scope) {
+        voiceStore.observeTtsAcknowledged().stateIn(scope, SharingStarted.WhileSubscribed(5000), false)
+    }
+    val ttsAcknowledged by ackFlow.collectAsStateWithLifecycle()
 
     // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
     // 橋接授權三位一體；一鍵收回原子清表、關開關、撤授權（見 PrivilegeBridgeState）。
@@ -271,6 +327,20 @@ fun MainScreen(
                             viewModel = chatViewModel,
                             onOpenSettings = { goSetupForEdit() },
                             onTurnFinished = { sessionListViewModel.refresh() },
+                            userSwitches = voiceUiSwitches,
+                            voiceSwitchLoadFailed = voiceEffectiveSnapshot.loadFailed,
+                            ttsAcknowledged = ttsAcknowledged,
+                            onTtsAcknowledged = {
+                                try {
+                                    voiceStore.acknowledgeTtsDisclosure()
+                                    true
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "voice tts ack persist failed", e)
+                                    false
+                                }
+                            },
                         )
                     }
                     composable(Routes.SETTINGS) {
@@ -288,6 +358,32 @@ fun MainScreen(
                                 privilegeAuditCount = privilegeState.auditCount()
                             },
                             privilegeAuditCount = privilegeAuditCount,
+                            voiceInputEnabled = VoiceTools.inputEnabled(voiceEffectiveSnapshot),
+                            voiceOutputEnabled = VoiceTools.outputEnabled(voiceEffectiveSnapshot),
+                            voiceSwitchesEnabled = voiceEffectiveSnapshot.loaded && !voiceEffectiveSnapshot.loadFailed,
+                            voiceLoadFailed = voiceEffectiveSnapshot.loadFailed,
+                            onVoiceInputSwitch = { enabled ->
+                                scope.launch {
+                                    try {
+                                        voiceStore.setInputEnabled(enabled)
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "voice input switch persist failed", e)
+                                    }
+                                }
+                            },
+                            onVoiceOutputSwitch = { enabled ->
+                                scope.launch {
+                                    try {
+                                        voiceStore.setOutputEnabled(enabled)
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        Log.w(TAG, "voice output switch persist failed", e)
+                                    }
+                                }
+                            },
                         )
                     }
                     composable(Routes.SETUP) {

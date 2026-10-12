@@ -1,5 +1,7 @@
 package dev.librepocket.voice
 
+import dev.librepocket.tool.DenyReason
+import dev.librepocket.tool.S1bFallback
 import java.util.Locale
 
 /**
@@ -7,11 +9,52 @@ import java.util.Locale
  *
  * - 分段上限 [MAX_CHUNK_CHARS] = 4000 字（`TextToSpeech.speak` 長文截斷防線）；
  * - 語言回退鏈：`zh-TW` → `zh-CN` → 列出 voices 找 `zh` 前綴。
+ * - 失敗話術：[ttsFallbackMessage]（與 [VoiceStt.fallbackMessage] 對稱，
+ *   原因碼原文引用）；缺中文語料走非失敗的降級提醒
+ *   [ttsLanguageWarningMessage]（不以「做不到」開頭）；引擎探測：[hasEngine]。
  */
 object VoiceTts {
 
     /** 單次 `speak` 最大字元數（超過即分段，首段 QUEUE_FLUSH、後續 QUEUE_ADD）。 */
     const val MAX_CHUNK_CHARS = 4000
+
+    /** TTS 失敗細分碼（隨 [ttsFallbackMessage] 原文引用，見 `VoiceStt.DETAIL_*` 對稱）。 */
+    const val DETAIL_NO_ENGINE = "NO_ENGINE"
+    const val DETAIL_INIT_FAILED = "INIT_FAILED"
+    const val DETAIL_LISTENER_FAILED = "LISTENER_FAILED"
+    const val DETAIL_LANG_UNAVAILABLE = "LANG_UNAVAILABLE"
+    const val DETAIL_SPEAK_FAILED = "SPEAK_FAILED"
+
+    /**
+     * 系統引擎揭露（S2 鎖定）：朗讀走裝置安裝的系統語音引擎，
+     * 離線能力與資料處理（是否送雲）取決於該引擎；本 app 不新增權限、
+     * 不自建語音通道。[SPEAK_BUTTON_DESCRIPTION] 與設定頁語音卡引用同一語義，
+     * 文案語義由 `VoiceDisclosureTest` 的 formatter 斷言覆蓋。
+     */
+    const val ENGINE_DISCLOSURE = "系統語音引擎處理；資料傳輸取決於已安裝的引擎"
+
+    /** 朗讀鈕無障礙文案：動作 + 引擎揭露（ChatScreen 引用此常數，不手寫字串）。 */
+    const val SPEAK_BUTTON_DESCRIPTION = "朗讀（" + ENGINE_DISCLOSURE + "）"
+
+    /**
+     * 首次朗讀內聯確認門（#2，Stage3）：尚未持久化確認前，朗讀鈕首次點擊
+     * 先顯示內聯可見確認（文案見 [ttsConfirmMessage]），確認後才送引擎；
+     * 確認狀態經 `VoiceSwitchStore` 持久化，只問一次。
+     */
+    fun requiresTtsConfirmation(acknowledged: Boolean): Boolean = !acknowledged
+
+    /**
+     * 內聯確認文案：引用 [ENGINE_DISCLOSURE] 同語義（ChatScreen 確認列用此，
+     * 不手寫字串；視力用戶不需進設定頁即可看到）。
+     */
+    fun ttsConfirmMessage(): String =
+        "朗讀由" + ENGINE_DISCLOSURE + "。確定要朗讀此則訊息嗎？"
+
+    /**
+     * 確認狀態寫入失敗的內聯警告（ChatScreen 確認寫入失敗時顯示，不手寫字串）：
+     * 本次仍朗讀，但確認未持久化，下次重問。
+     */
+    const val TTS_ACK_PERSIST_WARNING = "確認狀態儲存失敗，下次仍會再詢問"
 
     val PREFERRED_TW: Locale = Locale.forLanguageTag("zh-TW")
     val PREFERRED_CN: Locale = Locale.forLanguageTag("zh-CN")
@@ -32,6 +75,44 @@ object VoiceTts {
         }
         return out
     }
+
+    /**
+     * 引擎可用性探測（純函數；`null`/空表皆視為無可用引擎，fail-closed）。
+     *
+     * [VoiceSpeaker] 以 `TextToSpeech.engines` 餵入此函數：探測到無引擎時
+     * 視為初始化失敗（阻擋後續朗讀並經失敗通道揭露），未知（`null`，如引擎
+     * 查詢本身拋錯）則維持原初始化流程，不改變既有 lifecycle 語義。
+     */
+    fun hasEngine(engines: Collection<*>?): Boolean = !engines.isNullOrEmpty()
+
+    /** 降級話術（CAPABILITY_MATRIX §5：原因碼原文引用；與 `VoiceStt` 對稱）。 */
+    fun ttsFallbackMessage(reason: DenyReason, detail: String): String =
+        S1bFallback.message(
+            what = "語音輸出（$detail）",
+            reason = reason,
+            detail = detail,
+            alternative = VoiceTools.FALLBACK_TTS_HINT,
+            needFromUser = "直接看螢幕上的文字",
+        )
+
+    /**
+     * 缺中文語料的降級提醒（非播放失敗，不以「做不到」開頭）：
+     * 引擎可用、朗讀仍會繼續，只是腔調可能非中文。
+     * 仍帶原因碼／細分碼以便觀測（與失敗通道同格式前綴）。
+     */
+    const val LANG_FALLBACK_HINT = "語音可能非中文腔，但會繼續用系統語音朗讀"
+
+    fun ttsLanguageWarningMessage(
+        reason: DenyReason,
+        detail: String = DETAIL_LANG_UNAVAILABLE,
+    ): String =
+        S1bFallback.warning(
+            what = "語音輸出（$detail）",
+            reason = reason,
+            detail = detail,
+            hint = LANG_FALLBACK_HINT,
+            needFromUser = "直接聽朗讀，必要時看螢幕上的文字",
+        )
 
     /**
      * 語言回退鏈（純函數，TTS 查詢結果以 lambda/集合注入以便單測）。

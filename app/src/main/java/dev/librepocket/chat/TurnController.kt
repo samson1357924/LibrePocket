@@ -984,9 +984,11 @@ class TurnController(
    * writer never owns → ledger misses the row, sink pending dangles). After a
    * successful flush, a still-pending id (`pendingRunIds()` contains it) proves
    * non-delivery — an admitted ghost's pending is always removed by the writer
-   * `finally` before the barrier (FIFO order) drains — so settle returns false
-   * and retains UNKNOWN; only a later seal converts it fail-closed. Flush
-   * timeout already returns false, so it stays safe.
+   * `finally` before the barrier (FIFO order) drains — R9-1 resolves it in the
+   * open session via tryResolveUndelivered (true INTERRUPTED, convert, same-opId
+   * retryable); only when the resolver loses (seal won) does settle return
+   * false and retain UNKNOWN. Flush timeout already returns false, so it stays
+   * safe.
    *
    * - ghost durable (flushed + pending gone) → claim under the SAME logical id (adds [durableUserRows]
    *   before the host starts so [runTurnLoop] skips a second user row;補 UI
@@ -1033,11 +1035,25 @@ class TurnController(
         return true
       }
       if (!flushed) return false
-      // R8-6 pending-guard (before cancel/claim): flush success with the id
+      // R9-1 non-delivery proof (before cancel/claim): flush success with the id
       // still pending proves the fuzzy entry never entered the channel (an
-      // admitted ghost's pending is removed before the barrier drains), so
-      // never claim nor drain — stay UNKNOWN until a later seal converts.
-      if (orderedTranscript.pendingRunIds().contains(logicalTurnId)) return false
+      // admitted ghost's pending is removed before the barrier drains). Resolve
+      // in the open session: tryResolveUndelivered releases the dangling ack
+      // (never late-commits) with a true INTERRUPTED mark, then convert —
+      // direct rolls back the UI row (same opId retryable with a fresh id),
+      // promotion retains the FIFO for explicit recovery. No durableUserRows,
+      // no launch, no second row. Resolver loss (seal won) stays UNKNOWN.
+      if (orderedTranscript.pendingRunIds().contains(logicalTurnId)) {
+        if (orderedTranscript.tryResolveUndelivered(logicalTurnId)) {
+          if (cur.isPromotion) {
+            convertPromotionUnknownToFailedLocked(cur, "transcript store unavailable")
+          } else {
+            convertUnknownToFailedLocked(cur, "transcript store unavailable")
+          }
+          return true
+        }
+        return false
+      }
       // Admission-window cancel raced the late commit: direct admissions drain
       // a cancel terminal instead of ghost-launching (Finding 1, UNKNOWN
       // variant). Promotion UNKNOWN takes the convert-like branch below

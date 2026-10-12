@@ -1573,16 +1573,22 @@ class TurnControllerLedgerTest {
   }
 
   /**
-   * R8-6 pending-guard (controller Phase-A): a CE racing a truly suspended
-   * send (attempted, physically never admitted — buffer full behind a parked
+   * R9-1 undelivered barrier proof: a CE racing a truly suspended send
+   * (attempted, physically never admitted — buffer full behind a parked
    * writer, no receiver) is fuzzy and maps to UNKNOWN, but the ghost was never
-   * delivered so a successful barrier flush must NOT claim. Settle returns
-   * false and retains UNKNOWN with the pending mark; only a later seal
-   * converts fail-closed (INTERRUPTED, pending gone, still no ledger row).
+   * delivered so a successful barrier flush proves non-delivery (admitted
+   * ghosts always clear pending before the barrier drains, FIFO). Settle
+   * resolves in the OPEN session via tryResolveUndelivered — no seal needed:
+   * ownership released, true INTERRUPTED mark, still no ledger row and no
+   * launch, and the same opId is immediately retryable in the same session
+   * with a fresh id (exactly one row, single provider call, retry id clean).
+   * Contrast: fuzzy DELIVERED still claims (see
+   * fullChannelResumedSendCancelLateCommitRetryReopenSingleRow — flush + pending
+   * gone → claim, no false INTERRUPTED).
    */
   @OptIn(DelicateCoroutinesApi::class)
   @Test
-  fun fuzzyUndeliveredSettleMustNotClaimUntilSeal() {
+  fun fuzzyUndeliveredBarrierRecoversInOpenSession() {
     val store = DelaySessionStore()
     val inner = SessionTranscriptSink(store, store.sessionId)
     val writerGate = CompletableDeferred<Unit>()
@@ -1609,7 +1615,7 @@ class TurnControllerLedgerTest {
       transcript = blockingSink,
       dispatcher = Dispatchers.Default,
       sleeper = {},
-      newId = { "r8guard-${n++}" },
+      newId = { "r9guard-${n++}" },
       acceptTimeoutMs = 10_000L,
       transcriptCapacity = 1,
     )
@@ -1658,42 +1664,60 @@ class TurnControllerLedgerTest {
       assertEquals(1, c.uiState.value.messages.count { it.role == "user" && it.text == text })
       assertTrue("ghost must not have persisted yet", store.events.none { it.kind == "user" })
       // Release the writer so the barrier can drain blocker + filler. The
-      // ghost never entered, so flush succeeds with the id still pending.
+      // ghost never entered, so flush succeeds with the id still pending —
+      // R9-1 non-delivery proof, resolved without sealing.
       writerGate.complete(Unit)
       val settled = runBlocking {
         withTimeout(5_000) { c.settlePendingAdmission(500L) }
       }
-      assertFalse("fuzzy-undelivered settle must stay UNKNOWN (pending-guard)", settled)
-      assertTrue("guard must retain UNKNOWN ownership", c.hasPendingAdmission())
+      assertTrue("fuzzy-undelivered barrier proof must resolve in the open session", settled)
+      assertFalse("resolved UNKNOWN must release ownership", c.hasPendingAdmission())
       assertTrue(
-        "guard must retain the pending mark",
-        c.pendingTranscriptRunIds().contains(ghost),
+        "resolved ghost must release the pending mark",
+        c.pendingTranscriptRunIds().isEmpty(),
       )
       assertTrue(
-        "guard must not mark INTERRUPTED and must not claim",
-        c.interruptedTranscriptRunIds().isEmpty(),
-      )
-      assertTrue("guarded settle must persist no user row", store.events.none { it.kind == "user" })
-      assertEquals("guarded settle must never launch the host", 0, provider.streamCalls.get())
-      assertEquals(1, c.uiState.value.messages.count { it.role == "user" && it.text == text })
-      // Same-opId retry stays blocked while UNKNOWN (no second row).
-      try {
-        runBlocking { withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) } }
-        fail("same-opId retry during guarded UNKNOWN must throw TranscriptPendingException")
-      } catch (_: TranscriptPendingException) {
-        // Expected.
-      }
-      // Only the seal converts fail-closed: pending gone, INTERRUPTED explicit,
-      // still no ledger row (never claimed).
-      c.close()
-      runBlocking { withTimeout(5_000) { c.flushTranscript() } }
-      assertTrue(c.pendingTranscriptRunIds().isEmpty())
-      assertTrue(
-        "sealed fuzzy entry converts fail-closed",
+        "resolved ghost carries a true INTERRUPTED mark (never claimed)",
         c.interruptedTranscriptRunIds().contains(ghost),
       )
-      assertTrue("sealed fuzzy entry was never claimed", store.events.none { it.kind == "user" })
-      assertEquals("sealed fuzzy entry never launches", 0, provider.streamCalls.get())
+      assertTrue("resolved fuzzy entry was never claimed", store.events.none { it.kind == "user" })
+      assertEquals("resolved fuzzy entry never launches", 0, provider.streamCalls.get())
+      assertTrue(
+        "convert must roll back the optimistic UI row",
+        c.uiState.value.messages.none { it.role == "user" && it.text == text },
+      )
+      assertEquals("transcript store unavailable", c.uiState.value.error)
+      // Same-session retry with the SAME opId admits immediately (no close, no
+      // seal): fresh logical id, exactly one row, single provider call.
+      val retry = runBlocking {
+        withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) }
+      }
+      assertTrue("same-session retry after barrier proof must admit", retry is TurnStart.Started)
+      runBlocking {
+        (retry as TurnStart.Started).host.join()
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      val users = store.events.filter { it.kind == "user" }
+      assertEquals("retry keeps exactly one user row", 1, users.size)
+      assertEquals(text, users.single().text)
+      assertEquals("retry runs the provider exactly once", 1, provider.streamCalls.get())
+      val retryId = users.single().runId
+      assertTrue(
+        "retry id must differ from the undelivered ghost",
+        retryId != ghost,
+      )
+      assertTrue(
+        "undelivered ghost stays marked",
+        c.interruptedTranscriptRunIds().contains(ghost),
+      )
+      assertTrue(
+        "retry id must not carry a false INTERRUPTED mark",
+        !c.interruptedTranscriptRunIds().contains(retryId),
+      )
+      assertEquals(
+        1,
+        c.uiState.value.messages.count { it.role == "user" && it.text == text },
+      )
     } finally {
       writerGate.complete(Unit)
       c.beforeAdmissionSendForTest = null

@@ -760,6 +760,39 @@ class OrderedTranscriptSink(
   }
 
   /**
+   * R9-1 non-delivery proof resolver: flush barrier drained while [runId] is
+   * still pending. Channel FIFO guarantees an admitted ghost's pending is
+   * removed by the writer `finally` before the barrier drains, so
+   * still-pending after a successful barrier proves the fuzzy entry never
+   * entered (writer only commits Entries it received). Atomically releases the
+   * dangling ack so the ghost can never late-commit, records the true
+   * INTERRUPTED mark via the existing ack handler (+ explicit guarantee), and
+   * returns true. Already-cleared (delivered + claimed, or already resolved)
+   * returns false (idempotent); sealed returns false (seal wins, caller defers
+   * to the seal convert path).
+   */
+  fun tryResolveUndelivered(runId: String): Boolean {
+    if (isSealed()) return false
+    if (!pendingCore.remove(runId)) return false
+    for ((ack, id) in coreAcks.entries.toList()) {
+      if (id == runId) {
+        coreAcks.remove(ack)
+        try {
+          if (!ack.isCompleted) {
+            ack.completeExceptionally(CancellationException("transcript undelivered ghost resolved"))
+          }
+        } catch (_: Exception) {
+          // Best effort: the waiter already observes the interrupt mark.
+        }
+      }
+    }
+    // Explicit guarantee alongside the 409 handler above (idempotent): the
+    // barrier proof makes this a true mark, never a false INTERRUPTED.
+    markInterrupted(runId)
+    return true
+  }
+
+  /**
    * Seals the writer exactly once: closes the channel (unblocking parked
    * senders with [ClosedSendChannelException]), fails every outstanding core
    * ack, and drains orphan-buffered entries admitted but never consumed.

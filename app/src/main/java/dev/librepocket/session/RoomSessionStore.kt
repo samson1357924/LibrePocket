@@ -5,9 +5,12 @@ import androidx.room.withTransaction
 import dev.librepocket.redact.Redactor
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.Callable
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -29,26 +32,44 @@ import kotlinx.coroutines.withContext
  * tail (counter or sweep) — only emits [Log.w]; the committed rowId is still
  * returned, so a post-commit maintenance failure never fails the durable core
  * ack, never writes an INTERRUPTED mark, and never affects
- * `hasDurableFailures`/`flushDurable`. Only a cancellation inside the append
- * transaction itself propagates (rollback → row absent → ack must fail).
+ * `hasDurableFailures`/`flushDurable`. Only a CE actually thrown by the
+ * entry gate or thrown inside the append transaction itself propagates
+ * (rollback → row absent → ack must fail); a bare cancel request inside the
+ * tx (flag set, nothing thrown) cannot interrupt the blocking body, so it
+ * always commit-wins and the deferred delivery is swallowed after the flag
+ * is set.
  *
- * R6-4 commit→return boundary: the [withContext] hop that carries the
- * committed rowId back to the dispatching thread is cancellable with
- * prompt cancellation — if the writer Job is cancelled after the DB commit
- * but before the resume, the rowId is discarded and a
- * [CancellationException] is thrown from a point where the row is already
- * durable. That CE is thrown by the commit region itself (lines ~72-101),
- * so the R5-6 tail catch below cannot see it. The narrow fix: a
- * non-suspend [AtomicReference] flag is published synchronously on the IO
- * thread immediately after the transaction returns (no suspension point in
- * between, so the flag cannot miss a post-commit cancel), and an outer
- * `catch (CE)` around ONLY the commit region swallows the CE iff the flag
- * is set (Log.w + return the durable id) and rethrows otherwise. The prune
- * tail is deliberately NOT covered by this catch (and never by
- * NonCancellable): the sweep is O(sessions) and must not hold the shutdown
- * bound. Deliberately not a blanket `NonCancellable` around the commit
- * region either: that would also suppress in-transaction cancellation and
- * change the rollback contract.
+ * R6-4 commit→return boundary, corrected by R8-5: the R6-4 KDoc claimed
+ * the [AtomicReference] flag below is published with no suspension point
+ * between the transaction return and the set, so any CE at the resume must
+ * be post-commit. That premise was false — `db.withTransaction` is itself
+ * `suspend`, so the SQLite COMMIT (inside) and the flag set (after) straddle
+ * a cancellable resume point (`withTransaction` return → `withContext`
+ * resume): a cancel landing after the COMMIT but before the resume threw
+ * with the flag still null, misreporting a durable commit as a pre-commit
+ * failure (row present, ack failed; R8-5 `RoomCommitSetGapCancelTest` pins
+ * the fingerprint pre-fix).
+ *
+ * R8-5 invariant: the transaction now runs via blocking
+ * [androidx.room.RoomDatabase.runInTransaction] on the IO thread, so
+ * COMMIT→`committed.set` stays synchronous on one thread with no suspension
+ * point in between — a framework-delivered CE can only land after the flag
+ * is set (swallow with Log.w + return the durable id) or before the first
+ * write. Request vs delivery: a `cancel()` inside the blocking body only sets
+ * the flag, so after the first write the region is de facto NonCancellable
+ * and deliberately commit-wins (SQLite COMMIT atomicity + durable-ack
+ * priority) — rollback stays reserved for the pre-write gate and a CE
+ * actually thrown inside the tx. The latter keeps the rollback contract
+ * through an explicit non-suspending [ensureActive] gate at the transaction
+ * entry (a cancel racing the IO dispatch still propagates with zero rows;
+ * the R6-4 pre-commit test pins this), never a suspension. The prune tail is
+ * deliberately NOT covered by this catch (and never by NonCancellable):
+ * the sweep is O(sessions) and must not hold the shutdown bound.
+ * Deliberately not a blanket `NonCancellable` around the commit region
+ * either: the blocking body already delivers nothing mid-transaction, so it
+ * would only mask the pre-write gate (turning a must-fail pre-commit ack
+ * into silent commit-wins) and hide the explicit commit-vs-rollback
+ * discriminant.
  *
  * Notes:
  * - seq gaps are legal (prune deletes old rows; import preserves file seqs);
@@ -79,6 +100,19 @@ class RoomSessionStore(
      */
     internal var afterCommitHookForTest: (() -> Unit)? = null
 
+    /**
+     * R8-5 test seam: invoked synchronously inside the append transaction,
+     * after [SessionDao.touchSession] but before the transaction block
+     * returns its row(s). Receives the innermost transaction-running
+     * coroutine's [Job] so tests can `cancel()` it without throwing: the
+     * framework then delivers the [CancellationException] naturally at the
+     * next suspension point. Production leaves it `null`. Cancelling only
+     * this inner Job keeps the blast radius inside the commit region — the
+     * outer caller (direct `runBlocking` or the sink writer) is never
+     * cancelled by the test.
+     */
+    internal var insideTxAfterInsertHookForTest: ((Job?) -> Unit)? = null
+
     override suspend fun createSession(title: String, model: String): String =
         withContext(Dispatchers.IO) {
             require(model.isNotBlank()) { "model must not be blank" }
@@ -99,40 +133,57 @@ class RoomSessionStore(
 
     override suspend fun appendEvent(event: TranscriptEvent): Long {
         val prepared = prepareEvent(event)
-        // R6-4: commit→return guard. [committed] is published with a plain
-        // synchronous set on the IO thread straight after the transaction
-        // returns — no suspension point between commit and set, so any CE
-        // delivered at the withContext resume is observably post-commit.
+        // R8-5: commit→set gap guard. [committed] is published with a plain
+        // synchronous set on the IO thread straight after the BLOCKING
+        // transaction returns — COMMIT→set runs on one thread with no
+        // suspension point in between (the R6-4 `withTransaction` resume
+        // hole is gone), so any CE delivered at the withContext resume is
+        // observably post-commit. A CE before the first write still
+        // propagates via the entry [ensureActive] gate below (rollback →
+        // row absent → ack must fail).
         val committed = AtomicReference<Long?>(null)
         val rowId = try {
             appendMutex.withLock {
                 withContext(Dispatchers.IO) {
-                    val id = db.withTransaction {
-                        require(dao.sessionById(event.sessionId) != null) {
-                            "unknown session"
-                        }
-                        val seq = dao.nextSeq(event.sessionId)
-                        val row = dao.insertEvent(
-                            TranscriptEventEntity(
-                                0,
-                                event.sessionId,
-                                seq,
-                                event.runId,
-                                event.kind,
-                                prepared.text,
-                                prepared.truncated,
-                                event.imagesOmitted,
-                                event.createdAt,
-                                event.isPartial,
-                                prepared.reason,
-                                event.parentRunId,
-                                event.attemptIndex,
-                                event.isFinal,
-                            ),
-                        )
-                        dao.touchSession(event.sessionId, clock())
-                        row
-                    }
+                    // Pre-commit gate (non-suspending, no suspension point):
+                    // a cancel racing the IO dispatch still fails before any
+                    // write, preserving the pre-commit → zero-row contract.
+                    ensureActive()
+                    val txJob = coroutineContext[Job]
+                    val id = db.runInTransaction(
+                        Callable<Long> {
+                            // Same-tick entry gate for a cancel that lands
+                            // after the dispatch above but before the first
+                            // write. [Job.ensureActive] never suspends, so
+                            // COMMIT→set below stays gap-free.
+                            txJob?.ensureActive()
+                            require(dao.sessionById(event.sessionId) != null) {
+                                "unknown session"
+                            }
+                            val seq = dao.nextSeq(event.sessionId)
+                            val row = dao.insertEvent(
+                                TranscriptEventEntity(
+                                    0,
+                                    event.sessionId,
+                                    seq,
+                                    event.runId,
+                                    event.kind,
+                                    prepared.text,
+                                    prepared.truncated,
+                                    event.imagesOmitted,
+                                    event.createdAt,
+                                    event.isPartial,
+                                    prepared.reason,
+                                    event.parentRunId,
+                                    event.attemptIndex,
+                                    event.isFinal,
+                                ),
+                            )
+                            dao.touchSession(event.sessionId, clock())
+                            insideTxAfterInsertHookForTest?.invoke(txJob)
+                            row
+                        },
+                    )
                     committed.set(id)
                     afterCommitHookForTest?.invoke()
                     id
@@ -165,8 +216,10 @@ class RoomSessionStore(
         // successful ack (the Job cancelled flag stays set; the next channel
         // receive still seals normally). Deliberately no
         // withContext(NonCancellable): the sweep is O(sessions) and must not
-        // hold the shutdown bound. Only a cancel inside the transaction above
-        // propagates (rollback → row absent → ack must fail).
+        // hold the shutdown bound. Only a CE actually thrown by the entry gate
+        // or thrown inside the transaction above propagates (rollback → row
+        // absent → ack must fail); a bare in-tx cancel request commit-wins
+        // (blocking body, deferred delivery swallowed after the flag is set).
         try {
             val shouldPrune = appendMutex.withLock {
                 appendsSincePrune++
@@ -206,7 +259,7 @@ class RoomSessionStore(
     /**
      * R5-4 atomic batch (single DB transaction): every event is redacted /
      * truncated / seq-assigned exactly as in [appendEvent], but the inserts
-     * share one [db.withTransaction] under [appendMutex], with one
+     * share one blocking transaction under [appendMutex], with one
      * [SessionDao.touchSession] per touched session inside the same
      * transaction. A failure (unknown session, unknown kind, I/O error,
      * cancellation) rolls back the whole batch — including the touch — so
@@ -219,62 +272,74 @@ class RoomSessionStore(
      * [AUTO_PRUNE_EVERY] and the sweep (if due) runs once after commit,
      * exactly like the single-row path: a committed bulk is never un-done by
      * a prune failure ([Log.w] only, including post-commit cancellation,
-     * rowIds still returned). Only a cancellation inside the transaction
-     * itself propagates (rollback → zero rows → ack must fail).
-     * R6-4: like [appendEvent], a CE delivered on the commit→return resume
-     * (after the transaction commits, before the rowIds reach the caller)
-     * is swallowed via the same committed-flag discriminant; the returned
-     * list is the defensive copy published at commit time.
+     * rowIds still returned). Only a CE actually thrown by the entry gate or
+     * thrown inside the transaction itself propagates (rollback → zero rows
+     * → ack must fail); a bare in-tx cancel request commit-wins (blocking
+     * body, deferred delivery swallowed after the flag is set).
+     * R8-5: like [appendEvent], the bulk runs via blocking
+     * [androidx.room.RoomDatabase.runInTransaction] with the same entry
+     * [ensureActive] gate, so the COMMIT→flag resume hole is closed here
+     * too; a CE delivered on the commit→return resume (after the
+     * transaction commits, before the rowIds reach the caller) is swallowed
+     * via the same committed-flag discriminant; the returned list is the
+     * defensive copy published at commit time.
      */
     override suspend fun appendEvents(events: List<TranscriptEvent>): List<Long> {
         if (events.isEmpty()) return emptyList()
         // Fail fast before any write: a bad kind aborts with zero rows.
         val prepared = events.map { prepareEvent(it) }
-        // R6-4: batch analogue of the single-row commit→return guard. The
-        // published value is a defensive copy: the transaction-local [ids]
-        // buffer must never escape mutably.
+        // R8-5: batch analogue of the single-row commit→set gap guard (see
+        // [appendEvent]): blocking transaction + entry gate, so COMMIT→set
+        // has no suspension point. The published value is a defensive copy:
+        // the transaction-local [ids] buffer must never escape mutably.
         val committed = AtomicReference<List<Long>?>(null)
         val rowIds = try {
             appendMutex.withLock {
                 withContext(Dispatchers.IO) {
-                    val ids = db.withTransaction {
-                        val ids = ArrayList<Long>(events.size)
-                        for (index in events.indices) {
-                            val event = events[index]
-                            val ready = prepared[index]
-                            require(dao.sessionById(event.sessionId) != null) {
-                                "unknown session"
-                            }
-                            val seq = dao.nextSeq(event.sessionId)
-                            ids.add(
-                                dao.insertEvent(
-                                    TranscriptEventEntity(
-                                        0,
-                                        event.sessionId,
-                                        seq,
-                                        event.runId,
-                                        event.kind,
-                                        ready.text,
-                                        ready.truncated,
-                                        event.imagesOmitted,
-                                        event.createdAt,
-                                        event.isPartial,
-                                        ready.reason,
-                                        event.parentRunId,
-                                        event.attemptIndex,
-                                        event.isFinal,
+                    ensureActive()
+                    val txJob = coroutineContext[Job]
+                    val ids = db.runInTransaction(
+                        Callable<List<Long>> {
+                            txJob?.ensureActive()
+                            val ids = ArrayList<Long>(events.size)
+                            for (index in events.indices) {
+                                val event = events[index]
+                                val ready = prepared[index]
+                                require(dao.sessionById(event.sessionId) != null) {
+                                    "unknown session"
+                                }
+                                val seq = dao.nextSeq(event.sessionId)
+                                ids.add(
+                                    dao.insertEvent(
+                                        TranscriptEventEntity(
+                                            0,
+                                            event.sessionId,
+                                            seq,
+                                            event.runId,
+                                            event.kind,
+                                            ready.text,
+                                            ready.truncated,
+                                            event.imagesOmitted,
+                                            event.createdAt,
+                                            event.isPartial,
+                                            ready.reason,
+                                            event.parentRunId,
+                                            event.attemptIndex,
+                                            event.isFinal,
+                                        ),
                                     ),
-                                ),
-                            )
-                        }
-                        // One touch per session, inside the transaction: a bulk
-                        // failure rolls the touch back together with the rows.
-                        val touched = HashSet<String>()
-                        for (event in events) {
-                            if (touched.add(event.sessionId)) dao.touchSession(event.sessionId, clock())
-                        }
-                        ids
-                    }
+                                )
+                            }
+                            // One touch per session, inside the transaction: a bulk
+                            // failure rolls the touch back together with the rows.
+                            val touched = HashSet<String>()
+                            for (event in events) {
+                                if (touched.add(event.sessionId)) dao.touchSession(event.sessionId, clock())
+                            }
+                            insideTxAfterInsertHookForTest?.invoke(txJob)
+                            ids
+                        },
+                    )
                     committed.set(ArrayList(ids))
                     afterCommitHookForTest?.invoke()
                     ids
@@ -477,6 +542,11 @@ class RoomSessionStore(
             Redactor.redact(it).text.take(TITLE_CHARS)
         } ?: IMPORT_FALLBACK_TITLE
         return withContext(Dispatchers.IO) {
+            // Deliberately keeps the suspend withTransaction: import has no
+            // durable-ack discriminant to protect (R8-5 blocking mode not
+            // applicable) and retry is inherently non-idempotent (a new
+            // sessionId per attempt), so the COMMIT→resume gap carries no
+            // ack-misclassification risk.
             db.withTransaction {
                 val sessionId = UUID.randomUUID().toString()
                 dao.insertSession(

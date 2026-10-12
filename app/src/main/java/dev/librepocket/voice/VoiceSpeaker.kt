@@ -116,6 +116,7 @@ class VoiceSpeaker(
      * 用於確定性重現 複查→emit 窗口的交錯（投遞者在其後會再做一次最終複查才 emit）。
      * 生產路徑為 null；語義與 [preEmitHook] 相同（異常吞掉）。
      */
+    @VisibleForTesting
     @Volatile
     internal var postCheckHook: (() -> Unit)? = null
 

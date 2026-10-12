@@ -31,10 +31,7 @@ import {
   MAX_DIFF_LENGTH,
   prioritizeFiles,
   truncateDiff,
-  validateReviewDiffChunkReports,
-  verifyReviewDiffChunkCoverage,
   type ReviewCoverage,
-  type ReviewDiffChunkReport,
 } from './review_diff';
 import { redactForModel } from './redact';
 
@@ -76,7 +73,7 @@ export const MAX_ISSUE_CONTEXT_LENGTH = 20000;
 // Boundary: total 20000 stays single-turn, 20001 chunks; body 8000 stays
 // single-turn, 8001 chunks. Multi-chunk single rounds still consume exactly
 // one claim-slot (issues are never counted; claim semantics untouched).
-// PR side keeps the 120k single-segment strategy (MAX_DIFF_LENGTH in
+// PR side keeps the single-segment strategy (MAX_DIFF_LENGTH in
 // review_diff.ts: one visible diff with truncation/omission recorded in
 // coverage, never chunked); only issues use the chunked path below.
 export const MAX_ISSUE_CHUNK_LENGTH = 8000;
@@ -107,8 +104,8 @@ export const GITHUB_COMMENT_HARD_LIMIT = 65536;
 export const REVIEW_REPORT_JSON_NAME = 'review-report.json';
 export const REVIEW_REPORT_MD_NAME = 'review-report.md';
 export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
-// Phase 3 (P2 #3) N-chunk deadline/concurrency/timeout (fail-closed, never
-// silent omission). t0 + effectiveDeadline bounds the whole chunked PR
+// Phase 3 (P2 #3) deadline/concurrency/timeout (fail-closed, never
+// silent omission). t0 + effectiveDeadline bounds the whole PR
 // review, where effectiveDeadline = min(configured POCKETGUARD_REVIEW_DEADLINE_MS
 // (default 20min minus REVIEW_DEADLINE_MARGIN_MS for artifact/report upload),
 // jobRemaining - REVIEW_JOB_UPLOAD_SKEW_MS) with jobRemaining =
@@ -116,12 +113,11 @@ export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
 // jobStarted is recorded by the first review-send step into $GITHUB_ENV so
 // slow hosted setup still leaves upload headroom; a missing/invalid
 // jobStarted downgrades to the configured deadline (fail-closed, never
-// extends). Before each wave the runner estimates need (the per-chunk timeout
-// for the next wave: min(420s, effectiveRemaining/remainingWaves) with
+// extends). Before the single wave the runner estimates need (the per-wave
+// timeout: min(420s, effectiveRemaining/remainingWaves) with
 // effectiveRemaining = min(reviewRemaining, jobRemaining - skew));
-// remaining < need exits early with INCONCLUSIVE + chunkCoverageComplete:false
-// + completed reports + omission placeholders (or legacy INCONCLUSIVE when
-// nothing was completed) and never writes true. Fixed concurrency
+// remaining < need exits early with an INCONCLUSIVE checkpoint (roles
+// marked not-run, diff coverage as computed) and never writes true.
 // Longest configured model fallback chain across the three review roles.
 // Mirrors the model client's chain composition without importing it: tag
 // and publish entry points must stay free of the OpenAI client so secrets never
@@ -140,14 +136,11 @@ function maxModelChainAttempts(env: NodeJS.ProcessEnv): number {
   return Math.max(1, ...chains);
 }
 
-// PR_CHUNK_CONCURRENCY runs orchestrateReview in parallel with index-sorted
-// synthesis; timeoutMs passes through min(420s, remaining/remainingWaves) so
-// slow roles abort via the transport timeout. chunkCoverageComplete is a
-// computed value (any INCONCLUSIVE per-chunk verdict — including transport
-// timeout/abort/deadline omission — forces false; publish gates on true for
-// APPROVE). Claim pre-flight adds a chunkCount x timeout budget check; over
-// budget claims nothing with zero writes. Every deadline exit saves via
-// saveReviewOutput (checkpoint artifact) as INCONCLUSIVE + false.
+// Fixed-concurrency review waves run orchestrateReview; timeoutMs passes
+// through min(420s, remaining/remainingWaves) so slow roles abort via the
+// transport timeout. The claim pre-flight adds a wave x timeout budget
+// check; over budget claims nothing with zero writes. Every deadline exit
+// saves via saveReviewOutput (checkpoint artifact) as INCONCLUSIVE.
 export const REVIEW_DEADLINE_MARGIN_MS = 60_000;
 export const DEFAULT_REVIEW_DEADLINE_MS = 20 * 60 * 1000 - REVIEW_DEADLINE_MARGIN_MS;
 // Phase 2 (P2 #2) job wall-clock: the review-send job runs with
@@ -251,27 +244,6 @@ export function estimateChunkedReviewMs(chunkCount: number, perChunkTimeoutMs: n
   const conc = Number.isFinite(concurrency) && concurrency >= 1 ? Math.max(1, Math.floor(concurrency)) : PR_CHUNK_CONCURRENCY;
   if (count === 0 || timeout === 0) return 0;
   return Math.ceil(count / conc) * timeout;
-}
-
-// Computed chunk-coverage value (Phase 3): true only when every report is
-// complete, every per-chunk verdict is conclusive (APPROVE or NEEDS_CHANGES),
-// and the spans/files cover the reviewed diff. Any transport/timeout/deadline
-// INCONCLUSIVE forces false so the publish triple-gate falls back instead of
-// approving with missing coverage. Never returns true for a partial set.
-export function computePrChunkCoverageComplete(
-  reports: ReviewDiffChunkReport[],
-  opts?: { totalLength?: number; files?: string[]; maxLength?: number },
-): boolean {
-  if (!Array.isArray(reports) || reports.length < 1) return false;
-  for (const report of reports) {
-    if (!report || report.complete !== true) return false;
-    if (report.verdict !== 'APPROVE' && report.verdict !== 'NEEDS_CHANGES') return false;
-  }
-  return verifyReviewDiffChunkCoverage(reports, {
-    ...(opts?.totalLength !== undefined ? { totalLength: opts.totalLength } : {}),
-    ...(opts?.files !== undefined ? { files: opts.files } : {}),
-    ...(opts?.maxLength !== undefined ? { maxLength: opts.maxLength } : {}),
-  });
 }
 
 type ReviewRoleName = typeof ROLE_NAMES[number];
@@ -437,19 +409,6 @@ export interface RunnerReviewOutput {
   // APPROVE. Optional for backward compatibility with pre-S5 artifacts
   // (missing defaults to []).
   suggestedLabels?: string[];
-  // Phase 4 (P2 #2) PR chunking: present only on the chunked path (single-
-  // turn coverage incomplete but changedFilesComplete with originalLength past
-  // MAX_DIFF_LENGTH). Each entry is a minimal proof
-  // {index/total/start/end/complete/coveredLength/files/verdict} — never
-  // chunk diff text. chunkCoverageComplete is true only when every review
-  // character is covered and every per-chunk orchestration ran; publish
-  // requires it plus count/coverage consistency for APPROVE, otherwise
-  // INCONCLUSIVE (deterministic BLOCK may still NEEDS_CHANGES). Legacy
-  // single-turn artifacts omit these fields. Multi-chunk single rounds still
-  // consume exactly one claim-slot (claim semantics untouched).
-  chunks?: ReviewDiffChunkReport[];
-  chunkCoverageComplete?: boolean;
-  chunkCount?: number;
 }
 
 function stdout(context: RunnerContext, text: string): void {
@@ -1724,12 +1683,12 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
     if (changedFiles.length > MAX_CHANGED_FILES) {
       return emit({ claimed: false, reviewsUsed: 0, reason: 'diff-unavailable: changed file list exceeds limit; fail-closed without occupying a slot', issueNumber });
     }
-    // Phase 3 (P2 #3) claim budget: chunkCount x timeout estimation (fail-
-    // closed, zero writes when over budget). The review runs N chunks under
-    // PR_CHUNK_CONCURRENCY with per-chunk timeoutMs min(420s,
-    // remaining/remainingWaves); the claim refuses when the clamped per-chunk
-    // share would fall below MIN_VIABLE_PER_CHUNK_TIMEOUT_MS, i.e. the
-    // deadline budget cannot reliably cover all chunks. A refused claim
+    // Phase 3 (P2 #3) claim budget: wave x timeout estimation (fail-
+    // closed, zero writes when over budget). The review runs one wave with
+    // per-wave timeoutMs min(420s, remaining/remainingWaves); the claim
+    // refuses when the clamped per-wave share would fall below
+    // MIN_VIABLE_PER_CHUNK_TIMEOUT_MS, i.e. the deadline budget cannot
+    // reliably cover the waves. A refused claim
     // occupies nothing (claimed:false, reviewsUsed 0); a granted claim whose
     // later review times out still holds its slot (never refunded).
     // Phase 2 (P2 #2): the budget is the effective deadline
@@ -1748,7 +1707,7 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
       const perChunkShare = Math.floor(deadlineMs / waves);
       const perChunkTimeout = Math.min(MAX_PER_CHUNK_TIMEOUT_MS, perChunkShare);
       if (perChunkTimeout < MIN_VIABLE_PER_CHUNK_TIMEOUT_MS) {
-        return emit({ claimed: false, reviewsUsed: 0, reason: `budget-exceeded: chunkCount 1 needs ${waves} wave(s) x ${MAX_PER_CHUNK_TIMEOUT_MS}ms over deadline ${deadlineMs}ms (share ${perChunkShare}ms < viable ${MIN_VIABLE_PER_CHUNK_TIMEOUT_MS}ms); fail-closed without occupying a slot`, issueNumber });
+        return emit({ claimed: false, reviewsUsed: 0, reason: `budget-exceeded: single wave needs ${waves} wave(s) x ${MAX_PER_CHUNK_TIMEOUT_MS}ms over deadline ${deadlineMs}ms (share ${perChunkShare}ms < viable ${MIN_VIABLE_PER_CHUNK_TIMEOUT_MS}ms); fail-closed without occupying a slot`, issueNumber });
       }
     }
   } catch {
@@ -3200,19 +3159,6 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
       ...pr.roles.flatMap((r) => r.findings.map((f) => ({ role: r.role, ...f }))),
       ...pr.deterministicViolations.map((v) => ({ role: 'deterministic', severity: v.severity, issue: v.message, file: v.file, line: v.line })),
     ];
-    // Phase 4 (P2 #2) per-chunk results: minimal proofs with per-chunk
-    // verdicts readable in both JSON and Markdown reports (never chunk diff
-    // text). Single-turn outputs omit these keys.
-    const prSegments = Array.isArray(pr.chunks) ? pr.chunks.map((c) => ({
-      index: c.index,
-      total: c.total,
-      start: c.start,
-      end: c.end,
-      complete: c.complete,
-      coveredLength: c.coveredLength,
-      files: [...c.files],
-      verdict: c.verdict,
-    })) : [];
     reportJson = {
       kind: 'pull-request',
       verdict: pr.verdict,
@@ -3220,12 +3166,6 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
       roles: pr.roles,
       coverage: pr.coverage,
       findings,
-      ...(prSegments.length > 0 ? {
-        segments: prSegments,
-        chunks: prSegments,
-        chunkCoverageComplete: pr.chunkCoverageComplete ?? null,
-        chunkCount: pr.chunkCount ?? prSegments.length,
-      } : {}),
       time,
     };
   }
@@ -4235,7 +4175,6 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
     Object.keys(raw).some((key) => ![
       'verdict', 'pullRequestNumber', 'baseSha', 'headSha', 'headRepository', 'roles', 'coverage',
       'deterministicViolations', 'areaLabels', 'changedFiles', 'changedFilesComplete', 'suggestedLabels',
-      'chunks', 'chunkCoverageComplete', 'chunkCount',
     ].includes(key)) ||
     !Number.isSafeInteger(raw.pullRequestNumber) || Number(raw.pullRequestNumber) < 1 ||
     !safeSha(raw.baseSha) || !safeSha(raw.headSha) || !safeRepositoryName(raw.headRepository) ||
@@ -4247,31 +4186,6 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
   ) return undefined;
   const suggestedLabels = parseSuggestedLabelsField(raw.suggestedLabels);
   if (!suggestedLabels) return undefined;
-  // Phase 4 (P2 #2) PR chunks are optional for backward compatibility
-  // (legacy single-turn artifacts omit them). Chunked artifacts must carry
-  // all three fields consistently: per-segment schema plus continuity plus
-  // complete flags, chunkCount matching, and — for APPROVE — every per-chunk
-  // verdict APPROVE with full coverage (a missing chunk can never approve).
-  let chunks: ReviewDiffChunkReport[] | undefined;
-  let chunkCoverageComplete: boolean | undefined;
-  let chunkCount: number | undefined;
-  if (raw.chunks !== undefined) {
-    const validated = validateReviewDiffChunkReports(raw.chunks);
-    if (!validated) return undefined;
-    chunks = validated;
-  }
-  if (raw.chunkCoverageComplete !== undefined) {
-    if (typeof raw.chunkCoverageComplete !== 'boolean') return undefined;
-    chunkCoverageComplete = raw.chunkCoverageComplete;
-  }
-  if (raw.chunkCount !== undefined) {
-    if (!Number.isSafeInteger(raw.chunkCount) || Number(raw.chunkCount) < 1) return undefined;
-    chunkCount = Number(raw.chunkCount);
-  }
-  if (chunks !== undefined || chunkCoverageComplete !== undefined || chunkCount !== undefined) {
-    if (!chunks || chunkCoverageComplete === undefined || chunkCount === undefined) return undefined;
-    if (chunkCount !== chunks.length) return undefined;
-  }
   const rawCoverage = raw.coverage;
   if (!rawCoverage || typeof rawCoverage !== 'object' || Array.isArray(rawCoverage)) return undefined;
   const coverage = rawCoverage as Record<string, unknown>;
@@ -4373,12 +4287,6 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
       ? 'APPROVE'
       : 'INCONCLUSIVE';
   if (raw.verdict !== calculatedVerdict) return undefined;
-  // Phase 4: APPROVE over chunks additionally requires every per-chunk
-  // verdict APPROVE plus complete chunk coverage; NEEDS_CHANGES and
-  // INCONCLUSIVE flow through the recalculation above (merged roles carry
-  // the blocking or inconclusive signal).
-  if (chunks !== undefined && calculatedVerdict === 'APPROVE' &&
-    (!chunks.every((report) => report.verdict === 'APPROVE') || chunkCoverageComplete !== true)) return undefined;
 
   return {
     verdict: calculatedVerdict,
@@ -4402,9 +4310,6 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
       : [],
     changedFilesComplete: raw.changedFilesComplete === true,
     suggestedLabels,
-    ...(chunks ? { chunks } : {}),
-    ...(chunkCoverageComplete !== undefined ? { chunkCoverageComplete } : {}),
-    ...(chunkCount !== undefined ? { chunkCount } : {}),
   };
 }
 
@@ -4491,18 +4396,9 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
   const roleVerdicts = Array.isArray(output.roles) && output.roles.length > 0
     ? output.roles.map((role) => `${role.role}=${role.verdict}`).join(', ')
     : 'none';
-  // Phase 4 (P2 #2) chunk line: per-chunk verdicts with boundaries plus an
-  // omission note when many chunks; bounded like the issue chunk line.
-  let prChunkLine: string;
-  if (Array.isArray(output.chunks) && output.chunks.length > 0) {
-    const total = output.chunkCount ?? output.chunks.length;
-    const shown = output.chunks.slice(0, MAX_STICKY_CHUNK_LINES);
-    const shownText = shown.map((c) => `#${c.index}:${c.start}-${c.end}:${c.verdict}`).join(', ');
-    const omitted = total > shown.length ? `, … (${total} segments total, ${total - shown.length} omitted)` : '';
-    prChunkLine = `Segments: ${total} segment(s) (${shownText}${omitted}, complete: ${output.chunkCoverageComplete === true ? 'yes' : 'no'})`;
-  } else {
-    prChunkLine = 'Segments: single segment';
-  }
+  // PR reviews are always single-segment: one visible diff with
+  // truncation/omission recorded in coverage.
+  const prChunkLine = 'Segments: single segment';
   const headerLines = [
     REVIEW_MARKER,
     '',
@@ -5428,77 +5324,6 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       freshPullRequest,
       botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
       isStale: true,
-    });
-    return;
-  }
-
-  // Phase 4 (P2 #2) chunked-artifact triple gate (mirrors the issue chunk
-  // gates): incomplete chunk coverage, APPROVE count mismatch, or chunk
-  // spans/files totals inconsistent with the reviewed diff all fall back to
-  // the same sticky INCONCLUSIVE (never a wrong APPROVE). Legacy single-turn
-  // artifacts omit chunk fields and skip these gates. PR freshness is already
-  // pinned by sameReviewIdentity above plus the pre/post-write
-  // currentReviewProblem re-checks below.
-  if (output.chunks !== undefined && output.chunkCoverageComplete !== true) {
-    const chunkLine = formatReportLine(env, false);
-    const chunkReason = 'the review output is unverifiable: PR chunks were not fully covered; review freshness could not be verified.';
-    const wroteChunks = await publishPrSticky(
-      reconciledInitialBody(inconclusiveComment(chunkReason, chunkLine)),
-      async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
-    );
-    if (!wroteChunks) return;
-    await reconcileFallbackPrLabels({
-      client,
-      repository,
-      target,
-      context,
-      env,
-      output,
-      freshPullRequest,
-      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
-    });
-    return;
-  }
-  if (output.chunks !== undefined && output.verdict === 'APPROVE' && output.chunkCount !== output.chunks.length) {
-    const chunkLine = formatReportLine(env, false);
-    const chunkReason = 'the review output is unverifiable: PR chunk count mismatch.';
-    const wroteCount = await publishPrSticky(
-      reconciledInitialBody(inconclusiveComment(chunkReason, chunkLine)),
-      async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
-    );
-    if (!wroteCount) return;
-    await reconcileFallbackPrLabels({
-      client,
-      repository,
-      target,
-      context,
-      env,
-      output,
-      freshPullRequest,
-      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
-    });
-    return;
-  }
-  if (output.chunks !== undefined && !verifyReviewDiffChunkCoverage(output.chunks, {
-    totalLength: output.coverage.originalLength,
-    files: filterReviewDiffFiles(output.changedFiles),
-  })) {
-    const chunkLine = formatReportLine(env, false);
-    const chunkReason = 'the review output is unverifiable: PR chunk coverage does not match the reviewed diff.';
-    const wroteSpan = await publishPrSticky(
-      reconciledInitialBody(inconclusiveComment(chunkReason, chunkLine)),
-      async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
-    );
-    if (!wroteSpan) return;
-    await reconcileFallbackPrLabels({
-      client,
-      repository,
-      target,
-      context,
-      env,
-      output,
-      freshPullRequest,
-      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
     });
     return;
   }

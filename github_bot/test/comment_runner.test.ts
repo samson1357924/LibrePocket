@@ -369,7 +369,6 @@ export async function runCommentRunnerTests(): Promise<void> {
       });
       // Single-turn review with 1,000,000 budget: diffs fit in single-turn review with full coverage.
       assert.equal(truncatedReview.verdict, 'APPROVE');
-      assert.equal(truncatedReview.chunks, undefined);
       assert.equal(truncatedReview.coverage.complete, true);
       assert.deepEqual(truncatedReview.coverage.truncatedFiles, []);
       assert.deepEqual(truncatedReview.coverage.omittedFiles, []);

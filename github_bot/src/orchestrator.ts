@@ -51,9 +51,9 @@ export interface OrchestratorOptions {
   env?: OpenAIEnvironment;
   promptDirectory?: string;
   allowedOrigins?: string[];
-  // Phase 3 (P2 #3): per-chunk timeout passthrough (fail-closed). When set,
+  // Phase 3 (P2 #3): per-wave timeout passthrough (fail-closed). When set,
   // forwarded to every fallback-chain role call so slow roles abort via
-  // the transport timeout instead of hanging the chunk wave. Omitted keeps
+  // the transport timeout instead of hanging the wave. Omitted keeps
   // the send default (420s). Must be >0 when provided; invalid values throw
   // fail-closed (zero AI) via the send path.
   timeoutMs?: number;
@@ -237,8 +237,8 @@ export interface TriageIssueOptions {
   promptDirectory?: string;
   allowedOrigins?: string[];
   // Phase 3 (P2 #3): timeout passthrough for symmetry (issue chunks stay
-  // sequential; PR chunks use OrchestratorOptions.timeoutMs). Omitted keeps
-  // the send default.
+  // sequential; follow-up PR waves use OrchestratorOptions.timeoutMs).
+  // Omitted keeps the send default.
   timeoutMs?: number;
 }
 
@@ -295,82 +295,6 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
   } catch {
     return fallback;
   }
-}
-
-// Phase 4 (P2 #2): synthesize per-chunk orchestrated reviews into one verdict.
-// Each entry is the orchestrateReview result for one ReviewDiffChunk (chunk-
-// local coverage complete; deterministic violations scanned once over the
-// full diff and passed via opts, never per chunk). Rules mirror the
-// single-turn synthesis: any NEEDS_CHANGES verdict or BLOCK finding (or
-// deterministic BLOCK) forces NEEDS_CHANGES; otherwise any INCONCLUSIVE
-// (including per-chunk transport/schema failures, which orchestrateReview
-// already funnels to INCONCLUSIVE) forces INCONCLUSIVE; APPROVE requires
-// every chunk unanimous-APPROVE plus complete global coverage plus no
-// critical omission. Merged roles concatenate per-chunk findings per role so
-// validateReviewOutput recalculation stays consistent.
-export interface SynthesizeChunkedReviewOptions {
-  coverage: ReviewCoverage;
-  deterministicViolations: ScanViolation[];
-}
-
-export function synthesizeChunkedReview(
-  perChunk: OrchestratedReview[],
-  options: SynthesizeChunkedReviewOptions,
-): OrchestratedReview {
-  const coverage = safeCoverage(options.coverage);
-  const deterministicViolations = safeViolations(options.deterministicViolations);
-  const mergedRoles: RoleReview[] = ROLES.map((role) => {
-    const parts = perChunk.filter((entry) => Array.isArray(entry?.roles) &&
-      entry.roles.some((candidate) => candidate?.role === role));
-    const findings = parts.flatMap((entry) =>
-      entry.roles.filter((candidate) => candidate?.role === role).flatMap((candidate) =>
-        Array.isArray(candidate.findings) ? candidate.findings : []));
-    const firstHolder = parts.find((entry) =>
-      entry.roles.some((candidate) => candidate?.role === role));
-    const modelUsed = firstHolder?.roles.find((candidate) => candidate?.role === role)?.modelUsed ?? 'unavailable';
-    let verdict: ReviewVerdict = 'APPROVE';
-    if (parts.length !== perChunk.length || perChunk.length === 0) {
-      verdict = 'INCONCLUSIVE';
-    } else if (parts.some((entry) =>
-      entry.roles.filter((candidate) => candidate?.role === role)
-        .some((candidate) => candidate.verdict === 'NEEDS_CHANGES' ||
-          candidate.findings.some((finding) => finding?.severity === 'BLOCK')))) {
-      verdict = 'NEEDS_CHANGES';
-    } else if (parts.some((entry) =>
-      entry.roles.filter((candidate) => candidate?.role === role)
-        .some((candidate) => candidate.verdict !== 'APPROVE'))) {
-      verdict = 'INCONCLUSIVE';
-    }
-    const summaries = parts
-      .flatMap((entry) => entry.roles.filter((candidate) => candidate?.role === role).map((candidate) => candidate.summary).filter((s): s is string => typeof s === 'string' && s.trim().length > 0));
-    const summary = summaries.join('\n\n').slice(0, MAX_TEXT_LENGTH);
-    return {
-      role,
-      modelUsed,
-      verdict,
-      findings,
-      suggestedLabels: [...new Set(parts.flatMap((entry) =>
-        entry.roles.filter((candidate) => candidate?.role === role)
-          .flatMap((candidate) => Array.isArray(candidate.suggestedLabels) ? candidate.suggestedLabels : [])))],
-      summary,
-    };
-  });
-
-  const hasBlockingFinding = perChunk.some((entry) => entry?.verdict === 'NEEDS_CHANGES') ||
-    mergedRoles.some((role) =>
-      role.verdict === 'NEEDS_CHANGES' || role.findings.some((finding) => finding?.severity === 'BLOCK'));
-  const hasDeterministicBlock = deterministicViolations.some((violation) => violation.severity === 'BLOCK');
-  const hasCriticalOmission = coverage.omittedFiles.some((file) => reviewTier(file) <= 3);
-  const unanimousApproval = perChunk.length > 0 &&
-    perChunk.every((entry) => entry?.verdict === 'APPROVE') &&
-    mergedRoles.length === ROLES.length && mergedRoles.every((role) => role.verdict === 'APPROVE');
-  const verdict: ReviewVerdict = hasBlockingFinding || hasDeterministicBlock
-    ? 'NEEDS_CHANGES'
-    : unanimousApproval && coverage.complete && !hasCriticalOmission
-      ? 'APPROVE'
-      : 'INCONCLUSIVE';
-
-  return { verdict, roles: mergedRoles, coverage, deterministicViolations };
 }
 
 export async function orchestrateReview(options: OrchestratorOptions): Promise<OrchestratedReview> {

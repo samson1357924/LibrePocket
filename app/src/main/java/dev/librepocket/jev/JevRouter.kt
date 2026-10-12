@@ -1,8 +1,11 @@
 package dev.librepocket.jev
 
 import dev.librepocket.redact.Redactor
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
 
@@ -166,7 +169,8 @@ class JevRouterImpl(
             withTimeout(JevBudgets.CHOICE_TIMEOUT_MS) {
                 choice.choose(redacted, safeCandidates, topK = 1, timeoutMs = JevBudgets.CHOICE_TIMEOUT_MS)
             }
-        } catch (_: TimeoutCancellationException) {
+        } catch (e: TimeoutCancellationException) {
+            currentCoroutineContext().ensureActive()
             ChoiceResult(
                 bestId = JevIntents.GUI_FALLBACK,
                 confidences = emptyMap(),
@@ -174,6 +178,8 @@ class JevRouterImpl(
                 status = JevStatus.TIMEOUT,
                 latencyMs = JevBudgets.CHOICE_TIMEOUT_MS,
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             ChoiceResult(
                 bestId = JevIntents.GUI_FALLBACK,
@@ -275,8 +281,11 @@ class JevRouterImpl(
             withTimeout(JevBudgets.CHOICE_TIMEOUT_MS) {
                 choice.choose(redactedGoal, safeNodes, topK = 1, timeoutMs = JevBudgets.CHOICE_TIMEOUT_MS)
             }
-        } catch (_: TimeoutCancellationException) {
+        } catch (e: TimeoutCancellationException) {
+            currentCoroutineContext().ensureActive()
             ChoiceResult("", emptyMap(), true, JevStatus.TIMEOUT, JevBudgets.CHOICE_TIMEOUT_MS)
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             ChoiceResult("", emptyMap(), true, JevStatus.ERROR, 0)
         }
@@ -363,8 +372,11 @@ class JevRouterImpl(
                             withTimeout(JevBudgets.SCORE_TIMEOUT_MS) {
                                 score.score(redactedAction, safeCtx, JevBudgets.SCORE_TIMEOUT_MS)
                             }
-                        } catch (_: TimeoutCancellationException) {
+                        } catch (e: TimeoutCancellationException) {
+                            currentCoroutineContext().ensureActive()
                             ScoreResult(0.6f, listOf("TIMEOUT"), JevStatus.TIMEOUT, JevBudgets.SCORE_TIMEOUT_MS)
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (_: Exception) {
                             ScoreResult(0.6f, listOf("TRANSPORT"), JevStatus.ERROR, 0)
                         }
@@ -374,17 +386,23 @@ class JevRouterImpl(
                         withTimeout(JevBudgets.NOUL_TIMEOUT_MS) {
                             noul.gate(redactedAction, scoreRes, safeCtx, JevBudgets.NOUL_TIMEOUT_MS)
                         }
-                    } catch (_: TimeoutCancellationException) {
+                    } catch (e: TimeoutCancellationException) {
+                        currentCoroutineContext().ensureActive()
                         NoulResult(true, 0.5f, JevStatus.TIMEOUT, JevBudgets.NOUL_TIMEOUT_MS)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (_: Exception) {
                         NoulResult(true, 0.5f, JevStatus.ERROR, 0)
                     }
                     scoreRes to n
                 }
             }
-        } catch (_: TimeoutCancellationException) {
+        } catch (e: TimeoutCancellationException) {
+            currentCoroutineContext().ensureActive()
             ScoreResult(0.6f, listOf("STEP_TIMEOUT"), JevStatus.TIMEOUT, JevBudgets.STEP_TOTAL_MS) to
                 NoulResult(true, 0.5f, JevStatus.TIMEOUT, JevBudgets.STEP_TOTAL_MS)
+        } catch (e: CancellationException) {
+            throw e
         }
         var (sRes, nRes) = pair
         breaker.onResult(sRes.status)

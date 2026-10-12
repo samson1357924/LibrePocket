@@ -2,6 +2,9 @@ package dev.librepocket.jev
 
 import dev.librepocket.keystore.KeyVault
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
@@ -13,6 +16,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -65,10 +69,12 @@ class JevRouterTest {
 
     private class FakeNoul(
         var result: NoulResult = NoulResult(false, 0.9f, JevStatus.OK, 5),
+        var delayMs: Long = 0,
     ) : JevNoul {
         var calls = 0
         override suspend fun gate(action: String, score: ScoreResult?, context: JevContext, timeoutMs: Long): NoulResult {
             calls++
+            if (delayMs > 0) delay(delayMs)
             return result
         }
     }
@@ -474,5 +480,157 @@ class JevRouterTest {
         val d = router.rerankNodes("點確定", nodes, pageSignature = "p9")
         assertTrue(d is JevRerankFallback)
         assertEquals(JevFallbackCause.NEED_CONFIRM_UPGRADE, (d as JevRerankFallback).cause)
+    }
+
+    // ---- 外部取消穿透（P2）：取消必須拋出，不可誤記 TIMEOUT/ERROR、不計熔斷、不寫快取 ----
+
+    @Test fun routeIntentExternalCancelPropagates() = runBlocking {
+        val choice = FakeChoice(delayMs = 5_000)
+        val breaker = JevCircuitBreaker()
+        val router = enabledRouter(choice = choice, breaker = breaker)
+        val deferred = async { router.routeIntent("取消測試 設鬧鐘") }
+        delay(50)
+        deferred.cancel()
+        try {
+            deferred.await()
+            fail("expected CancellationException")
+        } catch (e: CancellationException) {
+            assertFalse("external cancel must not be TIMEOUT", e is TimeoutCancellationException)
+        }
+        assertEquals(0, breaker.failureCount())
+        assertFalse(breaker.isOpen())
+        assertEquals(1, choice.calls)
+        // 無 cache 寫入：第二次呼叫仍調 choice。
+        choice.delayMs = 0
+        choice.result = ChoiceResult("ALARM", mapOf("ALARM" to 0.91f), false, JevStatus.OK, 5)
+        val d = router.routeIntent("取消測試 設鬧鐘")
+        assertTrue(d is JevFast)
+        assertEquals(2, choice.calls)
+    }
+
+    @Test fun rerankNodesExternalCancelPropagates() = runBlocking {
+        val fake = FakeChoice(delayMs = 5_000)
+        val breaker = JevCircuitBreaker()
+        val router = enabledRouter(choice = fake, breaker = breaker)
+        val nodes = listOf(JevCandidate("node#1", "確定"), JevCandidate("node#2", "取消"))
+        val deferred = async { router.rerankNodes("點確定取消測試", nodes, pageSignature = "p-cancel") }
+        delay(50)
+        deferred.cancel()
+        try {
+            deferred.await()
+            fail("expected CancellationException")
+        } catch (e: CancellationException) {
+            assertFalse("external cancel must not be TIMEOUT", e is TimeoutCancellationException)
+        }
+        assertEquals(0, breaker.failureCount())
+        assertFalse(breaker.isOpen())
+        assertEquals(1, fake.calls)
+        // 無 cache 寫入：第二次呼叫仍調 choice。
+        fake.delayMs = 0
+        fake.result = ChoiceResult("node#1", mapOf("node#1" to 0.9f), false, JevStatus.OK, 5)
+        val d = router.rerankNodes("點確定取消測試", nodes, pageSignature = "p-cancel")
+        assertTrue(d is JevRerankHit)
+        assertEquals(2, fake.calls)
+    }
+
+    @Test fun checkRiskScoreExternalCancelPropagates() = runBlocking {
+        val score = FakeScore(delayMs = 5_000)
+        val noul = FakeNoul()
+        val breaker = JevCircuitBreaker()
+        val router = enabledRouter(score = score, noul = noul, breaker = breaker)
+        val deferred = async { router.checkRisk("navigate", readCtx(SideEffect.READ)) }
+        delay(50)
+        deferred.cancel()
+        try {
+            deferred.await()
+            fail("expected CancellationException")
+        } catch (e: CancellationException) {
+            assertFalse("external cancel must not be TIMEOUT", e is TimeoutCancellationException)
+        }
+        assertEquals(0, breaker.failureCount())
+        assertFalse(breaker.isOpen())
+        assertEquals(1, score.calls)
+        assertEquals(0, noul.calls)
+        // 無 cache 寫入：第二次呼叫仍調 score。
+        score.delayMs = 0
+        score.result = ScoreResult(0.2f, listOf("LOW"), JevStatus.OK, 5)
+        router.checkRisk("navigate", readCtx(SideEffect.READ))
+        assertEquals(2, score.calls)
+    }
+
+    @Test fun checkRiskNoulExternalCancelPropagates() = runBlocking {
+        val score = FakeScore()
+        val noul = FakeNoul(delayMs = 5_000)
+        val breaker = JevCircuitBreaker()
+        val router = enabledRouter(score = score, noul = noul, breaker = breaker)
+        val deferred = async { router.checkRisk("navigate", readCtx(SideEffect.READ)) }
+        delay(50)
+        deferred.cancel()
+        try {
+            deferred.await()
+            fail("expected CancellationException")
+        } catch (e: CancellationException) {
+            assertFalse("external cancel must not be TIMEOUT", e is TimeoutCancellationException)
+        }
+        assertEquals(0, breaker.failureCount())
+        assertFalse(breaker.isOpen())
+        assertEquals(1, score.calls)
+        assertEquals(1, noul.calls)
+        // 無 cache 寫入：第二次呼叫仍調 score。
+        noul.delayMs = 0
+        val callsAfter = score.calls
+        router.checkRisk("navigate", readCtx(SideEffect.READ))
+        assertEquals(callsAfter + 1, score.calls)
+    }
+
+    @Test fun checkRiskStepTotalExternalCancelPropagates() = runBlocking {
+        val score = FakeScore(delayMs = 5_000)
+        val noul = FakeNoul(delayMs = 5_000)
+        val breaker = JevCircuitBreaker()
+        val router = enabledRouter(score = score, noul = noul, breaker = breaker)
+        val deferred = async { router.checkRisk("navigate", readCtx(SideEffect.READ)) }
+        delay(50)
+        deferred.cancel()
+        try {
+            deferred.await()
+            fail("expected CancellationException")
+        } catch (e: CancellationException) {
+            assertFalse("external cancel must not be STEP_TIMEOUT", e is TimeoutCancellationException)
+        }
+        assertEquals(0, breaker.failureCount())
+        assertFalse(breaker.isOpen())
+        assertEquals(1, score.calls)
+        assertEquals(0, noul.calls)
+        // 無 cache 寫入：第二次呼叫仍調 score。
+        score.delayMs = 0
+        score.result = ScoreResult(0.2f, listOf("LOW"), JevStatus.OK, 5)
+        noul.delayMs = 0
+        router.checkRisk("navigate", readCtx(SideEffect.READ))
+        assertEquals(2, score.calls)
+    }
+
+    @Test fun fiveExternalCancelsDoNotTripBreaker() = runBlocking {
+        val choice = FakeChoice(delayMs = 5_000)
+        val breaker = JevCircuitBreaker()
+        val router = enabledRouter(choice = choice, breaker = breaker)
+        repeat(5) { i ->
+            val deferred = async { router.routeIntent("取消壓測 $i 設鬧鐘") }
+            delay(50)
+            deferred.cancel()
+            try {
+                deferred.await()
+                fail("expected CancellationException")
+            } catch (e: CancellationException) {
+                assertFalse("external cancel must not be TIMEOUT", e is TimeoutCancellationException)
+            }
+        }
+        assertEquals(5, choice.calls)
+        assertEquals(0, breaker.failureCount())
+        assertFalse(breaker.isOpen())
+        // 熔斷仍可用：後續正常呼叫成功。
+        choice.delayMs = 0
+        choice.result = ChoiceResult("ALARM", mapOf("ALARM" to 0.91f), false, JevStatus.OK, 5)
+        val d = router.routeIntent("取消壓測恢復 設鬧鐘")
+        assertTrue(d is JevFast)
     }
 }

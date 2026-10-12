@@ -72,6 +72,7 @@ import dev.librepocket.voice.PendingSpeak
 import dev.librepocket.voice.VoiceStt
 import dev.librepocket.voice.VoiceSpeaker
 import dev.librepocket.voice.VoiceTools
+import dev.librepocket.voice.shouldApplyUiEvent
 import dev.librepocket.voice.VoiceTts
 import dev.librepocket.voice.VoiceTtsConfirmState
 import dev.librepocket.voice.TtsConfirmDecision
@@ -151,18 +152,40 @@ fun ChatScreen(
     var outputGeneration by remember { mutableLongStateOf(0L) }
     var prevOutputEnabled by remember { mutableStateOf(outputEnabled) }
     // M2 延遲建構：voice_output 關閉時不初始化 TTS 引擎（不佔系統服務）。
+    // R5-2 Main 投遞 epoch fence：speaker 回調（binder 執行緒）攜事件 epoch，
+    // 經主線程作用域投遞時以 shouldApplyUiEvent 比對當代 currentEpoch，不符丟棄
+    //（舊 request 事件排入 Main 後、執行前若有新 speak 使 epoch 前進，即被擋下）。
+    // remember 初始化器內拿不到自身（self-reference 不可寫），故不做實例比對、
+    // 只比對 currentEpoch：舊實例事件由 shutdown terminal 在 speaker 層擋下
+    //（見 VoiceSpeaker），epoch-only 已足夠。holder 為 null（輸出關閉）時丟棄；
+    // 直讀分支同步 onSpeakStarted 語義不變。
+    val speakerHolder = remember { object { var speaker: VoiceSpeaker? = null } }
     val speaker: VoiceSpeaker? = remember(context, outputEnabled) {
-        if (outputEnabled) {
+        val created = if (outputEnabled) {
             VoiceSpeaker(
                 context.applicationContext,
                 // P3：引擎回呼在 binder 執行緒：經主線程作用域投遞（仿 SetupViewModel
                 // logout 的 withContext(Dispatchers.Main)；VoiceSpeaker 層不動）。
-                onError = { msg -> confirmScope.launch { voiceErrors.onTtsFailure(msg) } },
-                onDone = { confirmScope.launch { voiceErrors.onTtsSuccess() } },
+                onError = { msg, epoch ->
+                    confirmScope.launch {
+                        val current = speakerHolder.speaker
+                        if (current == null || !shouldApplyUiEvent(epoch, current.currentEpoch)) return@launch
+                        voiceErrors.onTtsFailure(msg)
+                    }
+                },
+                onDone = { epoch ->
+                    confirmScope.launch {
+                        val current = speakerHolder.speaker
+                        if (current == null || !shouldApplyUiEvent(epoch, current.currentEpoch)) return@launch
+                        voiceErrors.onTtsSuccess()
+                    }
+                },
             )
         } else {
             null
         }
+        speakerHolder.speaker = created
+        created
     }
     DisposableEffect(speaker) {
         onDispose { speaker?.shutdown() }

@@ -42,16 +42,32 @@ import java.util.UUID
  * 先記賬後調用（登記＋pending++ 後才調 `engine.speak`），同步重入回調命中已登記條目，
  * 提交中（[isSubmitting]）的 onDone 只更新計數不入隊，全同步完成時由提交收尾合成一次 DONE 入隊；
  * 同步送入失敗在鎖內移除條目、pending--、failed=true 後回傳 SPEAK_FAILED（不留追蹤）。
+ *
+ * UI 身分（R5-2）：[QueuedEmit.epoch] 只在 speaker 內部消耗、從未進回調參數，
+ * Main dispatcher 排隊的 UI lambda 無身分檢查，舊事件可覆蓋新 request。
+ * 故 [onError]／[onDone] 改攜事件 epoch（`event.epoch`），UI 在 Main 投遞 block 內以
+ * [shouldApplyUiEvent] 比對 `epoch == currentEpoch`，不符丟棄。
+ * [currentEpoch] 為 [speechEpoch] 的 `@Volatile` 鏡像（5 處 bump 點同步更新）：
+ * 寫入一律在 [lifecycleLock] 內（單一互斥，無遺失更新），讀取在 Main/UI 執行緒免鎖；
+ * 不用 synchronized getter，避免 Main 執行緒與 binder 回呼執行緒搶同一把鎖。
  */
+fun shouldApplyUiEvent(eventEpoch: Long, currentEpoch: Long): Boolean = eventEpoch == currentEpoch
+
 class VoiceSpeaker(
     appContext: Context,
     private val maxChunk: Int = VoiceTts.MAX_CHUNK_CHARS,
-    private val onError: (String) -> Unit = {},
+    /**
+     * 失敗通道：訊息＋事件 epoch（R5-2：供 UI 在 Main 投遞時以
+     * [shouldApplyUiEvent] 比對 [currentEpoch]，舊 request 事件丟棄）。
+     */
+    private val onError: (String, Long) -> Unit = { _, _ -> },
     /**
      * utterance 完成信號：整 request 全 chunk 無失敗終結時恰發一次；
      * 任一失敗、遲到／未知 id、terminal 後一律不發（供 UI 清除 TTS 錯誤，見 `VoiceErrorState.onTtsSuccess`）。
+     *
+     * R5-2：改攜事件 epoch（語義同 [onError] 的 epoch 參數）。
      */
-    private val onDone: () -> Unit = {},
+    private val onDone: (Long) -> Unit = {},
 ) {
 
     private val context: Context = appContext.applicationContext
@@ -66,6 +82,22 @@ class VoiceSpeaker(
     private var terminal = false
     private var speechEpoch = 0L
     private var pending: PendingSpeech? = null
+
+    /**
+     * Main/UI 執行緒可讀的當代 epoch 鏡像（R5-2：[onError]／[onDone] 回調攜帶的
+     * 事件 epoch 即以此為比對基準，供 UI 以 [shouldApplyUiEvent] 丟棄舊 request 事件）。
+     *
+     * 選 `@Volatile` 而非 synchronized getter：寫入一律在 [lifecycleLock] 內完成
+     * （與 [speechEpoch] 同臨界區鏡像更新，無遺失更新），讀取側（Main dispatcher
+     * 排隊的 UI lambda）免鎖即可見最新值；synchronized getter 會迫使 Main 執行緒
+     * 與 binder 回呼執行緒競爭同一把鎖，無必要。5 處 bump 點（stop／shutdown／
+     * 初始化失敗×2／[speakInternalLocked]）皆有 `currentEpoch = speechEpoch` 鏡像。
+     * 直接回調路徑（init／listener／speak 同步失敗）在鎖外 [emitError] 前，
+     * 於鎖內快照當代 epoch 後傳入，避免鎖外重讀撕裂。
+     */
+    @Volatile
+    var currentEpoch: Long = 0L
+        private set
 
     /**
      * 已送引擎的 utterance 追蹤（utteranceId → 送出時的 [speechEpoch]）。
@@ -130,7 +162,7 @@ class VoiceSpeaker(
      */
     private fun initializeEngine() {
         val engine = TextToSpeech(context) { status ->
-            val initErrors: List<String> = synchronized(lifecycleLock) {
+            val initResult: Pair<List<String>, Long> = synchronized(lifecycleLock) {
                 val initializedEngine = tts
                 if (initializedEngine == null) {
                     // TextToSpeech is allowed to call back from its constructor. Defer that result
@@ -138,16 +170,23 @@ class VoiceSpeaker(
                     if (!initCallbackHandled && deferredInitStatus == null) {
                         deferredInitStatus = status
                     }
-                    emptyList()
+                    // 鎖內快照當代 epoch（R5-2：鎖外重讀會與併發 stop/speak 撕裂）。
+                    emptyList<String>() to speechEpoch
                 } else {
-                    handleInitLocked(initializedEngine, status)
+                    handleInitLocked(initializedEngine, status) to speechEpoch
                 }
             }
-            initErrors.forEach { emitError(it) }
+            val (initErrors, initEpoch) = initResult
+            initErrors.forEach { emitError(it, initEpoch) }
             drainQueue()
         }
         val listenerError: String?
         val deferredErrors: List<String>
+        // R5-2：鎖外直調 emitError 的兩路徑共用同一鎖內快照（post-bump epoch）：
+        // listener 警告產生於 handleInitLocked 之前，但快照取其後，使兩事件在 UI
+        // epoch fence 下同被視為當代（維持既有「兩者皆顯示」行為；初始化已失敗時
+        // 失敗訊息主導，警告不因 stale epoch 被丟）。
+        val directEmitEpoch: Long
         synchronized(lifecycleLock) {
             listenerError = try {
                 val listenerStatus =
@@ -176,34 +215,37 @@ class VoiceSpeaker(
             val callbackStatus = deferredInitStatus
             deferredInitStatus = null
             deferredErrors = if (callbackStatus != null) handleInitLocked(engine, callbackStatus) else emptyList()
+            directEmitEpoch = speechEpoch
         }
-        if (listenerError != null) emitError(listenerError)
-        deferredErrors.forEach { emitError(it) }
+        if (listenerError != null) emitError(listenerError, directEmitEpoch)
+        deferredErrors.forEach { emitError(it, directEmitEpoch) }
         drainQueue()
     }
 
     /** 朗讀正文，交由 Android 系統 TTS；離線能力及資料處理取決於已安裝的語音引擎。 */
     fun speak(text: String) {
         if (text.isBlank()) return
-        val error: String? = synchronized(lifecycleLock) {
+        // R5-2：同步送入失敗的錯誤訊息在鎖內快照當代 epoch 後，於鎖外攜 epoch 發出。
+        val speakResult: Pair<String?, Long> = synchronized(lifecycleLock) {
             if (terminal) return
             val failureDetail = initFailureDetail
             if (failureDetail != null) {
                 // 初始化已失敗：本次朗讀不會送引擎，沿用原始 detail 揭露（不再靜默）。
-                VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, failureDetail)
+                VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, failureDetail) to speechEpoch
             } else {
                 val engine = tts ?: return
                 if (!ready) {
                     pending = PendingSpeech(text, speechEpoch)
-                    null
+                    null to speechEpoch
                 } else {
-                    speakInternalLocked(engine, text)
+                    speakInternalLocked(engine, text) to speechEpoch
                 }
             }
         }
+        val (error, errorEpoch) = speakResult
         // 提交中同步重入回調已入隊（投遞延後到此）：先排空佇列（時序在前），再揭露同步送入失敗。
         drainQueue()
-        if (error != null) emitError(error)
+        if (error != null) emitError(error, errorEpoch)
     }
 
     /** 停播並清除尚未送入引擎的文字；保留已初始化的引擎，之後仍可 [speak]。 */
@@ -211,6 +253,7 @@ class VoiceSpeaker(
         synchronized(lifecycleLock) {
             if (terminal) return
             speechEpoch++
+            currentEpoch = speechEpoch
             pending = null
             // 舊 utterance 已被 QUEUE_FLUSH 語義或引擎 stop 丟棄：遲到錯誤不再揭露。
             utteranceEpochs.clear()
@@ -231,6 +274,7 @@ class VoiceSpeaker(
             terminal = true
             ready = false
             speechEpoch++
+            currentEpoch = speechEpoch
             pending = null
             utteranceEpochs.clear()
             activeRequestFailed = false
@@ -259,6 +303,7 @@ class VoiceSpeaker(
             initFailureDetail = VoiceTts.DETAIL_INIT_FAILED
             pending = null
             speechEpoch++
+            currentEpoch = speechEpoch
             activeRequestFailed = false
             activeRequestPending = 0
             return listOf(VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_INIT_FAILED))
@@ -276,6 +321,7 @@ class VoiceSpeaker(
             initFailureDetail = VoiceTts.DETAIL_NO_ENGINE
             pending = null
             speechEpoch++
+            currentEpoch = speechEpoch
             activeRequestFailed = false
             activeRequestPending = 0
             return listOf(VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_NO_ENGINE))
@@ -357,6 +403,7 @@ class VoiceSpeaker(
         }
         utteranceEpochs.clear()
         speechEpoch++
+        currentEpoch = speechEpoch
         activeRequestFailed = false
         activeRequestPending = 0
         isSubmitting = true
@@ -507,8 +554,8 @@ class VoiceSpeaker(
         if (!secondPass) return
         when (event.kind) {
             EmitKind.ERROR ->
-                emitError(VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED))
-            EmitKind.DONE -> emitDone()
+                emitError(VoiceTts.ttsFallbackMessage(DenyReason.NO_PRIVILEGE, VoiceTts.DETAIL_SPEAK_FAILED), event.epoch)
+            EmitKind.DONE -> emitDone(event.epoch)
         }
     }
 
@@ -546,17 +593,17 @@ class VoiceSpeaker(
     }
 
     /** 失敗通道出口（鎖外呼叫；listener 本體異常不回拋，避免壞掉引擎回呼執行緒）。 */
-    private fun emitError(message: String) {
+    private fun emitError(message: String, epoch: Long) {
         try {
-            onError(message)
+            onError(message, epoch)
         } catch (_: Exception) {
         }
     }
 
     /** 成功通道出口（語義同 [emitError]）。 */
-    private fun emitDone() {
+    private fun emitDone(epoch: Long) {
         try {
-            onDone()
+            onDone(epoch)
         } catch (_: Exception) {
         }
     }

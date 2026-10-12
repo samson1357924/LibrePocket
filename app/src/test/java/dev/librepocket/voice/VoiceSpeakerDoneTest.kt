@@ -33,11 +33,12 @@ class VoiceSpeakerDoneTest {
     @Test
     fun doneForTrackedUtterance_emitsSuccess() {
         val doneCalls = CopyOnWriteArrayList<Unit>()
+        val doneEpochs = CopyOnWriteArrayList<Long>()
         val errors = CopyOnWriteArrayList<String>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { epoch -> doneCalls += Unit; doneEpochs += epoch },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -47,6 +48,8 @@ class VoiceSpeakerDoneTest {
         requireNotNull(shadow.utteranceListener).onDone(utteranceId)
 
         assertEquals(1, doneCalls.size)
+        // R5-2：成功信號攜事件 epoch；無新 speak 推進時即為當代 epoch。
+        assertEquals(listOf(speaker.currentEpoch), doneEpochs.toList())
         // Robolectric 預設 shadow 無中文語料，init 照例發 LANG_UNAVAILABLE
         // 降級提醒（既有行為）；成功信號不斷言零錯誤，只斷言無朗讀失敗。
         assertTrue("errors=$errors", errors.none { it.contains(VoiceTts.DETAIL_SPEAK_FAILED) })
@@ -58,7 +61,7 @@ class VoiceSpeakerDoneTest {
         val doneCalls = CopyOnWriteArrayList<Unit>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onDone = { doneCalls += Unit },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -76,7 +79,7 @@ class VoiceSpeakerDoneTest {
         val doneCalls = CopyOnWriteArrayList<Unit>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onDone = { doneCalls += Unit },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -95,7 +98,7 @@ class VoiceSpeakerDoneTest {
         val doneCalls = CopyOnWriteArrayList<Unit>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onDone = { doneCalls += Unit },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -115,8 +118,8 @@ class VoiceSpeakerDoneTest {
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
             maxChunk = 3,
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -144,8 +147,8 @@ class VoiceSpeakerDoneTest {
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
             maxChunk = 3,
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -173,8 +176,8 @@ class VoiceSpeakerDoneTest {
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
             maxChunk = 3,
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -199,8 +202,8 @@ class VoiceSpeakerDoneTest {
         val errors = CopyOnWriteArrayList<String>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -225,8 +228,8 @@ class VoiceSpeakerDoneTest {
         val errors = CopyOnWriteArrayList<String>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -247,7 +250,7 @@ class VoiceSpeakerDoneTest {
         val doneCalls = CopyOnWriteArrayList<Unit>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onDone = { doneCalls += Unit },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -268,8 +271,8 @@ class VoiceSpeakerDoneTest {
         val errors = CopyOnWriteArrayList<String>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -293,7 +296,7 @@ class VoiceSpeakerDoneTest {
         val doneCalls = CopyOnWriteArrayList<Unit>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onDone = { doneCalls += Unit },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -317,8 +320,8 @@ class VoiceSpeakerDoneTest {
         val errors = CopyOnWriteArrayList<String>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -345,8 +348,8 @@ class VoiceSpeakerDoneTest {
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
             maxChunk = 3,
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -367,8 +370,8 @@ class VoiceSpeakerDoneTest {
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
             maxChunk = 3,
-            onError = { errors += it },
-            onDone = { doneCalls += Unit },
+            onError = { msg, _ -> errors += msg },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -388,7 +391,7 @@ class VoiceSpeakerDoneTest {
         val doneCalls = CopyOnWriteArrayList<Unit>()
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
-            onDone = { doneCalls += Unit },
+            onDone = { _ -> doneCalls += Unit },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)

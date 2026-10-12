@@ -106,7 +106,7 @@ class VoiceSpeakerLifecycleTest {
     @Test
     fun initFailure_isObservableAndLaterSpeakStaysObservable() {
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         speaker.speak("pending before failure")
         val shadow = currentTtsShadow()
 
@@ -127,7 +127,7 @@ class VoiceSpeakerLifecycleTest {
     fun noEngine_isObservableAndFailClosed() {
         ControlledTextToSpeechShadow.forcedEngines = emptyList()
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         speaker.speak("pending before probe")
         val shadow = currentTtsShadow()
 
@@ -147,7 +147,7 @@ class VoiceSpeakerLifecycleTest {
     fun noEngine_laterSpeakKeepsOriginalDetail() {
         ControlledTextToSpeechShadow.forcedEngines = emptyList()
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         speaker.speak("pending before probe")
         val shadow = currentTtsShadow()
 
@@ -174,7 +174,7 @@ class VoiceSpeakerLifecycleTest {
         // 語義與拋錯分支一致（見 engineQueryThrow_maintainsOriginalFlowWithoutFailure）。
         ControlledTextToSpeechShadow.forcedEngines = null
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         speaker.speak("pending before probe")
         val shadow = currentTtsShadow()
 
@@ -201,7 +201,7 @@ class VoiceSpeakerLifecycleTest {
         // 故不改生產碼，只在此鎖定語義：未知查詢不斷言失敗、不阻擋後續朗讀。
         ControlledTextToSpeechShadow.throwOnGetEngines = true
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         speaker.speak("pending before probe")
         val shadow = currentTtsShadow()
 
@@ -225,7 +225,7 @@ class VoiceSpeakerLifecycleTest {
     fun listenerReturnError_isWarningButSpeakerStaysUsable() {
         ControlledTextToSpeechShadow.forcedListenerResult = TextToSpeech.ERROR
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
 
@@ -243,7 +243,7 @@ class VoiceSpeakerLifecycleTest {
     fun listenerException_isWarningButSpeakerStaysUsable() {
         ControlledTextToSpeechShadow.throwOnListener = true
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
 
@@ -261,7 +261,7 @@ class VoiceSpeakerLifecycleTest {
     fun speakReturnError_isObservable() {
         ControlledTextToSpeechShadow.failSpeak = true
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
 
@@ -280,7 +280,7 @@ class VoiceSpeakerLifecycleTest {
     fun speakException_isObservable() {
         ControlledTextToSpeechShadow.throwOnSpeak = true
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
 
@@ -298,7 +298,8 @@ class VoiceSpeakerLifecycleTest {
     @Test
     fun utteranceError_isObservable() {
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val errorEpochs = CopyOnWriteArrayList<Pair<String, Long>>()
+        val speaker = newSpeaker(onError = { msg, epoch -> errors += msg; errorEpochs += msg to epoch })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
         speaker.speak("hello")
@@ -312,13 +313,19 @@ class VoiceSpeakerLifecycleTest {
                 it.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.contains("NO_PRIVILEGE")
             },
         )
+        // R5-2：朗讀失敗攜事件 epoch；無新 speak 推進時即為當代 epoch。
+        val speakFailures = errorEpochs.filter {
+            it.first.contains(VoiceTts.DETAIL_SPEAK_FAILED) && it.first.contains("NO_PRIVILEGE")
+        }
+        assertEquals(1, speakFailures.size)
+        assertEquals(speaker.currentEpoch, speakFailures.single().second)
         speaker.shutdown()
     }
 
     @Test
     fun utteranceError_unknownId_isSuppressed() {
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
 
@@ -336,7 +343,7 @@ class VoiceSpeakerLifecycleTest {
     @Test
     fun utteranceError_duplicateId_isDeduped() {
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
         speaker.speak("hello")
@@ -360,7 +367,7 @@ class VoiceSpeakerLifecycleTest {
     @Test
     fun utteranceError_afterStop_isSuppressed() {
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
         speaker.speak("hello")
@@ -379,7 +386,7 @@ class VoiceSpeakerLifecycleTest {
     @Test
     fun utteranceError_afterShutdown_isSuppressed() {
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
         speaker.speak("hello")
@@ -400,7 +407,7 @@ class VoiceSpeakerLifecycleTest {
         val speaker = VoiceSpeaker(
             ApplicationProvider.getApplicationContext<Context>(),
             maxChunk = 3,
-            onError = { errors += it },
+            onError = { msg, _ -> errors += msg },
         )
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
@@ -426,7 +433,7 @@ class VoiceSpeakerLifecycleTest {
         ControlledTextToSpeechShadow.failLanguageLookup = true
         ControlledTextToSpeechShadow.failSpeak = true
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         speaker.speak("pending before init")
         val shadow = currentTtsShadow()
 
@@ -453,7 +460,7 @@ class VoiceSpeakerLifecycleTest {
         // 缺中文語料走降級提醒（非播放失敗：不以「做不到」開頭），但 ready 語義不變（仍可朗讀）。
         ControlledTextToSpeechShadow.failLanguageLookup = true
         val errors = CopyOnWriteArrayList<String>()
-        val speaker = newSpeaker(onError = { errors += it })
+        val speaker = newSpeaker(onError = { msg, _ -> errors += msg })
         val shadow = currentTtsShadow()
         initSuccessfully(shadow)
 
@@ -596,7 +603,7 @@ class VoiceSpeakerLifecycleTest {
         }
     }
 
-    private fun newSpeaker(onError: (String) -> Unit = {}): VoiceSpeaker =
+    private fun newSpeaker(onError: (String, Long) -> Unit = { _, _ -> }): VoiceSpeaker =
         VoiceSpeaker(ApplicationProvider.getApplicationContext<Context>(), onError = onError)
 
     private fun currentTtsShadow(): ControlledTextToSpeechShadow {

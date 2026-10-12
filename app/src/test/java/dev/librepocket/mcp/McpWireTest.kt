@@ -65,4 +65,28 @@ class McpWireTest {
         val (_, isError) = McpWire.parseCall(json)
         assertFalse(isError)
     }
+
+    @Test fun missingContentAndResultThrowsProtocol() {
+        // 截斷半 JSON（content/result 雙缺）：必須拋 IllegalArgumentException（server 映射 PROTOCOL），
+        // 不回 (null, false) 假成功。
+        val truncated = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":"
+        try {
+            McpWire.parseCall(truncated)
+            fail("expected IllegalArgumentException for missing result.content")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("truncated JSON must not be McpToolFailure (TOOL_ERROR), got: ${e.message}")
+        } catch (_: IllegalArgumentException) {
+            // 預期：server 映射 PROTOCOL + 計熔斷。
+        }
+    }
+
+    @Test fun largeContentPreservedWithoutSilentTake() {
+        // 傳輸層 64k 字元內的完整結果不得靜默 take(32768)：40k CJK 必須逐字保留。
+        val big = "繁".repeat(40_000)
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+            "{\"content\":[{\"type\":\"text\",\"text\":\"$big\"}],\"isError\":false}}"
+        val (result, isError) = McpWire.parseCall(json)
+        assertFalse(isError)
+        assertTrue("40k CJK 結果必須完整保留（無 32k 靜默截斷）", result != null && result.contains(big))
+    }
 }

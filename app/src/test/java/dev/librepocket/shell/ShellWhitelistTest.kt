@@ -1,7 +1,10 @@
 package dev.librepocket.shell
 
 import dev.librepocket.tool.Flavor
+import java.io.File
+import java.nio.file.Files
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -26,7 +29,15 @@ class ShellWhitelistTest {
 
     private fun shellWithFake(stdoutSize: Int): Pair<RestrictedShell, FakeRunner> {
         val runner = FakeRunner(ByteArray(stdoutSize) { 'x'.code.toByte() })
-        return RestrictedShell(runner = runner) to runner
+        // S3 hermetic：FakeRunner 不執行，spawn 目標永不落地；解析一律用桩，
+        // 只驗政策/配額/截斷語義。真解析覆蓋見 ShellTrustedExecTest（暫存 fixture
+        // + systemOwned 模擬裝置不可寫）。桩因：宿主 /bin/echo 實體落點隨發行版
+        // 而異（本機 -> /usr/lib/cargo/...，containment 快照外），預設解析在
+        // 此類宿主必拒，與被測語義無關。
+        return RestrictedShell(
+            runner = runner,
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+        ) to runner
     }
 
     @Test fun nonWhitelistedBinaryDeniedWithoutSpawn() {
@@ -89,17 +100,93 @@ class ShellWhitelistTest {
     }
 
     @Test fun timeoutKillsSleep() {
-        val shell = RestrictedShell()
-        val startMs = System.currentTimeMillis()
-        val result = shell.execute(listOf("sleep", "120"), timeoutMs = 500L)
-        val elapsedMs = System.currentTimeMillis() - startMs
-        assertTrue("expected TimedOut, got $result", result is ShellResult.TimedOut)
-        // 閾值理由：正常 kill 路徑約 0.5–1s（500ms waitFor + destroyForcibly +
-        // gobbler join 上限 2×5s，兩個 stream 依序 join）；sleep 120 與 kill 上限明顯分離，若 kill 迴歸為
-        // 自然等待，elapsed 會遠超上限。10s 約為正常路徑的 10 倍，CI 高負載不誤殺，
-        // 但 kill 退化到 grace 全滿（約 15.5s = 0.5s wait + 5s destroy wait + 2×5s gobbler join）會被擋下。不設下界斷言
-        // （CI 調度抖動易 flake）。生產碼未動。
-        assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 10_000L)
+        // Stage1 hermetic：自建 `sleep` fixture（無限迴圈，不依賴宿主 /bin/sleep
+        // 實體落點與宿主 searchDirs 可寫性），真 DefaultProcessRunner 真超時殺。
+        // 舊 host-sniffing（hostSleepRoots 只補 allowedRoots，未覆 S5 searchDir
+        // 守衛）在 CI `ubuntu-24.04`（/usr/local/bin 777）整表拒，已刪除。
+        // systemOwned 模擬裝置不可寫（宿主 fixture 屬主可寫，見 TrustedExec 註解）；
+        // 守衛存活另由 writableFixture_* 負向控制證明，非假綠。
+        // 需 host `/bin/sh`（與 multicall fixture 同約束）；缺失則硬紅非跳過。
+        // 閾值理由（合併我方 hardening）：sleep 120 與 kill 上限明顯分離，若 kill
+        // 迴歸為自然等待 elapsed 會遠超上限；10s 約為正常路徑（~0.5–1s：500ms
+        // waitFor + destroyForcibly + gobbler join 上限 2×5s，兩個 stream 依序
+        // join）的 10 倍，CI 高負載不誤殺，但 kill 退化到 grace 全滿（約 15.5s =
+        // 0.5s wait + 5s destroy wait + 2×5s gobbler join）會被擋下。下界 400ms
+        // 證明真等待超時而非瞬時假回（fixture 迴圈忽略參數，120 僅表意圖）。
+        val bin = Files.createTempDirectory("sleep-bin").toFile()
+        val scope = Files.createTempDirectory("sleep-scope").toFile()
+        try {
+            val sleepFile = File(bin, "sleep")
+            sleepFile.writeText("#!/bin/sh\nwhile true; do :; done\n")
+            assertTrue("setExecutable failed for $sleepFile", sleepFile.setExecutable(true))
+            val systemOwned: (java.nio.file.Path) -> Boolean = { _ -> false }
+            // 預檢：解析必先成功，否則 TimedOut 斷言 vacuous（未 spawn 即回傳不算殺）。
+            val pre = ShellExecutables.resolve(
+                "sleep",
+                listOf(bin.absolutePath),
+                allowedRoots = listOf(bin.canonicalPath),
+                isWritable = systemOwned,
+            )
+            assertTrue("fixture must resolve before spawn, got null", pre != null)
+            val shell = RestrictedShell(
+                runner = DefaultProcessRunner(),
+                privateRoot = scope.absolutePath,
+                execSearchDirs = listOf(bin.absolutePath),
+                execAllowedRoots = listOf(bin.canonicalPath),
+                execIsWritable = systemOwned,
+            )
+            val startMs = System.currentTimeMillis()
+            val result = shell.execute(listOf("sleep", "120"), timeoutMs = 500L)
+            val elapsedMs = System.currentTimeMillis() - startMs
+            assertTrue("expected TimedOut, got $result", result is ShellResult.TimedOut)
+            assertTrue("must actually wait for timeout (no instant fake): ${elapsedMs}ms", elapsedMs >= 400L)
+            assertTrue("kill took too long: ${elapsedMs}ms", elapsedMs < 10_000L)
+        } finally {
+            bin.deleteRecursively()
+            scope.deleteRecursively()
+        }
+    }
+
+    @Test fun writableFixture_deniedWithoutSpawn() {
+        // 負向控制：同一 fixture 在可寫判定下必須拒且零 spawn，證守衛仍咬合。
+        val bin = Files.createTempDirectory("sleep-w-bin").toFile()
+        val scope = Files.createTempDirectory("sleep-w-scope").toFile()
+        try {
+            val sleepFile = File(bin, "sleep")
+            sleepFile.writeText("#!/bin/sh\nwhile true; do :; done\n")
+            assertTrue("setExecutable failed for $sleepFile", sleepFile.setExecutable(true))
+            val direct = ShellExecutables.resolve(
+                "sleep",
+                listOf(bin.absolutePath),
+                allowedRoots = listOf(bin.canonicalPath),
+                isWritable = { _ -> true },
+            )
+            assertTrue("writable fixture must not resolve, got $direct", direct == null)
+            val detailed = ShellExecutables.resolveDetailed(
+                "sleep",
+                listOf(bin.absolutePath),
+                allowedRoots = listOf(bin.canonicalPath),
+                isWritable = { _ -> true },
+            )
+            assertTrue("expected SEARCH_DIR_UNTRUSTED, got $detailed", detailed is ShellExecutables.ResolveOutcome.Denied &&
+                detailed.reason == ShellExecutables.ResolveDeny.SEARCH_DIR_UNTRUSTED)
+            val runner = FakeRunner(ByteArray(0))
+            val shell = RestrictedShell(
+                runner = runner,
+                privateRoot = scope.absolutePath,
+                execSearchDirs = listOf(bin.absolutePath),
+                execAllowedRoots = listOf(bin.canonicalPath),
+                execIsWritable = { _ -> true },
+            )
+            val r = shell.execute(listOf("sleep", "30"), timeoutMs = 500L)
+            assertTrue("expected Denied, got $r", r is ShellResult.Denied)
+            assertTrue("message=$r", (r as ShellResult.Denied).message.contains("SEARCH_DIR_UNTRUSTED"))
+            assertFalse("message must not leak path: $r", r.message.contains(bin.canonicalPath))
+            assertEquals(0, runner.calls)
+        } finally {
+            bin.deleteRecursively()
+            scope.deleteRecursively()
+        }
     }
 
     @Test fun outputTruncatedAtCap() {
@@ -124,7 +211,11 @@ class ShellWhitelistTest {
     @Test fun quotaExceededAfterLimit() {
         val runner = FakeRunner("ok".toByteArray())
         val quota = ShellQuota(maxCalls = 2, windowMs = 60_000L)
-        val shell = RestrictedShell(quota = quota, runner = runner)
+        val shell = RestrictedShell(
+            quota = quota,
+            runner = runner,
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+        )
         assertTrue(shell.execute(listOf("echo", "1")) is ShellResult.Ok)
         assertTrue(shell.execute(listOf("echo", "2")) is ShellResult.Ok)
         val third = shell.execute(listOf("echo", "3"))
@@ -136,7 +227,11 @@ class ShellWhitelistTest {
     @Test fun deniedCallsDoNotConsumeQuota() {
         val runner = FakeRunner(ByteArray(0))
         val quota = ShellQuota(maxCalls = 1, windowMs = 60_000L)
-        val shell = RestrictedShell(quota = quota, runner = runner)
+        val shell = RestrictedShell(
+            quota = quota,
+            runner = runner,
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+        )
         assertTrue(shell.execute(listOf("nope-bin-xyz")) is ShellResult.Denied)
         // 策略拒絕不佔配額：隨後一次合法呼叫仍應放行。
         assertTrue(shell.execute(listOf("echo", "hi")) is ShellResult.Ok)
@@ -271,7 +366,11 @@ class ShellWhitelistTest {
 
     @Test fun privateAbsoluteAllowedWithScope() {
         val runner = FakeRunner("ok".toByteArray())
-        val shell = RestrictedShell(runner = runner, privateRoot = shellPrivateRoot)
+        val shell = RestrictedShell(
+            runner = runner,
+            privateRoot = shellPrivateRoot,
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+        )
         val result = shell.execute(listOf("cat", "$shellPrivateRoot/chat/x.txt"))
         assertTrue("expected Ok, got $result", result is ShellResult.Ok)
         assertEquals(1, runner.calls)
@@ -284,6 +383,7 @@ class ShellWhitelistTest {
             runner = runner,
             privateRoot = shellPrivateRoot,
             safRoots = listOf(safTree),
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
         )
         val result = shell.execute(listOf("cat", "$safTree/report.pdf"))
         assertTrue("expected Ok, got $result", result is ShellResult.Ok)

@@ -105,6 +105,10 @@ function roleEffortEnvName(role: OpenAIModelRole): string {
   return `${roleEnvironmentNames[role]}_REASONING_EFFORT`;
 }
 
+function roleFallbackEnvName(role: OpenAIModelRole): string {
+  return `${roleEnvironmentNames[role]}_FALLBACKS`;
+}
+
 export function resolveRoleModel(role: OpenAIModelRole, env: OpenAIEnvironment): string {
   const modelId = env[roleEnvironmentNames[role]]?.trim() ?? '';
   if (!modelId || containsPlaceholder(modelId)) throw new Error('model not configured');
@@ -331,6 +335,8 @@ export interface SendOpenAISingleTurnOptions {
   maxOutputTokens?: number;
   timeoutMs?: number;
   allowedOrigins?: string[];
+  /** Role whose configured fallback list extends the chain; set by callers. */
+  modelRole?: OpenAIModelRole;
   /** An injection seam for offline callers and tests; omitted in production. */
   env?: OpenAIEnvironment;
 }
@@ -338,6 +344,45 @@ export interface SendOpenAISingleTurnOptions {
 export interface OpenAISingleTurnResult {
   content: string;
   modelId: string;
+}
+
+function modelFailureReason(error: unknown): string {
+  const status = (error as { statusCode?: unknown } | undefined)?.statusCode;
+  if (typeof status === 'number') return `status ${status}`;
+  const message = error instanceof Error ? error.message : '';
+  return message || 'unknown error';
+}
+
+// Longest configured model chain across the three roles, used by callers that
+// must budget wall-clock time (a role may burn a whole chain before finishing).
+export function resolveMaxModelChainLength(env: OpenAIEnvironment): number {
+  const lengths = (['chief', 'android_sec', 'android_code'] as const)
+    .map((role) => resolveModelFallbackChain(`len-${role}`, env, role).length);
+  return Math.max(1, ...lengths);
+}
+
+// Ordered model candidates: primary first, then the role's fallbacks, then the
+// global list. Unset lists mean no fallback and the previous single-model
+// behaviour. There is no hardcoded preference list and no catalog tail: an
+// unlisted model stays unknown (fail closed) instead of being guessed.
+export function resolveModelFallbackChain(
+  modelId: string,
+  env: OpenAIEnvironment,
+  role?: OpenAIModelRole,
+): string[] {
+  const trimmed = modelId.trim();
+  const chain = !trimmed || containsPlaceholder(trimmed) ? [] : [trimmed];
+  const sources = [
+    role ? env[roleFallbackEnvName(role)] : undefined,
+    env.POCKETGUARD_MODEL_FALLBACKS,
+  ];
+  for (const raw of sources) {
+    for (const part of (raw ?? '').split(',')) {
+      const candidate = part.trim();
+      if (candidate && !containsPlaceholder(candidate) && !chain.includes(candidate)) chain.push(candidate);
+    }
+  }
+  return chain;
 }
 
 function errorWithStatus(status: number): Error & { statusCode: number } {
@@ -354,12 +399,27 @@ function extractOutputText(payload: unknown): string {
   const pieces: string[] = [];
   for (const item of output) {
     if (!item || typeof item !== 'object') continue;
-    const content = (item as { content?: unknown }).content;
-    if (!Array.isArray(content)) continue;
-    for (const part of content) {
-      if (!part || typeof part !== 'object') continue;
-      const textPart = part as { type?: unknown; text?: unknown };
-      if (textPart.type === 'output_text' && typeof textPart.text === 'string') pieces.push(textPart.text);
+    const rec = item as Record<string, unknown>;
+    if (rec.type === 'message') {
+      if (typeof rec.content === 'string') {
+        pieces.push(rec.content);
+      } else if (Array.isArray(rec.content)) {
+        for (const part of rec.content) {
+          if (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string') {
+            pieces.push((part as { text: string }).text);
+          }
+        }
+      }
+    } else if (rec.type === 'output_text' && typeof rec.text === 'string') {
+      pieces.push(rec.text);
+    } else if (Array.isArray(rec.content)) {
+      for (const part of rec.content) {
+        if (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string') {
+          pieces.push((part as { text: string }).text);
+        }
+      }
+    } else if (typeof rec.text === 'string') {
+      pieces.push(rec.text);
     }
   }
   return pieces.join('');
@@ -409,6 +469,7 @@ export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions)
         throw new Error('reasoning effort excludes temperature/top_p');
       }
       body.reasoning = { effort: effort || resolveDefaultReasoningEffort(env) };
+      body.include = ['reasoning.encrypted_content'];
     }
   } else {
     // Non-reasoning: never send reasoning. Temperature/top_p are opt-in
@@ -429,6 +490,7 @@ export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions)
         headers: {
           Authorization: `Bearer ${config.apiKey}`,
           'Content-Type': 'application/json',
+          'User-Agent': 'LibrePocket-Bot/1.0',
         },
         body: JSON.stringify(body),
         signal: controller.signal,
@@ -454,4 +516,77 @@ export async function sendOpenAISingleTurn(options: SendOpenAISingleTurnOptions)
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// Sends one single turn, falling back through the configured model chain when a
+// candidate is unavailable. Mirrors the Vegan-scan-app chain design: candidates
+// are tried in order, falling back to the next candidate on any model error
+// (including 400/404 when a model is not deployed/unlaunched, 500/503, 429, timeout,
+// invalid/empty response). The result reports the model that actually served so
+// reports never attribute a result to a model that failed, and exhaustion
+// throws an aggregated error the caller already converges to INCONCLUSIVE.
+//
+// Candidates whose per-model profile is unconfigured are skipped without any request,
+// so an unknown model never turns into a guessed body.
+export async function sendOpenAISingleTurnWithFallback(
+  options: SendOpenAISingleTurnOptions,
+): Promise<OpenAISingleTurnResult> {
+  const env = options.env ?? process.env;
+  // A missing or placeholder primary is a configuration failure, not a model
+  // outage: it must not be silently satisfied by a fallback candidate.
+  const primary = options.modelId?.trim() ?? '';
+  if (!primary || containsPlaceholder(primary)) throw new Error('model not configured');
+  const config = resolveOpenAIConfig(env, options.allowedOrigins ?? []);
+  const timeoutMs = options.timeoutMs ?? config.timeoutMs;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('OpenAI timeout invalid');
+
+  const chain = resolveModelFallbackChain(options.modelId, env, options.modelRole);
+  if (chain.length === 0) throw new Error('model not configured');
+
+  const attempts: string[] = [];
+  let lastError: unknown;
+  for (const [index, candidate] of chain.entries()) {
+    const isLast = index === chain.length - 1;
+    if (!resolveModelProfile(candidate, env)) {
+      attempts.push(`${candidate}: model profile not configured`);
+      console.warn(
+        `[PocketGuard] model ${candidate} skipped (profile not configured)${
+          isLast ? '; chain exhausted, failing closed' : '; falling back'
+        }`,
+      );
+      continue;
+    }
+    try {
+      const result = await sendOpenAISingleTurn({ ...options, modelId: candidate });
+      if (attempts.length > 0) {
+        console.warn(
+          `[PocketGuard] model ${candidate} served the request after: ${attempts.join('; ')}`,
+        );
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      const reason = modelFailureReason(error);
+      attempts.push(`${candidate}: ${reason}`);
+      if (isLast) {
+        console.warn(
+          `[PocketGuard] model ${candidate} unavailable (${reason}); chain exhausted, failing closed`,
+        );
+      } else {
+        console.warn(
+          `[PocketGuard] model ${candidate} unavailable (${reason}); falling back`,
+        );
+      }
+    }
+  }
+
+  const aggregatedError = new Error(
+    `All models failed [${chain.join(' → ')}]: ${attempts.join(' | ')}`,
+  );
+  if (lastError && typeof (lastError as { statusCode?: unknown }).statusCode === 'number') {
+    (aggregatedError as unknown as { statusCode: number }).statusCode = (
+      lastError as { statusCode: number }
+    ).statusCode;
+  }
+  throw aggregatedError;
 }

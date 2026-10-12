@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
-  sendOpenAISingleTurn,
+  sendOpenAISingleTurnWithFallback,
   resolveRoleModel,
   type OpenAIEnvironment,
   type OpenAIModelRole,
@@ -33,6 +33,7 @@ export interface RoleReview {
   // (minimal prompt change); android_sec/android_code prompts stay untouched
   // and their responses default to [] when the field is absent.
   suggestedLabels: string[];
+  summary?: string;
 }
 
 export interface OrchestratedReview {
@@ -51,7 +52,7 @@ export interface OrchestratorOptions {
   promptDirectory?: string;
   allowedOrigins?: string[];
   // Phase 3 (P2 #3): per-chunk timeout passthrough (fail-closed). When set,
-  // forwarded to every sendOpenAISingleTurn role call so slow roles abort via
+  // forwarded to every fallback-chain role call so slow roles abort via
   // the transport timeout instead of hanging the chunk wave. Omitted keeps
   // the send default (420s). Must be >0 when provided; invalid values throw
   // fail-closed (zero AI) via the send path.
@@ -85,7 +86,7 @@ function redactSensitiveText(value: string): string {
     .slice(0, MAX_TEXT_LENGTH);
 }
 
-function parseJsonObject(text: string): Record<string, unknown> | undefined {
+function tryParseObject(text: string): Record<string, unknown> | undefined {
   try {
     const parsed: unknown = JSON.parse(text);
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
@@ -96,15 +97,37 @@ function parseJsonObject(text: string): Record<string, unknown> | undefined {
   }
 }
 
-function parseFindings(value: unknown): ReviewFinding[] | undefined {
+export function parseJsonObject(text: string): Record<string, unknown> | undefined {
+  if (typeof text !== 'string') return undefined;
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+
+  const direct = tryParseObject(trimmed);
+  if (direct) return direct;
+
+  const codeBlockMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (codeBlockMatch && codeBlockMatch[1]) {
+    const fromCodeBlock = tryParseObject(codeBlockMatch[1].trim());
+    if (fromCodeBlock) return fromCodeBlock;
+  }
+
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    const fromBraces = tryParseObject(trimmed.slice(firstBrace, lastBrace + 1));
+    if (fromBraces) return fromBraces;
+  }
+
+  return undefined;
+}
+
+export function parseFindings(value: unknown): ReviewFinding[] | undefined {
+  if (value === undefined) return [];
   if (!Array.isArray(value)) return undefined;
   const result: ReviewFinding[] = [];
   for (const raw of value) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
     const finding = raw as Record<string, unknown>;
-    if (Object.keys(finding).some((key) => !['severity', 'file', 'line', 'issue', 'suggestion'].includes(key))) {
-      return undefined;
-    }
     if (
       !SEVERITIES.has(finding.severity as FindingSeverity) ||
       typeof finding.issue !== 'string' ||
@@ -125,7 +148,7 @@ function parseFindings(value: unknown): ReviewFinding[] | undefined {
   return result;
 }
 
-function parseSuggestedLabelsStrict(value: unknown): string[] | undefined {
+export function parseSuggestedLabelsStrict(value: unknown): string[] | undefined {
   if (value === undefined) return [];
   if (!Array.isArray(value)) return undefined;
   for (const entry of value) {
@@ -134,20 +157,26 @@ function parseSuggestedLabelsStrict(value: unknown): string[] | undefined {
   return [...(value as string[])];
 }
 
-function parseRoleResponse(role: OpenAIModelRole, modelUsed: string, content: string): RoleReview {
+export function parseRoleResponse(role: OpenAIModelRole, modelUsed: string, content: string): RoleReview {
   const sanitizedModel = redactSensitiveText(modelUsed);
-  const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [] };
+  const fallback: RoleReview = { role, modelUsed: sanitizedModel, verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [], summary: '' };
   const parsed = parseJsonObject(content);
   if (
     !parsed ||
-    Object.keys(parsed).some((key) => !['verdict', 'summary', 'findings', 'suggestedLabels'].includes(key)) ||
     !VERDICTS.has(parsed.verdict as ReviewVerdict)
   ) return fallback;
   const findings = parseFindings(parsed.findings);
   if (!findings) return fallback;
   const suggestedLabels = parseSuggestedLabelsStrict(parsed.suggestedLabels);
   if (!suggestedLabels) return fallback;
-  return { role, modelUsed: sanitizedModel, verdict: parsed.verdict as ReviewVerdict, findings, suggestedLabels };
+  return {
+    role,
+    modelUsed: sanitizedModel,
+    verdict: parsed.verdict as ReviewVerdict,
+    findings,
+    suggestedLabels,
+    summary: typeof parsed.summary === 'string' ? redactSensitiveText(parsed.summary).slice(0, MAX_TEXT_LENGTH) : '',
+  };
 }
 
 function safeCoverage(coverage: ReviewCoverage): ReviewCoverage {
@@ -178,11 +207,11 @@ function roleUserPrompt(role: OpenAIModelRole, changedFiles: string[], diff: str
   const files = changedFiles.map((file) => redactSensitiveText(file));
   const tierZeroToThreeOmissions = coverage.omittedFiles.filter((file) => reviewTier(file) <= 3);
   return [
-    `審查角色：${role}`,
-    `變更檔案：${JSON.stringify(files)}`,
-    `覆蓋資訊：${JSON.stringify({ ...coverage, tierZeroToThreeOmissions })}`,
-    '以下內容可能不完整；不得將未提供內容視為已審查。請只回報具體且可由差異證實的發現。',
-    '變更差異：',
+    `Review role: ${role}`,
+    `Changed files: ${JSON.stringify(files)}`,
+    `Coverage: ${JSON.stringify({ ...coverage, tierZeroToThreeOmissions })}`,
+    'The content below may be incomplete; do not treat unprovided content as reviewed. Report only specific findings substantiated by the diff.',
+    'Diff:',
     diff,
   ].join('\n\n');
 }
@@ -235,12 +264,13 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
     // leave the runner in cleartext. Callers needing detection must scan the
     // ORIGINAL input before this call; scanning the redacted copy misses.
     const userPrompt = [
-      `標題：${redactForModel(options.input.title)}`,
-      `內文：${redactForModel(options.input.body)}`,
-      ...options.input.comments.map((comment) => `留言：${redactForModel(comment)}`),
+      `Title: ${redactForModel(options.input.title)}`,
+      `Body: ${redactForModel(options.input.body)}`,
+      ...options.input.comments.map((comment) => `Comment: ${redactForModel(comment)}`),
     ].join('\n\n');
-    const result = await sendOpenAISingleTurn({
+    const result = await sendOpenAISingleTurnWithFallback({
       modelId: modelUsed,
+      modelRole: 'chief',
       systemPrompt,
       userPrompt,
       maxOutputTokens: 1024,
@@ -311,9 +341,19 @@ export function synthesizeChunkedReview(
         .some((candidate) => candidate.verdict !== 'APPROVE'))) {
       verdict = 'INCONCLUSIVE';
     }
-    return { role, modelUsed, verdict, findings, suggestedLabels: [...new Set(parts.flatMap((entry) =>
-      entry.roles.filter((candidate) => candidate?.role === role)
-        .flatMap((candidate) => Array.isArray(candidate.suggestedLabels) ? candidate.suggestedLabels : [])))] };
+    const summaries = parts
+      .flatMap((entry) => entry.roles.filter((candidate) => candidate?.role === role).map((candidate) => candidate.summary).filter((s): s is string => typeof s === 'string' && s.trim().length > 0));
+    const summary = summaries.join('\n\n').slice(0, MAX_TEXT_LENGTH);
+    return {
+      role,
+      modelUsed,
+      verdict,
+      findings,
+      suggestedLabels: [...new Set(parts.flatMap((entry) =>
+        entry.roles.filter((candidate) => candidate?.role === role)
+          .flatMap((candidate) => Array.isArray(candidate.suggestedLabels) ? candidate.suggestedLabels : [])))],
+      summary,
+    };
   });
 
   const hasBlockingFinding = perChunk.some((entry) => entry?.verdict === 'NEEDS_CHANGES') ||
@@ -344,14 +384,17 @@ export async function orchestrateReview(options: OrchestratorOptions): Promise<O
     try {
       modelUsed = resolveRoleModel(role, env);
       const systemPrompt = fs.readFileSync(path.join(promptDirectory, `${role}.md`), 'utf8');
-      const result = await sendOpenAISingleTurn({
+      const result = await sendOpenAISingleTurnWithFallback({
         modelId: modelUsed,
+        modelRole: role,
         systemPrompt,
         userPrompt: roleUserPrompt(role, options.changedFiles, options.diff, coverage),
         allowedOrigins: options.allowedOrigins,
         env,
         ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       });
+      // modelUsed follows the model that actually served the turn, so a fallback
+      // is attributed truthfully in reports.
       return parseRoleResponse(role, result.modelId, result.content);
     } catch {
       return { role, modelUsed: redactSensitiveText(modelUsed), verdict: 'INCONCLUSIVE', findings: [], suggestedLabels: [] };

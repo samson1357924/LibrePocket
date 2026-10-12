@@ -6,10 +6,12 @@ import {
 import {
   isReasoningNoneSupported,
   resolveDefaultReasoningEffort,
+  resolveModelFallbackChain,
   resolveModelProfile,
   resolveOpenAIConfig,
   resolveRoleModel,
   sendOpenAISingleTurn,
+  sendOpenAISingleTurnWithFallback,
 } from '../src/send_openai';
 import {
   coverageSummary,
@@ -19,7 +21,13 @@ import {
   truncateDiff,
 } from '../src/review_diff';
 import { buildReviewDiff } from '../src/github_runner';
-import { orchestrateReview, triageIssue } from '../src/orchestrator';
+import {
+  orchestrateReview,
+  parseFindings,
+  parseJsonObject,
+  parseRoleResponse,
+  triageIssue,
+} from '../src/orchestrator';
 
 const FAKE_OPENAI_BASE_URL = ['https:', '', 'pocketguard-openai.test', 'v1'].join('/');
 const FAKE_ALLOWED_ORIGINS = [new URL(FAKE_OPENAI_BASE_URL).origin];
@@ -226,7 +234,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
   ]);
 
   const boundaryDiffs: Record<string, string> = {
-    'app/src/main/java/example/First.kt': 'A'.repeat(119850),
+    'app/src/main/java/example/First.kt': 'A'.repeat(999850),
     'app/src/main/java/example/Second.kt': 'B'.repeat(1000),
   };
   const assembled = buildReviewDiff({
@@ -349,8 +357,10 @@ export async function runScannerSendOpenAITests(): Promise<void> {
   };
   try {
     let ordinaryRedirectMode: RequestInit['redirect'] | undefined;
+    let recordedHeaders: HeadersInit | undefined;
     globalThis.fetch = (async (_input, init) => {
       ordinaryRedirectMode = init?.redirect;
+      recordedHeaders = init?.headers;
       return new Response(JSON.stringify({
         output: [{ content: [{ type: 'output_text', text: 'review result' }] }],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -365,6 +375,8 @@ export async function runScannerSendOpenAITests(): Promise<void> {
     });
     assert.deepEqual(result, { content: 'review result', modelId: FAKE_MODEL_ID });
     assert.equal(ordinaryRedirectMode, 'error');
+    const headerRecord = recordedHeaders as Record<string, string> | undefined;
+    assert.equal(headerRecord?.['User-Agent'], 'LibrePocket-Bot/1.0');
 
     const redirectTarget = 'https://redirect-target.test/receive';
     for (const status of [307, 308]) {
@@ -524,20 +536,199 @@ export async function runScannerSendOpenAITests(): Promise<void> {
       assert.equal(completeWithOmission.verdict, 'INCONCLUSIVE', omittedFile);
     }
 
+    // Robust JSON & auxiliary keys: extra fields in findings or top-level are tolerated and ignored.
     const unknownFindingField = await runOrchestratorResponse(JSON.stringify({
       verdict: 'APPROVE',
       findings: [{ severity: 'WARN', issue: 'Synthetic finding.', unexpected: true }],
     }));
-    assert.equal(unknownFindingField.verdict, 'INCONCLUSIVE');
-    assert.equal(unknownFindingField.roles.every((role) => role.findings.length === 0), true);
+    assert.equal(unknownFindingField.verdict, 'APPROVE');
+    assert.equal(unknownFindingField.roles.every((role) => role.findings.length === 1), true);
+    assert.equal(unknownFindingField.roles[0]?.findings[0]?.severity, 'WARN');
+    assert.equal(unknownFindingField.roles[0]?.findings[0]?.issue, 'Synthetic finding.');
+    assert.equal(Object.hasOwn(unknownFindingField.roles[0]?.findings[0] ?? {}, 'unexpected'), false);
 
     const unknownTopLevelField = await runOrchestratorResponse(JSON.stringify({
       verdict: 'APPROVE',
       findings: [],
       unexpected: true,
     }));
-    assert.equal(unknownTopLevelField.verdict, 'INCONCLUSIVE');
-    assert.equal(unknownTopLevelField.roles.every((role) => role.verdict === 'INCONCLUSIVE'), true);
+    assert.equal(unknownTopLevelField.verdict, 'APPROVE');
+    assert.equal(unknownTopLevelField.roles.every((role) => role.verdict === 'APPROVE'), true);
+
+    // Genuinely invalid finding severity still triggers fallback to INCONCLUSIVE.
+    const invalidFindingField = await runOrchestratorResponse(JSON.stringify({
+      verdict: 'APPROVE',
+      findings: [{ severity: 'INVALID', issue: 'Synthetic finding.' }],
+    }));
+    assert.equal(invalidFindingField.verdict, 'INCONCLUSIVE');
+    assert.equal(invalidFindingField.roles.every((role) => role.findings.length === 0), true);
+
+    // Markdown-wrapped codeblock response through orchestrator
+    const markdownOrchestrated = await runOrchestratorResponse([
+      'Review analysis:',
+      '```json',
+      JSON.stringify({
+        verdict: 'APPROVE',
+        summary: 'Opus markdown codeblock handled properly.',
+        findings: [{ severity: 'SUGGESTION', issue: 'Consider adding comments.', auxiliaryKey: 'ignored' }],
+        suggestedLabels: ['area:runtime'],
+        extraMeta: { pass: true },
+      }),
+      '```',
+      'End of review.',
+    ].join('\n'));
+    assert.equal(markdownOrchestrated.verdict, 'APPROVE');
+    assert.equal(markdownOrchestrated.roles[0]?.summary, 'Opus markdown codeblock handled properly.');
+    assert.equal(markdownOrchestrated.roles[0]?.findings.length, 1);
+    assert.equal(markdownOrchestrated.roles[0]?.findings[0]?.severity, 'SUGGESTION');
+    assert.equal(markdownOrchestrated.roles[0]?.findings[0]?.issue, 'Consider adding comments.');
+    assert.equal(Object.hasOwn(markdownOrchestrated.roles[0]?.findings[0] ?? {}, 'auxiliaryKey'), false);
+    assert.deepEqual(markdownOrchestrated.roles[0]?.suggestedLabels, ['area:runtime']);
+
+    // Direct unit tests for parseJsonObject and parseRoleResponse with realistic Opus shapes.
+    {
+      // 1. Direct parseJsonObject testing
+      assert.deepEqual(parseJsonObject('{"verdict":"APPROVE"}'), { verdict: 'APPROVE' });
+      assert.deepEqual(parseJsonObject('  \n{"verdict":"APPROVE"}\n  '), { verdict: 'APPROVE' });
+      assert.deepEqual(parseJsonObject('```json\n{"verdict":"APPROVE"}\n```'), { verdict: 'APPROVE' });
+      assert.deepEqual(parseJsonObject('```\n{"verdict":"APPROVE"}\n```'), { verdict: 'APPROVE' });
+      assert.deepEqual(parseJsonObject('```JSON\n{"verdict":"APPROVE"}\n```'), { verdict: 'APPROVE' });
+      assert.deepEqual(
+        parseJsonObject('Here is the review:\n```json\n{"verdict":"APPROVE"}\n```\nHope that helps!'),
+        { verdict: 'APPROVE' },
+      );
+      assert.deepEqual(
+        parseJsonObject('Some text before {"verdict":"APPROVE"} some text after'),
+        { verdict: 'APPROVE' },
+      );
+      assert.equal(parseJsonObject('not json at all'), undefined);
+      assert.equal(parseJsonObject(''), undefined);
+      assert.equal(parseJsonObject('[1, 2, 3]'), undefined);
+
+      // 2. Realistic Claude Opus 4.6 Thinking response shape
+      const realisticOpusResponse = [
+        'I have completed the review of the pull request changes.',
+        '',
+        '```json',
+        JSON.stringify({
+          verdict: 'NEEDS_CHANGES',
+          summary: 'Critical vulnerability detected in credential handling and missing boundary checks in file access.',
+          findings: [
+            {
+              severity: 'BLOCK',
+              file: 'app/src/main/java/dev/librepocket/keystore/KeyStoreManager.kt',
+              line: 42,
+              issue: 'Hardcoded secret encryption key in plaintext.',
+              suggestion: 'Use AndroidKeyStore provider to generate and retrieve hardware-backed keys.',
+              category: 'security',
+              rule: 'SEC-KEYSTORE-HARDCODED',
+              confidence: 'high',
+            },
+            {
+              severity: 'WARN',
+              file: 'app/src/main/java/dev/librepocket/tool/ToolDispatcher.kt',
+              line: 105,
+              issue: 'Unchecked execution boundary allows potential path traversal.',
+              suggestion: 'Validate canonical file paths against allowed root directories.',
+              category: 'integrity',
+              score: 8.5,
+            },
+          ],
+          suggestedLabels: ['status:needs-decision', 'security'],
+          analysis: 'The PR introduces significant security regressions that should be addressed before merging.',
+          overview: 'Overall code structure is clean but crypto implementation lacks hardware backing.',
+          scores: { security: 45, quality: 80 },
+        }, null, 2),
+        '```',
+        '',
+        'Please address the blocking findings before proceeding.',
+      ].join('\n');
+
+      const parsedOpus = parseRoleResponse('chief', 'cpa-claude-opus-4-6-thinking', realisticOpusResponse);
+      assert.equal(parsedOpus.verdict, 'NEEDS_CHANGES');
+      assert.equal(parsedOpus.role, 'chief');
+      assert.equal(parsedOpus.modelUsed, 'cpa-claude-opus-4-6-thinking');
+      assert.equal(
+        parsedOpus.summary,
+        'Critical vulnerability detected in credential handling and missing boundary checks in file access.',
+      );
+      assert.equal(parsedOpus.findings.length, 2);
+      assert.deepEqual(parsedOpus.findings[0], {
+        severity: 'BLOCK',
+        file: 'app/src/main/java/dev/librepocket/keystore/KeyStoreManager.kt',
+        line: 42,
+        issue: 'Hardcoded secret encryption key in plaintext.',
+        suggestion: 'Use AndroidKeyStore provider to generate and retrieve hardware-backed keys.',
+      });
+      assert.deepEqual(parsedOpus.findings[1], {
+        severity: 'WARN',
+        file: 'app/src/main/java/dev/librepocket/tool/ToolDispatcher.kt',
+        line: 105,
+        issue: 'Unchecked execution boundary allows potential path traversal.',
+        suggestion: 'Validate canonical file paths against allowed root directories.',
+      });
+      assert.deepEqual(parsedOpus.suggestedLabels, ['status:needs-decision', 'security']);
+      // Verify auxiliary keys were not leaked into the parsed role review
+      assert.equal(Object.hasOwn(parsedOpus, 'analysis'), false);
+      assert.equal(Object.hasOwn(parsedOpus, 'overview'), false);
+      assert.equal(Object.hasOwn(parsedOpus, 'scores'), false);
+      assert.equal(Object.hasOwn(parsedOpus.findings[0], 'category'), false);
+      assert.equal(Object.hasOwn(parsedOpus.findings[0], 'rule'), false);
+      assert.equal(Object.hasOwn(parsedOpus.findings[0], 'confidence'), false);
+
+      // 3. Minimal response: verdict only, missing summary, findings, suggestedLabels
+      const minimalParsed = parseRoleResponse('android_sec', 'cpa-claude-opus-4-6-thinking', '{"verdict":"APPROVE"}');
+      assert.equal(minimalParsed.verdict, 'APPROVE');
+      assert.equal(minimalParsed.summary, '');
+      assert.deepEqual(minimalParsed.findings, []);
+      assert.deepEqual(minimalParsed.suggestedLabels, []);
+
+      // 4. Code block without language tag
+      const noLangParsed = parseRoleResponse(
+        'android_code',
+        'cpa-claude-opus-4-6-thinking',
+        '```\n{"verdict":"INCONCLUSIVE","summary":"Need diff context","findings":[]}\n```',
+      );
+      assert.equal(noLangParsed.verdict, 'INCONCLUSIVE');
+      assert.equal(noLangParsed.summary, 'Need diff context');
+      assert.deepEqual(noLangParsed.findings, []);
+      assert.deepEqual(noLangParsed.suggestedLabels, []);
+
+      // 5. Fallback on invalid verdict
+      const invalidVerdictParsed = parseRoleResponse(
+        'chief',
+        'cpa-claude-opus-4-6-thinking',
+        '{"verdict":"LGTM","summary":"All good"}',
+      );
+      assert.equal(invalidVerdictParsed.verdict, 'INCONCLUSIVE');
+      assert.equal(invalidVerdictParsed.summary, '');
+      assert.deepEqual(invalidVerdictParsed.findings, []);
+
+      // 6. Fallback on invalid finding structure (e.g. invalid severity)
+      const invalidFindingParsed = parseRoleResponse(
+        'chief',
+        'cpa-claude-opus-4-6-thinking',
+        '{"verdict":"APPROVE","findings":[{"severity":"INVALID","issue":"bad"}]}',
+      );
+      assert.equal(invalidFindingParsed.verdict, 'INCONCLUSIVE');
+      assert.deepEqual(invalidFindingParsed.findings, []);
+
+      // 7. Fallback on invalid suggestedLabels type
+      const invalidLabelsParsed = parseRoleResponse(
+        'chief',
+        'cpa-claude-opus-4-6-thinking',
+        '{"verdict":"APPROVE","suggestedLabels":"not-an-array"}',
+      );
+      assert.equal(invalidLabelsParsed.verdict, 'INCONCLUSIVE');
+      assert.deepEqual(invalidLabelsParsed.suggestedLabels, []);
+    }
+
+    const reviewWithSummary = await runOrchestratorResponse(JSON.stringify({
+      verdict: 'APPROVE',
+      summary: 'Clean architecture and robust error handling.',
+      findings: [],
+    }));
+    assert.equal(reviewWithSummary.roles[0]?.summary, 'Clean architecture and robust error handling.');
 
     // P1 #3: per-model request profiles. Reasoning bodies carry
     // reasoning.effort and never temperature/top_p; chat bodies never carry
@@ -574,6 +765,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
 
     const reasoningBody = await captureSingleTurnBody('gpt-5.2', openaiEnvironment);
     assert.deepEqual(reasoningBody.reasoning, { effort: 'high' });
+    assert.deepEqual(reasoningBody.include, ['reasoning.encrypted_content']);
     assert.equal(Object.hasOwn(reasoningBody, 'temperature'), false);
     assert.equal(Object.hasOwn(reasoningBody, 'top_p'), false);
     assert.equal(reasoningBody.model, 'gpt-5.2');
@@ -1030,6 +1222,373 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         assert.equal(fetchCount, 0, 'unknown profile orchestrator must not send requests');
       } finally {
         globalThis.fetch = previous;
+      }
+    }
+
+    // --- Model fallback chain (Vegan-scan-app parity, fail-closed deltas). ---
+    {
+      // Chain composition: primary, then role fallbacks, then global, deduped,
+      // placeholders filtered. Unset lists mean no fallback at all.
+      assert.deepEqual(
+        resolveModelFallbackChain('primary-model', {
+          POCKETGUARD_MODEL_CHIEF: 'primary-model',
+          POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'b-model, c-model, primary-model, ${MISSING}',
+          POCKETGUARD_MODEL_FALLBACKS: 'c-model, d-model',
+        }, 'chief'),
+        ['primary-model', 'b-model', 'c-model', 'd-model'],
+        'chain keeps order, drops duplicates and placeholders',
+      );
+      assert.deepEqual(
+        resolveModelFallbackChain('primary-model', {}, 'chief'),
+        ['primary-model'],
+        'no configured fallbacks yields the previous single-model behaviour',
+      );
+
+      const mapEnv: Record<string, string> = {
+        OPENAI_BASE_URL: FAKE_OPENAI_BASE_URL,
+        OPENAI_API_KEY: 'fake-key-for-fallback-probe',
+        POCKETGUARD_MODEL_PROFILES: JSON.stringify({
+          'primary-model': 'chat',
+          'second-model': 'chat',
+          'third-model': 'chat',
+        }),
+      };
+      const chainEnv = { ...mapEnv, POCKETGUARD_MODEL_FALLBACKS: 'second-model, third-model' };
+      const okResponse = (): Response => new Response(JSON.stringify({
+        output: [{ content: [{ type: 'output_text', text: 'ok' }] }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+      // Retryable status: primary 503 -> next model serves, and the result
+      // attributes the model that actually answered.
+      {
+        const models: string[] = [];
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async (_input, init) => {
+          models.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return models.length === 1
+            ? new Response('busy', { status: 503 })
+            : okResponse();
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.deepEqual(models, ['primary-model', 'second-model']);
+          assert.equal(result.modelId, 'second-model', 'result attributes the serving model');
+          assert.equal(result.content, 'ok');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Primary 400 (simulating unlaunched or undeployed model) automatically
+      // falls back to the second model and returns successfully.
+      {
+        const models: string[] = [];
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async (_input, init) => {
+          models.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return models.length === 1
+            ? new Response('model not deployed', { status: 400 })
+            : okResponse();
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.deepEqual(models, ['primary-model', 'second-model']);
+          assert.equal(result.modelId, 'second-model', 'result attributes the serving model after 400 fallback');
+          assert.equal(result.content, 'ok');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // A candidate without a profile is skipped without any request; when every
+      // candidate is unconfigured the chain fails closed with zero requests.
+      {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => {
+          fetchCount += 1;
+          return okResponse();
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'unknown-primary',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: { ...mapEnv, POCKETGUARD_MODEL_FALLBACKS: 'second-model' },
+            timeoutMs: 1000,
+          });
+          assert.equal(fetchCount, 1, 'unconfigured primary sends nothing');
+          assert.equal(result.modelId, 'second-model');
+
+          fetchCount = 0;
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'unknown-primary',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: { ...mapEnv },
+              timeoutMs: 1000,
+            }),
+            /model profile not configured/,
+          );
+          assert.equal(fetchCount, 0, 'all-unconfigured chain fails closed without requests');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Chain exhaustion: all candidates fail -> throws aggregated error without retrying.
+      {
+        let fetchCount = 0;
+        const requestedModels: string[] = [];
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async (_input, init) => {
+          fetchCount += 1;
+          requestedModels.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return new Response('busy', { status: 503 });
+        }) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'primary-model',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: chainEnv,
+              timeoutMs: 1000,
+            }),
+            (error: Error & { statusCode?: number }) => {
+              assert.match(error.message, /^All models failed/);
+              assert.ok(error.message.includes('primary-model'));
+              assert.ok(error.message.includes('second-model'));
+              assert.ok(error.message.includes('third-model'));
+              assert.equal(error.statusCode, 503);
+              return true;
+            },
+          );
+          assert.equal(fetchCount, 3, 'each candidate is tried once with no extra retries');
+          assert.deepEqual(requestedModels, ['primary-model', 'second-model', 'third-model']);
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Orchestrator level: primary down for every role -> all INCONCLUSIVE and
+      // the reported model is the one that actually served (no false credit).
+      {
+        const roleEnv = {
+          ...chainEnv,
+          POCKETGUARD_MODEL_CHIEF: 'primary-model',
+          POCKETGUARD_MODEL_ANDROID_SEC: 'primary-model',
+          POCKETGUARD_MODEL_ANDROID_CODE: 'primary-model',
+        };
+        const previous = globalThis.fetch;
+        const models: string[] = [];
+        globalThis.fetch = (async (_input, init) => {
+          models.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return new Response('busy', { status: 503 });
+        }) as typeof fetch;
+        try {
+          const review = await orchestrateReview({
+            changedFiles: ['app/src/main/java/demo/Safe.kt'],
+            diff: 'diff --git a/app/src/main/java/demo/Safe.kt b/app/src/main/java/demo/Safe.kt',
+            coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
+            deterministicViolations: [],
+            env: roleEnv,
+            timeoutMs: 1000,
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+          });
+          assert.equal(review.verdict, 'INCONCLUSIVE');
+          assert.equal(review.roles.every((role) => role.verdict === 'INCONCLUSIVE'), true);
+          assert.equal(models.length, 9, 'three roles each walk the full chain');
+          // Roles run concurrently, so assert per-model coverage instead of order.
+          for (const model of ['primary-model', 'second-model', 'third-model']) {
+            assert.equal(models.filter((entry) => entry === model).length, 3,
+              `every role reaches ${model}`);
+          }
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Message-typed transport failures also fall through (no statusCode).
+      for (const failure of ['OpenAI request failed', 'OpenAI response invalid', 'OpenAI response empty'] as const) {
+        const models: string[] = [];
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async (_input, init) => {
+          const model = (JSON.parse(String(init?.body)) as { model: string }).model;
+          models.push(model);
+          // Only the first attempt fails, so the fallback candidate must serve.
+          if (models.length > 1) return okResponse();
+          if (failure === 'OpenAI request failed') throw new Error('network down');
+          if (failure === 'OpenAI response invalid') {
+            return new Response('not json', { status: 200, headers: { 'Content-Type': 'application/json' } });
+          }
+          return new Response(JSON.stringify({ output: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.deepEqual(models, ['primary-model', 'second-model'], `${failure} falls back`);
+          assert.equal(result.modelId, 'second-model');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // A rejected origin / unusable configuration is not a model outage: it
+      // stops the chain immediately with zero requests instead of walking the
+      // chain looking for a model that can bypass the allowlist.
+      {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => { fetchCount += 1; return okResponse(); }) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'primary-model',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: ['https://allowed-origin.test'],
+              env: { ...chainEnv, OPENAI_BASE_URL: 'https://disallowed-origin.test/v1' },
+              timeoutMs: 1000,
+            }),
+            /OpenAI configuration rejected/,
+          );
+          assert.equal(fetchCount, 0, 'configuration errors never touch the chain');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Primary failure on 404, 500, 503 (as well as 401, 403, 409, 422, 429)
+      // successfully falls back to the next candidate.
+      for (const status of [404, 500, 503, 401, 403, 409, 422, 429]) {
+        const models: string[] = [];
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async (_input, init) => {
+          models.push((JSON.parse(String(init?.body)) as { model: string }).model);
+          return models.length === 1
+            ? new Response('error', { status })
+            : okResponse();
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.deepEqual(models, ['primary-model', 'second-model'], `status ${status} falls back`);
+          assert.equal(result.modelId, 'second-model');
+          assert.equal(result.content, 'ok');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // A missing or placeholder primary is a configuration failure: no request
+      // is sent and no fallback candidate may satisfy it silently.
+      for (const primary of ['', '   ', '${MODEL}']) {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => { fetchCount += 1; return okResponse(); }) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: primary,
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: chainEnv,
+              timeoutMs: 1000,
+            }),
+            /model not configured/,
+          );
+          assert.equal(fetchCount, 0, `primary '${primary}' sends no request`);
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // t0 timeout on the primary falls through to the next candidate.
+      {
+        const models: string[] = [];
+        const previous = globalThis.fetch;
+        globalThis.fetch = ((_input: unknown, init: { signal?: AbortSignal }) => {
+          const attempt = models.push('attempt');
+          // Only the primary stalls; the next candidate answers after its own
+          // timeout window, proving each attempt is bounded independently.
+          if (attempt > 1) return Promise.resolve(okResponse());
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+          });
+        }) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 120,
+          });
+          assert.equal(models.length, 2, 'aborted primary falls back');
+          assert.equal(result.modelId, 'second-model');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
+
+      // Output shape compatibility (Vegan-scan-app parity): string content,
+      // direct output_text items, and reasoning blocks alongside message.
+      for (const [shapeName, payload] of [
+        ['message string', { output: [{ type: 'message', content: 'string message' }] }],
+        ['message text parts', { output: [{ type: 'reasoning', summary: [] }, { type: 'message', content: [{ type: 'text', text: 'text part' }] }] }],
+        ['direct output_text', { output: [{ type: 'output_text', text: 'direct output text' }] }],
+      ] as const) {
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })) as typeof fetch;
+        try {
+          const result = await sendOpenAISingleTurnWithFallback({
+            modelId: 'primary-model',
+            systemPrompt: 's',
+            userPrompt: 'u',
+            allowedOrigins: FAKE_ALLOWED_ORIGINS,
+            env: chainEnv,
+            timeoutMs: 1000,
+          });
+          assert.ok(result.content.length > 0, `${shapeName} extracts usable content`);
+        } finally {
+          globalThis.fetch = previous;
+        }
       }
     }
   } finally {

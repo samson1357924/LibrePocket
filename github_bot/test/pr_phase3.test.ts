@@ -304,14 +304,11 @@ export async function runPrPhase3Tests(): Promise<void> {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'slow role timeout forces INCONCLUSIVE');
-        assert.equal(reviewed.chunkCoverageComplete, false, 'slow transport never writes true');
-        assert.ok(reviewed.chunks && reviewed.chunks.length >= 3, 'slow run keeps explicit per-chunk reports (no silent omission)');
-        assert.ok((reviewed.chunks ?? []).some((c) => c.verdict === 'INCONCLUSIVE'), 'timed-out chunks readable as INCONCLUSIVE');
-        assert.ok(counter.count >= 9, `slow roles still attempted transport (got ${counter.count})`);
-        // Checkpoint artifact: deadline/timeout exit saves INCONCLUSIVE+false.
+        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
+        assert.equal(counter.count, 3, `slow roles still attempted transport (got ${counter.count})`);
+        // Checkpoint artifact: deadline/timeout exit saves INCONCLUSIVE.
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
         assert.equal(artifact.verdict, 'INCONCLUSIVE', 'timeout artifact checkpoints INCONCLUSIVE');
-        assert.equal(artifact.chunkCoverageComplete, false, 'timeout artifact checkpoints coverage false');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -345,13 +342,10 @@ export async function runPrPhase3Tests(): Promise<void> {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'deadline exit forces INCONCLUSIVE');
-        assert.equal(reviewed.chunkCoverageComplete, false, 'deadline exit never writes true');
-        assert.ok(reviewed.chunks && reviewed.chunks.length >= 3, 'deadline exit keeps placeholders (no silent omission)');
-        assert.equal(reviewed.chunkCount, reviewed.chunks?.length, 'deadline chunkCount matches reports');
+        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
         assert.equal(counter.count, 0, 'deadline exit starts zero chunk turns when remaining < need');
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
         assert.equal(artifact.verdict, 'INCONCLUSIVE', 'deadline exit checkpoints the artifact');
-        assert.equal(artifact.chunkCoverageComplete, false, 'deadline artifact checkpoints coverage false');
       } finally {
         Date.now = realNow;
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -380,15 +374,10 @@ export async function runPrPhase3Tests(): Promise<void> {
       try {
         const first = await runOnce(path.join(tempDir, 'first-output.json'));
         const second = await runOnce(path.join(tempDir, 'second-output.json'));
-        assert.equal(first.verdict, 'APPROVE', 'concurrent full coverage may APPROVE');
-        assert.equal(second.verdict, first.verdict, 'repeated concurrent runs agree on verdict');
-        assert.deepEqual(second.chunks, first.chunks, 'repeated concurrent runs agree on index-sorted reports');
-        assert.deepEqual(
-          (second.chunks ?? []).map((c) => c.index),
-          (second.chunks ?? []).map((_, i) => i),
-          'reports stay index-sorted (verifiable aggregation)',
-        );
-        assert.equal(second.chunkCoverageComplete, true, 'conclusive concurrent run computes true');
+        assert.equal(first.verdict, 'APPROVE', 'single-turn full coverage may APPROVE');
+        assert.equal(second.verdict, first.verdict, 'repeated runs agree on verdict');
+        assert.equal(first.chunks, undefined, 'single-turn has no chunks');
+        assert.equal(second.chunks, undefined, 'single-turn has no chunks');
         assert.deepEqual(second.roles, first.roles, 'repeated runs agree on merged roles');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -435,7 +424,7 @@ export async function runPrPhase3Tests(): Promise<void> {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'timed-out review stays INCONCLUSIVE');
-        assert.equal(reviewed.chunkCoverageComplete, false, 'timed-out review never writes true');
+        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
         await runPublishMode({
           event: prEvent(),
           env: {
@@ -450,7 +439,7 @@ export async function runPrPhase3Tests(): Promise<void> {
           githubClient: prClient(shared),
         });
         assert.equal(parseReviewCountMarker(shared.comments[0]?.body ?? '', HEAD_SHA), 1, 'timed-out claim still holds one slot (never refunded)');
-        assert.ok(shared.comments[0]?.body.includes('判定：INCONCLUSIVE'), 'timed-out publish falls back on the same sticky');
+        assert.ok(shared.comments[0]?.body.includes('Verdict: INCONCLUSIVE'), 'timed-out publish falls back on the same sticky');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -517,14 +506,12 @@ export async function runPrPhase3Tests(): Promise<void> {
         } finally {
           restore();
         }
-        assert.equal(reviewed.verdict, 'APPROVE', '2min setup smoke still approves conclusive chunks');
-        assert.equal(reviewed.chunkCoverageComplete, true, '2min setup smoke computes true');
-        assert.ok(reviewed.chunks && reviewed.chunks.length >= 3, '2min setup smoke keeps per-chunk reports');
-        assert.equal(reviewed.chunkCount, reviewed.chunks?.length, '2min setup chunkCount matches reports');
-        assert.ok(counter.count >= 9, `2min setup smoke attempted all chunk turns (got ${counter.count})`);
+        assert.equal(reviewed.verdict, 'APPROVE', '2min setup smoke still approves single-turn');
+        assert.equal(reviewed.coverage.complete, true, '2min setup smoke computes complete coverage');
+        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
+        assert.equal(counter.count, 3, `2min setup smoke attempted 3 roles (got ${counter.count})`);
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
         assert.equal(artifact.verdict, 'APPROVE', '2min setup smoke checkpoints APPROVE');
-        assert.equal(artifact.chunkCoverageComplete, true, '2min setup smoke checkpoints coverage true');
       } finally {
         Date.now = realNow;
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -565,12 +552,10 @@ export async function runPrPhase3Tests(): Promise<void> {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'exhausted job exits INCONCLUSIVE');
-        assert.equal(reviewed.chunkCoverageComplete, false, 'exhausted job never writes true');
-        assert.ok(reviewed.chunks && reviewed.chunks.length >= 3, 'exhausted job keeps placeholders');
+        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
         assert.equal(counter.count, 0, 'exhausted job starts zero chunk turns (job cap, not review clock)');
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
         assert.equal(artifact.verdict, 'INCONCLUSIVE', 'exhausted job checkpoints INCONCLUSIVE');
-        assert.equal(artifact.chunkCoverageComplete, false, 'exhausted job checkpoints coverage false');
       } finally {
         Date.now = realNow;
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -578,19 +563,19 @@ export async function runPrPhase3Tests(): Promise<void> {
     }
 
     // E2E: claim pre-flight uses the same effective formula (Phase 2 P2 #2).
-    // A job with only ~19s of effective budget cannot cover 3 chunks over 2
-    // waves (share 9500ms < viable 10000ms) so it claims nothing with zero
+    // A job with only ~9s of effective budget cannot cover 1 wave
+    // (share 9000ms < viable 10000ms) so it claims nothing with zero
     // writes; without a job start the same tiny configured budget also
     // refuses (missing downgrades fail-closed to configured).
     {
       const frozenNow = 2_000_000_000_000;
       Date.now = () => frozenNow;
       try {
-        const jobStarted = String(frozenNow - (REVIEW_JOB_TIMEOUT_MS - REVIEW_JOB_UPLOAD_SKEW_MS - 19_000));
+        const jobStarted = String(frozenNow - (REVIEW_JOB_TIMEOUT_MS - REVIEW_JOB_UPLOAD_SKEW_MS - 9_000));
         assert.equal(
           resolveEffectiveReviewDeadlineMs({ POCKETGUARD_JOB_STARTED_MS: jobStarted } as NodeJS.ProcessEnv, frozenNow),
-          19_000,
-          'claim job-cap effective is 19000ms (precondition)',
+          9_000,
+          'claim job-cap effective is 9000ms (precondition)',
         );
         const state: { comments: StickyComment[]; created: number; updated: number } = { comments: [], created: 0, updated: 0 };
         const denied = await runClaimMode({
@@ -611,6 +596,30 @@ export async function runPrPhase3Tests(): Promise<void> {
         assert.equal(denied.reviewsUsed, 0, 'job-capped claim consumes zero slots');
         assert.equal(state.created, 0, 'job-capped claim performs zero creates');
         assert.equal(state.updated, 0, 'job-capped claim performs zero updates');
+
+        // A long fallback chain multiplies the attempts a role may burn, so the
+        // same diff that fits without fallbacks must be refused once a chain is
+        // configured (budget accounts for chainLength x timeout per role).
+        const chained = await runClaimMode({
+          event: prEvent(),
+          env: {
+            GITHUB_EVENT_NAME: 'pull_request_target',
+            GITHUB_REPOSITORY: REPO,
+            GITHUB_TOKEN: 'fake-token',
+            POCKETGUARD_RUN_ID: 'phase3-chain-run',
+            POCKETGUARD_JOB_STARTED_MS: jobStarted,
+            POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'second-model, third-model',
+            POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS: 'second-model, third-model',
+            POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS: 'second-model, third-model',
+          } as NodeJS.ProcessEnv,
+          githubClient: prClient(state),
+          writeStdout: () => undefined,
+          runGit: prGitStub(chunkedFiles()),
+        });
+        assert.equal(chained.claimed, false, 'chain-aware claim occupies nothing');
+        assert.match(chained.reason, /budget-exceeded/, 'chain-aware reason is explicit');
+        assert.equal(state.created, 0, 'chain-aware claim performs zero creates');
+        assert.equal(state.updated, 0, 'chain-aware claim performs zero updates');
       } finally {
         Date.now = realNow;
       }

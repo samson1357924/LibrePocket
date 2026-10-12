@@ -83,7 +83,17 @@ class RecoveryRequiredException : IllegalStateException("queued turn recovery re
  *
  * The controller consumes the unified [StreamEvent] union from [LlmProvider]
  * directly (no M3-local stub): [StreamEvent.TextDelta] and
- * [StreamEvent.ReasoningDelta] extend the current assistant block,
+ * [StreamEvent.ReasoningDelta] extend the current assistant block, with
+ * reasoning events ([StreamEvent.ReasoningDelta] and
+ * [StreamEvent.ReasoningPresent]) flagging it reasoning-sourced
+ * ([UiMessage.hasReasoning], rebuilt into [ChatMessage.hasReasoning] so
+ * tool-dependent / thinking-mode follow-ups fail closed while ordinary
+ * no-tools follow-ups continue),
+ * and persisted as a payload-free `reasoning` marker event (marker itself
+ * empty, flag-only) via
+ * [TranscriptSink.onTurnSucceeded]/[TranscriptSink.onTurnCancelled] so
+ * resume restores the flag. Visible reasoning deltas remain merged into the
+ * assistant text and persist as usual (pre-existing behavior),
  * [StreamEvent.ToolDelta]/[StreamEvent.ToolDone] are aggregated and recorded
  * (marker text + [TranscriptSink.onToolDone]) so tool calls are never dropped,
  * [StreamEvent.Usage] is recorded ([TranscriptSink.onUsage] + [lastUsage]).
@@ -589,7 +599,8 @@ class TurnController(
       // which may have moved on by the time the launched block runs.
       val cancelId = latestAssistantId()
       val cancelText = latestAssistantText()
-      fireTranscript { transcript.onTurnCancelled(cancelId, cancelText) }
+      val cancelReasoning = latestAssistantReasoning()
+      fireTranscript { transcript.onTurnCancelled(cancelId, cancelText, cancelReasoning) }
       throw e
     }
     // Normal completion only: hand off at most one queued steer as a detached
@@ -760,8 +771,14 @@ class TurnController(
           when (event) {
             is StreamEvent.TextDelta -> appendAssistantText(attemptRunId, event.delta)
             // Reasoning stays in the same assistant block: P1 keeps one visible
-            // stream and never loses thinking content.
-            is StreamEvent.ReasoningDelta -> appendAssistantText(attemptRunId, event.delta)
+            // stream and never loses thinking content. The block is additionally
+            // flagged reasoning-sourced so tool-dependent / thinking-mode
+            // follow-up rebuilds fail closed (ordinary no-tools ones continue).
+            // Single _uiState.update (text + flag) to avoid two full maps per delta.
+            is StreamEvent.ReasoningDelta -> appendReasoningDelta(attemptRunId, event.delta)
+            // Opaque reasoning marker: no visible text, only the source flag
+            // (covers reasoning origins with no replayable payload).
+            is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
             is StreamEvent.ToolDelta -> {
               toolArgText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
               event.idChunk?.let {
@@ -811,7 +828,8 @@ class TurnController(
       if (failure == null) {
         // Snapshot text: assistantTextOf reads uiState at execution time.
         val successText = assistantTextOf(attemptRunId)
-        fireTranscript { transcript.onTurnSucceeded(attemptRunId, successText) }
+        val successReasoning = assistantReasoningOf(attemptRunId)
+        fireTranscript { transcript.onTurnSucceeded(attemptRunId, successText, successReasoning) }
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
@@ -856,7 +874,7 @@ class TurnController(
   private fun buildRequest(images: List<ChatImageRef>): ChatRequest {
     val base = _uiState.value.messages
       .filter { !it.isPartial }
-      .map { ChatMessage(role = it.role, text = it.text) }
+      .map { ChatMessage(role = it.role, text = it.text, hasReasoning = it.hasReasoning) }
       .toMutableList()
     val loaded = runCatching { imageLoader(images) }.getOrDefault(emptyList())
     if (loaded.isNotEmpty()) {
@@ -944,6 +962,43 @@ class TurnController(
     }
   }
 
+  /**
+   * Flags the attempt's assistant block as reasoning-sourced (idempotent).
+   * Display text is untouched; the flag only rides [buildRequest] into
+   * [ChatMessage.hasReasoning] so adapters fail closed on a tool-dependent /
+   * thinking-mode follow-up (ordinary no-tools follow-ups continue).
+   * Short-circuits when the flag is already set to avoid a full list copy
+   * plus a no-op flow emission (opaque [StreamEvent.ReasoningPresent] path).
+   */
+  private fun markAssistantReasoning(runId: String) {
+    if (_uiState.value.messages.any { it.id == runId && it.role == "assistant" && it.hasReasoning }) return
+    _uiState.update { s ->
+      s.copy(
+        messages = s.messages.map { m ->
+          if (m.id == runId && m.role == "assistant") m.copy(hasReasoning = true) else m
+        },
+      )
+    }
+  }
+
+  /**
+   * Merges one reasoning delta into the attempt's assistant block with a
+   * single [_uiState] update (one list map): appends [delta] to the visible
+   * text and sets `hasReasoning=true` together. An empty [delta] still sets
+   * the flag (empty reasoning counts as reasoning-sourced, matching the
+   * previous mark-then-append behavior where the mark ran first and the
+   * empty append returned early).
+   */
+  private fun appendReasoningDelta(runId: String, delta: String) {
+    _uiState.update { s ->
+      s.copy(
+        messages = s.messages.map { m ->
+          if (m.id == runId && m.role == "assistant") m.copy(text = m.text + delta, hasReasoning = true) else m
+        },
+      )
+    }
+  }
+
   private fun finalizeAssistant(runId: String) {
     _uiState.update { s ->
       s.copy(
@@ -957,11 +1012,19 @@ class TurnController(
   private fun assistantTextOf(runId: String): String =
     _uiState.value.messages.firstOrNull { it.id == runId }?.text.orEmpty()
 
+  /** Reasoning-source flag of one attempt's block (false when absent). */
+  private fun assistantReasoningOf(runId: String): Boolean =
+    _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.hasReasoning == true
+
   private fun latestAssistantId(): String =
     _uiState.value.messages.lastOrNull { it.role == "assistant" }?.id.orEmpty()
 
   private fun latestAssistantText(): String =
     _uiState.value.messages.lastOrNull { it.role == "assistant" }?.text.orEmpty()
+
+  /** Reasoning-source flag of the latest assistant block (false when absent). */
+  private fun latestAssistantReasoning(): Boolean =
+    _uiState.value.messages.lastOrNull { it.role == "assistant" }?.hasReasoning == true
 }
 
 /**

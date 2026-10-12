@@ -90,7 +90,13 @@ class ShellExecRestrictedTest {
 
     @Test fun allowlistedArgvExecutes() {
         val runner = FakeRunner("ok".toByteArray())
-        val shell = RestrictedShell(runner = runner, privateRoot = privateRoot)
+        // S3 hermetic：FakeRunner 不執行，只驗 argv 直達；解析用桩（宿主
+        // /bin/echo 實體落點隨發行版而異，見 ShellWhitelistTest 註解）。
+        val shell = RestrictedShell(
+            runner = runner,
+            privateRoot = privateRoot,
+            execResolver = { ShellExecutables.ResolvedExec("/trusted/$it", null) },
+        )
         val r = ShellExecTool.execute(listOf("echo", "hi"), shell, switchOn = true)
         assertTrue("$r", r is ShellResult.Ok)
         assertEquals(1, runner.calls)
@@ -115,14 +121,16 @@ class ShellExecRestrictedTest {
         // 配額。
         val runner = FakeRunner("ok".toByteArray())
         val quota = ShellQuota(maxCalls = 1, windowMs = 60_000L)
-        val shell = RestrictedShell(quota = quota, runner = runner, privateRoot = privateRoot)
+        val stub: (String) -> ShellExecutables.ResolvedExec? =
+            { ShellExecutables.ResolvedExec("/trusted/$it", null) }
+        val shell = RestrictedShell(quota = quota, runner = runner, privateRoot = privateRoot, execResolver = stub)
         assertTrue(ShellExecTool.execute(listOf("echo", "1"), shell, switchOn = true) is ShellResult.Ok)
         val second = ShellExecTool.execute(listOf("echo", "2"), shell, switchOn = true)
         assertTrue("$second", second is ShellResult.Denied)
         assertEquals(ShellDeny.QUOTA_EXCEEDED, (second as ShellResult.Denied).reason)
         // 截斷。
         val big = FakeRunner(ByteArray(ShellPolicy.MAX_OUTPUT_BYTES + 8))
-        val bigShell = RestrictedShell(runner = big, privateRoot = privateRoot)
+        val bigShell = RestrictedShell(runner = big, privateRoot = privateRoot, execResolver = stub)
         val r = ShellExecTool.execute(listOf("echo", "x"), bigShell, switchOn = true)
         assertTrue("$r", r is ShellResult.Ok)
         assertEquals(true, (r as ShellResult.Ok).truncated)

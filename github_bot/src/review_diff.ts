@@ -1,4 +1,4 @@
-export const MAX_DIFF_LENGTH = 120000;
+export const MAX_DIFF_LENGTH = 1000000;
 
 // Phase 4 (P2 #2): per-chunk model budget for PR patches, mirroring the issue
 // chunk budget (MAX_ISSUE_CHUNK_LENGTH). Diffs whose full review length

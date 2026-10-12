@@ -1,17 +1,94 @@
 package dev.librepocket.files
 
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileNotFoundException
+import java.io.IOException
+import java.io.InputStream
+import java.nio.file.DirectoryIteratorException
+import java.nio.file.DirectoryStream
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
+
+/**
+ * 預算耗盡的 typed 失敗（[IOException] 子類：既有 `catch (Exception)` /
+ * `catch (IOException)` 通道照常接住，呼叫方再以 [budget] 細分映射；
+ * 見 [FileEditExecutor.patch] 的 `FILE_TOO_LARGE`、
+ * [FileSearchExecutor] 的跳過計數與列舉失敗）。
+ */
+class FileBudgetException(val budget: FileBudgetCode, message: String) : IOException(message)
+
+/** 預算種類（[detail] 為跨層傳遞的穩定機器碼）。 */
+enum class FileBudgetCode(val detail: String) {
+    /** read 超過位元組上限（sentinel 探針確認，絕不截斷回傳）。 */
+    READ_TOO_LARGE("FILE_TOO_LARGE"),
+
+    /** list 條目超過上限。 */
+    LIST_TOO_MANY("LIST_TOO_MANY"),
+
+    /** list 下探超過深度上限。 */
+    LIST_TOO_DEEP("LIST_TOO_DEEP"),
+
+    /** list 超過時間預算。 */
+    LIST_TIMEOUT("LIST_TIMEOUT"),
+}
 
 /**
  * 私有域檔案庫（BACKLOG D05）。
  *
  * - 作用域限定在 [root] 之下：任何穿越/絕對路徑在 [resolve] 即拋
  *   [IllegalArgumentException]，不觸碰檔案系統。
+ * - Symlink 政策（選項 a：禁 symlink，NOFOLLOW 語義）：[root] 自身、
+ *   構成 [root] 的每一詞法路徑段，以及目標路徑上每一路徑段若為 symlink
+ *   即拒絕（[resolve] 拋 [IllegalArgumentException]）；點存取（read/write/exists/delete）
+ *   語義一致。列目（[list]）不跟隨任何連結：遇 symlink 直接略過、
+ *   不下鑽，並以已造訪正規目錄集合防循環。
+ *   信任邊界：呼叫方須傳入可信正規根（例如 `filesDir.canonicalFile` 直建的
+ *   app 私有域），不得傳入不可信別名；`alias/.`、`alias/sub`、`alias/..`
+ *   類毒根一律拒絕（含原始 `.`/`..` 段直接 fail-closed，因 kernel 先跟隨再回退）。
+ *   若傳入非正規系統別名路徑，將 fail-closed 拒絕，呼叫方應改傳正規路徑。
+ * - 讀寫有界：[read] 先以 `length()` 快篩、再以 `cap+1` sentinel
+ *   串流讀取（抄 [dev.librepocket.tool.WebFetch.readCapped]／provider
+ *   `readBoundedProviderBody` 模式：exact-cap 視為合法 EOF，超限才拋
+ *   [FileBudgetException]，絕不把超大檔灌進記憶體；回傳前重驗鏈上無連結）；
+ *   [write] 的冪等比對先比長度、再以 8 KiB 固定緩衝串流比對（記憶體 O(1)，
+ *   不先讀完整舊檔；父目錄建立改用安全版 [mkdirParentNoFollow]）。
+ * - 列舉有窗：[list] 具條目／深度／deadline 三預算，超限拋
+ *   [FileBudgetException]（絕不靜默截斷）；同時 NOFOLLOW：基址及 walk 途中
+ *   遇 symlink 一律略過不下鑽（兄弟 diamond 連結只列真實側，見
+ *   ScopedFileStoreBudgetTest 的 NOFOLLOW 斷言；#57 語義凌駕 legacy 輸出），
+ *   以正規目錄集合防循環；[root] 自身為連結時回空表（fail-closed）。
+ *   開流／讀不到的子目錄視為空（沿舊 `listFiles()==null` 語義），不中斷兄弟列舉。
  * - 寫入冪等：內容相同即回 [WriteOutcome.Unchanged] 且不改 mtime；
  *   不同才原子落盤（同目錄暫存 +搬移），回 Created/Updated。
+ * - 寫前驗 parent chain：[write] 在建父目錄前後各驗一次鏈上無
+ *   symlink，並以 NOFOLLOW 逐段建父目錄（每段前驗連結、單層 `mkdir`，
+ *   不用會跟隨連結的 `mkdirs`），縮小檢查-使用窗口。
+ * - 點存取使用前重驗：[exists]/[delete] 在實際 `isFile`/`delete` 前重驗
+ *   一次整鏈（[resolve] 內已驗第一次）；[read] 在回傳前重驗一次。
+ *   重驗只能縮小窗口，不能消除——第二次驗證與實際 IO 之間攻擊者仍可能
+ *   以 `rename`/`symlink` 替換路徑段（見下）。
+ * - TOCTOU 殘餘風險：單次檢查無法解決併發替換——檢查與實際 IO 之間
+ *   攻擊者仍可能以 `rename`/`symlink` 替換路徑段。[read] 在回傳前重驗
+ *   一次鏈上無連結並丟棄可疑結果，可將單次替換轉為拒絕，但雙重替換
+ *   （檢查→換入連結→IO→換回真檔）仍可能穿出；[write] 的父目錄逐段建立、
+ *   暫存建立與搬移之間亦有同類窗口；[exists] 的第二次驗證與 `isFile` 之間、
+ *   [delete] 的第二次驗證與實際刪除之間同樣存在窗口（[delete] 為變更操作，
+ *   殘餘窗口內可能誤刪替換後的外部檔）。本類只保證有界行為：併發替換可能造成本次呼叫被拒
+ *   （[IllegalArgumentException]）、讀到舊內容、讀到替換後外部內容、
+ *   把本次寫入落在鏈外、誤刪替換後的外部檔，或短暫列出鏈外檔名
+ *   （後四者為殘餘小機率，寫穿出與列目洩露另見壓力測試說明），
+ *   不保證檢查後鏈上零變動；呼叫方不得假設檢查後路徑不可變。
+ *   併發壓力測試僅證明行為有界（無未處理異常、無懸掛、store 事後仍可用、
+ *   固定 `secret.txt` 未被竄改，`outsideExtra` 僅診斷），不宣稱消除競態；翻轉路徑上的併發寫入仍有殘餘小機率
+ *   把本次內容落在鏈外、併發列目仍有殘餘小機率短暫列出鏈外檔名
+ *   （兩者僅記錄、不計為通過條件），系統性穿出由單線程確定性測試覆蓋。
+ *   信任邊界：[root] 須為 app 私有域可信基直建；非 app UID 的併發 symlink 交換
+ *   為 out-of-scope，殘餘 TOCTOU 僅對 in-scope 競態有界，不做消除承諾。
+ *   Java 無 O_NOFOLLOW/openat，不以正規化一次比較充作消除。
  * - 檔名：中文/空格/深層嵌套原樣支援（見 [FileScope.sanitizeRelative]）；
  *   單名 255 位元組上限等非法輸入直接拒絕。
  * - SAF 側：本類不管；跨域路徑先經 [FileScope.decide] 裁決，
@@ -32,7 +109,8 @@ class ScopedFileStore(val root: File) {
 
     /**
      * 將相對路徑解析為根下檔案；穿越/絕對/非法名拋 [IllegalArgumentException]。
-     * 回傳前二次確認正規化絕對路徑仍在根內（防 `a/../..` 類邊界）。
+     * 回傳前二次確認正規化絕對路徑仍在根內（防 `a/../..` 類邊界），再驗
+     * 鏈上無 symlink（含 [root] 自身；NOFOLLOW 語義，見類註解 TOCTOU 說明）。
      */
     fun resolve(relativePath: String): File {
         val safe = FileScope.sanitizeRelative(relativePath)
@@ -43,30 +121,172 @@ class ScopedFileStore(val root: File) {
         if (targetNorm != rootNorm && !targetNorm.startsWith(rootNorm + "/")) {
             throw IllegalArgumentException("path escapes root: $relativePath")
         }
+        ensureNoSymlinkChain(safe, relativePath)
         return target
     }
 
-    /** 讀檔；不存在拋 [java.io.FileNotFoundException]。 */
-    fun read(relativePath: String): ByteArray {
-        val target = resolve(relativePath)
-        if (!target.isFile) throw java.io.FileNotFoundException(relativePath)
-        return target.readBytes()
+    /**
+     * 驗證自 [root] 至目標的每一路徑段（含兩端）皆非 symlink。
+     * 另驗構成 [root] 自身的每一詞法路徑段（防 `alias/.`、`alias/sub`
+     * 類毒根：`Files.isSymbolicLink(alias/.)` 為 false，但父段 `alias`
+     * 仍是連結，必須拒絕）。
+     * 不跟隨連結（NOFOLLOW）；懸空連結同樣拒絕。僅做單次檢查，
+     * 不防檢查-使用之間的併發替換（見類註解）。
+     */
+    private fun ensureNoSymlinkChain(safe: String, original: String) {
+        try {
+            ensureRootChainNoSymlink(original)
+            var cur = root
+            for (seg in safe.split("/")) {
+                cur = File(cur, seg)
+                if (Files.isSymbolicLink(cur.toPath())) {
+                    throw IllegalArgumentException("symlink not allowed: $original")
+                }
+            }
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            // fail-closed：無法判定是否為連結時一律拒絕。
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
     }
 
-    fun exists(relativePath: String): Boolean = resolve(relativePath).isFile
+    /**
+     * 驗構成 [root] 的每一詞法路徑段皆非 symlink。
+     * 先拒原始路徑中的 `.`/`..` 段（`alias/..` 經 kernel 先跟隨再回退，
+     * 詞法折疊後會誤判為無連結，必須 fail-closed；正規可信根永不含此類段）。
+     * 再以 [FileScope.normalize] 折疊尾端 `/.` 後逐段 lstat；
+     * 不存在路徑回 false（缺席根仍可檢查已存在的毒父段）。
+     * 呼叫方須傳正規可信根；非正規系統別名將 fail-closed，屬預期行為。
+     */
+    private fun ensureRootChainNoSymlink(original: String) {
+        val rawParts = root.absolutePath.split("/").filter { it.isNotEmpty() }
+        if (rawParts.any { it == "." || it == ".." }) {
+            throw IllegalArgumentException("symlink not allowed: $original")
+        }
+        val rootNorm = FileScope.normalize(root.absolutePath)
+        if (rootNorm.isEmpty()) {
+            throw IllegalArgumentException("symlink check failed: $original")
+        }
+        try {
+            val parts = rootNorm.split("/").filter { it.isNotEmpty() }
+            var cur = File("/")
+            if (Files.isSymbolicLink(cur.toPath())) {
+                throw IllegalArgumentException("symlink not allowed: $original")
+            }
+            for (part in parts) {
+                cur = File(cur, part)
+                if (Files.isSymbolicLink(cur.toPath())) {
+                    throw IllegalArgumentException("symlink not allowed: $original")
+                }
+            }
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
+    }
+
+    /**
+     * 讀檔；不存在拋 [FileNotFoundException]，超過 [maxBytes] 拋
+     * [FileBudgetException]（[FileBudgetCode.READ_TOO_LARGE]）。
+     * `length()` 快篩只是建議值；權威判定是串流中的 `cap+1` sentinel
+     * （檔在檢查後變大仍會被擋下），恰等於上限視為合法 EOF。
+     * 回傳前重驗鏈上無連結（見類註解 TOCTOU 說明；雙重替換仍為殘餘風險）。
+     *
+     * 測試接縫：實際經由 [read] internal 多載委派（`open` 預設為
+     * [defaultOpenRead]，行為不變）；測試可注入「小檔大流」工廠，使
+     * `length()` 預檢通過但串流超限，確定性命中 sentinel（見
+     * ScopedFileStoreBudgetTest.readSentinelRejectsGrowthAfterStat）。
+     */
+    fun read(relativePath: String, maxBytes: Int = MAX_READ_BYTES): ByteArray =
+        read(relativePath, maxBytes, ::defaultOpenRead)
+
+    /**
+     * 測試接縫多載（生產經由 [read] 委派，預設行為不變）。
+     *
+     * - [open]：預設為 [defaultOpenRead]（`FileInputStream` 直開）；測試可注入
+     *   任意 [InputStream] 工廠，模擬 stat 後成長（磁碟小檔、串流大內容），
+     *   證明預檢通過後 sentinel 仍拒絕。預檢、`cap+1` 串流上限與回傳前重驗
+     *   皆在此多載內，公開函數僅一行情委派，不分叉。
+     */
+    internal fun read(
+        relativePath: String,
+        maxBytes: Int,
+        open: (File) -> InputStream,
+    ): ByteArray {
+        require(maxBytes >= 1) { "maxBytes must be >= 1" }
+        val target = resolve(relativePath)
+        if (!target.isFile) throw FileNotFoundException(relativePath)
+        if (target.length() > maxBytes) {
+            throw FileBudgetException(
+                FileBudgetCode.READ_TOO_LARGE,
+                "file too large: $relativePath (${target.length()} bytes, limit $maxBytes)",
+            )
+        }
+        val cap = maxBytes.toLong() + 1
+        val bytes = open(target).use { input ->
+            val out = ByteArrayOutputStream(minOf(cap, READ_CHUNK_BYTES.toLong()).toInt())
+            val buf = ByteArray(READ_CHUNK_BYTES)
+            var total = 0L
+            while (true) {
+                val n = input.read(buf, 0, minOf(buf.size.toLong(), cap - total).toInt())
+                if (n == -1) break
+                total += n
+                if (total > maxBytes) {
+                    throw FileBudgetException(
+                        FileBudgetCode.READ_TOO_LARGE,
+                        "file too large: $relativePath (over $maxBytes bytes)",
+                    )
+                }
+                out.write(buf, 0, n)
+            }
+            out.toByteArray()
+        }
+        val safe = FileScope.sanitizeRelative(relativePath)
+            ?: throw IllegalArgumentException("unsafe path: $relativePath")
+        ensureNoSymlinkChain(safe, relativePath)
+        return bytes
+    }
+
+    /** 生產預設的讀檔開流（直開 [FileInputStream]）。 */
+    private fun defaultOpenRead(file: File): InputStream = FileInputStream(file)
+
+    fun exists(relativePath: String): Boolean {
+        val target = resolve(relativePath)
+        // 使用前重驗：resolve→isFile 窗口內若路徑段被換成連結，isFile 會跟隨；
+        // 重驗把單次替換轉為拒絕，但重驗→isFile 之間仍有殘餘窗口（見類註解）。
+        val safe = FileScope.sanitizeRelative(relativePath)
+            ?: throw IllegalArgumentException("unsafe path: $relativePath")
+        ensureNoSymlinkChain(safe, relativePath)
+        return target.isFile
+    }
 
     /**
      * 冪等寫入：內容一致直接回 [WriteOutcome.Unchanged]（不改 mtime）；
-     * 否則經暫存檔原子搬移落盤。父目錄自動建立。
+     * 否則經暫存檔原子搬移落盤。父目錄以 NOFOLLOW 逐段建立（見
+     * [mkdirParentNoFollow]），建前後各驗一次整鏈。
+     *
+     * 一致性比對有界：先比 `length()`（不等即不同，不讀內容），再以固定
+     * 緩衝串流逐塊比對、首異即停；舊檔再大也不會被完整讀進記憶體。
+     * （檢查與比對之間檔被竄改只會導向「不同→重寫」的安全方向。）
+     *
+     * 殘餘：建前二驗→逐段建→建後三驗與暫存建立/搬移之間仍有窗口，
+     * 併發 `rename`/`symlink` 替換理論上仍可能把暫存或目標落在鏈外，
+     * 見類註解 TOCTOU 說明。
      */
     fun write(relativePath: String, bytes: ByteArray): WriteOutcome {
         val target = resolve(relativePath)
-        if (target.isFile && target.readBytes().contentEquals(bytes)) {
+        val safe = FileScope.sanitizeRelative(relativePath)
+            ?: throw IllegalArgumentException("unsafe path: $relativePath")
+        mkdirParentNoFollow(safe, relativePath)
+        // 建後三驗：mkdir 可能新建目錄，併發替換窗口下再次確認。
+        ensureNoSymlinkChain(safe, relativePath)
+        if (target.isFile && target.length() == bytes.size.toLong() && contentEquals(target, bytes)) {
             return WriteOutcome.Unchanged
         }
         val created = !target.exists()
-        target.parentFile?.mkdirs()
-        val tmp = File.createTempFile(".lp-", ".tmp", target.parentFile ?: root)
+        val tmp = File.createTempFile(TMP_NAME_PREFIX, ".tmp", target.parentFile ?: root)
         try {
             tmp.writeBytes(bytes)
             try {
@@ -86,8 +306,153 @@ class ScopedFileStore(val root: File) {
         return if (created) WriteOutcome.Created else WriteOutcome.Updated
     }
 
-    /** 列出相對前綴下的檔案（相對路徑回傳，排序穩定；前綴非法回空表）。 */
-    fun list(relativePrefix: String = ""): List<String> {
+    /**
+     * NOFOLLOW 逐段建立父目錄：每段前驗連結、僅用單層 `mkdir`，
+     * 不用會跟隨連結的 `mkdirs`。入口先做建前二驗（[resolve] 內已做一驗），
+     * 每段建後再驗該段，呼叫方（[write]）在建完後做建後三驗。
+     * 缺席 [root] 以單層 `mkdir` 安全建立（父層為 OS 已建的可信基，不用 `mkdirs`），
+     * 建後驗為目錄且非連結，否則 fail-closed。
+     * 懸空連結視為連結一律拒絕；檢查失敗 fail-closed。
+     * 殘餘：段前驗→`mkdir`→建後驗之間仍有併發替換窗口，見類註解。
+     */
+    private fun mkdirParentNoFollow(safe: String, original: String) {
+        val segs = safe.split("/")
+        if (segs.size <= 1) {
+            ensureNoSymlinkChain(safe, original)
+            ensureRootDirNoFollow(original)
+            return
+        }
+        ensureNoSymlinkChain(safe, original)
+        ensureRootDirNoFollow(original)
+        try {
+            ensureRootChainNoSymlink(original)
+            var cur = root
+            for (i in 0 until segs.size - 1) {
+                if (Files.isSymbolicLink(cur.toPath())) {
+                    throw IllegalArgumentException("symlink not allowed: $original")
+                }
+                val next = File(cur, segs[i])
+                if (Files.isSymbolicLink(next.toPath())) {
+                    throw IllegalArgumentException("symlink not allowed: $original")
+                }
+                if (!next.exists()) {
+                    next.mkdir()
+                    if (Files.isSymbolicLink(next.toPath())) {
+                        throw IllegalArgumentException("symlink not allowed: $original")
+                    }
+                }
+                if (!next.isDirectory) {
+                    throw IllegalArgumentException("symlink check failed: $original")
+                }
+                cur = next
+            }
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
+    }
+
+    /**
+     * 缺席根的安全建立：僅用單層 `mkdir`（不用跟隨連結的 `mkdirs`），
+     * 建後驗為目錄且非連結。併發競建由建後驗自然容忍（他線程建好即通過）。
+     * 毒根先由 [ensureRootChainNoSymlink] 拒絕；已存在普通檔亦 fail-closed。
+     */
+    private fun ensureRootDirNoFollow(original: String) {
+        try {
+            ensureRootChainNoSymlink(original)
+            if (!root.exists()) {
+                root.mkdir()
+            }
+            if (Files.isSymbolicLink(root.toPath())) {
+                throw IllegalArgumentException("symlink not allowed: $original")
+            }
+            if (!root.isDirectory) {
+                throw IllegalArgumentException("root not directory: $original")
+            }
+            ensureRootChainNoSymlink(original)
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
+    }
+
+    /**
+     * 列出相對前綴下的檔案（相對路徑回傳，排序穩定；前綴非法回空表）。
+     *
+     * 三預算（超限一律拋 [FileBudgetException]，不靜默截斷）：
+     * - [maxEntries]：列出上限（恰滿合法，第 `maxEntries+1` 個才拋
+     *   [FileBudgetCode.LIST_TOO_MANY]）；輸入側為 lazy 目錄迭代
+     *  （`Files.newDirectoryStream` 逐項遍歷），找到第 `maxEntries+1` 筆即拋，
+     *   不先一次配置整個目錄陣列；
+     * - [maxDepth]：相對深度上限（根下直屬為 1，檔案不查 depth；
+     *   子目錄再往下探才拋 [FileBudgetCode.LIST_TOO_DEEP]，恰滿合法）；
+     * - [deadlineMs]：自起走的牆鐘預算（耗盡拋 [FileBudgetCode.LIST_TIMEOUT]）。
+     *   迴圈中的牆鐘檢查為 best-effort：以「已訪問 entry」計數每 128 項、
+     *   每遇子目錄、以及返回前各補一次檢查（含被略過的 symlink／`.lp-*`／
+     *   特殊檔，不以收錄檔數為準）；但 blocking 的檔案系統呼叫
+     *  （開流／迭代／canonical）本身不可中止，超時只能在下一個檢查點拋出，
+     *   不作硬性 wall-clock 保證。
+     *
+     * NOFOLLOW 語義（#57）：[root] 鏈先驗，失敗 fail-closed 回空表；
+     * 基址及遍歷途中遇 symlink 一律略過不下鑽，不跟隨；
+     * 以祖先鏈正規目錄集合防循環（兄弟 diamond 可重入、真環裁剪；
+     * canonical 取不到時 fail-closed 跳過該子樹）。
+     * 殘餘：回傳檔名本身即洩露存在性，呼叫方不得將列目結果視為授權證明；
+     * 併發替換下僅保證快照有界（不跟隨、不懸掛），不保證與某次檢查原子一致。
+     * 開流失敗的子目錄視為空（沿舊 `listFiles()==null` 語義），不中斷兄弟列舉。
+     * 最終排序僅在成功路徑最後一步做一次 `out.sorted()`（預算按發現序，
+     * 不做 per-dir 預排序）。
+     *
+     * 資源保證：每個已開流目錄持有可關閉的 [DirectoryStream]；耗盡／迭代失敗時
+     * 原子 `close + pathCanons.remove + pop`，拋預算異常時外層 `try/finally`
+     * 關閉棧上殘留的全部開流，避免洩漏。
+     *
+     * 測試接縫：另有 `internal` 同名多載，追加 `nowNanos`／`openStream` 可注入參數
+     * （生產預設分別為系統牆鐘與 lazy 目錄迭代工廠，行為不變；見該多載 KDoc）。
+     * 主列舉禁止使用全量配置 API（見 ScopedFileStoreBudgetTest 靜態約束）。
+     */
+    fun list(
+        relativePrefix: String = "",
+        maxEntries: Int = MAX_LIST_ENTRIES,
+        maxDepth: Int = MAX_LIST_DEPTH,
+        deadlineMs: Long = LIST_DEADLINE_MS,
+    ): List<String> = list(
+        relativePrefix,
+        maxEntries,
+        maxDepth,
+        deadlineMs,
+        System::nanoTime,
+        { dir -> defaultOpenStream(dir) },
+    )
+
+    /**
+     * 測試接縫多載（生產經由 [list] 委派，預設行為不變）。
+     *
+     * - [nowNanos]：預設為系統牆鐘；測試可注入每次呼叫前進固定奈秒的 fake clock，
+     *   使 deadline 確定性可測（無 sleep、無 flaky）。新碼以「已訪問 entry」計數
+     *   每 128 項觸發檢查（含被略過者），舊邏輯僅計收錄檔故同場景不超時。
+     * - [openStream]：預設為 lazy 目錄迭代工廠；測試可注入計數工廠，證明第
+     *   `maxEntries+1` 筆即拋、未全量配置（fail-fast）。
+     * 主列舉僅以 `Files.newDirectoryStream` 逐項遍歷，不一次配置整個目錄陣列。
+     */
+    internal fun list(
+        relativePrefix: String,
+        maxEntries: Int,
+        maxDepth: Int,
+        deadlineMs: Long,
+        nowNanos: () -> Long,
+        openStream: (File) -> DirectoryStream<Path>?,
+    ): List<String> {
+        require(maxEntries >= 1) { "maxEntries must be >= 1" }
+        require(maxDepth >= 0) { "maxDepth must be >= 0" }
+        require(deadlineMs >= 0) { "deadlineMs must be >= 0" }
+        try {
+            ensureRootChainNoSymlink(relativePrefix.ifEmpty { "<root>" })
+        } catch (_: IllegalArgumentException) {
+            return emptyList()
+        }
         val base = if (relativePrefix.isEmpty()) {
             root
         } else {
@@ -98,22 +463,194 @@ class ScopedFileStore(val root: File) {
             }
         }
         if (!base.exists()) return emptyList()
-        val roots = if (base.isDirectory) base.walkTopDown() else sequenceOf(base)
-        return roots
-            .filter { it.isFile && !it.name.startsWith(".lp-") }
-            .map { it.relativeTo(root).path.replace('\\', '/') }
-            .sorted()
-            .toList()
+        if (Files.isSymbolicLink(base.toPath())) return emptyList()
+        if (!base.isDirectory) {
+            if (!base.isFile || base.name.startsWith(TMP_NAME_PREFIX)) return emptyList()
+            val rel = base.relativeTo(root).path.replace('\\', '/')
+            return if (FileScope.sanitizeRelative(rel) != null) listOf(rel) else emptyList()
+        }
+        val deadlineNanos = nowNanos() + deadlineMs * 1_000_000L
+        fun checkDeadline() {
+            if (nowNanos() - deadlineNanos >= 0) {
+                throw FileBudgetException(
+                    FileBudgetCode.LIST_TIMEOUT,
+                    "listing exceeded ${deadlineMs}ms budget under $relativePrefix",
+                )
+            }
+        }
+        checkDeadline()
+        val out = ArrayList<String>()
+        // 祖先鏈正規化路徑：只擋「回到自己祖先」的真環；NOFOLLOW 下 symlink
+        // 子項已在下方直接略過（不下鑽），diamond 別名不再列出（#57 凌駕 legacy）。
+        val pathCanons = HashSet<String>()
+        pathCanons.add(canonicalOrAbsolute(base))
+        // 已訪問 entry 計數（含被略過者）：每 128 項無條件檢查一次 deadline。
+        var visited = 0
+        fun noteVisited() {
+            visited++
+            if (visited % 128 == 0) checkDeadline()
+        }
+        val stack = ArrayDeque<DirFrame>()
+        val baseStream = openStream(base) ?: return emptyList()
+        stack.addLast(DirFrame(base, 0, canonicalOrAbsolute(base), baseStream, baseStream.iterator()))
+        try {
+            while (stack.isNotEmpty()) {
+                val frame = stack.last()
+                val childPath: Path? = try {
+                    if (frame.iter.hasNext()) frame.iter.next() else null
+                } catch (_: DirectoryIteratorException) {
+                    null
+                } catch (_: IOException) {
+                    null
+                } catch (_: SecurityException) {
+                    null
+                } catch (_: NoSuchElementException) {
+                    null
+                }
+                if (childPath == null) {
+                    try {
+                        frame.stream.close()
+                    } catch (_: Exception) {
+                    }
+                    pathCanons.remove(frame.canon)
+                    stack.removeLast()
+                    continue
+                }
+                noteVisited()
+                // NOFOLLOW：遇 symlink 直接略過、不下鑽（含懸空連結）。
+                if (Files.isSymbolicLink(childPath)) continue
+                val child = childPath.toFile()
+                if (child.isFile && !child.name.startsWith(TMP_NAME_PREFIX)) {
+                    val rel = child.relativeTo(root).path.replace('\\', '/')
+                    if (FileScope.sanitizeRelative(rel) == null) continue
+                    out.add(rel)
+                    if (out.size > maxEntries) {
+                        throw FileBudgetException(
+                            FileBudgetCode.LIST_TOO_MANY,
+                            "listing exceeded $maxEntries entries under $relativePrefix",
+                        )
+                    }
+                } else if (child.isDirectory) {
+                    checkDeadline()
+                    val childDepth = frame.depth + 1
+                    if (childDepth > maxDepth) {
+                        throw FileBudgetException(
+                            FileBudgetCode.LIST_TOO_DEEP,
+                            "listing exceeded depth $maxDepth under $relativePrefix",
+                        )
+                    }
+                    val canon = try {
+                        child.canonicalPath
+                    } catch (_: IOException) {
+                        continue
+                    }
+                    if (!pathCanons.add(canon)) continue
+                    val sub = openStream(child)
+                    if (sub == null) {
+                        pathCanons.remove(canon)
+                        continue
+                    }
+                    stack.addLast(DirFrame(child, childDepth, canon, sub, sub.iterator()))
+                }
+                // 懸空連結已在上方略過；其他非檔非目錄沿舊行為忽略
+                //（visited 已計數，deadline 仍覆蓋）。
+            }
+            checkDeadline()
+            return out.sorted()
+        } finally {
+            for (f in stack) {
+                try {
+                    f.stream.close()
+                } catch (_: Exception) {
+                }
+            }
+        }
     }
 
-    /** 刪除檔案；不存在回 false（冪等語義：重複刪不報錯）。 */
-    fun delete(relativePath: String): Boolean = resolve(relativePath).delete()
+    /** 生產預設的 lazy 目錄開流（開流失敗視為空，不中斷兄弟列舉）。 */
+    private fun defaultOpenStream(dir: File): DirectoryStream<Path>? {
+        return try {
+            Files.newDirectoryStream(dir.toPath())
+        } catch (_: IOException) {
+            null
+        } catch (_: SecurityException) {
+            null
+        } catch (_: UnsupportedOperationException) {
+            null
+        }
+    }
+
+    /** 刪除檔案；不存在回 false（冪等語義：重複刪不報錯）。
+     * 實際刪除前重驗一次整鏈（[resolve] 內已驗第一次）；重驗→刪除之間
+     * 仍有殘餘窗口，併發替換下可能誤刪替換後的外部檔（見類註解），
+     * 此為變更操作固有風險，呼叫方不得假設檢查後路徑不可變。 */
+    fun delete(relativePath: String): Boolean {
+        val target = resolve(relativePath)
+        val safe = FileScope.sanitizeRelative(relativePath)
+            ?: throw IllegalArgumentException("unsafe path: $relativePath")
+        ensureNoSymlinkChain(safe, relativePath)
+        return target.delete()
+    }
+
+    /** 迭代下探幀（顯式棧，避免遞迴深度風險；持有可關閉的 lazy 目錄迭代）。 */
+    private data class DirFrame(
+        val dir: File,
+        val depth: Int,
+        val canon: String,
+        val stream: DirectoryStream<Path>,
+        val iter: Iterator<Path>,
+    )
+
+    /**
+     * 固定記憶體比對：長度已由呼叫方確認相等；逐塊讀舊檔對新位元組，
+     * 首異即停，尾端多位元組亦判異。
+     */
+    private fun contentEquals(target: File, bytes: ByteArray): Boolean {
+        FileInputStream(target).use { input ->
+            val buf = ByteArray(READ_CHUNK_BYTES)
+            var offset = 0
+            while (offset < bytes.size) {
+                val n = input.read(buf, 0, minOf(buf.size, bytes.size - offset))
+                if (n == -1) return false
+                for (i in 0 until n) {
+                    if (buf[i] != bytes[offset + i]) return false
+                }
+                offset += n
+            }
+            return input.read() == -1
+        }
+    }
 
     companion object {
+        /** 讀入上限 1 MiB（對齊 provider model-list／WebFetch 絕對上限；patch 512 KiB 上限在其內）。 */
+        const val MAX_READ_BYTES = 1 * 1024 * 1024
+
+        /** 列舉條目上限（恰滿合法，超一才拋）。 */
+        const val MAX_LIST_ENTRIES = 2_000
+
+        /** 列舉相對深度上限（根下直屬為 1）。 */
+        const val MAX_LIST_DEPTH = 32
+
+        /** 列舉牆鐘預算（毫秒）。 */
+        const val LIST_DEADLINE_MS = 10_000L
+
+        /** 串流讀寫塊大小（抄 WebFetch／attach 的 8 KiB）。 */
+        const val READ_CHUNK_BYTES = 8192
+
+        /** 寫入暫存檔名前綴（列舉時過濾同類）。 */
+        const val TMP_NAME_PREFIX = ".lp-"
+
         /** 內容雜湊（呼叫方做去重/審計指紋用）。 */
         fun sha256Hex(bytes: ByteArray): String {
             val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
             return digest.joinToString("") { "%02x".format(it) }
         }
+
+        private fun canonicalOrAbsolute(dir: File): String =
+            try {
+                dir.canonicalPath
+            } catch (_: IOException) {
+                dir.absolutePath
+            }
     }
 }

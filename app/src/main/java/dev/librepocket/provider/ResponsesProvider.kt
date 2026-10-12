@@ -11,6 +11,14 @@ import okhttp3.OkHttpClient
  *
  * - `POST {base}/responses` with `"stream": true, "store": false`;
  *   never sends `previous_response_id`.
+ * - Phase 2 history (stateless): every request self-contains the full
+ *   pairing — user/assistant `{"type":"message"}` items, assistant-carried
+ *   calls as `{"type":"function_call"}` (`call_id`/`name`/`arguments`),
+ *   tool turns as `{"type":"function_call_output"}` (`call_id`/`output`).
+ *   Nothing is read back from a server store (`store=false`), so a truncated
+ *   history without its call side fails closed instead of being sent.
+ *   Non-thinking only; reasoning-bearing histories fail closed
+ *   (`THINKING_ROUND_TRIP_NOT_SUPPORTED`, checked first in `buildBody`).
  * - `response.output_text.delta` -> [StreamEvent.TextDelta] with
  *   `blockIndex = output_index * 1000 + content_index` (§3.5 mapping).
  * - `reasoning_summary_text.delta` / `reasoning_text.delta` ->
@@ -20,8 +28,10 @@ import okhttp3.OkHttpClient
  * - `response.completed` is the authoritative terminal; an empty `output`
  *   array recovers from already-streamed deltas (P1 simplification).
  * - `response.failed` / `response.incomplete` -> [StreamEvent.Failed].
- * - Opaque fields (encrypted reasoning etc.) stay in memory only and are
- *   never surfaced as events.
+ * - Opaque payloads (encrypted reasoning etc.) are never surfaced as text:
+ *   a `reasoning` output item only emits [StreamEvent.ReasoningPresent]
+ *   (presence marker, no payload). Visible reasoning deltas still surface as
+ *   [StreamEvent.ReasoningDelta]; only opaque items skip text conversion.
  */
 class ResponsesProvider(
     private val config: ProviderConfig,
@@ -80,6 +90,8 @@ class ResponsesProvider(
     internal fun endpoint(base: String): String = joinEndpoint(base, "/responses")
 
     internal fun buildBody(request: ChatRequest): String {
+        requireNoReasoningHistory(request)
+        requireNoAssistantImages(request.messages)
         val sb = StringBuilder()
         sb.append("{\"model\":${q(request.model)},\"stream\":true,\"store\":false")
         request.maxTokens?.let { sb.append(",\"max_output_tokens\":$it") }
@@ -102,8 +114,7 @@ class ResponsesProvider(
             request.tools.forEach { t ->
                 if (ti > 0) sb.append(',')
                 ti++
-                sb.append("{\"type\":\"function\",\"name\":${q(t.name)},")
-                sb.append("\"description\":${q(t.description)},\"parameters\":${t.jsonSchema}}}")
+                sb.append(responsesFunctionToolJson(t))
             }
             if (webSearch != null) {
                 if (ti > 0) sb.append(',')
@@ -113,28 +124,57 @@ class ResponsesProvider(
         }
         sb.append(",\"input\":[")
         var first = true
-        for (m in request.messages) {
-            if (m.role == "system") continue
+        fun emit(fragment: String) {
             if (!first) sb.append(',')
             first = false
+            sb.append(fragment)
+        }
+        val resolved = validateToolPairing(request.messages, false)
+        for ((i, m) in request.messages.withIndex()) {
+            if (m.role == "system") continue
+            if (m.role == "tool") {
+                // Phase 2: tool turns are function_call_output paired by call_id,
+                // never rewritten to user. Illegal pairings fail closed.
+                val callId = resolved[i]!!
+                val safeText = if (serverSearch) Redactor.redact(m.text).text else m.text
+                emit(responsesFunctionCallOutputJson(callId, safeText))
+                continue
+            }
+            if (m.role == "assistant" && m.toolCalls.isNotEmpty()) {
+                val safeText = if (serverSearch) Redactor.redact(m.text).text else m.text
+                if (safeText.isNotEmpty() || m.images.isNotEmpty()) {
+                    emit(responsesMessageItem("assistant", safeText, m.images))
+                }
+                for (tc in m.toolCalls) {
+                    emit(responsesFunctionCallJson(tc))
+                }
+                continue
+            }
             val safeText = if (serverSearch) Redactor.redact(m.text).text else m.text
-            sb.append("{\"type\":\"message\",\"role\":${q(if (m.role == "tool") "user" else m.role)},")
-            sb.append("\"content\":[{\"type\":\"input_text\",\"text\":${q(safeText)}}")
-            val infos = m.images.map { ImageFallbackPolicy.fromChatImage(it) }
-            when (val d = ImageFallbackPolicy.decide(infos, supportsImages = true)) {
-                is ImageFallbackPolicy.Decision.Reject ->
-                    throw ProviderFailure(false, d.reason)
-                is ImageFallbackPolicy.Decision.StripAll -> Unit
-                is ImageFallbackPolicy.Decision.Send -> {
-                    val encoder = java.util.Base64.getEncoder()
-                    for (idx in d.indices) {
-                        sb.append(",{\"type\":\"input_image\",\"image_url\":")
-                        sb.append(q("data:${m.images[idx].mimeType};base64,${encoder.encodeToString(m.images[idx].bytes)}"))
-                        sb.append('}')
-                    }
+            emit(responsesMessageItem(if (m.role == "assistant") "assistant" else m.role, safeText, m.images))
+        }
+        sb.append("]}")
+        return sb.toString()
+    }
+
+    /** `{"type":"message",…}` item with optional `input_image` parts. */
+    internal fun responsesMessageItem(role: String, text: String, images: List<ChatImage>): String {
+        val sb = StringBuilder()
+        sb.append("{\"type\":\"message\",\"role\":${q(role)},")
+        sb.append("\"content\":[{\"type\":\"input_text\",\"text\":${q(text)}}")
+        val infos = images.map { ImageFallbackPolicy.fromChatImage(it) }
+        when (val d = ImageFallbackPolicy.decide(infos, supportsImages = true)) {
+            is ImageFallbackPolicy.Decision.Reject ->
+                throw ProviderFailure(false, d.reason)
+            is ImageFallbackPolicy.Decision.StripAll -> Unit
+            is ImageFallbackPolicy.Decision.Send -> {
+                val encoder = java.util.Base64.getEncoder()
+                for (idx in d.indices) {
+                    sb.append(",{\"type\":\"input_image\",\"image_url\":")
+                    sb.append(q("data:${images[idx].mimeType};base64,${encoder.encodeToString(images[idx].bytes)}"))
+                    sb.append('}')
                 }
             }
-            sb.append("]}")
         }
         sb.append("]}")
         return sb.toString()
@@ -189,7 +229,13 @@ internal class ResponsesMapper(val round: Int = 0) {
                     out.add(StreamEvent.TextDelta(round, blockOf(root), ServerToolTranscript.webSearchMarker("started")))
                     return out
                 }
-                if (item.string("type") != "function_call") return emptyList()
+                if (item.string("type") != "function_call") {
+                    // Opaque reasoning items carry no replayable text: record
+                    // presence only, so history rebuilds fail closed instead of
+                    // replaying a reasoning origin as plain text.
+                    if (item.string("type") == "reasoning") out.add(StreamEvent.ReasoningPresent)
+                    return out
+                }
                 val itemId = root.string("item_id") ?: item.string("id") ?: ("item_" + UUID.randomUUID().toString().take(8))
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 item.string("call_id")?.takeIf { it.isNotEmpty() }?.let { if (agg.id.isEmpty()) agg.id = it }
@@ -209,7 +255,11 @@ internal class ResponsesMapper(val round: Int = 0) {
                     out.add(StreamEvent.TextDelta(round, blockOf(root), ServerToolTranscript.webSearchMarker("completed")))
                     return out
                 }
-                if (item.string("type") != "function_call") return emptyList()
+                if (item.string("type") != "function_call") {
+                    // Same opaque-reasoning presence rule as added (above).
+                    if (item.string("type") == "reasoning") out.add(StreamEvent.ReasoningPresent)
+                    return out
+                }
                 val itemId = root.string("item_id") ?: item.string("id") ?: return emptyList()
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 item.string("call_id")?.takeIf { it.isNotEmpty() }?.let { agg.id = it }

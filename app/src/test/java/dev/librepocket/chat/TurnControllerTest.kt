@@ -6,7 +6,10 @@ import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ChatCompletionsProvider
+import dev.librepocket.provider.ResponsesProvider
+import dev.librepocket.provider.AnthropicProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderHttpConfig
 import dev.librepocket.provider.ProviderProtocol
@@ -102,6 +105,9 @@ private class RecordingSink : TranscriptSink {
   data class Retried(val runId: String, val attempt: Int, val maxAttempts: Int, val delayMs: Long)
   val retried: MutableList<Retried> = Collections.synchronizedList(mutableListOf())
   val cancelled: MutableList<Pair<String, String>> = Collections.synchronizedList(mutableListOf())
+  /** Reasoning-source flags alongside [succeeded]/[cancelled] (same order). */
+  val succeededReasoning: MutableList<Boolean> = Collections.synchronizedList(mutableListOf())
+  val cancelledReasoning: MutableList<Boolean> = Collections.synchronizedList(mutableListOf())
   val steerQueued: MutableList<String> = Collections.synchronizedList(mutableListOf())
   data class Tool(val runId: String, val toolIndex: Int, val id: String, val name: String, val args: String)
   val tools: MutableList<Tool> = Collections.synchronizedList(mutableListOf())
@@ -109,12 +115,18 @@ private class RecordingSink : TranscriptSink {
   val usages: MutableList<Usage> = Collections.synchronizedList(mutableListOf())
 
   override suspend fun onTurnStarted(runId: String, text: String) { started.add(runId to text) }
-  override suspend fun onTurnSucceeded(runId: String, text: String) { succeeded.add(runId to text) }
+  override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
+    succeeded.add(runId to text)
+    succeededReasoning.add(hasReasoning)
+  }
   override suspend fun onTurnFailed(runId: String, error: String) { failed.add(runId to error) }
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
     retried.add(Retried(runId, attempt, maxAttempts, delayMs))
   }
-  override suspend fun onTurnCancelled(runId: String, partialText: String) { cancelled.add(runId to partialText) }
+  override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
+    cancelled.add(runId to partialText)
+    cancelledReasoning.add(hasReasoning)
+  }
   override suspend fun onSteerQueued(text: String) { steerQueued.add(text) }
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) {
     tools.add(Tool(runId, toolIndex, id, name, argumentsJson))
@@ -1022,6 +1034,348 @@ class TurnControllerTest {
     assertTrue(body.contains("thought"))
     assertTrue(body.contains("-done"))
     assertFalse(assistantsOf(c).single().isPartial)
+  }
+
+  @Test fun consecutiveReasoningDeltasMergeWithFlag() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ReasoningDelta(0, 1, "thought-"))
+        emit(StreamEvent.ReasoningDelta(0, 1, "part"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("hi") }
+    val block = assistantsOf(c).single()
+    assertEquals("thought-part", block.text)
+    assertTrue(block.hasReasoning)
+    assertFalse(block.isPartial)
+  }
+
+  // ---- Finding A [P1]: reasoning origin must survive into history ----
+  //
+  // Stage 1 scoped gate: production TurnController.buildRequest always sends
+  // tools == [] / serverTools == [] / thinking == null, and UiMessage has no
+  // toolCalls field (ToolDone only merges a text marker), so a pure-chat
+  // follow-up whose history carries hasReasoning must succeed. The Fakes
+  // below mirror the production requireNoReasoningHistory semantics with the
+  // same toolDependent formula: only a tool-dependent turn with reasoning
+  // history throws. They are drift-prone by construction; the authoritative
+  // proof that the real request shape passes the real adapters is
+  // realBuildRequestFeedsRealAdapters / opaqueRealBuildRequestFeedsRealAdapters
+  // below (real buildRequest product fed directly into the three real
+  // buildBody paths).
+
+  private fun gateMirroringFake(
+    transportCalls: AtomicInteger,
+    firstRound: Flow<StreamEvent>,
+    followUp: Flow<StreamEvent>,
+  ): FakeLlmProvider = FakeLlmProvider { request ->
+    if (request.thinking != null) throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
+    val toolDependent = request.tools.isNotEmpty() || request.serverTools.isNotEmpty() ||
+      request.messages.any { it.toolCalls.isNotEmpty() || it.role == "tool" }
+    if (toolDependent && request.messages.any { it.hasReasoning }) {
+      throw ProviderFailure(false, "THINKING_ROUND_TRIP_NOT_SUPPORTED")
+    }
+    transportCalls.incrementAndGet()
+    if (request.messages.any { it.hasReasoning }) followUp else firstRound
+  }
+
+  @Test fun reasoningMarkedHistoryContinuesOnFollowUpWithoutHttp() {
+    // transportCalls counts actual sends; the scoped gate passes a no-tools
+    // follow-up, so both turns reach transport.
+    val transportCalls = AtomicInteger(0)
+    val provider = gateMirroringFake(
+      transportCalls,
+      firstRound = flow {
+        emit(StreamEvent.ReasoningDelta(0, 1, "thought"))
+        // ToolDone only merges a "[tool:...]" text marker into the assistant
+        // block (no structural toolCalls on UiMessage): it must not arm the
+        // tool-dependent gate on the follow-up.
+        emit(StreamEvent.ToolDone(0, "call_1", "lookup", "{\"q\":\"hi\"}"))
+        emit(StreamEvent.Done("stop"))
+      },
+      followUp = flow {
+        emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+        emit(StreamEvent.Done("stop"))
+      },
+    )
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    // Display keeps the existing merged behavior (no split-out block).
+    val first = assistantsOf(c).single()
+    assertTrue(first.text.contains("thought"))
+    assertTrue(first.text.contains("lookup"))
+    assertTrue(first.hasReasoning)
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertEquals(1, transportCalls.get())
+
+    runBlocking { c.send("second") }
+    // The follow-up history carried the marker, but the turn is not
+    // tool-dependent, so the gate passed and transport sent again.
+    assertEquals(2, transportCalls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertTrue(provider.seenRequests.last().messages.any { it.hasReasoning })
+    // Production ordinary-chat shape: no tools / serverTools / thinking,
+    // and no structural tool content in history (ToolDone only merged a
+    // text marker) — this is what keeps the scoped gate passing.
+    val last = provider.seenRequests.last()
+    assertTrue(last.tools.isEmpty())
+    assertTrue(last.serverTools.isEmpty())
+    assertNull(last.thinking)
+    assertTrue(last.messages.none { it.toolCalls.isNotEmpty() || it.role == "tool" })
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    assertEquals("second-answer", assistantsOf(c).last().text)
+  }
+
+  @Test fun opaqueReasoningMarkerAloneContinuesOnFollowUp() {
+    val transportCalls = AtomicInteger(0)
+    val provider = gateMirroringFake(
+      transportCalls,
+      firstRound = flow {
+        emit(StreamEvent.ReasoningPresent)
+        emit(StreamEvent.TextDelta(0, 0, "answer"))
+        emit(StreamEvent.Done("stop"))
+      },
+      followUp = flow {
+        emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+        emit(StreamEvent.Done("stop"))
+      },
+    )
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    val first = assistantsOf(c).single()
+    assertEquals("answer", first.text)
+    assertTrue(first.hasReasoning)
+    runBlocking { c.send("second") }
+    assertEquals(2, transportCalls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertTrue(provider.seenRequests.last().messages.any { it.hasReasoning })
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    assertEquals("second-answer", assistantsOf(c).last().text)
+  }
+
+  @Test fun reasoningDeltaOnlyHistoryContinuesOnFollowUp() {
+    // Stage 1 acceptance: first round carries reasoning deltas only (no
+    // ToolDone at all); the ordinary follow-up question still succeeds.
+    val transportCalls = AtomicInteger(0)
+    val provider = gateMirroringFake(
+      transportCalls,
+      firstRound = flow {
+        emit(StreamEvent.ReasoningDelta(0, 1, "thought"))
+        emit(StreamEvent.TextDelta(0, 2, "answer"))
+        emit(StreamEvent.Done("stop"))
+      },
+      followUp = flow {
+        emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+        emit(StreamEvent.Done("stop"))
+      },
+    )
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    assertTrue(assistantsOf(c).single().hasReasoning)
+    runBlocking { c.send("second") }
+    assertEquals(2, transportCalls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertTrue(provider.seenRequests.last().messages.any { it.hasReasoning })
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+  }
+
+  @Test fun plainTwoTurnConversationSucceeds() {
+    // Stage 1 positive control (standard Fake, no reasoning anywhere):
+    // non-thinking no-tools two-turn conversation succeeds end to end.
+    val transportCalls = AtomicInteger(0)
+    val provider = FakeLlmProvider { _ ->
+      transportCalls.incrementAndGet()
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "answer"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    runBlocking { c.send("second") }
+    assertEquals(2, transportCalls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertFalse(provider.seenRequests.any { req -> req.messages.any { it.hasReasoning } })
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    assertEquals(2, assistantsOf(c).size)
+  }
+
+  // ---- Production integration: real buildRequest product feeds real adapters ----
+  //
+  // The gateMirroringFake above is drift-prone by construction. These two
+  // tests are authoritative: two real turns run through FakeLlmProvider, then
+  // seenRequests.last() (the real TurnController.buildRequest product, with
+  // its hasReasoning history) is fed directly into the three real adapter
+  // buildBody paths. Success plus retained assistant text proves the scoped
+  // gate passes the production shape on every wire.
+
+  private fun realChatConfig() = ProviderConfig(
+    id = "00000000-0000-0000-0000-00000000cc01",
+    label = "test",
+    baseUrl = "https://api.example.com/v1",
+    protocol = ProviderProtocol.CHAT_COMPLETIONS,
+    apiKeyRef = "provider_key/00000000-0000-0000-0000-00000000cc01",
+  )
+
+  private fun realResponsesConfig() = ProviderConfig(
+    id = "00000000-0000-0000-0000-00000000cc02",
+    label = "test",
+    baseUrl = "https://api.example.com/v1",
+    protocol = ProviderProtocol.RESPONSES,
+    apiKeyRef = "provider_key/00000000-0000-0000-0000-00000000cc02",
+  )
+
+  private fun realAnthropicConfig() = ProviderConfig(
+    id = "00000000-0000-0000-0000-00000000cc03",
+    label = "test",
+    baseUrl = "https://api.anthropic.com",
+    protocol = ProviderProtocol.ANTHROPIC,
+    apiKeyRef = "provider_key/00000000-0000-0000-0000-00000000cc03",
+  )
+
+  @Test fun realBuildRequestFeedsRealAdapters() {
+    val calls = AtomicInteger(0)
+    val provider = FakeLlmProvider { _ ->
+      flow {
+        if (calls.incrementAndGet() == 1) {
+          emit(StreamEvent.ReasoningDelta(0, 1, "thought-"))
+          emit(StreamEvent.TextDelta(0, 2, "answer"))
+          emit(StreamEvent.Done("stop"))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    assertEquals("thought-answer", assistantsOf(c).single().text)
+    assertTrue(assistantsOf(c).single().hasReasoning)
+    runBlocking { c.send("second") }
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    assertEquals("second-answer", assistantsOf(c).last().text)
+    val last = provider.seenRequests.last()
+    assertTrue(last.tools.isEmpty())
+    assertTrue(last.serverTools.isEmpty())
+    assertNull(last.thinking)
+    assertTrue(last.messages.any { it.hasReasoning })
+    assertTrue(last.messages.any { it.text.contains("thought-answer") })
+    val chatBody = ChatCompletionsProvider(realChatConfig(), { null }).buildBody(last)
+    val responsesBody = ResponsesProvider(realResponsesConfig(), { null }).buildBody(last)
+    val anthropicBody = AnthropicProvider(realAnthropicConfig(), { null }).buildBody(last)
+    assertTrue(chatBody.contains("thought-answer"))
+    assertTrue(responsesBody.contains("thought-answer"))
+    assertTrue(anthropicBody.contains("thought-answer"))
+  }
+
+  @Test fun opaqueRealBuildRequestFeedsRealAdapters() {
+    val calls = AtomicInteger(0)
+    val provider = FakeLlmProvider { _ ->
+      flow {
+        if (calls.incrementAndGet() == 1) {
+          emit(StreamEvent.ReasoningPresent)
+          emit(StreamEvent.TextDelta(0, 0, "opaque-answer"))
+          emit(StreamEvent.Done("stop"))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "second-answer"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("first") }
+    assertEquals("opaque-answer", assistantsOf(c).single().text)
+    assertTrue(assistantsOf(c).single().hasReasoning)
+    runBlocking { c.send("second") }
+    assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+    assertNull(c.uiState.value.error)
+    val last = provider.seenRequests.last()
+    assertTrue(last.tools.isEmpty())
+    assertTrue(last.serverTools.isEmpty())
+    assertNull(last.thinking)
+    assertTrue(last.messages.any { it.hasReasoning })
+    val chatBody = ChatCompletionsProvider(realChatConfig(), { null }).buildBody(last)
+    val responsesBody = ResponsesProvider(realResponsesConfig(), { null }).buildBody(last)
+    val anthropicBody = AnthropicProvider(realAnthropicConfig(), { null }).buildBody(last)
+    assertTrue(chatBody.contains("opaque-answer"))
+    assertTrue(responsesBody.contains("opaque-answer"))
+    assertTrue(anthropicBody.contains("opaque-answer"))
+  }
+
+  @Test fun emptyReasoningDeltaStillSetsFlag() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ReasoningDelta(0, 1, ""))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    runBlocking { c.send("hi") }
+    val block = assistantsOf(c).single()
+    assertEquals("", block.text)
+    assertTrue(block.hasReasoning)
+    assertFalse(block.isPartial)
+  }
+
+  // ---- Finding A follow-up: the reasoning flag must reach the transcript ----
+
+  @Test fun reasoningTurnReportsHasReasoningToTranscript() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "answer-"))
+        emit(StreamEvent.ReasoningDelta(0, 1, "thought"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking { c.send("hi") }
+    awaitTrue { sink.succeeded.isNotEmpty() }
+    assertEquals(listOf(true), sink.succeededReasoning.toList())
+  }
+
+  @Test fun plainTurnReportsNoReasoningToTranscript() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "plain"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking { c.send("hi") }
+    awaitTrue { sink.succeeded.isNotEmpty() }
+    assertEquals(listOf(false), sink.succeededReasoning.toList())
+  }
+
+  @Test fun cancelledReasoningTurnReportsHasReasoningToTranscript() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ReasoningPresent)
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        awaitCancellation()
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val job = outer.async { c.send("hi") }
+      awaitTrue { assistantsOf(c).any { it.text == "partial" } }
+      c.cancel()
+      runBlocking { withTimeout(5000) { job.join() } }
+      awaitTrue { sink.cancelled.isNotEmpty() }
+      assertEquals(listOf(true), sink.cancelledReasoning.toList())
+    } finally {
+      outer.cancel()
+    }
   }
 
   @Test fun toolDeltasAndDoneAreRecorded() {

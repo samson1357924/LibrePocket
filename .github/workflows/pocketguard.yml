@@ -122,8 +122,13 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      pull-requests: read
-      # Minimal write: the sticky quota ledger only. No OpenAI secrets here.
+      # Minimal write: the sticky ledger's write scopes. The sticky quota
+      # ledger lives on the pull-request conversation. On a PR resource,
+      # GitHub's authorization check greps the PullRequests scope (the
+      # issues/PR comment endpoint sits in both the Issues and the Pull
+      # requests permission set), so `issues: write` alone yields 403 for
+      # `createComment`. No OpenAI secrets here.
+      pull-requests: write
       issues: write
     outputs:
       claimed: ${{ steps.claim.outputs.claimed }}
@@ -160,6 +165,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           POCKETGUARD_REPO_OWNER: ${{ github.repository_owner }}
           POCKETGUARD_QUOTA_SHA: ${{ needs.prepare-tag.outputs.quota_head_sha }}
+          POCKETGUARD_MODEL_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_FALLBACKS || secrets.POCKETGUARD_MODEL_FALLBACKS }}
+          POCKETGUARD_MODEL_CHIEF_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_CHIEF_FALLBACKS || secrets.POCKETGUARD_MODEL_CHIEF_FALLBACKS }}
+          POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS || secrets.POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS }}
+          POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS || secrets.POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS }}
         run: ./node_modules/.bin/ts-node src/github_runner.ts --mode=claim
 
   review-send:
@@ -289,6 +298,10 @@ jobs:
           POCKETGUARD_MODEL_CHIEF: ${{ vars.POCKETGUARD_MODEL_CHIEF || secrets.POCKETGUARD_MODEL_CHIEF }}
           POCKETGUARD_MODEL_ANDROID_SEC: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC || secrets.POCKETGUARD_MODEL_ANDROID_SEC }}
           POCKETGUARD_MODEL_ANDROID_CODE: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE || secrets.POCKETGUARD_MODEL_ANDROID_CODE }}
+          POCKETGUARD_MODEL_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_FALLBACKS || secrets.POCKETGUARD_MODEL_FALLBACKS }}
+          POCKETGUARD_MODEL_CHIEF_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_CHIEF_FALLBACKS || secrets.POCKETGUARD_MODEL_CHIEF_FALLBACKS }}
+          POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS || secrets.POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS }}
+          POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS: ${{ vars.POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS || secrets.POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS }}
           POCKETGUARD_MODEL_PROFILES: ${{ vars.POCKETGUARD_MODEL_PROFILES || secrets.POCKETGUARD_MODEL_PROFILES }}
           POCKETGUARD_MODEL_PROFILE: ${{ vars.POCKETGUARD_MODEL_PROFILE || secrets.POCKETGUARD_MODEL_PROFILE }}
           POCKETGUARD_MODEL_CHIEF_PROFILE: ${{ vars.POCKETGUARD_MODEL_CHIEF_PROFILE || secrets.POCKETGUARD_MODEL_CHIEF_PROFILE }}

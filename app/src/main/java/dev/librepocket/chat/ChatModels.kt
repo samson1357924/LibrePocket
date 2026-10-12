@@ -16,6 +16,32 @@ data class UiMessage(
   val isPartial: Boolean,
   /** In-memory admission identity; not persisted or sent to the provider. */
   val operationId: Long? = null,
+  /**
+   * True when this assistant block is reasoning-sourced (visible
+   * [dev.librepocket.provider.StreamEvent.ReasoningDelta] or opaque
+   * [dev.librepocket.provider.StreamEvent.ReasoningPresent] was seen while
+   * collecting it). Rebuilt into [dev.librepocket.provider.ChatMessage.hasReasoning]
+   * so tool-dependent / thinking-mode follow-up requests fail closed instead
+   * of replaying a reasoning origin as plain text (ordinary no-tools
+   * follow-ups continue). Display text is unchanged (merged block).
+   *
+   * In memory during the live turn; persisted as a payload-free `reasoning`
+   * marker event (same runId, empty text — the marker itself is flag-only)
+   * by [dev.librepocket.session.SessionTranscriptSink], and restored on
+   * resume when history replay finds the marker. Visible reasoning deltas
+   * remain merged into the assistant text and persist as usual (pre-existing
+   * behavior). Defaults to false; only assistant blocks observed with
+   * reasoning events ever set it.
+   *
+   * Known limitation: transcripts written before the marker existed carry no
+   * marker, so resuming them restores hasReasoning=false even if the original
+   * turn was reasoning-sourced; only sessions written since this marker
+   * landed persist the flag. On this branch that is defense-in-depth only:
+   * resumed history is display state, never fed back into the provider
+   * request, so a missing flag cannot smuggle a reasoning origin into a
+   * follow-up as plain text.
+   */
+  val hasReasoning: Boolean = false,
 )
 
 data class ChatUiState(

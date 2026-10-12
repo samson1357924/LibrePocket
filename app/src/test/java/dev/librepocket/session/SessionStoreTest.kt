@@ -298,6 +298,51 @@ class SessionStoreTest {
         assertEquals("first message here", meta.title)
     }
 
+    @Test fun import_roundTripPreservesReasoningMarker(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("hello world session", "p/m")
+        store.appendEvent(event(sid, kind = "user", text = "first message here", run = "r1"))
+        store.appendEvent(event(sid, kind = "assistant", text = "reply", run = "r1"))
+        // Payload-free resume marker: same runId as its assistant event, empty text.
+        store.appendEvent(event(sid, kind = "reasoning", text = "", run = "r1"))
+
+        val dest = File(tmpDir, "s.jsonl")
+        store.exportJsonl(sid, dest)
+        val imported = store.importJsonl(dest)
+
+        val back = store.loadEvents(imported)
+        assertEquals(listOf("user", "assistant", "reasoning"), back.map { it.kind })
+        val marker = back.single { it.kind == "reasoning" }
+        assertEquals("r1", marker.runId)
+        assertEquals("", marker.text)
+    }
+
+    @Test fun import_nonEmptyReasoningMarkerRejected(): Unit = runBlocking {
+        setUp()
+        val bad = File(tmpDir, "bad-reasoning.jsonl")
+        bad.writeText(
+            "{\"seq\":1,\"runId\":\"r1\",\"kind\":\"reasoning\",\"text\":\"smuggled thought\",\"imagesOmitted\":0,\"createdAt\":1}\n",
+            Charsets.UTF_8,
+        )
+        try {
+            store.importJsonl(bad)
+            fail("non-empty reasoning marker must be rejected")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("line 1"))
+        }
+    }
+
+    @Test fun append_nonEmptyReasoningMarkerRejected(): Unit = runBlocking {
+        setUp()
+        val sid = store.createSession("t", "p/m")
+        try {
+            store.appendEvent(event(sid, kind = "reasoning", text = "smuggled thought", run = "r1"))
+            fail("non-empty reasoning marker must be rejected")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("reasoning"))
+        }
+    }
+
     @Test fun import_badLineRollsBackWholeBatch(): Unit = runBlocking {
         setUp()
         val sid = store.createSession("t", "p/m")

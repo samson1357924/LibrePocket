@@ -16,6 +16,7 @@ import {
 } from '../src/review_diff';
 import { synthesizeChunkedReview, type OrchestratedReview } from '../src/orchestrator';
 import {
+  defaultGit,
   parseReviewCountMarker,
   reviewComment,
   runClaimMode,
@@ -394,6 +395,29 @@ export async function runPrChunksTests(): Promise<void> {
         /no diff for a changed review file/, 'empty review patch fails closed');
     }
 
+    // Regression (hosted smoke): the runner is invoked with
+    // `working-directory: github_bot`, so repo-root-relative pathspecs must not
+    // be resolved against that cwd. defaultGit pins the git process at the
+    // worktree root, so a root-relative pathspec resolves even when
+    // process.cwd() is a subdirectory (previously every per-file diff came back
+    // empty with exit code 0 and the claim pre-flight failed closed).
+    {
+      const previousCwd = process.cwd();
+      const subdir = path.join(defaultGit(['rev-parse', '--show-toplevel']).trim(), 'github_bot');
+      fs.mkdirSync(subdir, { recursive: true });
+      try {
+        process.chdir(subdir);
+        assert.equal(defaultGit(['rev-parse', '--show-prefix']).trim(), '',
+          'git runs at the worktree root regardless of process.cwd()');
+        // A root-relative pathspec matches from the subdir; from that cwd the
+        // interpreted path would be github_bot/github_bot/... and fail (128).
+        assert.doesNotThrow(() => defaultGit(['ls-files', '--error-unmatch', '--', 'github_bot/package.json']),
+          'root-relative pathspecs resolve from a subdirectory cwd');
+      } finally {
+        process.chdir(previousCwd);
+      }
+    }
+
     // Unit: synthesis rules (BLOCK/NEEDS first, then INCONCLUSIVE, then APPROVE).
     {
       const detBlock = [{ ruleId: 'SEC-X', severity: 'BLOCK' as const, category: 'security' as const, message: 'm' }];
@@ -454,28 +478,17 @@ export async function runPrChunksTests(): Promise<void> {
         } finally {
           restore();
         }
-        assert.equal(reviewed.verdict, 'APPROVE', '>120k full chunk coverage may APPROVE');
-        assert.ok(reviewed.chunks && reviewed.chunks.length >= 3, `splits into chunks (got ${reviewed.chunks?.length})`);
-        assert.equal(reviewed.chunkCount, reviewed.chunks?.length);
-        assert.equal(reviewed.chunkCoverageComplete, true);
+        assert.equal(reviewed.verdict, 'APPROVE', '>120k full coverage may APPROVE');
+        assert.equal(reviewed.chunks, undefined, 'single-turn review stores no chunks');
+        assert.equal(reviewed.chunkCount, undefined);
+        assert.equal(reviewed.chunkCoverageComplete, undefined);
         assert.equal(reviewed.coverage.complete, true);
         assert.deepEqual(reviewed.coverage.omittedFiles, []);
         assert.deepEqual(reviewed.coverage.truncatedFiles, []);
-        assert.ok(counter.count >= 3, `per-chunk orchestration ran (got ${counter.count})`);
-        for (const report of reviewed.chunks ?? []) {
-          assert.ok(validateReviewDiffChunkReport(report), 'each chunk report validates');
-          assert.equal(report.complete, true);
-          assert.equal(report.verdict, 'APPROVE');
-          assert.ok(!('diff' in (report as unknown as Record<string, unknown>)), 'minimal retention: no chunk diff text');
-        }
-        // Reports carry per-chunk segments; sticky carries the chunk line.
-        const reportJson = JSON.parse(fs.readFileSync(path.join(tempDir, 'review-report.json'), 'utf8')) as Record<string, unknown>;
-        assert.ok(Array.isArray(reportJson.segments) && (reportJson.segments as unknown[]).length === reviewed.chunks?.length, 'report carries segments');
-        const reportMd = fs.readFileSync(path.join(tempDir, 'review-report.md'), 'utf8');
-        assert.ok(reportMd.includes('分段結果'), 'markdown shows per-chunk results');
-        const sticky = reviewComment(reviewed, [], '報告行');
-        assert.ok(sticky.includes('分段：'), 'sticky carries chunk line');
-        assert.ok(sticky.includes('判定：APPROVE'));
+        assert.equal(counter.count, 3, 'single-turn runs 3 roles in parallel (got 3)');
+        const sticky = reviewComment(reviewed, [], 'report line');
+        assert.ok(sticky.includes('Segments: single segment'), 'single-turn sticky carries single segment line');
+        assert.ok(sticky.includes('Verdict: APPROVE'));
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -542,8 +555,7 @@ export async function runPrChunksTests(): Promise<void> {
           restore();
         }
         assert.equal(reviewed.verdict, 'NEEDS_CHANGES', 'one NEEDS chunk forces NEEDS_CHANGES');
-        assert.ok(reviewed.chunks && reviewed.chunks.length >= 2, 'still chunked');
-        assert.ok((reviewed.chunks ?? []).some((c) => c.verdict === 'NEEDS_CHANGES'), 'per-chunk verdict readable');
+        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -574,7 +586,7 @@ export async function runPrChunksTests(): Promise<void> {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'one failed chunk forces INCONCLUSIVE');
-        assert.ok(reviewed.chunks && reviewed.chunks.length >= 2, 'still chunked');
+        assert.equal(reviewed.chunks, undefined, 'single-turn review has no chunks');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -599,7 +611,21 @@ export async function runPrChunksTests(): Promise<void> {
         } finally {
           restore();
         }
-        const good = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
+        const good = {
+          ...JSON.parse(fs.readFileSync(artifactPath, 'utf8')),
+          chunks: [{
+            index: 0,
+            total: 1,
+            start: 0,
+            end: 100,
+            complete: true,
+            coveredLength: 100,
+            files: ['app/src/main/AndroidManifest.xml'],
+            verdict: 'APPROVE' as const,
+          }],
+          chunkCoverageComplete: true,
+          chunkCount: 1,
+        } as Record<string, unknown>;
         // Gate A: chunks dropped but flags kept → schema invalid → INCONCLUSIVE.
         {
           const tampered = { ...good };
@@ -624,8 +650,8 @@ export async function runPrChunksTests(): Promise<void> {
           });
           assert.equal(state.created, 0, 'missing-chunk publish creates no second comment');
           assert.equal(state.updated, 1, 'missing-chunk publish updates the same sticky');
-          assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'missing chunks fall back');
-          assert.ok(!state.comments[0].body.includes('判定：APPROVE'));
+          assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'missing chunks fall back');
+          assert.ok(!state.comments[0].body.includes('Verdict: APPROVE'));
         }
         // Gate B: chunkCoverageComplete false → INCONCLUSIVE on the same sticky.
         {
@@ -653,7 +679,7 @@ export async function runPrChunksTests(): Promise<void> {
             githubClient: prClient(state),
           });
           assert.equal(state.updated, 1, 'incomplete-coverage publish updates the same sticky');
-          assert.ok(state.comments[0].body.includes('判定：INCONCLUSIVE'), 'incomplete chunk coverage falls back');
+          assert.ok(state.comments[0].body.includes('Verdict: INCONCLUSIVE'), 'incomplete chunk coverage falls back');
         }
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -689,8 +715,8 @@ export async function runPrChunksTests(): Promise<void> {
               writeStdout: () => undefined,
               runGit: prGitStub(chunkedFiles()),
             });
-            assert.ok((reviewed.chunkCount ?? 0) >= 3, `${runId} reviews many chunks`);
-            assert.ok(counter.count >= 9, `${runId} runs per-chunk orchestration`);
+            assert.equal(reviewed.chunks, undefined, `${runId} single-turn stores no chunks`);
+            assert.equal(counter.count, 3, `${runId} runs single-turn orchestration (3 calls)`);
             await runPublishMode({
               event: prEvent(),
               env: {
@@ -716,8 +742,8 @@ export async function runPrChunksTests(): Promise<void> {
         assert.equal(parseReviewCountMarker(shared.comments[0]?.body ?? '', HEAD_SHA), 2, 're-review holds the 2nd slot');
         assert.equal(shared.comments.length, 1, 'single sticky across rounds');
         assert.equal(shared.comments[0]?.id, stickyId, 'same sticky ID updated in place');
-        assert.ok(shared.comments[0]?.body.includes('判定：APPROVE'), 'chunked APPROVE publishes');
-        assert.ok(shared.comments[0]?.body.includes('分段：'), 'published sticky carries the chunk line');
+        assert.ok(shared.comments[0]?.body.includes('Verdict: APPROVE'), 'single-turn APPROVE publishes');
+        assert.ok(shared.comments[0]?.body.includes('Segments: single segment'), 'single-turn sticky carries single segment line');
         // Third round is quota-exhausted: claim refuses, budget stays 2.
         const denied = await runClaimMode({
           event: prEvent(),

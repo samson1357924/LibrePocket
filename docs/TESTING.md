@@ -106,16 +106,22 @@ For changes involving credentials, policy, persistence, session lifecycle, cance
 - Test execution contract: all asynchronous and coroutine waits must enforce a bounded timeout; teardown procedures, socket closures, and synthetic HTTP server (such as MockWebServer) requests must never block indefinitely. On a join timeout, release the peer latch/body/server (then client pools) before the bounded re-join so the parent scope cannot hang on a non-cooperative blocking read. Residual risk: if `close`/`shutdown` itself never returns, the backstop is the JUnit wall-clock timeout plus the CI job timeout.
 
 Shell timeout boundary (Current): `ShellWhitelistTest.timeoutKillsSleep`
-runs `sleep 120` with `timeoutMs=500` and asserts `TimedOut` plus
-`elapsedMs < 10s`. The 120s sleep is deliberately far above the kill ceiling
-so a kill regression (falling through to natural exit) cannot pass; the 10s
+uses a hermetic `sleep` fixture (temp-dir `#!/bin/sh` infinite loop resolved
+through `ShellExecutables` with a simulated device-unwritable search dir, so
+the assertion does not depend on host `/bin/sleep` placement or host search-dir
+writability) with `DefaultProcessRunner` and asserts `TimedOut` plus
+`elapsedMs >= 400ms` (proves a real timeout wait, not an instant fake) and
+`elapsedMs < 10s`. The 120s sleep argument is deliberately far above the kill
+ceiling so a kill regression (falling through to natural exit) cannot pass
+(the fixture loop ignores its argument); the 10s
 cap is roughly 10x the normal ~0.5–1s kill path (`waitFor` 500ms +
 `destroyForcibly` + per-stream gobbler `join` 5s×2), loose enough for loaded CI but tight
 enough to catch a fully-degraded kill (~15.5s when every grace period fills:
 0.5s wait + 5s destroy wait + 2×5s gobbler joins).
-There is intentionally no lower-bound assertion (CI scheduling jitter would
-flake). The passing-path cost stays ~1s: the long sleep only materializes as
-extra wait when the kill itself regresses.
+The passing-path cost stays ~1s: the long sleep only materializes as
+extra wait when the kill itself regresses. The `writableFixture_*` negative
+control proves the same fixture is denied with zero spawn when the search dir
+is writable.
 
 ## Reporting evidence
 

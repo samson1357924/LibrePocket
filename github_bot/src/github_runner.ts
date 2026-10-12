@@ -24,13 +24,11 @@ import {
   type ReconcileScope,
 } from './label_manager';
 import {
-  buildReviewDiffChunks,
   collectFileDiffs,
   coverageSummary,
   filterReviewDiffFiles,
   MAX_CHANGED_FILES,
   MAX_DIFF_LENGTH,
-  MAX_PR_CHUNK_LENGTH,
   prioritizeFiles,
   truncateDiff,
   validateReviewDiffChunkReports,
@@ -124,6 +122,19 @@ export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
 // remaining < need exits early with INCONCLUSIVE + chunkCoverageComplete:false
 // + completed reports + omission placeholders (or legacy INCONCLUSIVE when
 // nothing was completed) and never writes true. Fixed concurrency
+// Longest configured model fallback chain across the three review roles.
+// Mirrors the model client's chain composition without importing it: tag
+// and publish entry points must stay free of the OpenAI client so secrets never
+// reach those jobs. A role may burn a whole chain before it finishes, so
+// wall-clock budgets divide by this factor.
+function maxModelChainAttempts(env: NodeJS.ProcessEnv): number {
+  const count = (raw: string | undefined): number =>
+    (raw ?? '').split(',').map((part) => part.trim()).filter((part) => part !== '').length;
+  const chains = (['CHIEF', 'ANDROID_SEC', 'ANDROID_CODE'] as const).map((role) =>
+    1 + count(env[`POCKETGUARD_MODEL_${role}_FALLBACKS`]) + count(env.POCKETGUARD_MODEL_FALLBACKS));
+  return Math.max(1, ...chains);
+}
+
 // PR_CHUNK_CONCURRENCY runs orchestrateReview in parallel with index-sorted
 // synthesis; timeoutMs passes through min(420s, remaining/remainingWaves) so
 // slow roles abort via the transport timeout. chunkCoverageComplete is a
@@ -155,7 +166,7 @@ export const CHUNK_DEADLINE_SAVE_MARGIN_MS = 1_000;
 export const REVIEW_REPORT_WRITE_ERROR = 'PocketGuard: failed to write review reports.';
 export type ReviewReportWriteResult = { ok: true } | { ok: false; reason: string };
 const ROLE_NAMES = ['chief', 'android_sec', 'android_code'] as const;
-const SAFE_MESSAGE = '自動審查未執行；請由維護者檢視變更。';
+const SAFE_MESSAGE = 'Automated review was not executed; please have maintainers review the changes.';
 
 // Phase 3 (P2 #3) helpers: deadline/timeout estimation plus the computed
 // chunk-coverage value. All are pure (Date.now injected by callers via
@@ -211,8 +222,12 @@ export function resolvePerChunkTimeoutMs(
   env: NodeJS.ProcessEnv | undefined,
   remainingMs: number,
   remainingWaves: number,
+  attemptFactor: number = 1,
 ): number {
   const waves = Number.isFinite(remainingWaves) && remainingWaves > 0 ? Math.max(1, Math.floor(remainingWaves)) : 1;
+  // A model can fall through a fallback chain, so one role may burn
+  // chainLength attempts before it is done. Budget per attempt, not per role.
+  const attempts = Number.isFinite(attemptFactor) && attemptFactor >= 1 ? Math.max(1, Math.floor(attemptFactor)) : 1;
   const remaining = Number.isFinite(remainingMs) ? Math.max(0, Math.floor(remainingMs)) : 0;
   const raw = env?.POCKETGUARD_CHUNK_TIMEOUT_MS?.trim() ?? '';
   let ceiling = MAX_PER_CHUNK_TIMEOUT_MS;
@@ -220,7 +235,7 @@ export function resolvePerChunkTimeoutMs(
     const parsed = Number(raw);
     if (Number.isFinite(parsed) && parsed > 0) ceiling = Math.min(MAX_PER_CHUNK_TIMEOUT_MS, Math.floor(parsed));
   }
-  return Math.max(1, Math.min(ceiling, Math.floor(remaining / waves)));
+  return Math.max(1, Math.min(ceiling, Math.floor(remaining / (waves * attempts))));
 }
 
 // Wall-time estimate for the remaining chunked work under fixed concurrency:
@@ -403,6 +418,7 @@ export interface RunnerReviewOutput {
       issue: string;
       suggestion?: string;
     }>;
+    summary?: string;
   }>;
   coverage: ReviewCoverage;
   deterministicViolations: ScanViolation[];
@@ -802,6 +818,101 @@ export function isStickyLimitError(error: unknown): boolean {
 
 export function isStickyLedgerUnreadableError(error: unknown): boolean {
   return error instanceof Error && error.message.includes('sticky ledger unreadable during publish');
+}
+
+// Hosted claim-slot diagnostics (sanitized, never serializes the error).
+// publishStickyComment tags the failing write op plus the Octokit HTTP status
+// on the generic throw; classifyStickyWriteError recovers only those two
+// fields so callers can emit a fail-closed reason without leaking tokens,
+// headers, response bodies, or diffs. Only HTTP status, method/path resource
+// type (as op), PR number, SHA prefix, and run/attempt are ever recorded.
+export type StickyWriteOp = 'list' | 'create' | 'update' | 'auth';
+export interface StickyWriteErrorInfo {
+  op: StickyWriteOp;
+  status?: number;
+}
+
+function readOctokitStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const record = error as Record<string, unknown>;
+  const direct = record['status'];
+  if (typeof direct === 'number' && Number.isSafeInteger(direct) && direct >= 100 && direct <= 599) {
+    return direct;
+  }
+  const response = record['response'];
+  if (response && typeof response === 'object' && !Array.isArray(response)) {
+    const nested = (response as Record<string, unknown>)['status'];
+    if (typeof nested === 'number' && Number.isSafeInteger(nested) && nested >= 100 && nested <= 599) {
+      return nested;
+    }
+  }
+  return undefined;
+}
+
+export function classifyStickyWriteError(error: unknown): StickyWriteErrorInfo {
+  let op: StickyWriteOp | undefined;
+  let status: number | undefined;
+  if (error && typeof error === 'object' && !Array.isArray(error)) {
+    const record = error as Record<string, unknown>;
+    const rawOp = record['stickyOp'];
+    if (rawOp === 'list' || rawOp === 'create' || rawOp === 'update' || rawOp === 'auth') {
+      op = rawOp;
+    }
+    const rawStatus = record['stickyStatus'];
+    if (typeof rawStatus === 'number' && Number.isSafeInteger(rawStatus) && rawStatus >= 100 && rawStatus <= 599) {
+      status = rawStatus;
+    }
+    if (status === undefined) status = readOctokitStatus(error);
+    if (op === undefined) {
+      const cause = record['cause'];
+      if (cause && typeof cause === 'object' && !Array.isArray(cause)) {
+        const causeRecord = cause as Record<string, unknown>;
+        const causeOp = causeRecord['stickyOp'];
+        if (causeOp === 'list' || causeOp === 'create' || causeOp === 'update' || causeOp === 'auth') {
+          op = causeOp;
+        }
+        // Our own tag on the wrapped cause is read back with the same bounds
+        // as the top-level tag (an untagged cause still falls back to its
+        // Octokit status only).
+        const causeStatus = causeRecord['stickyStatus'];
+        if (
+          status === undefined &&
+          typeof causeStatus === 'number' &&
+          Number.isSafeInteger(causeStatus) &&
+          causeStatus >= 100 &&
+          causeStatus <= 599
+        ) {
+          status = causeStatus;
+        }
+        if (status === undefined) status = readOctokitStatus(cause);
+      }
+    }
+  } else {
+    status = readOctokitStatus(error);
+  }
+  if (op === undefined) op = 'update';
+  return status === undefined ? { op } : { op, status };
+}
+
+// Sanitized one-line error summary for stderr: message only (never headers,
+// response bodies, or diffs), token shapes redacted first, then sliced.
+export function sanitizeErrorSummary(error: unknown, maxLength = 200): string {
+  let raw: string;
+  if (error instanceof Error) raw = error.message;
+  else if (typeof error === 'string') raw = error;
+  else {
+    try {
+      raw = String(error);
+    } catch {
+      raw = 'unknown error';
+    }
+  }
+  let redacted = raw.replace(/gh[pousr]_[A-Za-z0-9_]+/g, '[redacted-token]');
+  redacted = redacted.replace(/Bearer\s+[^\s]+/gi, 'Bearer [redacted-token]');
+  redacted = redacted.replace(/[\r\n]+/g, ' ');
+  const limit = Number.isSafeInteger(Math.floor(maxLength)) && maxLength > 0 ? Math.floor(maxLength) : 200;
+  if (redacted.length > limit) redacted = redacted.slice(0, limit);
+  return redacted;
 }
 
 // True when the body carries sticky metadata that must never be truncated:
@@ -1498,18 +1609,22 @@ export interface ClaimResult {
   issueNumber?: number;
 }
 
-const CLAIM_PLACEHOLDER_BODY = `${REVIEW_MARKER}\n\n## PocketGuard 審查\n\n**判定：INCONCLUSIVE**\n**審查預佔名額已保留，等待審查結果。**\n`;
+const CLAIM_PLACEHOLDER_BODY = `${REVIEW_MARKER}\n\n## PocketGuard Review\n\n**Verdict: INCONCLUSIVE**\n**Review slot claimed, awaiting review results.**\n`;
 
 export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimResult> {
   const env = context.env ?? process.env;
   const emit = (result: ClaimResult): ClaimResult => {
-    appendWorkflowOutputs(env, {
-      claimed: String(result.claimed),
-      ...(result.claimSha ? { claim_sha: result.claimSha } : {}),
-      reviews_used: String(result.reviewsUsed),
-      ...(result.issueNumber ? { issue_number: String(result.issueNumber) } : {}),
-      claim_reason: result.reason,
-    });
+    try {
+      appendWorkflowOutputs(env, {
+        claimed: String(result.claimed),
+        ...(result.claimSha ? { claim_sha: result.claimSha } : {}),
+        reviews_used: String(result.reviewsUsed),
+        ...(result.issueNumber ? { issue_number: String(result.issueNumber) } : {}),
+        claim_reason: result.reason,
+      });
+    } catch {
+      // Degraded: an unwritable GITHUB_OUTPUT must never block stdout JSON.
+    }
     stdout(context, `${JSON.stringify(result)}\n`);
     return result;
   };
@@ -1524,7 +1639,12 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
   if (!repository) {
     return emit({ claimed: false, reviewsUsed: 0, reason: 'quota-unknown: repository identity unavailable' });
   }
-  const target = await inspectTarget(context);
+  let target: Awaited<ReturnType<typeof inspectTarget>>;
+  try {
+    target = await inspectTarget(context);
+  } catch {
+    return emit({ claimed: false, reviewsUsed: 0, reason: 'unstarted: target inspection failed' });
+  }
   if (!target.issueNumber) {
     return emit({ claimed: false, reviewsUsed: 0, reason: 'unstarted: no issue number' });
   }
@@ -1613,26 +1733,17 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
     // consumed job wall-clock) refuses instead of reserving a slot the review
     // job cannot finish; a missing jobStarted downgrades to configured.
     {
-      let chunkCount = 1;
       try {
-        const fileDiffs = collectFileDiffs(runGit, mergeBase, freshPullRequest.head.sha, changedFiles);
-        const reviewFiles = filterReviewDiffFiles(changedFiles).filter((file) => (fileDiffs.get(file) ?? '').length > 0);
-        if (reviewFiles.length > 0) {
-          try {
-            chunkCount = buildReviewDiffChunks(fileDiffs, changedFiles, MAX_PR_CHUNK_LENGTH).length;
-          } catch {
-            chunkCount = 1;
-          }
-        }
+        collectFileDiffs(runGit, mergeBase, freshPullRequest.head.sha, changedFiles);
       } catch {
         throw new Error('PocketGuard: diff pre-flight failed.');
       }
       const deadlineMs = resolveEffectiveReviewDeadlineMs(env, Date.now());
-      const waves = Math.max(1, Math.ceil(Math.max(1, chunkCount) / PR_CHUNK_CONCURRENCY));
+      const waves = 1;
       const perChunkShare = Math.floor(deadlineMs / waves);
       const perChunkTimeout = Math.min(MAX_PER_CHUNK_TIMEOUT_MS, perChunkShare);
       if (perChunkTimeout < MIN_VIABLE_PER_CHUNK_TIMEOUT_MS) {
-        return emit({ claimed: false, reviewsUsed: 0, reason: `budget-exceeded: chunkCount ${chunkCount} needs ${waves} wave(s) x ${MAX_PER_CHUNK_TIMEOUT_MS}ms over deadline ${deadlineMs}ms (share ${perChunkShare}ms < viable ${MIN_VIABLE_PER_CHUNK_TIMEOUT_MS}ms); fail-closed without occupying a slot`, issueNumber });
+        return emit({ claimed: false, reviewsUsed: 0, reason: `budget-exceeded: chunkCount 1 needs ${waves} wave(s) x ${MAX_PER_CHUNK_TIMEOUT_MS}ms over deadline ${deadlineMs}ms (share ${perChunkShare}ms < viable ${MIN_VIABLE_PER_CHUNK_TIMEOUT_MS}ms); fail-closed without occupying a slot`, issueNumber });
       }
     }
   } catch {
@@ -1696,7 +1807,7 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
     await publishStickyComment(client, repository, issueNumber, initialBody, buildFreshBody);
   } catch (error) {
     // Over-limit or mid-claim unreadable ledger: explicit failure with zero
-    // consumption (nothing was written). Genuine write failures still throw.
+    // consumption (nothing was written).
     if (isStickyLimitError(error) || isStickyLedgerUnreadableError(error)) {
       return emit({
         claimed: false,
@@ -1705,7 +1816,18 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
         issueNumber,
       });
     }
-    throw new Error('PocketGuard: failed to claim review slot.');
+    // Sanitized sticky-write diagnostics: resolve (never throw) with a
+    // fail-closed reason that carries only http-<status>-<op>. No tokens,
+    // headers, response bodies, or diffs are recorded.
+    const info = classifyStickyWriteError(error);
+    const label = info.status !== undefined ? `http-${info.status}-${info.op}` : `http-unknown-${info.op}`;
+    return emit({
+      claimed: false,
+      reviewsUsed: existing,
+      reason: `claim-failed: sticky write failed (${label}); fail-closed`,
+      issueNumber,
+      claimSha,
+    });
   }
   // Phase 1: the claim counts only when a re-read proves the marker survived
   // the write (no truncation, no lost race). Otherwise fail closed.
@@ -1745,15 +1867,32 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
   return emit({ claimed: true, reviewsUsed: expected, reason: `claimed: head ${claimSha} now at ${expected}`, issueNumber, claimSha });
 }
 
-function defaultGit(args: string[]): string {
+// Git commands must resolve repo-root-relative pathspecs regardless of the
+// process working directory. The workflow invokes the runner with
+// `working-directory: github_bot`, and a path like `app/src/...` would then be
+// interpreted as `github_bot/app/src/...` (silently empty diff, exit code 0),
+// failing every per-file review. Anchor once at the worktree root.
+let cachedRepoRoot: string | undefined;
+function repoRoot(): string {
+  if (cachedRepoRoot === undefined) {
+    cachedRepoRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  }
+  return cachedRepoRoot;
+}
+
+export function defaultGit(args: string[]): string {
   return execFileSync('git', args, {
+    cwd: repoRoot(),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     maxBuffer: 64 * 1024 * 1024,
   });
 }
 
-function getChangedPaths(context: RunnerContext, mergeBaseSha: string, headSha: string): string[] {
+export function getChangedPaths(context: RunnerContext, mergeBaseSha: string, headSha: string): string[] {
   const runGit = context.runGit ?? defaultGit;
   return runGit(['diff', '--name-only', '-z', mergeBaseSha, headSha])
     .split('\0')
@@ -2036,7 +2175,7 @@ function parseAllowedOrigins(env: NodeJS.ProcessEnv): string[] {
 function installOpenAIStub(env: NodeJS.ProcessEnv): () => void {
   if (env.POCKETGUARD_OPENAI_STUB !== '1') return () => undefined;
   const previousFetch = globalThis.fetch;
-  const responseText = JSON.stringify({ verdict: 'APPROVE', summary: '測試審查完成。', findings: [] });
+  const responseText = JSON.stringify({ verdict: 'APPROVE', summary: 'Test review complete.', findings: [] });
   globalThis.fetch = (async () => new Response(JSON.stringify({
     output: [{ content: [{ type: 'output_text', text: responseText }] }],
   }), { status: 200, headers: { 'Content-Type': 'application/json' } })) as typeof fetch;
@@ -2902,10 +3041,10 @@ export function getReportRunUrl(env: NodeJS.ProcessEnv | undefined): string | un
 }
 
 export function formatReportLine(env: NodeJS.ProcessEnv | undefined, available: boolean): string {
-  if (!available) return '報告：不可用（審查報告未能產生或上傳失敗，請見 Actions 執行紀錄）。';
+  if (!available) return 'Report: unavailable (review report could not be generated or failed to upload, see Actions run log).';
   const runUrl = getReportRunUrl(env);
-  if (!runUrl) return '報告：不可用（審查報告未能產生或上傳失敗，請見 Actions 執行紀錄）。';
-  return `報告：[run](${runUrl})（artifact: ${REVIEW_REPORT_ARTIFACT_NAME}，含 review-report.md / review-report.json，保留 30 天）。`;
+  if (!runUrl) return 'Report: unavailable (review report could not be generated or failed to upload, see Actions run log).';
+  return `Report: [run](${runUrl}) (artifact: ${REVIEW_REPORT_ARTIFACT_NAME}, includes review-report.md / review-report.json, retained for 30 days).`;
 }
 
 function resolveReportPaths(env: NodeJS.ProcessEnv): { jsonPath: string; mdPath: string } {
@@ -3095,19 +3234,19 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
   if (Array.isArray(issueSegments) && issueSegments.length > 0) {
     const shown = issueSegments.slice(0, MAX_STICKY_CHUNK_LINES);
     for (const seg of shown) {
-      segmentLines.push(`- 段 #${String(seg.index ?? '?')}: ${String(seg.verdict ?? '?')}（${String(seg.start ?? '?')}-${String(seg.end ?? '?')}）`);
+      segmentLines.push(`- Segment #${String(seg.index ?? '?')}: ${String(seg.verdict ?? '?')} (${String(seg.start ?? '?')}-${String(seg.end ?? '?')})`);
     }
     if (issueSegments.length > shown.length) {
-      segmentLines.push(`- …（共${issueSegments.length}段，省略${issueSegments.length - shown.length}段）`);
+      segmentLines.push(`- … (${issueSegments.length} segments total, ${issueSegments.length - shown.length} omitted)`);
     }
   }
   const redactedMd = redactForModel([
-    '# PocketGuard 審查報告',
+    '# PocketGuard Review Report',
     '',
-    `判定：${(reportJson as { verdict?: string }).verdict ?? 'INCONCLUSIVE'}`,
-    `指紋：\`${(reportJson as { fingerprint?: string }).fingerprint ?? ''}\``,
-    `時間：${time}`,
-    ...(segmentLines.length > 0 ? ['', '分段結果：', ...segmentLines] : []),
+    `Verdict: ${(reportJson as { verdict?: string }).verdict ?? 'INCONCLUSIVE'}`,
+    `Fingerprint: \`${(reportJson as { fingerprint?: string }).fingerprint ?? ''}\``,
+    `Time: ${time}`,
+    ...(segmentLines.length > 0 ? ['', 'Segment results:', ...segmentLines] : []),
     '',
     '```json',
     JSON.stringify(reportJson, null, 2),
@@ -3202,7 +3341,7 @@ function saveIssueOutput(output: RunnerIssueOutput, context: RunnerContext): Rev
       output.tags = ['status:needs-decision'];
     }
     try {
-      const note = '（審查報告未能產生；已降級為 INCONCLUSIVE，請見 Actions 執行紀錄。）';
+      const note = ' (Review report could not be generated; downgraded to INCONCLUSIVE, see Actions run log.)';
       output.summary = safeString(`${output.summary} ${note}`.trim());
     } catch {
       // Keep the verdict downgrade even if the summary cannot be updated.
@@ -3976,310 +4115,85 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
           changedFilesComplete,
           suggestedLabels: [],
         };
-      } else if (!reviewDiff.coverage.complete && changedFilesComplete && reviewDiff.coverage.originalLength > MAX_DIFF_LENGTH) {
-        // Phase 4 (P2 #2) chunked path: the single-turn visible diff is
-        // incomplete but the changed list is complete and the full review
-        // length exceeds the single-turn budget, so every review character is
-        // partitioned into sequential MAX_PR_CHUNK_LENGTH chunks (prioritized
-        // file order, small files atomic, oversized files sliced at line
-        // boundaries) and each chunk takes a full orchestrateReview turn.
-        // Deterministic BLOCK already short-circuited above over the FULL
-        // diff (zero AI). Phase 3 (P2 #3): N chunks run under a whole-review
-        // effective deadline (t0 + min(configured POCKETGUARD_REVIEW_DEADLINE_MS,
-        // jobRemaining - UPLOAD_SKEW); trusted POCKETGUARD_JOB_STARTED_MS from
-        // the first review-send step, missing downgrades to configured) with
-        // fixed PR_CHUNK_CONCURRENCY waves, per-wave need estimation
-        // (effectiveRemaining < need exits early fail-closed), per-chunk
-        // timeoutMs passthrough min(420s, effectiveRemaining/remainingWaves), and a
-        // computed chunkCoverageComplete (any INCONCLUSIVE — including
-        // transport timeout/abort/deadline omission — forces false so the
-        // publish triple-gate falls back). Deadline exits save via
-        // saveReviewOutput (checkpoint artifact) as INCONCLUSIVE + false and
-        // never write true; omission is explicit via placeholders, never
-        // silent. Multi-chunk rounds consume exactly one claim-slot: counting
-        // happened in the claim job before review and publish only reconciles.
-        try {
-          const chunks = buildReviewDiffChunks(reviewDiff.fileDiffs, changedFiles, MAX_PR_CHUNK_LENGTH);
-          if (!verifyReviewDiffChunkCoverage(chunks, {
-            totalLength: reviewDiff.coverage.originalLength,
-            files: filterReviewDiffFiles(changedFiles),
-          })) {
-            throw new Error('PocketGuard: PR chunks do not fully cover the review diff.');
-          }
-          const { orchestrateReview, synthesizeChunkedReview } = await import('./orchestrator');
-          const restoreFetch = installOpenAIStub(env);
-          try {
-            // Phase 2 (P2 #2): effective budget min(configured, jobRemaining -
-            // UPLOAD_SKEW). t0 anchors the review clock; the deadline already
-            // embeds the job cap at start, and each wave re-takes
-            // min(reviewRemaining, liveJobRemaining - skew) so hosted setup
-            // overhead plus elapsed waves cannot overrun the 20min job.
-            const t0 = Date.now();
-            const effectiveMs = resolveEffectiveReviewDeadlineMs(env, t0);
-            const deadline = t0 + effectiveMs;
-            const total = chunks.length;
-            const reviewFiles = filterReviewDiffFiles(changedFiles);
-            type ChunkResult = Awaited<ReturnType<typeof orchestrateReview>>;
-            const perChunk: Array<ChunkResult | undefined> = new Array(total);
-            let nextIndex = 0;
-            let deadlineExited = false;
-            // Fixed-concurrency waves with per-wave need estimation. Waves are
-            // index-ordered; Promise.all preserves input order and results are
-            // re-sorted by index before synthesis so completion order never
-            // affects the merged verdict (verifiable aggregation).
-            while (nextIndex < total) {
-              const nowMs = Date.now();
-              const reviewRemainingMs = deadline - nowMs;
-              // Per-chunk live job cap: min(reviewRemaining, jobRemaining -
-              // skew); missing jobStarted keeps reviewRemaining (fail-closed
-              // downgrade to configured). jobRemainingText stays 'n/a' without
-              // a trusted start so logs distinguish the two modes.
-              const jobStartedMs = resolveJobStartedMs(env);
-              let jobRemainingMs: number | undefined;
-              let remainingMs = reviewRemainingMs;
-              if (jobStartedMs !== undefined) {
-                jobRemainingMs = REVIEW_JOB_TIMEOUT_MS - (nowMs - jobStartedMs) - REVIEW_JOB_UPLOAD_SKEW_MS;
-                remainingMs = Math.min(reviewRemainingMs, jobRemainingMs);
-              }
-              const remainingChunks = total - nextIndex;
-              const remainingWaves = Math.ceil(remainingChunks / PR_CHUNK_CONCURRENCY);
-              const timeoutMs = resolvePerChunkTimeoutMs(env, remainingMs, remainingWaves);
-              const needMs = timeoutMs + CHUNK_DEADLINE_SAVE_MARGIN_MS;
-              try {
-                const jobRemainingText = jobRemainingMs === undefined ? 'n/a' : `${Math.max(0, Math.floor(jobRemainingMs))}ms`;
-                console.warn(`[PocketGuard] chunk progress ${nextIndex}/${total} remaining=${Math.max(0, Math.floor(remainingMs))}ms need=${needMs}ms timeout=${timeoutMs}ms jobRemaining=${jobRemainingText}`);
-              } catch {
-                // Logging never blocks review.
-              }
-              if (remainingMs < needMs) {
-                deadlineExited = true;
-                break;
-              }
-              const waveSize = Math.min(PR_CHUNK_CONCURRENCY, remainingChunks);
-              const waveIndices = Array.from({ length: waveSize }, (_, i) => nextIndex + i);
-              const waveResults = await Promise.all(waveIndices.map(async (chunkIdx) => {
-                const chunk = chunks[chunkIdx];
-                try {
-                  const review = await orchestrateReview({
-                    changedFiles: chunk.files,
-                    diff: redactForModel(chunk.diff),
-                    coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: chunk.coveredLength },
-                    deterministicViolations: [],
-                    env,
-                    allowedOrigins: parseAllowedOrigins(env),
-                    timeoutMs,
-                  });
-                  return { idx: chunkIdx, review };
-                } catch {
-                  // orchestrateReview is fail-closed internally (never throws
-                  // in practice); this guards a hung/broken import path with
-                  // an explicit transport INCONCLUSIVE so coverage computes
-                  // false instead of silently omitting the chunk.
-                  return {
-                    idx: chunkIdx,
-                    review: {
-                      verdict: 'INCONCLUSIVE' as const,
-                      roles: (['chief', 'android_sec', 'android_code'] as const).map((role) => ({
-                        role,
-                        modelUsed: 'unavailable',
-                        verdict: 'INCONCLUSIVE' as const,
-                        findings: [],
-                        suggestedLabels: [],
-                      })),
-                      coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: chunk.coveredLength },
-                      deterministicViolations: [],
-                    } satisfies ChunkResult,
-                  };
-                }
-              }));
-              waveResults.sort((left, right) => left.idx - right.idx);
-              for (const entry of waveResults) {
-                perChunk[entry.idx] = entry.review;
-              }
-              nextIndex += waveSize;
-            }
-            if (deadlineExited || nextIndex < total || perChunk.some((entry) => entry === undefined)) {
-              // Deadline/partial fail-closed: completed reports plus explicit
-              // omission placeholders for every unstarted chunk (same
-              // index/total/start/end/files spans, verdict INCONCLUSIVE) so
-              // nothing is silently omitted. Top-level coverage is false and
-              // the verdict is forced INCONCLUSIVE; never write true. When
-              // nothing completed, placeholders still cover all spans (valid
-              // shape, coverage false) rather than a silent empty set.
-              const completed = perChunk.map((entry, idx) => ({ entry, idx })).filter((item) => item.entry !== undefined);
-              void completed;
-              const chunkReports: ReviewDiffChunkReport[] = chunks.map((chunk) => {
-                const done = perChunk[chunk.index];
-                return {
-                  index: chunk.index,
-                  total: chunk.total,
-                  start: chunk.start,
-                  end: chunk.end,
-                  complete: true,
-                  coveredLength: chunk.coveredLength,
-                  files: [...chunk.files],
-                  verdict: (done?.verdict ?? 'INCONCLUSIVE') as RunnerVerdict,
-                };
-              });
-              // Computed value stays false: unstarted placeholders are
-              // INCONCLUSIVE by construction, and any transported INCONCLUSIVE
-              // among completed chunks also forces false via the helper.
-              const chunkCoverageComplete = false;
-              // Early fail-closed: the top-level verdict is forced INCONCLUSIVE
-              // with generic INCONCLUSIVE roles (no BLOCK/NEEDS findings) so
-              // the artifact stays schema-valid (validateReviewOutput
-              // recalculates INCONCLUSIVE) while per-chunk detail survives in
-              // chunks (completed verdicts plus omission placeholders). A
-              // partial review must never approve or claim needs-changes
-              // without full coverage; publish falls back on the same sticky.
-              const runnerRoles: RunnerReviewOutput['roles'] = ROLE_NAMES.map((role) => ({
-                role,
-                modelUsed: 'not-run',
-                verdict: 'INCONCLUSIVE' as RunnerVerdict,
-                findings: [],
-              }));
-              output = {
-                verdict: 'INCONCLUSIVE',
-                roles: runnerRoles,
-                coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: reviewDiff.coverage.originalLength },
-                deterministicViolations: scan.violations,
-                pullRequestNumber: target.pullRequest.number,
-                baseSha,
-                headSha,
-                headRepository: target.pullRequest.head.repo?.full_name ?? '',
-                areaLabels: resolveAreaLabelsFromPaths(changedFiles),
-                changedFiles,
-                changedFilesComplete,
-                suggestedLabels: [],
-                chunks: chunkReports,
-                chunkCoverageComplete,
-                chunkCount: chunkReports.length,
-              };
-            } else {
-              const done = perChunk.filter((entry): entry is ChunkResult => entry !== undefined);
-              const synthesized = synthesizeChunkedReview(done, {
-                coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: reviewDiff.coverage.originalLength },
-                deterministicViolations: scan.violations,
-              });
-              const mergedSuggested = [...new Set(synthesized.roles.flatMap((role) => role.suggestedLabels))];
-              const runnerRoles: RunnerReviewOutput['roles'] = synthesized.roles.map((role) => ({
-                role: role.role as ReviewRoleName,
-                modelUsed: role.modelUsed,
-                verdict: role.verdict as RunnerVerdict,
-                findings: role.findings.map((finding) => ({ ...finding })),
-              }));
-              let reviewVerdict = synthesized.verdict as RunnerVerdict;
-              if (hasUnknownAiLabels(mergedSuggested) && reviewVerdict === 'APPROVE') {
-                console.warn('[PocketGuard] Discarded unknown AI labels; downgrading review verdict to INCONCLUSIVE.');
-                reviewVerdict = 'INCONCLUSIVE';
-              }
-              // Per-chunk minimal retention: redacted proofs only (offsets,
-              // files, per-chunk verdict) — never chunk diff text.
-              const chunkReports: ReviewDiffChunkReport[] = chunks.map((chunk, idx) => ({
-                index: chunk.index,
-                total: chunk.total,
-                start: chunk.start,
-                end: chunk.end,
-                complete: true,
-                coveredLength: chunk.coveredLength,
-                files: [...chunk.files],
-                verdict: done[idx].verdict as RunnerVerdict,
-              }));
-              // Computed coverage: any transport/timeout INCONCLUSIVE forces
-              // false (publish triple-gate then falls back); never hardcode
-              // true. done[idx] order matches chunks order (index-sorted).
-              const chunkCoverageComplete = reviewVerdict === 'INCONCLUSIVE'
-                ? false
-                : computePrChunkCoverageComplete(chunkReports, {
-                  totalLength: reviewDiff.coverage.originalLength,
-                  files: reviewFiles,
-                  maxLength: MAX_PR_CHUNK_LENGTH,
-                });
-              // A synthesized INCONCLUSIVE (any chunk INCONCLUSIVE, including
-              // transport) is already false above without trusting spans
-              // alone; conclusive NEEDS_CHANGES/APPROVE still requires the
-              // span/file proof via the helper.
-              if (reviewVerdict !== 'INCONCLUSIVE' && !chunkCoverageComplete) reviewVerdict = 'INCONCLUSIVE';
-              output = {
-                verdict: reviewVerdict,
-                roles: runnerRoles,
-                coverage: synthesized.coverage,
-                deterministicViolations: synthesized.deterministicViolations,
-                pullRequestNumber: target.pullRequest.number,
-                baseSha,
-                headSha,
-                headRepository: target.pullRequest.head.repo?.full_name ?? '',
-                areaLabels: resolveAreaLabelsFromPaths(changedFiles),
-                changedFiles,
-                changedFilesComplete,
-                suggestedLabels: mergedSuggested,
-                chunks: chunkReports,
-                chunkCoverageComplete,
-                chunkCount: chunkReports.length,
-              };
-            }
-          } finally {
-            restoreFetch();
-          }
-        } catch {
+      } else {
+        const t0 = Date.now();
+        const effectiveMs = resolveEffectiveReviewDeadlineMs(env, t0);
+        let remainingMs = effectiveMs;
+        const jobStartedMs = resolveJobStartedMs(env);
+        if (jobStartedMs !== undefined) {
+          const jobRemainingMs = REVIEW_JOB_TIMEOUT_MS - (t0 - jobStartedMs) - REVIEW_JOB_UPLOAD_SKEW_MS;
+          remainingMs = Math.min(effectiveMs, jobRemainingMs);
+        }
+        const timeoutMs = resolvePerChunkTimeoutMs(env, remainingMs, 1);
+        const needMs = timeoutMs + CHUNK_DEADLINE_SAVE_MARGIN_MS;
+        if (remainingMs < needMs) {
+          const runnerRoles: RunnerReviewOutput['roles'] = ROLE_NAMES.map((role) => ({
+            role,
+            modelUsed: 'not-run',
+            verdict: 'INCONCLUSIVE',
+            findings: [],
+          }));
           output = {
-            ...genericReviewOutput(),
+            verdict: 'INCONCLUSIVE',
+            roles: runnerRoles,
+            coverage: reviewDiff.coverage,
+            deterministicViolations: scan.violations,
             pullRequestNumber: target.pullRequest.number,
             baseSha,
             headSha,
             headRepository: target.pullRequest.head.repo?.full_name ?? '',
-            coverage: reviewDiff.coverage,
-            deterministicViolations: scan.violations,
             areaLabels: resolveAreaLabelsFromPaths(changedFiles),
             changedFiles,
             changedFilesComplete,
             suggestedLabels: [],
           };
-        }
-      } else {
-        const { orchestrateReview } = await import('./orchestrator');
-        const restoreFetch = installOpenAIStub(env);
-        try {
-          const orchestrated = await orchestrateReview({
-            changedFiles,
-            diff: redactForModel(reviewDiff.diff),
-            coverage: reviewDiff.coverage,
-            deterministicViolations: scan.violations,
-            env,
-            allowedOrigins: parseAllowedOrigins(env),
-          });
-          const mergedSuggested = [...new Set(orchestrated.roles.flatMap((role) => role.suggestedLabels))];
-          const runnerRoles: RunnerReviewOutput['roles'] = orchestrated.roles.map((role) => ({
-            role: role.role as ReviewRoleName,
-            modelUsed: role.modelUsed,
-            verdict: role.verdict as RunnerVerdict,
-            findings: role.findings.map((finding) => ({ ...finding })),
-          }));
-          let reviewVerdict = orchestrated.verdict as RunnerVerdict;
-          // S5: illegal AI labels can never approve. Any unknown suggestion
-          // downgrades an APPROVE to INCONCLUSIVE (rules-only path at
-          // publish); NEEDS_CHANGES/INCONCLUSIVE stay as computed by the
-          // existing deterministic-BLOCK-first semantics.
-          if (hasUnknownAiLabels(mergedSuggested) && reviewVerdict === 'APPROVE') {
-            console.warn('[PocketGuard] Discarded unknown AI labels; downgrading review verdict to INCONCLUSIVE.');
-            reviewVerdict = 'INCONCLUSIVE';
+        } else {
+          const { orchestrateReview } = await import('./orchestrator');
+          const restoreFetch = installOpenAIStub(env);
+          try {
+            const orchestrated = await orchestrateReview({
+              changedFiles,
+              diff: redactForModel(reviewDiff.diff),
+              coverage: reviewDiff.coverage,
+              deterministicViolations: scan.violations,
+              env,
+              allowedOrigins: parseAllowedOrigins(env),
+              timeoutMs,
+            });
+            const mergedSuggested = [...new Set(orchestrated.roles.flatMap((role) => role.suggestedLabels))];
+            const runnerRoles: RunnerReviewOutput['roles'] = orchestrated.roles.map((role) => ({
+              role: role.role as ReviewRoleName,
+              modelUsed: role.modelUsed,
+              verdict: role.verdict as RunnerVerdict,
+              findings: role.findings.map((finding) => ({ ...finding })),
+              ...(typeof role.summary === 'string' ? { summary: role.summary } : {}),
+            }));
+            let reviewVerdict = orchestrated.verdict as RunnerVerdict;
+            // S5: illegal AI labels can never approve. Any unknown suggestion
+            // downgrades an APPROVE to INCONCLUSIVE (rules-only path at
+            // publish); NEEDS_CHANGES/INCONCLUSIVE stay as computed by the
+            // existing deterministic-BLOCK-first semantics.
+            if (hasUnknownAiLabels(mergedSuggested) && reviewVerdict === 'APPROVE') {
+              console.warn('[PocketGuard] Discarded unknown AI labels; downgrading review verdict to INCONCLUSIVE.');
+              reviewVerdict = 'INCONCLUSIVE';
+            }
+            output = {
+              verdict: reviewVerdict,
+              roles: runnerRoles,
+              coverage: orchestrated.coverage,
+              deterministicViolations: orchestrated.deterministicViolations,
+              pullRequestNumber: target.pullRequest.number,
+              baseSha,
+              headSha,
+              headRepository: target.pullRequest.head.repo?.full_name ?? '',
+              areaLabels: resolveAreaLabelsFromPaths(changedFiles),
+              changedFiles,
+              changedFilesComplete,
+              suggestedLabels: mergedSuggested,
+            };
+          } finally {
+            restoreFetch();
           }
-          output = {
-            verdict: reviewVerdict,
-            roles: runnerRoles,
-            coverage: orchestrated.coverage,
-            deterministicViolations: orchestrated.deterministicViolations,
-            pullRequestNumber: target.pullRequest.number,
-            baseSha,
-            headSha,
-            headRepository: target.pullRequest.head.repo?.full_name ?? '',
-            areaLabels: resolveAreaLabelsFromPaths(changedFiles),
-            changedFiles,
-            changedFilesComplete,
-            suggestedLabels: mergedSuggested,
-          };
-        } finally {
-          restoreFetch();
         }
       }
     } catch {
@@ -4373,9 +4287,10 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
     if (!rawRole || typeof rawRole !== 'object' || Array.isArray(rawRole)) return undefined;
     const role = rawRole as Record<string, unknown>;
     if (
-      Object.keys(role).some((key) => !['role', 'modelUsed', 'verdict', 'findings'].includes(key)) ||
+      Object.keys(role).some((key) => !['role', 'modelUsed', 'verdict', 'findings', 'summary'].includes(key)) ||
       !ROLE_NAMES.includes(role.role as ReviewRoleName) || typeof role.modelUsed !== 'string' || !role.modelUsed.trim() ||
-      !verdicts.has(String(role.verdict)) || !Array.isArray(role.findings)
+      !verdicts.has(String(role.verdict)) || !Array.isArray(role.findings) ||
+      (role.summary !== undefined && typeof role.summary !== 'string')
     ) return undefined;
     const findings: RunnerReviewOutput['roles'][number]['findings'] = [];
     for (const rawFinding of role.findings) {
@@ -4402,6 +4317,7 @@ function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
       modelUsed: safeString(role.modelUsed, 200),
       verdict: role.verdict as RunnerVerdict,
       findings,
+      ...(typeof role.summary === 'string' ? { summary: safeString(role.summary, 2000) } : {}),
     });
   }
 
@@ -4496,7 +4412,7 @@ function escapeMarkdown(value: string): string {
 export function truncateStickyText(value: string, maxLength: number): string {
   const src = typeof value === 'string' ? value : '';
   if (src.length <= maxLength) return src;
-  return `${src.slice(0, maxLength)}…（已省略${src.length - maxLength}字）`;
+  return `${src.slice(0, maxLength)}… (${src.length - maxLength} chars omitted)`;
 }
 
 // Phase 3 (P2 #3) sticky helpers: truncate raw first, then escape, and
@@ -4515,20 +4431,20 @@ export function stickyField(raw: unknown, cap: number): string {
   const src = typeof raw === 'string' ? raw : '';
   const budget = Math.max(0, Math.floor(cap));
   if (src.length <= budget) return escapeMarkdown(src);
-  return `${escapeMarkdown(src.slice(0, budget))}…（已省略${src.length - budget}字）`;
+  return `${escapeMarkdown(src.slice(0, budget))}… (${src.length - budget} chars omitted)`;
 }
 
 function formatStickyFileList(label: string, files: string[]): string {
   const total = files.length;
-  if (total === 0) return `${label}：無`;
+  if (total === 0) return `${label}: none`;
   const shownCount = Math.min(total, MAX_STICKY_FILE_LIST_SHOWN);
   const shown = files.slice(0, shownCount).map((file) => stickyField(file, MAX_STICKY_FILE_NAME_LENGTH));
   const omitted = total - shownCount;
-  const counts = `（共${total}，示${shownCount}，省略${omitted}）`;
+  const counts = ` (${total} total, ${shownCount} shown, ${omitted} omitted)`;
   if (omitted > 0) {
-    return `${label}${counts}：${shown.join('、')}…（另省略${omitted}個檔案，完整清單見 artifact）`;
+    return `${label}${counts}: ${shown.join(', ')}… (${omitted} more file(s) omitted, full list in artifact)`;
   }
-  return `${label}${counts}：${shown.join('、')}`;
+  return `${label}${counts}: ${shown.join(', ')}`;
 }
 
 function hardTruncateSticky(body: string, limit: number): string {
@@ -4536,7 +4452,7 @@ function hardTruncateSticky(body: string, limit: number): string {
   // Visible-only last resort (never used on a metadata-carrying ledger path;
   // see publishStickyComment). Counts live only in the sticky ledger and are
   // never recoverable from the report artifact.
-  const note = '…（已省略超長審查明細，完整明細見 artifact；計數以本則為準）';
+  const note = '… (long review details omitted, full details in artifact; counts in this comment prevail)';
   const keep = Math.max(0, limit - note.length);
   return `${body.slice(0, keep)}${note}`;
 }
@@ -4565,41 +4481,63 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
     : [];
   const labelsLine = appliedLabels.length > 0
     ? appliedLabels.filter((label): label is string => typeof label === 'string')
-      .map((label) => stickyField(label, MAX_STICKY_FILE_NAME_LENGTH)).join('、')
-    : '無';
+      .map((label) => stickyField(label, MAX_STICKY_FILE_NAME_LENGTH)).join(', ')
+    : 'none';
   const roleVerdicts = Array.isArray(output.roles) && output.roles.length > 0
-    ? output.roles.map((role) => `${role.role}=${role.verdict}`).join('、')
-    : '無';
+    ? output.roles.map((role) => `${role.role}=${role.verdict}`).join(', ')
+    : 'none';
   // Phase 4 (P2 #2) chunk line: per-chunk verdicts with boundaries plus an
   // omission note when many chunks; bounded like the issue chunk line.
   let prChunkLine: string;
   if (Array.isArray(output.chunks) && output.chunks.length > 0) {
     const total = output.chunkCount ?? output.chunks.length;
     const shown = output.chunks.slice(0, MAX_STICKY_CHUNK_LINES);
-    const shownText = shown.map((c) => `#${c.index}:${c.start}-${c.end}:${c.verdict}`).join('、');
-    const omitted = total > shown.length ? `，…（共${total}段，省略${total - shown.length}段）` : '';
-    prChunkLine = `分段：${total} 段（${shownText}${omitted}，完整：${output.chunkCoverageComplete === true ? '是' : '否'}）`;
+    const shownText = shown.map((c) => `#${c.index}:${c.start}-${c.end}:${c.verdict}`).join(', ');
+    const omitted = total > shown.length ? `, … (${total} segments total, ${total - shown.length} omitted)` : '';
+    prChunkLine = `Segments: ${total} segment(s) (${shownText}${omitted}, complete: ${output.chunkCoverageComplete === true ? 'yes' : 'no'})`;
   } else {
-    prChunkLine = '分段：單段';
+    prChunkLine = 'Segments: single segment';
   }
   const headerLines = [
     REVIEW_MARKER,
     '',
-    '## PocketGuard 審查',
+    '## PocketGuard Review',
     '',
-    `**判定：${output.verdict}**`,
-    `審查的 head SHA：\`${output.headSha}\``,
-    `審查的 base SHA：\`${output.baseSha}\``,
-    `標籤決策：${labelsLine}`,
-    `更新時間：${updatedAt}`,
+    `**Verdict: ${output.verdict}**`,
+    `Reviewed head SHA: \`${output.headSha}\``,
+    `Reviewed base SHA: \`${output.baseSha}\``,
+    `Label decision: ${labelsLine}`,
+    `Updated: ${updatedAt}`,
     reportLine ?? formatReportLine(process.env, false),
     coverageSummary(output.coverage),
-    formatStickyFileList('省略檔案', omittedFiles),
-    formatStickyFileList('截斷檔案', truncatedFiles),
-    `角色判定：${roleVerdicts}`,
+    formatStickyFileList('Omitted files', omittedFiles),
+    formatStickyFileList('Truncated files', truncatedFiles),
+    `Role verdicts: ${roleVerdicts}`,
     prChunkLine,
     '',
   ];
+
+  const summaryLines: string[] = ['### Summary'];
+  const chief = output.roles?.find((r) => r.role === 'chief');
+  const chiefSummary = typeof chief?.summary === 'string' ? chief.summary.trim() : '';
+  const otherRoles = (output.roles ?? []).filter(
+    (r) => r.role !== 'chief' && typeof r.summary === 'string' && r.summary.trim().length > 0,
+  );
+  if (chiefSummary && otherRoles.length === 0) {
+    summaryLines.push(truncateStickyText(chiefSummary, MAX_STICKY_SUMMARY_LENGTH));
+  } else if (chiefSummary && otherRoles.length > 0) {
+    summaryLines.push(`- **chief**: ${truncateStickyText(chiefSummary, MAX_STICKY_SUMMARY_LENGTH)}`);
+    for (const r of otherRoles) {
+      summaryLines.push(`- **${r.role}**: ${truncateStickyText(r.summary!.trim(), MAX_STICKY_SUMMARY_LENGTH)}`);
+    }
+  } else if (otherRoles.length > 0) {
+    for (const r of otherRoles) {
+      summaryLines.push(`- **${r.role}**: ${truncateStickyText(r.summary!.trim(), MAX_STICKY_SUMMARY_LENGTH)}`);
+    }
+  } else {
+    summaryLines.push('No summary provided.');
+  }
+
   // Candidate pools: all findings/violations sorted by BLOCK>WARN>SUGGESTION
   // with stable original order within a severity, then capped to 60/20. Totals
   // below stay over the full sets so the tail omission counts are honest.
@@ -4664,7 +4602,9 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
   const TAIL_RESERVE = Math.max(1500, reserveInput + STICKY_TAIL_MARGIN);
   const lines: string[] = [
     ...headerLines,
-    `### 發現（共${totalFindings}，候選${poolFindings.length}，按 BLOCK>WARN>SUGGESTION 擇要，同級保持原序）`,
+    ...summaryLines,
+    '',
+    `### Findings & Recommendations (total ${totalFindings}, candidate ${poolFindings.length}, prioritized by BLOCK>WARN>SUGGESTION, preserving order within severity)`,
   ];
   const joinedLength = (entries: string[]): number => entries.join('\n').length + 1;
   let shownFindings = 0;
@@ -4678,7 +4618,7 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
       : '';
     const main = `- **${severity}** [${role}]${location}: ${stickyField(finding.issue, MAX_STICKY_ITEM_LENGTH)}`;
     const extra = typeof finding.suggestion === 'string' && finding.suggestion
-      ? `  - 建議：${stickyField(finding.suggestion, MAX_STICKY_ITEM_LENGTH)}`
+      ? `  - Recommendation: ${stickyField(finding.suggestion, MAX_STICKY_ITEM_LENGTH)}`
       : undefined;
     const probe = extra ? [...lines, main, extra] : [...lines, main];
     if (joinedLength(probe) + TAIL_RESERVE > MAX_STICKY_TOTAL_LENGTH) break;
@@ -4686,7 +4626,7 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
     if (extra) lines.push(extra);
     shownFindings += 1;
   }
-  lines.push(`### 確定性檢查（共${totalViolations}，候選${poolViolations.length}）`);
+  lines.push(`### Deterministic Checks (total ${totalViolations}, candidate ${poolViolations.length})`);
   let shownViolations = 0;
   for (const violation of poolViolations) {
     const severity = violation.severity === 'BLOCK' || violation.severity === 'WARN' ? violation.severity : 'WARN';
@@ -4699,8 +4639,8 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
   const omittedViolations = totalViolations - shownViolations;
   lines.push(
     '',
-    `共${totalFindings}項發現，示${shownFindings}項，省略${omittedFindings}項；共${totalViolations}項確定性違規，示${shownViolations}項，省略${omittedViolations}項。`,
-    '完整審查明細見 artifact `pocketguard-review-report`；超量審查內容只進 artifact，本則不另開留言。計數以本則 ledger 為準，不由 artifact 恢復。',
+    `Total ${totalFindings} finding(s), ${shownFindings} shown, ${omittedFindings} omitted; total ${totalViolations} deterministic violation(s), ${shownViolations} shown, ${omittedViolations} omitted.`,
+    `Full review details available in artifact \`${REVIEW_REPORT_ARTIFACT_NAME}\`; excess review content is retained in artifact only. Counts in this comment ledger prevail and are not recovered from artifact.`,
   );
   const body = `${lines.join('\n')}\n`;
   if (body.length <= MAX_STICKY_TOTAL_LENGTH) return body;
@@ -4711,11 +4651,11 @@ function inconclusiveComment(reason: string, reportLine?: string): string {
   return [
     REVIEW_MARKER,
     '',
-    '## PocketGuard 審查',
+    '## PocketGuard Review',
     '',
-    '**判定：INCONCLUSIVE**',
-    `**審查結果不可用：${safeString(reason)}**`,
-    `更新時間：${new Date().toISOString()}`,
+    '**Verdict: INCONCLUSIVE**',
+    `**Review result unavailable: ${safeString(reason)}**`,
+    `Updated: ${new Date().toISOString()}`,
     reportLine ?? formatReportLine(process.env, false),
     SAFE_MESSAGE,
     '',
@@ -4735,33 +4675,33 @@ export function issueReviewComment(output: RunnerIssueOutput, appliedLabels: str
   if (output.chunks && output.chunks.length > 0) {
     const total = output.chunkCount ?? output.chunks.length;
     const shown = output.chunks.slice(0, MAX_STICKY_CHUNK_LINES);
-    const shownText = shown.map((c) => `#${c.index}:${c.start}-${c.end}:${c.verdict}`).join('、');
-    const omitted = total > shown.length ? `，…（共${total}段，省略${total - shown.length}段）` : '';
-    chunkLine = `分段：${total} 段（${shownText}${omitted}，完整：${output.chunkCoverageComplete === true ? '是' : '否'}）`;
+    const shownText = shown.map((c) => `#${c.index}:${c.start}-${c.end}:${c.verdict}`).join(', ');
+    const omitted = total > shown.length ? `, … (${total} segments total, ${total - shown.length} omitted)` : '';
+    chunkLine = `Segments: ${total} segment(s) (${shownText}${omitted}, complete: ${output.chunkCoverageComplete === true ? 'yes' : 'no'})`;
     for (const seg of shown) {
-      segmentDetailLines.push(`- 段 #${seg.index} ${seg.verdict}（${seg.start}-${seg.end}）：${truncateStickyText(seg.summary || '', 200) || '（無摘要）'}`);
+      segmentDetailLines.push(`- Segment #${seg.index} ${seg.verdict} (${seg.start}-${seg.end}): ${truncateStickyText(seg.summary || '', 200) || '(No summary)'}`);
     }
     if (total > shown.length) {
-      segmentDetailLines.push(`- …（共${total}段，省略${total - shown.length}段）`);
+      segmentDetailLines.push(`- … (${total} segments total, ${total - shown.length} omitted)`);
     }
   } else {
-    chunkLine = '分段：單段（完整）';
+    chunkLine = 'Segments: single segment (complete)';
   }
   const boundedSummary = truncateStickyText(output.summary || '', MAX_STICKY_SUMMARY_LENGTH);
   const issueBody = [
     REVIEW_MARKER,
     '',
-    '## PocketGuard 議題審查',
+    '## PocketGuard Issue Review',
     '',
-    `**判定：${output.verdict}**`,
-    `議題：#${output.issueNumber} ${escapeMarkdown(output.title)}`,
-    `摘要：${escapeMarkdown(boundedSummary) || '（無摘要）'}`,
-    ...(boundedSummary.length < (output.summary || '').length ? ['（摘要已省略部分內容，詳見報告 artifact）'] : []),
-    `標籤決策：${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join('、') : '無'}`,
-    `修訂指紋：\`${output.fingerprint}\``,
+    `**Verdict: ${output.verdict}**`,
+    `Issue: #${output.issueNumber} ${escapeMarkdown(output.title)}`,
+    `Summary: ${escapeMarkdown(boundedSummary) || '(No summary)'}`,
+    ...(boundedSummary.length < (output.summary || '').length ? ['(Summary partially omitted; see report artifact for full content)'] : []),
+    `Label decision: ${appliedLabels.length > 0 ? appliedLabels.map((label) => escapeMarkdown(label)).join(', ') : 'none'}`,
+    `Revision fingerprint: \`${output.fingerprint}\``,
     chunkLine,
     ...segmentDetailLines,
-    `更新時間：${updatedAt}`,
+    `Updated: ${updatedAt}`,
     reportLine ?? formatReportLine(process.env, false),
     '',
   ].join('\n');
@@ -4775,13 +4715,13 @@ function issueInconclusiveComment(issueNumber: number, title: string, reason: st
   return [
     REVIEW_MARKER,
     '',
-    '## PocketGuard 議題審查',
+    '## PocketGuard Issue Review',
     '',
-    '**判定：INCONCLUSIVE**',
-    `議題：#${issueNumber} ${escapeMarkdown(title)}`,
-    `**審查結果不可用：${safeString(reason)}**`,
-    `修訂指紋：\`${safeString(fingerprint, 100)}\``,
-    `更新時間：${new Date().toISOString()}`,
+    '**Verdict: INCONCLUSIVE**',
+    `Issue: #${issueNumber} ${escapeMarkdown(title)}`,
+    `**Review result unavailable: ${safeString(reason)}**`,
+    `Revision fingerprint: \`${safeString(fingerprint, 100)}\``,
+    `Updated: ${new Date().toISOString()}`,
     reportLine ?? formatReportLine(process.env, false),
     SAFE_MESSAGE,
     '',
@@ -4821,9 +4761,11 @@ async function publishStickyComment(
     // The marker plus GitHub's bot author metadata provides a safe fallback.
   }
 
+  let currentOp: StickyWriteOp = 'list';
   try {
     let existing: GithubComment | undefined;
     for (let page = 1; ; page += 1) {
+      currentOp = 'list';
       const comments = await client.rest.issues.listComments({
         owner: repository.owner,
         repo: repository.repo,
@@ -4852,6 +4794,7 @@ async function publishStickyComment(
     }
     const currentBody = enforceGithubCommentLimit(resolvedBody);
     if (existing) {
+      currentOp = 'update';
       await client.rest.issues.updateComment({
         owner: repository.owner,
         repo: repository.repo,
@@ -4859,6 +4802,7 @@ async function publishStickyComment(
         body: currentBody,
       });
     } else {
+      currentOp = 'create';
       await client.rest.issues.createComment({
         owner: repository.owner,
         repo: repository.repo,
@@ -4868,10 +4812,20 @@ async function publishStickyComment(
     }
   } catch (error) {
     // Distinct fail-closed signals propagate so callers can keep the old
-    // ledger with zero writes; anything else stays a generic publish failure.
+    // ledger with zero writes; anything else stays a generic publish failure
+    // tagged with the sanitized op/status (no tokens, headers, bodies, diffs).
     // Do not leak API details, and do not let labels advertise an unpublished result.
     if (isStickyLimitError(error) || isStickyLedgerUnreadableError(error)) throw error;
-    throw new Error('PocketGuard: failed to publish review comment.');
+    let op: StickyWriteOp = currentOp;
+    if (error && typeof error === 'object' && !Array.isArray(error)) {
+      const rawOp = (error as Record<string, unknown>)['stickyOp'];
+      if (rawOp === 'list' || rawOp === 'create' || rawOp === 'update' || rawOp === 'auth') op = rawOp;
+    }
+    const status = readOctokitStatus(error);
+    const wrapped = new Error('PocketGuard: failed to publish review comment.');
+    (wrapped as unknown as Record<string, unknown>)['stickyOp'] = op;
+    if (status !== undefined) (wrapped as unknown as Record<string, unknown>)['stickyStatus'] = status;
+    throw wrapped;
   }
 }
 
@@ -4906,27 +4860,74 @@ async function currentReviewProblem(
   }
 }
 
-async function reconcileNeedsDecisionOnly(
-  client: RunnerGitHubClient,
-  repository: { owner: string; repo: string },
-  issueNumber: number,
-): Promise<void> {
-  // P1 #3 provenance: this fallback only desires status:needs-decision (never
-  // a transitionable peer), so no transition can occur; provenance is passed
-  // explicitly as unknown (fail-closed) for contract uniformity.
+interface ReconcileFallbackPrLabelsOptions {
+  client: RunnerGitHubClient;
+  repository: { owner: string; repo: string };
+  target: ReviewTarget;
+  context: RunnerContext;
+  env: NodeJS.ProcessEnv;
+  output?: RunnerReviewOutput;
+  freshPullRequest?: PullRequestData;
+  botWrittenLabels?: ReadonlySet<string> | readonly string[];
+  isStale?: boolean;
+}
+
+async function reconcileFallbackPrLabels(options: ReconcileFallbackPrLabelsOptions): Promise<void> {
+  const { client, repository, target, context, env, output, freshPullRequest, botWrittenLabels } = options;
+  if (!target.issueNumber) return;
+
+  const pullRequest = target.pullRequest ?? (
+    freshPullRequest && safeSha(freshPullRequest.base?.sha) && safeSha(freshPullRequest.head?.sha)
+      ? freshPullRequest
+      : undefined
+  );
+  const isStale = Boolean(options.isStale || (output && pullRequest && !sameReviewIdentity(output, pullRequest)));
+
+  let areaLabels: string[] = [];
+  if (output && !isStale && Array.isArray(output.areaLabels)) {
+    areaLabels = output.areaLabels;
+  } else if ((target.diffSafe || Boolean(pullRequest && safeSha(pullRequest.base?.sha) && safeSha(pullRequest.head?.sha))) && pullRequest) {
+    const changed = collectChangedPaths(context, pullRequest);
+    areaLabels = resolveAreaLabelsFromPaths(changed.changedFiles, changed.complete);
+  }
+
+  const titleLabels = resolveLabelsFromTitle(target.title);
+  const tagLabels = configuredTagLabels(env);
+
+  const hasSecurityBlock = Boolean(
+    !isStale && (
+      output?.deterministicViolations?.some((violation) =>
+        violation.severity === 'BLOCK' && (violation.category === 'security' || violation.ruleId.startsWith('SEC-'))
+      ) ||
+      output?.roles?.some((role) =>
+        role.role === 'android_sec' && role.findings?.some((finding) => finding.severity === 'BLOCK')
+      )
+    )
+  );
+
+  const fallbackDesired = sanitizeLabels([
+    ...tagLabels,
+    ...titleLabels,
+    ...areaLabels,
+    'status:needs-decision',
+    ...(hasSecurityBlock ? ['security'] : []),
+  ]);
+
   const reconciliation = await reconcileBotLabelsSafely({
     client,
     owner: repository.owner,
     repo: repository.repo,
-    issueNumber,
-    desiredLabels: ['status:needs-decision'],
-    scope: { managedExactLabels: ['status:needs-decision'] } satisfies ReconcileScope,
+    issueNumber: target.issueNumber,
+    desiredLabels: fallbackDesired,
+    scope: DEFAULT_PR_RECONCILE_SCOPE,
     coverageComplete: false,
-    botWrittenLabels: undefined,
+    botWrittenLabels,
   });
+
+  const reconciled = new Set([...reconciliation.added, ...reconciliation.skipped]);
   if (
-    !reconciliation.added.includes('status:needs-decision') &&
-    !reconciliation.skipped.includes('status:needs-decision')
+    !reconciled.has('status:needs-decision') ||
+    fallbackDesired.some((label) => !reconciled.has(label))
   ) {
     throw new Error('PocketGuard: failed to ensure maintainer decision label.');
   }
@@ -5376,7 +5377,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildPreservedBody(inconclusiveComment(reasonText, unavailableLine)),
     );
     if (!wroteFallback) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baseline.body),
+    });
     return;
   }
 
@@ -5403,7 +5413,17 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(staleReason, staleLine)),
     );
     if (!wroteStale) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+      isStale: true,
+    });
     return;
   }
 
@@ -5422,7 +5442,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
     if (!wroteChunks) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
   if (output.chunks !== undefined && output.verdict === 'APPROVE' && output.chunkCount !== output.chunks.length) {
@@ -5433,7 +5462,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
     if (!wroteCount) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
   if (output.chunks !== undefined && !verifyReviewDiffChunkCoverage(output.chunks, {
@@ -5447,7 +5485,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(chunkReason, chunkLine)),
     );
     if (!wroteSpan) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
 
@@ -5479,7 +5526,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(discardReason, discardLine)),
     );
     if (!wroteDiscard) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
 
@@ -5505,7 +5561,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   // reports (output↔report verdict/fingerprint/time). A valid APPROVE with a
   // missing/tampered/partial report must not publish APPROVE with an
   // unavailable line; fall back to the same sticky INCONCLUSIVE with no fake
-  // link plus reconcileNeedsDecisionOnly. Single comment ID updated in place.
+  // link plus reconcileFallbackPrLabels. Single comment ID updated in place.
   const prReportsAvailable = areReviewReportsAvailable(env);
   if (!prReportsAvailable) {
     const unavailableLine = formatReportLine(env, false);
@@ -5515,7 +5571,16 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(reportsMissingReason, unavailableLine)),
     );
     if (!wroteReportsMissing) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+    });
     return;
   }
   // Phase 2 (H): success writes back the artifact/run link; the gate above
@@ -5535,7 +5600,17 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
   });
   if (!wroteSuccess) return;
   if (publishFallbackReason) {
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+      isStale: true,
+    });
     return;
   }
 
@@ -5547,7 +5622,17 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       async () => buildReconciledBody(inconclusiveComment(labelFallbackReason, labelFallbackLine)),
     );
     if (!wroteLabelFallback) return;
-    await reconcileNeedsDecisionOnly(client, repository, target.issueNumber);
+    await reconcileFallbackPrLabels({
+      client,
+      repository,
+      target,
+      context,
+      env,
+      output,
+      freshPullRequest,
+      botWrittenLabels: parseBotLabelsMarker(baselineReconciled.body),
+      isStale: true,
+    });
     return;
   }
 
@@ -5602,8 +5687,12 @@ async function main(): Promise<void> {
     if (mode === 'review') await runReviewEntryMode();
     if (mode === 'claim') await runClaimMode();
     if (mode === 'publish') await runPublishMode();
-  } catch {
-    process.stderr.write('PocketGuard: operation failed.\n');
+  } catch (error) {
+    // Sanitized summary only: message sliced to 200 chars after redacting
+    // token shapes (gh[pousr]_* and Bearer). Never serializes the error, and
+    // never logs headers, response bodies, or diffs. Still exits 1.
+    const summary = sanitizeErrorSummary(error, 200);
+    process.stderr.write(`PocketGuard: operation failed. ${summary}\n`);
     process.exitCode = 1;
   }
 }

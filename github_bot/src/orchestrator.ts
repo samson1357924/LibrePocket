@@ -29,7 +29,7 @@ export interface RoleReview {
   // S5 AI label schema (strict): raw model-suggested labels as a string
   // array. Only sanitized through the allowlist at publish time; unknown
   // entries are discarded there and force a non-APPROVE verdict. Decision
-  // record: only issue_triage.md and chief.md instruct label suggestions
+  // record: only issue_triage.md and architecture.md instruct label suggestions
   // (minimal prompt change); android_sec/android_code prompts stay untouched
   // and their responses default to [] when the field is absent.
   suggestedLabels: string[];
@@ -59,7 +59,7 @@ export interface OrchestratorOptions {
   timeoutMs?: number;
 }
 
-const ROLES: readonly OpenAIModelRole[] = ['chief', 'android_sec', 'android_code'];
+const ROLES: readonly OpenAIModelRole[] = ['architecture', 'android_sec', 'android_code'];
 const VERDICTS = new Set<ReviewVerdict>(['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE']);
 const SEVERITIES = new Set<FindingSeverity>(['BLOCK', 'WARN', 'SUGGESTION']);
 const MAX_TEXT_LENGTH = 2000;
@@ -242,7 +242,7 @@ export interface TriageIssueOptions {
   timeoutMs?: number;
 }
 
-// S4 issue execution (minimal): a single chief-role turn over the issue
+// S4 issue execution (minimal): a single architecture-role turn over the issue
 // title, body, and human comments. Decision record: a dedicated
 // issue_triage.md prompt with one role call is the smallest viable path —
 // reusing orchestrateReview would force diff/coverage concepts onto issues.
@@ -256,7 +256,7 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
   try {
     const env = options.env ?? process.env;
     const promptDirectory = options.promptDirectory ?? path.resolve(__dirname, '../prompts');
-    const modelUsed = resolveRoleModel('chief', env);
+    const modelUsed = resolveRoleModel('architecture', env);
     const systemPrompt = fs.readFileSync(path.join(promptDirectory, 'issue_triage.md'), 'utf8');
     // Issue triage carries human-supplied title/body/comments with no
     // authorization gate (issue-auto). Redact the AI-bound copy with the same
@@ -270,7 +270,7 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
     ].join('\n\n');
     const result = await sendOpenAISingleTurnWithFallback({
       modelId: modelUsed,
-      modelRole: 'chief',
+      modelRole: 'architecture',
       systemPrompt,
       userPrompt,
       maxOutputTokens: 1024,

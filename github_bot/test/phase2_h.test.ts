@@ -47,10 +47,10 @@ function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     OPENAI_BASE_URL: TEST_BASE_URL,
     OPENAI_API_KEY: 'fake-openai-key',
     POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-    POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+    POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
     POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
     POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-    POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+    POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
     ...extra,
   } as NodeJS.ProcessEnv;
 }
@@ -947,7 +947,7 @@ export async function runPhase2HTests(): Promise<void> {
         headSha: 'b'.repeat(40),
         headRepository: REPO,
         roles: [
-          { role: 'chief' as const, modelUsed: 'm', verdict: 'NEEDS_CHANGES' as const, findings: manyFindings.slice(0, 40) },
+          { role: 'architecture' as const, modelUsed: 'm', verdict: 'NEEDS_CHANGES' as const, findings: manyFindings.slice(0, 40) },
           { role: 'android_sec' as const, modelUsed: 'm', verdict: 'APPROVE' as const, findings: manyFindings.slice(40, 70) },
           { role: 'android_code' as const, modelUsed: 'm', verdict: 'APPROVE' as const, findings: manyFindings.slice(70) },
         ],
@@ -1007,7 +1007,7 @@ export async function runPhase2HTests(): Promise<void> {
       assert.equal(MAX_STICKY_TOTAL_LENGTH, 50000, 'P3 total budget leaves 65536 headroom');
       assert.equal(GITHUB_COMMENT_HARD_LIMIT, 65536, 'P3 fail-safe matches the GitHub limit');
       const prShape = (
-        roles: Array<{ role: 'chief' | 'android_sec' | 'android_code'; findings: Array<{ severity: 'BLOCK' | 'WARN' | 'SUGGESTION'; file?: string; line?: number; issue: string; suggestion?: string }> }>,
+        roles: Array<{ role: 'architecture' | 'android_sec' | 'android_code'; findings: Array<{ severity: 'BLOCK' | 'WARN' | 'SUGGESTION'; file?: string; line?: number; issue: string; suggestion?: string }> }>,
         violations: Array<{ ruleId: string; severity: 'BLOCK' | 'WARN'; category: 'security' | 'reliability'; message: string }> = [],
         coverage: { complete: boolean; omittedFiles: string[]; truncatedFiles: string[]; originalLength: number } = { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
       ): Parameters<typeof reviewComment>[0] => ({
@@ -1034,7 +1034,7 @@ export async function runPhase2HTests(): Promise<void> {
           issue: `P3LONG-${tag}-${i} ${'x'.repeat(2000)}`,
           suggestion: `fix-${tag}-${i} ${'y'.repeat(2000)}`,
         });
-        const roles = (['chief', 'android_sec', 'android_code'] as const).map((role) => ({
+        const roles = (['architecture', 'android_sec', 'android_code'] as const).map((role) => ({
           role,
           findings: Array.from({ length: 20 }, (_, i) => mkLong(role, i)),
         }));
@@ -1057,7 +1057,7 @@ export async function runPhase2HTests(): Promise<void> {
           category: 'security' as const,
           message: `P3V-${i} ${'z'.repeat(2000)}`,
         }));
-        const sticky = reviewComment(prShape([{ role: 'chief', findings: [] }], violations), [], 'report line');
+        const sticky = reviewComment(prShape([{ role: 'architecture', findings: [] }], violations), [], 'report line');
         assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-2 120 long violations within total cap (got ${sticky.length})`);
         assert.ok(sticky.includes('omitted'), 'P3-2 carries omission note');
         assert.ok(sticky.includes('120 deterministic violation(s)'), 'P3-2 tail carries total violation count');
@@ -1067,7 +1067,7 @@ export async function runPhase2HTests(): Promise<void> {
       // P3-3: escape-dense text is truncated->escaped and accounted post-escape.
       {
         const dense = '`*_{}[]()#+-.!|<>\\'.repeat(200);
-        const roles = [{ role: 'chief' as const, findings: [{ severity: 'BLOCK' as const, file: 'a*b_c[d](e)#f.kt', line: 1, issue: dense, suggestion: dense }] }];
+        const roles = [{ role: 'architecture' as const, findings: [{ severity: 'BLOCK' as const, file: 'a*b_c[d](e)#f.kt', line: 1, issue: dense, suggestion: dense }] }];
         const sticky = reviewComment(prShape(roles), [], 'report line');
         assert.ok(sticky.length <= MAX_STICKY_TOTAL_LENGTH, `P3-3 escape-dense within total cap (got ${sticky.length})`);
         // Truncate->escape helper: raw cut first, escaped length accounted.
@@ -1081,7 +1081,7 @@ export async function runPhase2HTests(): Promise<void> {
       {
         const longName = `${'d'.repeat(300)}/${'e'.repeat(300)}.kt`;
         assert.ok(longName.length > 500, 'P3-4 fixture really exceeds 500 chars');
-        const roles = [{ role: 'chief' as const, findings: [{ severity: 'WARN' as const, file: longName, line: 7, issue: 'name check', suggestion: 'rename' }] }];
+        const roles = [{ role: 'architecture' as const, findings: [{ severity: 'WARN' as const, file: longName, line: 7, issue: 'name check', suggestion: 'rename' }] }];
         const coverage = {
           complete: false,
           omittedFiles: Array.from({ length: 30 }, (_, i) => `${'o'.repeat(250)}/omitted-${i}.kt`),
@@ -1115,7 +1115,7 @@ export async function runPhase2HTests(): Promise<void> {
         }));
         // Interleave roles so input order alone would not keep BLOCKs first.
         const roles = [
-          { role: 'chief' as const, findings: [...sugs.slice(0, 30), ...blocks.slice(0, 2)] },
+          { role: 'architecture' as const, findings: [...sugs.slice(0, 30), ...blocks.slice(0, 2)] },
           { role: 'android_sec' as const, findings: [...sugs.slice(30, 60), ...blocks.slice(2, 4)] },
           { role: 'android_code' as const, findings: [...sugs.slice(60), ...blocks.slice(4)] },
         ];

@@ -130,8 +130,13 @@ export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
 function maxModelChainAttempts(env: NodeJS.ProcessEnv): number {
   const count = (raw: string | undefined): number =>
     (raw ?? '').split(',').map((part) => part.trim()).filter((part) => part !== '').length;
-  const chains = (['CHIEF', 'ANDROID_SEC', 'ANDROID_CODE'] as const).map((role) =>
-    1 + count(env[`POCKETGUARD_MODEL_${role}_FALLBACKS`]) + count(env.POCKETGUARD_MODEL_FALLBACKS));
+  const chains = (['ARCHITECTURE', 'ANDROID_SEC', 'ANDROID_CODE'] as const).map((role) =>
+    1 + count(env[`POCKETGUARD_MODEL_${role}_FALLBACKS`]) +
+    // Deprecated pre-rename fallback list still extends the chain (see the
+    // model client's legacy env fallback table); count it so the
+    // wall-clock budget never underestimates.
+    count(role === 'ARCHITECTURE' ? env.POCKETGUARD_MODEL_CHIEF_FALLBACKS : undefined) +
+    count(env.POCKETGUARD_MODEL_FALLBACKS));
   return Math.max(1, ...chains);
 }
 
@@ -165,7 +170,7 @@ export const CHUNK_DEADLINE_SAVE_MARGIN_MS = 1_000;
 // on failure so a missing report can never approve.
 export const REVIEW_REPORT_WRITE_ERROR = 'PocketGuard: failed to write review reports.';
 export type ReviewReportWriteResult = { ok: true } | { ok: false; reason: string };
-const ROLE_NAMES = ['chief', 'android_sec', 'android_code'] as const;
+const ROLE_NAMES = ['architecture', 'android_sec', 'android_code'] as const;
 const SAFE_MESSAGE = 'Automated review was not executed; please have maintainers review the changes.';
 
 // Phase 3 (P2 #3) helpers: deadline/timeout estimation plus the computed
@@ -686,7 +691,7 @@ export function routeReviewFlags(kind: RouteKind, eventName: string, event?: Git
   if (kind === 'issue-update') return { shouldReview: true, shouldTag: true };
   // first-review: both pull-request opens and human issue opens request
   // review. PR execution is a gated diff review (origin/auth/quota checks in
-  // review mode); issue execution is a single chief triage turn with no
+  // review mode); issue execution is a single architecture triage turn with no
   // auth/quota gate by owner decision (bot senders already routed to ignore,
   // per-issue serialization via the workflow concurrency group).
   // should_tag stays true so publish can complete deterministic tagging.
@@ -3175,7 +3180,7 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
       verdict: issue.verdict,
       issueNumber: issue.issueNumber,
       fingerprint: issue.fingerprint,
-      roles: [{ role: 'chief', verdict: issue.verdict, findings: [] }],
+      roles: [{ role: 'architecture', verdict: issue.verdict, findings: [] }],
       coverage: {
         complete: issue.commentsComplete === true && (issue.chunkCoverageComplete ?? true) === true,
         commentsComplete: issue.commentsComplete,
@@ -3678,7 +3683,7 @@ async function buildIssueContext(
 }
 
 // S5 issue execution (never counted): issues opened/edited/reopened and
-// human issue comments each take one chief single-turn over the issue
+// human issue comments each take one architecture single-turn over the issue
 // context and record verdict plus merged tags (deterministic rules first,
 // then allowlisted AI suggestions). Unknown AI labels are discarded with a
 // log and force INCONCLUSIVE so illegal suggestions are never written and
@@ -3855,7 +3860,7 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       const allowed = parseAllowedOrigins(env);
       const perChunk: Array<Awaited<ReturnType<typeof triageIssue>>> = [];
       for (const chunk of validatedChunks) {
-        // Each chunk is one chief single-turn; issues never consume quota so
+        // Each chunk is one architecture single-turn; issues never consume quota so
         // N chunks still count as a single (zero) slot.
         const triaged = await triageIssue({
           input: { title: chunk.title.slice(0, 2000), body: chunk.body, comments: chunk.comments },
@@ -4222,7 +4227,7 @@ function safeString(value: unknown, maxLength = 2000): string {
   return cleanForModel(value).slice(0, maxLength);
 }
 
-function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
+export function validateReviewOutput(value: unknown): RunnerReviewOutput | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   const verdicts = new Set(['APPROVE', 'NEEDS_CHANGES', 'INCONCLUSIVE']);
@@ -4518,15 +4523,15 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
   ];
 
   const summaryLines: string[] = ['### Summary'];
-  const chief = output.roles?.find((r) => r.role === 'chief');
-  const chiefSummary = typeof chief?.summary === 'string' ? chief.summary.trim() : '';
+  const architecture = output.roles?.find((r) => r.role === 'architecture');
+  const architectureSummary = typeof architecture?.summary === 'string' ? architecture.summary.trim() : '';
   const otherRoles = (output.roles ?? []).filter(
-    (r) => r.role !== 'chief' && typeof r.summary === 'string' && r.summary.trim().length > 0,
+    (r) => r.role !== 'architecture' && typeof r.summary === 'string' && r.summary.trim().length > 0,
   );
-  if (chiefSummary && otherRoles.length === 0) {
-    summaryLines.push(truncateStickyText(chiefSummary, MAX_STICKY_SUMMARY_LENGTH));
-  } else if (chiefSummary && otherRoles.length > 0) {
-    summaryLines.push(`- **chief**: ${truncateStickyText(chiefSummary, MAX_STICKY_SUMMARY_LENGTH)}`);
+  if (architectureSummary && otherRoles.length === 0) {
+    summaryLines.push(truncateStickyText(architectureSummary, MAX_STICKY_SUMMARY_LENGTH));
+  } else if (architectureSummary && otherRoles.length > 0) {
+    summaryLines.push(`- **architecture**: ${truncateStickyText(architectureSummary, MAX_STICKY_SUMMARY_LENGTH)}`);
     for (const r of otherRoles) {
       summaryLines.push(`- **${r.role}**: ${truncateStickyText(r.summary!.trim(), MAX_STICKY_SUMMARY_LENGTH)}`);
     }
@@ -4612,7 +4617,7 @@ export function reviewComment(output: RunnerReviewOutput, appliedLabels: string[
     const severity = finding.severity === 'BLOCK' || finding.severity === 'WARN' || finding.severity === 'SUGGESTION'
       ? finding.severity
       : 'WARN';
-    const role = typeof finding.role === 'string' && finding.role ? finding.role : 'chief';
+    const role = typeof finding.role === 'string' && finding.role ? finding.role : 'architecture';
     const location = typeof finding.file === 'string' && finding.file
       ? ` (${stickyField(finding.file, MAX_STICKY_FILE_NAME_LENGTH)}${typeof finding.line === 'number' && Number.isInteger(finding.line) && finding.line >= 1 ? `:${finding.line}` : ''})`
       : '';

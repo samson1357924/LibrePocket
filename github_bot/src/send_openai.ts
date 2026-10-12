@@ -5,7 +5,7 @@ export interface OpenAIConfig {
 }
 
 export type OpenAIEnvironment = Readonly<Record<string, string | undefined>>;
-export type OpenAIModelRole = 'chief' | 'android_sec' | 'android_code';
+export type OpenAIModelRole = 'architecture' | 'android_sec' | 'android_code';
 
 const DEFAULT_TIMEOUT_MS = 420000;
 
@@ -92,26 +92,34 @@ export function resolveOpenAIConfig(
 }
 
 const roleEnvironmentNames: Record<OpenAIModelRole, string> = {
-  chief: 'POCKETGUARD_MODEL_CHIEF',
+  architecture: 'POCKETGUARD_MODEL_ARCHITECTURE',
   android_sec: 'POCKETGUARD_MODEL_ANDROID_SEC',
   android_code: 'POCKETGUARD_MODEL_ANDROID_CODE',
 };
 
-function roleProfileEnvName(role: OpenAIModelRole): string {
-  return `${roleEnvironmentNames[role]}_PROFILE`;
-}
+// Deprecated pre-rename env names. Read-only fallback for one release so
+// existing vars/secrets keep working; never written, only read.
+const legacyRoleEnvironmentNames: Partial<Record<OpenAIModelRole, string>> = {
+  architecture: 'POCKETGUARD_MODEL_CHIEF',
+};
 
-function roleEffortEnvName(role: OpenAIModelRole): string {
-  return `${roleEnvironmentNames[role]}_REASONING_EFFORT`;
-}
-
-function roleFallbackEnvName(role: OpenAIModelRole): string {
-  return `${roleEnvironmentNames[role]}_FALLBACKS`;
+// Reads the per-role env value by suffix ('' for the model itself,
+// '_PROFILE', '_REASONING_EFFORT', '_FALLBACKS'). Prefers the current name,
+// falls back to the deprecated pre-rename name. Placeholders never count.
+function roleEnvValue(env: OpenAIEnvironment, role: OpenAIModelRole, suffix: string): string {
+  const primary = env[`${roleEnvironmentNames[role]}${suffix}`]?.trim() ?? '';
+  if (primary && !containsPlaceholder(primary)) return primary;
+  const legacy = legacyRoleEnvironmentNames[role];
+  if (legacy) {
+    const fallback = env[`${legacy}${suffix}`]?.trim() ?? '';
+    if (fallback && !containsPlaceholder(fallback)) return fallback;
+  }
+  return '';
 }
 
 export function resolveRoleModel(role: OpenAIModelRole, env: OpenAIEnvironment): string {
-  const modelId = env[roleEnvironmentNames[role]]?.trim() ?? '';
-  if (!modelId || containsPlaceholder(modelId)) throw new Error('model not configured');
+  const modelId = roleEnvValue(env, role, '');
+  if (!modelId) throw new Error('model not configured');
   return modelId;
 }
 
@@ -228,11 +236,11 @@ function lookupProfileInJsonMap(parsed: unknown, modelId: string, defaultEffort:
 }
 
 function effortForModel(modelId: string, env: OpenAIEnvironment): string {
-  for (const role of ['chief', 'android_sec', 'android_code'] as const) {
-    const configuredModel = env[roleEnvironmentNames[role]]?.trim() ?? '';
+  for (const role of ['architecture', 'android_sec', 'android_code'] as const) {
+    const configuredModel = roleEnvValue(env, role, '');
     if (configuredModel && configuredModel === modelId) {
-      const raw = env[roleEffortEnvName(role)]?.trim() ?? '';
-      if (raw && !containsPlaceholder(raw)) return raw;
+      const raw = roleEnvValue(env, role, '_REASONING_EFFORT');
+      if (raw) return raw;
       break;
     }
   }
@@ -267,19 +275,26 @@ export function resolveModelProfile(modelId: string, env: OpenAIEnvironment): Mo
   };
   const defaultEffort = resolveDefaultReasoningEffort(env);
 
-  for (const role of ['chief', 'android_sec', 'android_code'] as const) {
-    const configuredModel = env[roleEnvironmentNames[role]]?.trim() ?? '';
+  for (const role of ['architecture', 'android_sec', 'android_code'] as const) {
+    const configuredModel = roleEnvValue(env, role, '');
     if (configuredModel && configuredModel === trimmedId) {
-      const rawProfile = env[roleProfileEnvName(role)]?.trim() ?? '';
+      const rawPrimaryProfile = env[`${roleEnvironmentNames[role]}_PROFILE`]?.trim() ?? '';
+      if (rawPrimaryProfile && containsPlaceholder(rawPrimaryProfile)) {
+        // A placeholder primary means "unconfigured": use the legacy value
+        // when it is valid, otherwise fail closed exactly like before.
+        const legacyName = legacyRoleEnvironmentNames[role];
+        const rawLegacyProfile = legacyName ? env[`${legacyName}_PROFILE`]?.trim() ?? '' : '';
+        if (!rawLegacyProfile || containsPlaceholder(rawLegacyProfile)) return undefined;
+      }
+      const rawProfile = roleEnvValue(env, role, '_PROFILE');
       if (rawProfile) {
-        if (containsPlaceholder(rawProfile)) return undefined;
         const parsed = parseProfileString(rawProfile, defaultEffort);
         if (!parsed) return undefined;
         if (parsed.kind === 'reasoning') {
-          const override = env[roleEffortEnvName(role)]?.trim() ?? '';
+          const override = roleEnvValue(env, role, '_REASONING_EFFORT');
           const global = env.POCKETGUARD_REASONING_EFFORT?.trim() ?? '';
           const alias = env.POCKETGUARD_DEFAULT_REASONING_EFFORT?.trim() ?? '';
-          if (override && !containsPlaceholder(override)) return gateNone({ kind: 'reasoning', effort: override });
+          if (override) return gateNone({ kind: 'reasoning', effort: override });
           if (global && !containsPlaceholder(global)) return gateNone({ kind: 'reasoning', effort: global });
           if (alias && !containsPlaceholder(alias)) return gateNone({ kind: 'reasoning', effort: alias });
         }
@@ -356,7 +371,7 @@ function modelFailureReason(error: unknown): string {
 // Longest configured model chain across the three roles, used by callers that
 // must budget wall-clock time (a role may burn a whole chain before finishing).
 export function resolveMaxModelChainLength(env: OpenAIEnvironment): number {
-  const lengths = (['chief', 'android_sec', 'android_code'] as const)
+  const lengths = (['architecture', 'android_sec', 'android_code'] as const)
     .map((role) => resolveModelFallbackChain(`len-${role}`, env, role).length);
   return Math.max(1, ...lengths);
 }
@@ -373,7 +388,8 @@ export function resolveModelFallbackChain(
   const trimmed = modelId.trim();
   const chain = !trimmed || containsPlaceholder(trimmed) ? [] : [trimmed];
   const sources = [
-    role ? env[roleFallbackEnvName(role)] : undefined,
+    role ? env[`${roleEnvironmentNames[role]}_FALLBACKS`] : undefined,
+    role && legacyRoleEnvironmentNames[role] ? env[`${legacyRoleEnvironmentNames[role]}_FALLBACKS`] : undefined,
     env.POCKETGUARD_MODEL_FALLBACKS,
   ];
   for (const raw of sources) {

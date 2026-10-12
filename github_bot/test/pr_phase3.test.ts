@@ -37,10 +37,10 @@ function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     OPENAI_BASE_URL: TEST_BASE_URL,
     OPENAI_API_KEY: 'fake-openai-key',
     POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-    POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+    POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
     POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
     POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-    POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+    POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
     ...extra,
   } as NodeJS.ProcessEnv;
 }
@@ -145,7 +145,7 @@ function installImmediateApprove(counter: { count: number }): () => void {
 // fails closed to INCONCLUSIVE instead of hanging the wave.
 function installRoleDelayStub(
   counter: { count: number },
-  opts: { chiefDelayMs: number; otherDelayMs?: number },
+  opts: { architectureDelayMs: number; otherDelayMs?: number },
 ): () => void {
   const previousFetch = globalThis.fetch;
   globalThis.fetch = (async (_input: unknown, init?: { signal?: AbortSignal; body?: unknown }) => {
@@ -157,8 +157,8 @@ function installRoleDelayStub(
     } catch {
       model = '';
     }
-    const isChief = model.includes('chief');
-    const delay = isChief ? opts.chiefDelayMs : (opts.otherDelayMs ?? 0);
+    const isArchitecture = model.includes('architecture');
+    const delay = isArchitecture ? opts.architectureDelayMs : (opts.otherDelayMs ?? 0);
     const signal = init?.signal;
     if (delay > 0) {
       await new Promise<void>((resolve, reject) => {
@@ -279,14 +279,14 @@ export async function runPrPhase3Tests(): Promise<void> {
       );
     }
 
-    // E2E: slow chief role times out via timeoutMs passthrough (fake fetch
+    // E2E: slow architecture role times out via timeoutMs passthrough (fake fetch
     // delay + abort), verdict INCONCLUSIVE with computed coverage false.
     {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-phase3-slow-'));
       try {
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
-        const restore = installRoleDelayStub(counter, { chiefDelayMs: 1000 });
+        const restore = installRoleDelayStub(counter, { architectureDelayMs: 1000 });
         let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
         try {
           reviewed = await runReviewMode({
@@ -405,7 +405,7 @@ export async function runPrPhase3Tests(): Promise<void> {
         assert.equal(claimed.claimed, true, 'timeout run still claims one slot before AI');
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
-        const restore = installRoleDelayStub(counter, { chiefDelayMs: 1000 });
+        const restore = installRoleDelayStub(counter, { architectureDelayMs: 1000 });
         let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
         try {
           reviewed = await runReviewMode({
@@ -608,7 +608,7 @@ export async function runPrPhase3Tests(): Promise<void> {
             GITHUB_TOKEN: 'fake-token',
             POCKETGUARD_RUN_ID: 'phase3-chain-run',
             POCKETGUARD_JOB_STARTED_MS: jobStarted,
-            POCKETGUARD_MODEL_CHIEF_FALLBACKS: 'second-model, third-model',
+            POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS: 'second-model, third-model',
             POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS: 'second-model, third-model',
             POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS: 'second-model, third-model',
           } as NodeJS.ProcessEnv,

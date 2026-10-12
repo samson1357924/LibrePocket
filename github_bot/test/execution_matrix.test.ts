@@ -19,6 +19,7 @@ import {
   runReviewMode,
   runTagMode,
   validateIssueOutput,
+  validateReviewOutput,
   type RunnerContext,
 } from '../src/github_runner';
 
@@ -149,10 +150,10 @@ function openAiEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     OPENAI_BASE_URL: TEST_BASE_URL,
     OPENAI_API_KEY: 'fake-openai-key',
     POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-    POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+    POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
     POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
     POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-    POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+    POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
     ...extra,
   } as NodeJS.ProcessEnv;
 }
@@ -1039,7 +1040,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
         headSha: HEAD_SHA,
         headRepository: REPO,
         roles: [
-          { role: 'chief', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
+          { role: 'architecture', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
           { role: 'android_sec', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
           { role: 'android_code', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
         ],
@@ -1347,7 +1348,7 @@ export async function runExecutionMatrixTests(): Promise<void> {
     }
 
     // Issue execution: opened, edited, and human comments each take one
-    // chief single-turn; issues are never counted.
+    // architecture single-turn; issues are never counted.
     {
       const issueOpened = {
         action: 'opened',
@@ -1621,6 +1622,34 @@ export async function runExecutionMatrixTests(): Promise<void> {
       'unknown verdicts reject',
     );
 
+    // validateReviewOutput: pre-rename artifacts carrying the retired
+    // 'chief' role are rejected (fail-closed INCONCLUSIVE downstream).
+    {
+      const roleReview = (role: string) => ({ role, modelUsed: 'm', verdict: 'APPROVE', findings: [] });
+      const baseArtifact = {
+        verdict: 'INCONCLUSIVE',
+        pullRequestNumber: 7,
+        baseSha: BASE_SHA,
+        headSha: HEAD_SHA,
+        headRepository: REPO,
+        roles: [roleReview('architecture'), roleReview('android_sec'), roleReview('android_code')],
+        coverage: { complete: false, omittedFiles: [], truncatedFiles: [], originalLength: 0 },
+        deterministicViolations: [],
+        areaLabels: [],
+        changedFiles: [],
+        changedFilesComplete: false,
+      };
+      assert.ok(validateReviewOutput(baseArtifact), 'renamed roles validate');
+      assert.equal(
+        validateReviewOutput({
+          ...baseArtifact,
+          roles: [roleReview('chief'), roleReview('android_sec'), roleReview('android_code')],
+        }),
+        undefined,
+        'retired chief role rejects',
+      );
+    }
+
     // Workflow wiring: route-driven gates, quota outputs, and the quota mutex note.
     {
       const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/pocketguard.yml'), 'utf8');
@@ -1701,18 +1730,23 @@ export async function runExecutionMatrixTests(): Promise<void> {
       assert.doesNotMatch(claimJob, /OPENAI_API_KEY/, 'claim-slot takes no OpenAI secrets');
       for (const fallbackVar of [
         'POCKETGUARD_MODEL_FALLBACKS',
-        'POCKETGUARD_MODEL_CHIEF_FALLBACKS',
+        'POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS',
         'POCKETGUARD_MODEL_ANDROID_SEC_FALLBACKS',
         'POCKETGUARD_MODEL_ANDROID_CODE_FALLBACKS',
       ]) {
+        // Renamed role: the architecture entries additionally forward the
+        // deprecated CHIEF names so existing settings keep working.
+        const expected = fallbackVar === 'POCKETGUARD_MODEL_ARCHITECTURE_FALLBACKS'
+          ? `${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*vars\\.POCKETGUARD_MODEL_CHIEF_FALLBACKS\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.POCKETGUARD_MODEL_CHIEF_FALLBACKS\\s*\\}\\}`
+          : `${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`;
         assert.match(
           claimJob,
-          new RegExp(`${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`),
+          new RegExp(expected),
           `claim-slot forwards ${fallbackVar}`,
         );
         assert.match(
           trustedStep,
-          new RegExp(`${fallbackVar}:\\s*\\$\\{\\{\\s*vars\\.${fallbackVar}\\s*\\|\\|\\s*secrets\\.${fallbackVar}\\s*\\}\\}`),
+          new RegExp(expected),
           `review-send trusted step forwards ${fallbackVar}`,
         );
       }

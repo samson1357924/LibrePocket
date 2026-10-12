@@ -195,10 +195,10 @@ export async function runCommentRunnerTests(): Promise<void> {
           OPENAI_BASE_URL: TEST_BASE_URL,
           OPENAI_API_KEY: 'fake-openai-key',
           POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-          POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+          POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
           POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
           POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-          POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+          POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
         } as NodeJS.ProcessEnv,
         githubClient: {
           rest: {
@@ -972,10 +972,10 @@ export async function runCommentRunnerTests(): Promise<void> {
               OPENAI_BASE_URL: TEST_BASE_URL,
               OPENAI_API_KEY: 'fake-openai-key',
               POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-              POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+              POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
               POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
               POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-              POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+              POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
             } as NodeJS.ProcessEnv,
             githubClient: {
               rest: {
@@ -1085,10 +1085,10 @@ export async function runCommentRunnerTests(): Promise<void> {
                 OPENAI_BASE_URL: TEST_BASE_URL,
                 OPENAI_API_KEY: 'fake-openai-key',
                 POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-                POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+                POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
                 POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
                 POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-                POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+                POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
               } as NodeJS.ProcessEnv,
               githubClient: {
                 rest: {
@@ -1130,7 +1130,7 @@ export async function runCommentRunnerTests(): Promise<void> {
             changedFilesComplete: true,
             roles: [
               {
-                role: 'chief',
+                role: 'architecture',
                 modelUsed: 'test-model',
                 verdict: 'APPROVE',
                 summary: 'Overall architecture looks clean and modular.',
@@ -1164,10 +1164,10 @@ export async function runCommentRunnerTests(): Promise<void> {
           assert.ok(rendered.includes('## PocketGuard Review'));
           assert.ok(rendered.includes('**Verdict: APPROVE**'));
           assert.ok(rendered.includes('### Summary'));
-          assert.ok(rendered.includes('- **chief**: Overall architecture looks clean and modular.'));
+          assert.ok(rendered.includes('- **architecture**: Overall architecture looks clean and modular.'));
           assert.ok(rendered.includes('- **android_sec**: No security boundary violations.'));
           assert.ok(rendered.includes('### Findings & Recommendations'));
-          assert.ok(rendered.includes('- **SUGGESTION** [chief]'));
+          assert.ok(rendered.includes('- **SUGGESTION** [architecture]'));
           assert.ok(rendered.includes('Variable name can be more descriptive'));
           assert.ok(rendered.includes('Recommendation: Rename val x to val timeoutMs'));
         }
@@ -1389,10 +1389,10 @@ export async function runCommentAuthTests(): Promise<void> {
         OPENAI_BASE_URL: TEST_BASE_URL,
         OPENAI_API_KEY: 'fake-openai-key',
         POCKETGUARD_OPENAI_ORIGIN: TEST_ORIGIN,
-        POCKETGUARD_MODEL_CHIEF: 'fake-chief-model',
+        POCKETGUARD_MODEL_ARCHITECTURE: 'fake-architecture-model',
         POCKETGUARD_MODEL_ANDROID_SEC: 'fake-sec-model',
         POCKETGUARD_MODEL_ANDROID_CODE: 'fake-code-model',
-        POCKETGUARD_MODEL_PROFILES: '{"fake-chief-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
+        POCKETGUARD_MODEL_PROFILES: '{"fake-architecture-model":"chat","fake-sec-model":"chat","fake-code-model":"chat"}',
       } as NodeJS.ProcessEnv;
       const tagContext = {
         event,

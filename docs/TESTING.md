@@ -4,7 +4,7 @@
 
 - **Scope:** Repository CI, local JVM/Robolectric tests, static policy gates, and separately scheduled Android device tests.
 - **Owner role:** CI/build maintainer; no individual is assigned here.
-- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, `scripts/apk_policy_inspect.py`, `scripts/tests/test_apk_policy_check.py`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
+- **Source of truth:** `.github/workflows/pr-check.yml`, `.github/workflows/codeql.yml`, `.github/workflows/security-audit.yml`, `scripts/docs_claim_check.sh`, `scripts/apk_policy_inspect.py`, `scripts/summarize_junit.py`, `scripts/tests/test_apk_policy_check.py`, `scripts/tests/test_summarize_junit.py`, test source sets, Gradle wrapper/catalog, and the command results from the exact commit being assessed.
 - **Update trigger:** CI, test source-set, Android SDK/JDK, policy-script, or merge-gate changes.
 
 ## Current CI scope
@@ -15,7 +15,9 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
 `.github/workflows/pr-check.yml`) and `policy`
 (`scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
+`scripts/summarize_junit.py`,
 `scripts/tests/test_apk_policy_check.py`,
+`scripts/tests/test_summarize_junit.py`,
 `.github/workflows/pr-check.yml`) outputs. `docs-guard` always runs the
 static grep guard `scripts/docs_claim_check.sh` (no Gradle, no emulator);
 `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
@@ -24,7 +26,7 @@ stage as pass only when the corresponding `changes` output is explicitly
 
 When `code == true`, the workflow uses JDK 17 and runs these Gradle stages:
 
-1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets). The unit-tests job fans out over a flavor matrix with fail-fast disabled, so each flavor runs on its own runner and wall time is the slowest shard rather than the sum. Test report artifacts now include both HTML reports and structured JUnit XML (`app/build/test-results/`), retained for 14 days; results are parsed in real time into GitHub Actions Step Summary (`$GITHUB_STEP_SUMMARY`) to surface failure counts, skipped tests, and assertion summaries directly without requiring artifact downloads.
+1. `:app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest` (including Robolectric tests available in those source sets). The unit-tests job fans out over a flavor matrix with fail-fast disabled, so each flavor runs on its own runner and wall time is the slowest shard rather than the sum. Test report artifacts now include both HTML reports and structured JUnit XML (`app/build/test-results/`), retained for 14 days; results are parsed in real time into GitHub Actions Step Summary (`$GITHUB_STEP_SUMMARY`) to surface failure counts, skipped tests, and assertion summaries directly without requiring artifact downloads. The parser (`scripts/summarize_junit.py`, covered by `scripts/tests/test_summarize_junit.py`) is reporting-only and never a gate: it emits an explicit `Status:` line that reads `PASS` only when every XML file is readable, `tests > 0`, `failures == 0`, `errors == 0`, and the per-case detail agrees with the suite counters — otherwise `FAIL`, `PARTIAL` (unreadable files), `INCOMPLETE` (empty or contradictory totals), or `NO_RESULTS` (no XML). Rendered output is capped at 900 KiB of UTF-8 bytes (single lines at 300 characters); overflow drops tail entries and records `omitted N failures / M skips; see XML artifact`.
 2. `:app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug`.
 3. `:app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug`, then `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss. This stage also runs when only `policy == true`.
 
@@ -46,7 +48,7 @@ including docs-only ones.
 No branch-protection required checks are configured on `main`; `pr-gate`
 and the checks above are informational until protection is configured.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
 
 ## Local commands
 
@@ -57,7 +59,8 @@ Use one Gradle execution at a time on constrained machines. The repo's maintenan
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   scripts/tests/test_apk_policy_check.py \
   scripts/tests/test_release_artifact_verifier.py \
-  scripts/tests/test_build_release_identity.py
+  scripts/tests/test_build_release_identity.py \
+  scripts/tests/test_summarize_junit.py
 
 # Flavor unit/Robolectric tests
 ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --max-workers=1 --no-daemon

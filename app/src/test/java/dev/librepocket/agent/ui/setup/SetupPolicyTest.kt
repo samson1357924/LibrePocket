@@ -395,7 +395,7 @@ class SetupPolicyTest {
     @Test
     fun denyBlocksWriteWithNoKeyPersisted() {
         val (vm, vault, store) = newVm(VerdictPolicy(Verdict.DENY))
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
@@ -410,7 +410,7 @@ class SetupPolicyTest {
     fun askShowsDialogThenSavesOnConfirm() {
         val policy = VerdictPolicy(Verdict.ASK)
         val (vm, vault, store) = newVm(policy)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         // Dialog requested, nothing persisted yet.
@@ -442,7 +442,7 @@ class SetupPolicyTest {
     fun allowSavesDirectlyWithoutDialog() {
         val policy = VerdictPolicy(Verdict.ALLOW)
         val (vm, vault, store) = newVm(policy)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertFalse(vm.form.value.confirmKeyWrite)
@@ -461,7 +461,7 @@ class SetupPolicyTest {
     @Test
     fun dismissCancelsWithoutSaving() {
         val (vm, vault, _) = newVm(VerdictPolicy(Verdict.ASK))
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -515,7 +515,7 @@ class SetupPolicyTest {
     @Test
     fun keyEditInvalidatesConfirmation() {
         val (vm, _, _) = newVm(VerdictPolicy(Verdict.ASK))
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -535,7 +535,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ASK)
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -563,7 +563,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ASK)
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -603,7 +603,7 @@ class SetupPolicyTest {
         val (vm, _, store) = newVm(policy, vault)
         vm.selectPreset("custom")
         vm.onBaseUrlChange("https://custom-a.example.com/v1")
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -630,7 +630,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ASK)
         val vault = CountingVault()
         val (vm, _, _) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         vm.confirmKeyWriteSave()
@@ -654,7 +654,7 @@ class SetupPolicyTest {
         val policy = GatedPolicy(Verdict.ASK).apply { gateNext = true }
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         assertTrue(policy.entered.await(10, TimeUnit.SECONDS))
         // Race: edit the key while the first fresh evaluation is in flight.
@@ -680,7 +680,7 @@ class SetupPolicyTest {
         val (vm, _, store) = newVm(policy, vault)
         vm.selectPreset("custom")
         vm.onBaseUrlChange("https://custom-a.example.com/v1")
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -712,7 +712,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ALLOW)
         val vault = BlockingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         assertTrue(vault.entered.await(10, TimeUnit.SECONDS))
         // Policy flips ALLOW->DENY while the vault write is in flight: the
@@ -740,7 +740,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ALLOW)
         val vault = BlockingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         assertTrue(vault.entered.await(10, TimeUnit.SECONDS))
         // Policy flips ALLOW->ASK during putKey: metadata must NOT be saved;
@@ -782,7 +782,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ASK)
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -807,7 +807,7 @@ class SetupPolicyTest {
         val policy = ThrowingPolicy()
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
@@ -826,7 +826,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ALLOW)
         val vault = BlockingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         assertTrue(vault.entered.await(10, TimeUnit.SECONDS))
         // External clear advances fresh null -> tombstone 1 while putKey is in
@@ -874,11 +874,11 @@ class SetupPolicyTest {
         val vmB = SetupViewModel(store, VaultSource { vaultB }, policyB, buildProvider = noProvider)
         val vmA = SetupViewModel(store, VaultSource { vaultA }, policyA, buildProvider = noProvider)
         // B snapshots fresh null, then blocks in putKey.
-        vmB.onApiKeyChange("sk-test-key-123")
+        vmB.onApiKeyChange("unit-test-key-123")
         vmB.save()
         assertTrue(enteredB.await(10, TimeUnit.SECONDS))
         // A wins the race: fresh null -> 1.
-        vmA.onApiKeyChange("sk-test-key-123")
+        vmA.onApiKeyChange("unit-test-key-123")
         vmA.save()
         awaitSettled(vmA)
         assertTrue(vmA.form.value.saved)
@@ -902,7 +902,7 @@ class SetupPolicyTest {
         assertVaultKeyEquals(
             delegate,
             SetupValidation.aliasFromRef(runBlocking { store.observe().first()!!.apiKeyRef }),
-            "sk-test-key-123",
+            "unit-test-key-123",
         )
     }
 
@@ -933,11 +933,11 @@ class SetupPolicyTest {
         val vmB = SetupViewModel(store, VaultSource { vaultB }, policyB, buildProvider = noProvider)
         val vmA = SetupViewModel(store, VaultSource { vaultA }, policyA, buildProvider = noProvider)
         // B snapshots fresh null, then blocks in putKey.
-        vmB.onApiKeyChange("sk-same-key-abcdef")
+        vmB.onApiKeyChange("unit-test-same-key-abcdef")
         vmB.save()
         assertTrue(enteredB.await(10, TimeUnit.SECONDS))
         // A wins with byte-identical content: fresh null -> 1.
-        vmA.onApiKeyChange("sk-same-key-abcdef")
+        vmA.onApiKeyChange("unit-test-same-key-abcdef")
         vmA.save()
         awaitSettled(vmA)
         assertTrue(vmA.form.value.saved)
@@ -969,7 +969,7 @@ class SetupPolicyTest {
         assertVaultKeyEquals(
             delegate,
             SetupValidation.aliasFromRef(runBlocking { store.observe().first()!!.apiKeyRef }),
-            "sk-same-key-abcdef",
+            "unit-test-same-key-abcdef",
         )
     }
 
@@ -990,7 +990,7 @@ class SetupPolicyTest {
         )
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(preseedConfig())
             assertEquals(1L, store.currentRevision())
         }
@@ -1005,11 +1005,11 @@ class SetupPolicyTest {
         val vmB = SetupViewModel(store, VaultSource { vaultB }, policyB, buildProvider = noProvider)
         val vmA = SetupViewModel(store, VaultSource { vaultA }, policyA, buildProvider = noProvider)
         // B snapshots rev 1 (backup = old), then blocks in putKey.
-        vmB.onApiKeyChange("sk-new-key-SAMEabcdef")
+        vmB.onApiKeyChange("unit-test-new-key-SAMEabcdef")
         vmB.save()
         assertTrue(enteredB.await(10, TimeUnit.SECONDS))
         // A wins with byte-identical content: rev 1 -> 2.
-        vmA.onApiKeyChange("sk-new-key-SAMEabcdef")
+        vmA.onApiKeyChange("unit-test-new-key-SAMEabcdef")
         vmA.save()
         awaitSettled(vmA)
         assertTrue(vmA.form.value.saved)
@@ -1045,7 +1045,7 @@ class SetupPolicyTest {
         assertVaultKeyEquals(
             delegate,
             SetupValidation.aliasFromRef(runBlocking { store.observe().first()!!.apiKeyRef }),
-            "sk-new-key-SAMEabcdef",
+            "unit-test-new-key-SAMEabcdef",
         )
     }
 
@@ -1060,7 +1060,7 @@ class SetupPolicyTest {
             policy = policy,
             buildProvider = { _, _ -> error("no provider needed") as LlmProvider },
         )
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         // currentRevision() failure before putKey fails closed with no orphan.
@@ -1076,7 +1076,7 @@ class SetupPolicyTest {
         val policy = VerdictPolicy(Verdict.ASK)
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         // Gated skeleton: pause the IO save after mint success but before the
         // dialog set, so the test can race an edit into the mint->dialog window.
         val entered = CountDownLatch(1)
@@ -1116,7 +1116,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ALLOW)
         val vault = BlockingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         // Blocking skeleton for the ALLOW->ASK flip path: block putKey, flip
         // policy, then gate the flip mint->dialog window with the probe.
         val mintEntered = CountDownLatch(1)
@@ -1159,12 +1159,12 @@ class SetupPolicyTest {
         val (vm, _, store) = newVm(policy, vault)
         runBlocking {
             // Preseed through the delegate: the blocking wrapper would hang.
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(preseedConfig())
         }
         val before = runBlocking { store.observe().first() }
         runBlocking { assertEquals(EndpointReadiness.READY, store.readiness(vault)) }
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         assertTrue(vault.entered.await(10, TimeUnit.SECONDS))
         // Policy flips ALLOW->DENY while the staged write is in flight: the
@@ -1183,7 +1183,7 @@ class SetupPolicyTest {
         assertEquals(1, vault.deleteKeys)
         assertEquals(0, vault.getKeys)
         // Key content compared inside try/finally with wiping (never logged).
-        assertVaultKeyEquals(vault, "preset:openai", "sk-old-key-123456")
+        assertVaultKeyEquals(vault, "preset:openai", "unit-test-old-key-123456")
         runBlocking {
             assertTrue(vault.hasKey("preset:openai"))
             assertTrue(store.hasMetadata())
@@ -1215,12 +1215,12 @@ class SetupPolicyTest {
             buildProvider = { _, _ -> error("no provider needed") as LlmProvider },
         )
         // Preseed through the delegate so putKeys counts only the save attempt.
-        runBlocking { delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray()) }
+        runBlocking { delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray()) }
         runBlocking {
             assertTrue(failingStore.hasMetadata())
             assertEquals(EndpointReadiness.READY, failingStore.readiness(vault))
         }
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitSettled(vm)
         // The metadata CAS threw: abort deletes only the attempt's own staged
@@ -1235,7 +1235,7 @@ class SetupPolicyTest {
         assertEquals(1, vault.putKeys)
         assertEquals(1, vault.deleteKeys)
         assertEquals(0, vault.getKeys)
-        assertVaultKeyEquals(vault, "preset:openai", "sk-old-key-123456")
+        assertVaultKeyEquals(vault, "preset:openai", "unit-test-old-key-123456")
         runBlocking {
             assertTrue(vault.hasKey("preset:openai"))
             assertTrue(failingStore.hasMetadata())
@@ -1253,10 +1253,10 @@ class SetupPolicyTest {
         val vault = CountingVault(delegate)
         val (vm, _, store) = newVm(policy, vault)
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(preseedConfig())
         }
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         // Our staged putKey has completed when the post-write V2 blocks: the
         // external writer lands strictly between our staged put and our abort
@@ -1293,7 +1293,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ALLOW)
         val vault = BlockingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         assertTrue(vault.entered.await(10, TimeUnit.SECONDS))
         // Race an edit while the staged putKey is in flight: the post-write
@@ -1318,15 +1318,15 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ALLOW)
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-old-key-123456")
+        vm.onApiKeyChange("unit-test-old-key-123456")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
         val firstRef = runBlocking { store.observe().first()!!.apiKeyRef }
         assertTrue(firstRef.startsWith("provider_key/preset:openai#staged-"))
-        assertVaultKeyEquals(vault, SetupValidation.aliasFromRef(firstRef), "sk-old-key-123456")
+        assertVaultKeyEquals(vault, SetupValidation.aliasFromRef(firstRef), "unit-test-old-key-123456")
         vm.consumeSaved()
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
@@ -1339,7 +1339,7 @@ class SetupPolicyTest {
         // Per-operation aliases: the rotation minted a fresh staged alias and
         // retired the previous live one.
         assertTrue(firstRef != secondRef)
-        assertVaultKeyEquals(vault, SetupValidation.aliasFromRef(secondRef), "sk-new-key-abcdef")
+        assertVaultKeyEquals(vault, SetupValidation.aliasFromRef(secondRef), "unit-test-new-key-abcdef")
         runBlocking {
             assertTrue(store.hasMetadata())
             assertEquals(2L, store.currentRevision())
@@ -1361,7 +1361,7 @@ class SetupPolicyTest {
         val policy = MapActionPolicy(mapOf("key.write" to Verdict.ALLOW, "key.read" to Verdict.DENY))
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
@@ -1381,7 +1381,7 @@ class SetupPolicyTest {
         assertVaultKeyEquals(
             vault,
             SetupValidation.aliasFromRef(runBlocking { store.observe().first()!!.apiKeyRef }),
-            "sk-test-key-123",
+            "unit-test-key-123",
         )
     }
 
@@ -1390,7 +1390,7 @@ class SetupPolicyTest {
         val policy = MapActionPolicy(mapOf("key.write" to Verdict.ASK, "key.read" to Verdict.DENY))
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -1421,7 +1421,7 @@ class SetupPolicyTest {
         val policy = ThrowingActionPolicy(throwAction = "key.read", fallback = Verdict.ALLOW)
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
@@ -1440,7 +1440,7 @@ class SetupPolicyTest {
         val policy = MapActionPolicy(mapOf("key.write" to Verdict.ALLOW, "key.read" to Verdict.ASK))
         val vault = CountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
@@ -1459,7 +1459,7 @@ class SetupPolicyTest {
         assertVaultKeyEquals(
             vault,
             SetupValidation.aliasFromRef(runBlocking { store.observe().first()!!.apiKeyRef }),
-            "sk-test-key-123",
+            "unit-test-key-123",
         )
     }
 
@@ -1470,11 +1470,11 @@ class SetupPolicyTest {
         val vault = CountingVault(delegate)
         val (vm, _, store) = newVm(policy, vault)
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(preseedConfig())
             assertEquals(1L, store.currentRevision())
         }
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
@@ -1487,7 +1487,7 @@ class SetupPolicyTest {
         assertEquals(listOf("preset:openai"), vault.deletedIds)
         val winnerRef = runBlocking { store.observe().first()!!.apiKeyRef }
         assertTrue(winnerRef.startsWith("provider_key/preset:openai#staged-"))
-        assertVaultKeyEquals(vault, SetupValidation.aliasFromRef(winnerRef), "sk-new-key-abcdef")
+        assertVaultKeyEquals(vault, SetupValidation.aliasFromRef(winnerRef), "unit-test-new-key-abcdef")
         runBlocking {
             assertEquals(2L, store.currentRevision())
             assertFalse(vault.hasKey("preset:openai"))
@@ -1547,10 +1547,10 @@ class SetupPolicyTest {
         val race = newSharedRace("setup-diffkey-fresh")
         val store = race.store
         val delegate = race.delegate
-        race.vmLoser.onApiKeyChange("sk-loser-key-AAAAAAAA")
+        race.vmLoser.onApiKeyChange("unit-test-loser-key-AAAAAAAA")
         race.vmLoser.save()
         assertTrue(race.vaultLoser.entered.await(10, TimeUnit.SECONDS))
-        race.vmWinner.onApiKeyChange("sk-winner-key-BBBBBBBB")
+        race.vmWinner.onApiKeyChange("unit-test-winner-key-BBBBBBBB")
         race.vmWinner.save()
         awaitSettled(race.vmWinner)
         assertTrue(race.vmWinner.form.value.saved)
@@ -1587,7 +1587,7 @@ class SetupPolicyTest {
         assertVaultKeyEquals(
             delegate,
             SetupValidation.aliasFromRef(runBlocking { store.observe().first()!!.apiKeyRef }),
-            "sk-winner-key-BBBBBBBB",
+            "unit-test-winner-key-BBBBBBBB",
         )
     }
 
@@ -1604,12 +1604,12 @@ class SetupPolicyTest {
         val urlB = "https://custom-b.example.com/v1"
         race.vmLoser.selectPreset("custom")
         race.vmLoser.onBaseUrlChange(urlA)
-        race.vmLoser.onApiKeyChange("sk-loser-key-AAAAAAAA")
+        race.vmLoser.onApiKeyChange("unit-test-loser-key-AAAAAAAA")
         race.vmLoser.save()
         assertTrue(race.vaultLoser.entered.await(10, TimeUnit.SECONDS))
         race.vmWinner.selectPreset("custom")
         race.vmWinner.onBaseUrlChange(urlB)
-        race.vmWinner.onApiKeyChange("sk-winner-key-BBBBBBBB")
+        race.vmWinner.onApiKeyChange("unit-test-winner-key-BBBBBBBB")
         race.vmWinner.save()
         awaitSettled(race.vmWinner)
         assertTrue(race.vmWinner.form.value.saved)
@@ -1633,7 +1633,7 @@ class SetupPolicyTest {
         assertVaultKeyEquals(
             delegate,
             SetupValidation.aliasFromRef(runBlocking { store.observe().first()!!.apiKeyRef }),
-            "sk-winner-key-BBBBBBBB",
+            "unit-test-winner-key-BBBBBBBB",
         )
     }
 
@@ -1647,14 +1647,14 @@ class SetupPolicyTest {
         val store = race.store
         val delegate = race.delegate
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(preseedConfig())
             assertEquals(1L, store.currentRevision())
         }
-        race.vmLoser.onApiKeyChange("sk-loser-key-AAAAAAAA")
+        race.vmLoser.onApiKeyChange("unit-test-loser-key-AAAAAAAA")
         race.vmLoser.save()
         assertTrue(race.vaultLoser.entered.await(10, TimeUnit.SECONDS))
-        race.vmWinner.onApiKeyChange("sk-winner-key-BBBBBBBB")
+        race.vmWinner.onApiKeyChange("unit-test-winner-key-BBBBBBBB")
         race.vmWinner.save()
         awaitSettled(race.vmWinner)
         assertTrue(race.vmWinner.form.value.saved)
@@ -1684,7 +1684,7 @@ class SetupPolicyTest {
         assertVaultKeyEquals(
             delegate,
             SetupValidation.aliasFromRef(runBlocking { store.observe().first()!!.apiKeyRef }),
-            "sk-winner-key-BBBBBBBB",
+            "unit-test-winner-key-BBBBBBBB",
         )
     }
 
@@ -1698,7 +1698,7 @@ class SetupPolicyTest {
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         val vault = CountingVault(delegate)
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-live-key-123456")
+        vm.onApiKeyChange("fake-unit-logout-key-123456")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
@@ -1729,7 +1729,7 @@ class SetupPolicyTest {
         val policy = MutablePolicy(Verdict.ALLOW)
         val vault = BlockingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         assertTrue(vault.entered.await(10, TimeUnit.SECONDS))
         runBlocking { store.clear() }
@@ -1784,7 +1784,7 @@ class SetupPolicyTest {
         val policy1 = MutablePolicy(Verdict.ALLOW)
         val vault1 = CountingVault(delegate)
         val vm1 = SetupViewModel(store, VaultSource { vault1 }, policy1, buildProvider = noProvider)
-        vm1.onApiKeyChange("sk-first-key-AAAAAAAA")
+        vm1.onApiKeyChange("unit-test-first-key-AAAAAAAA")
         vm1.save()
         awaitSettled(vm1)
         assertTrue(vm1.form.value.saved)
@@ -1792,7 +1792,7 @@ class SetupPolicyTest {
         val firstRef = runBlocking { store.observe().first()!!.apiKeyRef }
         assertTrue(firstRef.startsWith("provider_key/preset:openai#staged-"))
         val firstAlias = SetupValidation.aliasFromRef(firstRef)
-        assertVaultKeyEquals(delegate, firstAlias, "sk-first-key-AAAAAAAA")
+        assertVaultKeyEquals(delegate, firstAlias, "unit-test-first-key-AAAAAAAA")
         runBlocking { assertEquals(1L, store.currentRevision()) }
         // Fresh save retires nothing.
         assertEquals(0, vault1.deleteKeys)
@@ -1826,7 +1826,7 @@ class SetupPolicyTest {
         val policy2 = MutablePolicy(Verdict.ALLOW)
         val vault2 = CountingVault(delegate)
         val vm2 = SetupViewModel(store, VaultSource { vault2 }, policy2, buildProvider = noProvider)
-        vm2.onApiKeyChange("sk-second-key-BBBBBBBB")
+        vm2.onApiKeyChange("unit-test-second-key-BBBBBBBB")
         vm2.save()
         awaitSettled(vm2)
         assertTrue(vm2.form.value.saved)
@@ -1852,6 +1852,6 @@ class SetupPolicyTest {
             assertFalse(delegate.hasKey(firstAlias))
             assertEquals(EndpointReadiness.READY, store.readiness(delegate))
         }
-        assertVaultKeyEquals(delegate, secondAlias, "sk-second-key-BBBBBBBB")
+        assertVaultKeyEquals(delegate, secondAlias, "unit-test-second-key-BBBBBBBB")
     }
 }

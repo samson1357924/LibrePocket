@@ -284,7 +284,7 @@ class SetupCancelTest {
         val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 1)
         val vault = CancelCountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(policy.entered)
         assertTrue(vm.form.value.saving)
@@ -308,12 +308,12 @@ class SetupCancelTest {
         val vault = CancelCountingVault(delegate)
         val (vm, _, store) = newVm(policy, vault)
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(cancelPreseed())
         }
         val beforeMeta = runBlocking { store.observe().first() }
         val beforeRev = runBlocking { store.currentRevision() }
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(policy.entered)
         val job = vm.lastSaveJobForTest ?: error("no save job")
@@ -325,7 +325,7 @@ class SetupCancelTest {
         assertEquals(0, vault.putKeys)
         assertEquals(0, vault.deleteKeys)
         assertTrue(vault.deletedIds.isEmpty())
-        cancelAssertVaultKeyEquals(delegate, "preset:openai", "sk-old-key-123456")
+        cancelAssertVaultKeyEquals(delegate, "preset:openai", "unit-test-old-key-123456")
         assertEquals(beforeMeta, runBlocking { store.observe().first() })
         assertEquals(beforeRev, runBlocking { store.currentRevision() })
         assertEquals(EndpointReadiness.READY, runBlocking { store.readiness(delegate) })
@@ -338,7 +338,7 @@ class SetupCancelTest {
         val policy = SuspendPolicy(Verdict.ALLOW)
         val vault = GatedPutVault(gatePut = true)
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(vault.putEntered)
         assertTrue(vm.form.value.saving)
@@ -364,12 +364,12 @@ class SetupCancelTest {
         val vault = GatedPutVault(delegate = delegate, gatePut = true)
         val (vm, _, store) = newVm(policy, vault)
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(cancelPreseed())
         }
         val beforeMeta = runBlocking { store.observe().first() }
         val beforeRev = runBlocking { store.currentRevision() }
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(vault.putEntered)
         assertTrue(vm.form.value.saving)
@@ -384,7 +384,7 @@ class SetupCancelTest {
         assertEquals(1, vault.deleteKeys)
         assertEquals(listOf(staged), vault.deletedIds)
         assertFalse(delegate.hasKey(staged))
-        cancelAssertVaultKeyEquals(delegate, "preset:openai", "sk-old-key-123456")
+        cancelAssertVaultKeyEquals(delegate, "preset:openai", "unit-test-old-key-123456")
         assertEquals(beforeMeta, runBlocking { store.observe().first() })
         assertEquals(beforeRev, runBlocking { store.currentRevision() })
         assertEquals(EndpointReadiness.READY, runBlocking { store.readiness(delegate) })
@@ -397,7 +397,7 @@ class SetupCancelTest {
         val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 2)
         val vault = CancelCountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(policy.entered)
         assertEquals(1, vault.putKeys)
@@ -423,12 +423,12 @@ class SetupCancelTest {
         val vault = CancelCountingVault(delegate)
         val (vm, _, store) = newVm(policy, vault)
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(cancelPreseed())
         }
         val beforeMeta = runBlocking { store.observe().first() }
         val beforeRev = runBlocking { store.currentRevision() }
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(policy.entered)
         assertEquals(1, vault.putKeys)
@@ -442,7 +442,7 @@ class SetupCancelTest {
         assertEquals(1, vault.deleteKeys)
         assertEquals(listOf(staged), vault.deletedIds)
         assertFalse(runBlocking { delegate.hasKey(staged) })
-        cancelAssertVaultKeyEquals(delegate, "preset:openai", "sk-old-key-123456")
+        cancelAssertVaultKeyEquals(delegate, "preset:openai", "unit-test-old-key-123456")
         assertEquals(beforeMeta, runBlocking { store.observe().first() })
         assertEquals(beforeRev, runBlocking { store.currentRevision() })
         assertEquals(EndpointReadiness.READY, runBlocking { store.readiness(delegate) })
@@ -458,7 +458,7 @@ class SetupCancelTest {
         val store = pair.first
         val gated = pair.second
         gated.gateBeforeUpdate = true
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(gated.entered)
         assertEquals(1, vault.putKeys)
@@ -484,12 +484,12 @@ class SetupCancelTest {
         val store = pair.first
         val gated = pair.second
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(cancelPreseed())
         }
         val beforeMeta = runBlocking { store.observe().first() }
         gated.gateBeforeUpdate = true
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(gated.entered)
         val staged = vault.putIds.single()
@@ -501,7 +501,7 @@ class SetupCancelTest {
         assertFalse(vm.form.value.saved)
         assertEquals(listOf(staged), vault.deletedIds)
         assertFalse(runBlocking { delegate.hasKey(staged) })
-        cancelAssertVaultKeyEquals(delegate, "preset:openai", "sk-old-key-123456")
+        cancelAssertVaultKeyEquals(delegate, "preset:openai", "unit-test-old-key-123456")
         assertEquals(beforeMeta, runBlocking { store.observe().first() })
         assertEquals(EndpointReadiness.READY, runBlocking { store.readiness(delegate) })
     }
@@ -514,7 +514,7 @@ class SetupCancelTest {
         val store = pair.first
         val gated = pair.second
         gated.commitThenGate = true
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(gated.entered)
         val staged = vault.putIds.single()
@@ -528,7 +528,7 @@ class SetupCancelTest {
         assertEquals(1L, runBlocking { store.currentRevision() })
         val ref = runBlocking { store.observe().first()!!.apiKeyRef }
         assertEquals("provider_key/$staged", ref)
-        cancelAssertVaultKeyEquals(vault, staged, "sk-new-key-abcdef")
+        cancelAssertVaultKeyEquals(vault, staged, "unit-test-new-key-abcdef")
         assertEquals(EndpointReadiness.READY, store.readiness(vault))
         assertFalse(vault.deletedIds.contains(staged))
     }
@@ -542,11 +542,11 @@ class SetupCancelTest {
         val store = pair.first
         val gated = pair.second
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(cancelPreseed())
         }
         gated.commitThenGate = true
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(gated.entered)
         val staged = vault.putIds.single()
@@ -559,7 +559,7 @@ class SetupCancelTest {
         assertEquals(2L, runBlocking { store.currentRevision() })
         val ref = runBlocking { store.observe().first()!!.apiKeyRef }
         assertEquals("provider_key/$staged", ref)
-        cancelAssertVaultKeyEquals(delegate, staged, "sk-new-key-abcdef")
+        cancelAssertVaultKeyEquals(delegate, staged, "unit-test-new-key-abcdef")
         assertEquals(EndpointReadiness.READY, runBlocking { store.readiness(delegate) })
         assertFalse(vault.deletedIds.contains(staged))
     }
@@ -574,10 +574,10 @@ class SetupCancelTest {
         val vault = GatedDeleteVault(delegate = delegate, gateDelete = true)
         val (vm, _, store) = newVm(policy, vault)
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(cancelPreseed())
         }
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         // Retire entered => CAS already returned true (metadataCommitted==true).
         awaitGate(vault.deleteEntered)
@@ -592,7 +592,7 @@ class SetupCancelTest {
         assertTrue(vm.form.value.saved)
         assertFalse(vault.deletedIds.contains(staged))
         assertEquals(listOf("preset:openai"), vault.deletedIds)
-        cancelAssertVaultKeyEquals(delegate, staged, "sk-new-key-abcdef")
+        cancelAssertVaultKeyEquals(delegate, staged, "unit-test-new-key-abcdef")
         assertEquals(2L, runBlocking { store.currentRevision() })
         assertEquals("provider_key/$staged", runBlocking { store.observe().first()!!.apiKeyRef })
         assertEquals(EndpointReadiness.READY, runBlocking { store.readiness(delegate) })
@@ -623,12 +623,12 @@ class SetupCancelTest {
             { _, _ -> error("no provider needed") as LlmProvider }
         val vmLoser = SetupViewModel(store, VaultSource { vaultLoser }, policyLoser, buildProvider = noProvider)
         val vmWinner = SetupViewModel(store, VaultSource { vaultWinner }, policyWinner, buildProvider = noProvider)
-        vmLoser.onApiKeyChange("sk-loser-key-AAAAAAAA")
+        vmLoser.onApiKeyChange("unit-test-loser-key-AAAAAAAA")
         vmLoser.save()
         awaitGate(policyLoser.entered)
         assertEquals(1, vaultLoser.putKeys)
         val loserStaged = vaultLoser.putIds.single()
-        vmWinner.onApiKeyChange("sk-winner-key-BBBBBBBB")
+        vmWinner.onApiKeyChange("unit-test-winner-key-BBBBBBBB")
         vmWinner.save()
         awaitSettledSave(vmWinner)
         assertTrue(vmWinner.form.value.saved)
@@ -643,7 +643,7 @@ class SetupCancelTest {
         assertEquals(listOf(loserStaged), vaultLoser.deletedIds)
         assertFalse(runBlocking { delegate.hasKey(loserStaged) })
         assertTrue(runBlocking { delegate.hasKey(winnerStaged) })
-        cancelAssertVaultKeyEquals(delegate, winnerStaged, "sk-winner-key-BBBBBBBB")
+        cancelAssertVaultKeyEquals(delegate, winnerStaged, "unit-test-winner-key-BBBBBBBB")
         assertEquals(1L, runBlocking { store.currentRevision() })
         assertEquals("provider_key/$winnerStaged", runBlocking { store.observe().first()!!.apiKeyRef })
         assertEquals(EndpointReadiness.READY, runBlocking { store.readiness(delegate) })
@@ -664,7 +664,7 @@ class SetupCancelTest {
         val store = EndpointStore(raw)
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
-            delegate.putKey("preset:openai", "sk-old-key-123456".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(cancelPreseed())
         }
         val policyLoser = SuspendPolicy(Verdict.ALLOW, gateOnCall = 2)
@@ -675,11 +675,11 @@ class SetupCancelTest {
             { _, _ -> error("no provider needed") as LlmProvider }
         val vmLoser = SetupViewModel(store, VaultSource { vaultLoser }, policyLoser, buildProvider = noProvider)
         val vmWinner = SetupViewModel(store, VaultSource { vaultWinner }, policyWinner, buildProvider = noProvider)
-        vmLoser.onApiKeyChange("sk-loser-key-AAAAAAAA")
+        vmLoser.onApiKeyChange("unit-test-loser-key-AAAAAAAA")
         vmLoser.save()
         awaitGate(policyLoser.entered)
         val loserStaged = vaultLoser.putIds.single()
-        vmWinner.onApiKeyChange("sk-winner-key-BBBBBBBB")
+        vmWinner.onApiKeyChange("unit-test-winner-key-BBBBBBBB")
         vmWinner.save()
         awaitSettledSave(vmWinner)
         assertTrue(vmWinner.form.value.saved)
@@ -692,7 +692,7 @@ class SetupCancelTest {
         assertNull(vmLoser.form.value.errorCode)
         assertEquals(listOf(loserStaged), vaultLoser.deletedIds)
         assertFalse(runBlocking { delegate.hasKey(loserStaged) })
-        cancelAssertVaultKeyEquals(delegate, winnerStaged, "sk-winner-key-BBBBBBBB")
+        cancelAssertVaultKeyEquals(delegate, winnerStaged, "unit-test-winner-key-BBBBBBBB")
         assertFalse(runBlocking { delegate.hasKey("preset:openai") })
         assertEquals(2L, runBlocking { store.currentRevision() })
         assertEquals("provider_key/$winnerStaged", runBlocking { store.observe().first()!!.apiKeyRef })
@@ -707,7 +707,7 @@ class SetupCancelTest {
             val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = gateCall)
             val vault = CancelCountingVault()
             val (vm, _, _) = newVm(policy, vault)
-            vm.onApiKeyChange("sk-new-key-abcdef")
+            vm.onApiKeyChange("unit-test-new-key-abcdef")
             vm.save()
             if (gateCall != null) {
                 awaitGate(policy.entered)
@@ -730,7 +730,7 @@ class SetupCancelTest {
         val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 2)
         val vault = CancelCountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(policy.entered)
         val job = vm.lastSaveJobForTest ?: error("no save job")
@@ -749,7 +749,7 @@ class SetupCancelTest {
         val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 1)
         val vault = CancelCountingVault()
         val (vm, _, store) = newVm(policy, vault)
-        vm.onApiKeyChange("sk-new-key-abcdef")
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
         vm.save()
         awaitGate(policy.entered)
         assertTrue(vm.form.value.saving)
@@ -772,7 +772,7 @@ class SetupCancelTest {
         assertEquals(1L, store.currentRevision())
         val staged = vault.putIds.single()
         assertEquals("provider_key/$staged", store.observe().first()!!.apiKeyRef)
-        cancelAssertVaultKeyEquals(vault, staged, "sk-new-key-abcdef")
+        cancelAssertVaultKeyEquals(vault, staged, "unit-test-new-key-abcdef")
         assertEquals(EndpointReadiness.READY, store.readiness(vault))
     }
 }

@@ -185,7 +185,7 @@ class EndpointStoreTest {
             prefs[ENDPOINT_API_KEY_REF_V1] = "provider_key/preset:openai"
         }
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         assertEquals(EndpointReadiness.INVALID_BASE_URL, store.readiness(vault))
     }
 
@@ -198,7 +198,7 @@ class EndpointStoreTest {
         store.save(sampleConfig())
         assertEquals(EndpointReadiness.NO_KEY, store.readiness(vault))
 
-        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         assertEquals(EndpointReadiness.READY, store.readiness(vault))
     }
 
@@ -211,10 +211,10 @@ class EndpointStoreTest {
         val staged = "preset:openai#staged-7"
         store.save(sampleConfig().copy(apiKeyRef = "provider_key/$staged"))
         // Key under the fixed alias alone is NOT enough.
-        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         assertEquals(EndpointReadiness.NO_KEY, store.readiness(vault))
         // Key under the staged alias addressed by the ref is READY.
-        vault.putKey(staged, "sk-test-key-123".toCharArray())
+        vault.putKey(staged, "unit-test-key-123".toCharArray())
         assertEquals(EndpointReadiness.READY, store.readiness(vault))
     }
 
@@ -225,7 +225,7 @@ class EndpointStoreTest {
             prefs[ENDPOINT_PROVIDER_ID_V1] = "preset:openai"
             prefs[ENDPOINT_BASE_URL_V1] = "https://api.openai.com/v1"
             prefs[ENDPOINT_PROTOCOL_V1] = "CHAT_COMPLETIONS"
-            prefs[ENDPOINT_API_KEY_REF_V1] = "sk-pasted-key-material"
+            prefs[ENDPOINT_API_KEY_REF_V1] = "pasted-fake-key-material"
         }
         var touched = false
         val probe = object : KeyVault by EncryptedPrefsVault(InMemoryPrefs()) {

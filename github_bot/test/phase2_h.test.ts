@@ -503,6 +503,14 @@ export async function runPhase2HTests(): Promise<void> {
         assert.ok(forgedApproveSticky.includes('Review result unavailable'), 'forged APPROVE+truncation keeps the generic fallback');
         assert.ok(!forgedApproveSticky.includes('Truncated: showing'), 'forged APPROVE+truncation shows no counts');
         assert.ok(!forgedApproveSticky.includes('Verdict: APPROVE'), 'forged APPROVE never publishes');
+        // Zero-fingerprint truncation keeps the generic fallback.
+        const zeroFpSticky = await runPublishWithArtifact(
+          { ...base, fingerprint: '0'.repeat(64) },
+          liveTitle,
+          liveBody,
+        );
+        assert.ok(zeroFpSticky.includes('Review result unavailable'), 'zero fingerprint keeps the generic fallback');
+        assert.ok(!zeroFpSticky.includes('Truncated: showing'), 'zero fingerprint shows no counts');
         // Stale truncation: live content changed after review.
         const staleSticky = await runPublishWithArtifact(base, liveTitle, `${liveBody} edited`);
         assert.ok(staleSticky.includes('Review result unavailable'), 'stale truncation keeps the generic fallback');
@@ -743,7 +751,7 @@ export async function runPhase2HTests(): Promise<void> {
         '.env', '.ENV', '.env.local', 'config/.env.production',
         'tests/debug.keystore', 'TESTS/DEBUG.JKS', 'app/src/test/google-services.json',
         'Test/Google-Services.Json', 'tests/local.properties', 'tests/secret.pem',
-        'config/service-account-prod.json', 'config/service-account-prod.txt', 'app/credentials.json', 'app/secrets.json',
+        'config/service-account-prod.json', 'config/service-account-prod.txt', 'app/credentials.json', 'app/credentials.txt', 'app/secrets.json', 'app/secrets.md',
         'local.properties.txt', 'google-services.json.bak.txt', '.env_vars.txt', '.git/COMMIT_EDITMSG.txt',
         'keys/id_rsa', 'keys/id_ed25519.pub', 'app/keystore.properties', 'config.p12',
         'app/src/main/res/permission-map.map', 'app/proguard/rules.png',
@@ -1010,6 +1018,7 @@ export async function runPhase2HTests(): Promise<void> {
             runGit: (args: string[]) => { if (args[0] === 'show') shows += 1; return 'x'; },
           });
           assert.equal(shows, 10, 'at most 10 files fetched');
+          assert.equal(reviewed.codeRefs?.length, 10, 'proof capped at 10');
         } finally {
           restore();
         }

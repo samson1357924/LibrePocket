@@ -103,7 +103,7 @@ export const REVIEW_REPORT_ARTIFACT_NAME = 'pocketguard-review-report';
 // jobStarted is recorded by the first review-send step into $GITHUB_ENV so
 // slow hosted setup still leaves upload headroom; a missing/invalid
 // jobStarted downgrades to the configured deadline (fail-closed, never
-// extends). Before the single wave the runner estimates need (the per-wave
+// extends). Before the waves the runner estimates need (the per-wave
 // timeout: min(420s, effectiveRemaining/remainingWaves) with
 // effectiveRemaining = min(reviewRemaining, jobRemaining - skew));
 // remaining < need exits early with an INCONCLUSIVE checkpoint (roles
@@ -126,11 +126,13 @@ export function maxModelChainAttempts(env: NodeJS.ProcessEnv): number {
   return Math.max(1, ...chains);
 }
 
-// Fixed-concurrency review waves run orchestrateReview; timeoutMs passes
-// through min(420s, remaining/remainingWaves) so slow roles abort via the
-// transport timeout. The claim pre-flight adds a wave x timeout budget
-// check; over budget claims nothing with zero writes. Every deadline exit
-// saves via saveReviewOutput (checkpoint artifact) as INCONCLUSIVE.
+// Two review waves run orchestrateReview (roles) then synthesizeReview
+// (architecture guard); timeoutMs passes through min(420s,
+// remaining/remainingWaves) so slow roles abort via the transport timeout,
+// and an absolute deadlineMs bounds every fallback-chain attempt. The claim
+// pre-flight adds a 2-waves-x-chain-attempts budget check (F4); over budget
+// claims nothing with zero writes. Every deadline exit saves via
+// saveReviewOutput (checkpoint artifact) as INCONCLUSIVE.
 export const REVIEW_DEADLINE_MARGIN_MS = 60_000;
 export const DEFAULT_REVIEW_DEADLINE_MS = 20 * 60 * 1000 - REVIEW_DEADLINE_MARGIN_MS;
 // Phase 2 (P2 #2) job wall-clock: the review-send job runs with
@@ -201,9 +203,9 @@ export function resolveEffectiveReviewDeadlineMs(env?: NodeJS.ProcessEnv, nowMs?
   return Math.max(0, Math.min(configured, Math.floor(jobBudget)));
 }
 
-// Per-chunk timeout passthrough: min(420s, remaining/remainingWaves) with an
-// optional POCKETGUARD_CHUNK_TIMEOUT_MS override (tests) clamped to the same
-// ceiling. remainingWaves is ceil(remainingChunks / PR_CHUNK_CONCURRENCY).
+// Per-wave timeout passthrough ("chunk" is the legacy name for a wave):
+// min(420s, remaining/remainingWaves) with an optional
+// POCKETGUARD_CHUNK_TIMEOUT_MS override (tests) clamped to the same ceiling.
 // Returns at least 1ms (send rejects <=0 fail-closed); callers check
 // remaining < need before starting a wave so a 1ms timeout never starts.
 export function resolvePerChunkTimeoutMs(
@@ -2267,7 +2269,7 @@ export function issueContentFingerprint(title: string, body: string, comments: s
 // caller keeps the first-round result.
 // Denylist uses prefix matching so backup copies (google-services.json.bak,
 // local.properties.txt, .env_vars) are denied as well.
-const CODE_REF_DENY_BASENAME = /(^|\/)\.env[^/]*$|(^|\/)local\.properties[^/]*$|(^|\/)google-services\.json[^/]*$|(^|\/)googleservice-info\.plist[^/]*$|(^|\/)(credentials|secrets)\.json[^/]*$|(^|\/)service-account[^/]*$|(^|\/)keystore\.properties[^/]*$|(^|\/)\.(npmrc|pypirc)([./][^/]*)?$/i;
+const CODE_REF_DENY_BASENAME = /(^|\/)\.env[^/]*$|(^|\/)local\.properties[^/]*$|(^|\/)google-services\.json[^/]*$|(^|\/)googleservice-info\.plist[^/]*$|(^|\/)(credentials|secrets)[^/]*$|(^|\/)service-account[^/]*$|(^|\/)keystore\.properties[^/]*$|(^|\/)\.(npmrc|pypirc)([./][^/]*)?$/i;
 const CODE_REF_DENY_EXT = /\.(keystore|jks|key|pem|p12|pfx|asc|apk|aab|png|jpe?g|webp|gif|mp4|map|lock|sqlite3?|db|realm)$/i;
 const CODE_REF_DENY_MINIFIED = /(^|\/)[^/]*\.min\.[^/]+$/i;
 const CODE_REF_DENY_DIR = /(^|\/)(\.git|build|\.gradle|\.idea)(\/|$)/i;
@@ -4516,6 +4518,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
         && validated.truncation !== undefined
         && (validated.verdict === 'INCONCLUSIVE' || validated.verdict === 'NEEDS_CHANGES')
         && /^[0-9a-f]{64}$/.test(validated.fingerprint)
+        && validated.fingerprint !== '0'.repeat(64)
         && validated.fingerprint === currentFingerprint
         && issueFallbackReason !== undefined
         && issueFallbackReason.includes('not fully fetched during review')

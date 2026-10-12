@@ -91,7 +91,10 @@ class ApprovalRequiredException : Exception("chat.send approval required")
  * Outgoing context window for one [ChatRequest], and the resumed-history
  * prefix bound (Phase 3).
  *
- * Oldest-first truncation at whole-message boundaries. Tool-pair integrity
+ * The cap bounds the combined request copy (capped resumed prefix + live
+ * messages), newest kept — a new live turn evicts the oldest prefix row once
+ * the total reaches the cap. Oldest-first truncation at whole-message
+ * boundaries. Tool-pair integrity
  * is structural — tool calls ride inline in their assistant block
  * (`[tool:name args]` marker text, never separate provider `tool` messages)
  * — so whole-message truncation can never detach a tool result from its
@@ -574,7 +577,11 @@ class TurnController(
    * with the resumed-prefix drops at load time (0 when
    * [HistoryWindowCap.Unbounded]). The observable counterpart to context
    * truncation: the request copy never silently loses history. Updated on
-   * every [buildRequest]; the UI list and transcript keep everything.
+   * every [buildRequest] to that request's combined-window drop
+   * (`combined - base`, capped prefix + live); the seed is then replaced, so
+   * a resumed session at cap reports a growing send-time count while the
+   * load-time total stays observable separately via the factory's
+   * historyDroppedCount. The UI list and transcript keep everything.
    */
   var droppedHistoryCount: Int = (initialHistory.size - cappedHistory.size).coerceAtLeast(0)
     private set
@@ -2952,8 +2959,9 @@ class TurnController(
    * live messages. The current user message is already in [uiState] (appended
    * by [send] before the turn starts), so images attach to the last user line.
    *
-   * Context window: [historyCap] truncates a **copy** of the settled
-   * non-partial history oldest-first at whole-message boundaries before
+   * Context window: [historyCap] truncates a **copy** of the combined
+   * (capped prefix + settled non-partial live) history oldest-first at
+   * whole-message boundaries before
    * images/time-block attach. UI state and transcript keep everything; only
    * the outgoing request is windowed. The drop count is published on
    * [droppedHistoryCount] (0 when Unbounded), never silent.

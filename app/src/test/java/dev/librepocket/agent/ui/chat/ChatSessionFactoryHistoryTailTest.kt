@@ -39,6 +39,8 @@ private class TailFakeProvider(
  *
  * - Model history keeps the NEWEST rows (tail), oldest-first restored, with
  *   an exact dropped count ([CreatedSession.historyDroppedCount]).
+ * - The outgoing cap windows the combined (prefix + live) total, so the
+ *   first send after a full tail evicts one more oldest row to hold 2000.
  * - A giant single row is truncated with a visible marker (fail-closed, never
  *   a silent unbounded payload).
  */
@@ -106,16 +108,18 @@ class ChatSessionFactoryHistoryTailTest {
         }
         val opened = factoryWith(transcripts, provider).open(sampleEndpoint(), sid)
         try {
-            // 2002 qualifying rows, cap 2000: oldest pair (u0,a0) omitted.
+            // 2002 qualifying rows, cap 2000: oldest pair (u0,a0) omitted at load.
             assertEquals(2, opened.historyDroppedCount)
             opened.session.send("q-new")
             val req = provider.seenRequests.single()
-            // 2000 restored + the new turn.
-            assertEquals(2001, req.messages.size)
-            assertEquals("u1", req.messages.first().text)
-            assertEquals("a1000", req.messages[2000 - 1].text)
+            // Total-window semantics: the outgoing cap bounds the combined
+            // (2000-row prefix + 1 live) copy at 2000, so the new turn evicts
+            // one more oldest prefix row (u1). Request holds [a1..a1000, q-new].
+            assertEquals(2000, req.messages.size)
+            assertEquals("a1", req.messages.first().text)
+            assertEquals("a1000", req.messages[2000 - 2].text)
             assertTrue(req.messages.last().text.startsWith("q-new"))
-            assertTrue(req.messages.none { it.text == "u0" || it.text == "a0" })
+            assertTrue(req.messages.none { it.text == "u0" || it.text == "a0" || it.text == "u1" })
         } finally {
             opened.session.close()
         }

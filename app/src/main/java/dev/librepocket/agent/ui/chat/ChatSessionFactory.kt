@@ -633,8 +633,9 @@ class ChatSessionFactory(
         }
         // Stage E: tail load (newest kept) with an exact dropped count; the
         // cap also travels as MaxMessages so TurnController.droppedHistoryCount
-        // observes the same truncation (defense in depth: pre-trimmed prefix
-        // makes the controller trim a no-op).
+        // observes the same truncation (defense in depth: the prefix already
+        // saturates the cap, so each new live turn evicts the oldest prefix
+        // row to hold the combined request total at cap).
         val loaded = loadModelHistory(store, sessionId)
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)

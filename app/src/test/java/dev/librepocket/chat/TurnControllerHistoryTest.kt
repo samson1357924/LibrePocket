@@ -79,7 +79,8 @@ private class PartialCapturingSink : TranscriptSink {
  * Phase 3 hydration regressions (pure JVM, all fake data).
  *
  * - F8: the first request after resume carries the restored prefix.
- * - [HistoryWindowCap] truncates oldest-first at whole-message boundaries
+ * - [HistoryWindowCap] windows the combined (capped prefix + live) request
+ *   copy and truncates oldest-first at whole-message boundaries
  *   (tool markers ride inside their assistant block, so pairs stay intact)
  *   and every truncation is observable via [TurnController.droppedHistoryCount].
  * - The terminal failure path forwards the live partial fragment plus the
@@ -162,15 +163,23 @@ class TurnControllerHistoryTest {
             historyCap = HistoryWindowCap.MaxMessages(2),
         )
         try {
+            // Total-window semantics: the cap bounds the combined
+            // (capped prefix + live) request copy, newest kept. Load caps the
+            // 4-row prefix to [keep-q2, keep-a2] (seed drop 2); the first send
+            // appends q3 (combined 3) so the window evicts one more oldest
+            // prefix row (keep-q2) to hold the total at 2. The load-time seed
+            // is replaced by this request's window drop (1); the load-time
+            // total stays observable separately via the factory's
+            // historyDroppedCount.
             runBlocking { c.send("q3") }
             val req = provider.seenRequests.single()
             assertEquals(
-                listOf("user", "assistant", "user"),
+                listOf("assistant", "user"),
                 req.messages.map { it.role },
             )
-            assertEquals("keep-q2", req.messages[0].text)
-            assertEquals("keep-a2", req.messages[1].text)
-            assertEquals(2, c.droppedHistoryCount)
+            assertEquals("keep-a2", req.messages[0].text)
+            assertTrue(req.messages[1].text.startsWith("q3"))
+            assertEquals(1, c.droppedHistoryCount)
         } finally {
             c.close()
         }

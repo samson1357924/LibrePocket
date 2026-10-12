@@ -2267,11 +2267,14 @@ class ChatViewModel(
                     }
                 }
                 val store = sessions.storeOrNull()
-                // R6-3 (a): both settles above completed — a later cancel in
-                // the ledger read below needs no re-park (ledger durable, no
-                // dangling to fence); assigned before any further suspension,
-                // so the catch below sees the exact settle state.
-                fenceSettled = true
+                // R6-3 (a) + R10: the re-park gate below must see the exact
+                // settle state. Only a fully durable settle clears it: a
+                // failed settle (timeout / flushDurable false) leaves the ledger
+                // possibly-dangling, so a later cancel in the ledger read must still re-park for the next
+                // fork's re-join + re-check (which re-derives the failure
+                // flags instead of copying an orphan row). Assigned before
+                // any further suspension.
+                fenceSettled = settleOk && durableOk
                 val previousMeta = store?.getSession(prevId)
                 val sameOrigin = previousMeta != null && isSameProviderOrigin(
                     previousMeta.model,

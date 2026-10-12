@@ -317,14 +317,14 @@ class CaptureDeniedException(message: String = "ENDPOINT_BINDING_STALE") : Secur
  * Implementors must override at least one [create] form.
  * The two defaults delegate to each other; overriding neither
  * recurses infinitely (StackOverflowError at runtime).
- * Canonical form is the 4-arg one (production caller ChatViewModel.kt:1289 uses it).
+ * Canonical form is the 4-arg one (production caller ChatViewModel.ensureSession uses it).
  */
 interface ChatSessionProvider {
     /**
      * Implementors must override at least one [create] form.
      * The two defaults delegate to each other; overriding neither
      * recurses infinitely (StackOverflowError at runtime).
-     * Canonical form is the 4-arg one (production caller ChatViewModel.kt:1289 uses it).
+     * Canonical form is the 4-arg one (production caller ChatViewModel.ensureSession uses it).
      */
     suspend fun create(
         endpoint: EndpointConfig,
@@ -338,7 +338,7 @@ interface ChatSessionProvider {
      * Implementors must override at least one [create] form.
      * The two defaults delegate to each other; overriding neither
      * recurses infinitely (StackOverflowError at runtime).
-     * Canonical form is the 4-arg one (production caller ChatViewModel.kt:1289 uses it).
+     * Canonical form is the 4-arg one (production caller ChatViewModel.ensureSession uses it).
      */
     suspend fun create(
         endpoint: EndpointConfig,

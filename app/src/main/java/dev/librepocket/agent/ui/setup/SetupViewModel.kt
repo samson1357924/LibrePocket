@@ -105,6 +105,7 @@ class SetupViewModel(
     private val buildProvider: (ProviderConfig, KeyProvider) -> LlmProvider =
         { cfg, keys -> DefaultProviderFactory(keys).create(cfg) },
     private val fetchDirectory: (suspend (String) -> String)? = null,
+    private val stagedAliasProvider: (String) -> String = SetupValidation::newStagedAlias,
 ) : ViewModel() {
 
     private val directoryClient by lazy {
@@ -133,6 +134,16 @@ class SetupViewModel(
     private var pendingConsent: KeyWriteConsent? = null
     private val consentNonces = AtomicLong(0L)
 
+    companion object {
+        /**
+         * Bounded staged-alias mint attempts (initial mint + redraws).
+         * Covers the snapshot-inequality guard and the existence-only
+         * `hasKey` orphan guard; persistent collision fails closed with
+         * POLICY_DENIED without touching the vault.
+         */
+        internal const val MAX_STAGED_MINT_ATTEMPTS = 5
+    }
+
     /**
      * Serializes the save critical section ([executeKeyWrite] staged put,
      * re-verification, metadata CAS, old-alias retire) against privileged
@@ -145,7 +156,8 @@ class SetupViewModel(
      * winner's staged live key untouched; the loser only deletes its own
      * per-operation restart-unique staged alias, never a live slot). Staged
      * alias uniqueness itself holds across restarts and processes via the
-     * UUID suffix (see [SetupValidation.newStagedAlias]); only the metadata
+     * full-UUID 32-hex suffix (see [SetupValidation.newStagedAlias]) plus a
+     * bounded mint-time inequality + existence guard; only the metadata
      * CAS remains single-process (documented on EndpointStore). Never present
      * this mutex as multi-writer safety.
      */
@@ -396,10 +408,12 @@ class SetupViewModel(
      * critical section runs under [saveMutex] (same-VM save/logout
      * serialization). The vault commit uses a per-operation restart-unique
      * staged alias: the new key is written aside under
-     * `<providerId>#staged-<uuid8>` (see [SetupValidation.newStagedAlias];
-     * the suffix is random per attempt, never a process-local counter, so a
-     * relaunch can never re-mint an alias that collides with an already
-     * committed live alias), the metadata CAS swings `apiKeyRef` to
+     * `<providerId>#staged-<uuid32>` (see [SetupValidation.newStagedAlias];
+     * the suffix is a full 32-hex UUID per attempt, never a process-local
+     * counter, so a relaunch cannot re-mint an alias that collides with an
+     * already committed live alias — residual ~2^-122 risk is additionally
+     * fenced by a bounded mint-time inequality + existence guard that fails
+     * closed), the metadata CAS swings `apiKeyRef` to
      * it, and only then is the previous live alias retired best-effort. A CAS
      * loss or any earlier abort deletes only the attempt's own staged alias
      * (known per-operation name, safe) and never touches a live slot, never
@@ -574,8 +588,9 @@ class SetupViewModel(
         // cannot be clobbered by our put, and no backup/restore of live key
         // material is needed: there is no live read anywhere on this path,
         // hence no key.read evaluation either (the backup scheme and its gate
-        // are gone by construction). The alias comes from
-        // [SetupValidation.newStagedAlias] (UUID suffix, fresh per attempt):
+        // are gone by construction). The alias comes from the injected
+        // [stagedAliasProvider] (default [SetupValidation.newStagedAlias],
+        // full-UUID 32-hex suffix, fresh per attempt):
         // a process-local counter is deliberately NOT used because it
         // restarts at zero after a relaunch and would re-mint the previous
         // round's live alias, overwriting it in place (with a later abort or
@@ -595,7 +610,8 @@ class SetupViewModel(
         //   discipline for endpoint identity: two writers still race on the
         //   single metadata slot (the loser fails closed), they just can no
         //   longer destroy each other's key bytes. Staged alias uniqueness
-        //   holds across restarts and processes via the UUID suffix; only the
+        //   holds across restarts and processes via the full-UUID 32-hex
+        //   suffix (122-bit) plus the bounded collision guard below; only the
         //   DataStore metadata CAS itself is single-process only (documented
         //   on EndpointStore).
         // - [EncryptedPrefsVault.putKey] wipes the array it is given, so the
@@ -605,7 +621,96 @@ class SetupViewModel(
         //   key is still current. Model may be stale (onModelChange does not
         //   bump per #17 scope) but model is not consent identity and does not
         //   affect key.write fencing; endpointConfigOf below shares this note.
-        val stagedAlias = SetupValidation.newStagedAlias(providerId)
+        //
+        // Collision guard (Re-review #5 Finding 2): the freshly minted alias
+        // is compared against the snapshot [oldAlias] with zero vault I/O;
+        // on equality it is redrawn via [stagedAliasProvider], bounded to
+        // [MAX_STAGED_MINT_ATTEMPTS] total mints. Persistent collision fails
+        // closed with POLICY_DENIED without touching the vault (no put, no
+        // delete, no hasKey). A surviving candidate then gets an
+        // existence-only `hasKey` check (never `getKey`, never reads content)
+        // covering a crash-orphan placeholder still occupying the alias;
+        // on existence it is redrawn (re-checking inequality) within the same
+        // bound, else it fails closed the same way. Any `hasKey` host failure
+        // (except cancellation, rethrown) also fails closed before any put.
+        var stagedAlias: String = try {
+            stagedAliasProvider(providerId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        var mintAttempts = 1
+        while (stagedAlias == oldAlias && mintAttempts < MAX_STAGED_MINT_ATTEMPTS) {
+            if (entryRevision != formRevision.get()) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            try {
+                stagedAlias = stagedAliasProvider(providerId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            mintAttempts++
+        }
+        if (stagedAlias == oldAlias) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // Existence-only orphan guard (no content read). Bounded by the same
+        // total-mint budget; each redraw re-checks the snapshot inequality
+        // synchronously before the next existence probe.
+        while (true) {
+            if (entryRevision != formRevision.get()) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            val orphanExists: Boolean = try {
+                vault().hasKey(stagedAlias)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (!orphanExists) break
+            if (mintAttempts >= MAX_STAGED_MINT_ATTEMPTS) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            try {
+                stagedAlias = stagedAliasProvider(providerId)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            mintAttempts++
+            while (stagedAlias == oldAlias && mintAttempts < MAX_STAGED_MINT_ATTEMPTS) {
+                if (entryRevision != formRevision.get()) {
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                try {
+                    stagedAlias = stagedAliasProvider(providerId)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                mintAttempts++
+            }
+            if (stagedAlias == oldAlias) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+        }
         val stagedRef = "provider_key/$stagedAlias"
         val keyCopy = form.apiKey.trim().toCharArray()
         // Explicit commit-state for cancellation compensation (P1-1 hardening):
@@ -773,8 +878,10 @@ class SetupViewModel(
             // fails the save). Guarded by inequality with the just-committed
             // staged alias, so the new live key is never deleted here. The
             // guard is sound across restarts because staged aliases are
-            // restart-unique (UUID): the fresh alias can never equal the
-            // previous live alias except on a ~2^-32 UUID collision. Runs in
+            // restart-unique (full-UUID 32-hex, 122-bit): the fresh alias
+            // collides with the previous live alias only at ~2^-122 per pair,
+            // and the mint-time bounded inequality + existence guard above
+            // already fails closed on such a collision before any put. Runs in
             // the cancellable context (deliberately outside NonCancellable): if
             // cancellation lands here the previous alias may leak at rest
             // (documented orphan class, strictly better than loss); the new
@@ -853,7 +960,7 @@ class SetupViewModel(
      * Best-effort delete of an attempt-owned staged alias.
      *
      * Safe by construction: staged aliases are per-operation restart-unique
-     * (UUID suffix, see [SetupValidation.newStagedAlias]) and never published
+     * (full-UUID 32-hex suffix, see [SetupValidation.newStagedAlias]) and never published
      * before the metadata CAS, so no winner or live reader can reference them
      * — including across process restarts, where a counter-based alias would
      * be re-minted and collide with a committed live key. Vault failures are

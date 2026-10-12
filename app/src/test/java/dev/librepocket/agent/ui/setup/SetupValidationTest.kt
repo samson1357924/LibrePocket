@@ -29,20 +29,29 @@ class SetupValidationTest {
 
     @Test
     fun newStagedAliasIsRestartUnique() {
-        // UUID suffix: every mint is distinct, even back-to-back in one
-        // process — a relaunch can therefore never re-mint a committed live
-        // alias (the counter-restart collision this replaces).
+        // Full-UUID 32-hex suffix: every mint is distinct, even back-to-back
+        // in one process — a relaunch can therefore never re-mint a committed
+        // live alias (the counter-restart collision this replaces). Residual
+        // ~2^-122 risk is additionally fenced by the ViewModel mint-time
+        // inequality + existence guard (fail-closed).
         val seen = (1..32).map { SetupValidation.newStagedAlias("preset:openai") }.toSet()
         assertEquals(32, seen.size)
         for (alias in seen) {
             assertTrue(alias.startsWith("preset:openai#staged-"))
             val suffix = alias.removePrefix("preset:openai#staged-")
-            assertEquals(8, suffix.length)
+            assertEquals(32, suffix.length)
             assertTrue(suffix.all { it in '0'..'9' || it in 'a'..'f' })
             // Vault-safe: no blank/NUL/newline (passes requireValidProviderId).
             assertTrue(suffix.isNotBlank())
             assertTrue('\u0000' !in suffix && '\n' !in suffix && '\r' !in suffix)
         }
+    }
+
+    @Test
+    fun newStagedSuffixIsFullUuid32Hex() {
+        val suffix = SetupValidation.newStagedSuffix()
+        assertEquals(32, suffix.length)
+        assertTrue(suffix.all { it in '0'..'9' || it in 'a'..'f' })
     }
 
     @Test

@@ -50,7 +50,7 @@ enum class EndpointReadiness {
  * [SetupValidation.aliasFromRef]. Fresh/legacy metadata points at the fixed
  * live alias (`provider_key/<providerId>`); saves committed through the
  * staged scheme point at a per-operation restart-unique staged alias
- * (`provider_key/<providerId>#staged-<uuid8>`, see
+ * (`provider_key/<providerId>#staged-<uuid32>`, see
  * [SetupValidation.newStagedAlias]). Readers MUST resolve the alias
  * from [apiKeyRef] and MUST NOT re-derive it from [providerId]: after a staged
  * commit the live alias and the providerId-derived alias differ.

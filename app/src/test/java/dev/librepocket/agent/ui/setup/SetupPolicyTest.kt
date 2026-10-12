@@ -364,6 +364,7 @@ class SetupPolicyTest {
     private fun newVm(
         policy: PolicyStore,
         vault: KeyVault = EncryptedPrefsVault(InMemoryPrefs()),
+        stagedAliasProvider: (String) -> String = SetupValidation::newStagedAlias,
     ): Triple<SetupViewModel, KeyVault, EndpointStore> {
         val dir = Files.createTempDirectory("setup-policy-test").toFile()
         tmpDirs.add(dir)
@@ -380,6 +381,7 @@ class SetupPolicyTest {
             vaultSource = VaultSource { vault },
             policy = policy,
             buildProvider = { _, _ -> error("no provider needed") as LlmProvider },
+            stagedAliasProvider = stagedAliasProvider,
         )
         return Triple(vm, vault, store)
     }
@@ -1853,5 +1855,133 @@ class SetupPolicyTest {
             assertEquals(EndpointReadiness.READY, store.readiness(delegate))
         }
         assertVaultKeyEquals(delegate, secondAlias, "unit-test-second-key-BBBBBBBB")
+    }
+
+    // ---- Staged alias collision guard (full-UUID 32-hex + bounded redraw) ----
+
+    @Test
+    fun stagedCollisionRedrawSucceedsWithoutOverwritingLive() {
+        // Deterministic collision: the injected provider's first candidate
+        // equals the snapshot live alias; the bounded inequality guard must
+        // redraw before any vault write, so the put never overwrites live in
+        // place. Success path: second candidate is fresh, CAS commits, the
+        // predecessor is retired (deleted) and the new live key survives.
+        val liveAlias = "preset:openai"
+        val freshAlias = "preset:openai#staged-" + "a".repeat(32)
+        val candidates = java.util.ArrayDeque(listOf(liveAlias, freshAlias))
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey(liveAlias, "unit-test-old-key-123456".toCharArray())
+        }
+        val policy = MutablePolicy(Verdict.ALLOW)
+        val vault = CountingVault(delegate)
+        val (vm, _, store) = newVm(
+            policy,
+            vault,
+            stagedAliasProvider = { _ -> candidates.pollFirst() ?: SetupValidation.newStagedAlias("preset:openai") },
+        )
+        runBlocking {
+            store.save(preseedConfig())
+            assertEquals(1L, store.currentRevision())
+        }
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        awaitSettled(vm)
+        assertTrue(vm.form.value.saved)
+        assertNull(vm.form.value.errorCode)
+        assertEquals(2, policy.freshCalls)
+        // Put went to the redrawn alias only — live was never overwritten.
+        assertEquals(listOf(freshAlias), vault.putIds)
+        assertFalse(vault.putIds.contains(liveAlias))
+        // New live bytes survive; retire deleted only the predecessor, never
+        // the new live key.
+        assertVaultKeyEquals(delegate, freshAlias, "unit-test-new-key-abcdef")
+        assertEquals(listOf(liveAlias), vault.deletedIds)
+        assertFalse(vault.deletedIds.contains(freshAlias))
+        runBlocking {
+            assertEquals(2L, store.currentRevision())
+            assertEquals("provider_key/$freshAlias", store.observe().first()!!.apiKeyRef)
+            assertTrue(delegate.hasKey(freshAlias))
+            assertFalse(delegate.hasKey(liveAlias))
+            assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+        }
+    }
+
+    @Test
+    fun stagedPersistentCollisionFailsClosedWithoutTouchingLive() {
+        // Persistent collision: every mint equals the snapshot live alias.
+        // The bounded guard exhausts MAX_STAGED_MINT_ATTEMPTS and fails closed
+        // with POLICY_DENIED before any vault I/O (no put, no delete, no
+        // hasKey): live bytes survive and metadata is untouched.
+        val liveAlias = "preset:openai"
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey(liveAlias, "unit-test-old-key-123456".toCharArray())
+        }
+        val policy = MutablePolicy(Verdict.ALLOW)
+        val vault = CountingVault(delegate)
+        val (vm, _, store) = newVm(
+            policy,
+            vault,
+            stagedAliasProvider = { _ -> liveAlias },
+        )
+        runBlocking {
+            store.save(preseedConfig())
+            assertEquals(1L, store.currentRevision())
+        }
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        awaitSettled(vm)
+        assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        // Fail-closed before V2/put/CAS: only the pre-write V1 ran.
+        assertEquals(1, policy.freshCalls)
+        // Never overwrote live, never deleted live (zero vault mutation, zero
+        // existence probe — the inequality guard fails before hasKey).
+        assertTrue(vault.putIds.isEmpty())
+        assertTrue(vault.deletedIds.isEmpty())
+        assertFalse(vault.deletedIds.contains(liveAlias))
+        assertEquals(0, vault.hasKeys)
+        assertVaultKeyEquals(delegate, liveAlias, "unit-test-old-key-123456")
+        runBlocking {
+            assertEquals(1L, store.currentRevision())
+            assertEquals("provider_key/$liveAlias", store.observe().first()!!.apiKeyRef)
+            assertTrue(delegate.hasKey(liveAlias))
+        }
+    }
+
+    @Test
+    fun stagedCollisionDenyVariantFailsBeforeMint() {
+        // DENY variant: V1 DENY wins before any mint/guard/vault side effect,
+        // even when the injected first candidate would collide with live.
+        val liveAlias = "preset:openai"
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey(liveAlias, "unit-test-old-key-123456".toCharArray())
+        }
+        val policy = MutablePolicy(Verdict.DENY)
+        val vault = CountingVault(delegate)
+        val (vm, _, store) = newVm(
+            policy,
+            vault,
+            stagedAliasProvider = { _ -> liveAlias },
+        )
+        runBlocking {
+            store.save(preseedConfig())
+            assertEquals(1L, store.currentRevision())
+        }
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        awaitSettled(vm)
+        assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertEquals(1, policy.freshCalls)
+        assertTrue(vault.putIds.isEmpty())
+        assertTrue(vault.deletedIds.isEmpty())
+        assertVaultKeyEquals(delegate, liveAlias, "unit-test-old-key-123456")
+        runBlocking {
+            assertEquals(1L, store.currentRevision())
+            assertEquals("provider_key/$liveAlias", store.observe().first()!!.apiKeyRef)
+        }
     }
 }

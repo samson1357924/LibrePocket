@@ -41,15 +41,18 @@ object SetupValidation {
     }
 
     /**
-     * Fresh restart-unique suffix: 8 lowercase hex chars from [UUID].
+     * Fresh restart-unique suffix: full 32 lowercase hex chars from [UUID]
+     * (dashes stripped, 122-bit randomness).
      *
-     * 32 bits of randomness per attempt (collision ~2^-32 per pair, negligible
-     * for a single-user local save path); vault-safe (no blank/NUL/newline,
+     * Collision ~2^-122 per pair, plus a bounded mint-time inequality guard
+     * against the snapshot live alias (and an existence-only [dev.librepocket.keystore.KeyVault.hasKey]
+     * guard for crash-orphan placeholders) still applies, so even a collision
+     * fails closed without touching live bytes. Vault-safe (no blank/NUL/newline,
      * so it passes [dev.librepocket.keystore.EncryptedPrefsVault.requireValidProviderId]).
      * A process-local counter alone is NOT sufficient here (see [stagedAlias]).
      */
     fun newStagedSuffix(): String =
-        UUID.randomUUID().toString().replace("-", "").take(8).lowercase()
+        UUID.randomUUID().toString().replace("-", "").lowercase()
 
     /** Mint a fresh restart-unique staged alias for one save attempt. */
     fun newStagedAlias(providerId: String): String = stagedAlias(providerId, newStagedSuffix())

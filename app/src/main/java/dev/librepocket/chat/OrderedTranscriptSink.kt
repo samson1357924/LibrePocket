@@ -136,9 +136,20 @@ class OrderedTranscriptSink(
    * - [beforeSendForTest] runs after the predecessor gate completes and
    *   before the channel send; tests suspend it on a gate to deterministically
    *   widen the await -> send gap that pre-fix newcomers exploited.
+   * - [afterSendForTest] runs after the channel send returns and before the
+   *   `sent` proof flag is set (core writes only). Deterministic proxy
+   *   (stronger-than-production: guaranteed-admitted) for the send-races-cancel
+   *   flag shape (`sent == false && sendAttempted == true`): production's true
+   *   window is a CE racing a suspended channel send (send throws CE with the
+   *   attempt already recorded — delivery ambiguous, entry may already be with
+   *   the writer), while send-return → `sent.set` has no suspension point so an
+   *   external cancel cannot land there. Tests park here to exercise the same
+   *   flag shape with guaranteed admission; a cancel landing here must map to
+   *   UNKNOWN, never NOT_ADMITTED.
    */
   internal var onAdmissionReservedForTest: ((Long) -> Unit)? = null
   internal var beforeSendForTest: (suspend (Long) -> Unit)? = null
+  internal var afterSendForTest: (suspend (Long) -> Unit)? = null
 
   /**
    * Reserves one admission slot (ticket + chain link) in a single tiny
@@ -245,9 +256,21 @@ class OrderedTranscriptSink(
    * (UNKNOWN/PENDING_COMMIT, ghost may late-commit via the independent
    * writer). Channel semantics unchanged: still a single ordered
    * [channel.send] under the same admission ticket/chain.
+   *
+   * R8-6: [sent] == false is untrusted — a [CancellationException] racing a
+   * suspended [channel.send] may fire after the entry was already handed to
+   * the writer. [sendAttempted] is therefore set immediately *before* the
+   * send call: only `!sent && !sendAttempted` proves the entry never entered
+   * (NOT_ADMITTED); `!sent && sendAttempted` is fuzzy and must map to UNKNOWN
+   * until the independent ack (or a non-delivery proof: seal / closed channel
+   * / pre-send liveness throw) settles it.
    */
-  suspend fun onTurnStartedTracked(runId: String, text: String, sent: AtomicBoolean) =
-    writeCoreTracked(runId, { delegate.onTurnStarted(runId, text) }, sent)
+  suspend fun onTurnStartedTracked(
+    runId: String,
+    text: String,
+    sent: AtomicBoolean,
+    sendAttempted: AtomicBoolean = AtomicBoolean(false),
+  ) = writeCoreTracked(runId, { delegate.onTurnStarted(runId, text) }, sent, sendAttempted)
 
   override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) =
     writeCore(runId) { delegate.onTurnSucceeded(runId, text, hasReasoning) }
@@ -347,12 +370,23 @@ class OrderedTranscriptSink(
   /**
    * R5-1 tracked core write. Identical ordering/ack contract to [writeCore];
    * additionally flips [sent] once the entry is buffered in [channel].
-   * A caller timeout with `sent == false` never entered the ledger
-   * (NOT_ADMITTED); with `sent == true` the independent writer may still
-   * persist it (UNKNOWN). No channel semantic change.
+   * R8-6: [sent] == false no longer proves the entry never entered —
+   * [sendAttempted] is set immediately before the (possibly suspending)
+   * channel send, so only `!sent && !sendAttempted` is proven NOT_ADMITTED;
+   * a [CancellationException] after the send was invoked is fuzzy (the entry
+   * may already have been handed to the writer) and keeps its ack + pending
+   * mark for the writer/settle to decide, mapping to UNKNOWN upstream. Proven
+   * non-delivery (sealed pre-check, [ClosedSendChannelException], pre-send
+   * liveness throw — all before the send is invoked) keeps the existing
+   * fail-closed semantics. No channel semantic change.
    * PG-W2: reservation follows the [reserveAdmission] lock-order contract.
    */
-  private suspend fun writeCoreTracked(runId: String, block: suspend () -> Unit, sent: AtomicBoolean) {
+  private suspend fun writeCoreTracked(
+    runId: String,
+    block: suspend () -> Unit,
+    sent: AtomicBoolean,
+    sendAttempted: AtomicBoolean = AtomicBoolean(false),
+  ) {
     // Fail fast behind a dead/sealed writer: never park unbounded with no
     // drainer. The mark keeps the interruption explicit.
     if (writerDead.get() || writer.isCompleted || channel.isClosedForSend) {
@@ -377,6 +411,9 @@ class OrderedTranscriptSink(
     }
     coreAcks[ack] = runId
     pendingCore.add(runId)
+    // R8-6 send-attempt proof (sink-local; mirrored to the caller-owned
+    // [sendAttempted] flag at the linearization point below).
+    var sendInvoked = false
     try {
       // Admission order, not resumption order: every smaller ticket's send
       // was already attempted once its gate completes.
@@ -393,15 +430,36 @@ class OrderedTranscriptSink(
       if (coroutineContext[Job]?.isCancelled == true) {
         throw CancellationException("admission waiter cancelled before send")
       }
+      // R8-6: record the send attempt BEFORE the (possibly suspending)
+      // channel.send. Delivery under cancel is ambiguous: a CE racing a
+      // suspended send may fire after the entry was already handed to the
+      // writer, with `sent` still false. Only a CE with `sendInvoked == false`
+      // proves the entry never entered (NOT_ADMITTED); anything after this
+      // point is fuzzy and maps to UNKNOWN upstream. No suspension happens
+      // between the liveness check above and this flag + send pair, so a
+      // throw above provably means the entry never entered.
+      sendInvoked = true
+      sendAttempted.set(true)
       channel.send(Entry(runId, block, ack))
+      checkNotHoldingAdmissionLock("afterSendForTest:writeCoreTracked")
+      afterSendForTest?.invoke(reservation.ticket)
       sent.set(true)
     } catch (e: CancellationException) {
-      // The caller was cancelled before admission: the entry never entered
-      // the channel, so drop the pending mark and propagate. The gate is
-      // still completed normally by the finally below, skipping the slot
-      // without sticking the successor.
-      coreAcks.remove(ack)
-      pendingCore.remove(runId)
+      if (!sendInvoked) {
+        // Proven: the send was never attempted — the entry never entered
+        // the channel, so drop the pending mark and propagate. The gate is
+        // still completed normally by the finally below, skipping the slot
+        // without sticking the successor.
+        coreAcks.remove(ack)
+        pendingCore.remove(runId)
+        throw e
+      }
+      // R8-6 fuzzy: the send was invoked, so this CE may have raced a
+      // successful handoff to the writer. Keep the ack in coreAcks and the id
+      // in pendingCore so the independent writer (late-commit claim) or a
+      // later seal (INTERRUPTED convert) settles it; never mark here and
+      // never report NOT_ADMITTED. The caller maps `sent == false &&
+      // sendAttempted == true` to UNKNOWN via the flags above.
       throw e
     } catch (e: ClosedSendChannelException) {
       // Sealed after shutdown/writer death: fail fast instead of reporting

@@ -20,10 +20,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
@@ -1139,6 +1142,561 @@ class TurnControllerLedgerTest {
       )
     } finally {
       gate.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * R8-6 fuzzy send-cancel end to end: the channel is full (capacity 1 behind
+   * a parked writer) so the admission send really suspends and resumes; the
+   * post-send hook then parks it after the send returned but before the `sent`
+   * proof flag is set (admitted yet `sent == false`, deterministically — no
+   * send-guessing sleep). A caller cancel landing there must map to UNKNOWN,
+   * never NOT_ADMITTED: ownership retained ([hasPendingAdmission], UI row
+   * kept, same-opId resend blocked), no false INTERRUPTED mark, and the
+   * bounded settle claims the late commit under the SAME logical id (single
+   * user row; reopen trio: single row + complete family + no INTERRUPTED).
+   * Only the external cancel fires (large [acceptTimeoutMs], no timeout).
+   */
+  @OptIn(DelicateCoroutinesApi::class)
+  @Test
+  fun fullChannelResumedSendCancelLateCommitRetryReopenSingleRow() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val writerGate = CompletableDeferred<Unit>()
+    val blockerEntered = CompletableDeferred<Unit>()
+    val ghostGate = CompletableDeferred<Unit>()
+    val ghostEntered = AtomicBoolean(false)
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onSteerQueued(text: String) {
+        if (text == "blocker") {
+          blockerEntered.complete(Unit)
+          writerGate.await()
+        }
+        inner.onSteerQueued(text)
+      }
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        ghostEntered.set(true)
+        ghostGate.await()
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    val provider = LedgerFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "r8fuzzy-${n++}" },
+      // Large budget excludes the timeout path: only the external cancel fires.
+      acceptTimeoutMs = 10_000L,
+      transcriptCapacity = 1,
+    )
+    val afterSendEntered = AtomicBoolean(false)
+    val hookRelease = CompletableDeferred<Unit>()
+    c.afterAdmissionSendForTest = { _ ->
+      afterSendEntered.set(true)
+      hookRelease.await()
+    }
+    val text = "fuzzy admission text"
+    val opId = 801L
+    try {
+      // Fill the channel behind the parked writer: blocker (taken, parked in
+      // the delegate gate) + filler (buffered, capacity 1).
+      c.offerSteerForTest("blocker")
+      runBlocking {
+        withTimeout(5_000) { blockerEntered.await() }
+      }
+      c.offerSteerForTest("filler")
+      val deferred = GlobalScope.async(Dispatchers.Default) {
+        c.startOrEnqueue(text, opId = opId)
+      }
+      // Release the writer so the really-suspended send resumes, then park
+      // post-send-pre-flag. Either interleaving (suspend-then-resume or instant
+      // send) lands in the hook with sent == false and the entry admitted.
+      writerGate.complete(Unit)
+      runBlocking {
+        withTimeout(5_000) { while (!afterSendEntered.get()) delay(10) }
+      }
+      assertFalse("admission must be parked post-send-pre-flag", deferred.isCompleted)
+      // Hold the late commit in the delegate while the fuzzy cancel lands.
+      runBlocking {
+        withTimeout(5_000) { while (!ghostEntered.get()) delay(10) }
+      }
+      deferred.cancel()
+      try {
+        runBlocking {
+          withTimeout(5_000) { deferred.await() }
+        }
+        fail("fuzzy send-cancel must throw TranscriptPendingException, not return Started")
+      } catch (e: TranscriptPendingException) {
+        // Expected UNKNOWN path.
+      } catch (e: CancellationException) {
+        fail("fuzzy send-cancel must not surface CancellationException, got $e")
+      }
+      // UNKNOWN ownership: still pending, UI row kept, never INTERRUPTED.
+      assertTrue(c.hasPendingAdmission())
+      assertTrue(
+        "fuzzy cancel must not mark INTERRUPTED before settle",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      assertEquals(1, c.uiState.value.messages.count { it.role == "user" && it.text == text })
+      val ghost = c.pendingTranscriptRunIds().single()
+      // Same-opId explicit retry is blocked (no second row) until settle.
+      try {
+        runBlocking { withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) } }
+        fail("same-opId retry during UNKNOWN must throw TranscriptPendingException")
+      } catch (e: TranscriptPendingException) {
+        // Expected: no resend, no duplicate.
+      }
+      assertEquals(
+        "blocked retry must not append a second UI row",
+        1,
+        c.uiState.value.messages.count { it.role == "user" && it.text == text },
+      )
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      // Late commit: release the ghost delegate + hook, settle claims the
+      // ghost under the SAME logical id.
+      ghostGate.complete(Unit)
+      hookRelease.complete(Unit)
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.hasPendingAdmission()) {
+            c.settlePendingAdmission(500L)
+            delay(25)
+          }
+        }
+      }
+      assertTrue(
+        "claimed ghost must not be INTERRUPTED",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      val users = store.events.filter { it.kind == "user" }
+      assertEquals("claimed ghost keeps exactly one user row", 1, users.size)
+      assertEquals(text, users.single().text)
+      assertEquals(ghost, users.single().runId)
+      // The claimed host runs the turn to completion (single provider call).
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.uiState.value.status != ChatStatus.IDLE) delay(10)
+        }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals(
+        "no duplicate user row after the claimed turn completes",
+        1,
+        store.events.count { it.kind == "user" },
+      )
+      assertEquals(
+        1,
+        c.uiState.value.messages.count { it.role == "user" && it.text == text },
+      )
+      // Reopen trio: single user row, complete logical family, no INTERRUPTED.
+      assertTrue(
+        "claimed family must not dangle",
+        dev.librepocket.agent.ui.chat.findDanglingRunIds(store.events).isEmpty(),
+      )
+      assertTrue(c.interruptedTranscriptRunIds().isEmpty())
+      assertEquals("claimed host runs exactly once, no resend", 1, provider.streamCalls.get())
+    } finally {
+      writerGate.complete(Unit)
+      ghostGate.complete(Unit)
+      hookRelease.complete(Unit)
+      c.afterAdmissionSendForTest = null
+      c.close()
+    }
+  }
+
+  /**
+   * R8-1 promotion CE fuzzy: the follow-up send was attempted (`attempted == true`,
+   * `sent == false` via the deterministic post-send proxy, guaranteed-admitted —
+   * stronger than production's suspended-send CE race) when the predecessor host
+   * is cancelled before the timeout. Must retain promotion UNKNOWN ownership
+   * (same id, drain + same-opId blocked, `queuedRecoveryRequired == false`),
+   * never `failPromotion`, so the late commit claims under the SAME id with a
+   * single ledger row (no ghost double-column). Large [acceptTimeoutMs] excludes
+   * the timeout path: only the host CE fires.
+   */
+  @Test
+  fun promotionCeFuzzyKeepsUnknownAndClaimsSingleRow() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val firstGate = CompletableDeferred<Unit>()
+    val followStoreGate = CompletableDeferred<Unit>()
+    val ghostEntered = AtomicBoolean(false)
+    val followText = "follow-CE-fuzzy"
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        if (text == followText) {
+          ghostEntered.set(true)
+          followStoreGate.await()
+        }
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    val provider = LedgerFakeProvider { request ->
+      flow {
+        val lastUser = request.messages.lastOrNull { it.role == "user" }?.text ?: ""
+        if (lastUser.contains("first")) firstGate.await()
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "r8promo-${n++}" },
+      acceptTimeoutMs = 10_000L,
+    )
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    val afterSendEntered = AtomicBoolean(false)
+    val hookRelease = CompletableDeferred<Unit>()
+    try {
+      val first = outer.async { c.send("first") }
+      runBlocking {
+        withTimeout(5_000) {
+          while (provider.streamCalls.get() != 1) delay(10)
+        }
+      }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue(followText, opId = 901L) })
+      // Park ONLY the promotion ghost post-send-pre-flag (deterministic proxy
+      // for the suspended-send CE flag shape: attempted true, sent false,
+      // admitted). Installed in beforePromotionAwait (after the predecessor
+      // terminals already acked) so the predecessor's own core writes never
+      // hit this global hook (writeCore funnels through writeCoreTracked and
+      // would otherwise park the terminal and stick the ghost behind its gate).
+      c.beforePromotionAwaitForTest = {
+        c.afterAdmissionSendForTest = { _ ->
+          afterSendEntered.set(true)
+          hookRelease.await()
+        }
+      }
+      firstGate.complete(Unit)
+      runBlocking {
+        withTimeout(5_000) { while (!afterSendEntered.get()) delay(10) }
+        withTimeout(5_000) { while (!ghostEntered.get()) delay(10) }
+        withTimeout(5_000) { while (c.pendingTranscriptRunIds().isEmpty()) delay(10) }
+      }
+      assertFalse("promotion must be parked in the post-send hook", first.isCompleted)
+      // Host CE while fuzzy (attempted, sent false, admitted).
+      c.cancel()
+      runBlocking { withTimeout(5_000) { first.join() } }
+      runBlocking {
+        withTimeout(5_000) { while (!c.hasPendingAdmission()) delay(10) }
+      }
+      // UNKNOWN ownership: pending, drain + same-opId blocked, no recovery.
+      assertTrue(c.hasPendingAdmission())
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals("transcript store pending", c.uiState.value.error)
+      assertFalse(
+        "promotion UNKNOWN must not project recovery",
+        c.uiState.value.queuedRecoveryRequired,
+      )
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertEquals(listOf("first"), c.uiState.value.messages.filter { it.role == "user" }.map { it.text })
+      assertTrue(
+        "fuzzy CE must not mark INTERRUPTED before settle",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      val ghost = c.pendingTranscriptRunIds().single()
+      try {
+        c.drainQueued()
+        fail("drainQueued during promotion UNKNOWN must throw TranscriptPendingException")
+      } catch (_: TranscriptPendingException) {
+        // Expected: ownership retained, no steal.
+      }
+      try {
+        runBlocking { withTimeout(5_000) { c.startOrEnqueue(followText, opId = 901L) } }
+        fail("same-opId retry during promotion UNKNOWN must throw TranscriptPendingException")
+      } catch (_: TranscriptPendingException) {
+        // Expected: ghost already owns opId 901.
+      }
+      assertEquals(listOf("first"), c.uiState.value.messages.filter { it.role == "user" }.map { it.text })
+      assertEquals(1, provider.streamCalls.get())
+      assertTrue("ghost must not have persisted yet", store.events.none { it.kind == "user" && it.text == followText })
+      // Late commit: release the ghost delegate + hook, settle claims the ghost
+      // under the SAME logical id (Lock-2 commit, no resend).
+      c.afterAdmissionSendForTest = null
+      followStoreGate.complete(Unit)
+      hookRelease.complete(Unit)
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.hasPendingAdmission()) {
+            c.settlePendingAdmission(500L)
+            delay(25)
+          }
+        }
+      }
+      assertTrue(
+        "claimed ghost must not be INTERRUPTED",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      val followRows = store.events.filter { it.kind == "user" && it.text == followText }
+      assertEquals("claimed ghost keeps exactly one follow row (no ghost double-column)", 1, followRows.size)
+      assertEquals(ghost, followRows.single().runId)
+      assertEquals(2, store.events.count { it.kind == "user" })
+      // The claimed host runs the follow-up to completion (single provider call).
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.uiState.value.status != ChatStatus.IDLE) delay(10)
+        }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals(2, store.events.count { it.kind == "user" })
+      assertEquals(
+        1,
+        c.uiState.value.messages.count { it.role == "user" && it.text == followText },
+      )
+      assertEquals("follow must reach the provider exactly once", 2, provider.streamCalls.get())
+      assertTrue(c.drainQueued().isEmpty())
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      assertFalse(c.uiState.value.queuedRecoveryRequired)
+      // Reopen trio: single follow row, complete family, no INTERRUPTED.
+      assertTrue(
+        "claimed family must not dangle",
+        dev.librepocket.agent.ui.chat.findDanglingRunIds(store.events).isEmpty(),
+      )
+      assertTrue(c.interruptedTranscriptRunIds().isEmpty())
+    } finally {
+      firstGate.complete(Unit)
+      followStoreGate.complete(Unit)
+      hookRelease.complete(Unit)
+      c.afterAdmissionSendForTest = null
+      c.beforePromotionAwaitForTest = null
+      outer.cancel()
+      c.close()
+    }
+  }
+
+  /**
+   * R8-1 contrast (anti-over-UNKNOWN): a host CE before the channel send
+   * (`!sent && !attempted`, parked in the pre-send gate) is proven
+   * never-admitted and must stay fail-closed (`failPromotion`, FIFO retained
+   * with recovery, never UNKNOWN). Same wiring as the fuzzy main test, only
+   * the park point differs.
+   */
+  @Test
+  fun promotionCeBeforeSendStaysFailClosed() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val firstGate = CompletableDeferred<Unit>()
+    val followText = "follow-CE-proven"
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    val provider = LedgerFakeProvider { request ->
+      flow {
+        val lastUser = request.messages.lastOrNull { it.role == "user" }?.text ?: ""
+        if (lastUser.contains("first")) firstGate.await()
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "r8promop-${n++}" },
+      acceptTimeoutMs = 10_000L,
+    )
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    val beforeSendEntered = AtomicBoolean(false)
+    val beforeGate = CompletableDeferred<Unit>()
+    try {
+      val first = outer.async { c.send("first") }
+      runBlocking {
+        withTimeout(5_000) {
+          while (provider.streamCalls.get() != 1) delay(10)
+        }
+      }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue(followText, opId = 902L) })
+      // Park BEFORE the promotion send (proven never-attempted): the CE below
+      // must not become UNKNOWN. Installed in beforePromotionAwait so the
+      // predecessor terminals (same global beforeSend hook) never park here.
+      c.beforePromotionAwaitForTest = {
+        c.beforeAdmissionSendForTest = {
+          beforeSendEntered.set(true)
+          beforeGate.await()
+        }
+      }
+      firstGate.complete(Unit)
+      runBlocking {
+        withTimeout(5_000) { while (!beforeSendEntered.get()) delay(10) }
+      }
+      // Let the waiter settle into the gate (send provably not attempted).
+      Thread.sleep(200)
+      assertFalse("promotion must be parked before send", first.isCompleted)
+      c.cancel()
+      beforeGate.complete(Unit)
+      runBlocking { withTimeout(5_000) { first.join() } }
+      // Fail-closed: never UNKNOWN, FIFO retained with recovery for explicit
+      // reclaim (drainable, not Pending-blocked).
+      assertFalse("proven before-send CE must not become UNKNOWN", c.hasPendingAdmission())
+      assertTrue(c.pendingTranscriptRunIds().isEmpty())
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertTrue(
+        "proven promotion CE retains the FIFO for explicit recovery",
+        c.uiState.value.queuedRecoveryRequired,
+      )
+      assertEquals(listOf("first"), c.uiState.value.messages.filter { it.role == "user" }.map { it.text })
+      assertEquals("cancelled follow-up is never launched", 1, provider.streamCalls.get())
+      assertTrue(
+        "proven ghost was never admitted, so nothing follows to persist",
+        store.events.none { it.kind == "user" && it.text == followText },
+      )
+      assertEquals(listOf(QueuedIntent(902L, followText)), c.drainQueued())
+      assertTrue(c.drainQueued().isEmpty())
+    } finally {
+      firstGate.complete(Unit)
+      beforeGate.complete(Unit)
+      c.beforeAdmissionSendForTest = null
+      c.beforePromotionAwaitForTest = null
+      outer.cancel()
+      c.close()
+    }
+  }
+
+  /**
+   * R8-6 pending-guard (controller Phase-A): a CE racing a truly suspended
+   * send (attempted, physically never admitted — buffer full behind a parked
+   * writer, no receiver) is fuzzy and maps to UNKNOWN, but the ghost was never
+   * delivered so a successful barrier flush must NOT claim. Settle returns
+   * false and retains UNKNOWN with the pending mark; only a later seal
+   * converts fail-closed (INTERRUPTED, pending gone, still no ledger row).
+   */
+  @OptIn(DelicateCoroutinesApi::class)
+  @Test
+  fun fuzzyUndeliveredSettleMustNotClaimUntilSeal() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val writerGate = CompletableDeferred<Unit>()
+    val blockerEntered = CompletableDeferred<Unit>()
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onSteerQueued(text: String) {
+        if (text == "blocker") {
+          blockerEntered.complete(Unit)
+          writerGate.await()
+        }
+        inner.onSteerQueued(text)
+      }
+    }
+    val provider = LedgerFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "r8guard-${n++}" },
+      acceptTimeoutMs = 10_000L,
+      transcriptCapacity = 1,
+    )
+    val beforeSendEntered = AtomicBoolean(false)
+    c.beforeAdmissionSendForTest = {
+      beforeSendEntered.set(true)
+    }
+    val text = "fuzzy guard text"
+    val opId = 903L
+    try {
+      // Fill the channel behind the parked writer: blocker (taken, parked) +
+      // filler (buffered, capacity 1). The next admission send suspends.
+      c.offerSteerForTest("blocker")
+      runBlocking {
+        withTimeout(5_000) { blockerEntered.await() }
+      }
+      c.offerSteerForTest("filler")
+      val deferred = GlobalScope.async(Dispatchers.Default) {
+        c.startOrEnqueue(text, opId = opId)
+      }
+      runBlocking {
+        withTimeout(5_000) { while (!beforeSendEntered.get()) delay(10) }
+        withTimeout(5_000) { while (c.pendingTranscriptRunIds().isEmpty()) delay(10) }
+      }
+      // Let the waiter suspend inside channel.send (attempt recorded, buffer
+      // full, writer parked); the delay only lands the suspension, never
+      // guesses `sent`.
+      Thread.sleep(200)
+      assertFalse("admission must still be suspended in send", deferred.isCompleted)
+      deferred.cancel()
+      try {
+        runBlocking {
+          withTimeout(5_000) { deferred.await() }
+        }
+        fail("fuzzy suspended-send cancel must throw TranscriptPendingException")
+      } catch (e: TranscriptPendingException) {
+        // Expected UNKNOWN path (fuzzy, not NOT_ADMITTED).
+      } catch (e: CancellationException) {
+        fail("fuzzy cancel must not surface CancellationException, got $e")
+      }
+      c.beforeAdmissionSendForTest = null
+      // UNKNOWN ownership with the pending mark retained, never INTERRUPTED.
+      assertTrue(c.hasPendingAdmission())
+      val ghost = c.pendingTranscriptRunIds().single()
+      assertTrue(c.interruptedTranscriptRunIds().isEmpty())
+      assertEquals(1, c.uiState.value.messages.count { it.role == "user" && it.text == text })
+      assertTrue("ghost must not have persisted yet", store.events.none { it.kind == "user" })
+      // Release the writer so the barrier can drain blocker + filler. The
+      // ghost never entered, so flush succeeds with the id still pending.
+      writerGate.complete(Unit)
+      val settled = runBlocking {
+        withTimeout(5_000) { c.settlePendingAdmission(500L) }
+      }
+      assertFalse("fuzzy-undelivered settle must stay UNKNOWN (pending-guard)", settled)
+      assertTrue("guard must retain UNKNOWN ownership", c.hasPendingAdmission())
+      assertTrue(
+        "guard must retain the pending mark",
+        c.pendingTranscriptRunIds().contains(ghost),
+      )
+      assertTrue(
+        "guard must not mark INTERRUPTED and must not claim",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      assertTrue("guarded settle must persist no user row", store.events.none { it.kind == "user" })
+      assertEquals("guarded settle must never launch the host", 0, provider.streamCalls.get())
+      assertEquals(1, c.uiState.value.messages.count { it.role == "user" && it.text == text })
+      // Same-opId retry stays blocked while UNKNOWN (no second row).
+      try {
+        runBlocking { withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) } }
+        fail("same-opId retry during guarded UNKNOWN must throw TranscriptPendingException")
+      } catch (_: TranscriptPendingException) {
+        // Expected.
+      }
+      // Only the seal converts fail-closed: pending gone, INTERRUPTED explicit,
+      // still no ledger row (never claimed).
+      c.close()
+      runBlocking { withTimeout(5_000) { c.flushTranscript() } }
+      assertTrue(c.pendingTranscriptRunIds().isEmpty())
+      assertTrue(
+        "sealed fuzzy entry converts fail-closed",
+        c.interruptedTranscriptRunIds().contains(ghost),
+      )
+      assertTrue("sealed fuzzy entry was never claimed", store.events.none { it.kind == "user" })
+      assertEquals("sealed fuzzy entry never launches", 0, provider.streamCalls.get())
+    } finally {
+      writerGate.complete(Unit)
+      c.beforeAdmissionSendForTest = null
       c.close()
     }
   }

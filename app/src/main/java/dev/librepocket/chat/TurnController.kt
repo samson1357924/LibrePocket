@@ -347,6 +347,7 @@ class TurnController(
   private val historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
   transcriptDispatcher: CoroutineDispatcher? = null,
   private val acceptTimeoutMs: Long = ACCEPT_DURABLE_TIMEOUT_MS,
+  transcriptCapacity: Int = OrderedTranscriptSink.DEFAULT_CAPACITY,
 ) {
   companion object {
     const val POLICY_ACTION = "chat.send"
@@ -407,6 +408,7 @@ class TurnController(
 
   init {
     require(model.isNotBlank()) { "model must not be blank" }
+    require(transcriptCapacity > 0) { "transcriptCapacity must be positive" }
   }
 
   private val lock = Any()
@@ -434,7 +436,7 @@ class TurnController(
    * scope is independent of [scope], so turn cancellation cannot strand an
    * admitted event.
    */
-  private val orderedTranscript = OrderedTranscriptSink(transcript, writerDispatcher)
+  private val orderedTranscript = OrderedTranscriptSink(transcript, writerDispatcher, transcriptCapacity)
   /**
    * Stage 6: logical ids whose user row ack already succeeded (admission
    * await or [runTurnLoop] promotion write). [runTurnLoop] and
@@ -509,6 +511,22 @@ class TurnController(
     set(value) {
       orderedTranscript.beforeSendForTest = value
     }
+
+  /**
+   * Test seam forwarding to the sink's post-send hook. Deterministic proxy
+   * (stronger-than-production: guaranteed-admitted) for the send-races-cancel
+   * flag shape: production's true window is a CE racing a suspended send,
+   * while send-return → `sent.set` has no suspension point so an external
+   * cancel cannot land there.
+   */
+  internal var afterAdmissionSendForTest: (suspend (Long) -> Unit)?
+    get() = orderedTranscript.afterSendForTest
+    set(value) {
+      orderedTranscript.afterSendForTest = value
+    }
+
+  /** Test seam for filling the session channel (R8-6 full-channel simulation). */
+  internal fun offerSteerForTest(text: String) = orderedTranscript.offerSteer(text)
 
   private fun drainOrphanLocked(pending: PendingAdmission): Job {
     if (pendingAdmission?.logicalTurnId == pending.logicalTurnId) {
@@ -723,8 +741,10 @@ class TurnController(
    *   │
    *   └──promotion peek──▶ PromoAwait(active predecessor + promotionPending)
    *                          ├─ACK────▶ Active(predecessor → follow handoff)
-   *                          ├─NOT_ADMITTED─▶ no launch, FIFO retained, ERROR (predecessor terminal already recorded)
-   *                          └─UNKNOWN──▶ UnknownPromo(unknown[isPromotion], promotionPending
+   *                          ├─NOT_ADMITTED(proven never-attempted timeout/CE or seal)─▶ no launch,
+   *                          │                 FIFO retained, ERROR (predecessor terminal already recorded)
+   *                          └─UNKNOWN(timeout-fuzzy or CE-fuzzy R8-1: attempted regardless
+   *                                        of sent)──▶ UnknownPromo(unknown[isPromotion], promotionPending
    *                                        cleared at handoff; predecessor host may still
    *                                        be live until settle observes completion)
    * UnknownDirect ─settle claim──▶ Active(same id, no resend)
@@ -790,27 +810,41 @@ class TurnController(
    * ownership (no rollback) and throws [TranscriptPendingException] like the
    * timeout-after-send path. Seal races keep the old fail-closed mapping
    * (INTERRUPTED-marked [TranscriptDurabilityException]).
+   * R8-6: `sent == false` is untrusted — the sink sets [sendAttempted]
+   * immediately before the (possibly suspending) channel send, so a CE racing
+   * a suspended send leaves `sent == false` for an entry the writer may
+   * already own. Only `!sent && !sendAttempted` is proven NOT_ADMITTED (the
+   * send was never attempted); `!sent && sendAttempted` is fuzzy and maps to
+   * UNKNOWN here and in the outer catches (no mark, no rollback — settle
+   * claims or converts under the same id).
    */
   private suspend fun awaitUserRowDurable(
     logicalTurnId: String,
     text: String,
     sent: AtomicBoolean,
+    sendAttempted: AtomicBoolean,
   ): DurableAdmission {
     try {
       val acked = withTimeoutOrNull(acceptTimeoutMs) {
-        orderedTranscript.onTurnStartedTracked(logicalTurnId, text, sent)
+        orderedTranscript.onTurnStartedTracked(logicalTurnId, text, sent, sendAttempted)
       } != null
       if (acked) {
         durableUserRows.add(logicalTurnId)
         return DurableAdmission.ACKED
       }
       // Bounded timeout: consult the send proof before claiming anything.
+      // R8-6 tri-state: proven-not-admitted (send never attempted) stays
+      // fail-closed; fuzzy (send attempted, ack still pending — the ghost may
+      // late-commit) is UNKNOWN like the timeout-after-send path.
       if (!sent.get()) {
-        try {
-          orderedTranscript.markInterrupted(logicalTurnId)
-        } catch (_: Exception) {
+        if (!sendAttempted.get()) {
+          try {
+            orderedTranscript.markInterrupted(logicalTurnId)
+          } catch (_: Exception) {
+          }
+          return DurableAdmission.NOT_ADMITTED
         }
-        return DurableAdmission.NOT_ADMITTED
+        return DurableAdmission.UNKNOWN
       }
       return DurableAdmission.UNKNOWN
     } catch (e: CancellationException) {
@@ -825,7 +859,9 @@ class TurnController(
       // (NOT_ADMITTED, mark like the timeout-before-send path). After the send
       // the independent writer still owns the entry, so never mark here — the
       // outer catch retains UNKNOWN ownership instead.
-      if (!sent.get()) {
+      // R8-6: the same split consults the attempt proof — a CE racing a
+      // suspended send (sent false, attempt true) is fuzzy, never NOT_ADMITTED.
+      if (!sent.get() && !sendAttempted.get()) {
         try {
           orderedTranscript.markInterrupted(logicalTurnId)
         } catch (_: Exception) {
@@ -932,9 +968,20 @@ class TurnController(
   /**
    * R5-1 bounded settle for UNKNOWN ownership (ticket-tracked flush, never
    * unbounded). Flush barrier is ordered behind the ghost send via the sink's
-   * admission chain, so `flushed && !interrupted` proves the ghost durable.
+   * admission chain, so `flushed && !interrupted` proves the ghost durable —
+   * with one R8-6 exception below.
    *
-   * - ghost durable → claim under the SAME logical id (adds [durableUserRows]
+   * R8-6 pending-guard: a fuzzy CE racing a suspended send (attempted, entry
+   * never entered the channel) also drains the barrier successfully, so
+   * `flushed` alone would mis-claim (marking [durableUserRows] for a row the
+   * writer never owns → ledger misses the row, sink pending dangles). After a
+   * successful flush, a still-pending id (`pendingRunIds()` contains it) proves
+   * non-delivery — an admitted ghost's pending is always removed by the writer
+   * `finally` before the barrier (FIFO order) drains — so settle returns false
+   * and retains UNKNOWN; only a later seal converts it fail-closed. Flush
+   * timeout already returns false, so it stays safe.
+   *
+   * - ghost durable (flushed + pending gone) → claim under the SAME logical id (adds [durableUserRows]
    *   before the host starts so [runTurnLoop] skips a second user row;補 UI
    *   idempotently; launches the host; no resend).
    * - INTERRUPTED/sealed → convert to fail-closed (UI rolled back, ownership
@@ -979,6 +1026,11 @@ class TurnController(
         return true
       }
       if (!flushed) return false
+      // R8-6 pending-guard (before cancel/claim): flush success with the id
+      // still pending proves the fuzzy entry never entered the channel (an
+      // admitted ghost's pending is removed before the barrier drains), so
+      // never claim nor drain — stay UNKNOWN until a later seal converts.
+      if (orderedTranscript.pendingRunIds().contains(logicalTurnId)) return false
       // Admission-window cancel raced the late commit: direct admissions drain
       // a cancel terminal instead of ghost-launching (Finding 1, UNKNOWN
       // variant). Promotion UNKNOWN takes the convert-like branch below
@@ -1442,9 +1494,12 @@ class TurnController(
     // R6-2: the send proof is caller-owned so the CE catch below can consult
     // it. Installs UNKNOWN via writerScope (see enterUnknownAdmission); never
     // clears admissionCancelRequestedId first (accepted-then-cancelled race).
+    // R8-6: the attempt proof travels alongside `sent` — `sent == false` alone
+    // no longer proves non-delivery.
     val sent = AtomicBoolean(false)
+    val sendAttempted = AtomicBoolean(false)
     try {
-      when (awaitUserRowDurable(reservation.logicalTurnId, text, sent)) {
+      when (awaitUserRowDurable(reservation.logicalTurnId, text, sent, sendAttempted)) {
         DurableAdmission.ACKED -> Unit
         DurableAdmission.NOT_ADMITTED -> {
           rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
@@ -1463,7 +1518,9 @@ class TurnController(
       // still owns the entry) becomes UNKNOWN (no mark, no rollback — settle
       // claims the ghost under the same id). Sealed races already surfaced as
       // TranscriptDurabilityException inside the await, never here.
-      if (!sent.get()) {
+      // R8-6: proven-not-admitted is `!sent && !sendAttempted`; a CE racing a
+      // suspended send (fuzzy) retains UNKNOWN ownership like after-send.
+      if (!sent.get() && !sendAttempted.get()) {
         rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
         throw e
       }
@@ -1712,9 +1769,11 @@ class TurnController(
     // R5-1 tri-state: UNKNOWN retains ownership and throws Pending (same-opId
     // resend blocked until settle); NOT_ADMITTED keeps fail-closed rollback.
     // R6-2: same send-proof split as startTurn for external cancel.
+    // R8-6: the attempt proof travels alongside `sent` (see startTurn).
     val sent = AtomicBoolean(false)
+    val sendAttempted = AtomicBoolean(false)
     try {
-      when (awaitUserRowDurable(reservation.logicalTurnId, text, sent)) {
+      when (awaitUserRowDurable(reservation.logicalTurnId, text, sent, sendAttempted)) {
         DurableAdmission.ACKED -> Unit
         DurableAdmission.NOT_ADMITTED -> {
           rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
@@ -1728,7 +1787,10 @@ class TurnController(
         }
       }
     } catch (e: CancellationException) {
-      if (!sent.get()) {
+      // R8-6 tri-state like startTurn: proven-not-admitted (`!sent &&
+      // !sendAttempted) rolls back and rethrows CE; fuzzy (send attempted,
+      // ack pending) retains UNKNOWN ownership instead.
+      if (!sent.get() && !sendAttempted.get()) {
         rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
         throw e
       }
@@ -2441,12 +2503,19 @@ class TurnController(
     // below leaves the intent in the FIFO, reclaimable via drainQueued.
     // R6-2: the await no longer marks INTERRUPTED on cancel-after-send
     // (sent == true) — the ghost may still late-commit as an orphan; the FIFO
-    // stays retained via failPromotion below. Full promotion cancel-after-send
-    // UNKNOWN ownership (settle/claim) is a separate case; this path keeps the
-    // R6-1 timeout-UNKNOWN ownership untouched and never changes FIFO semantics.
+    // stays retained via failPromotion below for proven-not-admitted only.
+    // R8-1: the CE catch below consults the same attempt proof as timeouts —
+    // proven never-attempted (!sent && !attempted) stays fail-closed (FIFO
+    // retained, ERROR + reclaimable); fuzzy (attempted, regardless of sent —
+    // a CE racing a suspended send, or sent == true) retains promotion UNKNOWN
+    // ownership like the timeout-UNKNOWN path (settle/claim under the same id).
+    // R8-6: the attempt proof travels alongside `promotionSent` so the shared
+    // await tri-states timeouts (proven NOT_ADMITTED vs fuzzy UNKNOWN) and the
+    // CE catch (proven failPromotion vs fuzzy UNKNOWN).
     val promotionSent = AtomicBoolean(false)
+    val promotionAttempted = AtomicBoolean(false)
     try {
-      when (awaitUserRowDurable(reservation.logicalTurnId, head.text, promotionSent)) {
+      when (awaitUserRowDurable(reservation.logicalTurnId, head.text, promotionSent, promotionAttempted)) {
         DurableAdmission.ACKED -> Unit
         DurableAdmission.NOT_ADMITTED -> {
           synchronized(lock) {
@@ -2468,13 +2537,23 @@ class TurnController(
         }
       }
     } catch (e: CancellationException) {
-      // Our own wait cancelled (cancel()/close() won while parked): retain
-      // the FIFO for explicit recovery; failPromotion keeps closed/CANCELLED
-      // projections untouched and only clears the finished host slot.
-      synchronized(lock) {
-        if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+      // R8-1: consult the attempt proof like the direct paths and the timeout
+      // branch above. Proven never-attempted (!sent && !attempted) stays
+      // fail-closed: retain the FIFO for explicit recovery (failPromotion keeps
+      // closed/CANCELLED projections untouched, only clears the finished host
+      // slot). Fuzzy (attempted, regardless of sent — a CE racing a suspended
+      // send, or sent == true) retains UNKNOWN ownership under the SAME id
+      // (R6-1 background settle/claim, drain + same-opId blocked,
+      // queuedRecoveryRequired=false). Seal races surfaced as
+      // TranscriptDurabilityException inside the await and never land here.
+      if (!promotionSent.get() && !promotionAttempted.get()) {
+        synchronized(lock) {
+          if (promotionPending?.logicalTurnId == reservation.logicalTurnId) promotionPending = null
+        }
+        failPromotion("turn admission cancelled", self)
+        return
       }
-      failPromotion("turn admission cancelled", self)
+      enterUnknownAdmission(reservation, null, head.opId, isPromotion = true, host = self)
       return
     } catch (_: TranscriptDurabilityException) {
       // Fast store failure / seal race before any ack: never dequeued, so

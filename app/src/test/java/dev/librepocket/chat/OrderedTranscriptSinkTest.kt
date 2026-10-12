@@ -2,11 +2,13 @@ package dev.librepocket.chat
 
 import java.util.Collections
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.ClosedSendChannelException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
@@ -474,6 +476,167 @@ class OrderedTranscriptSinkTest {
       }
       sink.onAdmissionReservedForTest = null
       sink.beforeSendForTest = null
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * R8-6: `Channel.send` delivery is ambiguous under cancel — a CE racing a
+   * suspended send may fire after the entry was already handed to the writer,
+   * with `sent` still false. Only the send-attempt proof (`sendAttempted`,
+   * set immediately before the send call) distinguishes proven-not-admitted
+   * (send never attempted: ack + pending dropped, CE propagates) from fuzzy
+   * (send invoked: ack + pending retained for the writer/settle, never
+   * INTERRUPTED-marked, upstream maps to UNKNOWN).
+   *
+   * Phase A cancels a genuinely suspended send (writer parked, buffer full, no
+   * receiver — physically never admitted) and asserts the conservative
+   * retention. Phase B lets the send really resume, parks it post-send but
+   * pre-`sent`-flag via [OrderedTranscriptSink.afterSendForTest] (admitted yet
+   * `sent == false`), cancels, and asserts the same fuzzy mapping plus the
+   * late commit. Positioning uses gate observables (attempt flag / hook entry),
+   * never a sleep-guessed `sent`.
+   */
+  @Test fun suspendedSendRacesCancelStaysFuzzyUntilSettled() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      // ---- Phase A: real suspended send + cancel (no receiver available). ----
+      val writerGateA = CompletableDeferred<Unit>()
+      val blockerEnteredA = CompletableDeferred<Unit>()
+      val delegateA = object : SinkProbe() {
+        override suspend fun onSteerQueued(text: String) {
+          if (text == "blocker") {
+            blockerEnteredA.complete(Unit)
+            writerGateA.await()
+          }
+          recorded.add(text)
+        }
+      }
+      val sinkA = OrderedTranscriptSink(delegateA, dispatcher, capacity = 1)
+      runBlocking {
+        withTimeout(10_000) {
+          sinkA.offerSteer("blocker")
+          blockerEnteredA.await()
+          sinkA.offerSteer("filler")
+          val sentA = AtomicBoolean(false)
+          val attemptedA = AtomicBoolean(false)
+          val suspended = async { sinkA.onTurnStartedTracked("ghost-A", "hi", sentA, attemptedA) }
+          // Observable proof the waiter reached the send (set immediately
+          // before the call). The buffer holds filler behind the parked
+          // writer, so the waiter is provably suspended inside channel.send;
+          // the settle delay only lets the suspension land, it never guesses
+          // `sent`.
+          withTimeout(5_000) { while (!attemptedA.get()) delay(10) }
+          delay(100)
+          suspended.cancel()
+          try {
+            suspended.await()
+            fail("cancelled suspended send must throw CancellationException")
+          } catch (_: CancellationException) {
+            // Expected fuzzy path (not a NOT_ADMITTED cleanup).
+          }
+          assertFalse("sent must stay false", sentA.get())
+          assertTrue("attempt must be recorded", attemptedA.get())
+          // R8-6 fuzzy retention: ack + pending stay for the writer/settle to
+          // decide; never dropped, never INTERRUPTED-marked here.
+          assertTrue(
+            "fuzzy cancel must retain the pending mark",
+            sinkA.pendingRunIds().contains("ghost-A"),
+          )
+          assertTrue(
+            "fuzzy cancel must not mark INTERRUPTED",
+            sinkA.interruptedRunIds().isEmpty(),
+          )
+          // No receiver was available while parked, so this interleaving is
+          // physically not admitted: drain blocker + filler only.
+          writerGateA.complete(Unit)
+          assertTrue("drain must succeed", sinkA.flush())
+          assertEquals(listOf("blocker", "filler"), delegateA.recorded)
+          // Conservative retention stands until seal: only a non-delivery
+          // proof (here the shutdown seal) settles it fail-closed.
+          assertTrue(sinkA.pendingRunIds().contains("ghost-A"))
+          sinkA.shutdown()?.join()
+          assertTrue(sinkA.pendingRunIds().isEmpty())
+          assertTrue(
+            "sealed fuzzy entry converts fail-closed",
+            sinkA.interruptedRunIds().contains("ghost-A"),
+          )
+        }
+      }
+      // ---- Phase B: resumed send, parked post-send-pre-flag, then cancel. ----
+      val writerGateB = CompletableDeferred<Unit>()
+      val blockerEnteredB = CompletableDeferred<Unit>()
+      val ghostGateB = CompletableDeferred<Unit>()
+      val afterSendEnteredB = AtomicBoolean(false)
+      val hookReleaseB = CompletableDeferred<Unit>()
+      val delegateB = object : SinkProbe() {
+        override suspend fun onSteerQueued(text: String) {
+          if (text == "blocker") {
+            blockerEnteredB.complete(Unit)
+            writerGateB.await()
+          }
+          recorded.add(text)
+        }
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          ghostGateB.await()
+          recorded.add("core:$runId")
+        }
+      }
+      val sinkB = OrderedTranscriptSink(delegateB, dispatcher, capacity = 1)
+      runBlocking {
+        withTimeout(10_000) {
+          sinkB.offerSteer("blocker")
+          blockerEnteredB.await()
+          sinkB.offerSteer("filler")
+          sinkB.afterSendForTest = { _ ->
+            afterSendEnteredB.set(true)
+            hookReleaseB.await()
+          }
+          val sentB = AtomicBoolean(false)
+          val attemptedB = AtomicBoolean(false)
+          val admitted = async { sinkB.onTurnStartedTracked("ghost-B", "hi", sentB, attemptedB) }
+          withTimeout(5_000) { while (!attemptedB.get()) delay(10) }
+          // Let the really-suspended send resume; it parks post-send-pre-flag
+          // (send returned = admitted, `sent` still false).
+          writerGateB.complete(Unit)
+          withTimeout(5_000) { while (!afterSendEnteredB.get()) delay(10) }
+          assertFalse("waiter must be parked in the post-send hook", admitted.isCompleted)
+          admitted.cancel()
+          try {
+            admitted.await()
+            fail("cancelled post-send waiter must throw CancellationException")
+          } catch (_: CancellationException) {
+            // Expected fuzzy path.
+          }
+          assertFalse("sent must stay false (flag comes after the hook)", sentB.get())
+          assertTrue("attempt must be recorded", attemptedB.get())
+          assertTrue(
+            "fuzzy cancel must retain the pending mark",
+            sinkB.pendingRunIds().contains("ghost-B"),
+          )
+          assertTrue(
+            "fuzzy cancel must not mark INTERRUPTED",
+            sinkB.interruptedRunIds().isEmpty(),
+          )
+          // The admitted entry late-commits through the independent writer.
+          hookReleaseB.complete(Unit)
+          ghostGateB.complete(Unit)
+          assertTrue("late commit must drain", sinkB.flush())
+          assertEquals(
+            listOf("blocker", "filler", "core:ghost-B"),
+            delegateB.recorded,
+          )
+          assertTrue(sinkB.pendingRunIds().isEmpty())
+          assertTrue(
+            "late-committed ghost must not be INTERRUPTED",
+            sinkB.interruptedRunIds().isEmpty(),
+          )
+          sinkB.afterSendForTest = null
+          sinkB.shutdown()?.join()
+        }
+      }
     } finally {
       exec.shutdown()
     }

@@ -39,6 +39,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 private val EMPTY_SESSION_STATE = ChatUiState(
     messages = emptyList(),
@@ -148,10 +149,14 @@ internal fun shouldDeleteStaleFork(requestedSessionId: String, created: CreatedS
  * admitted transcript events are not lost with the session.
  * [ChatSession.flush] spends one such budget on the close shutdown-join and
  * another on the admitted-event drain, so one flush-then-close waits up to
- * ~2x this value after close (~1x when nothing was closed yet). The UI never
- * waits on it: VM state is detached synchronously and the flush itself is
- * bounded — a stalled store only delays the background close, never user
- * interaction. Mirrors
+ * ~2x this value after close (~1x when nothing was closed yet). An
+ * endpoint-switch fork fences up to three such bounded waits in series on
+ * IO — the prior parked fence join (~2x), its session re-flush (~2x), and
+ * the just-detached close-then-flush (~2x) — so the single-flight mutex is
+ * held up to ~6x this value (~30s) worst case before the snapshot read. The
+ * UI never waits on any of it: VM state is detached synchronously and each
+ * wait is bounded — a stalled store only delays the background close / the
+ * next fork's snapshot, never user interaction. Mirrors
  * [dev.librepocket.chat.OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS].
  */
 private const val SESSION_FLUSH_TIMEOUT_MS = 5_000L
@@ -318,6 +323,24 @@ class ChatViewModel(
     private var pendingOpen: PendingOpen? = null
     private val _pendingOpenSessionId = MutableStateFlow<String?>(null)
     val pendingOpenSessionId: StateFlow<String?> = _pendingOpenSessionId.asStateFlow()
+    /**
+     * R6-3 streaming-switch fence (Main-confined, guarded by [sessionMutex]
+     * like every other lifecycle field): the detached old ledger's background
+     * close-then-flush job plus the streaming evidence captured before its
+     * detach. [invalidateForEndpointChange] is synchronous and cannot suspend,
+     * so it parks the detached session here; the next `ensureSession` fork
+     * joins the fence (bounded, on IO) before reading the old ledger, so the
+     * doomed host's cancel terminal is already durable when the snapshot
+     * copies. Cleared once consumed. Null when no detached ledger is pending.
+     * Cancel-safety: a fork that consumed the fence but is lifecycle-cancelled
+     * before its settle completes re-parks the unfinished ledger
+     * ([reparkUnsettledLedger]); a fork whose history was discarded instead
+     * drops it ([invalidateLifecycle] with `clearChat`, `openSession` after
+     * attach) so a later unrelated fork never joins an ancient job.
+     */
+    private var pendingLedgerFence: Job? = null
+    private var pendingLedgerSession: ChatSession? = null
+    private var pendingLedgerWasStreaming: Boolean = false
     // R2: unsent texts are owned per send/steer operation, never by a single
     // global String. Cleared only when the controller accepts that exact op
     // (startOrEnqueue Started/Queued verdict); pre-accept endpoint
@@ -1309,6 +1332,17 @@ class ChatViewModel(
                     attach(created, access.binding, creationGeneration)
                     attached = true
                     candidate = null
+                    // R6-3 (b): open loads the requested id's history — not a
+                    // fork of the previous ledger — so a fence parked by an
+                    // earlier endpoint-switch is stale for every future fork.
+                    // Drop it now (the pre-clear above already dropped it via
+                    // invalidateLifecycle(clearChat=true); this covers the
+                    // attach window): otherwise the next fork would join an
+                    // ancient job, re-flush a long-sealed session, and OR
+                    // ancient wasStreaming into a new INCOMPLETE decision.
+                    pendingLedgerFence = null
+                    pendingLedgerSession = null
+                    pendingLedgerWasStreaming = false
                     // Stage D: a cross-provider resume keeps the local replay
                     // but withholds the model prefix; say so visibly instead
                     // of resuming silently on a blank context.
@@ -1683,8 +1717,21 @@ class ChatViewModel(
         // N1: reclaim its queued-but-unstarted FIFO first (same ownership as
         // the invalidate path); the current op stays in pendingOps and is
         // never touched here.
+        // R6-3: streaming-switch ledger fence inputs, captured on Main before
+        // any suspension and consumed on IO before the ledger read/snapshot
+        // below. The just-detached mismatched session settles on IO (not
+        // fire-and-forget), and any prior invalidate-parked ledger is joined
+        // there too — otherwise the snapshot would copy a ledger still
+        // missing its cancel terminal and the reopen backfill would stamp a
+        // false INTERRUPTED.
+        var mismatchedForSettle: ChatSession? = null
+        var mismatchedWasStreaming = false
+        var fencedJob: Job? = null
+        var fencedSession: ChatSession? = null
+        var fencedWasStreaming = false
         if (currentSession != null) {
             val mismatched = currentSession
+            mismatchedWasStreaming = isLedgerStreamingOrPending(mismatched)
             val queuedBeforeReplace: List<dev.librepocket.chat.QueuedIntent> = try {
                 mismatched?.drainQueued() ?: emptyList()
             } catch (_: Exception) {
@@ -1694,24 +1741,121 @@ class ChatViewModel(
             generation = lifecycleGeneration
             // F2: keep visible transcript when the transport is replaced.
             snapshotLiveToHistory()
-            // Bounded flush-then-close in the background (never a bare
-            // closeLive: admitted events must drain, as on every other
-            // detach path).
-            if (mismatched != null) detachAndFlushClose(mismatched)
+            // R6-3: synchronous detach now (UI immediate); the old ledger
+            // settles on IO below before any DB read (never a bare closeLive
+            // and never fire-and-forget here: admitted events must drain AND
+            // the doomed host must settle first, as on every other detach
+            // path — see closeThenFlushDurable).
+            if (mismatched != null) {
+                cancelAndDetachSync(mismatched)
+                mismatchedForSettle = mismatched
+            }
+            // Consume any prior invalidate-parked fence so the IO phase owns
+            // it exactly once.
+            fencedJob = pendingLedgerFence
+            fencedSession = pendingLedgerSession
+            fencedWasStreaming = pendingLedgerWasStreaming
+            pendingLedgerFence = null
+            pendingLedgerSession = null
+            pendingLedgerWasStreaming = false
             _sessionState.value = EMPTY_SESSION_STATE
             // R5-5: the detached session's send-time trim no longer applies;
             // zero now so a failed/slow replacement cannot leave a stale badge
             // (mirrors invalidateForEndpointChange).
             _requestTrimmedCount.value = 0
             absorbDrainedQueued(queuedBeforeReplace, fillInput = false, includePending = false)
+        } else {
+            // No live mismatched, but a prior invalidate may have parked a
+            // detached ledger whose settle the fork must still fence on.
+            fencedJob = pendingLedgerFence
+            fencedSession = pendingLedgerSession
+            fencedWasStreaming = pendingLedgerWasStreaming
+            pendingLedgerFence = null
+            pendingLedgerSession = null
+            pendingLedgerWasStreaming = false
         }
 
         val previousSessionId = _currentSessionId.value
         var initialHistory: List<ChatMessage> = emptyList()
         var fork: ForkPrefix? = null
+        // R6-3 fence outcome (set on IO before the read; read by the snapshot
+        // below). Locals confined to this single-flight invocation: assigning
+        // them inside the IO block below is sequential (no concurrent access).
+        var switchLedgerWasStreaming = mismatchedWasStreaming || fencedWasStreaming
+        var switchLedgerSettleOk = true
+        var switchLedgerDurableOk = true
         if (previousSessionId != null) {
-            val read = withContext(Dispatchers.IO) {
+            // R6-3 (a): the fence locals above were destructively consumed
+            // before any suspension. If this IO section is lifecycle-cancelled,
+            // close still runs under NonCancellable but flushDurable throws
+            // CancellationException, the mutex releases, and the locals would
+            // be lost (next fork: no fence to join, wasStreaming evidence
+            // gone). So a cancellation before [fenceSettled] re-parks the
+            // unfinished ledger below — gen-current only (gen-stale means a
+            // concurrent clearChat discarded the history, so drop instead of
+            // resurrecting it).
+            var fenceSettled = false
+            val read = try {
+            withContext(Dispatchers.IO) {
+                // R6-3 fence: settle the old ledger(s) BEFORE reading it.
+                // Prior invalidate fence first (background close-then-flush),
+                // then the just-detached mismatched session (close-then-flush
+                // here). Each phase gets SESSION_FLUSH_TIMEOUT_MS (~2x total
+                // after close); a timeout or flushDurable==false degrades to
+                // the incomplete path instead of copying a dangling family.
+                if (fencedJob != null || fencedSession != null) {
+                    val fence = fencedJob
+                    if (fence != null) {
+                        val joined = try {
+                            withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { fence.join() } != null
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!joined) switchLedgerSettleOk = false
+                    }
+                    val parked = fencedSession
+                    if (parked != null) {
+                        // The background job already closed+flushed; re-check
+                        // durability bounded (idempotent after seal).
+                        val durable = try {
+                            withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                parked.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
+                            } ?: false
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!durable) switchLedgerDurableOk = false
+                    }
+                }
+                val detached = mismatchedForSettle
+                if (detached != null) {
+                    val ok = try {
+                        withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                            closeThenFlushDurable(detached, SESSION_FLUSH_TIMEOUT_MS)
+                        } ?: false
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        false
+                    }
+                    // closeThenFlushDurable returns flushDurable (drain AND no
+                    // durable failure); an outer timeout (null) and a false
+                    // both mean the ledger may still miss its terminal.
+                    if (!ok) {
+                        switchLedgerSettleOk = false
+                        switchLedgerDurableOk = false
+                    }
+                }
                 val store = sessions.storeOrNull()
+                // R6-3 (a): both settles above completed — a later cancel in
+                // the ledger read below needs no re-park (ledger durable, no
+                // dangling to fence); assigned before any further suspension,
+                // so the catch below sees the exact settle state.
+                fenceSettled = true
                 val previousMeta = store?.getSession(previousSessionId)
                 val sameOrigin = previousMeta != null && isSameProviderOrigin(
                     previousMeta.model,
@@ -1736,6 +1880,24 @@ class ChatViewModel(
                         crossProviderWithheld = withheld,
                     ),
                 )
+            }
+            } catch (cancelled: CancellationException) {
+                // R6-3 (a): re-park the unfinished ledger so the next fork
+                // still fences it (see reparkUnsettledLedger). Back on Main
+                // here with the mutex still held — same confinement as the
+                // pendingLedger* fields. Gen-stale (concurrent clearChat):
+                // the history is gone, so drop and let the next fork start
+                // clean instead of joining an ancient job.
+                if (!fenceSettled && isGenerationCurrent(generation)) {
+                    reparkUnsettledLedger(
+                        fencedJob,
+                        fencedSession,
+                        fencedWasStreaming,
+                        mismatchedForSettle,
+                        mismatchedWasStreaming,
+                    )
+                }
+                throw cancelled
             }
             if (!isGenerationCurrent(generation)) return@withLock null
             val afterHistory = readEndpoint()
@@ -1791,9 +1953,22 @@ class ChatViewModel(
             // appends one system incomplete marker and surfaces
             // HISTORY_SNAPSHOT_INCOMPLETE (fail-open: the send still proceeds
             // on the in-memory prefix).
+            // R6-3 streaming-switch fallback (C): the fence above awaited the
+            // old ledger, but a streaming old turn (STREAMING/CANCELLED/
+            // WAITING projection, UNKNOWN admission, or pending cores) or a
+            // fence timeout / flushDurable==false means the ledger may still
+            // miss its terminal. Then the snapshot degrades: it skips dangling
+            // families (never copies an orphan user row that would gain a
+            // false INTERRUPTED on reopen) and rides one incomplete marker in
+            // the same atomic batch so the restart scan re-warns. A clean
+            // streaming switch whose terminal already settled copies the full
+            // family with no warning (exclude is a no-op without dangling).
             val forkTargetId = created.sessionId
             val forkProvenance = fork
             if (forkTargetId != null && forkProvenance != null && previousSessionId != null) {
+                val fenceFailed = !switchLedgerSettleOk || !switchLedgerDurableOk
+                val excludeDangling = switchLedgerWasStreaming || fenceFailed
+                val markIncomplete = fenceFailed
                 try {
                     withContext(Dispatchers.IO) {
                         val backing = sessions.storeOrNull()
@@ -1805,8 +1980,36 @@ class ChatViewModel(
                                 forkProvenance.oldModelShort,
                                 created.model,
                                 forkProvenance.crossProviderWithheld,
+                                excludeDanglingFamilies = excludeDangling,
+                                markIncomplete = markIncomplete,
                             )
                         }
+                    }
+                    if (markIncomplete) {
+                        // The batch rode the incomplete marker atomically, so
+                        // the restart scan will re-warn; surface it now too
+                        // (overrides a withhold notice: the copy itself is
+                        // what degraded).
+                        _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    } else if (excludeDangling) {
+                        // Streaming switch whose terminal settled (no fence
+                        // failure) but whose prefix still dangled: the snapshot
+                        // auto-marks incomplete when it drops a family (see
+                        // snapshotSwitchHistory) — re-surface that warning
+                        // without another scan on the hot path unless needed.
+                        // Best-effort bounded head/tail scan: only the notice
+                        // is at stake.
+                        val droppedWarn = try {
+                            withContext(Dispatchers.IO) {
+                                val backing = sessions.storeOrNull()
+                                backing != null && hasIncompleteSnapshotMarker(backing, forkTargetId)
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (droppedWarn) _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -2265,6 +2468,17 @@ class ChatViewModel(
         _sessionState.value = EMPTY_SESSION_STATE
         _notice.value = null
         if (clearChat) {
+            // R6-3 (b): the history is discarded below, so no future fork
+            // snapshots the detached ledger — drop any fence parked above (or
+            // by an earlier endpoint-switch) instead of letting it linger
+            // stale. The background close-then-flush keeps running unfenced
+            // (durability unaffected); only the fork fence + wasStreaming
+            // evidence are dropped, so a later unrelated fork never joins an
+            // ancient job nor ORs ancient wasStreaming into its INCOMPLETE
+            // decision. Non-clearChat resets keep the fence (history kept).
+            pendingLedgerFence = null
+            pendingLedgerSession = null
+            pendingLedgerWasStreaming = false
             _history.value = emptyList()
             _historyOmittedCount.value = 0
             // R5-5: the owning session is detached; a later attach restarts
@@ -2666,23 +2880,43 @@ class ChatViewModel(
     }
 
     /**
-     * Detach + bounded flush-then-close for explicit lifecycle resets
+     * Detach + bounded close-then-flush for explicit lifecycle resets
      * (newChat / openSession pre-clear), endpoint switches, transport
      * replacement, and attach-time incumbent replacement. The live turn is
      * cancelled synchronously (prompt stop, IO-free, a no-op when idle) and
      * VM state is detached synchronously so the UI updates immediately; the
-     * detached session is then flushed and closed on [viewModelScope] —
+     * detached session is then closed and flushed on [viewModelScope] —
      * never the per-generation lifecycle scope, so a later invalidation
      * cannot cancel another generation's teardown — strictly in that order.
-     * No outer timeout wraps the flush: [ChatSession.flush] is already
-     * bounded (one [SESSION_FLUSH_TIMEOUT_MS] budget for the close
+     *
+     * R6-3 order (close before flush): [ChatSession.flush] alone only drains
+     * barrier-reserved terminals; a cancel terminal whose host has not settled
+     * yet is still unreserved and would be missed. [close] first settles the
+     * doomed host (bounded: its NonCancellable terminal is admitted ahead of
+     * the flush barrier via the shutdown settle), then the flush drains it.
+     * No outer timeout wraps the background work: [ChatSession.flush] is
+     * already bounded (one [SESSION_FLUSH_TIMEOUT_MS] budget for the close
      * shutdown-join plus one for the admitted-event drain, ~2x total after
      * close). [close] runs under [NonCancellable] so teardown always seals
      * the session even if the background launch is cancelled. A stalled
      * store only delays that background close — the next generation is
      * unaffected because all VM references were already detached above.
+     * Returns the background teardown job so a later `ensureSession` fork can
+     * fence on it (see [pendingLedgerFence]).
      */
-    private fun detachAndFlushClose(session: ChatSession) {
+    private fun detachAndFlushClose(session: ChatSession): Job {
+        cancelAndDetachSync(session)
+        return launchCloseThenFlush(session)
+    }
+
+    /**
+     * R6-3 synchronous half of [detachAndFlushClose]: prompt cancel (IO-free)
+     * plus VM-state detach, with no suspension so the UI updates immediately.
+     * The caller owns the ledger settle separately: either
+     * [launchCloseThenFlush] (fire-and-forget fence) or an IO-bounded
+     * close-then-flush await inside `ensureSession` before the snapshot read.
+     */
+    private fun cancelAndDetachSync(session: ChatSession) {
         // Prompt stop first: cancel() is synchronous, IO-free, and a no-op
         // when idle, so a running turn never lingers into the flush window.
         try {
@@ -2698,14 +2932,31 @@ class ChatViewModel(
             currentBinding = null
             currentSessionGeneration = null
         }
-        viewModelScope.launch {
+    }
+
+    /**
+     * R6-3 background half: close (settle, includes the doomed-host terminal
+     * admission) strictly before the durable flush, on [viewModelScope] so it
+     * survives per-generation invalidation. Callers that need the ledger
+     * before forking (same-origin `ensureSession`) await the returned job
+     * (bounded, on IO) instead of only launching it.
+     */
+    private fun launchCloseThenFlush(session: ChatSession): Job {
+        val job = viewModelScope.launch {
             try {
-                session.flush(SESSION_FLUSH_TIMEOUT_MS)
+                withContext(NonCancellable) {
+                    session.close()
+                }
             } catch (_: Exception) {
-                // Bounded: timeout or flush failure still falls through to
-                // close below. A scope-teardown CancellationException is
-                // absorbed here on purpose: close() below is the teardown
-                // that matters and still runs under NonCancellable.
+            }
+            try {
+                session.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
+            } catch (_: Exception) {
+                // Bounded: timeout or flush failure still leaves the session
+                // sealed via close above. A scope-teardown
+                // CancellationException is absorbed here on purpose: close()
+                // above is the teardown that matters and still runs under
+                // NonCancellable.
             }
             try {
                 withContext(NonCancellable) {
@@ -2714,22 +2965,150 @@ class ChatViewModel(
             } catch (_: Exception) {
             }
         }
+        return job
     }
 
     /**
-     * Detach + bounded flush-then-close for explicit lifecycle resets
+     * R6-3 IO-bounded settle for a just-detached old session: close (settle)
+     * then durable flush, one [SESSION_FLUSH_TIMEOUT_MS] budget per phase
+     * (~2x total after close). Returns true only when the drain completed AND
+     * no durable failure was recorded; false (timeout / flushDurable false /
+     * store throw) means the fork must degrade via the incomplete path (see
+     * `ensureSession`). Caller cancellation still propagates.
+     */
+    private suspend fun closeThenFlushDurable(
+        session: ChatSession,
+        perPhaseTimeoutMs: Long = SESSION_FLUSH_TIMEOUT_MS,
+    ): Boolean {
+        try {
+            withContext(NonCancellable) {
+                session.close()
+            }
+        } catch (_: Exception) {
+        }
+        return try {
+            session.flushDurable(perPhaseTimeoutMs)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * R6-3 (a) cancel re-park for the endpoint-switch fork fence. Runs on
+     * Main under [sessionMutex] (same confinement as [pendingLedgerFence]):
+     * the caller consumed the parked fence and detached the mismatched
+     * session before its IO section was lifecycle-cancelled, so neither
+     * settle completed — park them again for the next fork instead of losing
+     * the join evidence and the streaming flag.
+     *
+     * The just-detached mismatched session has no background teardown yet
+     * (its inline settle was interrupted), so it gets one here via
+     * [launchCloseThenFlush] on [viewModelScope] (survives the cancelled
+     * generation); the prior parked job ([fencedJob], already on
+     * [viewModelScope]) keeps running untouched, and the combined fence joins
+     * both. Only the mismatched session is re-parked for the next fork's
+     * bounded re-check: it owns the previous ledger (the one the next fork
+     * snapshots); the older fenced session keeps draining via its own
+     * background job, unfenced. `wasStreaming` is OR'd so the next fork still
+     * degrades instead of copying a possibly-dangling family.
+     *
+     * Defensive merge: the slot must be empty here (nothing can park while
+     * the fork holds the mutex on a current generation — a concurrent
+     * clearChat bumps the generation and the caller re-parks only when
+     * current), but a newer park is never dropped if one appears: its
+     * evidence is OR'd and the leftover only background-settles.
+     */
+    private fun reparkUnsettledLedger(
+        fencedJob: Job?,
+        fencedSession: ChatSession?,
+        fencedWasStreaming: Boolean,
+        mismatched: ChatSession?,
+        mismatchedWasStreaming: Boolean,
+    ) {
+        val wasStreaming = fencedWasStreaming || mismatchedWasStreaming
+        if (pendingLedgerFence == null && pendingLedgerSession == null) {
+            val settleJob = mismatched?.let { launchCloseThenFlush(it) }
+            pendingLedgerFence = when {
+                fencedJob != null && settleJob != null -> viewModelScope.launch {
+                    try {
+                        fencedJob.join()
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        settleJob.join()
+                    } catch (_: Exception) {
+                    }
+                }
+                fencedJob != null -> fencedJob
+                else -> settleJob
+            }
+            pendingLedgerSession = mismatched ?: fencedSession
+            pendingLedgerWasStreaming = wasStreaming
+        } else {
+            pendingLedgerWasStreaming = pendingLedgerWasStreaming || wasStreaming
+            if (mismatched != null) launchCloseThenFlush(mismatched)
+        }
+    }
+
+    /**
+     * R6-3 streaming evidence for the incomplete fallback: true while the old
+     * session may still be missing its terminal record — live STREAMING /
+     * CANCELLED / WAITING_STEERED projection, a pending UNKNOWN admission, or
+     * admitted-but-unacked core runIds. Best-effort (never throws): a failed
+     * read means "no evidence", never "incomplete".
+     */
+    private fun isLedgerStreamingOrPending(session: ChatSession?): Boolean {
+        if (session == null) return false
+        try {
+            when (session.uiState.value.status) {
+                ChatStatus.STREAMING, ChatStatus.CANCELLED, ChatStatus.WAITING_STEERED -> return true
+                else -> Unit
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            if (session.hasPendingAdmission()) return true
+        } catch (_: Exception) {
+        }
+        return try {
+            session.pendingTranscriptRunIds().isNotEmpty()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Detach + bounded close-then-flush for explicit lifecycle resets
      * (newChat / openSession pre-clear) and endpoint switches. Thin wrapper
      * over [detachAndFlushClose]: the live turn is cancelled synchronously
      * and VM state is detached synchronously so the UI updates immediately,
-     * while the detached session flushes (bounded) before its background
-     * close. Callers cancel lifecycle operations first
+     * while the detached session closes (settle) before its background
+     * durable flush (R6-3 order). The teardown job + streaming evidence are
+     * parked in [pendingLedgerFence]/[pendingLedgerSession] so the next
+     * `ensureSession` fork fences on them before reading the old ledger.
+     * Callers cancel lifecycle operations first
      * ([cancelLifecycleOperations] before this call); that order is load
      * bearing — the teardown launch below lives on [viewModelScope], not the
      * just-invalidated lifecycle scope, so it survives the cancel above.
      */
     private fun releaseLiveAfterBoundedFlush() {
         val detached = currentSession ?: return
-        detachAndFlushClose(detached)
+        val wasStreaming = isLedgerStreamingOrPending(detached)
+        val fence = detachAndFlushClose(detached)
+        // Park for the next fork's IO fence. Overwriting an older unconsumed
+        // fence here is deliberate supersede, not a leak: the slot's consumer
+        // (the next ensureSession fork) snapshots only the latest
+        // previousSessionId's ledger, so an older parked ledger is irrelevant
+        // to it — and with the (b) clears above an overwrite no longer occurs
+        // on the open/newChat paths (the slot is empty there). The displaced
+        // job is NOT cancelled: it keeps running on viewModelScope to
+        // durability (close seals under NonCancellable, flush is bounded),
+        // just unfenced — the next fork only awaits the latest ledger.
+        pendingLedgerFence = fence
+        pendingLedgerSession = detached
+        pendingLedgerWasStreaming = wasStreaming
     }
 
     private suspend fun loadHistory(sessionId: String): LoadedUiHistory? {

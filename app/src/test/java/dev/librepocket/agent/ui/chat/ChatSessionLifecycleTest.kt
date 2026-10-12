@@ -272,12 +272,14 @@ class ChatSessionLifecycleTest {
         }
     }
 
-    // Phase 2 ledger wiring: an endpoint switch flushes the detached live
-    // session before closing it. The detach is synchronous (the UI never
-    // waits); flush-then-close runs bounded in the background, strictly in
-    // that order. The outbox recovery contract is unchanged.
+    // Phase 2 ledger wiring, R6-3 order: an endpoint switch closes (settle,
+    // includes the doomed-host terminal admission) the detached live session
+    // strictly before its durable flush. The detach is synchronous (the UI
+    // never waits); close-then-flush runs bounded in the background, strictly
+    // in that order (a bare flush alone would miss an unreserved cancel
+    // terminal). The outbox recovery contract is unchanged.
     @Test
-    fun endpointSwitchFlushesLiveSessionBeforeClose() = runBlocking {
+    fun endpointSwitchClosesLiveSessionBeforeFlush() = runBlocking {
         val store = newStore()
         store.save(endpoint())
         val sessions = ControlledSessions()
@@ -291,7 +293,12 @@ class ChatSessionLifecycleTest {
 
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { live.closed.await() }
-            assertEquals(listOf("flush", "close"), live.lifecycle.toList())
+            // R6-3 is close-then-flush: closed completes inside close() before
+            // the background flush runs, so await the flush barrier before
+            // asserting the strict order (awaiting closed alone races flush).
+            withTimeout(5_000) { while (live.flushCalls.get() != 1) delay(1) }
+            withTimeout(5_000) { while (live.lifecycle.size < 2) delay(1) }
+            assertEquals(listOf("close", "flush"), live.lifecycle.toList())
             assertEquals(1, live.flushCalls.get())
             assertEquals(1, live.closeCalls.get())
             assertEquals(listOf("first"), live.sent.toList())
@@ -3852,7 +3859,9 @@ class ChatSessionLifecycleTest {
         val steerReceived = CompletableDeferred<String>()
         val closeCalls = AtomicInteger()
         val cancelCalls = AtomicInteger()
-        // Phase 2 flush-before-close order record ("flush" must precede "close").
+        // R6-3 close-before-flush order record ("close" must precede "flush":
+        // close settles the doomed host so its terminal is admitted ahead of
+        // the flush barrier; a bare flush alone would miss it).
         val flushCalls = AtomicInteger()
         val lifecycle = CopyOnWriteArrayList<String>()
         @Volatile

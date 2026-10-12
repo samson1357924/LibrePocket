@@ -101,6 +101,9 @@ class ChatSessionImpl(
 
   override fun hasPendingAdmission(): Boolean = controller.hasPendingAdmission()
 
+  /** R6-3: live pending core set for the streaming-switch fence (see [ChatSession.pendingTranscriptRunIds]). */
+  override fun pendingTranscriptRunIds(): List<String> = controller.pendingTranscriptRunIds()
+
   override fun close() {
     controller.close()
     sessionScope.cancel()

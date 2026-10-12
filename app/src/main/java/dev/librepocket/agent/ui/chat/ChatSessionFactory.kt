@@ -1114,9 +1114,22 @@ private const val SNAPSHOT_INCOMPLETE_SCAN_LIMIT = 16
  * hidden-from-replay / visible-in-export shape as the switch marker, with a
  * distinct `snapshot incomplete ` prefix so the two scans never confuse
  * each other.
+ *
+ * R6-3 cause tag ([reason]): the scan ([hasIncompleteSnapshotMarker]) stays
+ * deliberately prefix-based and cause-agnostic — every cause re-warns the
+ * same HISTORY_SNAPSHOT_INCOMPLETE notice — but the suffix names the cause
+ * honestly instead of always claiming the copy failed:
+ * - `"copy failed"` (default): the atomic batch itself threw, so the fork
+ *   holds zero snapshot rows (appended best-effort by the caller's catch).
+ * - `"ledger unsettled"`: the copy succeeded but the pre-copy fence failed
+ *   (old ledger may still miss its terminal), so the marker rode inside the
+ *   same atomic batch ([snapshotSwitchHistory] with `markIncomplete`).
+ * - `"dangling excluded"`: the copy succeeded minus dropped dangling
+ *   families ([snapshotSwitchHistory] auto-marks when a family is skipped),
+ *   so "copy failed" would mislead — the rows landed, one family didn't.
  */
-internal fun snapshotIncompleteMarkerText(oldModel: String, newModel: String): String =
-    "snapshot incomplete $oldModel -> $newModel [history incomplete: copy failed]"
+internal fun snapshotIncompleteMarkerText(oldModel: String, newModel: String, reason: String = "copy failed"): String =
+    "snapshot incomplete $oldModel -> $newModel [history incomplete: $reason]"
 
 internal fun isSnapshotIncompleteMarker(text: String): Boolean =
     text.startsWith("snapshot incomplete ")
@@ -1129,7 +1142,11 @@ internal fun isSnapshotIncompleteMarker(text: String): Boolean =
  * row 1 (head); a non-atomic fallback store (default
  * [dev.librepocket.session.SessionStore.appendEvents]) may leave a partial
  * prefix with the marker trailing it (tail). Best-effort callers swallow
- * failures as "no marker" (only the notice is at stake).
+ * failures as "no marker" (only the notice is at stake). The scan matches
+ * only the `snapshot incomplete ` prefix, so every [reason] cause
+ * (`copy failed` / `ledger unsettled` / `dangling excluded`, see
+ * [snapshotIncompleteMarkerText]) re-warns the same notice — causes are not
+ * distinguished here by design.
  */
 internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId: String): Boolean {
     val head = store.loadEvents(sessionId, 0, SNAPSHOT_INCOMPLETE_SCAN_LIMIT)
@@ -1222,6 +1239,25 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * any other write.
  *
  * @return number of history rows copied (0 when withheld).
+ *
+ * R6-3 streaming-switch hardening (no schema change):
+ * - [excludeDanglingFamilies]: when true, families that dangle inside the
+ *   loaded prefix ([findDanglingRunIds]) are dropped before the copy, so a
+ *   fork taken while the old live turn had not settled yet never copies an
+ *   orphan `user(L)` that the reopen backfill would mis-stamp as INTERRUPTED
+ *   (degrades to pre-R4-2: new rows only for that family, with the warning
+ *   below). No-op when the prefix has no dangling families.
+ * - [markIncomplete]: when true, one system incomplete row
+ *   ([snapshotIncompleteMarkerText] with reason `"ledger unsettled"`) rides
+ *   inside the SAME atomic batch right after the switch marker, so a later
+ *   `openSession` re-surfaces HISTORY_SNAPSHOT_INCOMPLETE even though the
+ *   copy itself succeeded. The incomplete marker is deliberately NOT a
+ *   [findDanglingRunIds] terminal, so callers must combine it with
+ *   [excludeDanglingFamilies] (otherwise the orphan copy would still gain a
+ *   false INTERRUPTED on reopen).
+ *   A dropped-dangling copy also forces the incomplete row even when
+ *   [markIncomplete] is false (reason `"dangling excluded"`, since the copy
+ *   itself landed): losing a family silently must still warn.
  */
 internal suspend fun snapshotSwitchHistory(
     store: SessionStore,
@@ -1231,6 +1267,8 @@ internal suspend fun snapshotSwitchHistory(
     newModel: String,
     historyWithheld: Boolean,
     nowMillis: Long = System.currentTimeMillis(),
+    excludeDanglingFamilies: Boolean = false,
+    markIncomplete: Boolean = false,
 ): Int {
     require(fromSessionId != toSessionId) { "snapshot source and destination must differ" }
     // R5-4: read the whole prefix BEFORE writing anything, then persist
@@ -1238,8 +1276,21 @@ internal suspend fun snapshotSwitchHistory(
     // snapshot-rollback on the fake). The marker rides inside the same batch
     // so a marker-write failure also leaves zero rows — never a marker-only
     // or half-copied ledger.
-    val prefix = if (historyWithheld) emptyList() else loadSwitchSnapshotEvents(store, fromSessionId)
-    val batch = ArrayList<TranscriptEvent>(prefix.size + 1)
+    val loaded = if (historyWithheld) emptyList() else loadSwitchSnapshotEvents(store, fromSessionId)
+    // R6-3: drop orphan families before the copy (see above). Withheld forks
+    // already copy zero rows, so this is a no-op there.
+    val prefix: List<TranscriptEvent> = if (excludeDanglingFamilies && loaded.isNotEmpty()) {
+        val dangling = findDanglingRunIds(loaded).toSet()
+        if (dangling.isEmpty()) loaded else loaded.filterNot { familyOf(it) in dangling }
+    } else {
+        loaded
+    }
+    val droppedDangling = loaded.size - prefix.size
+    val incomplete = markIncomplete || droppedDangling > 0
+    // R6-3 cause tag (see snapshotIncompleteMarkerText): a fence failure
+    // outranks a drop — when both hold, the ledger may miss its terminal.
+    val incompleteReason = if (markIncomplete) "ledger unsettled" else "dangling excluded"
+    val batch = ArrayList<TranscriptEvent>(prefix.size + 2)
     batch.add(
         TranscriptEvent(
             sessionId = toSessionId,
@@ -1249,6 +1300,17 @@ internal suspend fun snapshotSwitchHistory(
             createdAt = nowMillis,
         ),
     )
+    if (incomplete) {
+        batch.add(
+            TranscriptEvent(
+                sessionId = toSessionId,
+                runId = "snapshot-incomplete-${java.util.UUID.randomUUID()}",
+                kind = SNAPSHOT_INCOMPLETE_MARKER_KIND,
+                text = snapshotIncompleteMarkerText(oldModel, newModel, incompleteReason),
+                createdAt = nowMillis,
+            ),
+        )
+    }
     for (event in prefix) {
         batch.add(event.copy(seq = 0, sessionId = toSessionId))
     }

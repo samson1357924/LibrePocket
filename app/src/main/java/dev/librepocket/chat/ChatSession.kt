@@ -136,6 +136,17 @@ interface ChatSession {
   /** R5-1: true while an UNKNOWN admission still owns the single-flight slot. */
   fun hasPendingAdmission(): Boolean = false
 
+  /**
+   * R6-3 streaming-switch fence: core runIds admitted but still awaiting the
+   * session writer. Non-empty means the old ledger may still be missing its
+   * cancel terminal (the doomed host has not settled yet), so a same-origin
+   * fork must await settle + durable flush before reading the ledger and must
+   * degrade (skip dangling families + incomplete marker) when the wait fails.
+   * Default is empty so test fakes stay source-compatible; production
+   * ([ChatSessionImpl]) overrides with the live controller set.
+   */
+  fun pendingTranscriptRunIds(): List<String> = emptyList()
+
   /** Release (close HTTP call, drop queue). */
   fun close()
 }

@@ -428,28 +428,31 @@ class SetupViewModel(
             // Same-VM serialization with privileged logout teardown. Held only
             // for the duration of one save attempt: dialog-pending paths return
             // (releasing the mutex) and the confirm tap re-acquires it.
-            // saveMutex.withLock releases on cancellation (verified); no extra
-            // handling needed here beyond unsticking `saving`.
-            saveMutex.withLock {
-                try {
+            // saveMutex.withLock releases on cancellation (verified). The
+            // try-catch sits OUTSIDE withLock so a cancel while QUEUED for the
+            // mutex (lambda never entered) still unsticks `saving`; an
+            // inner-only catch would leave saving=true in that window.
+            try {
+                saveMutex.withLock {
                     executeKeyWrite(cur, effectiveBaseUrl, consent, entryRevision)
-                } catch (e: CancellationException) {
-                    // Any cancel path (VM alive) must unstick saving and must
-                    // NOT mask the cancel with POLICY_DENIED. StateFlow copy is
-                    // non-suspending and safe under cancellation. Committed
-                    // cancels are already swallowed to saved=true inside
-                    // executeKeyWrite; only uncommitted/unknown cancels reach
-                    // here. Awaiting callers observe saving==false + rethrow.
-                    // (Dedicated SAVE_CANCELLED code is a UX follow-up; at
-                    // minimum never leave saving=true.)
-                    _form.value = _form.value.copy(saving = false)
-                    throw e
-                } catch (e: IllegalArgumentException) {
-                    _form.value = _form.value.copy(saving = false, errorCode = e.message ?: "SETUP_SAVE_FAILED")
-                } catch (e: Exception) {
-                    if (e is CancellationException) throw e
-                    _form.value = _form.value.copy(saving = false, errorCode = "SETUP_SAVE_FAILED")
                 }
+            } catch (e: CancellationException) {
+                // Any cancel path (VM alive) must unstick saving and must
+                // NOT mask the cancel with POLICY_DENIED. StateFlow copy is
+                // non-suspending and safe under cancellation. Committed
+                // cancels are already swallowed to saved=true inside
+                // executeKeyWrite; only uncommitted/unknown cancels reach
+                // here, including withLock-wait cancels. Awaiting callers
+                // observe saving==false + rethrow.
+                // (Dedicated SAVE_CANCELLED code is a UX follow-up; at
+                // minimum never leave saving=true.)
+                _form.value = _form.value.copy(saving = false)
+                throw e
+            } catch (e: IllegalArgumentException) {
+                _form.value = _form.value.copy(saving = false, errorCode = e.message ?: "SETUP_SAVE_FAILED")
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _form.value = _form.value.copy(saving = false, errorCode = "SETUP_SAVE_FAILED")
             }
         }
     }

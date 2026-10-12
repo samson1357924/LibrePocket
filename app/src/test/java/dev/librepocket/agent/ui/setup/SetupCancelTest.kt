@@ -775,5 +775,77 @@ class SetupCancelTest {
         cancelAssertVaultKeyEquals(vault, staged, "unit-test-new-key-abcdef")
         assertEquals(EndpointReadiness.READY, store.readiness(vault))
     }
+
+    // ---- T6: cancel while QUEUED for saveMutex (logout holder) resets saving ----
+    // R1: same VM + same mutex; the second save is issued while logout holds
+    // the lock (saving guard requires issuing under the holder).
+
+    @Test
+    fun t6MutexWaitCancelResetsSaving() = runBlocking {
+        val policy = SuspendPolicy(Verdict.ALLOW)
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        val vault = GatedDeleteVault(delegate = delegate, gateDelete = true)
+        val (vm, _, store) = newVm(policy, vault)
+        delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+        store.save(cancelPreseed())
+        val beforeMeta = store.observe().first()
+        val beforeRev = store.currentRevision()
+        // Logout acquires saveMutex and blocks inside deleteKey, holding the lock.
+        val logoutDone = CompletableDeferred<Unit>()
+        vm.logout { logoutDone.complete(Unit) }
+        awaitGate(vault.deleteEntered)
+        // Issue the save while the holder still holds the lock: saving=true and
+        // JobB parks on saveMutex.withLock (never enters executeKeyWrite).
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        awaitSaving(vm)
+        assertTrue(vm.form.value.saving)
+        // Let JobB reach the mutex queue while the holder stays blocked; the
+        // holder never releases in this window, so JobB cannot have acquired
+        // the lock and any cancel below is a withLock-wait cancel by
+        // construction. putKeys==0 confirms executeKeyWrite was never entered.
+        delay(250)
+        assertTrue(vm.form.value.saving)
+        val jobB = vm.lastSaveJobForTest ?: error("no save job")
+        assertTrue(jobB.isActive)
+        assertEquals(0, vault.putKeys)
+        assertTrue(vault.putIds.isEmpty())
+        // Cancel while queued: outer try-catch (outside withLock) must unstick
+        // saving; an inner-only catch would leave saving=true here.
+        jobB.cancel()
+        jobB.join()
+        assertFalse(vm.form.value.saving)
+        assertNull(vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertEquals(0, vault.putKeys)
+        assertTrue(vault.putIds.isEmpty())
+        // Only the holder's pending delete is staged; no save-side staged alias.
+        assertEquals(listOf("preset:openai"), vault.deletedIds)
+        assertTrue(store.hasMetadata())
+        assertEquals(beforeMeta, store.observe().first())
+        assertEquals(beforeRev, store.currentRevision())
+        cancelAssertVaultKeyEquals(delegate, "preset:openai", "unit-test-old-key-123456")
+        // Release the holder and await logout teardown.
+        vault.gateDelete = false
+        vault.deleteRelease.complete(Unit)
+        withTimeout(10_000) { logoutDone.await() }
+        assertFalse(store.hasMetadata())
+        // Same VM remains reusable: retype (logout reset the form) and save to
+        // READY with rev+1 over the post-logout tombstone revision.
+        val revAfterLogout = store.currentRevision()
+        vm.onApiKeyChange("unit-test-new-key-abcdef")
+        vm.save()
+        awaitSettledSave(vm)
+        assertFalse(vm.form.value.saving)
+        assertNull(vm.form.value.errorCode)
+        assertTrue(vm.form.value.saved)
+        assertEquals(1, vault.putKeys)
+        assertTrue(store.hasMetadata())
+        assertEquals((revAfterLogout ?: 0L) + 1L, store.currentRevision())
+        val staged = vault.putIds.single()
+        assertEquals("provider_key/$staged", store.observe().first()!!.apiKeyRef)
+        cancelAssertVaultKeyEquals(delegate, staged, "unit-test-new-key-abcdef")
+        assertEquals(EndpointReadiness.READY, store.readiness(delegate))
+    }
 }
 

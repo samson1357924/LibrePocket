@@ -466,4 +466,148 @@ class ChatSessionFactorySwitchStreamingTest {
             rows(transcripts, s2).singleOrNull { it.text == "turn L interrupted" },
         )
     }
+
+    /**
+     * R8-2 consecutive-switch fence: M1 streams (cancel terminal blocked in
+     * provider cleanup), M1->M2 parks the S1 fence, the M2 fork blocks on it,
+     * then M2->M3 invalidates again while still blocked. The M2 cancel must
+     * not drop the S1 fence (generation bump is transport replacement, not
+     * history abandonment): the M3 fork still joins it, so S3 copies the
+     * settled terminal (or degrades to incomplete) and a double reopen of S3
+     * gains zero false INTERRUPTED markers.
+     */
+    @Test fun doubleSwitchWhileFenceBlocked_noLostFence_noFalseInterrupted() = runBlocking {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = FakeSessionStore()
+        val streamGate = CompletableDeferred<Unit>()
+        val cleanupGate = CompletableDeferred<Unit>()
+        val fake = StreamingStuckProvider(streamGate, cleanupGate)
+        val factory = factoryWith(transcripts, fake)
+        val vm = newVm(store, transcripts, fake)
+        val m3 = sampleEndpoint().copy(model = "gpt-4-turbo")
+        try {
+            // 1. M1 streaming stuck: DB only user L, UI has partial.
+            onMain { vm.sendDirect("q-cancel") }
+            awaitTrue { vm.currentSessionId.value != null }
+            val s1 = vm.currentSessionId.value!!
+            awaitTrue { vm.messages.value.any { it.text == "half-cancelled" } }
+            awaitTrue { vm.sessionState.value.status == ChatStatus.STREAMING }
+            awaitTrue { rows(transcripts, s1).any { it.kind == "user" && it.text.startsWith("q-cancel") } }
+            assertTrue(
+                "cancel terminal must not be durable yet",
+                rows(transcripts, s1).none { it.kind == "assistant" },
+            )
+
+            // 2. M1->M2 parks the S1 fence (invalidate, still blocked).
+            runBlocking { store.save(sampleEndpoint().copy(model = "gpt-4o")) }
+            awaitTrue { vm.sessionState.value.messages.isEmpty() }
+
+            // 3. M2 fork starts and fences on the blocked settle.
+            onMain { vm.sendDirect("q-next") }
+            delay(500)
+            assertEquals(
+                "fork must fence on old settle (still S1 while cancel blocked)",
+                s1,
+                vm.currentSessionId.value,
+            )
+
+            // 4. M2->M3 consecutive switch while the fence is still blocked.
+            // Same origin (copies), different binding (invalidates). This
+            // cancels the M2 fork: with the R8-2 fix it re-parks the S1 fence
+            // instead of dropping it as "gen-stale".
+            runBlocking { store.save(m3) }
+            // Let the M3 invalidation land and the M2 fork cancel+repark
+            // before driving the M3 fork (a send racing the invalidation
+            // would authorize on the dead M2 generation and die with it).
+            delay(2000)
+            onMain { vm.sendDirect("q-next") }
+            delay(500)
+            assertEquals(
+                "M2 cancel must not lose the S1 fence (M3 fork still fenced)",
+                s1,
+                vm.currentSessionId.value,
+            )
+
+            // 5. Release: old terminal settles to S1 only, M3 fork copies it.
+            cleanupGate.complete(Unit)
+            streamGate.complete(Unit)
+            // The M3 fork above is fenced on the released settle and attaches
+            // S3. If the step-4 send raced the M3 invalidation (authorized on
+            // the dead M2 generation, died with it), no fork is live after
+            // the release — drive the M3 fork explicitly, once, mid-wait.
+            // Idempotent when the fenced fork already won (S3 attached: the
+            // resend just chats on S3).
+            val attachEnd = System.currentTimeMillis() + 15000
+            var resent = false
+            while (vm.currentSessionId.value == s1) {
+                if (System.currentTimeMillis() > attachEnd) {
+                    error("timed out waiting for M3 fork to attach S3")
+                }
+                if (!resent && System.currentTimeMillis() > attachEnd - 9000) {
+                    resent = true
+                    onMain { vm.sendDirect("q-next") }
+                }
+                delay(50)
+            }
+            val s3 = vm.currentSessionId.value!!
+            awaitTrue(timeoutMs = 15000) { vm.messages.value.any { it.text == "a-next" } }
+            awaitTrue(timeoutMs = 10000) {
+                rows(transcripts, s1).count { it.kind == "assistant" } == 1
+            }
+            val s1rows = rows(transcripts, s1)
+            assertEquals(listOf("user", "assistant"), s1rows.map { it.kind })
+            assertTrue(s1rows[0].text.startsWith("q-cancel"))
+            assertEquals("half-cancelled", s1rows[1].text)
+            assertTrue(s1rows[1].isPartial && s1rows[1].isFinal)
+
+            // S3 holds the carried terminal (clean copy) or the degraded
+            // incomplete marker — never a dangling family that would gain a
+            // false INTERRUPTED on reopen.
+            awaitTrue(timeoutMs = 10000) { rows(transcripts, s3).isNotEmpty() }
+            val s3rows = rows(transcripts, s3)
+            assertTrue(s3rows[0].kind == "system" && s3rows[0].text.startsWith("model switched "))
+            if (s3rows.none { it.text.startsWith("snapshot incomplete ") }) {
+                val copiedUser = s3rows.single { it.kind == "user" && it.text.startsWith("q-cancel") }
+                assertEquals(s1rows[0].runId, copiedUser.runId)
+                val copiedAsst = s3rows.single { it.kind == "assistant" && it.text == "half-cancelled" }
+                assertEquals(s1rows[1].runId, copiedAsst.runId)
+                assertTrue(copiedAsst.isPartial && copiedAsst.isFinal)
+            } else {
+                assertTrue(
+                    "incomplete fallback must skip the dangling family",
+                    s3rows.none { it.kind == "user" && it.text.startsWith("q-cancel") },
+                )
+            }
+            assertTrue(findDanglingRunIds(s3rows).isEmpty())
+
+            // Old terminal landed in S1 only (S3 holds copies under its own id).
+            assertTrue(s1rows.all { it.sessionId == s1 })
+            assertTrue(rows(transcripts, s3).all { it.sessionId == s3 })
+
+            // Reopen S3 twice: zero new INTERRUPTED markers, no dangling.
+            val before = interruptedMarkers(transcripts, s3).size
+            val opened1 = factory.open(m3, s3)
+            try {
+                assertEquals(before, interruptedMarkers(transcripts, s3).size)
+                assertTrue(findDanglingRunIds(rows(transcripts, s3)).isEmpty())
+            } finally {
+                opened1.session.close()
+            }
+            val opened2 = factory.open(m3, s3)
+            try {
+                assertEquals(before, interruptedMarkers(transcripts, s3).size)
+                assertTrue(findDanglingRunIds(rows(transcripts, s3)).isEmpty())
+            } finally {
+                opened2.session.close()
+            }
+            assertNull(
+                "reopen must not add a false INTERRUPTED for the carried family",
+                rows(transcripts, s3).singleOrNull { it.text == "turn L interrupted" },
+            )
+        } finally {
+            streamGate.complete(Unit)
+            cleanupGate.complete(Unit)
+        }
+    }
 }

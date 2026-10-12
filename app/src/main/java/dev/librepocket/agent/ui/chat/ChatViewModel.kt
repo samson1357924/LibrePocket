@@ -367,11 +367,26 @@ class ChatViewModel(
      * before its settle completes re-parks the unfinished ledger
      * ([reparkUnsettledLedger]); a fork whose history was discarded instead
      * drops it ([invalidateLifecycle] with `clearChat`, `openSession` after
-     * attach) so a later unrelated fork never joins an ancient job.
+     * attach, or [invalidateForEndpointChange] with `binding == null`) so a
+     * later unrelated fork never joins an ancient job.
+     *
+     * R8-2: the fence lifecycle is decoupled from [lifecycleGeneration]. A
+     * non-null endpoint switch only replaces the transport ([binding] != null
+     * keeps `_currentSessionId`/`_history`); it hands the fence over, never
+     * drops it. Only an explicit history discard (clearChat, openSession
+     * attach, binding == null) clears the slot. [pendingLedgerOwnerSessionId]
+     * is the `_currentSessionId` at park time (the ledger the next fork
+     * snapshots: the lineage the consume re-fills on re-park). The cancel
+     * re-park decision itself uses the caller's [explicitDiscardEpoch]
+     * snapshot (`entryDiscardEpoch` in `ensureSession`, taken before any
+     * suspension) plus `_currentSessionId == previousSessionId` — "same
+     * epoch" (no discard crossed) or "same owner" (snapshot target intact)
+     * re-parks, otherwise the ledger is dropped as abandoned.
      */
     private var pendingLedgerFence: Job? = null
     private var pendingLedgerSession: ChatSession? = null
     private var pendingLedgerWasStreaming: Boolean = false
+    private var pendingLedgerOwnerSessionId: String? = null
     // R2: unsent texts are owned per send/steer operation, never by a single
     // global String. Cleared only when the controller accepts that exact op
     // (startOrEnqueue Started/Queued verdict); pre-accept endpoint
@@ -1371,9 +1386,11 @@ class ChatViewModel(
                     // attach window): otherwise the next fork would join an
                     // ancient job, re-flush a long-sealed session, and OR
                     // ancient wasStreaming into a new INCOMPLETE decision.
+                    // R8-2: the owner lineage goes with it.
                     pendingLedgerFence = null
                     pendingLedgerSession = null
                     pendingLedgerWasStreaming = false
+                    pendingLedgerOwnerSessionId = null
                     // Stage D: a cross-provider resume keeps the local replay
                     // but withholds the model prefix; say so visibly instead
                     // of resuming silently on a blank context.
@@ -1723,10 +1740,15 @@ class ChatViewModel(
      * block (zero behavior change).
      *
      * Must be called with sessionMutex held. The caller holds the mutex across
-     * this call; this callee never takes it. [generation] is a value snapshot
-     * taken by the caller; the cancel re-park below uses that same snapshot
-     * (gen-stale means a concurrent clearChat discarded the history, so drop
-     * instead of resurrecting it). [providerId]/[baseUrl] are the endpoint
+     * this call; this callee never takes it. [entryDiscardEpoch] snapshots
+     * [explicitDiscardEpoch] before any suspension. The cancel re-park below
+     * is discard-scoped, not
+     * generation-scoped (R8-2): a non-null endpoint switch bumps the
+     * generation but keeps the history, so the fence must be re-parked; only
+     * an explicit discard (explicitDiscardEpoch moved, or the snapshot target
+     * itself is gone) drops it. [fencedOwnerSessionId] is the slot owner at
+     * consume time, re-filled on re-park so the next fork keeps the ledger
+     * lineage. [providerId]/[baseUrl] are the endpoint
      * identity snapshot (effective baseUrl via `toProviderConfig()` at the
      * call site). The pending-ledger inputs are passed by value with one-time
      * ownership (the caller already cleared the slots). Only store I/O plus
@@ -1734,13 +1756,14 @@ class ChatViewModel(
      * caller back on Main.
      */
     private suspend fun settleDetachedLedger(
-        generation: Long,
         previousSessionId: String?,
         providerId: String,
         baseUrl: String,
         fencedJob: Job?,
         fencedSession: ChatSession?,
         fencedWasStreaming: Boolean,
+        fencedOwnerSessionId: String?,
+        entryDiscardEpoch: Long,
         mismatchedForSettle: ChatSession?,
         mismatchedWasStreaming: Boolean,
     ): SettledFork {
@@ -1755,9 +1778,9 @@ class ChatViewModel(
         // CancellationException, the mutex releases, and the locals would
         // be lost (next fork: no fence to join, wasStreaming evidence
         // gone). So a cancellation before [fenceSettled] re-parks the
-        // unfinished ledger below — gen-current only (gen-stale means a
-        // concurrent clearChat discarded the history, so drop instead of
-        // resurrecting it).
+        // unfinished ledger below — R8-2 discard-scoped (explicit history
+        // abandon drops; a bare transport replacement re-parks even though
+        // the generation moved).
         var fenceSettled = false
         val read = try {
             withContext(Dispatchers.IO) {
@@ -1846,17 +1869,25 @@ class ChatViewModel(
                 )
             }
         } catch (cancelled: CancellationException) {
-            // R6-3 (a): re-park the unfinished ledger so the next fork
+            // R6-3 (a) + R8-2: re-park the unfinished ledger so the next fork
             // still fences it (see reparkUnsettledLedger). Back on Main
             // here with the mutex still held — same confinement as the
-            // pendingLedger* fields. Gen-stale (concurrent clearChat):
-            // the history is gone, so drop and let the next fork start
-            // clean instead of joining an ancient job.
-            if (!fenceSettled && isGenerationCurrent(generation)) {
+            // pendingLedger* fields. Discard-scoped, NOT generation-scoped:
+            // a concurrent non-null endpoint switch bumps lifecycleGeneration
+            // but keeps the history (owner still the snapshot target), so the
+            // fence must survive for the next fork. Only an explicit history
+            // discard drops: the discard epoch moved AND the snapshot target
+            // is no longer current (clearChat / openSession reset /
+            // binding == null). Either "same epoch" (no discard crossed) or
+            // "same owner" (snapshot target intact) re-parks.
+            if (!fenceSettled &&
+                (explicitDiscardEpoch == entryDiscardEpoch || _currentSessionId.value == previousSessionId)
+            ) {
                 reparkUnsettledLedger(
                     fencedJob,
                     fencedSession,
                     fencedWasStreaming,
+                    fencedOwnerSessionId ?: previousSessionId,
                     mismatchedForSettle,
                     mismatchedWasStreaming,
                 )
@@ -2064,6 +2095,7 @@ class ChatViewModel(
         var fencedJob: Job? = null
         var fencedSession: ChatSession? = null
         var fencedWasStreaming = false
+        var fencedOwnerSessionId: String? = null
         if (currentSession != null) {
             val mismatched = currentSession
             mismatchedWasStreaming = isLedgerStreamingOrPending(mismatched)
@@ -2086,13 +2118,21 @@ class ChatViewModel(
                 mismatchedForSettle = mismatched
             }
             // Consume any prior invalidate-parked fence so the IO phase owns
-            // it exactly once.
+            // it exactly once. R8-2: the slot owner travels with the fence so
+            // a cancel re-park can restore the ledger lineage. Unconditional
+            // consume is safe: the slot is either empty or owned by the
+            // snapshot target below — a non-null switch never changes
+            // _currentSessionId (so owner == previousSessionId), and every
+            // history-abandoning path (clearChat, openSession attach,
+            // binding == null) clears the slot before the next fork.
             fencedJob = pendingLedgerFence
             fencedSession = pendingLedgerSession
             fencedWasStreaming = pendingLedgerWasStreaming
+            fencedOwnerSessionId = pendingLedgerOwnerSessionId
             pendingLedgerFence = null
             pendingLedgerSession = null
             pendingLedgerWasStreaming = false
+            pendingLedgerOwnerSessionId = null
             _sessionState.value = EMPTY_SESSION_STATE
             // R5-5: the detached session's send-time trim no longer applies;
             // zero now so a failed/slow replacement cannot leave a stale badge
@@ -2102,28 +2142,41 @@ class ChatViewModel(
         } else {
             // No live mismatched, but a prior invalidate may have parked a
             // detached ledger whose settle the fork must still fence on.
+            // R8-2: consecutive non-null switches hand the fence over — the
+            // slot survives transport replacement (only an explicit discard
+            // clears it), so a fork racing a second switch still joins the
+            // first ledger's teardown instead of snapshotting early. Same
+            // empty-or-owner guarantee as the consume above.
             fencedJob = pendingLedgerFence
             fencedSession = pendingLedgerSession
             fencedWasStreaming = pendingLedgerWasStreaming
+            fencedOwnerSessionId = pendingLedgerOwnerSessionId
             pendingLedgerFence = null
             pendingLedgerSession = null
             pendingLedgerWasStreaming = false
+            pendingLedgerOwnerSessionId = null
         }
 
         val previousSessionId = _currentSessionId.value
+        // R8-2 (A): snapshot the discard epoch before any suspension. The
+        // settle catch re-parks unless an explicit discard crossed this
+        // point AND the snapshot target is gone — a bare generation bump
+        // (endpoint replacement) must not read as abandonment.
+        val entryDiscardEpoch = explicitDiscardEpoch
         var initialHistory: List<ChatMessage> = emptyList()
         var fork: ForkPrefix? = null
         // PG-S1: fence + read live in settleDetachedLedger (segment C); the
         // outcome locals below are read by the snapshot call, never shared
         // across segments as vars.
         val settled = settleDetachedLedger(
-            generation,
             previousSessionId,
             endpoint.providerId,
             endpoint.toProviderConfig().baseUrl,
             fencedJob,
             fencedSession,
             fencedWasStreaming,
+            fencedOwnerSessionId,
+            entryDiscardEpoch,
             mismatchedForSettle,
             mismatchedWasStreaming,
         )
@@ -2481,6 +2534,18 @@ class ChatViewModel(
         // via snapshotLiveToHistory): the next attach re-emits from zero.
         _requestTrimmedCount.value = 0
         if (binding == null) {
+            // R8-2: no endpoint means the history is abandoned (mirrors
+            // clearChat): the parked fence above — if any — belongs to a
+            // ledger no future fork will snapshot (previousSessionId is
+            // nulled below), so drop the slot instead of letting a later
+            // unrelated fork join an ancient job. The background
+            // close-then-flush keeps running unfenced (durability
+            // unaffected). A non-null switch never lands here: it hands the
+            // fence over via releaseLiveAfterBoundedFlush above.
+            pendingLedgerFence = null
+            pendingLedgerSession = null
+            pendingLedgerWasStreaming = false
+            pendingLedgerOwnerSessionId = null
             _history.value = emptyList()
             _historyOmittedCount.value = 0
             _currentSessionId.value = null
@@ -2618,9 +2683,12 @@ class ChatViewModel(
             // evidence are dropped, so a later unrelated fork never joins an
             // ancient job nor ORs ancient wasStreaming into its INCOMPLETE
             // decision. Non-clearChat resets keep the fence (history kept).
+            // R8-2: the owner lineage is dropped with the slot — an explicit
+            // discard is the only fence destroyer besides consume.
             pendingLedgerFence = null
             pendingLedgerSession = null
             pendingLedgerWasStreaming = false
+            pendingLedgerOwnerSessionId = null
             _history.value = emptyList()
             _historyOmittedCount.value = 0
             // R5-5: the owning session is detached; a later attach restarts
@@ -3157,16 +3225,22 @@ class ChatViewModel(
      * background job, unfenced. `wasStreaming` is OR'd so the next fork still
      * degrades instead of copying a possibly-dangling family.
      *
-     * Defensive merge: the slot must be empty here (nothing can park while
-     * the fork holds the mutex on a current generation — a concurrent
-     * clearChat bumps the generation and the caller re-parks only when
-     * current), but a newer park is never dropped if one appears: its
-     * evidence is OR'd and the leftover only background-settles.
+     * R8-2 owner carry: [ownerSessionId] (the consumed slot owner, falling
+     * back to the fork's snapshot target) is re-filled so the next fork keeps
+     * the ledger lineage across consecutive transport replacements. The slot
+     * must normally be empty here (a concurrent non-null switch with no live
+     * session early-returns in [releaseLiveAfterBoundedFlush] instead of
+     * parking), but a newer park is never dropped if one appears: same-owner
+     * evidence is join-merged (the combined fence awaits every pending job,
+     * so an unresolved same-ledger teardown is never lost); a different-owner
+     * leftover only background-settles unfenced while the newest owner wins
+     * the slot, and `wasStreaming` is always OR'd.
      */
     private fun reparkUnsettledLedger(
         fencedJob: Job?,
         fencedSession: ChatSession?,
         fencedWasStreaming: Boolean,
+        ownerSessionId: String?,
         mismatched: ChatSession?,
         mismatchedWasStreaming: Boolean,
     ) {
@@ -3177,10 +3251,14 @@ class ChatViewModel(
                 fencedJob != null && settleJob != null -> viewModelScope.launch {
                     try {
                         fencedJob.join()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
                     } catch (_: Exception) {
                     }
                     try {
                         settleJob.join()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
                     } catch (_: Exception) {
                     }
                 }
@@ -3189,9 +3267,65 @@ class ChatViewModel(
             }
             pendingLedgerSession = mismatched ?: fencedSession
             pendingLedgerWasStreaming = wasStreaming
+            pendingLedgerOwnerSessionId = ownerSessionId
         } else {
+            // Same-owner unresolved teardown must not be dropped: merge the
+            // join evidence so the next fork still awaits it. Different-owner
+            // leftovers keep draining unfenced; the slot keeps the newest
+            // owner while wasStreaming is always OR'd.
+            val existingFence = pendingLedgerFence
+            val settleJob = mismatched?.let { launchCloseThenFlush(it) }
+            val incomingFence = when {
+                fencedJob != null && settleJob != null -> viewModelScope.launch {
+                    try {
+                        fencedJob.join()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        settleJob.join()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                    }
+                }
+                fencedJob != null -> fencedJob
+                else -> settleJob
+            }
+            val sameOwner = ownerSessionId != null &&
+                pendingLedgerOwnerSessionId != null &&
+                pendingLedgerOwnerSessionId == ownerSessionId
+            pendingLedgerFence = if (sameOwner && existingFence != null && incomingFence != null) {
+                // Same ledger still unsettled: one composite join awaits both
+                // so the next fork fences the full teardown.
+                val prior = existingFence
+                val incoming = incomingFence
+                viewModelScope.launch {
+                    try {
+                        prior.join()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        incoming.join()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                    }
+                }
+            } else {
+                // Different owner (or nothing new to fence): the newest ledger
+                // wins the fence; the displaced job keeps running on
+                // viewModelScope to durability, just unfenced.
+                incomingFence ?: pendingLedgerFence
+            }
+            if (mismatched != null || fencedSession != null) {
+                pendingLedgerSession = mismatched ?: fencedSession ?: pendingLedgerSession
+            }
             pendingLedgerWasStreaming = pendingLedgerWasStreaming || wasStreaming
-            if (mismatched != null) launchCloseThenFlush(mismatched)
+            if (ownerSessionId != null) pendingLedgerOwnerSessionId = ownerSessionId
         }
     }
 
@@ -3237,21 +3371,58 @@ class ChatViewModel(
      * just-invalidated lifecycle scope, so it survives the cancel above.
      */
     private fun releaseLiveAfterBoundedFlush() {
+        val ownerAtPark = _currentSessionId.value
         val detached = currentSession ?: return
         val wasStreaming = isLedgerStreamingOrPending(detached)
         val fence = detachAndFlushClose(detached)
-        // Park for the next fork's IO fence. Overwriting an older unconsumed
-        // fence here is deliberate supersede, not a leak: the slot's consumer
-        // (the next ensureSession fork) snapshots only the latest
-        // previousSessionId's ledger, so an older parked ledger is irrelevant
-        // to it — and with the (b) clears above an overwrite no longer occurs
-        // on the open/newChat paths (the slot is empty there). The displaced
-        // job is NOT cancelled: it keeps running on viewModelScope to
-        // durability (close seals under NonCancellable, flush is bounded),
-        // just unfenced — the next fork only awaits the latest ledger.
-        pendingLedgerFence = fence
-        pendingLedgerSession = detached
-        pendingLedgerWasStreaming = wasStreaming
+        // R8-2: park for the next fork's IO fence with the ledger lineage
+        // (the snapshot target at detach time). A non-null endpoint switch
+        // hands the fence over — it never clears this slot — while only an
+        // explicit history discard (clearChat / openSession attach /
+        // binding == null) drops it. Same-owner re-parks merge into one
+        // composite join so an unresolved same-ledger teardown is never lost;
+        // a different-owner park supersedes (the next fork snapshots only the
+        // latest previousSessionId's ledger, so the older parked ledger is
+        // irrelevant to it). The displaced job is NOT cancelled: it keeps
+        // running on viewModelScope to durability (close seals under
+        // NonCancellable, flush is bounded), just unfenced — the next fork
+        // only awaits the latest ledger.
+        if (pendingLedgerFence == null && pendingLedgerSession == null) {
+            pendingLedgerFence = fence
+            pendingLedgerSession = detached
+            pendingLedgerWasStreaming = wasStreaming
+            pendingLedgerOwnerSessionId = ownerAtPark
+        } else if (pendingLedgerOwnerSessionId != null && pendingLedgerOwnerSessionId == ownerAtPark) {
+            val prior = pendingLedgerFence
+            // Same ledger parked twice (e.g. re-park racing a late detach):
+            // join both teardowns under one fence instead of dropping either.
+            val incoming = fence
+            pendingLedgerFence = if (prior != null) {
+                viewModelScope.launch {
+                    try {
+                        prior.join()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        incoming.join()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                    }
+                }
+            } else {
+                incoming
+            }
+            pendingLedgerSession = detached
+            pendingLedgerWasStreaming = pendingLedgerWasStreaming || wasStreaming
+        } else {
+            pendingLedgerFence = fence
+            pendingLedgerSession = detached
+            pendingLedgerWasStreaming = wasStreaming
+            pendingLedgerOwnerSessionId = ownerAtPark
+        }
     }
 
     private suspend fun loadHistory(sessionId: String): LoadedUiHistory? {

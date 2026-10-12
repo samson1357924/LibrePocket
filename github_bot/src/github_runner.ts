@@ -3735,16 +3735,22 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
       (synth.summary !== undefined && typeof synth.summary !== 'string') ||
       (synth.skipped !== undefined && typeof synth.skipped !== 'boolean')
     ) return undefined;
-    // F3: a skipped synthesis never confirms anything, so a stored
-    // APPROVE paired with skipped:true is a forged or pre-fix artifact and
-    // is rejected (fail-closed to INCONCLUSIVE at publish).
+    // G4 (review #77 new #4): every stored APPROVE must carry an explicit
+    // synthesis confirmation. Missing synthesis, skipped:true, or a
+    // non-APPROVE synthesis verdict is a forged or pre-policy artifact and
+    // is rejected (fail-closed to INCONCLUSIVE at publish). Non-APPROVE
+    // verdicts are unaffected (downgrades keep passing through).
     if (String(raw.verdict) === 'APPROVE' && synth.skipped === true) return undefined;
+    if (String(raw.verdict) === 'APPROVE' && String(synth.verdict) !== 'APPROVE') return undefined;
     synthesis = {
       modelUsed: safeString(synth.modelUsed, 200),
       verdict: synth.verdict as RunnerVerdict,
       ...(typeof synth.summary === 'string' ? { summary: safeString(synth.summary, 2000) } : {}),
       ...(typeof synth.skipped === 'boolean' ? { skipped: synth.skipped } : {}),
     };
+  } else if (String(raw.verdict) === 'APPROVE') {
+    // G4: no synthesis field at all — unconfirmed APPROVE, rejected.
+    return undefined;
   }
   const rawCoverage = raw.coverage;
   if (!rawCoverage || typeof rawCoverage !== 'object' || Array.isArray(rawCoverage)) return undefined;

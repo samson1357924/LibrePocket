@@ -1752,6 +1752,47 @@ export async function runExecutionMatrixTests(): Promise<void> {
         }),
         'F3 INCONCLUSIVE with skipped synthesis validates',
       );
+      // G4 (review #77 new #4): unconfirmed APPROVE artifacts reject —
+      // missing synthesis, non-APPROVE synthesis verdict, or skipped.
+      const cleanArtifactLikeApprove = (): Record<string, unknown> => ({
+        ...baseArtifact,
+        verdict: 'APPROVE',
+        coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
+        changedFilesComplete: true,
+      });
+      const confirmedSynthesis = { modelUsed: 'm', verdict: 'APPROVE' };
+      assert.ok(
+        validateReviewOutput({ ...cleanArtifactLikeApprove(), synthesis: confirmedSynthesis }),
+        'G4 confirmed APPROVE validates',
+      );
+      assert.ok(
+        validateReviewOutput({
+          ...cleanArtifactLikeApprove(),
+          synthesis: { modelUsed: 'm', verdict: 'APPROVE', skipped: false },
+        }),
+        'G4 confirmed APPROVE with skipped:false validates',
+      );
+      for (const [label, synthesis] of [
+        ['missing', undefined],
+        ['INCONCLUSIVE', { modelUsed: 'm', verdict: 'INCONCLUSIVE' }],
+        ['INCONCLUSIVE-skipped-false', { modelUsed: 'm', verdict: 'INCONCLUSIVE', skipped: false }],
+        ['NEEDS_CHANGES', { modelUsed: 'm', verdict: 'NEEDS_CHANGES' }],
+        ['APPROVE-skipped', { modelUsed: 'not-run', verdict: 'APPROVE', skipped: true }],
+      ] as const) {
+        const artifact = { ...cleanArtifactLikeApprove() };
+        if (synthesis === undefined) delete (artifact as Record<string, unknown>).synthesis;
+        else (artifact as Record<string, unknown>).synthesis = synthesis;
+        assert.equal(
+          validateReviewOutput(artifact),
+          undefined,
+          `G4 unconfirmed APPROVE (${label}) rejects`,
+        );
+      }
+      // G4: non-APPROVE verdicts are unaffected by synthesis shape.
+      assert.ok(
+        validateReviewOutput({ ...cleanArtifactLikeApprove(), verdict: 'NEEDS_CHANGES' }),
+        'G4 NEEDS_CHANGES without synthesis validates',
+      );
       // Strictness direction: a stored verdict stricter than the
       // recalculation is accepted as stored (downgrades survive publish);
       // a stored verdict looser than the recalculation is rejected.

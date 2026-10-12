@@ -99,7 +99,10 @@ data class SetupUiState(
      *
      * 由 [stampLogoutError] 與落碼的 `errorCode` 同步寫入：值為落碼當時
      * replay／teardown 所持 journal 的 [PendingDelete.format] 原字串；無
-     * journal（`NO_OP`／`UNKNOWN`／未確認路徑）時為 null。`COMMITTED`
+     * journal（`NO_OP`／read-path `UNKNOWN`／未確認路徑）時為 null——
+     * clear-phase `UNKNOWN`（clear 拋後 probe 重讀亦失敗）攜帶當時的 active
+     * pending，故標籤非 null（同啟動 replay 核心的 read-path／clear-phase
+     * 區分）。`COMMITTED`
      * replay 僅當此標籤與其攜帶 journal 相同才清碼（併發 teardown 的碼不
      * 被誤清）；[clearLogoutError]、logout 入口 fresh 化與 logout 成功重置
      * 連碼一起清。其他 `errorCode = null` 站點不碰此欄（殘留 tag 無害：
@@ -160,8 +163,9 @@ class SetupViewModel(
      * - `startupCallbacks`：排隊等待同一輪結果的 `onDone`（含首發者）；
      * - `startupSettled`：已落定輪的 `(outcome, journal)` 快照——寫入先於
      *   Main fan-out；重 launch 先查此快照（回放，無 I/O、不碰 pending），
-     *   再查 worker（重疊者入列拿 join handle）。logout 出口與 save 提交
-     *   經 [invalidateStartupSettled] 使其失效（否則 rotation 重播過期結果）。
+     *   再查 worker（重疊者入列拿 join handle）。logout 入口與 save 提交
+     *   經 [invalidateStartupSettled] 使其失效（logout 終端再行斷言；否則
+     *   rotation 重播過期結果）。
      */
     private val startupLock = Any()
     private var startupWorker: Job? = null
@@ -1297,11 +1301,13 @@ class SetupViewModel(
      * [reconcilePendingDelete] 的 journal-identity 攜帶版（Stage C C2）。
      *
      * 與 [reconcilePendingDelete] 同一核心，另回傳 replay 當時快照的 journal：
-     * 有 journal 的輪（`COMMITTED`／`DELETE_FAILED`／`FAILED`／`STALE`）攜帶
-     * 該 [PendingDelete]（供 [onStartupReconcile] 落碼／清碼的身份比對）；
-     * `NO_OP`／`UNKNOWN`（strict 重讀失敗或 journal 毀損，身份不可確認）攜帶
-     * null。取消語義與 [reconcilePendingDelete] 相同（`COMMITTED` 吞取消，
-     * 其餘重拋）。
+     * 有 journal 的輪（`COMMITTED`／`DELETE_FAILED`／`FAILED`／`STALE`／
+     * clear-phase `UNKNOWN`）攜帶該 [PendingDelete]（供 [onStartupReconcile]
+     * 落碼／清碼的身份比對）；僅 `NO_OP` 與 read-path `UNKNOWN`（strict 重讀
+     * 失敗或 journal 毀損，身份不可確認）攜帶 null——clear-phase `UNKNOWN`
+     *（clear 拋後 probe 重讀亦失敗，見 [runPendingDeleteLocked]）攜帶當時的
+     * active pending。取消語義與 [reconcilePendingDelete] 相同（`COMMITTED`
+     * 吞取消，其餘重拋）。
      */
     internal suspend fun reconcilePendingDeleteWithJournal(): Pair<PendingDeleteOutcome, PendingDelete?> {
         return try {
@@ -1342,9 +1348,12 @@ class SetupViewModel(
      *    Main fan-out 全部 callbacks → `finally` 單點 `pending = false`
      *   （所有 `onDone` 之後，保留先落碼後落定順序）。
      *
-     * Never throws out of scope (failures report [PendingDeleteOutcome.UNKNOWN]
-     * with a null journal via [onDone] on [Dispatchers.Main] and keep the
-     * journal for the next logout retry); a cancelled scope rethrows without
+     * Never throws out of scope (an escaping failure is reported as
+     * [PendingDeleteOutcome.UNKNOWN] with a null journal via [onDone] on
+     * [Dispatchers.Main] and keeps the journal for the next logout retry —
+     * only read-path `UNKNOWN` carries null; a reconcile-returned clear-phase
+     * `UNKNOWN` carries the active pending, see
+     * [reconcilePendingDeleteWithJournal]); a cancelled scope rethrows without
      * calling [onDone].
      * Called once at composition from `MainScreen`, which MUST pass a non-empty
      * [onDone] (Stage 3 P2: [onStartupReconcile]) — a discarded outcome would
@@ -1356,11 +1365,15 @@ class SetupViewModel(
      * outcomes, including `NO_OP`) or the worker/scope is cancelled — the reset
      * is in `finally` so a scope cancel never leaves the startup spinner stuck.
      * Cancelling the returned join handle alone does NOT reset (the worker
-     * continues for other joiners). The
-     * returned [Job] is only a join handle (or a settled-replay dispatch), never
-     * the worker itself: production callers ignore it; cancelling it never kills
-     * an in-flight worker, and its callback still participates in the fan-out
-     * (at-least-once; cancelling a waiter must not silently drop the outcome).
+     * continues for other joiners). The returned [Job] is only a join handle,
+     * never the worker itself: production callers ignore it. Worker-path join
+     * (`viewModelScope.launch { worker.join() }`): cancelling it only stops
+     * waiting without killing the in-flight worker, and the caller's callback
+     * still participates in the Main fan-out (at-least-once; cancelling a
+     * waiter must not silently drop the outcome for others). Settled-replay
+     * dispatch (`viewModelScope.launch(Dispatchers.Main) { onDone(...) }`):
+     * the returned [Job] IS that dispatch itself (no fan-out exists on this
+     * path), so cancelling it discards this caller's own `onDone` delivery.
      */
     fun launchPendingDeleteReconcile(
         onDone: (PendingDeleteOutcome, PendingDelete?) -> Unit,
@@ -1818,6 +1831,11 @@ class SetupViewModel(
         // 外層 catch 復位。前次失敗碼在此清為 fresh attempt；失敗保留、成功
         // 重置、取消不蓋碼（見結尾與外層 catch）。
         _form.value = _form.value.copy(logoutInFlight = true, errorCode = null, logoutErrorSourceJournal = null)
+        // 入口即失效 settled：journal 寫入後被取消時走不到終端失效點，殘留快照
+        // 會使 rotation 重 launch 回放過期輪；入口在 Main、worker 寫 settled 在
+        // IO，兩種到達順序皆 benign（失效後 worker 寫新鮮值；寫後失效則本輪
+        // logout 自己產生終端 outcome）。
+        invalidateStartupSettled()
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
         modelRefreshJob?.cancel()
@@ -2074,8 +2092,9 @@ class SetupViewModel(
                 // cached startup-reconcile outcome — the metadata generation may
                 // have moved (commit, supersede, or discard), so a rotation
                 // relaunch must run fresh I/O instead of replaying a stale round.
-                // (Cancel rethrows before reaching here: the journal is kept and
-                // the cached round, if any, still describes it.)
+                // (Cancel rethrows before reaching here: the journal is kept, and
+                // the entry-point invalidation already dropped the cached round,
+                // so a rotation relaunch runs fresh I/O and rediscovers it.)
                 invalidateStartupSettled()
                 if (!committed) {
                     // logoutError is already stamped inside the lock when set;

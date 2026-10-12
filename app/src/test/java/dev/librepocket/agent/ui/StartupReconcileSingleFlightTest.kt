@@ -374,4 +374,54 @@ class StartupReconcileSingleFlightTest {
         assertEquals("relaunch must add zero vault deletes", 1, healthy.deleteKeys)
         assertNull(vm.form.value.errorCode)
     }
+
+    @Test
+    fun logoutCancelAfterJournalWriteInvalidatesSettled() {
+        // 入口失效驗收：第一輪 NO_OP 落定後起 logout（journal 寫入後、vault
+        // delete 內取消，journal 留存）→ rotation 重 launch 必須走新鮮 I/O
+        //（deleteKeys 增加）且發現 journal（COMMITTED 攜 journal），而非回放
+        // 過期 NO_OP（舊碼無入口失效即落此死路）。
+        val store = rawStore("singleflight-logout-cancel-invalidate")
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            store.save(preseed())
+        }
+        val vault = GatedDeleteVault(delegate = delegate, gateDelete = true)
+        val vm = newVm(store, vault)
+        // 第一輪：無 journal → NO_OP 落定。
+        var seen1: Pair<SetupViewModel.PendingDeleteOutcome, PendingDelete?>? = null
+        val job1 = vm.launchPendingDeleteReconcile { outcome, j -> seen1 = outcome to j }
+        runBlocking { withTimeout(10_000) { job1.join() } }
+        assertEquals(SetupViewModel.PendingDeleteOutcome.NO_OP to null, seen1)
+        // 起 logout：delete 入口到達即保證 journal 已寫入，其後取消。
+        var onDoneCalled = false
+        vm.logout { onDoneCalled = true }
+        runBlocking { withTimeout(10_000) { vault.deleteEntered.await() } }
+        val logoutJob = vm.lastLogoutJobForTest ?: error("no logout job")
+        runBlocking {
+            logoutJob.cancel()
+            logoutJob.join()
+        }
+        assertFalse("cancel must not call onDone", onDoneCalled)
+        val journal = runBlocking { store.pendingDelete() }
+        assertEquals("journal must survive the post-write cancel", "preset:openai", journal?.alias)
+        // 放行 vault；rotation 重 launch 必須走新鮮 I/O。
+        val deletesBefore = vault.deleteKeys
+        vault.gateDelete = false
+        vault.deleteRelease.complete(Unit)
+        var seen2: Pair<SetupViewModel.PendingDeleteOutcome, PendingDelete?>? = null
+        val job2 = vm.launchPendingDeleteReconcile { outcome, j -> seen2 = outcome to j }
+        runBlocking { withTimeout(10_000) { job2.join() } }
+        assertTrue(
+            "relaunch must run fresh vault I/O, not replay settled NO_OP",
+            vault.deleteKeys > deletesBefore,
+        )
+        assertEquals(
+            "relaunch must discover the retained journal",
+            SetupViewModel.PendingDeleteOutcome.COMMITTED,
+            seen2?.first,
+        )
+        assertEquals(journal, seen2?.second)
+    }
 }

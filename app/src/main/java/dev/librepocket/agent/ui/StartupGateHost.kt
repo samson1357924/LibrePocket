@@ -41,6 +41,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import dev.librepocket.agent.ui.setup.EndpointGate
+import dev.librepocket.agent.ui.setup.PendingDelete
 import dev.librepocket.session.SessionMeta
 import kotlinx.coroutines.launch
 
@@ -60,6 +61,13 @@ import kotlinx.coroutines.launch
  * 非 gate 邏輯不在此：entry 分發、replay 觸發、語音／提權／會話狀態仍歸
  * `MainScreen`（呼叫方經 [chatContent]／[settingsContent]／[setupContent] 與
  * 回調傳入）。
+ *
+ * Stage D2（R12 Finding 2 (b)）：派生恢復態內聚單一來源——有效碼
+ * `effectiveLogoutGuardError(logoutGuardError, pendingPresent, logoutInFlight)`
+ * （見 `NavGuard.kt`；無碼＋journal present＋非執行中 → `LOGOUT_UNKNOWN`）
+ * 代入雙守衛（nav 抑制＋CHAT→SETTINGS）、drawer 手勢與選單鍵門禁（恢復態啟用）；
+ * `MainScreen` 另以同一純函數派生 `SettingsScreen` `recoveryCode`
+ * （NoEndpoint 顯示 `LOGOUT_UNKNOWN` 卡＋重試清除，無 dismiss）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -80,6 +88,12 @@ internal fun StartupGateHost(
     chatContent: @Composable (PaddingValues) -> Unit,
     settingsContent: @Composable (PaddingValues) -> Unit,
     setupContent: @Composable (PaddingValues, Boolean) -> Unit,
+    /**
+     * Stage D2 跨 VM journal domain state（`SetupViewModel.pendingTeardown`
+     * 收集值；null＝確無 journal，非 null＝present，含 malformed／讀失敗
+     * sentinel）。僅 presence 參與派生（身份不作清除依據）。
+     */
+    pendingTeardown: PendingDelete? = null,
 ) {
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -96,13 +110,20 @@ internal fun StartupGateHost(
     // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
     val logoutGuardError = errorCode?.takeIf { it.startsWith("LOGOUT_") }
     val logoutGuardBusy = logoutInFlight
+    // Stage D2 派生恢復態（單一來源）：無碼＋journal present＋非執行中 →
+    // LOGOUT_UNKNOWN；有碼沿用（STALE 等不動）。有效值代入雙守衛與 drawer／選單。
+    val effectiveGuardError = effectiveLogoutGuardError(
+        logoutGuardError,
+        pendingPresent = pendingTeardown != null,
+        logoutInFlight = logoutInFlight,
+    )
 
     // Hard gate: no usable endpoint -> setup (and back again after save/logout).
     // P2/BLOCK（Re-review #8 Finding 2 階段2）：有未恢復 LOGOUT_* 或 logoutInFlight
     // 時不強制跳（留在 SETTINGS 可恢復；STALE 待 dismiss 亦攔截）。條件見
     // shouldNavigateToSetup 純函數（NavGuard.kt，真值表單測）。
-    LaunchedEffect(hasEndpoint, navLoading, currentRoute, logoutGuardError, logoutGuardBusy) {
-        if (!shouldNavigateToSetup(hasEndpoint, navLoading, currentRoute, logoutGuardError, logoutGuardBusy)) {
+    LaunchedEffect(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy) {
+        if (!shouldNavigateToSetup(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy)) {
             return@LaunchedEffect
         }
         navController.navigate(Routes.SETUP) {
@@ -116,8 +137,9 @@ internal fun StartupGateHost(
     // 與 SETUP 硬守衛互斥（有碼走此分支，無碼走 SETUP），條件見
     // shouldNavigateToSettings 純函數。Stage B：同以 navLoading（含落定閘）
     // 守門，落定後做一次完整資訊決策（直達 SETTINGS，無 SETUP 中間態）。
-    LaunchedEffect(hasEndpoint, navLoading, currentRoute, logoutGuardError, logoutGuardBusy) {
-        if (!shouldNavigateToSettings(hasEndpoint, navLoading, currentRoute, logoutGuardError, logoutGuardBusy)) {
+    // Stage D2：有效碼含派生 LOGOUT_UNKNOWN（跨 VM journal），同走此分支。
+    LaunchedEffect(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy) {
+        if (!shouldNavigateToSettings(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy)) {
             return@LaunchedEffect
         }
         navController.navigate(Routes.SETTINGS) {
@@ -137,7 +159,8 @@ internal fun StartupGateHost(
         drawerState = drawerState,
         // Stage 3 P2 (a)：恢復態（LOGOUT_* + NoEndpoint）啟用 drawer 手勢，
         // 否則停在 CHAT 的使用者到不了 SETTINGS 恢復卡。
-        gesturesEnabled = hasEndpoint || logoutGuardError != null,
+        // Stage D2：有效碼含派生 LOGOUT_UNKNOWN（跨 VM journal），同啟用。
+        gesturesEnabled = hasEndpoint || effectiveGuardError != null,
         drawerContent = {
             ModalDrawerSheet {
                 Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
@@ -228,8 +251,9 @@ internal fun StartupGateHost(
                     navigationIcon = {
                         IconButton(
                             // Stage 3 P2 (a)：恢復態啟用選單鍵（同 drawer 手勢）。
+                            // Stage D2：有效碼含派生 LOGOUT_UNKNOWN，同啟用。
                             onClick = { scope.launch { drawerState.open() } },
-                            enabled = hasEndpoint || logoutGuardError != null,
+                            enabled = hasEndpoint || effectiveGuardError != null,
                         ) {
                             Icon(Icons.Filled.Menu, contentDescription = "選單")
                         }

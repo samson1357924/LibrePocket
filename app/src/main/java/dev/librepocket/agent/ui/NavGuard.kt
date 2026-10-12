@@ -14,6 +14,34 @@ fun startupEffectiveLoading(
 ): Boolean = gateLoading || startupReconcilePending
 
 /**
+ * Stage D2 派生恢復態（R12 Finding 2 P2/BLOCK (b)，單一來源純函數）。
+ *
+ * 跨 VM journal 不可見：VM-A `NO_OP` 落定（`errorCode == null`）後，VM-B 寫入
+ * journal `J_B`——VM-A 的 `observe` 已折疊 `NoEndpoint`、save 已被擋，但
+ * `logoutGuardError` 仍為 null，舊守衛誤判 fresh（強制跳 SETUP、drawer/menu
+ * disabled、Settings 顯示「尚未設定」而無恢復入口）。
+ *
+ * 派生：`logoutGuardError ?: if (pendingPresent && !logoutInFlight)
+ * "LOGOUT_UNKNOWN" else null`——有碼沿用（STALE 等外語義不動），無碼＋journal
+ * present（[EndpointStore.observePendingDelete] 非 null，含 malformed／讀失敗
+ * sentinel）＋非執行中 → 中性 `LOGOUT_UNKNOWN`（未確認路徑禁寫「已刪除」；
+ * 與 D1 [SetupViewModel.LOGOUT_READ_RETRY] 區分：D1 新碼＝讀失敗未知
+ *（journal=null，未觀測存在）；此處＝journal 已觀測存在）。
+ * 呼叫方（[StartupGateHost] nav／drawer／menu、`MainScreen` Settings
+ * `recoveryCode`）皆以此有效值決策；safe reconcile 複用既有 `logout()`
+ * resume 分支（同一 `runPendingDeleteLocked` 核心，不新增 vault 路徑），落碼／
+ * 清碼走 `stampLogoutError`＋C2 journal-identity。
+ *
+ * 純函數、無副作用。
+ */
+fun effectiveLogoutGuardError(
+    logoutGuardError: String?,
+    pendingPresent: Boolean,
+    logoutInFlight: Boolean,
+): String? = logoutGuardError
+    ?: if (pendingPresent && !logoutInFlight) "LOGOUT_UNKNOWN" else null
+
+/**
  * 啟動導航守衛純條件（Re-review #8 Finding 2 P2/BLOCK 階段2）。
  *
  * 背景：登出部分清除（`LOGOUT_CLEAR_FAILED`：金鑰已刪、設定仍在）會把 gate

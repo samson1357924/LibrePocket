@@ -11,6 +11,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import dev.librepocket.keystore.KeyVault
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.validateBaseUrl
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -77,6 +78,21 @@ data class PendingDelete(
     fun format(): String = "v1|$alias|${revision?.toString() ?: ""}|$timestampMs"
 
     companion object {
+        /**
+         * Stage D2 fail-closed presence sentinel for [observePendingDelete].
+         *
+         * Malformed journals and DataStore read failures cannot be represented
+         * as a parsed [PendingDelete], yet folding them to `null` would hide a
+         * possibly-retained teardown (fail-open: gate `NoEndpoint` with no
+         * recovery, save blocked with no entry). They emit this non-null
+         * sentinel instead (unknown即present): presence (`!= null`) is the
+         * only contract — callers MUST NOT use its [format] for
+         * compare-and-delete or journal-identity clearing (safe reconcile
+         * reuses the strict snapshot + [runPendingDeleteLocked] core, never
+         * this sentinel identity).
+         */
+        val UNKNOWN_PRESENT = PendingDelete("__pending_delete_unknown__", null, 0L)
+
         /**
          * Strict parse. Throws [IllegalStateException] on ANY malformed input
          * (wrong version, wrong arity, blank/`|`-bearing alias, non-numeric
@@ -206,6 +222,47 @@ class EndpointStore(
         .catch { emit(emptyPreferences()) }
         .map { prefs ->
             if (prefs[ENDPOINT_PENDING_DELETE_V1] != null) null else parseConfig(prefs)
+        }
+
+    /**
+     * Stage D2 cross-VM teardown domain state (R12 Finding 2 P2/BLOCK).
+     *
+     * Derives `Flow<PendingDelete?>` from the single
+     * [ENDPOINT_PENDING_DELETE_V1] key (zero vault I/O):
+     * - absent → `null` (definitely no journal);
+     * - well-formed → parsed [PendingDelete];
+     * - malformed non-null → [PendingDelete.UNKNOWN_PRESENT] (present
+     *   fail-closed, never `null`);
+     * - DataStore read failure → [PendingDelete.UNKNOWN_PRESENT] via `catch`
+     *   (unknown即present — a `catch` folding to `null`/empty would hide a
+     *   retained journal; only [CancellationException] rethrows).
+     *
+     * Presence (`!= null`) is the only contract: a second VM writing a journal
+     * after this VM settled `NO_OP` surfaces here even though this VM's
+     * `form.errorCode` stays `null`. The derived recovery state
+     * ([dev.librepocket.agent.ui.effectiveLogoutGuardError]) and the
+     * generation-scoped relaunch below consume presence only; safe reconcile
+     * reuses the strict snapshot + `runPendingDeleteLocked` core (never this
+     * sentinel identity for vault/clear paths).
+     */
+    fun observePendingDelete(): Flow<PendingDelete?> = dataStore.data
+        .map { prefs ->
+            val raw = prefs[ENDPOINT_PENDING_DELETE_V1]
+            if (raw == null) {
+                null
+            } else {
+                try {
+                    PendingDelete.parse(raw)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    PendingDelete.UNKNOWN_PRESENT
+                }
+            }
+        }
+        .catch { e ->
+            if (e is CancellationException) throw e
+            emit(PendingDelete.UNKNOWN_PRESENT)
         }
 
     private fun parseConfig(prefs: Preferences): EndpointConfig? {

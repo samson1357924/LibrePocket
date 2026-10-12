@@ -94,4 +94,29 @@ class NavGuardTest {
             shouldNavigateToSetup(false, false, Routes.SETTINGS, null, false),
         )
     }
+
+    /**
+     * Stage D2 派生碼行（R12 Finding 2 (b)）：`effectiveLogoutGuardError` 派生
+     * `LOGOUT_UNKNOWN`（無碼＋journal present＋非 inFlight）與既有 `LOGOUT_*`
+     * 一致走 SETTINGS、互斥不走 SETUP；在途抑制派生（`null` 走 fresh SETUP）。
+     */
+    @Test
+    fun derivedUnknownBlocksSetupAndSteersToSettings() {
+        val derived = effectiveLogoutGuardError(null, pendingPresent = true, logoutInFlight = false)
+        assertEquals("LOGOUT_UNKNOWN", derived)
+        assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, derived, false))
+        assertEquals(false, shouldNavigateToSetup(false, false, Routes.SETTINGS, derived, false))
+        assertEquals(true, shouldNavigateToSettings(false, false, Routes.CHAT, derived, false))
+        assertEquals(false, shouldNavigateToSettings(false, false, Routes.SETTINGS, derived, false))
+        // 在途抑制：有效 null＋inFlight → 不決策（兩守衛皆 false）。
+        val suppressed = effectiveLogoutGuardError(null, pendingPresent = true, logoutInFlight = true)
+        assertEquals(null, suppressed)
+        assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, suppressed, true))
+        assertEquals(false, shouldNavigateToSettings(false, false, Routes.CHAT, suppressed, true))
+        // 有碼沿用（STALE 不被派生覆蓋）。
+        assertEquals(
+            "LOGOUT_STALE",
+            effectiveLogoutGuardError("LOGOUT_STALE", pendingPresent = true, logoutInFlight = false),
+        )
+    }
 }

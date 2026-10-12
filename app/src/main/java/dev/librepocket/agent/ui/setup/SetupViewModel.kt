@@ -161,16 +161,17 @@ class SetupViewModel(
      * - `startupWorker`：進行中的唯一 reconcile worker（無則 null；完成後
      *   殘留 dead job，以 `isActive` 判定存活，不另清 null）；
      * - `startupCallbacks`：排隊等待同一輪結果的 `onDone`（含首發者）；
-     * - `startupSettled`：已落定輪的 `(outcome, journal)` 快照——寫入先於
-     *   Main fan-out；重 launch 先查此快照（回放，無 I/O、不碰 pending），
-     *   再查 worker（重疊者入列拿 join handle）。logout 入口與 save 提交
-     *   經 [invalidateStartupSettled] 使其失效（logout 終端再行斷言；否則
-     *   rotation 重播過期結果）。
+     * - `startupSettled`：已落定輪的 [StartupSettled] 快照——寫入先於
+     *   Main fan-out；重 launch 先經廉價 strict 快照比對 generation（見
+     *   [launchPendingDeleteReconcile] Stage D2 作用域化），相同才回放（無
+     *   I/O、不碰 pending），不同則失效後新鮮 worker；再查 worker（重疊者入列
+     *   拿 join handle）。logout 入口與 save 提交經 [invalidateStartupSettled]
+     *   使其失效（logout 終端再行斷言；否則 rotation 重播過期結果）。
      */
     private val startupLock = Any()
     private var startupWorker: Job? = null
     private val startupCallbacks = ArrayList<(PendingDeleteOutcome, PendingDelete?) -> Unit>()
-    private var startupSettled: Pair<PendingDeleteOutcome, PendingDelete?>? = null
+    private var startupSettled: StartupSettled? = null
     private val modelRefreshGeneration = AtomicLong(0L)
     private var modelRefreshJob: Job? = null
     // Stage2 form fence: identity/key intent epoch. Bumped only by
@@ -233,6 +234,37 @@ class SetupViewModel(
     private val saveMutex = Mutex()
 
     /**
+     * Stage D2 settled generation 作用域（R12 Finding 2 (c)）。
+     *
+     * 由同一 `snapshotDeleteStateStrict` emission 取得的 `(revision,
+     * journal.format() raw)`：`revision` 為該 emission 的
+     * `ENDPOINT_CONFIG_REVISION_V1`（fresh 為 null），`journalRaw` 為該 emission
+     * journal 的 `format()`（無 journal 為 null）。跨 VM 寫入（journal 出現／
+     * 消失、revision 前進）即改變 generation，rotation 重 launch 據此失效舊
+     * 輪（新鮮 worker，同一 `runPendingDeleteLocked` 核心兜底），相同才回放。
+     * `null` 整體表示未知（strict 讀失敗或 journal 毀損，無可用 emission）——
+     * 永不視為相同（fail-closed 走 fresh，見 [startupGenerationsMatch] D1 保留
+     * 例外）。
+     */
+    private data class StartupGeneration(
+        val revision: Long?,
+        val journalRaw: String?,
+    )
+
+    /**
+     * 已落定輪快照（含 generation）。
+     *
+     * `outcome`＋`journal` 為回放內容（`journal` 為 null 僅限 `NO_OP` 與
+     * read-path `UNKNOWN`，語義不變）；`generation` 為該輪 reconcile 起點
+     * snapshot 的 generation（read-path `UNKNOWN` 無 emission 時為 null）。
+     */
+    private data class StartupSettled(
+        val outcome: PendingDeleteOutcome,
+        val journal: PendingDelete?,
+        val generation: StartupGeneration?,
+    )
+
+    /**
      * Test seam: the most recent save coroutine. Cancellation tests cancel this
      * job to inject [CancellationException] at suspending gates (V1/V2/CAS).
      * Production code never touches it; it is overwritten on every [save].
@@ -279,6 +311,21 @@ class SetupViewModel(
         }
         .catch { emit(EndpointGate.NoEndpoint) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), EndpointGate.Loading)
+
+    /**
+     * Stage D2 跨 VM teardown 可觀測態（R12 Finding 2 P2/BLOCK (a)）。
+     *
+     * 由 [EndpointStore.observePendingDelete] 派生（零 vault I/O，僅一
+     * Preferences key 讀；malformed／讀失敗皆為非 null present fail-closed，
+     * 見該函數）：第二 VM 在本 VM `NO_OP` 落定後寫入的 journal 在此發射，
+     * 即使本 VM `form.errorCode` 仍為 null。`MainScreen` 收集後傳入
+     * [dev.librepocket.agent.ui.StartupGateHost] 派生恢復態（
+     * [dev.librepocket.agent.ui.effectiveLogoutGuardError]）；safe reconcile
+     * 複用既有 [logout] resume 分支（同一 `runPendingDeleteLocked` 核心），
+     * 不新增 vault 路徑。`WhileSubscribed(5000)` 仿 [gate] 接線。
+     */
+    val pendingTeardown: StateFlow<PendingDelete?> = store.observePendingDelete()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     fun selectPreset(presetId: String) {
         val preset = ProviderCatalog.preset(presetId) ?: return
@@ -1320,17 +1367,38 @@ class SetupViewModel(
      * 吞取消，其餘重拋）。
      */
     internal suspend fun reconcilePendingDeleteWithJournal(): Pair<PendingDeleteOutcome, PendingDelete?> {
+        val triple = reconcilePendingDeleteWithJournalAndGeneration()
+        return triple.first to triple.second
+    }
+
+    /**
+     * Stage D2 generation 攜帶版（內部，[launchPendingDeleteReconcile] settled
+     * 作用域化用）。
+     *
+     * 與 [reconcilePendingDeleteWithJournal] 同一核心（同一 `saveMutex`、
+     * 同一 `snapshotDeleteStateStrict` 同 emission、同一
+     * `runPendingDeleteLocked`，取消語義不變），另回傳該 emission 的
+     * [StartupGeneration]（`revision + journal.format() raw`；read-path
+     * `UNKNOWN` 無可用 emission 時為 null）。既有 Pair 入口委託至此（丟棄
+     * generation），D1 映射／取消語義不變。
+     */
+    private suspend fun reconcilePendingDeleteWithJournalAndGeneration(): Triple<PendingDeleteOutcome, PendingDelete?, StartupGeneration?> {
         return try {
             saveMutex.withLock {
-                val pending = try {
-                    store.snapshotDeleteStateStrict().first
+                val snapshot = try {
+                    store.snapshotDeleteStateStrict()
                 } catch (e: CancellationException) {
                     throw e
                 } catch (_: Exception) {
                     // Read failure OR malformed journal: no-touch, keep journal.
-                    return@withLock PendingDeleteOutcome.UNKNOWN to null
-                } ?: return@withLock PendingDeleteOutcome.NO_OP to null
-                runPendingDeleteLocked(pending) to pending
+                    return@withLock Triple(PendingDeleteOutcome.UNKNOWN, null, null)
+                }
+                val pending = snapshot.first
+                val generation = StartupGeneration(snapshot.third, pending?.format())
+                if (pending == null) {
+                    return@withLock Triple(PendingDeleteOutcome.NO_OP, null, generation)
+                }
+                Triple(runPendingDeleteLocked(pending), pending, generation)
             }
         } catch (e: CancellationException) {
             // runPendingDeleteLocked already swallowed the COMMITTED cancel to
@@ -1340,23 +1408,78 @@ class SetupViewModel(
         }
     }
 
+    /**
+     * Stage D2 rotation 廉價 probe（[launchPendingDeleteReconcile] 用）。
+     *
+     * 單 `dataStore.data.first()`（經 `snapshotDeleteStateStrict` 同 emission
+     * 取 `revision + journal.format()`），零 vault I/O。`suspend` 故須在
+     * `startupLock` 外呼叫（見 launch 內鎖外 probe、鎖內比對）；probe→worker
+     * 窗口由 worker 內 `saveMutex` 下 strict 重讀兜底（同一核心）。
+     * Malformed／讀失敗回 null（未知）：呼叫方視為 generation-changed，
+     * fail-closed 走 fresh reconcile（見 [startupGenerationsMatch]）。
+     */
+    private suspend fun probeStartupGeneration(): StartupGeneration? {
+        try {
+            val snapshot = store.snapshotDeleteStateStrict()
+            return StartupGeneration(snapshot.third, snapshot.first?.format())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    /**
+     * Stage D2 generation 比對（純函數，鎖內呼叫）。
+     *
+     * - `current == null`（probe malformed／讀失敗）→ false（changed，走 fresh）；
+     * - `cached.generation == null`（前輪 read-path `UNKNOWN`，無 emission）→
+     *   D1 保留例外：僅當該輪為 `UNKNOWN`＋null 且 probe 見無 journal
+     *  （`journalRaw == null`）時視為相同（回放中性碼，不在 rotation 自動清除；
+     *   外部 journal 出現仍為不同，走 fresh 升級 retained）；其餘一律不同；
+     * - 否則 `revision`＋`journalRaw` 皆等才相同（回放），任一不等即不同
+     *  （失效後新鮮 worker）。
+     */
+    private fun startupGenerationsMatch(
+        cached: StartupSettled,
+        current: StartupGeneration?,
+    ): Boolean {
+        if (current == null) return false
+        val cachedGen = cached.generation
+        if (cachedGen == null) {
+            return cached.outcome == PendingDeleteOutcome.UNKNOWN &&
+                cached.journal == null &&
+                current.journalRaw == null
+        }
+        return cachedGen.revision == current.revision && cachedGen.journalRaw == current.journalRaw
+    }
+
     suspend fun reconcilePendingDelete(): PendingDeleteOutcome =
         reconcilePendingDeleteWithJournal().first
 
     /**
      * Startup replay entry point: single-flight [reconcilePendingDeleteWithJournal].
      *
-     * 語義（Stage C C1，全程 [startupLock] 保護）：
-     * 1. 已落定（[startupSettled] 非 null）：不碰 pending、不做 I/O，經
-     *    [Dispatchers.Main] 回放快照 `(outcome, journal)`（`STALE` 的
-     *    gateReady 仍由 [onStartupReconcile] 讀 live gate，保持新鮮）；
-     * 2. worker 進行中：呼叫方入列 `onDone`，回傳 `viewModelScope.launch {
+     * 語義（Stage C C1，全程 [startupLock] 保護；Stage D2 generation 作用域化）：
+     * 1. 未落定（[startupSettled] 為 null）：不做 probe，直走新鮮 worker／入列
+     *    （下述 3）；
+     * 2. 已落定：先在鎖外做一次廉價 strict 快照（[probeStartupGeneration]，單
+     *    `dataStore.data.first()`，零 vault I/O），再在鎖內比對 generation
+     *    （見 [startupGenerationsMatch]）：相同 → 經 [Dispatchers.Main] 回放
+     *    快照 `(outcome, journal)`（`STALE` 的 gateReady 仍由 [onStartupReconcile]
+     *    讀 live gate，保持新鮮；pending 恆 false，vault 零 I/O，只多一讀）；
+     *    不同（外部寫入／revision 前進／probe malformed／讀失敗）→ 鎖內失效後
+     *    新鮮 worker（probe→worker 窗口由 worker 內 `saveMutex` 下 strict 重讀
+     *    兜底，同一核心）。D1 保留：前輪 read-path `UNKNOWN`＋null 且 probe 見
+     *    無 journal 時視為相同（回放中性碼，不在 rotation 自動清除）。
+     * 3. worker 進行中：呼叫方入列 `onDone`，回傳 `viewModelScope.launch {
      *    worker.join() }` join handle——cancel 只停止等待，不殺 worker
      *    （fence 保持到 worker 落定）；
-     * 3. 否則建唯一 worker：`_startupReconcilePending = true`（首發本已
-     *    true，重斷言無害）→ 跑 reconcile → 快照＋先寫 `startupSettled` 再
-     *    Main fan-out 全部 callbacks → `finally` 單點 `pending = false`
-     *   （所有 `onDone` 之後，保留先落碼後落定順序）。
+     * 4. 否則建唯一 worker：`_startupReconcilePending = true`（首發本已
+     *    true，重斷言無害）→ 跑 reconcile（含 generation 攜帶，見
+     *    [reconcilePendingDeleteWithJournalAndGeneration]）→ 快照＋先寫
+     *    `startupSettled` 再 Main fan-out 全部 callbacks → `finally` 單點
+     *    `pending = false`（所有 `onDone` 之後，保留先落碼後落定順序）。
      *
      * Never throws out of scope (an escaping failure is reported as
      * [PendingDeleteOutcome.UNKNOWN] with a null journal via [onDone] on
@@ -1384,6 +1507,10 @@ class SetupViewModel(
      * dispatch (`viewModelScope.launch(Dispatchers.Main) { onDone(...) }`):
      * the returned [Job] IS that dispatch itself (no fan-out exists on this
      * path), so cancelling it discards this caller's own `onDone` delivery.
+     * Stage D2 probe-path: probe 在鎖外（`suspend` 不可持 `synchronized`），
+     * 回放分支同 settled-replay 可取消語義（取消丟棄自身 `onDone`）；新鮮分支
+     * 經遞迴 [launchPendingDeleteReconcile] 入列共享 worker（取消僅停止等待，
+     * 回調仍經 fan-out at-least-once）。
      */
     fun launchPendingDeleteReconcile(
         onDone: (PendingDeleteOutcome, PendingDelete?) -> Unit,
@@ -1391,52 +1518,107 @@ class SetupViewModel(
         val worker: Job
         synchronized(startupLock) {
             // Settled check BEFORE the worker check: a finished round replays
-            // without I/O even if its (dead) job reference lingers.
+            // (after D2 generation validation below) without vault I/O even if
+            // its (dead) job reference lingers.
             val settled = startupSettled
-            if (settled != null) {
-                return viewModelScope.launch(Dispatchers.Main) {
-                    onDone(settled.first, settled.second)
+            if (settled == null) {
+                startupCallbacks.add(onDone)
+                val active = startupWorker?.takeIf { it.isActive }
+                if (active != null) {
+                    worker = active
+                } else {
+                    worker = newStartupWorkerLocked()
                 }
-            }
-            startupCallbacks.add(onDone)
-            val active = startupWorker?.takeIf { it.isActive }
-            if (active != null) {
-                worker = active
             } else {
-                _startupReconcilePending.value = true
-                val fresh = viewModelScope.launch(Dispatchers.IO) {
-                    try {
-                        val result = try {
-                            reconcilePendingDeleteWithJournal()
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (_: Exception) {
-                            PendingDeleteOutcome.UNKNOWN to null
+                // D2: settled exists — async generation validation (probe outside
+                // the lock; suspend must not hold synchronized). Pending stays
+                // false during the probe; replay keeps it false with only one
+                // DataStore read and zero vault I/O.
+                return viewModelScope.launch {
+                    val current: StartupGeneration? = try {
+                        probeStartupGeneration()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        null
+                    }
+                    var replay: StartupSettled? = null
+                    var needFresh = false
+                    synchronized(startupLock) {
+                        val latest = startupSettled
+                        if (latest == null) {
+                            // Invalidated during the probe (logout/save entry):
+                            // fall through to a fresh round.
+                            needFresh = true
+                        } else if (startupGenerationsMatch(latest, current)) {
+                            replay = latest
+                        } else {
+                            startupSettled = null
+                            needFresh = true
                         }
-                        // Settled write BEFORE the Main fan-out, so any launch
-                        // landing after this point replays instead of fanning a
-                        // second round of I/O.
-                        val fanOut: List<(PendingDeleteOutcome, PendingDelete?) -> Unit> =
-                            synchronized(startupLock) {
-                                startupSettled = result
-                                val copy = startupCallbacks.toList()
-                                startupCallbacks.clear()
-                                copy
-                            }
+                    }
+                    if (replay != null) {
                         withContext(Dispatchers.Main) {
-                            fanOut.forEach { cb -> cb(result.first, result.second) }
+                            onDone(replay.outcome, replay.journal)
                         }
-                    } finally {
-                        _startupReconcilePending.value = false
+                        return@launch
+                    }
+                    if (needFresh) {
+                        // Reuse the single-flight fresh path (adds onDone to the
+                        // shared callbacks and joins the shared worker). The
+                        // probe→worker window is covered by the worker's
+                        // saveMutex-guarded strict re-read (same core).
+                        launchPendingDeleteReconcile(onDone).join()
                     }
                 }
-                startupWorker = fresh
-                worker = fresh
             }
         }
         // Join handle (first and reentrant callers alike): cancelling this
         // stops waiting without touching the shared worker.
         return viewModelScope.launch { worker.join() }
+    }
+
+    /**
+     * Creates the single-flight startup worker. Callers MUST hold [startupLock]
+     * (reads/writes `startupWorker`/`startupCallbacks` under it); the worker
+     * body leaves the lock before any suspend (probe→worker 窗口由其內
+     * `saveMutex` 下 strict 重讀兜底).
+     */
+    private fun newStartupWorkerLocked(): Job {
+        _startupReconcilePending.value = true
+        val fresh = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val triple = try {
+                    reconcilePendingDeleteWithJournalAndGeneration()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    Triple<PendingDeleteOutcome, PendingDelete?, StartupGeneration?>(
+                        PendingDeleteOutcome.UNKNOWN,
+                        null,
+                        null,
+                    )
+                }
+                val result = StartupSettled(triple.first, triple.second, triple.third)
+                // Settled write BEFORE the Main fan-out, so any launch
+                // landing after this point validates (D2 probe) instead of
+                // fanning a second round of I/O.
+                val fanOut: List<(PendingDeleteOutcome, PendingDelete?) -> Unit> =
+                    synchronized(startupLock) {
+                        startupSettled = result
+                        val copy = startupCallbacks.toList()
+                        startupCallbacks.clear()
+                        copy
+                    }
+                withContext(Dispatchers.Main) {
+                    fanOut.forEach { cb -> cb(result.outcome, result.journal) }
+                }
+            } finally {
+                _startupReconcilePending.value = false
+            }
+        }
+        startupWorker = fresh
+        return fresh
     }
 
     /** Drops the cached startup-reconcile outcome (logout exit / save commit). */

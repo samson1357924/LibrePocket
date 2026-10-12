@@ -2014,7 +2014,7 @@ export function buildReviewDiff(
   compareBaseSha: string,
   headSha: string,
   changedFiles: string[],
-): { diff: string; coverage: ReviewCoverage; fullDiff: string; fileDiffs: Map<string, string> } {
+): { diff: string; coverage: ReviewCoverage; fullDiff: string; fileDiffs: Map<string, string>; visibleFiles: string[] } {
   const runGit = context.runGit ?? defaultGit;
   const diffs = collectFileDiffs(runGit, compareBaseSha, headSha, changedFiles);
   const reviewFiles = new Set(filterReviewDiffFiles(changedFiles));
@@ -2068,6 +2068,11 @@ export function buildReviewDiff(
     diff,
     fullDiff,
     fileDiffs: diffs,
+    // G1: the review-eligible file set (filterReviewDiffFiles). fileDiffs
+    // above still carries every changed file's raw patch; snippet readers
+    // must gate on this set so deliberately excluded files are never
+    // re-fetched through an anchor.
+    visibleFiles: [...reviewFiles],
     coverage: {
       complete: omittedFiles.length === 0 && truncatedFiles.length === 0,
       omittedFiles,
@@ -3523,10 +3528,18 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
                     ...(typeof violation.line === 'number' ? { line: violation.line } : {}),
                   })),
               ];
+              // G1: snippets read only from the review-eligible set; the
+              // raw per-file map still carries excluded files, so narrow it
+              // here and enforce inside the builder (defense in depth).
+              const allowedSynthesisFiles = new Set(reviewDiff.visibleFiles);
+              const allowedSynthesisDiffs = new Map(
+                [...reviewDiff.fileDiffs].filter(([file]) => allowedSynthesisFiles.has(file)),
+              );
               const synthesisBuilt = buildSynthesisExcerpt({
                 diff: reviewDiff.diff,
-                fileDiffs: reviewDiff.fileDiffs,
+                fileDiffs: allowedSynthesisDiffs,
                 anchors: synthesisAnchors,
+                allowedFiles: allowedSynthesisFiles,
               });
               const excerpt = synthesisBuilt.excerpt;
               const synth = await synthesizeReview({

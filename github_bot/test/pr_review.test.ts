@@ -624,6 +624,81 @@ export async function runPrReviewTests(): Promise<void> {
       }
     }
 
+    // E2E (G1): a WARN anchor naming a review-excluded file never pulls
+    // its patch into the synthesis prompt, while tail anchors still work.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-excluded-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const tailName = 'app/src/main/java/demo/Big.kt';
+        const tailBody = Array.from({ length: 2500 }, (_, i) => `+line ${i} ${'y'.repeat(40)}`);
+        const files = {
+          'app/src/main/AndroidManifest.xml': reviewFiles()['app/src/main/AndroidManifest.xml'],
+          'app/src/main/java/demo/Safe.kt': reviewFiles()['app/src/main/java/demo/Safe.kt'],
+          [tailName]: [
+            `diff --git a/${tailName} b/${tailName}`,
+            `--- a/${tailName}`,
+            `+++ b/${tailName}`,
+            '@@ -1,1 +1,2500 @@',
+            ...tailBody,
+          ].join('\n'),
+          'app/local.properties': [
+            'diff --git a/app/local.properties b/app/local.properties',
+            '--- a/app/local.properties',
+            '+++ b/app/local.properties',
+            '@@ -1,2 +1,2 @@',
+            ' sdk.dir=/opt/old',
+            '+sdk.dir=/opt/G1-EXCLUDED-MARKER',
+          ].join('\n'),
+        };
+        const rolePayload = {
+          verdict: 'APPROVE',
+          summary: 'fine',
+          findings: [
+            { severity: 'WARN', file: tailName, line: 2400, issue: 'tail check' },
+            { severity: 'WARN', file: 'app/local.properties', line: 2, issue: 'excluded check' },
+          ],
+          suggestedLabels: [],
+        };
+        const synthPayload = { verdict: 'APPROVE', summary: 'confirmed', findings: [] };
+        const seenBodies: string[] = [];
+        const previousFetch = globalThis.fetch;
+        globalThis.fetch = (async (_input, init) => {
+          counter.count += 1;
+          seenBodies.push(String((init as { body?: unknown })?.body ?? ''));
+          const payload = counter.count <= 3 ? rolePayload : synthPayload;
+          return new Response(JSON.stringify({
+            output: [{ content: [{ type: 'output_text', text: JSON.stringify(payload) }] }],
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as typeof fetch;
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: {
+              ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+              POCKETGUARD_OUTPUT: artifactPath,
+            } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(files),
+          });
+        } finally {
+          globalThis.fetch = previousFetch;
+        }
+        assert.equal(counter.count, 4, 'both waves ran');
+        assert.equal(reviewed.verdict, 'APPROVE', 'synthesis confirmed');
+        const synthInput = seenBodies[3];
+        assert.ok(!synthInput.includes('G1-EXCLUDED-MARKER'), 'G1 excluded patch never reaches synthesis');
+        assert.ok(synthInput.includes('+line 2399'), 'G1 tail anchor still snippeted');
+        assert.ok(synthInput.includes('local.properties') && synthInput.includes('omitted'), 'G1 excluded anchor recorded omitted');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
     // E2E (F3): a budget too small for even one wave fails closed before any
     // model call (zero AI, INCONCLUSIVE).
     {

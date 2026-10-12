@@ -564,6 +564,13 @@ export function buildSynthesisExcerpt(input: {
   diff: string;
   fileDiffs: Map<string, string>;
   anchors: SynthesisExcerptAnchor[];
+  /**
+   * G1: review-eligible file set (required). A resolved anchor outside this
+   * set is recorded omitted — deliberately excluded files (e.g.
+   * local.properties) can never be re-fetched through a model-controlled
+   * anchor.
+   */
+  allowedFiles: ReadonlySet<string> | readonly string[];
 }): SynthesisExcerptPlan {
   const redactedFull = redactForModel(input.diff);
   const head = redactedFull.slice(0, SYNTHESIS_HEAD_EXCERPT_CHARS);
@@ -579,6 +586,7 @@ export function buildSynthesisExcerpt(input: {
   });
   const omitted: string[] = [];
   let snippets = 0;
+  const allowed = new Set([...input.allowedFiles]);
   const labelOf = (file: string, line: number | undefined): string => {
     // Omitted labels land in the prompt plan: keep them single-line and
     // bounded (anchors are model-controlled).
@@ -592,9 +600,14 @@ export function buildSynthesisExcerpt(input: {
       continue;
     }
     const key = resolveAnchorFile(input.fileDiffs, anchorObj.file);
-    const redacted = key ? redactForModel(input.fileDiffs.get(key) ?? '') : '';
+    // G1: excluded files stay excluded even when named by an anchor.
+    if (!key || !allowed.has(key)) {
+      omitted.push(label);
+      continue;
+    }
+    const redacted = redactForModel(input.fileDiffs.get(key) ?? '');
     const hunks = parseSynthesisHunks(redacted);
-    if (!key || hunks.length === 0) {
+    if (hunks.length === 0) {
       omitted.push(label);
       continue;
     }

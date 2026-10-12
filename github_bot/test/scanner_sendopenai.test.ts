@@ -1736,6 +1736,38 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         'unsupported evidence is unusable',
       );
 
+      // G1 wiring: the raw per-file map carries excluded files while
+      // the eligible set does not.
+      {
+        const patches: Record<string, string> = {
+          'app/src/main/java/demo/Safe.kt': [
+            'diff --git a/app/src/main/java/demo/Safe.kt b/app/src/main/java/demo/Safe.kt',
+            '--- a/app/src/main/java/demo/Safe.kt',
+            '+++ b/app/src/main/java/demo/Safe.kt',
+            '@@ -1,1 +1,1 @@',
+            '+class Safe',
+          ].join('\n'),
+          'app/local.properties': [
+            'diff --git a/app/local.properties b/app/local.properties',
+            '--- a/app/local.properties',
+            '+++ b/app/local.properties',
+            '@@ -1,1 +1,1 @@',
+            '+sdk.dir=/opt/x',
+          ].join('\n'),
+        };
+        const built = buildReviewDiff(
+          { runGit: (args: string[]) => patches[args[args.length - 1]] ?? '' } as never,
+          'a'.repeat(40),
+          'b'.repeat(40),
+          Object.keys(patches),
+        );
+        assert.ok(built.fileDiffs.has('app/local.properties'), 'G1 raw map carries the excluded patch');
+        assert.ok(!built.visibleFiles.includes('app/local.properties'), 'G1 eligible set excludes it');
+        assert.ok(built.visibleFiles.includes('app/src/main/java/demo/Safe.kt'), 'G1 eligible set keeps review files');
+        assert.ok(built.diff.includes('class Safe'), 'G1 visible diff keeps review files');
+        assert.ok(!built.diff.includes('sdk.dir'), 'G1 visible diff drops the excluded patch');
+      }
+
       // F5: head sample + evidence-anchored snippets within the fixed
       // budget; tail anchors stay verifiable, omissions are recorded.
       {
@@ -1762,6 +1794,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           diff: `${headDiff}\n${tailDiff}`,
           fileDiffs,
           anchors: [{ file: tailPath, line: 2 }],
+          allowedFiles: new Set(fileDiffs.keys()),
         });
         assert.ok(built.excerpt.includes('HEAD-MARKER-ADDED'), 'F5 head sample kept');
         assert.ok(built.excerpt.includes('TAIL-MARKER-ADDED'), 'F5 tail anchor snippet included');
@@ -1775,6 +1808,7 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           diff: headDiff,
           fileDiffs,
           anchors: [{ file: 'Nope.kt', line: 1 }, { file: 'Tail.kt' }, { file: tailPath, line: 99 }],
+          allowedFiles: new Set(fileDiffs.keys()),
         });
         assert.equal(built2.snippetCount, 1, 'F5 resolvable anchor still emitted');
         assert.equal(built2.omittedAnchors.length, 2, 'F5 unknown + out-of-range anchors omitted');
@@ -1786,11 +1820,47 @@ export async function runScannerSendOpenAITests(): Promise<void> {
         ]);
         const built3 = buildSynthesisExcerpt({
           diff: headDiff,
+          allowedFiles: new Set(dupDiffs.keys()),
           fileDiffs: dupDiffs,
           anchors: [{ file: 'Same.kt' }],
         });
         assert.equal(built3.snippetCount, 0, 'F5 ambiguous anchor emits nothing');
         assert.equal(built3.omittedAnchors.length, 1, 'F5 ambiguity recorded omitted');
+        // G1: deliberately excluded files stay excluded through anchors.
+        const secretDiff = [
+          'diff --git a/app/local.properties b/app/local.properties',
+          '--- a/app/local.properties',
+          '+++ b/app/local.properties',
+          '@@ -1,2 +1,2 @@',
+          ' sdk.dir=/opt/old',
+          '+sdk.dir=/opt/G1-EXCLUDED-MARKER',
+        ].join('\n');
+        const g1Diffs = new Map([
+          ['app/src/main/java/demo/Head.kt', headDiff],
+          ['app/local.properties', secretDiff],
+        ]);
+        const g1Allowed = new Set(filterReviewDiffFiles([...g1Diffs.keys()]));
+        assert.ok(!g1Allowed.has('app/local.properties'), 'G1 local.properties is review-excluded');
+        const built4 = buildSynthesisExcerpt({
+          diff: headDiff,
+          fileDiffs: g1Diffs,
+          anchors: [{ file: 'app/local.properties', line: 2 }, { file: 'app/src/main/java/demo/Head.kt' }],
+          allowedFiles: g1Allowed,
+        });
+        assert.equal(built4.snippetCount, 1, 'G1 only the allowed anchor emits');
+        assert.equal(built4.omittedAnchors.length, 1, 'G1 excluded anchor recorded omitted');
+        assert.ok(!built4.excerpt.includes('G1-EXCLUDED-MARKER'), 'G1 excluded patch never enters the excerpt');
+        // G1: short-name anchors resolving only to an excluded file are
+        // blocked the same way.
+        const built5 = buildSynthesisExcerpt({
+          diff: headDiff,
+          fileDiffs: g1Diffs,
+          anchors: [{ file: 'local.properties', line: 2 }],
+          allowedFiles: g1Allowed,
+        });
+        assert.equal(built5.snippetCount, 0, 'G1 short-name excluded anchor emits nothing');
+        assert.ok(!built5.excerpt.includes('G1-EXCLUDED-MARKER'), 'G1 short-name excluded patch never enters');
+        assert.ok(built4.excerpt.includes('HEAD-MARKER-ADDED'), 'G1 allowed anchor still snippeted');
       }
       assert.deepEqual(
         selectUsableBlockFindings(

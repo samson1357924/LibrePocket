@@ -19,10 +19,10 @@ import org.junit.Test
 private open class SinkProbe : TranscriptSink {
   val recorded: MutableList<String> = Collections.synchronizedList(mutableListOf())
   override suspend fun onTurnStarted(runId: String, text: String) = Unit
-  override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+  override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
   override suspend fun onTurnFailed(runId: String, error: String) = Unit
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-  override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+  override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
   override suspend fun onSteerQueued(text: String) {
     recorded.add(text)
   }

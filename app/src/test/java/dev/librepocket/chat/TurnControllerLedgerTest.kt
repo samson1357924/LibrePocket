@@ -316,10 +316,10 @@ class TurnControllerLedgerTest {
     // tests below.
     val fastSink = object : dev.librepocket.chat.TranscriptSink {
       override suspend fun onTurnStarted(runId: String, text: String) = Unit
-      override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+      override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
       override suspend fun onTurnFailed(runId: String, error: String) = Unit
       override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-      override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+      override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
       override suspend fun onSteerQueued(text: String) = Unit
       override suspend fun onToolDone(
         runId: String,
@@ -385,12 +385,12 @@ class TurnControllerLedgerTest {
       // Stage 6: admission (user row) stays fast so Started is still returned;
       // terminal + orphan-cancel acks stall, parking the drain behind the gate.
       override suspend fun onTurnStarted(runId: String, text: String) = Unit
-      override suspend fun onTurnSucceeded(runId: String, text: String) {
+      override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
         gate.await()
       }
       override suspend fun onTurnFailed(runId: String, error: String) = Unit
       override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-      override suspend fun onTurnCancelled(runId: String, partialText: String) {
+      override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
         gate.await()
       }
       override suspend fun onLogicalTurnCancelled(
@@ -641,10 +641,10 @@ class TurnControllerLedgerTest {
     // stalls (timeout-after-send) are now UNKNOWN; see R5-1 tests below.
     val fastSink = object : dev.librepocket.chat.TranscriptSink {
       override suspend fun onTurnStarted(runId: String, text: String) = Unit
-      override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+      override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
       override suspend fun onTurnFailed(runId: String, error: String) = Unit
       override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-      override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+      override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
       override suspend fun onSteerQueued(text: String) = Unit
       override suspend fun onToolDone(
         runId: String,

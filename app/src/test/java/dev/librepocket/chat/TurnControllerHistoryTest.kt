@@ -57,13 +57,13 @@ private class PartialCapturingSink : TranscriptSink {
     val failedThreeArg = Collections.synchronizedList(mutableListOf<Failed>())
 
     override suspend fun onTurnStarted(runId: String, text: String) = Unit
-    override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+    override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
     override suspend fun onTurnFailed(runId: String, error: String) = Unit
     override suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
         failedThreeArg.add(Failed(runId, partialText, error))
     }
     override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-    override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+    override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
     override suspend fun onSteerQueued(text: String) = Unit
     override suspend fun onToolDone(
         runId: String,
@@ -479,10 +479,10 @@ class TurnControllerHistoryTest {
         val startedTexts: MutableList<String> = Collections.synchronizedList(mutableListOf())
         val sink = object : TranscriptSink {
             override suspend fun onTurnStarted(runId: String, text: String) { startedTexts.add(text) }
-            override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+            override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
             override suspend fun onTurnFailed(runId: String, error: String) = Unit
             override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-            override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+            override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
             override suspend fun onSteerQueued(text: String) = Unit
             override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
             override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
@@ -564,10 +564,10 @@ class TurnControllerHistoryTest {
         val startedTexts: MutableList<String> = Collections.synchronizedList(mutableListOf())
         val sink = object : TranscriptSink {
             override suspend fun onTurnStarted(runId: String, text: String) { startedTexts.add(text) }
-            override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+            override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
             override suspend fun onTurnFailed(runId: String, error: String) = Unit
             override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-            override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+            override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
             override suspend fun onSteerQueued(text: String) = Unit
             override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
             override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
@@ -633,10 +633,10 @@ class TurnControllerHistoryTest {
         val startedTexts: MutableList<String> = Collections.synchronizedList(mutableListOf())
         val sink = object : TranscriptSink {
             override suspend fun onTurnStarted(runId: String, text: String) { startedTexts.add(text) }
-            override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+            override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
             override suspend fun onTurnFailed(runId: String, error: String) = Unit
             override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-            override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+            override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
             override suspend fun onSteerQueued(text: String) = Unit
             override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
             override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit

@@ -316,8 +316,8 @@ class StageFPersistenceTest {
         sink.onTurnStarted("L", "hello")
         sink.onTurnFailed("L", "half", "boom", null, 0, false)
         sink.onTurnFailed("A2", "frag", "down", "L", 1, true)
-        sink.onTurnSucceeded("A3", "ok", "L", 2)
-        sink.onTurnCancelled("A4", "cut", "L", 3)
+        sink.onTurnSucceeded("A3", "ok", "L", 2, hasReasoning = false)
+        sink.onTurnCancelled("A4", "cut", "L", 3, hasReasoning = false)
         sink.onLogicalTurnCancelled("L2", "A5", "half", 0)
 
         val rows = store.events

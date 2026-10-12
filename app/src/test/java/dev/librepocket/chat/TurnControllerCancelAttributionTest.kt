@@ -65,7 +65,7 @@ private class CancelAttrSink : TranscriptSink {
     startedGate?.invoke(text)
     started.add(runId to text)
   }
-  override suspend fun onTurnSucceeded(runId: String, text: String) {
+  override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
     failSucceededWith?.let { throw it }
     succeeded.add(runId to text)
   }
@@ -74,7 +74,7 @@ private class CancelAttrSink : TranscriptSink {
     failed.add(Triple(runId, partialText, error))
   }
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-  override suspend fun onTurnCancelled(runId: String, partialText: String) {
+  override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
     cancelled.add(runId to partialText)
   }
   override suspend fun onSteerQueued(text: String) = Unit

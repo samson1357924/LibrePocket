@@ -212,7 +212,7 @@ class OrderedTranscriptSink(
   suspend fun onTurnStartedTracked(runId: String, text: String, sent: AtomicBoolean) =
     writeCoreTracked(runId, { delegate.onTurnStarted(runId, text) }, sent)
 
-  override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean = false) =
+  override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) =
     writeCore(runId) { delegate.onTurnSucceeded(runId, text, hasReasoning) }
 
   override suspend fun onTurnSucceeded(
@@ -220,7 +220,7 @@ class OrderedTranscriptSink(
     text: String,
     parentRunId: String?,
     attemptIndex: Int?,
-    hasReasoning: Boolean = false,
+    hasReasoning: Boolean,
   ) = writeCore(runId) { delegate.onTurnSucceeded(runId, text, parentRunId, attemptIndex, hasReasoning) }
 
   override suspend fun onTurnFailed(runId: String, error: String) =
@@ -246,7 +246,7 @@ class OrderedTranscriptSink(
     isFinal: Boolean,
   ) = writeCore(runId) { delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal) }
 
-  override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean = false) =
+  override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) =
     writeCore(runId) { delegate.onTurnCancelled(runId, partialText, hasReasoning) }
 
   override suspend fun onTurnCancelled(
@@ -254,7 +254,7 @@ class OrderedTranscriptSink(
     partialText: String,
     parentRunId: String?,
     attemptIndex: Int?,
-    hasReasoning: Boolean = false,
+    hasReasoning: Boolean,
   ) = writeCore(runId) { delegate.onTurnCancelled(runId, partialText, parentRunId, attemptIndex, hasReasoning) }
 
   override suspend fun onTurnCancelled(

@@ -46,7 +46,7 @@ class OrderedTranscriptSinkSealTest {
             assertTrue("ack must fail explicitly, got $e", e is IOException)
           }
           try {
-            sink.onTurnSucceeded("run-1", "hi")
+            sink.onTurnSucceeded("run-1", "hi", hasReasoning = false)
             fail("durable assistant-row failure must not ack as success")
           } catch (e: Exception) {
             assertTrue("ack must fail explicitly, got $e", e is IOException)
@@ -80,10 +80,10 @@ class OrderedTranscriptSinkSealTest {
           ran.add("started:$runId")
           throw CancellationException("writer teardown")
         }
-        override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
         override suspend fun onTurnFailed(runId: String, error: String) = Unit
         override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-        override suspend fun onTurnCancelled(runId: String, partialText: String) {
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
           ran.add("cancelled:$runId")
         }
         override suspend fun onSteerQueued(text: String) = Unit
@@ -100,7 +100,7 @@ class OrderedTranscriptSinkSealTest {
       runBlocking {
         withTimeout(10_000) {
           val first = async { sink.onTurnStarted("run-1", "hi") }
-          val second = async { sink.onTurnCancelled("run-2", "half") }
+          val second = async { sink.onTurnCancelled("run-2", "half", hasReasoning = false) }
           for (job in listOf(first, second)) {
             try {
               job.await()
@@ -131,10 +131,10 @@ class OrderedTranscriptSinkSealTest {
         override suspend fun onTurnStarted(runId: String, text: String) {
           throw CancellationException("writer teardown")
         }
-        override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
         override suspend fun onTurnFailed(runId: String, error: String) = Unit
         override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-        override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
         override suspend fun onSteerQueued(text: String) = Unit
         override suspend fun onToolDone(
           runId: String,
@@ -157,7 +157,7 @@ class OrderedTranscriptSinkSealTest {
           val started = System.currentTimeMillis()
           withTimeout(4_000) {
             try {
-              sink.onTurnSucceeded("run-2", "late")
+              sink.onTurnSucceeded("run-2", "late", hasReasoning = false)
               fail("post-death core must fail fast, never succeed")
             } catch (_: CancellationException) {
             } catch (_: Exception) {
@@ -186,10 +186,10 @@ class OrderedTranscriptSinkSealTest {
           entered.complete(Unit)
           gate.await()
         }
-        override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
         override suspend fun onTurnFailed(runId: String, error: String) = Unit
         override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-        override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
         override suspend fun onSteerQueued(text: String) = Unit
         override suspend fun onToolDone(
           runId: String,

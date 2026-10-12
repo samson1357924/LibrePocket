@@ -159,7 +159,7 @@ class SessionTranscriptSink(
         text: String,
         parentRunId: String?,
         attemptIndex: Int?,
-        hasReasoning: Boolean = false,
+        hasReasoning: Boolean,
     ) {
         appendDurable(runId, "assistant", text, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true)
         if (hasReasoning) {
@@ -220,7 +220,7 @@ class SessionTranscriptSink(
         partialText: String,
         parentRunId: String?,
         attemptIndex: Int?,
-        hasReasoning: Boolean = false,
+        hasReasoning: Boolean,
     ) {
         appendDurable(
             runId, "assistant", partialText,

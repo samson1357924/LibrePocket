@@ -292,7 +292,7 @@ class Phase3PersistenceTest {
 
         sink.onTurnStarted("r1", "hello")
         sink.onTurnFailed("r1", "half-written", "HTTP 500")
-        sink.onTurnCancelled("r2", "cut off")
+        sink.onTurnCancelled("r2", "cut off", hasReasoning = false)
 
         val rows = store.events
         assertEquals(listOf("user", "assistant", "assistant"), rows.map { it.kind })

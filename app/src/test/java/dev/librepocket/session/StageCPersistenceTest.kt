@@ -331,8 +331,8 @@ class StageCPersistenceTest {
 
         sink.onTurnStarted("L", "hello")
         sink.onTurnFailed("L", "half", "boom", null, 0)
-        sink.onTurnSucceeded("A2", "ok", "L", 1)
-        sink.onTurnCancelled("A3", "cut", "L", 2)
+        sink.onTurnSucceeded("A2", "ok", "L", 1, hasReasoning = false)
+        sink.onTurnCancelled("A3", "cut", "L", 2, hasReasoning = false)
 
         val rows = store.events
         assertEquals(listOf("user", "assistant", "assistant", "assistant"), rows.map { it.kind })

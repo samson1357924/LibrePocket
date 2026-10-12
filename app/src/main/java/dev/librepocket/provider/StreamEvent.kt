@@ -128,6 +128,7 @@ internal fun requireToolAggBudget(currentChars: Int, incomingChars: Int) {
  *
  * @throws ProviderFailure non-retryable, [ProviderFailureCode.AGG_TOO_LARGE].
  */
+// Deliberate delegation: same 1 MiB, same semantics; do not tune independently (see TODO #16).
 internal fun requireTotalToolAggBudget(totalChars: Int, incomingChars: Int) =
     requireToolAggBudget(totalChars, incomingChars)
 

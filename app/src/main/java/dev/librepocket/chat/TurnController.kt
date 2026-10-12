@@ -112,7 +112,8 @@ sealed interface HistoryWindowCap {
 }
 
 /**
- * Oldest-first, whole-message truncation for an outgoing request copy.
+ * Oldest-first eviction (evicts oldest first, retains newest; eviction order,
+ * not iteration order), whole-message truncation for an outgoing request copy.
  * Whole messages only (tool-pair integrity is structural, see above). A
  * single newest message that already exceeds a char budget is still kept
  * whole — truncation drops messages, never splits one — so at least the
@@ -302,7 +303,8 @@ class TurnController(
    * Chars copied by immutable UI text updates (prior block length + delta
    * length per write, tool markers included). This is the quadratic term a
    * future throttle must cut; exact under the controller's single-writer
-   * discipline.
+   * discipline (prior read-then-update is precise only with one writer;
+   * future multi-writer must recompute inside update{} or accept approx).
    */
   var uiTextCopiedChars: Long = 0
     private set
@@ -894,6 +896,7 @@ class TurnController(
             // Stage E invariant: NO total/count billing here — the delta path
             // already billed both at collection time; re-adding would
             // double-count.
+            // currentChars=0: pending was never per-call-billed; delta path already counted total/count, Stage E here is per-call only.
             requireToolAggBudget(0, id.length + name.length + argsStr.length)
             appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
             fireTranscript { transcript.onToolDone(attemptRunId, index, id, name, argsStr) }
@@ -1181,6 +1184,7 @@ class TurnController(
 
   private fun appendAssistantText(runId: String, delta: String) {
     if (delta.isEmpty()) return
+    // Single-writer: prior read-then-update is exact; multi-writer must recompute inside update{} or accept approx.
     val prior = _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
     _uiState.update { s ->
       s.copy(
@@ -1223,6 +1227,7 @@ class TurnController(
   private fun appendReasoningDelta(runId: String, delta: String) {
     // Observable cost baseline (same as appendAssistantText): every delta is
     // exactly one update; copies count prior text re-copied plus new chars.
+    // Single-writer: prior read-then-update is exact; multi-writer must recompute inside update{} or accept approx.
     val prior = _uiState.value.messages.firstOrNull { it.id == runId && it.role == "assistant" }?.text?.length ?: 0
     _uiState.update { s ->
       s.copy(

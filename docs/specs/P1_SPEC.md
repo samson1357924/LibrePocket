@@ -362,7 +362,7 @@ sealed interface StreamEvent {
 | 終態成功 | `finish_reason` + `[DONE]` → `Done` | `response.completed`（非空 output 為權威） → `Done` | `message_stop`（前需 `message_delta stop_reason`） → `Done` |
 | 終態異常 | 缺 `[DONE]`/無合法 `finish_reason` → `Failed(retryable=true)` | `response.completed` 缺 `output`/空陣列 → 用流內已收增量恢復（記 `recovered=true`）；`response.failed/incomplete` → `Failed` | 缺 `message_stop` 或可見/工具塊未閉合 → `Failed(retryable=true)` |
 
-- 發送前上下文窗口（Current）：`HistoryWindowCap` 僅裁剪發送用請求副本（oldest-first、整訊息；預設 `Unbounded` 即不裁剪），UI 與 transcript 保留完整歷史；裁剪數見 `TurnController.droppedHistoryCount`（永不靜默）。token 預算待裝置量測後再定（TODO #16，不硬編數字）。
+- 發送前上下文窗口（Current）：`HistoryWindowCap` 僅裁剪發送用請求副本（oldest-first，淘汰最舊、保留最新、整訊息；預設 `Unbounded` 即不裁剪），UI 與 transcript 保留完整歷史；裁剪數見 `TurnController.droppedHistoryCount`（永不靜默）。token 預算待裝置量測後再定（TODO #16，不硬編數字）。
 - UI 更新成本（Current）：可見增量仍逐 delta 寫入（串流可見性＋cancel 快照依賴）；`streamedTextDeltaCount`／`uiTextUpdateCount`／`uiTextCopiedChars` 為節流決策提供可觀察基線，節流閾值待裝置量測後再定（TODO #16）。
 
 ### 3.3 工具 ID 與多輪一致性（P1 記錄、不執行）

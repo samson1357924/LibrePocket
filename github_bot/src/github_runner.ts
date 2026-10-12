@@ -3432,14 +3432,18 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
           const restoreFetch = installOpenAIStub(env);
           try {
             // P4 two-wave budget: the first wave runs the 3 parallel roles,
-            // the second wave runs the architecture synthesis guard. Equal
-            // shares keep both waves inside the same deadline; when only one
-            // wave fits, the review degrades to the legacy single wave and
-            // records synthesis as skipped.
-            const waveTimeout = resolvePerChunkTimeoutMs(env, remainingMs, 2);
-            const needTwoWaves = waveTimeout * 2 + CHUNK_DEADLINE_SAVE_MARGIN_MS;
+            // the second wave runs the architecture synthesis guard. F3: the
+            // save margin is subtracted BEFORE splitting (margin-first), so a
+            // budget that fits two waves is never misjudged as single-wave;
+            // the old allocate-then-add-margin formula could never fit below
+            // the per-wave ceiling. A skipped synthesis never stores APPROVE.
+            const waveBudget = remainingMs - CHUNK_DEADLINE_SAVE_MARGIN_MS;
+            const waveTimeout = waveBudget > 0 ? resolvePerChunkTimeoutMs(env, waveBudget, 2) : 1;
             const singleTimeout = resolvePerChunkTimeoutMs(env, remainingMs, 1);
-            const firstWaveTimeout = remainingMs >= needTwoWaves ? waveTimeout : singleTimeout;
+            const canTwoWaves = waveBudget > 0
+              && waveTimeout >= MIN_VIABLE_PER_CHUNK_TIMEOUT_MS
+              && waveTimeout * 2 + CHUNK_DEADLINE_SAVE_MARGIN_MS <= remainingMs;
+            const firstWaveTimeout = canTwoWaves ? waveTimeout : singleTimeout;
             const orchestrated = await orchestrateReview({
               changedFiles,
               diff: redactForModel(reviewDiff.diff),
@@ -3472,7 +3476,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
             // already strict enough and skips synthesis. A failed synthesis
             // never stores APPROVE.
             let synthesis: RunnerReviewOutput['synthesis'];
-            if (reviewVerdict === 'APPROVE' && remainingMs >= needTwoWaves) {
+            if (reviewVerdict === 'APPROVE' && canTwoWaves) {
               const redactedDiff = redactForModel(reviewDiff.diff);
               const excerpt = redactedDiff.length > SYNTHESIS_DIFF_EXCERPT_CHARS
                 ? redactedDiff.slice(0, SYNTHESIS_DIFF_EXCERPT_CHARS)
@@ -3540,6 +3544,14 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
                 };
               }
             } else {
+              // F3: an unverified APPROVE is not stored. When synthesis is
+              // skipped (budget or non-APPROVE first round) an APPROVE first
+              // round converges to INCONCLUSIVE; other verdicts are already
+              // strict enough and pass through unchanged.
+              if (reviewVerdict === 'APPROVE') {
+                console.warn('[PocketGuard] Synthesis skipped; downgrading unverified APPROVE to INCONCLUSIVE.');
+                reviewVerdict = 'INCONCLUSIVE';
+              }
               synthesis = { modelUsed: 'not-run', verdict: 'INCONCLUSIVE', skipped: true };
             }
             output = {
@@ -3619,6 +3631,10 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
       (synth.summary !== undefined && typeof synth.summary !== 'string') ||
       (synth.skipped !== undefined && typeof synth.skipped !== 'boolean')
     ) return undefined;
+    // F3: a skipped synthesis never confirms anything, so a stored
+    // APPROVE paired with skipped:true is a forged or pre-fix artifact and
+    // is rejected (fail-closed to INCONCLUSIVE at publish).
+    if (String(raw.verdict) === 'APPROVE' && synth.skipped === true) return undefined;
     synthesis = {
       modelUsed: safeString(synth.modelUsed, 200),
       verdict: synth.verdict as RunnerVerdict,

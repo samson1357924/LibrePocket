@@ -1709,6 +1709,23 @@ export async function runExecutionMatrixTests(): Promise<void> {
         undefined,
         'unknown synthesis keys reject',
       );
+      assert.equal(
+        validateReviewOutput({
+          ...baseArtifact,
+          verdict: 'APPROVE',
+          synthesis: { modelUsed: 'not-run', verdict: 'INCONCLUSIVE', skipped: true },
+        }),
+        undefined,
+        'F3 APPROVE paired with skipped synthesis rejects',
+      );
+      assert.ok(
+        validateReviewOutput({
+          ...baseArtifact,
+          verdict: 'INCONCLUSIVE',
+          synthesis: { modelUsed: 'not-run', verdict: 'INCONCLUSIVE', skipped: true },
+        }),
+        'F3 INCONCLUSIVE with skipped synthesis validates',
+      );
       // Strictness direction: a stored verdict stricter than the
       // recalculation is accepted as stored (downgrades survive publish);
       // a stored verdict looser than the recalculation is rejected.

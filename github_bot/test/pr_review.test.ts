@@ -479,10 +479,11 @@ export async function runPrReviewTests(): Promise<void> {
       }
     }
 
-    // E2E: tight deadline degrades to the single wave with synthesis skipped.
-    // Budget 500000 fits one wave (420000 + margin) but not two (2x250000).
+    // E2E (F3): margin-first budget — 500000 fits two waves
+    // (2x249500 + 1000 margin); the old allocate-then-add-margin formula
+    // misjudged this as single-wave.
     {
-      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-skip-'));
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-marginfirst-'));
       try {
         const artifactPath = path.join(tempDir, 'review-output.json');
         const counter = { count: 0 };
@@ -504,9 +505,76 @@ export async function runPrReviewTests(): Promise<void> {
         } finally {
           restore();
         }
-        assert.equal(reviewed.verdict, 'APPROVE', 'single wave keeps legacy behavior under a tight deadline');
-        assert.equal(reviewed.synthesis?.skipped, true, 'synthesis skipped without budget');
+        assert.equal(reviewed.verdict, 'APPROVE', 'margin-first budget runs both waves');
+        assert.equal(reviewed.synthesis?.skipped, undefined, 'synthesis ran, not skipped');
+        assert.equal(reviewed.synthesis?.verdict, 'APPROVE', 'synthesis confirmed');
+        assert.equal(counter.count, 4, 'both waves ran');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E (F3): per-wave ceiling below the viable threshold forces the
+    // single wave; an unverified APPROVE then converges to INCONCLUSIVE
+    // (never stored) with synthesis marked skipped.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-skip-downgrade-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] }]);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: {
+              ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+              POCKETGUARD_OUTPUT: artifactPath,
+              POCKETGUARD_CHUNK_TIMEOUT_MS: '100',
+            } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(reviewFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'skipped synthesis never stores APPROVE');
+        assert.equal(reviewed.synthesis?.skipped, true, 'synthesis marked skipped');
         assert.equal(counter.count, 3, 'only the first wave ran');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E (F3): a budget too small for even one wave fails closed before any
+    // model call (zero AI, INCONCLUSIVE).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-tiny-budget-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'must not run', findings: [], suggestedLabels: [] }]);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: {
+              ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+              POCKETGUARD_OUTPUT: artifactPath,
+              POCKETGUARD_REVIEW_DEADLINE_MS: '15000',
+            } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(reviewFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'tiny budget fails closed');
+        assert.equal(counter.count, 0, 'no model calls on a hopeless budget');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }

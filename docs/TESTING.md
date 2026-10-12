@@ -30,6 +30,14 @@ When `code == true`, the workflow uses JDK 17 and runs these Gradle stages:
 2. `:app:lintPlayDebug :app:lintFossDebug :app:lintGithubDebug`.
 3. `:app:assemblePlayDebug :app:assembleFossDebug :app:assembleGithubDebug`, then `scripts/play_policy_check.sh` for Play and `scripts/play_policy_check.sh --foss` for Foss. This stage also runs when only `policy == true`.
 
+Robolectric SDK pin (Current): JVM unit tests run with `sdk=33` pinned in
+`app/src/test/resources/robolectric.properties`, while `targetSdk` is 36
+(see [Build Environment](ENV.md)). A green run on API 33 does **not** imply
+API 34–36 behavior is verified; version-sensitive Android API behavior needs
+a separate higher-API smoke pass (Proposed, not a current CI gate). The pin
+itself and any `@Config` SDK matrix expansion are out of scope for the
+current deflake work — do not change them here.
+
 What runs by edit type:
 
 - Docs-only (neither `code` nor `policy`, e.g. `docs/**` or `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.
@@ -96,6 +104,18 @@ For changes involving credentials, policy, persistence, session lifecycle, cance
 - Test fail-closed behavior and stale/late callbacks, not only the successful path.
 - Keep tool states distinct: declared, implemented, wired, and verified. A test-only fake executor does not verify production wiring.
 - Test execution contract: all asynchronous and coroutine waits must enforce a bounded timeout; teardown procedures, socket closures, and synthetic HTTP server (such as MockWebServer) requests must never block indefinitely. On a join timeout, release the peer latch/body/server (then client pools) before the bounded re-join so the parent scope cannot hang on a non-cooperative blocking read.
+
+Shell timeout boundary (Current): `ShellWhitelistTest.timeoutKillsSleep`
+runs `sleep 120` with `timeoutMs=500` and asserts `TimedOut` plus
+`elapsedMs < 10s`. The 120s sleep is deliberately far above the kill ceiling
+so a kill regression (falling through to natural exit) cannot pass; the 10s
+cap is roughly 10x the normal ~0.5–1s kill path (`waitFor` 500ms +
+`destroyForcibly` + per-stream gobbler `join` 5s×2), loose enough for loaded CI but tight
+enough to catch a fully-degraded kill (~15.5s when every grace period fills:
+0.5s wait + 5s destroy wait + 2×5s gobbler joins).
+There is intentionally no lower-bound assertion (CI scheduling jitter would
+flake). The passing-path cost stays ~1s: the long sleep only materializes as
+extra wait when the kill itself regresses.
 
 ## Reporting evidence
 

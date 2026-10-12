@@ -352,6 +352,14 @@ export interface SendOpenAISingleTurnOptions {
   allowedOrigins?: string[];
   /** Role whose configured fallback list extends the chain; set by callers. */
   modelRole?: OpenAIModelRole;
+  /**
+   * F4 (review #77 P1-2): absolute wall-clock deadline (Date.now() ms) for
+   * the whole fallback chain. Each attempt recomputes its share from the
+   * remaining time so a chain of slow fallbacks cannot overrun the job;
+   * an already-passed deadline fails closed before any request. Omitted
+   * keeps the legacy fixed per-attempt timeout.
+   */
+  deadlineMs?: number;
   /** An injection seam for offline callers and tests; omitted in production. */
   env?: OpenAIEnvironment;
 }
@@ -563,6 +571,17 @@ export async function sendOpenAISingleTurnWithFallback(
   let lastError: unknown;
   for (const [index, candidate] of chain.entries()) {
     const isLast = index === chain.length - 1;
+    // F4: divide the remaining chain budget across the attempts still
+    // ahead (including this one) so the sum stays inside the deadline.
+    let attemptTimeoutMs = timeoutMs;
+    if (options.deadlineMs !== undefined) {
+      const remainingAttempts = chain.length - index;
+      const remainingMs = options.deadlineMs - Date.now();
+      if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+        throw new Error('review deadline exceeded');
+      }
+      attemptTimeoutMs = Math.max(1, Math.min(timeoutMs, Math.floor(remainingMs / remainingAttempts)));
+    }
     if (!resolveModelProfile(candidate, env)) {
       attempts.push(`${candidate}: model profile not configured`);
       console.warn(
@@ -573,7 +592,7 @@ export async function sendOpenAISingleTurnWithFallback(
       continue;
     }
     try {
-      const result = await sendOpenAISingleTurn({ ...options, modelId: candidate });
+      const result = await sendOpenAISingleTurn({ ...options, modelId: candidate, timeoutMs: attemptTimeoutMs });
       if (attempts.length > 0) {
         console.warn(
           `[PocketGuard] model ${candidate} served the request after: ${attempts.join('; ')}`,

@@ -971,6 +971,32 @@ export async function runExecutionMatrixTests(): Promise<void> {
       assert.equal(parseReviewCountMarker(state.comments[0].body, HEAD_SHA), 1);
     }
 
+    // F4 (review #77 P1-2): the claim budgets two waves times the full
+    // fallback chain — a 61-attempt chain over the default deadline refuses
+    // instead of occupying a slot the review cannot finish.
+    {
+      const state = makeState();
+      const fallbacks = Array.from({ length: 60 }, (_, i) => `fb${i}`).join(', ');
+      const claimed = await runClaimMode({
+        event: prOpenedEvent(),
+        env: {
+          GITHUB_EVENT_NAME: 'pull_request_target',
+          GITHUB_REPOSITORY: REPO,
+          GITHUB_TOKEN: 'fake-token',
+          POCKETGUARD_RUN_ID: 'f4-long-chain-1',
+          POCKETGUARD_MODEL_FALLBACKS: fallbacks,
+        } as NodeJS.ProcessEnv,
+        githubClient: makeClient(state),
+        writeStdout: () => undefined,
+        runGit: safeGitStub(),
+      });
+      assert.equal(claimed.claimed, false, 'F4 over-budget chain claims nothing');
+      assert.match(claimed.reason, /budget-exceeded/);
+      assert.match(claimed.reason, /61 attempt/);
+      assert.equal(state.created, 0, 'F4 refusal creates nothing');
+      assert.equal(state.updated, 0, 'F4 refusal updates nothing');
+    }
+
     // Quota unknown (fail-closed): listComments throw closes all three
     // stages with zero OpenAI and an untouched sticky.
     {

@@ -1463,6 +1463,33 @@ export async function runScannerSendOpenAITests(): Promise<void> {
           );
           assert.equal(fetchCount, 3, 'each candidate is tried once with no extra retries');
           assert.deepEqual(requestedModels, ['primary-model', 'second-model', 'third-model']);
+
+      // F4: an already-passed deadline fails closed before any request.
+      {
+        let fetchCount = 0;
+        const previous = globalThis.fetch;
+        globalThis.fetch = (async () => {
+          fetchCount += 1;
+          return okResponse();
+        }) as typeof fetch;
+        try {
+          await assert.rejects(
+            sendOpenAISingleTurnWithFallback({
+              modelId: 'primary-model',
+              systemPrompt: 's',
+              userPrompt: 'u',
+              allowedOrigins: FAKE_ALLOWED_ORIGINS,
+              env: chainEnv,
+              timeoutMs: 1000,
+              deadlineMs: Date.now() - 1,
+            }),
+            /review deadline exceeded/,
+          );
+          assert.equal(fetchCount, 0, 'expired deadline sends nothing');
+        } finally {
+          globalThis.fetch = previous;
+        }
+      }
         } finally {
           globalThis.fetch = previous;
         }

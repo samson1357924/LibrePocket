@@ -57,6 +57,12 @@ export interface OrchestratorOptions {
   // the send default (420s). Must be >0 when provided; invalid values throw
   // fail-closed (zero AI) via the send path.
   timeoutMs?: number;
+  /**
+   * F4 (review #77 P1-2): absolute wall-clock deadline (Date.now() ms)
+   * forwarded to every fallback-chain call so the summed attempts stay
+   * inside the job budget. Optional; omitted keeps legacy behavior.
+   */
+  deadlineMs?: number;
 }
 
 const ROLES: readonly OpenAIModelRole[] = ['architecture', 'android_sec', 'android_code'];
@@ -244,6 +250,12 @@ export interface TriageIssueOptions {
   // transport aborts without waiting the 420s default). Omitted keeps
   // the send default.
   timeoutMs?: number;
+  /**
+   * F4 (review #77 P1-2): absolute wall-clock deadline (Date.now() ms)
+   * forwarded to every fallback-chain call so the summed attempts stay
+   * inside the job budget. Optional; omitted keeps legacy behavior.
+   */
+  deadlineMs?: number;
 }
 
 // S4 issue execution (minimal): a single architecture-role turn over the issue
@@ -292,6 +304,7 @@ export async function triageIssue(options: TriageIssueOptions): Promise<IssueTri
       allowedOrigins: options.allowedOrigins,
       env,
       ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options.deadlineMs !== undefined ? { deadlineMs: options.deadlineMs } : {}),
     });
     const parsed = parseJsonObject(result.content);
     if (
@@ -334,6 +347,7 @@ export async function orchestrateReview(options: OrchestratorOptions): Promise<O
         allowedOrigins: options.allowedOrigins,
         env,
         ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+        ...(options.deadlineMs !== undefined ? { deadlineMs: options.deadlineMs } : {}),
       });
       // modelUsed follows the model that actually served the turn, so a fallback
       // is attributed truthfully in reports.
@@ -389,6 +403,12 @@ export interface SynthesizeReviewOptions {
   promptDirectory?: string;
   allowedOrigins?: string[];
   timeoutMs?: number;
+  /**
+   * F4 (review #77 P1-2): absolute wall-clock deadline (Date.now() ms)
+   * forwarded to every fallback-chain call so the summed attempts stay
+   * inside the job budget. Optional; omitted keeps legacy behavior.
+   */
+  deadlineMs?: number;
 }
 
 export function parseSynthesisResponse(modelUsed: string, content: string): SynthesisResult | undefined {
@@ -491,6 +511,7 @@ export async function synthesizeReview(options: SynthesizeReviewOptions): Promis
       allowedOrigins: options.allowedOrigins,
       env,
       ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options.deadlineMs !== undefined ? { deadlineMs: options.deadlineMs } : {}),
     });
     return parseSynthesisResponse(result.modelId, result.content) ?? { ok: false, modelUsed: redactSensitiveText(result.modelId), verdict: 'INCONCLUSIVE', findings: [], evidences: [], summary: '' };
   } catch {
@@ -530,6 +551,12 @@ export interface DiagnoseIssueOptions {
   promptDirectory?: string;
   allowedOrigins?: string[];
   timeoutMs?: number;
+  /**
+   * F4 (review #77 P1-2): absolute wall-clock deadline (Date.now() ms)
+   * forwarded to every fallback-chain call so the summed attempts stay
+   * inside the job budget. Optional; omitted keeps legacy behavior.
+   */
+  deadlineMs?: number;
 }
 
 function diagnosisUserPrompt(input: IssueDiagnosisInput): string {
@@ -566,6 +593,7 @@ export async function diagnoseIssue(options: DiagnoseIssueOptions): Promise<Issu
       allowedOrigins: options.allowedOrigins,
       env,
       ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options.deadlineMs !== undefined ? { deadlineMs: options.deadlineMs } : {}),
     });
     const parsed = parseJsonObject(result.content);
     if (

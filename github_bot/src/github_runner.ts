@@ -1685,12 +1685,12 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
     if (changedFiles.length > MAX_CHANGED_FILES) {
       return emit({ claimed: false, reviewsUsed: 0, reason: 'diff-unavailable: changed file list exceeds limit; fail-closed without occupying a slot', issueNumber });
     }
-    // Phase 3 (P2 #3) claim budget: wave x timeout estimation (fail-
-    // closed, zero writes when over budget). The review runs one wave with
-    // per-wave timeoutMs min(420s, remaining/remainingWaves); the claim
-    // refuses when the clamped per-wave share would fall below
-    // MIN_VIABLE_PER_CHUNK_TIMEOUT_MS, i.e. the deadline budget cannot
-    // reliably cover the waves. A refused claim
+    // Phase 3 (P2 #3) claim budget: wave x attempt estimation (fail-
+    // closed, zero writes when over budget). The review runs up to two
+    // waves (roles + synthesis), each attempt bounded by min(420s, share);
+    // the claim refuses when the clamped share (deadline / (2 waves x
+    // chain attempts)) would fall below MIN_VIABLE_PER_CHUNK_TIMEOUT_MS,
+    // i.e. the deadline budget cannot reliably cover the waves. A refused claim
     // occupies nothing (claimed:false, reviewsUsed 0); a granted claim whose
     // later review times out still holds its slot (never refunded).
     // Phase 2 (P2 #2): the budget is the effective deadline
@@ -1705,11 +1705,15 @@ export async function runClaimMode(context: RunnerContext = {}): Promise<ClaimRe
         throw new Error('PocketGuard: diff pre-flight failed.');
       }
       const deadlineMs = resolveEffectiveReviewDeadlineMs(env, Date.now());
-      const waves = 1;
-      const perChunkShare = Math.floor(deadlineMs / waves);
+      // F4: budget two waves (roles + synthesis) times the full model
+      // fallback chain so a granted claim cannot overrun the job when
+      // every candidate burns its whole attempt timeout.
+      const attempts = maxModelChainAttempts(env);
+      const waves = 2;
+      const perChunkShare = Math.floor(deadlineMs / (waves * attempts));
       const perChunkTimeout = Math.min(MAX_PER_CHUNK_TIMEOUT_MS, perChunkShare);
       if (perChunkTimeout < MIN_VIABLE_PER_CHUNK_TIMEOUT_MS) {
-        return emit({ claimed: false, reviewsUsed: 0, reason: `budget-exceeded: single wave needs ${waves} wave(s) x ${MAX_PER_CHUNK_TIMEOUT_MS}ms over deadline ${deadlineMs}ms (share ${perChunkShare}ms < viable ${MIN_VIABLE_PER_CHUNK_TIMEOUT_MS}ms); fail-closed without occupying a slot`, issueNumber });
+        return emit({ claimed: false, reviewsUsed: 0, reason: `budget-exceeded: ${waves} wave(s) x ${attempts} attempt(s) over deadline ${deadlineMs}ms (share ${perChunkShare}ms < viable ${MIN_VIABLE_PER_CHUNK_TIMEOUT_MS}ms); fail-closed without occupying a slot`, issueNumber });
       }
     }
   } catch {
@@ -3172,6 +3176,20 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
     saveIssueOutput(output, context);
     return output;
   }
+  // F4: total wall-clock deadline across the triage + diagnosis
+  // attempts (issues have no wave split, but the summed fallbacks must
+  // still fit the job budget with margin for output/upload).
+  const issueT0 = Date.now();
+  const issueEffectiveMs = resolveEffectiveReviewDeadlineMs(env, issueT0);
+  let issueRemainingMs = issueEffectiveMs;
+  const issueJobStartedMs = resolveJobStartedMs(env);
+  if (issueJobStartedMs !== undefined) {
+    issueRemainingMs = Math.min(
+      issueEffectiveMs,
+      REVIEW_JOB_TIMEOUT_MS - (issueT0 - issueJobStartedMs) - REVIEW_JOB_UPLOAD_SKEW_MS,
+    );
+  }
+  const issueDeadlineMs = issueT0 + issueRemainingMs - CHUNK_DEADLINE_SAVE_MARGIN_MS;
   const restoreFetch = installOpenAIStub(env);
   try {
     const { triageIssue, diagnoseIssue } = await import('./orchestrator');
@@ -3179,6 +3197,7 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
       input: { title: built.title, body: built.body, comments: built.comments },
       env,
       allowedOrigins: parseAllowedOrigins(env),
+      deadlineMs: issueDeadlineMs,
     });
     // P6 second layer: when the first round names readable files and the
     // verdict is not already fixed, fetch them read-only from the trusted
@@ -3215,6 +3234,7 @@ export async function runIssueReviewMode(context: RunnerContext = {}): Promise<R
           },
           env,
           allowedOrigins: parseAllowedOrigins(env),
+          deadlineMs: issueDeadlineMs,
         });
         const strictness: Record<RunnerVerdict, number> = { NEEDS_CHANGES: 2, INCONCLUSIVE: 1, APPROVE: 0 };
         // A failed diagnosis (ok:false) never changes the first-round
@@ -3444,6 +3464,10 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
               && waveTimeout >= MIN_VIABLE_PER_CHUNK_TIMEOUT_MS
               && waveTimeout * 2 + CHUNK_DEADLINE_SAVE_MARGIN_MS <= remainingMs;
             const firstWaveTimeout = canTwoWaves ? waveTimeout : singleTimeout;
+            // F4: absolute wall-clock deadline for the whole chain (both
+            // waves plus fallbacks); each attempt recomputes its share so
+            // slow fallbacks cannot overrun the job without a checkpoint.
+            const reviewDeadlineMs = t0 + remainingMs - CHUNK_DEADLINE_SAVE_MARGIN_MS;
             const orchestrated = await orchestrateReview({
               changedFiles,
               diff: redactForModel(reviewDiff.diff),
@@ -3452,6 +3476,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
               env,
               allowedOrigins: parseAllowedOrigins(env),
               timeoutMs: firstWaveTimeout,
+              deadlineMs: reviewDeadlineMs,
             });
             const mergedSuggested = [...new Set(orchestrated.roles.flatMap((role) => role.suggestedLabels))];
             const runnerRoles: RunnerReviewOutput['roles'] = orchestrated.roles.map((role) => ({
@@ -3489,6 +3514,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
                 env,
                 allowedOrigins: parseAllowedOrigins(env),
                 timeoutMs: waveTimeout,
+                deadlineMs: reviewDeadlineMs,
               });
               if (!synth.ok) {
                 console.warn('[PocketGuard] Synthesis failed; downgrading review verdict to INCONCLUSIVE.');

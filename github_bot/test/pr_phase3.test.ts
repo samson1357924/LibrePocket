@@ -538,8 +538,8 @@ export async function runPrPhase3Tests(): Promise<void> {
     }
 
     // E2E: claim pre-flight uses the same effective formula (Phase 2 P2 #2).
-    // A job with only ~9s of effective budget cannot cover 1 wave
-    // (share 9000ms < viable 10000ms) so it claims nothing with zero
+    // A job with only ~9s of effective budget cannot cover 2 waves x 1
+    // attempt (share 4500ms < viable 10000ms) so it claims nothing with zero
     // writes; without a job start the same tiny configured budget also
     // refuses (missing downgrades fail-closed to configured).
     {

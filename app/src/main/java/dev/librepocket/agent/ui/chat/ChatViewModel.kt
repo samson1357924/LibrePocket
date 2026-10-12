@@ -832,7 +832,8 @@ class ChatViewModel(
                                 restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
                                 return@launch
                             } catch (_: TranscriptPendingException) {
-                                // R5-1 UNKNOWN/PENDING_COMMIT (timeout-after-send):
+                                // R5-1/R6-2 UNKNOWN/PENDING_COMMIT (timeout-after-send /
+                                // external-cancel-after-send):
                                 // ownership retained by the controller, same-opId
                                 // resend blocked until settle. Do NOT restore
                                 // (no draft, no retry yet); project pending and
@@ -1067,7 +1068,7 @@ class ChatViewModel(
                                 restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
                                 return@launch
                             } catch (_: TranscriptPendingException) {
-                                // R5-1 UNKNOWN/PENDING_COMMIT: same as the steer
+                                // R5-1/R6-2 UNKNOWN/PENDING_COMMIT: same as the steer
                                 // path above (no restore; settle waiter flips).
                                 setNoticeIfCurrent(operationGeneration, "CHAT_STORE_PENDING")
                                 launchPendingSettleWaiter(opId, text, handle, operationGeneration)

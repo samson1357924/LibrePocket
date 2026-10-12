@@ -178,10 +178,12 @@ class InputTooLongException(message: String) : IllegalArgumentException(message)
 class TranscriptDurabilityException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
 /**
- * R5-1 (admission timeout late-commit): the user-row entry was buffered in
+ * R5-1 (admission timeout late-commit) / R6-2 (external cancel after send):
+ * the user-row entry was buffered in
  * the session channel ([OrderedTranscriptSink.onTurnStartedTracked] send
  * proof true) but its durable ack did not arrive within
- * [TurnController.ACCEPT_DURABLE_TIMEOUT_MS]. Fate is UNKNOWN: the
+ * [TurnController.ACCEPT_DURABLE_TIMEOUT_MS] (R5-1) or the caller's wait was
+ * externally cancelled after the send (R6-2). Fate is UNKNOWN: the
  * independent writer may still late-commit it as a ghost row. The controller
  * retains ownership (single-flight still held, same-opId admission blocked),
  * keeps the optimistic UI row with `transcript store pending`, and settles in
@@ -691,11 +693,20 @@ class TurnController(
    * - timeout with send proof true → [DurableAdmission.UNKNOWN] (no
    *   INTERRUPTED mark — the ghost may still late-commit; caller retains
    *   ownership via [unknownAdmission]).
-   * Caller cancellation (external, writer still live) propagates as-is after
-   * the same rollback+mark, so no ghost UI remains.
+   * R6-2 caller cancellation consults the same send proof ([sent] is
+   * caller-owned so the outer catch can distinguish): external cancel with
+   * `sent == false` keeps NOT_ADMITTED semantics (INTERRUPTED-marked here,
+   * rollback + rethrow CE outside, immediately retryable); external cancel
+   * with `sent == true` does NOT mark here — the outer catch retains UNKNOWN
+   * ownership (no rollback) and throws [TranscriptPendingException] like the
+   * timeout-after-send path. Seal races keep the old fail-closed mapping
+   * (INTERRUPTED-marked [TranscriptDurabilityException]).
    */
-  private suspend fun awaitUserRowDurable(logicalTurnId: String, text: String): DurableAdmission {
-    val sent = AtomicBoolean(false)
+  private suspend fun awaitUserRowDurable(
+    logicalTurnId: String,
+    text: String,
+    sent: AtomicBoolean,
+  ): DurableAdmission {
     try {
       val acked = withTimeoutOrNull(acceptTimeoutMs) {
         orderedTranscript.onTurnStartedTracked(logicalTurnId, text, sent)
@@ -721,9 +732,15 @@ class TurnController(
         }
         throw TranscriptDurabilityException("transcript store unavailable (sealed)", e)
       }
-      try {
-        orderedTranscript.markInterrupted(logicalTurnId)
-      } catch (_: Exception) {
+      // R6-2: external cancel before the channel send never entered the ledger
+      // (NOT_ADMITTED, mark like the timeout-before-send path). After the send
+      // the independent writer still owns the entry, so never mark here — the
+      // outer catch retains UNKNOWN ownership instead.
+      if (!sent.get()) {
+        try {
+          orderedTranscript.markInterrupted(logicalTurnId)
+        } catch (_: Exception) {
+        }
       }
       throw e
     } catch (e: TranscriptDurabilityException) {
@@ -1223,9 +1240,14 @@ class TurnController(
    * [CancellationException]/[SecurityException]/[IllegalStateException]/
    * [TranscriptDurabilityException] before return means the text was NOT
    * accepted and must stay recoverable. A [TranscriptPendingException] means
-   * UNKNOWN/PENDING_COMMIT (R5-1, timeout-after-send): ownership retained,
-   * same-opId resend blocked until bounded settle; the caller must NOT treat
-   * it as not-accepted and must NOT immediately resend. A [RecoveryRequiredException] means
+   * UNKNOWN/PENDING_COMMIT (R5-1 timeout-after-send, R6-2 external cancel
+   * after-send): ownership retained, same-opId resend blocked until bounded
+   * settle; the caller must NOT treat it as not-accepted and must NOT
+   * immediately resend. R6-2: an external (caller-scope) cancel with send
+   * proof false stays NOT_ADMITTED (CE + rollback + INTERRUPTED, immediately
+   * retryable); with send proof true it becomes UNKNOWN/PENDING_COMMIT
+   * (Pending, no rollback, no INTERRUPTED — settle claims the ghost under the
+   * same id). A [RecoveryRequiredException] means
    * queued recovery work must be drained before this direct admission can
    * proceed; this method never drains it. If recovery appears after the
    * initial admission lock, this attempt may already have passed a fresh
@@ -1318,8 +1340,12 @@ class TurnController(
     // Stage 6 durable gate (outside the lock): Started == durable user row.
     // R5-1 tri-state: UNKNOWN retains ownership and throws Pending (no
     // rollback, no INTERRUPTED mark); NOT_ADMITTED keeps fail-closed rollback.
+    // R6-2: the send proof is caller-owned so the CE catch below can consult
+    // it. Installs UNKNOWN via writerScope (see enterUnknownAdmission); never
+    // clears admissionCancelRequestedId first (accepted-then-cancelled race).
+    val sent = AtomicBoolean(false)
     try {
-      when (awaitUserRowDurable(reservation.logicalTurnId, text)) {
+      when (awaitUserRowDurable(reservation.logicalTurnId, text, sent)) {
         DurableAdmission.ACKED -> Unit
         DurableAdmission.NOT_ADMITTED -> {
           rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
@@ -1333,8 +1359,17 @@ class TurnController(
         }
       }
     } catch (e: CancellationException) {
-      rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
-      throw e
+      // R6-2 external cancel: sent == false (never entered the channel) stays
+      // NOT_ADMITTED (rollback + rethrow CE, retryable); sent == true (writer
+      // still owns the entry) becomes UNKNOWN (no mark, no rollback — settle
+      // claims the ghost under the same id). Sealed races already surfaced as
+      // TranscriptDurabilityException inside the await, never here.
+      if (!sent.get()) {
+        rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+        throw e
+      }
+      enterUnknownAdmission(reservation, uiMessageId, null)
+      throw TranscriptPendingException("transcript store pending", e)
     } catch (e: TranscriptPendingException) {
       throw e
     } catch (e: TranscriptDurabilityException) {
@@ -1471,10 +1506,13 @@ class TurnController(
    * promotion-gate-failed intents to return to the caller before it retries
    * this admission. A [CancellationException]/[SecurityException]/
    * [IllegalStateException]/[TranscriptDurabilityException] before return
-   * means NOT accepted. A [TranscriptPendingException] means UNKNOWN (R5-1):
+   * means NOT accepted. A [TranscriptPendingException] means UNKNOWN (R5-1
+   * timeout-after-send, R6-2 external cancel after-send):
    * the entry may already be in the channel — do NOT resend the same opId
    * until [settlePendingAdmission] resolves (claimed under the same id, or
-   * converted to retryable). Unlike [steer], the idle path never fire-and-forgets:
+   * converted to retryable). R6-2: external cancel with send proof false stays
+   * NOT_ADMITTED (CE + rollback + INTERRUPTED, retryable); with send proof
+   * true it becomes UNKNOWN like the timeout path. Unlike [steer], the idle path never fire-and-forgets:
    * callers always get an explicit acknowledgment.
    *
    * Stage 6 (R4-3): [TurnStart.Started] is durable — see [startTurn]. A
@@ -1574,8 +1612,10 @@ class TurnController(
     // Stage 6 durable gate (outside the lock): Started == durable user row.
     // R5-1 tri-state: UNKNOWN retains ownership and throws Pending (same-opId
     // resend blocked until settle); NOT_ADMITTED keeps fail-closed rollback.
+    // R6-2: same send-proof split as startTurn for external cancel.
+    val sent = AtomicBoolean(false)
     try {
-      when (awaitUserRowDurable(reservation.logicalTurnId, text)) {
+      when (awaitUserRowDurable(reservation.logicalTurnId, text, sent)) {
         DurableAdmission.ACKED -> Unit
         DurableAdmission.NOT_ADMITTED -> {
           rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
@@ -1589,8 +1629,12 @@ class TurnController(
         }
       }
     } catch (e: CancellationException) {
-      rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
-      throw e
+      if (!sent.get()) {
+        rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
+        throw e
+      }
+      enterUnknownAdmission(reservation, uiMessageId, opId)
+      throw TranscriptPendingException("transcript store pending", e)
     } catch (e: TranscriptPendingException) {
       throw e
     } catch (e: TranscriptDurabilityException) {
@@ -2296,8 +2340,14 @@ class TurnController(
     // Durable gate outside the lock (suspend must never hold the intrinsic
     // monitor). STREAMING stays behind this ack: a kill before the commit
     // below leaves the intent in the FIFO, reclaimable via drainQueued.
+    // R6-2: the await no longer marks INTERRUPTED on cancel-after-send
+    // (sent == true) — the ghost may still late-commit as an orphan; the FIFO
+    // stays retained via failPromotion below. Full promotion cancel-after-send
+    // UNKNOWN ownership (settle/claim) is a separate case; this path keeps the
+    // R6-1 timeout-UNKNOWN ownership untouched and never changes FIFO semantics.
+    val promotionSent = AtomicBoolean(false)
     try {
-      when (awaitUserRowDurable(reservation.logicalTurnId, head.text)) {
+      when (awaitUserRowDurable(reservation.logicalTurnId, head.text, promotionSent)) {
         DurableAdmission.ACKED -> Unit
         DurableAdmission.NOT_ADMITTED -> {
           synchronized(lock) {

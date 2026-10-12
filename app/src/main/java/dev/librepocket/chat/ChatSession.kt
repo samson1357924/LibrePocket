@@ -41,7 +41,7 @@ interface ChatSession {
    * hosted turn to finish. A [CancellationException]/[SecurityException]/
    * [IllegalStateException]/[IllegalArgumentException]/[TranscriptDurabilityException] before return means
    * the text was NOT accepted. A [TranscriptPendingException] means UNKNOWN
-   * (R5-1 timeout-after-send): ownership retained, do NOT immediately resend
+   * (R5-1 timeout-after-send / R6-2 external-cancel-after-send): ownership retained, do NOT immediately resend
    * the same opId — await [settlePendingAdmission] (claimed under the same id
    * without resend, or converted to retryable).
    */

@@ -16,9 +16,14 @@ import dev.librepocket.session.SessionTranscriptSink
 import dev.librepocket.session.TranscriptEvent
 import java.io.File
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
@@ -897,6 +902,237 @@ class TurnControllerLedgerTest {
       // is clean.
       assertTrue(c.interruptedTranscriptRunIds().contains("settle-fail-1"))
       val recoveredRunId = store.events.single { it.kind == "user" }.runId
+      assertTrue(
+        "recovered turn must not be INTERRUPTED",
+        !c.interruptedTranscriptRunIds().contains(recoveredRunId),
+      )
+    } finally {
+      gate.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * R6-2 external cancel after the channel send (send proof true) must follow
+   * the UNKNOWN path — not the NOT_ADMITTED rollback. Ownership is retained
+   * (UI row kept, same-opId resend blocked), no false INTERRUPTED mark is
+   * written, and the bounded settle claims the late-committing ghost under the
+   * SAME logical id (single user row, no dangling family).
+   */
+  @OptIn(DelicateCoroutinesApi::class)
+  @Test
+  fun callerCancelAfterSendKeepsOwnershipAndClaimsOnLateCommit() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val gate = CompletableDeferred<Unit>()
+    val delegateEntered = AtomicBoolean(false)
+    val blockingSink = object : TranscriptSink by inner {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        delegateEntered.set(true)
+        gate.await()
+        inner.onTurnStarted(runId, text)
+      }
+    }
+    val provider = LedgerFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "cancel-after-${n++}" },
+      // Large budget excludes the timeout path: only the external cancel fires.
+      acceptTimeoutMs = 10_000L,
+    )
+    val text = "caller cancel after send"
+    val opId = 101L
+    try {
+      val deferred = GlobalScope.async(Dispatchers.Default) {
+        c.startOrEnqueue(text, opId = opId)
+      }
+      // Delegate entry proves the channel send already succeeded (writer only
+      // runs after send), so sent == true and the waiter is parked in ack.await.
+      runBlocking {
+        withTimeout(5_000) {
+          while (!delegateEntered.get()) delay(10)
+        }
+      }
+      runBlocking {
+        withTimeout(5_000) {
+          while (!c.pendingTranscriptRunIds().contains("cancel-after-1")) delay(10)
+        }
+      }
+      assertFalse("admission must still be parked in ack.await", deferred.isCompleted)
+      // External caller-scope cancel (ack.await cancelled, entry already sent).
+      deferred.cancel()
+      try {
+        runBlocking {
+          withTimeout(5_000) { deferred.await() }
+        }
+        fail("caller cancel after send must throw TranscriptPendingException, not return Started")
+      } catch (e: TranscriptPendingException) {
+        // Expected UNKNOWN path.
+      } catch (e: CancellationException) {
+        fail("caller cancel after send must not surface CancellationException, got $e")
+      }
+      // UNKNOWN ownership: UI row kept, still pending, never INTERRUPTED.
+      assertTrue(c.hasPendingAdmission())
+      assertTrue(
+        "sent==true cancel must not mark INTERRUPTED before settle",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      assertEquals(1, c.uiState.value.messages.count { it.role == "user" && it.text == text })
+      assertTrue(c.pendingTranscriptRunIds().contains("cancel-after-1"))
+      assertTrue("ghost must not have persisted yet", store.events.none { it.kind == "user" })
+      // Same-opId explicit retry is blocked (no second row) until settle.
+      try {
+        runBlocking { withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) } }
+        fail("same-opId retry during UNKNOWN must throw TranscriptPendingException")
+      } catch (e: TranscriptPendingException) {
+        // Expected: no resend, no duplicate.
+      }
+      assertEquals(
+        "blocked retry must not append a second UI row",
+        1,
+        c.uiState.value.messages.count { it.role == "user" && it.text == text },
+      )
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      // Late commit: unblock the writer, then drive bounded settle to claim.
+      gate.complete(Unit)
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.hasPendingAdmission()) {
+            c.settlePendingAdmission(500L)
+            delay(25)
+          }
+        }
+      }
+      assertTrue(
+        "claimed ghost must not be INTERRUPTED",
+        c.interruptedTranscriptRunIds().isEmpty(),
+      )
+      val users = store.events.filter { it.kind == "user" }
+      assertEquals("claimed ghost keeps exactly one user row", 1, users.size)
+      assertEquals(text, users.single().text)
+      assertEquals("cancel-after-1", users.single().runId)
+      // The claimed host runs the turn to completion (single provider call).
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.uiState.value.status != ChatStatus.IDLE) delay(10)
+        }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals(
+        "no duplicate user row after the claimed turn completes",
+        1,
+        store.events.count { it.kind == "user" },
+      )
+      assertEquals(
+        1,
+        c.uiState.value.messages.count { it.role == "user" && it.text == text },
+      )
+      assertTrue(
+        "claimed family must not dangle",
+        dev.librepocket.agent.ui.chat.findDanglingRunIds(store.events).isEmpty(),
+      )
+      assertTrue(c.interruptedTranscriptRunIds().isEmpty())
+      assertEquals("claimed host runs exactly once, no resend", 1, provider.streamCalls.get())
+    } finally {
+      gate.complete(Unit)
+      c.close()
+    }
+  }
+
+  /**
+   * R6-2对照: external cancel before the channel send (send proof false) keeps
+   * NOT_ADMITTED semantics — CE + rollback + INTERRUPTED, immediately
+   * retryable with a fresh id once the admission backpressure clears.
+   */
+  @OptIn(DelicateCoroutinesApi::class)
+  @Test
+  fun callerCancelBeforeSendStillFailsClosed() {
+    val store = DelaySessionStore()
+    val inner = SessionTranscriptSink(store, store.sessionId)
+    val provider = LedgerFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "recovered"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = LedgerAllowPolicy(),
+      transcript = inner,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "cancel-before-${n++}" },
+      acceptTimeoutMs = 10_000L,
+    )
+    val gate = CompletableDeferred<Unit>()
+    val beforeSendEntered = AtomicBoolean(false)
+    // Park BEFORE the channel send so sent stays false at cancel time.
+    c.beforeAdmissionSendForTest = {
+      beforeSendEntered.set(true)
+      gate.await()
+    }
+    val text = "caller cancel before send"
+    val opId = 102L
+    try {
+      val deferred = GlobalScope.async(Dispatchers.Default) {
+        c.startOrEnqueue(text, opId = opId)
+      }
+      runBlocking {
+        withTimeout(5_000) {
+          while (!beforeSendEntered.get()) delay(10)
+        }
+      }
+      // Let the waiter settle into the gate (send provably not attempted).
+      Thread.sleep(200)
+      assertFalse("admission must still be parked before send", deferred.isCompleted)
+      deferred.cancel()
+      try {
+        runBlocking {
+          withTimeout(5_000) { deferred.await() }
+        }
+        fail("caller cancel before send must throw CancellationException")
+      } catch (e: TranscriptPendingException) {
+        fail("before-send cancel must not become UNKNOWN/Pending, got $e")
+      } catch (e: CancellationException) {
+        // Expected NOT_ADMITTED path.
+      }
+      // Fail-closed: no ownership, UI rolled back, explicit INTERRUPTED mark.
+      assertFalse(c.hasPendingAdmission())
+      assertTrue(
+        "failed admission must roll back the UI append",
+        c.uiState.value.messages.none { it.role == "user" && it.text == text },
+      )
+      assertTrue(c.interruptedTranscriptRunIds().contains("cancel-before-1"))
+      assertTrue(c.pendingTranscriptRunIds().isEmpty())
+      assertTrue("nothing was ever sent, so nothing persisted", store.events.none { it.kind == "user" })
+      // Retryable once the backpressure clears: fresh id admits exactly one row.
+      gate.complete(Unit)
+      val retry = runBlocking {
+        withTimeout(5_000) { c.startOrEnqueue(text, opId = opId) }
+      }
+      assertTrue("unblocked retry must admit", retry is TurnStart.Started)
+      runBlocking {
+        (retry as TurnStart.Started).host.join()
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals(1, store.events.count { it.kind == "user" })
+      assertEquals(text, store.events.single { it.kind == "user" }.text)
+      val recoveredRunId = store.events.single { it.kind == "user" }.runId
+      assertTrue(
+        "cancelled before-send id stays marked",
+        c.interruptedTranscriptRunIds().contains("cancel-before-1"),
+      )
       assertTrue(
         "recovered turn must not be INTERRUPTED",
         !c.interruptedTranscriptRunIds().contains(recoveredRunId),

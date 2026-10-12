@@ -139,6 +139,12 @@ class SetupViewModel(
     // One-shot key.write consent (ASK path). Main-thread edits and the IO save
     // coroutine touch it from different threads; all access goes through
     // [consentLock]. Never persisted, never leaves this ViewModel.
+    //
+    // Locking note: the guarded section is non-suspending (plain take/assign,
+    // callable from Main-thread edits/dialog taps as well as the IO save
+    // coroutine), so a plain `synchronized` block is used — a coroutine `Mutex`
+    // would need suspend and cannot serve the Main-thread callers. [saveMutex]
+    // stays a coroutine `Mutex` as the save/logout serialization fence.
     private val consentLock = Any()
     private var pendingConsent: KeyWriteConsent? = null
     private val consentNonces = AtomicLong(0L)
@@ -590,11 +596,9 @@ class SetupViewModel(
             ?.takeIf { it.startsWith("provider_key/") }
             ?.let { SetupValidation.aliasFromRef(it) }
             ?.takeIf { it.isNotBlank() }
-        if (entryRevision != formRevision.get()) {
-            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
-            return
-        }
-        // 4. Fence again immediately before the vault write.
+        // 4. Fence after the snapshot/oldAlias read, immediately before the
+        // vault write. Single check: no suspend lies between the snapshot read
+        // and here, so a second identical check would be redundant.
         if (entryRevision != formRevision.get()) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return

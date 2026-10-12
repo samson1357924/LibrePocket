@@ -95,7 +95,7 @@ For changes involving credentials, policy, persistence, session lifecycle, cance
 - Use fake keys, temporary databases/files, synthetic transcript text, and local fake HTTP servers only. Do not use live credentials, production signing keys, paid endpoints, or private transcripts.
 - Test fail-closed behavior and stale/late callbacks, not only the successful path.
 - Keep tool states distinct: declared, implemented, wired, and verified. A test-only fake executor does not verify production wiring.
-- Test execution contract: all asynchronous and coroutine waits must enforce a bounded timeout; teardown procedures, socket closures, and synthetic HTTP server (such as MockWebServer) requests must never block indefinitely.
+- Test execution contract: all asynchronous and coroutine waits must enforce a bounded timeout; teardown procedures, socket closures, and synthetic HTTP server (such as MockWebServer) requests must never block indefinitely. On a join timeout, release the peer latch/body/server (then client pools) before the bounded re-join so the parent scope cannot hang on a non-cooperative blocking read.
 
 ## Reporting evidence
 

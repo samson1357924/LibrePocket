@@ -392,30 +392,45 @@ class JevClient(
             .header("Accept", "application/json")
             .build()
         val call = http.newCall(request)
-        val job = currentCoroutineContext()[Job]
-        val cancellation = job?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+        val outerJob = currentCoroutineContext()[Job]
+        val outerCancellation = outerJob?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
             if (cause != null) call.cancel()
         }
         try {
             currentCoroutineContext().ensureActive()
             return withTimeout(timeoutMs) {
-                withContext(Dispatchers.IO) {
-                    call.execute().use { resp ->
-                        val code = resp.code
-                        val body = resp.body
-                        val text = if (body == null) {
-                            null
-                        } else try {
-                            readBoundedJevBody(body) { call.cancel() }
-                        } catch (e: JevFailure) {
-                            currentCoroutineContext().ensureActive()
-                            throw e
-                        } catch (e: IOException) {
-                            currentCoroutineContext().ensureActive()
-                            null
+                val innerJob = currentCoroutineContext()[Job]
+                val innerCancellation = innerJob?.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+                    if (cause != null) call.cancel()
+                }
+                try {
+                    withContext(Dispatchers.IO) {
+                        call.execute().use { resp ->
+                            val code = resp.code
+                            val body = resp.body
+                            val text = if (body == null) {
+                                null
+                            } else try {
+                                readBoundedJevBody(body) { call.cancel() }
+                            } catch (e: JevFailure) {
+                                currentCoroutineContext().ensureActive()
+                                throw e
+                            } catch (e: IOException) {
+                                currentCoroutineContext().ensureActive()
+                                null
+                            }
+                            code to text
                         }
-                        code to text
                     }
+                } catch (e: IOException) {
+                    // call.cancel() 中斷 execute()/read() 會拋 IOException；若起因是
+                    // withTimeout 超時，內層 Job 已取消，ensureActive 轉為拋
+                    // TimeoutCancellationException（外層映射為 TIMEOUT/null）。
+                    // 唯有內層 Job 視角能看到超時，外層 ensureActive 看不到。
+                    currentCoroutineContext().ensureActive()
+                    throw e
+                } finally {
+                    innerCancellation?.dispose()
                 }
             }
         } catch (e: TimeoutCancellationException) {
@@ -428,7 +443,7 @@ class JevClient(
             currentCoroutineContext().ensureActive()
             throw e
         } finally {
-            cancellation?.dispose()
+            outerCancellation?.dispose()
         }
     }
 

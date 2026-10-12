@@ -341,4 +341,91 @@ class JevClientTest {
             job?.let { active -> withTimeoutOrNull(1_500) { active.join() } }
         }
     }
+
+    @Test
+    fun timeoutBeforeHeadersMapsToTimeoutAndCancelsCall() = runBlocking {
+        val server = MockWebServer()
+        val signals = CallSignals()
+        server.start()
+        try {
+            server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+            val client = OkHttpClient.Builder()
+                .readTimeout(5, TimeUnit.MINUTES)
+                .eventListener(signals.listener)
+                .build()
+            val base = server.url("/").toString().trimEnd('/')
+            val timeoutMs = 250L
+            val start = System.currentTimeMillis()
+            // Hang guard only: the passing path returns via internal timeoutMs (~250ms);
+            // reaching the 10s bound means the inner withTimeout handler regressed.
+            val res: ChoiceResult = try {
+                withTimeout(10_000) {
+                    JevClient(base, FakeVault(), http = client)
+                        .choose("明天七點設鬧鐘", JevIntents.defaultCandidates(), timeoutMs = timeoutMs)
+                }
+            } catch (e: CancellationException) {
+                throw AssertionError("pre-headers stall must map to TIMEOUT, not leak CancellationException", e)
+            }
+            val elapsed = System.currentTimeMillis() - start
+            assertEquals(JevStatus.TIMEOUT, res.status)
+            assertTrue("pre-headers timeout abstains", res.abstain)
+            assertTrue("pre-headers timeout returns far before the 5min socket timeout, elapsed=$elapsed", elapsed < 5_000)
+            assertTrue(
+                "OkHttp Call.cancel was invoked",
+                withContext(Dispatchers.IO) { signals.cancelled.await(3, TimeUnit.SECONDS) },
+            )
+            assertEquals(1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun timeoutDuringStalledChunkedBodyMapsToTimeoutAndCancelsCall() = runBlocking {
+        val server = MockWebServer()
+        val signals = CallSignals()
+        server.start()
+        try {
+            // 先回 headers、body 停頓：首個 throttle 週期立即送出 headers + 部分 body，
+            // 剩餘 body 停頓 5s，讀端卡在 source.read() 等待下一個位元組。
+            // body 8KiB 遠小於 32KiB 上限，TIMEOUT 必然先於任何 TOO_LARGE 判定。
+            val stalled = choiceJsonWithExactBytes(8 * 1024)
+            server.enqueue(
+                MockResponse()
+                    .setChunkedBody(stalled, 1024)
+                    .throttleBody(2048, 5, TimeUnit.SECONDS),
+            )
+            val client = OkHttpClient.Builder()
+                .readTimeout(5, TimeUnit.MINUTES)
+                .eventListener(signals.listener)
+                .build()
+            val base = server.url("/").toString().trimEnd('/')
+            val timeoutMs = 250L
+            val start = System.currentTimeMillis()
+            // Hang guard only: the passing path returns via internal timeoutMs (~250ms).
+            val res: ChoiceResult = try {
+                withTimeout(10_000) {
+                    JevClient(base, FakeVault(), http = client)
+                        .choose("明天七點設鬧鐘", JevIntents.defaultCandidates(), timeoutMs = timeoutMs)
+                }
+            } catch (e: CancellationException) {
+                throw AssertionError("stalled body must map to TIMEOUT, not leak CancellationException", e)
+            }
+            val elapsed = System.currentTimeMillis() - start
+            assertEquals("stalled body maps to TIMEOUT, not TOO_LARGE/ERROR", JevStatus.TIMEOUT, res.status)
+            assertTrue("stalled body timeout abstains", res.abstain)
+            assertTrue("stalled body timeout returns far before the 5min socket timeout, elapsed=$elapsed", elapsed < 5_000)
+            assertTrue(
+                "response headers arrive before the body stall",
+                withContext(Dispatchers.IO) { signals.headers.await(3, TimeUnit.SECONDS) },
+            )
+            assertTrue(
+                "OkHttp Call.cancel was invoked",
+                withContext(Dispatchers.IO) { signals.cancelled.await(3, TimeUnit.SECONDS) },
+            )
+            assertEquals(1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
 }

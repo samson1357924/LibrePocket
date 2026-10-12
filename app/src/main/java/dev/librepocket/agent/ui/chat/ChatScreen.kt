@@ -49,6 +49,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -67,6 +68,9 @@ import dev.librepocket.voice.VoiceStt
 import dev.librepocket.voice.VoiceSpeaker
 import dev.librepocket.voice.VoiceTools
 import dev.librepocket.voice.VoiceTts
+import dev.librepocket.voice.VoiceTtsConfirmState
+import dev.librepocket.voice.TtsConfirmDecision
+import kotlinx.coroutines.launch
 
 /** User-visible text for a chat notice code; unknown codes fall through raw. */
 internal fun chatNoticeText(code: String): String =
@@ -96,8 +100,10 @@ fun ChatScreen(
     // mic 鈕與朗讀鈕按此顯隱。
     userSwitches: Map<String, Boolean> = emptyMap(),
     // #2 朗讀首次揭露確認（持久化，只問一次）：未確認前朗讀鈕先顯示內聯確認。
+    // 確認鈕 await 寫入再行動（見 VoiceTtsConfirmState）：成功才算確認，
+    // 失敗仍執行本次朗讀並顯示 TTS_ACK_PERSIST_WARNING（保持未確認，下次重問）。
     ttsAcknowledged: Boolean = false,
-    onTtsAcknowledged: () -> Unit = {},
+    onTtsAcknowledged: suspend () -> Boolean = { true },
 ) {
     val session by viewModel.sessionState.collectAsStateWithLifecycle()
     val messages by viewModel.messages.collectAsStateWithLifecycle()
@@ -114,10 +120,13 @@ fun ChatScreen(
     // S2 系統 STT（優先）+ 系統 TTS（優先）：零新權限。
     // #7 雙錯誤通道（各管各的）：STT 失敗經 onSttFailure → sttError 顯示，
     // STT 成功只清 sttError；TTS 引擎失敗（無引擎／初始化／語言／朗讀）
-    // 經 speaker onError → ttsError 顯示，新 speak 發起／TTS 成功／
+    // 經 speaker onError → ttsError 顯示，實際送引擎前／TTS 成功／
     // voice_output 關閉時清除（見 VoiceErrorState）。
     val context = LocalContext.current
     val voiceErrors = remember { VoiceErrorState() }
+    // #2 確認編排（await 寫入 → 按結果行動；寫入中禁用確認鈕防連打）。
+    val ttsConfirm = remember { VoiceTtsConfirmState() }
+    val confirmScope = rememberCoroutineScope()
     // #2 朗讀確認中文字（null 即無待確認朗讀；單一待確認位，後按覆蓋前按）。
     var pendingSpeakText by remember { mutableStateOf<String?>(null) }
     // M2 延遲建構：voice_output 關閉時不初始化 TTS 引擎（不佔系統服務）。
@@ -135,10 +144,11 @@ fun ChatScreen(
     DisposableEffect(speaker) {
         onDispose { speaker?.shutdown() }
     }
-    // voice_output 關閉：TTS 通道消失，清 tts 錯誤與待確認朗讀。
+    // voice_output 關閉：TTS 通道消失，清 tts 錯誤、寫入失敗警告與待確認朗讀。
     LaunchedEffect(outputEnabled) {
         if (!outputEnabled) {
             voiceErrors.onOutputDisabled()
+            ttsConfirm.clearAckWarning()
             pendingSpeakText = null
         }
     }
@@ -258,13 +268,15 @@ fun ChatScreen(
                     // 為 null（延遲建構）時直接不送引擎；引擎失敗經 onError
                     // 進 ttsError 顯示（見 VoiceSpeaker 失敗通道）。
                     // #2：未確認前先記下待朗讀文字、顯示內聯確認，確認後才 speak。
+                    // 清錯只在實際送引擎前（直讀分支／確認接受分支）；進入確認
+                    // 與取消確認皆不碰 tts 錯誤（取消後舊錯保留）。
                     MessageBubble(
                         msg,
                         onSpeak = {
-                            voiceErrors.onSpeakStarted()
                             if (VoiceTts.requiresTtsConfirmation(ttsAcknowledged)) {
                                 pendingSpeakText = it
                             } else {
+                                voiceErrors.onSpeakStarted()
                                 speaker?.speak(it)
                             }
                         },
@@ -387,7 +399,10 @@ fun ChatScreen(
         }
 
         // #2 朗讀內聯確認（首次可見揭露：視力用戶不需進設定頁即可看到；
-        // 既有朗讀鈕 contentDescription 保留）。確認後持久化，只問一次。
+        // 既有朗讀鈕 contentDescription 保留）。確認鈕 await 寫入再行動：
+        // 成功／寫入失敗皆執行本次朗讀（寫入失敗另顯示 TTS_ACK_PERSIST_WARNING，
+        // 保持未確認，下次重問）；寫入中禁用確認鈕（連打防護，寫完恢復）；
+        // 取消鈕只清待朗讀文字，不碰錯誤。
         pendingSpeakText?.let { text ->
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
@@ -403,15 +418,33 @@ fun ChatScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick = {
-                                onTtsAcknowledged()
-                                pendingSpeakText = null
-                                speaker?.speak(text)
+                                confirmScope.launch {
+                                    when (ttsConfirm.confirm(onTtsAcknowledged)) {
+                                        TtsConfirmDecision.SUPPRESSED -> Unit
+                                        else -> {
+                                            voiceErrors.onSpeakStarted()
+                                            speaker?.speak(text)
+                                            pendingSpeakText = null
+                                        }
+                                    }
+                                }
                             },
+                            enabled = !ttsConfirm.confirming,
                         ) { Text("朗讀") }
                         TextButton(onClick = { pendingSpeakText = null }) { Text("取消") }
                     }
                 }
             }
+        }
+
+        // ack 寫入失敗警告（內聯可見；下次確認成功或輸出關閉時清除）。
+        if (ttsConfirm.ackWriteFailed) {
+            Text(
+                text = VoiceTts.TTS_ACK_PERSIST_WARNING,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
         }
 
         // Bottom input bar (ChatGPT/Gemini style).

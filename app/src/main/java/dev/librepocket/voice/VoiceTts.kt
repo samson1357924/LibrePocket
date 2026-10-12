@@ -50,6 +50,12 @@ object VoiceTts {
     fun ttsConfirmMessage(): String =
         "朗讀由" + ENGINE_DISCLOSURE + "。確定要朗讀此則訊息嗎？"
 
+    /**
+     * 確認狀態寫入失敗的內聯警告（ChatScreen 確認寫入失敗時顯示，不手寫字串）：
+     * 本次仍朗讀，但確認未持久化，下次重問。
+     */
+    const val TTS_ACK_PERSIST_WARNING = "確認狀態儲存失敗，下次仍會再詢問"
+
     val PREFERRED_TW: Locale = Locale.forLanguageTag("zh-TW")
     val PREFERRED_CN: Locale = Locale.forLanguageTag("zh-CN")
 

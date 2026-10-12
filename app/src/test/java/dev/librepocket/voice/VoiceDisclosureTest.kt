@@ -88,6 +88,13 @@ class VoiceDisclosureTest {
         assertTrue("msg=$msg", msg.contains("朗讀"))
     }
 
+    @Test fun ackPersistWarning_promisesRetryNotSilence() {
+        val msg = VoiceTts.TTS_ACK_PERSIST_WARNING
+        assertTrue("msg=$msg", msg.contains("儲存失敗"))
+        assertTrue("msg=$msg", msg.contains("再詢問"))
+        assertFalse("msg=$msg", msg.contains("本地"))
+    }
+
     // ---- ChatScreen/Settings 接線（原始碼釘選，僅保留無行為測試且難補者） ----
     //
     // 脆弱性說明（以下各保留處皆同）：JVM 單測看不到 Compose 渲染結果，只能做字串
@@ -129,6 +136,13 @@ class VoiceDisclosureTest {
         // 行為測試行使（狀態機與 speaker 發射各自由 VoiceErrorStateTest 與
         // VoiceSpeakerLifecycleTest 覆蓋），故保留此檔級守衛；刪掉接線時此測變紅。
         assertTrue(chatScreen().contains("onTtsFailure"))
+    }
+
+    @Test fun chatScreen_ackFailureWarningIsWired() {
+        // 脆弱性：見本節說明。確認寫入失敗警告的顯示無 Compose 行為測試行使
+        // （編排決策由 VoiceTtsConfirmStateTest 覆蓋），故保留此檔級守衛；
+        // 刪掉警告接線時此測變紅。
+        assertTrue(chatScreen().contains("TTS_ACK_PERSIST_WARNING"))
     }
 
     @Test fun chatScreen_speakStaysSwitchGated() {

@@ -9,9 +9,10 @@ import androidx.compose.runtime.setValue
  *
  * - STT 失敗 → [sttError]；STT 成功只清 [sttError]，不碰 TTS；
  * - TTS 失敗（[VoiceSpeaker.onError]）→ [ttsError]；
- * - [ttsError] 只在三處清除：新 speak 發起（[onSpeakStarted]）、TTS 成功
- *  （[VoiceSpeaker.onDone] → [onTtsSuccess]）、`voice_output` 關閉
- *  （[onOutputDisabled]）；
+ * - [ttsError] 只在三處清除：實際送引擎前（[onSpeakStarted]，直讀分支與
+ *   確認接受分支）、TTS 成功（[VoiceSpeaker.onDone] → [onTtsSuccess]）、
+ *   `voice_output` 關閉（[onOutputDisabled]）；進入確認流程（只記待朗讀
+ *   文字）與取消確認皆不碰 [ttsError]；
  * - 純狀態 holder（Compose `mutableStateOf` 驅動重組），轉換規則可純 JVM 單測，
  *   不依賴 Compose 測試框架。
  */
@@ -34,7 +35,7 @@ class VoiceErrorState {
         ttsError = message
     }
 
-    /** 新 speak 發起：先清舊 TTS 錯誤，再送引擎／進確認流程。 */
+    /** 實際送引擎前：先清舊 TTS 錯誤，再送引擎。 */
     fun onSpeakStarted() {
         ttsError = null
     }

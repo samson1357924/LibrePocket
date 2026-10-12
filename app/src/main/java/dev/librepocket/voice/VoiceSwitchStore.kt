@@ -12,7 +12,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
-val Context.voiceDataStore by preferencesDataStore(
+internal val Context.voiceDataStore by preferencesDataStore(
     name = "librepocket_voice",
 )
 

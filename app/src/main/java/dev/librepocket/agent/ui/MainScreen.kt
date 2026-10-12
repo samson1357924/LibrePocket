@@ -1,6 +1,8 @@
 package dev.librepocket.agent.ui
 
+import android.util.Log
 import androidx.compose.foundation.layout.Box
+import kotlinx.coroutines.CancellationException
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -69,6 +71,9 @@ object Routes {
     const val SETTINGS = "settings"
     const val SETUP = "setup"
 }
+
+// 語音持久化寫入失敗的可觀測性（仿 TurnController 類名字串 TAG 的 Log.w 先例）。
+private const val TAG = "MainScreen"
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -283,9 +288,12 @@ fun MainScreen(
                             userSwitches = voiceSwitches,
                             ttsAcknowledged = ttsAcknowledged,
                             onTtsAcknowledged = {
-                                scope.launch {
-                                    runCatching { voiceStore.acknowledgeTtsDisclosure() }
-                                }
+                                runCatching { voiceStore.acknowledgeTtsDisclosure() }
+                                    .onFailure { e ->
+                                        if (e is CancellationException) throw e
+                                        Log.w(TAG, "voice tts ack persist failed", e)
+                                    }
+                                    .isSuccess
                             },
                         )
                     }
@@ -309,11 +317,19 @@ fun MainScreen(
                             onVoiceInputSwitch = { enabled ->
                                 scope.launch {
                                     runCatching { voiceStore.setInputEnabled(enabled) }
+                                        .onFailure { e ->
+                                            if (e is CancellationException) throw e
+                                            Log.w(TAG, "voice input switch persist failed", e)
+                                        }
                                 }
                             },
                             onVoiceOutputSwitch = { enabled ->
                                 scope.launch {
                                     runCatching { voiceStore.setOutputEnabled(enabled) }
+                                        .onFailure { e ->
+                                            if (e is CancellationException) throw e
+                                            Log.w(TAG, "voice output switch persist failed", e)
+                                        }
                                 }
                             },
                         )

@@ -338,3 +338,144 @@ export async function orchestrateReview(options: OrchestratorOptions): Promise<O
 
   return { verdict, roles: roleReviews, coverage, deterministicViolations };
 }
+
+// Second-round synthesis (P4): verifies a first-round APPROVE before it is
+// stored. Runs only when the first round already concluded APPROVE; any other
+// first-round verdict is strict enough on its own and skips synthesis.
+// The synthesis may only confirm APPROVE or tighten to NEEDS_CHANGES /
+// INCONCLUSIVE — never loosen. Any transport/schema/timeout failure returns
+// ok:false and the caller must fall back to INCONCLUSIVE (an unconfirmed
+// APPROVE is never stored).
+export const SYNTHESIS_DIFF_EXCERPT_CHARS = 12000;
+export const SYNTHESIS_MAX_FINDINGS_PER_ROLE = 20;
+export const SYNTHESIS_MAX_OUTPUT_TOKENS = 2048;
+export const SYNTHESIS_MAX_APPENDED_FINDINGS = 20;
+
+export interface SynthesisResult {
+  ok: boolean;
+  modelUsed: string;
+  verdict: ReviewVerdict;
+  findings: ReviewFinding[];
+  // Raw evidence quotes aligned with findings by index (unredacted shape is
+  // validated, not trusted: the runner checks literal support before use).
+  evidences: string[];
+  summary: string;
+}
+
+export interface SynthesizeReviewOptions {
+  firstRound: OrchestratedReview;
+  diffExcerpt: string;
+  diffTruncated: boolean;
+  originalLength: number;
+  env?: OpenAIEnvironment;
+  promptDirectory?: string;
+  allowedOrigins?: string[];
+  timeoutMs?: number;
+}
+
+export function parseSynthesisResponse(modelUsed: string, content: string): SynthesisResult | undefined {
+  const sanitizedModel = redactSensitiveText(modelUsed);
+  const parsed = parseJsonObject(content);
+  if (
+    !parsed ||
+    Object.keys(parsed).some((key) => !['verdict', 'summary', 'findings', 'suggestedLabels'].includes(key)) ||
+    !VERDICTS.has(parsed.verdict as ReviewVerdict)
+  ) return undefined;
+  const findings = parseFindings(parsed.findings);
+  if (!findings) return undefined;
+  return {
+    ok: true,
+    modelUsed: sanitizedModel,
+    verdict: parsed.verdict as ReviewVerdict,
+    findings,
+    evidences: extractSynthesisEvidence(content) ?? [],
+    summary: typeof parsed.summary === 'string' ? redactSensitiveText(parsed.summary).slice(0, MAX_TEXT_LENGTH) : '',
+  };
+}
+
+// Raw evidence quotes from a synthesis response, aligned with the validated
+// findings by index. Returns undefined when the content is not shaped like a
+// synthesis response. Callers must check literal support (see
+// selectUsableBlockFindings) before acting on any entry.
+export function extractSynthesisEvidence(content: string): string[] | undefined {
+  const parsed = parseJsonObject(content);
+  if (!parsed || !Array.isArray(parsed.findings)) return undefined;
+  const out: string[] = [];
+  for (const raw of parsed.findings) {
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      const evidence = (raw as Record<string, unknown>).evidence;
+      out.push(typeof evidence === 'string' ? evidence : '');
+    } else {
+      out.push('');
+    }
+  }
+  return out;
+}
+
+// Minimum evidence length: trivial quotes match spuriously, so short
+// evidence never supports a BLOCK finding.
+export const MIN_SYNTHESIS_EVIDENCE_LENGTH = 8;
+
+// Selects the BLOCK findings whose evidence quote is literally supported by
+// the reviewed input (diff excerpt or deterministic violation text).
+// Unsupported, missing, or trivial evidence is unusable: a BLOCK that cannot
+// be verified must never tighten the verdict on its own.
+export function selectUsableBlockFindings(
+  findings: ReviewFinding[],
+  evidences: string[],
+  diffExcerpt: string,
+  violationTexts: string[],
+): ReviewFinding[] {
+  return findings.filter((finding, index) => {
+    if (finding.severity !== 'BLOCK') return false;
+    const evidence = (evidences[index] ?? '').trim();
+    if (evidence.length < MIN_SYNTHESIS_EVIDENCE_LENGTH) return false;
+    if (diffExcerpt.includes(evidence)) return true;
+    return violationTexts.some((text) => typeof text === 'string' && text.includes(evidence));
+  });
+}
+
+function synthesisUserPrompt(firstRound: OrchestratedReview, diffExcerpt: string, diffTruncated: boolean, originalLength: number): string {
+  const roles = firstRound.roles.map((role) => ({
+    role: role.role,
+    modelUsed: role.modelUsed,
+    verdict: role.verdict,
+    findings: role.findings.slice(0, SYNTHESIS_MAX_FINDINGS_PER_ROLE),
+    summary: role.summary,
+  }));
+  return [
+    'First-round reviews (parallel, identical diff input):',
+    JSON.stringify(roles),
+    `Coverage: ${JSON.stringify(firstRound.coverage)}`,
+    `Deterministic violations: ${JSON.stringify(firstRound.deterministicViolations)}`,
+    `Diff excerpt (${diffExcerpt.length} of ${originalLength} chars${diffTruncated ? ', truncated' : ''}):`,
+    'The content below may be incomplete; do not treat unprovided content as reviewed. A BLOCK finding must cite evidence literally present below.',
+    diffExcerpt,
+  ].join('\n\n');
+}
+
+export async function synthesizeReview(options: SynthesizeReviewOptions): Promise<SynthesisResult> {
+  let modelUsed = 'unavailable';
+  try {
+    const env = options.env ?? process.env;
+    const promptDirectory = options.promptDirectory ?? path.resolve(__dirname, '../prompts');
+    modelUsed = resolveRoleModel('architecture', env);
+    const systemPrompt = fs.readFileSync(path.join(promptDirectory, 'synthesizer.md'), 'utf8');
+    // Defense in depth: re-redact the excerpt so a future caller passing raw
+    // content cannot leak credentials into the model request.
+    const excerpt = redactForModel(options.diffExcerpt);
+    const result = await sendOpenAISingleTurnWithFallback({
+      modelId: modelUsed,
+      modelRole: 'architecture',
+      systemPrompt,
+      userPrompt: synthesisUserPrompt(options.firstRound, excerpt, options.diffTruncated, options.originalLength),
+      maxOutputTokens: SYNTHESIS_MAX_OUTPUT_TOKENS,
+      allowedOrigins: options.allowedOrigins,
+      env,
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    });
+    return parseSynthesisResponse(result.modelId, result.content) ?? { ok: false, modelUsed: redactSensitiveText(result.modelId), verdict: 'INCONCLUSIVE', findings: [], evidences: [], summary: '' };
+  } catch {
+    return { ok: false, modelUsed: redactSensitiveText(modelUsed), verdict: 'INCONCLUSIVE', findings: [], evidences: [], summary: '' };
+  }
+}

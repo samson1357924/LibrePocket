@@ -22,10 +22,13 @@ import {
 } from '../src/review_diff';
 import { buildReviewDiff } from '../src/github_runner';
 import {
+  extractSynthesisEvidence,
   orchestrateReview,
   parseFindings,
   parseJsonObject,
   parseRoleResponse,
+  parseSynthesisResponse,
+  selectUsableBlockFindings,
   triageIssue,
 } from '../src/orchestrator';
 
@@ -1670,6 +1673,61 @@ export async function runScannerSendOpenAITests(): Promise<void> {
   } finally {
     globalThis.fetch = originalFetch;
   }
+
+    // Synthesis response parsing is strict: unknown top-level keys reject,
+    // evidence is extracted index-aligned for the runner's support check.
+    {
+      const good = parseSynthesisResponse('m', JSON.stringify({
+        verdict: 'NEEDS_CHANGES',
+        summary: 's',
+        findings: [{ severity: 'BLOCK', file: 'a.kt', line: 1, issue: 'i', evidence: 'quoted code here' }],
+      }));
+      assert.ok(good?.ok);
+      assert.deepEqual(good?.evidences, ['quoted code here']);
+      assert.equal(
+        parseSynthesisResponse('m', JSON.stringify({ verdict: 'APPROVE', summary: 's', findings: [], extra: 1 })),
+        undefined,
+        'unknown synthesis keys reject',
+      );
+      assert.deepEqual(extractSynthesisEvidence('not json'), undefined);
+      const usable = selectUsableBlockFindings(
+        good?.findings ?? [],
+        good?.evidences ?? [],
+        'diff with quoted code here inside',
+        ['rule message'],
+      );
+      assert.equal(usable.length, 1, 'literally supported BLOCK is usable');
+      assert.deepEqual(
+        selectUsableBlockFindings(
+          good?.findings ?? [],
+          ['missing quote'],
+          'unrelated diff',
+          ['unrelated violation'],
+        ),
+        [],
+        'unsupported evidence is unusable',
+      );
+      assert.deepEqual(
+        selectUsableBlockFindings(
+          good?.findings ?? [],
+          ['short'],
+          'diff containing short inside',
+          [],
+        ),
+        [],
+        'trivial evidence never supports',
+      );
+      assert.deepEqual(
+        selectUsableBlockFindings(
+          [{ severity: 'WARN', issue: 'w' }],
+          ['warn evidence in diff'],
+          'diff with warn evidence in diff inside',
+          [],
+        ),
+        [],
+        'non-BLOCK never usable for tightening',
+      );
+    }
 
   console.log('[PocketGuard scanner/OpenAI tests] All tests passed.');
 }

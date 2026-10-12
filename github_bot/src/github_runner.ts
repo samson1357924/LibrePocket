@@ -410,6 +410,18 @@ export interface RunnerReviewOutput {
   // APPROVE. Optional for backward compatibility with pre-S5 artifacts
   // (missing defaults to []).
   suggestedLabels?: string[];
+  // P4 second-round synthesis: the architecture guard over a first-round
+  // APPROVE. skipped is true when synthesis never ran (non-APPROVE first
+  // round, or only one wave fit the deadline); otherwise verdict carries the
+  // synthesis outcome and the stored top-level verdict already reflects it
+  // (confirmed APPROVE, or tightened NEEDS_CHANGES with evidenced BLOCK
+  // findings attached to the architecture role, or INCONCLUSIVE).
+  synthesis?: {
+    modelUsed: string;
+    verdict: RunnerVerdict;
+    summary?: string;
+    skipped?: boolean;
+  };
 }
 
 function stdout(context: RunnerContext, text: string): void {
@@ -3167,6 +3179,7 @@ export function writeReviewReports(output: RunnerReviewOutput | RunnerIssueOutpu
       roles: pr.roles,
       coverage: pr.coverage,
       findings,
+      ...(pr.synthesis ? { synthesis: pr.synthesis } : {}),
       time,
     };
   }
@@ -4118,9 +4131,18 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
             suggestedLabels: [],
           };
         } else {
-          const { orchestrateReview } = await import('./orchestrator');
+          const { orchestrateReview, synthesizeReview, SYNTHESIS_DIFF_EXCERPT_CHARS, SYNTHESIS_MAX_APPENDED_FINDINGS, selectUsableBlockFindings } = await import('./orchestrator');
           const restoreFetch = installOpenAIStub(env);
           try {
+            // P4 two-wave budget: the first wave runs the 3 parallel roles,
+            // the second wave runs the architecture synthesis guard. Equal
+            // shares keep both waves inside the same deadline; when only one
+            // wave fits, the review degrades to the legacy single wave and
+            // records synthesis as skipped.
+            const waveTimeout = resolvePerChunkTimeoutMs(env, remainingMs, 2);
+            const needTwoWaves = waveTimeout * 2 + CHUNK_DEADLINE_SAVE_MARGIN_MS;
+            const singleTimeout = resolvePerChunkTimeoutMs(env, remainingMs, 1);
+            const firstWaveTimeout = remainingMs >= needTwoWaves ? waveTimeout : singleTimeout;
             const orchestrated = await orchestrateReview({
               changedFiles,
               diff: redactForModel(reviewDiff.diff),
@@ -4128,7 +4150,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
               deterministicViolations: scan.violations,
               env,
               allowedOrigins: parseAllowedOrigins(env),
-              timeoutMs,
+              timeoutMs: firstWaveTimeout,
             });
             const mergedSuggested = [...new Set(orchestrated.roles.flatMap((role) => role.suggestedLabels))];
             const runnerRoles: RunnerReviewOutput['roles'] = orchestrated.roles.map((role) => ({
@@ -4147,6 +4169,82 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
               console.warn('[PocketGuard] Discarded unknown AI labels; downgrading review verdict to INCONCLUSIVE.');
               reviewVerdict = 'INCONCLUSIVE';
             }
+            // P4 synthesis guard: a first-round APPROVE is stored only after
+            // the architecture synthesis confirms it (or tightens with
+            // evidenced BLOCK findings). Any other first-round verdict is
+            // already strict enough and skips synthesis. A failed synthesis
+            // never stores APPROVE.
+            let synthesis: RunnerReviewOutput['synthesis'];
+            if (reviewVerdict === 'APPROVE' && remainingMs >= needTwoWaves) {
+              const redactedDiff = redactForModel(reviewDiff.diff);
+              const excerpt = redactedDiff.length > SYNTHESIS_DIFF_EXCERPT_CHARS
+                ? redactedDiff.slice(0, SYNTHESIS_DIFF_EXCERPT_CHARS)
+                : redactedDiff;
+              const synth = await synthesizeReview({
+                firstRound: orchestrated,
+                diffExcerpt: excerpt,
+                diffTruncated: redactedDiff.length > excerpt.length,
+                originalLength: reviewDiff.coverage.originalLength,
+                env,
+                allowedOrigins: parseAllowedOrigins(env),
+                timeoutMs: waveTimeout,
+              });
+              if (!synth.ok) {
+                console.warn('[PocketGuard] Synthesis failed; downgrading review verdict to INCONCLUSIVE.');
+                reviewVerdict = 'INCONCLUSIVE';
+                synthesis = {
+                  modelUsed: synth.modelUsed,
+                  verdict: 'INCONCLUSIVE',
+                  ...(synth.summary ? { summary: synth.summary } : {}),
+                };
+              } else if (synth.verdict === 'APPROVE' &&
+                !synth.findings.some((finding) => finding.severity === 'BLOCK')) {
+                synthesis = {
+                  modelUsed: synth.modelUsed,
+                  verdict: 'APPROVE',
+                  ...(synth.summary ? { summary: synth.summary } : {}),
+                };
+              } else if (synth.verdict === 'NEEDS_CHANGES') {
+                // Tighten only with evidenced BLOCK findings: the evidence
+                // quote must literally appear in the reviewed excerpt or a
+                // deterministic violation, otherwise the dissent is
+                // unverifiable and the review falls back to INCONCLUSIVE.
+                // An APPROVE verdict carrying BLOCK findings is likewise
+                // contradictory and can never be stored.
+                const violationTexts = orchestrated.deterministicViolations.map(
+                  (violation) => `${violation.ruleId} ${violation.message} ${violation.file ?? ''}`,
+                );
+                const usable = selectUsableBlockFindings(synth.findings, synth.evidences, excerpt, violationTexts)
+                  .slice(0, SYNTHESIS_MAX_APPENDED_FINDINGS)
+                  .map((finding) => ({ ...finding }));
+                const architectureRole = runnerRoles.find((role) => role.role === 'architecture');
+                if (architectureRole && usable.length > 0) {
+                  // Attach the evidenced BLOCK findings to the architecture
+                  // role (and flip its verdict) so the deterministic
+                  // recalculation below and at publish converge to
+                  // NEEDS_CHANGES.
+                  architectureRole.findings.push(...usable);
+                  architectureRole.verdict = 'NEEDS_CHANGES';
+                  reviewVerdict = 'NEEDS_CHANGES';
+                } else {
+                  reviewVerdict = 'INCONCLUSIVE';
+                }
+                synthesis = {
+                  modelUsed: synth.modelUsed,
+                  verdict: reviewVerdict,
+                  ...(synth.summary ? { summary: synth.summary } : {}),
+                };
+              } else {
+                reviewVerdict = 'INCONCLUSIVE';
+                synthesis = {
+                  modelUsed: synth.modelUsed,
+                  verdict: 'INCONCLUSIVE',
+                  ...(synth.summary ? { summary: synth.summary } : {}),
+                };
+              }
+            } else {
+              synthesis = { modelUsed: 'not-run', verdict: 'INCONCLUSIVE', skipped: true };
+            }
             output = {
               verdict: reviewVerdict,
               roles: runnerRoles,
@@ -4160,6 +4258,7 @@ export async function runReviewMode(context: RunnerContext = {}): Promise<Runner
               changedFiles,
               changedFilesComplete,
               suggestedLabels: mergedSuggested,
+              synthesis,
             };
           } finally {
             restoreFetch();
@@ -4200,6 +4299,7 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
     Object.keys(raw).some((key) => ![
       'verdict', 'pullRequestNumber', 'baseSha', 'headSha', 'headRepository', 'roles', 'coverage',
       'deterministicViolations', 'areaLabels', 'changedFiles', 'changedFilesComplete', 'suggestedLabels',
+      'synthesis',
     ].includes(key)) ||
     !Number.isSafeInteger(raw.pullRequestNumber) || Number(raw.pullRequestNumber) < 1 ||
     !safeSha(raw.baseSha) || !safeSha(raw.headSha) || !safeRepositoryName(raw.headRepository) ||
@@ -4211,6 +4311,24 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
   ) return undefined;
   const suggestedLabels = parseSuggestedLabelsField(raw.suggestedLabels);
   if (!suggestedLabels) return undefined;
+  let synthesis: RunnerReviewOutput['synthesis'];
+  if (raw.synthesis !== undefined) {
+    if (!raw.synthesis || typeof raw.synthesis !== 'object' || Array.isArray(raw.synthesis)) return undefined;
+    const synth = raw.synthesis as Record<string, unknown>;
+    if (
+      Object.keys(synth).some((key) => !['modelUsed', 'verdict', 'summary', 'skipped'].includes(key)) ||
+      typeof synth.modelUsed !== 'string' || !synth.modelUsed.trim() ||
+      !verdicts.has(String(synth.verdict)) ||
+      (synth.summary !== undefined && typeof synth.summary !== 'string') ||
+      (synth.skipped !== undefined && typeof synth.skipped !== 'boolean')
+    ) return undefined;
+    synthesis = {
+      modelUsed: safeString(synth.modelUsed, 200),
+      verdict: synth.verdict as RunnerVerdict,
+      ...(typeof synth.summary === 'string' ? { summary: safeString(synth.summary, 2000) } : {}),
+      ...(typeof synth.skipped === 'boolean' ? { skipped: synth.skipped } : {}),
+    };
+  }
   const rawCoverage = raw.coverage;
   if (!rawCoverage || typeof rawCoverage !== 'object' || Array.isArray(rawCoverage)) return undefined;
   const coverage = rawCoverage as Record<string, unknown>;
@@ -4311,10 +4429,16 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
     : unanimousApproval && completeFileCoverage && !hasCriticalOmission
       ? 'APPROVE'
       : 'INCONCLUSIVE';
-  if (raw.verdict !== calculatedVerdict) return undefined;
+  // Fail-closed in the dangerous direction only: a stored verdict looser
+  // than the recalculation (e.g. forged APPROVE over BLOCK roles) is
+  // rejected. A stored verdict stricter than the recalculation (label-gate
+  // or synthesis downgrades to INCONCLUSIVE/NEEDS_CHANGES) is accepted as
+  // stored so the downgrade — and its reason — survives publish.
+  const strictness: Record<RunnerVerdict, number> = { NEEDS_CHANGES: 2, INCONCLUSIVE: 1, APPROVE: 0 };
+  if (strictness[raw.verdict as RunnerVerdict] < strictness[calculatedVerdict]) return undefined;
 
   return {
-    verdict: calculatedVerdict,
+    verdict: raw.verdict as RunnerVerdict,
     pullRequestNumber: Number(raw.pullRequestNumber),
     baseSha: raw.baseSha,
     headSha: raw.headSha,
@@ -4335,6 +4459,7 @@ export function validateReviewOutput(value: unknown): RunnerReviewOutput | undef
       : [],
     changedFilesComplete: raw.changedFilesComplete === true,
     suggestedLabels,
+    ...(synthesis ? { synthesis } : {}),
   };
 }
 

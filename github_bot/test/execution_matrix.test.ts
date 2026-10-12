@@ -1648,6 +1648,59 @@ export async function runExecutionMatrixTests(): Promise<void> {
         undefined,
         'retired chief role rejects',
       );
+      assert.ok(
+        validateReviewOutput({
+          ...baseArtifact,
+          synthesis: { modelUsed: 'm', verdict: 'APPROVE', summary: 'confirmed' },
+        }),
+        'well-formed synthesis validates',
+      );
+      assert.equal(
+        validateReviewOutput({
+          ...baseArtifact,
+          synthesis: { modelUsed: 'm', verdict: 'MAYBE' },
+        }),
+        undefined,
+        'malformed synthesis verdict rejects',
+      );
+      assert.equal(
+        validateReviewOutput({
+          ...baseArtifact,
+          synthesis: { modelUsed: 'm', verdict: 'APPROVE', extra: 1 },
+        }),
+        undefined,
+        'unknown synthesis keys reject',
+      );
+      // Strictness direction: a stored verdict stricter than the
+      // recalculation is accepted as stored (downgrades survive publish);
+      // a stored verdict looser than the recalculation is rejected.
+      {
+        const cleanArtifact = {
+          ...baseArtifact,
+          verdict: 'APPROVE',
+          coverage: { complete: true, omittedFiles: [], truncatedFiles: [], originalLength: 10 },
+          changedFilesComplete: true,
+        };
+        const downgraded = validateReviewOutput({
+          ...cleanArtifact,
+          verdict: 'INCONCLUSIVE',
+          synthesis: { modelUsed: 'm', verdict: 'INCONCLUSIVE' },
+        });
+        assert.equal(downgraded?.verdict, 'INCONCLUSIVE', 'stricter stored verdict is preserved');
+        assert.equal(
+          validateReviewOutput({
+            ...cleanArtifact,
+            roles: [
+              { role: 'architecture', modelUsed: 'm', verdict: 'NEEDS_CHANGES', findings: [] },
+              { role: 'android_sec', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
+              { role: 'android_code', modelUsed: 'm', verdict: 'APPROVE', findings: [] },
+            ],
+            verdict: 'APPROVE',
+          }),
+          undefined,
+          'looser stored verdict rejects',
+        );
+      }
     }
 
     // Workflow wiring: route-driven gates, quota outputs, and the quota mutex note.

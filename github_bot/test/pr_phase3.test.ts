@@ -484,7 +484,8 @@ export async function runPrPhase3Tests(): Promise<void> {
         }
         assert.equal(reviewed.verdict, 'APPROVE', '2min setup smoke still approves single-turn');
         assert.equal(reviewed.coverage.complete, true, '2min setup smoke computes complete coverage');
-        assert.equal(counter.count, 3, `2min setup smoke attempted 3 roles (got ${counter.count})`);
+        assert.equal(counter.count, 4, `2min setup smoke attempted 3 roles plus synthesis (got ${counter.count})`);
+        assert.equal(reviewed.synthesis?.verdict, 'APPROVE', 'synthesis confirms APPROVE');
         const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8')) as Record<string, unknown>;
         assert.equal(artifact.verdict, 'APPROVE', '2min setup smoke checkpoints APPROVE');
       } finally {

@@ -198,7 +198,9 @@ export async function runPrReviewTests(): Promise<void> {
         assert.equal(reviewed.coverage.complete, true);
         assert.deepEqual(reviewed.coverage.omittedFiles, []);
         assert.deepEqual(reviewed.coverage.truncatedFiles, []);
-        assert.equal(counter.count, 3, 'single-turn runs 3 roles in parallel (got 3)');
+        assert.equal(counter.count, 4, 'first wave runs 3 roles plus synthesis (got 4)');
+        assert.equal(reviewed.synthesis?.verdict, 'APPROVE', 'synthesis confirms APPROVE');
+        assert.equal(reviewed.synthesis?.skipped, undefined, 'synthesis ran');
         const sticky = reviewComment(reviewed, [], 'report line');
         assert.ok(sticky.includes('Segments: single segment'), 'single-turn sticky carries single segment line');
         assert.ok(sticky.includes('Verdict: APPROVE'));
@@ -301,6 +303,7 @@ export async function runPrReviewTests(): Promise<void> {
           restore();
         }
         assert.equal(reviewed.verdict, 'NEEDS_CHANGES', 'one NEEDS role forces NEEDS_CHANGES');
+        assert.equal(reviewed.synthesis?.skipped, true, 'non-APPROVE first round skips synthesis');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -331,6 +334,253 @@ export async function runPrReviewTests(): Promise<void> {
           restore();
         }
         assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'one failed role forces INCONCLUSIVE');
+        assert.equal(reviewed.synthesis?.skipped, true, 'non-APPROVE first round skips synthesis');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E: synthesis tightens APPROVE to NEEDS_CHANGES with evidenced BLOCK.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-needs-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          {
+            verdict: 'NEEDS_CHANGES',
+            summary: 'found an issue on second look',
+            findings: [{ severity: 'BLOCK', file: 'app/src/main/java/demo/Safe.kt', issue: 'unguarded call', evidence: 'class Safe' }],
+            suggestedLabels: [],
+          },
+        ]);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(reviewFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'NEEDS_CHANGES', 'evidenced synthesis BLOCK tightens to NEEDS_CHANGES');
+        assert.equal(reviewed.synthesis?.verdict, 'NEEDS_CHANGES', 'synthesis recorded');
+        assert.equal(counter.count, 4, 'synthesis ran as the fourth turn');
+        const architecture = reviewed.roles.find((r) => r.role === 'architecture');
+        assert.ok(architecture?.findings.some((f) => f.severity === 'BLOCK' && f.issue === 'unguarded call'), 'synthesis BLOCK attached to architecture role');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E: synthesis NEEDS_CHANGES without BLOCK evidence becomes INCONCLUSIVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-warn-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'NEEDS_CHANGES', summary: 'vague worry', findings: [{ severity: 'WARN', issue: 'maybe' }], suggestedLabels: [] },
+        ]);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(reviewFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'evidenceless synthesis dissent cannot NEEDS_CHANGES');
+        assert.equal(reviewed.synthesis?.verdict, 'INCONCLUSIVE');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E: synthesis schema failure never stores APPROVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-schema-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: 'not-an-array' },
+        ]);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(reviewFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'broken synthesis never stores APPROVE');
+        assert.equal(counter.count, 4, 'synthesis was attempted');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E: synthesis transport failure never stores APPROVE.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-fail-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const previousFetch = globalThis.fetch;
+        const okPayload = { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] };
+        globalThis.fetch = (async () => {
+          counter.count += 1;
+          if (counter.count >= 4) throw new Error('synthesis transport down');
+          return new Response(JSON.stringify({
+            output: [{ content: [{ type: 'output_text', text: JSON.stringify(okPayload) }] }],
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }) as typeof fetch;
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(reviewFiles()),
+          });
+        } finally {
+          globalThis.fetch = previousFetch;
+        }
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'failed synthesis never stores APPROVE');
+        assert.equal(counter.count, 4, 'synthesis was attempted');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E: tight deadline degrades to the single wave with synthesis skipped.
+    // Budget 500000 fits one wave (420000 + margin) but not two (2x250000).
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-skip-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [{ verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] }]);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: {
+              ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }),
+              POCKETGUARD_OUTPUT: artifactPath,
+              POCKETGUARD_REVIEW_DEADLINE_MS: '500000',
+            } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(reviewFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'APPROVE', 'single wave keeps legacy behavior under a tight deadline');
+        assert.equal(reviewed.synthesis?.skipped, true, 'synthesis skipped without budget');
+        assert.equal(counter.count, 3, 'only the first wave ran');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E: synthesis APPROVE carrying BLOCK findings is contradictory and
+    // can never be stored.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-contra-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          {
+            verdict: 'APPROVE',
+            summary: 'fine',
+            findings: [{ severity: 'BLOCK', file: 'app/src/main/java/demo/Safe.kt', issue: 'contradiction', evidence: 'class Safe' }],
+            suggestedLabels: [],
+          },
+        ]);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(reviewFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'APPROVE with BLOCK findings is contradictory');
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+
+    // E2E: synthesis BLOCK with unsupported evidence cannot tighten.
+    {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pocketguard-pr-review-synth-noev-'));
+      try {
+        const artifactPath = path.join(tempDir, 'review-output.json');
+        const counter = { count: 0 };
+        const restore = installQueuedOpenAI(counter, [
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          { verdict: 'APPROVE', summary: 'fine', findings: [], suggestedLabels: [] },
+          {
+            verdict: 'NEEDS_CHANGES',
+            summary: 'claims an issue without proof',
+            findings: [{ severity: 'BLOCK', file: 'app/src/main/java/demo/Safe.kt', issue: 'phantom', evidence: 'no-such-quote-anywhere-zzz' }],
+            suggestedLabels: [],
+          },
+        ]);
+        let reviewed!: Awaited<ReturnType<typeof runReviewMode>>;
+        try {
+          const client = prClient({ comments: [], created: 0, updated: 0 });
+          reviewed = await runReviewMode({
+            event: prEvent(),
+            env: { ...openAiEnv({ GITHUB_EVENT_NAME: 'pull_request_target' }), POCKETGUARD_OUTPUT: artifactPath } as NodeJS.ProcessEnv,
+            githubClient: client,
+            writeStdout: () => undefined,
+            runGit: prGitStub(reviewFiles()),
+          });
+        } finally {
+          restore();
+        }
+        assert.equal(reviewed.verdict, 'INCONCLUSIVE', 'unevidenced BLOCK cannot tighten');
+        assert.equal(reviewed.synthesis?.verdict, 'INCONCLUSIVE');
       } finally {
         fs.rmSync(tempDir, { recursive: true, force: true });
       }
@@ -428,7 +678,8 @@ export async function runPrReviewTests(): Promise<void> {
               writeStdout: () => undefined,
               runGit: prGitStub(reviewFiles()),
             });
-            assert.equal(counter.count, 3, `${runId} runs single-turn orchestration (3 calls)`);
+            assert.equal(counter.count, 4, `${runId} runs first wave plus synthesis (4 calls)`);
+            assert.equal(reviewed.synthesis?.verdict, 'APPROVE', `${runId} synthesis confirms`);
             await runPublishMode({
               event: prEvent(),
               env: {

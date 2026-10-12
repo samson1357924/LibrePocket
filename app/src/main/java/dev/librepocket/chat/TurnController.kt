@@ -655,7 +655,14 @@ class TurnController(
   /** Test seam for pausing startTurn after its fresh gate and before its second lock. */
   internal var afterStartTurnGateForTest: (() -> Unit)? = null
 
-  /** Returns the live in-flight job, dropping (and clearing) completed ones. */
+  /**
+   * Returns the live in-flight host job, lazily clearing a completed one.
+   *
+   * Has a lazy-clear side effect (`inFlight = null` when completed), so the
+   * caller must hold [lock] — like every other `*Locked` accessor here.
+   * Read via [activeLocked] rather than touching [inFlight] directly, so the
+   * completed-job slot is never mistaken for a live turn.
+   */
   private fun activeLocked(): Job? {
     val current = inFlight ?: return null
     if (current.isCompleted) {
@@ -675,6 +682,88 @@ class TurnController(
    * promotion ghost cannot be duplicated by a racing direct admission or
    * reclaimed by drain while its fate is still unknown.
    * Caller must hold [lock].
+   *
+   * PG-S2 ownership states (Round 7 Stage 4, documentation only — no behavior
+   * change; a sealed-class refactor is left to a future RFC because the legal
+   * overlaps below do not fit a single-state model and there are 30+ writers):
+   *
+   * Four flags, all guarded by [lock] (see the declaration-site KDocs for the
+   * full set/clear lists):
+   * - Active (`inFlight`, via [activeLocked]): the live host job. Set at every
+   *   host launch ([claimUnknownLocked], [claimPromotionUnknownLocked],
+   *   direct/promotion Lock-2 launches); cleared only by identity guard
+   *   (`inFlight === job/self/host`) on completion/cancel, or by the
+   *   [activeLocked] lazy clear above.
+   * - `pendingAdmission`: direct-admission durable-await window. Set before the
+   *   user-row await, cleared on host entry ([hostedTurn] prologue) or
+   *   NOT_ADMITTED rollback; retained across the UNKNOWN handoff
+   *   ([enterUnknownAdmission] keeps it for direct UNKNOWN), cleared later by
+   *   claim / convert / cancel-drain / [close].
+   * - `unknownAdmission`: at most one UNKNOWN/PENDING_COMMIT ownership
+   *   (direct: `isPromotion == false`, with optimistic UI row; promotion:
+   *   `isPromotion == true`, no optimistic row yet, predecessor [Job] kept in
+   *   `host`). Set only by [enterUnknownAdmission]; cleared only by claim /
+   *   convert / cancel-drain / [close], always under the logicalTurnId identity
+   *   guard except the [close] seal, which clears unconditionally.
+   * - `promotionPending`: Lock-1 promotion reservation (follow-up identity
+   *   minted by the promotion peek, held across its durable await). Deliberately
+   *   separate from [pendingAdmission] so [close] drains only direct orphans;
+   *   cleared by the promotion waiter paths, [enterUnknownAdmission] handoff,
+   *   or [close], always under the logicalTurnId identity guard except the
+   *   [close] seal, which clears unconditionally.
+   *
+   * Transition sketch (full set/clear lists are in the declaration-site KDocs
+   * above; this sketch is the summary):
+   * ```
+   * Idle ──direct admit──▶ DirectAwait(pending)
+   *   │                      ├─ACK────▶ Active(hostedTurn; pending cleared at entry)
+   *   │                      ├─NOT_ADMITTED─▶ Idle (rollback, retryable)
+   *   │                      ├─UNKNOWN──▶ UnknownDirect(unknown + pending, same id)
+   *   │                      └─cancel/close─▶ Idle (cancel-drain / orphan drain)
+   *   │
+   *   └──promotion peek──▶ PromoAwait(active predecessor + promotionPending)
+   *                          ├─ACK────▶ Active(predecessor → follow handoff)
+   *                          ├─NOT_ADMITTED─▶ no launch, FIFO retained, ERROR (predecessor terminal already recorded)
+   *                          └─UNKNOWN──▶ UnknownPromo(unknown[isPromotion], promotionPending
+   *                                        cleared at handoff; predecessor host may still
+   *                                        be live until settle observes completion)
+   * UnknownDirect ─settle claim──▶ Active(same id, no resend)
+   *               ─settle fail/seal─▶ Idle (convert: UI rolled back, retryable)
+   *               ─cancel/close──▶ Idle (cancel-drain / orphan drain)
+   * UnknownPromo ─settle claim──▶ Active(Lock-2 commit: dequeue + append + launch, same id)
+   *               ─settle fail/seal/cancel─▶ convert-like (FIFO retained, ERROR +
+   *                                          reclaimable, no second ledger row)
+   *               ─close──▶ drained per the drain-before-close contract
+   * ```
+   *
+   * Legal overlaps are by design, not bugs:
+   * - Active + pending may briefly co-exist: the host entry ([hostedTurn]
+   *   prologue) clears `pendingAdmission` just after launch, so the launch
+   *   path and the clearing path overlap transiently.
+   * - UnknownDirect holds unknown + pending with the SAME id: the direct
+   *   reservation stays in `pendingAdmission` while UNKNOWN ownership lives in
+   *   `unknownAdmission` (settle claims or converts both).
+   * - Active + promotionPending co-exist: the still-live predecessor host
+   *   covers the promotion await; cancel/close reach the promotion by
+   *   cancelling that host (except the promotion UNKNOWN window, where
+   *   ownership has moved to `unknownAdmission` and [cancel] reuses
+   *   [admissionCancelRequestedId] for the promotion id).
+   *
+   * Invariants (all currently KDoc-only; no runtime asserts — a mispredicted
+   * hard throw in prod is riskier than the documentation value, and R6 just
+   * converged):
+   * 1. `unknownAdmission` holds at most one entry (single-flight admits at most
+   *    one pending user row); `isPromotion` distinguishes direct from promotion.
+   * 2. `promotionPending` and `unknownAdmission` never claim different ids at
+   *    once: the UNKNOWN handoff moves the same reservation id from
+   *    `promotionPending` to `unknownAdmission` ([enterUnknownAdmission]).
+   * 3. Direct UNKNOWN keeps unknown + pending on the SAME id (see overlap above).
+   * 4. Promotion UNKNOWN has `promotionPending == null` (cleared at the handoff);
+   *    the predecessor host, if still live, is tracked via `unknown.host` /
+   *    `inFlight`, never via `promotionPending`.
+   * 5. After [close] seals, both `unknownAdmission` and `promotionPending` are
+   *    null (single-monotone seal: close drains direct orphans and clears the
+   *    promotion reservation explicitly as well as via the waiter path).
    */
   private fun isBusyLocked(): Boolean =
     activeLocked() != null || pendingAdmission != null || unknownAdmission != null || promotionPending != null
@@ -948,7 +1037,17 @@ class TurnController(
     }
   }
 
-  /** R5-1: does an UNKNOWN ownership exist? (Test/VM seam.) */
+  /**
+   * R5-1: does an UNKNOWN ownership exist? (Test/VM seam.)
+   *
+   * Naming note: despite the name, this checks ONLY [unknownAdmission] — not
+   * [pendingAdmission] (direct durable-await window) nor [promotionPending]
+   * (promotion await window). Kept as-is to avoid churning callers; internal
+   * lock-held callers use [isBusyLocked] (private) when the question is really
+   * "is any admission window or host holding single-flight?". External callers
+   * cannot reach [isBusyLocked]; use this public seam (via [ChatSessionImpl]
+   * to the ViewModel).
+   */
   fun hasPendingAdmission(): Boolean = synchronized(lock) { unknownAdmission != null }
 
   /** Caller must hold [lock]. Claim the ghost: same id,補 UI, launch host, no resend. */

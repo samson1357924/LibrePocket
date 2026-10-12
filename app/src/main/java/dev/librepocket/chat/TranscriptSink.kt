@@ -12,10 +12,19 @@ package dev.librepocket.chat
  */
 interface TranscriptSink {
   suspend fun onTurnStarted(runId: String, text: String)
-  suspend fun onTurnSucceeded(runId: String, text: String)
+  /**
+   * @param hasReasoning true when the finished assistant block is
+   *   reasoning-sourced (see [UiMessage.hasReasoning]); sinks persist it as
+   *   a payload-free marker (marker itself empty, flag-only) so resume
+   *   restores the flag instead of replaying a reasoning origin as plain
+   *   text. Visible reasoning deltas remain merged into the assistant text
+   *   and persist as usual (pre-existing behavior).
+   */
+  suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean = false)
   suspend fun onTurnFailed(runId: String, error: String)
   suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long)
-  suspend fun onTurnCancelled(runId: String, partialText: String)
+  /** Same [hasReasoning] marker contract as [onTurnSucceeded] for partial text. */
+  suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean = false)
   suspend fun onSteerQueued(text: String)
 
   /** One tool call finished (P1 records only, never executes). */
@@ -28,10 +37,10 @@ interface TranscriptSink {
 /** Default sink: drops everything (used until the M4 store lands). */
 class NoOpTranscriptSink : TranscriptSink {
   override suspend fun onTurnStarted(runId: String, text: String) = Unit
-  override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+  override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
   override suspend fun onTurnFailed(runId: String, error: String) = Unit
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-  override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+  override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
   override suspend fun onSteerQueued(text: String) = Unit
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit

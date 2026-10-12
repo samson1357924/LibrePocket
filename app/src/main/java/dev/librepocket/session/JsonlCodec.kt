@@ -9,7 +9,7 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.put
 
 /** Closed event-kind set (spec §8.5 import validation). */
-val VALID_KINDS: Set<String> = setOf("user", "assistant", "tool", "steer", "retry", "system")
+val VALID_KINDS: Set<String> = setOf("user", "assistant", "tool", "steer", "retry", "system", "reasoning")
 
 /**
  * One JSONL line (spec §8.5): flat object, no header line, so `jq` reads it directly.
@@ -70,6 +70,10 @@ object JsonlCodec {
             createdAt = createdAt,
         )
         if (parsed.kind !in VALID_KINDS) fail()
+        // The reasoning marker is payload-free by contract (same runId as its
+        // assistant event, empty text); a non-empty body is rejected like an
+        // unknown kind so imports cannot smuggle reasoning content into the store.
+        if (parsed.kind == "reasoning" && parsed.text.isNotEmpty()) fail()
         // Reject nonsensical fields early (spec §8.5): seqs start at 1 and the
         // importer additionally requires strict increase; negative counters /
         // timestamps would pollute ordering and prune math.

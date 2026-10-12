@@ -21,6 +21,18 @@ sealed interface StreamEvent {
     /** Visible reasoning delta (reasoning_content / summary / thinking text). */
     data class ReasoningDelta(val round: Int, val blockIndex: Int, val delta: String) : StreamEvent
 
+    /**
+     * Opaque reasoning presence marker (with no replayable payload).
+     *
+     * Emitted when a protocol surface proves a reasoning origin with no
+     * replayable payload (Responses `reasoning` output items, Anthropic
+     * `thinking` / `redacted_thinking` blocks / `signature_delta`). Carries
+     * no text, so display and persistence behavior are unchanged; it only
+     * lets the turn controller flag the attempt's assistant block as
+     * reasoning-sourced.
+     */
+    data object ReasoningPresent : StreamEvent
+
     /** Tool-call argument delta, aggregated by index; terminal state is [ToolDone]. */
     data class ToolDelta(
         val toolIndex: Int,

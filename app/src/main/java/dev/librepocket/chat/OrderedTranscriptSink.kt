@@ -104,6 +104,18 @@ class OrderedTranscriptSink(
    * A bare Mutex cannot do this: acquisition order is not arrival order and
    * parked bodies still lose to direct sends. The synchronous link is the
    * single linearization point for all types.
+   *
+   * PG-W2 lock-order contract: the synchronized section below covers ONLY
+   * `nextTicket.getAndIncrement()` + `admissionChain.getAndSet()` — two
+   * lock-free atomics, no suspend, no channel send/trySend, no delegate call,
+   * no controller-lock acquisition, no `interrupted`/hook invocation, and no
+   * other monitor. `@GuardedBy("admissionLock")` therefore means exactly
+   * those two fields during reservation; everything else (hooks, sends,
+   * awaits, delegate, seal/barrier work) runs after the monitor is released.
+   * The only controller → sink nesting is `TurnController.enqueueLocked`
+   * (holding its lock) → `offerSteer` → `reserveAdmission`; the order
+   * controller → admissionLock is never reversed, and `reserveAdmission`
+   * never blocks on the controller, so lock-held callers cannot deadlock.
    */
   private val admissionLock = Any()
   private val nextTicket = AtomicLong(0)
@@ -128,6 +140,19 @@ class OrderedTranscriptSink(
   internal var onAdmissionReservedForTest: ((Long) -> Unit)? = null
   internal var beforeSendForTest: (suspend (Long) -> Unit)? = null
 
+  /**
+   * Reserves one admission slot (ticket + chain link) in a single tiny
+   * synchronized section.
+   *
+   * Lock-order contract (PG-W2, see [admissionLock]): MAY be called with the
+   * controller lock held (the `enqueueLocked` → `offerSteer` path does so);
+   * MUST NOT acquire the controller lock or any other monitor inside; MUST
+   * NOT suspend (no await/send/delegate inside the section — only the two
+   * atomics); test hooks ([onAdmissionReservedForTest]) and every send/await
+   * run strictly after the monitor is released (guarded by
+   * `check(!Thread.holdsLock(admissionLock))`). Global order is always
+   * controller → admissionLock, never reversed.
+   */
   private fun reserveAdmission(): Admission {
     val gate = CompletableDeferred<Unit>()
     val ticket: Long
@@ -137,6 +162,7 @@ class OrderedTranscriptSink(
       prev = admissionChain.getAndSet(gate)
     }
     try {
+      checkNotHoldingAdmissionLock("onAdmissionReservedForTest")
       onAdmissionReservedForTest?.invoke(ticket)
     } catch (e: Throwable) {
       releaseAdmission(gate)
@@ -153,6 +179,17 @@ class OrderedTranscriptSink(
     }
     admissionChain.compareAndSet(gate, null)
   }
+
+  /**
+   * PG-W2 sink-local guard: test hooks must never run while holding
+   * [admissionLock] (a future move of a hook into the critical section would
+   * risk suspend/channel/delegate under the monitor and lock-order drift).
+   * `Thread.holdsLock` is exact at the synchronous hook call site — no
+   * coroutine hop is involved there — so this `check` is fail-fast with zero
+   * behaviour change while every hook stays outside the lock.
+   */
+  private fun checkNotHoldingAdmissionLock(hook: String) =
+    check(!Thread.holdsLock(admissionLock)) { "PG-W2: $hook must not run under admissionLock" }
 
   private val writer: Job = writerScope.launch {
     try {
@@ -313,6 +350,7 @@ class OrderedTranscriptSink(
    * A caller timeout with `sent == false` never entered the ledger
    * (NOT_ADMITTED); with `sent == true` the independent writer may still
    * persist it (UNKNOWN). No channel semantic change.
+   * PG-W2: reservation follows the [reserveAdmission] lock-order contract.
    */
   private suspend fun writeCoreTracked(runId: String, block: suspend () -> Unit, sent: AtomicBoolean) {
     // Fail fast behind a dead/sealed writer: never park unbounded with no
@@ -343,6 +381,7 @@ class OrderedTranscriptSink(
       // Admission order, not resumption order: every smaller ticket's send
       // was already attempted once its gate completes.
       reservation.prev?.await()
+      checkNotHoldingAdmissionLock("beforeSendForTest:writeCoreTracked")
       beforeSendForTest?.invoke(reservation.ticket)
       // R5-2: channel.send below does not suspend when capacity is available,
       // so a close/cancel that landed while parked above would otherwise slip
@@ -414,6 +453,7 @@ class OrderedTranscriptSink(
     val reservation = reserveAdmission()
     try {
       reservation.prev?.await()
+      checkNotHoldingAdmissionLock("beforeSendForTest:writeOrdered")
       beforeSendForTest?.invoke(reservation.ticket)
       channel.send(Entry(runId = null, block))
     } finally {
@@ -445,6 +485,8 @@ class OrderedTranscriptSink(
    * A seal race after shutdown drops here with no recovery
    * path (`close()` clears the controller FIFO, so there is no drainQueued
    * fallback for it).
+   * PG-W2: reservation follows the [reserveAdmission] lock-order contract
+   * (MAY be called with the controller lock held via `enqueueLocked`).
    */
   fun offerSteer(text: String) {
     val entry = Entry(runId = null, block = { delegate.onSteerQueued(text) })
@@ -467,6 +509,7 @@ class OrderedTranscriptSink(
       val job = writerScope.launch {
         try {
           // No predecessor to await (prev == null by construction here).
+          checkNotHoldingAdmissionLock("beforeSendForTest:offerSteerFast")
           beforeSendForTest?.invoke(reservation.ticket)
           channel.send(entry)
         } catch (e: CancellationException) {
@@ -490,6 +533,7 @@ class OrderedTranscriptSink(
         // Admission order, not launch order: the predecessor's gate completes
         // once its send was attempted, so this send runs strictly after it.
         reservation.prev.await()
+        checkNotHoldingAdmissionLock("beforeSendForTest:offerSteerQueued")
         beforeSendForTest?.invoke(reservation.ticket)
         channel.send(entry)
       } catch (e: CancellationException) {
@@ -532,6 +576,7 @@ class OrderedTranscriptSink(
    * barrier is admitted drains first) while still serializing later arrivals
    * behind the barrier. A timeout abandoning the reserved slot completes it
    * normally so successors are never stuck.
+   * PG-W2: barrier reservation follows the [reserveAdmission] lock-order contract.
    */
   suspend fun flush(timeoutMs: Long = DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
     try {
@@ -541,6 +586,7 @@ class OrderedTranscriptSink(
         try {
           reservation.prev?.await()
           val barrier = CompletableDeferred<Unit>()
+          checkNotHoldingAdmissionLock("beforeSendForTest:flush")
           beforeSendForTest?.invoke(reservation.ticket)
           try {
             channel.send(Entry(runId = null, block = {}, barrier))

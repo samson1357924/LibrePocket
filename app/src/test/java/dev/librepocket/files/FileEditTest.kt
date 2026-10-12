@@ -253,6 +253,25 @@ class FileEditTest {
         assertEquals("v1 hello", String(saf.read("$path.bak")))
     }
 
+    @Test fun patchRejectsJustOver512KiBAtFirstLayer() {
+        // MAX_PATCH_BYTES+1（約 513KiB，<1MiB）：bounded read 第一層即拒，
+        // 回 FILE_TOO_LARGE（若仍用無參 1MiB 讀，第二層才拒；訊息應統一用 512KiB）。
+        val root = tempRoot()
+        val store = ScopedFileStore(root)
+        val oldText = "patch-target-xyz"
+        val targetSize = FileEditTools.MAX_PATCH_BYTES + 1
+        val oldBytes = oldText.toByteArray(Charsets.UTF_8)
+        val content = oldBytes + ByteArray(targetSize - oldBytes.size) { 'a'.code.toByte() }
+        assertTrue(executor(root).edit("big.txt", content).ok)
+        val result = executor(root).patch("big.txt", oldText, "replaced")
+        assertFalse(result.message, result.ok)
+        assertEquals("FILE_TOO_LARGE", result.detail)
+        assertTrue(result.message.contains(FileEditTools.MAX_PATCH_BYTES.toString()))
+        // 原檔未動、無備份。
+        assertTrue(store.read("big.txt", targetSize + 1024).contentEquals(content))
+        assertFalse(File(root, "big.txt.bak").exists())
+    }
+
     @Test fun patchCrossDomainDenied() {
         val root = tempRoot()
         val result = executor(root).patch("/sdcard/Download/other/x.txt", "a", "b")

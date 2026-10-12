@@ -211,6 +211,13 @@ class FileSearchExecutor(
     private fun searchPrivate(query: String, prefix: String, cap: Int): FileSearchTools.SearchResult {
         val paths = try {
             store.list(prefix)
+        } catch (e: FileBudgetException) {
+            // 列舉預算耗盡：加法細碼回傳（呼叫形狀不變），不靜默給部分結果。
+            return FileSearchTools.SearchResult(
+                false,
+                detail = e.budget.detail,
+                message = "列舉受限（${e.budget.detail}）：${e.message}",
+            )
         } catch (_: IllegalArgumentException) {
             return FileSearchTools.SearchResult(false, detail = "BAD_PATH", message = "檢索根非法：「$prefix」")
         }
@@ -220,8 +227,15 @@ class FileSearchExecutor(
             paths = paths,
             read = { rel ->
                 try {
-                    store.read(rel)
+                    // Bounded read：>maxFileBytes 即拋 READ_TOO_LARGE（收斂為 filesSkipped，
+                    // ok=true 語義不變）；避免 64KiB~1MiB 檔案先全量進記憶體。
+                    // maxFileBytes<=0 的注入經 require 拋 IllegalArgumentException，
+                    // 下方已收斂為 null→skipped，不會未預期崩潰。
+                    store.read(rel, maxFileBytes)
                 } catch (_: FileNotFoundException) {
+                    null
+                } catch (_: FileBudgetException) {
+                    // 單檔超讀預算：沿既有「過大跳過」語義計入 filesSkipped。
                     null
                 } catch (_: IllegalArgumentException) {
                     null

@@ -83,6 +83,30 @@ class AnthropicProviderTest {
     }
 
     @Test
+    fun redactedThinkingBlockMarksReasoningPresence() {
+        val mapper = AnthropicMapper()
+        val start = mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking"}}""",
+        )
+        assertEquals(listOf(StreamEvent.ReasoningPresent), start)
+    }
+
+    @Test
+    fun signatureDeltaMarksReasoningPresenceWithoutPayload() {
+        val mapper = AnthropicMapper()
+        mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}""",
+        )
+        val sig = mapper.mapPayload(
+            """{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG-SECRET-ABC"}}""",
+        )
+        assertEquals(listOf(StreamEvent.ReasoningPresent), sig)
+        for (e in sig) {
+            assertFalse("signature leak: $e", e.toString().contains("SIG-SECRET-ABC"))
+        }
+    }
+
+    @Test
     fun missingMessageStopFailsRetryable() {
         val mapper = AnthropicMapper()
         mapper.mapPayload(

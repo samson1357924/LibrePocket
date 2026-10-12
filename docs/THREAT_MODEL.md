@@ -16,6 +16,7 @@
 - JSONL codec、transcript export/import 與 backup bundle 有程式碼實作，但目前沒有可供使用者完成 flavor 遷移的 export/import UI 流程。backup bundle 預設不帶 key；其 API 可顯式要求帶 key。不要把「系統備份排除 key 檔」解讀成所有 app-level export 都不可能包含 key。
 - `play`、`foss`、`github` 由不同 source set、manifest 與依賴組成。`foss`/`github` 含 accessibility service；該 service 不是 OS sandbox。Root、Shizuku、PRoot 同樣不等於隔離執行環境。
 - 工具 registry 有 41 個定義，但目前所有內建 `ToolDef.executionReady` 均為 false；模型可見的內建工具集合為空。高風險工具描述或 scaffold 不代表目前可執行能力。
+- 直接 shell 通道的可信 executable 解析（`ShellExecutables.resolve`，JVM 單測覆蓋、尚未經指定裝置/API 實跑驗證）：bare 只在受控搜尋目錄按固定順序找，不查宿主 `PATH`、不看 cwd；含分隔符 `argv[0]` 詞法父目錄須在可信表內；候選經 `toRealPath()` 固定後驗正規檔＋可執行、containment（快照＋系統實體前綴）、real 本體至根不可寫、lexical entry 至所屬 searchDir 不可寫、searchDir 本體及其詞法與 real 兩側祖先至根不可寫；任一失敗即拒且零 spawn。拒絕僅回 reason code（`SEARCH_DIR_UNTRUSTED`／`ENTRY_WRITABLE`／`REAL_WRITABLE`／`OUTSIDE_ROOTS` 等），不含任意 filesystem path。殘餘 TOCTOU（驗證至 spawn 非原子）、APEX/overlay 窮舉不能、舊 toolbox applet 語義未驗仍在；操作數路徑（`FileScope.decide` 詞法前綴、symlink/TOCTOU）屬另一邊界，見 #9，不因 executable resolver 改善而關閉。
 
 ## 主要資產、威脅主體與信任邊界
 
@@ -24,6 +25,7 @@
 | Provider key | 裝置或 app 私有資料遭讀取、錯誤匯出、雲端/裝置轉移備份 | Android backup 規則排除特定 key 檔；不是對所有匯出路徑或遭 root 裝置的保證。 |
 | Transcript、附件與 provider 請求 | Provider 接收敏感內容；備份或匯出副本外流；本機帳號/裝置遭存取 | Room 寫入 redaction 不等於送出前 redaction；`allowBackup=true` 且 transcript 未列入 key-only exclusions。 |
 | 外部副作用 | 模型輸出、錯誤授權或競態導致不當操作 | 目前 built-in tools 全部 not-ready；未來接線必須逐工具驗證 permission、fresh evaluation、不可變確認快照及實際副作用。 |
+| App workspace（`ScopedFileStore` 根） | 毒根別名（`alias/.`、`alias/sub`）、workspace 內 symlink 穿出、併發 `rename`/`symlink` 替換 | 單線程 NOFOLLOW 確定性保證（根鏈+段鏈全驗，毒根拒絕，缺席根單層建）；非 app UID 的併發 symlink 交換為 out-of-scope，Java 無 `O_NOFOLLOW/openat`，殘餘 TOCTOU 僅有界不消除。 |
 | Flavor / 發布產物 | 不同 channel 意外帶入依賴、權限或錯誤 artifact | source-set 與 policy checks 存在；目前沒有 final-byte signature/certificate/package/version/debug fail-closed gate。 |
 
 威脅主體包括惡意或遭入侵的 provider/MCP endpoint、提示注入內容、取得裝置或備份副本的人、以及錯誤配置或被替換的發布產物。本清單不宣稱每項攻擊都有防護。
@@ -35,6 +37,8 @@
 - Tool readiness 逐項推進並以負向控制驗證；未 verified 的工具保持不可執行。不能以設定開關、projection 或一般單測取代端到端安全證據。
 - Session 初始化採 single-flight/generation；過期 callback 不得接入新 session。取消須解除 HTTP blocking I/O。
 - 路徑權限以實體路徑、可信 executable 和 OS 邊界判斷；Root/Shizuku/PRoot 不可描述為 sandbox。
+- `ScopedFileStore` 根須為 app 私有域可信基直建的正規目錄；毒根別名 fail-closed；非 app UID 的併發 symlink 交換為 out-of-scope，不宣稱消除併發 escapes。
+- 直接 shell 通道啟用前須完成 Android 實機 smoke（生產預設 resolver/env）：toybox/toolbox/APEX 的 bare＋絕對 `argv[0]` 允許／拒絕與實際 argv0/env，以及 `Files.isWritable` 在 App UID/SELinux 下的表現；JVM 綠＋組裝綠不能代替裝置證據。exotic ROM（合法二進位在快照外或系統目錄可寫）降級為拒，須回報擴表、不得放寬。
 - 對使用者明確揭露 provider 傳輸、Android backup、匯出檔敏感性及 redaction 的實際作用範圍。
 
 以上為待維持的工程契約，不表示整套 Target 已完成。更詳細的測試與 release 缺口見 [Testing](TESTING.md) 與 [Release](RELEASE.md)。

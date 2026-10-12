@@ -114,6 +114,38 @@ class ResponsesProviderTest {
     }
 
     @Test
+    fun reasoningOutputItemMarksPresenceWithoutDelta() {
+        val mapper = ResponsesMapper()
+        val added = mapper.mapPayload(
+            """{"type":"response.output_item.added","output_index":1,"item_id":"item_rs1","item":{"type":"reasoning","id":"rs_1"}}""",
+        )
+        assertEquals(listOf(StreamEvent.ReasoningPresent), added)
+        val done = mapper.mapPayload(
+            """{"type":"response.output_item.done","output_index":1,"item_id":"item_rs1","item":{"type":"reasoning","id":"rs_1"}}""",
+        )
+        assertEquals(listOf(StreamEvent.ReasoningPresent), done)
+    }
+
+    @Test
+    fun reasoningPresenceMarkerCarriesNoPayload() {
+        val mapper = ResponsesMapper()
+        val events = mapper.mapPayload(
+            """{"type":"response.output_item.added","output_index":1,"item_id":"item_rs1","item":{"type":"reasoning","id":"rs_1","summary":[],"content":[]}}""",
+        )
+        assertEquals(1, events.size)
+        assertTrue(events.single() is StreamEvent.ReasoningPresent)
+    }
+
+    @Test
+    fun functionCallItemsDoNotMarkReasoning() {
+        val mapper = ResponsesMapper()
+        val added = mapper.mapPayload(
+            """{"type":"response.output_item.added","output_index":2,"item_id":"item_wx8f","item":{"type":"function_call","id":"","call_id":"call_x","name":"get_weather"}}""",
+        )
+        assertTrue(added.none { it is StreamEvent.ReasoningPresent })
+    }
+
+    @Test
     fun requestBodyIsUnstoredStreamWithoutPreviousResponse() {
         val provider = ResponsesProvider(testConfig(), { null })
         val body = provider.buildBody(

@@ -21,7 +21,7 @@ data class TranscriptEvent(
     val seq: Long = 0, // DB-assigned; ignored on write
     val sessionId: String,
     val runId: String, // one turn shares a runId; a retry starts a new runId
-    val kind: String, // "user" | "assistant" | "tool" | "steer" | "retry" | "system"
+    val kind: String, // "user" | "assistant" | "tool" | "steer" | "retry" | "system" | "reasoning"
     val text: String, // redacted before write
     val imagesOmitted: Int = 0, // stripped image-body count (bytes never stored)
     val createdAt: Long,

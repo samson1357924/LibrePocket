@@ -14,9 +14,14 @@ import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
 /** Closed event-kind set (mirrors SessionStore VALID_KINDS; re-declared so this
- *  package has no dependency on session internals). */
+ *  package has no dependency on session internals).
+ *
+ *  `reasoning` is the payload-free resume marker written by SessionTranscriptSink
+ *  for reasoning-sourced turns (same runId as its `assistant` event, empty text);
+ *  it round-trips through export/import/backup like any other kind but never
+ *  renders as a chat message. */
 private val BACKUP_VALID_KINDS: Set<String> = setOf(
-    "user", "assistant", "tool", "steer", "retry", "system",
+    "user", "assistant", "tool", "steer", "retry", "system", "reasoning",
 )
 
 /** One transcript event inside a backup bundle. */
@@ -141,11 +146,16 @@ object BackupCodec {
                         eo[key]?.jsonPrimitive?.takeIf { it.isString }?.content ?: fail("event.$key")
                     val kind = estr("kind")
                     if (kind !in BACKUP_VALID_KINDS) fail("unknown event kind: $kind")
+                    val text = estr("text")
+                    // Same contract as the JSONL import: the reasoning marker
+                    // is payload-free (empty text); a non-empty body is
+                    // rejected like an unknown kind.
+                    if (kind == "reasoning" && text.isNotEmpty()) fail("non-empty reasoning marker")
                     BackupEvent(
                         seq = eo["seq"]?.jsonPrimitive?.longOrNull ?: fail("event.seq"),
                         runId = estr("runId"),
                         kind = kind,
-                        text = estr("text"),
+                        text = text,
                         imagesOmitted = eo["imagesOmitted"]?.jsonPrimitive?.intOrNull
                             ?: fail("event.imagesOmitted"),
                         createdAt = eo["createdAt"]?.jsonPrimitive?.longOrNull

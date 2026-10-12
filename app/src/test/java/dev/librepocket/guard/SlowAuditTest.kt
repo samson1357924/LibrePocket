@@ -49,7 +49,11 @@ class SlowAuditTest {
         val sensitiveGoal = "帮我转账 9999 元到银行卡 6228****，附言 sk-secret-key"
         val proposal = SlowProposal(id = "s-pay-1", kind = SlowActionKind.TAP, goalText = sensitiveGoal)
         val verdict = SlowArbitrator.arbitrate(proposal)
-        log.recordVerdict(proposal, verdict, SlowTargetKind.NODE)
+        // Pin atMs: rows.toString() always embeds the timestamp, and the default
+        // System.currentTimeMillis() can occasionally contain "9999"/"6228",
+        // making the blob.contains checks below flaky. 1700000000000L contains
+        // neither sensitive fragment.
+        log.recordVerdict(proposal, verdict, SlowTargetKind.NODE, atMs = 1700000000000L)
 
         val rows = log.snapshot()
         assertEquals(1, rows.size)

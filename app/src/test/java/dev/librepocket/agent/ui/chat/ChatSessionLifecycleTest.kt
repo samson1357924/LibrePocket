@@ -359,6 +359,12 @@ class ChatSessionLifecycleTest {
             withTimeout(5_000) { live.hostEntered.await() }
 
             chatMain.run { vm.sendDirect("second") }
+            // Determinism barrier: each sendDirect goes through authorizeEndpoint
+            // (Dispatchers.IO DataStore) + ensureSession before reaching
+            // startOrEnqueue, so back-to-back sends can arrive out of order.
+            // Wait for "second" to land in the FIFO before sending "third"
+            // to keep the strict [second, third] order assertion meaningful.
+            withTimeout(5_000) { while (live.steered.size < 1 || live.steered[0] != "second") delay(1) }
             chatMain.run { vm.sendDirect("third") }
             withTimeout(5_000) { while (live.steered.size < 2) delay(1) }
             assertEquals(listOf("second", "third"), live.steered.toList())

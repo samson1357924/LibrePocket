@@ -993,7 +993,7 @@ class PolicyCiGateControl(unittest.TestCase):
     def test_pr_gate_requires_policy_harness(self) -> None:
         workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("policy-harness", workflow)
-        self.assertIn("needs: [changes, unit-tests, lint, build-and-policy-gate, policy-harness, docs-guard]", workflow)
+        self.assertIn("needs: [changes, unit-tests, lint, build-and-policy-gate, policy-harness, docs-guard, bot-tests]", workflow)
         self.assertIn("needs.policy-harness.result", workflow)
         self.assertIn("policy-harness skipped but policy=", workflow)
         for test_path in (

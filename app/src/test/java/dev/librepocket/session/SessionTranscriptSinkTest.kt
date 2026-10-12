@@ -25,7 +25,7 @@ open class FakeSessionStore : SessionStore {
     override suspend fun getSession(sessionId: String): SessionMeta? = metas[sessionId]
 
     override suspend fun appendEvent(event: TranscriptEvent): Long {
-        require(event.kind in setOf("user", "assistant", "tool", "steer", "retry", "system"))
+        require(event.kind in VALID_KINDS)
         events.add(event.copy(seq = (events.size + 1).toLong()))
         return events.size.toLong()
     }
@@ -50,10 +50,10 @@ class SessionTranscriptSinkTest {
         val sink = SessionTranscriptSink(store, sid) { 42L }
 
         sink.onTurnStarted("r1", "hello")
-        sink.onTurnSucceeded("r1", "hi there")
+        sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
         sink.onTurnRetried("r2", 1, 3, 2000)
         sink.onTurnFailed("r2", "HTTP 500")
-        sink.onTurnCancelled("r3", "partial")
+        sink.onTurnCancelled("r3", "partial", hasReasoning = false)
         sink.onSteerQueued("be brief")
         sink.onToolDone("r1", 0, "t1", "search", """{"q":"x"}""")
         sink.onUsage("r1", 10, 20)
@@ -76,12 +76,52 @@ class SessionTranscriptSinkTest {
         val sink = SessionTranscriptSink(store, "sid")
         // Must not propagate: persistence never breaks the chat loop.
         sink.onTurnStarted("r1", "hello")
-        sink.onTurnSucceeded("r1", "hi")
+        sink.onTurnSucceeded("r1", "hi", hasReasoning = false)
         sink.onTurnFailed("r1", "boom")
         sink.onTurnRetried("r1", 1, 3, 2000)
-        sink.onTurnCancelled("r1", "partial")
+        sink.onTurnCancelled("r1", "partial", hasReasoning = false)
         sink.onSteerQueued("be brief")
         sink.onToolDone("r1", 0, "t1", "search", """{"q":"x"}""")
         sink.onUsage("r1", 10, 20)
+    }
+
+    @Test
+    fun reasoningTurnAppendsEmptyMarkerAfterAssistant() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onTurnStarted("r1", "hello")
+        sink.onTurnSucceeded("r1", "thoughtful answer", hasReasoning = true)
+
+        assertEquals(listOf("user", "assistant", "reasoning"), store.events.map { it.kind })
+        val marker = store.events.last()
+        assertEquals("r1", marker.runId)
+        assertEquals("", marker.text)
+    }
+
+    @Test
+    fun plainTurnWritesNoMarker() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onTurnSucceeded("r1", "plain answer", hasReasoning = false)
+        sink.onTurnCancelled("r2", "partial", hasReasoning = false)
+
+        assertEquals(listOf("assistant", "assistant"), store.events.map { it.kind })
+    }
+
+    @Test
+    fun cancelledReasoningTurnAppendsMarker() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onTurnCancelled("r9", "partial thought", hasReasoning = true)
+
+        assertEquals(listOf("assistant", "reasoning"), store.events.map { it.kind })
+        assertEquals("r9", store.events.last().runId)
+        assertEquals("", store.events.last().text)
     }
 }

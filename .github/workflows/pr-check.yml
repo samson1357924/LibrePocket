@@ -23,6 +23,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       policy: ${{ steps.filter.outputs.policy }}
+      bot: ${{ steps.filter.outputs.bot }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -57,6 +58,10 @@ jobs:
               # The PR workflow itself: wiring changes must run the harness
               # tests that pin the workflow wiring (defense in depth; a
               # workflow edit already counts as code, so Gradle stages run).
+              - '.github/workflows/pr-check.yml'
+            bot:
+              - 'github_bot/**'
+              - '.github/workflows/pocketguard.yml'
               - '.github/workflows/pr-check.yml'
 
   unit-tests:
@@ -214,11 +219,38 @@ jobs:
           chmod +x scripts/docs_claim_check.sh
           scripts/docs_claim_check.sh
 
+  bot-tests:
+    name: PocketGuard Bot Tests
+    needs: changes
+    if: needs.changes.outputs.bot == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install locked dependencies
+        working-directory: github_bot
+        run: npm ci --ignore-scripts
+
+      - name: Run bot tests
+        working-directory: github_bot
+        run: npm test
+
+      - name: Typecheck bot
+        working-directory: github_bot
+        run: npm run build
+
   pr-gate:
     name: PR Gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [changes, unit-tests, lint, build-and-policy-gate, policy-harness, docs-guard]
+    needs: [changes, unit-tests, lint, build-and-policy-gate, policy-harness, docs-guard, bot-tests]
     if: always()
     steps:
       - name: Evaluate gate
@@ -231,6 +263,8 @@ jobs:
           BUILD: ${{ needs.build-and-policy-gate.result }}
           HARNESS: ${{ needs.policy-harness.result }}
           DOCS: ${{ needs.docs-guard.result }}
+          BOT: ${{ needs.bot-tests.result }}
+          BOT_PATHS: ${{ needs.changes.outputs.bot }}
         run: |
           fail=0
 
@@ -312,6 +346,24 @@ jobs:
               ;;
             *)
               echo "pr-gate: policy-harness result=$HARNESS — fail"
+              fail=1
+              ;;
+          esac
+
+          case "$BOT" in
+            success)
+              echo "pr-gate: bot-tests passed"
+              ;;
+            skipped)
+              if [ "$BOT_PATHS" = "false" ]; then
+                echo "pr-gate: bot-tests skipped (no bot changes) — pass"
+              else
+                echo "pr-gate: bot-tests skipped but bot='$BOT_PATHS' — fail"
+                fail=1
+              fi
+              ;;
+            *)
+              echo "pr-gate: bot-tests result=$BOT — fail"
               fail=1
               ;;
           esac

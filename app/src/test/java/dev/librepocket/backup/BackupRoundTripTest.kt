@@ -121,6 +121,39 @@ class BackupRoundTripTest {
         }
     }
 
+    @Test fun roundTrip_preservesReasoningMarker() {
+        val bundle = sampleBundle().copy(
+            sessions = sampleBundle().sessions.map { s ->
+                s.copy(
+                    events = s.events + BackupEvent(3, "run-1", "reasoning", "", 0, 1_700_000_000_002L),
+                )
+            },
+        )
+        val restored = BackupCodec.decode(BackupCodec.encode(bundle))
+
+        val events = restored.sessions.single().events
+        assertEquals(listOf("user", "assistant", "reasoning"), events.map { it.kind })
+        val marker = events.single { it.kind == "reasoning" }
+        assertEquals("run-1", marker.runId)
+        assertEquals("", marker.text)
+    }
+
+    @Test fun nonEmptyReasoningMarker_rejected() {
+        val bundle = sampleBundle().copy(
+            sessions = sampleBundle().sessions.map { s ->
+                s.copy(
+                    events = s.events + BackupEvent(3, "run-1", "reasoning", "smuggled thought", 0, 1_700_000_000_002L),
+                )
+            },
+        )
+        try {
+            BackupCodec.decode(BackupCodec.encode(bundle))
+            fail("non-empty reasoning marker must be rejected")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.startsWith("backup decode failed"))
+        }
+    }
+
     @Test fun unknownKind_rejected() {
         val raw = BackupCodec.encode(sampleBundle()).replace("\"user\"", "\"root-shell\"")
         try {

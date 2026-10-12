@@ -53,10 +53,10 @@ private class TimeRecordingSink : TranscriptSink {
   val started: MutableList<Pair<String, String>> = Collections.synchronizedList(mutableListOf())
 
   override suspend fun onTurnStarted(runId: String, text: String) { started.add(runId to text) }
-  override suspend fun onTurnSucceeded(runId: String, text: String) = Unit
+  override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
   override suspend fun onTurnFailed(runId: String, error: String) = Unit
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
-  override suspend fun onTurnCancelled(runId: String, partialText: String) = Unit
+  override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
   override suspend fun onSteerQueued(text: String) = Unit
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit

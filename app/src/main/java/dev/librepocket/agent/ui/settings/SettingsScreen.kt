@@ -332,7 +332,8 @@ fun SettingsScreen(
                 }
             }
             EndpointGate.NoEndpoint -> {
-                // NoEndpoint 恢復入口（Re-review #8 Finding 2 P2/BLOCK 階段2）：
+                // NoEndpoint 恢復入口（Re-review #8 Finding 2 P2/BLOCK 階段2；
+                // Stage 3 P2：DELETE 失敗與中性 UNKNOWN 同為可重試碼）：
                 // 部分清除（LOGOUT_CLEAR_FAILED：金鑰已刪、設定仍在）gate 已折疊為
                 // NoEndpoint；若只顯示「尚未設定」會丟失重試入口。有未恢復 LOGOUT_*
                 // 時改顯示 setupErrorText + 重試（可重試碼）/ STALE 僅關閉 + 取消；

@@ -274,7 +274,7 @@ class SetupLogoutInFlightTest {
 
     @Test
     fun clearLogoutErrorClearsOnlyLogoutCodes() {
-        // LOGOUT 碼可清。
+        // LOGOUT 碼可清（journal 寫即拋＋未達 delete：中性 UNKNOWN，可重試）。
         val raw = rawStore("logout-inflight-clear-code")
         val realStore = EndpointStore(raw)
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
@@ -291,7 +291,7 @@ class SetupLogoutInFlightTest {
         val done = CompletableDeferred<Boolean>()
         vm.logout { done.complete(it) }
         runBlocking { withTimeout(10_000) { done.await() } }
-        assertEquals("LOGOUT_CLEAR_FAILED", vm.form.value.errorCode)
+        assertEquals("LOGOUT_UNKNOWN", vm.form.value.errorCode)
         vm.clearLogoutError()
         assertNull(vm.form.value.errorCode)
         assertFalse(vm.form.value.logoutInFlight)

@@ -1198,18 +1198,24 @@ class SetupViewModel(
      * - `NO_OP`: no journal present; nothing to do (no vault I/O, no clear).
      * - `COMMITTED`: the vault delete won and the fenced clear committed (the
      *   journal was removed atomically with the clear).
-     * - `FAILED`: known-not-committed (vault delete failed, or the clear threw
-     *   and the probe still sees metadata at the same revision, including a
-     *   failed bounded retry). The journal is KEPT for the next replay.
+     * - `DELETE_FAILED`: the vault delete threw (Stage 3 P2: split from
+     *   `FAILED`) — no clear attempted, journal KEPT, and the key may still
+     *   be in the vault. Must never surface "already deleted" wording.
+     * - `FAILED`: delete provably won but the clear is known-not-committed
+     *   (the initial clear threw, the probe still sees metadata at the same
+     *   revision, and the bounded same-rev retry still fails). Journal KEPT.
+     *   Only a `FAILED` with a proven delete win justifies "already deleted" wording: the resume replay core here, and the fresh logout clear path below (probe confirmed metadata-present-at-same-rev + same-rev retry still fails — same taxonomy, same `LOGOUT_CLEAR_FAILED`). Any unconfirmed path (delete not yet attempted, or probe `UNKNOWN`) must use neutral `LOGOUT_UNKNOWN`.
      * - `STALE`: a concurrent winner advanced the revision; the superseded
      *   journal was discarded (best-effort, metadata untouched) and the winner
      *   survives.
      * - `UNKNOWN`: the strict re-read itself failed (or the journal is
-     *   malformed): no-touch, journal kept.
+     *   malformed): no-touch, journal kept, zero vault I/O. Unconfirmed —
+     *   must never surface "already deleted" wording.
      */
     enum class PendingDeleteOutcome {
         NO_OP,
         COMMITTED,
+        DELETE_FAILED,
         FAILED,
         STALE,
         UNKNOWN,
@@ -1227,8 +1233,8 @@ class SetupViewModel(
      * (no vault I/O, no clear); malformed journal or read failure →
      * [PendingDeleteOutcome.UNKNOWN] with no side effects (fail-closed,
      * journal kept). Otherwise the idempotent `deleteKey(journal.alias)` runs
-     * (a delete failure reports [PendingDeleteOutcome.FAILED] with the journal
-     * kept and no clear attempted), then the fenced
+     * (a delete failure reports [PendingDeleteOutcome.DELETE_FAILED] with the
+     * journal kept and no clear attempted), then the fenced
      * `clearIfRevision(journal.revision)` — which removes the journal in the
      * SAME atomic edit on a win — with the same bounded probe + single same-rev
      * retry discipline as the logout clear phase below.
@@ -1268,9 +1274,13 @@ class SetupViewModel(
      * Never throws out of scope (failures report [PendingDeleteOutcome.UNKNOWN]
      * via [onDone] on [Dispatchers.Main] and keep the journal for the next
      * logout retry); a cancelled scope rethrows without calling [onDone].
-     * Called once at composition from `MainScreen`.
+     * Called once at composition from `MainScreen`, which MUST pass a non-empty
+     * [onDone] (Stage 3 P2: [onStartupReconcile]) — a discarded outcome would
+     * leave a retained journal (gate `NoEndpoint`) with no `errorCode` and no
+     * recovery entry. Cancellation semantics unchanged (COMMITTED swallows,
+     * everything else rethrows with no `onDone`).
      */
-    fun launchPendingDeleteReconcile(onDone: (PendingDeleteOutcome) -> Unit = {}) {
+    fun launchPendingDeleteReconcile(onDone: (PendingDeleteOutcome) -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             val outcome = try {
                 reconcilePendingDelete()
@@ -1299,8 +1309,10 @@ class SetupViewModel(
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            // Delete failed: no clear attempted, journal kept for replay.
-            return PendingDeleteOutcome.FAILED
+            // Delete failed: no clear attempted, journal kept for replay. The
+            // key may still be in the vault — Stage 3 DELETE_FAILED (never
+            // "already deleted").
+            return PendingDeleteOutcome.DELETE_FAILED
         }
         try {
             if (store.clearIfRevision(pending.revision)) {
@@ -1379,19 +1391,78 @@ class SetupViewModel(
         }
     }
 
-    /** Maps a resume-path reconcile outcome to (committed, errorCode). */
+    /**
+     * Maps a resume-path reconcile outcome to (committed, errorCode).
+     *
+     * Stage 3 P2 error taxonomy (never claim "already deleted" without a
+     * proven delete win):
+     * - `DELETE_FAILED` (deleteKey threw: key may still be in the vault) →
+     *   `LOGOUT_DELETE_FAILED`;
+     * - `FAILED` (delete won + clear known-not-committed: probe saw metadata
+     *   at the same rev and the bounded retry still failed) → the only outcome
+     *   that may use `LOGOUT_CLEAR_FAILED` ("already deleted" wording);
+     * - `UNKNOWN` (strict re-read failed or malformed journal, zero vault I/O,
+     *   unconfirmed) → neutral `LOGOUT_UNKNOWN`, never `LOGOUT_CLEAR_FAILED`;
+     * - `NO_OP` (dead-mapping on the resume path: the caller only resumes a
+     *   present journal, so the replay core never returns it here) → no error,
+     *   never `LOGOUT_CLEAR_FAILED`.
+     */
     private fun reconcileOutcomeToLogout(outcome: PendingDeleteOutcome): Pair<Boolean, String?> =
         when (outcome) {
             PendingDeleteOutcome.COMMITTED -> true to null
+            PendingDeleteOutcome.NO_OP -> true to null
             PendingDeleteOutcome.STALE -> false to "LOGOUT_STALE"
-            // Resume-path FAILED/UNKNOWN collapse delete/clear failures to the
-            // retryable clear code (both keep the journal for the next replay;
-            // the fresh path below still distinguishes LOGOUT_DELETE_FAILED).
-            PendingDeleteOutcome.FAILED,
-            PendingDeleteOutcome.UNKNOWN,
-            PendingDeleteOutcome.NO_OP,
-            -> false to "LOGOUT_CLEAR_FAILED"
+            PendingDeleteOutcome.DELETE_FAILED -> false to "LOGOUT_DELETE_FAILED"
+            PendingDeleteOutcome.FAILED -> false to "LOGOUT_CLEAR_FAILED"
+            PendingDeleteOutcome.UNKNOWN -> false to "LOGOUT_UNKNOWN"
         }
+
+    /**
+     * Startup replay result handler (Stage 3 P2): stamps a
+     * [reconcilePendingDelete] outcome into `form.errorCode` so a retained
+     * journal (gate `NoEndpoint`) stays recoverable from Settings instead of
+     * invisible.
+     *
+     * Runs on [Dispatchers.Main] as the `MainScreen` `onDone` (direct calls in
+     * tests are equivalent — a plain state copy, no I/O):
+     * - `COMMITTED`/`NO_OP`: silent — writes nothing and never clears a
+     *   pre-existing `LOGOUT_*` (a committed teardown needs no banner; a
+     *   commit racing this stamp keeps its own code);
+     * - `STALE`: explicit decision — silent when [gate] is already `Ready`
+     *   (the concurrent winner is live, nothing to dismiss), otherwise stamps
+     *   `LOGOUT_STALE` for the dismiss card;
+     * - `DELETE_FAILED`/`FAILED`/`UNKNOWN`: stamps per [reconcileOutcomeToLogout]
+     *   (`LOGOUT_DELETE_FAILED` / `LOGOUT_CLEAR_FAILED` / neutral
+     *   `LOGOUT_UNKNOWN`), which the Settings `NoEndpoint` recovery card
+     *   offers as retry (STALE excepted: dismiss only).
+     *
+     * Never touches `logoutInFlight` (startup replay is not a logout attempt);
+     * cancellation never reaches here (rethrows with no `onDone`).
+     */
+    fun onStartupReconcile(outcome: PendingDeleteOutcome) {
+        onStartupReconcile(outcome, gateReady = gate.value is EndpointGate.Ready)
+    }
+
+    /**
+     * Test seam for the STALE gate decision above: the production entry reads
+     * the live [gate], tests pass the decision input directly (collecting the
+     * `WhileSubscribed` gate flow in a unit test races teardown cancellation).
+     */
+    internal fun onStartupReconcile(outcome: PendingDeleteOutcome, gateReady: Boolean) {
+        val code: String? = when (outcome) {
+            PendingDeleteOutcome.COMMITTED,
+            PendingDeleteOutcome.NO_OP,
+            -> null
+            PendingDeleteOutcome.STALE ->
+                if (gateReady) null else "LOGOUT_STALE"
+            PendingDeleteOutcome.DELETE_FAILED -> "LOGOUT_DELETE_FAILED"
+            PendingDeleteOutcome.FAILED -> "LOGOUT_CLEAR_FAILED"
+            PendingDeleteOutcome.UNKNOWN -> "LOGOUT_UNKNOWN"
+        }
+        if (code != null) {
+            _form.value = _form.value.copy(errorCode = code)
+        }
+    }
 
     /**
      * Clear-phase probe outcome for the logout hardening below.
@@ -1503,8 +1574,10 @@ class SetupViewModel(
      *     committed; never retry (a retry would delete the winner's
      *     metadata). Report `LOGOUT_STALE`.
      *   - `UNKNOWN` (re-read failed): no-touch — no second delete, no second
-     *     clear, never report success. Report `LOGOUT_CLEAR_FAILED` with
-     *     `onDone(false)` (retryable once the store recovers).
+     *     clear, never report success. Report `LOGOUT_UNKNOWN` with
+     *     `onDone(false)` (retryable once the store recovers; the journal is
+     *     kept — the delete win is unproven because ack-loss + probe failure
+     *     is the counterexample, so `LOGOUT_CLEAR_FAILED` is forbidden here).
      *   Bounded: exactly one strict read + at most one retry clear; no loop,
      *   no retry storm. Only a CAS win (initial, retry, or ack-loss
      *   reclassification) resets the form and reports `onDone(true)`; every
@@ -1662,7 +1735,11 @@ class SetupViewModel(
                                 false
                             }
                             if (!journalWon) {
-                                _form.value = _form.value.copy(errorCode = "LOGOUT_CLEAR_FAILED")
+                                // Unconfirmed (journal write may or may not have
+                                // won, delete not yet attempted): neutral
+                                // retryable code, never CLEAR_FAILED ("already
+                                // deleted" requires a proven delete win).
+                                _form.value = _form.value.copy(errorCode = "LOGOUT_UNKNOWN")
                                 return@withLock
                             }
                             true
@@ -1684,7 +1761,10 @@ class SetupViewModel(
                             } catch (e: CancellationException) {
                                 throw e
                             } catch (_: Exception) {
-                                _form.value = _form.value.copy(errorCode = "LOGOUT_CLEAR_FAILED")
+                                // Fenced-loss re-read failed before any delete:
+                                // unconfirmed, neutral retryable code (never
+                                // CLEAR_FAILED).
+                                _form.value = _form.value.copy(errorCode = "LOGOUT_UNKNOWN")
                                 return@withLock
                             }
                             val snapshotRef = state.second?.apiKeyRef
@@ -1771,7 +1851,12 @@ class SetupViewModel(
                                 logoutError = "LOGOUT_STALE"
                             }
                             LogoutClearProbe.UNKNOWN -> {
-                                logoutError = "LOGOUT_CLEAR_FAILED"
+                                // Re-read failed: the clear may still have won
+                                // (ack-loss + probe failure is the
+                                // counterexample), so the delete win is
+                                // unproven — neutral retryable code with the
+                                // journal kept, never CLEAR_FAILED.
+                                logoutError = "LOGOUT_UNKNOWN"
                             }
                             LogoutClearProbe.FAILED -> {
                                 val retried: Boolean? = try {

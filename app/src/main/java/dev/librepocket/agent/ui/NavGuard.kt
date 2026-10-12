@@ -34,3 +34,34 @@ fun shouldNavigateToSetup(
     if (logoutErrorCode?.startsWith("LOGOUT_") == true) return false
     return true
 }
+
+/**
+ * 啟動恢復導向純條件（Stage 3 P2，可達性決策 (a)）。
+ *
+ * 決策：啟動 replay 失敗（`LOGOUT_*` + `NoEndpoint`）的使用者若停在 CHAT，
+ * 恢復卡（在 Settings）不可達——舊硬守衛只攔截 SETUP 導向，人會卡在無端點的
+ * CHAT 空態。此函數把該態自動導向 SETTINGS 而非 SETUP（[shouldNavigateToSetup]
+ * 語義不變：兩者互斥——有碼走 SETTINGS，無碼走 SETUP），drawer/選單鍵亦在
+ * 恢復態啟用（見 `MainScreen`），手動前往 SETTINGS 始終可達。
+ *
+ * 規則（全部滿足才導向 SETTINGS）：
+ * - 非 loading；無可用端點；不在登出執行中；
+ * - 有未恢復登出態（`LOGOUT_*` 任一碼，含 STALE 待 dismiss）；
+ * - 當前路由為 CHAT（已在 SETTINGS/SETUP 不重導；`null` 初始幀不決策）。
+ *
+ * 純函數、無副作用。
+ */
+fun shouldNavigateToSettings(
+    hasEndpoint: Boolean,
+    gateLoading: Boolean,
+    currentRoute: String?,
+    logoutErrorCode: String?,
+    logoutInFlight: Boolean,
+): Boolean {
+    if (gateLoading) return false
+    if (hasEndpoint) return false
+    if (logoutInFlight) return false
+    if (logoutErrorCode?.startsWith("LOGOUT_") != true) return false
+    if (currentRoute != Routes.CHAT) return false
+    return true
+}

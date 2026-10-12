@@ -172,10 +172,14 @@ fun MainScreen(
     // Crash-resume (phase 1, Re-review #8 Finding 1 P1): a logout torn down
     // between the vault delete and the metadata clear restarts with a pending
     // journal (readers folded to NoEndpoint); replay it once at startup so the
-    // teardown completes instead of stranding metadata. Fire-and-forget: a
-    // failure keeps the journal for the next logout retry, never crashes UI.
+    // teardown completes instead of stranding metadata. Stage 3 P2: the outcome
+    // is stamped via onStartupReconcile (DELETE/UNKNOWN surface retryable codes
+    // instead of silent discard); a failure keeps the journal for the next
+    // logout retry, never crashes UI.
     LaunchedEffect(Unit) {
-        setupViewModel.launchPendingDeleteReconcile()
+        setupViewModel.launchPendingDeleteReconcile { outcome ->
+            setupViewModel.onStartupReconcile(outcome)
+        }
     }
 
     // Hard gate: no usable endpoint -> setup (and back again after save/logout).
@@ -189,6 +193,20 @@ fun MainScreen(
             return@LaunchedEffect
         }
         navController.navigate(Routes.SETUP) {
+            popUpTo(Routes.CHAT) { inclusive = true }
+            launchSingleTop = true
+        }
+    }
+
+    // 恢復導向（Stage 3 P2，可達性決策 (a)）：啟動 replay 失敗（LOGOUT_* +
+    // NoEndpoint）時把 CHAT 自動導向 SETTINGS 恢復卡，而非留在無端點 CHAT 空態；
+    // 與 SETUP 硬守衛互斥（有碼走此分支，無碼走 SETUP），條件見
+    // shouldNavigateToSettings 純函數。
+    LaunchedEffect(hasEndpoint, gateLoading, currentRoute, logoutGuardError, logoutGuardBusy) {
+        if (!shouldNavigateToSettings(hasEndpoint, gateLoading, currentRoute, logoutGuardError, logoutGuardBusy)) {
+            return@LaunchedEffect
+        }
+        navController.navigate(Routes.SETTINGS) {
             popUpTo(Routes.CHAT) { inclusive = true }
             launchSingleTop = true
         }
@@ -211,7 +229,9 @@ fun MainScreen(
 
     ModalNavigationDrawer(
         drawerState = drawerState,
-        gesturesEnabled = hasEndpoint,
+        // Stage 3 P2 (a)：恢復態（LOGOUT_* + NoEndpoint）啟用 drawer 手勢，
+        // 否則停在 CHAT 的使用者到不了 SETTINGS 恢復卡。
+        gesturesEnabled = hasEndpoint || logoutGuardError != null,
         drawerContent = {
             ModalDrawerSheet {
                 Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
@@ -303,8 +323,9 @@ fun MainScreen(
                     },
                     navigationIcon = {
                         IconButton(
+                            // Stage 3 P2 (a)：恢復態啟用選單鍵（同 drawer 手勢）。
                             onClick = { scope.launch { drawerState.open() } },
-                            enabled = hasEndpoint,
+                            enabled = hasEndpoint || logoutGuardError != null,
                         ) {
                             Icon(Icons.Filled.Menu, contentDescription = "選單")
                         }

@@ -1,23 +1,29 @@
 package dev.librepocket.voice
 
+import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.Preferences
 import dev.librepocket.tool.CapabilityLevel
 import dev.librepocket.tool.DenyReason
 import dev.librepocket.tool.Flavor
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
+import java.io.IOException
 import java.nio.file.Files
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -27,6 +33,9 @@ import org.junit.Test
  * - 寫入持久化（同檔新實例可見；測試間以獨立暫存目錄隔離）；
  * - 同一快照 map 同時驅動 UI 門禁判定與 `ToolRegistry.projectAll`
  *   （UI 開關與 tool 投影讀同一組值）；
+ * - R4-2 三態快照（[VoiceSwitchSnapshot]）：首發射為 loading（門禁關閉，
+ *   不經預設開）；讀取拋 IOException 即 loadFailed（門禁關閉＋投影拒絕，
+ *   其餘例外照拋）；無 key 新戶維持預設開；
  * - 朗讀首次揭露確認狀態預設未確認、確認後持久化（只問一次）。
  */
 class VoiceSwitchStoreTest {
@@ -52,16 +61,49 @@ class VoiceSwitchStoreTest {
         return VoiceSwitchStore(dataStore)
     }
 
+    private fun throwingStore(): VoiceSwitchStore {
+        // 讀取即拋 IOException 的假 store（DataStore.data 讀錯契約），
+        // 走同一注入建構子（PreferenceDataStoreFactory 注入模式）。
+        val broken = object : DataStore<Preferences> {
+            override val data: Flow<Preferences> = flow { throw IOException("injected voice read failure") }
+            override suspend fun updateData(transform: suspend (Preferences) -> Preferences): Preferences {
+                throw IOException("injected voice read failure")
+            }
+        }
+        return VoiceSwitchStore(broken)
+    }
+
+    @Test
+    fun nonIoException_isRethrownNotFailClosed() = runBlocking {
+        // 非 IOException（程式錯誤／取消語義）照拋，不靜默成 fail-closed 快照。
+        val broken = object : DataStore<Preferences> {
+            override val data: Flow<Preferences> = flow { throw IllegalStateException("injected non-io failure") }
+            override suspend fun updateData(transform: suspend (Preferences) -> Preferences): Preferences {
+                throw IllegalStateException("injected non-io failure")
+            }
+        }
+        try {
+            VoiceSwitchStore(broken).observeSwitches().first { it.loaded }
+            fail("expected IllegalStateException to propagate")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message!!.contains("injected non-io failure"))
+        }
+    }
+
     @Test
     fun freshStore_defaultsBothOn() = runBlocking {
-        val snapshot = newStore().observeSwitches().first()
+        // 無 key 新戶：載入完成後維持預設開（行為不變）。
+        val snapshot = newStore().observeSwitches().first { it.loaded }
+        assertFalse(snapshot.loadFailed)
         assertEquals(
             mapOf(
                 VoiceTools.SWITCH_INPUT to true,
                 VoiceTools.SWITCH_OUTPUT to true,
             ),
-            snapshot,
+            snapshot.switches,
         )
+        assertTrue(VoiceTools.inputEnabled(snapshot))
+        assertTrue(VoiceTools.outputEnabled(snapshot))
     }
 
     @Test
@@ -81,7 +123,7 @@ class VoiceSwitchStoreTest {
                 VoiceTools.SWITCH_INPUT to false,
                 VoiceTools.SWITCH_OUTPUT to false,
             ),
-            second.observeSwitches().first(),
+            second.observeSwitches().first { it.loaded }.switches,
         )
     }
 
@@ -89,11 +131,11 @@ class VoiceSwitchStoreTest {
     fun switchFlip_roundTrips() = runBlocking {
         val store = newStore()
         store.setInputEnabled(false)
-        assertFalse(VoiceTools.inputEnabled(store.observeSwitches().first()))
+        assertFalse(VoiceTools.inputEnabled(store.observeSwitches().first { it.loaded }))
         store.setInputEnabled(true)
-        assertTrue(VoiceTools.inputEnabled(store.observeSwitches().first()))
+        assertTrue(VoiceTools.inputEnabled(store.observeSwitches().first { it.loaded }))
         store.setOutputEnabled(false)
-        assertFalse(VoiceTools.outputEnabled(store.observeSwitches().first()))
+        assertFalse(VoiceTools.outputEnabled(store.observeSwitches().first { it.loaded }))
     }
 
     @Test
@@ -108,13 +150,16 @@ class VoiceSwitchStoreTest {
     fun sameSnapshot_drivesUiGateAndToolProjectionTogether() = runBlocking {
         val store = newStore()
         store.setOutputEnabled(false)
-        val snapshot = store.observeSwitches().first()
+        val snapshot = store.observeSwitches().first { it.loaded }
 
         // UI 門禁：輸出關閉即隱藏朗讀入口。
         assertFalse(VoiceTools.outputEnabled(snapshot))
         assertTrue(VoiceTools.inputEnabled(snapshot))
         // Tool 投影讀同一組值：voice.speak 不可用＋USER_DISABLED，transcribe 維持可見。
-        val ctx = ProjectionContext(flavor = Flavor.PLAY, userSwitches = snapshot)
+        val ctx = ProjectionContext(
+            flavor = Flavor.PLAY,
+            userSwitches = VoiceTools.projectionSwitches(snapshot),
+        )
         val projected = ToolRegistry.projectAll(ctx)
         assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.SPEAK_NAME).level)
         assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.SPEAK_NAME).reason)
@@ -130,6 +175,93 @@ class VoiceSwitchStoreTest {
         val projected = ToolRegistry.projectAll(ctx)[VoiceTools.TRANSCRIBE_NAME]!!
         assertEquals(CapabilityLevel.UNAVAILABLE, projected.level)
         assertEquals(DenyReason.USER_DISABLED, projected.reason)
+    }
+
+    @Test
+    fun readFailure_emitsLoadFailedAndGatesClosed() = runBlocking {
+        // (a) 讀取拋 IOException → loadFailed 快照、門禁關閉、投影拒絕。
+        val snapshot = throwingStore().observeSwitches().first { it.loaded }
+        assertTrue(snapshot.loadFailed)
+        assertFalse(VoiceTools.inputEnabled(snapshot))
+        assertFalse(VoiceTools.outputEnabled(snapshot))
+        val projected = ToolRegistry.projectAll(
+            ProjectionContext(
+                flavor = Flavor.PLAY,
+                userSwitches = VoiceTools.projectionSwitches(snapshot),
+            ),
+        )
+        assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.TRANSCRIBE_NAME).level)
+        assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.TRANSCRIBE_NAME).reason)
+        assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.SPEAK_NAME).level)
+        assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.SPEAK_NAME).reason)
+    }
+
+    @Test
+    fun coldStart_disabledStaysClosedFromFirstFrame() = runBlocking {
+        // (b) 冷啟動已關閉戶：首發射（loading）即關閉，不經預設開；載入後仍關閉。
+        val dir = Files.createTempDirectory("voice-test").toFile().also { tmpDirs.add(it) }
+        newStore(dir).also {
+            it.setInputEnabled(false)
+            it.setOutputEnabled(false)
+        }
+        // 同檔不允許雙 active DataStore：先停掉寫入方 scope 並等其完全結束。
+        scopes.forEach { it.cancel() }
+        scopes.forEach { it.coroutineContext[Job]?.join() }
+
+        val reader = newStore(dir)
+        val first = reader.observeSwitches().first()
+        assertFalse(first.loaded)
+        assertFalse(first.loadFailed)
+        assertFalse(VoiceTools.inputEnabled(first))
+        assertFalse(VoiceTools.outputEnabled(first))
+        // 載入完成後仍為關閉（真相源），非失敗。
+        val loaded = reader.observeSwitches().first { it.loaded }
+        assertFalse(loaded.loadFailed)
+        assertEquals(
+            mapOf(
+                VoiceTools.SWITCH_INPUT to false,
+                VoiceTools.SWITCH_OUTPUT to false,
+            ),
+            loaded.switches,
+        )
+    }
+
+    @Test
+    fun projection_loadFailedTreatsSwitchesAsOff() {
+        // (d) 即使快照攜帶開值，loadFailed 仍視 requiresSwitch 為關
+        //（防 UI 隱藏但 tool 仍可用的分叉）。
+        val snapshot = VoiceSwitchSnapshot(
+            switches = mapOf(
+                VoiceTools.SWITCH_INPUT to true,
+                VoiceTools.SWITCH_OUTPUT to true,
+            ),
+            loaded = true,
+            loadFailed = true,
+        )
+        val projected = ToolRegistry.projectAll(
+            ProjectionContext(
+                flavor = Flavor.PLAY,
+                userSwitches = VoiceTools.projectionSwitches(snapshot),
+            ),
+        )
+        assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.TRANSCRIBE_NAME).level)
+        assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.TRANSCRIBE_NAME).reason)
+        assertEquals(CapabilityLevel.UNAVAILABLE, projected.getValue(VoiceTools.SPEAK_NAME).level)
+        assertEquals(DenyReason.USER_DISABLED, projected.getValue(VoiceTools.SPEAK_NAME).reason)
+    }
+
+    @Test
+    fun projection_loadingKeepsExistingDefaults() {
+        // loading 態沿用既有預設（缺鍵即開；tool 側無 UI 等待語義，且語音工具
+        // 現階段 executionReady=false 不進模型名單）。
+        val projected = ToolRegistry.projectAll(
+            ProjectionContext(
+                flavor = Flavor.PLAY,
+                userSwitches = VoiceTools.projectionSwitches(VoiceSwitchSnapshot.LOADING),
+            ),
+        )
+        assertEquals(CapabilityLevel.NATIVE, projected.getValue(VoiceTools.TRANSCRIBE_NAME).level)
+        assertEquals(CapabilityLevel.NATIVE, projected.getValue(VoiceTools.SPEAK_NAME).level)
     }
 
     @Test

@@ -100,10 +100,15 @@ fun ChatScreen(
     onOpenSettings: () -> Unit = {},
     onTurnFinished: () -> Unit = {},
     // M2 語音開關（與 ProjectionContext 同源：同 key、同預設，缺鍵即預設值）。
-    // 呼叫方（MainScreen 經 VoiceSwitchStore 持久化快照）傳入使用者開關；
-    // 預設空 map 即全預設值（voice_input/voice_output 預設開）。
+    // 呼叫方（MainScreen 經 VoiceSwitchStore 三態快照轉 fail-closed 後的 map）傳入
+    // 使用者開關；loading／讀錯時為全關 map（門禁關閉），loaded 時兩鍵恆在。
+    // 預設空 map 即全預設值（voice_input/voice_output 預設開，僅預覽用）。
     // mic 鈕與朗讀鈕按此顯隱。
     userSwitches: Map<String, Boolean> = emptyMap(),
+    // R4-2：設定讀取失敗旗（真相源讀錯時 true）：此時 userSwitches 已為全關
+    //（入口隱藏、VoiceSpeaker 未建構），另在此顯示一行讀取問題提示（沿用下方
+    // 錯誤區既有樣式，不新增設計語言）。
+    voiceSwitchLoadFailed: Boolean = false,
     // #2 朗讀首次揭露確認（持久化，只問一次）：未確認前朗讀鈕先顯示內聯確認。
     // 確認鈕 await 寫入再行動（見 VoiceTtsConfirmState）：成功才算確認，
     // 失敗仍執行本次朗讀並顯示 TTS_ACK_PERSIST_WARNING（保持未確認，下次重問）。
@@ -436,6 +441,16 @@ fun ChatScreen(
             voiceErrors.ttsError?.let {
                 Text(
                     text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
+
+            // R4-2 設定讀取問題提示（沿用錯誤區既有樣式；開關已 fail-closed 隱藏入口）。
+            if (voiceSwitchLoadFailed) {
+                Text(
+                    text = "語音設定讀取失敗，語音輸入與朗讀已停用。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.padding(horizontal = 16.dp),

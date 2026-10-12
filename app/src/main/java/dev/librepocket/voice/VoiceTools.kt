@@ -62,4 +62,30 @@ object VoiceTools {
     /** 見 [inputEnabled]（`voice_output` 預設開）。 */
     fun outputEnabled(switches: Map<String, Boolean>): Boolean =
         switches.getOrDefault(SWITCH_OUTPUT, SWITCH_OUTPUT_DEFAULT)
+
+    /**
+     * 快照門禁（R4-2 三態）：載入完成且未失敗才看開關值；loading／讀錯一律關閉
+     * （fail-closed，不經產品預設開）。`MainScreen` 餵 `ChatScreen` 前與設定頁
+     * 開關顯示皆經此判定。
+     */
+    fun inputEnabled(snapshot: VoiceSwitchSnapshot): Boolean =
+        snapshot.loaded && !snapshot.loadFailed && inputEnabled(snapshot.switches)
+
+    /** 見 [inputEnabled]（快照三態門禁，`voice_output` 側）。 */
+    fun outputEnabled(snapshot: VoiceSwitchSnapshot): Boolean =
+        snapshot.loaded && !snapshot.loadFailed && outputEnabled(snapshot.switches)
+
+    /**
+     * 投影用開關（R4-2）：同一快照在 loadFailed 時兩鍵視為關（fail-closed），
+     * 避免 UI 隱藏但 tool 仍可用的分叉；loading 態照常回 map（缺鍵即產品預設）。
+     * Tool 側無 UI 等待語義（投影為純函數、無首幀概念，且語音工具現階段皆
+     * `executionReady=false` 不進模型名單），故 loading 沿用既有預設而不等待。
+     * 未來投影接線時以此結果為 `ProjectionContext(userSwitches=...)`。
+     */
+    fun projectionSwitches(snapshot: VoiceSwitchSnapshot): Map<String, Boolean> =
+        if (snapshot.loadFailed) {
+            snapshot.switches + mapOf(SWITCH_INPUT to false, SWITCH_OUTPUT to false)
+        } else {
+            snapshot.switches
+        }
 }

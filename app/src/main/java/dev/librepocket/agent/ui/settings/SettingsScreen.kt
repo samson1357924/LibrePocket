@@ -50,9 +50,14 @@ fun SettingsScreen(
      * #3 語音開關（DataStore 持久化，單一真相源見 `VoiceSwitchStore`）：
      * 預設皆開；關閉即隱藏聊天頁對應入口（mic 鈕／朗讀鈕，與投影層同 key）。
      * 形狀仿無障礙自動化開關（checked + onCheckedChange 回調）。
+     * R4-2 三態：[voiceSwitchesEnabled] 為 `loaded && !loadFailed`（loading／
+     * 失敗態禁用開關，避免在未知真相源上寫入）；[voiceLoadFailed] 時另顯示
+     * 一行讀取問題提示。
      */
     voiceInputEnabled: Boolean = VoiceTools.SWITCH_INPUT_DEFAULT,
     voiceOutputEnabled: Boolean = VoiceTools.SWITCH_OUTPUT_DEFAULT,
+    voiceSwitchesEnabled: Boolean = true,
+    voiceLoadFailed: Boolean = false,
     onVoiceInputSwitch: (Boolean) -> Unit = {},
     onVoiceOutputSwitch: (Boolean) -> Unit = {},
 ) {
@@ -130,6 +135,23 @@ fun SettingsScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Spacer(modifier = Modifier.height(8.dp))
+                        // R4-2 三態提示（沿用既有文字樣式；失敗態開關不可撥，
+                        // 避免在未知真相源上寫入）。
+                        if (voiceLoadFailed) {
+                            Text(
+                                "語音設定讀取失敗，開關暫時停用。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        } else if (!voiceSwitchesEnabled) {
+                            Text(
+                                "語音設定讀取中…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
                         // #3 語音開關（仿無障礙開關模式）：關閉即隱藏聊天頁對應入口。
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -143,6 +165,7 @@ fun SettingsScreen(
                             Switch(
                                 checked = voiceInputEnabled,
                                 onCheckedChange = onVoiceInputSwitch,
+                                enabled = voiceSwitchesEnabled,
                             )
                         }
                         Row(
@@ -157,6 +180,7 @@ fun SettingsScreen(
                             Switch(
                                 checked = voiceOutputEnabled,
                                 onCheckedChange = onVoiceOutputSwitch,
+                                enabled = voiceSwitchesEnabled,
                             )
                         }
                     }

@@ -63,6 +63,7 @@ import dev.librepocket.entry.EntryDispatch
 import dev.librepocket.entry.EntryRoute
 import dev.librepocket.shell.PrivilegeBridgeState
 import dev.librepocket.voice.VoiceSwitchStore
+import dev.librepocket.voice.VoiceSwitchSnapshot
 import dev.librepocket.voice.VoiceTools
 import kotlinx.coroutines.launch
 
@@ -97,11 +98,21 @@ fun MainScreen(
     val sessions by sessionListViewModel.sessions.collectAsStateWithLifecycle()
     val currentSessionId by chatViewModel.currentSessionId.collectAsStateWithLifecycle()
 
-    // #3 語音開關真相源（VoiceSwitchStore，DataStore 持久化）：同一快照同時
-    // 餵給 ChatScreen 門禁（userSwitches）與設定頁開關顯示；tool 投影未來
-    // 接線時以前述同一 map 為 ProjectionContext.userSwitches（同 key、同預設）。
+    // #3 語音開關真相源（VoiceSwitchStore，DataStore 持久化）：R4-2 三態快照
+    // （loading／loaded／loadFailed）。UI 門禁 fail-closed：`!loaded || loadFailed`
+    // 時傳全關 map（沿用 outputEnabled=false 同路徑：mic／朗讀入口隱藏、VoiceSpeaker
+    // 不建構）；loadFailed 另經 voiceSwitchLoadFailed 在聊天頁顯示一行讀取問題提示；
+    // tool 投影未來接線時以 VoiceTools.projectionSwitches 同一快照轉 map 為
+    // ProjectionContext.userSwitches（失敗態視為關，同 key、同預設）。
     val voiceStore = remember(app) { VoiceSwitchStore(app) }
-    val voiceSwitches by voiceStore.observeSwitches().collectAsStateWithLifecycle(initialValue = emptyMap())
+    val voiceSnapshot by voiceStore.observeSwitches().collectAsStateWithLifecycle(
+        initialValue = VoiceSwitchSnapshot.LOADING,
+    )
+    val voiceUiSwitches = if (voiceSnapshot.loaded && !voiceSnapshot.loadFailed) {
+        voiceSnapshot.switches
+    } else {
+        mapOf(VoiceTools.SWITCH_INPUT to false, VoiceTools.SWITCH_OUTPUT to false)
+    }
     val ttsAcknowledged by voiceStore.observeTtsAcknowledged().collectAsStateWithLifecycle(initialValue = false)
 
     // S3 提權橋產品態（BACKLOG D09）：審計表 + privilege_bridge 開關 +
@@ -285,7 +296,8 @@ fun MainScreen(
                             viewModel = chatViewModel,
                             onOpenSettings = { goSetupForEdit() },
                             onTurnFinished = { sessionListViewModel.refresh() },
-                            userSwitches = voiceSwitches,
+                            userSwitches = voiceUiSwitches,
+                            voiceSwitchLoadFailed = voiceSnapshot.loadFailed,
                             ttsAcknowledged = ttsAcknowledged,
                             onTtsAcknowledged = {
                                 runCatching { voiceStore.acknowledgeTtsDisclosure() }
@@ -312,8 +324,10 @@ fun MainScreen(
                                 privilegeAuditCount = privilegeState.auditCount()
                             },
                             privilegeAuditCount = privilegeAuditCount,
-                            voiceInputEnabled = VoiceTools.inputEnabled(voiceSwitches),
-                            voiceOutputEnabled = VoiceTools.outputEnabled(voiceSwitches),
+                            voiceInputEnabled = VoiceTools.inputEnabled(voiceSnapshot),
+                            voiceOutputEnabled = VoiceTools.outputEnabled(voiceSnapshot),
+                            voiceSwitchesEnabled = voiceSnapshot.loaded && !voiceSnapshot.loadFailed,
+                            voiceLoadFailed = voiceSnapshot.loadFailed,
                             onVoiceInputSwitch = { enabled ->
                                 scope.launch {
                                     runCatching { voiceStore.setInputEnabled(enabled) }

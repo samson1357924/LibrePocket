@@ -196,6 +196,22 @@ internal fun shouldDeleteStaleFork(requestedSessionId: String, created: CreatedS
 private const val SESSION_FLUSH_TIMEOUT_MS = 5_000L
 
 /**
+ * R9-3 deferred-backfill block horizon: a same-ID reopen whose pre-read
+ * settle failed (flush-timeout: the old writer may still land its terminal
+ * late) parks `pendingBackfillBlock[sessionId] = now + this`. A later open
+ * whose settle trivially succeeds (fresh idle live) must NOT backfill while
+ * the block holds — the ledger still dangles — until promotion (the ledger
+ * proves its terminal) or this deadline (old writer truly dead/restarted;
+ * bounded, never a permanent ban). 6x the flush budget (~30s) so a slow but
+ * live writer has room to settle across consecutive reopens. Each forced
+ * hold refreshes the deadline (idle-bounded: back-to-back premature reopens
+ * keep sliding it); a restart inside the window drops the memory-only block,
+ * so the first post-restart reopen of a still-dangling id may backfill early
+ * (pre-existing behavior class, bounded by the same horizon).
+ */
+private const val PENDING_BACKFILL_BLOCK_MS = SESSION_FLUSH_TIMEOUT_MS * 6
+
+/**
  * Chat UI state holder wired to the real [ChatSession] plus the transcript store.
  *
  * Exposes replayed history ([messages] = stored history + live session messages),
@@ -390,6 +406,21 @@ class ChatViewModel(
     private var pendingLedgerSession: ChatSession? = null
     private var pendingLedgerWasStreaming: Boolean = false
     private var pendingLedgerOwnerSessionId: String? = null
+    /**
+     * R9-3 deferred-backfill block (Main-confined, guarded by [sessionMutex]
+     * like every other lifecycle field): sessionId → deadlineMs. A deferred
+     * same-ID reopen (`!backfillNow`: settle failed, terminal may land late)
+     * parks its id here; a later open with a trivially-successful settle
+     * (fresh idle live, old writer still alive) stays deferred while its
+     * entry holds. Promotion deletes the entry (ledger proves no dangling
+     * family AND the detached live shows no pending evidence); deadline
+     * expiry deletes it too (bounded). Memory-only: a process restart drops
+     * every entry (a durable marker would need a single-event delete for its
+     * clear semantics — no SessionStore API — and the head-anchored scan
+     * loses pruned markers anyway, so the marker stays a noted follow-up and
+     * this block is the enforcement).
+     */
+    private var pendingBackfillBlock = HashMap<String, Long>()
     // R2: unsent texts are owned per send/steer operation, never by a single
     // global String. Cleared only when the controller accepts that exact op
     // (startOrEnqueue Started/Queued verdict); pre-accept endpoint
@@ -1446,6 +1477,18 @@ class ChatViewModel(
 
                     if (!isSlowReopen) {
                         val creationGeneration = requestedGeneration
+                        // R9-3: a from-null reopen of a still-blocked ledger
+                        // defers like the slow path (no live to settle here,
+                        // so settle evidence is vacuously clean; only the
+                        // ledger probe can promote). Different-ID opens check
+                        // their own id, so an unrelated ledger never inherits
+                        // this block.
+                        val fastBackfill = gateBackfillForSession(
+                            sessionId,
+                            settleOk = true,
+                            durableOk = true,
+                            detached = null,
+                        )
                         try {
                             withContext(Dispatchers.IO) {
                                 candidate = sessions.open(
@@ -1453,7 +1496,7 @@ class ChatViewModel(
                                     sessionId,
                                     allowAsk = access.allowAsk,
                                     keyIsCurrent = { isBindingCurrent(access.binding, creationGeneration) },
-                                    backfillInterrupted = true,
+                                    backfillInterrupted = fastBackfill,
                                 )
                             }
                         } catch (cancelled: CancellationException) {
@@ -1506,8 +1549,12 @@ class ChatViewModel(
                         // Stage D: a cross-provider resume keeps the local
                         // replay but withholds the model prefix; say so
                         // visibly instead of resuming silently on a blank
-                        // context.
-                        _notice.value = if (created.historyWithheld) {
+                        // context. R9-3: a fast-path defer (still-blocked
+                        // ledger, see fastBackfill above) warns like the slow
+                        // path instead of the marker scan.
+                        _notice.value = if (!fastBackfill) {
+                            "HISTORY_SNAPSHOT_INCOMPLETE"
+                        } else if (created.historyWithheld) {
                             "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
                         } else {
                             // R4-2: a cross-provider fork marker persisted in
@@ -1667,8 +1714,19 @@ class ChatViewModel(
                     // durableOk backfills, otherwise this open skips it and
                     // relies on the next open's retry (best-effort). The
                     // cross-origin fork path always backfills its fresh
-                    // ledger and is never gated.
-                    val backfillNow = settleOk && durableOk
+                    // ledger and is never gated. R9-3: the gate is
+                    // sessionId-grained ([gateBackfillForSession]) — a live
+                    // defer block forces a second premature reopen to defer
+                    // again even though its fresh idle live settles cleanly
+                    // (flush-timeout vs flush-failure are indistinguishable
+                    // here; only the ledger state tells them apart).
+                    val detachedForGate = if (isSameIdReopen) prevLive else null
+                    val backfillNow = gateBackfillForSession(
+                        sessionId,
+                        settleOk,
+                        durableOk,
+                        detachedForGate,
+                    )
                     val creationGeneration = requestedGeneration
                     try {
                         withContext(Dispatchers.IO) {
@@ -3596,6 +3654,78 @@ class ChatViewModel(
         } catch (_: Exception) {
             false
         }
+    }
+
+    /**
+     * R9-3 (A) sessionId-granularity backfill gate. Must be called with
+     * [sessionMutex] held on Main (same confinement as
+     * [pendingBackfillBlock]); the promotion probe suspends on IO internally
+     * and resumes on Main before touching the map.
+     *
+     * - `settleOk && durableOk` with no live block backfills (unchanged).
+     * - `!backfillNow` (settle failed: flush-timeout means the old writer
+     *   may still land its terminal late; flush-failure means it is sealed)
+     *   parks `block[sessionId] = now + [PENDING_BACKFILL_BLOCK_MS]` and
+     *   returns false. The caller still hydrates and warns
+     *   HISTORY_SNAPSHOT_INCOMPLETE; the next open retries.
+     * - A later open with `backfillNow == true` but a live (unexpired) block
+     *   is forced to false UNLESS promotion proves the ledger already
+     *   terminal (no dangling family in the backfill window AND the detached
+     *   live shows no pending evidence) — this is the second-reopen fix: a
+     *   fresh idle live settles trivially while the old writer is still
+     *   alive, and only the ledger state tells the two apart.
+     * - An expired block is dropped (bounded: the old writer is truly dead
+     *   or the process restarted its writer; never a permanent ban).
+     *
+     * Idempotent and fail-closed: a probe failure keeps the block until its
+     * deadline. Caller cancellation propagates.
+     */
+    private suspend fun gateBackfillForSession(
+        sessionId: String,
+        settleOk: Boolean,
+        durableOk: Boolean,
+        detached: ChatSession?,
+    ): Boolean {
+        var backfillNow = settleOk && durableOk
+        val nowMs = System.currentTimeMillis()
+        val blockedUntil = pendingBackfillBlock[sessionId]
+        if (blockedUntil != null) {
+            if (nowMs >= blockedUntil) {
+                pendingBackfillBlock.remove(sessionId)
+            } else if (backfillNow) {
+                val ledgerClean = try {
+                    withContext(Dispatchers.IO) { probeLedgerHasNoDangling(sessionId) }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    false
+                }
+                val liveClean = !isLedgerStreamingOrPending(detached)
+                if (ledgerClean && liveClean) {
+                    pendingBackfillBlock.remove(sessionId)
+                } else {
+                    backfillNow = false
+                }
+            }
+        }
+        if (!backfillNow) {
+            pendingBackfillBlock[sessionId] = nowMs + PENDING_BACKFILL_BLOCK_MS
+        }
+        return backfillNow
+    }
+
+    /**
+     * R9-3 promotion probe: true only when the ledger's backfill window
+     * holds no dangling family — the terminal already landed, so a gated
+     * backfill would no-op and the block may lift. Fail-closed (null store
+     * or any read failure keeps the block until its deadline). Scans the
+     * same [BACKFILL_SCAN_LIMIT] window the factory backfill marks, so the
+     * two can never disagree. Cancellation propagates; call from IO (see
+     * [gateBackfillForSession]).
+     */
+    private suspend fun probeLedgerHasNoDangling(sessionId: String): Boolean {
+        val backing = sessions.storeOrNull() ?: return false
+        return findDanglingRunIds(backing.loadTailEvents(sessionId, BACKFILL_SCAN_LIMIT)).isEmpty()
     }
 
     /**

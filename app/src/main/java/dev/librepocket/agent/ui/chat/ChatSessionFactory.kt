@@ -89,8 +89,12 @@ internal const val HISTORY_TRUNCATION_MARKER = "…[history truncated]"
  * newest-first window replaces the old unbounded full load (OOM-safe).
  * Best-effort: an ancient unmarked row outside the window stays for the next
  * open, same as any failed backfill before.
+ *
+ * R9-3: internal (was private) so the ViewModel's deferred-backfill
+ * promotion probe scans the same window the backfill marks — promote holds
+ * exactly when a gated backfill would no-op.
  */
-private const val BACKFILL_SCAN_LIMIT = 2000
+internal const val BACKFILL_SCAN_LIMIT = 2000
 
 /**
  * Stage E: tail-loaded model prefix. [droppedCount] is the exact number of

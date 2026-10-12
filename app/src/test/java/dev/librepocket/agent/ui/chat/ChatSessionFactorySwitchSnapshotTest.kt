@@ -530,4 +530,101 @@ class ChatSessionFactorySwitchSnapshotTest {
         assertTrue(vm.messages.value.none { it.text.startsWith("usage ") })
         assertTrue(vm.messages.value.none { it.text.startsWith("model switched ") })
     }
+
+    // -- R8-4: reasoning markers ride the fork + hydrate the request flag ---
+
+    @Test fun reasoningMarkersSwitchReopen_restoreUiAndRequestFlags() = runBlocking {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = ExportingFakeStore()
+        val fake = answeringFake()
+        val factory = factoryWith(transcripts, fake)
+
+        val oldId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(oldId, "r0", "user", "q0"))
+        transcripts.appendEvent(event(oldId, "r0", "assistant", "a0"))
+        // Success reasoning turn: assistant + payload-free marker, same runId.
+        transcripts.appendEvent(event(oldId, "R1", "user", "q-reason"))
+        transcripts.appendEvent(event(oldId, "R1", "assistant", "a-reason"))
+        transcripts.appendEvent(event(oldId, "R1", "reasoning", ""))
+        // Cancel reasoning turn: partial assistant + marker, same runId.
+        transcripts.appendEvent(event(oldId, "L", "user", "q-cancel"))
+        transcripts.appendEvent(event(oldId, "L", "assistant", "half-cancel", isPartial = true))
+        transcripts.appendEvent(event(oldId, "L", "reasoning", ""))
+
+        val newId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o")
+        val copied = snapshotSwitchHistory(transcripts, oldId, newId, "gpt-4o-mini", "gpt-4o", false)
+        assertEquals(8, copied)
+
+        // Ledger: marker row 1, then the full prefix verbatim incl. markers.
+        val forked = rows(transcripts, newId)
+        assertEquals(
+            listOf("system", "user", "assistant", "user", "assistant", "reasoning", "user", "assistant", "reasoning"),
+            forked.map { it.kind },
+        )
+        assertTrue(forked[0].text.startsWith("model switched gpt-4o-mini -> gpt-4o"))
+        assertCopiedVerbatim(rows(transcripts, oldId), forked.drop(1))
+        // Reasoning markers are never dangling terminals.
+        assertTrue(findDanglingRunIds(forked).isEmpty())
+        assertTrue(findDanglingRunIds(forked.filter { it.kind == "reasoning" }).isEmpty())
+
+        // UI: reopen replays user/assistant only, restoring hasReasoning.
+        val vm = newVm(store, transcripts, fake)
+        onMain { vm.openSession(newId) }
+        awaitTrue { vm.currentSessionId.value == newId && vm.messages.value.size == 6 }
+        assertEquals(
+            listOf("q0", "a0", "q-reason", "a-reason", "q-cancel", "half-cancel"),
+            vm.messages.value.map { it.text },
+        )
+        assertEquals(
+            listOf(false, false, false, true, false, true),
+            vm.messages.value.map { it.hasReasoning },
+        )
+        assertEquals(listOf(false, false, false, false, false, true), vm.messages.value.map { it.isPartial })
+        assertNull(vm.notice.value)
+
+        // Model hydration: the next request carries the flag on the
+        // reasoning-origin assistant only; the partial never enters context.
+        val before = interruptedMarkers(transcripts, newId).size
+        val opened = factory.open(sampleEndpoint(), newId)
+        try {
+            assertEquals(before, interruptedMarkers(transcripts, newId).size)
+            opened.session.send("q-next")
+            val req = fake.seenRequests.single()
+            assertEquals(
+                listOf("user", "assistant", "user", "assistant", "user", "user"),
+                req.messages.map { it.role },
+            )
+            assertEquals("q0", req.messages[0].text)
+            assertEquals("a0", req.messages[1].text)
+            assertEquals("q-reason", req.messages[2].text)
+            assertEquals("a-reason", req.messages[3].text)
+            assertEquals("q-cancel", req.messages[4].text)
+            assertTrue(req.messages[5].text.startsWith("q-next"))
+            assertEquals(listOf(false, false, false, true, false, false), req.messages.map { it.hasReasoning })
+        } finally {
+            opened.session.close()
+        }
+    }
+
+    @Test fun reasoningMarkerHydration_exactRunIdOnly() = runBlocking {
+        val transcripts = ExportingFakeStore()
+        val sid = transcripts.createSession("t", "m")
+        // Plain turn must not gain the flag from a neighboring marker
+        // (exact-runId pairing, never family): R-other marker shares no
+        // runId with R-plain.
+        transcripts.appendEvent(event(sid, "R-plain", "user", "q1"))
+        transcripts.appendEvent(event(sid, "R-plain", "assistant", "a1"))
+        transcripts.appendEvent(event(sid, "R-other", "reasoning", ""))
+        transcripts.appendEvent(event(sid, "R-flagged", "user", "q2"))
+        transcripts.appendEvent(event(sid, "R-flagged", "assistant", "a2"))
+        transcripts.appendEvent(event(sid, "R-flagged", "reasoning", ""))
+
+        val loaded = loadModelHistory(transcripts, sid)
+        assertEquals(4, loaded.messages.size)
+        assertEquals(listOf("q1", "a1", "q2", "a2"), loaded.messages.map { it.text })
+        assertEquals(listOf(false, false, false, true), loaded.messages.map { it.hasReasoning })
+        // Markers never count as model rows.
+        assertEquals(0, loaded.droppedCount)
+    }
 }

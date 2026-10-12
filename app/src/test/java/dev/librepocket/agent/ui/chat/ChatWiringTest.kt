@@ -984,6 +984,101 @@ class ChatWiringTest {
     }
 
     @Test
+    fun reasoningLiveTurn_switchCarriesMarker_reopenRestoresFlags() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        }
+        // R8-4 live provenance: u1 exercises both reasoning event shapes
+        // (opaque ReasoningPresent + visible ReasoningDelta); later turns
+        // stay plain so the flag pairing stays exact.
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                when {
+                    userMsg.startsWith("u1") -> {
+                        emit(StreamEvent.ReasoningPresent)
+                        emit(StreamEvent.ReasoningDelta(0, 0, "think-"))
+                        emit(StreamEvent.TextDelta(0, 0, "a1"))
+                    }
+                    userMsg.startsWith("u2") -> emit(StreamEvent.TextDelta(0, 0, "a2"))
+                    else -> emit(StreamEvent.TextDelta(0, 0, "a3"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+
+        // Round 1: reasoning-origin turn writes assistant + marker.
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        assertTrue(vm.messages.value[1].hasReasoning)
+        awaitTrue {
+            transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 &&
+                transcripts.events.count { it.kind == "reasoning" } == 1
+        }
+        val oldId = vm.currentSessionId.value
+        assertNotNull(oldId)
+        val marker = transcripts.events.single { it.kind == "reasoning" }
+        assertEquals("", marker.text)
+        assertEquals(transcripts.events.single { it.kind == "assistant" }.runId, marker.runId)
+
+        // Same-provider switch, then a plain round 2.
+        runBlocking { store.save(sampleEndpoint().copy(model = "gpt-4o")) }
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        val newId = vm.currentSessionId.value
+        assertNotNull(newId)
+        assertFalse(newId == oldId)
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == newId && (it.kind == "user" || it.kind == "assistant")
+            } == 4
+        }
+        awaitTrue { transcripts.events.count { it.sessionId == newId && it.kind == "reasoning" } == 1 }
+        // Fork ledger carries the marker verbatim between its assistant and the next turn.
+        val forkedRows = transcripts.events.filter { it.sessionId == newId }
+        assertEquals(
+            listOf("system", "user", "assistant", "reasoning", "user", "assistant"),
+            forkedRows.map { it.kind },
+        )
+        assertEquals(forkedRows[2].runId, forkedRows[3].runId)
+        assertEquals("", forkedRows[3].text)
+        assertTrue(vm.messages.value[1].hasReasoning)
+        assertFalse(vm.messages.value[3].hasReasoning)
+        assertNull(vm.notice.value)
+
+        // Restart: UI flag survives, and the next request carries it.
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm2.openSession(newId!!) }
+        awaitTrue { vm2.currentSessionId.value == newId && vm2.messages.value.size == 4 }
+        assertTrue(vm2.messages.value[1].hasReasoning)
+        assertFalse(vm2.messages.value[3].hasReasoning)
+        assertNull(vm2.notice.value)
+        onMain { vm2.onInputChange("u3") }
+        onMain { vm2.send() }
+        awaitTrue { vm2.sessionState.value.status == ChatStatus.IDLE && vm2.messages.value.size == 6 }
+        val restartReq = fake.seenRequests.last()
+        assertEquals(
+            listOf("user", "assistant", "user", "assistant", "user"),
+            restartReq.messages.map { it.role },
+        )
+        assertEquals(listOf(false, true, false, false, false), restartReq.messages.map { it.hasReasoning })
+        assertTrue(restartReq.messages[1].text.contains("a1"))
+    }
+
+    @Test
     fun sameProviderSwitch_survivesRestart() {
         val store = newStore()
         val transcripts = dev.librepocket.session.FakeSessionStore()

@@ -66,6 +66,11 @@ interface TranscriptSink {
    * ([dev.librepocket.chat.TurnController]) always call this three-arg form.
    * The legacy two-arg form stays as the reason-only (system-row) record.
    *
+   * Marker contract: failed turns never persist a `reasoning` marker (unlike
+   * [onTurnSucceeded] / [onTurnCancelled], which do when `hasReasoning` is
+   * true) — the failed `assistant` row is `isPartial=1`, so it never enters
+   * the provider request (display-only, no provider impact).
+   *
    * Stage F: this three-arg form is always final (`isFinal=1`).
    */
   suspend fun onTurnFailed(runId: String, partialText: String, error: String) {

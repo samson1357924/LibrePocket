@@ -1040,6 +1040,20 @@ class ChatSessionFactory(
  * mirroring the live `!isPartial` request filter); `system` markers stay
  * export/debug-only via the same filter.
  *
+ * R8-4: payload-free `reasoning` markers ride the same scan (exact-`runId`)
+ * into [ChatMessage.hasReasoning] on their assistant row (`isFinal` /
+ * `isPartial` ignored); the marker rows themselves never enter model
+ * context and never affect [LoadedModelHistory.droppedCount].
+ *
+ * Known limitation: a `reasoning` marker outside the
+ * [SnapshotBudget.HISTORY_LOAD_CAP] window is not collected, so its
+ * assistant row (when the row itself is still inside the window) resumes
+ * with `hasReasoning=false` (fail-open to plain-text continuation). On
+ * this branch that is defense-in-depth only: resumed history is display
+ * state, never fed back into the provider request, so a missing flag
+ * cannot smuggle a reasoning origin into a follow-up as plain text
+ * (ordinary no-tools follow-ups continue either way).
+ *
  * Truncation is observable: [LoadedModelHistory.droppedCount] carries the
  * exact omitted-row total (filtered COUNT query, O(1) memory). A giant
  * single row is truncated to [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] with a
@@ -1051,13 +1065,78 @@ class ChatSessionFactory(
  * through the caller's UNKNOWN/NO_ENDPOINT path instead.
  */
 internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): LoadedModelHistory {
-    val events = loadModelHistoryEvents(store, sessionId)
+    val scan = loadModelHistoryScan(store, sessionId)
     val total = store.countHistoryEvents(sessionId, includePartial = false)
-    val dropped = (total - events.size).coerceAtLeast(0)
+    val dropped = (total - scan.events.size).coerceAtLeast(0)
     return LoadedModelHistory(
-        events.map { ChatMessage(role = it.kind, text = cappedHistoryText(it.text)) },
+        scan.events.map {
+            ChatMessage(
+                role = it.kind,
+                text = cappedHistoryText(it.text),
+                hasReasoning = it.kind == "assistant" && it.runId in scan.reasoningRunIds,
+            )
+        },
         dropped,
     )
+}
+
+/**
+ * R8-4: shared backward scan backing [loadModelHistory] /
+ * [loadModelHistoryEvents]. Collects the payload-free `reasoning` marker
+ * runIds (exact-`runId` pairing, never [familyOf]; `isFinal` / `isPartial`
+ * ignored) alongside the newest qualifying model rows, so reopened
+ * reasoning-origin turns keep their `hasReasoning` flag in
+ * `cappedHistory` → `buildRequest` (fail-closed on tool-dependent /
+ * thinking-mode follow-ups; ordinary no-tools follow-ups continue).
+ *
+ * Known limitation: same CAP-boundary fail-open as [loadModelHistory] — a
+ * marker outside the [SnapshotBudget.HISTORY_LOAD_CAP] window is not
+ * collected even when its assistant row is kept. Production no-tools
+ * follow-ups cannot observe the difference (display-only flag).
+ */
+internal data class ModelHistoryScan(
+    /**
+     * Newest qualifying model rows, oldest-first: pure user/assistant
+     * projection (`!isPartial` only; `reasoning` markers and `system` rows
+     * never appear here).
+     */
+    val events: List<TranscriptEvent>,
+    /**
+     * Exact-`runId` `reasoning`-marker owners (`isFinal` / `isPartial`
+     * ignored, never [familyOf]). A marker outside the CAP window is not
+     * collected (fail-open; see the class note above).
+     */
+    val reasoningRunIds: Set<String>,
+)
+
+internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String): ModelHistoryScan {
+    val keptNewestFirst = ArrayList<TranscriptEvent>(SnapshotBudget.HISTORY_LOAD_CAP)
+    val reasoningRunIds = HashSet<String>()
+    var beforeSeq = Long.MAX_VALUE
+    outer@ while (keptNewestFirst.size < SnapshotBudget.HISTORY_LOAD_CAP) {
+        val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
+        if (page.isEmpty()) break
+        for (event in page) {
+            if (event.kind == "reasoning") {
+                // Flag-only marker (empty text): never model context itself,
+                // only the exact-runId flag for its assistant row.
+                reasoningRunIds.add(event.runId)
+                continue
+            }
+            if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
+                if (keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) break@outer
+                keptNewestFirst.add(event)
+            }
+        }
+        // Pages are newest-first with distinct seqs; the next window ends
+        // strictly below this page's minimum. A non-advancing store would
+        // spin forever, so fail closed instead.
+        val pageMin = page.minOf { it.seq }
+        if (pageMin >= beforeSeq) break
+        beforeSeq = pageMin
+        if (page.size < HISTORY_PAGE) break
+    }
+    return ModelHistoryScan(keptNewestFirst.asReversed(), reasoningRunIds)
 }
 
 /**
@@ -1081,26 +1160,10 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
  * them via [loadSwitchSnapshotEvents] instead.
  */
 internal suspend fun loadModelHistoryEvents(store: SessionStore, sessionId: String): List<TranscriptEvent> {
-    val keptNewestFirst = ArrayList<TranscriptEvent>(SnapshotBudget.HISTORY_LOAD_CAP)
-    var beforeSeq = Long.MAX_VALUE
-    outer@ while (keptNewestFirst.size < SnapshotBudget.HISTORY_LOAD_CAP) {
-        val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
-        if (page.isEmpty()) break
-        for (event in page) {
-            if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
-                if (keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) break@outer
-                keptNewestFirst.add(event)
-            }
-        }
-        // Pages are newest-first with distinct seqs; the next window ends
-        // strictly below this page's minimum. A non-advancing store would
-        // spin forever, so fail closed instead.
-        val pageMin = page.minOf { it.seq }
-        if (pageMin >= beforeSeq) break
-        beforeSeq = pageMin
-        if (page.size < HISTORY_PAGE) break
-    }
-    return keptNewestFirst.asReversed()
+    // R8-4: same backward scan as [loadModelHistory] (reasoning markers are
+    // collected there for the hasReasoning flag but never returned here —
+    // this stays the pure user/assistant model projection).
+    return loadModelHistoryScan(store, sessionId).events
 }
 
 /**
@@ -1142,7 +1205,11 @@ internal data class SwitchSnapshotLoad(
  * `failureReason` / `parentRunId` / `attemptIndex` / `isFinal` /
  * `createdAt` preserved, `seq` reassigned on copy, texts never truncated —
  * truncation stays a read-path concern via [cappedHistoryText] on hydrate)
- * plus the terminal `system` marks above ([isSwitchSnapshotTerminalMark]).
+ * plus the terminal `system` marks above ([isSwitchSnapshotTerminalMark])
+ * plus every payload-free `reasoning` marker (R8-4: same `runId`, empty text,
+ * verbatim copy — never a [findDanglingRunIds] terminal, so an orphan marker
+ * is a harmless pending entry; the marker rides with its assistant under the
+ * same [familyOf] in the R6-3 dangling filter).
  *
  * Hydration is intentionally split after R5-3: [loadModelHistoryEvents]
  * stays the model-context projection (`!isPartial`, used by `open` /
@@ -1155,7 +1222,9 @@ internal data class SwitchSnapshotLoad(
  * Counting basis: the row budget covers the combined UI/audit set
  * (`countHistoryEvents(includePartial=true)` user/assistant rows plus the
  * terminal marks, which that COUNT excludes as `system` rows), newest-first,
- * so a large ledger drops the oldest rows first (silent, as before). The
+ * so a large ledger drops the oldest rows first (silent, as before). At a
+ * full 1999-row prefix each `reasoning`/terminal marker displaces one
+ * oldest row; bounded (one marker slot) and acceptable. The
  * char budget accumulates the same newest-first order and stops the prefix
  * at the first row that would overflow [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS] — that row
  * and every older qualifying row is reported via [SwitchSnapshotLoad.droppedByBytes]
@@ -1174,7 +1243,11 @@ internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: St
         val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
         if (page.isEmpty()) break
         for (event in page) {
-            val keep = (event.kind == "user" || event.kind == "assistant") ||
+            // R8-4: reasoning markers ride verbatim (flag-only, empty text).
+            // Deliberately NOT a terminal mark (see
+            // [isSwitchSnapshotTerminalMark]): an orphan marker must never
+            // close a family for [findDanglingRunIds].
+            val keep = (event.kind == "user" || event.kind == "assistant" || event.kind == "reasoning") ||
                 isSwitchSnapshotTerminalMark(event)
             if (!keep) continue
             if (byteCapped) {
@@ -1301,7 +1374,8 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * [loadSwitchSnapshotEvents] UI replay/audit prefix oldest-first (every
  * `user`/`assistant` row INCLUDING partials, verbatim `isPartial` /
  * `failureReason` / `parentRunId` / `attemptIndex` / `isFinal` / `createdAt`,
- * plus terminal `system` interrupted/cancelled/legacy-failure marks).
+ * plus terminal `system` interrupted/cancelled/legacy-failure marks, plus
+ * every payload-free `reasoning` marker verbatim — R8-4).
  * Copied rows keep their family linkage and `createdAt` verbatim; `seq` is
  * reassigned by the store; texts are stored verbatim (truncation stays a
  * read-path concern via [cappedHistoryText] on hydrate). The copy is bounded

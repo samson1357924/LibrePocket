@@ -253,6 +253,16 @@ class FileEditExecutor(
             readBytes(target)
         } catch (e: FileNotFoundException) {
             return failed("NOT_FOUND", "檔案不存在，先用 file.edit 建立「$path」")
+        } catch (e: FileBudgetException) {
+            // 私有域讀預算耗盡：沿既有用語回 FILE_TOO_LARGE（bounded read 第一層即拒，
+            // 不經全量讀；上限為 MAX_PATCH_BYTES）。
+            if (e.budget == FileBudgetCode.READ_TOO_LARGE) {
+                return failed(
+                    "FILE_TOO_LARGE",
+                    "檔案過大（超過 ${FileEditTools.MAX_PATCH_BYTES} 位元組上限），改用 file.edit 全量覆寫「$path」",
+                )
+            }
+            return failed("READ_FAILED", "讀取失敗「$path」：${e.message}")
         } catch (e: Exception) {
             return failed("READ_FAILED", "讀取失敗「$path」：${e.message}")
         }
@@ -304,7 +314,9 @@ class FileEditExecutor(
 
     private fun readBytes(target: FileEditTools.Target): ByteArray =
         when (target) {
-            is FileEditTools.Target.Private -> store.read(target.relativePath)
+            // Bounded read：私有域第一層即以 MAX_PATCH_BYTES 拒 >512KiB；
+            // 第二層 current.size 後檢保留（覆蓋 SAF 無 maxBytes 路徑）。
+            is FileEditTools.Target.Private -> store.read(target.relativePath, FileEditTools.MAX_PATCH_BYTES)
             is FileEditTools.Target.Saf -> safBridge.read(target.absolutePath)
             is FileEditTools.Target.Denied -> throw IllegalStateException("unreachable")
             is FileEditTools.Target.Invalid -> throw IllegalStateException("unreachable")

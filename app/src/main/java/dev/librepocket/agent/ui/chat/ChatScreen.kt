@@ -68,6 +68,7 @@ import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.tool.DenyReason
 import dev.librepocket.voice.VoiceErrorState
+import dev.librepocket.voice.PendingSpeak
 import dev.librepocket.voice.VoiceStt
 import dev.librepocket.voice.VoiceSpeaker
 import dev.librepocket.voice.VoiceTools
@@ -114,6 +115,7 @@ fun ChatScreen(
     val input by viewModel.input.collectAsStateWithLifecycle()
     val notice by viewModel.notice.collectAsStateWithLifecycle()
     val pendingRecoveryCount by viewModel.pendingRecoveryCount.collectAsStateWithLifecycle()
+    val currentSessionId by viewModel.currentSessionId.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val streaming = session.status == ChatStatus.STREAMING
     var wasActive by remember { mutableStateOf(false) }
@@ -132,8 +134,12 @@ fun ChatScreen(
     // 兼 TTS 引擎回呼的主線程投遞（見 speaker 接線）。
     val ttsConfirm = remember { VoiceTtsConfirmState() }
     val confirmScope = rememberCoroutineScope()
-    // #2 朗讀確認中文字（null 即無待確認朗讀；單一待確認位，後按覆蓋前按）。
-    var pendingSpeakText by remember { mutableStateOf<String?>(null) }
+    // #2 朗讀確認中待朗讀（null 即無待確認朗讀；單一待確認位，後按覆蓋前按）。
+    // P2 身分防線：純文字無法區分同文不同訊息亦無 session 身分，改攜 messageId＋
+    // sessionId＋單調 token（見 PendingSpeak）；確認協程 capture 後 token＋世代＋
+    // session 三者全等才朗讀。speakToken 每次新建／失效遞增，使舊確認協程失效。
+    var pendingSpeak by remember { mutableStateOf<PendingSpeak?>(null) }
+    var speakToken by remember { mutableLongStateOf(0L) }
     // P2 確認競態世代：outputEnabled 每次變更即 bump（初次組合時與 prev 同值，不 bump；
     // capture 皆發生在其後）。確認協程以此偵測 await 期間的開關翻轉，判定見
     // VoiceTtsConfirmState.shouldSpeakAfterConfirm（純函數，JVM 可測）。
@@ -156,7 +162,8 @@ fun ChatScreen(
     DisposableEffect(speaker) {
         onDispose { speaker?.shutdown() }
     }
-    // voice_output 關閉：TTS 通道消失，清 tts 錯誤、寫入失敗警告與待確認朗讀。
+    // voice_output 關閉：TTS 通道消失，清 tts 錯誤、寫入失敗警告與待確認朗讀
+    //（token 遞增使 suspend 中的舊確認協程失效，恢復後丟棄不 speak）。
     LaunchedEffect(outputEnabled) {
         if (outputEnabled != prevOutputEnabled) {
             outputGeneration++
@@ -165,7 +172,19 @@ fun ChatScreen(
         if (!outputEnabled) {
             voiceErrors.onOutputDisabled()
             ttsConfirm.clearAckWarning()
-            pendingSpeakText = null
+            speakToken++
+            pendingSpeak = null
+        }
+    }
+    // 新對話不卸載 ChatScreen：session 切換即清待確認朗讀並使舊 token 失效，
+    // 否則殘留 pending 會跨會話朗讀。初次組合與 current 同值時不動
+    //（仿 outputGeneration 的 prev 比對）。
+    var prevSessionId by remember { mutableStateOf(currentSessionId) }
+    LaunchedEffect(currentSessionId) {
+        if (currentSessionId != prevSessionId) {
+            prevSessionId = currentSessionId
+            speakToken++
+            pendingSpeak = null
         }
     }
     val sttLauncher = rememberLauncherForActivityResult(
@@ -288,12 +307,13 @@ fun ChatScreen(
                     // 與取消確認皆不碰 tts 錯誤（取消後舊錯保留）。
                     MessageBubble(
                         msg,
-                        onSpeak = {
+                        onSpeak = { messageId, text ->
                             if (VoiceTts.requiresTtsConfirmation(ttsAcknowledged)) {
-                                pendingSpeakText = it
+                                speakToken++
+                                pendingSpeak = PendingSpeak(messageId, currentSessionId, text, speakToken)
                             } else {
                                 voiceErrors.onSpeakStarted()
-                                speaker?.speak(it)
+                                speaker?.speak(text)
                             }
                         },
                         showSpeak = outputEnabled,
@@ -427,7 +447,7 @@ fun ChatScreen(
             // 成功／寫入失敗皆執行本次朗讀（寫入失敗另顯示 TTS_ACK_PERSIST_WARNING，
             // 保持未確認，下次重問）；寫入中禁用確認鈕（連打防護，寫完恢復）；
             // 取消鈕只清待朗讀文字，不碰錯誤。
-            pendingSpeakText?.let { text ->
+            pendingSpeak?.let { shown ->
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
                     modifier = Modifier
@@ -442,22 +462,31 @@ fun ChatScreen(
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(
                                 onClick = {
-                                    // P2：先 capture 當代 speaker＋文字＋世代；await 期間輸出開關
-                                    // 翻轉（世代不符）即丟棄（不 speak、不清錯、不碰 pending，
-                                    // 後者已由開關效應清空或屬翻轉後的新確認）。
+                                    // P2：先 capture 當代 speaker＋待朗讀（token／session 身分）＋世代；
+                                    // await 期間取消／開關翻轉／session 切換皆使 token 或世代或
+                                    // session 失配，恢復後即丟棄（不 speak、不清錯、不碰 pending，
+                                    // 後者已由各失效效應清空或屬其後的新確認）。
+                                    val captured = shown
                                     val capturedSpeaker = speaker
                                     val capturedGeneration = outputGeneration
                                     confirmScope.launch {
                                         when (ttsConfirm.confirm(onTtsAcknowledged)) {
                                             TtsConfirmDecision.SUPPRESSED -> Unit
                                             else -> {
-                                                if (!ttsConfirm.shouldSpeakAfterConfirm(capturedGeneration, outputGeneration)) {
+                                                if (!ttsConfirm.shouldSpeakAfterConfirm(
+                                                        captured,
+                                                        pendingSpeak,
+                                                        capturedGeneration,
+                                                        outputGeneration,
+                                                        currentSessionId,
+                                                    )
+                                                ) {
                                                     return@launch
                                                 }
                                                 voiceErrors.onSpeakStarted()
-                                                capturedSpeaker?.speak(text)
-                                                if (ttsConfirm.shouldClearPendingAfterConfirm(text, pendingSpeakText)) {
-                                                    pendingSpeakText = null
+                                                capturedSpeaker?.speak(captured.text)
+                                                if (pendingSpeak?.token == captured.token) {
+                                                    pendingSpeak = null
                                                 }
                                             }
                                         }
@@ -465,7 +494,12 @@ fun ChatScreen(
                                 },
                                 enabled = !ttsConfirm.confirming,
                             ) { Text("朗讀") }
-                            TextButton(onClick = { pendingSpeakText = null }) { Text("取消") }
+                            TextButton(
+                                onClick = {
+                                    speakToken++
+                                    pendingSpeak = null
+                                },
+                            ) { Text("取消") }
                         }
                     }
                 }
@@ -542,7 +576,7 @@ fun ChatScreen(
 @Composable
 private fun MessageBubble(
     msg: UiMessage,
-    onSpeak: (String) -> Unit = {},
+    onSpeak: (messageId: String, text: String) -> Unit = { _, _ -> },
     // M2：voice_output 開關（false 即隱藏朗讀鈕，與 ToolRegistry 投影同源）。
     showSpeak: Boolean = true,
 ) {
@@ -578,7 +612,7 @@ private fun MessageBubble(
                 // 引擎揭露見按鈕無障礙文案（VoiceTts.SPEAK_BUTTON_DESCRIPTION）。
                 if (!isUser && msg.text.isNotBlank() && !msg.isPartial && showSpeak) {
                     IconButton(
-                        onClick = { onSpeak(msg.text) },
+                        onClick = { onSpeak(msg.id, msg.text) },
                         modifier = Modifier.size(32.dp),
                     ) {
                         Icon(

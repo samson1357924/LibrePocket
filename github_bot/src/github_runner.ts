@@ -4503,6 +4503,12 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
     // A throw here is fail-closed (unverifiable) rather than a crash.
     let currentFingerprint = '0'.repeat(64);
     let currentCommentsComplete = false;
+    // G3: transport completeness of the CURRENT read. The honest-truncation
+    // branch requires the current side transport-complete (the review side
+    // is pinned by the validated truncation proof); a current
+    // listComments failure must fall back to generic INCONCLUSIVE even when
+    // the fingerprint still matches (empty comment sets hash equal).
+    let currentFetchComplete = false;
     try {
       const builtCurrent = await buildIssueContext(context, repository, issueNumber, issueTitle, issueBody, publishIssueMeta);
       // Phase B v2: compare full RAW-content fingerprints (pre-cut, no
@@ -4510,9 +4516,11 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
       // same-mask secret swap -- is detected as stale.
       currentFingerprint = builtCurrent.fullFingerprint;
       currentCommentsComplete = builtCurrent.commentsComplete;
+      currentFetchComplete = builtCurrent.fetchComplete;
     } catch {
       currentFingerprint = '0'.repeat(64);
       currentCommentsComplete = false;
+      currentFetchComplete = false;
     }
 
     let validated: RunnerIssueOutput | undefined;
@@ -4567,6 +4575,7 @@ export async function runPublishMode(context: RunnerContext = {}): Promise<void>
         && /^[0-9a-f]{64}$/.test(validated.fingerprint)
         && validated.fingerprint !== '0'.repeat(64)
         && validated.fingerprint === currentFingerprint
+        && currentFetchComplete === true
         && issueFallbackReason !== undefined
         && issueFallbackReason.includes('not fully fetched during review')
         ? validated

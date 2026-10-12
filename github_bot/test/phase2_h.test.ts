@@ -511,6 +511,62 @@ export async function runPhase2HTests(): Promise<void> {
         );
         assert.ok(zeroFpSticky.includes('Review result unavailable'), 'zero fingerprint keeps the generic fallback');
         assert.ok(!zeroFpSticky.includes('Truncated: showing'), 'zero fingerprint shows no counts');
+        // G3 (review #77 new #3): the current read's transport failure
+        // (listComments throws on the fresh re-read, same body) keeps the
+        // generic fallback even though the fingerprint still matches on
+        // empty comment sets. The later sticky write succeeds, isolating
+        // the re-read failure from the write path.
+        {
+          const g3state = {
+            comments: [{ id: 7, body: '<!-- PocketGuard-review -->\nold', user: { login: 'pocketguard[bot]', type: 'Bot' } }],
+            created: 0,
+            updated: 0,
+          };
+          let listCalls = 0;
+          const g3client = {
+            rest: {
+              users: { getAuthenticated: async () => ({ data: { login: 'pocketguard[bot]' } }) },
+              issues: {
+                get: async () => ({ data: { number: 7, title: liveTitle, body: liveBody } }),
+                listComments: async (params: { page: number }) => {
+                  listCalls += 1;
+                  if (listCalls === 1) throw new Error('synthetic list failure');
+                  void params;
+                  return { data: g3state.comments };
+                },
+                createComment: async () => { g3state.created += 1; return {}; },
+                updateComment: async (params: { comment_id: number; body: string }) => {
+                  g3state.updated += 1;
+                  const c = g3state.comments.find((x) => x.id === params.comment_id);
+                  if (c) c.body = params.body;
+                  return {};
+                },
+                addLabels: async () => ({}),
+                listLabelsOnIssue: async () => ({ data: [] }),
+                removeLabel: async () => ({}),
+              },
+            },
+          } as unknown as NonNullable<RunnerContext['githubClient']>;
+          fs.writeFileSync(artifactPath, JSON.stringify(base));
+          await runPublishMode({
+            event: { action: 'opened', repository: { full_name: REPO }, issue: { number: 7, title: liveTitle, body: liveBody } },
+            env: {
+              GITHUB_EVENT_NAME: 'issues',
+              GITHUB_REPOSITORY: REPO,
+              GITHUB_SERVER_URL: 'https://github.com',
+              GITHUB_RUN_ID: '123456',
+              GITHUB_TOKEN: 'fake-token',
+              POCKETGUARD_OUTPUT: artifactPath,
+              POCKETGUARD_REVIEW_JOB_RESULT: 'success',
+              POCKETGUARD_TAG_LABELS: '[]',
+            } as unknown as NodeJS.ProcessEnv,
+            githubClient: g3client,
+          });
+          const g3sticky = g3state.comments[0].body;
+          assert.ok(g3sticky.includes('Review result unavailable'), 'G3 current transport failure keeps the generic fallback');
+          assert.ok(!g3sticky.includes('Truncated: showing'), 'G3 shows no stale counts as current');
+          assert.ok(!g3sticky.includes('Verdict: APPROVE'), 'G3 never approves');
+        }
         // Stale truncation: live content changed after review.
         const staleSticky = await runPublishWithArtifact(base, liveTitle, `${liveBody} edited`);
         assert.ok(staleSticky.includes('Review result unavailable'), 'stale truncation keeps the generic fallback');

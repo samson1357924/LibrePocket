@@ -147,6 +147,46 @@ class FileSearchTest {
         assertTrue(result.filesSkipped >= 1)
     }
 
+    @Test fun boundedReadSkipsFileBetween64KiBAnd1MiB() {
+        // 64KiB < size < 1MiB（含 needle）：bounded read 第一層即以 64KiB 拒，
+        // 不先全量讀進記憶體；語義沿既有「過大跳過」（ok=true、filesSkipped 計數）。
+        val root = tempRoot()
+        val store = ScopedFileStore(root)
+        val needle = "bounded-needle-xyz-999"
+        val targetSize = 80 * 1024 // 81920：>64KiB 且 <1MiB
+        val needleBytes = needle.toByteArray(Charsets.UTF_8)
+        val content = needleBytes + ByteArray(targetSize - needleBytes.size) { 'a'.code.toByte() }
+        store.write("mid.txt", content)
+        val result = executor(root).search(needle)
+        assertTrue(result.message, result.ok)
+        assertTrue(result.hits.none { it.path == "mid.txt" })
+        assertTrue(result.hits.isEmpty())
+        assertTrue(result.filesSkipped >= 1)
+    }
+
+    @Test fun exact64KiBBoundaryHitVsPlusOneSkipped() {
+        // 邊界對：恰 64KiB 合法命中；64KiB+1 跳過（檔名均不含 needle，避免檔名命中干擾）。
+        val root = tempRoot()
+        val store = ScopedFileStore(root)
+        val needle = "edge-needle-xyz-123"
+        val needleBytes = needle.toByteArray(Charsets.UTF_8)
+        val exactSize = FileSearchTools.MAX_FILE_BYTES
+        val overSize = FileSearchTools.MAX_FILE_BYTES + 1
+        store.write(
+            "exact.txt",
+            needleBytes + ByteArray(exactSize - needleBytes.size) { 'a'.code.toByte() },
+        )
+        store.write(
+            "over.txt",
+            needleBytes + ByteArray(overSize - needleBytes.size) { 'a'.code.toByte() },
+        )
+        val result = executor(root).search(needle)
+        assertTrue(result.message, result.ok)
+        assertTrue(result.hits.any { it.path == "exact.txt" })
+        assertTrue(result.hits.none { it.path == "over.txt" })
+        assertTrue(result.filesSkipped >= 1)
+    }
+
     @Test fun maxHitsTruncates() {
         val root = tempRoot()
         val store = ScopedFileStore(root)

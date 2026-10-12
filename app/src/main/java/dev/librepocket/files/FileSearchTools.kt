@@ -227,7 +227,11 @@ class FileSearchExecutor(
             paths = paths,
             read = { rel ->
                 try {
-                    store.read(rel)
+                    // Bounded read：>maxFileBytes 即拋 READ_TOO_LARGE（收斂為 filesSkipped，
+                    // ok=true 語義不變）；避免 64KiB~1MiB 檔案先全量進記憶體。
+                    // maxFileBytes<=0 的注入經 require 拋 IllegalArgumentException，
+                    // 下方已收斂為 null→skipped，不會未預期崩潰。
+                    store.read(rel, maxFileBytes)
                 } catch (_: FileNotFoundException) {
                     null
                 } catch (_: FileBudgetException) {

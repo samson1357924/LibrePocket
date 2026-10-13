@@ -104,16 +104,20 @@ interface ChatSession {
   /**
    * Suspends until every transcript event admitted so far is persisted and verifies
    * that no durable store failure occurred, no cancel receipt is still unsettled,
-   * and no SEALED receipt is still uncompensated.
+   * no SEALED receipt is still uncompensated, and no direct admission is still
+   * unsettled.
    *
    * Returns true only when [flush] drains within [timeoutMs] AND [hasDurableFailures] is false
    * AND [hasUnsettledCancelReceipts] is false (no PENDING/CLAIMED receipt)
    * AND [hasSealedUncompensatedReceipts] is false (no SEALED receipt without
    * proven family-final). SEALED alone is NOT settled.
+   * AND [hasUnsettledAdmission] is false (no direct admission window or
+   * in-flight orphan drain — R21-1 Phase 1: a family without its terminal
+   * never reports true-and-dangling).
    */
   suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
     flush(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts() &&
-      !hasSealedUncompensatedReceipts()
+      !hasSealedUncompensatedReceipts() && !hasUnsettledAdmission()
 
   /**
    * Steering: queue an instruction for the next round.
@@ -144,6 +148,20 @@ interface ChatSession {
 
   /** R5-1: true while an UNKNOWN admission still owns the single-flight slot. */
   fun hasPendingAdmission(): Boolean = false
+
+  /**
+   * R21-1 Phase 1 admission settle proof: true while a direct admission still
+   * owns the single-flight slot (durable await or finalize barrier, host not
+   * yet entered) or its orphan cancel drain is still in flight. A running host
+   * alone (pending cleared at [dev.librepocket.chat.TurnController] host entry)
+   * never trips this. Conjoined into [flushDurable] and consulted by the
+   * ViewModel incomplete fallback alongside [hasPendingAdmission] (which stays
+   * UNKNOWN-only), [hasUnsettledCancelReceipts], and
+   * [hasSealedUncompensatedReceipts]. Default false so test fakes stay
+   * source-compatible; production ([ChatSessionImpl]) overrides with the live
+   * controller state.
+   */
+  fun hasUnsettledAdmission(): Boolean = false
 
   /**
    * R19-1 read-only receipt settle proof: true while any cancel receipt on

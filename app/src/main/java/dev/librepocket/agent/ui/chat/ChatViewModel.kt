@@ -4396,11 +4396,14 @@ class ChatViewModel(
     /**
      * R6-3 streaming evidence for the incomplete fallback: true while the old
      * session may still be missing its terminal record — live STREAMING /
-     * CANCELLED / WAITING_STEERED projection, a pending UNKNOWN admission, an
-     * unsettled cancel receipt (R19-1 PENDING/CLAIMED: the deferred
-     * system/batch write is still owed), a SEALED-but-uncompensated receipt
-     * (Phase 1 truth contract: SEALED without proven family-final still
-     * dangles), or admitted-but-unacked core runIds.
+     * CANCELLED / WAITING_STEERED projection, a pending UNKNOWN admission, a
+     * direct admission still in its durable/finalize window or orphan drain
+     * (R21-1 Phase 1 [ChatSession.hasUnsettledAdmission]: user row durable
+     * but no terminal yet), an unsettled cancel receipt (R19-1
+     * PENDING/CLAIMED: the deferred system/batch write is still owed), a
+     * SEALED-but-uncompensated receipt (Phase 1 truth contract: SEALED
+     * without proven family-final still dangles), or admitted-but-unacked
+     * core runIds.
      * Best-effort (never throws): a failed read means "no evidence", never
      * "incomplete". Per-session ownership: only the passed (source) session's
      * receipts are consulted, so a fresh session never inherits an old
@@ -4417,6 +4420,10 @@ class ChatViewModel(
         }
         try {
             if (session.hasPendingAdmission()) return true
+        } catch (_: Exception) {
+        }
+        try {
+            if (session.hasUnsettledAdmission()) return true
         } catch (_: Exception) {
         }
         try {

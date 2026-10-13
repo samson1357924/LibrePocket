@@ -365,7 +365,7 @@ class ChatSessionFactorySwitchStreamingTest {
     private class TimeoutSessions(
         val transcripts: FakeSessionStore,
         val oldId: String,
-        val oldSession: TimeoutOldSession,
+        val oldSession: ChatSession,
         val newSession: TimeoutNewSession,
     ) : ChatSessionProvider {
         val createdNewIds = CopyOnWriteArrayList<String>()
@@ -609,5 +609,162 @@ class ChatSessionFactorySwitchStreamingTest {
             streamGate.complete(Unit)
             cleanupGate.complete(Unit)
         }
+    }
+
+    /**
+     * R21-1 Phase 1 old session whose ONLY streaming evidence is the new
+     * [ChatSession.hasUnsettledAdmission] seam: IDLE projection, no UNKNOWN
+     * admission, no unsettled receipts, no unacked cores — but the direct
+     * admission window is still open (user row durable, terminal missing),
+     * so flushDurable is false via the new conjunct (production-consistent:
+     * the controller conjoins the same seam).
+     */
+    private class UnsettledAdmissionOnlySession : ChatSession {
+        private val state = MutableStateFlow(
+            ChatUiState(emptyList(), ChatStatus.IDLE, 0, null),
+        )
+        override val uiState: StateFlow<ChatUiState> = state
+
+        override suspend fun send(text: String, images: List<ChatImageRef>) = Unit
+        override suspend fun startTurn(text: String, images: List<ChatImageRef>): Job =
+            Job().apply { complete() }
+
+        override suspend fun startOrEnqueue(
+            text: String,
+            images: List<ChatImageRef>,
+            opId: Long?,
+        ): TurnStart = TurnStart.Queued
+
+        override fun drainQueued(): List<QueuedIntent> = emptyList()
+        override fun cancel() = Unit
+        override suspend fun flush(timeoutMs: Long): Boolean = true
+        override fun hasDurableFailures(): Boolean = false
+        override suspend fun flushDurable(timeoutMs: Long): Boolean = false
+        override fun hasPendingAdmission(): Boolean = false
+        override fun hasUnsettledAdmission(): Boolean = true
+        override fun pendingTranscriptRunIds(): List<String> = emptyList()
+        override fun steer(text: String) = Unit
+        override fun close() = Unit
+    }
+
+    private class CleanIdleSession : ChatSession {
+        private val state = MutableStateFlow(
+            ChatUiState(emptyList(), ChatStatus.IDLE, 0, null),
+        )
+        override val uiState: StateFlow<ChatUiState> = state
+
+        override suspend fun send(text: String, images: List<ChatImageRef>) = Unit
+        override suspend fun startTurn(text: String, images: List<ChatImageRef>): Job =
+            Job().apply { complete() }
+
+        override suspend fun startOrEnqueue(
+            text: String,
+            images: List<ChatImageRef>,
+            opId: Long?,
+        ): TurnStart = TurnStart.Queued
+
+        override fun drainQueued(): List<QueuedIntent> = emptyList()
+        override fun cancel() = Unit
+        override suspend fun flush(timeoutMs: Long): Boolean = true
+        override fun hasDurableFailures(): Boolean = false
+        override suspend fun flushDurable(timeoutMs: Long): Boolean = true
+        override fun hasPendingAdmission(): Boolean = false
+        override fun pendingTranscriptRunIds(): List<String> = emptyList()
+        override fun steer(text: String) = Unit
+        override fun close() = Unit
+    }
+
+    /**
+     * R21-1 Phase 1 VM wiring pin: `isLedgerStreamingOrPending` must consult
+     * [ChatSession.hasUnsettledAdmission]. The unsettled-only session trips
+     * it with every other signal clean (isolates the new branch — without
+     * the branch this returns false), while the fully clean session stays
+     * false (no false positive from the new conjunct).
+     */
+    @Test fun unsettledAdmissionAlone_tripsLedgerStreamingEvidence() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = FakeSessionStore()
+        val vm = newVm(store, transcripts, AnsweringProvider())
+        val method = ChatViewModel::class.java.getDeclaredMethod(
+            "isLedgerStreamingOrPending",
+            ChatSession::class.java,
+        )
+        method.isAccessible = true
+        fun evidence(session: ChatSession): Boolean = method.invoke(vm, session) as Boolean
+        assertTrue(
+            "hasUnsettledAdmission alone must trip the streaming evidence",
+            evidence(UnsettledAdmissionOnlySession()),
+        )
+        assertTrue(
+            "fully clean session must not trip the streaming evidence",
+            !evidence(CleanIdleSession()),
+        )
+    }
+
+    /**
+     * R21-1 Phase 1 VM fallback pin (mirrors
+     * `switchWhileStreaming_timeoutFallback_marksIncompleteAndSkipsDangling`):
+     * the old ledger's only live evidence is the new admission seam, so the
+     * same-origin fork must still degrade — skip the dangling family, ride
+     * the incomplete marker, and surface HISTORY_SNAPSHOT_INCOMPLETE.
+     */
+    @Test fun switchWhileStreaming_unsettledAdmissionOnly_marksIncompleteAndSkipsDangling() = runBlocking {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = FakeSessionStore()
+        val oldId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(oldId, "r0", "user", "q0"))
+        transcripts.appendEvent(event(oldId, "r0", "assistant", "a0"))
+        // Dangling live family: user L without any terminal (direct admission
+        // still in its durable/finalize window).
+        transcripts.appendEvent(event(oldId, "L", "user", "q-cancel"))
+
+        val oldSession = UnsettledAdmissionOnlySession()
+        val newSession = TimeoutNewSession()
+        val sessions = TimeoutSessions(transcripts, oldId, oldSession, newSession)
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        // Attach the old ledger.
+        onMain { vm.openSession(oldId) }
+        awaitTrue { vm.currentSessionId.value == oldId }
+
+        // Same-origin switch, then the fork-driving send.
+        runBlocking { store.save(sampleEndpoint().copy(model = "gpt-4o")) }
+        awaitTrue { vm.sessionState.value.messages.isEmpty() || vm.currentSessionId.value == oldId }
+        onMain { vm.sendDirect("q-next") }
+        awaitTrue(timeoutMs = 15000) { sessions.createdNewIds.isNotEmpty() }
+        val s2 = sessions.createdNewIds.first()
+        awaitTrue(timeoutMs = 10000) { newSession.sent.isNotEmpty() }
+
+        // Fallback: incomplete marker, dangling L skipped, completed prefix kept.
+        val s2rows = rows(transcripts, s2)
+        assertTrue(s2rows[0].kind == "system" && s2rows[0].text.startsWith("model switched "))
+        assertTrue(s2rows.any { it.text.startsWith("snapshot incomplete ") })
+        assertEquals(listOf("q0", "a0"), s2rows.filter { it.kind != "system" }.map { it.text })
+        assertTrue(s2rows.none { it.text == "q-cancel" })
+        assertTrue(findDanglingRunIds(s2rows).isEmpty())
+        assertEquals("HISTORY_SNAPSHOT_INCOMPLETE", vm.notice.value)
+
+        // Reopen twice: zero new INTERRUPTED markers, still no dangling.
+        val reopenFactory = factoryWith(transcripts, AnsweringProvider())
+        val before = interruptedMarkers(transcripts, s2).size
+        val opened1 = reopenFactory.open(sampleEndpoint().copy(model = "gpt-4o"), s2)
+        try {
+            assertEquals(before, interruptedMarkers(transcripts, s2).size)
+            assertTrue(findDanglingRunIds(rows(transcripts, s2)).isEmpty())
+        } finally {
+            opened1.session.close()
+        }
+        val opened2 = reopenFactory.open(sampleEndpoint().copy(model = "gpt-4o"), s2)
+        try {
+            assertEquals(before, interruptedMarkers(transcripts, s2).size)
+            assertTrue(findDanglingRunIds(rows(transcripts, s2)).isEmpty())
+        } finally {
+            opened2.session.close()
+        }
+        assertNull(
+            "reopen must not add a false INTERRUPTED for the skipped family",
+            rows(transcripts, s2).singleOrNull { it.text == "turn L interrupted" },
+        )
     }
 }

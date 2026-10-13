@@ -101,6 +101,9 @@ class ChatSessionImpl(
 
   override fun hasPendingAdmission(): Boolean = controller.hasPendingAdmission()
 
+  /** R21-1 Phase 1 admission barrier for the durable guard (see [ChatSession.hasUnsettledAdmission]). */
+  override fun hasUnsettledAdmission(): Boolean = controller.hasUnsettledAdmission()
+
   /** R19-1: live unsettled-receipt state for the close-barrier guard (see [ChatSession.hasUnsettledCancelReceipts]). */
   override fun hasUnsettledCancelReceipts(): Boolean = controller.hasUnsettledCancelReceipts()
 

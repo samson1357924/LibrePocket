@@ -1457,6 +1457,16 @@ class TurnController(
   internal var afterStartTurnGateForTest: (() -> Unit)? = null
 
   /**
+   * R21-1 Phase 1 test seam: runs after the durable user-row await succeeds
+   * (ACKED) and before the finalize lock in [startTurn]/[startOrEnqueue]
+   * (suspending, null in production). Lets the admission-finalize barrier grid
+   * deterministically park the waiter with the user row already durable but no
+   * terminal yet, so close/cancel/fork interleave before the host launches.
+   * Must run outside the lock (suspend must never hold the intrinsic monitor).
+   */
+  internal var beforeAdmissionFinalizeForTest: (suspend () -> Unit)? = null
+
+  /**
    * Returns the live in-flight host job, lazily clearing a completed one.
    *
    * Has a lazy-clear side effect (`inFlight = null` when completed), so the
@@ -1957,6 +1967,24 @@ class TurnController(
    */
   fun hasPendingAdmission(): Boolean = synchronized(lock) { unknownAdmission != null }
 
+  /**
+   * R21-1 Phase 1 admission settle proof: true while a direct admission still
+   * owns the single-flight slot ([pendingAdmission] set: durable await or
+   * finalize barrier, host not yet entered) or its orphan cancel drain is
+   * still in flight ([orphanDrainJob] not completed). Cleared on host entry
+   * ([hostedTurn] prologue), rollback, claim/convert, cancel-drain, or drain
+   * completion — so a running host alone never trips this (no false positive),
+   * while a user row without its terminal (admission barrier, close/cancel
+   * interleave) keeps it true. Lock-held read, lock-free, never suspends.
+   * Conjoined into [flushDurable] and consulted by the ViewModel's
+   * `isLedgerStreamingOrPending` alongside [hasPendingAdmission] (which stays
+   * UNKNOWN-only, see its KDoc), [hasUnsettledCancelReceipts], and
+   * [hasSealedUncompensatedReceipts].
+   */
+  internal fun hasUnsettledAdmission(): Boolean = synchronized(lock) {
+    pendingAdmission != null || (orphanDrainJob?.isCompleted == false)
+  }
+
   /** Caller must hold [lock]. Claim the ghost: same id,補 UI, launch host, no resend. */
   private fun claimUnknownLocked(unknown: UnknownAdmission) {
     unknownAdmission = null
@@ -2402,6 +2430,9 @@ class TurnController(
       rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
       throw e
     }
+    // R21-1 Phase 1 finalize barrier (outside the lock): the user row is
+    // already durable here but no terminal exists yet. Test-only pause point.
+    beforeAdmissionFinalizeForTest?.invoke()
     // Finalize under lock: project STREAMING + launch. Closed after the ack
     // is treated as a durability failure (Finding 2: drain cancel + roll back
     // UI + throw TranscriptDurabilityException for retry, never a bare
@@ -2682,6 +2713,9 @@ class TurnController(
       rollbackFailedAdmission(uiMessageId, reservation, "transcript store unavailable")
       throw e
     }
+    // R21-1 Phase 1 finalize barrier (outside the lock): same durable-but-
+    // unterminated window as startTurn. Test-only pause point.
+    beforeAdmissionFinalizeForTest?.invoke()
     val host = synchronized(lock) {
       if (closed) {
         rollbackClosedAdmissionLocked(uiMessageId, reservation)
@@ -2992,21 +3026,27 @@ class TurnController(
 
   /**
    * Suspends until every transcript event admitted so far is persisted and verifies
-   * that no durable store failure occurred and no cancel receipt is still unsettled.
+   * that no durable store failure occurred, no cancel receipt is still unsettled,
+   * and no direct admission is still unsettled.
    *
    * Returns true only when [flushTranscript] drains within [timeoutMs] AND [hasDurableFailures] is false
-   * AND [hasUnsettledCancelReceipts] is false AND [hasSealedUncompensatedReceipts] is false.
+   * AND [hasUnsettledCancelReceipts] is false AND [hasSealedUncompensatedReceipts] is false
+   * AND [hasUnsettledAdmission] is false.
    * The third conjunct is the R19-1 close-barrier guard: a drained ledger whose receipt waiter still owes its
    * deferred system/batch write (PENDING/CLAIMED) reports false instead of
    * true-and-dangling, so callers degrade (skip dangling families +
    * incomplete marker) rather than snapshotting an orphan user row. The
    * fourth conjunct is the Phase 1 SEALED truth contract: a SEALED receipt
    * without proven family-final (see [hasSealedUncompensatedReceipts])
-   * likewise reports false instead of true-and-dangling.
+   * likewise reports false instead of true-and-dangling. The fifth conjunct
+   * is the R21-1 Phase 1 admission barrier: a family without its terminal
+   * (direct [pendingAdmission] window or in-flight orphan drain, see
+   * [hasUnsettledAdmission]) likewise reports false instead of
+   * true-and-dangling.
    */
   suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
     flushTranscript(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts() &&
-      !hasSealedUncompensatedReceipts()
+      !hasSealedUncompensatedReceipts() && !hasUnsettledAdmission()
 
   /**
    * Core runIds admitted but never acked (drain timeout / seal race).

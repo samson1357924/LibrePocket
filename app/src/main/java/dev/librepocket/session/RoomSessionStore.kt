@@ -160,7 +160,14 @@ class RoomSessionStore(
                             require(dao.sessionById(event.sessionId) != null) {
                                 "unknown session"
                             }
-                            val seq = dao.nextSeq(event.sessionId)
+                            val max = dao.maxSeq(event.sessionId)
+                            // D15-5: seq space exhausted (imported
+                            // Long.MAX_VALUE): refuse fail-closed. The
+                            // (sessionId, seq) index is non-unique and
+                            // MAX+1 overflows, so neither the DB nor the old
+                            // nextSeq expression would catch the wrap.
+                            check(max < Long.MAX_VALUE) { "seq exhausted" }
+                            val seq = max + 1
                             val row = dao.insertEvent(
                                 TranscriptEventEntity(
                                     0,
@@ -308,7 +315,14 @@ class RoomSessionStore(
                                 require(dao.sessionById(event.sessionId) != null) {
                                     "unknown session"
                                 }
-                                val seq = dao.nextSeq(event.sessionId)
+                                val max = dao.maxSeq(event.sessionId)
+                                // D15-5: seq space exhausted (imported
+                                // Long.MAX_VALUE): refuse fail-closed. The
+                                // (sessionId, seq) index is non-unique and
+                                // MAX+1 overflows, so neither the DB nor the old
+                                // nextSeq expression would catch the wrap.
+                                check(max < Long.MAX_VALUE) { "seq exhausted" }
+                                val seq = max + 1
                                 ids.add(
                                     dao.insertEvent(
                                         TranscriptEventEntity(
@@ -449,6 +463,12 @@ class RoomSessionStore(
     /**
      * Stage E: backward page (newest-first) via one DESC query. Memory stays
      * O(limit), never O(session).
+     *
+     * D15-5: [Long.MAX_VALUE] is the readers' unbounded-tail sentinel for
+     * the first page (every backward reader starts there), so it resolves to
+     * the unbounded tail query — a legally imported `seq = Long.MAX_VALUE`
+     * row stays visible. All other bounds use the strictly exclusive
+     * `seq <` query (sparse seqs safe, advancement guards unchanged).
      */
     override suspend fun loadEventsBefore(
         sessionId: String,
@@ -456,7 +476,12 @@ class RoomSessionStore(
         limit: Int,
     ): List<TranscriptEvent> = withContext(Dispatchers.IO) {
         require(limit > 0) { "limit must be positive" }
-        dao.eventsBefore(sessionId, beforeSeq, limit).map { it.toEvent() }
+        val rows = if (beforeSeq == Long.MAX_VALUE) {
+            dao.eventsTail(sessionId, limit)
+        } else {
+            dao.eventsBefore(sessionId, beforeSeq, limit)
+        }
+        rows.map { it.toEvent() }
     }
 
     override suspend fun listSessions(): List<SessionMeta> = withContext(Dispatchers.IO) {

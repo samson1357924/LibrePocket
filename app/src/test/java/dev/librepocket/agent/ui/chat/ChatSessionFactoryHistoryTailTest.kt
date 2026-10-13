@@ -191,4 +191,52 @@ class ChatSessionFactoryHistoryTailTest {
         assertTrue(capped.endsWith(HISTORY_TRUNCATION_MARKER))
         assertEquals(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE + HISTORY_TRUNCATION_MARKER.length, capped.length)
     }
+
+    /**
+     * D15-5: a legally imported `seq = Long.MAX_VALUE` row must survive the
+     * model-context backward scan (first page starts at the MAX sentinel).
+     */
+    @Test fun maxSeq_modelHistoryScanSeesMaxRow() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        transcripts.events.add(event(sid, "r-max", "user", "u-old").copy(seq = Long.MAX_VALUE - 1))
+        transcripts.events.add(event(sid, "r-max", "assistant", "a-max").copy(seq = Long.MAX_VALUE))
+
+        val loaded = loadModelHistory(transcripts, sid)
+        assertEquals(listOf("u-old", "a-max"), loaded.messages.map { it.text })
+        assertEquals(0, loaded.droppedCount)
+    }
+
+    /** D15-5: the fork-snapshot scan sees the MAX row too (same sentinel start). */
+    @Test fun maxSeq_switchSnapshotScanSeesMaxRow() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        transcripts.events.add(event(sid, "r-max", "user", "u-old").copy(seq = Long.MAX_VALUE - 1))
+        transcripts.events.add(event(sid, "r-max", "assistant", "a-max").copy(seq = Long.MAX_VALUE))
+
+        val snap = loadSwitchSnapshotEvents(transcripts, sid)
+        assertEquals(listOf(Long.MAX_VALUE - 1, Long.MAX_VALUE), snap.events.map { it.seq })
+        assertEquals(0, snap.droppedByBytes)
+    }
+
+    /**
+     * D15-5: sparse ledger (dense prefix + MAX pair) spanning more than one
+     * 200-row reader page: the MAX row is kept and every row is visited once.
+     */
+    @Test fun maxSeq_modelScanMultiPageSparseSeesMax() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        for (i in 0 until 250) {
+            transcripts.appendEvent(event(sid, "r$i", "user", "u$i"))
+        }
+        transcripts.events.add(event(sid, "r-max", "user", "u-old").copy(seq = Long.MAX_VALUE - 1))
+        transcripts.events.add(event(sid, "r-max", "assistant", "a-max").copy(seq = Long.MAX_VALUE))
+
+        val scan = loadModelHistoryScan(transcripts, sid)
+        assertEquals(252, scan.events.size)
+        assertEquals(252, scan.events.map { it.seq }.toSet().size)
+        assertEquals(Long.MAX_VALUE, scan.events.last().seq)
+        assertEquals("a-max", scan.events.last().text)
+        assertEquals("u0", scan.events.first().text)
+    }
 }

@@ -29,8 +29,11 @@ public interface SessionDao {
     @Query("UPDATE sessions SET pinned = :pinned WHERE sessionId = :sid")
     void setPinned(String sid, boolean pinned);
 
-    @Query("SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_events WHERE sessionId = :sid")
-    long nextSeq(String sid);
+    // D15-5: raw MAX (no +1 here) so append paths can fail closed when the
+    // seq space is exhausted (imported Long.MAX_VALUE) instead of inserting
+    // an overflowed/wrapped row the non-unique index would not catch.
+    @Query("SELECT COALESCE(MAX(seq), 0) FROM transcript_events WHERE sessionId = :sid")
+    long maxSeq(String sid);
 
     @Insert
     long insertEvent(TranscriptEventEntity e);

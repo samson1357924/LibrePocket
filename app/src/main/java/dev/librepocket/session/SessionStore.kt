@@ -88,7 +88,12 @@ interface SessionStore {
     /** One session header, or null (title re-redacted on read). */
     suspend fun getSession(sessionId: String): SessionMeta?
 
-    /** Append one event; returns the rowId. */
+    /** Append one event; returns the rowId.
+     *
+     * D15-5: when the session already holds `seq = Long.MAX_VALUE` (legal
+     * import), the seq space is exhausted and the write is refused
+     * fail-closed (throws, zero rows) — never a wrapped/duplicate seq.
+     */
     suspend fun appendEvent(event: TranscriptEvent): Long
 
     /**
@@ -139,6 +144,13 @@ interface SessionStore {
      * rows (sparse seqs safe: predicate is `seq <`, never an offset).
      * Default pages forward and filters (test-scale fakes); the Room store
      * overrides with a single DESC query.
+     *
+     * D15-5: [Long.MAX_VALUE] is the unbounded-tail sentinel for the first
+     * page (every backward reader starts there). A legally imported
+     * `seq = Long.MAX_VALUE` row MUST be visible in that first page, so the
+     * sentinel is inclusive-unbounded; every subsequent page (with
+     * `beforeSeq` = the previous page minimum, always `< MAX`) stays
+     * strictly exclusive.
      */
     suspend fun loadEventsBefore(
         sessionId: String,
@@ -155,7 +167,10 @@ interface SessionStore {
             afterSeq = page.last().seq
             if (page.size < 200) break
         }
-        return all.filter { it.seq < beforeSeq }.takeLast(limit).reversed()
+        // D15-5: the MAX sentinel is inclusive-unbounded (first page); all
+        // other bounds stay strictly exclusive.
+        val unbounded = beforeSeq == Long.MAX_VALUE
+        return all.filter { unbounded || it.seq < beforeSeq }.takeLast(limit).reversed()
     }
 
     /**

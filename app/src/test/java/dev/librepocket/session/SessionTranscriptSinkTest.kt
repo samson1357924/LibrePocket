@@ -27,7 +27,15 @@ open class FakeSessionStore : SessionStore {
 
     override suspend fun appendEvent(event: TranscriptEvent): Long {
         require(event.kind in VALID_KINDS)
-        events.add(event.copy(seq = (events.size + 1).toLong()))
+        // D15-5 Room parity: seq is the per-session max + 1 (identical to
+        // the old size + 1 for dense single-session stores), refused
+        // fail-closed once the space is exhausted so no wrapped/duplicate
+        // row is ever written. Must filter by sessionId like Room's
+        // WHERE sessionId = :sid, otherwise a MAX row in another session
+        // would wrongly exhaust this session.
+        val max = events.filter { it.sessionId == event.sessionId }.maxOfOrNull { it.seq } ?: 0L
+        check(max < Long.MAX_VALUE) { "seq exhausted" }
+        events.add(event.copy(seq = max + 1))
         return events.size.toLong()
     }
 

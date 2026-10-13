@@ -1,6 +1,6 @@
 # LibrePocket 能力與接線狀態
 
-> **Current snapshot**：依 `b3d8a818f37f8455a254a0670b512286e4deb750` 核對（2026-10-07）。本文件不把規格列出的能力當成已可用功能。
+> **Current snapshot**：依 `d5a98bd35e919083b0475027c9b2e74b703e4e58` 核對（2026-10-14）。本文件不把規格列出的能力當成已可用功能。
 >
 > - **範圍：** built-in tools、provider adapters、三個 flavor 的 source/manifest 邊界。
 > - **Owner role：** app/runtime 維護者；未指派個人。

@@ -1,6 +1,6 @@
 # 威脅模型：目前資料流與安全邊界
 
-> **狀態：Current snapshot**，依 `b3d8a818f37f8455a254a0670b512286e4deb750`（2026-10-07）核對。這不是正式安全認證，也不代表所有列出的防護均已驗證。
+> **狀態：Current snapshot**，依 `d5a98bd35e919083b0475027c9b2e74b703e4e58`（2026-10-14）核對。這不是正式安全認證，也不代表所有列出的防護均已驗證。
 >
 > - **範圍：** Android app 的聊天、provider、Room transcript、Android backup 與已宣告工具邊界。
 > - **Owner role：** app/runtime 維護者；目前未指派個人或安全團隊。
@@ -26,7 +26,7 @@
 | Transcript、附件與 provider 請求 | Provider 接收敏感內容；備份或匯出副本外流；本機帳號/裝置遭存取 | Room 寫入 redaction 不等於送出前 redaction；`allowBackup=true` 且 transcript 未列入 key-only exclusions。 |
 | 外部副作用 | 模型輸出、錯誤授權或競態導致不當操作 | 目前 built-in tools 全部 not-ready；未來接線必須逐工具驗證 permission、fresh evaluation、不可變確認快照及實際副作用。 |
 | App workspace（`ScopedFileStore` 根） | 毒根別名（`alias/.`、`alias/sub`）、workspace 內 symlink 穿出、併發 `rename`/`symlink` 替換 | 單線程 NOFOLLOW 確定性保證（根鏈+段鏈全驗，毒根拒絕，缺席根單層建）；非 app UID 的併發 symlink 交換為 out-of-scope，Java 無 `O_NOFOLLOW/openat`，殘餘 TOCTOU 僅有界不消除。 |
-| Flavor / 發布產物 | 不同 channel 意外帶入依賴、權限或錯誤 artifact | source-set 與 policy checks 存在；目前沒有 final-byte signature/certificate/package/version/debug fail-closed gate。 |
+| Flavor / 發布產物 | 不同 channel 意外帶入依賴、權限或錯誤 artifact | source-set 與 policy checks 存在；本機已有 staged final-byte signature/certificate/package/version/debug fail-closed gate（`scripts/verify_release_apk.py`＋`scripts/release_artifact_stage.py` 對 staged snapshot bytes 驗證，policy 跑在 staged bytes 上並重核 checksum，見 [Release](RELEASE.md)）；正式 key custody/provenance 與 signer-pin registry 未建立，public release workflow 仍停用。 |
 
 威脅主體包括惡意或遭入侵的 provider/MCP endpoint、提示注入內容、取得裝置或備份副本的人、以及錯誤配置或被替換的發布產物。本清單不宣稱每項攻擊都有防護。
 

@@ -31,6 +31,8 @@ The local builder implements the identity checks above for staged APK bytes via 
 
 The local builder's existing environment-first/Bitwarden keystore-password resolution is unchanged. The verifier/stager performs no credential lookup and does not select or approve production signing policy; this work does not establish production-key custody/provenance or a trusted signer-pin registry, wire a public release workflow, prove correctness of every SDK/toolchain combination, publish, or establish release readiness. The existing Play/Foss policy gate remains in addition to signature/identity verification, not replaced by it. A filename, checksum alone, or policy scan is not a substitute for final-byte verification. Issue #12 remains open until all scoped requirements, native verification, and required release evidence are complete; see [Testing](TESTING.md).
 
+Current: a direct Gradle release build without `-PreleaseSigning=true` still yields an unsigned (debug-signed) artifact, so the only blessed path to a verified release artifact is `scripts/build_release.sh --apk` with caller-supplied per-flavor identity values plus the staged final-byte gate above; formal key custody/provenance and a signer-pin registry are not established.
+
 ## Target release sequence
 
 1. Review a pinned source commit and confirm docs, tests, policy results, and known limitations.

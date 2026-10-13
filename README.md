@@ -6,7 +6,7 @@ LibrePocket is an Android application for chatting with a user-configured model 
 
 ## Current status
 
-Checked against `b3d8a818f37f8455a254a0670b512286e4deb750` on 2026-10-07. This is a source snapshot, not a release or device certification. Scope: public product status. Owner role: project maintainers. Source of truth: checked-in app/build/CI configuration and the cited commit. Update trigger: changes to current runtime, flavor, privacy, test, or release claims.
+Checked against `d5a98bd35e919083b0475027c9b2e74b703e4e58` on 2026-10-14. This is a source snapshot, not a release or device certification. Scope: public product status. Owner role: project maintainers. Source of truth: checked-in app/build/CI configuration and the cited commit. Update trigger: changes to current runtime, flavor, privacy, test, or release claims.
 
 - The current app has three Android product flavors: `play`, `foss`, and `github`, each with a distinct application ID. Their source sets, dependencies, and manifests are not capability-equivalent.
 - The provider layer contains adapters for Chat Completions, Responses, and Anthropic Messages. Protocol support does not certify compatibility with every endpoint using those labels.

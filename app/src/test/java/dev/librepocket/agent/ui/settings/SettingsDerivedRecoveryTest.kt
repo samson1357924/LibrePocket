@@ -38,7 +38,9 @@ class SettingsDerivedRecoveryTest {
         composeRule.onNodeWithText(text).performScrollTo()
 
     @Test
-    fun noEndpointDerivedUnknownShowsRecoveryAndRetryWithoutDismiss() {
+    fun noEndpointDerivedUnknownShowsRecoveryRetryAndDismiss() {
+        // Stage R5：無身份（null journal）UNKNOWN 卡：重試＋關閉皆可達；
+        // 有身份（journal）時僅重試（見 SettingsNoEndpointRecoveryTest 有身份用例）。
         var logoutCalls = 0
         var dismissed = 0
         composeRule.setContent {
@@ -50,16 +52,18 @@ class SettingsDerivedRecoveryTest {
                 onDismissLogoutError = { dismissed++ },
             )
         }
-        // UNKNOWN 卡文案可見（禁寫已刪除），重試可達；無取消／關閉出口.
+        // UNKNOWN 卡文案可見（禁寫已刪除），重試＋關閉可達；無取消出口.
         onArea(setupErrorText("LOGOUT_UNKNOWN")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
+        onArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
         composeRule.onAllNodesWithText("前往設定").assertCountEquals(0)
         onArea("重試清除").performClick()
         assertEquals(1, logoutCalls)
         assertEquals(0, dismissed)
+        onArea("關閉").performClick()
+        assertEquals(1, dismissed)
         // 文案斷言：殘留待清理（已觀測存在），禁寫已刪除（未確認路徑）.
         val text = setupErrorText("LOGOUT_UNKNOWN")
         assertEquals(false, text.contains("已刪除"))
@@ -78,7 +82,9 @@ class SettingsDerivedRecoveryTest {
         onArea(setupErrorText("LOGOUT_UNKNOWN")).assertIsDisplayed()
         onArea("清除中…").assertIsDisplayed()
         onArea("清除中…").assertIsNotEnabled()
+        // Stage R5：無身份時關閉可見但同樣 disabled（在途）。
+        onArea("關閉").assertIsDisplayed()
+        onArea("關閉").assertIsNotEnabled()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
     }
 }

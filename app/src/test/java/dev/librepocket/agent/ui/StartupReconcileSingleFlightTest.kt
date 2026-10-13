@@ -424,4 +424,60 @@ class StartupReconcileSingleFlightTest {
         )
         assertEquals(journal, seen2?.second)
     }
+
+    @Test
+    fun drainWindowInvalidateRejoinDeliversExactlyOnce() {
+        // R4 主回歸：A drain（已封存）後停在 Main fan-out 前；retry 失效並重入。
+        // B 不得 join 已封存的 A（否則 B join 完成但 callback stranded），必須跑
+        // 新一輪；兩位 callback 各恰好一次，且 join 返回即已送達。
+        val store = rawStore("r4-drain-window")
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            store.save(preseed())
+        }
+        val vault = CountingVault(delegate)
+        val vm = newVm(store, vault)
+        val drainCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val enteredA = java.util.concurrent.CountDownLatch(1)
+        val enteredB = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        vm.afterDrainBeforeMainForTest = {
+            when (drainCount.incrementAndGet()) {
+                1 -> enteredA.countDown()
+                2 -> enteredB.countDown()
+            }
+            if (!release.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                error("drain seam timeout")
+            }
+        }
+        val seenA = java.util.Collections.synchronizedList(
+            ArrayList<Pair<SetupViewModel.PendingDeleteOutcome, PendingDelete?>>(),
+        )
+        val seenB = java.util.Collections.synchronizedList(
+            ArrayList<Pair<SetupViewModel.PendingDeleteOutcome, PendingDelete?>>(),
+        )
+        val jobA = vm.launchPendingDeleteReconcile { outcome, j -> seenA.add(outcome to j) }
+        assertTrue(enteredA.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        // A 已 drain（settled 已寫、已封存）但 fan-out 未送：此時失效＋重入。
+        val jobB = vm.retryStartupReconcile { outcome, j -> seenB.add(outcome to j) }
+        assertTrue(enteredB.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        release.countDown()
+        runBlocking {
+            withTimeout(10_000) { jobA.join() }
+            withTimeout(10_000) { jobB.join() }
+        }
+        // join 返回即已送達（不再輪詢）：各恰好一次，皆為 NO_OP＋null。
+        assertEquals(1, seenA.size)
+        assertEquals(1, seenB.size)
+        assertEquals(SetupViewModel.PendingDeleteOutcome.NO_OP, seenA.single().first)
+        assertNull(seenA.single().second)
+        assertEquals(SetupViewModel.PendingDeleteOutcome.NO_OP, seenB.single().first)
+        assertNull(seenB.single().second)
+        // NO_OP 兩輪皆零 vault 寫入（strict 讀而已）；B 跑的是新一輪 I/O，
+        // 不是回放（回放亦 NO_OP，但 B 若 join 舊 A 則 seenB 為空——上已斷言）。
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertEquals(0, vault.hasKeys)
+    }
 }

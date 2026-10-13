@@ -355,7 +355,8 @@ fun SettingsScreen(
                         // 不在此做（follow-up：區分 CLEAR_FAILED 導致的 NO_KEY）。
                         // Stage A（R10 Finding 1 P2/BLOCK，方案 B）：retained 碼
                         // （STALE 以外全部 LOGOUT_*，Stage D1 起不含 READ_RETRY）
-                        // journal 釋放前不給出口，只留重試；
+                        // 有身份（journal）時 journal 釋放前不給出口，只留重試；
+                        // Stage R5：無身份時另給關閉（純 state 清除）；
                         // 僅 STALE（journal 已丟棄）留關閉；無碼初始確認才有取消。
                         // 結構性 follow-up（方案 A：journal domain state 驅動）另行處理。
                         logoutErrorCode?.let { code ->
@@ -409,6 +410,19 @@ fun SettingsScreen(
                                     Text(if (logoutErrorCode == null) "確定清除" else "重試清除")
                                 }
                             }
+                            // Stage R5：retained 但無身份（logoutRetryJournal==null）
+                            // 時另給關閉（純 state 清除回 fresh 重確認；真 journal 由
+                            // observation 重現；null 身份永不 fresh destructive）。
+                            if (isRetainedReadyError && logoutRetryJournal == null) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedButton(
+                                    onClick = onDismissLogoutError,
+                                    enabled = !logoutInFlight,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("關閉")
+                                }
+                            }
                             if (!isRetainedReadyError) {
                                 Spacer(modifier = Modifier.height(8.dp))
                             }
@@ -439,7 +453,7 @@ fun SettingsScreen(
                 // retained UNKNOWN 僅指 clear-phase UNKNOWN+J（重試清除））：
                 // 部分清除（LOGOUT_CLEAR_FAILED：金鑰已刪、設定仍在）gate 已折疊為
                 // NoEndpoint；若只顯示「尚未設定」會丟失重試入口。有未恢復 LOGOUT_*
-                // 時改顯示 setupErrorText + 重試（retained 碼僅重試，無取消：
+                // 時改顯示 setupErrorText + 重試（有身份 retained 碼僅重試；無身份另給關閉：
                 // journal 釋放前不給出口，同次執行無其他入口，故不暗示稍後處理）/
                 // STALE 僅關閉（journal 已丟棄，save 不被擋）；
                 // inFlight 時可見按鍵 disabled + spinner。無碼時保留原尚未設定文案。
@@ -499,10 +513,14 @@ fun SettingsScreen(
                             }
                         }
                     } else if (isRetainedNoEndpointError) {
-                        // retained 碼（READ_FAILED/DELETE/CLEAR/UNKNOWN）：journal 可能保留，
-                        // 只留重試清除，不給取消（journal 釋放前不給出口）。
-                        // Stage D1：READ_RETRY 已另分支，不在此（上游條件同步排除）。
+                        // retained 碼（READ_FAILED/DELETE/CLEAR/UNKNOWN）：journal 可能保留。
                         // Stage G F1：重試 targeting 顯示身份（同 Ready 分支；提交仍快照比對）。
+                        // Stage R5：無身份（logoutRetryJournal==null）時另給 [關閉]：
+                        // 無 journal 可回放，重試只走 reconcile-only（下次 NO_OP 即
+                        // 收斂回 fresh）；關閉為純 state 清除（clearLogoutError），
+                        // 真 journal 由 observation 獨立重現，不會被關閉掩蓋；且
+                        // null 身份永不觸發 fresh destructive logout（路由守衛見
+                        // MainScreen／retryPendingDelete）。
                         if (logoutRetryJournal != null) {
                             Text(
                                 "重試目標：$logoutRetryJournal",
@@ -524,6 +542,16 @@ fun SettingsScreen(
                                 Text("重試清除")
                             }
                         }
+                        if (logoutRetryJournal == null) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = onDismissLogoutError,
+                                enabled = !logoutInFlight,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("關閉")
+                            }
+                        }
                     } else {
                         // STALE：已有新的金鑰生效，不需重試，僅關閉待 dismiss
                         //（導航守衛亦攔截，見 shouldNavigateToSetup）。
@@ -543,6 +571,30 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            EndpointGate.ReadFailure -> {
+                // Stage R2: strict/vault read unconfirmed — never show the
+                // NoEndpoint empty state (which would mislead to Setup).
+                // Retry-read only; the next gateTick rebuild re-resolves.
+                Text(
+                    "設定讀取失敗，請重試讀取。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = onRetryStartupRead,
+                    enabled = !startupReconcilePending,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (startupReconcilePending) {
+                        CircularProgressIndicator(strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.padding(4.dp))
+                        Text("讀取中…")
+                    } else {
+                        Text("重試讀取")
+                    }
+                }
             }
         }
     }

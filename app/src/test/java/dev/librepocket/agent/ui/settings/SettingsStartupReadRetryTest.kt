@@ -183,11 +183,12 @@ class SettingsStartupReadRetryTest {
     }
 
     @Test
-    fun oldFourCodesStillOnlyRetryClear() {
-        // 舊四碼（retained）仍僅重試清除（無重試讀取／無取消／無關閉）。
+    fun nullJournalFourCodesShowRetryAndDismiss() {
+        // Stage R5：無身份（null journal）舊四碼：重試清除＋關閉（無重試讀取／無取消）。
         var code by mutableStateOf("LOGOUT_READ_FAILED")
         var retryCalls = 0
         var readCalls = 0
+        var dismissed = 0
         composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
@@ -195,6 +196,7 @@ class SettingsStartupReadRetryTest {
                 onLogout = { retryCalls++ },
                 logoutErrorCode = code,
                 onRetryStartupRead = { readCalls++ },
+                onDismissLogoutError = { dismissed++ },
             )
         }
         for (c in listOf("LOGOUT_READ_FAILED", "LOGOUT_DELETE_FAILED", "LOGOUT_CLEAR_FAILED", "LOGOUT_UNKNOWN")) {
@@ -202,23 +204,28 @@ class SettingsStartupReadRetryTest {
             composeRule.waitForIdle()
             onArea(setupErrorText(c)).assertIsDisplayed()
             onArea("重試清除").assertIsDisplayed()
+            onArea("關閉").assertIsDisplayed()
             composeRule.onAllNodesWithText("重試讀取").assertCountEquals(0)
             composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-            composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         }
         onArea("重試清除").performClick()
         assertEquals(1, retryCalls)
         assertEquals(0, readCalls)
+        onArea("關閉").performClick()
+        assertEquals(1, dismissed)
     }
 
     @Test
-    fun readyOldFourCodesStillOnlyRetryClear() {
+    fun readyNullJournalFourCodesShowRetryAndDismiss() {
+        // Stage R5（Ready 分支）：無身份時重試清除＋關閉（無重試讀取／無取消）。
         var code by mutableStateOf("LOGOUT_DELETE_FAILED")
+        var dismissed = 0
         composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = readyGate(),
                 logoutErrorCode = code,
+                onDismissLogoutError = { dismissed++ },
             )
         }
         for (c in listOf("LOGOUT_DELETE_FAILED", "LOGOUT_CLEAR_FAILED", "LOGOUT_UNKNOWN", "LOGOUT_READ_FAILED")) {
@@ -226,10 +233,12 @@ class SettingsStartupReadRetryTest {
             composeRule.waitForIdle()
             onArea(setupErrorText(c)).assertIsDisplayed()
             onArea("重試清除").assertIsDisplayed()
+            onArea("關閉").assertIsDisplayed()
             composeRule.onAllNodesWithText("重試讀取").assertCountEquals(0)
             composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-            composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         }
+        onArea("關閉").performClick()
+        assertEquals(1, dismissed)
     }
 
     @Test

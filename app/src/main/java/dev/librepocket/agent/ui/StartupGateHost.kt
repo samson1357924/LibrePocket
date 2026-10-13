@@ -115,7 +115,9 @@ internal fun StartupGateHost(
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     val hasEndpoint = gate is EndpointGate.Ready
-    val gateLoading = gate is EndpointGate.Loading
+    // Stage R2: ReadFailure (unconfirmed strict/vault read) suppresses nav
+    // exactly like Loading — never decide Setup/Settings on an unknown.
+    val gateLoading = gate is EndpointGate.Loading || gate is EndpointGate.ReadFailure
     // Stage B（R10 Finding 2 P2/UX）：啟動 replay 落定前視同 loading——gate
     // 已折疊 NoEndpoint 但落碼未發生時，兩守衛不決策（不先跳 Setup）、全屏
     // spinner 覆蓋（不暴露 NavHost(CHAT) 空態 FOUC）。條件見

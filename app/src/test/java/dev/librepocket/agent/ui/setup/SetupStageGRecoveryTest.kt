@@ -81,9 +81,9 @@ private class StageGFailUpdates(
  * STALE 恆顯、在途抑制；`MainScreen.onRetryLogout` 讀顯示快照的 `retryJournal`
  * （漂移仍重試顯示身份，終端快照比對即 `StaleGone`，禁盲 replay）。
  *
- * F2：`onStartupReconcile` NO_OP 擴大清 tag-null 未確認碼（READ_FAILED-null／
- * UNKNOWN-null／READ_RETRY；STALE 無論 tag 皆不清；DELETE／CLEAR 不動，含
- * 2226 dirty-alias DELETE-null 與 alias-null CLEAR-null 殘留 follow-up）；
+ * F2／R5：`onStartupReconcile` NO_OP 收斂無身份（tag==null）的非 STALE `LOGOUT_*`
+ * （READ_FAILED／UNKNOWN／READ_RETRY／CLEAR_FAILED-null／DELETE_FAILED-null 皆清，回 fresh
+ * 重確認態，零 vault／metadata 寫入）；STALE 無論 tag 皆不清；帶 tag 碼永不清；
  * COMMITTED 分支不同步擴大（保 C2 同源不變式）；清除純 state，真 pending 由
  * observation 獨立重現，清除後回 fresh 確認態。
  *
@@ -563,7 +563,7 @@ class SetupStageGRecoveryTest {
     // ---------- F2 負向：STALE／帶 tag 碼 NO_OP 不清；2226／CLEAR-null 殘留 ----------
 
     @Test
-    fun f2_negative_staleAndTaggedNeverCleared_residualLocked() {
+    fun f2_negative_staleAndTaggedNeverCleared_nullTagConverges() {
         val vm = newVm(rawStore("g-f2-negative"), CountingVault())
         val jA = PendingDelete("preset:openai", 1L, 1700000000000L)
         val jC = PendingDelete("preset:openai#staged-" + "c".repeat(32), 3L, 1800000000000L)
@@ -594,9 +594,11 @@ class SetupStageGRecoveryTest {
         vm.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP, null, gateReady = false)
         assertEquals("LOGOUT_UNKNOWN+tag must survive NO_OP", "LOGOUT_UNKNOWN", vm.form.value.errorCode)
         vm.clearLogoutError()
-        // 2226 dirty-alias DELETE_FAILED-null 殘留（PendingDelete 構造失敗，無 journal 可比對，
-        // 見 SetupViewModel:2226）：經 DataStore 直寫繞過 save 驗證（save 拒 `|`，模擬歷史髒數據），
-        // 真實 logout 落 `DELETE_FAILED-null`，再給 NO_OP 仍保留（follow-up，不清）。
+        // Stage R5：無身份 null-tag 碼經 NO_OP（證無 journal）收斂回 fresh，
+        // 不再殘留。2226 dirty-alias DELETE_FAILED-null（PendingDelete 構造失敗，
+        // 無 journal 可比對）：經 DataStore 直寫繞過 save 驗證（save 拒 `|`，
+        // 模擬歷史髒數據），真實 logout 落 `DELETE_FAILED-null`，再給 NO_OP 即
+        // 收斂（零 vault／metadata 寫入，不自動 fresh-delete 任何 key）。
         val raw2226 = rawStore("g-f2-2226")
         val delegate2226 = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
@@ -607,21 +609,29 @@ class SetupStageGRecoveryTest {
                 prefs[ENDPOINT_API_KEY_REF_V1] = "provider_key/bad|alias"
             }
         }
-        val vm2226 = newVm(raw2226, CountingVault(delegate2226))
+        val vault2226 = CountingVault(delegate2226)
+        val vm2226 = newVm(raw2226, vault2226)
         val done2226 = CompletableDeferred<Boolean>()
         vm2226.logout { done2226.complete(it) }
         assertEquals(false, runBlocking { withTimeout(10_000) { done2226.await() } })
         assertEquals("LOGOUT_DELETE_FAILED", vm2226.form.value.errorCode)
         assertNull(vm2226.form.value.logoutErrorSourceJournal)
+        val puts2226 = vault2226.putKeys
+        val deletes2226 = vault2226.deleteKeys
+        val rev2226 = runBlocking { raw2226.currentRevision() }
         vm2226.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP, null, gateReady = false)
-        assertEquals(
-            "2226 DELETE-null must survive NO_OP (residual follow-up)",
-            "LOGOUT_DELETE_FAILED",
+        assertNull(
+            "2226 DELETE-null must converge to fresh on proven-Absent NO_OP",
             vm2226.form.value.errorCode,
         )
-        // alias-null CLEAR_FAILED-null 殘留（無 alias 跳過 journal，直進 clear 失敗）：
+        assertNull(vm2226.form.value.logoutErrorSourceJournal)
+        assertEquals(puts2226, vault2226.putKeys)
+        assertEquals(deletes2226, vault2226.deleteKeys)
+        assertEquals(rev2226, runBlocking { raw2226.currentRevision() })
+        runBlocking { assertTrue(delegate2226.hasKey("bad|alias")) }
+        // alias-null CLEAR_FAILED-null（無 alias 跳過 journal，直進 clear 失敗）：
         // 先健康 save，再直寫惡化 apiKeyRef（繞 save 驗證），疊加寫全敗 store 使 clear 失敗，
-        // 真實 logout 落 `CLEAR_FAILED-null`，再給 NO_OP 仍保留。
+        // 真實 logout 落 `CLEAR_FAILED-null`，再給 NO_OP 即收斂（同上零寫入）。
         val rawAliasNull = rawStore("g-f2-aliasnull")
         val delegateAliasNull = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
@@ -632,17 +642,25 @@ class SetupStageGRecoveryTest {
             }
         }
         val storeAliasNull = EndpointStore(StageGFailUpdates(rawAliasNull.dataStore))
-        val vmAliasNull = newVm(storeAliasNull, CountingVault(delegateAliasNull))
+        val vaultAliasNull = CountingVault(delegateAliasNull)
+        val vmAliasNull = newVm(storeAliasNull, vaultAliasNull)
         val doneAliasNull = CompletableDeferred<Boolean>()
         vmAliasNull.logout { doneAliasNull.complete(it) }
         assertEquals(false, runBlocking { withTimeout(10_000) { doneAliasNull.await() } })
         assertEquals("LOGOUT_CLEAR_FAILED", vmAliasNull.form.value.errorCode)
         assertNull(vmAliasNull.form.value.logoutErrorSourceJournal)
+        val putsAliasNull = vaultAliasNull.putKeys
+        val deletesAliasNull = vaultAliasNull.deleteKeys
+        val revAliasNull = runBlocking { rawAliasNull.currentRevision() }
         vmAliasNull.onStartupReconcile(SetupViewModel.PendingDeleteOutcome.NO_OP, null, gateReady = false)
-        assertEquals(
-            "alias-null CLEAR-null must survive NO_OP (residual follow-up)",
-            "LOGOUT_CLEAR_FAILED",
+        assertNull(
+            "alias-null CLEAR-null must converge to fresh on proven-Absent NO_OP",
             vmAliasNull.form.value.errorCode,
         )
+        assertNull(vmAliasNull.form.value.logoutErrorSourceJournal)
+        assertEquals(putsAliasNull, vaultAliasNull.putKeys)
+        assertEquals(deletesAliasNull, vaultAliasNull.deleteKeys)
+        assertEquals(revAliasNull, runBlocking { rawAliasNull.currentRevision() })
+        runBlocking { assertTrue(delegateAliasNull.hasKey("preset:openai")) }
     }
 }

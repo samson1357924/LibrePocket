@@ -4,6 +4,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.lifecycle.viewModelScope
 import dev.librepocket.agent.ui.Routes
 import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.agent.ui.shouldNavigateToSettings
@@ -26,6 +27,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -567,6 +569,116 @@ class SetupStartupReadRetryTest {
         val (second, secondJournal) = runBlocking { healthy.reconcilePendingDeleteWithJournal() }
         assertEquals(SetupViewModel.PendingDeleteOutcome.COMMITTED, second)
         assertEquals(journal, secondJournal)
+    }
+
+    @Test
+    fun gateRecoversOnSameSubscriptionAfterTransientReadFailure() {
+        // R2 主回歸：同一 VM + 持續 gate 訂閱（不重建 VM、不重訂）：
+        // transient 讀失敗一次 → ReadFailure（非 NoEndpoint）→ retry 重建 gate
+        // → Ready(A) → save B → Ready(B)。修前 gate 卡 NoEndpoint（observe
+        // catch 完成 + WhileSubscribed 保留），此測試紅燈。
+        val raw = rawStore("r2-gate-rebuild")
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            raw.save(preseed())
+        }
+        val failingReads = D1StrictReadFailingDataStore(raw.dataStore, failReads = 1)
+        val store = EndpointStore(failingReads)
+        val vault = CountingVault(delegate)
+        val vm = newVm(store, vault)
+        // 持續訂閱：失敗前啟動、全程不取消（修前黏住的正是這個收集）。
+        val seen = java.util.Collections.synchronizedList(ArrayList<EndpointGate>())
+        val gateScope = CoroutineScope(Dispatchers.Unconfined + SupervisorJob())
+        val gateJob = gateScope.launch { vm.gate.collect { seen.add(it) } }
+        try {
+            // Gate 首個非 Loading 發射必須是未確認的 ReadFailure（嚴格讀失敗），
+            // 絕不能是已確認無端點的 NoEndpoint。直接斷言首值（不等 seen 轉發，
+            // 兩收集器喚醒順序無保證），再輪詢等 seen 跟上。
+            val first = runBlocking {
+                withTimeout(10_000) {
+                    vm.gate.first { it !is EndpointGate.Loading }
+                }
+            }
+            assertTrue(
+                "transient read failure must surface ReadFailure, got $first",
+                first is EndpointGate.ReadFailure,
+            )
+            runBlocking {
+                withTimeout(10_000) {
+                    while (!seen.any { it is EndpointGate.ReadFailure }) {
+                        kotlinx.coroutines.delay(10)
+                    }
+                }
+            }
+            assertFalse(
+                "transient failure must never masquerade as proven Absent: $seen",
+                seen.any { it is EndpointGate.NoEndpoint },
+            )
+            // 重試：failReads 已耗盡，strict 讀成功、無 journal → NO_OP；同函數內
+            // 同步 bump gateTick + pendingTick，重建 gate（同一訂閱）。
+            val retryJob = vm.retryStartupReconcile { outcome, journal ->
+                vm.onStartupReconcile(outcome, journal)
+            }
+            runBlocking { retryJob.join() }
+            runBlocking {
+                withTimeout(10_000) {
+                    vm.gate.first { it is EndpointGate.Ready }
+                }
+            }
+            val readyA = runBlocking { vm.gate.first { it is EndpointGate.Ready } }
+            assertEquals("m-old", (readyA as EndpointGate.Ready).config.model)
+            // 同一訂閱上成功保存 B → Ready(B)（不斷言重建 VM）。
+            vm.onApiKeyChange("unit-test-new-key-BBBBBBBB")
+            vm.save()
+            awaitSaveSettled(vm)
+            assertTrue(vm.form.value.saved)
+            runBlocking {
+                withTimeout(10_000) {
+                    vm.gate.first {
+                        it is EndpointGate.Ready &&
+                            it.config.apiKeyRef.startsWith("provider_key/preset:openai#staged-")
+                    }
+                }
+            }
+            // 同一收集器見證完整恢復鏈（不重建 VM、不重訂）。輪詢等轉發跟上
+            //（StateFlow 多收集器喚醒順序無保證）。
+            runBlocking {
+                withTimeout(10_000) {
+                    while (true) {
+                        val c = seen.toList()
+                        val f = c.indexOfFirst { it is EndpointGate.ReadFailure }
+                        val a = c.indexOfFirst {
+                            it is EndpointGate.Ready && it.config.model == "m-old"
+                        }
+                        val b = c.indexOfFirst {
+                            it is EndpointGate.Ready &&
+                                it.config.apiKeyRef.startsWith("provider_key/preset:openai#staged-")
+                        }
+                        if (f >= 0 && a > f && b > a) break
+                        kotlinx.coroutines.delay(10)
+                    }
+                }
+            }
+            val chain = seen.toList()
+            val iFail = chain.indexOfFirst { it is EndpointGate.ReadFailure }
+            val iA = chain.indexOfFirst {
+                it is EndpointGate.Ready && it.config.model == "m-old"
+            }
+            val iB = chain.indexOfFirst {
+                it is EndpointGate.Ready &&
+                    it.config.apiKeyRef.startsWith("provider_key/preset:openai#staged-")
+            }
+            assertTrue("same subscription must see ReadFailure then Ready(A) then Ready(B): $chain", iFail >= 0 && iA > iFail && iB > iA)
+        } finally {
+            gateJob.cancel()
+            runBlocking { runCatching { gateJob.join() } }
+            // Stop the gate's WhileSubscribed upstream (child of viewModelScope)
+            // before tearDown cancels the DataStore scope; otherwise the
+            // lingering 5s sharing window crashes scope cancel.
+            runCatching { vm.viewModelScope.cancel() }
+            gateScope.cancel()
+        }
     }
 }
 

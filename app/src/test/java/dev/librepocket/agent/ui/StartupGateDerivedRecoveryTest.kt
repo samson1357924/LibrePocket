@@ -80,9 +80,16 @@ class StartupGateDerivedRecoveryTest {
         val e by error.collectAsState()
         val b by inFlight.collectAsState()
         // 與 MainScreen 同一純函數單一來源：host 側 nav／drawer 用有效值；
-        // Settings 側 recoveryCode 同以有效值傳入（生產 MainScreen 同式）。
+        // Settings 側 recoveryCode＋retryJournal 同以有效值傳入（生產 MainScreen
+        // 同式：effectiveLogoutRecovery 攜身份，KnownPending 即帶 journal）。
         val effective = effectiveLogoutGuardError(
             e?.takeIf { it.startsWith("LOGOUT_") },
+            pendingTeardown = pt,
+            logoutInFlight = b,
+        )
+        val recovery = effectiveLogoutRecovery(
+            e?.takeIf { it.startsWith("LOGOUT_") },
+            null,
             pendingTeardown = pt,
             logoutInFlight = b,
         )
@@ -116,6 +123,7 @@ class StartupGateDerivedRecoveryTest {
                     gate = g,
                     onLogout = { logoutCalls++ },
                     logoutErrorCode = effective,
+                    logoutRetryJournal = recovery.retryJournal?.format(),
                     logoutInFlight = b,
                     onDismissLogoutError = {
                         dismissCalls++

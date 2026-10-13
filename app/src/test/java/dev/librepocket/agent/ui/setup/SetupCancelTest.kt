@@ -408,7 +408,8 @@ class SetupCancelTest {
 
     @Test
     fun t2FreshPutAfterV2BeforeCancel() = runBlocking {
-        val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 2)
+        // R3: V2 is the 3rd fresh call (V1/VPut/V2); gate parks post-put.
+        val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 3)
         val vault = CancelCountingVault()
         val (vm, _, store) = newVm(policy, vault)
         vm.onApiKeyChange("unit-test-new-key-abcdef")
@@ -422,7 +423,8 @@ class SetupCancelTest {
         assertFalse(vm.form.value.saving)
         assertNull(vm.form.value.errorCode)
         assertFalse(vm.form.value.saved)
-        assertEquals(2, policy.freshCalls)
+        // V1 + VPut + V2 (parked, cancelled inside) = 3 evaluations.
+        assertEquals(3, policy.freshCalls)
         assertEquals(1, vault.deleteKeys)
         assertEquals(listOf(staged), vault.deletedIds)
         assertFalse(runBlocking { vault.hasKey(staged) })
@@ -432,7 +434,8 @@ class SetupCancelTest {
 
     @Test
     fun t2RotationPutAfterV2BeforeCancel() = runBlocking {
-        val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 2)
+        // R3: V2 is the 3rd fresh call (V1/VPut/V2); gate parks post-put.
+        val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 3)
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
         val vault = CancelCountingVault(delegate)
         val (vm, _, store) = newVm(policy, vault)
@@ -629,7 +632,8 @@ class SetupCancelTest {
         )
         val store = EndpointStore(raw)
         val delegate = EncryptedPrefsVault(InMemoryPrefs())
-        val policyLoser = SuspendPolicy(Verdict.ALLOW, gateOnCall = 2)
+        // R3: loser parks post-put at V2 = 3rd fresh call (V1/VPut/V2).
+        val policyLoser = SuspendPolicy(Verdict.ALLOW, gateOnCall = 3)
         val policyWinner = SuspendPolicy(Verdict.ALLOW)
         val vaultLoser = CancelCountingVault(delegate)
         val vaultWinner = CancelCountingVault(delegate)
@@ -681,7 +685,8 @@ class SetupCancelTest {
             delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
             store.save(cancelPreseed())
         }
-        val policyLoser = SuspendPolicy(Verdict.ALLOW, gateOnCall = 2)
+        // R3: loser parks post-put at V2 = 3rd fresh call (V1/VPut/V2).
+        val policyLoser = SuspendPolicy(Verdict.ALLOW, gateOnCall = 3)
         val policyWinner = SuspendPolicy(Verdict.ALLOW)
         val vaultLoser = CancelCountingVault(delegate)
         val vaultWinner = CancelCountingVault(delegate)
@@ -775,7 +780,7 @@ class SetupCancelTest {
         assertFalse(vm.form.value.saved)
         assertEquals(0, vault.putKeys)
         // Same VM reuses the still-typed key: saving reset + mutex released, so
-        // the second save (V1 now passes, freshCalls==2) must commit to READY.
+        // the second save (full V1/VPut/V2/VCommit gates) must commit to READY.
         vm.save()
         awaitSettledSave(vm)
         assertFalse(vm.form.value.saving)

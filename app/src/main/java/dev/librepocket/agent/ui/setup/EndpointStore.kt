@@ -236,6 +236,21 @@ class EndpointStore(
         }
 
     /**
+     * Stage R2 strict gate source (no catch-folding).
+     *
+     * Same mapping as [observe] but read failures rethrow instead of folding to
+     * `emptyPreferences()` → `null`. Lets [SetupViewModel.gate] distinguish a
+     * proven Absent (`null` from a successful read) from an unconfirmed
+     * ReadFailure (exception → `EndpointGate.ReadFailure`), so a transient
+     * failure never masquerades as NoEndpoint. Existing [observe] callers
+     * (chat, lenient readers) are untouched.
+     */
+    fun observeStrict(): Flow<EndpointConfig?> = dataStore.data
+        .map { prefs ->
+            if (prefs[ENDPOINT_PENDING_DELETE_V1] != null) null else parseConfig(prefs)
+        }
+
+    /**
      * Stage E four-state teardown domain read (R13 Finding P2/BLOCK).
      *
      * Derives [PendingTeardownState] from the single

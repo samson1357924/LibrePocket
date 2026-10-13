@@ -95,13 +95,15 @@ class LogoutAckLossDataStore(
 }
 
 /**
- * Deferred-flush model of `apply()` memory-vs-durable gap (test model only,
- * prod behavior unchanged).
+ * Honest-durable model backend (Stage R1).
  *
- * `put`/`remove` touch memory synchronously (like `apply()`'s in-memory
- * cache); [flush] persists to durable; [restart] discards unflushed memory
- * (process kill before the async fsync). [InMemoryPrefs] is synchronous
- * (memory == durable) and masks this gap, which is why this double exists.
+ * `putDurable`/`removeDurable` persist to both memory and durable synchronously
+ * and report `true` — the test-model equivalent of the production `commit()`
+ * path. [flush] persists memory→durable (no-op when in sync, kept for
+ * restart-simulation call sites); [restart] drops memory for durable
+ * (process-kill simulation: with an honest backend nothing is lost).
+ * The pre-R1 `apply()`-gap demonstration (memory-only write + restart loss)
+ * is intentionally gone: production no longer has that path.
  */
 class DeferredFlushPrefs : PrefBackend {
     private val memory = LinkedHashMap<String, String>()
@@ -111,13 +113,17 @@ class DeferredFlushPrefs : PrefBackend {
     override fun get(key: String): String? = memory[key]
 
     @Synchronized
-    override fun put(key: String, value: String) {
+    override fun putDurable(key: String, value: String): Boolean {
         memory[key] = value
+        durable[key] = value
+        return true
     }
 
     @Synchronized
-    override fun remove(key: String) {
+    override fun removeDurable(key: String): Boolean {
         memory.remove(key)
+        durable.remove(key)
+        return true
     }
 
     @Synchronized
@@ -140,6 +146,43 @@ class DeferredFlushPrefs : PrefBackend {
 
     @Synchronized
     fun memoryHas(key: String): Boolean = memory.containsKey(key)
+}
+
+/**
+ * Durability-failing backend (Stage R1 fault injection): `putDurable`/
+ * `removeDurable` always report `false` (fsync refused). Production must fail
+ * closed — save publishes nothing, logout keeps the journal. Seeded entries
+ * model pre-existing durable state.
+ */
+class DurabilityFailingPrefs : PrefBackend {
+    private val durable = LinkedHashMap<String, String>()
+    var putAttempts = 0
+        private set
+    var removeAttempts = 0
+        private set
+
+    @Synchronized
+    fun seed(key: String, value: String) {
+        durable[key] = value
+    }
+
+    @Synchronized
+    override fun get(key: String): String? = durable[key]
+
+    @Synchronized
+    override fun putDurable(key: String, value: String): Boolean {
+        putAttempts++
+        return false
+    }
+
+    @Synchronized
+    override fun removeDurable(key: String): Boolean {
+        removeAttempts++
+        return false
+    }
+
+    @Synchronized
+    override fun contains(key: String): Boolean = durable.containsKey(key)
 }
 
 private fun logoutClearPreseed(model: String = "m-old"): EndpointConfig = EndpointConfig(
@@ -412,11 +455,11 @@ class SetupLogoutClearTest {
     }
 
     @Test
-    fun saveUnflushedPutThenRestartYieldsNoKey() {
-        // Durability-gap model case 1 (test-model demonstration, prod unchanged):
-        // staged put stays in apply-memory while the metadata CAS is durable.
-        // A restart before flush loses the key bytes -> metadata points at a
-        // missing alias (NO_KEY). InMemoryPrefs masks this (synchronous).
+    fun saveDurablePutThenRestartStaysReady() {
+        // Stage R1: the vault put is durable-ACKed before the metadata CAS, so
+        // a restart after save keeps both sides: metadata points at a present
+        // alias (READY). The pre-R1 apply-gap loss (unflushed put + durable
+        // CAS = NO_KEY after restart) cannot happen on this path.
         val (store, _) = rawStore("setup-deferred-save")
         val prefs = DeferredFlushPrefs()
         val vault = EncryptedPrefsVault(prefs)
@@ -433,36 +476,116 @@ class SetupLogoutClearTest {
         val ref = runBlocking { store.observe().first()!!.apiKeyRef }
         val staged = SetupValidation.aliasFromRef(ref)
         assertTrue(staged.isNotBlank())
-        // Memory has it, durable does not (no flush yet).
+        // Durable on both layers before the CAS reported success.
         runBlocking { assertTrue(vault.hasKey(staged)) }
         assertTrue(prefs.memoryHas(EncryptedPrefsVault.prefsKey(staged)))
-        assertFalse(prefs.durableHas(EncryptedPrefsVault.prefsKey(staged)))
-        // Crash/restart before the apply flush.
+        assertTrue(prefs.durableHas(EncryptedPrefsVault.prefsKey(staged)))
+        // Crash/restart: nothing is lost.
         prefs.restart()
         runBlocking {
             assertTrue("metadata is durable across the restart", store.hasMetadata())
-            assertFalse("unflushed key bytes are lost on restart", vault.hasKey(staged))
-            assertEquals(EndpointReadiness.NO_KEY, store.readiness(vault))
+            assertTrue("durable key bytes survive the restart", vault.hasKey(staged))
+            assertEquals(EndpointReadiness.READY, store.readiness(vault))
         }
     }
 
     @Test
-    fun logoutUnflushedDeleteThenRestartRevivesOrphan() {
-        // Durability-gap model case 2 (test-model demonstration, prod unchanged):
-        // delete stays in apply-memory while the metadata clear is durable.
-        // A restart before flush revives the key bytes as an unreferenced
-        // orphan (metadata gone, hasKey true). InMemoryPrefs masks this.
-        val (store, _) = rawStore("setup-deferred-logout")
+    fun saveDurabilityFalseAbortsWithoutMetadata() {
+        // Stage R1 N1: backend refuses durability (fsync false) — the save must
+        // fail closed with zero publish (no metadata), never saved=true.
+        val (store, _) = rawStore("setup-durability-false-save")
+        val prefs = DurabilityFailingPrefs()
+        val delegate = EncryptedPrefsVault(prefs)
+        val vault = CountingVault(delegate)
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vm.onApiKeyChange("unit-test-save-key-123456")
+        vm.save()
+        awaitSavingSettled(vm)
+        assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals(1, prefs.putAttempts)
+        runBlocking {
+            assertFalse("refused put must publish no metadata", store.hasMetadata())
+        }
+    }
+
+    @Test
+    fun saveDurabilityThrowAbortsWithoutMetadata() {
+        // Stage R1: backend throws on write — same fail-closed branch as a
+        // `false` ACK (cause chained for observability).
+        val (store, _) = rawStore("setup-durability-throw-save")
+        val throwing = object : PrefBackend {
+            override fun get(key: String): String? = null
+            override fun putDurable(key: String, value: String): Boolean =
+                throw java.io.IOException("FSYNC_THROW")
+            override fun removeDurable(key: String): Boolean = true
+            override fun contains(key: String): Boolean = false
+        }
+        val vault = EncryptedPrefsVault(throwing)
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vm.onApiKeyChange("unit-test-save-key-123456")
+        vm.save()
+        awaitSavingSettled(vm)
+        assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        runBlocking {
+            assertFalse("thrown write must publish no metadata", store.hasMetadata())
+        }
+    }
+
+    @Test
+    fun logoutDurableDeleteThenRestartStaysTornDown() {
+        // Stage R1: the vault delete is durable-ACKed before the fenced clear,
+        // so a restart after logout stays torn down (no revived orphan).
+        val (store, _) = rawStore("setup-durable-logout")
         val prefs = DeferredFlushPrefs()
         val vault = EncryptedPrefsVault(prefs)
         runBlocking {
             vault.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            store.save(logoutClearPreseed())
+            assertTrue(vault.hasKey("preset:openai"))
         }
-        prefs.flush()
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        val done = CompletableDeferred<Boolean>()
+        vm.logout { done.complete(it) }
+        assertTrue(awaitLogoutDone(done))
+        assertNull(vm.form.value.errorCode)
+        prefs.restart()
+        runBlocking {
+            assertFalse(store.hasMetadata())
+            assertFalse("no orphan revives after a durable teardown", vault.hasKey("preset:openai"))
+            assertNull("journal finalized with the clear", store.pendingDelete())
+        }
+    }
+
+    @Test
+    fun logoutDurabilityFalseKeepsJournal() {
+        // Stage R1 N3: backend refuses durability on delete — logout must fail
+        // closed (LOGOUT_DELETE_FAILED) with the journal kept and metadata
+        // untouched, never reporting success.
+        val (store, _) = rawStore("setup-durability-false-logout")
+        val prefs = DurabilityFailingPrefs()
+        prefs.seed(EncryptedPrefsVault.prefsKey("preset:openai"), "unit-test-old-key-123456")
+        val vault = EncryptedPrefsVault(prefs)
         runBlocking {
             store.save(logoutClearPreseed())
             assertEquals(1L, store.currentRevision())
-            assertTrue(vault.hasKey("preset:openai"))
         }
         val revBefore = runBlocking { store.currentRevision() }
         val vm = SetupViewModel(
@@ -473,24 +596,17 @@ class SetupLogoutClearTest {
         )
         val done = CompletableDeferred<Boolean>()
         vm.logout { done.complete(it) }
-        val ok = awaitLogoutDone(done)
-        assertTrue(ok)
-        assertNull(vm.form.value.errorCode)
-        // In-process: memory deleted, metadata cleared. Durable still holds
-        // the deleted bytes (delete unflushed).
-        runBlocking { assertFalse(vault.hasKey("preset:openai")) }
-        assertFalse(prefs.memoryHas(EncryptedPrefsVault.prefsKey("preset:openai")))
-        assertTrue(prefs.durableHas(EncryptedPrefsVault.prefsKey("preset:openai")))
+        assertEquals(false, awaitLogoutDone(done))
+        assertEquals("LOGOUT_DELETE_FAILED", vm.form.value.errorCode)
+        assertTrue(vm.form.value.logoutErrorSourceJournal != null)
+        assertEquals(1, prefs.removeAttempts)
         runBlocking {
-            assertFalse(store.hasMetadata())
-            assertEquals((revBefore ?: 0L) + 1L, store.currentRevision())
-        }
-        // Crash/restart before the apply flush revives the orphan.
-        prefs.restart()
-        runBlocking {
-            assertFalse("metadata stays cleared across the restart", store.hasMetadata())
-            assertTrue("unflushed delete revives the key as an orphan", vault.hasKey("preset:openai"))
-            assertEquals(EndpointReadiness.NO_ENDPOINT_METADATA, store.readiness(vault))
+            // Journal present folds lenient readers to null by design — assert
+            // the strict shape instead: revision untouched (no clear ran) and
+            // the journal kept for replay; the seeded key bytes are untouched.
+            assertEquals(revBefore, store.currentRevision())
+            assertTrue("journal kept for replay", store.pendingDelete() != null)
+            assertTrue(vault.hasKey("preset:openai"))
         }
     }
 }

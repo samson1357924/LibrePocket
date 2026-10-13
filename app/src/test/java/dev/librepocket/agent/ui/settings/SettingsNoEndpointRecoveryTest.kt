@@ -28,7 +28,8 @@ import org.robolectric.annotation.Config
  * [performScrollTo] 證明產品 [SettingsScreen] root Column 本身可滾
  *（外包可滾容器已移除；與產品 scroll 嵌套會觸發無限約束崩潰，故必須直寫）。
  * Stage A（R10 Finding 1 P2/BLOCK 方案 B 立即止血）：
- * retained 碼（READ/DELETE/CLEAR/UNKNOWN，journal 可能保留）只留重試、無取消；
+ * retained 碼（READ/DELETE/CLEAR/UNKNOWN）：有身份（journal）時只留重試、無取消；
+ * 無身份（null journal）時另有關閉（Stage R5）；
  * 僅 STALE（journal 已丟棄）留關閉。
  *
  * - `LOGOUT_CLEAR_FAILED`（部分清除，gate 已折疊 NoEndpoint）顯示恢復卡 +
@@ -52,25 +53,57 @@ class SettingsNoEndpointRecoveryTest {
 
     @Test
     fun noEndpointClearFailedShowsRecoveryAndRetryReachesLogout() {
+        // Stage R5：無身份（null journal）CLEAR_FAILED：重試＋關閉皆可達；
+        // 有身份時僅重試（見本檔有身份用例）。
         var logoutCalls = 0
+        var dismissed = 0
         composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
                 gate = EndpointGate.NoEndpoint,
                 onLogout = { logoutCalls++ },
                 logoutErrorCode = "LOGOUT_CLEAR_FAILED",
+                onDismissLogoutError = { dismissed++ },
             )
         }
-        // 恢復卡文案可見，重試可達；Stage A：retained 碼無取消/關閉出口。
+        // 恢復卡文案可見，重試＋關閉可達；無取消出口。
         onArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
+        onArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         // readyGate 反例：恢復態不顯示「尚未設定」文案。
         composeRule.onAllNodesWithText("尚未設定 API 端點。").assertCountEquals(0)
         composeRule.onAllNodesWithText("前往設定").assertCountEquals(0)
         onArea("重試清除").performClick()
         assertEquals(1, logoutCalls)
+        onArea("關閉").performClick()
+        assertEquals(1, dismissed)
+    }
+
+    @Test
+    fun noEndpointClearFailedWithJournalShowsRetryOnlyWithoutDismiss() {
+        // Stage R5 安全屬性：有身份（journal）時仍僅重試、無關閉——真 pending
+        // 不可被關閉掩蓋；重試目標顯示身份。
+        var logoutCalls = 0
+        var dismissed = 0
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = EndpointGate.NoEndpoint,
+                onLogout = { logoutCalls++ },
+                logoutErrorCode = "LOGOUT_CLEAR_FAILED",
+                logoutRetryJournal = "v1|preset:openai|1|1700000000000",
+                onDismissLogoutError = { dismissed++ },
+            )
+        }
+        onArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
+        onArea("重試清除").assertIsDisplayed()
+        onArea("重試目標：v1|preset:openai|1|1700000000000").assertIsDisplayed()
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
+        onArea("重試清除").performClick()
+        assertEquals(1, logoutCalls)
+        assertEquals(0, dismissed)
     }
 
     @Test
@@ -125,9 +158,11 @@ class SettingsNoEndpointRecoveryTest {
         onArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
         onArea("清除中…").assertIsDisplayed()
         onArea("清除中…").assertIsNotEnabled()
-        // Stage A：retained 碼無取消/關閉鍵，僅重試（執行中 disabled + spinner）。
+        // Stage A＋R5：retained 碼僅重試可見（執行中 disabled + spinner），無取消；
+        // 無身份時關閉可見但同樣 disabled。
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
+        onArea("關閉").assertIsDisplayed()
+        onArea("關閉").assertIsNotEnabled()
     }
 
     @Test
@@ -145,13 +180,14 @@ class SettingsNoEndpointRecoveryTest {
         }
         onArea(setupErrorText("LOGOUT_READ_FAILED")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
+        // Stage R5：無身份時關閉可達（兩碼皆然）；無取消。
+        onArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         code = "LOGOUT_DELETE_FAILED"
         composeRule.waitForIdle()
         onArea(setupErrorText("LOGOUT_DELETE_FAILED")).assertIsDisplayed()
         onArea("重試清除").assertIsDisplayed()
+        onArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
     }
 }

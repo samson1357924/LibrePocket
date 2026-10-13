@@ -184,11 +184,11 @@ class SetupLogoutInFlightTest {
 
     @Test
     fun queuedCancelResetsInFlight() {
-        // 排隊取消：save 持鎖停在 V2 閘，logout 排隊等鎖時被 cancel；
-        // 外層 catch（withLock 之外）必須復位 inFlight（仿 saving t6 語義）。
+        // 排隊取消：save 持鎖停在 V2 閘（R3 起 V2 為第 3 次調用），logout 排隊
+        // 等鎖時被 cancel；外層 catch（withLock 之外）必須復位 inFlight。
         val raw = rawStore("logout-inflight-queued-cancel")
         val store = EndpointStore(raw)
-        val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 2)
+        val policy = SuspendPolicy(Verdict.ALLOW, gateOnCall = 3)
         val vault = CountingVault()
         val vm = SetupViewModel(
             store = store,

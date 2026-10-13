@@ -31,7 +31,7 @@ import org.robolectric.annotation.Config
  * 階段3：產品容器可滾（Re-review #8 Finding 3）——直寫 setContent，
  * [performScrollTo] 證明產品 [SettingsScreen] root Column 本身可滾。
  * Stage A（R10 Finding 1 P2/BLOCK 方案 B）：Ready 分支同理——retained 碼
- * 只留重試、無取消；僅 STALE 留關閉；無碼初始確認才有取消。
+ * 有身份時只留重試、無取消；無身份（null journal）時另有關閉；僅 STALE 留關閉；無碼初始確認才有取消。
  *
  * Robolectric + compose rule（unit source set）：失敗顯示 + 重試可達、
  * inFlight disabled + spinner、初始確認取消零調用、失敗不關 dialog（保持/重現）。
@@ -68,6 +68,7 @@ class SettingsScreenTest {
     fun logoutFailureKeepsDialogAndRetryReachesLogout() {
         var error: String? by mutableStateOf(null)
         var logoutCalls = 0
+        var dismissed = 0
         composeRule.setContent {
             SettingsScreen(
                 padding = PaddingValues(0.dp),
@@ -78,20 +79,45 @@ class SettingsScreenTest {
                     error = "LOGOUT_CLEAR_FAILED"
                 },
                 logoutErrorCode = error,
+                onDismissLogoutError = {
+                    dismissed++
+                    error = null
+                },
             )
         }
         onLogoutArea("登出（清除金鑰）").performClick()
         onLogoutArea("確定清除").performClick()
         assertEquals(1, logoutCalls)
-        // 失敗不關 dialog：失敗卡 + 重試鍵仍在；Stage A：retained 碼無取消/關閉出口。
+        // 失敗不關 dialog：失敗卡 + 重試鍵仍在；Stage R5：無身份時關閉可達（無取消）。
         onLogoutArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
         onLogoutArea("重試清除").assertIsDisplayed()
+        onLogoutArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         // 重試可達：再調一次 logout。
         onLogoutArea("重試清除").performClick()
         assertEquals(2, logoutCalls)
         onLogoutArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
+        // 關閉可達：純 state 清除回 fresh（dialog 消失）。
+        onLogoutArea("關閉").performClick()
+        assertEquals(1, dismissed)
+    }
+
+    @Test
+    fun readyClearFailedWithJournalShowsRetryOnlyWithoutDismiss() {
+        // Stage R5 安全屬性（Ready 分支）：有身份時僅重試、無關閉。
+        composeRule.setContent {
+            SettingsScreen(
+                padding = PaddingValues(0.dp),
+                gate = readyGate(),
+                logoutErrorCode = "LOGOUT_CLEAR_FAILED",
+                logoutRetryJournal = "v1|preset:openai|1|1700000000000",
+            )
+        }
+        onLogoutArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
+        onLogoutArea("重試清除").assertIsDisplayed()
+        onLogoutArea("重試目標：v1|preset:openai|1|1700000000000").assertIsDisplayed()
+        composeRule.onAllNodesWithText("取消").assertCountEquals(0)
+        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
     }
 
     @Test
@@ -127,10 +153,12 @@ class SettingsScreenTest {
             )
         }
         onLogoutArea("清除中…").assertIsDisplayed()
-        // Stage A：retained 碼僅重試可見（執行中 disabled + spinner），無取消/關閉。
+        // Stage A＋R5：retained 碼僅重試可見（執行中 disabled + spinner），無取消；
+        // 無身份時關閉可見但同樣 disabled。
         onLogoutArea("清除中…").assertIsNotEnabled()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
+        onLogoutArea("關閉").assertIsDisplayed()
+        onLogoutArea("關閉").assertIsNotEnabled()
         onLogoutArea(setupErrorText("LOGOUT_CLEAR_FAILED")).assertIsDisplayed()
     }
 
@@ -194,17 +222,19 @@ class SettingsScreenTest {
                 onOpenSystemA11y = { a11yClicks++ },
             )
         }
-        // 兩入口皆 displayed（經產品容器 scrollTo 滾入）；取消/關閉皆無。
+        // 三入口皆 displayed（經產品容器 scrollTo 滾入）；取消無。
+        // Stage R5：無身份時關閉可達（最高棧仍須可滾入可點）。
         onLogoutArea("前往系統無障礙設定").assertIsDisplayed()
         onLogoutArea("重試清除").assertIsDisplayed()
+        onLogoutArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
-        // 兩入口皆可點；無 dismiss 入口，計數保持 0。
+        // 三入口皆可點。
         onLogoutArea("前往系統無障礙設定").performClick()
         onLogoutArea("重試清除").performClick()
+        onLogoutArea("關閉").performClick()
         assertEquals(1, a11yClicks)
         assertEquals(1, retryCalls)
-        assertEquals(0, dismissed)
+        assertEquals(1, dismissed)
     }
 
     /**
@@ -234,13 +264,14 @@ class SettingsScreenTest {
         }
         onLogoutArea("前往系統無障礙設定").assertIsDisplayed()
         onLogoutArea("重試清除").assertIsDisplayed()
+        onLogoutArea("關閉").assertIsDisplayed()
         composeRule.onAllNodesWithText("取消").assertCountEquals(0)
-        composeRule.onAllNodesWithText("關閉").assertCountEquals(0)
         onLogoutArea("前往系統無障礙設定").performClick()
         onLogoutArea("重試清除").performClick()
+        onLogoutArea("關閉").performClick()
         assertEquals(1, a11yClicks)
         assertEquals(1, retryCalls)
-        assertEquals(0, dismissed)
+        assertEquals(1, dismissed)
     }
 
     /**

@@ -61,6 +61,8 @@ private data class KeyWriteConsent(
 sealed interface EndpointGate {
     data object Loading : EndpointGate
     data object NoEndpoint : EndpointGate
+    /** Strict read or vault check failed: unconfirmed, must not decide nav. */
+    data object ReadFailure : EndpointGate
     data class Ready(val config: EndpointConfig) : EndpointGate
 }
 
@@ -158,7 +160,7 @@ class SetupViewModel(
     /**
      * 啟動 replay 單飛鎖（Stage C C1：解 premature unlock + fence 缺口）。
      *
-     * 以下三者全程以此鎖保護（`LaunchedEffect` 在 Main、測試可併發）：
+     * 以下全程以此鎖保護（`LaunchedEffect` 在 Main、測試可併發）：
      * - `startupWorker`：進行中的唯一 reconcile worker（無則 null；完成後
      *   殘留 dead job，以 `isActive` 判定存活，不另清 null）；
      * - `startupCallbacks`：排隊等待同一輪結果的 `onDone`（含首發者）；
@@ -168,11 +170,16 @@ class SetupViewModel(
      *   I/O、不碰 pending），不同則失效後新鮮 worker；再查 worker（重疊者入列
      *   拿 join handle）。logout 入口與 save 提交經 [invalidateStartupSettled]
      *   使其失效（logout 終端再行斷言；否則 rotation 重播過期結果）。
+     * - `startupSealed`（Stage R4）：drain（抽走 fanOut＋寫 settled）時同鎖封存
+     *   本輪——已封存 worker 不再接受新 joiner（即使其 Job 仍 active
+     *   等 Main dispatch）；失效只清 settled、不重開封存。新呼叫在同鎖內
+     *   判定＋入列，杜絕 drain→Main 窗口的 stranded callback。
      */
     private val startupLock = Any()
     private var startupWorker: Job? = null
     private val startupCallbacks = ArrayList<(PendingDeleteOutcome, PendingDelete?) -> Unit>()
     private var startupSettled: StartupSettled? = null
+    private var startupSealed: Boolean = false
     private val modelRefreshGeneration = AtomicLong(0L)
     private var modelRefreshJob: Job? = null
     // Stage2 form fence: identity/key intent epoch. Bumped only by
@@ -283,34 +290,66 @@ class SetupViewModel(
     /** Test seam for racing an edit between mint success and dialog display. */
     internal var afterMintBeforeDialogForTest: (() -> Unit)? = null
 
-    val gate: StateFlow<EndpointGate> = store.observe()
-        .map { config ->
-            if (config == null) {
-                EndpointGate.NoEndpoint
-            } else {
-                val okUrl = try {
-                    dev.librepocket.provider.validateBaseUrl(config.baseUrl)
-                    true
-                } catch (_: IllegalArgumentException) {
-                    false
-                }
-                val hasKey = try {
-                    // Ref-driven: the live alias comes from metadata, never from
-                    // providerId (staged commits point at a per-operation alias).
-                    // Malformed refs fail closed to NoEndpoint without vault I/O.
-                    if (!config.apiKeyRef.startsWith("provider_key/")) {
-                        false
+    /** Test seam for parking the startup worker between drain and Main fan-out. */
+    internal var afterDrainBeforeMainForTest: (() -> Unit)? = null
+
+    /**
+     * Stage R2 gate re-read tick (mirrors [pendingTick]).
+     *
+     * The gate's inner [EndpointStore.observeStrict] completes after a `catch`
+     * emission, so a transient failure would stick as ReadFailure under a
+     * continuous subscription. Every tick re-collects the authoritative
+     * snapshot (one DataStore read + one vault hasKey, same cost class as the
+     * pending rebuild). Bump points align with [invalidateStartupSettled]
+     * (retry/logout entry+terminal, save commit, probe generation-changed):
+     * every place journal/metadata existence may have changed. Settled replay
+     * never bumps (zero extra reads).
+     */
+    private val gateTick = MutableStateFlow(0L)
+
+    val gate: StateFlow<EndpointGate> = gateTick
+        .flatMapLatest {
+            store.observeStrict()
+                .map { config ->
+                    if (config == null) {
+                        // Proven Absent (strict read succeeded, no metadata).
+                        EndpointGate.NoEndpoint
                     } else {
-                        val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
-                        if (alias.isBlank()) false else withContext(Dispatchers.IO) { vault().hasKey(alias) }
+                        val okUrl = try {
+                            dev.librepocket.provider.validateBaseUrl(config.baseUrl)
+                            true
+                        } catch (_: IllegalArgumentException) {
+                            false
+                        }
+                        // Ref-driven: the live alias comes from metadata, never from
+                        // providerId (staged commits point at a per-operation alias).
+                        // Malformed refs and invalid URLs fail closed to NoEndpoint
+                        // without vault I/O (proven unusable, not a read failure).
+                        if (!okUrl || !config.apiKeyRef.startsWith("provider_key/")) {
+                            EndpointGate.NoEndpoint
+                        } else {
+                            val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
+                            if (alias.isBlank()) {
+                                EndpointGate.NoEndpoint
+                            } else {
+                                // Vault check failure propagates to the outer catch
+                                // → ReadFailure (unconfirmed, never NoEndpoint).
+                                // hasKey==false is proven keyless → NoEndpoint.
+                                val hasKey = withContext(Dispatchers.IO) { vault().hasKey(alias) }
+                                if (hasKey) EndpointGate.Ready(config) else EndpointGate.NoEndpoint
+                            }
+                        }
                     }
-                } catch (_: Exception) {
-                    false
                 }
-                if (okUrl && hasKey) EndpointGate.Ready(config) else EndpointGate.NoEndpoint
-            }
+                .catch { e ->
+                    if (e is CancellationException) throw e
+                    emit(EndpointGate.ReadFailure)
+                }
         }
-        .catch { emit(EndpointGate.NoEndpoint) }
+        .catch { e ->
+            if (e is CancellationException) throw e
+            emit(EndpointGate.ReadFailure)
+        }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), EndpointGate.Loading)
 
     /**
@@ -869,6 +908,57 @@ class SetupViewModel(
                 return
             }
         }
+        // Final put-gate (R3): hasKey is a blocking suspend; policy may have
+        // flipped to DENY/ASK during it. Re-fence generation and take a fresh
+        // verdict immediately before the vault effect. No suspend lies between
+        // this gate and putKey below, so the residual window is CPU-only
+        // (accepted, documented). DENY blocks with zero writes; ASK without a
+        // carried consent demands confirmation without writing.
+        if (entryRevision != formRevision.get()) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        val vPut = freshVerdictOrDeny("key.write", providerId)
+        if (vPut == Verdict.DENY) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // Post-verdict generation fence (R3 review): an edit racing the vPut
+        // evaluateFresh suspend must not reach putKey with a stale entry key.
+        // Mirrors the post-vCommit fence below; keeps W1/W2 fence order
+        // consistent (verdict first, then generation).
+        if (entryRevision != formRevision.get()) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        if (vPut == Verdict.ASK && consent == null) {
+            val livePut = _form.value
+            val liveBaseUrlPut = try {
+                effectiveBaseUrlOf(livePut)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrlPut, entryRevision)) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            afterMintBeforeDialogForTest?.invoke()
+            if (entryRevision != formRevision.get()) {
+                takePendingConsent()
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+            if (entryRevision != formRevision.get()) {
+                takePendingConsent()
+                _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            return
+        }
         val stagedRef = "provider_key/$stagedAlias"
         val keyCopy = form.apiKey.trim().toCharArray()
         // Explicit commit-state for cancellation compensation (P1-1 hardening):
@@ -1006,6 +1096,57 @@ class SetupViewModel(
             // restart-unique); the fixed deriveApiKeyRef form is kept only for
             // backward-compatible reads of old metadata and in-memory
             // (non-persisted) mapping.
+            // Final metadata-gate (R3): consentMatches above performs a blocking
+            // currentRevision read; policy may have flipped to DENY/ASK during
+            // it. Take a fresh verdict immediately before the metadata CAS. No
+            // unrelated suspend lies between this gate and saveIfRevision below
+            // (config construction is pure), so the residual window is CPU-only
+            // (accepted). DENY blocks with staged cleanup and zero publish; ASK
+            // without a carried consent demands confirmation (staged deleted,
+            // no publish); ASK with the verified carried consent proceeds.
+            val vCommit = freshVerdictOrDeny("key.write", providerId)
+            if (vCommit == Verdict.DENY) {
+                deleteStagedBestEffort(stagedAlias)
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (entryRevision != formRevision.get()) {
+                deleteStagedBestEffort(stagedAlias)
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (vCommit == Verdict.ASK && consent == null) {
+                val liveCommit = _form.value
+                val liveBaseUrlCommit = try {
+                    effectiveBaseUrlOf(liveCommit)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    deleteStagedBestEffort(stagedAlias)
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrlCommit, entryRevision)) {
+                    deleteStagedBestEffort(stagedAlias)
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                afterMintBeforeDialogForTest?.invoke()
+                if (entryRevision != formRevision.get()) {
+                    takePendingConsent()
+                    deleteStagedBestEffort(stagedAlias)
+                    _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                deleteStagedBestEffort(stagedAlias)
+                _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+                if (entryRevision != formRevision.get()) {
+                    takePendingConsent()
+                    _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    return
+                }
+                return
+            }
             val config = endpointConfigOf(form, effectiveBaseUrl, providerId, stagedRef)
             val wrote = try {
                 store.saveIfRevision(config, expectedRevision)
@@ -1529,9 +1670,9 @@ class SetupViewModel(
      *    新鮮 worker（probe→worker 窗口由 worker 內 `saveMutex` 下 strict 重讀
      *    兜底，同一核心）。D1 保留：前輪 read-path `UNKNOWN`＋null 且 probe 見
      *    無 journal 時視為相同（回放中性碼，不在 rotation 自動清除）。
-     * 3. worker 進行中：呼叫方入列 `onDone`，回傳 `viewModelScope.launch {
+     * 3. worker 進行中且未封存：呼叫方入列 `onDone`，回傳 `viewModelScope.launch {
      *    worker.join() }` join handle——cancel 只停止等待，不殺 worker
-     *    （fence 保持到 worker 落定）；
+     *    （fence 保持到 worker 落定）。已封存（drain 已抽走 fanOut，正等 Main dispatch）視同無 active：進第 4 步新世代，不 join 舊 worker（R4）；
      * 4. 否則建唯一 worker：`_startupReconcilePending = true`（首發本已
      *    true，重斷言無害）→ 跑 reconcile（含 generation 攜帶，見
      *    [reconcilePendingDeleteWithJournalAndGeneration]）→ 快照＋先寫
@@ -1579,11 +1720,16 @@ class SetupViewModel(
             // its (dead) job reference lingers.
             val settled = startupSettled
             if (settled == null) {
-                startupCallbacks.add(onDone)
+                // Stage R4: sealed worker 不再接受新 joiner——即使其 Job 仍
+                // active（drain→Main dispatch 窗口），新呼叫也進新一輪。
+                // 判定＋入列同鎖原子：drain 內 sealed=true 與此分支互斥，
+                // 故 join 者必在 fanOut 內、新輪者必跑新 I/O，不 stranded。
                 val active = startupWorker?.takeIf { it.isActive }
-                if (active != null) {
+                if (active != null && !startupSealed) {
+                    startupCallbacks.add(onDone)
                     worker = active
                 } else {
+                    startupCallbacks.add(onDone)
                     worker = newStartupWorkerLocked()
                 }
             } else {
@@ -1614,8 +1760,10 @@ class SetupViewModel(
                             // Stage E probe-changed：generation 變化與 settled 失效對齊，
                             // 同步 bump pending tick（新鮮 worker 的 strict 重讀兜底
                             // outcome，tick 重建兜底 domain flow——內層 `catch` 完成
-                            // 後不重建即黏住 phantom present）。
+                            // 後不重建即黏住 phantom present）。Stage R2：gate 與
+                            // pending 同代重建，否則 gate 留在舊 ReadFailure。
                             bumpPendingTick()
+                            gateTick.update { it + 1 }
                             needFresh = true
                         }
                     }
@@ -1648,6 +1796,8 @@ class SetupViewModel(
      */
     private fun newStartupWorkerLocked(): Job {
         _startupReconcilePending.value = true
+        // Stage R4: 新世代開封（sealed=false）；drain 時同鎖封存。
+        startupSealed = false
         val fresh = viewModelScope.launch(Dispatchers.IO) {
             try {
                 val triple = try {
@@ -1670,8 +1820,16 @@ class SetupViewModel(
                         startupSettled = result
                         val copy = startupCallbacks.toList()
                         startupCallbacks.clear()
+                        // Stage R4: 抽走 fanOut 即封存本輪——此後的新呼叫不得
+                        // 再入列本 worker（即使 Job 仍 active 等 Main），必須
+                        // 進新世代。封存與 settled 寫入＋清空同鎖原子。
+                        startupSealed = true
                         copy
                     }
+                // Test seam: pause between drain (sealed) and Main fan-out so
+                // tests can park the worker in the drain→Main window and race
+                // an invalidate+rejoin into it (R4 stranded-callback window).
+                afterDrainBeforeMainForTest?.invoke()
                 withContext(Dispatchers.Main) {
                     fanOut.forEach { cb -> cb(result.outcome, result.journal) }
                 }
@@ -1685,10 +1843,15 @@ class SetupViewModel(
 
     /** Drops the cached startup-reconcile outcome (logout exit / save commit). */
     private fun invalidateStartupSettled() {
+        // Stage R4: 只清 settled、不重開封存——已 drain 的 worker 保持 sealed，
+        // drain→Main 窗口的新呼叫進新世代，不 join 舊 worker。
         synchronized(startupLock) { startupSettled = null }
         // Stage E: journal 存否可能變化處同步重讀 pending domain（bump 點與
         // settled 失效對齊；settled 回放不經此處，故不 bump、零多讀）。
         bumpPendingTick()
+        // Stage R2: gate 與 pending 從同一失效點一致重建（同一 authoritative
+        // snapshot 世代）；只重建 pending 會留 gate 卡在 ReadFailure/NoEndpoint。
+        gateTick.update { it + 1 }
     }
 
     /**
@@ -1863,10 +2026,9 @@ class SetupViewModel(
      *   journal）；其他 `LOGOUT_*` 仍走同源比對，絕不誤清；
      * - `NO_OP`: silent — writes nothing and never clears (no journal, no identity).
      *   Stage D1 例外：現行碼為 [LOGOUT_READ_RETRY] 時顯式清除（重試確認真無
-     *   journal）；Stage G F2 擴大：現碼為 `LOGOUT_READ_FAILED`／`LOGOUT_UNKNOWN`
-     *   且 tag==null（無源未確認碼）亦清（回 fresh；STALE 無論 tag 皆不清；
-     *   `LOGOUT_DELETE_FAILED`／`LOGOUT_CLEAR_FAILED` 不動，含 2226／alias-null
-     *   null 變體殘留）；其他帶 tag `LOGOUT_*` 仍永不清；`COMMITTED` 分支不同步
+     *   journal）；Stage G F2／R5：現碼為無身份（tag==null）的非 STALE
+     *   `LOGOUT_*` 亦清（回 fresh 重確認態；STALE 無論 tag 皆不清；帶 tag
+     *   `LOGOUT_*` 仍永不清）；`COMMITTED` 分支不同步
      *   擴大（下次 NO_OP 收斂；保 C2 同源不變式）；
      * - `STALE`: explicit decision — silent when [gate] is already `Ready`
      *   (the concurrent winner is live, nothing to dismiss), otherwise stamps
@@ -1900,8 +2062,8 @@ class SetupViewModel(
      *
      * Stage D1: read-path `UNKNOWN` (journal==null) maps to [LOGOUT_READ_RETRY],
      * clear-phase `UNKNOWN` (journal!=null) keeps `LOGOUT_UNKNOWN`. `NO_OP`
-     * clears [LOGOUT_READ_RETRY] and tag-null `LOGOUT_READ_FAILED` /
-     * `LOGOUT_UNKNOWN` (proven no journal; other `LOGOUT_*` untouched);
+     * clears [LOGOUT_READ_RETRY] and any tag-null non-STALE `LOGOUT_*`
+     * (proven no journal in this emission; STALE and tagged codes untouched);
      * `COMMITTED` keeps the same-origin-only rule.
      */
     internal fun onStartupReconcile(
@@ -1931,22 +2093,26 @@ class SetupViewModel(
             // Stage G F2: NO_OP 分支擴大——現碼為 READ_RETRY 照舊清；現碼為
             // READ_FAILED／UNKNOWN 且 tag==null（無源可比對的未確認碼）亦清
             // （errorCode＋tag 同清，回 fresh 確認態：確定清除＋取消）。
+            // Stage R5: 不再逐碼擴大白名單——NO_OP 證無 journal 的 emission 下，
+            // 任何無身份（tag==null）的非 STALE LOGOUT_* 碼皆可收斂（含
+            // alias-null CLEAR_FAILED-null 與 dirty-alias DELETE_FAILED-null：
+            // 無 journal 可回放，重試亦只走 reconcile-only 空轉，故回到
+            // fresh 重確認態；STALE 無論 tag 皆不清，帶 tag 碼永不清）。
             // 安全性：清除純 state；真 pending 由 observation（pendingTeardown）
             // 派生獨立重現（見 F1 派生），不依賴此碼；清除後若新 J_new 出現，
-            // 下次觀察即重現 UNKNOWN＋J_new。
+            // 下次觀察即重現 UNKNOWN＋J_new。null 身份永不觸發 vault／metadata
+            // 寫入（重試路由見 MainScreen：null 走 reconcile-only）。
             // 排除：STALE 無論 tag 皆不清（dismiss-only，需顯式關閉）；
-            // DELETE_FAILED／CLEAR_FAILED 不動——含 2226 dirty-alias
-            // DELETE_FAILED-null（PendingDelete 構造失敗，無 journal 可比對）
-            // 與 alias-null CLEAR_FAILED-null（無 alias 跳過 journal，直進
-            // clear 失敗，無 journal 可比對）兩 null 變體：留殘留 follow-up，
-            // 此處故意不清（見單測殘留鎖定）。
+            // 帶 tag 的 DELETE_FAILED／CLEAR_FAILED／UNKNOWN 不清（真 journal
+            // 由 domain state 顯示）。
             // COMMITTED 分支不同步擴大（下次 NO_OP 收斂；保 C2 同源不變式）。
             val cur = _form.value
             if (cur.errorCode == LOGOUT_READ_RETRY) {
                 _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
                 return
             }
-            if ((cur.errorCode == "LOGOUT_READ_FAILED" || cur.errorCode == "LOGOUT_UNKNOWN") &&
+            val code = cur.errorCode
+            if (code != null && code.startsWith("LOGOUT_") && code != "LOGOUT_STALE" &&
                 cur.logoutErrorSourceJournal == null
             ) {
                 _form.value = cur.copy(errorCode = null, logoutErrorSourceJournal = null)
@@ -2246,6 +2412,11 @@ class SetupViewModel(
                         } catch (e: CancellationException) {
                             throw e
                         } catch (_: Exception) {
+                            // Dirty-alias fail-closed (R5 follow-up: no repair exit
+                            // yet — corrupt metadata+key linger as-is; the next
+                            // logout re-reports DELETE_FAILED-null until a fresh
+                            // save overwrites the ref. Never guess an alias or
+                            // auto-delete here).
                             stampLogoutError("LOGOUT_DELETE_FAILED", null)
                             return@withLock
                         }
@@ -2353,6 +2524,14 @@ class SetupViewModel(
                         }
                     }
                     try {
+                        // R5 follow-up note: when alias==null (unparseable ref, no
+                        // journal, no delete attempted) this clear still reports
+                        // CLEAR_FAILED on transport failure, but the shared
+                        // "already deleted" wording is imprecise on that path
+                        // (zero deletes happened). Kept for taxonomy stability;
+                        // the null-tag card converges via NO_OP and offers
+                        // dismiss. Do not invent a new code without updating
+                        // NavGuard/Settings/tests in step.
                         val cleared = store.clearIfRevision(expectedRevision)
                         if (cleared) {
                             // Win removes metadata AND the journal atomically.

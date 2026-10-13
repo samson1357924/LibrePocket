@@ -787,7 +787,7 @@ class CancelReceiptCloseBarrierTest {
     val n = AtomicInteger(0)
     val c = controller(provider, SessionTranscriptSink(store, sid), n, "r192-gate")
     try {
-      startedHost(c)
+      val host = startedHost(c)
       assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
       c.cancel()
       // The waiter installed its receipt and is inside its first 50ms poll
@@ -798,14 +798,19 @@ class CancelReceiptCloseBarrierTest {
       // waiter snapshot + flush barrier are queued behind it.
       c.close(drainTimeoutMs = 450L)
       // Land the terminal SUCCESS before the waiter next wakes: the handoff
-      // (deferred system mark) is admitted pre-barrier.
+      // (deferred system mark) is admitted pre-barrier. Fix the read order
+      // deterministically — host join, then the ledger fence, then the
+      // receipt-terminal fence — and only then read flushDurable, so the
+      // true below proves a settled handoff instead of racing it in flight.
       store.gate.complete(Unit)
-      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
-      assertNotTrueAndDangling(store, durable, "barrier-gated success")
+      runBlocking { withTimeout(8_000) { host.join() } }
       awaitLedger(store) { evts ->
         evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 1
       }
+      val terminal = awaitReceiptTerminal(c)
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "barrier-gated success")
       val kinds = store.events.map { it.kind }
       assertTrue("gated success must land the deferred system mark, was $kinds", kinds.contains("system"))
       assertEquals("half", store.events.single { it.kind == "assistant" }.text)
@@ -815,7 +820,6 @@ class CancelReceiptCloseBarrierTest {
         "gated success must not leave a sealed-uncompensated receipt",
         c.hasSealedUncompensatedReceipts(),
       )
-      val terminal = awaitReceiptTerminal(c)
       assertTrue(
         "gated success must hand off, never SEAL, was $terminal",
         terminal == "REVOKED" || terminal == "COMPENSATED",

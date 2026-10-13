@@ -705,6 +705,37 @@ class TurnController(
   private var inFlight: Job? = null
   private val steerQueue: ArrayDeque<PendingSteer> = ArrayDeque()
   private var closed = false
+  /**
+   * R22 Phase 1 sticky close obligation, liftable tier (guarded by [lock]).
+   *
+   * Set by [close] when it observes a controller-observed terminal obligation
+   * (direct [pendingAdmission], a live host via [activeLocked], or an
+   * in-flight [orphanDrainJob]): the post-close path for those families still
+   * runs through controller code (finalize-closed rollback + cancel-terminal
+   * drain, doomed-host join + cancel terminal + receipt settle), so the flag
+   * lifts once [hasClosedUnsettledAdmission]'s clean proof holds (shutdown
+   * completed, no flags, no durable failures, receipts settled). Until then
+   * [flushDurable] stays false (never true-and-dangling).
+   *
+   * Unprovable fates (UNKNOWN ghost, promotion await — see
+   * [closedWithUnknownGhost]) never lift: only reopen backfill can own them.
+   */
+  private var closedWithUnsettledAdmission = false
+  /**
+   * R22 Phase 1 sticky close obligation, permanent tier (guarded by [lock]).
+   *
+   * Set by [close] when it drops an [unknownAdmission] (direct or promotion
+   * ghost: fate unprovable by definition) or a [promotionPending] reservation
+   * (Lock-1 may already have sent it, and the post-close Lock-2 closed-win
+   * writes no row and drains no terminal). The controller can never prove
+   * those families final — the acked ghost, if any, survives as an orphan
+   * user row with no cancel-terminal — so this never lifts on this session;
+   * only reopen INTERRUPTED backfill (a new session) repairs the ledger.
+   * Conservative by design (a pre-send parked promotion with a clean ledger
+   * also trips it): fail-closed until a ledger probe proves otherwise
+   * (Target: probeLedgerHasNoDangling; Current: this flag).
+   */
+  private var closedWithUnknownGhost = false
   /** Monotonic under [lock]; invalidates fresh-gate failures after turn activity. */
   private var activityRevision = 0L
   /**
@@ -1467,6 +1498,16 @@ class TurnController(
   internal var beforeAdmissionFinalizeForTest: (suspend () -> Unit)? = null
 
   /**
+   * R22-3 Phase 1 TOCTOU linearization gate: runs inside [flushDurable]
+   * between the first durable-failure read (after the admission proof) and
+   * the failure re-read (suspending, null in production). Lets the gate test
+   * deterministically open a new terminal obligation (or land a durable
+   * failure) in that window and prove the second read still fails closed.
+   * Must run outside the lock (suspend must never hold the intrinsic monitor).
+   */
+  internal var beforeFlushDurableReverifyForTest: (suspend () -> Unit)? = null
+
+  /**
    * Returns the live in-flight host job, lazily clearing a completed one.
    *
    * Has a lazy-clear side effect (`inFlight = null` when completed), so the
@@ -1968,21 +2009,93 @@ class TurnController(
   fun hasPendingAdmission(): Boolean = synchronized(lock) { unknownAdmission != null }
 
   /**
-   * R21-1 Phase 1 admission settle proof: true while a direct admission still
-   * owns the single-flight slot ([pendingAdmission] set: durable await or
-   * finalize barrier, host not yet entered) or its orphan cancel drain is
-   * still in flight ([orphanDrainJob] not completed). Cleared on host entry
-   * ([hostedTurn] prologue), rollback, claim/convert, cancel-drain, or drain
-   * completion — so a running host alone never trips this (no false positive),
-   * while a user row without its terminal (admission barrier, close/cancel
-   * interleave) keeps it true. Lock-held read, lock-free, never suspends.
-   * Conjoined into [flushDurable] and consulted by the ViewModel's
+   * R22 Phase 1 promotion settle proof: true while a promotion reservation
+   * still holds the single-flight slot ([promotionPending] set: Lock-1 await,
+   * no UNKNOWN yet) or a promotion ghost still owns it ([unknownAdmission]
+   * with `isPromotion == true`). Named subset of [hasUnsettledAdmission]
+   * (which covers the same windows plus direct ones) so promotion barriers
+   * assert — and [flushDurable] conjoins — the window explicitly. Lock-held
+   * read, lock-free, never suspends.
+   */
+  fun hasUnsettledPromotion(): Boolean = synchronized(lock) {
+    promotionPending != null || unknownAdmission?.isPromotion == true
+  }
+
+  /**
+   * R22 Phase 1 live-host proof: true while a hosted turn job is still
+   * running ([inFlight] live via [activeLocked]). A live host owns a user row
+   * with no proven terminal yet, so [flushDurable] conjoins this separately
+   * from [hasUnsettledAdmission] (which clears at the [hostedTurn] prologue
+   * and stays false while the host runs) — otherwise a streaming turn whose
+   * user row already drained would report true-and-dangling. Lock-held read
+   * (via the lazy-clearing [activeLocked], like every other `*Locked`
+   * accessor), never suspends.
+   */
+  fun hasActiveHost(): Boolean = synchronized(lock) { activeLocked() != null }
+
+  /**
+   * R22 Phase 1 sticky close proof: true while [close] dropped a terminal
+   * obligation this session can no longer prove final.
+   *
+   * - Permanent tier ([closedWithUnknownGhost]): close observed an UNKNOWN
+   *   ghost or a promotion reservation — unprovable fates (orphan user row
+   *   with no cancel-terminal, Lock-2 closed-win writes nothing). Never lifts
+   *   on this session; only reopen INTERRUPTED backfill repairs the ledger.
+   * - Liftable tier ([closedWithUnsettledAdmission]): close observed a
+   *   controller-observed family (direct pending, live host, orphan drain).
+   *   Lifts only once the background settle+drain+seal completed
+   *   ([shutdownJob] done) with no remaining obligation evidence (no
+   *   pending/UNKNOWN/promotion/active/orphan-drain, no durable failures, no
+   *   unsettled or SEALED-uncompensated receipts). Until then fail-closed.
+   *
+   * Conjoined into [flushDurable]. The ViewModel observes this session's debt
+   * indirectly today (a `false` from [flushDurable] degrades the fork to
+   * skip-dangling + incomplete marker); direct `isLedgerStreamingOrPending`
+   * wiring for this seam is follow-up work, not claimed here. Lock-held read,
+   * never suspends.
+   */
+  fun hasClosedUnsettledAdmission(): Boolean = synchronized(lock) {
+    if (closedWithUnknownGhost) return@synchronized true
+    if (!closedWithUnsettledAdmission) return@synchronized false
+    val shutdownDone = shutdownJob?.isCompleted == true
+    val orphanActive = orphanDrainJob?.isCompleted == false
+    val clean =
+      shutdownDone && pendingAdmission == null && unknownAdmission == null &&
+        promotionPending == null && activeLocked() == null && !orphanActive &&
+        !orderedTranscript.hasDurableFailures() && !hasUnsettledCancelReceipts() &&
+        !hasSealedUncompensatedReceipts()
+    !clean
+  }
+
+  /**
+   * R21-1 Phase 1 admission settle proof, R22 Phase 1 broadened from
+   * direct-only to every terminal-obligation window (the old "direct-only"
+   * claim is superseded): true while a direct admission still owns the
+   * single-flight slot ([pendingAdmission] set: durable await or finalize
+   * barrier, host not yet entered), while a promotion reservation holds it
+   * ([promotionPending] set: Lock-1 await — see [hasUnsettledPromotion]),
+   * while any UNKNOWN ownership exists ([unknownAdmission] set: direct ghost
+   * or promotion ghost — see [hasPendingAdmission], which stays UNKNOWN-only),
+   * or while an orphan cancel drain is still in flight ([orphanDrainJob] not
+   * completed). Cleared on host entry ([hostedTurn] prologue), rollback,
+   * claim/convert, cancel-drain, drain completion, or the Lock-2 promotion
+   * commit — so a running host alone never trips this (no false positive;
+   * that window is owned by [hasActiveHost] instead), while a user row
+   * without its terminal (admission barrier, promotion await/UNKNOWN, ghost,
+   * close/cancel interleave) keeps it true. Lock-held read, lock-free, never
+   * suspends. Conjoined into [flushDurable] and consulted by the ViewModel's
    * `isLedgerStreamingOrPending` alongside [hasPendingAdmission] (which stays
-   * UNKNOWN-only, see its KDoc), [hasUnsettledCancelReceipts], and
-   * [hasSealedUncompensatedReceipts].
+   * UNKNOWN-only), [hasUnsettledCancelReceipts], and
+   * [hasSealedUncompensatedReceipts] — so the promotion windows newly covered
+   * here already reach the VM through this proof. The sibling proofs
+   * [hasUnsettledPromotion], [hasActiveHost], and [hasClosedUnsettledAdmission]
+   * are [flushDurable]-conjoined (the VM observes them indirectly via a
+   * `false` downgrade); their direct VM wiring is follow-up work, not claimed
+   * here.
    */
   internal fun hasUnsettledAdmission(): Boolean = synchronized(lock) {
-    pendingAdmission != null || (orphanDrainJob?.isCompleted == false)
+    pendingAdmission != null || promotionPending != null || unknownAdmission != null ||
+      (orphanDrainJob?.isCompleted == false)
   }
 
   /** Caller must hold [lock]. Claim the ghost: same id,補 UI, launch host, no resend. */
@@ -2859,7 +2972,11 @@ class TurnController(
     // the FIFO head and clears the UNKNOWN ownership here; the head disappears
     // from the outbox (not reclaimable via the recovery box) while the acked
     // ghost — if the flush later proves it — survives in the ledger as an
-    // orphan user row with no cancel-terminal (reopen marks it INTERRUPTED).
+    // orphan user row with no cancel-terminal. R22 Phase 1 fail-closed: that
+    // orphan is NOT claimed clean here — [closedWithUnknownGhost] keeps
+    // [flushDurable] false on this session until reopen INTERRUPTED backfill
+    // (a new session) repairs the family, so the seal never reports
+    // true-and-dangling.
     // Confirmed NOT_ADMITTED/unavailable FIFO stays reclaimable as before;
     // only the UNKNOWN-fated head is excepted.
     // Round 10 H1: the promotion-await window (promotionPending set, no UNKNOWN
@@ -2880,6 +2997,27 @@ class TurnController(
       closed = true
       activityRevision++
       steerQueue.clear()
+      // R22 Phase 1 sticky close obligation (fail-closed): capture the
+      // terminal obligations close is about to drop, BEFORE clearing them
+      // below. Unprovable fates (UNKNOWN ghost, promotion reservation — the
+      // await may already have sent it and the Lock-2 closed-win writes
+      // nothing) take the permanent tier ([closedWithUnknownGhost]: this
+      // session never reports durable-true again; only reopen backfill
+      // repairs the ledger). Controller-observed families (direct pending,
+      // live host, in-flight orphan drain) take the liftable tier
+      // ([closedWithUnsettledAdmission]: lifts once the background
+      // settle+drain+seal below completes with no remaining evidence).
+      // Either tier keeps [flushDurable] false until proven — never
+      // true-and-dangling across the close.
+      if (unknownAdmission != null || promotionPending != null) {
+        closedWithUnknownGhost = true
+      }
+      if (
+        pendingAdmission != null || activeLocked() != null ||
+        orphanDrainJob?.isCompleted == false
+      ) {
+        closedWithUnsettledAdmission = true
+      }
       // R5-1: an UNKNOWN waiter already threw Pending — nobody will finalize
       // its pendingAdmission. Clear it (and the UNKNOWN ownership) here so no
       // second user-row write can duplicate a late-committing ghost; the
@@ -2950,7 +3088,15 @@ class TurnController(
     // leaves the receipt PENDING/CLAIMED (later SEALED-on-seal) instead of
     // silently extending the fence. [flushDurable] stays false via
     // [hasUnsettledCancelReceipts] plus the Phase 1
-    // [hasSealedUncompensatedReceipts] conjunct (never true-and-dangling).
+    // [hasSealedUncompensatedReceipts] conjunct (never true-and-dangling),
+    // and — R22 Phase 1 — via [hasActiveHost] while the doomed host still
+    // runs plus the sticky [hasClosedUnsettledAdmission] tiers after it.
+    // R22 doomed-host settle timeout: if the bounded join above times out,
+    // the still-live host keeps owning its terminal (no INTERRUPTED mark is
+    // forged here — only provably-unacked pendingCore ids are marked by the
+    // drain timeout below, never a never-admitted terminal); the sticky
+    // tiers carry that debt instead, so an unterminated doomed family is
+    // never reported clean. Reopen backfill owns the repair.
     // This covers both waiter self-expiry ([cancelReceiptMaxRounds] SEALED)
     // and settle-budget exhaustion (outer timeout) with one bounded fence.
     // Compensation writes run inside the waiter job, hence before the
@@ -3027,26 +3173,64 @@ class TurnController(
   /**
    * Suspends until every transcript event admitted so far is persisted and verifies
    * that no durable store failure occurred, no cancel receipt is still unsettled,
-   * and no direct admission is still unsettled.
+   * no SEALED receipt is still uncompensated, and no terminal obligation is
+   * still open.
    *
-   * Returns true only when [flushTranscript] drains within [timeoutMs] AND [hasDurableFailures] is false
-   * AND [hasUnsettledCancelReceipts] is false AND [hasSealedUncompensatedReceipts] is false
-   * AND [hasUnsettledAdmission] is false.
-   * The third conjunct is the R19-1 close-barrier guard: a drained ledger whose receipt waiter still owes its
-   * deferred system/batch write (PENDING/CLAIMED) reports false instead of
-   * true-and-dangling, so callers degrade (skip dangling families +
-   * incomplete marker) rather than snapshotting an orphan user row. The
-   * fourth conjunct is the Phase 1 SEALED truth contract: a SEALED receipt
-   * without proven family-final (see [hasSealedUncompensatedReceipts])
-   * likewise reports false instead of true-and-dangling. The fifth conjunct
-   * is the R21-1 Phase 1 admission barrier: a family without its terminal
-   * (direct [pendingAdmission] window or in-flight orphan drain, see
-   * [hasUnsettledAdmission]) likewise reports false instead of
-   * true-and-dangling.
+   * Returns true only when [flushTranscript] drains within [timeoutMs] AND all
+   * of the following hold (Current: eight conjuncts; R22 Phase 1 — never
+   * true-and-dangling across every terminal-obligation window):
+   * 1. [hasDurableFailures] is false (re-read AFTER the admission proof, see
+   *    the R22-3 note below);
+   * 2. [hasUnsettledCancelReceipts] is false (no PENDING/CLAIMED receipt —
+   *    the R19-1 close-barrier guard);
+   * 3. [hasSealedUncompensatedReceipts] is false (no SEALED receipt without
+   *    proven family-final — the Phase 1 SEALED truth contract; SEALED alone
+   *    is NOT settled);
+   * 4. [hasUnsettledAdmission] is false (no direct pending, promotion
+   *    reservation, UNKNOWN ghost, or orphan drain — the R21-1 Phase 1
+   *    barrier, R22-broadened from direct-only);
+   * 5. [hasUnsettledPromotion] is false (no promotion await / promotion ghost
+   *    — named subset of (4), conjoined explicitly);
+   * 6. [hasActiveHost] is false (no live host: a running host owns a user row
+   *    with no proven terminal yet — the R22 streaming/doomed-host guard);
+   * 7. [hasClosedUnsettledAdmission] is false (no sticky close obligation:
+   *    close-dropped UNKNOWN/promotion fates stay false until reopen
+   *    backfill; controller-observed families stay false until the
+   *    settle+drain+seal clean proof holds).
+   *
+   * R22-3 TOCTOU linearization: the five obligation reads above are separate
+   * lock acquisitions, so a window opened between two reads could slip
+   * through a single pass. The failure epoch is therefore re-read after the
+   * admission proof (a failure admitted during the guard window still fails
+   * closed), the test gate [beforeFlushDurableReverifyForTest] runs between
+   * the two failure reads, and the admission snapshot is re-verified once
+   * more before returning true (a window opened during the re-read still
+   * fails closed). Ending on the snapshot (rather than fail-last on the
+   * failure read) is equivalent, not weaker: either last-read leaves a
+   * symmetric one-window residual, so only the Target single-lock snapshot
+   * plus a monotonic failure epoch closes both directions. A single-lock
+   * snapshot plus a monotonic failure epoch is Target; Current is this
+   * double-read.
    */
-  suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
-    flushTranscript(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts() &&
-      !hasSealedUncompensatedReceipts() && !hasUnsettledAdmission()
+  suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
+    if (!flushTranscript(timeoutMs)) return false
+    if (!admissionSettledSnapshot()) return false
+    if (hasDurableFailures()) return false
+    beforeFlushDurableReverifyForTest?.invoke()
+    if (hasDurableFailures()) return false
+    if (!admissionSettledSnapshot()) return false
+    return true
+  }
+
+  /**
+   * One pass over every non-failure [flushDurable] obligation (see
+   * [flushDurable] conjuncts 2–7). Read twice per call (before and after the
+   * failure-epoch re-read) for the R22-3 linearization.
+   */
+  private fun admissionSettledSnapshot(): Boolean =
+    !hasUnsettledCancelReceipts() && !hasSealedUncompensatedReceipts() &&
+      !hasUnsettledAdmission() && !hasUnsettledPromotion() && !hasActiveHost() &&
+      !hasClosedUnsettledAdmission()
 
   /**
    * Core runIds admitted but never acked (drain timeout / seal race).

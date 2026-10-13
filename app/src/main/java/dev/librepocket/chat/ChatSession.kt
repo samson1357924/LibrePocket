@@ -104,20 +104,34 @@ interface ChatSession {
   /**
    * Suspends until every transcript event admitted so far is persisted and verifies
    * that no durable store failure occurred, no cancel receipt is still unsettled,
-   * no SEALED receipt is still uncompensated, and no direct admission is still
-   * unsettled.
+   * no SEALED receipt is still uncompensated, and no terminal obligation is
+   * still open.
    *
    * Returns true only when [flush] drains within [timeoutMs] AND [hasDurableFailures] is false
    * AND [hasUnsettledCancelReceipts] is false (no PENDING/CLAIMED receipt)
    * AND [hasSealedUncompensatedReceipts] is false (no SEALED receipt without
    * proven family-final). SEALED alone is NOT settled.
-   * AND [hasUnsettledAdmission] is false (no direct admission window or
-   * in-flight orphan drain — R21-1 Phase 1: a family without its terminal
-   * never reports true-and-dangling).
+   * AND [hasUnsettledAdmission] is false (no direct pending, promotion
+   * reservation, UNKNOWN ghost, or orphan drain — R21-1 Phase 1 barrier,
+   * R22-broadened from direct-only: a family without its terminal never
+   * reports true-and-dangling)
+   * AND [hasUnsettledPromotion] is false (no promotion await / promotion ghost)
+   * AND [hasActiveHost] is false (no live host: a running host owns a user
+   * row with no proven terminal yet)
+   * AND [hasClosedUnsettledAdmission] is false (no sticky close obligation).
+   *
+   * Production ([ChatSessionImpl] over a real sink) conjoins all of the above
+   * (see [dev.librepocket.chat.TurnController.flushDurable], which additionally
+   * re-reads the failure epoch after the admission proof for R22-3 TOCTOU
+   * linearization). The interface defaults below report no obligations (all
+   * guards false), so a `true` from a fake proves NOTHING about durability —
+   * fakes must never stand in as durability evidence; only production with a
+   * real sink is proof. Never assert ledger durability via a fake session.
    */
   suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
     flush(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts() &&
-      !hasSealedUncompensatedReceipts() && !hasUnsettledAdmission()
+      !hasSealedUncompensatedReceipts() && !hasUnsettledAdmission() &&
+      !hasUnsettledPromotion() && !hasActiveHost() && !hasClosedUnsettledAdmission()
 
   /**
    * Steering: queue an instruction for the next round.
@@ -150,18 +164,58 @@ interface ChatSession {
   fun hasPendingAdmission(): Boolean = false
 
   /**
-   * R21-1 Phase 1 admission settle proof: true while a direct admission still
+   * R21-1 Phase 1 admission settle proof, R22-broadened from direct-only to
+   * every terminal-obligation window: true while a direct admission still
    * owns the single-flight slot (durable await or finalize barrier, host not
-   * yet entered) or its orphan cancel drain is still in flight. A running host
-   * alone (pending cleared at [dev.librepocket.chat.TurnController] host entry)
-   * never trips this. Conjoined into [flushDurable] and consulted by the
+   * yet entered), while a promotion reservation holds it (Lock-1 await), while
+   * any UNKNOWN ownership exists (direct ghost or promotion ghost), or while
+   * an orphan cancel drain is still in flight. A running host alone (pending
+   * cleared at host entry) never trips this — that window is owned by
+   * [hasActiveHost] instead. Conjoined into [flushDurable] and consulted by the
    * ViewModel incomplete fallback alongside [hasPendingAdmission] (which stays
    * UNKNOWN-only), [hasUnsettledCancelReceipts], and
-   * [hasSealedUncompensatedReceipts]. Default false so test fakes stay
-   * source-compatible; production ([ChatSessionImpl]) overrides with the live
+   * [hasSealedUncompensatedReceipts] — so the promotion windows newly covered
+   * here already reach the VM through this proof. The sibling proofs
+   * [hasUnsettledPromotion], [hasActiveHost], and [hasClosedUnsettledAdmission]
+   * are [flushDurable]-conjoined (the VM observes them indirectly via a
+   * `false` downgrade); their direct VM wiring is follow-up work, not claimed
+   * here. Default false so test fakes stay
+   * source-compatible (a fake `true` proves nothing — see [flushDurable]);
+   * production ([ChatSessionImpl]) overrides with the live
    * controller state.
    */
   fun hasUnsettledAdmission(): Boolean = false
+
+  /**
+   * R22 Phase 1 promotion settle proof: true while a promotion reservation
+   * still holds the single-flight slot (Lock-1 await) or a promotion ghost
+   * still owns it. Named subset of [hasUnsettledAdmission], conjoined into
+   * [flushDurable] explicitly. Default false so test fakes stay
+   * source-compatible (never durability evidence — see [flushDurable]);
+   * production ([ChatSessionImpl]) overrides with the live controller state.
+   */
+  fun hasUnsettledPromotion(): Boolean = false
+
+  /**
+   * R22 Phase 1 live-host proof: true while a hosted turn is still running.
+   * A live host owns a user row with no proven terminal yet, so [flushDurable]
+   * stays false while this is true (never true-and-dangling for a streaming
+   * turn). Default false so test fakes stay source-compatible (never
+   * durability evidence — see [flushDurable]); production
+   * ([ChatSessionImpl]) overrides with the live controller state.
+   */
+  fun hasActiveHost(): Boolean = false
+
+  /**
+   * R22 Phase 1 sticky close proof: true while [close] dropped a terminal
+   * obligation this session can no longer prove final (UNKNOWN ghost or
+   * promotion reservation — permanent until reopen backfill; direct pending,
+   * live host, or orphan drain — until the settle+drain+seal clean proof
+   * holds). Conjoined into [flushDurable]. Default false so test fakes stay
+   * source-compatible (never durability evidence — see [flushDurable]);
+   * production ([ChatSessionImpl]) overrides with the live controller state.
+   */
+  fun hasClosedUnsettledAdmission(): Boolean = false
 
   /**
    * R19-1 read-only receipt settle proof: true while any cancel receipt on

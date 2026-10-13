@@ -104,6 +104,15 @@ class ChatSessionImpl(
   /** R21-1 Phase 1 admission barrier for the durable guard (see [ChatSession.hasUnsettledAdmission]). */
   override fun hasUnsettledAdmission(): Boolean = controller.hasUnsettledAdmission()
 
+  /** R22 Phase 1 promotion barrier for the durable guard (see [ChatSession.hasUnsettledPromotion]). */
+  override fun hasUnsettledPromotion(): Boolean = controller.hasUnsettledPromotion()
+
+  /** R22 Phase 1 live-host barrier for the durable guard (see [ChatSession.hasActiveHost]). */
+  override fun hasActiveHost(): Boolean = controller.hasActiveHost()
+
+  /** R22 Phase 1 sticky close barrier for the durable guard (see [ChatSession.hasClosedUnsettledAdmission]). */
+  override fun hasClosedUnsettledAdmission(): Boolean = controller.hasClosedUnsettledAdmission()
+
   /** R19-1: live unsettled-receipt state for the close-barrier guard (see [ChatSession.hasUnsettledCancelReceipts]). */
   override fun hasUnsettledCancelReceipts(): Boolean = controller.hasUnsettledCancelReceipts()
 

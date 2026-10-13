@@ -5,9 +5,12 @@ import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatImageRef
 import dev.librepocket.chat.ChatSession
+import dev.librepocket.chat.ChatSessionImpl
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.ChatUiState
 import dev.librepocket.chat.QueuedIntent
+import dev.librepocket.chat.TranscriptDurabilityException
+import dev.librepocket.chat.TurnController
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.chat.stripTimeBlock
@@ -20,10 +23,13 @@ import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.session.FakeSessionStore
 import dev.librepocket.session.SessionStore
+import dev.librepocket.session.SessionTranscriptSink
 import dev.librepocket.session.TranscriptEvent
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -31,6 +37,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,11 +46,15 @@ import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 
@@ -680,6 +691,16 @@ class ChatSessionFactorySwitchStreamingTest {
      * it with every other signal clean (isolates the new branch — without
      * the branch this returns false), while the fully clean session stays
      * false (no false positive from the new conjunct).
+     *
+     * Unit-semantics ONLY: [UnsettledAdmissionOnlySession] is a hand-written
+     * fake whose `flushDurable == false` is hardcoded — it proves the VM
+     * branch exists, never the production wiring (a fake `true` proves
+     * nothing; see [ChatSession.flushDurable]). Production wiring is proven
+     * by the real-controller tests below
+     * ([switchWhileStreaming_realAdmissionBarrier_marksIncompleteAndSkipsDangling],
+     * [realHostAlone_tripsLedgerStreamingEvidence_directWiring],
+     * [realPromotionAwait_tripsLedgerStreamingEvidence_directWiring]), which
+     * park a real [TurnController] behind a real [ChatSessionImpl].
      */
     @Test fun unsettledAdmissionAlone_tripsLedgerStreamingEvidence() {
         val store = newStore()
@@ -708,6 +729,12 @@ class ChatSessionFactorySwitchStreamingTest {
      * the old ledger's only live evidence is the new admission seam, so the
      * same-origin fork must still degrade — skip the dangling family, ride
      * the incomplete marker, and surface HISTORY_SNAPSHOT_INCOMPLETE.
+     *
+     * Unit-semantics ONLY (same fake caveat as
+     * [unsettledAdmissionAlone_tripsLedgerStreamingEvidence]): the hardcoded
+     * `flushDurable == false` cannot prove the production controller ever
+     * reports this shape. The real-wiring counterpart is
+     * [switchWhileStreaming_realAdmissionBarrier_marksIncompleteAndSkipsDangling].
      */
     @Test fun switchWhileStreaming_unsettledAdmissionOnly_marksIncompleteAndSkipsDangling() = runBlocking {
         val store = newStore()
@@ -766,5 +793,499 @@ class ChatSessionFactorySwitchStreamingTest {
             "reopen must not add a false INTERRUPTED for the skipped family",
             rows(transcripts, s2).singleOrNull { it.text == "turn L interrupted" },
         )
+    }
+
+    // -- R22 Phase 2: real-controller wiring (no hand-written session fakes) ---
+
+    private fun controllerOf(impl: ChatSessionImpl): TurnController {
+        val field = ChatSessionImpl::class.java.getDeclaredField("controller")
+        field.isAccessible = true
+        return field.get(impl) as TurnController
+    }
+
+    private fun vmEvidence(vm: ChatViewModel, method: String, session: ChatSession): Boolean {
+        val m = ChatViewModel::class.java.getDeclaredMethod(method, ChatSession::class.java)
+        m.isAccessible = true
+        return m.invoke(vm, session) as Boolean
+    }
+
+    private fun realRows(store: FakeSessionStore, sid: String): List<TranscriptEvent> =
+        synchronized(store.events) {
+            ArrayList(store.events.filter { it.sessionId == sid }.sortedBy { it.seq })
+        }
+
+    private suspend fun awaitCond(timeoutMs: Long, what: String, cond: () -> Boolean) {
+        withTimeout(timeoutMs) {
+            while (!cond()) delay(15)
+        }
+    }
+
+    /**
+     * R22 Phase 2 end-to-end fork through a REAL [TurnController] behind a
+     * real [ChatSessionImpl] (the VM's old session is production-built, never
+     * a hand-written fake): the old turn parks on the finalize barrier
+     * (`beforeAdmissionFinalizeForTest` — user row durable, no terminal yet),
+     * then an optional barrier cancel lands, then a same-origin switch drives
+     * the VM fork. The fork must go through the VM's own
+     * `settleDetachedLedger → snapshotSwitchHistory(excludeDangling = true,
+     * markIncomplete = true)` downgrade (this test never calls
+     * `snapshotSwitchHistory` directly): skip the dangling family, ride the
+     * incomplete marker, and surface HISTORY_SNAPSHOT_INCOMPLETE.
+     *
+     * Barrier shape (P1-1/P1-3) is pinned on the same real session AFTER the
+     * VM settle sealed it: still-unsettled admission + sticky close debt with
+     * seal held must read `isWriterSealedDead == false` and
+     * `isWriterAliveEvidence == true`, so the expired-block promotion
+     * (`tryPromoteExpiredBlock`, which short-circuits on the alive proof
+     * first) keeps deferring — the block never promotes under a barrier.
+     *
+     * Deterministic: every park is a gate/latch (no wall-clock sleeps);
+     * convergence waits are bounded `withTimeout + delay` polls.
+     */
+    private suspend fun realBarrierFork(cancelDuringBarrier: Boolean): Unit = supervisorScope {
+        val store = newStore()
+        store.save(sampleEndpoint())
+        val transcripts = FakeSessionStore()
+        val oldId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(oldId, "r0", "user", "q0"))
+        transcripts.appendEvent(event(oldId, "r0", "assistant", "a0"))
+
+        val ids = AtomicInteger(0)
+        val oldSession = ChatSessionImpl(
+            provider = AnsweringProvider(),
+            policy = InMemoryPolicyStore(),
+            transcript = SessionTranscriptSink(transcripts, oldId),
+            dispatcher = Dispatchers.Default,
+            newId = { "p2-real-${ids.incrementAndGet() - 1}" },
+        )
+        val controller = controllerOf(oldSession)
+        val enteredBarrier = CountDownLatch(1)
+        val barrierGate = CompletableDeferred<Unit>()
+        controller.beforeAdmissionFinalizeForTest = {
+            enteredBarrier.countDown()
+            barrierGate.await()
+        }
+        try {
+            val oldTurn = async(Dispatchers.Default) { oldSession.startOrEnqueue("q-cancel", opId = 901L) }
+            check(enteredBarrier.await(5, TimeUnit.SECONDS)) {
+                "old turn must park on the finalize barrier"
+            }
+            awaitCond(8_000, "barrier user row must be durable") {
+                realRows(transcripts, oldId).any { it.kind == "user" && it.text == "q-cancel" }
+            }
+            assertTrue(
+                "parked barrier must trip hasUnsettledAdmission",
+                oldSession.hasUnsettledAdmission(),
+            )
+
+            val newSession = TimeoutNewSession()
+            val sessions = TimeoutSessions(transcripts, oldId, oldSession, newSession)
+            val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+            onMain { vm.openSession(oldId) }
+            awaitCond(10_000, "VM must attach the old ledger") { vm.currentSessionId.value == oldId }
+
+            // P1-1: the VM fence must observe the REAL admission seam.
+            assertTrue(
+                "VM must observe the real unsettled admission as streaming/pending evidence",
+                vmEvidence(vm, "isLedgerStreamingOrPending", oldSession),
+            )
+            assertTrue(
+                "pre-fork ledger must dangle, was ${realRows(transcripts, oldId).map { it.kind }}",
+                findDanglingRunIds(realRows(transcripts, oldId)).isNotEmpty(),
+            )
+
+            if (cancelDuringBarrier) {
+                oldSession.cancel()
+                assertEquals(ChatStatus.CANCELLED, oldSession.uiState.value.status)
+                assertTrue(
+                    "cancelled barrier must still trip the guard",
+                    oldSession.hasUnsettledAdmission(),
+                )
+            }
+
+            // Same-origin switch; the fork-driving send goes through the VM.
+            store.save(sampleEndpoint().copy(model = "gpt-4o"))
+            awaitCond(10_000, "endpoint switch must invalidate the live view") {
+                vm.sessionState.value.messages.isEmpty()
+            }
+            onMain { vm.sendDirect("q-next") }
+            awaitCond(15_000, "VM fork must attach S2") { sessions.createdNewIds.isNotEmpty() }
+            val s2 = sessions.createdNewIds.first()
+            awaitCond(10_000, "forked turn must send") { newSession.sent.isNotEmpty() }
+
+            // P1-3 barrier shape on the sealed real session: the VM settle
+            // closed it (seal lands via the shutdown drain, which never waits
+            // on the parked admission waiter), while the barrier still owns
+            // the admission window plus the sticky close debt.
+            awaitCond(8_000, "settled old writer must seal") { oldSession.isTranscriptSealed() }
+            assertTrue(
+                "sealed barrier writer must still trip the admission guard",
+                oldSession.hasUnsettledAdmission(),
+            )
+            assertTrue(
+                "sealed barrier writer must carry the sticky close debt",
+                oldSession.hasClosedUnsettledAdmission(),
+            )
+            assertFalse(
+                "sealed-but-obligated writer must not be dead",
+                vmEvidence(vm, "isWriterSealedDead", oldSession),
+            )
+            assertTrue(
+                "sealed-but-obligated writer must still read alive (block must not promote)",
+                vmEvidence(vm, "isWriterAliveEvidence", oldSession),
+            )
+            assertTrue(
+                "sticky close debt must trip the VM evidence directly",
+                vmEvidence(vm, "isLedgerStreamingOrPending", oldSession),
+            )
+            val durableAfterSettle = withTimeout(8_000) { oldSession.flushDurable() }
+            assertFalse(
+                "barrier family without terminal must not flushDurable true",
+                durableAfterSettle,
+            )
+
+            // Fork degraded through the VM: incomplete marker, dangling L
+            // skipped, completed prefix kept.
+            val s2rows = realRows(transcripts, s2)
+            assertTrue(s2rows[0].kind == "system" && s2rows[0].text.startsWith("model switched "))
+            assertTrue(s2rows.any { it.text.startsWith("snapshot incomplete ") })
+            assertEquals(listOf("q0", "a0"), s2rows.filter { it.kind != "system" }.map { it.text })
+            assertTrue(s2rows.none { it.text == "q-cancel" })
+            assertTrue(findDanglingRunIds(s2rows).isEmpty())
+            assertEquals("HISTORY_SNAPSHOT_INCOMPLETE", vm.notice.value)
+
+            // Reopen twice: zero new INTERRUPTED markers, still no dangling.
+            val reopenFactory = factoryWith(transcripts, AnsweringProvider())
+            val before = realRows(transcripts, s2).count {
+                it.kind == "system" && it.text.endsWith("interrupted")
+            }
+            val opened1 = reopenFactory.open(sampleEndpoint().copy(model = "gpt-4o"), s2)
+            try {
+                assertEquals(before, realRows(transcripts, s2).count {
+                    it.kind == "system" && it.text.endsWith("interrupted")
+                })
+                assertTrue(findDanglingRunIds(realRows(transcripts, s2)).isEmpty())
+            } finally {
+                opened1.session.close()
+            }
+            val opened2 = reopenFactory.open(sampleEndpoint().copy(model = "gpt-4o"), s2)
+            try {
+                assertEquals(before, realRows(transcripts, s2).count {
+                    it.kind == "system" && it.text.endsWith("interrupted")
+                })
+                assertTrue(findDanglingRunIds(realRows(transcripts, s2)).isEmpty())
+            } finally {
+                opened2.session.close()
+            }
+            assertNull(
+                "reopen must not add a false INTERRUPTED for the skipped family",
+                realRows(transcripts, s2).singleOrNull { it.text == "turn L interrupted" },
+            )
+
+            // Release the barrier: the waiter observes the VM's close and
+            // fails closed (rollback + TranscriptDurabilityException for retry).
+            barrierGate.complete(Unit)
+            try {
+                withTimeout(5_000) { oldTurn.await() }
+                fail("finalize-closed waiter must throw TranscriptDurabilityException")
+            } catch (_: TranscriptDurabilityException) {
+                // Expected fail-closed path (caller retains the text).
+            }
+            withTimeout(5_000) { oldSession.flush() }
+        } finally {
+            barrierGate.complete(Unit)
+            runCatching { oldSession.close() }
+        }
+    }
+
+    /**
+     * R22 Phase 2 branch-level pins for every new obligation seam.
+     *
+     * Unit-semantics ONLY (same fake caveat as above): each [Phase2SeamSession]
+     * trips exactly one seam with an IDLE projection and everything else
+     * clean, so a `true` isolates the VM branch (without the new conjunct it
+     * would read `false`). The sealed-shape negatives pin the expanded dead
+     * proof conjunct-by-conjunct, and the sealed-clean positive control pins
+     * that a truly settled writer still reads dead (the expansion must not
+     * over-block the R10-2/R14-1 dead path). Production wiring for each seam
+     * is proven by the real-controller tests above, not here.
+     */
+    private class Phase2SeamSession(
+        val sealed: Boolean = false,
+        val writerCompleted: Boolean = false,
+        val unsettledAdmission: Boolean = false,
+        val unsettledPromotion: Boolean = false,
+        val activeHost: Boolean = false,
+        val closedUnsettled: Boolean = false,
+        val unsettledReceipts: Boolean = false,
+        val sealedUncompensated: Boolean = false,
+    ) : ChatSession {
+        private val state = MutableStateFlow(
+            ChatUiState(emptyList(), ChatStatus.IDLE, 0, null),
+        )
+        override val uiState: StateFlow<ChatUiState> = state
+
+        override suspend fun send(text: String, images: List<ChatImageRef>) = Unit
+        override suspend fun startTurn(text: String, images: List<ChatImageRef>): Job =
+            Job().apply { complete() }
+
+        override suspend fun startOrEnqueue(
+            text: String,
+            images: List<ChatImageRef>,
+            opId: Long?,
+        ): TurnStart = TurnStart.Queued
+
+        override fun drainQueued(): List<QueuedIntent> = emptyList()
+        override fun cancel() = Unit
+        override suspend fun flush(timeoutMs: Long): Boolean = true
+        override fun hasDurableFailures(): Boolean = false
+        override suspend fun flushDurable(timeoutMs: Long): Boolean = true
+        override fun hasPendingAdmission(): Boolean = false
+        override fun hasUnsettledAdmission(): Boolean = unsettledAdmission
+        override fun hasUnsettledPromotion(): Boolean = unsettledPromotion
+        override fun hasActiveHost(): Boolean = activeHost
+        override fun hasClosedUnsettledAdmission(): Boolean = closedUnsettled
+        override fun hasUnsettledCancelReceipts(): Boolean = unsettledReceipts
+        override fun hasSealedUncompensatedReceipts(): Boolean = sealedUncompensated
+        override fun pendingTranscriptRunIds(): List<String> = emptyList()
+        override fun isTranscriptSealed(): Boolean = sealed
+        override fun isTranscriptWriterCompleted(): Boolean = writerCompleted
+        override fun steer(text: String) = Unit
+        override fun close() = Unit
+    }
+
+    @Test fun phase2Seams_tripEvidenceAndBlockDead_unitPins() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = FakeSessionStore()
+        val vm = newVm(store, transcripts, AnsweringProvider())
+        fun evidence(session: ChatSession): Boolean = vmEvidence(vm, "isLedgerStreamingOrPending", session)
+        fun dead(session: ChatSession): Boolean = vmEvidence(vm, "isWriterSealedDead", session)
+        fun alive(session: ChatSession): Boolean = vmEvidence(vm, "isWriterAliveEvidence", session)
+
+        // Direct wiring: each new seam alone trips the evidence with an IDLE
+        // projection and every other signal clean.
+        assertTrue(
+            "hasUnsettledPromotion alone must trip the streaming evidence",
+            evidence(Phase2SeamSession(unsettledPromotion = true)),
+        )
+        assertTrue(
+            "hasActiveHost alone must trip the streaming evidence",
+            evidence(Phase2SeamSession(activeHost = true)),
+        )
+        assertTrue(
+            "hasClosedUnsettledAdmission alone must trip the streaming evidence",
+            evidence(Phase2SeamSession(closedUnsettled = true)),
+        )
+
+        // Expanded dead proof: sealed + any single open obligation → not dead.
+        assertFalse(
+            "sealed + unsettled admission must not be dead",
+            dead(Phase2SeamSession(sealed = true, writerCompleted = true, unsettledAdmission = true)),
+        )
+        assertFalse(
+            "sealed + unsettled promotion must not be dead",
+            dead(Phase2SeamSession(sealed = true, writerCompleted = true, unsettledPromotion = true)),
+        )
+        assertFalse(
+            "sealed + active host must not be dead",
+            dead(Phase2SeamSession(sealed = true, writerCompleted = true, activeHost = true)),
+        )
+        assertFalse(
+            "sealed + sticky close debt must not be dead",
+            dead(Phase2SeamSession(sealed = true, writerCompleted = true, closedUnsettled = true)),
+        )
+        assertFalse(
+            "sealed + unsettled receipts must not be dead",
+            dead(Phase2SeamSession(sealed = true, writerCompleted = true, unsettledReceipts = true)),
+        )
+        assertFalse(
+            "sealed + uncompensated receipts must not be dead",
+            dead(Phase2SeamSession(sealed = true, writerCompleted = true, sealedUncompensated = true)),
+        )
+
+        // Positive control: sealed + fully clean + completed still reads dead
+        // (the expansion must not over-block the R10-2/R14-1 dead path), and
+        // therefore not alive.
+        val settled = Phase2SeamSession(sealed = true, writerCompleted = true)
+        assertTrue("sealed-clean-completed writer must still be dead", dead(settled))
+        assertFalse("sealed-clean-completed writer must not read alive", alive(settled))
+        assertFalse(
+            "sealed-clean-completed writer must not trip the evidence",
+            evidence(settled),
+        )
+
+        // Barrier shape reads alive (so the expired block keeps deferring).
+        val barrier = Phase2SeamSession(sealed = true, writerCompleted = true, unsettledAdmission = true)
+        assertTrue("sealed-but-obligated writer must read alive", alive(barrier))
+        assertTrue("sealed-but-obligated writer must trip the evidence", evidence(barrier))
+    }
+
+    @Test fun switchWhileStreaming_realAdmissionBarrier_marksIncompleteAndSkipsDangling() = runBlocking {
+        realBarrierFork(cancelDuringBarrier = false)
+    }
+
+    @Test fun switchWhileStreaming_realCancelDuringBarrier_marksIncompleteAndSkipsDangling() = runBlocking {
+        realBarrierFork(cancelDuringBarrier = true)
+    }
+
+    /**
+     * R22 Phase 2 direct wiring pin for [ChatSession.hasActiveHost]: a REAL
+     * hosted turn (provider-gated, behind a real [ChatSessionImpl]) must trip
+     * the VM evidence while the admission guard stays clear (no false
+     * positive from the admission branch), and must not read dead while
+     * unsealed.
+     */
+    @Test fun realHostAlone_tripsLedgerStreamingEvidence_directWiring() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val providerGate = CompletableDeferred<Unit>()
+        val enteredProvider = CountDownLatch(1)
+        val provider = object : LlmProvider {
+            override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
+            override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
+                enteredProvider.countDown()
+                providerGate.await()
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+
+            override suspend fun listModels(): List<String> = emptyList()
+        }
+        val ids = AtomicInteger(0)
+        val session = ChatSessionImpl(
+            provider = provider,
+            policy = InMemoryPolicyStore(),
+            transcript = SessionTranscriptSink(transcripts, sid),
+            dispatcher = Dispatchers.Default,
+            newId = { "p2-host-${ids.incrementAndGet() - 1}" },
+        )
+        val store = newStore()
+        store.save(sampleEndpoint())
+        val vm = newVm(store, transcripts, AnsweringProvider())
+        try {
+            supervisorScope {
+                val started = withTimeout(8_000) { session.startOrEnqueue("p2-host-q", opId = 902L) }
+                assertTrue("host admission must start, was $started", started is TurnStart.Started)
+                check(enteredProvider.await(5, TimeUnit.SECONDS)) { "host must park on the provider gate" }
+                awaitCond(8_000, "host entry must clear the admission guard") {
+                    !session.hasUnsettledAdmission()
+                }
+                assertTrue("running host must trip hasActiveHost", session.hasActiveHost())
+                assertFalse(
+                    "running host must not trip the admission guard",
+                    session.hasUnsettledAdmission(),
+                )
+                assertTrue(
+                    "VM must observe the real live host directly",
+                    vmEvidence(vm, "isLedgerStreamingOrPending", session),
+                )
+                assertFalse(
+                    "running (unsealed) host must not be dead",
+                    vmEvidence(vm, "isWriterSealedDead", session),
+                )
+                assertTrue(
+                    "running host must read alive",
+                    vmEvidence(vm, "isWriterAliveEvidence", session),
+                )
+                providerGate.complete(Unit)
+                withTimeout(8_000) { (started as TurnStart.Started).host.join() }
+                withTimeout(8_000) { session.flush() }
+                awaitCond(8_000, "host must clear") { !session.hasActiveHost() }
+                assertTrue(
+                    "settled turn must flushDurable true",
+                    withTimeout(8_000) { session.flushDurable() },
+                )
+            }
+        } finally {
+            providerGate.complete(Unit)
+            runCatching { session.close() }
+        }
+    }
+
+    /**
+     * R22 Phase 2 direct wiring pin for [ChatSession.hasUnsettledPromotion]:
+     * a REAL promotion await (`beforePromotionAwaitForTest` park behind a
+     * real [ChatSessionImpl]) must trip the VM evidence explicitly — never
+     * only via the admission branch — and must not read dead.
+     */
+    @Test fun realPromotionAwait_tripsLedgerStreamingEvidence_directWiring() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val firstGate = CompletableDeferred<Unit>()
+        val firstEntered = CountDownLatch(1)
+        val promoParked = CountDownLatch(1)
+        val releasePromo = CountDownLatch(1)
+        val provider = object : LlmProvider {
+            override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
+            override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
+                val last = request.messages.last { it.role == "user" }.text
+                if (last.contains("p2-promofirst")) {
+                    firstEntered.countDown()
+                    firstGate.await()
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+
+            override suspend fun listModels(): List<String> = emptyList()
+        }
+        val ids = AtomicInteger(0)
+        val session = ChatSessionImpl(
+            provider = provider,
+            policy = InMemoryPolicyStore(),
+            transcript = SessionTranscriptSink(transcripts, sid),
+            dispatcher = Dispatchers.Default,
+            newId = { "p2-promo-${ids.incrementAndGet() - 1}" },
+        )
+        controllerOf(session).beforePromotionAwaitForTest = {
+            promoParked.countDown()
+            check(releasePromo.await(30, TimeUnit.SECONDS)) { "promotion gate released on teardown" }
+        }
+        val store = newStore()
+        store.save(sampleEndpoint())
+        val vm = newVm(store, transcripts, AnsweringProvider())
+        try {
+            supervisorScope {
+                val started = withTimeout(8_000) { session.startOrEnqueue("p2-promofirst", opId = 903L) }
+                assertTrue("first admission must start, was $started", started is TurnStart.Started)
+                check(firstEntered.await(5, TimeUnit.SECONDS)) { "first provider call must park" }
+                assertEquals(
+                    TurnStart.Queued,
+                    withTimeout(8_000) { session.startOrEnqueue("p2-promofollow", opId = 904L) },
+                )
+                firstGate.complete(Unit)
+                check(promoParked.await(5, TimeUnit.SECONDS)) { "promotion must park on its durable await" }
+                assertTrue(
+                    "promotion await must trip hasUnsettledPromotion",
+                    session.hasUnsettledPromotion(),
+                )
+                assertTrue(
+                    "VM must observe the real promotion reservation directly",
+                    vmEvidence(vm, "isLedgerStreamingOrPending", session),
+                )
+                assertFalse(
+                    "parked promotion must not be dead",
+                    vmEvidence(vm, "isWriterSealedDead", session),
+                )
+                assertTrue(
+                    "parked promotion must read alive",
+                    vmEvidence(vm, "isWriterAliveEvidence", session),
+                )
+                releasePromo.countDown()
+                withTimeout(8_000) { (started as TurnStart.Started).host.join() }
+                awaitCond(8_000, "promotion must settle") {
+                    !session.hasUnsettledPromotion() && !session.hasActiveHost()
+                }
+                withTimeout(8_000) { session.flush() }
+                assertTrue(
+                    "settled promotion family must flushDurable true",
+                    withTimeout(8_000) { session.flushDurable() },
+                )
+            }
+        } finally {
+            releasePromo.countDown()
+            firstGate.complete(Unit)
+            runCatching { session.close() }
+        }
     }
 }

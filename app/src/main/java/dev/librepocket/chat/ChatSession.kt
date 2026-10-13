@@ -260,8 +260,13 @@ interface ChatSession {
    * ([ChatSessionImpl]) overrides with the live controller state. The
    * backfill gate treats `isTranscriptSealed() && pending empty &&
    * !hasPendingAdmission()` as proof the old writer can never land a late
-   * terminal, so an expired block may promote even while the ledger still
-   * dangles (marking INTERRUPTED is then correct, never a mis-mark).
+   * terminal ONLY together with [isTranscriptWriterCompleted] (R14-1) and no
+   * Phase 1 obligation evidence ([hasUnsettledAdmission],
+   * [hasUnsettledPromotion], [hasActiveHost], [hasClosedUnsettledAdmission],
+   * [hasUnsettledCancelReceipts], [hasSealedUncompensatedReceipts] — R22
+   * Phase 2 barrier-aware), so an expired block may promote even while the
+   * ledger still dangles (marking INTERRUPTED is then correct, never a
+   * mis-mark), while a sealed-but-still-obligated writer keeps deferring.
    *
    * R14-1: seal alone is NOT that proof — a timed-out shutdown closes the
    * channel (sealed) and empties pending while the writer is still inside a

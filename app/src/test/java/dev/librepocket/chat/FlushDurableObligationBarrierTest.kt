@@ -314,9 +314,9 @@ class FlushDurableObligationBarrierTest {
           firstGate.await()
         }
         if (lastUserContains(req, "p1-unkfollow")) {
-          // Parks the claimed follow host pre-terminal so the UNKNOWN-window
-          // ledger shape stays stable no matter when the background settle
-          // claims the ghost (dangling holds until the test releases below).
+          // Parks the claimed follow host pre-terminal so the ledger shape
+          // stays stable across the release-then-claim gap below (dangling
+          // holds until the test releases this gate after the ghost ack).
           followGate.await()
         }
         emit(StreamEvent.Done("stop"))

@@ -3245,10 +3245,11 @@ class TurnController(
   /**
    * R10-2 writer-dead proof: true once the session writer is sealed/torn
    * down (later core writes fail fast instead of parking). The backfill gate
-   * consults this together with an empty pending set to promote an expired
-   * block whose ledger still dangles (terminal will never land → marking
-   * INTERRUPTED is correct); without this proof an expired-but-unsettled
-   * ledger keeps deferring.
+   * consults this together with an empty pending set, [isTranscriptWriterCompleted]
+   * (R14-1), and no Phase 1 obligation evidence (R22 Phase 2 barrier-aware)
+   * to promote an expired block whose ledger still dangles (terminal will
+   * never land → marking INTERRUPTED is correct); without this proof an
+   * expired-but-unsettled ledger keeps deferring.
    *
    * R14-1: seal alone is NOT the dead proof (see
    * [OrderedTranscriptSink.isWriterCompleted]) — the gate conjoins
@@ -3258,9 +3259,9 @@ class TurnController(
 
   /**
    * R14-1 writer-completion proof: true only once the session writer can no
-   * longer execute a store block (writer joined or writer-dead flag set in
-   * its own finally). Conjoined with [isTranscriptSealed], empty
-   * [pendingTranscriptRunIds] and no [hasPendingAdmission] before an expired
+   * longer execute a store block. Conjoined with [isTranscriptSealed], empty
+   * [pendingTranscriptRunIds], no [hasPendingAdmission], and no Phase 1
+   * obligation evidence (R22 Phase 2 barrier-aware) before an expired
    * outstanding teardown may be treated as dead.
    */
   fun isTranscriptWriterCompleted(): Boolean = orderedTranscript.isWriterCompleted()

@@ -351,6 +351,22 @@ class TurnController(
   transcriptDispatcher: CoroutineDispatcher? = null,
   private val acceptTimeoutMs: Long = ACCEPT_DURABLE_TIMEOUT_MS,
   transcriptCapacity: Int = OrderedTranscriptSink.DEFAULT_CAPACITY,
+  /**
+   * R17-1 review: bounded settle-wait for a SUBMITTING terminal before the
+   * sync cancel suppression decision (injectable seam for CI; production
+   * default matches the 5s ledger budget). Tests use a short budget with a
+   * proportionally longer writer stall to deterministically hit the
+   * still-pending receipt path without a real 5.1s stall.
+   */
+  private val cancelSettleTimeoutMs: Long = CANCEL_SETTLE_TIMEOUT_MS,
+  /**
+   * WARN-1: bounded compensation write for the late-writer receipt waiter.
+   * The compensation runs in NonCancellable (channel.send + ack.await); without
+   * a timeout a wedged writer parks it forever. Timeout degrades to
+   * SEALED/backfill like the sealed path. Injectable for the wedged-writer
+   * test.
+   */
+  private val cancelCompensationTimeoutMs: Long = CANCEL_RECEIPT_COMPENSATION_TIMEOUT_MS,
 ) {
   companion object {
     const val POLICY_ACTION = "chat.send"
@@ -366,6 +382,21 @@ class TurnController(
      * so no ANR: Room stays on IO via its own `withContext(IO)`.
      */
     const val ACCEPT_DURABLE_TIMEOUT_MS = 5_000L
+
+    /**
+     * R17-1 P1: bounded settle-wait for a SUBMITTING terminal before the sync
+     * cancel suppression decision. Production default matches the 5s ledger
+     * budget (5.1s stall in the wild times out here and installs the receipt);
+     * tests inject a short budget with a proportionally longer stall.
+     */
+    const val CANCEL_SETTLE_TIMEOUT_MS = 5_000L
+
+    /**
+     * WARN-1: bounded compensation write for the receipt waiter
+     * (channel.send + ack.await inside NonCancellable). Timeout degrades to
+     * SEALED/backfill instead of parking forever behind a wedged writer.
+     */
+    const val CANCEL_RECEIPT_COMPENSATION_TIMEOUT_MS = 5_000L
 
     /** Single-image byte cap (spec §4: >10 MiB is rejected, never transcoded). */
     const val MAX_IMAGE_BYTES = 10 * 1024 * 1024L
@@ -668,10 +699,10 @@ class TurnController(
    * committed the store row but the ack has not yet returned, so the set is
    * still empty and the old handler wrote a duplicate assistant row for the
    * same attempt). The handler now combines this acked set with the sink's
-   * synchronous submit truth ([OrderedTranscriptSink.isCorePending] /
-   * [OrderedTranscriptSink.coreCommitCount]) and the attempt-dimension terminal
-   * intent below ([attemptTerminalFinal]): SUBMITTING or COMMITTED suppresses
-   * the duplicate assistant; a suppressed final terminal writes zero new rows
+   * synchronous submit truth ([OrderedTranscriptSink.coreSubmitTruth]) and the
+   * attempt-dimension terminal intent below ([attemptTerminalFinal]):
+   * SUBMITTING or COMMITTED suppresses the duplicate assistant; a suppressed
+   * final terminal writes zero new rows
    * (the family already owns its final), a suppressed intermediate partial
    * writes one system-kind final mark (the family still dangles). FAILED or
    * never-submitted keeps the normal final cancel assistant. The sink owns
@@ -693,6 +724,275 @@ class TurnController(
    */
   private val attemptTerminalFinal: java.util.concurrent.ConcurrentHashMap<String, Boolean> =
     java.util.concurrent.ConcurrentHashMap()
+
+  /**
+   * R17-1 P1 attempt-scoped terminal receipt (controller-owned cancel intent).
+   *
+   * Installed only when a cancel's suppression rests solely on SUBMITTING
+   * (terminal intent present + writer still pending after the bounded
+   * settle-wait, neither acked nor COMMITTED). The host keeps its existing
+   * optimistic outcome (zero new rows for final intent, one system mark for
+   * non-final) so COMMITTED-revoke is a no-op; a late writer FAIL (pending
+   * cleared, no commit, INTERRUPTED-marked) is claimed exactly once via CAS
+   * and compensated in the background (see [launchCancelReceiptWaiter]).
+   *
+   * - Key: cancel attempt runId (attempt-scoped, NOT the admission opId).
+   *   opId guards admission duplication; runId guards terminal dedup — the
+   *   two namespaces never overlap.
+   * - `suppressedFinal`: the D15-2 attempt-dimension intent (`true` for
+   *   success / terminal-failure finals, `false` for retryable intermediate
+   *   partials). Decides the compensation kind: FAIL + final → normal cancel
+   *   final (assistant, isPartial, isFinal=true); FAIL + non-final → partial
+   *   dump (assistant, isPartial, isFinal=false, preserving the cancel-time
+   *   text snapshot) — chosen over a second system mark because it preserves
+   *   the user-visible fragment that would otherwise be lost, reuses the
+   *   existing sink API without new methods, and stays backfill-idempotent
+   *   (the family is already closed by the optimistic system mark).
+   * - State: PENDING → REVOKED (COMMITTED/acked, no op) | CLAIMED → COMPENSATED
+   *   (FAILED, compensation written) | SEALED (sealed/closed/killed: no write,
+   *   degrade to INTERRUPTED/backfill). CAS via [AtomicReference] guarantees
+   *   exactly-once in-process; the writer-finally outcome (commit vs fail) is
+   *   the single linearization point observed via the sink's atomic
+   *   [OrderedTranscriptSink.coreSubmitTruth] snapshot (+ [terminalizedAttempts]).
+   * - Bounded by the session's attempt count (one entry per cancelId, never
+   *   removed — same bound as [attemptTerminalFinal]/[terminalizedAttempts]).
+   *   Commit truth stays in the sink (append-only counts); this map holds only
+   *   cancel intent, never persistence truth. Not persisted across restart —
+   *   a kill falls back to the reopen INTERRUPTED backfill.
+   */
+  private enum class CancelReceiptState { PENDING, REVOKED, CLAIMED, COMPENSATED, SEALED }
+  private data class CancelReceipt(
+    val cancelId: String,
+    val logicalTurnId: String,
+    val suppressedFinal: Boolean,
+    val cancelText: String,
+    val cancelParent: String?,
+    val cancelIndex: Int,
+    val cancelReasoning: Boolean,
+    val state: AtomicReference<CancelReceiptState> = AtomicReference(CancelReceiptState.PENDING),
+  )
+  private val cancelReceipts: java.util.concurrent.ConcurrentHashMap<String, CancelReceipt> =
+    java.util.concurrent.ConcurrentHashMap()
+
+  /**
+   * R17-1 P1 late-writer compensation waiter (background, NonCancellable).
+   *
+   * Runs in [writerScope] (independent of the cancelled host) so the UI
+   * cancel stays synchronous (CANCELLED already flipped by [cancel]) while
+   * settlement continues. Observes the sink's synchronous submit truth via
+   * one atomic [OrderedTranscriptSink.coreSubmitTruth] snapshot per round —
+   * never separate commit-then-pending reads, whose torn mix (stale count
+   * `0` + already-cleared pending) misclaimed a committed terminal as FAILED
+   * (see that API's KDoc) — with the same D15-2 predicates (first-attempt
+   * terminal needs `commitCount >= 2`, fresh retry ids need `>= 1`;
+   * SUBMITTING additionally requires terminal intent) until the writer
+   * settles:
+   * - COMMITTED/acked → CAS PENDING→REVOKED, no op (optimistic stands).
+   * - FAILED (pending cleared, no commit, not acked) → double-check the
+   *   snapshot once more immediately before the CAS PENDING→CLAIMED (no
+   *   suspend between, so the window is microseconds), then compensate via
+   *   the normal [orderedTranscript] path (which reserves admission queuing;
+   *   never a synchronous send inside the sink writer thread — this waiter
+   *   is a separate coroutine): final intent gets the normal cancel final,
+   *   non-final gets the partial dump documented above. A commit landing
+   *   between CLAIM and the write is re-checked pre-write and revokes
+   *   (CLAIMED→REVOKED, no row written yet, optimistic stands).
+   *   Compensation rows use the same isFinal/kind as the immediate paths, so
+   *   backfill stays idempotent (family already closed or closed by the
+   *   compensation final; a second open adds zero rows).
+   * - Sealed/closed → CAS→SEALED, no write (degrade to INTERRUPTED/backfill).
+   * - Bounded poll (50ms base, capped exponential backoff, finite rounds —
+   *   see below): timeout degrades to SEALED with a Log.w instead of parking
+   *   forever behind a wedged writer. Cancelled with the scope on
+   *   [close]/shutdown teardown likewise degrades.
+   */
+  private fun launchCancelReceiptWaiter(receipt: CancelReceipt) {
+    // Child of writerScope (cancelled on shutdown teardown → degrades to
+    // SEALED/backfill); compensation writes below re-enter NonCancellable.
+    writerScope.launch {
+      fun committedThreshold(count: Int): Boolean =
+        if (receipt.cancelId == receipt.logicalTurnId) count >= 2 else count >= 1
+      try {
+        var backoffMs = 50L
+        var waits = 0
+        while (true) {
+          if (orderedTranscript.isSealed() || synchronized(lock) { closed }) {
+            receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.SEALED)
+            break
+          }
+          val ackedNow = terminalizedAttempts.contains(receipt.cancelId)
+          val snap = orderedTranscript.coreSubmitTruth(receipt.cancelId)
+          // R17-1 fix: the optimistic system mark (non-final) commits under the
+          // same cancelId and would otherwise mask a terminal FAIL as COMMITTED
+          // (user + system = 2 meets the first-attempt threshold even though the
+          // terminal never committed). A store-failed terminal stays in
+          // interrupted (append-only), while a committed terminal never does —
+          // so COMMITTED requires no interrupt mark.
+          val failedNow = orderedTranscript.interruptedRunIds().contains(receipt.cancelId)
+          val committedNow = committedThreshold(snap.commitCount) && !failedNow
+          val intentNow = attemptTerminalFinal[receipt.cancelId] != null
+          val pendingNow = intentNow && snap.pending
+          if (ackedNow || committedNow) {
+            receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.REVOKED)
+            break
+          }
+          if (!pendingNow) {
+            // Double-check before CLAIM: a commit that landed after the loop
+            // read above revokes instead of claiming (same interrupt guard:
+            // a system-mark commit must not mask the terminal FAIL).
+            val reAcked = terminalizedAttempts.contains(receipt.cancelId)
+            val reFailed = orderedTranscript.interruptedRunIds().contains(receipt.cancelId)
+            val reCommitted = committedThreshold(orderedTranscript.coreSubmitTruth(receipt.cancelId).commitCount) && !reFailed
+            if (reAcked || reCommitted) {
+              receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.REVOKED)
+              break
+            }
+            if (!receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.CLAIMED)) break
+            try {
+              withContext(NonCancellable) {
+                if (orderedTranscript.isSealed() || synchronized(lock) { closed }) {
+                  receipt.state.set(CancelReceiptState.SEALED)
+                } else if (
+                  terminalizedAttempts.contains(receipt.cancelId) ||
+                  (
+                    committedThreshold(orderedTranscript.coreSubmitTruth(receipt.cancelId).commitCount) &&
+                      !orderedTranscript.interruptedRunIds().contains(receipt.cancelId)
+                  )
+                ) {
+                  // Commit/ack landed between CLAIM and the write: no row has
+                  // been written yet, so revoke back and keep the optimistic
+                  // outcome instead of duplicating the terminal.
+                  receipt.state.set(CancelReceiptState.REVOKED)
+                } else if (receipt.suppressedFinal) {
+                  try {
+                    // WARN-1: bounded compensation write (channel.send +
+                    // ack.await inside NonCancellable). A wedged writer would
+                    // otherwise park this waiter forever; timeout degrades to
+                    // SEALED/backfill like the sealed path.
+                    val completed = withTimeoutOrNull(cancelCompensationTimeoutMs) {
+                      orderedTranscript.onTurnCancelled(
+                        receipt.cancelId, receipt.cancelText,
+                        receipt.cancelParent, receipt.cancelIndex, receipt.cancelReasoning,
+                      )
+                    }
+                    if (completed == null) {
+                      runCatching {
+                        android.util.Log.w(
+                          "TurnController",
+                          "cancel receipt compensation timed out for ${receipt.cancelId}",
+                        )
+                      }
+                      receipt.state.set(CancelReceiptState.SEALED)
+                    } else {
+                      receipt.state.set(CancelReceiptState.COMPENSATED)
+                    }
+                  } catch (_: ClosedSendChannelException) {
+                    receipt.state.set(CancelReceiptState.SEALED)
+                  } catch (sealFailure: CancellationException) {
+                    if (!orderedTranscript.isSealed()) throw sealFailure
+                    receipt.state.set(CancelReceiptState.SEALED)
+                  } catch (storeFailure: Exception) {
+                    // Durable store failure for the compensation row itself
+                    // (e.g. store IOException): the sink already
+                    // INTERRUPTED-marked it. Degrade to backfill, loudly —
+                    // the writer was alive at the pre-write check above, so
+                    // this is unexpected and must not vanish silently.
+                    runCatching {
+                      android.util.Log.w(
+                        "TurnController",
+                        "cancel receipt compensation failed: ${storeFailure.message}",
+                      )
+                    }
+                    receipt.state.set(CancelReceiptState.SEALED)
+                  }
+                } else {
+                  try {
+                    // WARN-1: same bounded write as above (wedged writer must
+                    // not park the compensation forever).
+                    val completed = withTimeoutOrNull(cancelCompensationTimeoutMs) {
+                      orderedTranscript.onTurnFailed(
+                        receipt.cancelId, receipt.cancelText, "partial lost (store failure)",
+                        receipt.cancelParent, receipt.cancelIndex, false,
+                      )
+                    }
+                    if (completed == null) {
+                      runCatching {
+                        android.util.Log.w(
+                          "TurnController",
+                          "cancel receipt compensation timed out for ${receipt.cancelId}",
+                        )
+                      }
+                      receipt.state.set(CancelReceiptState.SEALED)
+                    } else {
+                      receipt.state.set(CancelReceiptState.COMPENSATED)
+                    }
+                  } catch (_: ClosedSendChannelException) {
+                    receipt.state.set(CancelReceiptState.SEALED)
+                  } catch (sealFailure: CancellationException) {
+                    if (!orderedTranscript.isSealed()) throw sealFailure
+                    receipt.state.set(CancelReceiptState.SEALED)
+                  } catch (storeFailure: Exception) {
+                    // Same store-failure degrade path as above.
+                    runCatching {
+                      android.util.Log.w(
+                        "TurnController",
+                        "cancel receipt compensation failed: ${storeFailure.message}",
+                      )
+                    }
+                    receipt.state.set(CancelReceiptState.SEALED)
+                  }
+                }
+              }
+            } catch (_: CancellationException) {
+              receipt.state.compareAndSet(CancelReceiptState.CLAIMED, CancelReceiptState.SEALED)
+            } catch (compensationFailure: Exception) {
+              // Unexpected failure around the NonCancellable compensation
+              // (never the write itself, which is handled above): never leave
+              // CLAIMED stuck — degrade loudly so backfill owns the row.
+              runCatching {
+                android.util.Log.w(
+                  "TurnController",
+                  "cancel receipt waiter failed: ${compensationFailure.message}",
+                )
+              }
+              receipt.state.compareAndSet(CancelReceiptState.CLAIMED, CancelReceiptState.SEALED)
+            }
+            break
+          }
+          // Still SUBMITTING: back off (50→100→200→400→500ms cap) and bound
+          // the rounds (~29s worst case over 60 rounds: far above the
+          // writer's normal ms-scale settle, but a wedged writer cannot park
+          // this waiter forever). Timeout degrades to SEALED/backfill; the
+          // already-projected optimistic outcome stays.
+          waits++
+          if (waits >= 60) {
+            runCatching {
+              android.util.Log.w(
+                "TurnController",
+                "cancel receipt waiter timed out for ${receipt.cancelId}",
+              )
+            }
+            receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.SEALED)
+            break
+          }
+          delay(backoffMs)
+          backoffMs = (backoffMs * 2).coerceAtMost(500L)
+        }
+      } catch (_: CancellationException) {
+        receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.SEALED)
+      } catch (waiterFailure: Exception) {
+        // Unexpected poll-loop failure (never the compensation write, which
+        // is handled above): degrade loudly, never silently.
+        runCatching {
+          android.util.Log.w(
+            "TurnController",
+            "cancel receipt waiter failed: ${waiterFailure.message}",
+          )
+        }
+        receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.SEALED)
+      }
+    }
+  }
 
   /**
    * D15-2 test seam: runs in [runTurnLoop] immediately after a terminal ack
@@ -2551,41 +2851,71 @@ class TurnController(
       // normal final. A still-pending stall keeps the optimistic suppression.
       val terminalFinal = attemptTerminalFinal[cancelId]
       var acked = terminalizedAttempts.contains(cancelId)
-      var commitCount = orderedTranscript.coreCommitCount(cancelId)
+      // R17-1 review BLOCK-1: one atomic snapshot per decision point — never
+      // separate coreCommitCount/isCorePending reads, whose torn mix (stale
+      // count + already-cleared pending, or vice versa) misclassifies
+      // COMMITTED as SUBMITTING/FAILED. The writer publishes the success pair
+      // under submitTruthLock; coreSubmitTruth reads both under the same lock.
+      // The older accessors stay only for pre-existing D15 settle paths.
+      var snap = orderedTranscript.coreSubmitTruth(cancelId)
+      var commitCount = snap.commitCount
       var terminalCommitted =
         if (cancelId == logicalTurnId) commitCount >= 2 else commitCount >= 1
-      var terminalSubmitting = terminalFinal != null && orderedTranscript.isCorePending(cancelId)
+      var terminalSubmitting = terminalFinal != null && snap.pending
       if (terminalSubmitting && !acked && !terminalCommitted) {
         withContext(NonCancellable) {
-          withTimeoutOrNull(5_000) {
-            while (orderedTranscript.isCorePending(cancelId)) delay(10)
+          withTimeoutOrNull(cancelSettleTimeoutMs) {
+            while (orderedTranscript.coreSubmitTruth(cancelId).pending) delay(10)
           }
         }
         acked = terminalizedAttempts.contains(cancelId)
-        commitCount = orderedTranscript.coreCommitCount(cancelId)
+        snap = orderedTranscript.coreSubmitTruth(cancelId)
+        commitCount = snap.commitCount
         terminalCommitted =
           if (cancelId == logicalTurnId) commitCount >= 2 else commitCount >= 1
-        terminalSubmitting = terminalFinal != null && orderedTranscript.isCorePending(cancelId)
+        terminalSubmitting = terminalFinal != null && snap.pending
       }
       val suppressed = acked || terminalCommitted || terminalSubmitting
       val suppressedFinal = terminalFinal ?: true
-      // Durable and non-cancellable: the host is cancelled but the session
-      // writer is independent, so this record still drains on close (or is
-      // explicitly marked INTERRUPTED instead of silently dropped). A
-      // sealed/closed writer after close()/shutdown fails this write fast
-      // (ClosedSendChannelException or the sealed fail-fast
-      // CancellationException, already marked INTERRUPTED in the sink): swallow
-      // only that seal race so it cannot mask the original cancellation, then
-      // still rethrow the original. A durable store failure is likewise
-      // already INTERRUPTED-marked: keep the original cancellation.
-      // Any other write failure propagates.
+      // R17-1 P1: still-pending stall (suppression rests solely on SUBMITTING
+      // after the bounded wait) keeps the optimistic outcome below AND installs
+      // an attempt-scoped PENDING receipt for late-writer compensation. The
+      // background waiter observes the single commit/FAIL outcome via the
+      // sink's append-only truth and CAS-claims exactly once: COMMITTED/acked
+      // revokes with no op (optimistic stands); FAILED writes the missing
+      // final (final intent) or the partial dump (non-final, documented on
+      // [cancelReceipts]); sealed degrades to INTERRUPTED/backfill. The
+      // receipt is in-memory only (no cross-restart persistence — kill falls
+      // back to backfill) and bounded by attempt (one entry per cancelId,
+      // never removed). Existing D15-2 thresholds/predicates above are
+      // untouched; this only adds the late-FAIL correction that the bounded
+      // wait cannot see.
       val cancelReasoning = assistantReasoningOf(cancelId)
+      if (terminalSubmitting && !acked && !terminalCommitted) {
+        val receipt = CancelReceipt(
+          cancelId = cancelId,
+          logicalTurnId = logicalTurnId,
+          suppressedFinal = suppressedFinal,
+          cancelText = cancelText,
+          cancelParent = cancelParent,
+          cancelIndex = cancelIndex,
+          cancelReasoning = cancelReasoning,
+        )
+        if (cancelReceipts.putIfAbsent(cancelId, receipt) == null) {
+          launchCancelReceiptWaiter(receipt)
+        }
+      }
       if (suppressed && suppressedFinal) {
         // Success / terminal-failure final already durable (COMMITTED/acked,
         // or SUBMITTING that settled as COMMITTED during the bounded wait
-        // above): zero new rows, so the attempt keeps exactly one assistant
-        // row. A SUBMITTING that settled as FAILED falls through below to
-        // the normal final. Still rethrow the original cancellation below.
+        // above, or still-pending stall keeping the optimistic zero below with
+        // a PENDING receipt above): zero new rows, so the attempt keeps
+        // exactly one assistant row. A SUBMITTING that settled as FAILED falls
+        // through below to the normal final. Still rethrow the original
+        // cancellation below.
+        // Durable and non-cancellable: the host is cancelled but the session
+        // writer is independent, so the record below still drains on close (or
+        // is explicitly marked INTERRUPTED instead of silently dropped).
       } else {
         withContext(NonCancellable) {
           try {

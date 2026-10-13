@@ -74,6 +74,14 @@ class OrderedTranscriptSink(
   private val channel = kotlinx.coroutines.channels.Channel<Entry>(capacity)
   private val pendingCore = ConcurrentHashMap.newKeySet<String>()
   /**
+   * R17-1 P1 review: leaf monitor for the writer success-path commit pair
+   * (commit count increment + pending clear) and the atomic snapshot below.
+   * Never nests [poisonLock], [admissionLock], or the controller lock, and no
+   * suspend/delegate/channel work runs inside — increment + remove + two
+   * concurrent-map reads only — so no new lock-order edge exists.
+   */
+  private val submitTruthLock = Any()
+  /**
    * D15-2 committed proof (sink-owned submit truth): successful core commits
    * per runId, incremented in the writer `finally` on the success path only
    * (before the ack completes). Counts — not a set — because a first attempt
@@ -376,10 +384,14 @@ class OrderedTranscriptSink(
                 // COMMITTED via [coreCommitCount]. The intermediate state
                 // (pending + committed) suppresses via either signal, safe.
                 // Runs before the test hook below so the hook widens the
-                // true post-commit window.
+                // true post-commit window. The pair is committed under
+                // [submitTruthLock] so [coreSubmitTruth] never observes the
+                // torn (old count + cleared pending) mix (see its KDoc).
                 entry.runId?.let { id ->
-                  commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
-                  pendingCore.remove(id)
+                  synchronized(submitTruthLock) {
+                    commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
+                    pendingCore.remove(id)
+                  }
                 }
                 // D15-2 test seam: widens the commit→ack window for the
                 // cancel-race grid (null in production). Must not throw;
@@ -400,10 +412,14 @@ class OrderedTranscriptSink(
               // D15-2: the ack was already completed (abandoned waiter) but
               // the row still committed — record the proof before clearing
               // pending so a racing cancel handler observes COMMITTED,
-              // never a false NOT_COMMITTED.
+              // never a false NOT_COMMITTED. Same [submitTruthLock] pair as
+              // above: the snapshot below sees either pre- or post-commit,
+              // never the torn mix.
               entry.runId?.let { id ->
-                commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
-                pendingCore.remove(id)
+                synchronized(submitTruthLock) {
+                  commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
+                  pendingCore.remove(id)
+                }
               }
             }
           } else {
@@ -991,6 +1007,35 @@ class OrderedTranscriptSink(
   fun coreCommitCount(runId: String): Int = commitCounts[runId]?.get() ?: 0
 
   fun isCoreCommitted(runId: String): Boolean = coreCommitCount(runId) > 0
+
+  /**
+   * R17-1 P1 review: atomic submit-truth snapshot for one runId.
+   *
+   * The writer success path used to publish its two signals with two
+   * unsynchronized map ops (commit count increment, then pending clear), so
+   * a waiter reading them with two separate calls (commit-then-pending)
+   * could observe the torn mix — stale count `0` with already-cleared
+   * pending — and misclaim a committed terminal as FAILED (duplicate
+   * compensation write). Both success-path pairs above now publish under
+   * [submitTruthLock], and this snapshot reads both under the same lock, so
+   * callers see either the pre-commit or the post-commit state, never the
+   * mix. (Failure paths never increment the count, so their pending clear
+   * cannot tear toward a false COMMITTED; only the success pair needs the
+   * lock.) Read order inside is pending-then-count so that even a
+   * hypothetical unsynchronized reader would stall one more round (safe
+   * side) instead of misclaiming. Prefer this over the separate
+   * [isCorePending]/[coreCommitCount] pair wherever a commit-vs-failed
+   * decision is made; the older accessors stay for the pre-existing D15
+   * settle paths, whose logic is untouched.
+   */
+  data class CoreSubmitTruth(val commitCount: Int, val pending: Boolean)
+
+  fun coreSubmitTruth(runId: String): CoreSubmitTruth = synchronized(submitTruthLock) {
+    // P-then-C inside the lock (order is belt-and-braces under the monitor).
+    val pending = pendingCore.contains(runId)
+    val count = commitCounts[runId]?.get() ?: 0
+    CoreSubmitTruth(count, pending)
+  }
 
   /**
    * R14-1 writer-completion proof: true only once the session writer can no

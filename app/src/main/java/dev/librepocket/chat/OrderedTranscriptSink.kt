@@ -580,6 +580,47 @@ class OrderedTranscriptSink(
     delegate.onLogicalTurnCancelled(logicalTurnId, attemptRunId, partialText, attemptIndex)
   }
 
+  /**
+   * R18-1 Stage 2 cancel-intent notice (ordered notice, never a terminal).
+   * Best-effort like [onTurnRetried] (same [writeOrdered] admission, no ack,
+   * no commitCounts/pending): a kill before the deferred system/batch still
+   * leaves the family dangling (reopen INTERRUPTED) instead of silently
+   * closing without the partial. `retry` kind never closes a family.
+   */
+  override suspend fun onTurnCancelRequested(
+    logicalTurnId: String,
+    attemptRunId: String,
+    attemptIndex: Int?,
+  ) = writeOrdered { delegate.onTurnCancelRequested(logicalTurnId, attemptRunId, attemptIndex) }
+
+  /**
+   * R18-1 Stage 2 atomic FAILED batch (single core entry, single runId key).
+   *
+   * One [writeCore] entry keyed by the attempt id ([attemptRunId] ==
+   * [CancelReceipt.cancelId]) whose delegate block persists
+   * `partial(isFinal=false)` + `system cancelled(isFinal=true)` via one
+   * [SessionStore.appendEvents] unit. Explicit commit-count design: the writer
+   * increments `commitCounts[attemptRunId]` once for this entry, so the D15-2
+   * thresholds still hold — first attempt (`cancelId == logicalTurnId`)
+   * observes `user(1) + batch(1) = 2` (`>= 2` holds); fresh retry ids observe
+   * `batch(1) = 1` (`>= 1` holds). The system row binds the logical family
+   * (`runId == logicalTurnId`) for [findDanglingRunIds] closure; its runId is
+   * intentionally NOT a second commit key (single-key design, documented here).
+   * Old ledgers `[user + system]` without the partial are a known historical
+   * gap (pre-R18-1 premature close) and are NOT retroactively backfilled —
+   * the family is already closed there by the exact-text system mark.
+   */
+  override suspend fun onTurnFailedAndCancelled(
+    logicalTurnId: String,
+    attemptRunId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) = writeCore(attemptRunId) {
+    delegate.onTurnFailedAndCancelled(logicalTurnId, attemptRunId, partialText, error, parentRunId, attemptIndex)
+  }
+
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) =
     writeOrdered { delegate.onTurnRetried(runId, attempt, maxAttempts, delayMs) }
 

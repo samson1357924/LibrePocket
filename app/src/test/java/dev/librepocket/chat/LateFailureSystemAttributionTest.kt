@@ -266,36 +266,42 @@ class LateFailureSystemAttributionTest {
       assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
       c.cancel()
       joinHost(host)
-      // Terminal commits (delayed SUCCESS) + optimistic system FAILs + waiter
-      // rewrites the system mark: exactly one assistant + one system.
+      // R18-1 Stage 2 notice-first: terminal commits (delayed SUCCESS of the
+      // intermediate partial), notice lands, deferred system mark FAILs once
+      // (injected) → SEALED/backfill (no retry, family stays dangling for
+      // reopen INTERRUPTED). Ledger: user + original partial + notice, no
+      // system. Never a duplicate assistant.
       awaitLedger(store) { evts ->
-        evts.count { it.kind == "assistant" } == 1 && evts.count { it.kind == "system" } == 1
+        evts.count { it.kind == "assistant" } == 1 &&
+          evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") } &&
+          evts.none { it.kind == "system" }
       }
+      // Deferred system try fails (injected) → SEALED. Wait for the waiter to
+      // attempt it before asserting counts.
+      awaitCalls(store.systemCalls, 1)
+      assertEquals("SEALED", awaitReceiptTerminalState(c))
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
-      // (DB) user + original intermediate partial (non-final) + system mark
-      // (final, closes the family). Order is deterministic: the terminal
-      // commits before the compensation system mark lands last.
-      assertEquals(listOf("user", "assistant", "system"), store.events.map { it.kind })
+      assertEquals(listOf("user", "assistant", "retry"), store.events.map { it.kind })
       val attemptId = store.events[0].runId
-      // Assistant unique: the original terminal, never a duplicate dump.
       val assistants = store.events.filter { it.kind == "assistant" && it.runId == attemptId }
       assertEquals("duplicate assistant for $attemptId: ${store.events}", 1, assistants.size)
       val partial = assistants.single()
       assertEquals("half", partial.text)
       assertEquals(true, partial.isPartial)
       assertEquals("system-FAIL must keep the original non-final partial", false, partial.isFinal)
-      // Failure attribution is system: the assistant keeps its original
-      // provider reason, never the compensation "partial lost" reason.
       assertEquals("boom", partial.failureReason)
-      // System mark is the idempotent exact-text rewrite (compensation, not
-      // optimistic: the optimistic one threw, so systemCalls == 2).
-      assertEquals(2, store.systemCalls.get())
+      // Single deferred try (no optimistic + rewrite): first system call throws,
+      // waiter degrades to SEALED without a second try.
+      assertEquals(1, store.systemCalls.get())
       assertEquals(1, store.assistantCalls.get())
-      val mark = store.events.single { it.kind == "system" }
-      assertEquals(attemptId, mark.runId)
-      assertEquals("turn $attemptId cancelled", mark.text)
-      assertEquals(true, mark.isFinal)
-      assertTrue("dangling: ${store.events}", findDanglingRunIds(store.events).isEmpty())
+      val notice = store.events.single { it.kind == "retry" }
+      assertEquals(attemptId, notice.runId)
+      assertEquals("SEALED", awaitReceiptTerminalState(c))
+      assertEquals(
+        "deferred system failure must leave the family dangling for backfill: ${store.events}",
+        listOf(attemptId),
+        findDanglingRunIds(store.events),
+      )
       // (JSONL) + (reopen) + (UI) + (flushDurable=false: durable failure occurred, no duplicate).
       for (e in store.events) {
         val back = JsonlCodec.decode(1, JsonlCodec.encode(e.copy(seq = e.seq.coerceAtLeast(1))))
@@ -335,16 +341,19 @@ class LateFailureSystemAttributionTest {
       assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
       c.cancel()
       joinHost(host)
-      // Terminal FAILs (no row) + optimistic system mark succeeds + waiter
-      // dumps the partial: exactly one assistant (compensation) + one system.
+      // R18-1 notice-first: terminal FAILs (no row), notice lands, waiter
+      // writes the atomic batch partial+system: exactly one assistant (batch)
+      // + one system (batch) + one notice.
       awaitLedger(store) { evts ->
-        evts.count { it.kind == "assistant" } == 1 && evts.any { it.kind == "system" }
+        evts.count { it.kind == "assistant" } == 1 && evts.any { it.kind == "system" } &&
+          evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
       }
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
       val kinds = store.events.map { it.kind }
-      assertTrue(
-        "expected user + assistant + system in any order, was $kinds",
-        kinds == listOf("user", "assistant", "system") || kinds == listOf("user", "system", "assistant"),
+      assertEquals(
+        "R18-1 batch must be user+retry+assistant+system, was $kinds",
+        listOf("user", "retry", "assistant", "system"),
+        kinds,
       )
       val attemptId = store.events[0].runId
       // Assistant unique: the compensation dump (original terminal left no
@@ -402,29 +411,22 @@ class LateFailureSystemAttributionTest {
       assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
       c.cancel()
       joinHost(host)
-      // Terminal FAILs (no row); the waiter dumps the partial first.
-      awaitLedger(store) { evts -> evts.count { it.kind == "assistant" } == 1 }
-      // Then the sequential system exact-text rewrite is attempted and fails.
-      awaitCalls(store.systemCalls, 2)
+      // R18-1 atomic batch: terminal FAILs (no row), notice lands, batch
+      // assistant+system is attempted as one unit and rolls back (fake
+      // snapshot) on the injected system failure → zero batch rows. Ledger:
+      // user + notice only, family stays dangling for backfill.
+      awaitLedger(store) { evts -> evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") } }
+      awaitCalls(store.systemCalls, 1)
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
-      // (DB) user + compensation dump only: the optimistic system mark threw
-      // (system-1) and the compensation rewrite threw (system-2), so zero
-      // system rows exist — never a second assistant either.
-      assertEquals(listOf("user", "assistant"), store.events.map { it.kind })
+      assertEquals(listOf("user", "retry"), store.events.map { it.kind })
       val attemptId = store.events[0].runId
-      val dump = store.events.single { it.kind == "assistant" }
-      assertEquals(attemptId, dump.runId)
-      assertEquals("half", dump.text)
-      assertEquals(true, dump.isPartial)
-      assertEquals("non-final compensation must stay non-final", false, dump.isFinal)
-      assertEquals("partial lost (store failure)", dump.failureReason)
       assertEquals(2, store.assistantCalls.get())
-      assertEquals("optimistic + compensation rewrite", 2, store.systemCalls.get())
-      // Sequential dual-write order: terminal fail, then assistant dump,
-      // then the failed system rewrite.
+      assertEquals("notice + single batch try (no optimistic)", 1, store.systemCalls.get())
+      // Atomic attempt order: terminal fail, then batch assistant try, then
+      // batch system fail (rollback removes the batch assistant row).
       val order = ArrayList(store.order)
       assertEquals(
-        listOf("terminal-fail", "system-1", "assistant-comp", "system-2"),
+        listOf("terminal-fail", "assistant-comp", "system-1"),
         order,
       )
       // Failed second write degrades to SEALED (not COMPENSATED, never

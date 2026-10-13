@@ -275,25 +275,35 @@ class LateFailureCompensationTest {
       val host = startedHost(c)
       assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
       c.cancel()
-      // Non-final optimistic is the system mark (queued behind the stalled
-      // terminal), so the host joins only after the stall FAILs; the waiter
-      // then appends the partial dump.
+      // R18-1 Stage 2 notice-first: the host writes only a durable
+      // non-terminal notice (retry-like) while the terminal is still
+      // SUBMITTING; the waiter then appends the atomic batch
+      // partial(non-final)+system(final) after the late FAIL.
       joinHost(host)
       awaitLedger(store) { evts ->
-        evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 1
+        evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 1 &&
+          evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
       }
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
-      // (DB) user + partial dump (non-final, cancel-time "half") + system mark
-      // (final, closes the family). Order: system mark is admitted behind the
-      // failed terminal, compensation lands last.
+      // (DB) user + cancel-intent notice (non-terminal, keeps dangling) +
+      // atomic batch partial dump (non-final, cancel-time "half") + system mark
+      // (final, closes the family). Order: notice is admitted behind the
+      // failed terminal, batch lands last (partial then system in one unit).
       val kinds = store.events.map { it.kind }
-      assertTrue("expected user + assistant + system, was $kinds", kinds == listOf("user", "assistant", "system") || kinds == listOf("user", "system", "assistant"))
+      assertEquals(
+        "R18-1 notice-first batch must be user+retry+assistant+system, was $kinds",
+        listOf("user", "retry", "assistant", "system"),
+        kinds,
+      )
       val attemptId = store.events[0].runId
+      val notice = store.events.single { it.kind == "retry" && it.text.startsWith("cancel requested") }
+      assertEquals(attemptId, notice.runId)
       val partial = store.events.single { it.kind == "assistant" }
       assertEquals(attemptId, partial.runId)
       assertEquals("half", partial.text)
       assertEquals(true, partial.isPartial)
-      assertEquals("non-final compensation must stay non-final", false, partial.isFinal)
+      assertEquals("non-final batch partial must stay non-final", false, partial.isFinal)
+      assertEquals("partial lost (store failure)", partial.failureReason)
       val mark = store.events.single { it.kind == "system" }
       assertEquals(attemptId, mark.runId)
       assertEquals("turn $attemptId cancelled", mark.text)
@@ -438,13 +448,24 @@ class LateFailureCompensationTest {
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
       Thread.sleep(400)
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
-      // Benign: intermediate commits, optimistic system mark stands, waiter
-      // revokes — never the partial dump (exactly one assistant).
-      assertEquals(listOf("user", "assistant", "system"), store.events.map { it.kind })
+      // R18-1 benign: intermediate commits, notice-first keeps dangling until
+      // the waiter appends the deferred system mark — never the partial dump
+      // (exactly one assistant). Ledger: user + original partial + notice +
+      // system (notice is retry-like, hidden from replay, visible in export).
+      assertEquals(
+        listOf("user", "assistant", "retry", "system"),
+        store.events.map { it.kind },
+      )
       assertEquals(1, store.events.count { it.kind == "assistant" })
       val partial = store.events.single { it.kind == "assistant" }
       assertEquals("half", partial.text)
       assertEquals(false, partial.isFinal)
+      assertEquals("boom", partial.failureReason)
+      val notice = store.events.single { it.kind == "retry" && it.text.startsWith("cancel requested") }
+      assertEquals(store.events[0].runId, notice.runId)
+      val mark = store.events.single { it.kind == "system" }
+      assertEquals(store.events[0].runId, mark.runId)
+      assertEquals("turn ${store.events[0].runId} cancelled", mark.text)
       assertTrue("dangling: ${store.events}", findDanglingRunIds(store.events).isEmpty())
       assertJsonlRoundTrip(store.events)
       assertReopen(store, sid, store.events)

@@ -167,6 +167,58 @@ interface TranscriptSink {
       attemptIndex,
     )
   }
+  /**
+   * R18-1 Stage 2 cancel-intent notice (durable but non-terminal).
+   *
+   * Written by the cancel host BEFORE the raced retryable terminal settles,
+   * so the family stays dangling (reopen backfills INTERRUPTED) instead of
+   * being prematurely closed by a system final. `retry` kind is never a
+   * terminal for [findDanglingRunIds][dev.librepocket.agent.ui.chat.findDanglingRunIds]
+   * (like the existing retry notice), hidden from chat replay, visible in
+   * export. Best-effort notice (failures swallowed, never breaks the loop);
+   * a lost notice still leaves the family dangling (user only), safe.
+   * The default forwards to [onTurnRetried] so existing fakes keep compiling.
+   * Fake semantics: the in-memory test fake ([dev.librepocket.session.FakeSessionStore]
+   * via [dev.librepocket.session.SessionTranscriptSink]) persists notices with the
+   * same best-effort path as production (appendNotice); only legacy fakes that keep
+   * this interface default observe the coarse `onTurnRetried` fallback mapping
+   * (`attempt = (attemptIndex ?: 0) + 1`), never the exact cancel-notice text.
+   */
+  suspend fun onTurnCancelRequested(
+    logicalTurnId: String,
+    attemptRunId: String,
+    attemptIndex: Int?,
+  ) {
+    onTurnRetried(logicalTurnId, (attemptIndex ?: 0) + 1, 3, 0L)
+  }
+  /**
+   * R18-1 Stage 2 atomic FAILED batch: retryable terminal failed (no row)
+   * with a racing cancel — persists `partial(isFinal=false)` +
+   * `system cancelled(isFinal=true)` as one all-or-nothing unit via
+   * [dev.librepocket.session.SessionStore.appendEvents] (Room single tx,
+   * fake snapshot; external default sequential fallback is partial-first so
+   * a mid-batch failure still leaves the family dangling, fail-closed).
+   * The default is sequential partial-first for old fakes / external stores;
+   * production ([dev.librepocket.session.SessionTranscriptSink]) overrides
+   * to the atomic batch. Fake semantics: the current in-memory test fake
+   * implements atomic [dev.librepocket.session.SessionStore.appendEvents]
+   * (snapshot + rollback, same all-or-nothing contract as Room), so tests
+   * exercise the atomic path; only legacy fakes/external stores that keep
+   * this interface default observe the sequential partial-first fallback
+   * (which may leave the partial behind on a mid-batch failure — still
+   * fail-closed, never a premature close).
+   */
+  suspend fun onTurnFailedAndCancelled(
+    logicalTurnId: String,
+    attemptRunId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) {
+    onTurnFailed(attemptRunId, partialText, error, parentRunId, attemptIndex, false)
+    onLogicalTurnCancelled(logicalTurnId, attemptRunId, partialText, attemptIndex)
+  }
   suspend fun onSteerQueued(text: String)
 
   /** One tool call finished (P1 records only, never executes). */

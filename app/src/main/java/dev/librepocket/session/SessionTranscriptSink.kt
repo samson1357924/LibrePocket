@@ -325,6 +325,62 @@ class SessionTranscriptSink(
         appendDurable(logicalTurnId, "system", "turn $logicalTurnId cancelled", isFinal = true)
     }
 
+    /**
+     * R18-1 Stage 2 cancel-intent notice (best-effort, non-terminal).
+     * `retry` kind never closes a family for `findDanglingRunIds`, so a kill
+     * before the deferred system/batch leaves user(+partial)+notice dangling
+     * (reopen INTERRUPTED) instead of silently closing without the partial.
+     */
+    override suspend fun onTurnCancelRequested(
+        logicalTurnId: String,
+        attemptRunId: String,
+        attemptIndex: Int?,
+    ) {
+        appendNotice(
+            logicalTurnId, "retry",
+            "cancel requested for attempt ${attemptIndex ?: 0} (attempt $attemptRunId)",
+            isFinal = true,
+        )
+    }
+
+    /**
+     * R18-1 Stage 2 atomic FAILED batch (single [store.appendEvents] unit).
+     * [RoomSessionStore] (single DB transaction) and the in-memory test fake
+     * (snapshot + rollback) commit both rows or zero; an external store keeping
+     * the default sequential fallback may leave the partial behind — still
+     * fail-closed (non-final partial alone never closes the family, reopen
+     * backfills INTERRUPTED). Single entry.runId key is the attempt id (see
+     * OrderedTranscriptSink): first attempt (cancelId == logical) observes
+     * user(1)+batch(1)=2 (>=2 holds); fresh retry id observes batch(1)=1
+     * (>=1 holds).
+     */
+    override suspend fun onTurnFailedAndCancelled(
+        logicalTurnId: String,
+        attemptRunId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+    ) {
+        val now = clock()
+        val batch = ArrayList<TranscriptEvent>(2)
+        batch.add(
+            coreEvent(
+                attemptRunId, "assistant", partialText, now,
+                isPartial = true, failureReason = error,
+                parentRunId = parentRunId, attemptIndex = attemptIndex,
+                isFinal = false,
+            ),
+        )
+        batch.add(
+            coreEvent(
+                logicalTurnId, "system", "turn $logicalTurnId cancelled", now,
+                isFinal = true,
+            ),
+        )
+        appendDurableBatch(batch)
+    }
+
     override suspend fun onSteerQueued(text: String) {
         appendNotice("steer-${UUID.randomUUID()}", "steer", text, isFinal = true)
     }

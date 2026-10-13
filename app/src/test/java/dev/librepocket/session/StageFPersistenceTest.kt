@@ -298,10 +298,14 @@ class StageFPersistenceTest {
     }
 
     @Test fun jsonlCodec_acceptsIntFinalAndRejectsBad() {
+        // Production shape: a non-final assistant intermediate is always
+        // partial (see SessionTranscriptSink), so the int-0 case carries
+        // isPartial=true; a bare non-partial non-final assistant line is
+        // rejected (see jsonlCodec_rejectsNonPartialNonFinalAssistant below).
         val zero = JsonlCodec.decode(
             1,
             "{\"seq\":1,\"runId\":\"r\",\"kind\":\"assistant\",\"text\":\"t\"," +
-                "\"imagesOmitted\":0,\"createdAt\":1,\"isFinal\":0}",
+                "\"imagesOmitted\":0,\"createdAt\":1,\"isPartial\":true,\"isFinal\":0}",
         )
         assertFalse(zero.isFinal)
         val one = JsonlCodec.decode(
@@ -321,6 +325,37 @@ class StageFPersistenceTest {
             assertTrue(e.message!!.contains("line 3"))
             assertFalse(e.message!!.contains("yes"))
         }
+    }
+
+    @Test fun jsonlCodec_rejectsNonPartialNonFinalAssistant() {
+        // Phase 5: a crafted assistant row with isFinal=false and
+        // isPartial=false would dangle forever (backfill treats non-final as
+        // non-terminal) yet still enter model context (projection filters
+        // !isPartial only) — production never writes this shape, so decode
+        // rejects it fail-closed with a line-number-only error.
+        try {
+            JsonlCodec.decode(
+                7,
+                "{\"seq\":7,\"runId\":\"r\",\"kind\":\"assistant\",\"text\":\"smuggled\"," +
+                    "\"imagesOmitted\":0,\"createdAt\":1,\"isPartial\":false,\"isFinal\":false}",
+            )
+            fail("non-partial non-final assistant must throw")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("line 7"))
+            assertFalse(e.message!!.contains("smuggled"))
+        }
+        // Missing-key pre-F lines still default (old single-terminal rows are
+        // final, so they never hit the reject): covered by
+        // jsonlCodec_missingKeyDefaultsFinal.
+        // Reasoning flag-only markers legitimately carry isFinal=false with
+        // isPartial=false (see SessionTranscriptSink) and stay accepted.
+        val marker = JsonlCodec.decode(
+            8,
+            "{\"seq\":8,\"runId\":\"r\",\"kind\":\"reasoning\",\"text\":\"\"," +
+                "\"imagesOmitted\":0,\"createdAt\":1,\"isFinal\":false}",
+        )
+        assertFalse(marker.isFinal)
+        assertFalse(marker.isPartial)
     }
 
     @Test fun sink_failureFinalFlagAndCancelMarkPersist() = runBlocking {

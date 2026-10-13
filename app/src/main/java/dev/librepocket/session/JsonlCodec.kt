@@ -33,6 +33,15 @@ val VALID_KINDS: Set<String> = setOf("user", "assistant", "tool", "steer", "retr
  * `isFinal` (boolean; legacy encoders may write 0/1, both decode). The key is
  * optional on decode: pre-F lines have no key and read back as `isFinal=true`
  * (old single-terminal semantics). Encoders always write the key.
+ *
+ * Phase 5 (implemented): an `assistant` row with `isFinal=false` must also
+ * carry `isPartial=true` — production writes intermediate partials only in
+ * that shape (see `SessionTranscriptSink`), while the model-context
+ * projection filters `!isPartial` and the backfill treats `isFinal=false`
+ * as non-terminal. A crafted `assistant` line with `isFinal=false` and
+ * `isPartial=false` would dangle forever yet still enter model context, so
+ * decode rejects it fail-closed. `reasoning` flag-only markers legitimately
+ * carry `isFinal=false` with `isPartial=false` and stay accepted.
  */
 data class JsonlLine(
     val seq: Long,
@@ -154,6 +163,12 @@ object JsonlCodec {
             isFinal = isFinal,
         )
         if (parsed.kind !in VALID_KINDS) fail()
+        // Phase 5: an assistant intermediate partial must stay partial. A
+        // crafted non-partial non-final assistant row would never close its
+        // family (backfill treats isFinal=false as non-terminal) yet still
+        // enter model context (projection filters !isPartial only) — reject
+        // fail-closed. Reasoning flag-only markers are exempt by contract.
+        if (parsed.kind == "assistant" && !parsed.isFinal && !parsed.isPartial) fail()
         // The reasoning marker is payload-free by contract (same runId as its
         // assistant event, empty text); a non-empty body is rejected like an
         // unknown kind so imports cannot smuggle reasoning content into the store.

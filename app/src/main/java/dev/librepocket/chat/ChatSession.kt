@@ -107,18 +107,18 @@ interface ChatSession {
    * no SEALED receipt is still uncompensated, and no terminal obligation is
    * still open.
    *
-   * Returns true only when [flush] drains within [timeoutMs] AND [hasDurableFailures] is false
-   * AND [hasUnsettledCancelReceipts] is false (no PENDING/CLAIMED receipt)
-   * AND [hasSealedUncompensatedReceipts] is false (no SEALED receipt without
-   * proven family-final). SEALED alone is NOT settled.
-   * AND [hasUnsettledAdmission] is false (no direct pending, promotion
+   * Returns true only when [flush] drains within [timeoutMs], [hasDurableFailures] is false,
+   * [hasUnsettledCancelReceipts] is false (no PENDING/CLAIMED receipt),
+   * [hasSealedUncompensatedReceipts] is false (no SEALED receipt without
+   * proven family-final; SEALED alone is NOT settled),
+   * [hasUnsettledAdmission] is false (no direct pending, promotion
    * reservation, UNKNOWN ghost, or orphan drain — R21-1 Phase 1 barrier,
    * R22-broadened from direct-only: a family without its terminal never
-   * reports true-and-dangling)
-   * AND [hasUnsettledPromotion] is false (no promotion await / promotion ghost)
-   * AND [hasActiveHost] is false (no live host: a running host owns a user
-   * row with no proven terminal yet)
-   * AND [hasClosedUnsettledAdmission] is false (no sticky close obligation).
+   * reports true-and-dangling),
+   * [hasUnsettledPromotion] is false (no promotion await / promotion ghost),
+   * [hasActiveHost] is false (no live host: a running host owns a user
+   * row with no proven terminal yet),
+   * and [hasClosedUnsettledAdmission] is false (no sticky close obligation).
    *
    * Production ([ChatSessionImpl] over a real sink) conjoins all of the above
    * (see [dev.librepocket.chat.TurnController.flushDurable], which additionally

@@ -22,6 +22,8 @@
 |---|---|---|
 | Chat provider adapters | `Chat Completions`, `Responses`, `Anthropic Messages` adapter 與 factory 存在 | 對每個相容宣稱的 endpoint 均已互通或認證 |
 | Session transcript | production chat/session path 使用 Room；JSONL codec/import-export 有 library code | JSONL 是 canonical store；有可供使用者操作的匯出/遷移 UI |
+| Ledger durability (`flushDurable`) | `TurnController.flushDurable` 八檢查合取（排空＋無 PENDING/CLAIMED receipt＋無未補償 SEALED＋admission／promotion／host／sticky 證明＋failure epoch 雙讀），永不 true-and-dangling；close 以 cancel-receipt barrier＋remaining-budget 線性化交接 | `true` 代表跨重啟耐久；fake session 的 `true` 可作耐久證據；SEALED 等同 settled |
+| Cancel receipt / admission proofs | `hasUnsettledCancelReceipts`（PENDING/CLAIMED）、`hasSealedUncompensatedReceipts`（SEALED truth）、`hasUnsettledAdmission`（direct／promotion／UNKNOWN ghost／orphan；R22 由 direct-only 擴大）皆為 production 實作並合取進 `flushDurable` | 僅有 KDoc／介面預設即代表已接線；介面預設 `false` 可作耐久證據 |
 | Built-in tools | registry 有 41 個 definitions；目前 `executionReady=false` 全部未啟用；model-visible built-in tool 集合為空 | 模型可以執行 schema 中描述的動作 |
 | `play` | base application ID；Play overlay 移除高風險權限/service | 商店已上架或政策已被商店批准 |
 | `foss` | `.foss` application ID；Foss manifest/source set 有 accessibility service 與 OSS vision dependencies | 與 `github` 有相同能力或已由 F-Droid 發布 |

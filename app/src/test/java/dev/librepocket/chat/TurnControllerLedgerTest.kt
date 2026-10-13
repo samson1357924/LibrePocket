@@ -1108,12 +1108,18 @@ class TurnControllerLedgerTest {
       assertFalse("flush timeout must stay unknown (false)", stillUnknown)
       assertTrue(c.hasPendingAdmission())
       // Caller-cancelled settle rethrows CancellationException (never Pending).
+      // Phase 5 observable gate (was a fixed 300ms sleep heuristic): the
+      // settle parks inside the flush barrier send — latch the barrier-send
+      // hook instead of guessing wall-clock time. Flake risk: low; a slow
+      // scheduler only delays the latch, and the isCompleted assert below
+      // still applies after it (never passes vacuously).
+      val flushEntered = CompletableDeferred<Unit>()
+      c.beforeAdmissionSendForTest = { flushEntered.complete(Unit) }
       val settleJob = GlobalScope.async(Dispatchers.Default) {
         c.settlePendingAdmission(10_000L)
       }
       runBlocking {
-        // Let the settle park inside flush (writer still gated).
-        delay(300)
+        withTimeout(5_000) { flushEntered.await() }
       }
       assertFalse("settle must still be parked in flush", settleJob.isCompleted)
       settleJob.cancel()
@@ -1281,6 +1287,11 @@ class TurnControllerLedgerTest {
         }
       }
       // Let the waiter settle into the gate (send provably not attempted).
+      // Phase 5 flake note: fixed 200ms landing sleep (no suspension-entry
+      // observable exists here). Risk: low; failure mode is false-red only —
+      // if the waiter has not reached the gate yet, the cancel below lands
+      // pre-send (NOT_ADMITTED) and the Pending expectation fails loudly,
+      // never a false-green pass.
       Thread.sleep(200)
       assertFalse("admission must still be parked before send", deferred.isCompleted)
       deferred.cancel()
@@ -1730,6 +1741,9 @@ class TurnControllerLedgerTest {
         withTimeout(5_000) { while (!beforeSendEntered.get()) delay(10) }
       }
       // Let the waiter settle into the gate (send provably not attempted).
+      // Phase 5 flake note: fixed 200ms landing sleep. Risk: low; failure
+      // mode is false-red only (pre-gate cancel → NOT_ADMITTED, the
+      // recovery assertions below fail loudly), never false-green.
       Thread.sleep(200)
       assertFalse("promotion must be parked before send", first.isCompleted)
       c.cancel()
@@ -1832,7 +1846,9 @@ class TurnControllerLedgerTest {
       }
       // Let the waiter suspend inside channel.send (attempt recorded, buffer
       // full, writer parked); the delay only lands the suspension, never
-      // guesses `sent`.
+      // guesses `sent`. Phase 5 flake note: fixed 200ms landing sleep. Risk:
+      // low; failure mode is false-red only (pre-send cancel → NOT_ADMITTED
+      // instead of the expected UNKNOWN Pending), never false-green.
       Thread.sleep(200)
       assertFalse("admission must still be suspended in send", deferred.isCompleted)
       deferred.cancel()

@@ -859,8 +859,15 @@ class TurnController(
      * R18-2 system-mark attribution: SKIPPED when no system mark was
      * attempted (final intent, optimistic zero rows); PENDING until the
      * optimistic `onLogicalTurnCancelled` settles, then SUCCESS/FAILED/SEALED.
-     * Updated once by the cancelling host synchronously in NonCancellable;
-     * observed by the background waiter.
+     *
+     * Current (Phase 5 note): no write site exists — every receipt is
+     * constructed SKIPPED and nothing ever CASes it, so the waiter branches
+     * keyed on PENDING (still-settling stall) and FAILED (system-only
+     * repair) are dead, and [isSealedUncompensated] effectively reads
+     * `suppressedFinal && terminalOutcome == true`. Kept as an explicit
+     * dimension (not deleted) so a future optimistic system-mark write has
+     * a cell to land in; wiring that write is Target, not claimed here.
+     * Observed by the background waiter.
      */
     val systemOutcome: AtomicReference<SystemMarkOutcome> =
       AtomicReference(SystemMarkOutcome.SKIPPED),
@@ -922,9 +929,10 @@ class TurnController(
    * settlement continues. The terminal fate is observed via the per-entry
    * outcome ([CancelReceipt.terminalOutcome]: null vs true vs false) and
    * the optimistic system-mark outcome via
-   * ([CancelReceipt.systemOutcome]: SKIPPED/PENDING/SUCCESS/FAILED/SEALED,
-   * captured synchronously at the `onLogicalTurnCancelled` call site in
-   * NonCancellable) — never the aggregated per-runId commitCounts/interrupted
+   * ([CancelReceipt.systemOutcome]: SKIPPED/PENDING/SUCCESS/FAILED/SEALED —
+   * Phase 5 Current: always SKIPPED, no write site exists, so the
+   * PENDING/FAILED branches below are dead; kept as the explicit dimension
+   * for a future optimistic write, see the field KDoc) — never the aggregated per-runId commitCounts/interrupted
    * mix alone, which observes terminal SUCCESS + system FAIL and terminal
    * FAIL + system SUCCESS identically (`commitCount == 2, interrupted ==
    * true, pending == false` for a first-attempt id) and mis-compensated with
@@ -1399,6 +1407,10 @@ class TurnController(
       }
     }
     cancelReceiptWaiters.putIfAbsent(receipt.cancelId, job)
+    // Phase 5: fire the waiter-entered seam synchronously after registration
+    // (see the seam KDoc): awaiting tests then happens-before any later
+    // close snapshot, so the snapshot necessarily contains this job.
+    onCancelReceiptWaiterEnteredForTest?.invoke()
     return job
   }
 
@@ -1441,6 +1453,20 @@ class TurnController(
   fun hasSealedUncompensatedReceipts(): Boolean =
     cancelReceipts.values.any { isSealedUncompensated(it) }
 
+  /**
+   * Phase 5 structural-test seam: read-only snapshot of cancel-receipt
+   * terminal states (`cancelId -> PENDING|REVOKED|CLAIMED|COMPENSATED|SEALED`
+   * name). Exposed so tests assert the waiter handoff without reflecting
+   * into the private [cancelReceipts] map and its `state` cell. The map is
+   * in-memory only (one entry per cancel attempt, never removed, bounded by
+   * the session's attempt count; a kill falls back to reopen INTERRUPTED
+   * backfill), so this snapshot is attempt-liveness evidence, never
+   * cross-restart durability proof — only [flushDurable] plus reopen
+   * backfill prove the ledger.
+   */
+  fun cancelReceiptStates(): Map<String, String> =
+    cancelReceipts.entries.associate { it.key to it.value.state.get().name }
+
   /** Phase 1 SEALED truth predicate (see [hasSealedUncompensatedReceipts]). */
   private fun isSealedUncompensated(receipt: CancelReceipt): Boolean {
     if (receipt.state.get() != CancelReceiptState.SEALED) return false
@@ -1471,6 +1497,20 @@ class TurnController(
 
   /** Test seam for pausing after follow-up policy approval, before handoff. */
   internal var afterFollowUpGateForTest: (() -> Unit)? = null
+
+  /**
+   * Phase 5 waiter-entered seam: runs synchronously after the waiter job
+   * is registered in `cancelReceiptWaiters`, before
+   * [launchCancelReceiptWaiter] returns (non-suspending, null in
+   * production). Lets the close-barrier grid await waiter
+   * launch+registration observably instead of sleeping a fixed 20ms
+   * heuristic: once the seam fires, a later [close] snapshot necessarily
+   * contains the job, so the handoff-before-barrier order no longer races
+   * waiter startup. A cancel still racing [close] concurrently is fenced by
+   * close's re-snapshot join; any residual stays fail-closed
+   * ([hasUnsettledCancelReceipts] still blocks [flushDurable]).
+   */
+  internal var onCancelReceiptWaiterEnteredForTest: (() -> Unit)? = null
 
   /** Test seam for pausing a promotion after its peek-reserve, before the durable await. */
   internal var beforePromotionAwaitForTest: (() -> Unit)? = null
@@ -3114,18 +3154,46 @@ class TurnController(
       } catch (_: CancellationException) {
       }
       try {
-        val waiters = cancelReceiptWaiters.values.toList()
-        if (waiters.isNotEmpty()) {
-          val elapsedMs = (System.nanoTime() - settleStartNs) / 1_000_000L
-          val waiterBudgetMs = (drainTimeoutMs - elapsedMs).coerceAtLeast(0L)
-          withTimeoutOrNull(waiterBudgetMs) {
-            for (waiter in waiters) {
-              try {
-                waiter.join()
-              } catch (_: CancellationException) {
-              }
+        // Phase 5: re-snapshot loop. A cancel racing this close can install
+        // its receipt and launch its waiter between the snapshot above and
+        // the barrier; joining only the first snapshot would let the barrier
+        // pass pre-handoff. Re-read the map and join newcomers within the
+        // same remainder budget (deadline, never a fresh budget). A waiter
+        // that still misses the deadline stays PENDING/CLAIMED and fails
+        // [hasUnsettledCancelReceipts] instead of reporting true-and-dangling.
+        val elapsedMs = (System.nanoTime() - settleStartNs) / 1_000_000L
+        val waiterBudgetMs = (drainTimeoutMs - elapsedMs).coerceAtLeast(0L)
+        val waiterDeadlineNs = System.nanoTime() + waiterBudgetMs * 1_000_000L
+        val joinedWaiters = HashSet<Job>()
+        while (true) {
+          val fresh = cancelReceiptWaiters.values.filter { it !in joinedWaiters }
+          if (fresh.isEmpty()) break
+          val remainingMs = ((waiterDeadlineNs - System.nanoTime()) / 1_000_000L).coerceAtLeast(0L)
+          if (remainingMs <= 0L) break
+          var exhausted = false
+          for (waiter in fresh) {
+            val leftMs = ((waiterDeadlineNs - System.nanoTime()) / 1_000_000L).coerceAtLeast(0L)
+            if (leftMs <= 0L) {
+              exhausted = true
+              break
+            }
+            val done = try {
+              withTimeoutOrNull(leftMs) {
+                try {
+                  waiter.join()
+                } catch (_: CancellationException) {
+                }
+              } != null
+            } catch (_: Throwable) {
+              true
+            }
+            joinedWaiters.add(waiter)
+            if (!done) {
+              exhausted = true
+              break
             }
           }
+          if (exhausted) break
         }
       } catch (_: Throwable) {
         // Best effort: the flush barrier below still drains what was admitted;

@@ -88,7 +88,7 @@ internal fun chatNoticeText(code: String): String =
         "KEY_READ_CONFIRM_REQUIRED" -> "需要本次確認才可讀取金鑰，本次未送出。"
         "CHAT_SEND_DENIED" -> "對話送出被政策拒絕（chat.send DENY），本次未發送任何請求。"
         "CHAT_APPROVAL_REQUIRED" -> "此操作需要明確核准；目前沒有互動核准流程，本次未送出，也未自動允許。"
-        "CHAT_POLICY_UNAVAILABLE" -> "無法驗證對話權限，本次未送出，請稍後重試"
+        "CHAT_POLICY_UNAVAILABLE" -> "無法驗證對話權限，本次未送出，請稍後重試。"
         "CHAT_INPUT_TOO_LONG" -> "輸入過長，本次未送出，請縮短後重試。"
         "CHAT_STORE_UNAVAILABLE" -> "無法寫入對話紀錄，本次未送出，請稍後重試。"
         "CHAT_STORE_PENDING" -> "對話紀錄寫入確認中，結果未定請勿重送。"

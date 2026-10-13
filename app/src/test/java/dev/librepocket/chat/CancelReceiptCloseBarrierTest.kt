@@ -173,19 +173,15 @@ class CancelReceiptCloseBarrierTest {
   }
 
   private fun awaitReceiptTerminal(c: TurnController, timeoutMs: Long = 8_000L): String {
-    val f = TurnController::class.java.getDeclaredField("cancelReceipts")
-    f.isAccessible = true
+    // Phase 5: read-only seam snapshot (see TurnController.cancelReceiptStates),
+    // no reflection into the private receipt map. Structural-test note: the
+    // map is in-memory, attempt-bounded, never removed — a kill falls back to
+    // reopen INTERRUPTED backfill, so this latches attempt liveness, never
+    // cross-restart durability (only flushDurable + reopen prove the ledger).
     val deadline = System.currentTimeMillis() + timeoutMs
     while (System.currentTimeMillis() < deadline) {
-      @Suppress("UNCHECKED_CAST")
-      val map = f.get(c) as java.util.concurrent.ConcurrentHashMap<*, *>
-      val receipt = map.values.singleOrNull()
-      if (receipt != null) {
-        val sf = receipt.javaClass.getDeclaredField("state")
-        sf.isAccessible = true
-        val state = (sf.get(receipt) as java.util.concurrent.atomic.AtomicReference<*>).get().toString()
-        if (state != "PENDING" && state != "CLAIMED") return state
-      }
+      val receipt = c.cancelReceiptStates().values.singleOrNull()
+      if (receipt != null && receipt != "PENDING" && receipt != "CLAIMED") return receipt
       Thread.sleep(25)
     }
     throw AssertionError("receipt never reached a terminal state")
@@ -216,6 +212,24 @@ class CancelReceiptCloseBarrierTest {
       Thread.sleep(25)
     }
     assertTrue("receipt must be unsettled after cancel", c.hasUnsettledCancelReceipts())
+  }
+
+  private fun armWaiterGate(c: TurnController): CountDownLatch {
+    val entered = CountDownLatch(1)
+    c.onCancelReceiptWaiterEnteredForTest = { entered.countDown() }
+    return entered
+  }
+
+  private fun awaitWaiterEntered(entered: CountDownLatch, what: String, timeoutMs: Long = 5_000L) {
+    // Waiter launch+registration gate via the Phase 5 test seam (see
+    // TurnController.onCancelReceiptWaiterEnteredForTest): replaces the old
+    // fixed 20ms sleep heuristic. Once this fires, a later close snapshot
+    // necessarily contains the waiter job, so the handoff-before-barrier
+    // order no longer races waiter startup. Flake risk: low — a cancel still
+    // racing close concurrently is fenced by close's re-snapshot join, and
+    // any residual stays fail-closed (hasUnsettledCancelReceipts blocks
+    // flushDurable; reopen backfill repairs the family).
+    assertTrue("$what: waiter never launched+registered", entered.await(timeoutMs, TimeUnit.SECONDS))
   }
 
   private fun assertNotTrueAndDangling(
@@ -614,8 +628,15 @@ class CancelReceiptCloseBarrierTest {
       awaitLedger(store) { evts ->
         evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
       }
-      // Release the late SUCCESS intermediate, then drain.
-      Thread.sleep(900)
+      // Double latch, no wall-clock sleep (Phase 5): the stalled terminal
+      // commits on its own stall clock — latch the late assistant row in the
+      // ledger first, then re-latch the SEALED terminal (still SEALED: a
+      // post-seal SUCCESS never revokes, the family stays dangling for
+      // backfill). Timing note: maxRounds=3 bounds the waiter to ~350ms of
+      // polling vs the 800ms stall, so SEALED-before-SUCCESS holds by a
+      // ~450ms margin on any scheduler that runs the waiter at all.
+      awaitLedger(store) { evts -> evts.any { it.kind == "assistant" } }
+      assertEquals("SEALED", awaitReceiptTerminal(c))
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
       val kinds = store.events.map { it.kind }
       assertEquals(listOf("user", "assistant", "retry"), kinds)
@@ -786,14 +807,16 @@ class CancelReceiptCloseBarrierTest {
     }
     val n = AtomicInteger(0)
     val c = controller(provider, SessionTranscriptSink(store, sid), n, "r192-gate")
+    val entered = armWaiterGate(c)
     try {
       val host = startedHost(c)
       assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
       c.cancel()
-      // The waiter installed its receipt and is inside its first 50ms poll
-      // sleep (terminal still stalled on the gate).
+      // The waiter installed its receipt and launched+registered (seam gate
+      // below replaces the old fixed 20ms sleep heuristic); the terminal is
+      // still stalled on the gate.
       awaitUnsettled(c)
-      Thread.sleep(20)
+      awaitWaiterEntered(entered, "r192-gate")
       // Shutdown settle: the doomed join parks on the stalled host; the
       // waiter snapshot + flush barrier are queued behind it.
       c.close(drainTimeoutMs = 450L)
@@ -846,12 +869,13 @@ class CancelReceiptCloseBarrierTest {
     }
     val n = AtomicInteger(0)
     val c = controller(provider, SessionTranscriptSink(store, sid), n, "r192-late")
+    val entered = armWaiterGate(c)
     try {
       startedHost(c)
       assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
       c.cancel()
       awaitUnsettled(c)
-      Thread.sleep(20)
+      awaitWaiterEntered(entered, "r192-late")
       c.close(drainTimeoutMs = 450L)
       // Do NOT release the gate: let the 450ms settle budget exhaust, the
       // barrier flush, and the seal land first.
@@ -907,12 +931,13 @@ class CancelReceiptCloseBarrierTest {
       provider, SessionTranscriptSink(store, sid), n, "r192-eqfail",
       settleMs = 500L,
     )
+    val entered = armWaiterGate(c)
     try {
       startedHost(c)
       assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
       c.cancel()
       awaitUnsettled(c)
-      Thread.sleep(20)
+      awaitWaiterEntered(entered, "r192-eqfail")
       c.close(drainTimeoutMs = 500L)
       // Seal lands while the terminal is still parked on the gate.
       awaitSealed(c)
@@ -963,12 +988,13 @@ class CancelReceiptCloseBarrierTest {
       provider, SessionTranscriptSink(store, sid), n, "r192-eqok",
       settleMs = 500L,
     )
+    val entered = armWaiterGate(c)
     try {
       startedHost(c)
       assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
       c.cancel()
       awaitUnsettled(c)
-      Thread.sleep(20)
+      awaitWaiterEntered(entered, "r192-eqok")
       c.close(drainTimeoutMs = 500L)
       awaitSealed(c)
       assertEquals(1, store.assistantCalls.get())
@@ -993,5 +1019,65 @@ class CancelReceiptCloseBarrierTest {
       runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
     }
     assertReopenAddsSingleInterrupted(store, sid)
+  }
+
+  @Test fun equalBudget_earlyTerminal_handsOff_noSeal_durableTrue() {
+    // Phase 5 positive control for the T3 pair above (same 500 == 500
+    // shape): the gate releases BEFORE close, so the terminal SUCCESS and
+    // its deferred system mark linearize before the barrier — the
+    // remaining-budget fence must hand off (never SEAL) and flushDurable
+    // must report true. Proves the T3 SEALED outcomes come from the
+    // late-terminal order, not from the equal budgets themselves.
+    val store = R192GateStore(failWith = null)
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(
+      provider, SessionTranscriptSink(store, sid), n, "r192-early",
+      settleMs = 500L,
+    )
+    val entered = armWaiterGate(c)
+    try {
+      val host = startedHost(c)
+      assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      awaitWaiterEntered(entered, "early-terminal hands-off")
+      // Hands off before the seal: release the parked terminal while the
+      // waiter still polls, then latch the deferred system mark + handoff.
+      store.gate.complete(Unit)
+      runBlocking { withTimeout(8_000) { host.join() } }
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 1
+      }
+      val terminal = awaitReceiptTerminal(c)
+      // Equal-budget close after the handoff: nothing owed, barrier drains.
+      c.close(drainTimeoutMs = 500L)
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "equal-budget early-terminal hands-off")
+      assertEquals(listOf("user", "assistant", "retry", "system"), store.events.map { it.kind })
+      assertEquals("half", store.events.single { it.kind == "assistant" }.text)
+      assertTrue(findDanglingRunIds(store.events).isEmpty())
+      assertFalse(c.hasUnsettledCancelReceipts())
+      assertFalse(
+        "early terminal must not leave a sealed-uncompensated receipt",
+        c.hasSealedUncompensatedReceipts(),
+      )
+      assertTrue(
+        "early terminal must hand off, never SEAL, was $terminal",
+        terminal == "REVOKED" || terminal == "COMPENSATED",
+      )
+      assertTrue("handed-off ledger must drain durable, was $durable", durable)
+    } finally {
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    openTwiceConsistent(store, sid)
+    assertCrossOriginForkClean(store, sid)
   }
 }

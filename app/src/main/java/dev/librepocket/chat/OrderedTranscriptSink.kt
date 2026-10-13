@@ -1159,6 +1159,13 @@ class OrderedTranscriptSink(
    * Async: the synchronous part only launches this work, so `close()` stays
    * fast even when the store stalls. Returns the background drain job so
    * [TurnController.flushTranscript] can await the full settle+drain+seal.
+   *
+   * Budget truth (Phase 5): the background job spends up to ~3x
+   * [drainTimeoutMs] total — settle ≤ 1x, flush barrier ≤ 1x (full budget,
+   * not the settle remainder), writer-join ≤ 1x. A caller awaiting it via
+   * flush-then-drain observes up to ~2x its own [flush] timeout (shutdown-join
+   * 1x + admitted-drain 1x); the background job may still be inside its third
+   * budget when the caller stops waiting.
    */
   fun shutdown(
     drainTimeoutMs: Long = DEFAULT_DRAIN_TIMEOUT_MS,

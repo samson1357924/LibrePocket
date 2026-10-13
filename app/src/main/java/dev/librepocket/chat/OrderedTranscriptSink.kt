@@ -127,8 +127,11 @@ class OrderedTranscriptSink(
    * channel send, never on persistence), attempts its own send, then
    * completes its gate (waking exactly one successor) and CAS-clears the
    * tail when still current. Gates always complete normally with Unit — even
-   * on cancellation, timeout, or seal — so an abandoned slot skips without
-   * sticking its successor. Completion precedes the CAS clear so a newcomer
+   * on cancellation, timeout, or seal — so a pre-send abandoned slot stays
+   * parked via a writerScope forwarder awaiting its predecessor instead of
+   * skipping past a still-waiting admission; the CAS clear rides with the
+   * forwarder so a newcomer arriving after a tail cancel links behind the
+   * abandoned gate. Completion precedes the CAS clear so a newcomer
    * arriving between the two can never fast-path past an already-linked
    * successor.
    *
@@ -194,6 +197,12 @@ class OrderedTranscriptSink(
    * run strictly after the monitor is released (guarded by
    * `check(!Thread.holdsLock(admissionLock))`). Global order is always
    * controller → admissionLock, never reversed.
+   *
+   * D15-1: the hook runs after the link is taken. A hook throw abandons the
+   * slot pre-send (never awaited its predecessor), so the gate MUST go
+   * through [releaseAbandoned] (deferred forwarding), never an immediate
+   * complete — otherwise the successor is woken past a still-waiting
+   * predecessor and a tail clear lets a newcomer fast-path past everyone.
    */
   private fun reserveAdmission(): Admission {
     val gate = CompletableDeferred<Unit>()
@@ -207,7 +216,7 @@ class OrderedTranscriptSink(
       checkNotHoldingAdmissionLock("onAdmissionReservedForTest")
       onAdmissionReservedForTest?.invoke(ticket)
     } catch (e: Throwable) {
-      releaseAdmission(gate)
+      releaseAbandoned(Admission(ticket, prev, gate))
       throw e
     }
     return Admission(ticket, prev, gate)
@@ -220,6 +229,61 @@ class OrderedTranscriptSink(
       // Idempotent best effort: a cancelled/completed gate still wakes.
     }
     admissionChain.compareAndSet(gate, null)
+  }
+
+  /**
+   * D15-1 deferred forwarding gate for every pre-send (!sendInvoked) abandon
+   * path (pre-send CE, liveness throw, hook Exception with the send never
+   * invoked, await CE in writeOrdered/offerSteer/flush, tail cancel).
+   *
+   * The caller rethrows immediately; the gate completion is delegated to a
+   * forwarder living in [writerScope] (decoupled from the caller, never a
+   * NonCancellable infinite await around the abandon path):
+   * - `prev == null` or already completed: no predecessor to preserve, so
+   *   complete immediately (identical to [releaseAdmission]).
+   * - otherwise `writerScope.launch { prev.await(); complete(gate) }`: the
+   *   successor stays parked behind the predecessor via this gate, exactly as
+   *   if the abandoned slot had waited. The gate always completes normally
+   *   with Unit (never exceptionally, so no successor mistakes it for its own
+   *   cancellation), and the chain CAS clear rides with the forwarder — the
+   *   tail is never nulled while a predecessor is still pending, so a
+   *   newcomer arriving after a tail cancel links behind the abandoned gate
+   *   instead of fast-pathing past everyone.
+   * - `invokeOnCompletion` seal fallback: if the scope is cancelled under the
+   *   forwarder (body never runs or await torn down), complete immediately so
+   *   the chain never sticks; successors then hit the seal/ClosedSend path.
+   *
+   * Post-send (`sendInvoked == true`) paths keep the immediate
+   * [releaseAdmission]: the predecessor was already awaited, so the successor
+   * transitively waited and waking it is order-safe.
+   */
+  private fun releaseAbandoned(reservation: Admission) {
+    val prev = reservation.prev
+    val gate = reservation.gate
+    if (prev == null || prev.isCompleted) {
+      releaseAdmission(gate)
+      return
+    }
+    try {
+      val fwd = writerScope.launch {
+        try {
+          try {
+            prev.await()
+          } catch (_: Throwable) {
+            // Predecessor abnormal (forwarder torn down with the scope):
+            // still forward normally so the successor never sticks; the
+            // seal/ClosedSend path below settles delivery.
+          }
+        } finally {
+          releaseAdmission(gate)
+        }
+      }
+      fwd.invokeOnCompletion {
+        if (!gate.isCompleted) releaseAdmission(gate)
+      }
+    } catch (_: Throwable) {
+      if (!gate.isCompleted) releaseAdmission(gate)
+    }
   }
 
   /**
@@ -485,9 +549,10 @@ class OrderedTranscriptSink(
     } catch (e: CancellationException) {
       if (!sendInvoked) {
         // Proven: the send was never attempted — the entry never entered
-        // the channel, so drop the pending mark and propagate. The gate is
-        // still completed normally by the finally below, skipping the slot
-        // without sticking the successor.
+        // the channel, so drop the pending mark and propagate. D15-1: the
+        // gate MUST NOT complete here — it is delegated to the forwarder by
+        // the finally below, so the successor stays parked behind this slot's
+        // predecessor instead of overtaking a still-waiting admission.
         coreAcks.remove(ack)
         pendingCore.remove(runId)
         throw e
@@ -521,7 +586,14 @@ class OrderedTranscriptSink(
       // Gate signals send *attempt*, not persistence: successors may attempt
       // their sends as soon as this entry is buffered, while this waiter
       // moves on to the durable ack below. Always completes normally.
-      releaseAdmission(reservation.gate)
+      // D15-1: pre-send abandon (!sendInvoked, never awaited-or-attempted)
+      // defers to the forwarder so the successor cannot overtake a
+      // still-waiting predecessor and the tail CAS is not cleared early;
+      // post-send (sendInvoked, predecessor already awaited) completes
+      // immediately — the successor transitively waited and waking it is
+      // order-safe.
+      if (sendInvoked) releaseAdmission(reservation.gate)
+      else releaseAbandoned(reservation)
     }
     try {
       ack.await()
@@ -553,18 +625,24 @@ class OrderedTranscriptSink(
     // No catch: admission failure is the caller's explicit signal.
     // CancellationException propagates to the cancelled caller, and
     // ClosedSendChannelException (sealed after shutdown) propagates to the
-    // caller instead of succeeding silently. The finally still completes the
-    // gate normally so an abandoned slot never sticks its successor.
+    // caller instead of succeeding silently.
     // Stage 3 (R4-5): same synchronous reservation as cores, so a waiting
     // notice holds its place ahead of later arrivals.
+    // D15-1: pre-send abandon (!sendInvoked, await CE or hook throw before
+    // the send) defers to the forwarder like cores; post-send (send invoked,
+    // predecessor already awaited) completes immediately. The gate always
+    // completes normally so an abandoned slot never sticks its successor.
     val reservation = reserveAdmission()
+    var sendInvoked = false
     try {
       reservation.prev?.await()
       checkNotHoldingAdmissionLock("beforeSendForTest:writeOrdered")
       beforeSendForTest?.invoke(reservation.ticket)
+      sendInvoked = true
       channel.send(Entry(runId = null, block))
     } finally {
-      releaseAdmission(reservation.gate)
+      if (sendInvoked) releaseAdmission(reservation.gate)
+      else releaseAbandoned(reservation)
     }
   }
 
@@ -599,7 +677,7 @@ class OrderedTranscriptSink(
     val entry = Entry(runId = null, block = { delegate.onSteerQueued(text) })
     // Synchronous, non-suspending reservation: the single linearization
     // point. Only test hooks throw here, and reserveAdmission already
-    // released the slot on that path.
+    // delegated the slot (deferred forwarding when pre-send) on that path.
     val reservation = reserveAdmission()
     if (reservation.prev == null) {
       // No predecessor: try immediate admission without parking.
@@ -636,23 +714,35 @@ class OrderedTranscriptSink(
       return
     }
     val job = writerScope.launch {
+      // D15-1: pre-send abandon (await CE / hook throw before the send)
+      // defers to the forwarder; post-send completes immediately. The gate
+      // always completes normally with Unit.
+      var sendInvoked = false
       try {
         // Admission order, not launch order: the predecessor's gate completes
         // once its send was attempted, so this send runs strictly after it.
         reservation.prev.await()
         checkNotHoldingAdmissionLock("beforeSendForTest:offerSteerQueued")
         beforeSendForTest?.invoke(reservation.ticket)
+        sendInvoked = true
         channel.send(entry)
       } catch (e: CancellationException) {
         throw e
       } catch (_: ClosedSendChannelException) {
         // Sealed after shutdown: no recovery path, drop explicitly.
       } finally {
-        releaseAdmission(reservation.gate)
+        if (sendInvoked) releaseAdmission(reservation.gate)
+        else releaseAbandoned(reservation)
       }
     }
+    // D15-1: the fallback must also defer (not immediate-complete), or it
+    // would wake the successor past a still-waiting predecessor whenever the
+    // body delegated to a forwarder and the gate is still pending. The
+    // duplicate forwarder is idempotent; the scope-cancel case still falls
+    // back to an immediate complete inside the forwarder's own handler so
+    // the chain never sticks behind a dead scope.
     job.invokeOnCompletion {
-      if (!reservation.gate.isCompleted) releaseAdmission(reservation.gate)
+      if (!reservation.gate.isCompleted) releaseAbandoned(reservation)
     }
   }
 
@@ -690,11 +780,16 @@ class OrderedTranscriptSink(
       return withTimeoutOrNull(timeoutMs) {
         awaitAdmissionTail()
         val reservation = reserveAdmission()
+        // D15-1: pre-send abandon (await CE / hook throw / timeout before the
+        // barrier send) defers to the forwarder; post-send completes
+        // immediately. The gate always completes normally.
+        var sendInvoked = false
         try {
           reservation.prev?.await()
           val barrier = CompletableDeferred<Unit>()
           checkNotHoldingAdmissionLock("beforeSendForTest:flush")
           beforeSendForTest?.invoke(reservation.ticket)
+          sendInvoked = true
           try {
             channel.send(Entry(runId = null, block = {}, barrier))
           } catch (_: ClosedSendChannelException) {
@@ -709,9 +804,12 @@ class OrderedTranscriptSink(
           releaseAdmission(reservation.gate)
           barrier.await()
         } finally {
-          // Always completes normally, including on timeout abandonment, so
-          // the chain never sticks.
-          releaseAdmission(reservation.gate)
+          // D15-1: a timeout/cancel abandoning the reserved slot before the
+          // send defers to the forwarder (never an immediate complete past a
+          // still-waiting predecessor); post-send is already released above
+          // and this stays idempotent. The chain never sticks either way.
+          if (sendInvoked) releaseAdmission(reservation.gate)
+          else releaseAbandoned(reservation)
         }
       } != null
     } catch (e: CancellationException) {

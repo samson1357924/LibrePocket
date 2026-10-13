@@ -445,6 +445,14 @@ class TurnControllerCancelAttributionTest {
       assertEquals(1, sink.started.size)
       assertEquals("Q-closed", sink.started.single().second)
       val closedLogicalId = sink.started.single().first
+      // flushTranscript does not join the NonCancellable drain job, so the
+      // cancel row / interrupt mark may land after flush returns. Poll
+      // boundedly for either trace before asserting; genuine loss still
+      // times out and fails instead of masking the regression.
+      awaitTrue {
+        (sink.cancelled.size == 1 && sink.cancelled.single().first == closedLogicalId) ||
+          c.interruptedTranscriptRunIds().contains(closedLogicalId)
+      }
       val hasClosedCancel =
         sink.cancelled.size == 1 && sink.cancelled.single().first == closedLogicalId
       val closedInterrupted = c.interruptedTranscriptRunIds().contains(closedLogicalId)

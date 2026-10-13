@@ -3943,7 +3943,9 @@ class ChatViewModel(
      * R6-3 IO-bounded settle for a just-detached old session: close (settle)
      * then durable flush, one [SESSION_FLUSH_TIMEOUT_MS] budget per phase
      * (~2x total after close). Returns true only when the drain completed AND
-     * no durable failure was recorded; false (timeout / flushDurable false /
+     * no durable failure was recorded AND no cancel receipt is still unsettled
+     * (R19-1 PENDING/CLAIMED via [ChatSession.hasUnsettledCancelReceipts],
+     * conjoined inside `flushDurable`); false (timeout / flushDurable false /
      * store throw) means the fork must degrade via the incomplete path (see
      * `ensureSession`). Caller cancellation still propagates.
      */
@@ -4394,9 +4396,13 @@ class ChatViewModel(
     /**
      * R6-3 streaming evidence for the incomplete fallback: true while the old
      * session may still be missing its terminal record — live STREAMING /
-     * CANCELLED / WAITING_STEERED projection, a pending UNKNOWN admission, or
-     * admitted-but-unacked core runIds. Best-effort (never throws): a failed
-     * read means "no evidence", never "incomplete".
+     * CANCELLED / WAITING_STEERED projection, a pending UNKNOWN admission, an
+     * unsettled cancel receipt (R19-1 PENDING/CLAIMED: the deferred
+     * system/batch write is still owed), or admitted-but-unacked core runIds.
+     * Best-effort (never throws): a failed read means "no evidence", never
+     * "incomplete". Per-session ownership: only the passed (source) session's
+     * receipts are consulted, so a fresh session never inherits an old
+     * session's evidence.
      */
     private fun isLedgerStreamingOrPending(session: ChatSession?): Boolean {
         if (session == null) return false
@@ -4409,6 +4415,10 @@ class ChatViewModel(
         }
         try {
             if (session.hasPendingAdmission()) return true
+        } catch (_: Exception) {
+        }
+        try {
+            if (session.hasUnsettledCancelReceipts()) return true
         } catch (_: Exception) {
         }
         return try {

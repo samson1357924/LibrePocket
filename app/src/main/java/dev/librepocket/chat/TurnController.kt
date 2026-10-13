@@ -839,6 +839,18 @@ class TurnController(
     java.util.concurrent.ConcurrentHashMap()
 
   /**
+   * R19-1 receipt waiter jobs keyed by cancelId (same attempt boundary as
+   * [cancelReceipts]: one entry per cancel attempt, never removed, bounded
+   * by the session's attempt count). [launchCancelReceiptWaiter] registers
+   * here; [close]'s shutdown settle joins the snapshot after the doomed-host
+   * + orphan joins and before the flush barrier, so a terminal outcome
+   * handoff (CLAIM/REVOKED/COMPENSATED/SEALED) always precedes the barrier
+   * and any compensation admission lands before `channel.close()`.
+   */
+  private val cancelReceiptWaiters: java.util.concurrent.ConcurrentHashMap<String, Job> =
+    java.util.concurrent.ConcurrentHashMap()
+
+  /**
    * R17-1 P1 late-writer compensation waiter (background, NonCancellable).
    *
    * Runs in [writerScope] (independent of the cancelled host) so the UI
@@ -919,10 +931,13 @@ class TurnController(
    * write is re-checked pre-write and revokes (CLAIMED→REVOKED, no row
    * written yet, optimistic stands).
    */
-  private fun launchCancelReceiptWaiter(receipt: CancelReceipt) {
+  private fun launchCancelReceiptWaiter(receipt: CancelReceipt): Job {
     // Child of writerScope (cancelled on shutdown teardown → degrades to
     // SEALED/backfill); compensation writes below re-enter NonCancellable.
-    writerScope.launch {
+    // R19-1: the job is registered by cancelId (same attempt boundary as
+    // [cancelReceipts]) so [close]'s shutdown settle can bounded-join it
+    // before the flush barrier (see [close]).
+    val job = writerScope.launch {
       fun committedThreshold(count: Int): Boolean =
         if (receipt.cancelId == receipt.logicalTurnId) count >= 2 else count >= 1
       fun terminalCommitted(): Boolean {
@@ -1086,7 +1101,16 @@ class TurnController(
         var backoffMs = 50L
         var waits = 0
         while (true) {
-          if (orderedTranscript.isSealed() || synchronized(lock) { closed }) {
+          // R19-1: only the channel seal (not controller [closed]) degrades
+          // here. [close]'s shutdown settle bounded-joins this waiter BEFORE
+          // the flush barrier, so a receipt still owed its handoff when close
+          // lands must keep polling until the terminal outcome resolves and
+          // the compensation is admitted pre-`channel.close()` — bailing on
+          // [closed] would seal the family dangling while the terminal (and
+          // its compensation window) is still alive, producing
+          // true-and-dangling. Post-seal the channel truth ([isSealed] /
+          // ClosedSendChannelException below) still degrades to SEALED.
+          if (orderedTranscript.isSealed()) {
             receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.SEALED)
             break
           }
@@ -1099,7 +1123,7 @@ class TurnController(
           // system cancelled in order; FAILED → atomic batch
           // partial(non-final)+system(final) via one appendEvents unit.
           // Still-pending → back off with [cancelReceiptMaxRounds]; timeout /
-          // seal / close writes no terminal row (family stays dangling,
+          // seal writes no terminal row (family stays dangling,
           // reopen INTERRUPTED takes over). Per-entry outcome is authoritative
           // (Stage 1 preserved); legacy acked/committed thresholds (>=2 first
           // attempt, >=1 fresh retry) are kept as the commit fast-path.
@@ -1131,7 +1155,11 @@ class TurnController(
             if (!receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.CLAIMED)) break
             try {
               withContext(NonCancellable) {
-                if (orderedTranscript.isSealed() || synchronized(lock) { closed }) {
+                // R19-1: seal-only gate (see the loop-top note): the settle
+                // join holds the barrier open for this CLAIM, so controller
+                // [closed] must not revoke the admission — only a real seal
+                // (or a failed/bounded write below) degrades to SEALED.
+                if (orderedTranscript.isSealed()) {
                   receipt.state.set(CancelReceiptState.SEALED)
                 } else {
                   // Pre-write re-check (no suspend between CLAIM and these
@@ -1252,7 +1280,8 @@ class TurnController(
           if (!receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.CLAIMED)) break
           try {
             withContext(NonCancellable) {
-              if (orderedTranscript.isSealed() || synchronized(lock) { closed }) {
+              // R19-1: seal-only gate (see the loop-top note).
+              if (orderedTranscript.isSealed()) {
                 receipt.state.set(CancelReceiptState.SEALED)
               } else {
                 // Pre-write re-check: commit/ack landing between CLAIM and
@@ -1338,7 +1367,26 @@ class TurnController(
         receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.SEALED)
       }
     }
+    cancelReceiptWaiters.putIfAbsent(receipt.cancelId, job)
+    return job
   }
+
+  /**
+   * R19-1 read-only receipt settle proof: true while any cancel receipt is
+   * still PENDING (awaiting the terminal outcome) or CLAIMED (compensation
+   * write in flight). Terminal states (REVOKED/COMPENSATED/SEALED) are
+   * settled. Lock-free (ConcurrentHashMap + AtomicReference reads); never
+   * suspends. [flushDurable] conjoins this so a drained-but-uncompensated
+   * ledger never reports true-and-dangling; the ViewModel treats it as
+   * same-level downgrade evidence (see `isLedgerStreamingOrPending`).
+   */
+  fun hasUnsettledCancelReceipts(): Boolean =
+    cancelReceipts.values.any {
+      when (it.state.get()) {
+        CancelReceiptState.PENDING, CancelReceiptState.CLAIMED -> true
+        else -> false
+      }
+    }
 
   /**
    * D15-2 test seam: runs in [runTurnLoop] immediately after a terminal ack
@@ -2811,11 +2859,29 @@ class TurnController(
     // Bounded ledger drain on the session-owned writer (independent of
     // [scope], so it survives the cancel above): settle the doomed host first
     // so its non-cancellable terminal record is admitted ahead of the flush
-    // barrier, then drain, then seal. Core runIds still unacked afterwards are
-    // exposed via [interruptedTranscriptRunIds], never silently dropped. The
-    // synchronous part only launches this work, so close() stays fast even
-    // when the store stalls; await it via [flushTranscript]. The job is
-    // published under [lock] so a concurrent [flushTranscript] observes it.
+    // barrier, then receipt outcome handoff, then drain, then seal. Core runIds
+    // still unacked afterwards are exposed via [interruptedTranscriptRunIds],
+    // never silently dropped. The synchronous part only launches this work, so
+    // close() stays fast even when the store stalls; await it via
+    // [flushTranscript]. The job is published under [lock] so a concurrent
+    // [flushTranscript] observes it.
+    //
+    // R19-1 order: host settle → receipt outcome handoff
+    // (CLAIM/REVOKED/COMPENSATED/SEALED terminal) → flush barrier → seal.
+    // The waiter snapshot is taken AFTER the doomed-host + orphan joins (a
+    // receipt is installed synchronously before its host completes, so the
+    // join happens-before the snapshot and no host-installed receipt is
+    // missed; post-seal admissions are impossible since [closed] is set).
+    // The waiter join is nested inside the outer [OrderedTranscriptSink.shutdown]
+    // settle budget, which bounds the whole settle (doomed-host + orphan +
+    // waiters) to [drainTimeoutMs] — the entire settle never exceeds it. The
+    // inner withTimeoutOrNull only short-circuits the waiter phase within
+    // whatever outer budget the host/orphan joins left. A timeout leaves
+    // the receipt PENDING/CLAIMED: the waiter later observes the seal and
+    // degrades to SEALED/backfill, and [flushDurable] stays false via
+    // [hasUnsettledCancelReceipts] (never true-and-dangling). Compensation
+    // writes run inside the waiter job, hence before the barrier and before
+    // `channel.close()`.
     val shutdown = orderedTranscript.shutdown(drainTimeoutMs) {
       try {
         doomed?.join()
@@ -2826,6 +2892,23 @@ class TurnController(
         val drain = synchronized(lock) { orphanDrainJob } ?: orphanJob
         drain?.join()
       } catch (_: CancellationException) {
+      }
+      try {
+        val waiters = cancelReceiptWaiters.values.toList()
+        if (waiters.isNotEmpty()) {
+          withTimeoutOrNull(drainTimeoutMs) {
+            for (waiter in waiters) {
+              try {
+                waiter.join()
+              } catch (_: CancellationException) {
+              }
+            }
+          }
+        }
+      } catch (_: Throwable) {
+        // Best effort: the flush barrier below still drains what was admitted;
+        // an unhanded receipt stays PENDING/CLAIMED and fails
+        // [hasUnsettledCancelReceipts] instead of reporting true-and-dangling.
       }
     }
     shutdown?.invokeOnCompletion {
@@ -2867,12 +2950,17 @@ class TurnController(
 
   /**
    * Suspends until every transcript event admitted so far is persisted and verifies
-   * that no durable store failure occurred.
+   * that no durable store failure occurred and no cancel receipt is still unsettled.
    *
-   * Returns true only when [flushTranscript] drains within [timeoutMs] AND [hasDurableFailures] is false.
+   * Returns true only when [flushTranscript] drains within [timeoutMs] AND [hasDurableFailures] is false
+   * AND [hasUnsettledCancelReceipts] is false. The third conjunct is the R19-1
+   * close-barrier guard: a drained ledger whose receipt waiter still owes its
+   * deferred system/batch write (PENDING/CLAIMED) reports false instead of
+   * true-and-dangling, so callers degrade (skip dangling families +
+   * incomplete marker) rather than snapshotting an orphan user row.
    */
   suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
-    flushTranscript(timeoutMs) && !hasDurableFailures()
+    flushTranscript(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts()
 
   /**
    * Core runIds admitted but never acked (drain timeout / seal race).

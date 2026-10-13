@@ -1,0 +1,577 @@
+package dev.librepocket.chat
+
+import dev.librepocket.agent.ui.chat.ChatSessionFactory
+import dev.librepocket.agent.ui.chat.SessionStoreSource
+import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.cancelledMarkerText
+import dev.librepocket.agent.ui.chat.findDanglingRunIds
+import dev.librepocket.agent.ui.setup.EndpointConfig
+import dev.librepocket.keystore.EncryptedPrefsVault
+import dev.librepocket.keystore.InMemoryPrefs
+import dev.librepocket.policy.InMemoryPolicyStore
+import dev.librepocket.policy.PolicyDecision
+import dev.librepocket.policy.PolicyRule
+import dev.librepocket.policy.PolicyStore
+import dev.librepocket.policy.Verdict
+import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderProtocol as ProviderProto
+import dev.librepocket.provider.StreamEvent
+import dev.librepocket.session.FakeSessionStore
+import dev.librepocket.session.JsonlCodec
+import dev.librepocket.session.SessionTranscriptSink
+import dev.librepocket.session.TranscriptEvent
+import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+private class R191Provider(
+  var handler: (ChatRequest) -> Flow<StreamEvent> = { emptyFlow() },
+) : LlmProvider {
+  override val protocol: ProviderProto = ProviderProto.CHAT_COMPLETIONS
+  override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
+    emitAll(handler(request))
+  }
+  override suspend fun listModels(): List<String> = emptyList()
+}
+
+private class R191Policy : PolicyStore {
+  override fun evaluate(action: String, resource: String) =
+    PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+  override suspend fun setRule(rule: PolicyRule) = Unit
+  override suspend fun removeRule(pattern: String) = Unit
+  override suspend fun listRules(): List<PolicyRule> = emptyList()
+  override suspend fun evaluateFresh(action: String, resource: String) =
+    PolicyDecision(Verdict.ALLOW, null, System.currentTimeMillis())
+}
+
+private class R191ReopenProvider : LlmProvider {
+  override val protocol: ProviderProto = ProviderProto.CHAT_COMPLETIONS
+  override fun stream(request: ChatRequest): Flow<StreamEvent> = emptyFlow()
+  override suspend fun listModels(): List<String> = emptyList()
+}
+
+/**
+ * R19-1 regressions: the cancel-receipt waiter must hand its terminal
+ * outcome off before the close flush barrier, and [TurnController.flushDurable]
+ * must conjoin "no PENDING/CLAIMED receipt" so an immediate close never
+ * reports true-and-dangling.
+ *
+ * Each test uses a controlled store gate (stalled terminal write): cancel
+ * installs the receipt while SUBMITTING, then [TurnController.close] runs
+ * immediately (no host join — the New Chat / endpoint-switch interleave).
+ * Order under test: host settle → receipt outcome handoff
+ * (CLAIM/REVOKED/COMPENSATED/SEALED terminal) → flush barrier → seal, with
+ * the compensation admission landing before `channel.close()`.
+ *
+ * Paths: FAILED atomic batch, SUCCESS deferred system mark, final-intent
+ * zero-row revoke, fresh-retry id, reasoning marker. A sixth test pins the
+ * live [flushDurable] conjunction directly (terminal settled, waiter not yet
+ * awake) plus source-session ownership (a fresh session never claims the old
+ * receipt). Every ledger-shape test finishes with real
+ * [ChatSessionFactory.open] twice (second open adds zero).
+ *
+ * Existing guards (deadline-expired SEALED, pre-compensation-death seed,
+ * old-gap user+system) stay in [RetryableCancelNoticeFirstTest] untouched.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [33])
+class CancelReceiptCloseBarrierTest {
+
+  companion object {
+    private const val SETTLE_MS = 300L
+    private const val STALL_MS = 600L
+    private const val MODEL = "preset:openai@https://api.openai.com/gpt-4o-mini"
+  }
+
+  private open class R191LateStore(
+    val stallMs: Long = STALL_MS,
+    val failPredicate: (call: Int) -> Boolean = { true },
+    val failWith: IOException? = IOException("late writer failure"),
+  ) : FakeSessionStore() {
+    val assistantCalls = AtomicInteger(0)
+    val assistantEntered = CountDownLatch(1)
+    override suspend fun appendEvent(event: TranscriptEvent): Long {
+      if (event.kind == "assistant") {
+        val n = assistantCalls.incrementAndGet()
+        if (failPredicate(n)) {
+          assistantEntered.countDown()
+          kotlinx.coroutines.delay(stallMs)
+          failWith?.let { throw it }
+        }
+      }
+      return super.appendEvent(event)
+    }
+  }
+
+  private fun controller(
+    provider: R191Provider,
+    sink: SessionTranscriptSink,
+    n: AtomicInteger,
+    prefix: String,
+    retry: TurnRetryConfig = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(5_000L)),
+  ): TurnController = TurnController(
+    provider = provider,
+    policy = R191Policy(),
+    transcript = sink,
+    retryConfig = retry,
+    dispatcher = Dispatchers.Default,
+    sleeper = {},
+    newId = { "$prefix-${n.incrementAndGet() - 1}" },
+    cancelSettleTimeoutMs = SETTLE_MS,
+    cancelCompensationTimeoutMs = 5_000L,
+    cancelReceiptMaxRounds = 60,
+  )
+
+  private fun endpoint(): EndpointConfig = EndpointConfig(
+    providerId = "preset:openai",
+    presetId = "openai",
+    label = "OpenAI",
+    baseUrl = "https://api.openai.com/v1",
+    protocol = ProviderProto.CHAT_COMPLETIONS,
+    model = "gpt-4o-mini",
+    apiKeyRef = "provider_key/preset:openai",
+  )
+
+  private fun factory(store: FakeSessionStore): ChatSessionFactory = ChatSessionFactory(
+    policy = InMemoryPolicyStore(),
+    vaultSource = VaultSource {
+      val vault = EncryptedPrefsVault(InMemoryPrefs())
+      vault.putKey("preset:openai", "test-key-12345678".toCharArray())
+      vault
+    },
+    buildProvider = { _, _ -> R191ReopenProvider() },
+    sessionStores = object : SessionStoreSource {
+      override suspend fun store() = store
+    },
+  )
+
+  private fun startedHost(c: TurnController): kotlinx.coroutines.Job {
+    val admission = runBlocking { c.startOrEnqueue("hi") }
+    assertTrue("admission must start, was $admission", admission is TurnStart.Started)
+    return (admission as TurnStart.Started).host
+  }
+
+  private fun awaitReceiptTerminal(c: TurnController, timeoutMs: Long = 8_000L): String {
+    val f = TurnController::class.java.getDeclaredField("cancelReceipts")
+    f.isAccessible = true
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (System.currentTimeMillis() < deadline) {
+      @Suppress("UNCHECKED_CAST")
+      val map = f.get(c) as java.util.concurrent.ConcurrentHashMap<*, *>
+      val receipt = map.values.singleOrNull()
+      if (receipt != null) {
+        val sf = receipt.javaClass.getDeclaredField("state")
+        sf.isAccessible = true
+        val state = (sf.get(receipt) as java.util.concurrent.atomic.AtomicReference<*>).get().toString()
+        if (state != "PENDING" && state != "CLAIMED") return state
+      }
+      Thread.sleep(25)
+    }
+    throw AssertionError("receipt never reached a terminal state")
+  }
+
+  private fun awaitLedger(
+    store: FakeSessionStore,
+    timeoutMs: Long = 8_000L,
+    cond: (List<TranscriptEvent>) -> Boolean,
+  ) {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (System.currentTimeMillis() < deadline) {
+      val snapshot: List<TranscriptEvent> = synchronized(store.events) {
+        ArrayList(store.events)
+      }
+      if (cond(snapshot)) return
+      Thread.sleep(25)
+    }
+    throw AssertionError("ledger condition not met in ${timeoutMs}ms: ${store.events}")
+  }
+
+  private fun awaitUnsettled(c: TurnController, timeoutMs: Long = 5_000L) {
+    // The receipt installs in the host's cancel catch (async, after the
+    // bounded cancelSettleTimeoutMs wait): poll instead of asserting
+    // synchronously right after cancel().
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (!c.hasUnsettledCancelReceipts() && System.currentTimeMillis() < deadline) {
+      Thread.sleep(25)
+    }
+    assertTrue("receipt must be unsettled after cancel", c.hasUnsettledCancelReceipts())
+  }
+
+  private fun assertNotTrueAndDangling(
+    store: FakeSessionStore,
+    durable: Boolean,
+    what: String,
+  ) {
+    val dangling = findDanglingRunIds(store.events)
+    assertFalse(
+      "$what: flushDurable must never be true-and-dangling (durable=$durable, dangling=$dangling, kinds=${store.events.map { it.kind }})",
+      durable && dangling.isNotEmpty(),
+    )
+  }
+
+  private fun openTwiceConsistent(store: FakeSessionStore, sid: String) {
+    val f = factory(store)
+    val ep = endpoint()
+    val first = runBlocking { f.open(ep, sid) }
+    try {
+      val afterFirst = store.events.filter { it.sessionId == sid }.sortedBy { it.seq }
+      assertTrue(findDanglingRunIds(afterFirst).isEmpty())
+    } finally {
+      first.session.close()
+    }
+    val sizeAfterFirst = store.events.count { it.sessionId == sid }
+    val second = runBlocking { f.open(ep, sid) }
+    try {
+      val afterSecond = store.events.filter { it.sessionId == sid }.sortedBy { it.seq }
+      assertEquals(sizeAfterFirst, afterSecond.size)
+      assertTrue(findDanglingRunIds(afterSecond).isEmpty())
+    } finally {
+      second.session.close()
+    }
+  }
+
+  @Test fun failedBatch_immediateClose_noTrueAndDangling_reopenTwiceConsistent() {
+    val store = R191LateStore(failPredicate = { it == 1 })
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(provider, SessionTranscriptSink(store, sid), n, "r191-fail")
+    try {
+      startedHost(c)
+      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      // Immediate close: no host join (New Chat / switch interleave).
+      awaitUnsettled(c)
+      c.close()
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "failed-batch immediate close")
+      // The deferred atomic batch must still land (admitted before the seal):
+      // partial preserved, family closed by the batch system mark.
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 1 &&
+          evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
+      }
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals(listOf("user", "retry", "assistant", "system"), store.events.map { it.kind })
+      assertEquals("half", store.events.single { it.kind == "assistant" }.text)
+      assertTrue(findDanglingRunIds(store.events).isEmpty())
+      assertFalse("failed batch must not be unsettled after handoff", c.hasUnsettledCancelReceipts())
+      assertEquals("COMPENSATED", awaitReceiptTerminal(c))
+    } finally {
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    // Late store failure poisons durability but the family is closed; reopen
+    // adds at most the durable-failure accounting, never a second partial.
+    val f = factory(store)
+    val ep = endpoint()
+    val first = runBlocking { f.open(ep, sid) }
+    try {
+      val afterFirst = store.events.filter { it.sessionId == sid }.sortedBy { it.seq }
+      assertEquals(1, afterFirst.count { it.kind == "assistant" })
+      assertTrue(afterFirst.any { it.kind == "system" })
+      assertTrue(findDanglingRunIds(afterFirst).isEmpty())
+    } finally {
+      first.session.close()
+    }
+    val sizeAfterFirst = store.events.count { it.sessionId == sid }
+    val second = runBlocking { f.open(ep, sid) }
+    try {
+      assertEquals(sizeAfterFirst, store.events.count { it.sessionId == sid })
+    } finally {
+      second.session.close()
+    }
+  }
+
+  @Test fun successSystem_immediateClose_noTrueAndDangling_reopenTwiceConsistent() {
+    val store = R191LateStore(failPredicate = { it == 1 }, failWith = null)
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(provider, SessionTranscriptSink(store, sid), n, "r191-ok")
+    try {
+      startedHost(c)
+      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      c.close()
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "success-system immediate close")
+      // Terminal committed late-success: deferred system mark lands in order.
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 1
+      }
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals(listOf("user", "assistant", "retry", "system"), store.events.map { it.kind })
+      assertTrue(findDanglingRunIds(store.events).isEmpty())
+      assertEquals("half", store.events.single { it.kind == "assistant" }.text)
+      assertFalse(c.hasUnsettledCancelReceipts())
+    } finally {
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    openTwiceConsistent(store, sid)
+  }
+
+  @Test fun finalIntent_immediateClose_zeroNewRows_reopenClean() {
+    val store = R191LateStore(failPredicate = { it == 1 }, failWith = null)
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(
+      provider, SessionTranscriptSink(store, sid), n, "r191-final",
+      retry = TurnRetryConfig(),
+    )
+    try {
+      startedHost(c)
+      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      c.close()
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "final-intent immediate close")
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      // Final intent keeps zero new rows: exactly user + terminal assistant.
+      awaitLedger(store) { evts -> evts.count { it.kind == "assistant" } == 1 && evts.size == 2 }
+      assertEquals(listOf("user", "assistant"), store.events.map { it.kind })
+      assertTrue(findDanglingRunIds(store.events).isEmpty())
+      assertFalse(c.hasUnsettledCancelReceipts())
+    } finally {
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    openTwiceConsistent(store, sid)
+  }
+
+  @Test fun freshRetry_immediateClose_batchPreserved_reopenTwiceConsistent() {
+    val store = R191LateStore(failPredicate = { it == 2 })
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val attemptNo = AtomicInteger(0)
+    val provider = R191Provider {
+      flow {
+        if (attemptNo.incrementAndGet() == 1) {
+          emit(StreamEvent.TextDelta(0, 0, "half1"))
+          emit(StreamEvent.Failed("boom1", retryable = true))
+        } else {
+          emit(StreamEvent.TextDelta(0, 0, "half2"))
+          emit(StreamEvent.Failed("boom2", retryable = true))
+        }
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(
+      provider, SessionTranscriptSink(store, sid), n, "r191-fresh",
+      retry = TurnRetryConfig(maxRetries = 2, retryDelaysMs = listOf(0L, 0L)),
+    )
+    try {
+      startedHost(c)
+      assertTrue("fresh terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      c.close()
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "fresh-retry immediate close")
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 2
+      }
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals(
+        listOf("user", "assistant", "retry", "retry", "assistant", "system"),
+        store.events.map { it.kind },
+      )
+      val logical = store.events[0].runId
+      val batchPartial = store.events[4]
+      assertTrue("fresh retry must mint a fresh id", batchPartial.runId != logical)
+      assertEquals("half2", batchPartial.text)
+      assertTrue(findDanglingRunIds(store.events).isEmpty())
+      assertFalse(c.hasUnsettledCancelReceipts())
+      assertEquals("COMPENSATED", awaitReceiptTerminal(c))
+    } finally {
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    openTwiceConsistent(store, sid)
+  }
+
+  @Test fun reasoning_immediateClose_markerPreserved_reopenTwiceConsistent() {
+    val store = R191LateStore(failPredicate = { it == 1 })
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.ReasoningDelta(0, 0, "think"))
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(provider, SessionTranscriptSink(store, sid), n, "r191-rsn")
+    try {
+      startedHost(c)
+      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      c.close()
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "reasoning immediate close")
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "system" } && evts.any { it.kind == "reasoning" } &&
+          evts.count { it.kind == "assistant" } == 1
+      }
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals(
+        listOf("user", "retry", "assistant", "reasoning", "system"),
+        store.events.map { it.kind },
+      )
+      assertEquals("thinkhalf", store.events.single { it.kind == "assistant" }.text)
+      assertTrue(findDanglingRunIds(store.events).isEmpty())
+      for (e in store.events) {
+        val back = JsonlCodec.decode(1, JsonlCodec.encode(e.copy(seq = e.seq.coerceAtLeast(1))))
+        assertEquals(e.kind, back.kind)
+        assertEquals(e.isFinal, back.isFinal)
+      }
+      assertFalse(c.hasUnsettledCancelReceipts())
+    } finally {
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    openTwiceConsistent(store, sid)
+  }
+
+  @Test fun unsettledReceipt_flushDurableConjunction_blocksTrueAndDangling_sourceOwnershipKept() {
+    // Terminal settle → barrier → waiter-not-awake interleave on a LIVE
+    // session (no close): the terminal outcome is still stalled, so the
+    // waiter has not yet claimed, while user + notice are already durable.
+    // flushDurable must report false (never true-and-dangling) until the
+    // handoff lands; a fresh session never claims the old receipt.
+    val store = R191LateStore(failPredicate = { it == 1 }, failWith = null, stallMs = 2_000L)
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(provider, SessionTranscriptSink(store, sid), n, "r191-conj")
+    try {
+      val host = startedHost(c)
+      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      // Source-session ownership: a fresh controller on its own store has no
+      // unsettled receipt even while the source still owes its handoff.
+      val freshStore = FakeSessionStore()
+      val freshSid = runBlocking { freshStore.createSession("hi", MODEL) }
+      val fresh = controller(
+        R191Provider(), SessionTranscriptSink(freshStore, freshSid),
+        AtomicInteger(0), "r191-new",
+      )
+      try {
+        assertFalse(
+          "new session must not claim the old receipt",
+          fresh.hasUnsettledCancelReceipts(),
+        )
+      } finally {
+        fresh.close()
+      }
+      // Live flush while the waiter still sleeps: drain succeeds for
+      // user + notice, but the conjunction must hold false.
+      val drained = runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertTrue("user + notice must drain while terminal stalls, was $drained", drained)
+      val durableWhilePending = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durableWhilePending, "live conjunction while PENDING")
+      assertFalse(
+        "flushDurable must be false while the receipt is still PENDING",
+        durableWhilePending,
+      )
+      // Let the terminal settle; the waiter hands off and the deferred system
+      // lands in order.
+      runBlocking { withTimeout(8_000) { host.join() } }
+      awaitLedger(store) { evts -> evts.any { it.kind == "system" } }
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals(listOf("user", "assistant", "retry", "system"), store.events.map { it.kind })
+      assertTrue(findDanglingRunIds(store.events).isEmpty())
+      val durableAfter = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertTrue("flushDurable must recover after the handoff, was $durableAfter", durableAfter)
+      assertNotTrueAndDangling(store, durableAfter, "live conjunction after handoff")
+      assertFalse(c.hasUnsettledCancelReceipts())
+    } finally {
+      c.close()
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    openTwiceConsistent(store, sid)
+  }
+
+  @Test fun sessionImpl_exposesUnsettledReceiptSeam() {
+    // ChatSessionImpl must forward the read-only seam (VM downgrade evidence).
+    val store = FakeSessionStore()
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = object : LlmProvider {
+      override val protocol: ProviderProto = ProviderProto.CHAT_COMPLETIONS
+      override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+      override suspend fun listModels(): List<String> = emptyList()
+    }
+    val n = AtomicInteger(0)
+    val session: ChatSession = ChatSessionImpl(
+      provider = provider,
+      policy = R191Policy(),
+      transcript = SessionTranscriptSink(store, sid),
+      retryConfig = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(5_000L)),
+      dispatcher = Dispatchers.Default,
+      newId = { "r191-seam-${n.incrementAndGet() - 1}" },
+    )
+    try {
+      assertFalse("fresh session must start settled", session.hasUnsettledCancelReceipts())
+    } finally {
+      session.close()
+    }
+    // Default fake seam stays false so existing VM fakes are unaffected.
+    val fake: ChatSession = object : ChatSession {
+      override val uiState: kotlinx.coroutines.flow.StateFlow<ChatUiState>
+        get() = throw UnsupportedOperationException()
+      override suspend fun send(text: String, images: List<ChatImageRef>) = Unit
+      override suspend fun startTurn(text: String, images: List<ChatImageRef>) =
+        throw UnsupportedOperationException()
+      override suspend fun startOrEnqueue(
+        text: String,
+        images: List<ChatImageRef>,
+        opId: Long?,
+      ): TurnStart = throw UnsupportedOperationException()
+      override fun drainQueued(): List<QueuedIntent> = emptyList()
+      override fun cancel() = Unit
+      override suspend fun flush(timeoutMs: Long): Boolean = true
+      override fun steer(text: String) = Unit
+      override fun close() = Unit
+    }
+    assertFalse("default seam must stay false for legacy fakes", fake.hasUnsettledCancelReceipts())
+  }
+}

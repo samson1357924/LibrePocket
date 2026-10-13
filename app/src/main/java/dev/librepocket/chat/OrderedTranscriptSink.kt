@@ -2,6 +2,7 @@ package dev.librepocket.chat
 
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
@@ -72,6 +73,18 @@ class OrderedTranscriptSink(
   private val writerScope = CoroutineScope(SupervisorJob() + dispatcher)
   private val channel = kotlinx.coroutines.channels.Channel<Entry>(capacity)
   private val pendingCore = ConcurrentHashMap.newKeySet<String>()
+  /**
+   * D15-2 committed proof (sink-owned submit truth): successful core commits
+   * per runId, incremented in the writer `finally` on the success path only
+   * (before the ack completes). Counts — not a set — because a first attempt
+   * reuses its logical id for both the user row and its assistant terminal:
+   * user commit = 1, terminal commit = 2. Retry attempts mint fresh ids so
+   * their terminal commit = 1. The controller combines this count with its
+   * attempt-dimension terminal intent to tell SUBMITTING vs COMMITTED vs
+   * FAILED without suspending. Append-only, bounded by the session's core
+   * write count; never cleared (like the store itself).
+   */
+  private val commitCounts = ConcurrentHashMap<String, AtomicInteger>()
   /** Outstanding core acks (ack -> runId) for bounded seal/shutdown failure. */
   private val coreAcks = ConcurrentHashMap<CompletableDeferred<Unit>, String>()
   /** Set once the writer exits (teardown or drain): later cores fail fast. */
@@ -184,6 +197,16 @@ class OrderedTranscriptSink(
   internal var onAdmissionReservedForTest: ((Long) -> Unit)? = null
   internal var beforeSendForTest: (suspend (Long) -> Unit)? = null
   internal var afterSendForTest: (suspend (Long) -> Unit)? = null
+  /**
+   * D15-2 test seam: runs in the writer `finally` after the commit count is
+   * recorded and before the ack completes (store-write success only,
+   * non-suspending, null in production). Lets the terminal-ack cancel grid
+   * deterministically widen the commit→ack window: the hook signals commit,
+   * holds the writer until the test cancels the host, then releases so the
+   * ack drains. Must not throw (a throw is swallowed so an already-durable
+   * commit never fails its ack on hook error).
+   */
+  internal var afterCommitBeforeAckForTest: ((String) -> Unit)? = null
 
   /**
    * Reserves one admission slot (ticket + chain link) in a single tiny
@@ -322,7 +345,6 @@ class OrderedTranscriptSink(
           failure = e
           throw e
         } finally {
-          entry.runId?.let { pendingCore.remove(it) }
           val ack = entry.ack
           if (ack != null) {
             coreAcks.remove(ack)
@@ -331,11 +353,43 @@ class OrderedTranscriptSink(
                 entry.runId?.let(::markInterrupted)
                 ack.completeExceptionally(failure)
               } else {
+                // D15-2: record the commit BEFORE clearing pending, so a
+                // host cancelled in the commit→ack window still observes
+                // COMMITTED via [coreCommitCount]. The intermediate state
+                // (pending + committed) suppresses via either signal, safe.
+                // Runs before the test hook below so the hook widens the
+                // true post-commit window.
+                entry.runId?.let { id ->
+                  commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
+                  pendingCore.remove(id)
+                }
+                // D15-2 test seam: widens the commit→ack window for the
+                // cancel-race grid (null in production). Must not throw;
+                // a throw here would fail an already-durable ack.
+                val commitHook = afterCommitBeforeAckForTest
+                if (commitHook != null && failure == null && entry.runId != null) {
+                  try {
+                    commitHook(entry.runId)
+                  } catch (_: Throwable) {
+                    // Test-only: never fail a durable commit on hook error.
+                  }
+                }
                 ack.complete(Unit)
               }
             } else if (failure != null) {
               entry.runId?.let(::markInterrupted)
+            } else {
+              // D15-2: the ack was already completed (abandoned waiter) but
+              // the row still committed — record the proof before clearing
+              // pending so a racing cancel handler observes COMMITTED,
+              // never a false NOT_COMMITTED.
+              entry.runId?.let { id ->
+                commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
+                pendingCore.remove(id)
+              }
             }
+          } else {
+            entry.runId?.let { pendingCore.remove(it) }
           }
         }
       }
@@ -876,6 +930,31 @@ class OrderedTranscriptSink(
 
   /** Core runIds admitted but still awaiting the writer. */
   fun pendingRunIds(): List<String> = pendingCore.toList()
+
+  /**
+   * D15-2 synchronous submit-truth queries (all non-suspending, safe from a
+   * cancelled host): the cancel handler combines pending + commit count with
+   * its attempt-dimension terminal intent to tell SUBMITTING (admitted, writer
+   * not yet committed) vs COMMITTED (writer committed, ack may still be in
+   * flight) vs FAILED-or-never-submitted (no commit for the id, keeps the
+   * normal final cancel assistant).
+   *
+   * - [isCorePending]: id still in [pendingCore] (admitted, writer has not
+   *   finished its block). True until the writer `finally` records the commit
+   *   and clears pending (committed) or marks INTERRUPTED (failed).
+   * - [coreCommitCount]: successful writer commits for the id (user row +
+   *   terminal share the first-attempt id, so the controller treats
+   *   `cancelId == logicalTurnId` as terminal-committed only at `>= 2`,
+   *   fresh retry ids at `>= 1`). Append-only; a failed store write never
+   *   increments it.
+   * - [isCoreCommitted]: convenience (`count > 0`); the controller prefers
+   *   [coreCommitCount] for the attempt-dimension threshold above.
+   */
+  fun isCorePending(runId: String): Boolean = pendingCore.contains(runId)
+
+  fun coreCommitCount(runId: String): Int = commitCounts[runId]?.get() ?: 0
+
+  fun isCoreCommitted(runId: String): Boolean = coreCommitCount(runId) > 0
 
   /**
    * R14-1 writer-completion proof: true only once the session writer can no

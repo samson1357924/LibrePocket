@@ -531,6 +531,17 @@ class TurnController(
   /** Test seam for filling the session channel (R8-6 full-channel simulation). */
   internal fun offerSteerForTest(text: String) = orderedTranscript.offerSteer(text)
 
+  /**
+   * D15-2 test seam forwarding to the sink's commit→ack hook (commit后ack前
+   * simulation). Holds the session writer between its commit-count record and
+   * its ack completion so a cancel deterministically lands on COMMITTED.
+   */
+  internal var afterCommitBeforeAckForTest: ((String) -> Unit)?
+    get() = orderedTranscript.afterCommitBeforeAckForTest
+    set(value) {
+      orderedTranscript.afterCommitBeforeAckForTest = value
+    }
+
   private fun drainOrphanLocked(pending: PendingAdmission): Job {
     if (pendingAdmission?.logicalTurnId == pending.logicalTurnId) {
       pendingAdmission = null
@@ -652,9 +663,46 @@ class TurnController(
    * final mark instead of a second assistant row for the same attempt. Ids
    * are unique per attempt (UUID/newId), so the set stays bounded by the
    * session's attempt count; entries are added only after the ack succeeds.
+   *
+   * D15-2: the set alone cannot see the commit→ack window (the writer has
+   * committed the store row but the ack has not yet returned, so the set is
+   * still empty and the old handler wrote a duplicate assistant row for the
+   * same attempt). The handler now combines this acked set with the sink's
+   * synchronous submit truth ([OrderedTranscriptSink.isCorePending] /
+   * [OrderedTranscriptSink.coreCommitCount]) and the attempt-dimension terminal
+   * intent below ([attemptTerminalFinal]): SUBMITTING or COMMITTED suppresses
+   * the duplicate assistant; a suppressed final terminal writes zero new rows
+   * (the family already owns its final), a suppressed intermediate partial
+   * writes one system-kind final mark (the family still dangles). FAILED or
+   * never-submitted keeps the normal final cancel assistant. The sink owns
+   * the commit truth, the controller owns the cancel decision.
    */
   private val terminalizedAttempts: MutableSet<String> =
     java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+  /**
+   * D15-2 attempt-dimension terminal intent (attemptId -> isFinal of the
+   * terminal being written): `true` for success / terminal-failure finals,
+   * `false` for retryable intermediate partials. Recorded synchronously
+   * BEFORE the terminal write is admitted, so a cancel landing in the
+   * commit→ack window (or while SUBMITTING) still sees which kind of terminal
+   * it is racing even though [terminalizedAttempts] is not yet updated.
+   * Entries are never removed (bounded by the session's attempt count, same
+   * as [terminalizedAttempts]); the store stays append-only and legal retries
+   * still mint fresh ids with fresh entries.
+   */
+  private val attemptTerminalFinal: java.util.concurrent.ConcurrentHashMap<String, Boolean> =
+    java.util.concurrent.ConcurrentHashMap()
+
+  /**
+   * D15-2 test seam: runs in [runTurnLoop] immediately after a terminal ack
+   * succeeds and [terminalizedAttempts] is updated, before the return /
+   * retry-notice / sleeper step (suspending, null in production). Lets the
+   * terminal-ack cancel grid deterministically pause the host in the true
+   * post-ack window, cancel it there, and assert zero-new (final) vs
+   * system-mark (intermediate) without racing the microsecond return path.
+   */
+  internal var afterTerminalAckForTest: (suspend (String) -> Unit)? = null
 
   /** Test seam between an idle admission snapshot and its fresh policy gate. */
   internal var beforeAdmissionGateForTest: (() -> Unit)? = null
@@ -2444,7 +2492,8 @@ class TurnController(
    * attempt (retry backoff gap: the just-failed partial is already durable)
    * writes one system-kind final mark instead of a second assistant row for
    * the same attempt; otherwise the cancel assistant row is final
-   * (`isFinal=1`).
+   * (`isFinal=1`). D15-2: a cancel racing a success / terminal-failure final
+   * in its commit→ack window (or while SUBMITTING) writes zero new rows.
    */
   private suspend fun hostedTurn(
     text: String,
@@ -2470,13 +2519,32 @@ class TurnController(
       val cancelIndex = attemptIndexRef.get()
       val cancelParent = parentFor(cancelId, logicalTurnId)
       val cancelText = assistantTextOf(cancelId)
-      // Stage F dedup: the terminalized set holds every attempt whose row is
-      // already durably acked (success final, terminal-failure final, or
-      // retryable intermediate partial non-final). A backoff-gap cancel hits
-      // the just-failed id, so it writes one system-kind final mark instead
-      // of a second assistant row for the same attempt. A streaming cancel
-      // misses and keeps the original final assistant row.
-      val deduped = terminalizedAttempts.contains(cancelId)
+      // Stage F dedup, D15-2 submit-truth fix: the terminalized set holds every
+      // attempt whose row is already durably acked, but it is updated only
+      // AFTER the ack returns — a host cancelled in the commit→ack window
+      // (writer committed, ack still in flight) used to miss the set and write
+      // a duplicate assistant row for the same attempt. The sink now owns the
+      // submit truth synchronously (no suspend): SUBMITTING (admitted, writer
+      // not yet committed) or COMMITTED (writer committed, ack may still be
+      // in flight) both suppress the duplicate. Attempt-dimension: a first
+      // attempt reuses its logical id for the user row, so its terminal
+      // commit is `commitCount >= 2` (user + terminal); fresh retry ids use
+      // `>= 1`. SUBMITTING additionally requires terminal intent
+      // ([attemptTerminalFinal] present) so a user-row admission race (same
+      // id, no terminal attempted yet) never suppresses a streaming cancel.
+      // FAILED (store failure, INTERRUPTED-marked, no commit) and
+      // never-submitted keep the normal final cancel assistant. Suppressed
+      // finals write zero new rows (the family already owns — or will own —
+      // its final); suppressed intermediate partials (non-final, family still
+      // dangling) write one system-kind final mark instead.
+      val terminalFinal = attemptTerminalFinal[cancelId]
+      val acked = terminalizedAttempts.contains(cancelId)
+      val commitCount = orderedTranscript.coreCommitCount(cancelId)
+      val terminalCommitted =
+        if (cancelId == logicalTurnId) commitCount >= 2 else commitCount >= 1
+      val terminalSubmitting = terminalFinal != null && orderedTranscript.isCorePending(cancelId)
+      val suppressed = acked || terminalCommitted || terminalSubmitting
+      val suppressedFinal = terminalFinal ?: true
       // Durable and non-cancellable: the host is cancelled but the session
       // writer is independent, so this record still drains on close (or is
       // explicitly marked INTERRUPTED instead of silently dropped). A
@@ -2488,21 +2556,28 @@ class TurnController(
       // already INTERRUPTED-marked: keep the original cancellation.
       // Any other write failure propagates.
       val cancelReasoning = assistantReasoningOf(cancelId)
-      withContext(NonCancellable) {
-        try {
-          if (deduped) {
-            orderedTranscript.onLogicalTurnCancelled(logicalTurnId, cancelId, cancelText, cancelIndex)
-          } else {
-            orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex, cancelReasoning)
+      if (suppressed && suppressedFinal) {
+        // Success / terminal-failure final already durable (or SUBMITTING and
+        // about to commit via the independent writer): zero new rows, so the
+        // attempt keeps exactly one assistant row. Still rethrow the original
+        // cancellation below.
+      } else {
+        withContext(NonCancellable) {
+          try {
+            if (suppressed) {
+              orderedTranscript.onLogicalTurnCancelled(logicalTurnId, cancelId, cancelText, cancelIndex)
+            } else {
+              orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex, cancelReasoning)
+            }
+          } catch (_: ClosedSendChannelException) {
+            // Sealed after close(): explicit INTERRUPTED mark already recorded.
+          } catch (sealFailure: CancellationException) {
+            if (!orderedTranscript.isSealed()) throw sealFailure
+            // Sealed fail-fast: INTERRUPTED already marked, keep original cancel.
+          } catch (_: Exception) {
+            // Durable store failure for the cancel terminal itself: the sink
+            // already marked this runId INTERRUPTED; keep original cancel.
           }
-        } catch (_: ClosedSendChannelException) {
-          // Sealed after close(): explicit INTERRUPTED mark already recorded.
-        } catch (sealFailure: CancellationException) {
-          if (!orderedTranscript.isSealed()) throw sealFailure
-          // Sealed fail-fast: INTERRUPTED already marked, keep original cancel.
-        } catch (_: Exception) {
-          // Durable store failure for the cancel terminal itself: the sink
-          // already marked this runId INTERRUPTED; keep original cancel.
         }
       }
       throw e
@@ -3058,11 +3133,15 @@ class TurnController(
         // Snapshot text: assistantTextOf reads uiState at execution time.
         val successText = assistantTextOf(attemptRunId)
         val successReasoning = assistantReasoningOf(attemptRunId)
+        // D15-2: record terminal intent BEFORE the write is admitted, so a
+        // cancel racing the commit→ack window still sees a final terminal.
+        attemptTerminalFinal[attemptRunId] = true
         orderedTranscript.onTurnSucceeded(
           attemptRunId, successText,
           parentFor(attemptRunId, logicalTurnId), attempt, successReasoning,
         )
         terminalizedAttempts.add(attemptRunId)
+        afterTerminalAckForTest?.invoke(attemptRunId)
         return
       }
       // Keep the failed fragment as-is (isPartial=true); the retry below
@@ -3076,11 +3155,14 @@ class TurnController(
           activityRevision++
           _uiState.update { it.copy(status = ChatStatus.ERROR, error = clean) }
         }
+        // D15-2: terminal intent before admission (final, like success).
+        attemptTerminalFinal[attemptRunId] = true
         orderedTranscript.onTurnFailed(
           attemptRunId, assistantTextOf(attemptRunId), clean,
           parentFor(attemptRunId, logicalTurnId), attempt, true,
         )
         terminalizedAttempts.add(attemptRunId)
+        afterTerminalAckForTest?.invoke(attemptRunId)
         return
       }
       // Stage C: persist the retried partial BEFORE the retry notice, so a
@@ -3090,11 +3172,16 @@ class TurnController(
       // same logical family. Stage F: intermediate partials are non-final
       // (isFinal=false) so the family still dangles until a final row lands.
       val retriedClean = sanitizeError(failure.message)
+      // D15-2: terminal intent before admission (non-final: the family still
+      // dangles until a final row lands, so a suppressing cancel writes the
+      // system mark instead of zero rows).
+      attemptTerminalFinal[attemptRunId] = false
       orderedTranscript.onTurnFailed(
         attemptRunId, assistantTextOf(attemptRunId), retriedClean,
         parentFor(attemptRunId, logicalTurnId), attempt, false,
       )
       terminalizedAttempts.add(attemptRunId)
+      afterTerminalAckForTest?.invoke(attemptRunId)
       attempt += 1
       val waitMs = retryConfig.delayForRetry(attempt)
       // Bound to the logical turn (single user row), not to the failed

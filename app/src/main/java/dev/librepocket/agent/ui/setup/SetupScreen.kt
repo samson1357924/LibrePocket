@@ -40,6 +40,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,6 +49,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -81,20 +83,7 @@ private fun modelDirectoryStatusText(status: ModelDirectoryStatus): String? = wh
     }
 }
 
-private fun errorText(code: String): String = when (code) {
-    "SETUP_UNKNOWN_PRESET" -> "未知的供應商，請重新選擇。"
-    "SETUP_BASE_URL_BLANK" -> "請填寫伺服器位址。"
-    "PROVIDER_BAD_URL" -> "位址格式不正確。"
-    "PROVIDER_URL_MUST_BE_HTTPS" -> "必須使用 https（本機/內網測試位址除外）。"
-    "SETUP_KEY_TOO_SHORT" -> "金鑰太短（至少 8 字元），請檢查後重貼。"
-    "PROVIDER_KEY_REF_BLANK", "PROVIDER_KEY_REF_MALFORMED" -> "內部參照異常，請重試。"
-    "API key too short" -> "金鑰太短（至少 8 字元），請檢查後重貼。"
-    "TEST_UNAUTHORIZED" -> "金鑰無效（認證失敗），請檢查後重貼。"
-    "TEST_TOO_LARGE" -> "模型列表過大，未能完整載入，請重試。"
-    "TEST_RETRYABLE" -> "伺服器忙碌或網路不穩，請稍後重試。"
-    "POLICY_DENIED_KEY_WRITE" -> "政策拒絕寫入金鑰（key.write DENY），請檢查權限設定。"
-    else -> "儲存失敗（$code），請重試。"
-}
+private fun errorText(code: String): String = setupErrorText(code)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -105,6 +94,11 @@ fun SetupScreen(
     viewModel: SetupViewModel,
 ) {
     val state by viewModel.form.collectAsStateWithLifecycle()
+    // collectAsState (not WithLifecycle): mirrors every test harness and the
+    // MainScreen->host wiring in this repo; the gate/pending snapshot only
+    // drives the retry card and never leaves this composition.
+    val gate by viewModel.gate.collectAsState()
+    val startupPending by viewModel.startupReconcilePending.collectAsState()
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
 
@@ -154,9 +148,46 @@ fun SetupScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
+        // Stage F2 (#18)：gate 讀取未確認時在 SETUP 內提供非破壞性重試入口。
+        // gate-first 發射序／transient 失敗後使用者可能靜止在此頁（舊守衛不導、
+        // Back 被攔、menu disabled），重試走同一安全 reconcile（只重讀＋回放，
+        // 不碰表單草稿、不調 logout）；在途時 disabled＋spinner。
+        if (gate is EndpointGate.ReadFailure) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = "設定讀取失敗，請重試讀取。輸入草稿會保留。",
+                    modifier = Modifier.padding(12.dp),
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            Button(
+                onClick = {
+                    viewModel.retryStartupReconcile { o, j -> viewModel.onStartupReconcile(o, j) }
+                },
+                enabled = !startupPending,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("setupRetryRead"),
+            ) {
+                if (startupPending) {
+                    CircularProgressIndicator(strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.padding(4.dp))
+                    Text("讀取中…")
+                } else {
+                    Text("重試讀取")
+                }
+            }
+        }
+
         ExposedDropdownMenuBox(
             expanded = presetExpanded,
-            onExpandedChange = { presetExpanded = !presetExpanded },
+            onExpandedChange = { if (!state.saving) presetExpanded = !presetExpanded },
         ) {
             OutlinedTextField(
                 value = selectedPreset.label,
@@ -188,7 +219,7 @@ fun SetupScreen(
             value = state.baseUrl,
             onValueChange = viewModel::onBaseUrlChange,
             readOnly = !baseUrlEditable,
-            enabled = baseUrlEditable,
+            enabled = baseUrlEditable && !state.saving,
             label = { Text("伺服器位址") },
             supportingText = {
                 if (baseUrlEditable) Text("自訂位址必須是 https（本機/內網測試位址除外）。")
@@ -198,6 +229,8 @@ fun SetupScreen(
         )
 
         var modelExpanded by remember { mutableStateOf(false) }
+        // Stage2: model stays editable while saving (out of scope, see #17);
+        // only preset/baseUrl/apiKey are fenced by saving.
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -261,6 +294,7 @@ fun SetupScreen(
         OutlinedTextField(
             value = state.apiKey,
             onValueChange = viewModel::onApiKeyChange,
+            enabled = !state.saving,
             label = { Text("API Key") },
             placeholder = { Text("貼上你的金鑰") },
             modifier = Modifier.fillMaxWidth(),

@@ -159,6 +159,11 @@ dependencies {
     testImplementation(libs.robolectric)
     testImplementation(libs.room.testing)
     testImplementation(libs.test.core)
+    // Settings logout-failure UI tests (Robolectric + compose rule, unit source set).
+    testImplementation(libs.compose.ui.test.junit4)
+    // Provides the default ComponentActivity for createComposeRule(): must be
+    // merged into the tested (debug) manifest, not the unit-test classpath.
+    debugImplementation(libs.compose.ui.test.manifest)
     // Local HTTPS certificate fixtures for provider redirect security tests only.
     testImplementation(libs.okhttp.tls)
     // SSE replay transport for JVM unit tests (never hits the external network).

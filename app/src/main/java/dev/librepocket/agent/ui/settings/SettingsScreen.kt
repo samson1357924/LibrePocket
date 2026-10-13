@@ -8,9 +8,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
@@ -24,6 +27,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.librepocket.agent.ui.setup.EndpointGate
+import dev.librepocket.agent.ui.setup.setupErrorText
 import dev.librepocket.automation.AutomationSettingsState
 import dev.librepocket.voice.VoiceTools
 import dev.librepocket.voice.VoiceTts
@@ -61,12 +65,59 @@ fun SettingsScreen(
     voiceLoadFailed: Boolean = false,
     onVoiceInputSwitch: (Boolean) -> Unit = {},
     onVoiceOutputSwitch: (Boolean) -> Unit = {},
+    /**
+     * 登出失敗碼（僅 `LOGOUT_*` 顯示；呼叫方由 form.errorCode 過濾傳入）。
+     * 非 null 即顯示失敗卡；失敗不自動關 dialog（見 [showConfirmLogout]）。
+     *
+     * Stage A（R10 Finding 1 P2/BLOCK，方案 B 立即止血）：retained 碼
+     * （`LOGOUT_READ_FAILED`／`LOGOUT_DELETE_FAILED`／`LOGOUT_CLEAR_FAILED`／
+     * `LOGOUT_UNKNOWN`，journal 可能保留）不可 dismiss——journal 釋放前不給出口，
+     * 同次執行無其他入口，故不暗示可稍後處理；僅 `LOGOUT_STALE`（journal 已丟棄，
+     * save 不被擋）可關閉。
+     *
+     * Stage D1：`LOGOUT_READ_RETRY`（啟動 read-path `UNKNOWN`+null 中性碼）不屬
+     * retained——Ready/NoEndpoint 兩分支另開分支，僅顯示 [重試讀取]（無取消／無
+     * 重試清除／無關閉；enabled 綁 [startupReconcilePending]，非 [logoutInFlight]）。
+     */
+    logoutErrorCode: String? = null,
+    /**
+     * Stage G F1 已派生重試目標身份（`MainScreen` 由 `effectiveLogoutRecovery`
+     * 同源計算的 `retryJournal.format()`；null 表無特定目標）。
+     *
+     * 僅作重試 targeting 顯示（retained 重試清除鍵上方小字）；提交仍經
+     * `retryPendingDelete` 快照比對（禁盲 replay），此欄不作清除依據。
+     */
+    logoutRetryJournal: String? = null,
+    /** 登出執行中：可見按鍵皆 disabled，確認/重試鍵轉 spinner 防重點。 */
+    logoutInFlight: Boolean = false,
+    /**
+     * 關閉失敗卡（不調 logout）。
+     *
+     * 僅初始確認（無碼）與 `LOGOUT_STALE` 可達；retained 碼與 `LOGOUT_READ_RETRY`
+     * 皆無 dismiss 入口。
+     */
+    onDismissLogoutError: () -> Unit = {},
+    /** 重試登出；預設複用 [onLogout]。 */
+    onRetryLogout: () -> Unit = onLogout,
+    /**
+     * Stage D1 非破壞性重試讀取入口（中性碼 `LOGOUT_READ_RETRY` 專用）。
+     *
+     * 呼叫方（MainScreen）接 `SetupViewModel.retryStartupReconcile`（reconcile-only，
+     * 絕不調 logout）；按鍵 enabled 綁 [startupReconcilePending]（pending 中
+     * disabled＋spinner），與 [logoutInFlight] 無關。
+     */
+    onRetryStartupRead: () -> Unit = {},
+    /** 啟動 replay 落定閘：中性碼 [重試讀取] 鍵的 enabled／spinner 來源。 */
+    startupReconcilePending: Boolean = false,
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
+    // 失敗不自動關 dialog：error 存續即重現確認態（confirm 已手動關閉又回來也一樣）。
+    val showConfirmLogout = confirmLogout || logoutErrorCode != null
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(padding)
+            .verticalScroll(rememberScrollState())
             .padding(20.dp),
     ) {
         Text("設定", style = MaterialTheme.typography.headlineSmall)
@@ -252,7 +303,7 @@ fun SettingsScreen(
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                 }
-                if (!confirmLogout) {
+                if (!showConfirmLogout) {
                     OutlinedButton(
                         onClick = { confirmLogout = true },
                         modifier = Modifier.fillMaxWidth(),
@@ -260,32 +311,258 @@ fun SettingsScreen(
                         Text("登出（清除金鑰）")
                     }
                 } else {
-                    Text(
-                        "確定清除本機金鑰與端點設定？此動作無法復原。",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Button(
-                        onClick = {
-                            confirmLogout = false
-                            onLogout()
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("確定清除")
+                    // Stage D1：中性碼 `LOGOUT_READ_RETRY` 另開分支——非破壞性重試讀取，
+                    // 不顯示破壞性確認文案，僅 [重試讀取]（無取消／無重試清除／無關閉；
+                    // enabled 綁 startupReconcilePending，非 logoutInFlight）。
+                    val isReadRetryReady = logoutErrorCode == "LOGOUT_READ_RETRY"
+                    if (isReadRetryReady) {
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                text = setupErrorText("LOGOUT_READ_RETRY"),
+                                modifier = Modifier.padding(12.dp),
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = onRetryStartupRead,
+                            enabled = !startupReconcilePending,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            if (startupReconcilePending) {
+                                CircularProgressIndicator(strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.padding(4.dp))
+                                Text("讀取中…")
+                            } else {
+                                Text("重試讀取")
+                            }
+                        }
+                    } else {
+                        Text(
+                            "確定清除本機金鑰與端點設定？此動作無法復原。",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        // 登出失敗卡：文案複用 Setup 共享映射；CLEAR_FAILED 說明部分
+                        // 狀態（金鑰已刪、設定仍在→重試）。gate NoEndpoint 原因重構
+                        // 不在此做（follow-up：區分 CLEAR_FAILED 導致的 NO_KEY）。
+                        // Stage A（R10 Finding 1 P2/BLOCK，方案 B）：retained 碼
+                        // （STALE 以外全部 LOGOUT_*，Stage D1 起不含 READ_RETRY）
+                        // 有身份（journal）時 journal 釋放前不給出口，只留重試；
+                        // Stage R5：無身份時另給關閉（純 state 清除）；
+                        // 僅 STALE（journal 已丟棄）留關閉；無碼初始確認才有取消。
+                        // 結構性 follow-up（方案 A：journal domain state 驅動）另行處理。
+                        logoutErrorCode?.let { code ->
+                            Card(
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                                ),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(
+                                    text = setupErrorText(code),
+                                    modifier = Modifier.padding(12.dp),
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+                        val isStaleReadyError = logoutErrorCode == "LOGOUT_STALE"
+                        // Stage D1：READ_RETRY 已另分支，此處 retained 明確排除它
+                        // （防禦性：未來合併分支時亦不誤判為重試清除）。
+                        val isRetainedReadyError = logoutErrorCode != null &&
+                            !isStaleReadyError &&
+                            logoutErrorCode != "LOGOUT_READ_RETRY"
+                        // STALE 不需重試，僅關閉；retained 只留重試（無取消，不暗示稍後處理，
+                        // 同次執行無其他入口）；無碼初始確認維持確定清除 + 取消。
+                        if (!isStaleReadyError) {
+                            // Stage G F1：重試 targeting 顯示身份（已派生 `logoutRetryJournal`；
+                            // 提交仍快照比對，禁盲 replay）。fresh（無碼）無目標顯示。
+                            if (isRetainedReadyError && logoutRetryJournal != null) {
+                                Text(
+                                    "重試目標：$logoutRetryJournal",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+                            // fresh 確定清除走 onLogout（全新 logout），retained 重試清除
+                            // 走 onRetryLogout（Stage G 起帶顯示身份同源回放；Absent 抑制
+                            // 回 fresh 時走 onLogout 不變）。
+                            Button(
+                                onClick = if (logoutErrorCode == null) onLogout else onRetryLogout,
+                                enabled = !logoutInFlight,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                if (logoutInFlight) {
+                                    CircularProgressIndicator(strokeWidth = 2.dp)
+                                    Spacer(modifier = Modifier.padding(4.dp))
+                                    Text("清除中…")
+                                } else {
+                                    Text(if (logoutErrorCode == null) "確定清除" else "重試清除")
+                                }
+                            }
+                            // Stage R5：retained 但無身份（logoutRetryJournal==null）
+                            // 時另給關閉（純 state 清除回 fresh 重確認；真 journal 由
+                            // observation 重現；null 身份永不 fresh destructive）。
+                            if (isRetainedReadyError && logoutRetryJournal == null) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedButton(
+                                    onClick = onDismissLogoutError,
+                                    enabled = !logoutInFlight,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("關閉")
+                                }
+                            }
+                            if (!isRetainedReadyError) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+                        }
+                        if (!isRetainedReadyError) {
+                            // 取消/關閉語義：只關 dialog + 清失敗碼，絕不調 logout。
+                            // retained 碼與 READ_RETRY 皆無此鍵（journal 釋放前不給出口；
+                            // READ_RETRY 另分支本就無此鍵）。
+                            OutlinedButton(
+                                onClick = {
+                                    confirmLogout = false
+                                    onDismissLogoutError()
+                                },
+                                enabled = !logoutInFlight,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(if (isStaleReadyError) "關閉" else "取消")
+                            }
+                        }
                     }
                 }
             }
             EndpointGate.NoEndpoint -> {
-                Text(
-                    "尚未設定 API 端點。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                Button(onClick = onEditEndpoint, modifier = Modifier.fillMaxWidth()) {
-                    Text("前往設定")
+                // NoEndpoint 恢復入口（Re-review #8 Finding 2 P2/BLOCK 階段2；
+                // Stage 3 P2：DELETE 失敗與中性 UNKNOWN 同為可重試碼；
+                // Stage A R10 Finding 1 P2/BLOCK 方案 B 立即止血；
+                // Stage D1：read-path UNKNOWN+null 改走中性 READ_RETRY（僅重試讀取），
+                // retained UNKNOWN 僅指 clear-phase UNKNOWN+J（重試清除））：
+                // 部分清除（LOGOUT_CLEAR_FAILED：金鑰已刪、設定仍在）gate 已折疊為
+                // NoEndpoint；若只顯示「尚未設定」會丟失重試入口。有未恢復 LOGOUT_*
+                // 時改顯示 setupErrorText + 重試（有身份 retained 碼僅重試；無身份另給關閉：
+                // journal 釋放前不給出口，同次執行無其他入口，故不暗示稍後處理）/
+                // STALE 僅關閉（journal 已丟棄，save 不被擋）；
+                // inFlight 時可見按鍵 disabled + spinner。無碼時保留原尚未設定文案。
+                // 恢復態隱藏「前往設定」（dismiss 回 fresh 後再出現），避免在元數據
+                // 仍殘留時進 Setup 預填陳舊值；重試/關閉才是此態的恢復入口。
+                val recoveryCode = logoutErrorCode?.takeIf { it.startsWith("LOGOUT_") }
+                if (recoveryCode == null) {
+                    Text(
+                        "尚未設定 API 端點。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = onEditEndpoint,
+                        enabled = !logoutInFlight,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("前往設定")
+                    }
+                } else {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = setupErrorText(recoveryCode),
+                            modifier = Modifier.padding(12.dp),
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    val isStale = recoveryCode == "LOGOUT_STALE"
+                    val isReadRetry = recoveryCode == "LOGOUT_READ_RETRY"
+                    // Stage E：與 Ready 分支同步——retained 明確排除 READ_RETRY
+                    // （經上游 if/else 已不可達，防禦性：未來合併分支時亦不誤判
+                    // 為重試清除；Ready 分支 `isRetainedReadyError` 同式）。
+                    val isRetainedNoEndpointError = !isStale &&
+                        recoveryCode != "LOGOUT_READ_RETRY"
+                    if (isReadRetry) {
+                        // Stage D1 中性碼：非破壞性重試讀取，僅 [重試讀取]（無取消／無
+                        // 重試清除／無關閉；enabled 綁 startupReconcilePending）。
+                        Button(
+                            onClick = onRetryStartupRead,
+                            enabled = !startupReconcilePending,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            if (startupReconcilePending) {
+                                CircularProgressIndicator(strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.padding(4.dp))
+                                Text("讀取中…")
+                            } else {
+                                Text("重試讀取")
+                            }
+                        }
+                    } else if (isRetainedNoEndpointError) {
+                        // retained 碼（READ_FAILED/DELETE/CLEAR/UNKNOWN）：journal 可能保留。
+                        // Stage G F1：重試 targeting 顯示身份（同 Ready 分支；提交仍快照比對）。
+                        // Stage R5：無身份（logoutRetryJournal==null）時另給 [關閉]：
+                        // 無 journal 可回放，重試只走 reconcile-only（下次 NO_OP 即
+                        // 收斂回 fresh）；關閉為純 state 清除（clearLogoutError），
+                        // 真 journal 由 observation 獨立重現，不會被關閉掩蓋；且
+                        // null 身份永不觸發 fresh destructive logout（路由守衛見
+                        // MainScreen／retryPendingDelete）。
+                        if (logoutRetryJournal != null) {
+                            Text(
+                                "重試目標：$logoutRetryJournal",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+                        Button(
+                            onClick = onRetryLogout,
+                            enabled = !logoutInFlight,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            if (logoutInFlight) {
+                                CircularProgressIndicator(strokeWidth = 2.dp)
+                                Spacer(modifier = Modifier.padding(4.dp))
+                                Text("清除中…")
+                            } else {
+                                Text("重試清除")
+                            }
+                        }
+                        if (logoutRetryJournal == null) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = onDismissLogoutError,
+                                enabled = !logoutInFlight,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("關閉")
+                            }
+                        }
+                    } else {
+                        // STALE：已有新的金鑰生效，不需重試，僅關閉待 dismiss
+                        //（導航守衛亦攔截，見 shouldNavigateToSetup）。
+                        OutlinedButton(
+                            onClick = onDismissLogoutError,
+                            enabled = !logoutInFlight,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("關閉")
+                        }
+                    }
                 }
             }
             EndpointGate.Loading -> {
@@ -294,6 +571,30 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            EndpointGate.ReadFailure -> {
+                // Stage R2: strict/vault read unconfirmed — never show the
+                // NoEndpoint empty state (which would mislead to Setup).
+                // Retry-read only; the next gateTick rebuild re-resolves.
+                Text(
+                    "設定讀取失敗，請重試讀取。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = onRetryStartupRead,
+                    enabled = !startupReconcilePending,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (startupReconcilePending) {
+                        CircularProgressIndicator(strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.padding(4.dp))
+                        Text("讀取中…")
+                    } else {
+                        Text("重試讀取")
+                    }
+                }
             }
         }
     }

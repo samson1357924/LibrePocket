@@ -17,9 +17,16 @@ package dev.librepocket.mcp
  */
 internal object McpWire {
 
+    /** 輸入 Schema 字元上限：超限拒絕（拋 [McpProtocol]），不靜默截斷。 */
+    internal const val INPUT_SCHEMA_MAX_CHARS = 8_192
+
+    /**
+     * 使用者自訂完整 URL（僅去尾斜線，不附加任何 suffix，原樣使用）。
+     *
+     * 呼叫方應在配置寫完整端點（含 path，如 `/mcp`）。
+     */
     fun endpoint(baseUrl: String): String {
-        val b = baseUrl.trimEnd('/')
-        return if (b.endsWith("/mcp")) b else b + "/mcp"
+        return baseUrl.trimEnd('/')
     }
 
     fun listBody(id: Long = 1L): String =
@@ -31,26 +38,50 @@ internal object McpWire {
             ""","params":{"name":"${esc(toolName)}","arguments":$args}}"""
     }
 
-    /** 解析 tools/list；惡形輸入拋 IllegalArgumentException（呼叫方映射為 PROTOCOL）。 */
+    /**
+     * 解析 tools/list；惡形輸入拋 IllegalArgumentException（呼叫方映射為 PROTOCOL）。
+     *
+     * 只認頂層 `result` 包裝（先取頂層 `result`，缺/`null` 即拋 fail-closed，與 parseCall 一致），
+     * 再從 `result` 內取頂層 `tools` 陣列；無 `result` 包裝的 `{"tools":[...]}` 必須拒絕。
+     * inputSchema 超 [INPUT_SCHEMA_MAX_CHARS] 字元拋 [McpProtocol]（拒絕＋原因碼），
+     * 不靜默 take 截斷；name/description 短欄位 take 裝飾保留。
+     */
     fun parseList(serverId: String, json: String): List<McpTool> {
-        val toolsBlock = sectionArray(json, "\"tools\"")
+        val resultRaw = topLevelRawField(json, "result")
+            ?: throw IllegalArgumentException("mcp: missing result")
+        if (resultRaw == "null") throw IllegalArgumentException("mcp: missing result")
+        val toolsRaw = (if (resultRaw.startsWith("{")) topLevelRawField(resultRaw, "tools") else null)
             ?: throw IllegalArgumentException("mcp: missing result.tools")
+        val toolsTrimmed = toolsRaw.trim()
+        if (!toolsTrimmed.startsWith("[") || !toolsTrimmed.endsWith("]")) {
+            throw IllegalArgumentException("mcp: missing result.tools")
+        }
+        val toolsBlock = toolsTrimmed.substring(1, toolsTrimmed.length - 1)
         if (toolsBlock.isBlank()) return emptyList()
         return splitObjects(toolsBlock).map { obj ->
             val name = stringField(obj, "name")
                 ?: throw IllegalArgumentException("mcp: tool without name")
             val desc = stringField(obj, "description") ?: ""
             val schema = rawField(obj, "inputSchema") ?: """{"type":"object"}"""
+            if (schema.length > INPUT_SCHEMA_MAX_CHARS) {
+                throw McpProtocol("mcp: inputSchema exceeds $INPUT_SCHEMA_MAX_CHARS chars")
+            }
             McpTool(
                 serverId = serverId,
                 name = name.take(128),
                 description = desc.take(500),
-                inputSchema = schema.take(8_192),
+                inputSchema = schema,
             )
         }
     }
 
-    /** 解析 tools/call：回傳 (resultJson, isError)；只有頂層 error 鍵才算 error 包。 */
+    /**
+     * 解析 tools/call：回傳 (resultJson, isError)。
+     *
+     * 只有頂層 `error` 鍵才算 error 包；`isError`/`content` 只認頂層 `result`
+     * 物件的直接成員（depth 1），巢狀 content 內同名鍵不得誤判整包為 TOOL_ERROR；
+     * 缺 `result` 即拋 IllegalArgumentException（fail-closed，呼叫方映射 PROTOCOL）。
+     */
     fun parseCall(json: String): Pair<String?, Boolean> {
         val errRaw = topLevelRawField(json, "error")
         if (errRaw != null && errRaw != "null") {
@@ -59,16 +90,23 @@ internal object McpWire {
                 ?: "tool error"
             throw McpToolFailure(msg.take(200))
         }
-        val isError = boolField(json, "isError") ?: false
-        val content = rawField(json, "content")
-        val result = rawField(json, "result")
+        val resultRaw = topLevelRawField(json, "result")
+            ?: throw IllegalArgumentException("mcp: missing result")
+        if (resultRaw == "null") throw IllegalArgumentException("mcp: missing result")
+        // result 非 object（如字串/陣列字面量）時無成員可取：isError 預設 false，直接回原文。
+        val contentRaw = if (resultRaw.startsWith("{")) topLevelRawField(resultRaw, "content") else null
+        val isErrorRaw = if (resultRaw.startsWith("{")) topLevelRawField(resultRaw, "isError") else null
+        val isError = isErrorRaw?.trim() == "true"
         // 內存消費用：優先保留 content，否則整個 result；調用方用後即丟，不寫盤。
         // 上限由傳輸層雙上限保證（64k 字元內完整 JSON）：此處不靜默 take，
-        // content/result 雙缺（截斷半 JSON）必須拋 PROTOCOL，不回 OK(null) 假成功。
-        return ((content ?: result) ?: throw IllegalArgumentException("mcp: missing result.content")) to isError
+        // 缺頂層 result（截斷半 JSON 含）即拋 PROTOCOL，不回 OK(null) 假成功。
+        return ((contentRaw ?: resultRaw)) to isError
     }
 
     class McpToolFailure(message: String) : IllegalArgumentException(message)
+
+    /** 協議形狀錯誤（inputSchema 超限、缺 result 等）：[McpServer] 映射為 PROTOCOL。 */
+    class McpProtocol(message: String) : IllegalArgumentException(message)
 
     // ---- 極簡 JSON 掃描器（只夠本包兩種回應形狀；完整 JSON 解析不在此做） ----
 

@@ -5,7 +5,7 @@ import dev.librepocket.tool.SideEffect
 /**
  * D03 MCP 客戶端最小版模型（BACKLOG D03，ARCHITECTURE §10.1）。
  *
- * 原創小模型，只走 Streamable HTTP（POST `{baseUrl}/mcp`）+ Bearer；
+ * 原創小模型，只走 Streamable HTTP（POST `endpoint(baseUrl)`，使用者自訂完整 URL）+ Bearer；
  * 舊 SSE transport 不做。
  *
  * 隱私不變式（測試強制）：
@@ -26,7 +26,7 @@ object McpTimeouts {
 data class McpServerConfig(
     /** 穩定 id，轉錄/稽核只記此 id，不記地址明文以外的東西（地址本身是使用者配置，可記）。 */
     val id: String,
-    /** 使用者配置的伺服器基地址，例如 `https://mcp.example.com`（結尾斜線可有可無）。 */
+    /** 使用者配置的伺服器完整 URL，例如 `https://mcp.example.com/mcp`（結尾斜線可有可無）。BREAKING：舊只寫 origin（如 `https://mcp.example.com`）的配置升級後需補完整 path（含 `/mcp`），否則請求打到根 path。 */
     val baseUrl: String,
     /** [dev.librepocket.keystore.KeyVault] 內的 key 別名，預設 `mcp:<id>`。 */
     val keyId: String = "mcp:$id",

@@ -18,7 +18,7 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
 
 /**
- * D03 Streamable HTTP 傳輸：POST `{baseUrl}/mcp` + Bearer（舊 SSE 不做）。
+ * D03 Streamable HTTP 傳輸：POST `endpoint(baseUrl)`（使用者自訂完整 URL，不強制附加 `/mcp`）+ Bearer（舊 SSE 不做）。
  *
  * 安全約定：
  * - [bearer] 只放 `Authorization` 標頭，永不拼進 body，不寫 log；

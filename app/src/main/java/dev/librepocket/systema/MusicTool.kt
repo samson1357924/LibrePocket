@@ -57,7 +57,8 @@ object MusicTool : SystemTool<MusicTool.Params> {
 
   fun buildControlIntent(control: Control): IntentSpec = IntentSpec(
     action = IntentActions.MEDIA_BUTTON,
-    extras = mapOf("keyCode" to CONTROL_KEY_CODES.getValue(control).toString()),
+    // D2 型別化：keyCode 用 Int，端側 MediaSession 回調按 int 讀回。
+    extras = mapOf("keyCode" to IntentExtra.IntVal(CONTROL_KEY_CODES.getValue(control))),
   )
 
   override fun execute(params: Params, env: SystemEnv, launcher: IntentLauncher): ToolResult {
@@ -67,9 +68,7 @@ object MusicTool : SystemTool<MusicTool.Params> {
     }
     if (params.control != null) {
       val spec = buildControlIntent(params.control)
-      val ok = runCatching { launcher.launch(spec) }.getOrDefault(false)
-      return if (ok) ToolResult(true, false, spec)
-      else ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到控制播放（${ReasonCodes.NO_HANDLER}）")
+      return launcher.launchCatching(spec).toToolResult(spec, "控制播放")
     }
     if (params.query.isBlank()) {
       return ToolResult(
@@ -78,9 +77,10 @@ object MusicTool : SystemTool<MusicTool.Params> {
       )
     }
     val spec = buildPlayIntent(params)
-    val ok = runCatching { launcher.launch(spec) }.getOrDefault(false)
-    return if (ok) ToolResult(true, !env.hasMusicApp, spec, check.reasonCode)
-    else ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到播放音樂（${ReasonCodes.NO_HANDLER}）")
+    return launcher.launchCatching(spec).toToolResult(
+      spec, "播放音樂",
+      usedFallbackOnSuccess = !env.hasMusicApp, successReason = check.reasonCode,
+    )
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec = FallbackSpec(

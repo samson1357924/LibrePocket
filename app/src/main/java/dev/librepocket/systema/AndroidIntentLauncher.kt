@@ -9,18 +9,31 @@ import android.net.Uri
  * 端側執行適配：把純側 [IntentSpec] 轉成真正的 Intent 並走
  * resolveActivity → startActivity；音量走 AudioManager 直調。
  *
- * resolveActivity 為空一律回 false（不拋錯），呼叫方接 [FallbackSpec]。
+ * 失敗分型（D2）：resolve 無處理者 → [LaunchResult.NoHandler]；
+ * toIntent / resolve / start 任一拋錯 → [LaunchResult.Internal]
+ * （含 `resolveActivity` 自身拋錯，D1 此處在 runCatching 之外會直接外洩）。
+ * 呼叫方接 [FallbackSpec]。
  */
 class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
 
-  override fun launch(spec: IntentSpec): Boolean {
-    val intent = toIntent(spec)
-    if (intent.resolveActivity(context.packageManager) == null) return false
-    intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-    return runCatching {
+  override fun launch(spec: IntentSpec): LaunchResult {
+    val intent = try {
+      toIntent(spec)
+    } catch (t: Throwable) {
+      return LaunchResult.Internal(t)
+    }
+    val resolved = try {
+      intent.resolveActivity(context.packageManager)
+    } catch (t: Throwable) {
+      return LaunchResult.Internal(t)
+    }
+    if (resolved == null) return LaunchResult.NoHandler
+    return try {
       context.startActivity(intent)
-      true
-    }.getOrDefault(false)
+      LaunchResult.Success
+    } catch (t: Throwable) {
+      LaunchResult.Internal(t)
+    }
   }
 
   /** 經 AudioManager 落地音量操作；回傳實際是否生效。 */
@@ -56,7 +69,18 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
       intent.setDataAndType(data, mime)
     }
     spec.targetPackage?.let { intent.setPackage(it) }
-    spec.extras.forEach { (k, v) -> intent.putExtra(k, v) }
+    spec.extras.forEach { (k, v) ->
+      when (v) {
+        is IntentExtra.Str -> intent.putExtra(k, v.value)
+        is IntentExtra.LongVal -> intent.putExtra(k, v.value)
+        is IntentExtra.IntVal -> intent.putExtra(k, v.value)
+        is IntentExtra.Bool -> intent.putExtra(k, v.value)
+      }
+    }
+    // 預設恆加 NEW_TASK（維持 D1 行為）；spec.flags 僅套用 allowlist。
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    val allowed = IntentFlags.sanitize(spec.flags)
+    if (allowed != 0) intent.addFlags(allowed)
     return intent
   }
 }

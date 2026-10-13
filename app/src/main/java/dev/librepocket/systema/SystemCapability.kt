@@ -22,6 +22,8 @@ object ReasonCodes {
   const val NO_HANDLER = "NO_HANDLER"
   const val NEED_PERMISSION = "NEED_PERMISSION"
   const val NEED_CLARIFICATION = "NEED_CLARIFICATION"
+  /** 啟動執行期拋錯（與無處理者 NO_HANDLER 區分，D2）。 */
+  const val INTERNAL = "INTERNAL"
 }
 
 /**

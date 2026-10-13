@@ -65,12 +65,10 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
       return ToolResult(false, false, null, check.reasonCode, "做不到導航（${check.reasonCode}）")
     }
     val spec = resolve(params, env)
-    val ok = runCatching { launcher.launch(spec) }.getOrDefault(false)
-    return if (ok) {
-      ToolResult(true, !env.hasMapApp, spec, check.reasonCode)
-    } else {
-      ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到導航（${ReasonCodes.NO_HANDLER}）")
-    }
+    return launcher.launchCatching(spec).toToolResult(
+      spec, "導航",
+      usedFallbackOnSuccess = !env.hasMapApp, successReason = check.reasonCode,
+    )
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec {

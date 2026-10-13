@@ -191,17 +191,19 @@ class McpFuseTest {
             val good = s.listTools()
             assertEquals(McpStatus.OK, good.status)
             assertEquals(listOf("search"), good.tools.map { it.name })
-            // 端點形狀：POST /mcp（Streamable HTTP，不走 SSE）。
+            // 端點形狀：POST 使用者自訂完整 URL（此處 baseUrl 為根 path，故為 /，不強制改寫 /mcp）。
             val first = web.takeRequest(5, TimeUnit.SECONDS)
             assertNotNull("expected first request within 5s", first)
             val second = web.takeRequest(5, TimeUnit.SECONDS)
             assertNotNull("expected second request within 5s", second)
             for (req in listOf(first!!, second!!)) {
-                assertEquals("/mcp", req.path?.substringBefore("?"))
+                assertEquals("/", req.path?.substringBefore("?"))
                 assertEquals("POST", req.method)
             }
-            assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/"))
+            // D1：endpoint() 保留自訂 path（無後綴不強制加 /mcp；已有不重複加）。
+            assertEquals("https://x.example", McpWire.endpoint("https://x.example/"))
             assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/mcp"))
+            assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/mcp/"))
         } finally {
             web.shutdown()
         }

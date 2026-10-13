@@ -100,9 +100,7 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
     }
     return when (val r = resolve(params.query, env.installedPackages)) {
       is LaunchResolution.Single -> {
-        val ok = runCatching { launcher.launch(r.spec) }.getOrDefault(false)
-        if (ok) ToolResult(true, false, r.spec)
-        else ToolResult(false, false, r.spec, ReasonCodes.NO_HANDLER, "做不到開啟 App（${ReasonCodes.NO_HANDLER}）")
+        launcher.launchCatching(r.spec).toToolResult(r.spec, "開啟 App")
       }
       is LaunchResolution.NeedClarification -> ToolResult(
         false, false, null, ReasonCodes.NEED_CLARIFICATION,

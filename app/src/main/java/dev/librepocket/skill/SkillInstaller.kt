@@ -4,6 +4,8 @@ import dev.librepocket.tool.ToolRegistry
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 
@@ -17,6 +19,11 @@ import java.util.zip.ZipInputStream
  * - 每個 ZIP 只允許一個 Skill（單一頂層目錄 + 恰一個 `SKILL.md`）；
  * - 安裝只保存檔案、登記索引並預設啟用：永不執行 `scripts/` 下任何內容；
  * - 校驗失敗拒裝：先在記憶體完整驗證，再原子提交；失敗時目標目錄保持不變；
+ * - 原子提交：staging 目錄完整落盤後，同目錄 rename 切換；replace 時舊版先搬到
+ *   `.bak`，成功後刪 bak，失敗回滾 bak；rename 失敗直接失敗，不退回拷貝；
+ * - 同 skill 安裝互斥（per-skill 鎖），防併發交錯；孤兒 staging／`.bak` 需呼叫方
+ *   在啟動時呼叫 [cleanupStaleStaging] 清理（本安裝器與該清理皆尚未接入
+ *   production 啟動路徑；未呼叫則孤兒留存，成功路徑的 `.bak` 殘留由下次清理收斂）；
  * - 同名 Skill 預設保持不變（需 `replace=true` 才覆蓋）。
  */
 object SkillInstaller {
@@ -50,6 +57,72 @@ object SkillInstaller {
     sealed interface Result {
         data class Success(val skill: SkillDef) : Result
         data class Failure(val reason: SkillInstaller.Failure, val message: String) : Result
+    }
+
+    /** 過期 staging 的預設保留期限（啟動清理用）。 */
+    const val STALE_STAGING_MAX_AGE_MILLIS = 24L * 60 * 60 * 1000L
+
+    /** 同 skill 互斥鎖（per-skill 序列化併發安裝）。 */
+    private val skillLocks = ConcurrentHashMap<String, ReentrantLock>()
+
+    internal fun lockFor(skillId: String): ReentrantLock =
+        skillLocks.computeIfAbsent(skillId) { ReentrantLock() }
+
+    /** 測試接縫：為 null 時走真實 [File.renameTo]；測試可注入失敗以驗證回滾。 */
+    @Volatile
+    internal var renameHook: ((from: File, to: File) -> Boolean)? = null
+
+    private fun rename(from: File, to: File): Boolean =
+        renameHook?.invoke(from, to) ?: from.renameTo(to)
+
+    /**
+     * 重啟 staging 清理：刪除 [destRoot] 下過期的安裝器內部條目（`.$id.tmp-*`），
+     * 以及 target 仍在時的孤兒 `.bak`；若 target 缺席而
+     * `.bak` 仍在（崩潰窗口遺留），則盡力把舊版恢復為 target。
+     *
+     * 只碰開頭為 `.` 的安裝器內部條目；真實 skill 目錄永不以 `.` 開頭
+     *（見 [SkillParser] 的 name 規則），不會被誤刪。
+     *
+     * @return 刪除或恢復的條目數。
+     */
+    fun cleanupStaleStaging(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): Int {
+        if (!destRoot.isDirectory) return 0
+        val entries = try {
+            destRoot.listFiles()
+        } catch (_: Exception) {
+            null
+        } ?: return 0
+        val now = System.currentTimeMillis()
+        var removed = 0
+        for (f in entries) {
+            val n = f.name
+            if (!n.startsWith(".")) continue
+            val isStaging = n.contains(".tmp-")
+            val isBak = n.contains(".bak")
+            if (!isStaging && !isBak) continue
+            if (now - f.lastModified() < maxAgeMillis) continue
+            if (isBak && !isStaging) {
+                val id = n.removePrefix(".").substringBefore(".bak")
+                if (id.isNotEmpty()) {
+                    val target = File(destRoot, id)
+                    if (!target.exists() && f.isDirectory) {
+                        // 崩潰窗口遺留：舊版已搬離、target 缺席 → 盡力恢復。
+                        if (rename(f, target)) {
+                            removed++
+                            continue
+                        }
+                        // 恢復失敗則保留供人工處理，不計數。
+                        continue
+                    }
+                }
+            }
+            try {
+                if (f.deleteRecursively()) removed++
+            } catch (_: Exception) {
+                // best-effort：刪不掉就留下，不影響呼叫方。
+            }
+        }
+        return removed
     }
 
     /**
@@ -177,22 +250,26 @@ object SkillInstaller {
             hasScripts = hasScripts,
             enabled = true,
         )
-        // 原子提交：先寫臨時目錄再改名；失敗不留殘餘。
+        // 原子提交：staging 先完整落盤，再同目錄 rename 切換；replace 時舊版先搬到
+        // .bak，成功後刪 bak，失敗回滾 bak。rename 失敗直接失敗，不退回拷貝。
+        val lock = lockFor(root)
+        lock.lock()
         try {
             if (!destRoot.exists()) destRoot.mkdirs()
             val target = File(destRoot, root)
             if (target.exists() && !replace) {
                 return Result.Failure(Failure.ALREADY_EXISTS, "skill '$root' already installed")
             }
-            val tmp = File(destRoot, ".$root.tmp-${System.nanoTime()}")
-            if (tmp.exists()) tmp.deleteRecursively()
-            tmp.mkdirs()
+            val tid = Thread.currentThread().id
+            val staging = File(destRoot, ".$root.tmp-${System.nanoTime()}-$tid")
+            if (staging.exists()) staging.deleteRecursively()
+            staging.mkdirs()
             try {
                 for ((path, bytes) in normalized) {
                     val rel = path.removePrefix("$root/")
-                    val out = File(tmp, rel)
+                    val out = File(staging, rel)
                     // 寫盤前再做一次 canonical 約束（縱深）。
-                    val canonicalRoot = tmp.canonicalFile
+                    val canonicalRoot = staging.canonicalFile
                     val canonicalOut = out.canonicalFile
                     if (canonicalOut.path != canonicalRoot.path &&
                         !canonicalOut.path.startsWith(canonicalRoot.path + File.separator)
@@ -202,19 +279,46 @@ object SkillInstaller {
                     out.parentFile?.mkdirs()
                     out.writeBytes(bytes)
                 }
-                if (target.exists() && replace) target.deleteRecursively()
-                if (!tmp.renameTo(target)) {
-                    // rename 跨卷失敗時退回拷貝。
-                    target.mkdirs()
-                    tmp.copyRecursively(target, overwrite = true)
-                    tmp.deleteRecursively()
+                if (!target.exists()) {
+                    if (!rename(staging, target)) {
+                        staging.deleteRecursively()
+                        return Result.Failure(Failure.IO_ERROR, "commit failed: rename staging")
+                    }
+                } else {
+                    val backup = File(destRoot, ".$root.bak-${System.nanoTime()}-$tid")
+                    if (backup.exists()) backup.deleteRecursively()
+                    if (!rename(target, backup)) {
+                        staging.deleteRecursively()
+                        return Result.Failure(Failure.IO_ERROR, "commit failed: backup old version")
+                    }
+                    if (!rename(staging, target)) {
+                        val restored = try {
+                            rename(backup, target)
+                        } catch (_: Exception) {
+                            false
+                        }
+                        staging.deleteRecursively()
+                        return if (restored) {
+                            Result.Failure(Failure.IO_ERROR, "commit failed: rename staging, rolled back")
+                        } else {
+                            Result.Failure(
+                                Failure.IO_ERROR,
+                                "commit failed: rename staging, rollback failed, backup kept at ${backup.name}",
+                            )
+                        }
+                    }
+                    // 成功路徑的 bak 刪除為 best-effort：回傳忽略，
+                    // 殘留由下次 [cleanupStaleStaging] 收斂。
+                    backup.deleteRecursively()
                 }
             } catch (e: Exception) {
-                tmp.deleteRecursively()
+                staging.deleteRecursively()
                 throw e
             }
         } catch (e: Exception) {
             return Result.Failure(Failure.IO_ERROR, "commit failed: ${e.message}")
+        } finally {
+            lock.unlock()
         }
         return Result.Success(skill)
     }

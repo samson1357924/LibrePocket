@@ -8,8 +8,9 @@ import org.junit.Test
  * CHAT 自動導向 SETTINGS 恢復卡，而非留在無端點 CHAT 空態。
  *
  * - [shouldNavigateToSetup] 語義不變（兩者互斥：有碼走 SETTINGS，無碼走 SETUP）；
- * - [shouldNavigateToSettings] 僅在 CHAT 生效（已在 SETTINGS/SETUP 不重導，
- *   `null` 初始幀不決策；loading/inFlight 不決策）。
+ * - [shouldNavigateToSettings] 在 CHAT 或 SETUP 生效（已在 SETTINGS 不重導，
+ *   `null` 初始幀不決策；loading/inFlight 不決策；Stage F2 起 SETUP＋後到 retained
+ *   碼亦自動轉向 SETTINGS，gate-first 發射序不再靜止）。
  */
 class StartupRecoveryNavTest {
 
@@ -37,9 +38,10 @@ class StartupRecoveryNavTest {
     }
 
     @Test
-    fun alreadyInSettingsOrSetupDoesNotResteer() {
+    fun alreadyInSettingsDoesNotResteer_setupSteersToRecovery() {
         assertEquals(false, shouldNavigateToSettings(false, false, Routes.SETTINGS, "LOGOUT_DELETE_FAILED", false))
-        assertEquals(false, shouldNavigateToSettings(false, false, Routes.SETUP, "LOGOUT_DELETE_FAILED", false))
+        // Stage F2 (#18)：已在 SETUP＋後到 retained 碼 → 自動轉向 SETTINGS。
+        assertEquals(true, shouldNavigateToSettings(false, false, Routes.SETUP, "LOGOUT_DELETE_FAILED", false))
         assertEquals(false, shouldNavigateToSettings(false, false, null, "LOGOUT_DELETE_FAILED", false))
     }
 

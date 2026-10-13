@@ -220,24 +220,17 @@ class StartupGateWiringTest {
     }
 
     @Test
-    fun drawerOpensToRecoveryCard() {
-        // 恢復態選單鍵 enabled；drawer 開後點「設定」可達恢復卡。
-        // 經 SETUP 停留態切碼（避免 CHAT 自動導向搶先），證明 drawer 路徑可達。
+    fun setupSteersToRecoveryCardOnCodeArrival() {
+        // Stage F2 (#18)：SETUP 停留態後到 retained 碼 → 自動轉向 SETTINGS 恢復卡
+        // （不再靜止；drawer 手動路徑仍可用，但自動轉向優先）。
+        // 經 SETUP 停留態切碼，證明 gate-first 發射序終於恢復卡、無乒乓。
         val h = Harness()
         h.pending.value = false
         render(h)
         awaitRoute(h, Routes.SETUP)
         h.error.value = "LOGOUT_DELETE_FAILED"
-        composeRule.waitForIdle()
-        // 有碼但已在 SETUP：兩守衛皆不重導，停留。
-        assertEquals(Routes.SETUP, currentRoute(h))
-        composeRule.onNodeWithContentDescription("選單").assertIsEnabled()
-
-        composeRule.onNodeWithContentDescription("選單").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("設定").assertIsDisplayed()
-        composeRule.onNodeWithText("設定").performClick()
         awaitRoute(h, Routes.SETTINGS)
+        assertEquals(Routes.SETTINGS, currentRoute(h))
         composeRule.onNodeWithText(setupErrorText("LOGOUT_DELETE_FAILED")).assertIsDisplayed()
         composeRule.onNodeWithText("重試清除").assertIsDisplayed()
         // 重試回調可達（Stage F：獨立重試入口，禁回退全新 `onLogout`）。
@@ -246,6 +239,9 @@ class StartupGateWiringTest {
             assertEquals(1, h.retryLogoutCalls)
             assertEquals(0, h.logoutCalls)
         }
+        // 終止在 SETTINGS：無乒乓。
+        composeRule.waitForIdle()
+        assertEquals(Routes.SETTINGS, currentRoute(h))
     }
 
     @Test

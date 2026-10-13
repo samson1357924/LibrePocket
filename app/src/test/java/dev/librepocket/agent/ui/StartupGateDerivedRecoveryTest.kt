@@ -259,21 +259,43 @@ class StartupGateDerivedRecoveryTest {
     }
 
     @Test
-    fun drawerOpensToDerivedRecovery() {
-        // SETUP 停留態切 present（跨 VM 寫入模擬）：兩守衛皆不重導（已在 SETUP），
-        // 選單轉 enabled；drawer 開後點設定可達 UNKNOWN 恢復卡.
+    fun gateFirst_steersSetupToSettingsOnJournalArrival() {
+        // Stage F2 (#18)：gate-first 發射序——Absent 先硬導 SETUP，後到的
+        // KnownPending(J_C) 須自動把 SETUP 帶往 Settings 恢復卡（同源身份顯示），
+        // 而非靜止在無恢復卡的 SETUP。重試只能走身份回放入口，絕不回退全新 logout。
         val h = Harness()
         render(h)
         awaitRoute(h, Routes.SETUP)
         h.pendingTeardown.value = PendingTeardownState.KnownPending(journalB)
-        composeRule.waitForIdle()
-        assertEquals(Routes.SETUP, currentRoute(h))
-        composeRule.onNodeWithContentDescription("選單").assertIsEnabled()
-        composeRule.onNodeWithContentDescription("選單").performClick()
-        composeRule.waitForIdle()
-        composeRule.onNodeWithText("設定").performClick()
         awaitRoute(h, Routes.SETTINGS)
+        assertEquals(Routes.SETTINGS, currentRoute(h))
+        composeRule.runOnIdle {
+            assertTrue(h.visited.contains(Routes.SETUP))
+            assertTrue(h.visited.indexOf(Routes.SETUP) < h.visited.indexOf(Routes.SETTINGS))
+        }
         composeRule.onNodeWithText(setupErrorText("LOGOUT_UNKNOWN")).assertIsDisplayed()
+        composeRule.onNodeWithText("重試目標：${journalB.format()}").assertIsDisplayed()
+        composeRule.onNodeWithText("重試清除").assertIsDisplayed()
+        composeRule.onNodeWithText("重試清除").performClick()
+        composeRule.runOnIdle {
+            assertEquals(1, h.retryLogoutCalls)
+            assertEquals(0, h.logoutCalls)
+        }
+        // 終止在 SETTINGS：無乒乓（不自動回 SETUP/CHAT）。
+        composeRule.waitForIdle()
+        assertEquals(Routes.SETTINGS, currentRoute(h))
+    }
+
+    @Test
+    fun pendingFirst_reachesSettingsWithoutSetup() {
+        // 反向發射序對照：pending 先到即直達 SETTINGS，SETUP 從未訪問；
+        // 重試目標攜 J_C 身份。
+        val h = Harness()
+        h.pendingTeardown.value = PendingTeardownState.KnownPending(journalB)
+        render(h)
+        awaitRoute(h, Routes.SETTINGS)
+        composeRule.runOnIdle { assertTrue(h.visited.none { it == Routes.SETUP }) }
+        composeRule.onNodeWithText("重試目標：${journalB.format()}").assertIsDisplayed()
         composeRule.onNodeWithText("重試清除").performClick()
         composeRule.runOnIdle {
             assertEquals(1, h.retryLogoutCalls)

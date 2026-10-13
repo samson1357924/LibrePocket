@@ -244,7 +244,10 @@ fun shouldNavigateToSetup(
  * 規則（全部滿足才導向 SETTINGS）：
  * - 非 loading；無可用端點；不在登出執行中；
  * - 有未恢復登出態（`LOGOUT_*` 任一碼，含 STALE 待 dismiss）；
- * - 當前路由為 CHAT（已在 SETTINGS/SETUP 不重導；`null` 初始幀不決策）。
+ * - 當前路由為 CHAT 或 SETUP（已在 SETTINGS 不重導；`null` 初始幀不決策）。
+ *   SETUP 來源（Stage F2 #18）：gate-first 發射序下硬導航搶先進 SETUP，
+ *   後到的 retained 碼須能把使用者帶往 Settings 恢復卡，而非靜止在無恢復卡
+ *   的 SETUP；fresh（無碼）SETUP 不動。
  *
  * 純函數、無副作用。
  */
@@ -263,7 +266,7 @@ fun shouldNavigateToSettings(
     if (hasEndpoint) return false
     if (logoutInFlight) return false
     if (logoutErrorCode?.startsWith("LOGOUT_") != true) return false
-    if (currentRoute != Routes.CHAT) return false
+    if (currentRoute != Routes.CHAT && currentRoute != Routes.SETUP) return false
     return true
 }
 
@@ -271,9 +274,10 @@ fun shouldNavigateToSettings(
  * 讀取失敗導向純條件（Stage F1：#17 NEW Finding 1 P1）。
  *
  * `ReadFailure` 是需用戶重試的已落定終態（非過渡 loading）：fail-closed 不進
- * SETUP（未證 Absent），而是把 CHAT 上的使用者帶往 SETTINGS 的重試讀取畫面
- *（[SettingsScreen] `ReadFailure` 分支，僅重試讀取）。在途（pending）時不決策
- *（全屏 spinner 照舊，避免 FOUC）；已在 SETTINGS／SETUP 不重導；`null` 初始幀
+ * SETUP（未證 Absent），而是把 CHAT／SETUP 上的使用者帶往 SETTINGS 的重試讀取
+ * 畫面（[SettingsScreen] `ReadFailure` 分支，僅重試讀取；SETUP 來源見 Stage F2，
+ * gate-first 發射序下硬導航搶先時同需可達）。在途（pending）時不決策
+ *（全屏 spinner 照舊，避免 FOUC）；已在 SETTINGS 不重導；`null` 初始幀
  * 不決策（NavHost 組成後 currentRoute 落 CHAT 即觸發）。
  *
  * 純函數、無副作用。
@@ -285,6 +289,6 @@ fun shouldNavigateToSettingsOnReadFailure(
 ): Boolean {
     if (!isReadFailure) return false
     if (startupReconcilePending) return false
-    if (currentRoute != Routes.CHAT) return false
+    if (currentRoute != Routes.CHAT && currentRoute != Routes.SETUP) return false
     return true
 }

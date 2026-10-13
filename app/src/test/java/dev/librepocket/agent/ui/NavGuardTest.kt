@@ -70,13 +70,32 @@ class NavGuardTest {
 
     @Test
     fun readFailureSteeringTruthTable() {
-        // 專用轉向：已落定 ReadFailure＋CHAT 才去 SETTINGS。
+        // 專用轉向：已落定 ReadFailure＋CHAT/SETUP 才去 SETTINGS。
         assertEquals(true, shouldNavigateToSettingsOnReadFailure(true, false, Routes.CHAT))
+        assertEquals(true, shouldNavigateToSettingsOnReadFailure(true, false, Routes.SETUP))
         assertEquals(false, shouldNavigateToSettingsOnReadFailure(false, false, Routes.CHAT))
         assertEquals(false, shouldNavigateToSettingsOnReadFailure(true, true, Routes.CHAT))
+        assertEquals(false, shouldNavigateToSettingsOnReadFailure(true, true, Routes.SETUP))
         assertEquals(false, shouldNavigateToSettingsOnReadFailure(true, false, Routes.SETTINGS))
-        assertEquals(false, shouldNavigateToSettingsOnReadFailure(true, false, Routes.SETUP))
         assertEquals(false, shouldNavigateToSettingsOnReadFailure(true, false, null))
+    }
+
+    @Test
+    fun retainedCodeSteersFromSetupToSettings() {
+        // Stage F2 (#18)：gate-first 發射序下硬導航搶先進 SETUP，後到的 retained
+        // 碼須能把使用者帶往 Settings 恢復卡；fresh（無碼）SETUP 不動。
+        for (code in listOf("LOGOUT_UNKNOWN", "LOGOUT_DELETE_FAILED", "LOGOUT_CLEAR_FAILED", "LOGOUT_READ_FAILED", "LOGOUT_READ_RETRY", "LOGOUT_STALE")) {
+            assertEquals("code=$code SETUP", true, shouldNavigateToSettings(false, false, Routes.SETUP, code, false))
+            assertEquals("code=$code SETUP not SETUP-nav", false, shouldNavigateToSetup(false, false, Routes.SETUP, code, false))
+        }
+        assertEquals(false, shouldNavigateToSettings(false, false, Routes.SETUP, null, false))
+        // Ready／loading／在途／ReadFailure 下不轉向。
+        assertEquals(false, shouldNavigateToSettings(true, false, Routes.SETUP, "LOGOUT_UNKNOWN", false))
+        assertEquals(false, shouldNavigateToSettings(false, true, Routes.SETUP, "LOGOUT_UNKNOWN", false))
+        assertEquals(false, shouldNavigateToSettings(false, false, Routes.SETUP, "LOGOUT_UNKNOWN", true))
+        assertEquals(false, shouldNavigateToSettings(false, false, Routes.SETUP, "LOGOUT_UNKNOWN", false, isReadFailure = true))
+        // 到達 SETTINGS 後不重導、不乒乓。
+        assertEquals(false, shouldNavigateToSettings(false, false, Routes.SETTINGS, "LOGOUT_UNKNOWN", false))
     }
 
     @Test

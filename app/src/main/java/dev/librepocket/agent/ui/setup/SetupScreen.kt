@@ -40,6 +40,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -48,6 +49,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -92,6 +94,11 @@ fun SetupScreen(
     viewModel: SetupViewModel,
 ) {
     val state by viewModel.form.collectAsStateWithLifecycle()
+    // collectAsState (not WithLifecycle): mirrors every test harness and the
+    // MainScreen->host wiring in this repo; the gate/pending snapshot only
+    // drives the retry card and never leaves this composition.
+    val gate by viewModel.gate.collectAsState()
+    val startupPending by viewModel.startupReconcilePending.collectAsState()
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
 
@@ -140,6 +147,43 @@ fun SetupScreen(
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        // Stage F2 (#18)：gate 讀取未確認時在 SETUP 內提供非破壞性重試入口。
+        // gate-first 發射序／transient 失敗後使用者可能靜止在此頁（舊守衛不導、
+        // Back 被攔、menu disabled），重試走同一安全 reconcile（只重讀＋回放，
+        // 不碰表單草稿、不調 logout）；在途時 disabled＋spinner。
+        if (gate is EndpointGate.ReadFailure) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = "設定讀取失敗，請重試讀取。輸入草稿會保留。",
+                    modifier = Modifier.padding(12.dp),
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            Button(
+                onClick = {
+                    viewModel.retryStartupReconcile { o, j -> viewModel.onStartupReconcile(o, j) }
+                },
+                enabled = !startupPending,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("setupRetryRead"),
+            ) {
+                if (startupPending) {
+                    CircularProgressIndicator(strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.padding(4.dp))
+                    Text("讀取中…")
+                } else {
+                    Text("重試讀取")
+                }
+            }
+        }
 
         ExposedDropdownMenuBox(
             expanded = presetExpanded,

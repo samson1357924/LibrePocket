@@ -1054,11 +1054,11 @@ class ChatSessionFactory(
  * Known limitation: a `reasoning` marker outside the
  * [SnapshotBudget.HISTORY_LOAD_CAP] window is not collected, so its
  * assistant row (when the row itself is still inside the window) resumes
- * with `hasReasoning=false` (fail-open to plain-text continuation). On
- * this branch that is defense-in-depth only: resumed history is display
- * state, never fed back into the provider request, so a missing flag
- * cannot smuggle a reasoning origin into a follow-up as plain text
- * (ordinary no-tools follow-ups continue either way).
+ * with `hasReasoning=false` (provider-visible fail-open to plain-text
+ * continuation: the resumed prefix feeds the provider via TurnController,
+ * so a tool-dependent follow-up would mis-pass `requireNoReasoningHistory`
+ * instead of failing closed; ordinary no-tools follow-ups continue either
+ * way).
  *
  * Truncation is observable: [LoadedModelHistory.droppedCount] carries the
  * exact omitted-row total (filtered COUNT query, O(1) memory). A giant
@@ -1097,8 +1097,11 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
  *
  * Known limitation: same CAP-boundary fail-open as [loadModelHistory] — a
  * marker outside the [SnapshotBudget.HISTORY_LOAD_CAP] window is not
- * collected even when its assistant row is kept. Production no-tools
- * follow-ups cannot observe the difference (display-only flag).
+ * collected even when its assistant row is kept. The resumed prefix feeds
+ * the provider via [loadModelHistory] into [TurnController], so the lost
+ * flag is provider-visible fail-open to plain-text continuation: ordinary
+ * no-tools follow-ups continue either way, while a tool-dependent follow-up
+ * mis-passes `requireNoReasoningHistory` instead of failing closed.
  */
 internal data class ModelHistoryScan(
     /**

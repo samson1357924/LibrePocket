@@ -17,8 +17,8 @@ import kotlinx.coroutines.CancellationException
  * export), retried -> `retry` event, steer queued -> `steer` event, tool
  * done -> `tool` event, usage -> `system` event (accounting, P1 records only).
  *
- * A reasoning-sourced turn (`hasReasoning == true`) appends one extra
- * `reasoning` event with the same runId and empty text right after its
+ * A reasoning-sourced turn (`hasReasoning == true`) persists one extra
+ * `reasoning` event with the same runId and empty text together with its
  * `assistant` event on success and on cancel: the marker itself is empty
  * (flag-only; no reasoning
  * payload touches the store), but visible reasoning deltas remain merged
@@ -30,12 +30,20 @@ import kotlinx.coroutines.CancellationException
  * [dev.librepocket.chat.UiMessage.hasReasoning] so resumed reasoning-origin
  * turns still fail closed on tool-dependent / thinking-mode follow-ups
  * (ordinary no-tools follow-ups continue; see `requireNoReasoningHistory`).
- * Resume history here is display-only (rebuilt UiMessages, never fed back
- * into a provider request), so the restored flag is defense-in-depth only.
+ * Resume history feeds the provider via `loadModelHistory` into
+ * [dev.librepocket.chat.TurnController], so the restored flag is
+ * provider-visible: a missing flag fail-opens to plain-text continuation
+ * on a tool-dependent follow-up instead of failing closed.
  *
- * The two appends (`assistant` + `reasoning`) are non-atomic: a crash
- * between them loses the flag (fail-open to plain-text continuation);
- * display-only, so no provider impact beyond the missing flag.
+ * D15-3: the `assistant` + `reasoning` pair persists as one atomic batch
+ * via [SessionStore.appendEvents] (single transaction on [RoomSessionStore],
+ * snapshot + rollback on the in-memory test fake): a second-row failure
+ * leaves zero rows, never an orphaned `assistant` that would read back as a
+ * complete plain-text result. External [SessionStore] implementations that
+ * keep the default sequential [SessionStore.appendEvents] fallback may still
+ * leave a partial batch behind — callers must treat a throw as a
+ * possibly-partial batch unless the store documents atomicity (fail-closed
+ * handling on the caller side; the default itself is unchanged).
  *
  * The controller routes every call through its session-owned
  * [dev.librepocket.chat.OrderedTranscriptSink] (single session writer:
@@ -116,6 +124,51 @@ class SessionTranscriptSink(
         }
     }
 
+    /**
+     * D15-3 atomic batch core write: persists every event as one
+     * all-or-nothing unit via [SessionStore.appendEvents].
+     * [RoomSessionStore] (single DB transaction) and the in-memory test
+     * fake (snapshot + rollback) commit all rows or zero; an external
+     * [SessionStore] keeping the default sequential fallback may leave the
+     * earlier rows behind, so callers must treat a throw as a
+     * possibly-partial batch unless the store documents atomicity
+     * (fail-closed handling on the caller side; the default itself is
+     * unchanged here). Store failures propagate so the writer fails the ack
+     * instead of reporting a false durable write. Cancellation always
+     * propagates.
+     */
+    private suspend fun appendDurableBatch(events: List<TranscriptEvent>) {
+        try {
+            store.appendEvents(events)
+        } catch (e: CancellationException) {
+            // Same teardown contract as [appendDurable]: propagate.
+            throw e
+        }
+    }
+
+    private fun coreEvent(
+        runId: String,
+        kind: String,
+        text: String,
+        createdAt: Long,
+        isPartial: Boolean = false,
+        failureReason: String? = null,
+        parentRunId: String? = null,
+        attemptIndex: Int? = null,
+        isFinal: Boolean = true,
+    ): TranscriptEvent = TranscriptEvent(
+        sessionId = sessionId,
+        runId = runId,
+        kind = kind,
+        text = text,
+        createdAt = createdAt,
+        isPartial = isPartial,
+        failureReason = failureReason,
+        parentRunId = parentRunId,
+        attemptIndex = attemptIndex,
+        isFinal = isFinal,
+    )
+
     /** Best-effort notice write: persistence must never break the chat loop. */
     private suspend fun appendNotice(
         runId: String,
@@ -154,8 +207,11 @@ class SessionTranscriptSink(
     }
 
     override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
-        appendDurable(runId, "assistant", text, isFinal = true)
-        if (hasReasoning) appendDurable(runId, "reasoning", "", isFinal = true)
+        val now = clock()
+        val batch = ArrayList<TranscriptEvent>(2)
+        batch.add(coreEvent(runId, "assistant", text, now, isFinal = true))
+        if (hasReasoning) batch.add(coreEvent(runId, "reasoning", "", now, isFinal = true))
+        appendDurableBatch(batch)
     }
 
     override suspend fun onTurnSucceeded(
@@ -165,10 +221,13 @@ class SessionTranscriptSink(
         attemptIndex: Int?,
         hasReasoning: Boolean,
     ) {
-        appendDurable(runId, "assistant", text, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true)
+        val now = clock()
+        val batch = ArrayList<TranscriptEvent>(2)
+        batch.add(coreEvent(runId, "assistant", text, now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
         if (hasReasoning) {
-            appendDurable(runId, "reasoning", "", parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true)
+            batch.add(coreEvent(runId, "reasoning", "", now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
         }
+        appendDurableBatch(batch)
     }
 
     override suspend fun onTurnFailed(runId: String, error: String) {
@@ -215,8 +274,11 @@ class SessionTranscriptSink(
     }
 
     override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
-        appendDurable(runId, "assistant", partialText, isPartial = true, isFinal = true)
-        if (hasReasoning) appendDurable(runId, "reasoning", "", isFinal = true)
+        val now = clock()
+        val batch = ArrayList<TranscriptEvent>(2)
+        batch.add(coreEvent(runId, "assistant", partialText, now, isPartial = true, isFinal = true))
+        if (hasReasoning) batch.add(coreEvent(runId, "reasoning", "", now, isFinal = true))
+        appendDurableBatch(batch)
     }
 
     override suspend fun onTurnCancelled(
@@ -226,14 +288,19 @@ class SessionTranscriptSink(
         attemptIndex: Int?,
         hasReasoning: Boolean,
     ) {
-        appendDurable(
-            runId, "assistant", partialText,
-            isPartial = true, parentRunId = parentRunId, attemptIndex = attemptIndex,
-            isFinal = true,
+        val now = clock()
+        val batch = ArrayList<TranscriptEvent>(2)
+        batch.add(
+            coreEvent(
+                runId, "assistant", partialText, now,
+                isPartial = true, parentRunId = parentRunId, attemptIndex = attemptIndex,
+                isFinal = true,
+            ),
         )
         if (hasReasoning) {
-            appendDurable(runId, "reasoning", "", parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true)
+            batch.add(coreEvent(runId, "reasoning", "", now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
         }
+        appendDurableBatch(batch)
     }
 
     /**

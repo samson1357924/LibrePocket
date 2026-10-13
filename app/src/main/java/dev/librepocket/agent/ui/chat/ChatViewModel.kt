@@ -4487,9 +4487,10 @@ class ChatViewModel(
         // Marker events never render; an assistant event whose runId has a marker
         // restores hasReasoning so resumed reasoning-origin turns still fail
         // closed on tool-dependent / thinking-mode follow-ups (ordinary
-        // no-tools follow-ups continue). Resume history here is display-only
-        // (rebuilt UiMessages, never fed into provider requests), so the flag
-        // is defense-in-depth only. Backward scan sees each marker before its
+        // no-tools follow-ups continue). This replay is display UiMessages;
+        // the provider-visible flag rides loadModelHistory into TurnController,
+        // so a missing marker fail-opens to plain-text continuation on a
+        // tool-dependent follow-up instead of failing closed. Backward scan sees each marker before its
         // assistant (markers append right after), so the pending path is the
         // live one; the patch path stays for reorder tolerance. Cancelled /
         // failed fragments replay with their persisted partial flag (never as

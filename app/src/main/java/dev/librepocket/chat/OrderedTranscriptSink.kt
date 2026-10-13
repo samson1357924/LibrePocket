@@ -68,6 +68,14 @@ class OrderedTranscriptSink(
     val runId: String?,
     val block: suspend () -> Unit,
     val ack: CompletableDeferred<Unit>? = null,
+    /**
+     * R18-2 per-entry outcome (null = pending, true = committed, false =
+     * failed). Set by the writer finally alongside the ack completion, so a
+     * waiter can observe this entry fate without consulting the aggregated
+     * per-runId mix and without delicate ack introspection. Null in
+     * production for non-terminal entries.
+     */
+    val outcome: AtomicReference<Boolean?>? = null,
   )
 
   private val writerScope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -95,6 +103,14 @@ class OrderedTranscriptSink(
   private val commitCounts = ConcurrentHashMap<String, AtomicInteger>()
   /** Outstanding core acks (ack -> runId) for bounded seal/shutdown failure. */
   private val coreAcks = ConcurrentHashMap<CompletableDeferred<Unit>, String>()
+  /**
+   * R18-2 per-entry outcomes (ack -> outcome ref) for terminal receipts.
+   * Populated in [writeCoreWithAck] alongside [coreAcks]; completed by the
+   * writer finally (true on commit, false on failure/seal) and removed with
+   * the ack. Lets the controller waiter observe one entry fate with a plain
+   * atomic read.
+   */
+  private val coreOutcomes = ConcurrentHashMap<CompletableDeferred<Unit>, AtomicReference<Boolean?>>()
   /** Set once the writer exits (teardown or drain): later cores fail fast. */
   private val writerDead = AtomicBoolean(false)
   /**
@@ -374,9 +390,12 @@ class OrderedTranscriptSink(
           val ack = entry.ack
           if (ack != null) {
             coreAcks.remove(ack)
+            val outcome = entry.outcome ?: coreOutcomes.remove(ack)
             if (!ack.isCompleted) {
               if (failure != null) {
                 entry.runId?.let(::markInterrupted)
+                outcome?.compareAndSet(null, false)
+                coreOutcomes.remove(ack)
                 ack.completeExceptionally(failure)
               } else {
                 // D15-2: record the commit BEFORE clearing pending, so a
@@ -404,10 +423,13 @@ class OrderedTranscriptSink(
                     // Test-only: never fail a durable commit on hook error.
                   }
                 }
+                outcome?.compareAndSet(null, true)
+                coreOutcomes.remove(ack)
                 ack.complete(Unit)
               }
             } else if (failure != null) {
               entry.runId?.let(::markInterrupted)
+              (entry.outcome ?: coreOutcomes.remove(ack))?.compareAndSet(null, false)
             } else {
               // D15-2: the ack was already completed (abandoned waiter) but
               // the row still committed — record the proof before clearing
@@ -421,6 +443,7 @@ class OrderedTranscriptSink(
                   pendingCore.remove(id)
                 }
               }
+              (entry.outcome ?: coreOutcomes.remove(ack))?.compareAndSet(null, true)
             }
           } else {
             entry.runId?.let { pendingCore.remove(it) }
@@ -473,6 +496,28 @@ class OrderedTranscriptSink(
     hasReasoning: Boolean,
   ) = writeCore(runId) { delegate.onTurnSucceeded(runId, text, parentRunId, attemptIndex, hasReasoning) }
 
+  /**
+   * R18-2 direction-A per-entry receipt: terminal success using a
+   * caller-provided ack. Identical ordering/ack contract to [writeCore],
+   * except the entry ack is the supplied [receipt] (retained by the caller
+   * for per-entry fate observation: committed vs failed vs pending), not a
+   * fresh one. The writer completes it exactly like the internal ack, so a
+   * waiter can tell terminal SUCCESS + system FAIL apart from terminal FAIL
+   * + system SUCCESS even though both aggregate to the same per-runId
+   * commitCounts/interrupted mix.
+   */
+  suspend fun onTurnSucceededWithReceipt(
+    runId: String,
+    text: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+    receipt: CompletableDeferred<Unit>,
+    outcome: AtomicReference<Boolean?>,
+  ) = writeCoreWithAck(runId, receipt, outcome) {
+    delegate.onTurnSucceeded(runId, text, parentRunId, attemptIndex, hasReasoning)
+  }
+
   override suspend fun onTurnFailed(runId: String, error: String) =
     writeCore(runId) { delegate.onTurnFailed(runId, error) }
 
@@ -495,6 +540,25 @@ class OrderedTranscriptSink(
     attemptIndex: Int?,
     isFinal: Boolean,
   ) = writeCore(runId) { delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal) }
+
+  /**
+   * R18-2 direction-A per-entry receipt: terminal/intermediate failure using
+   * a caller-provided ack. Same contract as [onTurnSucceededWithReceipt]:
+   * the writer completes [receipt] with this entry outcome only, never an
+   * aggregate per-runId count.
+   */
+  suspend fun onTurnFailedWithReceipt(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+    receipt: CompletableDeferred<Unit>,
+    outcome: AtomicReference<Boolean?>,
+  ) = writeCoreWithAck(runId, receipt, outcome) {
+    delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
+  }
 
   override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) =
     writeCore(runId) { delegate.onTurnCancelled(runId, partialText, hasReasoning) }
@@ -702,6 +766,97 @@ class OrderedTranscriptSink(
       throw e
     } finally {
       coreAcks.remove(ack)
+    }
+  }
+
+  /**
+   * R18-2 per-entry core write using a caller-provided ack + outcome.
+   *
+   * Identical admission/ordering/ack contract to [writeCoreTracked] (same
+   * ticket/chain, same fail-fast, same send-attempt proof, same writer
+   * finally that records commitCounts + clears pending on success or marks
+   * INTERRUPTED on failure), except the entry ack is the supplied [ack]
+   * instead of a fresh one and the writer publishes this entry fate into
+   * [outcome] (null = pending, true = committed, false = failed/sealed)
+   * alongside the ack completion. The caller retains both as the terminal
+   * entry receipt and the waiter observes [outcome] with a plain atomic
+   * read — never the aggregated per-runId commitCounts/interrupted mix and
+   * never delicate ack introspection. No channel semantic change; the older
+   * [writeCore]/[writeCoreTracked] paths are untouched.
+   */
+  private suspend fun writeCoreWithAck(
+    runId: String,
+    ack: CompletableDeferred<Unit>,
+    outcome: AtomicReference<Boolean?>,
+    block: suspend () -> Unit,
+  ) {
+    require(!ack.isCompleted) { "receipt ack must be incomplete" }
+    if (writerDead.get() || writer.isCompleted || channel.isClosedForSend) {
+      markInterrupted(runId)
+      outcome.compareAndSet(null, false)
+      coreOutcomes.remove(ack)
+      if (!ack.isCompleted) ack.completeExceptionally(CancellationException("transcript writer sealed"))
+      throw CancellationException("transcript writer sealed")
+    }
+    val reservation = reserveAdmission()
+    ack.invokeOnCompletion { cause ->
+      if (cause != null) markInterrupted(runId)
+    }
+    coreAcks[ack] = runId
+    coreOutcomes[ack] = outcome
+    pendingCore.add(runId)
+    var sendInvoked = false
+    try {
+      checkNotHoldingAdmissionLock("onPrevAwaitEnteredForTest:writeCoreWithAck")
+      onPrevAwaitEnteredForTest?.invoke(reservation.ticket)
+      reservation.prev?.await()
+      checkNotHoldingAdmissionLock("beforeSendForTest:writeCoreWithAck")
+      beforeSendForTest?.invoke(reservation.ticket)
+      if (coroutineContext[Job]?.isCancelled == true) {
+        throw CancellationException("admission waiter cancelled before send")
+      }
+      sendInvoked = true
+      channel.send(Entry(runId, block, ack, outcome))
+      checkNotHoldingAdmissionLock("afterSendForTest:writeCoreWithAck")
+      afterSendForTest?.invoke(reservation.ticket)
+    } catch (e: CancellationException) {
+      if (!sendInvoked) {
+        coreAcks.remove(ack)
+        coreOutcomes.remove(ack)
+        pendingCore.remove(runId)
+        throw e
+      }
+      throw e
+    } catch (e: ClosedSendChannelException) {
+      coreAcks.remove(ack)
+      markInterrupted(runId)
+      outcome.compareAndSet(null, false)
+      coreOutcomes.remove(ack)
+      if (!ack.isCompleted) ack.completeExceptionally(e)
+      throw e
+    } catch (e: Exception) {
+      if (!sendInvoked) {
+        coreAcks.remove(ack)
+        coreOutcomes.remove(ack)
+        pendingCore.remove(runId)
+      }
+      throw e
+    } finally {
+      if (sendInvoked) releaseAdmission(reservation.gate)
+      else releaseAbandoned(reservation)
+    }
+    try {
+      ack.await()
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: Exception) {
+      throw e
+    } finally {
+      coreAcks.remove(ack)
+      // Outcome stays for the waiter when the entry was admitted
+      // (sendInvoked): the writer finally publishes true/false. Pre-send
+      // abandon (!sendInvoked) never entered, so drop the mapping.
+      if (!sendInvoked) coreOutcomes.remove(ack)
     }
   }
 
@@ -1191,6 +1346,7 @@ class OrderedTranscriptSink(
     }
     for ((ack, runId) in coreAcks.entries.toList()) {
       coreAcks.remove(ack)
+      coreOutcomes.remove(ack)?.compareAndSet(null, false)
       pendingCore.remove(runId)
       synchronized(poisonLock) {
         if (!resolvedUndelivered.contains(runId) && !interrupted.contains(runId)) {
@@ -1205,6 +1361,8 @@ class OrderedTranscriptSink(
     }
     while (true) {
       val entry = channel.tryReceive().getOrNull() ?: break
+      entry.outcome?.compareAndSet(null, false)
+      entry.ack?.let { coreOutcomes.remove(it)?.compareAndSet(null, false) }
       entry.runId?.let { runId ->
         pendingCore.remove(runId)
         synchronized(poisonLock) {

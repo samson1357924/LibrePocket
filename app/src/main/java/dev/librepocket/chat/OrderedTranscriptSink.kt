@@ -250,6 +250,13 @@ class OrderedTranscriptSink(
           // ack explicitly; the writer itself stays alive for later entries.
           // Notice entries carry no ack, so this stays best-effort for them.
           failure = e
+        } catch (e: Throwable) {
+          // Fatal Error (e.g. store AssertionError/LinkageError): fail this
+          // entry's ack explicitly instead of reporting a false durable ack,
+          // then propagate so the writer seals like teardown. Never swallow
+          // and never continue draining behind a fatal.
+          failure = e
+          throw e
         } finally {
           entry.runId?.let { pendingCore.remove(it) }
           val ack = entry.ack

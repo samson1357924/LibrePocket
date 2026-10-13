@@ -6,6 +6,7 @@ import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.agent.ui.chat.cancelledMarkerText
 import dev.librepocket.agent.ui.chat.findDanglingRunIds
 import dev.librepocket.agent.ui.chat.interruptedMarkerText
+import dev.librepocket.agent.ui.chat.modelSwitchMarkerWithheld
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -26,6 +27,7 @@ import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
@@ -127,6 +129,7 @@ class CancelReceiptCloseBarrierTest {
     prefix: String,
     maxRounds: Int = 60,
     retry: TurnRetryConfig = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(5_000L)),
+    settleMs: Long = SETTLE_MS,
   ): TurnController = TurnController(
     provider = provider,
     policy = R191Policy(),
@@ -135,7 +138,7 @@ class CancelReceiptCloseBarrierTest {
     dispatcher = Dispatchers.Default,
     sleeper = {},
     newId = { "$prefix-${n.incrementAndGet() - 1}" },
-    cancelSettleTimeoutMs = SETTLE_MS,
+    cancelSettleTimeoutMs = settleMs,
     cancelCompensationTimeoutMs = 5_000L,
     cancelReceiptMaxRounds = maxRounds,
   )
@@ -652,5 +655,315 @@ class CancelReceiptCloseBarrierTest {
     } finally {
       second.session.close()
     }
+  }
+
+  // ---- Phase 2: close-budget linearization (fence T2/T3) ----
+
+  /**
+   * Gate-controlled terminal store (LateFailureCompensationTest
+   * sealedWriterDegradesWithoutParking手法): the first assistant write parks
+   * until [gate] completes, so the test fixes whether the terminal SUCCESS
+   * lands before the waiter's next poll (T2 forward) or after the barrier
+   * seal (T2 reverse). Non-assistant rows (user, notice, compensation marks)
+   * never park.
+   */
+  private class R192GateStore(
+    val entered: CountDownLatch = CountDownLatch(1),
+    val gate: CompletableDeferred<Unit> = CompletableDeferred(),
+  ) : FakeSessionStore() {
+    override suspend fun appendEvent(event: TranscriptEvent): Long {
+      if (event.kind == "assistant") {
+        entered.countDown()
+        gate.await()
+      }
+      return super.appendEvent(event)
+    }
+  }
+
+  private fun endpointCross(): EndpointConfig = EndpointConfig(
+    providerId = "preset:anthropic",
+    presetId = "anthropic",
+    label = "Anthropic",
+    baseUrl = "https://api.anthropic.com/v1",
+    protocol = ProviderProto.CHAT_COMPLETIONS,
+    model = "claude-3-5-sonnet",
+    apiKeyRef = "provider_key/preset:anthropic",
+  )
+
+  private fun forkFactory(store: FakeSessionStore): ChatSessionFactory = ChatSessionFactory(
+    policy = InMemoryPolicyStore(),
+    vaultSource = VaultSource {
+      val vault = EncryptedPrefsVault(InMemoryPrefs())
+      vault.putKey("preset:openai", "test-key-12345678".toCharArray())
+      vault.putKey("preset:anthropic", "test-key-12345678".toCharArray())
+      vault
+    },
+    buildProvider = { _, _ -> R191ReopenProvider() },
+    sessionStores = object : SessionStoreSource {
+      override suspend fun store() = store
+    },
+  )
+
+  private fun awaitSealed(c: TurnController, timeoutMs: Long = 5_000L) {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (!c.isTranscriptSealed() && System.currentTimeMillis() < deadline) {
+      Thread.sleep(25)
+    }
+    assertTrue("barrier must seal while the terminal is still gated", c.isTranscriptSealed())
+  }
+
+  private fun assertReopenAddsSingleInterrupted(store: FakeSessionStore, sid: String) {
+    val f = factory(store)
+    val ep = endpoint()
+    val sizeBefore = store.events.count { it.sessionId == sid }
+    val first = runBlocking { f.open(ep, sid) }
+    try {
+      val afterFirst = store.events.filter { it.sessionId == sid }.sortedBy { it.seq }
+      assertEquals(sizeBefore + 1, afterFirst.size)
+      val mark = afterFirst.last()
+      assertEquals("system", mark.kind)
+      assertEquals(interruptedMarkerText(afterFirst[0].runId), mark.text)
+      assertTrue(findDanglingRunIds(afterFirst).isEmpty())
+    } finally {
+      first.session.close()
+    }
+    val sizeAfterFirst = store.events.count { it.sessionId == sid }
+    val second = runBlocking { f.open(ep, sid) }
+    try {
+      assertEquals(sizeAfterFirst, store.events.count { it.sessionId == sid })
+    } finally {
+      second.session.close()
+    }
+  }
+
+  private fun assertCrossOriginForkClean(store: FakeSessionStore, sid: String) {
+    // ChatSessionFactory cross-origin fork semantics: a cross-origin open
+    // never reuses the old id; the old ledger stays a read-only archive
+    // (no backfill, no copy-out) and the fork holds only the withheld
+    // marker (never a copy of the old rows).
+    val oldCount = store.events.count { it.sessionId == sid }
+    val opened = runBlocking { forkFactory(store).open(endpointCross(), sid) }
+    try {
+      assertTrue("cross-origin open must withhold history", opened.historyWithheld)
+      val newId = checkNotNull(opened.sessionId)
+      assertTrue("cross-origin open must fork a new id", newId != sid)
+      assertEquals(
+        "old ledger must stay a read-only archive",
+        oldCount,
+        store.events.count { it.sessionId == sid },
+      )
+      val forked = store.events.filter { it.sessionId == newId }.sortedBy { it.seq }
+      assertTrue(
+        "fork must persist the withheld marker, was $forked",
+        forked.any {
+          it.kind == "system" && it.text.startsWith("model switched ") &&
+            modelSwitchMarkerWithheld(it.text)
+        },
+      )
+      assertTrue("new ledger must not dangle, was $forked", findDanglingRunIds(forked).isEmpty())
+    } finally {
+      opened.session.close()
+    }
+  }
+
+  @Test fun closeBarrierGatedSuccess_beforeWaiterNextPoll_reopenAndForkConsistent() {
+    // Phase 2 T2 forward: the terminal SUCCESS lands after close() but
+    // before the waiter's next poll wake, so the owed system-mark admission
+    // must linearize before the flush barrier/seal (never SEALED).
+    // maxRounds=60 never touches the receipt deadline here — the race under
+    // test is purely the close fence (drain 450ms vs the 50ms poll sleep).
+    val store = R192GateStore()
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(provider, SessionTranscriptSink(store, sid), n, "r192-gate")
+    try {
+      startedHost(c)
+      assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      // The waiter installed its receipt and is inside its first 50ms poll
+      // sleep (terminal still stalled on the gate).
+      awaitUnsettled(c)
+      Thread.sleep(20)
+      // Shutdown settle: the doomed join parks on the stalled host; the
+      // waiter snapshot + flush barrier are queued behind it.
+      c.close(drainTimeoutMs = 450L)
+      // Land the terminal SUCCESS before the waiter next wakes: the handoff
+      // (deferred system mark) is admitted pre-barrier.
+      store.gate.complete(Unit)
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "barrier-gated success")
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 1
+      }
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      val kinds = store.events.map { it.kind }
+      assertTrue("gated success must land the deferred system mark, was $kinds", kinds.contains("system"))
+      assertEquals("half", store.events.single { it.kind == "assistant" }.text)
+      assertTrue(findDanglingRunIds(store.events).isEmpty())
+      assertFalse(c.hasUnsettledCancelReceipts())
+      assertFalse(
+        "gated success must not leave a sealed-uncompensated receipt",
+        c.hasSealedUncompensatedReceipts(),
+      )
+      val terminal = awaitReceiptTerminal(c)
+      assertTrue(
+        "gated success must hand off, never SEAL, was $terminal",
+        terminal == "REVOKED" || terminal == "COMPENSATED",
+      )
+      assertTrue("clean handoff must drain durable, was $durable", durable)
+    } finally {
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    openTwiceConsistent(store, sid)
+    assertCrossOriginForkClean(store, sid)
+  }
+
+  @Test fun closeBarrierGatedLate_afterSealSealed_reopenInterrupted() {
+    // Phase 2 T2 reverse control: the SAME gate released only after the
+    // barrier seal must degrade to SEALED (proves the forward test's gate
+    // actually fixes the order rather than passing unconditionally).
+    val store = R192GateStore()
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(provider, SessionTranscriptSink(store, sid), n, "r192-late")
+    try {
+      startedHost(c)
+      assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      Thread.sleep(20)
+      c.close(drainTimeoutMs = 450L)
+      // Do NOT release the gate: let the 450ms settle budget exhaust, the
+      // barrier flush, and the seal land first.
+      awaitSealed(c)
+      // Late SUCCESS after the seal: too late for the barrier.
+      store.gate.complete(Unit)
+      Thread.sleep(900)
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals("SEALED", awaitReceiptTerminal(c))
+      val dangling = findDanglingRunIds(store.events)
+      assertTrue(
+        "late success must dangle, was ${store.events.map { it.kind }}",
+        dangling.isNotEmpty(),
+      )
+      assertTrue(
+        "SEALED without proven final must stay visible",
+        c.hasSealedUncompensatedReceipts(),
+      )
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "late-gated SEALED")
+      assertFalse("SEALED without proven final must block flushDurable", durable)
+    } finally {
+      c.close()
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    assertReopenAddsSingleInterrupted(store, sid)
+  }
+
+  @Test fun equalBudget_failedTerminal_closeDrainEqualsSettle_noTrueAndDangling() {
+    // Phase 2 T3 (FAILED): production budgets are equal
+    // (CANCEL_SETTLE_TIMEOUT_MS 5000 == OrderedTranscriptSink
+    // .DEFAULT_DRAIN_TIMEOUT_MS 5000); scaled 10x down here (500 == 500).
+    // The stall is measured from terminal entry (t≈0): cancel() itself
+    // spends the 500ms settle wait before installing the receipt, and close()
+    // seals at ≈ settle + drain (t≈1000ms), so the stall (1400ms) must
+    // exceed settle + drain for the shutdown settle budget to exhaust before
+    // the terminal lands. Must still never report true-and-dangling:
+    // SEALED + dangling + flushDurable false + reopen INTERRUPTED.
+    val store = R191LateStore(failPredicate = { it == 1 }, stallMs = 1_400L)
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(
+      provider, SessionTranscriptSink(store, sid), n, "r192-eqfail",
+      settleMs = 500L,
+    )
+    try {
+      startedHost(c)
+      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      c.close(drainTimeoutMs = 500L)
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals("SEALED", awaitReceiptTerminal(c))
+      val dangling = findDanglingRunIds(store.events)
+      assertTrue(
+        "exhausted settle must dangle, was ${store.events.map { it.kind }}",
+        dangling.isNotEmpty(),
+      )
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "equal-budget failed SEALED")
+      assertFalse("exhausted settle must block flushDurable", durable)
+    } finally {
+      c.close()
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    assertReopenAddsSingleInterrupted(store, sid)
+  }
+
+  @Test fun equalBudget_successTerminal_closeDrainEqualsSettle_noTrueAndDangling() {
+    // Phase 2 T3 (SUCCESS): same equal-budget shape as the FAILED case
+    // above (production 5000 == 5000, here 500 == 500; stall 1400ms > settle
+    // + drain counted from terminal entry, see above), but the
+    // terminal would commit SUCCESS if it ever landed — same shape as the
+    // T1 successSystem test but under the close paradigm
+    // (startedHost → cancel → awaitUnsettled → close(drain == settle) →
+    // flushDurable → awaitLedger → flushTranscript). The settle budget still
+    // exhausts first, so SEALED + dangling + flushDurable false + reopen
+    // INTERRUPTED, never true-and-dangling.
+    val store = R191LateStore(failPredicate = { it == 1 }, failWith = null, stallMs = 1_400L)
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(
+      provider, SessionTranscriptSink(store, sid), n, "r192-eqok",
+      settleMs = 500L,
+    )
+    try {
+      startedHost(c)
+      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      c.close(drainTimeoutMs = 500L)
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "equal-budget success SEALED")
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
+      }
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals("SEALED", awaitReceiptTerminal(c))
+      val dangling = findDanglingRunIds(store.events)
+      assertTrue(
+        "exhausted settle must dangle, was ${store.events.map { it.kind }}",
+        dangling.isNotEmpty(),
+      )
+      assertFalse("exhausted settle must block flushDurable", durable)
+    } finally {
+      c.close()
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    assertReopenAddsSingleInterrupted(store, sid)
   }
 }

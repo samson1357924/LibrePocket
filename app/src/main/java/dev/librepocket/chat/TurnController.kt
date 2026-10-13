@@ -2906,17 +2906,23 @@ class TurnController(
     // receipt is installed synchronously before its host completes, so the
     // join happens-before the snapshot and no host-installed receipt is
     // missed; post-seal admissions are impossible since [closed] is set).
-    // The waiter join is nested inside the outer [OrderedTranscriptSink.shutdown]
-    // settle budget, which bounds the whole settle (doomed-host + orphan +
-    // waiters) to [drainTimeoutMs] — the entire settle never exceeds it. The
-    // inner withTimeoutOrNull only short-circuits the waiter phase within
-    // whatever outer budget the host/orphan joins left. A timeout leaves
-    // the receipt PENDING/CLAIMED: the waiter later observes the seal and
-    // degrades to SEALED/backfill, and [flushDurable] stays false via
-    // [hasUnsettledCancelReceipts] (never true-and-dangling). Compensation
-    // writes run inside the waiter job, hence before the barrier and before
-    // `channel.close()`.
+    // Phase 2 (B) remaining-budget linearization: the whole settle
+    // (doomed-host + orphan + waiters) shares one [drainTimeoutMs] fence via
+    // the outer [OrderedTranscriptSink.shutdown] budget. The host/orphan
+    // joins above spend it first; the waiter phase below gets only the
+    // remainder (deadline-now), never a fresh full budget — so a waiter
+    // admission owed while the terminal is still alive linearizes before
+    // the flush barrier/seal whenever it fits, and a timeout explicitly
+    // leaves the receipt PENDING/CLAIMED (later SEALED-on-seal) instead of
+    // silently extending the fence. [flushDurable] stays false via
+    // [hasUnsettledCancelReceipts] plus the Phase 1
+    // [hasSealedUncompensatedReceipts] conjunct (never true-and-dangling).
+    // This covers both waiter self-expiry ([cancelReceiptMaxRounds] SEALED)
+    // and settle-budget exhaustion (outer timeout) with one bounded fence.
+    // Compensation writes run inside the waiter job, hence before the
+    // barrier and before `channel.close()`.
     val shutdown = orderedTranscript.shutdown(drainTimeoutMs) {
+      val settleStartNs = System.nanoTime()
       try {
         doomed?.join()
       } catch (_: CancellationException) {
@@ -2930,7 +2936,9 @@ class TurnController(
       try {
         val waiters = cancelReceiptWaiters.values.toList()
         if (waiters.isNotEmpty()) {
-          withTimeoutOrNull(drainTimeoutMs) {
+          val elapsedMs = (System.nanoTime() - settleStartNs) / 1_000_000L
+          val waiterBudgetMs = (drainTimeoutMs - elapsedMs).coerceAtLeast(0L)
+          withTimeoutOrNull(waiterBudgetMs) {
             for (waiter in waiters) {
               try {
                 waiter.join()

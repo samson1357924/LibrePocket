@@ -4398,7 +4398,9 @@ class ChatViewModel(
      * session may still be missing its terminal record — live STREAMING /
      * CANCELLED / WAITING_STEERED projection, a pending UNKNOWN admission, an
      * unsettled cancel receipt (R19-1 PENDING/CLAIMED: the deferred
-     * system/batch write is still owed), or admitted-but-unacked core runIds.
+     * system/batch write is still owed), a SEALED-but-uncompensated receipt
+     * (Phase 1 truth contract: SEALED without proven family-final still
+     * dangles), or admitted-but-unacked core runIds.
      * Best-effort (never throws): a failed read means "no evidence", never
      * "incomplete". Per-session ownership: only the passed (source) session's
      * receipts are consulted, so a fresh session never inherits an old
@@ -4419,6 +4421,10 @@ class ChatViewModel(
         }
         try {
             if (session.hasUnsettledCancelReceipts()) return true
+        } catch (_: Exception) {
+        }
+        try {
+            if (session.hasSealedUncompensatedReceipts()) return true
         } catch (_: Exception) {
         }
         return try {

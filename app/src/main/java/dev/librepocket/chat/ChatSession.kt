@@ -103,13 +103,17 @@ interface ChatSession {
 
   /**
    * Suspends until every transcript event admitted so far is persisted and verifies
-   * that no durable store failure occurred and no cancel receipt is still unsettled.
+   * that no durable store failure occurred, no cancel receipt is still unsettled,
+   * and no SEALED receipt is still uncompensated.
    *
    * Returns true only when [flush] drains within [timeoutMs] AND [hasDurableFailures] is false
-   * AND [hasUnsettledCancelReceipts] is false (no PENDING/CLAIMED receipt).
+   * AND [hasUnsettledCancelReceipts] is false (no PENDING/CLAIMED receipt)
+   * AND [hasSealedUncompensatedReceipts] is false (no SEALED receipt without
+   * proven family-final). SEALED alone is NOT settled.
    */
   suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
-    flush(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts()
+    flush(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts() &&
+      !hasSealedUncompensatedReceipts()
 
   /**
    * Steering: queue an instruction for the next round.
@@ -144,14 +148,28 @@ interface ChatSession {
   /**
    * R19-1 read-only receipt settle proof: true while any cancel receipt on
    * this session is still PENDING (awaiting the terminal outcome) or CLAIMED
-   * (compensation write in flight). Terminal states
-   * (REVOKED/COMPENSATED/SEALED) are settled. Per-session ownership: a fresh
-   * session never claims an old session's receipts (its own map starts
-   * empty), so new-session liveness checks are unaffected. Default false so
-   * test fakes stay source-compatible; production ([ChatSessionImpl])
-   * overrides with the live controller state.
+   * (compensation write in flight). REVOKED/COMPENSATED are settled; SEALED
+   * is settled only with proven family-final (see
+   * [hasSealedUncompensatedReceipts]) and otherwise still blocks
+   * [flushDurable]. Per-session ownership: a fresh session never claims an
+   * old session's receipts (its own map starts empty), so new-session
+   * liveness checks are unaffected. Default false so test fakes stay
+   * source-compatible; production ([ChatSessionImpl]) overrides with the
+   * live controller state.
    */
   fun hasUnsettledCancelReceipts(): Boolean = false
+
+  /**
+   * Phase 1 SEALED truth contract: true while any cancel receipt on this
+   * session is SEALED without proven family-final (final intent, terminal
+   * committed, no system repair owed — anything else stays uncompensated
+   * until reopen INTERRUPTED backfill). Conjoined into [flushDurable] and
+   * consulted by the ViewModel incomplete fallback alongside
+   * [hasUnsettledCancelReceipts]. Default false so test fakes stay
+   * source-compatible; production ([ChatSessionImpl]) overrides with the
+   * live controller state.
+   */
+  fun hasSealedUncompensatedReceipts(): Boolean = false
 
   /**
    * R6-3 streaming-switch fence: core runIds admitted but still awaiting the

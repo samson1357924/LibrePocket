@@ -5,6 +5,7 @@ import dev.librepocket.agent.ui.chat.SessionStoreSource
 import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.agent.ui.chat.cancelledMarkerText
 import dev.librepocket.agent.ui.chat.findDanglingRunIds
+import dev.librepocket.agent.ui.chat.interruptedMarkerText
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -124,6 +125,7 @@ class CancelReceiptCloseBarrierTest {
     sink: SessionTranscriptSink,
     n: AtomicInteger,
     prefix: String,
+    maxRounds: Int = 60,
     retry: TurnRetryConfig = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(5_000L)),
   ): TurnController = TurnController(
     provider = provider,
@@ -135,7 +137,7 @@ class CancelReceiptCloseBarrierTest {
     newId = { "$prefix-${n.incrementAndGet() - 1}" },
     cancelSettleTimeoutMs = SETTLE_MS,
     cancelCompensationTimeoutMs = 5_000L,
-    cancelReceiptMaxRounds = 60,
+    cancelReceiptMaxRounds = maxRounds,
   )
 
   private fun endpoint(): EndpointConfig = EndpointConfig(
@@ -573,5 +575,82 @@ class CancelReceiptCloseBarrierTest {
       override fun close() = Unit
     }
     assertFalse("default seam must stay false for legacy fakes", fake.hasUnsettledCancelReceipts())
+    assertFalse("default sealed seam must stay false for legacy fakes", fake.hasSealedUncompensatedReceipts())
+  }
+
+  @Test fun deadlineExpiredLateSuccessSeal_noTrueAndDangling_reopenInterrupted() {
+    // Phase 1 SEALED truth contract: deadline-expired SEALED with a late
+    // SUCCESS intermediate (non-final notice-first) leaves
+    // user + partial + notice dangling (no system mark). SEALED without
+    // proven family-final must block flushDurable (never true-and-dangling)
+    // and reopen must add exactly one INTERRUPTED (second open adds zero).
+    // Short receipt horizon (3 rounds ≈ 50+100+200ms) vs 800ms stall: the
+    // waiter times out to SEALED before the late SUCCESS commits.
+    val store = R191LateStore(failPredicate = { it == 1 }, failWith = null, stallMs = 800L)
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "half"))
+        emit(StreamEvent.Failed("boom", retryable = true))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(
+      provider, SessionTranscriptSink(store, sid), n, "r191-seal",
+      maxRounds = 3,
+      retry = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(5_000L)),
+    )
+    try {
+      val host = startedHost(c)
+      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      runBlocking { withTimeout(8_000) { host.join() } }
+      // Deadline first: SEALED before the late SUCCESS lands.
+      assertEquals("SEALED", awaitReceiptTerminal(c))
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
+      }
+      // Release the late SUCCESS intermediate, then drain.
+      Thread.sleep(900)
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      val kinds = store.events.map { it.kind }
+      assertEquals(listOf("user", "assistant", "retry"), kinds)
+      val attemptId = store.events[0].runId
+      assertEquals(listOf(attemptId), findDanglingRunIds(store.events))
+      assertTrue(
+        "SEALED without proven final must stay visible",
+        c.hasSealedUncompensatedReceipts(),
+      )
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "deadline-expired late-success SEALED")
+      assertFalse("SEALED without proven final must block flushDurable", durable)
+    } finally {
+      c.close()
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    // Real reopen/backfill: dangling family gains exactly one INTERRUPTED,
+    // second open adds zero.
+    val f = factory(store)
+    val ep = endpoint()
+    val sizeBefore = store.events.count { it.sessionId == sid }
+    val first = runBlocking { f.open(ep, sid) }
+    try {
+      val afterFirst = store.events.filter { it.sessionId == sid }.sortedBy { it.seq }
+      assertEquals(sizeBefore + 1, afterFirst.size)
+      val mark = afterFirst.last()
+      assertEquals("system", mark.kind)
+      assertEquals(interruptedMarkerText(afterFirst[0].runId), mark.text)
+      assertTrue(findDanglingRunIds(afterFirst).isEmpty())
+    } finally {
+      first.session.close()
+    }
+    val sizeAfterFirst = store.events.count { it.sessionId == sid }
+    val second = runBlocking { f.open(ep, sid) }
+    try {
+      assertEquals(sizeAfterFirst, store.events.count { it.sessionId == sid })
+    } finally {
+      second.session.close()
+    }
   }
 }

@@ -1374,10 +1374,15 @@ class TurnController(
   /**
    * R19-1 read-only receipt settle proof: true while any cancel receipt is
    * still PENDING (awaiting the terminal outcome) or CLAIMED (compensation
-   * write in flight). Terminal states (REVOKED/COMPENSATED/SEALED) are
-   * settled. Lock-free (ConcurrentHashMap + AtomicReference reads); never
-   * suspends. [flushDurable] conjoins this so a drained-but-uncompensated
-   * ledger never reports true-and-dangling; the ViewModel treats it as
+   * write in flight). REVOKED/COMPENSATED are settled. SEALED is settled
+   * only with proven family-final (see [hasSealedUncompensatedReceipts]):
+   * a SEALED receipt that never proved its terminal (especially the
+   * non-final notice-first path, where a late SUCCESS still leaves the
+   * family dangling without its deferred system mark) is NOT settled.
+   * Lock-free (ConcurrentHashMap + AtomicReference reads); never
+   * suspends. [flushDurable] conjoins this plus
+   * [hasSealedUncompensatedReceipts] so a drained-but-uncompensated
+   * ledger never reports true-and-dangling; the ViewModel treats either as
    * same-level downgrade evidence (see `isLedgerStreamingOrPending`).
    */
   fun hasUnsettledCancelReceipts(): Boolean =
@@ -1387,6 +1392,35 @@ class TurnController(
         else -> false
       }
     }
+
+  /**
+   * Phase 1 SEALED truth contract: true while any cancel receipt is SEALED
+   * without proven family-final. The only SEALED receipt that counts as
+   * settled is the REVOKED-equivalent the seal raced: final intent
+   * ([CancelReceipt.suppressedFinal]) whose per-entry terminal outcome
+   * committed (`terminalOutcome == true`) with no system repair owed
+   * (`systemOutcome` SKIPPED/SUCCESS). Every other SEALED receipt —
+   * non-final notice-first (a late SUCCESS still dangles without its
+   * deferred system/batch write), terminal FAILED/null, or system
+   * FAILED/PENDING/SEALED — stays uncompensated (fail-closed) until reopen
+   * INTERRUPTED backfill owns the family. Lock-free; never suspends.
+   * Conjoined into [flushDurable] and consulted by the ViewModel's
+   * `isLedgerStreamingOrPending` alongside [hasUnsettledCancelReceipts].
+   */
+  fun hasSealedUncompensatedReceipts(): Boolean =
+    cancelReceipts.values.any { isSealedUncompensated(it) }
+
+  /** Phase 1 SEALED truth predicate (see [hasSealedUncompensatedReceipts]). */
+  private fun isSealedUncompensated(receipt: CancelReceipt): Boolean {
+    if (receipt.state.get() != CancelReceiptState.SEALED) return false
+    if (receipt.suppressedFinal && receipt.terminalOutcome?.get() == true &&
+      (receipt.systemOutcome.get() == SystemMarkOutcome.SKIPPED ||
+        receipt.systemOutcome.get() == SystemMarkOutcome.SUCCESS)
+    ) {
+      return false
+    }
+    return true
+  }
 
   /**
    * D15-2 test seam: runs in [runTurnLoop] immediately after a terminal ack
@@ -2953,14 +2987,18 @@ class TurnController(
    * that no durable store failure occurred and no cancel receipt is still unsettled.
    *
    * Returns true only when [flushTranscript] drains within [timeoutMs] AND [hasDurableFailures] is false
-   * AND [hasUnsettledCancelReceipts] is false. The third conjunct is the R19-1
-   * close-barrier guard: a drained ledger whose receipt waiter still owes its
+   * AND [hasUnsettledCancelReceipts] is false AND [hasSealedUncompensatedReceipts] is false.
+   * The third conjunct is the R19-1 close-barrier guard: a drained ledger whose receipt waiter still owes its
    * deferred system/batch write (PENDING/CLAIMED) reports false instead of
    * true-and-dangling, so callers degrade (skip dangling families +
-   * incomplete marker) rather than snapshotting an orphan user row.
+   * incomplete marker) rather than snapshotting an orphan user row. The
+   * fourth conjunct is the Phase 1 SEALED truth contract: a SEALED receipt
+   * without proven family-final (see [hasSealedUncompensatedReceipts])
+   * likewise reports false instead of true-and-dangling.
    */
   suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
-    flushTranscript(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts()
+    flushTranscript(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts() &&
+      !hasSealedUncompensatedReceipts()
 
   /**
    * Core runIds admitted but never acked (drain timeout / seal race).

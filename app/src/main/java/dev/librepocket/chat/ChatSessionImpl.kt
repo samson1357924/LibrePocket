@@ -104,6 +104,9 @@ class ChatSessionImpl(
   /** R19-1: live unsettled-receipt state for the close-barrier guard (see [ChatSession.hasUnsettledCancelReceipts]). */
   override fun hasUnsettledCancelReceipts(): Boolean = controller.hasUnsettledCancelReceipts()
 
+  /** Phase 1 SEALED truth contract for the close-barrier guard (see [ChatSession.hasSealedUncompensatedReceipts]). */
+  override fun hasSealedUncompensatedReceipts(): Boolean = controller.hasSealedUncompensatedReceipts()
+
   /** R6-3: live pending core set for the streaming-switch fence (see [ChatSession.pendingTranscriptRunIds]). */
   override fun pendingTranscriptRunIds(): List<String> = controller.pendingTranscriptRunIds()
 

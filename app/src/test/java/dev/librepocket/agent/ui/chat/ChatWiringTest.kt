@@ -649,6 +649,50 @@ class ChatWiringTest {
     }
 
     @Test
+    fun openSessionRestoresReasoningMarkerOnFailedPartial() {
+        // R18-3: the post-compensation ledger shape for a reasoning-sourced
+        // retryable partial (user + cancel notice + batch partial + marker +
+        // system mark) must replay the partial flagged — never reopened as
+        // plain text — and the marker itself must never render.
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        runBlocking {
+            val sink = dev.librepocket.session.SessionTranscriptSink(transcripts, sid) { 1L }
+            sink.onTurnStarted("L", "q1")
+            sink.onTurnCancelRequested("L", "L", 0)
+            sink.onTurnFailedAndCancelled("L", "L", "half answer", "partial lost (store failure)", null, 0, true)
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 2 }
+        val replayed = vm.messages.value
+        // The marker restores the flag but never renders as a message; the
+        // system mark and the retry notice stay hidden too.
+        assertEquals(listOf("q1", "half answer"), replayed.map { it.text })
+        assertFalse(replayed[0].hasReasoning)
+        assertTrue("failed partial must replay reasoning-sourced", replayed[1].hasReasoning)
+        assertTrue("failed fragment must replay flagged, never as completed", replayed[1].isPartial)
+    }
+
+    @Test
     fun steerWhenIdleSends() {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }

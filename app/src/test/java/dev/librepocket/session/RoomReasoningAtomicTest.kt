@@ -105,4 +105,85 @@ class RoomReasoningAtomicTest {
         assertEquals(listOf("assistant", "reasoning"), rows.map { it.kind })
         assertTrue("cancel assistant keeps its partial text", rows.first().isPartial)
     }
+
+    @Test
+    fun failedNonFinal_hasReasoning_inTxFault_rollsBackZeroRows() = runBlocking {
+        val store = openStore()
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+        store.insideTxAfterInsertHookForTest = { throw IOException("injected second-row fault") }
+        try {
+            try {
+                sink.onTurnFailed("r1", "half", "boom", null, 0, false, true)
+                fail("in-tx batch failure must propagate")
+            } catch (_: IOException) {
+                // Expected: the batch aborts.
+            }
+            assertEquals(0, store.countEvents(sid))
+            assertTrue("orphaned assistant must never persist", store.loadEvents(sid).isEmpty())
+        } finally {
+            store.insideTxAfterInsertHookForTest = null
+        }
+        // Control: without the fault the failed batch commits assistant + marker.
+        sink.onTurnFailed("r1", "half", "boom", null, 0, false, true)
+        val rows = store.loadEvents(sid)
+        assertEquals(listOf("assistant", "reasoning"), rows.map { it.kind })
+        assertTrue("failed assistant keeps its partial text", rows.first().isPartial)
+        assertEquals("boom", rows.first().failureReason)
+        assertEquals(false, rows.first().isFinal)
+        assertEquals(false, rows.last().isFinal)
+        assertTrue("reasoning marker must stay payload-free", rows.last().text.isEmpty())
+    }
+
+    @Test
+    fun failedAndCancelled_hasReasoning_inTxFault_rollsBackZeroRows() = runBlocking {
+        val store = openStore()
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+        store.insideTxAfterInsertHookForTest = { throw IOException("injected batch fault") }
+        try {
+            try {
+                sink.onTurnFailedAndCancelled("L", "L", "half", "boom", null, 0, true)
+                fail("in-tx batch failure must propagate")
+            } catch (_: IOException) {
+                // Expected: the batch aborts.
+            }
+            assertEquals(0, store.countEvents(sid))
+            assertTrue("orphaned batch rows must never persist", store.loadEvents(sid).isEmpty())
+        } finally {
+            store.insideTxAfterInsertHookForTest = null
+        }
+        // Control: without the fault the compensation batch commits all three rows.
+        sink.onTurnFailedAndCancelled("L", "L", "half", "boom", null, 0, true)
+        val rows = store.loadEvents(sid)
+        assertEquals(listOf("assistant", "reasoning", "system"), rows.map { it.kind })
+        assertEquals("turn L cancelled", rows.last().text)
+    }
+
+    @Test
+    fun failedAndCancelled_noReasoning_inTxFault_rollsBackZeroRows() = runBlocking {
+        // R18-3 false path: 2-row batch (assistant + system) rolls back to
+        // zero on an in-tx fault, symmetric with the 3-row reasoning variant.
+        val store = openStore()
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+        store.insideTxAfterInsertHookForTest = { throw IOException("injected batch fault") }
+        try {
+            try {
+                sink.onTurnFailedAndCancelled("L", "L", "half", "boom", null, 0, false)
+                fail("in-tx batch failure must propagate")
+            } catch (_: IOException) {
+                // Expected: the batch aborts.
+            }
+            assertEquals(0, store.countEvents(sid))
+            assertTrue("orphaned batch rows must never persist", store.loadEvents(sid).isEmpty())
+        } finally {
+            store.insideTxAfterInsertHookForTest = null
+        }
+        // Control: without the fault the compensation batch commits both rows.
+        sink.onTurnFailedAndCancelled("L", "L", "half", "boom", null, 0, false)
+        val rows = store.loadEvents(sid)
+        assertEquals(listOf("assistant", "system"), rows.map { it.kind })
+        assertEquals("turn L cancelled", rows.last().text)
+    }
 }

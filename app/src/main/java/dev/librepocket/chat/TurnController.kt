@@ -1012,6 +1012,7 @@ class TurnController(
             orderedTranscript.onTurnFailed(
               receipt.cancelId, receipt.cancelText, "partial lost (store failure)",
               receipt.cancelParent, receipt.cancelIndex, false,
+              receipt.cancelReasoning,
             )
           }
           if (completed == null) {
@@ -1052,6 +1053,7 @@ class TurnController(
               receipt.logicalTurnId, receipt.cancelId,
               receipt.cancelText, "partial lost (store failure)",
               receipt.cancelParent, receipt.cancelIndex,
+              receipt.cancelReasoning,
             )
           }
           if (completed == null) {
@@ -3914,6 +3916,8 @@ class TurnController(
           _uiState.update { it.copy(status = ChatStatus.ERROR, error = clean) }
         }
         // D15-2 + R18-2: per-entry receipt before admission (final, like success).
+        // R18-3: the failed partial carries the live reasoning flag so the
+        // ledger marker survives reopen (same contract as success/cancel).
         val terminalReceipt = CompletableDeferred<Unit>()
         val terminalOutcome = AtomicReference<Boolean?>(null)
         attemptTerminalFinal[attemptRunId] = TerminalEntry(true, terminalReceipt, terminalOutcome)
@@ -3921,6 +3925,7 @@ class TurnController(
           attemptRunId, assistantTextOf(attemptRunId), clean,
           parentFor(attemptRunId, logicalTurnId), attempt, true,
           terminalReceipt, terminalOutcome,
+          assistantReasoningOf(attemptRunId),
         )
         terminalizedAttempts.add(attemptRunId)
         afterTerminalAckForTest?.invoke(attemptRunId)
@@ -3936,6 +3941,9 @@ class TurnController(
       // D15-2 + R18-2: per-entry receipt before admission (non-final: the
       // family still dangles until a final row lands, so a suppressing cancel
       // writes the system mark instead of zero rows).
+      // R18-3: same reasoning flag as the terminal path — a compensation
+      // with a marker but an intermediate partial without one would reopen
+      // inconsistently.
       val intermediateReceipt = CompletableDeferred<Unit>()
       val intermediateOutcome = AtomicReference<Boolean?>(null)
       attemptTerminalFinal[attemptRunId] = TerminalEntry(false, intermediateReceipt, intermediateOutcome)
@@ -3943,6 +3951,7 @@ class TurnController(
         attemptRunId, assistantTextOf(attemptRunId), retriedClean,
         parentFor(attemptRunId, logicalTurnId), attempt, false,
         intermediateReceipt, intermediateOutcome,
+        assistantReasoningOf(attemptRunId),
       )
       terminalizedAttempts.add(attemptRunId)
       afterTerminalAckForTest?.invoke(attemptRunId)

@@ -19,13 +19,16 @@ import kotlinx.coroutines.CancellationException
  *
  * A reasoning-sourced turn (`hasReasoning == true`) persists one extra
  * `reasoning` event with the same runId and empty text together with its
- * `assistant` event on success and on cancel: the marker itself is empty
+ * `assistant` event on success, on cancel, and (R18-3) on failure: the marker
+ * itself is empty
  * (flag-only; no reasoning
  * payload touches the store), but visible reasoning deltas remain merged
  * into the assistant text and persist as usual (pre-existing behavior).
- * Failed turns never write a `reasoning` marker (their `assistant` row is
- * `isPartial=1`, so it never enters the provider request — display-only,
- * no provider impact).
+ * Legacy three-arg / five-arg failure forms (no `hasReasoning` parameter)
+ * never write a marker (compat); the seven-arg `isFinal` + `hasReasoning`
+ * form does. Failed `assistant` rows stay `isPartial=1` and never enter the
+ * provider request (display-only) — the marker exists so UI replay restores
+ * the flag instead of reopening a reasoning partial as plain text.
  * History replay restores
  * [dev.librepocket.chat.UiMessage.hasReasoning] so resumed reasoning-origin
  * turns still fail closed on tool-dependent / thinking-mode follow-ups
@@ -269,6 +272,51 @@ class SessionTranscriptSink(
         )
     }
 
+    /**
+     * R18-3 reasoning-aware failed partial: `assistant` + optional
+     * payload-free `reasoning` marker as one [appendDurableBatch] unit (D15-3
+     * pattern: Room single tx, fake snapshot + rollback; 1 row without
+     * reasoning, 2 rows with it). The marker inherits `parentRunId` /
+     * `attemptIndex` / `isFinal` verbatim (flag-only, empty text).
+     */
+    override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+        hasReasoning: Boolean,
+    ) {
+        if (!hasReasoning) {
+            appendDurable(
+                runId, "assistant", partialText,
+                isPartial = true, failureReason = error,
+                parentRunId = parentRunId, attemptIndex = attemptIndex,
+                isFinal = isFinal,
+            )
+            return
+        }
+        val now = clock()
+        val batch = ArrayList<TranscriptEvent>(2)
+        batch.add(
+            coreEvent(
+                runId, "assistant", partialText, now,
+                isPartial = true, failureReason = error,
+                parentRunId = parentRunId, attemptIndex = attemptIndex,
+                isFinal = isFinal,
+            ),
+        )
+        batch.add(
+            coreEvent(
+                runId, "reasoning", "", now,
+                parentRunId = parentRunId, attemptIndex = attemptIndex,
+                isFinal = isFinal,
+            ),
+        )
+        appendDurableBatch(batch)
+    }
+
     override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) {
         appendNotice(runId, "retry", "attempt $attempt/$maxAttempts after ${delayMs}ms", isFinal = true)
     }
@@ -353,6 +401,11 @@ class SessionTranscriptSink(
      * OrderedTranscriptSink): first attempt (cancelId == logical) observes
      * user(1)+batch(1)=2 (>=2 holds); fresh retry id observes batch(1)=1
      * (>=1 holds).
+     *
+     * R18-3: [hasReasoning] adds the payload-free `reasoning` marker to the
+     * partial inside the same batch (same `runId`, empty text,
+     * `parentRunId`/`attemptIndex` inherited, `isFinal=false` like the
+     * partial, flag-only): 2 rows without reasoning vs 3 rows with it.
      */
     override suspend fun onTurnFailedAndCancelled(
         logicalTurnId: String,
@@ -361,9 +414,10 @@ class SessionTranscriptSink(
         error: String,
         parentRunId: String?,
         attemptIndex: Int?,
+        hasReasoning: Boolean,
     ) {
         val now = clock()
-        val batch = ArrayList<TranscriptEvent>(2)
+        val batch = ArrayList<TranscriptEvent>(if (hasReasoning) 3 else 2)
         batch.add(
             coreEvent(
                 attemptRunId, "assistant", partialText, now,
@@ -372,6 +426,15 @@ class SessionTranscriptSink(
                 isFinal = false,
             ),
         )
+        if (hasReasoning) {
+            batch.add(
+                coreEvent(
+                    attemptRunId, "reasoning", "", now,
+                    parentRunId = parentRunId, attemptIndex = attemptIndex,
+                    isFinal = false,
+                ),
+            )
+        }
         batch.add(
             coreEvent(
                 logicalTurnId, "system", "turn $logicalTurnId cancelled", now,

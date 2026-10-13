@@ -66,10 +66,14 @@ interface TranscriptSink {
    * ([dev.librepocket.chat.TurnController]) always call this three-arg form.
    * The legacy two-arg form stays as the reason-only (system-row) record.
    *
-   * Marker contract: failed turns never persist a `reasoning` marker (unlike
-   * [onTurnSucceeded] / [onTurnCancelled], which do when `hasReasoning` is
-   * true) — the failed `assistant` row is `isPartial=1`, so it never enters
-   * the provider request (display-only, no provider impact).
+   * Marker contract: the legacy three-arg / five-arg forms below never
+   *   persist a `reasoning` marker (compat — the failed `assistant` row is
+   *   `isPartial=1`, so it never enters the provider request: display-only,
+   *   no provider impact). A reasoning-sourced failure uses the seven-arg
+   *   `isFinal` + `hasReasoning` form below, which persists `assistant` +
+   *   payload-free `reasoning` marker atomically (same D15-3 batch pattern as
+   *   success/cancel); UI replay restores the flag via the exact-`runId`
+   *   marker, so a missing marker would reopen `hasReasoning=true` as false.
    *
    * Stage F: this three-arg form is always final (`isFinal=1`).
    */
@@ -112,6 +116,30 @@ interface TranscriptSink {
     isFinal: Boolean,
   ) {
     onTurnFailed(runId, partialText, error, parentRunId, attemptIndex)
+  }
+  /**
+   * R18-3 (implemented): reasoning-aware failed partial. Same `assistant`
+   * (`isPartial=1` + `failureReason`, `parentRunId`/`attemptIndex`/`isFinal`
+   * as the six-arg form) plus, when [hasReasoning] is true, one payload-free
+   * `reasoning` marker (same `runId`, empty text, `parentRunId`/`attemptIndex`
+   * /`isFinal` inherited verbatim, flag-only) persisted as one atomic batch
+   * via [dev.librepocket.session.SessionStore.appendEvents] (Room single tx,
+   * fake snapshot + rollback; external default sequential fallback may leave
+   * a partial batch behind — fail-closed, never a premature close). The
+   * default forwards to the six-arg form (dropping the flag) so existing
+   * fakes keep compiling; production ([dev.librepocket.session.SessionTranscriptSink])
+   * overrides to persist the marker.
+   */
+  suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+    hasReasoning: Boolean,
+  ) {
+    onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
   }
   suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long)
   /** Same [hasReasoning] marker contract as [onTurnSucceeded] for partial text. */
@@ -207,6 +235,12 @@ interface TranscriptSink {
    * this interface default observe the sequential partial-first fallback
    * (which may leave the partial behind on a mid-batch failure — still
    * fail-closed, never a premature close).
+   *
+   * R18-3: [hasReasoning] adds the payload-free `reasoning` marker to the
+   * partial (same `runId`, empty text, `parentRunId`/`attemptIndex` inherited,
+   * `isFinal=false` like the partial, flag-only), so the batch is 2 rows
+   * without reasoning vs 3 rows with it. The default forwards dropping the
+   * flag so existing fakes keep compiling.
    */
   suspend fun onTurnFailedAndCancelled(
     logicalTurnId: String,
@@ -215,8 +249,9 @@ interface TranscriptSink {
     error: String,
     parentRunId: String?,
     attemptIndex: Int?,
+    hasReasoning: Boolean = false,
   ) {
-    onTurnFailed(attemptRunId, partialText, error, parentRunId, attemptIndex, false)
+    onTurnFailed(attemptRunId, partialText, error, parentRunId, attemptIndex, false, hasReasoning)
     onLogicalTurnCancelled(logicalTurnId, attemptRunId, partialText, attemptIndex)
   }
   suspend fun onSteerQueued(text: String)

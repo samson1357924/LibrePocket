@@ -225,6 +225,167 @@ class SessionReasoningAtomicTest {
         }
     }
 
+    // -- R18-3 failed-partial marker: 1 row vs 2, atomic batch ----------
+
+    @Test
+    fun failedNonFinal_hasReasoningFalse_staysSingleRow() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onTurnFailed("r1", "half", "boom", null, 0, false, false)
+
+        assertEquals(listOf("assistant"), store.events.map { it.kind })
+        val partial = store.events.single()
+        assertTrue(partial.isPartial)
+        assertEquals("boom", partial.failureReason)
+        assertEquals(false, partial.isFinal)
+    }
+
+    @Test
+    fun failedPartial_hasReasoningTrue_writesAssistantPlusMarkerBatch() = runBlocking {
+        val store = BatchCountingStore()
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        // Non-final intermediate (retryable partial): marker inherits isFinal=false.
+        sink.onTurnFailed("r1", "half", "boom", null, 0, false, true)
+        // Final terminal: marker inherits isFinal=true.
+        sink.onTurnFailed("r2", "frag", "down", "L", 1, true, true)
+
+        assertEquals(listOf(2, 2), store.batchSizes.takeLast(2))
+        assertEquals(
+            listOf("assistant", "reasoning", "assistant", "reasoning"),
+            store.events.map { it.kind },
+        )
+        val markers = store.events.filter { it.kind == "reasoning" }
+        assertEquals(listOf("r1", "r2"), markers.map { it.runId })
+        assertTrue("reasoning marker must stay payload-free", markers.all { it.text.isEmpty() })
+        assertEquals(listOf(false, true), markers.map { it.isFinal })
+        assertEquals(listOf(null, "L"), markers.map { it.parentRunId })
+        assertEquals(listOf(0, 1), markers.map { it.attemptIndex })
+        val assistantsByRun = store.events.filter { it.kind == "assistant" }.associateBy { it.runId }
+        for (marker in markers) {
+            val assistant = assistantsByRun.getValue(marker.runId)
+            assertTrue(assistant.isPartial)
+            assertEquals(assistant.parentRunId, marker.parentRunId)
+            assertEquals(assistant.attemptIndex, marker.attemptIndex)
+            assertEquals(assistant.isFinal, marker.isFinal)
+        }
+    }
+
+    @Test
+    fun failedNonFinal_secondRowIOException_leavesZeroRowsAndPropagates() = runBlocking {
+        val store = FailSecondAppendStore()
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+        try {
+            sink.onTurnFailed("r1", "half", "boom", null, 0, false, true)
+            fail("second-row store failure must propagate")
+        } catch (_: IOException) {
+            // Expected: the batch aborts.
+        }
+        assertTrue("orphaned assistant must never persist", rows(store, sid).isEmpty())
+        assertEquals(0, store.events.size)
+    }
+
+    @Test
+    fun failedNonFinal_secondRowCancel_leavesZeroRowsAndPropagates() = runBlocking {
+        val store = FailSecondAppendStore({ CancellationException("writer teardown") })
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+        try {
+            sink.onTurnFailed("r1", "half", "boom", null, 0, false, true)
+            fail("cancellation must propagate")
+        } catch (_: CancellationException) {
+        }
+        assertTrue(rows(store, sid).isEmpty())
+        assertEquals(0, store.events.size)
+    }
+
+    @Test
+    fun failedAndCancelledBatch_reasoningShape_twoVsThreeRows() = runBlocking {
+        val store = BatchCountingStore()
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onTurnFailedAndCancelled("L", "L", "half", "boom", null, 0, false)
+        sink.onTurnFailedAndCancelled("L2", "A9", "half", "boom", "L2", 1, true)
+
+        assertEquals(listOf(2, 3), store.batchSizes.takeLast(2))
+        val first = store.events.take(2)
+        assertEquals(listOf("assistant", "system"), first.map { it.kind })
+        val second = store.events.drop(2)
+        assertEquals(listOf("assistant", "reasoning", "system"), second.map { it.kind })
+        val marker = second[1]
+        assertEquals("A9", marker.runId)
+        assertEquals("", marker.text)
+        assertEquals("L2", marker.parentRunId)
+        assertEquals(1, marker.attemptIndex)
+        assertEquals(false, marker.isFinal)
+        assertEquals(false, second[0].isFinal)
+        assertTrue(second[2].isFinal)
+        assertEquals("turn L2 cancelled", second[2].text)
+    }
+
+    @Test
+    fun failedAndCancelled_secondRowIOException_leavesZeroRowsAndPropagates() = runBlocking {
+        val store = FailSecondAppendStore()
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+        try {
+            sink.onTurnFailedAndCancelled("L", "L", "half", "boom", null, 0, true)
+            fail("second-row store failure must propagate")
+        } catch (_: IOException) {
+        }
+        assertTrue("orphaned batch rows must never persist", rows(store, sid).isEmpty())
+        assertEquals(0, store.events.size)
+    }
+
+    @Test
+    fun failedAndCancelled_noReasoning_secondRowIOException_leavesZeroRowsAndPropagates() = runBlocking {
+        // R18-3 false path: 2-row batch (assistant + system), fault on the
+        // 2nd row rolls back to zero, same as the 3-row reasoning variant.
+        val store = FailSecondAppendStore()
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+        try {
+            sink.onTurnFailedAndCancelled("L", "L", "half", "boom", null, 0, false)
+            fail("second-row store failure must propagate")
+        } catch (_: IOException) {
+        }
+        assertTrue("orphaned batch rows must never persist", rows(store, sid).isEmpty())
+        assertEquals(0, store.events.size)
+    }
+
+    @Test
+    fun failedAndCancelled_secondRowCancel_leavesZeroRowsAndPropagates() = runBlocking {
+        val store = FailSecondAppendStore({ CancellationException("writer teardown") })
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+        try {
+            sink.onTurnFailedAndCancelled("L", "L", "half", "boom", null, 0, true)
+            fail("cancellation must propagate")
+        } catch (_: CancellationException) {
+        }
+        assertTrue("orphaned batch rows must never persist", rows(store, sid).isEmpty())
+        assertEquals(0, store.events.size)
+    }
+
+    @Test
+    fun failedAndCancelled_noReasoning_secondRowCancel_leavesZeroRowsAndPropagates() = runBlocking {
+        val store = FailSecondAppendStore({ CancellationException("writer teardown") })
+        val sid = store.createSession("t", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+        try {
+            sink.onTurnFailedAndCancelled("L", "L", "half", "boom", null, 0, false)
+            fail("cancellation must propagate")
+        } catch (_: CancellationException) {
+        }
+        assertTrue("orphaned batch rows must never persist", rows(store, sid).isEmpty())
+        assertEquals(0, store.events.size)
+    }
+
     // -- writer durability: batch failure poisons flushDurable --------------
 
     @Test

@@ -542,10 +542,29 @@ class OrderedTranscriptSink(
   ) = writeCore(runId) { delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal) }
 
   /**
+   * R18-3 reasoning-aware failed partial: transparent ordered passthrough to
+   * the seven-arg sink form (same [writeCore] admission/ack contract; the
+   * marker rides inside the delegate batch, never a second entry, so
+   * commitCounts/single-key design is unchanged).
+   */
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+    hasReasoning: Boolean,
+  ) = writeCore(runId) { delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal, hasReasoning) }
+
+  /**
    * R18-2 direction-A per-entry receipt: terminal/intermediate failure using
    * a caller-provided ack. Same contract as [onTurnSucceededWithReceipt]:
    * the writer completes [receipt] with this entry outcome only, never an
    * aggregate per-runId count.
+   *
+   * R18-3: [hasReasoning] rides into the delegate seven-arg failed form so
+   * the receipted write persists the marker atomically with its partial.
    */
   suspend fun onTurnFailedWithReceipt(
     runId: String,
@@ -556,8 +575,9 @@ class OrderedTranscriptSink(
     isFinal: Boolean,
     receipt: CompletableDeferred<Unit>,
     outcome: AtomicReference<Boolean?>,
+    hasReasoning: Boolean = false,
   ) = writeCoreWithAck(runId, receipt, outcome) {
-    delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
+    delegate.onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal, hasReasoning)
   }
 
   override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) =
@@ -609,6 +629,10 @@ class OrderedTranscriptSink(
    * Old ledgers `[user + system]` without the partial are a known historical
    * gap (pre-R18-1 premature close) and are NOT retroactively backfilled —
    * the family is already closed there by the exact-text system mark.
+   *
+   * R18-3: [hasReasoning] adds the payload-free `reasoning` marker to the
+   * partial inside the same batch (2 rows vs 3); single-key commit design
+   * unchanged (one entry, one commit count).
    */
   override suspend fun onTurnFailedAndCancelled(
     logicalTurnId: String,
@@ -617,8 +641,9 @@ class OrderedTranscriptSink(
     error: String,
     parentRunId: String?,
     attemptIndex: Int?,
+    hasReasoning: Boolean,
   ) = writeCore(attemptRunId) {
-    delegate.onTurnFailedAndCancelled(logicalTurnId, attemptRunId, partialText, error, parentRunId, attemptIndex)
+    delegate.onTurnFailedAndCancelled(logicalTurnId, attemptRunId, partialText, error, parentRunId, attemptIndex, hasReasoning)
   }
 
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) =

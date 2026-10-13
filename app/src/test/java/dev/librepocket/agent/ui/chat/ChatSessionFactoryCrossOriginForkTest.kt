@@ -16,6 +16,7 @@ import dev.librepocket.session.TranscriptEvent
 import java.nio.file.Files
 import java.util.Collections
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
@@ -29,6 +30,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 
@@ -116,6 +118,35 @@ class ChatSessionFactoryCrossOriginForkTest {
         text = text,
         createdAt = 1L,
     )
+
+    /**
+     * Phase 3 P1-1: fault-injecting fake proving cancellation propagates
+     * instead of degrading (swallowed backfill → silent success, swallowed
+     * meta read → UNKNOWN_SESSION). Each flag throws CancellationException
+     * from exactly one store call; the test toggles it after seeding so the
+     * seed writes stay clean. Deterministic: direct factory open() on
+     * runBlocking, no timing involved.
+     */
+    private class CancelBackfillStore : FakeSessionStore() {
+        var failTailCancel = false
+        var failAppendCancel = false
+        var failGetCancelFor: (String) -> Boolean = { false }
+
+        override suspend fun loadTailEvents(sessionId: String, limit: Int): List<TranscriptEvent> {
+            if (failTailCancel) throw CancellationException("lifecycle cancel")
+            return super.loadTailEvents(sessionId, limit)
+        }
+
+        override suspend fun appendEvent(event: TranscriptEvent): Long {
+            if (failAppendCancel) throw CancellationException("lifecycle cancel")
+            return super.appendEvent(event)
+        }
+
+        override suspend fun getSession(sessionId: String): dev.librepocket.session.SessionMeta? {
+            if (failGetCancelFor(sessionId)) throw CancellationException("ENDPOINT_BINDING_STALE")
+            return super.getSession(sessionId)
+        }
+    }
 
     private fun seedQA(transcripts: FakeSessionStore, title: String = "my title here"): String = runBlocking {
         val sid = transcripts.createSession(title, "preset:openai@https://api.openai.com/gpt-4o-mini")
@@ -504,5 +535,140 @@ class ChatSessionFactoryCrossOriginForkTest {
         awaitTrue { vmA.currentSessionId.value == oldId && vmA.messages.value.size == 2 }
         assertEquals(listOf("QA", "AA"), vmA.messages.value.map { it.text })
         assertNull(vmA.notice.value)
+    }
+
+    @Test fun open_backfillScanCancel_propagatesInsteadOfSwallowing() = runBlocking {
+        val transcripts = CancelBackfillStore()
+        val oldId = seedQA(transcripts)
+        transcripts.failTailCancel = true
+        try {
+            factoryWith(transcripts, answerProvider()).open(endpointA(), oldId, { true }, true).session.close()
+            fail("backfill scan cancel must propagate, not resume silently without markers")
+        } catch (_: CancellationException) {
+            // Expected: lifecycle cancel releases the open instead of degrading.
+        }
+        assertTrue(transcripts.events.none { it.kind == "system" })
+    }
+
+    @Test fun open_backfillMarkerCancel_propagatesInsteadOfSwallowing() = runBlocking {
+        val transcripts = CancelBackfillStore()
+        val oldId = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        // Kill-stranded turn so the backfill reaches the per-marker write.
+        transcripts.appendEvent(event(oldId, "stranded", "user", "QSTRANDED"))
+        transcripts.failAppendCancel = true
+        try {
+            factoryWith(transcripts, answerProvider()).open(endpointA(), oldId, { true }, true).session.close()
+            fail("backfill marker cancel must propagate, not resume silently without markers")
+        } catch (_: CancellationException) {
+            // Expected.
+        }
+        assertTrue(transcripts.events.none { it.kind == "system" })
+    }
+
+    @Test fun open_metaReadCancel_propagatesInsteadOfUnknownSession() = runBlocking {
+        val transcripts = CancelBackfillStore()
+        val oldId = seedQA(transcripts)
+        transcripts.failGetCancelFor = { true }
+        try {
+            factoryWith(transcripts, answerProvider()).open(endpointA(), oldId, { true }, true).session.close()
+            fail("meta-read cancel must propagate, not degrade to UNKNOWN_SESSION")
+        } catch (e: CancellationException) {
+            assertEquals("ENDPOINT_BINDING_STALE", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("cancel must not degrade to ${e.message}")
+        }
+    }
+
+    @Test fun openForked_metaReadCancel_propagates() = runBlocking {
+        val transcripts = CancelBackfillStore()
+        val oldId = seedQA(transcripts)
+        // Initial meta read succeeds; only the fork's own header re-read cancels.
+        transcripts.failGetCancelFor = { sid -> sid != oldId }
+        try {
+            factoryWith(transcripts, answerProvider()).open(endpointB(), oldId, { true }, true).session.close()
+            fail("fork meta-read cancel must propagate")
+        } catch (_: CancellationException) {
+            // Expected: the fork header read is not silently nulled.
+        }
+    }
+
+    /**
+     * Phase 3 P1-2: cross-origin fork of a terminal-only old ledger (system
+     * INTERRUPTED/cancel marks + one orphan reasoning marker, no
+     * user/assistant left) persists only the withheld marker — never a copy
+     * of the old terminal/reasoning rows. True Factory + ViewModel path over
+     * FakeSessionStore; reopen is idempotent.
+     */
+    @Test
+    fun ensureSession_crossOrigin_terminalOnlyLedger_forksMarkerOnly() {
+        val store = newStore()
+        val transcripts = FakeSessionStore()
+        val oldId = runBlocking {
+            val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+            transcripts.appendEvent(event(sid, "r1", "system", "turn r1 interrupted"))
+            transcripts.appendEvent(event(sid, "r2", "system", "turn r2 cancelled"))
+            transcripts.appendEvent(event(sid, "r9", "reasoning", ""))
+            sid
+        }
+        runBlocking { store.save(endpointA()) }
+        val fake = ForkFakeProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "AB"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val vm = newVm(store, transcripts, fake)
+        // Attach the terminal-only archive on the same origin first.
+        onMain { vm.openSession(oldId) }
+        awaitTrue { vm.currentSessionId.value == oldId }
+        assertTrue(vm.messages.value.isEmpty())
+        assertNull(vm.notice.value)
+
+        // Switch provider, then send: ensureSession must fork marker-only even
+        // though the old ledger holds no user/assistant history.
+        runBlocking { store.save(endpointB()) }
+        onMain { vm.onInputChange("QB") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        val forkId = checkNotNull(vm.currentSessionId.value)
+        assertNotEquals(oldId, forkId)
+        // Empty old ledger withholds nothing visible: no switch-time notice.
+        assertNull(vm.notice.value)
+        // Fail closed: the forked request carries only the new turn.
+        val req = fake.seenRequests.single()
+        assertEquals(listOf("user"), req.messages.map { it.role })
+        assertTrue(req.messages.single().text.startsWith("QB"))
+
+        // Old ledger untouched (read-only archive).
+        assertEquals(3, transcripts.events.count { it.sessionId == oldId })
+
+        // Fork ledger: withheld marker + new turn only — no copied old
+        // terminal/reasoning rows.
+        val forkRows = transcripts.events.filter { it.sessionId == forkId }
+        assertEquals(listOf("system", "user", "assistant"), forkRows.map { it.kind })
+        assertTrue(modelSwitchMarkerWithheld(forkRows[0].text))
+        assertTrue(forkRows.none { it.text == "turn r1 interrupted" || it.text == "turn r2 cancelled" })
+        assertTrue(forkRows.none { it.kind == "reasoning" })
+        assertTrue(forkRows[1].text.startsWith("QB"))
+        assertEquals("AB", forkRows[2].text)
+
+        // Reopen idempotent: restart hydrates only the fork's own rows, the
+        // marker scan re-surfaces the withhold notice, and a second reopen
+        // adds no rows.
+        val vmB = newVm(store, transcripts, ForkFakeProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "reply"))
+                emit(StreamEvent.Done("stop"))
+            }
+        })
+        onMain { vmB.openSession(forkId) }
+        awaitTrue { vmB.currentSessionId.value == forkId && vmB.messages.value.size == 2 }
+        assertTrue(vmB.messages.value[0].text.startsWith("QB"))
+        assertEquals("AB", vmB.messages.value[1].text)
+        assertEquals("RESUME_CROSS_PROVIDER_HISTORY_WITHHELD", vmB.notice.value)
+        val rowsAfterFirstReopen = transcripts.events.count { it.sessionId == forkId }
+        onMain { vmB.openSession(forkId) }
+        awaitTrue { vmB.currentSessionId.value == forkId && vmB.messages.value.size == 2 }
+        assertEquals(rowsAfterFirstReopen, transcripts.events.count { it.sessionId == forkId })
     }
 }

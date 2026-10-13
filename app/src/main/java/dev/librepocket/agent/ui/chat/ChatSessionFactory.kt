@@ -88,8 +88,11 @@ internal const val HISTORY_TRUNCATION_MARKER = "…[history truncated]"
  * Stage E: raw-row window for the INTERRUPTED backfill scan. Dangling turns
  * are always recent (the first open after a kill marks them), so a bounded
  * newest-first window replaces the old unbounded full load (OOM-safe).
- * Best-effort: an ancient unmarked row outside the window stays for the next
- * open, same as any failed backfill before.
+ * Bounded best-effort: only rows inside the window are ever scanned — an
+ * ancient unmarked row outside the window is never marked (no retry can
+ * reach it while it stays outside); a failed scan inside the window leaves
+ * the run dangling and a later open re-scans the same window, still
+ * best-effort, never guaranteed.
  *
  * R9-3: internal (was private) so the ViewModel's deferred-backfill
  * promotion probe scans the same window the backfill marks — promote holds
@@ -748,6 +751,8 @@ class ChatSessionFactory(
             requireCurrentBinding(keyIsCurrent)
             val forkMeta = try {
                 store.getSession(newSessionId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
                 null
             }
@@ -974,7 +979,9 @@ class ChatSessionFactory(
      *
      * Best-effort (never blocks resume): marker writes go through the same
      * guarded path as every other transcript write. A failed backfill just
-     * leaves the run dangling for the next open to retry.
+     * leaves the run dangling; a later open re-scans the same bounded window
+     * (best-effort retry, never guaranteed). Cancellation always propagates
+     * so a lifecycle cancel / stale binding never turns into markers.
      */
     private suspend fun backfillInterrupted(store: SessionStore, sessionId: String) {
         try {
@@ -994,10 +1001,14 @@ class ChatSessionFactory(
                             createdAt = clock.millis(),
                         ),
                     )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
                 } catch (_: Exception) {
                     // Best effort per marker; the next open retries.
                 }
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             // Best effort overall; resume proceeds without markers.
         }

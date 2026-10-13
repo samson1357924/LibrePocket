@@ -110,9 +110,11 @@ data class PendingKeyReadConfirm(
  * its fresh transcript session, consumed after creation by the durable
  * snapshot. [oldModelShort] is the previous session's short model id
  * ("unknown" when its header is gone); [sameOrigin] is the
- * [isSameProviderOrigin] gate outcome; [crossProviderWithheld] is the exact
- * withhold verdict also surfaced as the switch-time notice, so the persisted
- * marker and the notice can never disagree.
+ * [isSameProviderOrigin] gate outcome; [crossProviderWithheld] is the copy
+ * gate (`!sameOrigin`): a cross-origin fork never copies old rows — not even
+ * terminal/reasoning-only ledgers — and persists only the withheld marker.
+ * It is deliberately NOT diluted by history presence; history presence gates
+ * only the switch-time notice ([ForkRead.crossProviderWithheld]).
  */
 private data class ForkPrefix(
     val oldModelShort: String,
@@ -120,7 +122,14 @@ private data class ForkPrefix(
     val crossProviderWithheld: Boolean,
 )
 
-/** R4-2: one IO round-trip's fork inputs — display replay, model prefix, withhold verdict, snapshot provenance. */
+/**
+ * R4-2: one IO round-trip's fork inputs — display replay, model prefix,
+ * notice verdict, snapshot provenance. [crossProviderWithheld] is the
+ * notice gate (`!sameOrigin && hasHistory`): an empty old ledger withholds
+ * nothing visible, so no RESUME_CROSS_PROVIDER_HISTORY_WITHHELD notice is
+ * shown at switch time (the persisted marker still records the withhold, so
+ * a later restart re-surfaces the notice via the marker scan).
+ */
 private data class ForkRead(
     val replay: LoadedUiHistory?,
     val modelHistory: List<ChatMessage>,
@@ -2594,15 +2603,20 @@ class ChatViewModel(
                 } else {
                     emptyList()
                 }
-                val withheld = !sameOrigin && hasHistory
+                // Copy gate is origin-only: a cross-origin fork never copies
+                // old rows (even a terminal/reasoning-only ledger with no
+                // user/assistant left) — only the withheld marker. History
+                // presence gates only the switch-time notice below.
+                val historyWithheld = !sameOrigin
+                val noticeWithheld = !sameOrigin && hasHistory
                 ForkRead(
                     rep,
                     hist,
-                    withheld,
+                    noticeWithheld,
                     ForkPrefix(
                         oldModelShort = previousMeta?.model?.substringAfterLast('/')?.takeIf { it.isNotEmpty() } ?: "unknown",
                         sameOrigin = sameOrigin,
-                        crossProviderWithheld = withheld,
+                        crossProviderWithheld = historyWithheld,
                     ),
                 )
             }

@@ -670,11 +670,15 @@ class CancelReceiptCloseBarrierTest {
   private class R192GateStore(
     val entered: CountDownLatch = CountDownLatch(1),
     val gate: CompletableDeferred<Unit> = CompletableDeferred(),
+    val failWith: IOException? = null,
   ) : FakeSessionStore() {
+    val assistantCalls = AtomicInteger(0)
     override suspend fun appendEvent(event: TranscriptEvent): Long {
       if (event.kind == "assistant") {
+        assistantCalls.incrementAndGet()
         entered.countDown()
         gate.await()
+        failWith?.let { throw it }
       }
       return super.appendEvent(event)
     }
@@ -848,16 +852,20 @@ class CancelReceiptCloseBarrierTest {
       // Do NOT release the gate: let the 450ms settle budget exhaust, the
       // barrier flush, and the seal land first.
       awaitSealed(c)
+      assertFalse("seal must land while the terminal is still gated", store.gate.isCompleted)
       // Late SUCCESS after the seal: too late for the barrier.
       store.gate.complete(Unit)
-      Thread.sleep(900)
+      // Late SUCCESS really committed (not a bare timeout): the gated
+      // assistant row lands post-seal, so the dangle claim has an object.
+      awaitLedger(store) { evts -> evts.any { it.kind == "assistant" } }
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals(listOf("user", "assistant", "retry"), store.events.map { it.kind })
+      assertEquals("half", store.events.single { it.kind == "assistant" }.text)
+      assertEquals(1, store.assistantCalls.get())
       assertEquals("SEALED", awaitReceiptTerminal(c))
+      val attemptId = store.events[0].runId
       val dangling = findDanglingRunIds(store.events)
-      assertTrue(
-        "late success must dangle, was ${store.events.map { it.kind }}",
-        dangling.isNotEmpty(),
-      )
+      assertEquals(listOf(attemptId), dangling)
       assertTrue(
         "SEALED without proven final must stay visible",
         c.hasSealedUncompensatedReceipts(),
@@ -876,13 +884,13 @@ class CancelReceiptCloseBarrierTest {
     // Phase 2 T3 (FAILED): production budgets are equal
     // (CANCEL_SETTLE_TIMEOUT_MS 5000 == OrderedTranscriptSink
     // .DEFAULT_DRAIN_TIMEOUT_MS 5000); scaled 10x down here (500 == 500).
-    // The stall is measured from terminal entry (t≈0): cancel() itself
-    // spends the 500ms settle wait before installing the receipt, and close()
-    // seals at ≈ settle + drain (t≈1000ms), so the stall (1400ms) must
-    // exceed settle + drain for the shutdown settle budget to exhaust before
-    // the terminal lands. Must still never report true-and-dangling:
+    // The terminal parks on the gate (R192GateStore手法): close(drain ==
+    // settle) seals first — awaitSealed proves the seal landed while the
+    // terminal is still gated — then gate.complete releases it, destined
+    // late → SEALED. Timeouts below are fences only, no wall-clock stall
+    // arithmetic. Must still never report true-and-dangling:
     // SEALED + dangling + flushDurable false + reopen INTERRUPTED.
-    val store = R191LateStore(failPredicate = { it == 1 }, stallMs = 1_400L)
+    val store = R192GateStore(failWith = IOException("late writer failure"))
     val sid = runBlocking { store.createSession("hi", MODEL) }
     val provider = R191Provider {
       flow {
@@ -897,17 +905,27 @@ class CancelReceiptCloseBarrierTest {
     )
     try {
       startedHost(c)
-      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
       c.cancel()
       awaitUnsettled(c)
+      Thread.sleep(20)
       c.close(drainTimeoutMs = 500L)
+      // Seal lands while the terminal is still parked on the gate.
+      awaitSealed(c)
+      assertEquals(1, store.assistantCalls.get())
+      assertFalse("seal must land while the terminal is still gated", store.gate.isCompleted)
+      // Release the parked terminal: too late for the barrier by construction.
+      store.gate.complete(Unit)
       runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
+      }
+      assertEquals(listOf("user", "retry"), store.events.map { it.kind })
+      assertEquals(1, store.assistantCalls.get())
       assertEquals("SEALED", awaitReceiptTerminal(c))
+      val attemptId = store.events[0].runId
       val dangling = findDanglingRunIds(store.events)
-      assertTrue(
-        "exhausted settle must dangle, was ${store.events.map { it.kind }}",
-        dangling.isNotEmpty(),
-      )
+      assertEquals(listOf(attemptId), dangling)
       val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
       assertNotTrueAndDangling(store, durable, "equal-budget failed SEALED")
       assertFalse("exhausted settle must block flushDurable", durable)
@@ -920,15 +938,15 @@ class CancelReceiptCloseBarrierTest {
 
   @Test fun equalBudget_successTerminal_closeDrainEqualsSettle_noTrueAndDangling() {
     // Phase 2 T3 (SUCCESS): same equal-budget shape as the FAILED case
-    // above (production 5000 == 5000, here 500 == 500; stall 1400ms > settle
-    // + drain counted from terminal entry, see above), but the
-    // terminal would commit SUCCESS if it ever landed — same shape as the
-    // T1 successSystem test but under the close paradigm
-    // (startedHost → cancel → awaitUnsettled → close(drain == settle) →
-    // flushDurable → awaitLedger → flushTranscript). The settle budget still
-    // exhausts first, so SEALED + dangling + flushDurable false + reopen
+    // above (production 5000 == 5000, here 500 == 500): the terminal parks
+    // on the gate, close(drain == settle) seals first (awaitSealed proves it
+    // landed while the terminal is still gated), then gate.complete releases
+    // it — destined late → SEALED. Differs from FAILED only in the
+    // failWith/provider shape (here the parked terminal would commit SUCCESS
+    // if it ever landed). Timeouts are fences only, no wall-clock stall
+    // arithmetic. SEALED + dangling + flushDurable false + reopen
     // INTERRUPTED, never true-and-dangling.
-    val store = R191LateStore(failPredicate = { it == 1 }, failWith = null, stallMs = 1_400L)
+    val store = R192GateStore(failWith = null)
     val sid = runBlocking { store.createSession("hi", MODEL) }
     val provider = R191Provider {
       flow {
@@ -943,22 +961,28 @@ class CancelReceiptCloseBarrierTest {
     )
     try {
       startedHost(c)
-      assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
+      assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
       c.cancel()
       awaitUnsettled(c)
+      Thread.sleep(20)
       c.close(drainTimeoutMs = 500L)
+      awaitSealed(c)
+      assertEquals(1, store.assistantCalls.get())
+      assertFalse("seal must land while the terminal is still gated", store.gate.isCompleted)
+      store.gate.complete(Unit)
+      // Late SUCCESS really committed post-seal (same proof as the T2 reverse):
+      // the gated assistant row lands, so the dangle claim has an object.
+      awaitLedger(store) { evts -> evts.any { it.kind == "assistant" } }
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertEquals(listOf("user", "assistant", "retry"), store.events.map { it.kind })
+      assertEquals("half", store.events.single { it.kind == "assistant" }.text)
+      assertEquals(1, store.assistantCalls.get())
+      assertEquals("SEALED", awaitReceiptTerminal(c))
+      val attemptId = store.events[0].runId
+      val dangling = findDanglingRunIds(store.events)
+      assertEquals(listOf(attemptId), dangling)
       val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
       assertNotTrueAndDangling(store, durable, "equal-budget success SEALED")
-      awaitLedger(store) { evts ->
-        evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
-      }
-      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
-      assertEquals("SEALED", awaitReceiptTerminal(c))
-      val dangling = findDanglingRunIds(store.events)
-      assertTrue(
-        "exhausted settle must dangle, was ${store.events.map { it.kind }}",
-        dangling.isNotEmpty(),
-      )
       assertFalse("exhausted settle must block flushDurable", durable)
     } finally {
       c.close()

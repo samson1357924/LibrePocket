@@ -2537,12 +2537,36 @@ class TurnController(
       // finals write zero new rows (the family already owns — or will own —
       // its final); suppressed intermediate partials (non-final, family still
       // dangling) write one system-kind final mark instead.
+      //
+      // D15-2 gap (FAILED/store-failure): SUBMITTING alone cannot distinguish
+      // a terminal that will commit (suppress: zero/system-mark) from one
+      // that will fail with no commit (FAILED: normal final). A cancel that
+      // lands while the terminal is still pending but the writer then fails
+      // (no commit, INTERRUPTED) used to suppress optimistically and leave
+      // only the user row (dangling). When suppression rests solely on
+      // SUBMITTING (not yet acked/committed), settle-wait boundedly for the
+      // independent writer (NonCancellable, never blocks the already-flipped
+      // CANCELLED UI) and re-evaluate: COMMITTED/acked stays suppressed,
+      // FAILED (pending cleared, still no commit) falls through to the
+      // normal final. A still-pending stall keeps the optimistic suppression.
       val terminalFinal = attemptTerminalFinal[cancelId]
-      val acked = terminalizedAttempts.contains(cancelId)
-      val commitCount = orderedTranscript.coreCommitCount(cancelId)
-      val terminalCommitted =
+      var acked = terminalizedAttempts.contains(cancelId)
+      var commitCount = orderedTranscript.coreCommitCount(cancelId)
+      var terminalCommitted =
         if (cancelId == logicalTurnId) commitCount >= 2 else commitCount >= 1
-      val terminalSubmitting = terminalFinal != null && orderedTranscript.isCorePending(cancelId)
+      var terminalSubmitting = terminalFinal != null && orderedTranscript.isCorePending(cancelId)
+      if (terminalSubmitting && !acked && !terminalCommitted) {
+        withContext(NonCancellable) {
+          withTimeoutOrNull(5_000) {
+            while (orderedTranscript.isCorePending(cancelId)) delay(10)
+          }
+        }
+        acked = terminalizedAttempts.contains(cancelId)
+        commitCount = orderedTranscript.coreCommitCount(cancelId)
+        terminalCommitted =
+          if (cancelId == logicalTurnId) commitCount >= 2 else commitCount >= 1
+        terminalSubmitting = terminalFinal != null && orderedTranscript.isCorePending(cancelId)
+      }
       val suppressed = acked || terminalCommitted || terminalSubmitting
       val suppressedFinal = terminalFinal ?: true
       // Durable and non-cancellable: the host is cancelled but the session
@@ -2557,10 +2581,11 @@ class TurnController(
       // Any other write failure propagates.
       val cancelReasoning = assistantReasoningOf(cancelId)
       if (suppressed && suppressedFinal) {
-        // Success / terminal-failure final already durable (or SUBMITTING and
-        // about to commit via the independent writer): zero new rows, so the
-        // attempt keeps exactly one assistant row. Still rethrow the original
-        // cancellation below.
+        // Success / terminal-failure final already durable (COMMITTED/acked,
+        // or SUBMITTING that settled as COMMITTED during the bounded wait
+        // above): zero new rows, so the attempt keeps exactly one assistant
+        // row. A SUBMITTING that settled as FAILED falls through below to
+        // the normal final. Still rethrow the original cancellation below.
       } else {
         withContext(NonCancellable) {
           try {

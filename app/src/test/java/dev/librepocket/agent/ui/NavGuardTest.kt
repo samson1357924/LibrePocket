@@ -59,6 +59,27 @@ class NavGuardTest {
     }
 
     @Test
+    fun readFailureSuppressesLegacyGuards() {
+        // Stage F1：未確認讀取對舊雙守衛一律不決策（絕不誤跳 SETUP）。
+        assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, null, false, isReadFailure = true))
+        assertEquals(false, shouldNavigateToSetup(false, false, Routes.SETTINGS, null, false, isReadFailure = true))
+        assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, "LOGOUT_CLEAR_FAILED", false, isReadFailure = true))
+        assertEquals(false, shouldNavigateToSettings(false, false, Routes.CHAT, "LOGOUT_CLEAR_FAILED", false, isReadFailure = true))
+        assertEquals(false, shouldNavigateToSettings(false, false, Routes.CHAT, null, false, isReadFailure = true))
+    }
+
+    @Test
+    fun readFailureSteeringTruthTable() {
+        // 專用轉向：已落定 ReadFailure＋CHAT 才去 SETTINGS。
+        assertEquals(true, shouldNavigateToSettingsOnReadFailure(true, false, Routes.CHAT))
+        assertEquals(false, shouldNavigateToSettingsOnReadFailure(false, false, Routes.CHAT))
+        assertEquals(false, shouldNavigateToSettingsOnReadFailure(true, true, Routes.CHAT))
+        assertEquals(false, shouldNavigateToSettingsOnReadFailure(true, false, Routes.SETTINGS))
+        assertEquals(false, shouldNavigateToSettingsOnReadFailure(true, false, Routes.SETUP))
+        assertEquals(false, shouldNavigateToSettingsOnReadFailure(true, false, null))
+    }
+
+    @Test
     fun logoutInFlightBlocksNavigate() {
         assertEquals(false, shouldNavigateToSetup(false, false, Routes.CHAT, null, true))
         assertEquals(false, shouldNavigateToSetup(false, false, Routes.SETTINGS, null, true))

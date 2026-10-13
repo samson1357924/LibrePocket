@@ -174,12 +174,25 @@ class SetupViewModel(
      *   本輪——已封存 worker 不再接受新 joiner（即使其 Job 仍 active
      *   等 Main dispatch）；失效只清 settled、不重開封存。新呼叫在同鎖內
      *   判定＋入列，杜絕 drain→Main 窗口的 stranded callback。
+     * - `startupPendingGen`（Stage F2）：擁有 pending fence 的世代，僅當代
+     *   worker 的 `finally` 可清 `false`。
      */
     private val startupLock = Any()
     private var startupWorker: Job? = null
     private val startupCallbacks = ArrayList<(PendingDeleteOutcome, PendingDelete?) -> Unit>()
     private var startupSettled: StartupSettled? = null
     private var startupSealed: Boolean = false
+    /**
+     * Generation owning [_startupReconcilePending] (Stage F2).
+     *
+     * Guarded by [startupLock], advanced in [newStartupWorkerLocked] before
+     * the worker launches. Each worker captures its generation; its `finally`
+     * clears pending only when it still owns the current generation, so an
+     * older overlapping worker (R4 sealed handoff) never releases a newer
+     * worker's fence. `0` = initial ownerless generation (initial pending
+     * `true` is set at declaration, untouched until the first worker).
+     */
+    private var startupPendingGen: Long = 0L
     private val modelRefreshGeneration = AtomicLong(0L)
     private var modelRefreshJob: Job? = null
     // Stage2 form fence: identity/key intent epoch. Bumped only by
@@ -1677,7 +1690,8 @@ class SetupViewModel(
      *    true，重斷言無害）→ 跑 reconcile（含 generation 攜帶，見
      *    [reconcilePendingDeleteWithJournalAndGeneration]）→ 快照＋先寫
      *    `startupSettled` 再 Main fan-out 全部 callbacks → `finally` 單點
-     *    `pending = false`（所有 `onDone` 之後，保留先落碼後落定順序）。
+     *    `pending = false`（僅當代世代，見 `startupPendingGen`；所有 `onDone`
+     *    之後，保留先落碼後落定順序）。
      *
      * Never throws out of scope (an escaping failure is reported as
      * [PendingDeleteOutcome.UNKNOWN] with a null journal via [onDone] on
@@ -1694,7 +1708,8 @@ class SetupViewModel(
      *
      * Stage B: [startupReconcilePending] stays `true` until [onDone] runs (all
      * outcomes, including `NO_OP`) or the worker/scope is cancelled — the reset
-     * is in `finally` so a scope cancel never leaves the startup spinner stuck.
+     * is in `finally` (guarded by the owning generation, see `startupPendingGen`)
+     * so a scope cancel never leaves the startup spinner stuck.
      * Cancelling the returned join handle alone does NOT reset (the worker
      * continues for other joiners). The returned [Job] is only a join handle,
      * never the worker itself: production callers ignore it. Worker-path join
@@ -1798,6 +1813,9 @@ class SetupViewModel(
         _startupReconcilePending.value = true
         // Stage R4: 新世代開封（sealed=false）；drain 時同鎖封存。
         startupSealed = false
+        // Stage F2: 世代前進——此 worker 擁有 pending 直到被超越。
+        startupPendingGen += 1
+        val myGen = startupPendingGen
         val fresh = viewModelScope.launch(Dispatchers.IO) {
             try {
                 val triple = try {
@@ -1834,7 +1852,11 @@ class SetupViewModel(
                     fanOut.forEach { cb -> cb(result.outcome, result.journal) }
                 }
             } finally {
-                _startupReconcilePending.value = false
+                // Stage F2: 僅當代 worker 可釋放 fence——被超越的舊世代
+                // （R4 重疊）跳過，pending 留給新世代。比對與覆寫同鎖串行。
+                synchronized(startupLock) {
+                    if (myGen == startupPendingGen) _startupReconcilePending.value = false
+                }
             }
         }
         startupWorker = fresh

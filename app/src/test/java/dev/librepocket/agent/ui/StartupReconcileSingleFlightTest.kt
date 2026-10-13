@@ -480,4 +480,71 @@ class StartupReconcileSingleFlightTest {
         assertEquals(0, vault.deleteKeys)
         assertEquals(0, vault.hasKeys)
     }
+
+    @Test
+    fun drainedSealedOverlapKeepsPendingUntilNewWorkerSettles() {
+        // F2 主回歸：A 已 drain＋封存（停 Main 前），B 啟動後亦停住；
+        // 放行 A 先退出時 pending 必須維持 true（舊世代 finally 不得釋放新
+        // 世代 fence），B 落定後才置 false。兩 callback 各恰好一次。
+        val store = rawStore("f2-overlap-pending")
+        val delegate = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            delegate.putKey("preset:openai", "unit-test-old-key-123456".toCharArray())
+            store.save(preseed())
+        }
+        val vault = CountingVault(delegate)
+        val vm = newVm(store, vault)
+        assertTrue(vm.startupReconcilePending.value)
+        val drainCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val enteredA = java.util.concurrent.CountDownLatch(1)
+        val enteredB = java.util.concurrent.CountDownLatch(1)
+        val releaseA = java.util.concurrent.CountDownLatch(1)
+        val releaseB = java.util.concurrent.CountDownLatch(1)
+        vm.afterDrainBeforeMainForTest = {
+            when (drainCount.incrementAndGet()) {
+                1 -> {
+                    enteredA.countDown()
+                    if (!releaseA.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                        error("drain seam A timeout")
+                    }
+                }
+                2 -> {
+                    enteredB.countDown()
+                    if (!releaseB.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                        error("drain seam B timeout")
+                    }
+                }
+                else -> error("unexpected third drain")
+            }
+        }
+        val seenA = java.util.Collections.synchronizedList(
+            ArrayList<Pair<SetupViewModel.PendingDeleteOutcome, PendingDelete?>>(),
+        )
+        val seenB = java.util.Collections.synchronizedList(
+            ArrayList<Pair<SetupViewModel.PendingDeleteOutcome, PendingDelete?>>(),
+        )
+        val jobA = vm.launchPendingDeleteReconcile { outcome, j -> seenA.add(outcome to j) }
+        assertTrue(enteredA.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        assertTrue(vm.startupReconcilePending.value)
+        val jobB = vm.retryStartupReconcile { outcome, j -> seenB.add(outcome to j) }
+        assertTrue(enteredB.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        assertTrue(vm.startupReconcilePending.value)
+        // 放行舊世代 A：fan-out 自家 callback，但 fence 不得釋放。
+        releaseA.countDown()
+        runBlocking { withTimeout(10_000) { jobA.join() } }
+        assertEquals(1, seenA.size)
+        assertEquals(0, seenB.size)
+        assertTrue("old generation finally must not release the new fence", vm.startupReconcilePending.value)
+        // 放行新世代 B：落定後 fence 才釋放。
+        releaseB.countDown()
+        runBlocking {
+            withTimeout(10_000) { jobB.join() }
+        }
+        assertEquals(1, seenA.size)
+        assertEquals(1, seenB.size)
+        assertEquals(SetupViewModel.PendingDeleteOutcome.NO_OP, seenB.single().first)
+        assertFalse(vm.startupReconcilePending.value)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+    }
 }

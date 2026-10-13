@@ -218,7 +218,11 @@ fun shouldNavigateToSetup(
     currentRoute: String?,
     logoutErrorCode: String?,
     logoutInFlight: Boolean,
+    // Stage F1: unconfirmed read failure suppresses the Setup hard gate like
+    // loading — a transient failure is never a proven Absent.
+    isReadFailure: Boolean = false,
 ): Boolean {
+    if (isReadFailure) return false
     if (gateLoading) return false
     if (hasEndpoint) return false
     if (currentRoute == null) return false
@@ -250,11 +254,37 @@ fun shouldNavigateToSettings(
     currentRoute: String?,
     logoutErrorCode: String?,
     logoutInFlight: Boolean,
+    // Stage F1: the legacy LOGOUT-code steering stays silent on an unconfirmed
+    // read — the dedicated read-failure steering below owns this state.
+    isReadFailure: Boolean = false,
 ): Boolean {
+    if (isReadFailure) return false
     if (gateLoading) return false
     if (hasEndpoint) return false
     if (logoutInFlight) return false
     if (logoutErrorCode?.startsWith("LOGOUT_") != true) return false
+    if (currentRoute != Routes.CHAT) return false
+    return true
+}
+
+/**
+ * 讀取失敗導向純條件（Stage F1：#17 NEW Finding 1 P1）。
+ *
+ * `ReadFailure` 是需用戶重試的已落定終態（非過渡 loading）：fail-closed 不進
+ * SETUP（未證 Absent），而是把 CHAT 上的使用者帶往 SETTINGS 的重試讀取畫面
+ *（[SettingsScreen] `ReadFailure` 分支，僅重試讀取）。在途（pending）時不決策
+ *（全屏 spinner 照舊，避免 FOUC）；已在 SETTINGS／SETUP 不重導；`null` 初始幀
+ * 不決策（NavHost 組成後 currentRoute 落 CHAT 即觸發）。
+ *
+ * 純函數、無副作用。
+ */
+fun shouldNavigateToSettingsOnReadFailure(
+    isReadFailure: Boolean,
+    startupReconcilePending: Boolean,
+    currentRoute: String?,
+): Boolean {
+    if (!isReadFailure) return false
+    if (startupReconcilePending) return false
     if (currentRoute != Routes.CHAT) return false
     return true
 }

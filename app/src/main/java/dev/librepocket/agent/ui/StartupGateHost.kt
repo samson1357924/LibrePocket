@@ -115,14 +115,22 @@ internal fun StartupGateHost(
     val backStack by navController.currentBackStackEntryAsState()
     val currentRoute = backStack?.destination?.route
     val hasEndpoint = gate is EndpointGate.Ready
-    // Stage R2: ReadFailure (unconfirmed strict/vault read) suppresses nav
-    // exactly like Loading — never decide Setup/Settings on an unknown.
-    val gateLoading = gate is EndpointGate.Loading || gate is EndpointGate.ReadFailure
+    // Stage F1 (#17 NEW Finding 1 P1): ReadFailure is a settled terminal state
+    // needing a user retry — it must NOT borrow Loading's fullscreen spinner
+    // (which would cover the retry entry with no recovery path). Loading (+
+    // pending) keeps the spinner; ReadFailure renders the NavHost and steers
+    // CHAT users to the Settings retry-read surface, fail-closed (never Setup:
+    // unconfirmed is not a proven Absent).
+    val isGateLoading = gate is EndpointGate.Loading
+    val isReadFailure = gate is EndpointGate.ReadFailure
+    // Stage R2: ReadFailure suppresses the legacy nav decisions exactly like
+    // Loading — never decide Setup/Settings on an unknown (now via the
+    // isReadFailure guard params below, not by folding into navLoading).
     // Stage B（R10 Finding 2 P2/UX）：啟動 replay 落定前視同 loading——gate
     // 已折疊 NoEndpoint 但落碼未發生時，兩守衛不決策（不先跳 Setup）、全屏
     // spinner 覆蓋（不暴露 NavHost(CHAT) 空態 FOUC）。條件見
     // startupEffectiveLoading（NavGuard.kt）；兩守衛簽名與語義不變。
-    val navLoading = startupEffectiveLoading(gateLoading, startupReconcilePending)
+    val navLoading = startupEffectiveLoading(isGateLoading, startupReconcilePending)
     // 登出失敗 Settings UI 可見（Re-review #7 Finding 2 階段2）：false 分支不導航
     // 不清空，只靠 form.errorCode（LOGOUT_*）驅動 Settings 失敗卡；簽名不改。
     val logoutGuardError = errorCode?.takeIf { it.startsWith("LOGOUT_") }
@@ -146,8 +154,8 @@ internal fun StartupGateHost(
     // P2/BLOCK（Re-review #8 Finding 2 階段2）：有未恢復 LOGOUT_* 或 logoutInFlight
     // 時不強制跳（留在 SETTINGS 可恢復；STALE 待 dismiss 亦攔截）。條件見
     // shouldNavigateToSetup 純函數（NavGuard.kt，真值表單測）。
-    LaunchedEffect(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy) {
-        if (!shouldNavigateToSetup(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy)) {
+    LaunchedEffect(hasEndpoint, navLoading, isReadFailure, currentRoute, effectiveGuardError, logoutGuardBusy) {
+        if (!shouldNavigateToSetup(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy, isReadFailure)) {
             return@LaunchedEffect
         }
         navController.navigate(Routes.SETUP) {
@@ -162,8 +170,21 @@ internal fun StartupGateHost(
     // shouldNavigateToSettings 純函數。Stage B：同以 navLoading（含落定閘）
     // 守門，落定後做一次完整資訊決策（直達 SETTINGS，無 SETUP 中間態）。
     // Stage D2：有效碼含派生 LOGOUT_UNKNOWN（跨 VM journal），同走此分支。
-    LaunchedEffect(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy) {
-        if (!shouldNavigateToSettings(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy)) {
+    LaunchedEffect(hasEndpoint, navLoading, isReadFailure, currentRoute, effectiveGuardError, logoutGuardBusy) {
+        if (!shouldNavigateToSettings(hasEndpoint, navLoading, currentRoute, effectiveGuardError, logoutGuardBusy, isReadFailure)) {
+            return@LaunchedEffect
+        }
+        navController.navigate(Routes.SETTINGS) {
+            popUpTo(Routes.CHAT) { inclusive = true }
+            launchSingleTop = true
+        }
+    }
+
+    // 讀取失敗導向（Stage F1）：已落定的 ReadFailure（非在途）把 CHAT 使用者帶往
+    // SETTINGS 重試讀取畫面（SettingsScreen ReadFailure 分支，僅重試讀取）；
+    // fail-closed（絕不進 SETUP）、在途不決策（spinner 照舊）。
+    LaunchedEffect(isReadFailure, startupReconcilePending, currentRoute) {
+        if (!shouldNavigateToSettingsOnReadFailure(isReadFailure, startupReconcilePending, currentRoute)) {
             return@LaunchedEffect
         }
         navController.navigate(Routes.SETTINGS) {

@@ -932,11 +932,14 @@ class OrderedTranscriptSink(
       withContext(NonCancellable) {
         try {
           withTimeoutOrNull(drainTimeoutMs) { settle() }
-        } catch (_: Exception) {
-          // Bounded: fall through to the drain attempt below. This also
-          // catches CancellationException from a cancelled settle (the
-          // NonCancellable context above makes that a settle bug, never an
-          // outer-scope cancel): the drain below still bounds the teardown.
+        } catch (_: Throwable) {
+          // D15-4 fail-closed: settle is best-effort, so an Error from it
+          // (like an Exception, including a CancellationException from a
+          // cancelled settle — the NonCancellable context above makes that
+          // a settle bug, never an outer-scope cancel) still falls through
+          // to the drain attempt below instead of aborting the teardown.
+          // Durability truth stays in interrupted/hasDurableFailures, never
+          // a false success from this swallow.
         }
         if (!flush(drainTimeoutMs)) {
           val cause = CancellationException("transcript drain timeout")
@@ -949,8 +952,11 @@ class OrderedTranscriptSink(
         withTimeoutOrNull(drainTimeoutMs) {
           try {
             writer.join()
-          } catch (_: Exception) {
-            // Best effort: the scope cancel below still bounds the teardown.
+          } catch (_: Throwable) {
+            // D15-4 fail-closed: a failed writer (including a fatal Error
+            // it rethrew to seal) still falls through to the scope cancel
+            // below instead of aborting the teardown. Best effort: the
+            // ack/interrupt marks already carry the failure.
           }
         }
         writerScope.cancel()

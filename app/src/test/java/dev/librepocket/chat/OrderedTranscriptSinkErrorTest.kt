@@ -4,6 +4,7 @@ import java.io.IOException
 import java.util.concurrent.Executors
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -123,6 +124,68 @@ class OrderedTranscriptSinkErrorTest {
           assertFalse(sink.flushDurable())
           withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
           assertTrue(sink.isSealed())
+          sink.shutdown()?.join()
+        }
+      }
+    } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * D15-4 notice-fatal: a notice entry carries no ack and no runId, so a
+   * fatal [Error] from its delegate block still seals the writer (never a
+   * silent continue behind the fatal) but poisons nothing — no
+   * INTERRUPTED mark, [hasDurableFailures] stays false. A later core still
+   * fails fast instead of parking behind the dead writer.
+   */
+  @Test fun steerNoticeFatalSealsWithoutDurableFailureAndLaterCoreFailsFast() {
+    val exec = Executors.newSingleThreadExecutor()
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      val delegate = object : TranscriptSink {
+        override suspend fun onTurnStarted(runId: String, text: String) = Unit
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+        override suspend fun onTurnFailed(runId: String, error: String) = Unit
+        override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+        override suspend fun onSteerQueued(text: String) {
+          throw AssertionError("notice invariant broken")
+        }
+        override suspend fun onToolDone(
+          runId: String,
+          toolIndex: Int,
+          id: String,
+          name: String,
+          argumentsJson: String,
+        ) = Unit
+        override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        withTimeout(10_000) {
+          // Notices only wait for admission, so this returns while the
+          // writer dies asynchronously behind the fatal.
+          sink.onSteerQueued("fatal-steer")
+          withTimeout(5_000) { while (!sink.isSealed()) delay(10) }
+          assertTrue(sink.isSealed())
+          assertTrue(sink.pendingRunIds().isEmpty())
+          assertTrue(sink.interruptedRunIds().isEmpty())
+          assertFalse(sink.hasDurableFailures())
+          // Later core fails fast (never parks, never succeeds).
+          val started = System.currentTimeMillis()
+          withTimeout(4_000) {
+            try {
+              sink.onTurnStarted("run-next", "hi")
+              fail("post-fatal core must fail fast, never succeed")
+            } catch (_: CancellationException) {
+            } catch (_: ClosedSendChannelException) {
+            }
+          }
+          val elapsed = System.currentTimeMillis() - started
+          assertTrue("post-fatal core must fail fast, took ${elapsed}ms", elapsed < 4_000L)
+          assertTrue(sink.interruptedRunIds().contains("run-next"))
+          assertTrue(sink.pendingRunIds().isEmpty())
           sink.shutdown()?.join()
         }
       }

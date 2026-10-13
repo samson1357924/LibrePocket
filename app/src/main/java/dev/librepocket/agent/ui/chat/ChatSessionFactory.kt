@@ -104,11 +104,15 @@ internal const val BACKFILL_SCAN_LIMIT = 2000
  * Stage E: tail-loaded model prefix. [droppedCount] is the exact number of
  * older qualifying rows omitted by the cap — the observable counterpart to
  * truncation (never silent; surfaced via [CreatedSession.historyDroppedCount]
- * and [TurnController.droppedHistoryCount]).
+ * and [TurnController.droppedHistoryCount]). [reasoningIncomplete] is true
+ * when the `reasoning`-marker scan may have missed older markers (Phase 4
+ * fail-closed: exactly `droppedCount > 0`); callers must treat kept
+ * assistant flags as suspect (see [loadModelHistory]).
  */
 internal data class LoadedModelHistory(
     val messages: List<ChatMessage>,
     val droppedCount: Int,
+    val reasoningIncomplete: Boolean = false,
 )
 
 /** Marker kind for RUNNING → INTERRUPTED backfill: hidden from chat replay, kept in export. */
@@ -234,17 +238,27 @@ internal fun storedOriginOf(storedModel: String): String? {
 }
 
 /**
- * Cross-provider and cross-origin resume gate (Stage G / R2-3): returns true
- * when the stored history may be hydrated into the current endpoint's model context.
+ * Cross-provider and cross-origin resume gate (Stage G / R2-3, Phase 4
+ * fail-closed): returns true when the stored history may be hydrated into
+ * the current endpoint's model context.
  *
  * - Stored format with "@origin": matches both providerId and normalized origin
- *   (scheme://host[:port]). Any mismatch (including custom endpoint host change
- *   or foreign provider) fails closed.
- * - Old format without "@origin" (e.g. "preset:openai/gpt-4o-mini"): only built-in
- *   presets matching their canonical origin succeed; custom endpoints or non-canonical
- *   origins fail closed (withhold).
+ *   (scheme://host[:port], path discarded per RFC 6454). Any mismatch
+ *   (including custom endpoint host change or foreign provider) fails closed.
+ * - Old format without "@origin" (e.g. "preset:openai/gpt-4o-mini"): ALWAYS
+ *   fails closed (quarantine via fork, never hydrate) — Phase 4 fix. These
+ *   headers predate R4-1 fork isolation, so one id may already mix two
+ *   recipients' rows; hydrating by header alone would forward B's rows to A.
+ *   The old canonical-origin allowance is removed.
  * - Legacy bare model id without "/" (e.g. "gpt-4o-mini", "m", ""): fails closed (withhold).
  * - Malformed / foreign / imported rows: fail closed (withhold).
+ *
+ * Guarantee scope (Phase 4): same-@origin hydration trusts the header and
+ * therefore holds only for R4-1+ new/fork ledgers (fresh create() or
+ * openForked() provenance, single-recipient by construction). A pre-R4-1
+ * @origin ledger that already mixes rows under one id is NOT auto-detected
+ * here (rows carry no per-row origin) — suspect ids must be quarantined
+ * manually (start a new chat; do not rely on auto withhold).
  */
 internal fun isSameProviderOrigin(
     storedModel: String,
@@ -258,19 +272,17 @@ internal fun isSameProviderOrigin(
     val currentOrigin = normalizeOrigin(currentBaseUrl)
     if (currentOrigin.isEmpty()) return false
 
-    val storedOrigin = storedOriginOf(storedModel)
-    return if (storedOrigin != null) {
-        if (storedOrigin.isEmpty()) return false
-        normalizeOrigin(storedOrigin) == currentOrigin
-    } else {
-        if (!storedProvider.startsWith("preset:")) return false
-        val presetId = storedProvider.removePrefix("preset:")
-        if (presetId == ProviderCatalog.CUSTOM_ID) return false
-        val preset = ProviderCatalog.preset(presetId) ?: return false
-        val canonicalOrigin = normalizeOrigin(preset.baseUrl)
-        canonicalOrigin.isNotEmpty() && currentOrigin == canonicalOrigin
-    }
+    val storedOrigin = storedOriginOf(storedModel) ?: return false
+    if (storedOrigin.isEmpty()) return false
+    return normalizeOrigin(storedOrigin) == currentOrigin
 }
+
+/**
+ * Phase 4: true when [storedModel] predates R2-3 provenance (no `@origin`
+ * segment). Such ids predate R4-1 fork isolation and may already mix two
+ * recipients' rows — callers must quarantine (fork, never hydrate).
+ */
+internal fun isLegacyProvenance(storedModel: String): Boolean = storedOriginOf(storedModel) == null
 
 /** Lazily provides the product vault (Keystore I/O must stay off the main thread). */
 fun interface VaultSource {
@@ -566,13 +578,19 @@ class ChatSessionFactory(
      * it (old rows are never copied), backfills and binds the sink to the new
      * id, and returns the new id with [CreatedSession.historyWithheld] = true.
      * The old session is never written (read-only archive), so a forked
-     * ledger never mixes two recipients' rows going forward. Pre-R4-1
-     * ledgers that already mix rows from two recipients under one id are NOT
-     * migrated, split, or backfilled by this path: a same-origin reopen still
-     * hydrates the whole batch gated only by the header provenance, and
-     * mixed-row detection inside one ledger is a known gap. Same-origin
-     * resumes keep the legacy same-id path below unchanged, except for the
-     * R8-3 [backfillInterrupted] gate (same-ID reopen defers the backfill
+     * ledger never mixes two recipients' rows going forward.
+     *
+     * Phase 4 fail-closed (P1-1): legacy headers without `@origin`
+     * ([isLegacyProvenance]) always take the fork path above — never the
+     * same-id hydrate path — because pre-R4-1 ids may already mix two
+     * recipients' rows under one id (rows carry no per-row origin, so a
+     * header match cannot prove row-level same-origin). Same-`@origin`
+     * hydration therefore holds only for R4-1+ new/fork ledgers (fresh
+     * create()/openForked() provenance, single-recipient by construction). A
+     * pre-R4-1 `@origin` ledger that already mixes rows is NOT auto-detected
+     * here: suspect ids must be quarantined manually (start a new chat).
+     * Same-origin resumes keep the same-id path below unchanged, except for
+     * the R8-3 [backfillInterrupted] gate (same-ID reopen defers the backfill
      * when its pre-read settle failed).
      */
     override suspend fun open(
@@ -691,14 +709,15 @@ class ChatSessionFactory(
     }
 
     /**
-     * Stage 5 (R4-1) fork body for a cross-provider/origin [open]: the old
-     * transcript session stays a read-only archive (no backfill, no sink, no
-     * model-history read), and every new row lands in a fresh provider-owned
-     * session. Mirrors the [dev.librepocket.agent.ui.chat.ChatViewModel.ensureSession]
+     * Stage 5 (R4-1) fork body for a cross-provider/origin [open] — Phase 4
+     * also the legacy quarantine path: the old transcript session stays a
+     * read-only archive (no backfill, no sink, no model-history read), and
+     * every new row lands in a fresh provider-owned session. Mirrors the
+     * [dev.librepocket.agent.ui.chat.ChatViewModel.ensureSession]
      * cross-origin path (marker-only [snapshotSwitchHistory], never a copy).
-     * Pre-R4-1 already-mixed ledgers are out of scope here as well: this path
-     * never splits, migrates, or backfills the archived session, and mixed-row
-     * detection inside one ledger remains a known gap.
+     * This path never splits, migrates, or backfills the archived session:
+     * already-mixed pre-R4-1 ids stay archived as-is (quarantined, never
+     * re-hydrated whole-batch into a live provider context).
      */
     private suspend fun openForked(
         store: SessionStore,
@@ -1062,14 +1081,17 @@ class ChatSessionFactory(
  * `isPartial` ignored); the marker rows themselves never enter model
  * context and never affect [LoadedModelHistory.droppedCount].
  *
- * Known limitation: a `reasoning` marker outside the
- * [SnapshotBudget.HISTORY_LOAD_CAP] window is not collected, so its
- * assistant row (when the row itself is still inside the window) resumes
- * with `hasReasoning=false` (provider-visible fail-open to plain-text
- * continuation: the resumed prefix feeds the provider via TurnController,
- * so a tool-dependent follow-up would mis-pass `requireNoReasoningHistory`
- * instead of failing closed; ordinary no-tools follow-ups continue either
- * way).
+ * Phase 4 fail-closed (P1-2): when the tail cap omits older rows
+ * (`droppedCount > 0`, i.e. [LoadedModelHistory.reasoningIncomplete]), the
+ * marker scan may have missed an older `reasoning` marker whose assistant
+ * row is still kept. Every kept assistant is then conservatively resumed
+ * with `hasReasoning=true`, so a tool-dependent / thinking-mode follow-up
+ * fails closed via `requireNoReasoningHistory`
+ * (`THINKING_ROUND_TRIP_NOT_SUPPORTED`) instead of mis-passing as
+ * plain-text. Ordinary no-tools follow-ups continue unchanged (the gate only
+ * refuses tool-dependent / thinking requests), so pure-chat resume is
+ * unaffected. This over-flags plain truncated ledgers by design (safe
+ * direction); the omission stays observable via `droppedCount`.
  *
  * Truncation is observable: [LoadedModelHistory.droppedCount] carries the
  * exact omitted-row total (filtered COUNT query, O(1) memory). A giant
@@ -1085,15 +1107,18 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
     val scan = loadModelHistoryScan(store, sessionId)
     val total = store.countHistoryEvents(sessionId, includePartial = false)
     val dropped = (total - scan.events.size).coerceAtLeast(0)
+    val incomplete = dropped > 0
     return LoadedModelHistory(
         scan.events.map {
             ChatMessage(
                 role = it.kind,
                 text = cappedHistoryText(it.text),
-                hasReasoning = it.kind == "assistant" && it.runId in scan.reasoningRunIds,
+                hasReasoning = it.kind == "assistant" &&
+                    (it.runId in scan.reasoningRunIds || incomplete),
             )
         },
         dropped,
+        incomplete,
     )
 }
 
@@ -1106,13 +1131,13 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
  * `cappedHistory` → `buildRequest` (fail-closed on tool-dependent /
  * thinking-mode follow-ups; ordinary no-tools follow-ups continue).
  *
- * Known limitation: same CAP-boundary fail-open as [loadModelHistory] — a
- * marker outside the [SnapshotBudget.HISTORY_LOAD_CAP] window is not
- * collected even when its assistant row is kept. The resumed prefix feeds
- * the provider via [loadModelHistory] into [TurnController], so the lost
- * flag is provider-visible fail-open to plain-text continuation: ordinary
- * no-tools follow-ups continue either way, while a tool-dependent follow-up
- * mis-passes `requireNoReasoningHistory` instead of failing closed.
+ * Phase 4 fail-closed (P1-2): [reasoningIncomplete] is true when the cap
+ * filled (`kept == HISTORY_LOAD_CAP`) and older rows — possibly `reasoning`
+ * markers — may exist outside the window. [loadModelHistory] refines this
+ * with the exact COUNT (`dropped > 0`) and conservatively flags every kept
+ * assistant; direct [ModelHistoryScan] callers must treat a true flag the
+ * same way (suspect, fail closed on tool-dependent follow-ups, never silent
+ * `hasReasoning=false`).
  */
 internal data class ModelHistoryScan(
     /**
@@ -1124,15 +1149,22 @@ internal data class ModelHistoryScan(
     /**
      * Exact-`runId` `reasoning`-marker owners (`isFinal` / `isPartial`
      * ignored, never [familyOf]). A marker outside the CAP window is not
-     * collected (fail-open; see the class note above).
+     * collected (suspect when [reasoningIncomplete]; see the class note).
      */
     val reasoningRunIds: Set<String>,
+    /**
+     * Phase 4: true when the scan hit the row cap and older markers may have
+     * been missed (conservative: true even when the ledger holds exactly CAP
+     * rows; [loadModelHistory] narrows it with the exact dropped count).
+     */
+    val reasoningIncomplete: Boolean = false,
 )
 
 internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String): ModelHistoryScan {
     val keptNewestFirst = ArrayList<TranscriptEvent>(SnapshotBudget.HISTORY_LOAD_CAP)
     val reasoningRunIds = HashSet<String>()
     var beforeSeq = Long.MAX_VALUE
+    var capHit = false
     outer@ while (keptNewestFirst.size < SnapshotBudget.HISTORY_LOAD_CAP) {
         val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
         if (page.isEmpty()) break
@@ -1144,7 +1176,10 @@ internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String
                 continue
             }
             if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
-                if (keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) break@outer
+                if (keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) {
+                    capHit = true
+                    break@outer
+                }
                 keptNewestFirst.add(event)
             }
         }
@@ -1156,7 +1191,8 @@ internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String
         beforeSeq = pageMin
         if (page.size < HISTORY_PAGE) break
     }
-    return ModelHistoryScan(keptNewestFirst.asReversed(), reasoningRunIds)
+    if (!capHit && keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) capHit = true
+    return ModelHistoryScan(keptNewestFirst.asReversed(), reasoningRunIds, capHit)
 }
 
 /**

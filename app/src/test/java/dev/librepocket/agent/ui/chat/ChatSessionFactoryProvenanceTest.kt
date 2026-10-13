@@ -149,9 +149,10 @@ class ChatSessionFactoryProvenanceTest {
         assertFalse(isSameProviderOrigin("preset:custom@http://127.0.0.1:11434/local-model", "preset:custom", "http://127.0.0.1:8080/v1"))
         assertFalse(isSameProviderOrigin("preset:custom@http://host-a:8080/local-model", "preset:custom", "http://host-b:8080/v1"))
 
-        // Old format without @origin: built-in preset with canonical origin succeeds; custom fails closed
-        assertTrue(isSameProviderOrigin("preset:openai/gpt-4o-mini", "preset:openai", openaiUrl))
-        assertTrue(isSameProviderOrigin("preset:openai/other-model", "preset:openai", openaiUrl))
+        // Old format without @origin: Phase 4 fail-closed (quarantine via fork,
+        // never hydrate) — even built-in presets. Pre-R4-1 ids may mix rows.
+        assertFalse(isSameProviderOrigin("preset:openai/gpt-4o-mini", "preset:openai", openaiUrl))
+        assertFalse(isSameProviderOrigin("preset:openai/other-model", "preset:openai", openaiUrl))
         assertFalse(isSameProviderOrigin("preset:openai/gpt-4o-mini", "preset:openai", "https://proxy.example.com/v1"))
         assertFalse(isSameProviderOrigin("preset:custom/local-model", "preset:custom", "http://127.0.0.1:11434/v1"))
         assertFalse(isSameProviderOrigin("preset:deepseek/deepseek-chat", "preset:openai", openaiUrl))
@@ -183,7 +184,8 @@ class ChatSessionFactoryProvenanceTest {
 
     @Test fun open_sameProviderHydratesFirstRequest() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        // Phase 4: hydrate only for R4-1+ @origin headers (single-recipient).
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(event(sid, "r1", "user", "q1"))
         transcripts.appendEvent(event(sid, "r1", "assistant", "a1"))
 
@@ -235,7 +237,7 @@ class ChatSessionFactoryProvenanceTest {
 
     @Test fun open_sameProviderDifferentModelStillHydrates() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o")
         transcripts.appendEvent(event(sid, "r1", "user", "q1"))
         transcripts.appendEvent(event(sid, "r1", "assistant", "a1"))
 

@@ -97,7 +97,7 @@ class ChatSessionFactoryHistoryTailTest {
 
     @Test fun open_keepsNewest2000AndReportsExactDropped() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         seedPairs(transcripts, sid, 1001)
 
         val provider = TailFakeProvider {
@@ -127,7 +127,7 @@ class ChatSessionFactoryHistoryTailTest {
 
     @Test fun open_noTruncationReportsZeroDropped() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         seedPairs(transcripts, sid, 3)
 
         val provider = TailFakeProvider {
@@ -152,7 +152,7 @@ class ChatSessionFactoryHistoryTailTest {
 
     @Test fun open_giantSingleRowTruncatedWithVisibleMarker() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         val big = "x".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE + 5_000)
         transcripts.appendEvent(event(sid, "r-big", "user", big))
         transcripts.appendEvent(event(sid, "r-big", "assistant", "ok"))
@@ -198,7 +198,7 @@ class ChatSessionFactoryHistoryTailTest {
      */
     @Test fun maxSeq_modelHistoryScanSeesMaxRow() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.events.add(event(sid, "r-max", "user", "u-old").copy(seq = Long.MAX_VALUE - 1))
         transcripts.events.add(event(sid, "r-max", "assistant", "a-max").copy(seq = Long.MAX_VALUE))
 
@@ -210,7 +210,7 @@ class ChatSessionFactoryHistoryTailTest {
     /** D15-5: the fork-snapshot scan sees the MAX row too (same sentinel start). */
     @Test fun maxSeq_switchSnapshotScanSeesMaxRow() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.events.add(event(sid, "r-max", "user", "u-old").copy(seq = Long.MAX_VALUE - 1))
         transcripts.events.add(event(sid, "r-max", "assistant", "a-max").copy(seq = Long.MAX_VALUE))
 
@@ -225,7 +225,7 @@ class ChatSessionFactoryHistoryTailTest {
      */
     @Test fun maxSeq_modelScanMultiPageSparseSeesMax() = runBlocking {
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
         for (i in 0 until 250) {
             transcripts.appendEvent(event(sid, "r$i", "user", "u$i"))
         }

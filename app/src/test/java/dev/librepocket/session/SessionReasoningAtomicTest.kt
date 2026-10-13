@@ -480,16 +480,16 @@ class SessionReasoningAtomicTest {
         assertTrue(forked.any { it.kind == "system" && it.text.startsWith("model switched ") })
     }
 
-    // -- CAP boundary: marker outside the window resumes fail-open -----------
+    // -- CAP boundary: marker outside the window resumes fail-closed --------
 
     @Test
-    fun capBoundary_markerOutsideWindow_resumesFailOpen() = runBlocking {
+    fun capBoundary_markerOutsideWindow_resumesFailClosed() = runBlocking {
         val store = FakeSessionStore()
         val sid = store.createSession("t", "m")
         // Reordered marker: the orphan marker for run "cap-old" lands at seq 1,
         // far below the assistant it flags. After the filler below pushes it
-        // outside the HISTORY_LOAD_CAP scan window, the kept assistant resumes
-        // provider-visible fail-open (hasReasoning=false).
+        // outside the HISTORY_LOAD_CAP scan window, Phase 4 fails closed:
+        // truncation-suspect kept assistants resume flagged.
         store.appendEvent(
             TranscriptEvent(sessionId = sid, runId = "cap-old", kind = "reasoning", text = "", createdAt = 1L),
         )
@@ -529,11 +529,40 @@ class SessionReasoningAtomicTest {
 
         val history = loadModelHistory(store, sid)
         assertTrue("cap truncation must be observable", history.droppedCount > 0)
+        assertTrue("truncation must mark the scan suspect", history.reasoningIncomplete)
         val old = history.messages.firstOrNull { it.text == "old answer" }
         assertTrue("old assistant must still be inside the window", old != null)
-        assertFalse("marker outside the window resumes fail-open", requireNotNull(old).hasReasoning)
+        assertTrue("marker outside the window resumes fail-closed (suspect flagged)", requireNotNull(old).hasReasoning)
         val fresh = history.messages.firstOrNull { it.text == "new answer" }
         assertTrue(requireNotNull(fresh).hasReasoning)
+        // Fail-closed provider effect: a tool-dependent follow-up over the
+        // truncated prefix must refuse instead of mis-passing as plain text.
+        val tools = listOf(ToolSchema("t", "d", "{}"))
+        try {
+            requireNoReasoningHistory(ChatRequest(model = "m", messages = history.messages, tools = tools))
+            fail("truncated suspect history must fail closed on tool-dependent follow-up")
+        } catch (e: ProviderFailure) {
+            assertFalse(e.retryable)
+            assertEquals("THINKING_ROUND_TRIP_NOT_SUPPORTED", e.message)
+        }
+        // Ordinary no-tools follow-ups still continue (scoped gate).
+        requireNoReasoningHistory(ChatRequest(model = "m", messages = history.messages))
+    }
+
+    @Test
+    fun capBoundary_noTruncation_keepsPlainFlag() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("t", "m")
+        store.appendEvent(
+            TranscriptEvent(sessionId = sid, runId = "r1", kind = "user", text = "q", createdAt = 1L),
+        )
+        store.appendEvent(
+            TranscriptEvent(sessionId = sid, runId = "r1", kind = "assistant", text = "a", createdAt = 2L),
+        )
+        val history = loadModelHistory(store, sid)
+        assertEquals(0, history.droppedCount)
+        assertFalse(history.reasoningIncomplete)
+        assertFalse(history.messages.first { it.role == "assistant" }.hasReasoning)
     }
 
     // -- provider gate: lost flag fail-opens on tool-dependent turns ---------
@@ -556,9 +585,11 @@ class SessionReasoningAtomicTest {
             assertFalse(e.retryable)
             assertEquals("THINKING_ROUND_TRIP_NOT_SUPPORTED", e.message)
         }
-        // The orphan-ledger shape (flag lost): the same turn replays as plain
-        // text and the tool-dependent gate mis-passes — provider-visible
-        // fail-open, pinned here so the ledger fix above stays load-bearing.
+        // The non-truncated orphan-ledger shape (flag lost, dropped == 0):
+        // the same turn replays as plain text and the tool-dependent gate
+        // mis-passes — compat fail-open for legacy pre-marker rows only.
+        // Truncated prefixes no longer reach this shape: loadModelHistory
+        // flags every kept assistant when dropped > 0 (see the test above).
         val unflagged = ChatRequest(
             model = "m",
             messages = listOf(

@@ -183,7 +183,7 @@ class ChatRequestTrimVisibilityTest {
         runBlocking { store.save(openaiEndpoint()) }
         val transcripts = FakeSessionStore()
         val sid = runBlocking {
-            val id = transcripts.createSession("big chat", "preset:openai/gpt-4o-mini")
+            val id = transcripts.createSession("big chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
             // 3 complete turns x 19k chars = 114k > MAX_REQUEST_CHARS (100k);
             // 6 rows < HISTORY_CAP so load-time omission stays 0.
             for (i in 0 until 3) {
@@ -230,7 +230,7 @@ class ChatRequestTrimVisibilityTest {
         runBlocking { store.save(openaiEndpoint()) }
         val transcripts = FakeSessionStore()
         val sid = runBlocking {
-            val id = transcripts.createSession("long chat", "preset:openai/gpt-4o-mini")
+            val id = transcripts.createSession("long chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
             // 1001 complete turns: 2002 replay rows, oldest pair (u0,a0) omitted.
             for (i in 0 until 1001) {
                 transcripts.appendEvent(
@@ -269,7 +269,7 @@ class ChatRequestTrimVisibilityTest {
         runBlocking { store.save(openaiEndpoint()) }
         val transcripts = FakeSessionStore()
         val big = runBlocking {
-            val id = transcripts.createSession("big chat", "preset:openai/gpt-4o-mini")
+            val id = transcripts.createSession("big chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
             for (i in 0 until 3) {
                 transcripts.appendEvent(
                     TranscriptEvent(sessionId = id, runId = "r$i", kind = "user", text = bigRow("u$i:"), createdAt = 1L),
@@ -280,7 +280,7 @@ class ChatRequestTrimVisibilityTest {
             }
             id
         }
-        val fresh = runBlocking { transcripts.createSession("fresh", "preset:openai/gpt-4o-mini") }
+        val fresh = runBlocking { transcripts.createSession("fresh", "preset:openai@https://api.openai.com/gpt-4o-mini") }
         val fake = TrimFakeProvider(okHandler())
         val vm = chatViewModels.own(ChatViewModel(store, newFactory(fake, transcripts), InMemoryPolicyStore()))
         onMain { vm.openSession(big) }

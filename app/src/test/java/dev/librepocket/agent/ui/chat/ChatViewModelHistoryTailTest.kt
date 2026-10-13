@@ -121,7 +121,7 @@ class ChatViewModelHistoryTailTest {
         runBlocking { store.save(openaiEndpoint()) }
         val transcripts = FakeSessionStore()
         val sid = runBlocking {
-            val id = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+            val id = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
             // 1001 complete turns: 2002 replay rows, oldest pair (u0,a0) omitted.
             for (i in 0 until 1001) {
                 transcripts.appendEvent(

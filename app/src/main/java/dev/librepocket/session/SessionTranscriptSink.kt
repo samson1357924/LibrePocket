@@ -1,6 +1,7 @@
 package dev.librepocket.session
 
 import dev.librepocket.chat.TranscriptSink
+import dev.librepocket.redact.Redactor
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 
@@ -35,8 +36,10 @@ import kotlinx.coroutines.CancellationException
  * (ordinary no-tools follow-ups continue; see `requireNoReasoningHistory`).
  * Resume history feeds the provider via `loadModelHistory` into
  * [dev.librepocket.chat.TurnController], so the restored flag is
- * provider-visible: a missing flag fail-opens to plain-text continuation
- * on a tool-dependent follow-up instead of failing closed.
+ * provider-visible. Phase 4: a truncation-suspect resume (`dropped > 0`)
+ * conservatively flags every kept assistant (fail-closed on
+ * tool-dependent follow-ups); only a non-truncated legacy orphan without a
+ * marker still resumes as plain text (compat fail-open, pinned by tests).
  *
  * D15-3: the `assistant` + `reasoning` pair persists as one atomic batch
  * via [SessionStore.appendEvents] (single transaction on [RoomSessionStore],
@@ -233,8 +236,15 @@ class SessionTranscriptSink(
         appendDurableBatch(batch)
     }
 
+    /**
+     * Legacy two-arg failure (compat): `system` row `turn <runId> failed:
+     * <reason>`. Phase 4: the reason is pre-sanitized with [Redactor.redactError]
+     * (stricter URL/query/token stripping) for parity with `failureReason`
+     * rows (which [RoomSessionStore] re-sanitizes with `redactError` on
+     * write); the store's text-path `redact()` second pass is then a no-op.
+     */
     override suspend fun onTurnFailed(runId: String, error: String) {
-        appendDurable(runId, "system", "turn $runId failed: $error", isFinal = true)
+        appendDurable(runId, "system", "turn $runId failed: ${Redactor.redactError(error)}", isFinal = true)
     }
 
     override suspend fun onTurnFailed(runId: String, partialText: String, error: String) {

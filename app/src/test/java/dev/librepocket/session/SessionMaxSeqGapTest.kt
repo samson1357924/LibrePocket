@@ -361,7 +361,7 @@ class SessionMaxSeqGapViewModelTest {
     fun openSession_maxPartialReplayTerminates() {
         val transcripts = FakeSessionStore()
         val sid = runBlocking {
-            val id = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+            val id = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
             transcripts.appendEvent(
                 TranscriptEvent(sessionId = id, runId = "r0", kind = "user", text = "u0", createdAt = 1L),
             )
@@ -407,7 +407,7 @@ class SessionMaxSeqGapViewModelTest {
     fun openSession_maxReasoningMarkerRestoresFlag() {
         val transcripts = FakeSessionStore()
         val sid = runBlocking {
-            val id = transcripts.createSession("old chat", "preset:openai/gpt-4o-mini")
+            val id = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
             transcripts.appendEvent(
                 TranscriptEvent(sessionId = id, runId = "r1", kind = "user", text = "q1", createdAt = 1L),
             )

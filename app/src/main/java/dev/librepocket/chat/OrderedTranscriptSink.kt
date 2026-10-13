@@ -198,6 +198,24 @@ class OrderedTranscriptSink(
   internal var beforeSendForTest: (suspend (Long) -> Unit)? = null
   internal var afterSendForTest: (suspend (Long) -> Unit)? = null
   /**
+   * D15-1 gap-coverage seams (G3): deterministic await-entrance signals
+   * (internal, default null, no production effect).
+   *
+   * - [onPrevAwaitEnteredForTest] runs synchronously right before the
+   *   predecessor-gate await (with the admission ticket), still before the
+   *   first suspend point of that await, so a test observing it knows the
+   *   holder has reserved and reached its park point — no delay inference.
+   *   Must not suspend (signals via thread-safe Deferred/collections only).
+   *   A throw is treated like any pre-send hook failure (abandon via the
+   *   forwarder in the surrounding finally); tests never throw here.
+   * - [onFlushTailAwaitEnteredForTest] runs once at [flush] tail-await entry
+   *   (before the barrier ticket is reserved, so no ticket exists yet). Lets
+   *   G2 deterministically observe a flush parked in [awaitAdmissionTail]
+   *   before its timeout/cancel. Must not throw/suspend.
+   */
+  internal var onPrevAwaitEnteredForTest: ((Long) -> Unit)? = null
+  internal var onFlushTailAwaitEnteredForTest: (() -> Unit)? = null
+  /**
    * D15-2 test seam: runs in the writer `finally` after the commit count is
    * recorded and before the ack completes (store-write success only,
    * non-suspending, null in production). Lets the terminal-ack cancel grid
@@ -509,6 +527,8 @@ class OrderedTranscriptSink(
    * behind the barrier, by construction.
    */
   private suspend fun awaitAdmissionTail() {
+    checkNotHoldingAdmissionLock("onFlushTailAwaitEnteredForTest")
+    onFlushTailAwaitEnteredForTest?.invoke()
     var tail = admissionChain.get()
     while (tail != null) {
       tail.await()
@@ -573,6 +593,9 @@ class OrderedTranscriptSink(
     try {
       // Admission order, not resumption order: every smaller ticket's send
       // was already attempted once its gate completes.
+      // G3: deterministic park-point signal (sync, before the await suspend).
+      checkNotHoldingAdmissionLock("onPrevAwaitEnteredForTest:writeCoreTracked")
+      onPrevAwaitEnteredForTest?.invoke(reservation.ticket)
       reservation.prev?.await()
       checkNotHoldingAdmissionLock("beforeSendForTest:writeCoreTracked")
       beforeSendForTest?.invoke(reservation.ticket)
@@ -689,6 +712,8 @@ class OrderedTranscriptSink(
     val reservation = reserveAdmission()
     var sendInvoked = false
     try {
+      checkNotHoldingAdmissionLock("onPrevAwaitEnteredForTest:writeOrdered")
+      onPrevAwaitEnteredForTest?.invoke(reservation.ticket)
       reservation.prev?.await()
       checkNotHoldingAdmissionLock("beforeSendForTest:writeOrdered")
       beforeSendForTest?.invoke(reservation.ticket)
@@ -775,6 +800,9 @@ class OrderedTranscriptSink(
       try {
         // Admission order, not launch order: the predecessor's gate completes
         // once its send was attempted, so this send runs strictly after it.
+        // G3: deterministic park-point signal for the queued steer job.
+        checkNotHoldingAdmissionLock("onPrevAwaitEnteredForTest:offerSteerQueued")
+        onPrevAwaitEnteredForTest?.invoke(reservation.ticket)
         reservation.prev.await()
         checkNotHoldingAdmissionLock("beforeSendForTest:offerSteerQueued")
         beforeSendForTest?.invoke(reservation.ticket)
@@ -839,6 +867,8 @@ class OrderedTranscriptSink(
         // immediately. The gate always completes normally.
         var sendInvoked = false
         try {
+          checkNotHoldingAdmissionLock("onPrevAwaitEnteredForTest:flush")
+          onPrevAwaitEnteredForTest?.invoke(reservation.ticket)
           reservation.prev?.await()
           val barrier = CompletableDeferred<Unit>()
           checkNotHoldingAdmissionLock("beforeSendForTest:flush")

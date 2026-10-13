@@ -69,6 +69,9 @@ class OrderedTranscriptSinkCancelOrderTest {
       val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
       val reserved: MutableList<Long> = Collections.synchronizedList(mutableListOf())
       sink.onAdmissionReservedForTest = { reserved.add(it) }
+      // G3: deterministic park-point signals (no delay inference for arrival).
+      val entered: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+      sink.onPrevAwaitEnteredForTest = { entered.add(it) }
       val aEntered = CompletableDeferred<Unit>()
       val aRelease = CompletableDeferred<Unit>()
       val firstHook = AtomicBoolean(true)
@@ -86,7 +89,9 @@ class OrderedTranscriptSinkCancelOrderTest {
           awaitCond("B reserved") { reserved.size >= 2 }
           val cJob = async { sink.onTurnStarted("C-run", "c") }
           awaitCond("C reserved") { reserved.size >= 3 }
-          delay(300)
+          // G3: B/C reached their park points (deterministic), not inferred.
+          awaitCond("B reached await") { entered.contains(1L) }
+          awaitCond("C reached await") { entered.contains(2L) }
           // B abandons pre-send while A is still parked in its gap.
           bJob.cancel()
           try {
@@ -115,6 +120,7 @@ class OrderedTranscriptSinkCancelOrderTest {
         }
       }
       sink.onAdmissionReservedForTest = null
+      sink.onPrevAwaitEnteredForTest = null
       sink.beforeSendForTest = null
       runBlocking { withTimeout(10_000) { sink.shutdown()?.join() } }
     } finally {
@@ -183,6 +189,9 @@ class OrderedTranscriptSinkCancelOrderTest {
       val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
       val reserved: MutableList<Long> = Collections.synchronizedList(mutableListOf())
       sink.onAdmissionReservedForTest = { reserved.add(it) }
+      // G3: deterministic park-point signals (no delay inference for arrival).
+      val entered: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+      sink.onPrevAwaitEnteredForTest = { entered.add(it) }
       val aEntered = CompletableDeferred<Unit>()
       val aRelease = CompletableDeferred<Unit>()
       val firstHook = AtomicBoolean(true)
@@ -198,7 +207,7 @@ class OrderedTranscriptSinkCancelOrderTest {
           aEntered.await()
           val bJob = async { sink.onTurnStarted("B-run", "b") }
           awaitCond("B reserved") { reserved.size >= 2 }
-          delay(200)
+          awaitCond("B reached await") { entered.contains(1L) }
           bJob.cancel()
           try {
             bJob.await()
@@ -210,6 +219,7 @@ class OrderedTranscriptSinkCancelOrderTest {
           // post-fix D links behind the abandoned B gate and waits for A.
           val dJob = async { sink.onTurnStarted("D-run", "d") }
           awaitCond("D reserved") { reserved.size >= 3 }
+          awaitCond("D reached await") { entered.contains(2L) }
           delay(300)
           assertTrue(
             "tail-cancel newcomer must not fast-path past A: ${delegate.recorded}",
@@ -223,6 +233,7 @@ class OrderedTranscriptSinkCancelOrderTest {
         }
       }
       sink.onAdmissionReservedForTest = null
+      sink.onPrevAwaitEnteredForTest = null
       sink.beforeSendForTest = null
       runBlocking { withTimeout(10_000) { sink.shutdown()?.join() } }
     } finally {
@@ -238,6 +249,9 @@ class OrderedTranscriptSinkCancelOrderTest {
       val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
       val reserved: MutableList<Long> = Collections.synchronizedList(mutableListOf())
       sink.onAdmissionReservedForTest = { reserved.add(it) }
+      // G3: deterministic park-point signals (no delay inference for arrival).
+      val entered: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+      sink.onPrevAwaitEnteredForTest = { entered.add(it) }
       val aEntered = CompletableDeferred<Unit>()
       val aRelease = CompletableDeferred<Unit>()
       val firstHook = AtomicBoolean(true)
@@ -256,7 +270,8 @@ class OrderedTranscriptSinkCancelOrderTest {
           awaitCond("B reserved") { reserved.size >= 2 }
           val cJob = async { sink.onTurnStarted("C-run", "c") }
           awaitCond("C reserved") { reserved.size >= 3 }
-          delay(200)
+          awaitCond("B reached await") { entered.contains(1L) }
+          awaitCond("C reached await") { entered.contains(2L) }
           // Cancel the middle notice: C must still wait for A via B's
           // forwarder (two-hop forwarding once D joins below).
           bJob.cancel()
@@ -268,6 +283,7 @@ class OrderedTranscriptSinkCancelOrderTest {
           // Newcomer D (notice) joins behind C while A still parked.
           val dJob = async { sink.onTurnRetried("D-run", 1, 3, 0L) }
           awaitCond("D reserved") { reserved.size >= 4 }
+          awaitCond("D reached await") { entered.contains(3L) }
           delay(300)
           assertTrue(
             "three-layer chain must not overtake A: ${delegate.recorded}",
@@ -285,6 +301,7 @@ class OrderedTranscriptSinkCancelOrderTest {
         }
       }
       sink.onAdmissionReservedForTest = null
+      sink.onPrevAwaitEnteredForTest = null
       sink.beforeSendForTest = null
       runBlocking { withTimeout(10_000) { sink.shutdown()?.join() } }
     } finally {

@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
@@ -135,6 +136,41 @@ class ScopedFileStoreB2Test {
         val store = ScopedFileStore(ws)
         assertRejected({ store.write("link/evil.txt", "x".toByteArray()) }, "write via swapped parent")
         assertFalse(File(out, "evil.txt").exists())
+    }
+
+    @Test fun writeDenied_leavesNoTmp() {
+        // 拒寫不留暫存：ws/link→out，write("link/evil.txt") 本 fixture 下 resolve→ensureNoSymlinkChain
+        // 即拋（見 write/resolve；本案鎖定終態無殘留，不區分未建／建後清）；
+        // 斷言 ws/out 內無 `.lp-*`（用 TMP_NAME_PREFIX 常數）+ 外部未落地。
+        // 沿用 workspace()/outside() 但本案加 try-finally（不重構既有 7 案 deleteOnExit）。
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        val ws = workspace()
+        val out = outside()
+        try {
+            link(File(ws, "link"), out)
+            val store = ScopedFileStore(ws)
+            try {
+                store.write("link/evil.txt", "x".toByteArray())
+                fail("expected IllegalArgumentException: write via parent link")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(
+                    "message must mention symlink/escapes, got ${e.message}",
+                    (e.message ?: "").contains("symlink") || (e.message ?: "").contains("escapes"),
+                )
+            }
+            val wsTop = (ws.listFiles()?.toList() ?: emptyList())
+                .filter { it.isFile && !Files.isSymbolicLink(it.toPath()) && it.name.startsWith(ScopedFileStore.TMP_NAME_PREFIX) }
+                .sortedBy { it.name }
+            assertTrue("denied write must leave no tmp in ws, got $wsTop", wsTop.isEmpty())
+            val outTop = (out.listFiles()?.toList() ?: emptyList())
+                .filter { it.isFile && !Files.isSymbolicLink(it.toPath()) && it.name.startsWith(ScopedFileStore.TMP_NAME_PREFIX) }
+                .sortedBy { it.name }
+            assertTrue("denied write must leave no tmp in out, got $outTop", outTop.isEmpty())
+            assertFalse(File(out, "evil.txt").exists())
+        } finally {
+            ws.deleteRecursively()
+            out.deleteRecursively()
+        }
     }
 
     @Test fun writeRevalidatesBeforeMove() {

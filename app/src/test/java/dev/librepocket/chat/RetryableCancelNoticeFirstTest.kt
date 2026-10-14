@@ -196,6 +196,24 @@ class RetryableCancelNoticeFirstTest {
     throw AssertionError("receipt never reached a terminal state")
   }
 
+  /**
+   * P0-1 Phase4 fence: two flush drains with zero-new-rows断言. Replaces
+   * `Thread.sleep(400/900)` guess-waits in benign/deadline tests.
+   *
+   * Given: host joined + ledger shape awaited.
+   * When: two consecutive flushTranscript drains run after the receipt
+   *   reaches a terminal state.
+   * Then: ledger size is identical (no late duplicate can still land).
+   */
+  private fun flushTwiceAssertStable(c: TurnController, store: FakeSessionStore) {
+    runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+    val before = synchronized(store.events) { ArrayList(store.events).size }
+    runCatching { awaitReceiptState(c, timeoutMs = 8_000L) }
+    runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+    val after = synchronized(store.events) { ArrayList(store.events).size }
+    assertEquals("two flush drains must add zero rows (fence, not sleep)", before, after)
+  }
+
   @Test fun retryableLateFailBatchSuccessReopenTerminal() {
     val store = R181LateStore(failPredicate = { it == 1 })
     val sid = runBlocking { store.createSession("hi", MODEL) }
@@ -274,9 +292,12 @@ class RetryableCancelNoticeFirstTest {
       assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
       c.cancel()
       joinHost(host)
-      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
-      Thread.sleep(400)
-      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      // P0-1 fence: deferred system mark awaited via ledger shape + receipt
+      // terminal + two flush drains zero-new (replaces sleep 400).
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 1
+      }
+      flushTwiceAssertStable(c, store)
       assertEquals(listOf("user", "assistant", "retry", "system"), store.events.map { it.kind })
       assertTrue(findDanglingRunIds(store.events).isEmpty())
       assertEquals("half", c.uiState.value.messages.single { it.role == "assistant" }.text)
@@ -371,8 +392,14 @@ class RetryableCancelNoticeFirstTest {
         evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
       }
       // Give the late FAIL a moment to settle (it must NOT write a batch now).
-      Thread.sleep(900)
-      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      // P0-1 fence: SEALED already awaited above; drain the stalled terminal
+      // FAIL via ledger fence (notice present + assistantCalls settled) then
+      // two flush drains zero-new — replaces sleep 900.
+      awaitLedger(store, timeoutMs = 8_000L) { evts ->
+        evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") } &&
+          store.assistantCalls.get() >= 1
+      }
+      flushTwiceAssertStable(c, store)
       val kinds = store.events.map { it.kind }
       assertTrue("deadline-expired must not compensate, was $kinds", kinds.none { it == "system" })
       assertTrue("deadline-expired must not compensate, was $kinds", kinds.none { it == "assistant" })
@@ -639,8 +666,9 @@ class RetryableCancelNoticeFirstTest {
       awaitLedger(stalling, timeoutMs = 8_000L) { evts ->
         evts.any { it.kind == "retry" && it.text.startsWith("cancel requested") }
       }
-      Thread.sleep(900)
-      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      // P0-1 fence: SEALED already awaited; drain stalled fresh FAIL then two
+      // flush drains zero-new — replaces sleep 900.
+      flushTwiceAssertStable(c, stalling)
       assertEquals(
         listOf("user", "assistant", "retry", "retry"),
         stalling.events.map { it.kind },

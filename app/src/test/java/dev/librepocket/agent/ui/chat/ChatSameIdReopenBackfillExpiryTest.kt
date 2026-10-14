@@ -473,6 +473,13 @@ class ChatSameIdReopenBackfillExpiryTest {
         // #3 wall-clock jump proxy: real time passes beyond the 500ms horizon
         // while the monotonic seam is frozen. Pre-fix (wall-clock deadline)
         // this reopen would expire the block and mis-mark; post-fix it defers.
+        // P0-1 Phase4 note: this Thread.sleep(800) is INTENTIONALLY retained —
+        // no latch/ledger fence can replace it. It is the stimulus (real
+        // wall-clock passage beyond the horizon while backfillClockMs is
+        // frozen), not a settle guess: the fence is the monotonic seam
+        // (fakeNow unchanged) + the live-writer latch (releaseGate
+        // incomplete + pending [L]). A gate-only rewrite would remove the
+        // very jump being pinned and make the test vacuous.
         Thread.sleep(800)
         onMain { vm.openSession(oldId) }
         awaitTrue(timeoutMs = 15000) { sessions.backfillFlags.size >= 3 }

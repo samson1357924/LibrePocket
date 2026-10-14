@@ -521,11 +521,15 @@ class ChatSameIdReopenEarlyExitTest {
             awaitTrue { vm.messages.value.any { it.text == "half-cancelled" } }
 
             // Same-ID reopen fences (blocked on gates), then immediate newChat cancels it.
+            // P0-1 fence: await the fenced-detach (null id) while gates held
+            // before the lifecycle cancel — replaces delay 300. The reopen
+            // parks asynchronously, so newChat must wait for the park.
             onMain { vm.openSession(s1) }
-            delay(300)
+            awaitTrue(timeoutMs = 10000) { vm.currentSessionId.value == null }
+            assertTrue("stream gate must still be held", !streamGate.isCompleted)
+            assertTrue("cleanup gate must still be held", !cleanupGate.isCompleted)
             onMain { vm.newChat() }
-            assertNull(vm.currentSessionId.value)
-            assertTrue(vm.messages.value.isEmpty())
+            awaitTrue(timeoutMs = 10000) { vm.currentSessionId.value == null && vm.messages.value.isEmpty() }
 
             // Teardown survives the lifecycle cancel: release lands the terminal in S1 only.
             cleanupGate.complete(Unit)
@@ -569,7 +573,11 @@ class ChatSameIdReopenEarlyExitTest {
             transcripts.appendEvent(event(otherId, "L2", "assistant", "a-other"))
 
             onMain { vm.openSession(s1) }
-            delay(300)
+            // P0-1 fence: await the fenced-detach (null id) while gates held
+            // before the open-other cancel — replaces delay 300.
+            awaitTrue(timeoutMs = 10000) { vm.currentSessionId.value == null }
+            assertTrue("stream gate must still be held", !streamGate.isCompleted)
+            assertTrue("cleanup gate must still be held", !cleanupGate.isCompleted)
             onMain { vm.openSession(otherId) }
             awaitTrue(timeoutMs = 15000) { vm.currentSessionId.value == otherId }
 
@@ -652,9 +660,15 @@ class ChatSameIdReopenEarlyExitTest {
 
             // Phase 3: ALLOW + immediate reopen from null WITHOUT releasing
             // the gate. Slow path must fence (no fast open, no attach).
+            // P0-1 fence: fence-latch (pendingSlot fence still incomplete) +
+            // ledger fence (no mark) — replaces delay 500. The latch proves
+            // the teardown is still unsettled, so a fast open would be a bug.
             policy.removeRule("key.read:*")
             onMain { vm.openSession(oldId) }
-            delay(500)
+            awaitTrue(timeoutMs = 10000) {
+                val (f, _, _) = pendingSlot(vm)
+                f != null && !f.isCompleted
+            }
             assertEquals(
                 "owner-matched reopen must not fast-open while the fence is unsettled",
                 1,

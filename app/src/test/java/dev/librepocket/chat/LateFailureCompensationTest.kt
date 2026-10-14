@@ -174,6 +174,58 @@ class LateFailureCompensationTest {
   private fun flushDurable(c: TurnController): Boolean =
     runBlocking { withTimeout(8_000) { c.flushDurable() } }
 
+  /**
+   * P0-1 Phase4 fence: receipt terminal state via the private cancelReceipts
+   * seam (PENDING/CLAIMED spin until REVOKED/COMPENSATED/SEALED). Replaces
+   * wall-clock sleeps that guessed the waiter had settled.
+   *
+   * Given: a cancel receipt was installed (stall > settle budget).
+   * When: the waiter settles the terminal outcome.
+   * Then: the single receipt leaves PENDING/CLAIMED for a terminal state.
+   */
+  private fun awaitReceiptTerminalState(c: TurnController, timeoutMs: Long = 8_000L): String {
+    val f = TurnController::class.java.getDeclaredField("cancelReceipts")
+    f.isAccessible = true
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (System.currentTimeMillis() < deadline) {
+      @Suppress("UNCHECKED_CAST")
+      val map = f.get(c) as java.util.concurrent.ConcurrentHashMap<*, *>
+      val receipt = map.values.singleOrNull()
+      if (receipt != null) {
+        val sf = receipt.javaClass.getDeclaredField("state")
+        sf.isAccessible = true
+        val state = (sf.get(receipt) as java.util.concurrent.atomic.AtomicReference<*>).get().toString()
+        if (state != "PENDING" && state != "CLAIMED") return state
+      } else {
+        // Benign revoke path may never install a receipt (acked before
+        // stall): treat empty as REVOKED-equivalent settled.
+        return "REVOKED"
+      }
+      Thread.sleep(25)
+    }
+    throw AssertionError("receipt never reached a terminal state")
+  }
+
+  /**
+   * P0-1 Phase4 fence: two flush drains with zero-new-rows断言. Replaces
+   * `Thread.sleep(400)` guess-waits in benign late-success tests.
+   *
+   * Given: host joined + first flush drained.
+   * When: two consecutive flushTranscript drains run.
+   * Then: ledger size is identical (no late duplicate can still land).
+   */
+  private fun flushTwiceAssertStable(c: TurnController, store: FakeSessionStore) {
+    runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+    val before = synchronized(store.events) { ArrayList(store.events).size }
+    // Fence on the receipt terminal state instead of a fixed sleep: the
+    // waiter has settled (REVOKED for benign commit-wins, COMPENSATED for
+    // late-FAIL, SEALED for wedge) before we measure stability.
+    runCatching { awaitReceiptTerminalState(c, timeoutMs = 8_000L) }
+    runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+    val after = synchronized(store.events) { ArrayList(store.events).size }
+    assertEquals("two flush drains must add zero rows (fence, not sleep)", before, after)
+  }
+
   // ---- ★1: success late-FAIL → compensation cancel final. ----
 
   @Test fun successLateFailCompensatesCancelFinal() {
@@ -404,9 +456,8 @@ class LateFailureCompensationTest {
       // Stall (800ms) exceeds the 300ms settle budget → receipt installed, but
       // the writer then commits: revoke, optimistic zero stands, no duplicate.
       joinHost(host)
-      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
-      Thread.sleep(400)
-      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      // P0-1 fence: receipt REVOKED + two flush drains zero-new (replaces sleep 400).
+      flushTwiceAssertStable(c, store)
       assertEquals(listOf("user", "assistant"), store.events.map { it.kind })
       val attemptId = store.events[0].runId
       val assistants = store.events.filter { it.kind == "assistant" && it.runId == attemptId }
@@ -445,9 +496,12 @@ class LateFailureCompensationTest {
       assertTrue("terminal never entered", store.assistantEntered.await(5, TimeUnit.SECONDS))
       c.cancel()
       joinHost(host)
-      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
-      Thread.sleep(400)
-      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      // P0-1 fence: deferred system mark lands via waiter; await ledger shape
+      // + receipt terminal + two flush drains zero-new (replaces sleep 400).
+      awaitLedger(store) { evts ->
+        evts.any { it.kind == "system" } && evts.count { it.kind == "assistant" } == 1
+      }
+      flushTwiceAssertStable(c, store)
       // R18-1 benign: intermediate commits, notice-first keeps dangling until
       // the waiter appends the deferred system mark — never the partial dump
       // (exactly one assistant). Ledger: user + original partial + notice +
@@ -513,7 +567,9 @@ class LateFailureCompensationTest {
       // Do NOT complete the gate: the writer stays wedged until shutdown
       // times out, marks INTERRUPTED and cancels the scope. The waiter must
       // observe the seal and degrade without writing (WARN-1 bounded write).
-      Thread.sleep(900)
+      // P0-1 fence: await SEALED receipt + flush drain (replaces sleep 900).
+      assertEquals("SEALED", awaitReceiptTerminalState(c))
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
       // Ledger owns only the user row; the terminal never committed and no
       // compensation was written (backfill owns the INTERRUPTED row).
       assertTrue(

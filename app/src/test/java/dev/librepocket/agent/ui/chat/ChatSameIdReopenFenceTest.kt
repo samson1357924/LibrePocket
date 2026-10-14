@@ -327,11 +327,24 @@ class ChatSameIdReopenFenceTest {
             )
 
             // 2. Same-ID reopen: slow path must fence before read/backfill.
+            // P0-1 fence: gate-latch (gates still held) + ledger fence
+            // (no assistant, no interrupted) + fenced-detach (null id, empty
+            // UI). Replaces delay 500. The detach is awaited (bounded) — the
+            // reopen parks asynchronously after onMain returns, so an
+            // immediate assert would race it.
             onMain { vm.openSession(s1) }
-            delay(500)
+            awaitTrue(timeoutMs = 10000) {
+                vm.currentSessionId.value == null && vm.messages.value.isEmpty()
+            }
+            assertTrue("stream gate must still be held", !streamGate.isCompleted)
+            assertTrue("cleanup gate must still be held", !cleanupGate.isCompleted)
             assertTrue(
                 "slow path must not backfill a false INTERRUPTED while unsettled",
                 interruptedMarkers(transcripts, s1).isEmpty(),
+            )
+            assertTrue(
+                "fenced ledger must stay user-only while gates held",
+                rows(transcripts, s1).none { it.kind == "assistant" },
             )
             assertNull(
                 "slow path must not attach a stale orphan-only hydrate while fenced",

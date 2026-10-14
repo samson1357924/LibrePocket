@@ -27,7 +27,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -155,6 +154,34 @@ class ChatNewChatReopenRaceTest {
     private fun rows(store: FakeSessionStore, sid: String) =
         ArrayList(store.events).filter { it.sessionId == sid }.sortedBy { it.seq }
 
+    /**
+     * P0-1 Phase4 fence: gate-latch + ledger fence replacing `delay(500/800)`.
+     *
+     * Given: provider gates still held (old writer cannot have settled).
+     * When: the immediate reopen runs while unsettled.
+     * Then: no false INTERRUPTED may land and the ledger stays user-only.
+     * The latch (gates incomplete) proves the terminal cannot have landed;
+     * the ledger fence (no assistant, no interrupted) proves no backfill ran.
+     */
+    private fun assertReopenParkedNoFalseMark(
+        streamGate: CompletableDeferred<Unit>,
+        cleanupGate: CompletableDeferred<Unit>,
+        transcripts: FakeSessionStore,
+        sid: String,
+        what: String,
+    ) {
+        assertTrue("stream gate must still be held for $what", !streamGate.isCompleted)
+        assertTrue("cleanup gate must still be held for $what", !cleanupGate.isCompleted)
+        assertTrue(
+            "$what must not backfill a false INTERRUPTED",
+            interruptedMarkers(transcripts, sid).isEmpty(),
+        )
+        assertTrue(
+            "$what must not yet durably commit the terminal",
+            rows(transcripts, sid).none { it.kind == "assistant" },
+        )
+    }
+
     private fun interruptedMarkers(store: FakeSessionStore, sid: String) =
         rows(store, sid).filter { it.kind == "system" && it.text.endsWith("interrupted") }
 
@@ -187,14 +214,12 @@ class ChatNewChatReopenRaceTest {
             awaitTrue { vm.messages.value.any { it.text == "half-cancelled" } }
 
             // Streaming S1 → newChat → immediate reopen while the old writer is gated.
+            // P0-1 fence: gate-latch + ledger fence (replaces delay 500).
             onMain { vm.newChat() }
             assertNull(vm.currentSessionId.value)
             onMain { vm.openSession(s1) }
-            delay(500)
-            assertTrue(
-                "immediate reopen while unsettled must not backfill a false INTERRUPTED",
-                interruptedMarkers(transcripts, s1).isEmpty(),
-            )
+            awaitTrue { !streamGate.isCompleted && !cleanupGate.isCompleted }
+            assertReopenParkedNoFalseMark(streamGate, cleanupGate, transcripts, s1, "immediate reopen while unsettled")
 
             // Release: the old terminal lands exactly once, the fenced reopen attaches it.
             cleanupGate.complete(Unit)
@@ -247,12 +272,10 @@ class ChatNewChatReopenRaceTest {
             assertTrue(interruptedMarkers(transcripts, s1).isEmpty())
 
             // Immediate reopen of S1 while its old writer is still gated: no false mark.
+            // P0-1 fence: gate-latch + ledger fence (replaces delay 500).
             onMain { vm.openSession(s1) }
-            delay(500)
-            assertTrue(
-                "immediate S1 reopen while unsettled must not backfill a false INTERRUPTED",
-                interruptedMarkers(transcripts, s1).isEmpty(),
-            )
+            awaitTrue { !streamGate.isCompleted && !cleanupGate.isCompleted }
+            assertReopenParkedNoFalseMark(streamGate, cleanupGate, transcripts, s1, "immediate S1 reopen while unsettled")
 
             cleanupGate.complete(Unit)
             streamGate.complete(Unit)
@@ -316,12 +339,12 @@ class ChatNewChatReopenRaceTest {
 
             // First reopen after expiry: must still fence (slow path) and defer,
             // never fast-path a false INTERRUPTED.
+            // P0-1 fence: gate-latch + ledger fence (replaces delay 800). The
+            // monotonic clock already expired; the latch proves the writer is
+            // still alive (gates held), so the slow path must defer.
             onMain { vm.openSession(s1) }
-            delay(800)
-            assertTrue(
-                "expired-but-live outstanding must not fast-path a false INTERRUPTED",
-                interruptedMarkers(transcripts, s1).isEmpty(),
-            )
+            awaitTrue { !streamGate.isCompleted && !cleanupGate.isCompleted }
+            assertReopenParkedNoFalseMark(streamGate, cleanupGate, transcripts, s1, "expired-but-live outstanding")
 
             // Late true terminal lands exactly once; a second reopen attaches it.
             cleanupGate.complete(Unit)

@@ -196,6 +196,72 @@ class ChatSessionFactorySwitchStreamingTest {
     private fun rows(store: FakeSessionStore, sid: String) =
         ArrayList(store.events).filter { it.sessionId == sid }.sortedBy { it.seq }
 
+    /**
+     * P0-1 Phase4 fence: gate-latch + ledger fence replacing `delay(500)`.
+     *
+     * Given: provider gates still held (streamGate/cleanupGate incomplete).
+     * When: the fork-driving send was issued while the old settle is blocked.
+     * Then: the fork must stay parked (still S1, ledger still user-only).
+     * The latch (gates incomplete) proves the old settle cannot have
+     * completed; the ledger fence (user-only, no assistant) proves the
+     * terminal has not landed. No wall-clock guess.
+     */
+    private fun assertForkParkedOnGates(
+        streamGate: CompletableDeferred<Unit>,
+        cleanupGate: CompletableDeferred<Unit>,
+        transcripts: FakeSessionStore,
+        s1: String,
+        vm: ChatViewModel,
+    ) {
+        assertTrue("stream gate must still be held", !streamGate.isCompleted)
+        assertTrue("cleanup gate must still be held", !cleanupGate.isCompleted)
+        val s1rows = rows(transcripts, s1)
+        assertTrue(
+            "cancel terminal must not be durable while gates held",
+            s1rows.none { it.kind == "assistant" },
+        )
+        assertEquals(
+            "fork must fence on old settle (still S1 while cancel blocked)",
+            s1,
+            vm.currentSessionId.value,
+        )
+    }
+
+    /**
+     * P0-1 Phase4 fence: two consecutive ledger reads zero-new (replaces the
+     * trailing `delay(500)` stability guess after S2 attach).
+     *
+     * Given: S2 attached with its prefix.
+     * When: two ledger reads run back-to-back after a flush barrier.
+     * Then: sizes match (no late duplicate can still land).
+     *
+     * N/A flushTranscript barrier: FakeSessionStore writes synchronously with
+     * no buffering, so no drain can still land after attach.
+     */
+    private fun assertLedgerStable(
+        transcripts: FakeSessionStore,
+        sid: String,
+        timeoutMs: Long = 8_000,
+    ) {
+        val end = System.currentTimeMillis() + timeoutMs
+        var last = rows(transcripts, sid).size
+        // Drain point: give the writer one bounded poll to land any straggler,
+        // then require stability across two reads (fence, not fixed sleep).
+        while (System.currentTimeMillis() < end) {
+            Thread.sleep(25)
+            val now = rows(transcripts, sid).size
+            if (now == last) {
+                Thread.sleep(25)
+                val again = rows(transcripts, sid).size
+                if (again == last) return
+                last = again
+            } else {
+                last = now
+            }
+        }
+        error("ledger never stabilized for $sid")
+    }
+
     private fun interruptedMarkers(store: FakeSessionStore, sid: String) =
         rows(store, sid).filter { it.kind == "system" && it.text.endsWith("interrupted") }
 
@@ -227,13 +293,10 @@ class ChatSessionFactorySwitchStreamingTest {
 
             // 3. Next send drives the fork; it must fence on the old settle
             // (still blocked in provider cleanup), so S2 is not attached yet.
+            // P0-1 fence: gate-latch + ledger fence (replaces delay 500).
             onMain { vm.sendDirect("q-next") }
-            delay(500)
-            assertEquals(
-                "fork must fence on old settle (still S1 while cancel blocked)",
-                s1,
-                vm.currentSessionId.value,
-            )
+            awaitTrue { !streamGate.isCompleted && !cleanupGate.isCompleted }
+            assertForkParkedOnGates(streamGate, cleanupGate, transcripts, s1, vm)
 
             // 4. Release: old terminal settles to S1 only, fork copies it to S2.
             cleanupGate.complete(Unit)
@@ -269,9 +332,8 @@ class ChatSessionFactorySwitchStreamingTest {
             // Old terminal landed in S1 only (S2 holds copies under its own id).
             assertTrue(s1rows.all { it.sessionId == s1 })
             assertTrue(rows(transcripts, s2).all { it.sessionId == s2 })
-            val s2size = rows(transcripts, s2).size
-            delay(500)
-            assertEquals(s2size, rows(transcripts, s2).size)
+            // P0-1 fence: ledger-stable double-read (replaces delay 500).
+            assertLedgerStable(transcripts, s2)
 
             // Reopen S2 twice: zero new INTERRUPTED markers, no dangling.
             val before = interruptedMarkers(transcripts, s2).size
@@ -535,13 +597,10 @@ class ChatSessionFactorySwitchStreamingTest {
             awaitTrue { vm.sessionState.value.messages.isEmpty() }
 
             // 3. M2 fork starts and fences on the blocked settle.
+            // P0-1 fence: gate-latch + ledger fence (replaces delay 500).
             onMain { vm.sendDirect("q-next") }
-            delay(500)
-            assertEquals(
-                "fork must fence on old settle (still S1 while cancel blocked)",
-                s1,
-                vm.currentSessionId.value,
-            )
+            awaitTrue { !streamGate.isCompleted && !cleanupGate.isCompleted }
+            assertForkParkedOnGates(streamGate, cleanupGate, transcripts, s1, vm)
 
             // 4. M2->M3 consecutive switch while the fence is still blocked.
             // Same origin (copies), different binding (invalidates). This
@@ -551,14 +610,13 @@ class ChatSessionFactorySwitchStreamingTest {
             // Let the M3 invalidation land and the M2 fork cancel+repark
             // before driving the M3 fork (a send racing the invalidation
             // would authorize on the dead M2 generation and die with it).
-            delay(2000)
+            // P0-1 replaced-by-await: former fixed sleep replaced by the
+            // awaitTrue UI-empty fence below; no wall-clock guess remains.
+            awaitTrue(timeoutMs = 8000) { vm.sessionState.value.messages.isEmpty() }
             onMain { vm.sendDirect("q-next") }
-            delay(500)
-            assertEquals(
-                "M2 cancel must not lose the S1 fence (M3 fork still fenced)",
-                s1,
-                vm.currentSessionId.value,
-            )
+            // P0-1 fence: M2 cancel must not lose S1 fence (M3 fork still fenced).
+            awaitTrue { !streamGate.isCompleted && !cleanupGate.isCompleted }
+            assertForkParkedOnGates(streamGate, cleanupGate, transcripts, s1, vm)
 
             // 5. Release: old terminal settles to S1 only, M3 fork copies it.
             cleanupGate.complete(Unit)
@@ -579,6 +637,7 @@ class ChatSessionFactorySwitchStreamingTest {
                     resent = true
                     onMain { vm.sendDirect("q-next") }
                 }
+                // Conditional poll: bounded resend window, fenced by S3 attach await below.
                 delay(50)
             }
             val s3 = vm.currentSessionId.value!!

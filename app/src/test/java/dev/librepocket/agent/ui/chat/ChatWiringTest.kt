@@ -178,10 +178,15 @@ class ChatWiringTest {
             store.save(sampleEndpoint())
             vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         }
+        // P0-1 Phase4 fence: gate-latch replaces `delay(5000)`. The old fixed
+        // stall guessed the turn was still streaming when steer/cancel land;
+        // the gate proves it: steer/cancel await STREAMING below, and the
+        // gate stays held until the test's teardown cancel drains it.
+        val streamGate = CompletableDeferred<Unit>()
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "partial"))
-                delay(5000)
+                streamGate.await()
                 emit(StreamEvent.Done("stop"))
             }
         }
@@ -206,6 +211,7 @@ class ChatWiringTest {
             val partial = vm.sessionState.value.messages.first { it.role == "assistant" }
             assertTrue(partial.isPartial)
         } finally {
+            streamGate.complete(Unit)
             onMain { vm.newChat() } // close session: drains the queued steer, no background leak
         }
     }
@@ -730,6 +736,7 @@ class ChatWiringTest {
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "part"))
+                // Provider stub stimulus: bounded streaming gap, fenced by awaitTrue below.
                 delay(300)
                 emit(StreamEvent.Done("stop"))
             }

@@ -31,9 +31,9 @@ The local builder implements the identity checks above for staged APK bytes via 
 
 The local builder's existing environment-first/Bitwarden keystore-password resolution is unchanged. The verifier/stager performs no credential lookup and does not select or approve production signing policy; this work does not establish production-key custody/provenance or a trusted signer-pin registry, wire a public release workflow, prove correctness of every SDK/toolchain combination, publish, or establish release readiness. The existing Play/Foss policy gate remains in addition to signature/identity verification, not replaced by it. A filename, checksum alone, or policy scan is not a substitute for final-byte verification. Issue #12 remains open until all scoped requirements, native verification, and required release evidence are complete; see [Testing](TESTING.md).
 
-Current: a direct Gradle release build without `-PreleaseSigning=true` falls back to the debug key (never release-signed; the verifier rejects it), so the only staged final-byte verified path is
-`scripts/build_release.sh --apk` with caller-supplied identity per selected flavor (all four values; identities for unselected flavors rejected) plus explicit `--apksigner`/`--aapt`/`--output-parent`
-and the staged final-byte gate above; the github flavor skips Play/Foss policy checks (signature/identity/checksum only); formal key custody/provenance and a signer-pin registry are not established.
+Current: a direct Gradle release build without `-PreleaseSigning=true` has no release signing configuration and produces an unsigned release artifact (not an approved distribution artifact); the only staged final-byte verified path is
+`scripts/build_release.sh --apk`, which explicitly enables per-flavor release signing, plus caller-supplied identity per selected flavor (all four values; identities for unselected flavors rejected), explicit `--apksigner`/`--aapt`/`--output-parent`,
+and the staged final-byte gate above, which rejects unsigned, debug-signed, debuggable, or identity-mismatched artifacts; the github flavor skips Play/Foss policy checks (signature/identity/checksum only); formal key custody/provenance and a signer-pin registry are not established.
 
 ## Target release sequence
 

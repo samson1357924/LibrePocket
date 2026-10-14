@@ -82,8 +82,8 @@ android {
     // Release-only signing: debug variants always keep the debug key, so local
     // development never needs passwords. The blessed path is
     // scripts/build_release.sh, which passes -PreleaseSigning=true; a direct
-    // `./gradlew bundleXxxRelease` without the flag yields an unsigned
-    // (debug-signed) artifact, exactly as before this change.
+    // `./gradlew bundleXxxRelease/assembleXxxRelease` without the flag yields
+    // an unsigned artifact (no signing config assigned; not a distribution artifact).
     // (Assigned per-flavor here rather than via applicationVariants, which
     // AGP 9 removed; a buildType-level assignment could not differ per flavor.)
     if (providers.gradleProperty("releaseSigning").map { it.toBoolean() }.getOrElse(false)) {

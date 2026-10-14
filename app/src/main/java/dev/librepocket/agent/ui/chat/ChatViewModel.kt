@@ -4487,6 +4487,16 @@ class ChatViewModel(
      * a SEALED-but-uncompensated receipt (Phase 1 truth contract: SEALED
      * without proven family-final still dangles), or admitted-but-unacked
      * core runIds.
+     * S3-F2: the immediate cancel terminal itself is bounded
+     * (TurnController cancelCompensationTimeoutMs): a wedged writer no longer
+     * parks the cancelled host — timeout converges via the PENDING receipt
+     * (deferred notice-first) or markInterrupted, so this proof keeps
+     * returning true (CANCELLED status + unsettled/sealed receipts + pending
+     * runIds) until reopen INTERRUPTED backfill lands, never flipping clean
+     * on a dangling family.
+     * Current (S3-F2): bounded immediate + orphan drain share the 5s
+     * production bound (tests inject 1s). Target: single shared ledger
+     * budget.
      * Best-effort (never throws): a failed read means "no evidence", never
      * "incomplete" — fail-open toward clean by contract (a wedged read must
      * not pin every fork to incomplete; the fence-failure path via

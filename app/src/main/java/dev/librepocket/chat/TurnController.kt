@@ -361,11 +361,21 @@ class TurnController(
    */
   private val cancelSettleTimeoutMs: Long = CANCEL_SETTLE_TIMEOUT_MS,
   /**
-   * WARN-1: bounded compensation write for the late-writer receipt waiter.
-   * The compensation runs in NonCancellable (channel.send + ack.await); without
-   * a timeout a wedged writer parks it forever. Timeout degrades to
-   * SEALED/backfill like the sealed path. Injectable for the wedged-writer
+   * WARN-1 + S3-F2: bounded compensation write for the late-writer receipt
+   * waiter AND the immediate cancel terminal AND the orphan drain. All three
+   * run in NonCancellable (channel.send + ack.await); without a timeout a
+   * wedged writer parks them forever. Timeout writes no terminal row and
+   * degrades to SEALED/backfill (receipt waiter) or to PENDING-receipt /
+   * markInterrupted convergence (immediate cancel: deferred notice-first keeps
+   * its PENDING receipt, every other path marks INTERRUPTED; orphan drain
+   * marks INTERRUPTED) like the sealed path. Injectable for the wedged-writer
    * test.
+   *
+   * Current (S3-F2): this bound owns all three wedged-writer convergences.
+   * Production is 5s ([CANCEL_RECEIPT_COMPENSATION_TIMEOUT_MS]); tests inject
+   * 1s to prove the mechanism without a real 5s stall (the 6s fence below is
+   * the spec's production-convergence bar). Target: single shared ledger
+   * budget instead of three shares of this timeout.
    */
   private val cancelCompensationTimeoutMs: Long = CANCEL_RECEIPT_COMPENSATION_TIMEOUT_MS,
   /**
@@ -600,22 +610,63 @@ class TurnController(
     val alreadyDurable = durableUserRows.contains(pending.logicalTurnId)
     val drain = writerScope.launch(NonCancellable) {
       try {
-        // Stage 6: admission-path user rows are already durable before the
-        // host launches; re-writing would duplicate the runId. Only orphans
-        // whose durable await never completed need the user row here.
-        if (!alreadyDurable) {
-          orderedTranscript.onTurnStarted(pending.logicalTurnId, pending.text)
-          durableUserRows.add(pending.logicalTurnId)
+        // S3-F2: bounded orphan drain. The compensation runs in
+        // NonCancellable (channel.send + ack.await); without a timeout a
+        // wedged writer parks it forever. Timeout writes no terminal row and
+        // marks INTERRUPTED so flushDurable stays false until reopen
+        // backfill (same fail-closed as the seal path). Shares
+        // cancelCompensationTimeoutMs with the immediate-cancel and
+        // receipt-waiter bounds.
+        //
+        // Current (S3-F2): single shared bound for user + terminal; timeout
+        // marks only when the family still dangles (landing check below), so
+        // a commit that landed just before the timeout never gets a false
+        // INTERRUPTED. Production 5s, tests inject 1s. Target: split
+        // user/terminal bounds with per-row landing proof.
+        val completed = withTimeoutOrNull(cancelCompensationTimeoutMs) {
+          // Stage 6: admission-path user rows are already durable before the
+          // host launches; re-writing would duplicate the runId. Only orphans
+          // whose durable await never completed need the user row here.
+          if (!alreadyDurable) {
+            orderedTranscript.onTurnStarted(pending.logicalTurnId, pending.text)
+            durableUserRows.add(pending.logicalTurnId)
+          }
+          orderedTranscript.onLogicalTurnCancelled(
+            pending.logicalTurnId,
+            pending.attemptRef.get(),
+            "",
+            pending.attemptIndexRef.get(),
+          )
         }
-        orderedTranscript.onLogicalTurnCancelled(
-          pending.logicalTurnId,
-          pending.attemptRef.get(),
-          "",
-          pending.attemptIndexRef.get(),
-        )
+        if (completed == null) {
+          // M3 landing check: an orphan is always a first-attempt family
+          // (user + terminal share pending.logicalTurnId), so only
+          // commitCount < 2 still dangles. A commit that landed just before
+          // the timeout (count >= 2) skips the mark instead of poisoning a
+          // durable family; a genuine store failure (count 0, poison tier in
+          // the sink) still marks here without clearing that poison (R23-1:
+          // markInterrupted never clears storeFailed, and the sink's
+          // clearTimeoutMarkOnCommit honors the tier).
+          val landed = orderedTranscript.coreSubmitTruth(pending.logicalTurnId)
+          if (landed.commitCount < 2) {
+            orderedTranscript.markInterrupted(pending.logicalTurnId)
+          }
+        }
       } catch (_: CancellationException) {
         orderedTranscript.markInterrupted(pending.logicalTurnId)
       } catch (_: Exception) {
+        orderedTranscript.markInterrupted(pending.logicalTurnId)
+      } catch (e: Throwable) {
+        // S3-F1 Error symmetry: fatal Error (e.g. store AssertionError/
+        // LinkageError) marks INTERRUPTED like Exception instead of escaping
+        // the drain. The sink writer already failed the ack and sealed; this
+        // keeps the interruption explicit. Never rethrows (drain is
+        // best-effort) except VM-fatal, which always propagates (never
+        // swallowed here, unlike the sink's fail+throw+seal which rethrows
+        // everything after failing the ack).
+        // Current (S3-F1): narrowed to non-VM Errors. Target: sink-owned
+        // fail+throw+seal for drains as well.
+        if (e is VirtualMachineError || e is ThreadDeath) throw e
         orderedTranscript.markInterrupted(pending.logicalTurnId)
       }
     }
@@ -3747,57 +3798,105 @@ class TurnController(
         // writer is independent, so the record below still drains on close (or
         // is explicitly marked INTERRUPTED instead of silently dropped).
       } else {
+        // S3-F2: bounded immediate cancel. The compensation runs in
+        // NonCancellable (channel.send + ack.await); without a timeout a
+        // wedged writer parks the cancelled host forever (cancel() itself
+        // stays fast — it only flips state — but the host join behind
+        // close()/flush never converges). Bound by
+        // cancelCompensationTimeoutMs like the receipt waiter: timeout writes
+        // no terminal row and relies on the PENDING receipt (deferred
+        // notice-first path, waiter still owns the handoff) or on an
+        // explicit markInterrupted (all other paths) so flushDurable stays
+        // false until reopen INTERRUPTED backfill — never true-and-dangling.
+        // The VM keeps reporting streaming/pending via
+        // isLedgerStreamingOrPending (CANCELLED status + unsettled/sealed
+        // receipts + pending runIds) until that backfill lands.
+        //
+        // Current (S3-F2): production 5s, tests inject 1s (see
+        // cancelCompensationTimeoutMs). Target: split notice/terminal bounds.
         withContext(NonCancellable) {
           try {
-            if (suppressed) {
-              // R18-1 Stage 2: split already-durable vs still-pending.
-              // Already-durable (acked || COMMITTED, no receipt): the
-              // intermediate partial is safely on disk, so the system final
-              // closes immediately (backoff-gap cancel, same as before).
-              // Still-pending SUBMITTING only (receipt installed above):
-              // notice-first (non-final only reaches here: suppressed &&
-              // !suppressedFinal; suppressed && suppressedFinal returns zero
-              // rows above). Writes a durable non-terminal notice (retry-like,
-              // best-effort) so the family stays dangling until the waiter
-              // appends the deferred system/batch. A kill or receipt timeout
-              // before that deferred write leaves user(+partial)+notice
-              // dangling (reopen INTERRUPTED takes over) instead of user+system
-              // closed without the partial. Timeout / seal exits write no
-              // terminal row here (notice only or nothing).
-              val deferred = terminalSubmitting && !acked && !terminalCommitted
-              if (!deferred) {
-                try {
-                  orderedTranscript.onLogicalTurnCancelled(logicalTurnId, cancelId, cancelText, cancelIndex)
-                } catch (_: ClosedSendChannelException) {
-                } catch (sealFailure: CancellationException) {
-                  if (!orderedTranscript.isSealed()) throw sealFailure
-                } catch (_: Exception) {
+            val completed = withTimeoutOrNull(cancelCompensationTimeoutMs) {
+              if (suppressed) {
+                // R18-1 Stage 2: split already-durable vs still-pending.
+                // Already-durable (acked || COMMITTED, no receipt): the
+                // intermediate partial is safely on disk, so the system final
+                // closes immediately (backoff-gap cancel, same as before).
+                // Still-pending SUBMITTING only (receipt installed above):
+                // notice-first (non-final only reaches here: suppressed &&
+                // !suppressedFinal; suppressed && suppressedFinal returns zero
+                // rows above). Writes a durable non-terminal notice (retry-like,
+                // best-effort) so the family stays dangling until the waiter
+                // appends the deferred system/batch. A kill or receipt timeout
+                // before that deferred write leaves user(+partial)+notice
+                // dangling (reopen INTERRUPTED takes over) instead of user+system
+                // closed without the partial. Timeout / seal exits write no
+                // terminal row here (notice only or nothing).
+                val deferred = terminalSubmitting && !acked && !terminalCommitted
+                if (!deferred) {
+                  try {
+                    orderedTranscript.onLogicalTurnCancelled(logicalTurnId, cancelId, cancelText, cancelIndex)
+                  } catch (_: ClosedSendChannelException) {
+                  } catch (sealFailure: CancellationException) {
+                    if (!orderedTranscript.isSealed()) throw sealFailure
+                  } catch (_: Exception) {
+                  } catch (e: Throwable) {
+                    // S3-F1 (Current): narrowed fatal in the cancel mark (sink
+                    // already failed the ack + sealed); keep original cancel.
+                    // VM-fatal always propagates.
+                    if (e is VirtualMachineError || e is ThreadDeath) throw e
+                  }
+                } else {
+                  try {
+                    orderedTranscript.onTurnCancelRequested(logicalTurnId, cancelId, cancelIndex)
+                  } catch (_: ClosedSendChannelException) {
+                    // Sealed: notice dropped, family stays dangling for backfill.
+                  } catch (sealFailure: CancellationException) {
+                    if (!orderedTranscript.isSealed()) throw sealFailure
+                    // Sealed fail-fast: notice dropped, backfill owns the row.
+                  } catch (_: Exception) {
+                    // Best-effort notice: a store failure here still leaves the
+                    // family dangling (no premature close), waiter degrades to
+                    // SEALED/backfill.
+                  } catch (e: Throwable) {
+                    // S3-F1 (Current): narrowed fatal in the notice (writer
+                    // seals); the PENDING receipt above still owns the
+                    // handoff. VM-fatal always propagates.
+                    if (e is VirtualMachineError || e is ThreadDeath) throw e
+                  }
                 }
               } else {
                 try {
-                  orderedTranscript.onTurnCancelRequested(logicalTurnId, cancelId, cancelIndex)
+                  orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex, cancelReasoning)
                 } catch (_: ClosedSendChannelException) {
-                  // Sealed: notice dropped, family stays dangling for backfill.
+                  // Sealed after close(): explicit INTERRUPTED mark already recorded.
                 } catch (sealFailure: CancellationException) {
                   if (!orderedTranscript.isSealed()) throw sealFailure
-                  // Sealed fail-fast: notice dropped, backfill owns the row.
+                  // Sealed fail-fast: INTERRUPTED already marked, keep original cancel.
                 } catch (_: Exception) {
-                  // Best-effort notice: a store failure here still leaves the
-                  // family dangling (no premature close), waiter degrades to
-                  // SEALED/backfill.
+                  // Durable store failure for the cancel terminal itself: the sink
+                  // already marked this runId INTERRUPTED; keep original cancel.
+                } catch (e: Throwable) {
+                  // S3-F1 (Current): narrowed fatal in the cancel terminal
+                  // (sink already failed the ack + sealed); keep original
+                  // cancel. VM-fatal always propagates.
+                  if (e is VirtualMachineError || e is ThreadDeath) throw e
                 }
               }
-            } else {
-              try {
-                orderedTranscript.onTurnCancelled(cancelId, cancelText, cancelParent, cancelIndex, cancelReasoning)
-              } catch (_: ClosedSendChannelException) {
-                // Sealed after close(): explicit INTERRUPTED mark already recorded.
-              } catch (sealFailure: CancellationException) {
-                if (!orderedTranscript.isSealed()) throw sealFailure
-                // Sealed fail-fast: INTERRUPTED already marked, keep original cancel.
-              } catch (_: Exception) {
-                // Durable store failure for the cancel terminal itself: the sink
-                // already marked this runId INTERRUPTED; keep original cancel.
+            }
+            if (completed == null) {
+              // Timeout: no terminal row was written. Deferred notice-first
+              // keeps the PENDING receipt above (waiter → COMPENSATED/SEALED);
+              // every other path marks INTERRUPTED so the dangling family
+              // stays visible to flushDurable/reopen instead of reporting
+              // true-and-dangling.
+              val receiptOwned = terminalSubmitting && !acked && !terminalCommitted
+              if (!receiptOwned) {
+                if (suppressed) {
+                  orderedTranscript.markInterrupted(logicalTurnId)
+                } else {
+                  orderedTranscript.markInterrupted(cancelId)
+                }
               }
             }
           } catch (_: ClosedSendChannelException) {
@@ -3805,6 +3904,14 @@ class TurnController(
           } catch (sealFailure: CancellationException) {
             if (!orderedTranscript.isSealed()) throw sealFailure
           } catch (_: Exception) {
+          } catch (e: Throwable) {
+            // S3-F1 (Current): narrowed fatal around the bounded immediate
+            // write; the sink already failed the ack + sealed, and the timeout
+            // branch above (or the PENDING receipt) owns convergence. Never
+            // replace the original cancellation with a new fatal, except
+            // VM-fatal which always propagates (contrast OrderedTranscriptSink
+            // fail+throw+seal: fail the ack, mark, then rethrow).
+            if (e is VirtualMachineError || e is ThreadDeath) throw e
           }
         }
       }
@@ -3816,6 +3923,27 @@ class TurnController(
       // STREAMING, and never report success. Falls through to the normal
       // completion path below (same as a provider failure): empty queue keeps
       // ERROR, queued work may still promote.
+      synchronized(lock) {
+        activityRevision++
+        _uiState.update {
+          it.copy(status = ChatStatus.ERROR, error = sanitizeError(e.message ?: "transcript store failed"))
+        }
+      }
+    } catch (e: Throwable) {
+      // S3-F1 Error symmetry (Current): narrowed fatal Error from the terminal
+      // write (e.g. store AssertionError/LinkageError via
+      // onTurnSucceededWithReceipt, or a provider Error rethrown from
+      // runTurnLoop) takes the same fail-closed path as Exception above —
+      // sanitizeError → UI ERROR, then fall through to the promotion handoff
+      // below (failPromotion semantics for queued work).
+      // The sink writer already failed the ack explicitly and sealed like
+      // teardown (see OrderedTranscriptSink writer catch Throwable:
+      // fail+throw+seal), so the INTERRUPTED mark + seal are already owned
+      // there; this only owns the UI projection. CancellationException never
+      // lands here (caught first above), so CE semantics are unchanged.
+      // VM-fatal (VirtualMachineError/ThreadDeath) never lands here either —
+      // it always propagates (never swallowed like the sink's rethrow).
+      if (e is VirtualMachineError || e is ThreadDeath) throw e
       synchronized(lock) {
         activityRevision++
         _uiState.update {
@@ -4355,6 +4483,18 @@ class TurnController(
       } catch (e: Exception) {
         failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
         flushPendingTools()
+      } catch (e: Throwable) {
+        // S3-F1 Error symmetry (Current, option (a)): fatal Error from the
+        // provider stream (e.g. AssertionError/LinkageError from a buggy
+        // adapter) is a non-retryable terminal like AGG_TOO_LARGE — never
+        // flush poison-adjacent pending ToolDeltas (unlike Exception, which
+        // flushes), never retry. The outer hostedTurn Throwable catch below
+        // (or the retry-exhausted terminal path here) still projects
+        // sanitizeError → UI ERROR. CancellationException never lands here
+        // (rethrown first above), so CE semantics are unchanged. VM-fatal
+        // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
+        if (e is VirtualMachineError || e is ThreadDeath) throw e
+        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
       }
       val failure = failed
       if (failure == null) {

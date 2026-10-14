@@ -10,7 +10,7 @@ import org.junit.Test
 
 /**
  * B1 實體解析門 regression（RED 未在版控留痕；原 9 件路徑門案〈不含 spawn 重驗〉中
- * 8 件拒絕案在無 B1+F1 時理論 RED；新增案中僅中段鏈／毒根／尾斜線鏈／`..`／`=` 後綴同門類具差分，
+ * 8 件拒絕案在無 B1+F1 時理論 RED；新增案中僅中段鏈／毒根／尾斜線鏈／`..`／`=` 後綴同門／F-backslash 類具差分，
  * 其餘為放行守衛。37a45aa 訊息所稱 RED 4 pre-fix 是對實際 parent 的本地觀測，
  * 與本理論基線不同，見 PR #80 審查記錄）：
  * - 詞法域內但實體指到域外的 symlink 操作數必須拒絕（直接/提權/guest host-tree 同門）。
@@ -20,9 +20,11 @@ import org.junit.Test
  */
 class ShellPhysicalGateTest {
 
-    private fun tempDir(prefix: String): File = Files.createTempDirectory(prefix).toFile()
+    private fun tempDir(prefix: String): File = Files.createTempDirectory(prefix).toFile().canonicalFile
 
     @Test fun symlinkOutsideDomain_deniedDirect() {
+        // symlink 需 POSIX；Windows 語義不同故限 Linux（後段案同）。
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         val scope = tempDir("b1-scope")
         val outside = tempDir("b1-outside")
         try {
@@ -46,6 +48,7 @@ class ShellPhysicalGateTest {
     }
 
     @Test fun symlinkOutsideDomain_deniedElevatedEvenWithBridge() {
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         val scope = tempDir("b1-elev-scope")
         val outside = tempDir("b1-elev-outside")
         try {
@@ -71,6 +74,7 @@ class ShellPhysicalGateTest {
     }
 
     @Test fun symlinkOutsideDomain_deniedGuestHostTree() {
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         val scope = tempDir("b1-guest-scope")
         val outside = tempDir("b1-guest-outside")
         try {
@@ -98,6 +102,7 @@ class ShellPhysicalGateTest {
     @Test fun dotdotViaSymlinkedDir_deniedDirect() {
         // F1 反例：/scope/sub/../escape，sub→域外。詞法折疊後為 /scope/escape（域內），
         // 但 spawn 用原始操作數，核心先解 sub→域外再回 ..，實為域外，故必須拒。
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         val scope = tempDir("b1-dotdot-scope")
         val outside = tempDir("b1-dotdot-outside")
         try {
@@ -119,6 +124,7 @@ class ShellPhysicalGateTest {
     @Test fun linkSlashDotDot_deniedDirect() {
         // F1 反例：/scope/link/..，link→域外目錄。詞法折疊後為 /scope（域內），
         // 但實為域外父目錄，故必須拒。
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         val scope = tempDir("b1-linkdotdot-scope")
         val outside = tempDir("b1-linkdotdot-outside")
         try {
@@ -172,6 +178,7 @@ class ShellPhysicalGateTest {
 
     @Test fun dotdotViaSymlinkedDir_deniedElevated() {
         // F1 提權同門：即使橋接已授權，`..` 仍先拒（提權不放寬詞法）。
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         val scope = tempDir("b1-dotdot-elev-scope")
         val outside = tempDir("b1-dotdot-elev-outside")
         try {
@@ -193,6 +200,7 @@ class ShellPhysicalGateTest {
     }
 
     @Test fun danglingLink_deniedDirectAndElevated() {
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         // 懸空連結回歸鎖定（非 exists 行差分證明）：單線程下步驟1逐段 lstat 已對懸空
         // final-link 回 true 即拒（symlink denied），根本到不了 exists 行；修前 following
         // exists 回 false 亦同樣被步驟1拒。exists NOFOLLOW 僅收斂步驟1→exists→toRealPath
@@ -254,6 +262,10 @@ class ShellPhysicalGateTest {
             val r = shell.execute(listOf("echo", "hi"))
             assertTrue("reverify mismatch must be denied, got $r", r is ShellResult.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (r as ShellResult.Denied).reason)
+            assertTrue(
+                "message must name the untrusted executable, got ${r.message}",
+                r.message.contains("untrusted executable"),
+            )
             assertEquals(0, runner.spawnCalls)
         } finally {
             scope.deleteRecursively()
@@ -472,6 +484,7 @@ class ShellPhysicalGateTest {
             val v = ShellPolicy.validate(listOf("cat", evil), scope.absolutePath)
             assertTrue("backslash operand must be denied, got $v", v is Validation.Denied)
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("message must carry reason, got ${v.message}", v.message.contains("backslash"))
         } finally { scope.deleteRecursively() }
     }
 }

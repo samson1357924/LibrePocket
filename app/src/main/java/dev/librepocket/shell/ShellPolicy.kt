@@ -800,6 +800,8 @@ object ShellPolicy {
      * 一致的拒絕語義；拒絕訊息帶原因碼 `DOTDOT`）。
      * 步驟（fail-closed，任一步失敗即拒）：
      * 0. `..` 段檢查（見上）：原始字串以 `/` 切段含 `..` 即拒；含反斜線 `\` 即拒（見 F-backslash，Linux 語義）。
+     *    例外：guest 容器內路徑在外層先 `continue` 跳過本門（含 backslash 門），
+     *    由容器邊界（proot -r 無 bind＋host 樹封堵＋同容器鎖）覆蓋，宿主無逃逸。
      * 1. 逐段 symlink 拒絕：候選全鏈（`/` 至本體）與 [privateRoot] 全鏈逐段
      *    `Files.isSymbolicLink`（NOFOLLOW lstat，不跟隨）；任一段是連結
      *    （含懸空連結）即拒。判定抛異常視為可疑而拒。

@@ -52,6 +52,7 @@ import dev.librepocket.tool.Flavor
  *   容器內 symlink／驗→spawn 窗口殘餘仍在：Java 無 `O_NOFOLLOW`／`openat`，
  *   只能縮窗、不能消除；容器內 symlink 逃逸（指到 rootfs 外需 bind 才可達，
  *   本命令無 bind）與併發替換不在消除承諾內。
+ *   PRoot 不等於 sandbox／不可描述為 sandbox（見 THREAT_MODEL）：本段邊界僅為縱深、非隔離證明。
  *
  * 本檔案零 Android 依賴；子進程縫沿用 [ProcessRunner]，單測可注入假實現。
  */

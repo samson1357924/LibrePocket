@@ -39,6 +39,8 @@ class ScopedFileStoreB2Test {
     // ---- delete：最終目標置換後拒刪外部 ----
 
     @Test fun deleteReplacedFinalLinkRefusesAndOutsideSurvives() {
+        // symlink 需 POSIX；Windows 語義不同故限 Linux。
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         val ws = workspace()
         val out = outside()
         val secret = File(out, "secret.txt").apply { writeText("OUTSIDE") }
@@ -54,6 +56,7 @@ class ScopedFileStoreB2Test {
     }
 
     @Test fun deleteReplacedParentLinkRefusesAndOutsideSurvives() {
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         val ws = workspace()
         val out = outside()
         val secret = File(out, "secret.txt").apply { writeText("OUTSIDE") }
@@ -130,6 +133,7 @@ class ScopedFileStoreB2Test {
     // ---- write：落盤前重驗 ----
 
     @Test fun writeParentSwappedBeforeCallRefuses() {
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
         val ws = workspace()
         val out = outside()
         link(File(ws, "link"), out)

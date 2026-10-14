@@ -128,6 +128,49 @@ private class RecordingSink : TranscriptSink {
     cancelled.add(runId to partialText)
     cancelledReasoning.add(hasReasoning)
   }
+  // S5 production-like sink: overrides every full form it can receive (the
+  // lossy interface defaults throw instead of downgrading; a base-only sink
+  // fails closed — pinned by TranscriptSinkLegacyFailClosedTest). Each
+  // override forwards exactly as the pre-S5 defaults did, so retry /
+  // reasoning / attempt-bound rows keep landing in the recorded lists.
+  override suspend fun onTurnSucceeded(
+    runId: String,
+    text: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = onTurnSucceeded(runId, text, hasReasoning)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) = onTurnFailed(runId, partialText, error)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+  ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+    hasReasoning: Boolean,
+  ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
+  override suspend fun onTurnCancelled(
+    runId: String,
+    partialText: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = onTurnCancelled(runId, partialText, hasReasoning)
   override suspend fun onSteerQueued(text: String) { steerQueued.add(text) }
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) {
     tools.add(Tool(runId, toolIndex, id, name, argumentsJson))

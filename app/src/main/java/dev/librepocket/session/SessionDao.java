@@ -72,6 +72,9 @@ public interface SessionDao {
     @Query("SELECT COUNT(*) FROM transcript_events WHERE sessionId = :sid AND kind IN ('user','assistant') AND isPartial = 0")
     int countModelHistory(String sid);
 
+    @Query("SELECT COUNT(*) FROM transcript_events WHERE sessionId = :sid AND seq < :before AND kind = 'reasoning'")
+    int countReasoningBefore(String sid, long before);
+
     @Query("DELETE FROM transcript_events WHERE sessionId = :sid AND rowId NOT IN "
             + "(SELECT rowId FROM transcript_events WHERE sessionId = :sid "
             + "ORDER BY seq DESC, rowId DESC LIMIT :keep)")

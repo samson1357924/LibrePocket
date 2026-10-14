@@ -131,6 +131,12 @@ open class FakeSessionStore : SessionStore {
     }
 
     /**
+     * R25-1 far-marker probe (in-memory, same session + `seq <` only).
+     */
+    override suspend fun hasReasoningBefore(sessionId: String, beforeSeq: Long): Boolean =
+        events.any { it.sessionId == sessionId && it.seq < beforeSeq && it.kind == "reasoning" }
+
+    /**
      * S1 F9 Target: Fake is no-prune/no-export/no-import. These always throw
      * (never silent success) so fork-snapshot caps cannot green-light on a
      * full-copy Fake; use Room (Robolectric) for those paths.

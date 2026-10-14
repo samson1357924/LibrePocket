@@ -69,14 +69,52 @@ private class CancelAttrSink : TranscriptSink {
     failSucceededWith?.let { throw it }
     succeeded.add(runId to text)
   }
+  override suspend fun onTurnSucceeded(
+    runId: String,
+    text: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = onTurnSucceeded(runId, text, hasReasoning)
   override suspend fun onTurnFailed(runId: String, error: String) = Unit
   override suspend fun onTurnFailed(runId: String, partialText: String, error: String) {
     failed.add(Triple(runId, partialText, error))
   }
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) = onTurnFailed(runId, partialText, error)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+  ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+    hasReasoning: Boolean,
+  ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
   override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
     cancelled.add(runId to partialText)
   }
+  override suspend fun onTurnCancelled(
+    runId: String,
+    partialText: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = onTurnCancelled(runId, partialText, hasReasoning)
   override suspend fun onSteerQueued(text: String) = Unit
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit

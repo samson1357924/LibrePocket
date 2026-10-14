@@ -60,9 +60,47 @@ class ErrorTerminalTest {
     override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
       throw AssertionError("store invariant broken")
     }
+    override suspend fun onTurnSucceeded(
+      runId: String,
+      text: String,
+      parentRunId: String?,
+      attemptIndex: Int?,
+      hasReasoning: Boolean,
+    ) = onTurnSucceeded(runId, text, hasReasoning)
     override suspend fun onTurnFailed(runId: String, error: String) = Unit
+    override suspend fun onTurnFailed(
+      runId: String,
+      partialText: String,
+      error: String,
+      parentRunId: String?,
+      attemptIndex: Int?,
+    ) = onTurnFailed(runId, partialText, error)
+    override suspend fun onTurnFailed(
+      runId: String,
+      partialText: String,
+      error: String,
+      parentRunId: String?,
+      attemptIndex: Int?,
+      isFinal: Boolean,
+    ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex)
+    override suspend fun onTurnFailed(
+      runId: String,
+      partialText: String,
+      error: String,
+      parentRunId: String?,
+      attemptIndex: Int?,
+      isFinal: Boolean,
+      hasReasoning: Boolean,
+    ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
     override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
     override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+    override suspend fun onTurnCancelled(
+      runId: String,
+      partialText: String,
+      parentRunId: String?,
+      attemptIndex: Int?,
+      hasReasoning: Boolean,
+    ) = onTurnCancelled(runId, partialText, hasReasoning)
     override suspend fun onSteerQueued(text: String) = Unit
     override suspend fun onToolDone(
       runId: String,
@@ -134,7 +172,21 @@ class ErrorTerminalTest {
       var toolDoneCalls = 0
       override suspend fun onTurnStarted(runId: String, text: String) = Unit
       override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnSucceeded(
+        runId: String,
+        text: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = onTurnSucceeded(runId, text, hasReasoning)
       override suspend fun onTurnFailed(runId: String, error: String) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+      ) = onTurnFailed(runId, partialText, error)
       override suspend fun onTurnFailed(
         runId: String,
         partialText: String,
@@ -143,8 +195,24 @@ class ErrorTerminalTest {
         attemptIndex: Int?,
         isFinal: Boolean,
       ) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+        hasReasoning: Boolean,
+      ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
       override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
       override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnCancelled(
+        runId: String,
+        partialText: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = onTurnCancelled(runId, partialText, hasReasoning)
       override suspend fun onSteerQueued(text: String) = Unit
       override suspend fun onToolDone(
         runId: String,
@@ -214,7 +282,21 @@ class ErrorTerminalTest {
       var toolDoneCalls = 0
       override suspend fun onTurnStarted(runId: String, text: String) = Unit
       override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnSucceeded(
+        runId: String,
+        text: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = onTurnSucceeded(runId, text, hasReasoning)
       override suspend fun onTurnFailed(runId: String, error: String) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+      ) = onTurnFailed(runId, partialText, error)
       override suspend fun onTurnFailed(
         runId: String,
         partialText: String,
@@ -223,8 +305,24 @@ class ErrorTerminalTest {
         attemptIndex: Int?,
         isFinal: Boolean,
       ) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+        hasReasoning: Boolean,
+      ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
       override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
       override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnCancelled(
+        runId: String,
+        partialText: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = onTurnCancelled(runId, partialText, hasReasoning)
       override suspend fun onSteerQueued(text: String) = Unit
       override suspend fun onToolDone(
         runId: String,

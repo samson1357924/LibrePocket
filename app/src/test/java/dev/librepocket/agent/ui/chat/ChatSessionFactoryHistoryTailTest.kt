@@ -293,6 +293,89 @@ class ChatSessionFactoryHistoryTailTest {
     }
 
     /**
+     * R25-1 far-marker regression (fake): exactly HISTORY_LOAD_CAP (2000)
+     * qualifying rows where the oldest assistant's marker sits more than one
+     * backward page below the window — seq=1 `reasoning(r-old)` + seq=2..201
+     * 200 non-model notices + seq=202 `assistant(r-old)` + seq=203..2201
+     * filler (1999 qualifying rows). The kept scan holds 2000 qualifying
+     * (2201..202); the R24-2 extra 200-row page covers only 201..2 and misses
+     * seq=1, so pre-fix `dropped == 0` with `a-old` resuming
+     * `hasReasoning == false` (fail-open). Post-fix the bounded
+     * `hasReasoningBefore(202)` probe forces `reasoningIncomplete == true`
+     * (all kept assistants suspect, like `dropped > 0`). Over-flags plain
+     * filler by design (Target: pair-aware narrowing).
+     */
+    @Test fun open_exactCap2000WithFarMarkerBeyondOnePage_flagsAllConservative() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val cap = SnapshotBudget.HISTORY_LOAD_CAP
+        val old = "r-old"
+        // seq=1: far reasoning marker for the oldest kept assistant.
+        transcripts.appendEvent(
+            TranscriptEvent(
+                sessionId = sid,
+                runId = old,
+                kind = "reasoning",
+                text = "",
+                createdAt = 1L,
+            ),
+        )
+        // seq=2..201: 200 non-model notices (never qualifying, never dropped-counted).
+        for (i in 0 until 200) {
+            transcripts.appendEvent(
+                TranscriptEvent(
+                    sessionId = sid,
+                    runId = "notice-$i",
+                    kind = "retry",
+                    text = "attempt ${i + 1}/3 after 0ms",
+                    createdAt = 1L,
+                ),
+            )
+        }
+        // seq=202: the marker's assistant (oldest kept qualifying row).
+        transcripts.appendEvent(event(sid, old, "assistant", "a-old"))
+        // seq=203..2201: 999 plain pairs (1998 rows) + one trailing user = 1999
+        // rows. Total qualifying = 1 + 1999 = CAP exactly.
+        for (i in 0 until cap / 2 - 1) {
+            transcripts.appendEvent(event(sid, "fill-$i", "user", "u-fill-$i"))
+            transcripts.appendEvent(event(sid, "fill-$i", "assistant", "a-fill-$i"))
+        }
+        transcripts.appendEvent(event(sid, "tail", "user", "u-tail"))
+
+        assertEquals(cap, transcripts.countHistoryEvents(sid, includePartial = false))
+        val scan = loadModelHistoryScan(transcripts, sid)
+        assertEquals(cap, scan.events.size)
+        // capHit conservative (true even at exact CAP, not far evidence).
+        // Far evidence is the triple below: hasFarReasoning + loaded
+        // Incomplete + dropped==0.
+        assertTrue("capHit conservative, true even at exact CAP", scan.reasoningIncomplete)
+        assertTrue(
+            "far marker must be missed by the one-page boundary scan (201..2 only)",
+            old !in scan.reasoningRunIds,
+        )
+        assertTrue("far marker below the extra-page floor must set the probe", scan.hasFarReasoning)
+        assertTrue(
+            "bounded probe must still see the far marker below the window",
+            transcripts.hasReasoningBefore(sid, scan.events.first().seq),
+        )
+
+        val loaded = loadModelHistory(transcripts, sid)
+        assertEquals(0, loaded.droppedCount)
+        // Far evidence triple: hasFarReasoning + loaded Incomplete + dropped==0.
+        assertTrue("far evidence (hasFarReasoning + loaded Incomplete + dropped==0) must fail closed", loaded.reasoningIncomplete)
+        assertEquals(cap, loaded.messages.size)
+        val assistants = loaded.messages.filter { it.role == "assistant" }
+        assertEquals(cap / 2, assistants.size)
+        assertEquals("a-old", assistants.first().text)
+        assertTrue("far marker assistant must resume flagged", assistants.first().hasReasoning)
+        assertTrue(
+            "far-marker guard over-flags all kept assistants by design (Target: pair-aware)",
+            assistants.all { it.hasReasoning },
+        )
+        assertTrue(loaded.messages.none { it.role == "reasoning" })
+    }
+
+    /**
      * D15-5: a legally imported `seq = Long.MAX_VALUE` row must survive the
      * model-context backward scan (first page starts at the MAX sentinel).
      */

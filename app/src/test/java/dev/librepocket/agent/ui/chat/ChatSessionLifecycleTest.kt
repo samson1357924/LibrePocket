@@ -3317,6 +3317,15 @@ class ChatSessionLifecycleTest {
         // (see ChatWiringTest scope note), so a non-empty prefix fails fast
         // instead of being silently dropped. The 3-arg shim rides the
         // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
@@ -3477,6 +3486,15 @@ class ChatSessionLifecycleTest {
         // (see ChatWiringTest scope note), so a non-empty prefix fails fast
         // instead of being silently dropped. The 3-arg shim rides the
         // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
@@ -3550,6 +3568,15 @@ class ChatSessionLifecycleTest {
         // (see ChatWiringTest scope note), so a non-empty prefix fails fast
         // instead of being silently dropped. The 3-arg shim rides the
         // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
@@ -3636,6 +3663,15 @@ class ChatSessionLifecycleTest {
         // (see ChatWiringTest scope note), so a non-empty prefix fails fast
         // instead of being silently dropped. The 3-arg shim rides the
         // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
@@ -3744,6 +3780,15 @@ class ChatSessionLifecycleTest {
         // (see ChatWiringTest scope note), so a non-empty prefix fails fast
         // instead of being silently dropped. The 3-arg shim rides the
         // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
@@ -3840,6 +3885,15 @@ class ChatSessionLifecycleTest {
         // (see ChatWiringTest scope note), so a non-empty prefix fails fast
         // instead of being silently dropped. The 3-arg shim rides the
         // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,

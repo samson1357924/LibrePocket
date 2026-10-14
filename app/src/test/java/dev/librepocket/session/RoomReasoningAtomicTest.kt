@@ -336,4 +336,130 @@ class RoomReasoningAtomicTest {
             tmpDir.deleteRecursively()
         }
     }
+
+    /**
+     * R25-1 far-marker regression via Room JSONL round-trip: exactly
+     * HISTORY_LOAD_CAP (2000) qualifying rows where the oldest assistant's
+     * marker sits more than one backward page below the window — seq=1
+     * `reasoning(r-old)` + seq=2..201 200 non-model notices + seq=202
+     * `assistant(r-old)` + seq=203..2201 filler (1999 qualifying rows). The
+     * kept scan holds 2000 qualifying (2201..202); the R24-2 extra 200-row
+     * page covers only 201..2 and misses seq=1, so pre-fix `dropped == 0`
+     * with `a-old` resuming `hasReasoning == false`. Post-fix the bounded
+     * COUNT probe (`SessionDao.countReasoningBefore`) forces
+     * `reasoningIncomplete == true` (all kept assistants suspect). Over-flags
+     * plain filler by design (Target: pair-aware narrowing).
+     */
+    @Test
+    fun exactCap2000WithFarMarkerBeyondOnePageViaJsonlImport_flagsAllConservative() = runBlocking {
+        val store = openStore()
+        val cap = SnapshotBudget.HISTORY_LOAD_CAP
+        val old = "r-old"
+        val rows = ArrayList<TranscriptEvent>(cap + 201)
+        rows.add(
+            TranscriptEvent(
+                seq = 1L,
+                sessionId = "ignored-on-import",
+                runId = old,
+                kind = "reasoning",
+                text = "",
+                createdAt = 1L,
+            ),
+        )
+        var seq = 2L
+        for (i in 0 until 200) {
+            rows.add(
+                TranscriptEvent(
+                    seq = seq++,
+                    sessionId = "ignored-on-import",
+                    runId = "notice-$i",
+                    kind = "retry",
+                    text = "attempt ${i + 1}/3 after 0ms",
+                    createdAt = 1L,
+                ),
+            )
+        }
+        rows.add(
+            TranscriptEvent(
+                seq = seq++,
+                sessionId = "ignored-on-import",
+                runId = old,
+                kind = "assistant",
+                text = "a-old",
+                createdAt = 1L,
+            ),
+        )
+        for (i in 0 until cap / 2 - 1) {
+            rows.add(
+                TranscriptEvent(
+                    seq = seq++,
+                    sessionId = "ignored-on-import",
+                    runId = "fill-$i",
+                    kind = "user",
+                    text = "u-fill-$i",
+                    createdAt = 1L,
+                ),
+            )
+            rows.add(
+                TranscriptEvent(
+                    seq = seq++,
+                    sessionId = "ignored-on-import",
+                    runId = "fill-$i",
+                    kind = "assistant",
+                    text = "a-fill-$i",
+                    createdAt = 1L,
+                ),
+            )
+        }
+        rows.add(
+            TranscriptEvent(
+                seq = seq,
+                sessionId = "ignored-on-import",
+                runId = "tail",
+                kind = "user",
+                text = "u-tail",
+                createdAt = 1L,
+            ),
+        )
+        val tmpDir = Files.createTempDirectory("room-far-marker-test").toFile()
+        try {
+            val src = File(tmpDir, "far-marker.jsonl")
+            src.writeText(rows.joinToString("\n") { JsonlCodec.encode(it) } + "\n", Charsets.UTF_8)
+            val sid = store.importJsonl(src)
+
+            assertEquals(cap, store.countHistoryEvents(sid, includePartial = false))
+            val scan = loadModelHistoryScan(store, sid)
+            assertEquals(cap, scan.events.size)
+            // capHit conservative (true even at exact CAP, not far evidence).
+            // Far evidence is the triple below: hasFarReasoning + loaded
+            // Incomplete + dropped==0.
+            assertTrue("capHit conservative, true even at exact CAP", scan.reasoningIncomplete)
+            assertTrue(
+                "far marker must be missed by the one-page boundary scan (201..2 only)",
+                old !in scan.reasoningRunIds,
+            )
+            assertTrue("far marker below the extra-page floor must set the probe", scan.hasFarReasoning)
+            assertTrue(
+                "bounded COUNT probe must still see the far marker below the window",
+                store.hasReasoningBefore(sid, scan.events.first().seq),
+            )
+
+            val loaded = loadModelHistory(store, sid)
+            assertEquals(0, loaded.droppedCount)
+            // Far evidence triple: hasFarReasoning + loaded Incomplete + dropped==0.
+            assertTrue("far evidence (hasFarReasoning + loaded Incomplete + dropped==0) must fail closed", loaded.reasoningIncomplete)
+            assertEquals(cap, loaded.messages.size)
+            val assistants = loaded.messages.filter { it.role == "assistant" }
+            assertEquals(cap / 2, assistants.size)
+            assertEquals("a-old", assistants.first().text)
+            assertTrue("far marker assistant must resume flagged", assistants.first().hasReasoning)
+            assertTrue(
+                "far-marker guard over-flags all kept assistants by design (Target: pair-aware)",
+                assistants.all { it.hasReasoning },
+            )
+            assertTrue(loaded.messages.none { it.role == "reasoning" })
+        } finally {
+            tmpDir.deleteRecursively()
+        }
+    }
 }

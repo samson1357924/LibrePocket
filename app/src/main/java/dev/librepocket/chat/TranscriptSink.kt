@@ -5,6 +5,24 @@ package dev.librepocket.chat
  * session-owned [OrderedTranscriptSink] (bounded channel, single writer, core
  * events durably acked), so implementations observe admission order.
  *
+ * External-sink contract (S5, fail-closed; Current, 已實作): production
+ * ([dev.librepocket.chat.TurnController] →
+ * [dev.librepocket.session.SessionTranscriptSink]) always calls the full
+ * forms (attempt-bound success/failure/cancel with `parentRunId` /
+ * `attemptIndex`, plus `isFinal` / `hasReasoning` where present). External
+ * [TranscriptSink] implementations MUST override every overload they can
+ * receive — the lossy interface defaults below throw
+ * [UnsupportedOperationException] instead of downgrading (never a silent
+ * `isFinal=false` → final write, never a dropped `parentRunId` /
+ * `attemptIndex` linkage, never a dropped `hasReasoning` marker). A legacy
+ * sink that overrides only the 2-arg / 3-arg base forms fails closed (throws,
+ * zero rows) on retryable/non-final/reasoning calls instead of prematurely
+ * closing the logical family. First-attempt shape (`parentRunId == null` and
+ * `attemptIndex == null || attemptIndex == 0`) is lossless and still forwards
+ * to the base form — production's ordered path always sends `attemptIndex=0`
+ * on the first attempt, so only true linkage (`parentRunId != null` or
+ * `attemptIndex != 0`) throws.
+ *
  * Core vs notice: [onTurnStarted], all [onTurnSucceeded] overloads, all
  * [onTurnFailed] overloads, all [onTurnCancelled] overloads and
  * [onLogicalTurnCancelled] are durable core events — a store failure
@@ -37,9 +55,13 @@ interface TranscriptSink {
    * Stage C (implemented): attempt-bound success terminal linked to its
    * logical turn. [parentRunId] is the logical turn id (null when
    * `runId` already is the logical id, i.e. the first attempt);
-   * [attemptIndex] is the 0-based attempt number. The default forwards to
-   * the reasoning-aware base form (keeping the marker) so existing fakes keep
-   * compiling; production ([dev.librepocket.chat.TurnController] →
+   * [attemptIndex] is the 0-based attempt number. S5 fail-closed: the default
+   * throws [UnsupportedOperationException] when true attempt linkage would be
+   * dropped (`parentRunId != null || (attemptIndex != null && attemptIndex != 0)`)
+   * instead of writing a single-id row; the first-attempt shape
+   * (`parentRunId == null` with `attemptIndex == null || attemptIndex == 0`,
+   * which is what production sends on attempt 0) still forwards to the base
+   * form. Production ([dev.librepocket.chat.TurnController] →
    * [dev.librepocket.session.SessionTranscriptSink]) always calls this form.
    *
    * Stage F: success rows are always final (`isFinal=1`).
@@ -51,6 +73,9 @@ interface TranscriptSink {
     attemptIndex: Int?,
     hasReasoning: Boolean = false,
   ) {
+    if (parentRunId != null || (attemptIndex != null && attemptIndex != 0)) {
+      throw UnsupportedOperationException("TranscriptSink: override 5-arg onTurnSucceeded to preserve attempt linkage")
+    }
     onTurnSucceeded(runId, text, hasReasoning)
   }
   suspend fun onTurnFailed(runId: String, error: String)
@@ -83,8 +108,11 @@ interface TranscriptSink {
   /**
    * Stage C (implemented): attempt-bound failure terminal (including retried
    * partials written before the retry notice) linked to its logical turn.
-   * Same [parentRunId]/[attemptIndex] semantics as the success overload. The
-   * default forwards to the three-arg form so existing fakes keep compiling.
+   * Same [parentRunId]/[attemptIndex] semantics as the success overload. S5
+   * fail-closed: the default throws [UnsupportedOperationException] when true
+   * attempt linkage would be dropped (`parentRunId != null ||
+   * `(attemptIndex != null && attemptIndex != 0)`) instead of writing a
+   * single-id row; the first-attempt shape (`null`, `null`/`0`) still forwards.
    *
    * Stage F: this five-arg form is always final (`isFinal=1`). Retryable
    * intermediate partials (`isFinal=0`) use the six-arg form below.
@@ -96,16 +124,20 @@ interface TranscriptSink {
     parentRunId: String?,
     attemptIndex: Int?,
   ) {
+    if (parentRunId != null || (attemptIndex != null && attemptIndex != 0)) {
+      throw UnsupportedOperationException("TranscriptSink: override 5-arg onTurnFailed to preserve attempt linkage")
+    }
     onTurnFailed(runId, partialText, error)
   }
   /**
    * Stage F (implemented): explicit final flag for attempt failure rows.
    * Success, terminal-failure and cancel rows pass `isFinal=true`; a
    * retryable failure's intermediate fragment (written before its retry
-   * notice) passes `isFinal=false` and never closes the logical family. The
-   * default forwards to the five-arg form (dropping the flag) so existing
-   * fakes keep compiling; production ([dev.librepocket.session.SessionTranscriptSink])
-   * overrides to persist the flag.
+   * notice) passes `isFinal=false` and never closes the logical family. S5
+   * fail-closed: the default throws [UnsupportedOperationException] on
+   * `isFinal=false` instead of downgrading to a final write (which would
+   * prematurely close the family); `isFinal=true` without linkage still
+   * forwards to the five-arg form (which itself guards linkage).
    */
   suspend fun onTurnFailed(
     runId: String,
@@ -115,6 +147,9 @@ interface TranscriptSink {
     attemptIndex: Int?,
     isFinal: Boolean,
   ) {
+    if (!isFinal) {
+      throw UnsupportedOperationException("TranscriptSink: override 6-arg onTurnFailed; legacy sinks cannot persist non-final partials")
+    }
     onTurnFailed(runId, partialText, error, parentRunId, attemptIndex)
   }
   /**
@@ -125,10 +160,12 @@ interface TranscriptSink {
    * /`isFinal` inherited verbatim, flag-only) persisted as one atomic batch
    * via [dev.librepocket.session.SessionStore.appendEvents] (Room single tx,
    * fake snapshot + rollback; external default sequential fallback may leave
-   * a partial batch behind — fail-closed, never a premature close). The
-   * default forwards to the six-arg form (dropping the flag) so existing
-   * fakes keep compiling; production ([dev.librepocket.session.SessionTranscriptSink])
-   * overrides to persist the marker.
+   * a partial batch behind — fail-closed, never a premature close). S5
+   * fail-closed: the default throws [UnsupportedOperationException] when the
+   * marker would be dropped (`hasReasoning=true`) or when the row is
+   * non-final (`isFinal=false`) instead of downgrading; production
+   * ([dev.librepocket.session.SessionTranscriptSink]) overrides to persist
+   * the marker.
    */
   suspend fun onTurnFailed(
     runId: String,
@@ -139,6 +176,9 @@ interface TranscriptSink {
     isFinal: Boolean,
     hasReasoning: Boolean,
   ) {
+    if (!isFinal || hasReasoning) {
+      throw UnsupportedOperationException("TranscriptSink: override 7-arg onTurnFailed; legacy sinks cannot drop isFinal/hasReasoning")
+    }
     onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
   }
   suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long)
@@ -147,8 +187,12 @@ interface TranscriptSink {
   /**
    * Stage C (implemented): attempt-bound cancel terminal linked to its
    * logical turn. Same [parentRunId]/[attemptIndex] semantics as above plus
-   * the [hasReasoning] marker contract. The default forwards to the
-   * reasoning-aware base form so existing fakes keep compiling.
+   * the [hasReasoning] marker contract. S5 fail-closed: the default throws
+   * [UnsupportedOperationException] when true attempt linkage would be dropped
+   * (`parentRunId != null || (attemptIndex != null && attemptIndex != 0)`)
+   * instead of writing a single-id row; the first-attempt shape (`null`,
+   * `null`/`0`) still forwards, with the marker riding into the base form
+   * (which itself carries [hasReasoning], so nothing is dropped).
    *
    * Stage F: this form is always final (`isFinal=1`).
    */
@@ -159,6 +203,9 @@ interface TranscriptSink {
     attemptIndex: Int?,
     hasReasoning: Boolean = false,
   ) {
+    if (parentRunId != null || (attemptIndex != null && attemptIndex != 0)) {
+      throw UnsupportedOperationException("TranscriptSink: override 5-arg onTurnCancelled to preserve attempt linkage/marker")
+    }
     onTurnCancelled(runId, partialText, hasReasoning)
   }
   /**
@@ -224,17 +271,23 @@ interface TranscriptSink {
    * with a racing cancel — persists `partial(isFinal=false)` +
    * `system cancelled(isFinal=true)` as one all-or-nothing unit via
    * [dev.librepocket.session.SessionStore.appendEvents] (Room single tx,
-   * fake snapshot; external default sequential fallback is partial-first so
+   * fake snapshot + rollback; sinks that override the full forms but keep
+   * this interface default get a sequential partial-first fallback, so
    * a mid-batch failure still leaves the family dangling, fail-closed).
-   * The default is sequential partial-first for old fakes / external stores;
-   * production ([dev.librepocket.session.SessionTranscriptSink]) overrides
-   * to the atomic batch. Fake semantics: the current in-memory test fake
-   * implements atomic [dev.librepocket.session.SessionStore.appendEvents]
-   * (snapshot + rollback, same all-or-nothing contract as Room), so tests
-   * exercise the atomic path; only legacy fakes/external stores that keep
-   * this interface default observe the sequential partial-first fallback
-   * (which may leave the partial behind on a mid-batch failure — still
-   * fail-closed, never a premature close).
+   * The default forwards sequentially (partial via the 7-arg `isFinal=false`
+   * form, then the cancel mark); production
+   * ([dev.librepocket.session.SessionTranscriptSink]) overrides to the atomic
+   * batch. S5 fail-closed: a legacy sink that overrides only the 2-arg /
+   * 3-arg base forms throws [UnsupportedOperationException] with zero rows
+   * here (the first forward is `isFinal=false`, which the 7-arg default
+   * rejects) instead of writing a downgraded final row — never a premature
+   * close. Fake semantics: the current in-memory test fake implements atomic
+   * [dev.librepocket.session.SessionStore.appendEvents] (snapshot + rollback,
+   * same all-or-nothing contract as Room), so tests exercise the atomic path;
+   * only sinks that override the full forms yet keep this interface default
+   * observe the sequential partial-first fallback (which may leave the partial
+   * behind on a mid-batch failure — still fail-closed, never a premature
+   * close).
    *
    * R18-3: [hasReasoning] adds the payload-free `reasoning` marker to the
    * partial (same `runId`, empty text, `parentRunId`/`attemptIndex` inherited,
@@ -267,9 +320,68 @@ interface TranscriptSink {
 class NoOpTranscriptSink : TranscriptSink {
   override suspend fun onTurnStarted(runId: String, text: String) = Unit
   override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+  override suspend fun onTurnSucceeded(
+    runId: String,
+    text: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = Unit
   override suspend fun onTurnFailed(runId: String, error: String) = Unit
+  override suspend fun onTurnFailed(runId: String, partialText: String, error: String) = Unit
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) = Unit
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+  ) = Unit
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+    hasReasoning: Boolean,
+  ) = Unit
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
   override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+  override suspend fun onTurnCancelled(
+    runId: String,
+    partialText: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = Unit
+  override suspend fun onLogicalTurnCancelled(
+    logicalTurnId: String,
+    attemptRunId: String,
+    partialText: String,
+    attemptIndex: Int?,
+  ) = Unit
+  override suspend fun onTurnCancelRequested(
+    logicalTurnId: String,
+    attemptRunId: String,
+    attemptIndex: Int?,
+  ) = Unit
+  override suspend fun onTurnFailedAndCancelled(
+    logicalTurnId: String,
+    attemptRunId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = Unit
   override suspend fun onSteerQueued(text: String) = Unit
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit

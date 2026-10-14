@@ -131,6 +131,15 @@ class GhostUndeliveredDurableTest {
                 attemptIndex: Int?,
                 isFinal: Boolean,
             ) = Unit
+            override suspend fun onTurnFailed(
+                runId: String,
+                partialText: String,
+                error: String,
+                parentRunId: String?,
+                attemptIndex: Int?,
+                isFinal: Boolean,
+                hasReasoning: Boolean,
+            ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
             override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
             override suspend fun onTurnCancelled(
                 runId: String,
@@ -257,6 +266,15 @@ class GhostUndeliveredDurableTest {
                 attemptIndex: Int?,
                 isFinal: Boolean,
             ) = Unit
+            override suspend fun onTurnFailed(
+                runId: String,
+                partialText: String,
+                error: String,
+                parentRunId: String?,
+                attemptIndex: Int?,
+                isFinal: Boolean,
+                hasReasoning: Boolean,
+            ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
             override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
             override suspend fun onTurnCancelled(
                 runId: String,
@@ -473,6 +491,15 @@ class GhostUndeliveredDurableTest {
                 attemptIndex: Int?,
                 isFinal: Boolean,
             ) = Unit
+            override suspend fun onTurnFailed(
+                runId: String,
+                partialText: String,
+                error: String,
+                parentRunId: String?,
+                attemptIndex: Int?,
+                isFinal: Boolean,
+                hasReasoning: Boolean,
+            ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
             override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
             override suspend fun onTurnCancelled(
                 runId: String,
@@ -586,6 +613,15 @@ class GhostUndeliveredDurableTest {
                 attemptIndex: Int?,
                 isFinal: Boolean,
             ) = Unit
+            override suspend fun onTurnFailed(
+                runId: String,
+                partialText: String,
+                error: String,
+                parentRunId: String?,
+                attemptIndex: Int?,
+                isFinal: Boolean,
+                hasReasoning: Boolean,
+            ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
             override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
             override suspend fun onTurnCancelled(
                 runId: String,

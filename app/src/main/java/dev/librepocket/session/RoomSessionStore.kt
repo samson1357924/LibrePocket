@@ -497,6 +497,15 @@ class RoomSessionStore(
         rows.map { it.toEvent() }
     }
 
+    /**
+     * R25-1: single bounded COUNT for the far-marker probe (O(1) memory, same
+     * session + `seq <` + `kind='reasoning'` only, never an unbounded scan).
+     */
+    override suspend fun hasReasoningBefore(sessionId: String, beforeSeq: Long): Boolean =
+        withContext(Dispatchers.IO) {
+            dao.countReasoningBefore(sessionId, beforeSeq) > 0
+        }
+
     override suspend fun listSessions(): List<SessionMeta> = withContext(Dispatchers.IO) {
         dao.allSessions().map { it.toMeta() }
     }

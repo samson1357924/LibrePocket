@@ -369,23 +369,28 @@ class CaptureDeniedException(message: String = "ENDPOINT_BINDING_STALE") : Secur
 
 /** Injectable session-construction boundary used by the chat lifecycle tests.
  *
- * The canonical forms are the 4-arg [create] (production caller
- * ChatViewModel.ensureSession uses it) and the 4-arg [open] (every
- * `openSession` path passes the R8-3 gate). Implementors MUST override both
- * canonical forms; the 3-arg [create] is a compat shim that forwards while
- * carrying the compat default (`initialHistory = emptyList()`). The lossy
- * direction (canonical → compat, silently dropping `initialHistory` /
- * `backfillInterrupted`) is deleted: with no default body on the canonical
- * forms, leaving one unimplemented is a compile error, never a runtime
- * StackOverflowError or a silent param drop.
+ * The canonical forms are the 4-arg [create] (policy-agnostic core) and the
+ * 4-arg [open] (every `openSession` path passes the R8-3 gate). Implementors
+ * MUST override both canonical forms; the 3-arg [create] and 3-arg [open]
+ * are compat shims that forward while carrying the compat defaults
+ * (`initialHistory = emptyList()`, `backfillInterrupted = true`, symmetric).
+ * The key.read policy entries (5-arg [create], allowAsk [open], full-union
+ * [open]) are concrete and delegate with explicit fail-closed defaults
+ * (`allowAsk = false`); production overrides them to thread the proof.
+ * The lossy direction (canonical → compat, silently dropping
+ * `initialHistory` / `backfillInterrupted`) is deleted: with no default
+ * body on the canonical forms, leaving one unimplemented is a compile
+ * error, never a runtime StackOverflowError or a silent param drop.
  */
 interface ChatSessionProvider {
     /**
-     * Canonical create (production caller ChatViewModel.ensureSession uses
-     * it): [initialHistory] is the fork-carried model prefix the new live
-     * turn already sends on. Abstract — implementors must override it; a
-     * storeless/provider-loop-only fake that never hydrates documents the
-     * intentional ignore on its override (see ChatWiringTest scope note).
+     * Policy entry: canonical create plus the key.read gate ([allowAsk]).
+     * Production caller ChatViewModel.ensureSession uses it. Concrete —
+     * delegates to the 4-arg canonical below; production overrides this to
+     * thread the proof. [initialHistory] is the fork-carried model prefix
+     * the new live turn already sends on; a storeless/provider-loop-only
+     * fake that never hydrates documents the intentional ignore on its
+     * override (see ChatWiringTest scope note).
      */
     suspend fun create(
         endpoint: EndpointConfig,
@@ -393,7 +398,7 @@ interface ChatSessionProvider {
         initialHistory: List<ChatMessage> = emptyList(),
         allowAsk: Boolean = false,
         keyIsCurrent: suspend () -> Boolean = { true },
-    ): CreatedSession
+    ): CreatedSession = create(endpoint, title, initialHistory, keyIsCurrent)
 
     /**
      * Compat create: forwards to the canonical form with an empty prefix
@@ -406,6 +411,26 @@ interface ChatSessionProvider {
         keyIsCurrent: suspend () -> Boolean,
     ): CreatedSession = create(endpoint, title, emptyList(), false, keyIsCurrent)
 
+    /**
+     * Canonical create (4-arg core, policy-agnostic): abstract —
+     * implementors must override it. The policy entry above delegates here
+     * with an explicit fail-closed `allowAsk = false` when the caller
+     * carries no proof; fakes that model hydration override this form
+     * (see ChatSessionProviderShimTest).
+     */
+    suspend fun create(
+        endpoint: EndpointConfig,
+        title: String,
+        initialHistory: List<ChatMessage>,
+        keyIsCurrent: suspend () -> Boolean,
+    ): CreatedSession
+
+    /**
+     * Compat open: forwards to the canonical form with the backfill gate open
+     * (`backfillInterrupted = true`, symmetric with the 3-arg create shim).
+     * Implementors override the canonical form instead; overriding only this
+     * shim drops the R8-3 gate.
+     */
     suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,
@@ -603,6 +628,15 @@ class ChatSessionFactory(
             throw failure
         }
     }
+
+    // Canonical 4-arg core: explicit fail-closed policy default; production
+    // callers use the 5-arg policy entry above.
+    override suspend fun create(
+        endpoint: EndpointConfig,
+        title: String,
+        initialHistory: List<ChatMessage>,
+        keyIsCurrent: suspend () -> Boolean,
+    ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
 
     /**
      * Binds a live session to an existing transcript session (resume, no re-create).
@@ -1156,6 +1190,19 @@ class ChatSessionFactory(
  * keep-newest prune may have cut a marker-first pair: marker pruned,
  * assistant kept). Memory-only hotfix; pair-aware prune stays Target (a).
  *
+ * R25-1 far-marker guard (P2, fail-closed, bounded): when the kept window is
+ * full (`kept == HISTORY_LOAD_CAP`) yet the filtered COUNT reports
+ * `dropped == 0`, a `reasoning` marker more than one backward page below the
+ * window (e.g. seq=1 marker + 200 non-model notices + 2000 qualifying rows)
+ * would otherwise resume its kept assistant as plain text. The scan's bounded
+ * existence probe ([ModelHistoryScan.hasFarReasoning], single COUNT strictly
+ * below the extra-page floor, no unbounded scan) forces the same conservative
+ * all-flag when any older `reasoning` row exists there; a probe failure also
+ * forces suspect (fail-closed). Adjacent markers collected by the extra page
+ * do not set it (R24-2 precise flag preserved). Over-flags by design when the
+ * far marker's assistant is no longer kept (plain filler flags too);
+ * pair-aware narrowing stays Target.
+ *
  * Truncation is observable: [LoadedModelHistory.droppedCount] carries the
  * exact omitted-row total (filtered COUNT query, O(1) memory). A giant
  * single row is truncated to [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] with a
@@ -1180,7 +1227,14 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
     } catch (_: Exception) {
         true
     }
-    val incomplete = dropped > 0 || pruneSuspect
+    // R25-1 far-marker guard: exact-cap with an uncollected marker more than
+    // one page out (scan.hasFarReasoning, bounded COUNT below the extra-page
+    // floor) forces the same conservative all-flag as dropped > 0. Adjacent
+    // markers collected by the extra page do not set it (R24-2 preserved).
+    // Over-flags plain filler by design (Target: pair-aware).
+    val farMarkerSuspect = dropped == 0 && !pruneSuspect &&
+        scan.events.size == SnapshotBudget.HISTORY_LOAD_CAP && scan.hasFarReasoning
+    val incomplete = dropped > 0 || pruneSuspect || farMarkerSuspect
     return LoadedModelHistory(
         scan.events.map {
             ChatMessage(
@@ -1217,7 +1271,10 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
  * seq N+1) whose assistant is the oldest kept row leaves its marker one row
  * below the window. One extra marker-only page plus same-page remainder
  * collection closes that adjacent gap; a marker more than one page out stays
- * suspect (covered by the COUNT fail-closed when `dropped > 0`).
+ * uncollected (R25-1: covered by the COUNT fail-closed when `dropped > 0`,
+ * and by the bounded [SessionStore.hasReasoningBefore] probe when
+ * `dropped == 0` with a full window — [loadModelHistory] then over-flags all
+ * kept assistants by design; pair-aware narrowing stays Target).
  */
 internal data class ModelHistoryScan(
     /**
@@ -1231,7 +1288,8 @@ internal data class ModelHistoryScan(
      * ignored, never [familyOf]). R24-2 covers the adjacent boundary marker
      * (oldest kept assistant's marker-first row, one extra page + the fill
      * page remainder); a marker more than one page out stays uncollected
-     * (suspect when [reasoningIncomplete]; see the class note).
+     * (R25-1: [loadModelHistory] probes it boundedly and over-flags; see the
+     * class note).
      */
     val reasoningRunIds: Set<String>,
     /**
@@ -1240,6 +1298,17 @@ internal data class ModelHistoryScan(
      * rows; [loadModelHistory] narrows it with the exact dropped count).
      */
     val reasoningIncomplete: Boolean = false,
+    /**
+     * R25-1: true when a `reasoning` row exists strictly below the R24-2
+     * extra-page floor (i.e. more than one backward page below the kept
+     * window and therefore uncollected). Bounded single COUNT probe, never an
+     * unbounded scan; a probe failure reports true (fail-closed). Adjacent
+     * boundary markers collected by the extra page do NOT set this (R24-2
+     * keeps its precise flag with `dropped == 0`); only truly far markers do,
+     * and then [loadModelHistory] over-flags all kept assistants by design
+     * (Target: pair-aware narrowing).
+     */
+    val hasFarReasoning: Boolean = false,
 )
 
 internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String): ModelHistoryScan {
@@ -1301,6 +1370,24 @@ internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String
         for (event in extra) {
             if (event.kind == "reasoning") reasoningRunIds.add(event.runId)
         }
+        // R25-1 far-marker probe (bounded, fail-closed): rows strictly below
+        // the extra-page floor were never scanned (neither kept nor extra).
+        // A single COUNT probe there catches a marker more than one page out
+        // (e.g. seq=1 marker + 200 notices + 2000 qualifying: extra covers
+        // 201..2, floor=2, probe seq<2 hits seq=1). An adjacent marker
+        // collected by the extra page sits at/above the floor and never sets
+        // this (R24-2 precise flag preserved). Probe failure is suspect.
+        // Cost note: this COUNT runs on every capHit even though
+        // [loadModelHistory] only consumes it when `dropped == 0` (`dropped > 0`
+        // already flags) — a single bounded COUNT is accepted over deferring,
+        // which would still need the COUNT first to decide (same cost).
+        val extraFloor = extra.minOfOrNull { it.seq } ?: beforeSeq
+        val farSuspect = try {
+            store.hasReasoningBefore(sessionId, extraFloor)
+        } catch (_: Exception) {
+            true
+        }
+        return ModelHistoryScan(keptNewestFirst.asReversed(), reasoningRunIds, capHit, farSuspect)
     }
     return ModelHistoryScan(keptNewestFirst.asReversed(), reasoningRunIds, capHit)
 }

@@ -226,6 +226,39 @@ interface SessionStore {
         return total
     }
 
+    /**
+     * R25-1 far-marker existence probe (bounded, fail-closed): true when the
+     * session holds any payload-free `reasoning` row with `seq < [beforeSeq]`
+     * (same session only). Backs the exact-cap far-marker guard in
+     * [loadModelHistoryScan]: the scan probes strictly below its R24-2
+     * extra-page floor (more than one backward page below the kept window),
+     * so an adjacent boundary marker already collected by the extra page never
+     * sets it (R24-2 precise flag preserved); only a truly far marker does,
+     * forcing conservative `reasoningIncomplete=true` in [loadModelHistory]
+     * (all kept assistants suspect, like `dropped > 0`). Over-flags by design
+     * when the far marker's assistant is no longer kept (Target: pair-aware
+     * narrowing). Single COUNT query on Room (O(1) memory); the default pages
+     * test-scale fakes with early exit. Throws propagate to the caller, which
+     * treats them as suspect (fail-closed).
+     */
+    suspend fun hasReasoningBefore(sessionId: String, beforeSeq: Long): Boolean {
+        var afterSeq = 0L
+        while (true) {
+            val page = loadEvents(sessionId, afterSeq, 500)
+            if (page.isEmpty()) break
+            for (e in page) {
+                if (e.seq >= beforeSeq) continue
+                if (e.kind == "reasoning") return true
+            }
+            afterSeq = page.last().seq
+            if (page.size < 500) break
+            // Bounded scan guard: only rows below beforeSeq matter; once the
+            // forward cursor passes beforeSeq no later page can match.
+            if (afterSeq >= beforeSeq) break
+        }
+        return false
+    }
+
     /** Export one session as pure JSONL (no header; `jq`-parseable, spec §8.5). */
     suspend fun exportJsonl(sessionId: String, destFile: File)
 

@@ -279,6 +279,8 @@ internal class ResponsesMapper(val round: Int = 0) {
                 // giant call_id is never retained (the empty AggCall placeholder
                 // may remain but holds no id chars, emits nothing, and drains
                 // nothing); first-wins resends (agg.id already set) skip this.
+                // Cap value and rationale live with MAX_TOOL_ID_CHARS in
+                // StreamEvent.kt.
                 if (addedId != null && agg.id.isEmpty()) requireToolIdBudget(addedId.length)
                 val addedIncoming =
                     (if (addedId != null && agg.id.isEmpty()) addedId.length else 0) +
@@ -378,8 +380,10 @@ internal class ResponsesMapper(val round: Int = 0) {
                 }
                 // All guards passed: single write-back, then emit-once per
                 // (toolIndex, id) pair — only a genuinely-new admission emits.
-                // A resend of an already-emitted pair is a true no-op (no
-                // event, no throw, no set growth), mirroring the
+                // A resend of an already-emitted pair is an output no-op (no
+                // event, no throw, no set growth; the agg write-back above
+                // still refreshes id/name/args and the round total, but
+                // nothing is emitted), mirroring the
                 // finishPendingTools drain below: at most one ToolDone per
                 // pair per attempt, however often the server repeats it.
                 agg.id = effectiveId
@@ -480,8 +484,10 @@ internal class ResponsesMapper(val round: Int = 0) {
                 // the re-run converges idempotently via the emittedToolIds
                 // dedup (already-emitted pairs add nothing), so the set stays
                 // within 2x MAX_TOOL_CALLS_PER_ATTEMPT overall (loose safe
-                // upper bound; emit-once convergence leaves at most 64
-                // actually emitted).
+                // upper bound, at most 128 total pairs: interleavings such as
+                // 64 done-path pairs plus 63 pending drain pairs can exceed
+                // 64 actually emitted, but never exceed 128; each pair is
+                // emitted at most once).
                 if (emittedToolIds.add(agg.toolIndex to agg.id)) {
                     out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))
                 }

@@ -643,7 +643,7 @@ class ToolAggBudgetTest {
     @Test
     fun responsesDoneResendAcceptedIdAtCapDuplicateIsTrueNoOp() {
         // Emit-once per (toolIndex, id) pair: at-cap re-send of an
-        // already-emitted pair emits NOTHING (true no-op, no throw) — the
+        // already-emitted pair emits NOTHING (output no-op, no throw) — the
         // guard charges only genuinely-new pairs, so a legal duplicate after
         // the cap is never misread as an overflow and never re-emits.
         val mapper = ResponsesMapper()
@@ -1378,9 +1378,9 @@ class ToolAggBudgetTest {
     // ---- S4: finishPendingTools drain executes at the cap (2x loose bound) ----
     //
     // The drain adds at most one pair per already-capped callsByItem entry, so
-    // the emitted set stays within 2x the admission cap (64 done-path pairs +
-    // 64 drain pairs, loose upper bound; emit-once convergence leaves at most
-    // 64 actually emitted). Both halves are executed here: 64 pending added
+    // the emitted set stays within 2x the admission cap (at most 128 total
+    // pairs, loose upper bound; each pair emitted at most once). Both halves
+    // are executed here: 64 pending added
     // entries drain into exactly 64 ToolDone + Done, and 64 already-emitted
     // done-path pairs drain silently into Done alone.
 

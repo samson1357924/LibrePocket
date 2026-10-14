@@ -225,6 +225,85 @@ class ProviderTransportC1Test {
     }
 
     /**
+     * Frame-stacking wire twin of [SseParserTest.stackedSmallLinesLatchFrameBudgetNotLine]:
+     * 300 individually-legal (~4 KiB) `data:` lines in ONE event must surface
+     * end to end as a single typed non-retryable `SSE_FRAME_TOO_LARGE` /
+     * `AGG_TOO_LARGE` terminal, with early abort (consumed well below the
+     * ~1.2 MiB queued body), no `Done`/`ToolDone`, and a single wire request.
+     *
+     * Latch math: each value is 4096 chars; the joined payload trips when
+     * (pending + value + separators) x3 exceeds 1 MiB, i.e. by the 86th line
+     * at the latest (86 x 4096 = 352256 chars, separators only trip earlier).
+     * Wire bytes before the latch are therefore at most 86 x ("data: " + 4096
+     * + "\n") = 86 x 4103, plus the in-flight chunks the pump already pulled.
+     */
+    @Test
+    fun sseStackedSmallLinesAbortStreamTypedEarly() = runBlocking {
+        val valueChars = 4_096
+        val lines = 300
+        val wirePerLine = 6 + valueChars + 1 // "data: " + value + "\n"
+        // Upper bound: latch by the 86th line at the latest; separators only
+        // make it earlier, so this never underestimates the trip point.
+        val tripLinesUpper = (SseFrameParser.MAX_FRAME_BYTES / 3 + 1 + valueChars - 1) / valueChars + 1
+        val maxWireBeforeLatch = tripLinesUpper.toLong() * wirePerLine.toLong()
+        val earlyReadBudget = maxWireBeforeLatch + SSE_READ_IN_FLIGHT_CHUNKS * SSE_PUMP_READ_CHUNK_BYTES
+        val line = "data: " + "q".repeat(valueChars) + "\n"
+        val body = buildString {
+            repeat(lines) { append(line) }
+            append("\n")
+        }
+        val bodyBytes = body.toByteArray(Charsets.UTF_8).size.toLong()
+        for (protocol in ProviderProtocol.values()) {
+            val server = MockWebServer()
+            val signals = SseBodyReadSignals()
+            server.start()
+            try {
+                server.enqueue(
+                    MockResponse()
+                        .setHeader("Content-Type", "text/event-stream")
+                        .setBody(body),
+                )
+                val events = withTimeout(10_000) {
+                    providerFor(protocol, server, signals.client()).stream(request()).toList()
+                }
+                val failures = events.filterIsInstance<StreamEvent.Failed>()
+                assertEquals("$protocol stacked event must end in exactly one terminal failure", 1, failures.size)
+                val failure = failures.single()
+                assertTrue(
+                    "$protocol stacked event must fail typed, got: ${failure.message}",
+                    failure.message.contains(SseFrameParser.FRAME_TOO_LARGE_MESSAGE),
+                )
+                assertFalse("$protocol frame overflow must not retry the poisoned stream", failure.retryable)
+                assertEquals(
+                    "$protocol frame overflow carries typed code",
+                    ProviderFailureCode.AGG_TOO_LARGE.name,
+                    failure.code,
+                )
+                assertTrue(
+                    "$protocol poisoned attempt never reports success, got: $events",
+                    events.none { it is StreamEvent.Done },
+                )
+                assertTrue(
+                    "$protocol poisoned fragment must never become a ToolDone",
+                    events.none { it is StreamEvent.ToolDone },
+                )
+                assertEquals("$protocol stacked overflow remains one request", 1, server.requestCount)
+                val consumed = signals.consumedBytes.get()
+                assertTrue(
+                    "$protocol aborts while stacking, consumed=$consumed bytes <= $earlyReadBudget (trip<=${maxWireBeforeLatch} + slack)",
+                    consumed <= earlyReadBudget,
+                )
+                assertTrue(
+                    "$protocol must not drain the whole $bodyBytes-byte body, consumed=$consumed bytes",
+                    consumed < bodyBytes,
+                )
+            } finally {
+                server.shutdown()
+            }
+        }
+    }
+
+    /**
      * End-to-end Anthropic twin of the mapper-level
      * [ToolAggBudgetTest.anthropicThinkingBlockFloodTripsDistinctCapTyped]:
      * 65 distinct `content_block_start` indexes must surface as one typed,
@@ -612,30 +691,8 @@ class ProviderTransportC1Test {
         }
     }
 
-    /**
-     * Original RED case of the blocks-map cap: 65 distinct TEXT block indexes
-     * (a legal small SSE line each) must trip the shared distinct-index budget
-     * with the same typed non-retryable failure as tool overflows.
-     * [ToolAggBudgetTest] adds the discriminating variants (thinking flood,
-     * mixed kinds, restart-is-not-admission, demotion).
-     */
-    @Test
-    fun anthropicManyDistinctTextBlocksTripBlockCapTyped() {
-        val mapper = AnthropicMapper()
-        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
-            mapper.mapPayload(
-                """{"type":"content_block_start","index":$i,"content_block":{"type":"text","text":""}}""",
-            )
-        }
-        try {
-            mapper.mapPayload(
-                """{"type":"content_block_start","index":$MAX_TOOL_CALLS_PER_ATTEMPT,"content_block":{"type":"text","text":""}}""",
-            )
-            fail("expected 65th distinct Anthropic block to trip the distinct-index budget")
-        } catch (e: ProviderFailure) {
-            assertEquals(TOOL_ARGS_TOO_LARGE, e.message)
-            assertFalse(e.retryable)
-            assertEquals(ProviderFailureCode.AGG_TOO_LARGE, e.code)
-        }
-    }
+    // NOTE(S4): the mapper-level 65-distinct-TEXT-block RED case lived here as
+    // anthropicManyDistinctTextBlocksTripBlockCapTyped; it now lives with the
+    // other mapper-level variants in ToolAggBudgetTest (same name). The wire
+    // twin stays here as anthropicStreamSixtyFiveDistinctBlocksFailsTypedWithoutDone.
 }

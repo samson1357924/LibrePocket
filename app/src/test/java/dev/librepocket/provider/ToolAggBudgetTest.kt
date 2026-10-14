@@ -3,6 +3,7 @@ package dev.librepocket.provider
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -1271,5 +1272,389 @@ class ToolAggBudgetTest {
             StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
             tail.single(),
         )
+    }
+
+    // ---- S4: moved back from ProviderTransportC1Test (mapper-level, no wire) ----
+    //
+    // Original RED case of the blocks-map cap: 65 distinct TEXT block indexes
+    // (a legal small SSE line each) must trip the shared distinct-index budget
+    // with the same typed non-retryable failure as tool overflows. Lives here
+    // with the other mapper-level discriminating variants (thinking flood,
+    // mixed kinds, restart-is-not-admission, demotion); the wire twin is
+    // ProviderTransportC1Test.anthropicStreamSixtyFiveDistinctBlocksFailsTypedWithoutDone.
+
+    @Test
+    fun anthropicManyDistinctTextBlocksTripBlockCapTyped() {
+        val mapper = AnthropicMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$i,"content_block":{"type":"text","text":""}}""",
+            )
+        }
+        try {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$MAX_TOOL_CALLS_PER_ATTEMPT,"content_block":{"type":"text","text":""}}""",
+            )
+            fail("expected 65th distinct Anthropic block to trip the distinct-index budget")
+        } catch (e: ProviderFailure) {
+            assertEquals(TOOL_ARGS_TOO_LARGE, e.message)
+            assertFalse(e.retryable)
+            assertEquals(ProviderFailureCode.AGG_TOO_LARGE, e.code)
+        }
+    }
+
+    // ---- S4: guard-priority determinism (same item, rotating call_id) ----
+    //
+    // Responses done-path guard order is id (4096) -> per-call -> total ->
+    // emitted-count. A 10KB rotating call_id trips the per-key id guard on the
+    // very first arrival (iteration 0); per-candidate growth is irrelevant and
+    // total/emitted are never reached. A 4-char rotation keeps every char
+    // guard silent (equal lengths => growth 0) so the emitted-count cap wins
+    // deterministically on the 65th distinct pair (iteration 64).
+
+    @Test
+    fun responsesRotatingGiantCallIdIdGuardWinsFirstIteration() {
+        val mapper = ResponsesMapper()
+        var firstIteration = -1
+        var failure: ProviderFailure? = null
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT + 1) {
+            val callId = "c".repeat(10_000 - 4) + String.format("%04d", i)
+            assertEquals(10_000, callId.length)
+            try {
+                mapper.mapPayload(
+                    """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$callId","name":"f"}}""",
+                )
+            } catch (e: ProviderFailure) {
+                if (failure == null) {
+                    failure = e
+                    firstIteration = i
+                    break
+                }
+            }
+        }
+        assertTrue("10KB rotation must throw on the first arrival", failure != null)
+        assertEquals("id guard wins before total/emitted: iteration 0", 0, firstIteration)
+        assertAggOverflow(failure!!)
+        val tail = mapper.finish()
+        assertTrue(tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty())
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
+    }
+
+    @Test
+    fun responsesRotatingSmallCallIdEmittedWinsAtSixtyFifth() {
+        // Same fixed item_id, 4-char rotating call_ids ("c000".."c064"): every
+        // candidate is ~5 chars, growth 0 after the first, so per-call/total
+        // stay silent and only the emitted (toolIndex, id) count can trip —
+        // deterministically on the 65th distinct pair (iteration 64).
+        val mapper = ResponsesMapper()
+        var firstIteration = -1
+        var failure: ProviderFailure? = null
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT + 1) {
+            val callId = String.format("c%03d", i)
+            try {
+                mapper.mapPayload(
+                    """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$callId","name":"f"}}""",
+                )
+            } catch (e: ProviderFailure) {
+                if (failure == null) {
+                    failure = e
+                    firstIteration = i
+                    break
+                }
+            }
+        }
+        assertTrue("small rotation must trip the emitted cap", failure != null)
+        assertEquals(
+            "emitted-count wins deterministically on the 65th pair (iteration 64)",
+            MAX_TOOL_CALLS_PER_ATTEMPT,
+            firstIteration,
+        )
+        assertAggOverflow(failure!!)
+    }
+
+    // ---- S4: finishPendingTools drain executes at the cap (2x loose bound) ----
+    //
+    // The drain adds at most one pair per already-capped callsByItem entry, so
+    // the emitted set stays within 2x the admission cap (64 done-path pairs +
+    // 64 drain pairs, loose upper bound; emit-once convergence leaves at most
+    // 64 actually emitted). Both halves are executed here: 64 pending added
+    // entries drain into exactly 64 ToolDone + Done, and 64 already-emitted
+    // done-path pairs drain silently into Done alone.
+
+    @Test
+    fun responsesDrainAtCapEmitsSixtyFourToolDonePlusDone() {
+        val mapper = ResponsesMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            val out = mapper.mapPayload(
+                """{"type":"response.output_item.added","item_id":"it$i","item":{"type":"function_call","call_id":"c$i","name":"f"}}""",
+            )
+            assertEquals(1, out.filterIsInstance<StreamEvent.ToolDelta>().size)
+        }
+        val tail = mapper.mapPayload("""{"type":"response.completed","response":{"output":[]}}""")
+        val dones = tail.filterIsInstance<StreamEvent.ToolDone>()
+        assertEquals(
+            "64 pending added entries drain into exactly 64 ToolDone",
+            MAX_TOOL_CALLS_PER_ATTEMPT,
+            dones.size,
+        )
+        assertEquals(
+            (0 until MAX_TOOL_CALLS_PER_ATTEMPT).toSet(),
+            dones.map { it.toolIndex }.toSet(),
+        )
+        assertEquals(StreamEvent.Done("stop"), tail.last())
+        assertTrue("drain at cap is clean: no Failed", tail.none { it is StreamEvent.Failed })
+        // Terminal latches: a repeated finish() stays silent (converged).
+        assertTrue(mapper.finish().isEmpty())
+    }
+
+    @Test
+    fun responsesCompletedAfterSixtyFourDonesDrainsSilently() {
+        val mapper = ResponsesMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            val out = mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it$i","item":{"type":"function_call","call_id":"c$i","name":"f"}}""",
+            )
+            assertEquals(1, out.filterIsInstance<StreamEvent.ToolDone>().size)
+        }
+        val tail = mapper.mapPayload("""{"type":"response.completed","response":{"output":[]}}""")
+        assertTrue(
+            "already-emitted pairs drain silently",
+            tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty(),
+        )
+        assertEquals(listOf(StreamEvent.Done("stop")), tail)
+        assertTrue(mapper.finish().isEmpty())
+    }
+
+    // ---- S4: object + mixed-alternate nesting 64/65 (arrays already locked) ----
+    //
+    // MiniJson counts objects and arrays equally toward MAX_DEPTH (the only
+    // two recursive productions share one withDepth guard). 64 nested objects
+    // parse; the 65th fails closed with the discriminable depth subtype. The
+    // mixed alternate (array/object churn) proves the counter is shared, not
+    // per-kind. Mapper-level twins prove the depth subtype translates to the
+    // same typed triple with the same latch (no later Done).
+
+    /** `levels` nested objects wrapping a `0` scalar. */
+    private fun deepObjJunk(levels: Int): String =
+        "{\"a\":".repeat(levels) + "0" + "}".repeat(levels)
+
+    /** `levels` alternating array/object nestings wrapping a `0` scalar. */
+    private fun deepMixedJunk(levels: Int): String = buildString {
+        for (i in 0 until levels) {
+            if (i % 2 == 0) append('[') else append("{\"a\":")
+        }
+        append('0')
+        for (i in levels - 1 downTo 0) {
+            if (i % 2 == 0) append(']') else append('}')
+        }
+    }
+
+    @Test
+    fun objectNestingAtCeilingParsesBeyondFailsClosed() {
+        val atCap = MiniJson.parse(deepObjJunk(MiniJson.MAX_DEPTH))
+        assertTrue(atCap is MiniJson.JObj)
+        try {
+            MiniJson.parse(deepObjJunk(MiniJson.MAX_DEPTH + 1))
+            fail("65 nested objects must fail closed")
+        } catch (e: MiniJson.MiniJsonException) {
+            assertTrue(
+                "object depth breach must be the discriminable depth subtype",
+                e is MiniJson.MiniJsonDepthException,
+            )
+        }
+    }
+
+    @Test
+    fun mixedAlternateNestingAtCeilingParsesBeyondFailsClosed() {
+        val atCap = MiniJson.parse(deepMixedJunk(MiniJson.MAX_DEPTH))
+        assertTrue(atCap is MiniJson.JArr)
+        try {
+            MiniJson.parse(deepMixedJunk(MiniJson.MAX_DEPTH + 1))
+            fail("65 mixed-alternate nestings must fail closed")
+        } catch (e: MiniJson.MiniJsonException) {
+            assertTrue(
+                "mixed depth breach must be the discriminable depth subtype",
+                e is MiniJson.MiniJsonDepthException,
+            )
+        }
+    }
+
+    @Test
+    fun objectDeepFrameViaMapperThrowsTypedAndTerminalNeverDone() {
+        val mapper = ResponsesMapper()
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_text.delta","delta":"hi","junk":${deepObjJunk(MiniJson.MAX_DEPTH + 1)}}""",
+            )
+        }
+        assertAggOverflow(over)
+        val terminalThrow = toolFailureOf {
+            mapper.mapPayload("""{"type":"response.completed","response":{"output":[]}}""")
+        }
+        assertAggOverflow(terminalThrow)
+        val tail = mapper.finish()
+        assertEquals(TOOL_ARGS_TOO_LARGE, (tail.single() as StreamEvent.Failed).message)
+        assertFalse((tail.single() as StreamEvent.Failed).retryable)
+        assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, (tail.single() as StreamEvent.Failed).code)
+        assertTrue(tail.none { it is StreamEvent.Done })
+        assertTrue(tail.none { it is StreamEvent.ToolDone })
+    }
+
+    @Test
+    fun mixedDeepFrameViaMapperThrowsTypedAndTerminalNeverDone() {
+        val mapper = ResponsesMapper()
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_text.delta","delta":"hi","junk":${deepMixedJunk(MiniJson.MAX_DEPTH + 1)}}""",
+            )
+        }
+        assertAggOverflow(over)
+        val terminalThrow = toolFailureOf {
+            mapper.mapPayload("""{"type":"response.completed","response":{"output":[]}}""")
+        }
+        assertAggOverflow(terminalThrow)
+        val tail = mapper.finish()
+        assertEquals(TOOL_ARGS_TOO_LARGE, (tail.single() as StreamEvent.Failed).message)
+        assertFalse((tail.single() as StreamEvent.Failed).retryable)
+        assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, (tail.single() as StreamEvent.Failed).code)
+        assertTrue(tail.none { it is StreamEvent.Done })
+        assertTrue(tail.none { it is StreamEvent.ToolDone })
+    }
+
+    // ---- S4: single-line exact-cap boundary (parser layer) ----
+    //
+    // Char->byte estimate is x3 against the 1 MiB line budget: a line of
+    // 349525 chars (x3 = 1048575) still fits, one more char latches. The
+    // "data: " prefix counts (6 chars), so 349519 value chars fit while 349520
+    // latch. Mirrors requireToolAggBudgetExactBoundary at the SSE layer.
+
+    @Test
+    fun sseSingleLineExactCapBoundary() {
+        val fit = SseFrameParser()
+        val fitFrames = fit.feed("data: " + "x".repeat(349_519) + "\n\n") + fit.flush()
+        assertFalse(fit.lineTooLong)
+        assertFalse(fit.frameTooLong)
+        assertEquals(1, fitFrames.size)
+        assertEquals(349_519, fitFrames[0].data.length)
+        val over = SseFrameParser()
+        val overFrames = over.feed("data: " + "x".repeat(349_520) + "\n\n") + over.flush()
+        assertTrue("349526-char line must latch lineTooLong", over.lineTooLong)
+        assertFalse(over.frameTooLong)
+        assertTrue(overFrames.isEmpty())
+    }
+
+    // ---- S4: Responses/Anthropic terminal-before-overlong-tail (Chat twin exists) ----
+    //
+    // Symmetric to ProviderTransportC1Test.chatCompletionsDoneBeforeOverlongLineKeepsSingleTerminal:
+    // the protocol terminal arrives first, the pump stops reading, and the
+    // over-long tail that follows on the wire never becomes a second terminal.
+    // Exactly one Done, no Failed, one request.
+
+    @Test
+    fun responsesTerminalBeforeOverlongTailKeepsSingleDone() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body = buildString {
+                append("data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n")
+                append("data: ")
+                append("x".repeat(SseFrameParser.MAX_LINE_BYTES + 1024))
+            }
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val config = ProviderConfig(
+                id = "s4-responses-terminal",
+                label = "test",
+                baseUrl = server.url("/").toString().trimEnd('/'),
+                protocol = ProviderProtocol.RESPONSES,
+                apiKeyRef = "fake",
+                http = ProviderHttpConfig(readTimeoutMs = TimeUnit.MINUTES.toMillis(5)),
+            )
+            val provider = ResponsesProvider(config, { "fake-key".toCharArray() }, OkHttpClient())
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(model = "m", messages = listOf(ChatMessage("user", "hi"))),
+                ).toList()
+            }
+            assertEquals(1, events.count { it is StreamEvent.Done })
+            assertTrue("the overlong tail must not append a failure, got: $events", events.none { it is StreamEvent.Failed })
+            assertEquals(StreamEvent.Done("stop"), events.last())
+            assertEquals("one terminal is one request", 1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun anthropicTerminalBeforeOverlongTailKeepsSingleDone() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val body = buildString {
+                append("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n")
+                append("data: {\"type\":\"message_stop\"}\n\n")
+                append("data: ")
+                append("x".repeat(SseFrameParser.MAX_LINE_BYTES + 1024))
+            }
+            server.enqueue(
+                MockResponse()
+                    .setHeader("Content-Type", "text/event-stream")
+                    .setBody(body),
+            )
+            val config = ProviderConfig(
+                id = "s4-anthropic-terminal",
+                label = "test",
+                baseUrl = server.url("/").toString().trimEnd('/'),
+                protocol = ProviderProtocol.ANTHROPIC,
+                apiKeyRef = "fake",
+                http = ProviderHttpConfig(readTimeoutMs = TimeUnit.MINUTES.toMillis(5)),
+            )
+            val provider = AnthropicProvider(config, { "fake-key".toCharArray() }, OkHttpClient())
+            val events = withTimeout(10_000) {
+                provider.stream(
+                    ChatRequest(model = "m", messages = listOf(ChatMessage("user", "hi"))),
+                ).toList()
+            }
+            assertEquals(1, events.count { it is StreamEvent.Done })
+            assertTrue("the overlong tail must not append a failure, got: $events", events.none { it is StreamEvent.Failed })
+            assertEquals(StreamEvent.Done("end_turn"), events.last())
+            assertEquals("one terminal is one request", 1, server.requestCount)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    // ---- S4: 64 x 20k poison path (triple only, no scope-name lock) ----
+    //
+    // 64 distinct tools x 20k-char fragments: per-call (20k x3 = 60k) and the
+    // distinct count (64) both pass in isolation, but the whole-round total
+    // (1.28M chars x3) exceeds the shared 1 MiB budget partway through. Which
+    // guard fires first (total vs count) is an ordering detail; this locks
+    // only the shared typed triple — message + non-retryable + code — so a
+    // future guard reorder does not churn the test.
+
+    @Test
+    fun chatSixtyFourByTwentyKTripsTypedWithoutLockingScope() {
+        val mapper = ChatCompletionsMapper()
+        val frag = "y".repeat(20_000)
+        var failure: ProviderFailure? = null
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            try {
+                mapper.mapPayload(
+                    """{"choices":[{"delta":{"tool_calls":[{"index":$i,"id":"c$i","function":{"name":"f$i","arguments":"$frag"}}]}}]}""",
+                )
+            } catch (e: ProviderFailure) {
+                if (failure == null) failure = e
+                break
+            }
+        }
+        assertTrue("64 x 20k-char tools must exceed the attempt budget", failure != null)
+        assertAggOverflow(failure!!)
     }
 }

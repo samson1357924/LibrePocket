@@ -388,6 +388,12 @@ internal class ResponsesMapper(val round: Int = 0) {
                 // callers track ToolDone ids; duplicates collapse downstream by
                 // (toolIndex, id). Only emit when never emitted — mappers own
                 // this set per stream.
+                //
+                // Bounded without a local budget check: this drain adds at most
+                // one pair per callsByItem entry, every entry's item_id was
+                // admitted through the same distinct cap above, and a stream
+                // drains once (terminal latches mapPayload/finish), so the set
+                // stays within 2x MAX_TOOL_CALLS_PER_ATTEMPT overall.
                 if (emittedToolIds.add(agg.toolIndex to agg.id)) {
                     out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))
                 }

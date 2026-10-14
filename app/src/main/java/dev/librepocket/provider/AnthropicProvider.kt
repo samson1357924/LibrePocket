@@ -257,6 +257,13 @@ internal class AnthropicMapper(val round: Int = 0) {
                 }
                 if (kind == BlockKind.TOOL) {
                     if (prev?.kind != BlockKind.TOOL) {
+                        // Belt-and-braces: toolBlockCount equals the number of
+                        // TOOL entries in blocks after every applied event (a
+                        // TOOL start adds one, a demotion drops one, a re-start
+                        // re-bills chars only), and blocks.size is capped
+                        // pre-insert above, so both branch cases here leave
+                        // toolBlockCount <= 63: this charge never rejects; an
+                        // all-TOOL flood is stopped by the pre-insert check.
                         requireToolCountBudget(toolBlockCount + 1)
                         toolBlockCount++
                     }

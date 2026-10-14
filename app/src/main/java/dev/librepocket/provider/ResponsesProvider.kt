@@ -475,9 +475,13 @@ internal class ResponsesMapper(val round: Int = 0) {
                 //
                 // Bounded without a local budget check: this drain adds at most
                 // one pair per callsByItem entry, every entry's item_id was
-                // admitted through the same distinct cap above, and a stream
-                // drains once (terminal latches mapPayload/finish), so the set
-                // stays within 2x MAX_TOOL_CALLS_PER_ATTEMPT overall.
+                // admitted through the same distinct cap above. finish() sets
+                // no terminal latch, so a repeated finish() re-runs this drain;
+                // the re-run converges idempotently via the emittedToolIds
+                // dedup (already-emitted pairs add nothing), so the set stays
+                // within 2x MAX_TOOL_CALLS_PER_ATTEMPT overall (loose safe
+                // upper bound; emit-once convergence leaves at most 64
+                // actually emitted).
                 if (emittedToolIds.add(agg.toolIndex to agg.id)) {
                     out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))
                 }

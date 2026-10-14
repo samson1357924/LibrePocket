@@ -12,6 +12,14 @@ import org.junit.Test
  * production symbol) so this spec compiles and holds independently: the
  * tests assert the CONTRACT itself — CEILING levels parse, CEILING + 1 fail
  * closed. Keep in sync with MiniJson's ceiling.
+ *
+ * The literal is deliberate RED hygiene, not duplication: building the
+ * nest() payloads directly from MiniJson.MAX_DEPTH would make the ceiling
+ * tests tautological (they would pass for any value). The independent
+ * literal plus the ceilingMatchesProductionContract tripwire below fails
+ * loudly on drift, so a ceiling change surfaces as one pointed failure
+ * instead of several contract failures whose messages do not name the
+ * root cause.
  */
 private const val CEILING = 64
 
@@ -44,10 +52,21 @@ class MiniJsonTest {
     }
 
     @Test
+    fun ceilingMatchesProductionContract() {
+        // Drift tripwire (the only place that couples to the production
+        // symbol): the mirrored CEILING above must equal MiniJson.MAX_DEPTH.
+        // The other tests assert the contract at CEILING / CEILING+1 without
+        // referencing the symbol, so without this tripwire a ceiling change
+        // would fail them with messages that do not point at the root cause.
+        assertEquals(
+            "mirrored CEILING drifted from MiniJson.MAX_DEPTH; update the contract literal and rationale together",
+            MiniJson.MAX_DEPTH,
+            CEILING,
+        )
+    }
+
+    @Test
     fun parsesNestingAtCeiling() {
-        // Drift tripwire: the mirrored spec and the production ceiling must
-        // never diverge silently (the const is visible to this source set).
-        assertEquals(MiniJson.MAX_DEPTH, CEILING)
         val v = MiniJson.parse(nest(ceiling))
         assertTrue(v is MiniJson.JArr)
     }

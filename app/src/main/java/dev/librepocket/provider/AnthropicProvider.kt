@@ -280,9 +280,11 @@ internal class AnthropicMapper(val round: Int = 0) {
                         // TOOL entries in blocks after every applied event (a
                         // TOOL start adds one, a demotion drops one, a re-start
                         // re-bills chars only), and blocks.size is capped
-                        // pre-insert above, so both branch cases here leave
-                        // toolBlockCount <= 63: this charge never rejects; an
-                        // all-TOOL flood is stopped by the pre-insert check.
+                        // pre-insert above, so on entry here the pre-charge
+                        // tally is <= 63 and after the increment below the
+                        // post-insert total is <= 64: this charge never
+                        // rejects; an all-TOOL flood is stopped by the
+                        // pre-insert check.
                         requireToolCountBudget(toolBlockCount + 1)
                         toolBlockCount++
                     }

@@ -1,6 +1,6 @@
 # Security Policy
 
-**Status:** Current disclosure of the repository's reporting capability as checked on 2026-10-07 at `b3d8a818f37f8455a254a0670b512286e4deb750`.
+**Status:** Current disclosure of the repository's reporting capability as checked on 2026-10-14 against `d5a98bd35e919083b0475027c9b2e74b703e4e58` (committed 2026-10-13).
 
 - **Scope:** This repository and its Android application. The project is alpha and is not a production security guarantee.
 - **Owner role:** Project maintainers; no dedicated security team or private contact is published here.

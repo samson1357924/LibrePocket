@@ -2,7 +2,7 @@
 
 > **重要：不要依照舊版本文卸載 app、清除資料或假設可從 UI 匯出/匯入。** 本文原有的逐步遷移指南與現行程式不符，已撤回為警告說明。保留舊安裝與其資料，直到有經實機驗證、與來源版本匹配的遷移方案；本文件不提供卸載步驟。
 
-- **狀態：** Current warning / Historical naming note。依 `b3d8a818f37f8455a254a0670b512286e4deb750` 核對（2026-10-07）。
+- **狀態：** Current warning / Historical naming note。依 `b3d8a818f37f8455a254a0670b512286e4deb750` 核對（2026-10-07）（snapshot purposely frozen; Current runtime facts follow docs/ARCHITECTURE.md and docs/TESTING.md at d5a98bd）。
 - **Owner role：** app/release 維護者；未指派個人。
 - **Source of truth：** `app/build.gradle.kts`, `app/src/*/AndroidManifest.xml`, current UI/session composition.
 - **更新觸發：** 真的新增且實機驗證 user-facing migration/export/import 流程，或 flavors/application IDs 改變時。

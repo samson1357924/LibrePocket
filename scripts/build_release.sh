@@ -235,8 +235,9 @@ for f in $FLAVORS; do
     TASKS="$TASKS :app:assemble${variant}Release"
 done
 # -PreleaseSigning=true activates the per-flavor release signingConfigs in
-# app/build.gradle.kts. Without it AGP would silently debug-sign the release
-# artifact — the flag makes signing explicit, never accidental.
+# app/build.gradle.kts. Without it the release build would have no signing
+# config (unsigned artifact, not a distribution artifact) — the flag makes
+# signing explicit, never accidental.
 # shellcheck disable=SC2086: TASKS is an intentional word-split task list.
 ./gradlew -PreleaseSigning=true $TASKS --console=plain
 

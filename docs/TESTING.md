@@ -93,6 +93,19 @@ The shared setup tests include local synthetic MockWebServer coverage for the mo
 
 ## Android instrumented tests
 
+Current scheduler/matrix truth (`.github/workflows/nightly-instrumented.yml`):
+the workflow runs on its nightly schedule and `workflow_dispatch`; on
+pull requests (types `labeled`, `synchronize`, `opened`, `reopened`) the
+`instrumented-test` job executes only when the PR carries the
+`run-instrumented` label (the job `if:` requires that label for PR
+events, so an unlabeled PR shows as Skipped/neutral — not a pass — and
+does not enter `pr-gate` merge evaluation). The emulator matrix is API
+levels 33 and 34 only, across the Play/Foss/Github flavors — while
+`minSdk` is 33, `compileSdk` is 37 and `targetSdk` is 36
+(`app/build.gradle.kts`), so there is currently no API 35, 36, or 37
+emulator coverage in CI. This paragraph states Current coverage only;
+any matrix expansion is Proposed until it is wired and run.
+
 Instrumented tests are a separate device-dependent tier. The existing [P1 androidTest runbook](specs/P1_ANDROIDTEST_RUNBOOK.md) lists test classes and sample commands, but its device matrix and prior status notes are not current CI evidence. Before treating a device matrix as a merge/release gate, maintainers must name the required API/flavor/device coverage, run it, and retain results tied to the tested SHA. Do not report a device pass when no device was used.
 
 ## Security-sensitive test expectations

@@ -977,6 +977,11 @@ class TurnController(
     // [cancelReceipts]) so [close]'s shutdown settle can bounded-join it
     // before the flush barrier (see [close]).
     val job = writerScope.launch {
+      // R24-1 pre-dispatch seam: first instruction of the waiter body, so a
+      // test holding the writer dispatcher can prove whether the body ever
+      // started (cancelled-before-start children complete without running a
+      // single instruction — see the invokeOnCompletion fail-safe below).
+      beforeCancelReceiptWaiterBodyForTest?.invoke()
       fun committedThreshold(count: Int): Boolean =
         if (receipt.cancelId == receipt.logicalTurnId) count >= 2 else count >= 1
       fun terminalCommitted(): Boolean {
@@ -1407,6 +1412,24 @@ class TurnController(
       }
     }
     cancelReceiptWaiters.putIfAbsent(receipt.cancelId, job)
+    // R24-1 cancelled-before-start fail-safe: every PENDING/CLAIMED→SEALED
+    // fallback above lives inside the coroutine body, so a waiter that was
+    // enqueued but never started (parent scope torn down before first
+    // dispatch, or launched into an already-cancelled scope) completes
+    // without running the body and would leave the receipt PENDING forever
+    // (fail-closed flushDurable + never-dead writer + permanently renewed
+    // backfill block). Seal monotonically here — no transcript write, only
+    // PENDING/CLAIMED→SEALED, never overwriting
+    // REVOKED/COMPENSATED/SEALED. A CLAIMED receipt genuinely inside
+    // NonCancellable compensation still owes its terminal row, so the dead
+    // proof keeps its PENDING/CLAIMED guard (R14-1 fence untouched); this
+    // only converges the never-ran case (and any post-CLAIM teardown
+    // residual the body catches missed) to SEALED/backfill.
+    job.invokeOnCompletion {
+      if (!receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.SEALED)) {
+        receipt.state.compareAndSet(CancelReceiptState.CLAIMED, CancelReceiptState.SEALED)
+      }
+    }
     // Phase 5: fire the waiter-entered seam synchronously after registration
     // (see the seam KDoc): awaiting tests then happens-before any later
     // close snapshot, so the snapshot necessarily contains this job.
@@ -1511,6 +1534,29 @@ class TurnController(
    * ([hasUnsettledCancelReceipts] still blocks [flushDurable]).
    */
   internal var onCancelReceiptWaiterEnteredForTest: (() -> Unit)? = null
+
+  /**
+   * R24-1 pre-dispatch seam: runs as the first instruction of the waiter
+   * coroutine body (non-suspending, null in production). Together with a
+   * held writer dispatcher it lets the pre-dispatch regression prove the
+   * body never started (seam cold) while the [invokeOnCompletion] fail-safe
+   * still converges the receipt — the existing
+   * [onCancelReceiptWaiterEnteredForTest] seam only proves
+   * launch+registration, never first execution.
+   */
+  internal var beforeCancelReceiptWaiterBodyForTest: (() -> Unit)? = null
+
+  /**
+   * R24-1 waiter-handle seam: returns the registered waiter [Job] for a
+   * cancel attempt (null when absent). Lets the pre-dispatch regression
+   * cancel the waiter deterministically while the writer dispatcher still
+   * holds it undispatched — the production-faithful equivalent of a parent
+   * teardown cancel landing before first dispatch (a child cancelled
+   * before start behaves identically whether cancelled directly or via its
+   * parent). Read-only; never completes or replaces the job.
+   */
+  internal fun cancelReceiptWaiterJobForTest(cancelId: String): Job? =
+    cancelReceiptWaiters[cancelId]
 
   /** Test seam for pausing a promotion after its peek-reserve, before the durable await. */
   internal var beforePromotionAwaitForTest: (() -> Unit)? = null

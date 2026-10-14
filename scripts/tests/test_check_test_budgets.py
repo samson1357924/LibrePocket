@@ -97,6 +97,68 @@ class CheckTestBudgetsTest(unittest.TestCase):
             set(), check_test_budgets._fixture_vars('val n = 100_000\n')
         )
 
+    def test_h1_typed_alias_fails(self) -> None:
+        # PR #87 Round2 P2-2: typed declaration.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "TypedTest.kt",
+                'val payload: String = "x".repeat(100_000)\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_size_variants_threshold(self) -> None:
+        # No-underscore, larger, and just-below-threshold sizes.
+        for name, size, expect_hit in (
+            ("NoUnderscoreTest.kt", "100000", True),
+            ("BiggerTest.kt", "150_000", True),
+            ("BelowTest.kt", "99_999", False),
+        ):
+            with self.subTest(size=size):
+                with tempfile.TemporaryDirectory() as d:
+                    p = _write(
+                        Path(d),
+                        name,
+                        f'val payload = "x".repeat({size})\n'
+                        "repeat(100) {\n"
+                        "    store.appendEvent(event(sid, payload))\n"
+                        "}\n",
+                    )
+                    v = check_test_budgets.check_file(p)
+                    if expect_hit:
+                        self.assertTrue(any("H1" in x for x in v), v)
+                    else:
+                        self.assertEqual([], v)
+
+    def test_h1_same_line_fast_plus_real_fails(self) -> None:
+        # Per-call exemption: the fast-path call is stripped, the true-path
+        # write on the same line is still examined (string-aware paren skip:
+        # the ")" inside "a)b" must not end the stripped segment early).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SameLineTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "repeat(100) { store.appendPreRedactedForBudgetTest(event(sid, \"a)b\")); "
+                "store.appendEvent(event(sid, payload)) }\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_same_line_fast_only_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "FastOnlyTest.kt",
+                'val huge = "x".repeat(100_000)\n'
+                "repeat(11) { store.appendPreRedactedForBudgetTest(event(sid, huge)) }\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
     def test_h1_single_huge_row_passes(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             p = _write(
@@ -115,6 +177,36 @@ class CheckTestBudgetsTest(unittest.TestCase):
             )
             v = check_test_budgets.check_file(p)
             self.assertTrue(any("H2" in x for x in v))
+
+    def test_h2_underscored_loop_count_normalized(self) -> None:
+        # `repeat(2_000)` must read as 2000, not 2.
+        with tempfile.TemporaryDirectory() as d:
+            bad = _write(
+                Path(d),
+                "Under2kTest.kt",
+                'repeat(2_000) { store.appendEvent(event(sid, "q")) }\n',
+            )
+            v = check_test_budgets.check_file(bad)
+            self.assertTrue(any("H2" in x for x in v), v)
+            ok = _write(
+                Path(d),
+                "UnderSmallTest.kt",
+                'repeat(1_0) { store.appendEvent(event(sid, "q")) }\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(ok))
+
+    def test_h1_underscored_loop_count_triggers_huge_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "UnderHugeTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "repeat(1_1) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
 
     def test_h2_repeat_1000_passes(self) -> None:
         with tempfile.TemporaryDirectory() as d:

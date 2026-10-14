@@ -6,17 +6,21 @@ unredacted writes; it only rejects / alerts.
 Rules (test sources only, no prod change):
 - H1 (huge-string via true shaping, heuristic tripwire): a `repeat(N>=10)`
   loop must NOT contain a true-path `.appendEvent(` write referencing a huge
-  fixture — either a literal hint on the write line (`100_000` / `100_001` /
-  `huge` / `big`) or a file-level `val`/`var <name> = ... .repeat(100_00x)`
-  variable used by the write — within its 12-line window. Huge homogeneous
-  strings through the true `redact` shaping are O(n^2) pre-Redactor-fix and
+  fixture — either an inline/literal hint on the write line (`100_000`-class
+  `.repeat(N>=100000)` constructors with underscores normalized, or the
+  legacy `huge`/`big` names) or a file-level `val`/`var <name>[: Type] =
+  ... .repeat(N>=100000)` variable used by the write — within its 12-line
+  window. The fast-path exemption is per-call (stripped call segments), so a
+  same-line true-path write is still examined. Huge homogeneous strings
+  through the true `redact` shaping are O(n^2) pre-Redactor-fix and
   amplified per row; PR tests must use the fast path
-  (`appendPreRedactedForBudgetTest`, skipped per-line) or slim the loop. The
+  (`appendPreRedactedForBudgetTest`) or slim the loop. The
   nightly-only full stress (`ChatSnapshotByteCapFullStressTest.kt`,
-  NIGHTLY_STRESS-gated) is allowlisted. Known gap (documented, not silent):
-  fixtures passed through helper parameters or built indirectly (no
-  `val/var = ... .repeat(100_00x)` shape) are not tracked — H1 is a tripwire,
-  not a coverage proof.
+  NIGHTLY_STRESS-gated) is allowlisted. Known gaps (documented, not silent):
+  fixtures passed through helper parameters, built indirectly, or sized via
+  constants (no `.repeat(N)` literal shape) are not tracked — H1 is a tripwire,
+  not a coverage proof; shadowed same-name variables in different methods are
+  treated as one name (flag-for-review direction).
 - H2 (unbounded row count, loop-local): a single `repeat(N>=2000)` loop must
   NOT contain a store write (`.appendEvent(` or the pre-redacted fast path)
   inside its actual brace-delimited body (single-line loops close on their own
@@ -42,7 +46,15 @@ import sys
 # Kotlin `repeat(N)` loop only — must NOT match `"x".repeat(100_000)"
 # (String.repeat fixture). Negative lookbehind excludes the `.repeat` shape;
 # `\w` excludes identifiers ending in repeat (none today, fail-closed).
-REPEAT_RE = re.compile(r"(?<![.\w])repeat\s*\(\s*(\d+)")
+# Underscored counts (`repeat(2_000)`) normalize to 2000.
+REPEAT_RE = re.compile(r"(?<![.\w])repeat\s*\(\s*(\d[\d_]*)")
+
+
+def _repeat_count(raw: str) -> int:
+    try:
+        return int(raw.replace("_", ""))
+    except ValueError:
+        return 0
 APPEND_EVENT_RE = re.compile(r"\.appendEvent\s*\(")
 FAST_PATH_RE = re.compile(r"appendPreRedactedForBudgetTest")
 HUGE_HINT_RE = re.compile(r"100_000|100_001|\bhuge\b|\bbig\b")
@@ -53,11 +65,15 @@ ALLOWLIST_HUGE_TRUE_PATH = {
     "ChatSnapshotByteCapFullStressTest.kt",
 }
 
-# `val payload = "x".repeat(100_000)` assigned anywhere in the file (String.repeat
-# fixture bound to a variable, even far above the loop that uses it).
+# `val payload = "x".repeat(100_000)` (optionally typed:
+# `val payload: String = ...`) assigned anywhere in the file, with the repeat
+# count normalized (underscores stripped) against HUGE_FIXTURE_MIN.
+HUGE_FIXTURE_MIN = 100_000
 FIXTURE_VAR_RE = re.compile(
-    r"(?:val|var)\s+(\w+)\s*=[^\n]*\.repeat\s*\(\s*100_00[01]"
+    r"(?:val|var)\s+(\w+)\s*(?::\s*[^=\n]+?)?=[^\n]*\.repeat\s*\(\s*([\d_]+)"
 )
+# Inline `"x".repeat(150_000)` fixture constructor (any size; thresholded).
+STRING_REPEAT_N_RE = re.compile(r"\.repeat\s*\(\s*([\d_]+)")
 
 HUGE_REPEAT_MIN = 10
 ROW_REPEAT_MAX = 2000
@@ -183,8 +199,75 @@ def _repeat_body_lines(
 
 
 def _fixture_vars(content: str) -> set[str]:
-    """Variable names bound to a 100k String.repeat fixture anywhere in the file."""
-    return {m.group(1) for m in FIXTURE_VAR_RE.finditer(content)}
+    """Variable names bound to a >=100k String.repeat fixture anywhere in the
+    file (typed or untyped declarations; `100000`/`100_000`/`150_000` all
+    normalize to the same threshold)."""
+    found: set[str] = set()
+    for m in FIXTURE_VAR_RE.finditer(content):
+        try:
+            size = int(m.group(2).replace("_", ""))
+        except ValueError:
+            continue
+        if size >= HUGE_FIXTURE_MIN:
+            found.add(m.group(1))
+    return found
+
+
+def _strip_fast_path_calls(line: str) -> str:
+    """Remove `appendPreRedactedForBudgetTest(...)` call segments (balanced
+    parens, string-aware) so a same-line true-path write is still examined."""
+    out: list[str] = []
+    i = 0
+    while True:
+        m = FAST_PATH_RE.search(line, i)
+        if not m:
+            out.append(line[i:])
+            break
+        out.append(line[i : m.start()])
+        j = line.find("(", m.end())
+        if j < 0:
+            break
+        depth = 0
+        k = j
+        in_str = False
+        in_char = False
+        while k < len(line):
+            c = line[k]
+            if in_str:
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == '"':
+                    in_str = False
+            elif in_char:
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == "'":
+                    in_char = False
+            elif c == '"':
+                in_str = True
+            elif c == "'":
+                in_char = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        i = k + 1 if k < len(line) else len(line)
+    return "".join(out)
+
+
+def _line_has_big_inline_fixture(line: str) -> bool:
+    for m in STRING_REPEAT_N_RE.finditer(line):
+        try:
+            if int(m.group(1).replace("_", "")) >= HUGE_FIXTURE_MIN:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _huge_loop_violation(lines: list[str], fixture_vars: set[str]) -> bool:
@@ -193,27 +276,26 @@ def _huge_loop_violation(lines: list[str], fixture_vars: set[str]) -> bool:
     ]
     for idx, line in enumerate(lines):
         m = REPEAT_RE.search(line)
-        if not m or int(m.group(1)) < HUGE_REPEAT_MIN:
+        if not m or _repeat_count(m.group(1)) < HUGE_REPEAT_MIN:
             continue
         window = lines[idx : idx + REPEAT_WINDOW_LINES]
         for follow in window:
-            if FAST_PATH_RE.search(follow):
-                continue
-            if APPEND_EVENT_RE.search(follow) and (
-                HUGE_HINT_RE.search(follow)
-                or any(v.search(follow) for v in var_res)
+            # Per-call (not per-line) fast-path exemption: strip the fast-path
+            # call segments, then examine what remains.
+            code = _strip_fast_path_calls(follow)
+            if APPEND_EVENT_RE.search(code) and (
+                HUGE_HINT_RE.search(code)
+                or _line_has_big_inline_fixture(code)
+                or any(v.search(code) for v in var_res)
             ):
                 return True
         # Fixture defined inside the loop then used by a later write:
         # `val huge = "x".repeat(100_000)` in-window plus a true-path write.
         # (Bare `== 100_000` length assertions do NOT count — only fixture
-        # creation via String.repeat.)
-        if any(
-            ".repeat" in w and ("100_000" in w or "100_001" in w) for w in window
-        ):
+        # creation via String.repeat, any size >= threshold.)
+        if any(_line_has_big_inline_fixture(w) for w in window):
             if any(
-                APPEND_EVENT_RE.search(w) and not FAST_PATH_RE.search(w)
-                for w in window
+                APPEND_EVENT_RE.search(_strip_fast_path_calls(w)) for w in window
             ):
                 return True
     return False
@@ -227,7 +309,7 @@ def _h2_loop_violation(
     long bodies are both handled)."""
     for idx, line in enumerate(lines):
         m = REPEAT_RE.search(line)
-        if not m or int(m.group(1)) < ROW_REPEAT_MAX:
+        if not m or _repeat_count(m.group(1)) < ROW_REPEAT_MAX:
             continue
         _, end = _repeat_body_lines(deltas, has_brace, idx)
         if any(

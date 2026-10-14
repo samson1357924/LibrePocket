@@ -5,7 +5,6 @@ import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ProviderProtocol
 import java.io.File
 import java.nio.file.Files
@@ -133,7 +132,7 @@ class ChatEndpointSessionRegressionTest {
         vault.putKey("shared-test-alias", "test-key-A-123".toCharArray())
         store.save(endpoint(endpointA))
 
-        val policy = InMemoryPolicyStore()
+        val policy = allowKeyReadPolicy()
         val sessions = ChatSessionFactory(
             policy = policy,
             vaultSource = VaultSource { vault },

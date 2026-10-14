@@ -71,7 +71,34 @@ object SetupValidation {
      */
     fun aliasFromRef(apiKeyRef: String): String = apiKeyRef.removePrefix("provider_key/")
 
-    fun validate(presetId: String, baseUrl: String, apiKey: String): String? {
+    fun validate(presetId: String, baseUrl: String, apiKey: String): String? =
+        validate(presetId, baseUrl, apiKey, KeyMode.NEW)
+
+    /**
+     * Key-material intent for the length gate (Phase A2, #17 P2).
+     *
+     * - [NEW]: any fresh key entry (first-run, rotation re-paste, and the
+     *   connectivity probes below, which need the key in memory). Blank and
+     *   short keys are both rejected.
+     * - [EDIT_KEEP_EXISTING]: editing an existing endpoint with the key field
+     *   left blank means "reuse the securely stored key" — the length gate is
+     *   skipped for a blank key ONLY. A non-blank short key is still rejected
+     *   in both modes.
+     *
+     * The ViewModel (not this pure function) owns the identity binding:
+     * EDIT_KEEP_EXISTING is offered only when the form identity (providerId +
+     * effectiveBaseUrl 全字串相等（嚴於 origin）) still matches the [prefillForEdit] baseline;
+     * any endpoint change falls back to NEW (fail closed, re-paste required).
+     * The connectivity probes ([SetupViewModel.testConnection]/
+     * [SetupViewModel.refreshModels]) always use NEW — they need the key
+     * material in memory and must never trigger a vault read here.
+     */
+    enum class KeyMode {
+        NEW,
+        EDIT_KEEP_EXISTING,
+    }
+
+    fun validate(presetId: String, baseUrl: String, apiKey: String, mode: KeyMode): String? {
         if (ProviderCatalog.preset(presetId) == null) return "SETUP_UNKNOWN_PRESET"
         val url = baseUrl.trim()
         if (url.isEmpty()) return "SETUP_BASE_URL_BLANK"
@@ -80,7 +107,15 @@ object SetupValidation {
         } catch (e: IllegalArgumentException) {
             return e.message ?: "PROVIDER_BAD_URL"
         }
-        if (apiKey.trim().length < 8) return "SETUP_KEY_TOO_SHORT"
+        val trimmed = apiKey.trim()
+        if (trimmed.isEmpty()) {
+            // Blank key reuses the stored key only under an explicit
+            // EDIT_KEEP_EXISTING intent (VM-gated to the unchanged endpoint);
+            // every other path still requires a pasted key.
+            if (mode == KeyMode.EDIT_KEEP_EXISTING) return null
+            return "SETUP_KEY_TOO_SHORT"
+        }
+        if (trimmed.length < 8) return "SETUP_KEY_TOO_SHORT"
         return null
     }
 }

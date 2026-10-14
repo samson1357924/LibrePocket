@@ -16,6 +16,5 @@ paths = [
 regexes = [
     '''sk-abcDEF1234567890''',
     '''sk-testSECRET1234567890''',
-    '''sk-abc123XYZ4567890''',
-    '''sk-live-device-roundtrip-0123456789'''
+    '''sk-abc123XYZ4567890'''
 ]

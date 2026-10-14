@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -76,6 +77,7 @@ import dev.librepocket.voice.shouldApplyUiEvent
 import dev.librepocket.voice.VoiceTts
 import dev.librepocket.voice.VoiceTtsConfirmState
 import dev.librepocket.voice.TtsConfirmDecision
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /** User-visible text for a chat notice code; unknown codes fall through raw. */
@@ -83,6 +85,7 @@ internal fun chatNoticeText(code: String): String =
     when (code) {
         "NO_ENDPOINT" -> "尚未設定端點，請先設定 API 金鑰。"
         "POLICY_DENIED" -> "政策拒絕讀取金鑰（key.read DENY），本次未發送任何請求。"
+        "KEY_READ_CONFIRM_REQUIRED" -> "需要本次確認才可讀取金鑰，本次未送出。"
         "CHAT_SEND_DENIED" -> "對話送出被政策拒絕（chat.send DENY），本次未發送任何請求。"
         "CHAT_APPROVAL_REQUIRED" -> "此操作需要明確核准；目前沒有互動核准流程，本次未送出，也未自動允許。"
         "CHAT_POLICY_UNAVAILABLE" -> "無法驗證對話權限，本次未送出，請稍後重試"
@@ -120,8 +123,11 @@ fun ChatScreen(
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val input by viewModel.input.collectAsStateWithLifecycle()
     val notice by viewModel.notice.collectAsStateWithLifecycle()
+    val keyReadConfirmSeq by viewModel.keyReadConfirmSequence.collectAsStateWithLifecycle()
     val pendingRecoveryCount by viewModel.pendingRecoveryCount.collectAsStateWithLifecycle()
     val currentSessionId by viewModel.currentSessionId.collectAsStateWithLifecycle()
+    // S2: pending history open retained across ConfirmRequired (explicit resume target).
+    val pendingOpenSid by viewModel.pendingOpenSessionId.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val streaming = session.status == ChatStatus.STREAMING
     var wasActive by remember { mutableStateOf(false) }
@@ -140,6 +146,65 @@ fun ChatScreen(
     // 兼 TTS 引擎回呼的主線程投遞（見 speaker 接線）。
     val ttsConfirm = remember { VoiceTtsConfirmState() }
     val confirmScope = rememberCoroutineScope()
+    // S7 key.read 確認對話框狀態（notice＋sequence 觸發，非自動彈窗擋路）。
+    // snapshot 為不可變 binding（peekKeyReadBinding，只讀，不含金鑰內容）＋
+    // P2 pending token（peekKeyReadConfirmToken，只讀，綁 binding＋generation＋
+    // sequence＋opId/openSessionId）；confirming 為 mint 在途（按鈕 disable 防 double-tap）；
+    // confirmResult null=待確認、true=已確認（有 pending open 顯示開啟歷史，
+    // 無則請再按發送）、false=已失效；
+    // dialogHidden 為本次 notice 的本地關閉（VM notice 在下次送出前保持，
+    // 故需本地隱藏；notice 離開 KEY_READ_CONFIRM_REQUIRED 即重置）。
+    // sequence 門：每次 deny sequence 單調遞增（VM 永不重置），故
+    // ConfirmRequired→null→ConfirmRequired 中間 null 被 StateFlow
+    // conflation 吃掉時仍以 seq 變化重置並重 peek；同 seq 內 effect 不重跑，
+    // confirm 進度不受影響。
+    // S2 resuming：顯式 resume 在途（按鈕 disable 防 double-tap；成功後
+    // notice 離開 KEY 即重置，失敗 bump seq 即重置重 peek）。
+    var keyReadBinding by remember { mutableStateOf<EndpointSessionBinding?>(null) }
+    var keyReadToken by remember { mutableStateOf<PendingKeyReadConfirm?>(null) }
+    var keyReadBindingReady by remember { mutableStateOf(false) }
+    var keyReadConfirming by remember { mutableStateOf(false) }
+    var keyReadConfirmResult by remember { mutableStateOf<Boolean?>(null) }
+    var keyReadDialogHidden by remember { mutableStateOf(false) }
+    var keyReadResuming by remember { mutableStateOf(false) }
+    val keyReadScope = rememberCoroutineScope()
+    LaunchedEffect(notice, keyReadConfirmSeq) {
+        if (notice != "KEY_READ_CONFIRM_REQUIRED") {
+            keyReadBinding = null
+            keyReadToken = null
+            keyReadBindingReady = false
+            keyReadConfirming = false
+            keyReadConfirmResult = null
+            keyReadDialogHidden = false
+            keyReadResuming = false
+        } else {
+            // 新 deny（seq 變化或 notice 新進 KEY）：無條件重置本地狀態後重 peek。
+            keyReadBinding = null
+            keyReadToken = null
+            keyReadBindingReady = false
+            keyReadConfirming = false
+            keyReadConfirmResult = null
+            keyReadDialogHidden = false
+            keyReadResuming = false
+            keyReadBinding = try {
+                viewModel.peekKeyReadBinding()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+            // P2: token 與 snapshot 同 emission 捕獲；任一為 null 即 fail-closed
+            //（confirm 攜 null token 必 false，顯示已失效）。
+            keyReadToken = try {
+                viewModel.peekKeyReadConfirmToken()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+            keyReadBindingReady = true
+        }
+    }
     // #2 朗讀確認中待朗讀（null 即無待確認朗讀；單一待確認位，後按覆蓋前按）。
     // P2 身分防線：純文字無法區分同文不同訊息亦無 session 身分，改攜 messageId＋
     // sessionId＋單調 token（見 PendingSpeak）；確認協程 capture 後 token＋世代＋
@@ -421,6 +486,33 @@ fun ChatScreen(
             )
         }
 
+        // S2: pending history open 的顯式 resume 入口（對話框隱藏後仍可開啟；
+        // 不自動 send；成功後 notice 離開 KEY 即消失）。
+        if (notice == "KEY_READ_CONFIRM_REQUIRED" && pendingOpenSid != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "歷史會話待開啟",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f),
+                )
+                Button(
+                    onClick = {
+                        if (keyReadResuming) return@Button
+                        keyReadResuming = true
+                        pendingOpenSid?.let { viewModel.resumePendingOpen(it) }
+                    },
+                    enabled = !keyReadResuming,
+                ) { Text(if (keyReadResuming) "開啟中…" else "開啟歷史") }
+            }
+        }
+
         // Q3: outbox recovery entry. Restoring fills a blank box only and
         // never sends; both actions cost zero provider calls.
         if (pendingRecoveryCount > 0) {
@@ -608,6 +700,182 @@ fun ChatScreen(
             }
         }
     }
+
+    // S7 key.read 確認對話框：notice 觸發（非自動彈窗擋路），內容為不可變
+    // binding 快照（唯讀，不含金鑰內容）＋ P2 pending token。確認僅 mint 一次性同意，不 auto-send；
+    // 拒絕/取消僅丟棄未消耗的同意＋token，不發送。
+    // S2: 有 pending open 時確認後顯示「已確認，開啟歷史」並提供顯式 resume
+    //（不自動 send、不自動 resume）。
+    if (notice == "KEY_READ_CONFIRM_REQUIRED" && !keyReadDialogHidden) {
+        KeyReadConfirmDialog(
+            binding = keyReadBinding,
+            loading = !keyReadBindingReady,
+            confirming = keyReadConfirming,
+            confirmResult = keyReadConfirmResult,
+            pendingOpenSessionId = pendingOpenSid,
+            resuming = keyReadResuming,
+            onConfirm = {
+                if (keyReadConfirming || keyReadConfirmResult != null) return@KeyReadConfirmDialog
+                // S3+P2: capture seq+binding+token at initiation; the mint runs
+                // against the displayed snapshot + pending token (null ⇒
+                // fail-closed false). Mint 前先驗新鮮由 VM 執行（三者全等才
+                // mint）；mint 後的 stale completion 丟棄維持（雙保險）。
+                val capturedSeq = viewModel.keyReadConfirmSequence.value
+                val capturedBinding = keyReadBinding
+                val capturedToken = keyReadToken
+                keyReadConfirming = true
+                keyReadScope.launch {
+                    val ok = try {
+                        viewModel.confirmKeyRead(capturedBinding, capturedToken)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        false
+                    }
+                    // S3: stale completion must not overwrite a newer dialog
+                    // generation. A sequence advance (new deny or replacement
+                    // retention re-peek) or a notice departure (explicit
+                    // discard/logout) — which together proxy every generation
+                    // advance that matters — discards this in-flight result:
+                    // neither confirming nor result is written.
+                    if (capturedSeq != viewModel.keyReadConfirmSequence.value) return@launch
+                    if (viewModel.notice.value != "KEY_READ_CONFIRM_REQUIRED") return@launch
+                    keyReadConfirming = false
+                    // 有 pending open 顯示開啟歷史，無則顯示再按發送；
+                    // 皆不 auto-send（S2 resume 需顯式按「開啟歷史」）。
+                    keyReadConfirmResult = ok
+                }
+            },
+            onResumeOpen = {
+                if (keyReadResuming) return@KeyReadConfirmDialog
+                // S3: resume is a synchronous launch with no async completion
+                // write; the resuming flag set below belongs to the current
+                // dialog generation — LaunchedEffect(notice, seq) already resets
+                // it on any newer deny/retention, so a stale resume never
+                // leaves the new dialog stuck in "開啟中…".
+                keyReadResuming = true
+                pendingOpenSid?.let { viewModel.resumePendingOpen(it) }
+            },
+            onReject = {
+                if (keyReadConfirming) return@KeyReadConfirmDialog
+                // S3: only the current dialog generation may dismiss/hide. A
+                // click racing a just-bumped sequence (recomposition pending)
+                // must not burn-or-hide the new dialog's state. Dual gate with
+                // onConfirm: seq alone does not proxy notice departure —
+                // invalidateLifecycle clears the notice WITHOUT bumping seq —
+                // so a stale click racing logout/newChat/open must also fail
+                // on the notice check.
+                if (viewModel.keyReadConfirmSequence.value != keyReadConfirmSeq) return@KeyReadConfirmDialog
+                if (viewModel.notice.value != "KEY_READ_CONFIRM_REQUIRED") return@KeyReadConfirmDialog
+                if (keyReadConfirmResult != true) viewModel.dismissKeyReadConfirm()
+                keyReadDialogHidden = true
+            },
+            onCancel = {
+                if (keyReadConfirming) return@KeyReadConfirmDialog
+                // S3: same dual gate as onReject above.
+                if (viewModel.keyReadConfirmSequence.value != keyReadConfirmSeq) return@KeyReadConfirmDialog
+                if (viewModel.notice.value != "KEY_READ_CONFIRM_REQUIRED") return@KeyReadConfirmDialog
+                if (keyReadConfirmResult != true) viewModel.dismissKeyReadConfirm()
+                keyReadDialogHidden = true
+            },
+            onClose = {
+                if (keyReadConfirming) return@KeyReadConfirmDialog
+                // S3: same dual gate as onReject above.
+                if (viewModel.keyReadConfirmSequence.value != keyReadConfirmSeq) return@KeyReadConfirmDialog
+                if (viewModel.notice.value != "KEY_READ_CONFIRM_REQUIRED") return@KeyReadConfirmDialog
+                if (keyReadConfirmResult != true) viewModel.dismissKeyReadConfirm()
+                keyReadDialogHidden = true
+            },
+        )
+    }
+}
+
+@Composable
+internal fun KeyReadConfirmDialog(
+    binding: EndpointSessionBinding?,
+    loading: Boolean,
+    confirming: Boolean,
+    confirmResult: Boolean?,
+    onConfirm: () -> Unit,
+    onReject: () -> Unit,
+    onCancel: () -> Unit,
+    onClose: () -> Unit,
+    pendingOpenSessionId: String? = null,
+    resuming: Boolean = false,
+    onResumeOpen: () -> Unit = {},
+) {
+    // S7：key.read ASK 的一次性確認。快照欄位皆為連線身份（唯讀），不含金鑰內容。
+    // confirmResult true=已確認（有 pending open 顯示開啟歷史，無則請再按發送）、
+    // false=已失效；loading/confirming/resuming 期間按鈕 disable 防 double-tap；
+    // binding null（peek 失敗／世代過期）顯示已失效。
+    val hasPendingOpen = pendingOpenSessionId != null
+    AlertDialog(
+        onDismissRequest = {
+            if (confirmResult != null) onClose() else onCancel()
+        },
+        title = { Text("讀取金鑰確認") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                when {
+                    confirmResult == true && hasPendingOpen -> {
+                        Text("已確認，開啟歷史。")
+                        if (resuming) {
+                            Text("開啟中…")
+                        }
+                    }
+                    confirmResult == true -> {
+                        Text("已確認，請再按發送。")
+                    }
+                    confirmResult == false -> {
+                        Text("已失效，請重新送出。")
+                    }
+                    loading -> {
+                        Text("讀取連線資訊中…")
+                    }
+                    binding == null -> {
+                        Text("已失效，請重新送出。")
+                    }
+                    else -> {
+                        Text("本次送出需要讀取金鑰，請確認以下連線資訊（唯讀，不含金鑰內容）。")
+                        Text("供應商：${binding.providerId}")
+                        Text("伺服器位址：${binding.effectiveBaseUrl}")
+                        Text("來源：${binding.origin}")
+                        Text("協定：${binding.protocol}")
+                        Text("金鑰別名：${binding.apiKeyRef}")
+                        Text("設定版本：${binding.configRevision}")
+                        Text("模型：${binding.model}")
+                        if (confirming) {
+                            Text("確認中…")
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (confirmResult == true && hasPendingOpen) {
+                TextButton(onClick = onResumeOpen, enabled = !confirming && !resuming) {
+                    Text(if (resuming) "開啟中…" else "開啟歷史")
+                }
+            } else if (confirmResult != null) {
+                TextButton(onClick = onClose, enabled = !confirming && !resuming) { Text("關閉") }
+            } else {
+                TextButton(
+                    onClick = onConfirm,
+                    enabled = !confirming && !loading && binding != null,
+                ) { Text("確認本次讀取") }
+            }
+        },
+        dismissButton = {
+            if (confirmResult == null) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onReject, enabled = !confirming) { Text("拒絕") }
+                    TextButton(onClick = onCancel, enabled = !confirming) { Text("取消") }
+                }
+            } else if (confirmResult == true && hasPendingOpen) {
+                TextButton(onClick = onClose, enabled = !confirming && !resuming) { Text("關閉") }
+            }
+        },
+    )
 }
 
 @Composable

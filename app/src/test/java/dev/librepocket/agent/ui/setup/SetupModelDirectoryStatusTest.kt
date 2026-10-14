@@ -207,6 +207,12 @@ class SetupModelDirectoryStatusTest {
             vm.selectPreset(dev.librepocket.preset.ProviderCatalog.ANTHROPIC_ID)
             vm.onApiKeyChange("synthetic-anthropic-key")
             vm.onModelChange("user/new-free-text")
+            // S4-C: switch + different paste never auto-rebinds — first refresh
+            // mints the explicit dialog (zero fetch), confirm, then refresh again.
+            vm.refreshModels()
+            assertTrue(vm.form.value.confirmRebind)
+            vm.confirmRebind()
+            assertFalse(vm.form.value.confirmRebind)
             vm.refreshModels()
             withTimeout(3_000) { secondStarted.await() }
             secondBody.complete(DIRECTORY_ANTHROPIC)
@@ -537,6 +543,11 @@ class SetupModelDirectoryStatusTest {
             vm.selectPreset(dev.librepocket.preset.ProviderCatalog.ANTHROPIC_ID)
             vm.onApiKeyChange("synthetic-anthropic-key")
             vm.onModelChange("user/new-free-text")
+            // S4-C: same explicit-rebind step as above.
+            vm.refreshModels()
+            assertTrue(vm.form.value.confirmRebind)
+            vm.confirmRebind()
+            assertFalse(vm.form.value.confirmRebind)
             vm.refreshModels()
             withTimeout(3_000) { secondStarted.await() }
 

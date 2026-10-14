@@ -1,6 +1,6 @@
 # LibrePocket 能力與接線狀態
 
-> **Current snapshot**：依 `d5a98bd35e919083b0475027c9b2e74b703e4e58`（2026-10-13 提交，2026-10-14 核對）。本文件不把規格列出的能力當成已可用功能。
+> **Current snapshot**：依 `6658e63086ea5b1af25ffe5bca4aaf28d6cee78e`（2026-10-15 提交，2026-10-15 核對）。本文件不把規格列出的能力當成已可用功能。
 >
 > - **範圍：** built-in tools、provider adapters、三個 flavor 的 source/manifest 邊界。
 > - **Owner role：** app/runtime 維護者；未指派個人。
@@ -29,6 +29,8 @@
 | Backup | manifest 設 `allowBackup=true`；XML rules 排除 key-specific paths | transcript、preferences、audit 都不會進入 Android backup |
 | ScopedFileStore | 根鏈+段鏈 NOFOLLOW 全驗（declared/implemented，未 wired）；單線程毒根/段內連結確定性拒絕 | 已消除併發 symlink escapes；JSONL 是 canonical store；有裝置實證 |
 | Direct shell executable | `ShellExecutables.resolve`＋`RestrictedShell` 有實作，正/負向 JVM 測試存在 | 已在指定裝置/API 實跑驗證（含 toybox/APEX、`isWritable` 真實語義）或可上線啟用 |
+| Setup key.write／probe 門 | staged 寫入＋metadata CAS、ASK one-shot 確認（含 STAGED／KEEP_EXISTING 身份列）、probe 的 provider.call 新鮮閘、KEEP_EXISTING metadata-only（存在性 hasKey 前提，零 put/get/delete）；JVM 單測存在 | 裝置端到端外洩證明；policy 後端本身的可用性保證；自訂端點在政策層的細粒度區分（共用同一 resource，見威脅模型） |
+| Chat key.read 門 | T0 新鮮評估＋綁定式 one-shot 確認、T1 capture 邊界重驗（ALLOW→ASK 翻轉拒絕、拒絕丟棄殘留槽位；T1→`vault()`→`getKey` 含 suspend／IO 的殘留窗口：`DENY` 翻轉後續無門捕捉，binding／generation 翻轉擋 attach 但擋不住已發生的 vault 讀，僅 close 抹除）；JVM 單測存在 | 重驗與 vault 讀之間的殘留窗口已消除；裝置端到端證明（已知殘留：含 suspend／IO，dispatcher hop＋Keystore/disk IO，未持有門控跨越；僅 JVM 單測） |
 | 語音 UI 手勢直連 | `ChatScreen` 直連系統引擎：使用者逐次手勢 + DataStore 持久化同名開關（`voice_input`/`voice_output`，設定頁可切、關閉隱藏入口）；朗讀首次內聯確認（只問一次）；引擎失敗經分離的 `sttError`／`ttsError` 可觀察（`NO_ENGINE` 無引擎 fail-closed；`LANG_UNAVAILABLE` 缺語料僅降級提醒非失敗；`LISTENER_FAILED` 掛載失敗僅警告）；引擎資料處理已揭露 | 直連等同政策授權；模型可經工具鏈執行語音（模型側 `executionReady=false` 維持未啟用） |
 
 `foss` 和 `github` 在某些 source/service 形狀上相似，不代表依賴、bridge 或能力相同。Flavor distribution/source-of-truth 見 [README](../README.md)、[Architecture](ARCHITECTURE.md) 與 [Threat Model](THREAT_MODEL.md)。

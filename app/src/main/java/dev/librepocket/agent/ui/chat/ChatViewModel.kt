@@ -1,5 +1,6 @@
 package dev.librepocket.agent.ui.chat
 
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.librepocket.agent.ui.setup.EndpointConfig
@@ -12,6 +13,7 @@ import dev.librepocket.chat.ApprovalRequiredException
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
+import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.policy.Verdict
 import dev.librepocket.session.SessionStore
 import dev.librepocket.session.TranscriptEvent
@@ -48,6 +50,49 @@ private const val HISTORY_CAP = 2000
 // unbounded I/O and hold unbounded memory on open. Stop at the bound and
 // build messages from what was scanned.
 private const val HISTORY_SCAN_CAP = HISTORY_CAP * 4
+
+/**
+ * One-shot key.read consent for an ASK verdict, mirroring the key.write
+ * consent in SetupViewModel (SetupViewModel KeyWriteConsent).
+ *
+ * In-memory only: never persisted, carries no key material (connection
+ * identity snapshot only). Bound to the immutable endpoint binding
+ * observed at mint time ([confirmKeyRead]): action + providerId /
+ * effectiveBaseUrl / origin / protocol / apiKeyRef / configRevision /
+ * model + the lifecycle [generation] observed at mint start. Consumed
+ * (nulled) on the first authorization that takes it, so it can never be
+ * replayed or reused. Any endpoint-identity difference fails the match and
+ * denies closed; a generation difference fails closed as well (data-inner
+ * fence against ABA: A→B→A returns to the same binding but a newer
+ * generation, so the stale consent must not pass on binding equality
+ * alone).
+ */
+private data class KeyReadConsent(
+    val action: String,
+    val providerId: String,
+    val effectiveBaseUrl: String,
+    val origin: String,
+    val protocol: ProviderProtocol,
+    val apiKeyRef: String,
+    val configRevision: Long,
+    val model: String,
+    val generation: Long,
+)
+
+/**
+ * P2 待確認 token：拒絕時與 [emitKeyReadConfirmRequired] 同 emission 產生，
+ * sequence 單調遞增永不重置沿用。綁定原待確認請求的不可變快照
+ * （binding＋generation＋confirmSequence＋opId/openSessionId），供
+ * [confirmKeyRead] 三者全等驗證（仍為原請求、generation/seq 未變、
+ * binding 全欄相等）才 mint。In-memory only，零 key material。
+ */
+data class PendingKeyReadConfirm(
+    val binding: EndpointSessionBinding,
+    val generation: Long,
+    val confirmSequence: Long,
+    val opId: Long?,
+    val openSessionId: String?,
+)
 
 /**
  * Chat UI state holder wired to the real [ChatSession] plus the transcript store.
@@ -87,6 +132,14 @@ class ChatViewModel(
     // calls; the box is only ever filled when blank, never auto-sent.
     private val _pendingRecoveryCount = MutableStateFlow(0)
     val pendingRecoveryCount: StateFlow<Int> = _pendingRecoveryCount.asStateFlow()
+
+    // S7：key.read 確認序列：每次 ConfirmRequired deny 單調遞增，永不重置
+    //（含 newChat/open/logout/endpoint 變更亦不重置）。ChatScreen 以
+    // (notice, sequence) 為 LaunchedEffect key，使 ConfirmRequired→null→
+    // ConfirmRequired 中間 null 被 StateFlow conflation 吃掉時仍能重置本地
+    // dialog 狀態並重 peek；同 sequence 內 confirm 進度不受影響。
+    private val _keyReadConfirmSequence = MutableStateFlow(0L)
+    val keyReadConfirmSequence: StateFlow<Long> = _keyReadConfirmSequence.asStateFlow()
 
     /** Restore the oldest recoverable text into a blank box. Never overwrites, never sends. */
     fun restoreNextRecovered(): Boolean {
@@ -151,6 +204,38 @@ class ChatViewModel(
     private var currentSessionGeneration: Long? = null
     private var sessionCollectJob: Job? = null
     private var openJob: Job? = null
+    // One-shot key.read consent (ASK path). Minted by [confirmKeyRead] from a
+    // suspending context and taken by [authorizeEndpoint] on Main, so all
+    // access goes through [keyReadConsentLock] (same shape as the key.write
+    // consentLock in SetupViewModel). Never persisted, never leaves this VM.
+    private val keyReadConsentLock = Any()
+    private var pendingKeyReadConsent: KeyReadConsent? = null
+    // P2: pending key.read confirm token (see PendingKeyReadConfirm). Created
+    // with emitKeyReadConfirmRequired in the same emission (sequence +1);
+    // burned together with the consent under keyReadConsentLock on
+    // invalidateLifecycle(clearChat)/invalidateForEndpointChange(null)/
+    // openSession new round/logout, discarded by dismissKeyReadConfirm.
+    // A successful mint burns it in the same lock (single-use); a stale tap
+    // with no pending/mismatched token fails closed with zero vault reads.
+    private var pendingKeyReadConfirm: PendingKeyReadConfirm? = null
+    // S2: pending history open retained across a key.read ConfirmRequired.
+    // Set only by openSession's ConfirmRequired branch (sessionId + endpoint
+    // snapshot + generation at that time); consumed once by an explicit
+    // resumePendingOpen without a second invalidate, so the just-minted
+    // consent is not burned. Never auto-resumed, never auto-sent. Cleared
+    // on successful attach, explicit discard (newChat/open/logout) and
+    // terminal open failures; kept across endpoint replacement/dismiss so a
+    // stale resume still fails closed with a fresh ConfirmRequired (re-armed
+    // to the current binding/generation). Main-confined like the consent
+    // slot; binding equality covers all EndpointSessionBinding fields.
+    private data class PendingOpen(
+        val sessionId: String,
+        val binding: EndpointSessionBinding,
+        val generation: Long,
+    )
+    private var pendingOpen: PendingOpen? = null
+    private val _pendingOpenSessionId = MutableStateFlow<String?>(null)
+    val pendingOpenSessionId: StateFlow<String?> = _pendingOpenSessionId.asStateFlow()
     // R2: unsent texts are owned per send/steer operation, never by a single
     // global String. Cleared only when the controller accepts that exact op
     // (startOrEnqueue Started/Queued verdict); pre-accept endpoint
@@ -261,6 +346,264 @@ class ChatViewModel(
         setInput(text)
     }
 
+    /**
+     * Mint a one-shot key.read confirmation bound to the currently persisted
+     * endpoint binding (providerId / effectiveBaseUrl / origin / protocol /
+     * apiKeyRef / configRevision / model) plus the mint-start generation.
+     *
+     * P2 token gate: the caller must also present the pending token captured
+     * with the displayed snapshot ([peekKeyReadConfirmToken] at dialog
+     * initiation). The mint proceeds only when all three hold: still the
+     * original pending request (token == current pending), generation/seq
+     * unchanged (pending.generation == lifecycleGeneration and
+     * pending.confirmSequence == current sequence), and binding full-field
+     * equality (expected == pending.binding == freshly re-read binding).
+     * Any mismatch returns false with no mint and zero vault reads. No
+     * pending / dismissed / newChat / open / logout stale tap passes.
+     *
+     * The next [authorizeEndpoint] that observes an ASK verdict consumes it:
+     * a binding match allows that single read, any mismatch denies closed.
+     * DENY always wins and burns the consent; a policy evaluation failure
+     * burns it too and denies closed. A successful mint burns the pending
+     * token in the same lock (single-use: the same token never mints twice,
+     * even before the consent is consumed). Returns false when no usable endpoint
+     * is persisted (no consent minted). A later mint overwrites an
+     * unconsumed one; an endpoint replacement keeps the slot (the binding
+     * match still rejects the stale snapshot), only a null endpoint
+     * (logout) or clearChat (newChat/open) discards it (together with the
+     * pending token under the same lock).
+     *
+     * S6 locking: the final mint (pending recheck + generation recheck +
+     * slot assign) shares [keyReadConsentLock] with the bump+burn in
+     * [invalidateForEndpointChange] / [invalidateLifecycle], so a racing
+     * invalidation cannot be overwritten by a stale mint (the mint aborts)
+     * nor leave a stale consent behind (the burn clears under the same lock).
+     *
+     * S7: production caller is the ChatScreen key.read confirm dialog, which
+     * shows the immutable snapshot from [peekKeyReadBinding] plus the token
+     * from [peekKeyReadConfirmToken] and mints via
+     * [confirmKeyRead(expected, token)][confirmKeyRead]. Minting never
+     * auto-sends: the denied text is already restored to the input box, and
+     * the user must explicitly send again to consume the consent.
+     *
+     * S3: production must call [confirmKeyRead(expected, token)][confirmKeyRead]
+     * with the displayed snapshot + captured token. The mint fences on
+     * full-field equality against the freshly re-read binding: any mismatch
+     * fails closed with no mint and no burn (see below). The no-arg
+     * confirmKeyReadForTest below is test-only (@VisibleForTesting internal).
+     */
+    suspend fun confirmKeyRead(
+        expected: EndpointSessionBinding?,
+        token: PendingKeyReadConfirm?,
+    ): Boolean {
+        // P2 + S3: null snapshot/token (peek failure/expired/no pending) never mints.
+        if (expected == null || token == null) return false
+        // P2 fail-fast before any IO (zero vault reads on stale tap): the
+        // presented token must still be the current pending, with current
+        // generation/sequence and matching binding.
+        val pendingSnapshot = synchronized(keyReadConsentLock) { pendingKeyReadConfirm }
+        if (pendingSnapshot == null) return false
+        if (pendingSnapshot != token) return false
+        if (pendingSnapshot.confirmSequence != _keyReadConfirmSequence.value) return false
+        if (pendingSnapshot.generation != lifecycleGeneration) return false
+        if (expected != pendingSnapshot.binding) return false
+        val startedGeneration = lifecycleGeneration
+        if (startedGeneration != token.generation) return false
+        val endpoint = try {
+            readEndpoint()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return false
+        } ?: return false
+        if (!isGenerationCurrent(startedGeneration)) return false
+        val binding = bindingOf(endpoint) ?: return false
+        if (!isGenerationCurrent(startedGeneration)) return false
+        // S3 snapshot fence: the displayed snapshot must equal the mint-time
+        // binding on every field (data-class equality covers providerId /
+        // effectiveBaseUrl / origin / protocol / apiKeyRef / configRevision /
+        // model). A mismatch (peek A, endpoint now B) fails closed: no mint.
+        // Deliberately no burn here: the mismatch is a display-stale no-op,
+        // and the slot (if any) belongs to another generation/binding whose
+        // own match still rejects it. Burning on a stale click would conflate
+        // it with an explicit dismiss and could destroy a just-minted valid
+        // consent racing the click.
+        if (binding != expected) return false
+        return mintKeyReadConsentWithToken(startedGeneration, binding, token)
+    }
+
+    /**
+     * Test-only mint without a snapshot fence (no displayed binding to check).
+     * Production (ChatScreen dialog) must use [confirmKeyRead(expected, token)][confirmKeyRead]
+     * so a stale dialog snapshot can never mint for a replaced endpoint.
+     * Renamed + internal (cf. VoiceSpeaker preEmitHook/postCheckHook
+     * @VisibleForTesting internal convention) so a production call site cannot
+     * accidentally use the unfenced overload: only confirmKeyRead(expected, token)
+     * is public.
+     */
+    @VisibleForTesting
+    internal suspend fun confirmKeyReadForTest(): Boolean {
+        // Capture identity before the IO read: an invalidation clearing or
+        // replacing the endpoint during the read (newChat/open/logout) must
+        // stop this mint. Returning false keeps the consent absent.
+        val startedGeneration = lifecycleGeneration
+        val endpoint = try {
+            readEndpoint()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return false
+        } ?: return false
+        if (!isGenerationCurrent(startedGeneration)) return false
+        val binding = bindingOf(endpoint) ?: return false
+        if (!isGenerationCurrent(startedGeneration)) return false
+        return mintKeyReadConsent(startedGeneration, binding)
+    }
+
+    /** Final mint for the test-only unfenced path (generation recheck + slot assign under lock). */
+    private fun mintKeyReadConsent(startedGeneration: Long, binding: EndpointSessionBinding): Boolean {
+        val consent = KeyReadConsent(
+            action = "key.read",
+            providerId = binding.providerId,
+            effectiveBaseUrl = binding.effectiveBaseUrl,
+            origin = binding.origin,
+            protocol = binding.protocol,
+            apiKeyRef = binding.apiKeyRef,
+            configRevision = binding.configRevision,
+            model = binding.model,
+            generation = startedGeneration,
+        )
+        synchronized(keyReadConsentLock) {
+            if (!isGenerationCurrent(startedGeneration)) return false
+            pendingKeyReadConsent = consent
+        }
+        return true
+    }
+
+    /**
+     * P2 final mint with token recheck (pending + generation + seq + binding
+     * equality under the same lock as bump+burn). A racing invalidation
+     * (bump+burn) or newer deny (pending overwrite + seq bump) aborts the
+     * stale mint; a successful mint burns the pending token in the same lock
+     * (single-use: the same token can never mint twice — a replay with the
+     * same token after mint or after T0 consume fails closed with zero vault
+     * reads). Only a still-pending deny can mint; a mismatch still burns
+     * nothing (see confirmKeyRead), and invalidate/dismiss/logout burn both
+     * slots.
+     */
+    private fun mintKeyReadConsentWithToken(
+        startedGeneration: Long,
+        binding: EndpointSessionBinding,
+        token: PendingKeyReadConfirm,
+    ): Boolean {
+        val consent = KeyReadConsent(
+            action = "key.read",
+            providerId = binding.providerId,
+            effectiveBaseUrl = binding.effectiveBaseUrl,
+            origin = binding.origin,
+            protocol = binding.protocol,
+            apiKeyRef = binding.apiKeyRef,
+            configRevision = binding.configRevision,
+            model = binding.model,
+            generation = startedGeneration,
+        )
+        synchronized(keyReadConsentLock) {
+            val currentPending = pendingKeyReadConfirm ?: return false
+            if (currentPending != token) return false
+            if (currentPending.confirmSequence != _keyReadConfirmSequence.value) return false
+            if (currentPending.generation != lifecycleGeneration) return false
+            if (!isGenerationCurrent(startedGeneration)) return false
+            if (startedGeneration != currentPending.generation) return false
+            if (binding != currentPending.binding) return false
+            pendingKeyReadConsent = consent
+            // Single-use: burn the token in the same critical section so a
+            // replay with this token (after mint, or after T0 consumes the
+            // consent) fails closed on the null-pending check above.
+            pendingKeyReadConfirm = null
+        }
+        return true
+    }
+
+    /**
+     * Abandon an unconsumed key.read confirmation and its pending token, if
+     * any. Single critical section: consent + token clear atomically, so an
+     * in-flight confirm parked in readEndpoint cannot slip a mint between a
+     * split take and token clear and leave a reusable consent behind.
+     */
+    fun dismissKeyReadConfirm() {
+        synchronized(keyReadConsentLock) {
+            pendingKeyReadConsent = null
+            pendingKeyReadConfirm = null
+        }
+    }
+
+    /**
+     * S7 read-only snapshot for the key.read confirm dialog.
+     *
+     * Reads the persisted endpoint and maps it to the immutable
+     * [EndpointSessionBinding] shown in the dialog (providerId /
+     * effectiveBaseUrl / origin / protocol / apiKeyRef / configRevision /
+     * model). Mints no consent, touches no consent slot, and is generation
+     * insensitive: a newer generation does not invalidate the returned
+     * snapshot (the later [confirmKeyRead] mint still fences on the current
+     * generation and fails closed when stale). Any read/mapping failure
+     * returns null (fail-closed: the dialog shows expired instead of a
+     * partial snapshot). Never carries key material.
+     */
+    suspend fun peekKeyReadBinding(): EndpointSessionBinding? {
+        return try {
+            val endpoint = readEndpoint()
+            bindingOf(endpoint)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * P2 read-only pending token for the key.read confirm dialog.
+     *
+     * Returns the current [PendingKeyReadConfirm] created with the latest
+     * [emitKeyReadConfirmRequired] emission, or null when there is no
+     * pending request (never denied / already burned by newChat/open/logout/
+     * replacement-dismiss / consumed-then-rearmed). Mints nothing, touches
+     * no slot. The dialog must capture this together with the binding
+     * snapshot and present both to [confirmKeyRead]; a stale tap with a
+     * mismatched or nulled token fails closed with zero vault reads.
+     */
+    fun peekKeyReadConfirmToken(): PendingKeyReadConfirm? =
+        synchronized(keyReadConsentLock) { pendingKeyReadConfirm }
+
+    /** Consume-once take: the returned consent (if any) can never be used again. */
+    private fun takePendingKeyReadConsent(): KeyReadConsent? =
+        synchronized(keyReadConsentLock) {
+            val consent = pendingKeyReadConsent
+            pendingKeyReadConsent = null
+            consent
+        }
+
+    private fun keyReadConsentMatches(
+        consent: KeyReadConsent,
+        binding: EndpointSessionBinding,
+        authorizedGeneration: Long,
+    ): Boolean {
+        if (consent.action != "key.read") return false
+        // S6 data-inner fence: the mint-start generation must equal the
+        // authorizing operation's generation. Timing checks alone
+        // (isGenerationCurrent before/after the policy suspension) cannot
+        // reject an ABA replay where the binding returns to an identical
+        // snapshot on a newer generation.
+        if (consent.generation != authorizedGeneration) return false
+        return consent.providerId == binding.providerId &&
+            consent.effectiveBaseUrl == binding.effectiveBaseUrl &&
+            consent.origin == binding.origin &&
+            consent.protocol == binding.protocol &&
+            consent.apiKeyRef == binding.apiKeyRef &&
+            consent.configRevision == binding.configRevision &&
+            consent.model == binding.model
+    }
+
     fun send() {
         val raw = _input.value
         val text = raw.trim()
@@ -326,7 +669,27 @@ class ChatViewModel(
                 when (val access = authorizeEndpoint(startedAt)) {
                     is EndpointAccess.Ready -> {
                         operationGeneration = access.endpoint.generation
-                        val handle = ensureSession(access.endpoint, clean)
+                        val handle = try {
+                            ensureSession(access.endpoint, clean)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: CaptureDeniedException) {
+                            // S1: burn a consent minted between T0 and T1 so
+                            // a T1 deny leaves no residual slot for replay.
+                            // CancellationException stays on its own branch
+                            // above and never burns.
+                            takePendingKeyReadConsent()
+                            // S6 capture-boundary T1 DENY/failure (factory
+                            // CaptureDeniedException): T0 key.read passed but
+                            // T1 failed. Distinct from chat.send CHAT_SEND_DENIED
+                            // below (the inner startOrEnqueue catch stays).
+                            // Only CaptureDeniedException maps to POLICY_DENIED
+                            // here; a non-Capture SecurityException falls
+                            // through to the outer NO_ENDPOINT branch.
+                            setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
+                            restoreOpForFailedSend(opId, "POLICY_DENIED")
+                            return@launch
+                        }
                         if (handle == null || !isHandleCurrent(handle)) {
                             // The generation is dead or the session was
                             // replaced: endpoint invalidation (or explicit
@@ -434,6 +797,12 @@ class ChatViewModel(
                         setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                         restoreOpForFailedSend(opId, "POLICY_DENIED")
                     }
+                    is EndpointAccess.ConfirmRequired -> {
+                        // P2:還原先於發布（input/outbox 就緒後才設 notice+seq+token），
+                        // 使觀測到 notice 即輸入已還原（消除 notice→input 競態）。
+                        restoreOpForConfirmRequired(opId, "KEY_READ_CONFIRM_REQUIRED")
+                        emitKeyReadConfirmRequired(access.generation, access.binding, opId = opId)
+                    }
                     EndpointAccess.Missing -> {
                         setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
                         restoreOpForFailedSend(opId, "NO_ENDPOINT")
@@ -515,7 +884,27 @@ class ChatViewModel(
                 when (val access = authorizeEndpoint(startedAt)) {
                     is EndpointAccess.Ready -> {
                         operationGeneration = access.endpoint.generation
-                        val handle = ensureSession(access.endpoint, text)
+                        val handle = try {
+                            ensureSession(access.endpoint, text)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: CaptureDeniedException) {
+                            // S1: burn a consent minted between T0 and T1 so
+                            // a T1 deny leaves no residual slot for replay.
+                            // CancellationException stays on its own branch
+                            // above and never burns.
+                            takePendingKeyReadConsent()
+                            // S6 capture-boundary T1 DENY/failure (factory
+                            // CaptureDeniedException): T0 key.read passed but
+                            // T1 failed. Distinct from chat.send CHAT_SEND_DENIED
+                            // below (the inner startOrEnqueue catch stays).
+                            // Only CaptureDeniedException maps to POLICY_DENIED
+                            // here; a non-Capture SecurityException falls
+                            // through to the outer NO_ENDPOINT branch.
+                            setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
+                            restoreOpForFailedSend(opId, "POLICY_DENIED")
+                            return@launch
+                        }
                         if (handle == null || !isHandleCurrent(handle)) {
                             // The generation is dead or the session was
                             // replaced: endpoint invalidation (or explicit
@@ -616,6 +1005,11 @@ class ChatViewModel(
                         setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                         restoreOpForFailedSend(opId, "POLICY_DENIED")
                     }
+                    is EndpointAccess.ConfirmRequired -> {
+                        // P2:還原先於發布（同上，消除 notice→input 競態）。
+                        restoreOpForConfirmRequired(opId, "KEY_READ_CONFIRM_REQUIRED")
+                        emitKeyReadConfirmRequired(access.generation, access.binding, opId = opId)
+                    }
                     EndpointAccess.Missing -> {
                         setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
                         restoreOpForFailedSend(opId, "NO_ENDPOINT")
@@ -714,6 +1108,20 @@ class ChatViewModel(
                         setNoticeIfCurrent(requestedGeneration, "POLICY_DENIED")
                         return@launch
                     }
+                    is EndpointAccess.ConfirmRequired -> {
+                        // S2: retain the pending open (same generation, no second
+                        // invalidate) so an explicit resumePendingOpen can
+                        // consume the just-minted consent once. The stored
+                        // binding is the authorize-time snapshot; the later
+                        // resume re-validates sessionId + full binding +
+                        // generation before any vault read.
+                        if (isGenerationCurrent(requestedGeneration)) {
+                            pendingOpen = PendingOpen(sessionId, result.binding, result.generation)
+                            _pendingOpenSessionId.value = sessionId
+                        }
+                        emitKeyReadConfirmRequired(result.generation, result.binding, openSessionId = sessionId)
+                        return@launch
+                    }
                     EndpointAccess.Missing -> {
                         setNoticeIfCurrent(requestedGeneration, "NO_ENDPOINT")
                         return@launch
@@ -734,10 +1142,24 @@ class ChatViewModel(
                     }
 
                     val creationGeneration = requestedGeneration
-                    withContext(Dispatchers.IO) {
-                        candidate = sessions.open(latest, sessionId) {
-                            isBindingCurrent(access.binding, creationGeneration)
+                    try {
+                        withContext(Dispatchers.IO) {
+                            candidate = sessions.open(latest, sessionId, allowAsk = access.allowAsk) {
+                                isBindingCurrent(access.binding, creationGeneration)
+                            }
                         }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: CaptureDeniedException) {
+                        // S1: burn a consent minted between T0 and T1 so a
+                        // T1 deny on open leaves no residual slot for replay.
+                        takePendingKeyReadConsent()
+                        // S6 capture-boundary T1 DENY/failure on open. Only
+                        // CaptureDeniedException maps to POLICY_DENIED here;
+                        // a non-Capture SecurityException falls through to
+                        // the outer NO_ENDPOINT branch.
+                        setNoticeIfCurrent(requestedGeneration, "POLICY_DENIED")
+                        return@withLock
                     }
                     val created = candidate ?: return@withLock
                     if (!isGenerationCurrent(creationGeneration)) return@withLock
@@ -777,6 +1199,191 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * S2: explicit resume for a history open retained across ConfirmRequired.
+     *
+     * Consumes the one-shot consent minted after [openSession]'s
+     * ConfirmRequired exactly once, without a second [invalidateLifecycle]
+     * (which would burn the consent and bump the generation into a dead
+     * loop). Fences on sessionId + full binding + generation: any mismatch
+     * fails closed with a fresh ConfirmRequired (sequence +1, zero
+     * transport); cancel still burns via [dismissKeyReadConfirm]; the
+     * generation fence is never weakened (a stale generation never adopts
+     * the new one to pass). Success clears the pending slot, loads history,
+     * attaches once (exactly one getKey/build) and leaves the sequence
+     * untouched. Never auto-sends.
+     */
+    fun resumePendingOpen(sessionId: String) {
+        val pending = pendingOpen ?: return
+        openJob?.cancel()
+        openJob = lifecycleScope.launch {
+            var candidate: CreatedSession? = null
+            var attached = false
+            var cancellation: CancellationException? = null
+            try {
+                // Sid fence first: a wrong sid never touches the consent slot
+                // nor any transport; it fails closed with a fresh confirm on
+                // the current generation and keeps the original pending.
+                if (pending.sessionId != sessionId || pendingOpen?.sessionId != sessionId) {
+                    val currentGen = lifecycleGeneration
+                    val currentBinding = observedBinding ?: pending.binding
+                    if (isGenerationCurrent(currentGen)) {
+                        emitKeyReadConfirmRequired(currentGen, currentBinding, openSessionId = pending.sessionId)
+                    }
+                    return@launch
+                }
+                if (!isGenerationCurrent(pending.generation)) {
+                    rearmPendingOpenAndRequireConfirm(sessionId)
+                    return@launch
+                }
+                val loaded = try {
+                    withContext(Dispatchers.IO) { loadHistory(sessionId) }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
+                if (!isGenerationCurrent(pending.generation)) {
+                    rearmPendingOpenAndRequireConfirm(sessionId)
+                    return@launch
+                }
+                if (loaded == null) {
+                    pendingOpen = null
+                    _pendingOpenSessionId.value = null
+                    _notice.value = "UNKNOWN_SESSION"
+                    return@launch
+                }
+                val access = when (val result = authorizeEndpoint(pending.generation)) {
+                    is EndpointAccess.Ready -> result.endpoint
+                    is EndpointAccess.ConfirmRequired -> {
+                        // Consent absent/mismatched but binding+generation
+                        // still current: keep the pending slot so a fresh
+                        // confirm + resume can pass without a fresh open.
+                        emitKeyReadConfirmRequired(result.generation, result.binding, openSessionId = pending.sessionId)
+                        return@launch
+                    }
+                    EndpointAccess.Denied -> {
+                        pendingOpen = null
+                        _pendingOpenSessionId.value = null
+                        setNoticeIfCurrent(pending.generation, "POLICY_DENIED")
+                        return@launch
+                    }
+                    EndpointAccess.Missing -> {
+                        pendingOpen = null
+                        _pendingOpenSessionId.value = null
+                        setNoticeIfCurrent(pending.generation, "NO_ENDPOINT")
+                        return@launch
+                    }
+                    EndpointAccess.Stale -> {
+                        rearmPendingOpenAndRequireConfirm(sessionId)
+                        return@launch
+                    }
+                }
+                if (access.generation != pending.generation || !isGenerationCurrent(pending.generation)) {
+                    rearmPendingOpenAndRequireConfirm(sessionId)
+                    return@launch
+                }
+                // Binding fence: full-field equality against the retained
+                // snapshot (endpoint switch must not move old context to B;
+                // ABA returns to the same binding on a newer generation and
+                // is already rejected by the generation check above).
+                if (access.binding != pending.binding) {
+                    rearmPendingOpenAndRequireConfirm(sessionId)
+                    return@launch
+                }
+                sessionMutex.withLock {
+                    if (!isGenerationCurrent(pending.generation)) return@withLock
+                    val latest = readEndpoint()
+                    if (!isGenerationCurrent(pending.generation)) return@withLock
+                    if (bindingOf(latest) != access.binding || latest == null) {
+                        reconcileReadBinding(bindingOf(latest))
+                        return@withLock
+                    }
+                    val creationGeneration = pending.generation
+                    try {
+                        withContext(Dispatchers.IO) {
+                            candidate = sessions.open(latest, sessionId, allowAsk = access.allowAsk) {
+                                isBindingCurrent(access.binding, creationGeneration)
+                            }
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: CaptureDeniedException) {
+                        takePendingKeyReadConsent()
+                        pendingOpen = null
+                        _pendingOpenSessionId.value = null
+                        setNoticeIfCurrent(pending.generation, "POLICY_DENIED")
+                        return@withLock
+                    }
+                    val created = candidate ?: return@withLock
+                    if (!isGenerationCurrent(creationGeneration)) return@withLock
+                    val afterCreate = readEndpoint()
+                    if (!isGenerationCurrent(creationGeneration)) return@withLock
+                    if (bindingOf(afterCreate) != access.binding || afterCreate == null) {
+                        reconcileReadBinding(bindingOf(afterCreate))
+                        return@withLock
+                    }
+                    _history.value = loaded
+                    attach(created, access.binding, creationGeneration)
+                    attached = true
+                    candidate = null
+                    pendingOpen = null
+                    _pendingOpenSessionId.value = null
+                    _notice.value = null
+                }
+            } catch (cancelled: CancellationException) {
+                cancellation = cancelled
+                throw cancelled
+            } catch (_: Exception) {
+                setNoticeIfCurrent(pending.generation, "NO_ENDPOINT")
+            } finally {
+                val unattached = candidate
+                if (!attached && unattached != null) {
+                    try {
+                        sessions.discardUnattached(unattached, deleteTranscriptRow = false)
+                    } catch (cleanupFailure: Throwable) {
+                        val originalCancellation = cancellation
+                        if (originalCancellation != null) {
+                            originalCancellation.addSuppressed(cleanupFailure)
+                        } else {
+                            throw cleanupFailure
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * S2: re-arm a stale pending open to the current binding/generation and
+     * require a fresh confirmation. Called when the retained generation no
+     * longer matches (endpoint switch/ABA/explicit discard racing resume) or
+     * the retained binding differs. Emits ConfirmRequired on the current
+     * generation (sequence +1, zero transport); a missing endpoint clears
+     * the slot with NO_ENDPOINT instead.
+     */
+    private suspend fun rearmPendingOpenAndRequireConfirm(sessionId: String) {
+        val currentGen = lifecycleGeneration
+        val latest = try {
+            readEndpoint()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
+        if (!isGenerationCurrent(currentGen)) return
+        val currentBinding = bindingOf(latest)
+        if (latest == null || currentBinding == null) {
+            pendingOpen = null
+            _pendingOpenSessionId.value = null
+            setNoticeIfCurrent(currentGen, "NO_ENDPOINT")
+            return
+        }
+        pendingOpen = PendingOpen(sessionId, currentBinding, currentGen)
+        _pendingOpenSessionId.value = sessionId
+        emitKeyReadConfirmRequired(currentGen, currentBinding, openSessionId = sessionId)
+    }
+
     private suspend fun authorizeEndpoint(startedAt: Long): EndpointAccess {
         if (!isGenerationCurrent(startedAt)) return EndpointAccess.Stale
         val endpoint = try {
@@ -809,12 +1416,46 @@ class ChatViewModel(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
+            // key.read evaluation failure stays POLICY_DENIED (fail-closed,
+            // no separate UNAVAILABLE code on this gate). This differs
+            // deliberately from the chat.send gate below, where a
+            // PolicyEvaluationException surfaces CHAT_POLICY_UNAVAILABLE to
+            // distinguish "controller unavailable" from an explicit
+            // CHAT_SEND_DENIED. Copy unchanged.
+            takePendingKeyReadConsent()
             return EndpointAccess.Denied
         }
         if (!isGenerationCurrent(authorizedGeneration)) return EndpointAccess.Stale
-        // Preserve existing ASK semantics; only an explicit DENY blocks. No
-        // synthetic ALLOW is introduced here.
-        if (decision.verdict == Verdict.DENY) return EndpointAccess.Denied
+        // key.read ASK never passes through: it requires a bound one-shot
+        // confirmation minted by confirmKeyRead(expected, token) (providerId /
+        // effectiveBaseUrl / origin / protocol / apiKeyRef / configRevision /
+        // model + mint generation). DENY always wins (and burns any minted
+        // consent), as does a policy evaluation failure above; only an
+        // explicit ALLOW proceeds without one. No synthetic ALLOW is
+        // introduced here.
+        // S1: every authorization consumes the one-shot slot at most once.
+        // DENY, ALLOW, and evaluation failure all burn an unconsumed
+        // consent; ASK takes it and passes only on a binding- and
+        // generation-matched consent (allowAsk proof for the T1 recheck).
+        // An ALLOW→ASK flip between T0 and T1 must not pass: T0 ALLOW
+        // carries no proof, so T1 ASK denies.
+        val allowAsk = when (decision.verdict) {
+            Verdict.DENY -> {
+                takePendingKeyReadConsent()
+                return EndpointAccess.Denied
+            }
+            Verdict.ALLOW -> {
+                takePendingKeyReadConsent()
+                false
+            }
+            Verdict.ASK -> {
+                val consent = takePendingKeyReadConsent()
+                if (consent == null || !keyReadConsentMatches(consent, binding, authorizedGeneration)) {
+                    return EndpointAccess.ConfirmRequired(binding, authorizedGeneration)
+                }
+                true
+            }
+        }
 
         // Fresh policy evaluation suspended. Re-read the complete connection
         // identity so a save/logout racing that suspension fails closed.
@@ -830,7 +1471,7 @@ class ChatViewModel(
             reconcileReadBinding(bindingOf(latest))
             return EndpointAccess.Stale
         }
-        return EndpointAccess.Ready(AuthorizedEndpoint(latest, binding, authorizedGeneration))
+        return EndpointAccess.Ready(AuthorizedEndpoint(latest, binding, authorizedGeneration, allowAsk))
     }
 
     /** Single-flight construction. All mutable ViewModel state stays on Main. */
@@ -898,7 +1539,7 @@ class ChatViewModel(
         var failure: Throwable? = null
         try {
             withContext(Dispatchers.IO) {
-                candidate = sessions.create(endpoint, title) {
+                candidate = sessions.create(endpoint, title, allowAsk = authorized.allowAsk) {
                     isBindingCurrent(authorized.binding, creationGeneration)
                 }
             }
@@ -970,6 +1611,10 @@ class ChatViewModel(
         currentBinding = binding
         currentSessionGeneration = generation
         _currentSessionId.value = created.sessionId
+        // S2: any successful attach consumes the pending history open (send
+        // success included, so a stale "開啟歷史" never lingers).
+        pendingOpen = null
+        _pendingOpenSessionId.value = null
         sessionCollectJob?.cancel()
         sessionCollectJob = viewModelScope.launch {
             created.session.uiState.collect { state ->
@@ -1065,9 +1710,11 @@ class ChatViewModel(
     }
 
     /**
-     * key.read is ASK-by-default (consented at setup); only a DENY rule blocks
-     * here. The endpoint revision/origin is revalidated immediately before a
-     * provider receives its session-frozen credential snapshot.
+     * key.read ASK requires a bound one-shot confirmation ([confirmKeyRead]);
+     * without it authorization denies closed before any vault read. Only an
+     * explicit ALLOW proceeds unconsumed; DENY always wins. The endpoint
+     * revision/origin is revalidated immediately before a provider receives
+     * its session-frozen credential snapshot.
      */
     private suspend fun readEndpoint(): EndpointConfig? = withContext(Dispatchers.IO) {
         store.observe().first()
@@ -1119,6 +1766,12 @@ class ChatViewModel(
      * must immediately return Stale; subsequent user actions use the new scope.
      */
     private fun invalidateForEndpointChange(binding: EndpointSessionBinding?) {
+        // S3: capture the pre-invalidation notice BEFORE mutating anything: a
+        // replacement that lands while a ConfirmRequired dialog is showing must
+        // retain that notice (and bump the sequence for a forced re-peek of the
+        // new binding) instead of clearing to null/SEND_CANCELLED, which would
+        // strand the dialog on a stale snapshot.
+        val hadConfirmNotice = _notice.value == "KEY_READ_CONFIRM_REQUIRED"
         observedBinding = binding
         // N1: reclaim queued-but-unstarted intents BEFORE close() drops the
         // FIFO. Queued is not acceptance, so the caller still owns the text:
@@ -1131,15 +1784,40 @@ class ChatViewModel(
         } catch (_: Exception) {
             emptyList()
         }
-        lifecycleGeneration += 1
-        if (binding == null) explicitDiscardEpoch += 1
-        else endpointReplacementEpoch += 1
+        // S6: bump+burn share keyReadConsentLock with confirmKeyRead's mint,
+        // so a racing mint cannot overwrite this invalidation's burn with a
+        // stale consent (mint aborts on the generation mismatch inside the
+        // same lock) and the burn cannot slip between the mint's recheck and
+        // assign. P2: the pending token is burned together with the consent
+        // on a cleared endpoint (logout); a replacement keeps the consent
+        // slot (binding+generation match still rejects stale) but the old
+        // token is superseded by the retention re-emit below.
+        synchronized(keyReadConsentLock) {
+            lifecycleGeneration += 1
+            if (binding == null) explicitDiscardEpoch += 1
+            else endpointReplacementEpoch += 1
+            // A cleared endpoint (logout) discards any minted key.read consent
+            // and its pending token. A replacement keeps the consent slot:
+            // the consent's own binding+generation match still rejects the
+            // stale snapshot, so the mismatch path stays genuinely enforced.
+            if (binding == null) {
+                pendingKeyReadConsent = null
+                pendingKeyReadConfirm = null
+            }
+        }
         retryFallbackTarget = null
         retryTargetCandidate = null
         latestAcceptedStartedTarget = null
         cancelLifecycleOperations()
         openJob?.cancel()
         openJob = null
+        // S2: logout (null binding) discards the pending history open; a
+        // replacement keeps it stale so an explicit resume still fails closed
+        // with a fresh ConfirmRequired (re-armed, never auto-adopted).
+        if (binding == null) {
+            pendingOpen = null
+            _pendingOpenSessionId.value = null
+        }
         // F2: decouple transport invalidation from transcript display.
         if (binding != null) snapshotLiveToHistory()
         closeLive()
@@ -1164,8 +1842,27 @@ class ChatViewModel(
             // N1: queued-but-unstarted intents reclaimed above join the same
             // outbox via absorbDrainedQueued (pending preaccept entries first,
             // then controller-drained FIFO; never auto-sent).
+            //
+            // S3: replacement during ConfirmRequired retains the Confirm notice
+            // and bumps the sequence (forced re-peek of the new binding) rather
+            // than clearing to null/SEND_CANCELLED. The outbox is still
+            // absorbed first so no unaccepted text is lost; the input box keeps
+            // its restored Confirm text (absorb never overwrites non-blank).
+            // S2 compat: pendingOpen stays stale (kept above, not re-armed
+            // here), so an explicit resume still fails closed with a fresh
+            // ConfirmRequired via rearmPendingOpenAndRequireConfirm (one more
+            // sequence bump) until the user confirms the new binding.
             val hadUnaccepted = pendingOps.isNotEmpty() || queuedFromSession.isNotEmpty()
-            if (!hadUnaccepted) {
+            if (hadConfirmNotice) {
+                absorbDrainedQueued(queuedFromSession, fillInput = true)
+                // P2: retention re-emit supersedes the old token with the new
+                // binding/generation (forced re-peek); the stale token fails
+                // on seq/generation/binding mismatch. Preserve the pending
+                // open sid so an explicit resume still fails closed via rearm.
+                val retainedOpenSid = pendingOpen?.sessionId
+                val newBinding = checkNotNull(binding)
+                emitKeyReadConfirmRequired(lifecycleGeneration, newBinding, openSessionId = retainedOpenSid)
+            } else if (!hadUnaccepted) {
                 _notice.value = null
             } else {
                 absorbDrainedQueued(queuedFromSession, fillInput = true)
@@ -1232,8 +1929,19 @@ class ChatViewModel(
     }
 
     private fun invalidateLifecycle(clearChat: Boolean) {
-        lifecycleGeneration += 1
-        if (clearChat) explicitDiscardEpoch += 1
+        // S6: same lock as the mint (see invalidateForEndpointChange): the
+        // generation bump and the consent+token burn are atomic, so a confirm
+        // parked in readEndpoint cannot mint over this clear. P2: newChat/
+        // open new round burns the pending token together with the consent,
+        // so a stale tap captured before the clear fails closed.
+        synchronized(keyReadConsentLock) {
+            lifecycleGeneration += 1
+            if (clearChat) explicitDiscardEpoch += 1
+            if (clearChat) {
+                pendingKeyReadConsent = null
+                pendingKeyReadConfirm = null
+            }
+        }
         cancelLifecycleOperations()
         openJob?.cancel()
         openJob = null
@@ -1243,6 +1951,8 @@ class ChatViewModel(
         if (clearChat) {
             _history.value = emptyList()
             _currentSessionId.value = null
+            pendingOpen = null
+            _pendingOpenSessionId.value = null
             pendingOps.clear()
             recoverableOps.clear()
             syncRecoveryCount()
@@ -1274,6 +1984,48 @@ class ChatViewModel(
 
     private fun setNoticeIfCurrent(generation: Long, value: String) {
         if (isGenerationCurrent(generation)) _notice.value = value
+    }
+
+    /**
+     * S7：ConfirmRequired 發布單一入口。世代不符回 false（不碰
+     * notice/sequence/token）；否則以同 emission 產生 P2 pending token
+     *（binding＋generation＋新 sequence＋opId/openSessionId）並設 notice、
+     *單調遞增 sequence。confirm/dismiss/peek 永不經此（不 bump）。
+     *
+     * P2 發布順序（全程無 suspension，Main-confined）：token 落定才發布
+     * notice＋sequence（token → notice → sequence）。觀測到 notice 即
+     * token 可見；觀測到新 sequence 即其 token 可見。 racing 的 bump+burn
+     * 在鎖內仍優先（emission 在發布前中止，不留半套 notice/sequence）。
+     * 呼叫方（send 路徑）須先完成輸入／outbox 還原再調用，使觀測到
+     * notice 即輸入已還原（同 restoreOpForFailedSend 的 notice-last 形狀）。
+     */
+    private fun emitKeyReadConfirmRequired(
+        generation: Long,
+        binding: EndpointSessionBinding,
+        opId: Long? = null,
+        openSessionId: String? = null,
+    ): Boolean {
+        if (!isGenerationCurrent(generation)) return false
+        val nextSequence = _keyReadConfirmSequence.value + 1
+        val token = PendingKeyReadConfirm(
+            binding = binding,
+            generation = generation,
+            confirmSequence = nextSequence,
+            opId = opId,
+            openSessionId = openSessionId,
+        )
+        synchronized(keyReadConsentLock) {
+            // Main-confined no-suspend path: generation cannot have moved
+            // between the check above and here without an interleaving
+            // suspension, but recheck under lock keeps mint/burn atomicity
+            // (a racing bump+burn wins over this emission before anything
+            // is published).
+            if (!isGenerationCurrent(generation)) return false
+            pendingKeyReadConfirm = token
+        }
+        _notice.value = "KEY_READ_CONFIRM_REQUIRED"
+        _keyReadConfirmSequence.value = nextSequence
+        return true
     }
 
     // F2: retain visible user/assistant messages before dropping live state,
@@ -1329,6 +2081,33 @@ class ChatViewModel(
         // reclaimed by the session-state collector.
         val recoverable = withRecoverySequence(op)
         setRetryableIfNewer(recoverable)
+        if (_input.value.isNotBlank()) {
+            addRecoverable(recoverable)
+            syncRecoveryCount()
+            return
+        }
+        setInput(recoverable.text, recoverable.opId, recoverable.text, recoverable.recoverySequence)
+        _notice.value = noticeValue
+    }
+
+    /**
+     * S6: ConfirmRequired restore path. Same input/recoverable ownership as
+     * [restoreOpForFailedSend] but never arms [retryableOp]: Retry stays
+     * controller-ERROR-only ([resolveRetryTarget] already gates on
+     * `ChatStatus.ERROR`, and this path leaves IDLE), so a
+     * KEY_READ_CONFIRM_REQUIRED must not become retryable even if an ERROR
+     * is already visible from another turn.
+     */
+    private fun restoreOpForConfirmRequired(opId: Long, noticeValue: String) {
+        if (recoverableOps.any { it.opId == opId } || inputDraft?.opId == opId) {
+            if (retryableOp?.opId == opId) retryableOp = null
+            return
+        }
+        val op = pendingOps.remove(opId) ?: return
+        if (!isGenerationCurrent(op.generation)) return
+        if (retryableOp?.opId == opId) retryableOp = null
+        val recoverable = withRecoverySequence(op)
+        // Intentionally no setRetryableIfNewer.
         if (_input.value.isNotBlank()) {
             addRecoverable(recoverable)
             syncRecoveryCount()
@@ -1586,6 +2365,10 @@ class ChatViewModel(
         val config: EndpointConfig,
         val binding: EndpointSessionBinding,
         val generation: Long,
+        // S1 T0 proof: true only when T0 observed ASK plus a bound,
+        // generation-matched one-shot consent. Threaded into the factory
+        // T1 recheck; every other T0 outcome passes false.
+        val allowAsk: Boolean,
     )
 
     private data class SessionHandle(
@@ -1597,6 +2380,11 @@ class ChatViewModel(
     private sealed class EndpointAccess {
         data class Ready(val endpoint: AuthorizedEndpoint) : EndpointAccess()
         object Denied : EndpointAccess()
+        /** key.read ASK without a valid bound one-shot confirmation. */
+        data class ConfirmRequired(
+            val binding: EndpointSessionBinding,
+            val generation: Long,
+        ) : EndpointAccess()
         object Missing : EndpointAccess()
         object Stale : EndpointAccess()
     }

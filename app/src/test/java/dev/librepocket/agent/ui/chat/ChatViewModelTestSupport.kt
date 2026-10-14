@@ -2,6 +2,9 @@ package dev.librepocket.agent.ui.chat
 
 import androidx.lifecycle.ViewModelStore
 import androidx.lifecycle.viewModelScope
+import dev.librepocket.policy.InMemoryPolicyStore
+import dev.librepocket.policy.PolicyRule
+import dev.librepocket.policy.Verdict
 import java.util.concurrent.Executors
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -83,4 +86,15 @@ internal fun cancelAndJoinChatTestScopes(scopes: List<CoroutineScope>) {
             )
         }
     }
+}
+
+/**
+ * Explicit key.read ALLOW for tests that exercise non-policy mechanics
+ * (streaming, steer queueing, retry, session lifecycle). The production
+ * default stays ASK; these tests must not rely on the ASK pass-through.
+ */
+internal fun allowKeyReadPolicy(): InMemoryPolicyStore {
+    val policy = InMemoryPolicyStore()
+    runBlocking { policy.setRule(PolicyRule("key.read:*", Verdict.ALLOW, 20)) }
+    return policy
 }

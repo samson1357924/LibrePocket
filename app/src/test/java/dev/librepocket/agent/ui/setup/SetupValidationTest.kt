@@ -56,14 +56,14 @@ class SetupValidationTest {
 
     @Test
     fun validInputPasses() {
-        assertNull(SetupValidation.validate("openai", "https://api.openai.com/v1", "sk-12345678"))
+        assertNull(SetupValidation.validate("openai", "https://api.openai.com/v1", "unit-test-key-12345678"))
     }
 
     @Test
     fun unknownPresetRejected() {
         assertEquals(
             "SETUP_UNKNOWN_PRESET",
-            SetupValidation.validate("nope", "https://api.openai.com/v1", "sk-12345678"),
+            SetupValidation.validate("nope", "https://api.openai.com/v1", "unit-test-key-12345678"),
         )
     }
 
@@ -71,14 +71,14 @@ class SetupValidationTest {
     fun badUrlsRejected() {
         assertEquals(
             "SETUP_BASE_URL_BLANK",
-            SetupValidation.validate("openai", "  ", "sk-12345678"),
+            SetupValidation.validate("openai", "  ", "unit-test-key-12345678"),
         )
         assertEquals(
             "PROVIDER_URL_MUST_BE_HTTPS",
-            SetupValidation.validate("openai", "http://evil.example.com", "sk-12345678"),
+            SetupValidation.validate("openai", "http://evil.example.com", "unit-test-key-12345678"),
         )
         // Loopback http is allowed for local dev (with release-time red warning).
-        assertNull(SetupValidation.validate("custom", "http://127.0.0.1:11434/v1", "sk-12345678"))
+        assertNull(SetupValidation.validate("custom", "http://127.0.0.1:11434/v1", "unit-test-key-12345678"))
     }
 
     @Test

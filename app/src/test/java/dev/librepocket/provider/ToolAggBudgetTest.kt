@@ -694,4 +694,196 @@ class ToolAggBudgetTest {
         }
         assertAggOverflow(over)
     }
+
+    // ---- PR #82 follow-up: the blocks-map cap is one distinct-admission
+    //      budget, not a TOOL-only tally ----
+
+    @Test
+    fun anthropicThinkingBlockFloodTripsDistinctCapTyped() {
+        // Non-TOOL kinds are charged by the same pre-insert distinct budget:
+        // 64 thinking blocks are legal, the 65th distinct index throws.
+        val mapper = AnthropicMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            val out = mapper.mapPayload(
+                """{"type":"content_block_start","index":$i,"content_block":{"type":"thinking","thinking":""}}""",
+            )
+            assertEquals(
+                "a thinking block start projects the presence marker only",
+                1,
+                out.filterIsInstance<StreamEvent.ReasoningPresent>().size,
+            )
+        }
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$MAX_TOOL_CALLS_PER_ATTEMPT,"content_block":{"type":"thinking","thinking":""}}""",
+            )
+        }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun anthropicMixedKindBlocksShareOneDistinctAdmissionBudget() {
+        // text / thinking / redacted_thinking / tool_use / an unknown opaque
+        // type all draw on ONE distinct-index budget. The overflowing index
+        // arrives as an opaque kind, so only the pre-insert check (shared by
+        // every kind) can explain the failure — a TOOL-only tally would stay
+        // silent on all four non-tool kinds.
+        val kinds = listOf("text", "thinking", "redacted_thinking", "tool_use", "server_tool_use")
+        val mapper = AnthropicMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            val kind = kinds[i % kinds.size]
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$i,"content_block":{"type":"$kind","id":"t$i","name":"n"}}""",
+            )
+        }
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$MAX_TOOL_CALLS_PER_ATTEMPT,"content_block":{"type":"server_tool_use","id":"x","name":"y"}}""",
+            )
+        }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun anthropicTextBlockRestartAtSameIndexIsNotANewAdmission() {
+        // Replacement, not admission: many restarts of ONE index must never
+        // charge the distinct budget, and the surviving entry must still
+        // project deltas (a restart replaces the buffered block, never evicts
+        // it), so the remaining 63 admissions stay available.
+        val mapper = AnthropicMapper()
+        repeat(70) {
+            val out = mapper.mapPayload(
+                """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+            )
+            assertTrue("a TEXT block start projects no event", out.isEmpty())
+        }
+        assertEquals(
+            1,
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"after-restart"}}""",
+            ).filterIsInstance<StreamEvent.TextDelta>().size,
+        )
+        for (i in 1 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$i,"content_block":{"type":"text","text":""}}""",
+            )
+        }
+        // Self-contained negative control: the budget really is at its limit
+        // (index 0 was never evicted), so one more distinct index still throws.
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$MAX_TOOL_CALLS_PER_ATTEMPT,"content_block":{"type":"text","text":""}}""",
+            )
+        }
+        assertAggOverflow(over)
+        // No message_delta stop_reason ever arrived and no block was closed,
+        // so the honest terminal is the retryable truncation, never a success
+        // Done.
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            mapper.mapPayload("""{"type":"message_stop"}""").single(),
+        )
+    }
+
+    @Test
+    fun anthropicToolToTextDemotionReleasesOneToolAdmission() {
+        // A TOOL index restarted as TEXT demotes the block: the TOOL-only tally
+        // decrements (reversible) while the blocks map keeps its entry
+        // (replacement, not eviction). Both halves are observable — a delta at
+        // the demoted index still projects, and re-promoting that index to
+        // TOOL re-charges the tally (which must see 63 + 1, not a stale 64 + 1).
+        val mapper = AnthropicMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$i,"content_block":{"type":"tool_use","id":"t$i","name":"n"}}""",
+            )
+        }
+        val demoted = mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+        )
+        assertTrue("a demoted TEXT block projects no event", demoted.isEmpty())
+        assertEquals(
+            1,
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"demoted"}}""",
+            ).filterIsInstance<StreamEvent.TextDelta>().size,
+        )
+        val promoted = mapper.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t0b","name":"n"}}""",
+        )
+        assertEquals(1, promoted.filterIsInstance<StreamEvent.ToolDelta>().size)
+        // Negative control: the shared cap stays live. A genuinely new index
+        // after 64 admissions is still refused, so nothing above disabled it.
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$MAX_TOOL_CALLS_PER_ATTEMPT,"content_block":{"type":"tool_use","id":"tX","name":"n"}}""",
+            )
+        }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun anthropicBlockCapOverflowLeavesNoBufferedOverflowEntry() {
+        // Negative control for the post-overflow mapper state: AnthropicMapper
+        // carries no failed latch, so the SAME mapper keeps projecting after a
+        // budget throw. The overflowing entry must never have been buffered
+        // (checked before insert), so its stop projects nothing, and the
+        // half-closed attempt degrades to the retryable truncation it always
+        // produced — never a resurrected Done and never a poisoned ToolDone.
+        val mapper = AnthropicMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$i,"content_block":{"type":"tool_use","id":"t$i","name":"n"}}""",
+            )
+        }
+        toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$MAX_TOOL_CALLS_PER_ATTEMPT,"content_block":{"type":"tool_use","id":"tX","name":"n"}}""",
+            )
+        }
+        val stopOverflow = mapper.mapPayload(
+            """{"type":"content_block_stop","index":$MAX_TOOL_CALLS_PER_ATTEMPT}""",
+        )
+        assertTrue("the never-buffered overflow entry projects nothing on stop", stopOverflow.isEmpty())
+        val delta = mapper.mapPayload(
+            """{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}""",
+        )
+        assertEquals(1, delta.filterIsInstance<StreamEvent.Usage>().size)
+        val stop = mapper.mapPayload("""{"type":"message_stop"}""")
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            stop.filterIsInstance<StreamEvent.Failed>().single(),
+        )
+        assertTrue(
+            "no Done is manufactured after an overflow",
+            (stop + delta).none { it is StreamEvent.Done },
+        )
+        assertTrue(
+            "no ToolDone is manufactured after an overflow",
+            (stop + delta).none { it is StreamEvent.ToolDone },
+        )
+    }
+
+    @Test
+    fun anthropicSixtyFourTextBlocksCloseIntoDone() {
+        // Positive control for the shared distinct budget: the cap must not
+        // kill a legal fan-out. 64 text blocks, all closed, with a stop_reason,
+        // project exactly one Done.
+        val mapper = AnthropicMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":$i,"content_block":{"type":"text","text":"b$i"}}""",
+            )
+        }
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            assertTrue(
+                mapper.mapPayload("""{"type":"content_block_stop","index":$i}""").isEmpty(),
+            )
+        }
+        mapper.mapPayload("""{"type":"message_delta","delta":{"stop_reason":"end_turn"}}""")
+        assertEquals(
+            listOf(StreamEvent.Done("end_turn")),
+            mapper.mapPayload("""{"type":"message_stop"}"""),
+        )
+    }
 }

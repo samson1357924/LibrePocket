@@ -33,6 +33,7 @@
 ## Target：接線前需維持的安全契約
 
 - Credential 綁定 endpoint origin/config revision；讀取、解析或持久化故障採 fail-closed，不得靜默沿用其他 endpoint 的 credential。
+- S4-B typed-key 身份守衛（方案 B，見 `SetupViewModel.boundKeyHash`）：已貼明文 key 綁定輸入時 endpoint 身份（providerId＋effectiveBaseUrl）；preset/URL 切換保留文字但保留舊綁定，探測／儲存入口先比綁定（`SETUP_KEY_IDENTITY_CHANGED` 零請求／零寫入）。`onApiKeyChange` 僅在 `sha256(trimmed)` 改變時重綁——尾端空白或同 key 重貼（hash 不變）不重綁，空白鍵清空後重貼同一字串亦不重綁（blank 清 binding 但保留 hash），維持擋下，關閉 S3「任意非空即重綁」bypass。身份比對為 trim 後全字串相等、case-sensitive（host 大小寫、尾端斜線、有無預設埠皆視為不同身份，不做其他正規化）。選 B 而非 A（切換即清空明文強制重貼）：S3 蓄意保留文字以支援 switch-back 免重貼（`backSwitchWithoutRepasteAllows`）且 `String` 不可抹除（清空僅丟引用，堆積殘留至 GC），清空的衛生收益邊際但常用流失；B 以最小 churn 關閉外洩（擋下後零 `provider.call`／零 vault I/O 仍成立）。已知代價：同一 key 字串跨 endpoint 合法共用被擋（hash 不變永不重綁）——affordance：先貼任一不同 key 觸發重綁再貼回，或切回原 endpoint（binding 仍在，免重貼），或經 prefill/save 成功/logout 成功後的新鮮貼上（hash 已清）；UI 文案已明示同字串重貼（含僅加空白、清空後重貼同一字串）不會解除（見 `setupErrorText`）。未選 C（降級為 nudge）：探測會把 key 明文送往當前 endpoint，屬外洩邊界，必須 fail-closed。
 - `ASK` 不可默認成 `ALLOW`。高風險確認必須綁定不可變操作快照，副作用前重新評估授權。
 - Tool readiness 逐項推進並以負向控制驗證；未 verified 的工具保持不可執行。不能以設定開關、projection 或一般單測取代端到端安全證據。
 - Session 初始化採 single-flight/generation；過期 callback 不得接入新 session。取消須解除 HTTP blocking I/O。

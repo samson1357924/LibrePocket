@@ -19,6 +19,7 @@ import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ProviderFailureCode
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -265,6 +266,46 @@ class SetupViewModel(
     // old binding so entries fail closed. @Volatile: written on Main
     // (key/prefill/logout/retry) and cleared on IO save success.
     @Volatile private var keyBoundIdentity: Pair<String, String>? = null
+    // S4-B typed-key hash gate (whitespace/reinsert bypass fix, 方案 B):
+    // sha256(trimmed) of the last rebinding key. onApiKeyChange rebinds
+    // [keyBoundIdentity] ONLY when this hash changes; whitespace-only or
+    // same-key re-paste (trimmed hash equal) keeps the old binding so
+    // preset/URL-switched entries stay SETUP_KEY_IDENTITY_CHANGED with zero
+    // I/O. Blank key clears the binding but RETAINS the hash, so
+    // clear→reinsertSameK also stays blocked (same hash, no rebind); a
+    // different key (hash change) rebinds to the current identity (explicit
+    // new intent, allowed). Fresh starts clear it: prefillForEdit (blank
+    // edit form), every save success (apiKey="" terminal), logout/retry
+    // success (fresh form reset) — so a post-success/post-prefill paste of
+    // the same string rebinds (prevHash null). Logout/retry entry,
+    // selectPreset/onBaseUrlChange and blank retain it (blocking preserved).
+    // In-memory only, never logged/persisted; SHA-256 preimage-resistant so
+    // the retained hash never exposes key material. Chose B over A (clear
+    // text on switch): S3's retain-for-backSwitch convenience
+    // (backSwitchWithoutRepasteAllows) and String-immutable non-wipe reality
+    // make clearing marginal hygiene but common-flow churn; B closes the
+    // exfil (zero I/O still holds) with minimal churn. Known cost: same key
+    // legitimately shared across endpoints stays blocked until a different
+    // key is typed first (hash must change) or the VM is recreated
+    // (restart/prefill/save-success clears); see THREAT_MODEL S4-B note and
+    // SetupErrorText affordance (same-string repaste never unblocks; paste a
+    // different key to rebind, or switch back to the original endpoint).
+    // @Volatile: same threads as [keyBoundIdentity].
+    // Tearing note: this pair ([keyBoundIdentity], [boundKeyHash]) is NOT
+    // atomic — two @Volatile fields written sequentially (Main paste writes
+    // identity then hash; IO save/logout/retry terminals clear one or both;
+    // logout/retry entries clear identity only). A Main-paste vs IO-clear
+    // interleave may publish a mixed snapshot. This costs availability only,
+    // never cross-endpoint exfiltration: (a) entries read identity only and
+    // a missing binding fails closed; (b) identity is ever only the
+    // live-form identity at paste time or null, so any snapshot either
+    // matches the displayed endpoint or blocks — never a third endpoint;
+    // (c) the hash gate only decides rebind-to-displayed-identity. Worst
+    // case is a spurious SETUP_KEY_IDENTITY_CHANGED (paste a different key
+    // or switch back to proceed). Converging to a single @Volatile holder is
+    // a follow-up (it touches every save/logout/retry terminal); deferred to
+    // keep this diff minimal.
+    @Volatile private var boundKeyHash: ByteArray? = null
     // Stage2 form fence: identity/key intent epoch. Bumped only by
     // selectPreset/onBaseUrlChange/onApiKeyChange/prefillForEdit/logout.
     // onModelChange/toggleShowKey deliberately do NOT bump (model edits are
@@ -553,15 +594,23 @@ class SetupViewModel(
     fun onApiKeyChange(v: String) {
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
-        // S3: (re)bind non-blank keys to the current identity; blank clears.
+        // S4-B: hash-gated (re)bind. Blank clears the binding but retains
+        // the hash (clear→reinsertSameK stays blocked); non-blank rebinds
+        // ONLY on trimmed-hash change (whitespace-only/same-key keeps the
+        // old binding, fail closed after a preset/URL switch).
         if (v.trim().isEmpty()) {
             keyBoundIdentity = null
         } else {
-            val cur = _form.value
-            keyBoundIdentity = try {
-                SetupValidation.deriveProviderId(cur.presetId) to effectiveBaseUrlOf(cur).trim()
-            } catch (_: Exception) {
-                null
+            val newHash = sha256Trimmed(v.trim())
+            val prevHash = boundKeyHash
+            if (prevHash == null || !MessageDigest.isEqual(prevHash, newHash)) {
+                val cur = _form.value
+                keyBoundIdentity = try {
+                    SetupValidation.deriveProviderId(cur.presetId) to effectiveBaseUrlOf(cur).trim()
+                } catch (_: Exception) {
+                    null
+                }
+                boundKeyHash = newHash
             }
         }
         modelRefreshJob?.cancel()
@@ -607,7 +656,10 @@ class SetupViewModel(
         val testRevision = testConnectionGeneration.incrementAndGet()
         editBaseline = config
         // S3: prefill rebuilds a blank form — drop any typed-key binding.
+        // S4-B: fresh start — also drop the hash so the next paste (even the
+        // same string) rebinds to the prefill identity.
         keyBoundIdentity = null
+        boundKeyHash = null
         val preset = ProviderCatalog.preset(config.presetId)
         if (preset == null || config.presetId == ProviderCatalog.CUSTOM_ID) {
             _form.value = SetupUiState(
@@ -654,6 +706,8 @@ class SetupViewModel(
      * S3 binding check: blank key bypasses (KeepExisting path); non-blank
      * requires a matching bound identity (strict trim-only, case/slash
      * sensitive like [keepExistingModeFor]). Missing binding fails closed.
+     * S4-B unchanged: the hash gate in [onApiKeyChange] decides *whether* to
+     * rebind; this check only compares the (possibly stale) binding.
      */
     private fun keyIdentityChanged(form: SetupUiState, effectiveBaseUrl: String, providerId: String): Boolean {
         if (form.apiKey.trim().isEmpty()) return false
@@ -661,6 +715,10 @@ class SetupViewModel(
         if (bound.first != providerId) return true
         return bound.second != effectiveBaseUrl.trim()
     }
+
+    /** S4-B: sha256(trimmed UTF-8), never logged/persisted. */
+    private fun sha256Trimmed(trimmed: String): ByteArray =
+        MessageDigest.getInstance("SHA-256").digest(trimmed.toByteArray(Charsets.UTF_8))
 
     fun consumeSaved() {
         _form.value = _form.value.copy(saved = false)
@@ -1635,6 +1693,8 @@ class SetupViewModel(
             // per #17) must not fork persisted=A/displayed=B.
             _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
             keyBoundIdentity = null
+            // S4-B fresh start: drop the hash so the next paste rebinds.
+            boundKeyHash = null
         } catch (e: CancellationException) {
             if (!metadataCommitted) {
                 // Uncommitted or ambiguous (put-after / V2 / fence / CAS-threw-
@@ -1671,6 +1731,8 @@ class SetupViewModel(
                         saved = true,
                     )
                     keyBoundIdentity = null
+                    // S4-B fresh start (同主路徑)。
+                    boundKeyHash = null
                     return
                 }
                 if (livePointsAtStaged == false && vaultDirty) {
@@ -1708,6 +1770,8 @@ class SetupViewModel(
                         saved = true,
                     )
                     keyBoundIdentity = null
+                    // S4-B fresh start (同主路徑)。
+                    boundKeyHash = null
                     return
                 }
                 _form.value = _form.value.copy(saving = false)
@@ -1883,6 +1947,8 @@ class SetupViewModel(
             // path above.
             _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
             keyBoundIdentity = null
+            // S4-B fresh start: drop the hash so the next paste rebinds.
+            boundKeyHash = null
         } catch (e: CancellationException) {
             if (!reuseCommitted) {
                 val ambiguous: Boolean? = try {
@@ -1896,6 +1962,8 @@ class SetupViewModel(
                     invalidateStartupSettled()
                     _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
                     keyBoundIdentity = null
+                    // S4-B fresh start (同主路徑)。
+                    boundKeyHash = null
                     return
                 }
                 invalidateStartupSettled()
@@ -1915,6 +1983,8 @@ class SetupViewModel(
                 // 同主路徑 config.model）。
                 _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
                 keyBoundIdentity = null
+                // S4-B fresh start (同主路徑)。
+                boundKeyHash = null
                 return
             }
             _form.value = _form.value.copy(saving = false)
@@ -3124,6 +3194,9 @@ class SetupViewModel(
         // Teardown in flight: a blank key must never reuse (baseline dropped).
         editBaseline = null
         // S3: retained key text loses its binding (fail closed on next entry).
+        // S4-B: hash retained on purpose — a whitespace-only/same-key edit
+        // after logout must NOT rebind (stays blocked); only a different key
+        // (hash change) rebinds. Cleared on logout success (fresh reset below).
         keyBoundIdentity = null
         val job = viewModelScope.launch(Dispatchers.IO) {
             // try-catch 在 withLock 之外（仿 save）：排隊等鎖時被取消（lambda
@@ -3405,6 +3478,8 @@ class SetupViewModel(
                     return@launch
                 }
                 _form.value = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
+                // S4-B fresh start: logout success drops the hash (next paste rebinds).
+                boundKeyHash = null
                 // Committed-then-cancel swallow must still report success: the
                 // job was cancelled, so a plain Main dispatch would rethrow
                 // Cancel before onDone runs. NonCancellable preserves the
@@ -3485,6 +3560,7 @@ class SetupViewModel(
         // Teardown-adjacent retry: same fail-closed baseline drop as logout.
         editBaseline = null
         // S3: same binding drop as logout (retained text must re-bind).
+        // S4-B: hash retained (same reason as logout entry above).
         keyBoundIdentity = null
         val job = viewModelScope.launch(Dispatchers.IO) {
             // try-catch 在 withLock 之外（仿 save／logout）：排隊等鎖時被取消仍復位。
@@ -3559,6 +3635,8 @@ class SetupViewModel(
                 val final = result ?: RetryResult.ReadUnknown
                 if (replayedCommitted) {
                     _form.value = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
+                    // S4-B fresh start (同 logout 成功)。
+                    boundKeyHash = null
                     withContext(NonCancellable + Dispatchers.Main) { onDone(final) }
                     return@launch
                 }

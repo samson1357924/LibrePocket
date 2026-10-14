@@ -749,7 +749,9 @@ class SetupPolicyTest {
         assertEquals(1, policy.freshCalls)
         assertEquals(0, vault.putKeys)
         // Re-paste for the new identity rebinds; a fresh save mints again.
-        vm.onApiKeyChange("unit-test-key-123")
+        // S4-B: must differ (trimmed-hash change) — same-key re-paste keeps
+        // the old binding (stays SETUP_KEY_IDENTITY_CHANGED); see S4-B note.
+        vm.onApiKeyChange("unit-test-key-456")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -795,7 +797,8 @@ class SetupPolicyTest {
         assertFalse(vm.form.value.confirmKeyWrite)
         assertEquals(1, policy.freshCalls)
         assertEquals(0, vault.putKeys)
-        vm.onApiKeyChange("unit-test-key-123")
+        // S4-B: re-paste must differ (same reason as above).
+        vm.onApiKeyChange("unit-test-key-456")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)

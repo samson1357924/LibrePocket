@@ -460,9 +460,129 @@ class SetupKeyIdentityBindingTest {
     }
 
     @Test
+    fun whitespaceAppendProbeStillBlocked() {
+        // S4-B: paste K for A → switch B (blocked) → trailing-space edit
+        // (trimmed hash unchanged) must NOT rebind — stays
+        // SETUP_KEY_IDENTITY_CHANGED with zero I/O.
+        val fake = SpyBindingProvider()
+        val buildCalls = AtomicInteger(0)
+        val dirCalls = AtomicInteger(0)
+        val (vm, policy, _) = newVm(fake, buildCalls, dirCalls)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.selectPreset("anthropic")
+        vm.onApiKeyChange("sk-test-key-123 ")
+        // Text retained (S3 UX); binding kept for mismatch detection.
+        assertEquals("sk-test-key-123 ", vm.form.value.apiKey)
+        vm.testConnection()
+        awaitIdle(vm)
+        assertEquals("SETUP_KEY_IDENTITY_CHANGED", vm.form.value.errorCode)
+        assertNull(vm.form.value.testModels)
+        assertEquals(0, fake.calls)
+        assertEquals(0, buildCalls.get())
+        assertEquals(0, dirCalls.get())
+        assertEquals(0, policy.freshCalls)
+    }
+
+    @Test
+    fun whitespaceAppendRefreshStillBlocked() {
+        // S4-B refreshModels entry: same whitespace bypass shape via custom
+        // URL switch — stays blocked with zero live/directory/policy I/O.
+        val fake = SpyBindingProvider(models = listOf("live-x"))
+        val buildCalls = AtomicInteger(0)
+        val dirCalls = AtomicInteger(0)
+        val (vm, policy, _) = newVm(fake, buildCalls, dirCalls)
+        vm.selectPreset("custom")
+        vm.onBaseUrlChange("http://127.0.0.1:11434/v1")
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.onBaseUrlChange("http://127.0.0.1:11434/v2")
+        vm.onApiKeyChange("sk-test-key-123   ")
+        assertEquals("sk-test-key-123   ", vm.form.value.apiKey)
+        vm.refreshModels()
+        awaitIdle(vm)
+        assertEquals("SETUP_KEY_IDENTITY_CHANGED", vm.form.value.errorCode)
+        assertTrue(vm.form.value.modelOptions.isEmpty())
+        assertEquals(0, fake.calls)
+        assertEquals(0, buildCalls.get())
+        assertEquals(0, dirCalls.get())
+        assertEquals(0, policy.freshCalls)
+    }
+
+    @Test
+    fun clearReinsertSameKeyProbeStillBlocked() {
+        // S4-B: paste K → switch B → clear to blank (binding dropped, hash
+        // retained) → reinsert same K (hash unchanged, no rebind) — stays
+        // blocked with zero I/O. Only a different key rebinds.
+        val fake = SpyBindingProvider()
+        val buildCalls = AtomicInteger(0)
+        val dirCalls = AtomicInteger(0)
+        val (vm, policy, _) = newVm(fake, buildCalls, dirCalls)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.selectPreset("anthropic")
+        vm.onApiKeyChange("")
+        assertEquals("", vm.form.value.apiKey)
+        vm.onApiKeyChange("sk-test-key-123")
+        assertEquals("sk-test-key-123", vm.form.value.apiKey)
+        vm.testConnection()
+        awaitIdle(vm)
+        assertEquals("SETUP_KEY_IDENTITY_CHANGED", vm.form.value.errorCode)
+        assertNull(vm.form.value.testModels)
+        assertEquals(0, fake.calls)
+        assertEquals(0, buildCalls.get())
+        assertEquals(0, dirCalls.get())
+        assertEquals(0, policy.freshCalls)
+    }
+
+    @Test
+    fun whitespaceAppendSaveZeroVaultWrite() {
+        // S4-B save entry: whitespace bypass shape — zero vault writes,
+        // zero vault reads, no consent mint, no metadata.
+        val fake = SpyBindingProvider()
+        val vault = CountingVault(EncryptedPrefsVault(InMemoryPrefs()))
+        val (vm, policy, store) = newVm(fake, AtomicInteger(0), AtomicInteger(0), vault)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.selectPreset("anthropic")
+        vm.onApiKeyChange("sk-test-key-123 ")
+        vm.save()
+        awaitIdle(vm)
+        assertEquals("SETUP_KEY_IDENTITY_CHANGED", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertEquals(0, vault.hasKeys)
+        assertEquals(0, policy.freshCalls)
+        runBlocking { assertFalse(store.hasMetadata()) }
+    }
+
+    @Test
+    fun clearReinsertSameKeySaveZeroVaultWrite() {
+        // S4-B save entry: clear→reinsert same K — same blocked shape as the
+        // probe above, with vault-zero assertions.
+        val fake = SpyBindingProvider()
+        val vault = CountingVault(EncryptedPrefsVault(InMemoryPrefs()))
+        val (vm, policy, store) = newVm(fake, AtomicInteger(0), AtomicInteger(0), vault)
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.selectPreset("anthropic")
+        vm.onApiKeyChange("")
+        vm.onApiKeyChange("sk-test-key-123")
+        vm.save()
+        awaitIdle(vm)
+        assertEquals("SETUP_KEY_IDENTITY_CHANGED", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertEquals(0, vault.hasKeys)
+        assertEquals(0, policy.freshCalls)
+        runBlocking { assertFalse(store.hasMetadata()) }
+    }
+
+    @Test
     fun identityChangedHasCopyText() {
         assertEquals(
-            "金鑰與目前伺服器不符（貼上後切換了供應商／位址），未發出任何請求／寫入，請重貼金鑰後重試。",
+            "金鑰與目前伺服器不符（貼上後切換了供應商／位址），未發出任何請求／寫入；同字串重貼（含僅加空白、清空後重貼同一字串）不會解除，請貼上不同金鑰觸發重綁（後再貼回亦可）或切回原伺服器。",
             setupErrorText("SETUP_KEY_IDENTITY_CHANGED"),
         )
     }

@@ -221,7 +221,8 @@ class ScopedFileStoreB2Test {
         )
         val snapIdx = writeBody.indexOf("snapshotTrustedRoot")
         val hookIdx = writeBody.indexOf("preGateHook?.invoke()")
-        val reverifyIdx = writeBody.indexOf("reverifyRootIdentity")
+        // 終門重驗取最後一次（冪等早返前另有一次 root 身分預驗，不在此序斷言內）。
+        val reverifyIdx = writeBody.lastIndexOf("reverifyRootIdentity")
         assertTrue(
             "snapshot + hook must precede re-verify (got indices $snapIdx/$hookIdx/$reverifyIdx)",
             snapIdx >= 0 && hookIdx > snapIdx && reverifyIdx > hookIdx,
@@ -303,8 +304,89 @@ class ScopedFileStoreB2Test {
         }
     }
 
-    // ---- T4 move fallback 故障注入（B2 收窄＋重驗） ----
+    // ---- F1 genuine-dir swap（canon 字串相同、無 symlink；舊碼 canon 比對放行，fileKey 定錨拒絕） ----
 
+    @Test fun deleteGenuineDirSwappedBetweenGatesRefuses() {
+        assumeNonWindows()
+        val parent = Files.createTempDirectory("b2-genuine-del").toFile()
+        val ws = File(parent, "ws").apply { mkdirs() }
+        val other = File(parent, "other").apply { mkdirs() }
+        try {
+            val store = ScopedFileStore(ws)
+            store.write("victim.txt", "inside".toByteArray())
+            File(other, "other-victim.txt").writeText("OTHER")
+            try {
+                store.deleteInternal("victim.txt", preGateHook = {
+                    Files.move(ws.toPath(), File(parent, "ws-old").toPath())
+                    Files.move(other.toPath(), ws.toPath())
+                })
+                fail("expected IllegalArgumentException: delete with genuine-dir swap")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(
+                    "message must mention identity/mismatch/symlink/escapes, got ${e.message}",
+                    (e.message ?: "").contains("mismatch") || (e.message ?: "").contains("identity") ||
+                        (e.message ?: "").contains("symlink") || (e.message ?: "").contains("escapes"),
+                )
+            }
+            // hook-run 證明：ws 仍是換入態（ws-old 存在＋換入標記在現 ws 下）。
+            assertTrue("hook must have run (ws-old exists)", File(parent, "ws-old").isDirectory)
+            assertTrue("hook must have run (swapped marker present)", File(ws, "other-victim.txt").isFile)
+            // 舊域內檔存活＋換入域檔存活（舊碼回 false，兩檔同樣存活但無拒絕——差分在拋 IAE）。
+            assertEquals("inside", File(File(parent, "ws-old"), "victim.txt").readText())
+            assertEquals("OTHER", File(ws, "other-victim.txt").readText())
+        } finally {
+            try { ws.deleteRecursively() } catch (_: Exception) { }
+            try { File(parent, "ws-old").deleteRecursively() } catch (_: Exception) { }
+            try { other.deleteRecursively() } catch (_: Exception) { }
+            try { parent.deleteRecursively() } catch (_: Exception) { }
+        }
+    }
+
+    @Test fun writeGenuineDirSwappedBetweenGatesRefusesWithoutLanding() {
+        assumeNonWindows()
+        val parent = Files.createTempDirectory("b2-genuine-wr").toFile()
+        val ws = File(parent, "ws").apply { mkdirs() }
+        val other = File(parent, "other").apply { mkdirs() }
+        try {
+            val store = ScopedFileStore(ws)
+            File(other, "other-victim.txt").writeText("OTHER")
+            try {
+                store.writeInternal(
+                    "evil.txt",
+                    "x".toByteArray(),
+                    preGateHook = {
+                        Files.move(ws.toPath(), File(parent, "ws-old").toPath())
+                        Files.move(other.toPath(), ws.toPath())
+                    },
+                )
+                fail("expected IllegalArgumentException: write with genuine-dir swap")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(
+                    "message must mention identity/mismatch/symlink/escapes, got ${e.message}",
+                    (e.message ?: "").contains("mismatch") || (e.message ?: "").contains("identity") ||
+                        (e.message ?: "").contains("symlink") || (e.message ?: "").contains("escapes"),
+                )
+            }
+            // hook-run 證明：ws 仍是換入態。
+            assertTrue("hook must have run (ws-old exists)", File(parent, "ws-old").isDirectory)
+            assertTrue("hook must have run (swapped marker present)", File(ws, "other-victim.txt").isFile)
+            // 舊碼 canon 比對放行，後續 move 因源暫存路徑懸空拋 NoSuchFileException（非 IAE 拒絕，亦不落地）；
+            // 差分在異常型別：新碼以 fileKey 在終門拋 IAE。以下斷言現 ws 下無落地、現 ws 下無 tmp
+            //（ws-old 內 hook 前已寫暫存的殘留不在本案斷言內，新舊碼皆然）。
+            assertFalse(File(ws, "evil.txt").exists())
+            assertFalse(File(File(parent, "ws-old"), "evil.txt").exists())
+            val wsTop = (ws.listFiles()?.toList() ?: emptyList())
+                .filter { it.isFile && !Files.isSymbolicLink(it.toPath()) && it.name.startsWith(ScopedFileStore.TMP_NAME_PREFIX) }
+            assertTrue("denied write must leave no tmp in ws, got $wsTop", wsTop.isEmpty())
+        } finally {
+            try { ws.deleteRecursively() } catch (_: Exception) { }
+            try { File(parent, "ws-old").deleteRecursively() } catch (_: Exception) { }
+            try { other.deleteRecursively() } catch (_: Exception) { }
+            try { parent.deleteRecursively() } catch (_: Exception) { }
+        }
+    }
+
+    // ---- T4 move fallback 故障注入（B2 收窄＋重驗） ----
     @Test fun writeFallbackAtomicUnsupportedRetriesAndLands() {
         val ws = workspace()
         try {

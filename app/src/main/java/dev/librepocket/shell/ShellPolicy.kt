@@ -239,8 +239,12 @@ object ShellPolicy {
      *   [ShellExecutables.TRUSTED_BIN_DIRS]；產品碼一律用預設值，單測可注入
      *   暫存目錄以覆蓋絕對 `argv[0]` 的全鏈路徑，呼叫方須同步把同表傳給
      *   [ShellExecutables.resolve] 的 `searchDirs`）。
+     *
+     * 測試接縫：[preRealPathHook] 僅供單測在步驟 1 後置換路徑段（見
+     * [checkPhysicalOperandGate]）；生產一律經公開 [validate]（無注入點，
+     * 內轉調本函數傳 null）。
      */
-    fun validate(
+    fun validateInternal(
         argv: List<String>,
         privateRoot: String? = null,
         safRoots: List<String> = emptyList(),
@@ -338,6 +342,21 @@ object ShellPolicy {
     }
 
     /**
+     * 公開直接通道校驗（無注入點；生產呼叫方一律走此函數）。
+     * 本體單行委派 [validateInternal]（`preRealPathHook = null`）。
+     */
+    fun validate(
+        argv: List<String>,
+        privateRoot: String? = null,
+        safRoots: List<String> = emptyList(),
+        flavor: Flavor = Flavor.PLAY,
+        bridgeGranted: Boolean = false,
+        allowedBinaries: Set<String> = ALLOWED_BINARIES,
+        isGuest: Boolean = false,
+        trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
+    ): Validation = validateInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, allowedBinaries, isGuest, trustedBinDirs, null)
+
+    /**
      * 提權通道校驗（S3，BACKLOG D09，矩陣 §3）。
      *
      * 與 [validate] 的差異只有兩處，其餘（空命令 → 黑名單二進位/全文片段 →
@@ -351,8 +370,11 @@ object ShellPolicy {
      *
      * 預設 [flavor] 為 PLAY（fail-closed：未指明風味時跨域一律拒；
      * 自裝風味呼叫方必須顯式傳 FOSS/GITHUB + bridgeGranted）。
+     *
+     * 測試接縫：[preRealPathHook] 僅供單測在步驟 1 後置換路徑段；生產一律經公開
+     * [validateElevated]（無注入點，內轉調本函數傳 null）。
      */
-    fun validateElevated(
+    fun validateElevatedInternal(
         argv: List<String>,
         privateRoot: String? = null,
         safRoots: List<String> = emptyList(),
@@ -421,6 +443,19 @@ object ShellPolicy {
         if (pathDenialElevated != null) return pathDenialElevated
         return Validation.Allowed(base)
     }
+
+    /**
+     * 公開提權通道校驗（無注入點；生產呼叫方一律走此函數）。
+     * 本體單行委派 [validateElevatedInternal]（`preRealPathHook = null`）。
+     */
+    fun validateElevated(
+        argv: List<String>,
+        privateRoot: String? = null,
+        safRoots: List<String> = emptyList(),
+        flavor: Flavor = Flavor.PLAY,
+        bridgeGranted: Boolean = false,
+        isGuest: Boolean = false,
+    ): Validation = validateElevatedInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, isGuest, null)
 
     /**
      * 宿主外掛點前綴（guest 容器內路徑豁免的例外，縱深保留拒絕）：

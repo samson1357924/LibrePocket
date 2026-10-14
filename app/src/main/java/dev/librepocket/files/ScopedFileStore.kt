@@ -11,8 +11,10 @@ import java.nio.file.CopyOption
 import java.nio.file.DirectoryIteratorException
 import java.nio.file.DirectoryStream
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 
 /**
@@ -74,10 +76,13 @@ enum class FileBudgetCode(val detail: String) {
  *   重驗只能縮小窗口，不能消除——第二次驗證與實際 IO 之間攻擊者仍可能
  *   以 `rename`/`symlink` 替換路徑段（見下）。
  * - B2 root 定錨：[delete]/[write] 在初驗後以 [snapshotTrustedRoot] 固定可信
- *   root 正規身分，containment 與最終門一律比對該定錨，不再以可能被換掉的
- *   `root.canonicalPath` 重定錨；操作前以 [reverifyRootIdentity] 再驗 root
- *   本體非連結且正規身分與定錨一致。單次 root 本體置換（真目錄→指外連結）
- *   轉為拒絕；雙重替換（驗→換入→用→換回）仍僅有界不消除。
+ *   root（正規路徑字串＋檔案系統物件鍵 fileKey〈inode+device〉雙定錨，不再把
+ *   canon 單獨稱為物件身分；鍵缺席即拒），containment 與最終門一律比對該定錨，
+ *   不再以可能被換掉的 `root.canonicalPath` 重定錨；操作前以 [reverifyRootIdentity]
+ *   再驗 root 本體非連結且正規身分與定錨一致＋物件鍵相等。單次 root 本體置換
+ *   （真目錄→指外連結）轉為拒絕；實目錄替換（同字串不同 inode）亦以 fileKey 拒絕
+ *   （刪後重建若重用同一 ino 則鍵相同，屬殘餘，見下 TOCTOU 段）；
+ *   雙重替換（驗→換入→用→換回）仍僅有界不消除。
  * - TOCTOU 殘餘風險：單次檢查無法解決併發替換——檢查與實際 IO 之間
  *   攻擊者仍可能以 `rename`/`symlink` 替換路徑段。[read] 在回傳前重驗
  *   一次鏈上無連結並丟棄可疑結果，可將單次替換轉為拒絕，但雙重替換
@@ -124,6 +129,9 @@ class ScopedFileStore(val root: File) {
         Updated,
         Unchanged,
     }
+
+    /** root 可信身分：正規路徑字串＋檔案系統物件鍵（inode+device）。 */
+    internal data class TrustedRoot(val canon: String, val fileKey: Any?)
 
     /**
      * 將相對路徑解析為根下檔案；穿越/絕對/非法名拋 [IllegalArgumentException]。
@@ -206,18 +214,29 @@ class ScopedFileStore(val root: File) {
     }
 
     /**
-     * B2 root 定錨：初驗後固定可信 root 正規身分；最終門與 IO 前比對，不再以可能被換掉的 root 重定錨。
+     * B2 root 定錨：初驗後固定可信 root（正規路徑字串＋檔案系統物件鍵 fileKey
+     * 〈inode+device〉雙定錨；canon 僅為路徑名字串，不單獨充作物件身分）。
      *
      * 先以 [ensureRootChainNoSymlink] 驗 root 鏈（含 root 本體段；[resolve]／
      * [ensureNoSymlinkChain] 已在入口驗過，故此處不新增誤殺，只加定錨），再驗
-     * root 本體非連結，最後回傳當下正規身分。呼叫方須在初驗後立刻 snapshot，
-     * containment 與終驗一律比對該定錨。
+     * root 本體非連結，最後回傳當下正規身分＋NOFOLLOW 本體鍵。呼叫方須在初驗後
+     * 立刻 snapshot，containment 與終驗一律比對該定錨。鍵讀不到即 fail-closed
+     * （Android ext4/f2fs 與測試 tmpfs/overlay 恆有鍵，null 僅 exotic FS 響亮失敗；null 分支無單測覆蓋）。
      */
-    private fun snapshotTrustedRoot(original: String): String {
+    private fun snapshotTrustedRoot(original: String): TrustedRoot {
         ensureRootChainNoSymlink(original)
         try {
             if (Files.isSymbolicLink(root.toPath())) throw IllegalArgumentException("symlink not allowed: $original")
-            return root.canonicalPath
+            val canon = root.canonicalPath
+            val key = try {
+                Files.readAttributes(root.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS).fileKey()
+                    ?: throw IllegalArgumentException("symlink check failed: $original")
+            } catch (e: IllegalArgumentException) {
+                throw e
+            } catch (e: Exception) {
+                throw IllegalArgumentException("symlink check failed: $original", e)
+            }
+            return TrustedRoot(canon, key)
         } catch (e: IllegalArgumentException) {
             throw e
         } catch (e: Exception) {
@@ -225,8 +244,11 @@ class ScopedFileStore(val root: File) {
         }
     }
 
-    /** 最終操作前再驗 root：本體非連結且正規身分與定錨一致；任一不符即拒。 */
-    private fun reverifyRootIdentity(trustedRootCanon: String, original: String) {
+    /**
+     * 最終操作前再驗 root：本體非連結＋正規身分與定錨一致＋物件鍵相等；任一不符即拒。
+     * 任一側鍵為 null 即拒（fail-closed；正常 FS 恆有鍵，見 [snapshotTrustedRoot]）。
+     */
+    private fun reverifyRootIdentity(trusted: TrustedRoot, original: String) {
         try {
             if (Files.isSymbolicLink(root.toPath())) throw IllegalArgumentException("symlink not allowed: $original")
         } catch (e: IllegalArgumentException) {
@@ -239,7 +261,12 @@ class ScopedFileStore(val root: File) {
         } catch (e: Exception) {
             throw IllegalArgumentException("symlink check failed: $original", e)
         }
-        if (now != trustedRootCanon) throw IllegalArgumentException("path escapes root: $original")
+        if (now != trusted.canon) throw IllegalArgumentException("path escapes root: $original")
+        val nowKey = try {
+            Files.readAttributes(root.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS).fileKey()
+        } catch (e: Exception) { throw IllegalArgumentException("symlink check failed: $original", e) }
+        val ok = trusted.fileKey != null && nowKey != null && trusted.fileKey == nowKey
+        if (!ok) throw IllegalArgumentException("root identity mismatch: $original")
     }
 
     /**
@@ -364,6 +391,9 @@ class ScopedFileStore(val root: File) {
         // 建後三驗：mkdir 可能新建目錄，併發替換窗口下再次確認。
         ensureNoSymlinkChain(safe, relativePath)
         val trustedRoot = snapshotTrustedRoot(relativePath)
+        // 冪等早返前先驗 root 身分：否則換根後內容碰巧相等即回成功
+        //（僅讀比對 oracle，不落盤；終門重驗見下，僅有界）。
+        reverifyRootIdentity(trustedRoot, relativePath)
         if (target.isFile && target.length() == bytes.size.toLong() && contentEquals(target, bytes)) {
             return WriteOutcome.Unchanged
         }
@@ -382,7 +412,7 @@ class ScopedFileStore(val root: File) {
             // root 身分另以定錨再驗（防 root 本體置換）。
             ensureNoSymlinkChain(safe, relativePath)
             reverifyRootIdentity(trustedRoot, relativePath)
-            ensurePreMoveNoSymlinkAndContained(target, tmp, relativePath, trustedRoot)
+            ensurePreMoveNoSymlinkAndContained(target, tmp, relativePath, trustedRoot.canon)
             try {
                 moveFn(
                     tmp.toPath(),
@@ -397,7 +427,7 @@ class ScopedFileStore(val root: File) {
                 // 退回前重跑整鏈＋落盤門（用定錨 root）；其餘異常直接拋（fail-closed）。
                 ensureNoSymlinkChain(safe, relativePath)
                 reverifyRootIdentity(trustedRoot, relativePath)
-                ensurePreMoveNoSymlinkAndContained(target, tmp, relativePath, trustedRoot)
+                ensurePreMoveNoSymlinkAndContained(target, tmp, relativePath, trustedRoot.canon)
                 moveFn(tmp.toPath(), target.toPath(), arrayOf(StandardCopyOption.REPLACE_EXISTING))
             }
         } finally {
@@ -744,8 +774,8 @@ class ScopedFileStore(val root: File) {
      * （攻擊者可無限重試，rename 原子，窗口非時間極小，僅有界不消除；
      * Java 無 O_NOFOLLOW/openat，見類註解），
      * 此為變更操作固有風險，呼叫方不得假設檢查後路徑不可變。
-     * root 定錨：初驗後 snapshot 可信 root 正規身分，containment 比對定錨，
-     * 操作前以 [reverifyRootIdentity] 再驗 root 本體；單次 root 本體置換拒絕，
+     * root 定錨：初驗後 snapshot 可信 root（正規路徑＋fileKey 雙定錨），containment 比對定錨，
+     * 操作前以 [reverifyRootIdentity] 再驗 root 本體；單次 root 本體置換與實目錄替換皆拒絕，
      * 雙重替換仍僅有界。
      *
      * 測試接縫：實際經由 [deleteInternal] 委派（`preGateHook` 預設 null；
@@ -775,7 +805,7 @@ class ScopedFileStore(val root: File) {
         } catch (e: Exception) {
             throw IllegalArgumentException("symlink check failed: $relativePath", e)
         }
-        if (targetCanon != trustedRoot && !targetCanon.startsWith("$trustedRoot/")) {
+        if (targetCanon != trustedRoot.canon && !targetCanon.startsWith("${trustedRoot.canon}/")) {
             throw IllegalArgumentException("path escapes root: $relativePath")
         }
         reverifyRootIdentity(trustedRoot, relativePath)

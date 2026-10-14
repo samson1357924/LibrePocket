@@ -646,7 +646,8 @@ class ShellPhysicalGateTest {
             )
             assertTrue("clean inside file must stay allowed, got $clean", clean is Validation.Allowed)
             // 有 hook：lstat 後把 a 換成 symlink→outside（橋接授權域亦拒）。
-            val swapped = ShellPolicy.validateElevated(
+            // internal 版（公開 validateElevated 無注入點，見 ShellPolicy KDoc）。
+            val swapped = ShellPolicy.validateElevatedInternal(
                 listOf("cat", candidate),
                 scope.absolutePath,
                 flavor = Flavor.GITHUB,

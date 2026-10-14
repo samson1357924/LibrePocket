@@ -26,6 +26,12 @@ internal object McpWire {
     /** 輸入 Schema 字元上限：超限拒絕（拋 [McpProtocol]），不靜默截斷。 */
     internal const val INPUT_SCHEMA_MAX_CHARS = 8_192
 
+    /**
+     * RFC 8259 §2 的空白：僅 space/tab/LF/CR。Kotlin `isWhitespace()` 另接受
+     * VT/FF/NBSP 等，parser 全程必須用此函數，不可用 `isWhitespace()`。
+     */
+    private fun isJsonWs(c: Char): Boolean = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
     /** JSON 字面量（true/false/null/number）校驗：非法字面量一律視為無效。 */
     private val NUMBER_RE = Regex("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")
 
@@ -80,13 +86,13 @@ internal object McpWire {
             throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
         }
         var p = 0
-        while (p < json.length && json[p].isWhitespace()) p++
+        while (p < json.length && isJsonWs(json[p])) p++
         if (p >= json.length) throw McpProtocol("mcp: bad envelope")
         val c = json[p]
         if (c != '{' && c != '[') throw McpProtocol("mcp: bad envelope")
         val (v, next) = parseValue(json, p, 0)
         var q = next
-        while (q < json.length && json[q].isWhitespace()) q++
+        while (q < json.length && isJsonWs(json[q])) q++
         if (q != json.length) throw McpProtocol("mcp: bad envelope")
         return v
     }
@@ -94,7 +100,7 @@ internal object McpWire {
     private fun parseValue(json: String, pos: Int, depth: Int): Pair<JVal, Int> {
         if (depth > MAX_DEPTH) throw McpProtocol("mcp: too deep")
         var p = pos
-        while (p < json.length && json[p].isWhitespace()) p++
+        while (p < json.length && isJsonWs(json[p])) p++
         if (p >= json.length) throw McpProtocol("mcp: bad envelope")
         return when (val c = json[p]) {
             '"' -> parseString(json, p)
@@ -145,7 +151,7 @@ internal object McpWire {
     private fun parseObject(json: String, start: Int, depth: Int): Pair<JObj, Int> {
         // start 指向 `{`；值遞迴 depth+1；同層重複 key 拋 duplicate key。
         var p = start + 1
-        while (p < json.length && json[p].isWhitespace()) p++
+        while (p < json.length && isJsonWs(json[p])) p++
         if (p >= json.length) throw McpProtocol("mcp: bad envelope")
         if (json[p] == '}') {
             p++
@@ -154,26 +160,26 @@ internal object McpWire {
         val members = ArrayList<Pair<String, JVal>>()
         val seen = HashSet<String>()
         while (true) {
-            while (p < json.length && json[p].isWhitespace()) p++
+            while (p < json.length && isJsonWs(json[p])) p++
             if (p >= json.length || json[p] != '"') throw McpProtocol("mcp: bad envelope")
             val (keyVal, keyEnd) = parseString(json, p)
             p = keyEnd
-            while (p < json.length && json[p].isWhitespace()) p++
+            while (p < json.length && isJsonWs(json[p])) p++
             if (p >= json.length || json[p] != ':') throw McpProtocol("mcp: bad envelope")
             p++
-            while (p < json.length && json[p].isWhitespace()) p++
+            while (p < json.length && isJsonWs(json[p])) p++
             if (p >= json.length) throw McpProtocol("mcp: bad envelope")
             val (v, vEnd) = parseValue(json, p, depth + 1)
             p = vEnd
             if (!seen.add(keyVal.v)) throw McpProtocol("mcp: duplicate key")
             members.add(keyVal.v to v)
-            while (p < json.length && json[p].isWhitespace()) p++
+            while (p < json.length && isJsonWs(json[p])) p++
             if (p >= json.length) throw McpProtocol("mcp: bad envelope")
             when (json[p]) {
                 ',' -> {
                     p++
                     var q = p
-                    while (q < json.length && json[q].isWhitespace()) q++
+                    while (q < json.length && isJsonWs(json[q])) q++
                     if (q >= json.length) throw McpProtocol("mcp: bad envelope")
                     if (json[q] == '}') throw McpProtocol("mcp: bad envelope")
                     p = q
@@ -190,7 +196,7 @@ internal object McpWire {
 
     private fun parseArray(json: String, start: Int, depth: Int): Pair<JArr, Int> {
         var p = start + 1
-        while (p < json.length && json[p].isWhitespace()) p++
+        while (p < json.length && isJsonWs(json[p])) p++
         if (p >= json.length) throw McpProtocol("mcp: bad envelope")
         if (json[p] == ']') {
             p++
@@ -198,20 +204,20 @@ internal object McpWire {
         }
         val items = ArrayList<JVal>()
         while (true) {
-            while (p < json.length && json[p].isWhitespace()) p++
+            while (p < json.length && isJsonWs(json[p])) p++
             if (p >= json.length) throw McpProtocol("mcp: bad envelope")
             // 空元素（`,,`/`[,]`）非法。
             if (json[p] == ',' || json[p] == ']') throw McpProtocol("mcp: bad envelope")
             val (v, vEnd) = parseValue(json, p, depth + 1)
             items.add(v)
             p = vEnd
-            while (p < json.length && json[p].isWhitespace()) p++
+            while (p < json.length && isJsonWs(json[p])) p++
             if (p >= json.length) throw McpProtocol("mcp: bad envelope")
             when (json[p]) {
                 ',' -> {
                     p++
                     var q = p
-                    while (q < json.length && json[q].isWhitespace()) q++
+                    while (q < json.length && isJsonWs(json[q])) q++
                     if (q >= json.length) throw McpProtocol("mcp: bad envelope")
                     if (json[q] == ']') throw McpProtocol("mcp: bad envelope")
                     p = q
@@ -242,7 +248,7 @@ internal object McpWire {
             if (end > json.length) return false
             if (end == json.length) return true
             val c = json[end]
-            return c.isWhitespace() || c == ',' || c == ']' || c == '}'
+            return isJsonWs(c) || c == ',' || c == ']' || c == '}'
         }
         if (json.startsWith("true", start)) {
             val end = start + 4

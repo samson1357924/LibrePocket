@@ -549,6 +549,64 @@ class McpWireD1Test {
         assertFalse(isError)
         val list = " \n {\"jsonrpc\":\"2.0\" , \"id\" : 1 , \"result\" : { \"tools\" : [] } } \n "
         assertTrue(McpWire.parseList("s1", list).isEmpty())
+        // 四種合法空白（space/tab/LF/CR）在分隔位置皆接受。
+        val allWs = "{\"jsonrpc\":\t\"2.0\",\r\n\"id\": 1,\n\"result\":\t{\r\"tools\": [] } }"
+        assertTrue(McpWire.parseList("s1", allWs).isEmpty())
+    }
+
+    @Test fun illegalWhitespaceNbspInArrayIsProtocol() {
+        // NBSP 非 RFC 8259 空白：舊 isWhitespace() 會接受並回空列表，必須擋。
+        val json = "{\"result\":{\"content\":[" + "\u00A0" + "]}}"
+        try {
+            McpWire.parseCall(json)
+            fail("NBSP 非法空白必須拋 McpProtocol，不得回 OK")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun illegalWhitespaceFormsInEnvelopeAreProtocol() {
+        // VT/FF/NBSP 在各分隔位置皆非法（每種走 parseCall 與 parseList）。
+        val bads = mapOf(
+            "vertical tab" to "\u000B",
+            "form feed" to "\u000C",
+            "nbsp" to "\u00A0",
+        )
+        for ((name, ws) in bads) {
+            val call = "{\"result\":{" + ws + "\"content\":[]}}"
+            try {
+                McpWire.parseCall(call)
+                fail("非法空白（$name）必須拋 McpProtocol，不得回 OK")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad envelope", e.message)
+            } catch (e: IllegalArgumentException) {
+                fail("非法空白（$name）必須拋 McpWire.McpProtocol，實際=${e.message}")
+            }
+            val list = "{\"result\":{\"tools\":[" + ws + "]}}"
+            try {
+                McpWire.parseList("s1", list)
+                fail("非法空白（$name）必須拋 McpProtocol，不得回工具列表")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad envelope", e.message)
+            } catch (e: IllegalArgumentException) {
+                fail("非法空白（$name）必須拋 McpWire.McpProtocol，實際=${e.message}")
+            }
+        }
+    }
+
+    @Test fun illegalWhitespaceAfterLiteralIsProtocol() {
+        // 字面量後的非法空白（literal delim 檢查亦須嚴格）。
+        val json = "{\"result\":{\"content\":[],\"isError\":false\u00A0}}"
+        try {
+            McpWire.parseCall(json)
+            fail("字面量後 NBSP 必須拋 McpProtocol，不得回 OK")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
     }
 
     // ---- i. Stage B P2-2：tools 非 object 元素與非 object inputSchema 一律 PROTOCOL ----

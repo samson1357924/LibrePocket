@@ -5,6 +5,7 @@ import dev.librepocket.tool.Flavor
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Paths
+import java.nio.file.attribute.BasicFileAttributes
 
 /**
  * 受限 shell 策略（BACKLOG D05，矩陣「終端命令」行）。
@@ -14,9 +15,9 @@ import java.nio.file.Paths
  * - 黑名單先於白名單判定：`rm -rf /` 類必須回 [ShellDeny.BLACKLISTED]，
  *   而不是普通的「不在白名單」。
  * - 操作數實體解析門（B1，#9 有界切片）：絕對路徑先過 [FileScope.decide]
- *   詞法門，通過後再走實體門（逐段 `Files.isSymbolicLink` NOFOLLOW 拒絕 +
- *   存在即 `toRealPath()` 重裁；任何失敗 fail-closed 拒絕）。直接／提權／
- *   guest host-tree 同門，不共享詞法 allow 就放行。
+ *   詞法門，通過後再走實體門（逐段 NOFOLLOW 三態拒絕＋未知即拒 +
+ *   存在即 `toRealPath()` 重裁＋real 身分獨立；任何失敗 fail-closed 拒絕）。
+ *   直接／提權／guest host-tree 同門，不共享詞法 allow 就放行。
  *   Java 無 `O_NOFOLLOW`／`openat`：逐段 lstat 與 `toRealPath` 之間、
  *   驗證與實際 open/spawn 之間仍有併發 `rename`／`symlink` 替換窗口，
  *   本門只能縮窗、不能消除（殘餘 TOCTOU，見 [checkPhysicalOperandGate]）。
@@ -248,6 +249,7 @@ object ShellPolicy {
         allowedBinaries: Set<String> = ALLOWED_BINARIES,
         isGuest: Boolean = false,
         trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
@@ -329,6 +331,7 @@ object ShellPolicy {
             isElevated = false,
             allowedBinaries = allowedBinaries,
             isGuest = isGuest,
+            preRealPathHook = preRealPathHook,
         )
         if (pathDenial != null) return pathDenial
         return Validation.Allowed(base)
@@ -356,6 +359,7 @@ object ShellPolicy {
         flavor: Flavor = Flavor.PLAY,
         bridgeGranted: Boolean = false,
         isGuest: Boolean = false,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
@@ -412,6 +416,7 @@ object ShellPolicy {
             isElevated = true,
             allowedBinaries = ALLOWED_BINARIES,
             isGuest = isGuest,
+            preRealPathHook = preRealPathHook,
         )
         if (pathDenialElevated != null) return pathDenialElevated
         return Validation.Allowed(base)
@@ -530,6 +535,7 @@ object ShellPolicy {
         isElevated: Boolean,
         allowedBinaries: Set<String>,
         isGuest: Boolean = false,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
         // grep 顯式 pattern 旗標預掃：-e/--regexp/-f 存在時無 positional pattern 槽。
         var grepPatternSeen = (base != "grep")
@@ -585,9 +591,9 @@ object ShellPolicy {
                     continue
                 }
                 val denial = if (isElevated) {
-                    checkFileScopeElevated(candidate, privateRoot, safRoots, flavor, bridgeGranted)
+                    checkFileScopeElevated(candidate, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
                 } else {
-                    checkFileScope(candidate, privateRoot, safRoots, flavor, bridgeGranted)
+                    checkFileScope(candidate, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
                 }
                 if (denial != null) return denial
             }
@@ -760,6 +766,7 @@ object ShellPolicy {
         safRoots: List<String>,
         flavor: Flavor,
         bridgeGranted: Boolean,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
         // 刻意冗餘：外層 checkPathArgs 已先拒同條件（見 checkPathArgs 內 hasDotDotSegment 外層檢查）；保留作縱深。
         if (hasDotDotSegment(path)) {
@@ -788,7 +795,29 @@ object ShellPolicy {
             flavor = flavor,
             bridgeGranted = bridgeGranted,
             isElevated = false,
+            preRealPathHook = preRealPathHook,
         )
+    }
+
+    /** lstat 三態：LINK（是連結）／PRESENT（存在非連結）／ABSENT（確定缺席）／UNKNOWN（不可判定，fail-closed）。 */
+    private enum class LstatState { LINK, PRESENT, ABSENT, UNKNOWN }
+
+    /**
+     * NOFOLLOW 讀屬性三態（fail-closed：不可判定即 UNKNOWN，不當缺席）。
+     * [Files.isSymbolicLink] 不可判定回 false、exists 步 EACCES 回 false 皆會把
+     * unknown 當 nonexistent 而降級，提權通道（權限高於檢查者）可繞行，故此處
+     * 以 `readAttributes(NOFOLLOW)` 區分：[NoSuchFileException] 才為 ABSENT，
+     * 含 `AccessDeniedException`／`SecurityException`／I/O 未知一律 UNKNOWN。
+     */
+    private fun lstatNoFollow(path: java.nio.file.Path): LstatState {
+        return try {
+            val attrs = Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+            if (attrs.isSymbolicLink) LstatState.LINK else LstatState.PRESENT
+        } catch (_: java.nio.file.NoSuchFileException) {
+            LstatState.ABSENT
+        } catch (_: Exception) {
+            LstatState.UNKNOWN
+        }
     }
 
     /**
@@ -802,16 +831,26 @@ object ShellPolicy {
      * 0. `..` 段檢查（見上）：原始字串以 `/` 切段含 `..` 即拒；含反斜線 `\` 即拒（見 F-backslash，Linux 語義）。
      *    例外：guest 容器內路徑在外層先 `continue` 跳過本門（含 backslash 門），
      *    由容器邊界（proot -r 無 bind＋host 樹封堵＋同容器鎖）覆蓋，宿主無逃逸。
-     * 1. 逐段 symlink 拒絕：候選全鏈（`/` 至本體）與 [privateRoot] 全鏈逐段
-     *    `Files.isSymbolicLink`（NOFOLLOW lstat，不跟隨）；任一段是連結
-     *    （含懸空連結）即拒。判定抛異常視為可疑而拒。
-     * 2. 存在即 `toRealPath()` 全解析固定，再以同一語義重裁
+     * 1. 逐段 symlink 拒絕（三態＋未知即拒）：候選全鏈（`/` 至本體）與 [privateRoot]
+     *    全鏈逐段 [lstatNoFollow]（NOFOLLOW，不跟隨）；LINK 即拒（含懸空連結），
+     *    UNKNOWN 即拒（`AccessDeniedException`／`SecurityException`／I/O 未知
+     *    （含 NotDirectory／瞬時 I/O 錯），關閉 EACCES 混同為缺席的繞行；ABSENT 等同舊 false 語義繼續，PRESENT 繼續；
+     *    超深仍拒）。提權注記：app UID 不可判定者雙通道皆拒，需提權側預檢者走
+     *    Refs #10 follow-up（刻意不在本 PR 碰 github source set）。
+     * 2. 存在即 `toRealPath()` 全解析固定，再驗 real 身分獨立條件＋同語義重裁
      *    [FileScope.decide]（[isElevated] 為 true 時沿提權語義
      *    `allowed==true` 即放行，否則要求 `allowed && !needsBridge`）；
-     *    real 逃出詞法域即拒；解析抛異常即拒。存在判定用 NOFOLLOW（懸空視為存在；但懸空早在步驟1即拒，此僅縱深）。
-     * 3. 不存在時降級為第 1 步（父鏈 symlink Walk）：leaf 無實體可固定，
+     *    兩條件獨立且皆須通過（不得經連結 AND real 授權）：`real != normCandidate`
+     *    即拒（未經連結則 real 恆等於正規候選；提權橋已授權亦不放寬 symlink
+     *    operand），real 逃出詞法域即拒；解析抛異常即拒。存在判定三態
+     *    （[lstatNoFollow]；懸空視為 LINK 早在步驟1即拒，此僅縱深）。
+     *    併發 delete（消失）降級為允許但 spawn 將 ENOENT（無逃逸）；併發 swap
+     *    （仍存在但指別處）經 real 身分條件拒。
+     * 3. 確定缺席才降級為第 1 步（父鏈 symlink Walk）：ABSENT 才回 null，
      *    不以 `NoSuchFileException` 誤殺合法未建檔查詢（如 `ls` 未建檔名、
-     *    單測假根）；其殘餘（檢查後建鏈、父目錄被換）見下。
+     *    單測假根）；LINK 即拒，UNKNOWN 即拒（未知即拒，不降級）；
+     *    其殘餘（檢查後建鏈、父目錄被換）見下。
+     *    hardlink／mount 不改字串故仍走舊語義（列 out-of-scope，與 ScopedFileStore 同）。
      *
      * 誠實揭露（Java 無 `O_NOFOLLOW`／`openat`，TOCTOU 只能縮窗不能消除）：
      * 逐段 lstat → `toRealPath` → 實際 open／spawn 非原子，驗證與使用之間
@@ -842,6 +881,9 @@ object ShellPolicy {
      * `rename` 換掉；段間安全網僅為終態 `toRealPath()`＋重裁，僅反映 toRealPath() 呼叫瞬間終態，不與逐段 lstat 原子一致，中間段在兩次檢查之間仍可被 rename 換掉。
      * mount／bind 不解（與 hardlink 同為 out-of-scope：`toRealPath()` 不解
      * mount，bind 到域外仍顯示域內）。
+     *
+     * 測試接縫：[preRealPathHook] 在步驟 1 迴圈後、exists 步前調用（預設 null，
+     * 生產行為零變；測試用來在 lstat 後、toRealPath 前置換路徑段）。
      */
     private fun checkPhysicalOperandGate(
         candidate: String,
@@ -850,6 +892,7 @@ object ShellPolicy {
         flavor: Flavor,
         bridgeGranted: Boolean,
         isElevated: Boolean,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
         fun deny(reason: String): Validation.Denied =
             Validation.Denied(ShellDeny.BLACKLISTED, reason)
@@ -864,7 +907,9 @@ object ShellPolicy {
         if (hasDotDotSegment(candidate)) {
             return deny("dotdot segment denied (reason=DOTDOT): $candidate")
         }
-        // 1. 逐段 NOFOLLOW：候選鏈 + 私有根鏈（防別名根讓詞法前綴失效）。
+        // 1. 逐段 NOFOLLOW 三態：候選鏈 + 私有根鏈（防別名根讓詞法前綴失效）。
+        // LINK→deny(symlink denied)；UNKNOWN→deny(symlink check failed)；
+        // ABSENT/PRESENT→繼續（ABSENT 等同舊 false 語義；PRESENT 繼續；超深仍拒）。
         for (target in listOf(candidate, privateRoot)) {
             val norm = try {
                 FileScope.normalize(target)
@@ -874,41 +919,46 @@ object ShellPolicy {
             if (!norm.startsWith("/")) return deny("symlink check failed: $candidate")
             val parts = norm.split("/").filter { it.isNotEmpty() }
             var cur = "/"
-            // 根自身先驗（罕見但 fail-closed）。
-            try {
-                if (Files.isSymbolicLink(Paths.get(cur))) return deny("symlink denied: $candidate")
-            } catch (_: Exception) {
-                return deny("symlink check failed: $candidate")
+            // 根自身先驗（罕見但 fail-closed；三態）。
+            when (lstatNoFollow(Paths.get(cur))) {
+                LstatState.LINK -> return deny("symlink denied: $candidate")
+                LstatState.UNKNOWN -> return deny("symlink check failed: $candidate")
+                LstatState.ABSENT, LstatState.PRESENT -> Unit
             }
             for (seg in parts) {
                 cur = if (cur == "/") "/$seg" else "$cur/$seg"
-                val isLink = try {
-                    Files.isSymbolicLink(Paths.get(cur))
-                } catch (_: Exception) {
-                    return deny("symlink check failed: $candidate")
+                when (lstatNoFollow(Paths.get(cur))) {
+                    LstatState.LINK -> return deny("symlink denied: $candidate")
+                    LstatState.UNKNOWN -> return deny("symlink check failed: $candidate")
+                    LstatState.ABSENT, LstatState.PRESENT -> Unit
                 }
-                if (isLink) return deny("symlink denied: $candidate")
                 // 步數上限外的超深路徑 fail-closed（不應發生，防病態輸入）。
                 if (cur.length > 4096) return deny("symlink check failed: $candidate")
             }
         }
-        // 2. 存在即實體固定 + 同語義重裁；不存在降級為第 1 步（見 KDoc）。
+        // 測試 seam：步驟 1 迴圈後、exists 步前調用（lstat 後置換路徑段用）。
+        preRealPathHook?.invoke()
+        // 2./3. 三態 exists＋實體固定 + 同語義重裁；確定缺席才降級（見 KDoc）。
         val normCandidate = try {
             FileScope.normalize(candidate)
         } catch (_: Exception) {
             return deny("symlink check failed: $candidate")
         }
-        val exists = try {
-            Files.exists(Paths.get(normCandidate), LinkOption.NOFOLLOW_LINKS)
-        } catch (_: Exception) {
-            return deny("symlink check failed: $candidate")
+        when (lstatNoFollow(Paths.get(normCandidate))) {
+            LstatState.ABSENT -> return null
+            LstatState.LINK -> return deny("symlink denied: $candidate")
+            LstatState.UNKNOWN -> return deny("symlink check failed: $candidate")
+            LstatState.PRESENT -> Unit
         }
-        if (!exists) return null
         val real = try {
             Paths.get(normCandidate).toRealPath().toString()
         } catch (_: Exception) {
             return deny("symlink check failed: $candidate")
         }
+        // F3/WARN1 elevated real 身分獨立條件（雙通道）：未經連結則 real 恆等於
+        // 正規候選；經連結（lstat 後換入跨域 symlink）即使橋接已授權亦拒。
+        // hardlink/mount 不改字串故仍走舊語義；併發 rename 到他處轉為拒絕。
+        if (real != normCandidate) return deny("real identity mismatch (symlink/rename, fail-closed): $candidate")
         val realDecision = try {
             FileScope.decide(real, privateRoot, safRoots, flavor, bridgeGranted)
         } catch (_: Exception) {
@@ -935,6 +985,7 @@ object ShellPolicy {
         safRoots: List<String>,
         flavor: Flavor,
         bridgeGranted: Boolean,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
         // 刻意冗餘：外層 checkPathArgs 已先拒同條件；保留作縱深（與 checkFileScope/checkPhysicalOperandGate 同）。
         if (hasDotDotSegment(path)) {
@@ -957,6 +1008,7 @@ object ShellPolicy {
             flavor = flavor,
             bridgeGranted = bridgeGranted,
             isElevated = true,
+            preRealPathHook = preRealPathHook,
         )
         return Validation.Denied(
             ShellDeny.BLACKLISTED,

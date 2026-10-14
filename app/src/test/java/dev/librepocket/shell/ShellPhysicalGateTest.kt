@@ -22,9 +22,88 @@ class ShellPhysicalGateTest {
 
     private fun tempDir(prefix: String): File = Files.createTempDirectory(prefix).toFile().canonicalFile
 
+    /** symlink 需 POSIX 語義；Windows 下跳過（整檔 symlink 案一致）。 */
+    private fun assumeNonWindows() {
+        val osName: String = System.getProperty("os.name") ?: ""
+        assumeTrue(!osName.startsWith("Windows"))
+    }
+
+    /**
+     * 權限強制探針：建 probe dir chmod 000 後同 UID 若仍可列目（root 繞行），
+     * 則未知即拒語義無法觀測，跳過。記得 chmod 回來再刪。
+     */
+    private fun assumePermissionEnforced() {
+        assumeNonWindows()
+        val probe = Files.createTempDirectory("b1-perm-probe").toFile()
+        try {
+            try {
+                Files.setPosixFilePermissions(probe.toPath(), emptySet())
+            } catch (_: UnsupportedOperationException) {
+                probe.setReadable(false, false)
+                probe.setWritable(false, false)
+                probe.setExecutable(false, false)
+            } catch (_: Exception) {
+                assumeTrue("cannot chmod probe, skip permission-unknown cases", false)
+            }
+            // 同 UID 去權後仍可列目（root）即跳過；僅確定缺席才繼續。
+            val listed = try { probe.listFiles() } catch (_: Exception) { null }
+            assumeTrue("permission not enforced (likely root), skip", listed == null)
+        } finally {
+            try {
+                try {
+                    Files.setPosixFilePermissions(
+                        probe.toPath(),
+                        setOf(
+                            java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                            java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                            java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE,
+                        ),
+                    )
+                } catch (_: Exception) {
+                    probe.setReadable(true, true)
+                    probe.setWritable(true, true)
+                    probe.setExecutable(true, true)
+                }
+            } catch (_: Exception) {
+            }
+            try { probe.deleteRecursively() } catch (_: Exception) { }
+        }
+    }
+
+    /** chmod-000 子目錄 fixture 的建構（含 link→outside secret；呼叫方負責 chmod 回來再刪）。 */
+    private fun chmodNoAccess(dir: File) {
+        try {
+            Files.setPosixFilePermissions(dir.toPath(), emptySet())
+        } catch (_: UnsupportedOperationException) {
+            dir.setReadable(false, false)
+            dir.setWritable(false, false)
+            dir.setExecutable(false, false)
+        }
+    }
+
+    private fun chmodRestore(dir: File) {
+        try {
+            Files.setPosixFilePermissions(
+                dir.toPath(),
+                setOf(
+                    java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                    java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                    java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE,
+                ),
+            )
+        } catch (_: Exception) {
+            try {
+                dir.setReadable(true, true)
+                dir.setWritable(true, true)
+                dir.setExecutable(true, true)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     @Test fun symlinkOutsideDomain_deniedDirect() {
         // symlink 需 POSIX；Windows 語義不同故限 Linux（後段案同）。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-scope")
         val outside = tempDir("b1-outside")
         try {
@@ -48,7 +127,7 @@ class ShellPhysicalGateTest {
     }
 
     @Test fun symlinkOutsideDomain_deniedElevatedEvenWithBridge() {
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-elev-scope")
         val outside = tempDir("b1-elev-outside")
         try {
@@ -74,7 +153,7 @@ class ShellPhysicalGateTest {
     }
 
     @Test fun symlinkOutsideDomain_deniedGuestHostTree() {
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-guest-scope")
         val outside = tempDir("b1-guest-outside")
         try {
@@ -102,7 +181,7 @@ class ShellPhysicalGateTest {
     @Test fun dotdotViaSymlinkedDir_deniedDirect() {
         // F1 反例：/scope/sub/../escape，sub→域外。詞法折疊後為 /scope/escape（域內），
         // 但 spawn 用原始操作數，核心先解 sub→域外再回 ..，實為域外，故必須拒。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-dotdot-scope")
         val outside = tempDir("b1-dotdot-outside")
         try {
@@ -124,7 +203,7 @@ class ShellPhysicalGateTest {
     @Test fun linkSlashDotDot_deniedDirect() {
         // F1 反例：/scope/link/..，link→域外目錄。詞法折疊後為 /scope（域內），
         // 但實為域外父目錄，故必須拒。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-linkdotdot-scope")
         val outside = tempDir("b1-linkdotdot-outside")
         try {
@@ -178,7 +257,7 @@ class ShellPhysicalGateTest {
 
     @Test fun dotdotViaSymlinkedDir_deniedElevated() {
         // F1 提權同門：即使橋接已授權，`..` 仍先拒（提權不放寬詞法）。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-dotdot-elev-scope")
         val outside = tempDir("b1-dotdot-elev-outside")
         try {
@@ -200,7 +279,7 @@ class ShellPhysicalGateTest {
     }
 
     @Test fun danglingLink_deniedDirectAndElevated() {
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         // 懸空連結回歸鎖定（非 exists 行差分證明）：單線程下步驟1逐段 lstat 已對懸空
         // final-link 回 true 即拒（symlink denied），根本到不了 exists 行；修前 following
         // exists 回 false 亦同樣被步驟1拒。exists NOFOLLOW 僅收斂步驟1→exists→toRealPath
@@ -275,7 +354,7 @@ class ShellPhysicalGateTest {
     @Test fun symlinkChain_middleSegment_denied() {
         // 中段鏈：scope/a 真目錄 + a/b symlink→域外，候選 scope/a/b/c.txt 必須拒（逐段 lstat 擋中段）。
         // fixture 用 canonicalFile（防 macOS /var→/private/var 詞法誤殺）。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-mid-scope").canonicalFile
         val outside = tempDir("b1-mid-outside").canonicalFile
         try {
@@ -301,7 +380,7 @@ class ShellPhysicalGateTest {
     @Test fun symlinkChain_privateRootItselfSymlinked_denied() {
         // 毒根：real 真目錄 + alias symlink→real，以 alias 為 privateRoot，
         // 候選 alias/f.txt（f.txt 建在 real 內）必須拒（根鏈別名讓詞法前綴失效，靠根鏈 lstat 擋）。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val parent = tempDir("b1-alias-parent").canonicalFile
         try {
             val real = File(parent, "real").apply { mkdirs() }
@@ -365,7 +444,7 @@ class ShellPhysicalGateTest {
     @Test fun trailingSlash_dirAllowed_linkDenied() {
         // 尾 slash：真目錄 scope/subdir/ 放行；scope/link/（link→域外目錄）拒。
         // 斷言分開寫清：前者 Allowed，後者 Denied + BLACKLISTED + symlink/cross-domain。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-slash-scope").canonicalFile
         val outside = tempDir("b1-slash-outside").canonicalFile
         try {
@@ -398,7 +477,7 @@ class ShellPhysicalGateTest {
         // //sub//..//escape 與 .../a/./../b.txt 含 .. 段即拒（split 出 .. 即拒，不先折疊）。
         // ...、`.. `（點點空格）、全形 `．．` 都不是 ASCII .. 段，不誤殺（放行）。
         // normalize 不做 NFKC／不解 %2e／不折全形，Linux 按位元組比對，故三者同 rationale。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-enc-scope").canonicalFile
         try {
             File(scope, "%2e%2e").mkdirs()
@@ -451,7 +530,7 @@ class ShellPhysicalGateTest {
         // `=` 後綴同門鎖定：absoluteCandidates 對任何 `--key=/abs` 都抽候選先驗（與鍵無關，
         // 見 checkPathArgs 內 absoluteCandidates 迴圈），故 `--opt=<link>` 走同一 B1 門必須拒。
         // 無放行對照：非路徑鍵的放行屬旗標政策（與 B1 正交），不屬本門承諾。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-eq-scope").canonicalFile
         val outside = tempDir("b1-eq-outside").canonicalFile
         try {
@@ -477,7 +556,7 @@ class ShellPhysicalGateTest {
         // F-backslash：候選含 `\` 即拒（Linux 上 \ 非分隔符，normalize 轉 / 即驗用分叉）。
         // Linux 檔名含 \ 極罕見，fail-closed 誤殺可接受；本案只鎖拒絕，不建真檔。
         // `\` 在 Windows 是分隔符、語義不同，故整案限非 Windows。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val scope = tempDir("b1-backslash-scope").canonicalFile
         try {
             val evil = scope.absolutePath + "\\evil.txt"
@@ -486,5 +565,120 @@ class ShellPhysicalGateTest {
             assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
             assertTrue("message must carry reason, got ${v.message}", v.message.contains("backslash"))
         } finally { scope.deleteRecursively() }
+    }
+
+    // ---- T2 permission-unknown（B1 三態；chmod-000-own-dir 是 owner「0700 非擁有者」
+    // fixture 的可行近似（同 UID 去權），root 下跳過） ----
+
+    @Test fun permissionUnknown_deniedDirect() {
+        // fixture：scope/sub（chmod 000）內放 link→outside secret；EACCES 下
+        // lstat 不可判定即 UNKNOWN，必須拒（不得當缺席降級）。
+        assumePermissionEnforced()
+        val scope = tempDir("b1-perm-scope").canonicalFile
+        val outside = tempDir("b1-perm-outside").canonicalFile
+        val sub = File(scope, "sub").apply { mkdirs() }
+        try {
+            val secret = File(outside, "secret.txt").apply { writeText("secret") }
+            Files.createSymbolicLink(File(sub, "link.txt").toPath(), secret.toPath())
+            chmodNoAccess(sub)
+            val candidate = File(sub, "link.txt").absolutePath
+            val v = ShellPolicy.validate(
+                listOf("cat", candidate),
+                scope.absolutePath,
+            )
+            assertTrue("permission-unknown must be denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("unknown must report check-failed, got ${v.message}", v.message.contains("symlink check failed"))
+        } finally {
+            chmodRestore(sub)
+            try { scope.deleteRecursively() } catch (_: Exception) { }
+            try { outside.deleteRecursively() } catch (_: Exception) { }
+        }
+    }
+
+    @Test fun permissionUnknown_deniedElevatedEvenWithBridge() {
+        // 提權同門：即使橋接已授權，未知即拒（雙通道皆拒）。
+        assumePermissionEnforced()
+        val scope = tempDir("b1-perm-elev-scope").canonicalFile
+        val outside = tempDir("b1-perm-elev-outside").canonicalFile
+        val sub = File(scope, "sub").apply { mkdirs() }
+        try {
+            val secret = File(outside, "secret.txt").apply { writeText("secret") }
+            Files.createSymbolicLink(File(sub, "link.txt").toPath(), secret.toPath())
+            chmodNoAccess(sub)
+            val candidate = File(sub, "link.txt").absolutePath
+            val v = ShellPolicy.validateElevated(
+                listOf("cat", candidate),
+                scope.absolutePath,
+                flavor = Flavor.GITHUB,
+                bridgeGranted = true,
+            )
+            assertTrue("elevated permission-unknown must be denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+            assertTrue("unknown must report check-failed, got ${v.message}", v.message.contains("symlink check failed"))
+        } finally {
+            chmodRestore(sub)
+            try { scope.deleteRecursively() } catch (_: Exception) { }
+            try { outside.deleteRecursively() } catch (_: Exception) { }
+        }
+    }
+
+    // ---- T3 elevated post-lstat swap（B1 身分規則；lstat 後換入跨域 symlink） ----
+
+    @Test fun elevatedPostLstatSwap_denialAndCleanAllowed() {
+        // fixture priv/a/f（實檔）；preRealPathHook 內把 a 換成 symlink→outside
+        //（bridge 授權域，validateElevated GITHUB+bridge）。
+        // 有 hook→Denied（real 身分獨立條件）；無 hook→Allowed（同 fixture 對照）。
+        assumeNonWindows()
+        val scope = tempDir("b1-swap-scope").canonicalFile
+        val outside = tempDir("b1-swap-outside").canonicalFile
+        try {
+            val a = File(scope, "a").apply { mkdirs() }
+            File(a, "f.txt").writeText("inside")
+            File(outside, "f.txt").writeText("outside")
+            val candidate = File(a, "f.txt").absolutePath
+            // 正例對照：無 hook 維持放行（real 恆等於正規候選，私有域）。
+            val clean = ShellPolicy.validateElevated(
+                listOf("cat", candidate),
+                scope.absolutePath,
+                flavor = Flavor.GITHUB,
+                bridgeGranted = true,
+            )
+            assertTrue("clean inside file must stay allowed, got $clean", clean is Validation.Allowed)
+            // 有 hook：lstat 後把 a 換成 symlink→outside（橋接授權域亦拒）。
+            val swapped = ShellPolicy.validateElevated(
+                listOf("cat", candidate),
+                scope.absolutePath,
+                flavor = Flavor.GITHUB,
+                bridgeGranted = true,
+                preRealPathHook = {
+                    val backup = File(scope, "a-real")
+                    if (a.exists() && !Files.isSymbolicLink(a.toPath())) {
+                        Files.move(a.toPath(), backup.toPath())
+                        Files.createSymbolicLink(a.toPath(), outside.toPath())
+                    }
+                },
+            )
+            assertTrue("post-lstat swap must be denied, got $swapped", swapped is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (swapped as Validation.Denied).reason)
+            assertTrue(
+                "message must mention symlink/real-identity, got ${swapped.message}",
+                swapped.message.contains("symlink") || swapped.message.contains("cross-domain"),
+            )
+        } finally {
+            try {
+                val a = File(scope, "a")
+                if (Files.isSymbolicLink(a.toPath())) Files.deleteIfExists(a.toPath())
+            } catch (_: Exception) {
+            }
+            try {
+                val backup = File(scope, "a-real")
+                val a = File(scope, "a")
+                if (backup.exists() && !a.exists()) Files.move(backup.toPath(), a.toPath())
+            } catch (_: Exception) {
+            }
+            try { scope.deleteRecursively() } catch (_: Exception) { }
+            try { outside.deleteRecursively() } catch (_: Exception) { }
+        }
     }
 }

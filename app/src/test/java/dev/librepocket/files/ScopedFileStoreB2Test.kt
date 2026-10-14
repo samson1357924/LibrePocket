@@ -7,7 +7,11 @@ import org.junit.Assert.fail
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
+import java.io.IOException
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.CopyOption
 import java.nio.file.Files
+import java.nio.file.Path
 
 /**
  * B2 有界切片回歸（#10，不碰 shell 政策本體）：
@@ -27,6 +31,12 @@ class ScopedFileStoreB2Test {
         Files.createSymbolicLink(link.toPath(), target.toPath())
     }
 
+    /** symlink 需 POSIX 語義；Windows 下跳過（整檔 symlink 案一致）。 */
+    private fun assumeNonWindows() {
+        val osName: String = System.getProperty("os.name") ?: ""
+        assumeTrue(!osName.startsWith("Windows"))
+    }
+
     private fun assertRejected(block: () -> Unit, label: String) {
         try {
             block()
@@ -40,7 +50,7 @@ class ScopedFileStoreB2Test {
 
     @Test fun deleteReplacedFinalLinkRefusesAndOutsideSurvives() {
         // symlink 需 POSIX；Windows 語義不同故限 Linux。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val ws = workspace()
         val out = outside()
         val secret = File(out, "secret.txt").apply { writeText("OUTSIDE") }
@@ -56,7 +66,7 @@ class ScopedFileStoreB2Test {
     }
 
     @Test fun deleteReplacedParentLinkRefusesAndOutsideSurvives() {
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val ws = workspace()
         val out = outside()
         val secret = File(out, "secret.txt").apply { writeText("OUTSIDE") }
@@ -76,11 +86,13 @@ class ScopedFileStoreB2Test {
 
     @Test fun deletePreDeleteGateExists() {
         // 結構守衛（非行為證明）：基底 ensureNoSymlinkChain 已擋單線程前置換，
-        // 故無單線程 RED 差分；本測試只鎖定 delete 體內的用時重驗門存在，
-        // B2 增量（驗→刪窗口縮小）由 code review 驗證。
+        // 故無單線程 RED 差分；本測試只鎖定 deleteInternal 體內的用時重驗門存在
+        //（公開 delete 經 deleteInternal 委派，行為不分叉），
+        // B2 增量（驗→刪窗口縮小＋root 定錨）由 code review 驗證。
         val source = findStoreSource() ?: fail("cannot locate ScopedFileStore.kt").let { throw AssertionError() }
         val text = source.readText()
-        val deleteBody = text.substringAfter("fun delete(relativePath: String)").substringBefore("\n    /**")
+        assertTrue("public delete must delegate to deleteInternal", text.contains("fun delete(relativePath: String): Boolean = deleteInternal(relativePath)"))
+        val deleteBody = text.substringAfter("fun deleteInternal(").substringBefore("\n    /**")
         assertTrue(
             "delete must lstat final target NOFOLLOW before delete (got: $deleteBody)",
             deleteBody.contains("isSymbolicLink") && deleteBody.contains("target.toPath()"),
@@ -88,6 +100,11 @@ class ScopedFileStoreB2Test {
         assertTrue(
             "delete must re-verify canonical containment before delete",
             deleteBody.contains("canonicalPath") && deleteBody.contains(".delete()"),
+        )
+        assertTrue(
+            "delete must anchor root and reverify identity (no re-read of root.canonicalPath)",
+            deleteBody.contains("snapshotTrustedRoot") && deleteBody.contains("reverifyRootIdentity") &&
+                deleteBody.contains("trustedRoot") && !deleteBody.contains("root.canonicalPath"),
         )
         // 順序鎖定：lstat＋canonical 重驗必須先於實際 delete，否則重排 bug 可穿透。
         val lstatIdx = deleteBody.indexOf("Files.isSymbolicLink(target.toPath())")
@@ -133,7 +150,7 @@ class ScopedFileStoreB2Test {
     // ---- write：落盤前重驗 ----
 
     @Test fun writeParentSwappedBeforeCallRefuses() {
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val ws = workspace()
         val out = outside()
         link(File(ws, "link"), out)
@@ -147,7 +164,7 @@ class ScopedFileStoreB2Test {
         // 即拋（見 write/resolve；本案鎖定終態無殘留，不區分未建／建後清）；
         // 斷言 ws/out 內無 `.lp-*`（用 TMP_NAME_PREFIX 常數）+ 外部未落地。
         // 沿用 workspace()/outside() 但本案加 try-finally（不重構既有 7 案 deleteOnExit）。
-        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        assumeNonWindows()
         val ws = workspace()
         val out = outside()
         try {
@@ -179,18 +196,170 @@ class ScopedFileStoreB2Test {
 
     @Test fun writeRevalidatesBeforeMove() {
         // 結構守衛（非行為證明）：基底已有建後三驗，單線程無 RED 差分；
-        // 本測試只鎖定搬移前再驗門存在，用時窗口縮小由 review 驗證。
+        // 本測試只鎖定 writeInternal 搬移前再驗門存在（公開 write 經委派），
+        // 用時窗口縮小＋root 定錨＋fallback 收窄由 review 驗證。
         val source = findStoreSource() ?: fail("cannot locate ScopedFileStore.kt").let { throw AssertionError() }
         val text = source.readText()
-        val writeBody = text.substringAfter("fun write(relativePath: String").substringBefore("private fun mkdirParentNoFollow")
+        assertTrue("public write must delegate to writeInternal", text.contains("fun write(relativePath: String, bytes: ByteArray): WriteOutcome ="))
+        val writeBody = text.substringAfter("fun writeInternal(").substringBefore("private fun mkdirParentNoFollow")
         val tmpIdx = writeBody.indexOf("createTempFile")
-        val moveIdx = writeBody.indexOf("Files.move")
+        val moveIdx = writeBody.indexOf("moveFn(")
         assertTrue("write must create tmp then move (got indices $tmpIdx/$moveIdx)", tmpIdx >= 0 && moveIdx > tmpIdx)
         val preMove = writeBody.substring(tmpIdx, moveIdx)
         assertTrue(
             "write must re-verify symlink chain between tmp creation and move",
             preMove.contains("ensureNoSymlinkChain") || preMove.contains("ensurePreMove"),
         )
+        assertTrue(
+            "write must anchor root and use moveFn with narrowed fallback",
+            writeBody.contains("snapshotTrustedRoot") && writeBody.contains("reverifyRootIdentity") &&
+                writeBody.contains("AtomicMoveNotSupportedException") && writeBody.contains("preGateHook"),
+        )
+        assertTrue(
+            "write must not re-anchor root from possibly-swapped root",
+            !writeBody.contains("root.canonicalPath") && writeBody.contains("trustedRoot"),
+        )
+        val snapIdx = writeBody.indexOf("snapshotTrustedRoot")
+        val hookIdx = writeBody.indexOf("preGateHook?.invoke()")
+        val reverifyIdx = writeBody.indexOf("reverifyRootIdentity")
+        assertTrue(
+            "snapshot + hook must precede re-verify (got indices $snapIdx/$hookIdx/$reverifyIdx)",
+            snapIdx >= 0 && hookIdx > snapIdx && reverifyIdx > hookIdx,
+        )
+    }
+
+    // ---- T1 root-swap 確定性（B2 定錨；初驗與終門之間 swap root） ----
+
+    @Test fun deleteRootSwappedBetweenGatesRefusesAndOutsideSurvives() {
+        assumeNonWindows()
+        val parent = Files.createTempDirectory("b2-roots-sw").toFile()
+        val ws = File(parent, "ws").apply { mkdirs() }
+        val out = Files.createTempDirectory("b2-roots-out").toFile()
+        try {
+            File(out, "victim.txt").writeText("OUTSIDE")
+            val store = ScopedFileStore(ws)
+            store.write("victim.txt", "inside".toByteArray())
+            assertRejected({
+                store.deleteInternal("victim.txt", preGateHook = {
+                    val old = File(parent, "ws-old")
+                    Files.move(ws.toPath(), old.toPath())
+                    Files.createSymbolicLink(ws.toPath(), out.toPath())
+                })
+            }, "delete with swapped root must be denied")
+            // 外部 victim 存活（定錨 containment 擋下，未刪真外部檔）。
+            assertEquals("OUTSIDE", File(out, "victim.txt").readText())
+            // 舊域內檔隨 rename 留在 ws-old（未被誤刪）。
+            assertEquals("inside", File(File(parent, "ws-old"), "victim.txt").readText())
+        } finally {
+            try {
+                if (Files.isSymbolicLink(ws.toPath())) Files.deleteIfExists(ws.toPath())
+            } catch (_: Exception) {
+            }
+            try { File(parent, "ws-old").deleteRecursively() } catch (_: Exception) { }
+            try { ws.deleteRecursively() } catch (_: Exception) { }
+            try { parent.deleteRecursively() } catch (_: Exception) { }
+            try { out.deleteRecursively() } catch (_: Exception) { }
+        }
+    }
+
+    @Test fun writeRootSwappedBetweenGatesRefusesWithoutLandingOrTmp() {
+        assumeNonWindows()
+        val ws = workspace()
+        val out = outside()
+        try {
+            val store = ScopedFileStore(ws)
+            try {
+                store.writeInternal(
+                    "evil.txt",
+                    "x".toByteArray(),
+                    preGateHook = {
+                        // 刪原域後以同名 symlink 指外（tmp 隨舊域同刪，不殘留到外部）。
+                        ws.deleteRecursively()
+                        Files.createSymbolicLink(ws.toPath(), out.toPath())
+                    },
+                )
+                fail("expected IllegalArgumentException: write with swapped root")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(
+                    "message must mention symlink/escapes, got ${e.message}",
+                    (e.message ?: "").contains("symlink") || (e.message ?: "").contains("escapes"),
+                )
+            }
+            // hook 確實跑過（ws 已被換成 symlink），非入口先拒。
+            assertTrue("hook must have run (ws is now symlink)", Files.isSymbolicLink(ws.toPath()))
+            // 外部未落地。
+            assertFalse(File(out, "evil.txt").exists())
+            // 無 tmp 殘留（外部域內無 `.lp-*`）。
+            val outTop = (out.listFiles()?.toList() ?: emptyList())
+                .filter { it.isFile && !Files.isSymbolicLink(it.toPath()) && it.name.startsWith(ScopedFileStore.TMP_NAME_PREFIX) }
+            assertTrue("denied write must leave no tmp in out, got $outTop", outTop.isEmpty())
+        } finally {
+            try {
+                if (Files.isSymbolicLink(ws.toPath())) Files.deleteIfExists(ws.toPath())
+            } catch (_: Exception) {
+            }
+            try { ws.deleteRecursively() } catch (_: Exception) { }
+            try { out.deleteRecursively() } catch (_: Exception) { }
+        }
+    }
+
+    // ---- T4 move fallback 故障注入（B2 收窄＋重驗） ----
+
+    @Test fun writeFallbackAtomicUnsupportedRetriesAndLands() {
+        val ws = workspace()
+        try {
+            val store = ScopedFileStore(ws)
+            var calls = 0
+            val outcome = store.writeInternal(
+                "t.txt",
+                "hello".toByteArray(),
+                moveFn = { s: Path, d: Path, o: Array<out CopyOption> ->
+                    calls++
+                    if (calls == 1) throw AtomicMoveNotSupportedException(s.toString(), d.toString(), "injected")
+                    Files.move(s, d, *o)
+                },
+            )
+            assertEquals(ScopedFileStore.WriteOutcome.Created, outcome)
+            // fallback 重試成功落盤（兩次 move；gates 重跑由結構守衛＋review 驗證，
+            // 本案僅鎖重試＋落盤＋無暫留）。
+            assertEquals(2, calls)
+            assertEquals("hello", File(ws, "t.txt").readText())
+            val tmps = (ws.listFiles()?.toList() ?: emptyList())
+                .filter { it.isFile && it.name.startsWith(ScopedFileStore.TMP_NAME_PREFIX) }
+            assertTrue("fallback must leave no tmp, got $tmps", tmps.isEmpty())
+        } finally {
+            ws.deleteRecursively()
+        }
+    }
+
+    @Test fun writeFallbackNonAtomicErrorFailsClosedWithoutTmpOrOverwrite() {
+        val ws = workspace()
+        try {
+            val store = ScopedFileStore(ws)
+            store.write("t.txt", "orig".toByteArray())
+            var calls = 0
+            try {
+                store.writeInternal(
+                    "t.txt",
+                    "new".toByteArray(),
+                    moveFn = { _: Path, _: Path, _: Array<out CopyOption> ->
+                        calls++
+                        throw IOException("injected")
+                    },
+                )
+                fail("expected IOException from moveFn")
+            } catch (_: IOException) {
+                // 預期向外拋（fail-closed；舊廣 catch 會重試，本案 calls==1 鎖定收窄）。
+            }
+            assertEquals(1, calls)
+            // tmp 已清＋target 未被覆寫。
+            val tmps = (ws.listFiles()?.toList() ?: emptyList())
+                .filter { it.isFile && it.name.startsWith(ScopedFileStore.TMP_NAME_PREFIX) }
+            assertTrue("failed move must leave no tmp, got $tmps", tmps.isEmpty())
+            assertEquals("orig", File(ws, "t.txt").readText())
+        } finally {
+            ws.deleteRecursively()
+        }
     }
 
     private fun findStoreSource(): File? {

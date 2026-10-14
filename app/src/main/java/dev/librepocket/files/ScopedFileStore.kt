@@ -6,6 +6,8 @@ import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.IOException
 import java.io.InputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.CopyOption
 import java.nio.file.DirectoryIteratorException
 import java.nio.file.DirectoryStream
 import java.nio.file.Files
@@ -71,6 +73,11 @@ enum class FileBudgetCode(val detail: String) {
  *   一次整鏈（[resolve] 內已驗第一次）；[read] 在回傳前重驗一次。
  *   重驗只能縮小窗口，不能消除——第二次驗證與實際 IO 之間攻擊者仍可能
  *   以 `rename`/`symlink` 替換路徑段（見下）。
+ * - B2 root 定錨：[delete]/[write] 在初驗後以 [snapshotTrustedRoot] 固定可信
+ *   root 正規身分，containment 與最終門一律比對該定錨，不再以可能被換掉的
+ *   `root.canonicalPath` 重定錨；操作前以 [reverifyRootIdentity] 再驗 root
+ *   本體非連結且正規身分與定錨一致。單次 root 本體置換（真目錄→指外連結）
+ *   轉為拒絕；雙重替換（驗→換入→用→換回）仍僅有界不消除。
  * - TOCTOU 殘餘風險：單次檢查無法解決併發替換——檢查與實際 IO 之間
  *   攻擊者仍可能以 `rename`/`symlink` 替換路徑段。[read] 在回傳前重驗
  *   一次鏈上無連結並丟棄可疑結果，可將單次替換轉為拒絕，但雙重替換
@@ -199,6 +206,43 @@ class ScopedFileStore(val root: File) {
     }
 
     /**
+     * B2 root 定錨：初驗後固定可信 root 正規身分；最終門與 IO 前比對，不再以可能被換掉的 root 重定錨。
+     *
+     * 先以 [ensureRootChainNoSymlink] 驗 root 鏈（含 root 本體段；[resolve]／
+     * [ensureNoSymlinkChain] 已在入口驗過，故此處不新增誤殺，只加定錨），再驗
+     * root 本體非連結，最後回傳當下正規身分。呼叫方須在初驗後立刻 snapshot，
+     * containment 與終驗一律比對該定錨。
+     */
+    private fun snapshotTrustedRoot(original: String): String {
+        ensureRootChainNoSymlink(original)
+        try {
+            if (Files.isSymbolicLink(root.toPath())) throw IllegalArgumentException("symlink not allowed: $original")
+            return root.canonicalPath
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
+    }
+
+    /** 最終操作前再驗 root：本體非連結且正規身分與定錨一致；任一不符即拒。 */
+    private fun reverifyRootIdentity(trustedRootCanon: String, original: String) {
+        try {
+            if (Files.isSymbolicLink(root.toPath())) throw IllegalArgumentException("symlink not allowed: $original")
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
+        val now = try {
+            root.canonicalPath
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
+        if (now != trustedRootCanon) throw IllegalArgumentException("path escapes root: $original")
+    }
+
+    /**
      * 讀檔；不存在拋 [FileNotFoundException]，超過 [maxBytes] 拋
      * [FileBudgetException]（[FileBudgetCode.READ_TOO_LARGE]）。
      * `length()` 快篩只是建議值；權威判定是串流中的 `cap+1` sentinel
@@ -288,14 +332,38 @@ class ScopedFileStore(val root: File) {
      * 見類註解 TOCTOU 說明。B2 在暫存建立前先驗整鏈再建暫存＋寫入，
      * 寫完搬移前再驗整鏈（NOFOLLOW）＋最終目標非連結＋暫存域內擋落鏈外；
      * 建暫存→寫入窗口仍可瞬時外寫（僅能事後刪暫存），殘餘 TOCTOU 僅有界。
+     * root 以定錨比對（見類註解 B2 root 定錨）：初驗後 snapshot，containment
+     * 與搬移前重驗一律比對定錨，不以可能被換掉的 root 重定錨。
+     * fallback 只接 [AtomicMoveNotSupportedException]（不支援原子搬移的檔案系統
+     * 才退回普通覆蓋，退回前重跑整鏈＋落盤門；其餘異常直接拋，fail-closed）。
+     *
+     * 測試接縫：實際經由 [writeInternal] 委派（`preGateHook`／`moveFn` 預設為
+     * 生產行為，測試可注入 hook 在初驗與終門之間置換 root、或注入 moveFn 模擬
+     * fallback；見 ScopedFileStoreB2Test）。
      */
-    fun write(relativePath: String, bytes: ByteArray): WriteOutcome {
+    fun write(relativePath: String, bytes: ByteArray): WriteOutcome =
+        writeInternal(relativePath, bytes)
+
+    /**
+     * 測試接縫多載（生產經由 [write] 委派，預設行為不變）。
+     *
+     * - [preGateHook]：搬移前重驗之前調用（測試用來在初驗與終門之間 swap root）。
+     * - [moveFn]：搬移執行（預設 `Files.move`；測試可注入首調拋
+     *   [AtomicMoveNotSupportedException] 驗 fallback 重跑 gates）。
+     */
+    internal fun writeInternal(
+        relativePath: String,
+        bytes: ByteArray,
+        preGateHook: (() -> Unit)? = null,
+        moveFn: (Path, Path, Array<out CopyOption>) -> Path = { s, d, o -> Files.move(s, d, *o) },
+    ): WriteOutcome {
         val target = resolve(relativePath)
         val safe = FileScope.sanitizeRelative(relativePath)
             ?: throw IllegalArgumentException("unsafe path: $relativePath")
         mkdirParentNoFollow(safe, relativePath)
         // 建後三驗：mkdir 可能新建目錄，併發替換窗口下再次確認。
         ensureNoSymlinkChain(safe, relativePath)
+        val trustedRoot = snapshotTrustedRoot(relativePath)
         if (target.isFile && target.length() == bytes.size.toLong() && contentEquals(target, bytes)) {
             return WriteOutcome.Unchanged
         }
@@ -306,21 +374,31 @@ class ScopedFileStore(val root: File) {
         val tmp = File.createTempFile(TMP_NAME_PREFIX, ".tmp", target.parentFile ?: root)
         try {
             tmp.writeBytes(bytes)
+            // 測試 seam：搬移前重驗之前調用（初驗與終門之間置換 root 用）。
+            preGateHook?.invoke()
             // B2 寫完搬移前再驗：暫存建立→搬移窗口內父鏈可能被換成連結；
             // 沿用 NOFOLLOW 語義再驗一次整鏈，並驗最終目標非連結、暫存仍在域內擋落鏈外；
             // 驗失敗拋出後由 finally 刪暫存，殘餘 TOCTOU 僅有界。
+            // root 身分另以定錨再驗（防 root 本體置換）。
             ensureNoSymlinkChain(safe, relativePath)
-            ensurePreMoveNoSymlinkAndContained(target, tmp, relativePath)
+            reverifyRootIdentity(trustedRoot, relativePath)
+            ensurePreMoveNoSymlinkAndContained(target, tmp, relativePath, trustedRoot)
             try {
-                Files.move(
+                moveFn(
                     tmp.toPath(),
                     target.toPath(),
-                    StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING,
+                    arrayOf(
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING,
+                    ),
                 )
-            } catch (_: Exception) {
-                // 檔案系統不支援原子搬移時退回普通覆蓋（仍先寫暫存，保證不截斷原檔）。
-                Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            } catch (_: AtomicMoveNotSupportedException) {
+                // 僅檔案系統不支援原子搬移時退回普通覆蓋（仍先寫暫存，保證不截斷原檔）。
+                // 退回前重跑整鏈＋落盤門（用定錨 root）；其餘異常直接拋（fail-closed）。
+                ensureNoSymlinkChain(safe, relativePath)
+                reverifyRootIdentity(trustedRoot, relativePath)
+                ensurePreMoveNoSymlinkAndContained(target, tmp, relativePath, trustedRoot)
+                moveFn(tmp.toPath(), target.toPath(), arrayOf(StandardCopyOption.REPLACE_EXISTING))
             }
         } finally {
             if (tmp.exists()) tmp.delete()
@@ -377,12 +455,19 @@ class ScopedFileStore(val root: File) {
 
     /**
      * B2 落盤門：驗最終目標非連結（NOFOLLOW lstat）、暫存非連結，
-     * 且兩者正規路徑仍在域內（防父段替換後指向外部）。失敗 fail-closed。
-     * 僅做單次檢查，不消除檢查-搬移之間的併發窗口（見類註解）。
+     * 且兩者正規路徑仍在定錨 root 域內（防父段／root 替換後指向外部；不再以可能
+     * 被換掉的 `root.canonicalPath` 重定錨，一律比對呼叫方傳入的定錨）。
+     * 失敗 fail-closed。僅做單次檢查，不消除檢查-搬移之間的併發窗口（見類註解）。
      * 注意 File.getCanonicalPath 對懸空連結不跟隨（返回詞法域內），故 containment
      * 不能替代 lstat，兩者缺一不可，順序不得對調；方法內 lstat→canonical 亦非原子。
+     * fallback 退回前呼叫方須重跑整鏈＋本門（見 [writeInternal]）。
      */
-    private fun ensurePreMoveNoSymlinkAndContained(target: File, tmp: File, original: String) {
+    private fun ensurePreMoveNoSymlinkAndContained(
+        target: File,
+        tmp: File,
+        original: String,
+        trustedRootCanon: String,
+    ) {
         try {
             if (Files.isSymbolicLink(target.toPath())) {
                 throw IllegalArgumentException("symlink not allowed: $original")
@@ -390,7 +475,7 @@ class ScopedFileStore(val root: File) {
             if (Files.isSymbolicLink(tmp.toPath())) {
                 throw IllegalArgumentException("symlink not allowed: $original")
             }
-            val rootCanon = root.canonicalPath
+            val rootCanon = trustedRootCanon
             val targetCanon = target.canonicalPath
             val tmpCanon = tmp.canonicalPath
             if (targetCanon != rootCanon && !targetCanon.startsWith("$rootCanon/")) {
@@ -658,30 +743,42 @@ class ScopedFileStore(val root: File) {
      * （跟隨父鏈刪外部）才是真正安全修復。重驗→刪除之間仍有有界併發窗口
      * （攻擊者可無限重試，rename 原子，窗口非時間極小，僅有界不消除；
      * Java 無 O_NOFOLLOW/openat，見類註解），
-     * 此為變更操作固有風險，呼叫方不得假設檢查後路徑不可變。 */
-    fun delete(relativePath: String): Boolean {
+     * 此為變更操作固有風險，呼叫方不得假設檢查後路徑不可變。
+     * root 定錨：初驗後 snapshot 可信 root 正規身分，containment 比對定錨，
+     * 操作前以 [reverifyRootIdentity] 再驗 root 本體；單次 root 本體置換拒絕，
+     * 雙重替換仍僅有界。
+     *
+     * 測試接縫：實際經由 [deleteInternal] 委派（`preGateHook` 預設 null；
+     * 測試可注入 hook 在初驗與終門之間 swap root）。 */
+    fun delete(relativePath: String): Boolean = deleteInternal(relativePath)
+
+    /**
+     * 測試接縫多載（生產經由 [delete] 委派，預設行為不變）。
+     *
+     * - [preGateHook]：B2 終門之前調用（測試用來在初驗與終門之間 swap root）。
+     */
+    internal fun deleteInternal(relativePath: String, preGateHook: (() -> Unit)? = null): Boolean {
         val target = resolve(relativePath)
         val safe = FileScope.sanitizeRelative(relativePath)
             ?: throw IllegalArgumentException("unsafe path: $relativePath")
         ensureNoSymlinkChain(safe, relativePath)
+        val trustedRoot = snapshotTrustedRoot(relativePath)
+        // 測試 seam：B2 終門之前調用（初驗與終門之間置換 root 用）。
+        preGateHook?.invoke()
         // B2 刪前重驗：NOFOLLOW lstat 最終目標，是 link 即拒不刪；
-        // 再驗正規路徑仍在域內（防父段替換後指向外部）。
+        // 再驗正規路徑仍在定錨域內（防父段／root 替換後指向外部，不重讀 root 定錨）。
         if (Files.isSymbolicLink(target.toPath())) {
             throw IllegalArgumentException("symlink not allowed: $relativePath")
-        }
-        val rootCanon = try {
-            root.canonicalPath
-        } catch (e: Exception) {
-            throw IllegalArgumentException("symlink check failed: $relativePath", e)
         }
         val targetCanon = try {
             target.canonicalPath
         } catch (e: Exception) {
             throw IllegalArgumentException("symlink check failed: $relativePath", e)
         }
-        if (targetCanon != rootCanon && !targetCanon.startsWith("$rootCanon/")) {
+        if (targetCanon != trustedRoot && !targetCanon.startsWith("$trustedRoot/")) {
             throw IllegalArgumentException("path escapes root: $relativePath")
         }
+        reverifyRootIdentity(trustedRoot, relativePath)
         return target.delete()
     }
 

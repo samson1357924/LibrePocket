@@ -9,9 +9,11 @@ Reads `app/build/test-results/**/TEST-*.xml` (same glob as
 the greater of the `<testsuite time="...">` attribute and the sum of its
 direct `<testcase time="...">` children (a zeroed/NaN suite total cannot hide
 slow cases). Malformed values (unparseable, NaN/inf, negative), unreadable
-files, and unrecognized roots are explicit ERRORS that fail the gate — a
-present-but-unreadable report never silently passes. Only the total absence
-of XML skips green (the Gradle step itself governs missing results).
+files, unrecognized roots, reports with zero suites, and suites with no
+usable timestamp at all are explicit ERRORS that fail the gate — a
+present-but-unreadable (or present-but-timeless) report never silently
+passes. Only the total absence of XML skips green (the Gradle step itself
+governs missing results).
 
 Threshold: 120s per class (Issue #86 acceptance: single-class >120s fails).
 
@@ -65,6 +67,9 @@ def analyze(root: str) -> tuple[dict[str, float], list[str]]:
         else:
             errors.append(f"{path}: unrecognized root <{xml_root.tag}>")
             continue
+        if not suites:
+            errors.append(f"{path}: report contains no <testsuite>")
+            continue
         for suite in suites:
             name = suite.get("name") or os.path.basename(path)
             suite_time = _valid_time(suite.get("time"))
@@ -74,9 +79,8 @@ def analyze(root: str) -> tuple[dict[str, float], list[str]]:
                     f"time={suite.get('time')!r}"
                 )
             case_total = 0.0
-            cases_seen = 0
+            valid_seen = suite_time is not None
             for case in suite.findall("testcase"):
-                cases_seen += 1
                 case_time = _valid_time(case.get("time"))
                 if case.get("time") is not None and case_time is None:
                     errors.append(
@@ -84,8 +88,13 @@ def analyze(root: str) -> tuple[dict[str, float], list[str]]:
                         f".{case.get('name')} has malformed "
                         f"time={case.get('time')!r}"
                     )
-                case_total += case_time if case_time is not None else 0.0
-            if suite_time is None and cases_seen == 0:
+                if case_time is not None:
+                    valid_seen = True
+                    case_total += case_time
+            if not valid_seen:
+                # Present-but-timeless reports must not read as "0s, under
+                # budget": without a single usable timestamp there is nothing
+                # to judge, so this is an error, not a pass.
                 errors.append(f"{path}: suite {name!r} has no usable time")
                 continue
             totals[name] = totals.get(name, 0.0) + max(

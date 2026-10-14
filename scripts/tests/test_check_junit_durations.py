@@ -148,6 +148,38 @@ class CheckJunitDurationsTest(unittest.TestCase):
             )
             self.assertEqual(1, check_junit_durations.main(d))
 
+    def test_main_empty_testsuites_exit_1(self) -> None:
+        # PR #87 Round2 P3-1: <testsuites/> matches the glob but carries no
+        # suite — must fail, not read as "no XML found, skipping".
+        with tempfile.TemporaryDirectory() as d:
+            _write_results(
+                Path(d),
+                {"TEST-e.xml": '<?xml version="1.0" encoding="UTF-8"?><testsuites/>'},
+            )
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_main_timeless_suite_and_cases_exit_1(self) -> None:
+        # Suite + case present but no usable timestamp anywhere: not "0s".
+        with tempfile.TemporaryDirectory() as d:
+            content = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<testsuite name="com.example.Timeless" tests="1" failures="0" errors="0" skipped="0">'
+                '<testcase classname="com.example.Timeless" name="ok"/>'
+                "</testsuite>"
+            )
+            _write_results(Path(d), {"TEST-t.xml": content})
+            self.assertEqual(1, check_junit_durations.main(d))
+
+    def test_main_empty_suite_no_cases_exit_1(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            content = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<testsuite name="com.example.Empty" tests="0" failures="0" errors="0" skipped="0">'
+                "</testsuite>"
+            )
+            _write_results(Path(d), {"TEST-0.xml": content})
+            self.assertEqual(1, check_junit_durations.main(d))
+
 
 if __name__ == "__main__":
     unittest.main()

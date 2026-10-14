@@ -215,7 +215,7 @@ class ChatViewModel(
     // burned together with the consent under keyReadConsentLock on
     // invalidateLifecycle(clearChat)/invalidateForEndpointChange(null)/
     // openSession new round/logout, discarded by dismissKeyReadConfirm.
-    // Kept after mint/consume (overwritten by the next deny); a stale tap
+    // A successful mint burns it in the same lock (single-use); a stale tap
     // with no pending/mismatched token fails closed with zero vault reads.
     private var pendingKeyReadConfirm: PendingKeyReadConfirm? = null
     // S2: pending history open retained across a key.read ConfirmRequired.
@@ -364,7 +364,9 @@ class ChatViewModel(
      * The next [authorizeEndpoint] that observes an ASK verdict consumes it:
      * a binding match allows that single read, any mismatch denies closed.
      * DENY always wins and burns the consent; a policy evaluation failure
-     * burns it too and denies closed. Returns false when no usable endpoint
+     * burns it too and denies closed. A successful mint burns the pending
+     * token in the same lock (single-use: the same token never mints twice,
+     * even before the consent is consumed). Returns false when no usable endpoint
      * is persisted (no consent minted). A later mint overwrites an
      * unconsumed one; an endpoint replacement keeps the slot (the binding
      * match still rejects the stale snapshot), only a null endpoint
@@ -482,8 +484,12 @@ class ChatViewModel(
      * P2 final mint with token recheck (pending + generation + seq + binding
      * equality under the same lock as bump+burn). A racing invalidation
      * (bump+burn) or newer deny (pending overwrite + seq bump) aborts the
-     * stale mint; the pending token itself is kept (overwritten only by the
-     * next deny, burned only by invalidate/dismiss/logout).
+     * stale mint; a successful mint burns the pending token in the same lock
+     * (single-use: the same token can never mint twice — a replay with the
+     * same token after mint or after T0 consume fails closed with zero vault
+     * reads). Only a still-pending deny can mint; a mismatch still burns
+     * nothing (see confirmKeyRead), and invalidate/dismiss/logout burn both
+     * slots.
      */
     private fun mintKeyReadConsentWithToken(
         startedGeneration: Long,
@@ -510,14 +516,25 @@ class ChatViewModel(
             if (startedGeneration != currentPending.generation) return false
             if (binding != currentPending.binding) return false
             pendingKeyReadConsent = consent
+            // Single-use: burn the token in the same critical section so a
+            // replay with this token (after mint, or after T0 consumes the
+            // consent) fails closed on the null-pending check above.
+            pendingKeyReadConfirm = null
         }
         return true
     }
 
-    /** Abandon an unconsumed key.read confirmation and its pending token, if any. */
+    /**
+     * Abandon an unconsumed key.read confirmation and its pending token, if
+     * any. Single critical section: consent + token clear atomically, so an
+     * in-flight confirm parked in readEndpoint cannot slip a mint between a
+     * split take and token clear and leave a reusable consent behind.
+     */
     fun dismissKeyReadConfirm() {
-        takePendingKeyReadConsent()
-        synchronized(keyReadConsentLock) { pendingKeyReadConfirm = null }
+        synchronized(keyReadConsentLock) {
+            pendingKeyReadConsent = null
+            pendingKeyReadConfirm = null
+        }
     }
 
     /**

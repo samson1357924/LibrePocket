@@ -464,4 +464,144 @@ class ChatViewModelKeyReadP2Test {
         assertEquals(0, h.getKeyCalls.get())
         assertEquals(0, h.buildCalls.get())
     }
+
+    /**
+     * P2-7（Finding A 主線）：mint 即耗 token，T0 耗 consent 後同 token
+     * 重放必 false。deny seq1→confirm(T1) true（token 已耗，同 token 立刻
+     * 重放已 false）→send 耗 consent 恰成功一次→同 token 再 confirm 必
+     * false 且零多餘 vault 讀→下次送出仍 ConfirmRequired(seq2)。
+     */
+    @Test
+    fun sameTokenReplayAfterConsumeFailsAndNextSendRequiresFreshConfirm() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val h = newHarness(store)
+        onMain { h.vm.sendDirect("hi") }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 1L
+        }
+        val snapshot = h.vm.peekKeyReadBinding()
+        val token = h.vm.peekKeyReadConfirmToken()
+        assertNotNull(snapshot)
+        assertNotNull(token)
+        assertTrue(h.vm.confirmKeyRead(snapshot, token))
+        // Mint 即耗 token：consent 尚未消耗，同 token 重放已必 false。
+        assertNull(h.vm.peekKeyReadConfirmToken())
+        assertFalse(h.vm.confirmKeyRead(snapshot, token))
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+
+        // 送出耗 consent，恰成功一次。
+        onMain { h.vm.sendDirect("hi") }
+        awaitCompletedTurn(h.vm, expectedTurns = 1)
+        assertEquals(1, h.fake.streamCalls)
+        assertEquals(1, h.getKeyCalls.get())
+
+        // T0 已耗 consent：同 token 重放仍 false，零多餘 vault 讀。
+        assertFalse(h.vm.confirmKeyRead(snapshot, token))
+        assertEquals(1, h.getKeyCalls.get())
+        assertEquals(1, h.buildCalls.get())
+
+        // 下次送出仍需新確認（seq 1→2），零新增 vault 讀。
+        onMain { h.vm.sendDirect("hi2") }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 2L
+        }
+        assertEquals(1, h.getKeyCalls.get())
+        assertEquals(1, h.buildCalls.get())
+        assertEquals(1, h.fake.streamCalls)
+    }
+
+    /**
+     * P2-8（Finding A 併發）：同 token 併發兩次 confirm 恰一次 true。兩次
+     * 皆經 readEndpoint 懸掛點交錯，最終在同一鎖下序列化：首勝 mint 並耗
+     * token，後者見無 pending 必 false。全程零 vault 讀；勝者的 consent 仍
+     * 為一次性（一次送出成功，下次仍需新確認）。
+     */
+    @Test
+    fun concurrentDoubleMintAtMostOnce() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val h = newHarness(store)
+        onMain { h.vm.sendDirect("hi") }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 1L
+        }
+        val snapshot = h.vm.peekKeyReadBinding()
+        val token = h.vm.peekKeyReadConfirmToken()
+        assertNotNull(snapshot)
+        assertNotNull(token)
+
+        val first = async { h.vm.confirmKeyRead(snapshot, token) }
+        val second = async { h.vm.confirmKeyRead(snapshot, token) }
+        val wins = listOf(first.await(), second.await()).count { it }
+        assertEquals(1, wins)
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+
+        // 勝者 consent 恰放行一次。
+        onMain { h.vm.sendDirect("hi") }
+        awaitCompletedTurn(h.vm, expectedTurns = 1)
+        assertEquals(1, h.fake.streamCalls)
+        assertEquals(1, h.getKeyCalls.get())
+
+        // 下次送出仍需新確認（seq 1→2），同 token 重放必 false。
+        assertFalse(h.vm.confirmKeyRead(snapshot, token))
+        onMain { h.vm.sendDirect("hi2") }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 2L
+        }
+        assertEquals(1, h.getKeyCalls.get())
+        assertEquals(1, h.buildCalls.get())
+        assertEquals(1, h.fake.streamCalls)
+    }
+
+    /**
+     * P2-9（Finding B）：dismiss 與在途 confirm 競賽後無殘留可用 consent。
+     * 在途 confirm 停在 readEndpoint 懸掛點時 dismiss 同鎖清 consent＋token：
+     * 先 dismiss 則 mint 見無 pending 必 false；先 mint 則 dismiss 連帶燒掉
+     * 剛 mint 的 consent。兩種交錯終態一致，故只斷言事後狀態（不 assert 在途
+     * 返回值，避免 order-dependent flaky）：token 已空、同 token 重放必
+     * false、下次 ASK 仍需新確認且零 vault 讀。
+     */
+    @Test
+    fun dismissRacingInflightConfirmLeavesNoReusableConsent() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val h = newHarness(store)
+        onMain { h.vm.sendDirect("hi") }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 1L
+        }
+        val snapshot = h.vm.peekKeyReadBinding()
+        val token = h.vm.peekKeyReadConfirmToken()
+        assertNotNull(snapshot)
+        assertNotNull(token)
+
+        // 在途 confirm 與 dismiss 交錯（任一先後終態一致，見上）。
+        val inFlight = async { h.vm.confirmKeyRead(snapshot, token) }
+        onMain { h.vm.dismissKeyReadConfirm() }
+        inFlight.await()
+
+        // 事後狀態確定性斷言：無 token、無可用 consent。
+        assertNull(h.vm.peekKeyReadConfirmToken())
+        assertFalse(h.vm.confirmKeyRead(snapshot, token))
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+
+        // 下次 ASK 仍需新確認（seq 1→2），零 vault 讀、零傳輸。
+        onMain { h.vm.sendDirect("hi") }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 2L
+        }
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+        assertEquals(0, h.fake.streamCalls)
+    }
 }

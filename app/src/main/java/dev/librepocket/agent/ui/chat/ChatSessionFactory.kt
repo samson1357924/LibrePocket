@@ -14,6 +14,7 @@ import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.KeyVault
 import dev.librepocket.policy.DataStorePolicyStore
 import dev.librepocket.policy.PolicyStore
+import dev.librepocket.policy.Verdict
 import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.provider.DefaultProviderFactory
 import dev.librepocket.provider.KeyProvider
@@ -68,6 +69,17 @@ data class CreatedSession(
 private fun Long.toInstantOrNull(): Instant? =
     if (this > 0) runCatching { Instant.ofEpochMilli(this) }.getOrNull() else null
 
+/**
+ * S6 capture-boundary denial: T1 `key.read` DENY or evaluation failure.
+ *
+ * Extends [SecurityException] (never [CancellationException]) so the chat
+ * ViewModel can distinguish a policy denial at the vault gate from a stale
+ * binding cancellation: cancellations still propagate as
+ * [CancellationException] and stay silent, while this maps to a visible
+ * `POLICY_DENIED` restore with zero vault reads.
+ */
+class CaptureDeniedException(message: String = "ENDPOINT_BINDING_STALE") : SecurityException(message)
+
 /** Injectable session-construction boundary used by the chat lifecycle tests. */
 interface ChatSessionProvider {
     suspend fun create(
@@ -119,12 +131,17 @@ class ChatSessionFactory(
         val config = endpoint.toProviderConfig()
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         val model = modelFor(endpoint)
-        val credential = captureCredential(endpoint)
+        var credential: SessionCredential? = null
         var storeForCleanup: SessionStore? = null
         var createdSessionId: String? = null
         var session: ChatSession? = null
         try {
             requireCurrentBinding(keyIsCurrent)
+            // S6 capture-boundary T1 recheck (see requireKeyReadAllowed):
+            // narrowed to DENY/failure only; ALLOW/ASK pass through.
+            requireKeyReadAllowed(endpoint.providerId)
+            val captured = captureCredential(endpoint)
+            credential = captured
             val store = sessionStores?.store()
             storeForCleanup = store
             requireCurrentBinding(keyIsCurrent)
@@ -147,12 +164,15 @@ class ChatSessionFactory(
                 }
             // Room SessionMeta.createdAt is the source of truth for `Session started`.
             // Storeless/sessionId null/unknown/invalid/exception → null (omit, never fake now).
+            // Cancellation passes through (never swallowed as null).
             val sessionStart: Instant? = try {
                 if (store != null && sessionId != null) {
                     store.getSession(sessionId)?.let { it.createdAt.toInstantOrNull() }
                 } else {
                     null
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (_: Exception) {
                 null
             }
@@ -160,7 +180,7 @@ class ChatSessionFactory(
                 config,
                 model,
                 transcript,
-                credential,
+                captured,
                 keyIsCurrent,
                 clock,
                 userTimezone,
@@ -181,7 +201,7 @@ class ChatSessionFactory(
             } catch (closeFailure: Throwable) {
                 failure.addSuppressed(closeFailure)
             }
-            credential.close()
+            credential?.close()
             val unusedStore = storeForCleanup
             val unusedSessionId = createdSessionId
             if (unusedStore != null && unusedSessionId != null) {
@@ -208,14 +228,20 @@ class ChatSessionFactory(
         requireCurrentBinding(keyIsCurrent)
         // Retain the meta so resume reuses the original createdAt (never re-stamps now).
         // getSession failure → null → UNKNOWN_SESSION (never masks unknown with now).
+        // Cancellation passes through (never swallowed as null).
         val meta = try {
             store.getSession(sessionId)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             null
         }
         require(meta != null) { "UNKNOWN_SESSION" }
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
+        // S6 capture-boundary T1 recheck (see requireKeyReadAllowed):
+        // narrowed to DENY/failure only; ALLOW/ASK pass through.
+        requireKeyReadAllowed(endpoint.providerId)
         val credential = captureCredential(endpoint)
         var session: ChatSession? = null
         try {
@@ -311,6 +337,32 @@ class ChatSessionFactory(
 
     private suspend fun requireCurrentBinding(keyIsCurrent: suspend () -> Boolean) {
         if (!keyIsCurrent()) throw CancellationException("ENDPOINT_BINDING_STALE")
+    }
+
+    /**
+     * S6 capture-boundary T1 recheck: a second `key.read` fresh evaluation
+     * immediately before the vault read (after the first binding gate).
+     *
+     * Only DENY or an evaluation failure aborts (fail-closed as
+     * [CaptureDeniedException], no vault read, no session built). ALLOW and
+     * ASK both pass: ASK relies on the T0 one-shot consent already consumed
+     * by [dev.librepocket.agent.ui.chat.ChatViewModel.authorizeEndpoint], so
+     * a still-ASK verdict at T1 is treated as a stable pass.
+     *
+     * Residual window (documented): a DENY flip landing after this recheck
+     * but before `vault.getKey` still passes. Narrowing it further would
+     * require holding the policy gate across the vault read, out of scope
+     * for this light recheck.
+     */
+    private suspend fun requireKeyReadAllowed(providerId: String) {
+        val verdict = try {
+            policy.evaluateFresh("key.read", providerId).verdict
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            throw CaptureDeniedException()
+        }
+        if (verdict == Verdict.DENY) throw CaptureDeniedException()
     }
 
     private suspend fun captureCredential(endpoint: EndpointConfig): SessionCredential {

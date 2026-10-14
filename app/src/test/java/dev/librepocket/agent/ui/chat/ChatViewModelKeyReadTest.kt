@@ -403,4 +403,119 @@ class ChatViewModelKeyReadTest {
         assertEquals(0, getKeyCalls.get())
         assertTrue(vm.sessionState.value.messages.isEmpty())
     }
+
+    /**
+     * S6 capture-boundary T1: T0 key.read ALLOW passes authorize, then the
+     * factory T1 recheck flips to DENY. Must surface POLICY_DENIED with the
+     * text restored, zero vault reads and zero provider calls.
+     */
+    @Test
+    fun captureDenyAfterT0AllowMapsToPolicyDeniedWithZeroVaultReads() {
+        val store = newStore()
+        runBlocking { store.save(endpointA()) }
+        val fake = KeyReadFakeProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "must not send"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val delegate = InMemoryPolicyStore()
+        runBlocking { delegate.setRule(PolicyRule("key.read:*", Verdict.ALLOW, 20)) }
+        val freshCalls = AtomicInteger(0)
+        val flipPolicy = object : PolicyStore {
+            override fun evaluate(action: String, resource: String) =
+                delegate.evaluate(action, resource)
+
+            override suspend fun setRule(rule: PolicyRule) = delegate.setRule(rule)
+            override suspend fun removeRule(pattern: String) = delegate.removeRule(pattern)
+            override suspend fun listRules(): List<PolicyRule> = delegate.listRules()
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+                val n = freshCalls.incrementAndGet()
+                if (n == 1) return delegate.evaluateFresh(action, resource)
+                return PolicyDecision(Verdict.DENY, null, System.currentTimeMillis())
+            }
+        }
+        val backend = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            backend.putKey("preset:openai", "test-key-123".toCharArray())
+            backend.putKey("preset:custom", "test-key-456".toCharArray())
+        }
+        val getKeyCalls = AtomicInteger(0)
+        val countingVault = object : KeyVault {
+            override suspend fun putKey(providerId: String, apiKey: CharArray) =
+                backend.putKey(providerId, apiKey)
+
+            override suspend fun getKey(providerId: String): CharArray? {
+                getKeyCalls.incrementAndGet()
+                return backend.getKey(providerId)
+            }
+
+            override suspend fun deleteKey(providerId: String) = backend.deleteKey(providerId)
+            override suspend fun hasKey(providerId: String): Boolean = backend.hasKey(providerId)
+        }
+        val factory = ChatSessionFactory(
+            policy = flipPolicy,
+            vaultSource = VaultSource { countingVault },
+            buildProvider = { _, _ -> fake },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, flipPolicy))
+        onMain { vm.sendDirect("hi") }
+        awaitTrue { vm.notice.value == "POLICY_DENIED" }
+        assertEquals("POLICY_DENIED", vm.notice.value)
+        assertEquals("hi", vm.input.value)
+        assertEquals(0, getKeyCalls.get())
+        assertEquals(0, fake.streamCalls)
+        assertTrue(vm.sessionState.value.messages.isEmpty())
+    }
+
+    /**
+     * S6 stale gate: a stale binding aborts before the T1 recheck and the
+     * vault read (zero getKey, zero provider build/stream).
+     */
+    @Test
+    fun staleBindingDoesNotReadVault() = runBlocking {
+        val backend = EncryptedPrefsVault(InMemoryPrefs())
+        backend.putKey("preset:openai", "test-key-123".toCharArray())
+        val getKeyCalls = AtomicInteger(0)
+        val countingVault = object : KeyVault {
+            override suspend fun putKey(providerId: String, apiKey: CharArray) =
+                backend.putKey(providerId, apiKey)
+
+            override suspend fun getKey(providerId: String): CharArray? {
+                getKeyCalls.incrementAndGet()
+                return backend.getKey(providerId)
+            }
+
+            override suspend fun deleteKey(providerId: String) = backend.deleteKey(providerId)
+            override suspend fun hasKey(providerId: String): Boolean = backend.hasKey(providerId)
+        }
+        val policy = InMemoryPolicyStore()
+        policy.setRule(PolicyRule("key.read:*", Verdict.ALLOW, 20))
+        val fake = KeyReadFakeProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "must not send"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val buildCalls = AtomicInteger(0)
+        val factory = ChatSessionFactory(
+            policy = policy,
+            vaultSource = VaultSource { countingVault },
+            buildProvider = { _, _ ->
+                buildCalls.incrementAndGet()
+                fake
+            },
+        )
+        val failure = try {
+            factory.create(endpointA(), "hi", keyIsCurrent = { false })
+            null
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            cancelled
+        }
+        assertTrue(failure is kotlinx.coroutines.CancellationException)
+        assertEquals("ENDPOINT_BINDING_STALE", failure?.message)
+        assertEquals(0, getKeyCalls.get())
+        assertEquals(0, buildCalls.get())
+        assertEquals(0, fake.streamCalls)
+    }
 }

@@ -26,7 +26,7 @@ object McpTimeouts {
 data class McpServerConfig(
     /** 穩定 id，轉錄/稽核只記此 id，不記地址明文以外的東西（地址本身是使用者配置，可記）。 */
     val id: String,
-    /** 使用者配置的伺服器完整 URL，例如 `https://mcp.example.com/mcp`（結尾斜線可有可無）。BREAKING：舊只寫 origin（如 `https://mcp.example.com`）的配置升級後需補完整 path（含 `/mcp`），否則請求打到根 path。 */
+    /** 使用者配置的伺服器完整 URL，例如 `https://mcp.example.com/mcp`（結尾斜線可有可無）。相容：舊只寫 bare-origin（如 `https://mcp.example.com`）的配置會自動補 `/mcp`（見 `McpWire.endpoint`），建議手動補完整 path。 */
     val baseUrl: String,
     /** [dev.librepocket.keystore.KeyVault] 內的 key 別名，預設 `mcp:<id>`。 */
     val keyId: String = "mcp:$id",

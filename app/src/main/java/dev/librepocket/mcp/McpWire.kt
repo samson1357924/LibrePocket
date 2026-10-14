@@ -20,13 +20,60 @@ internal object McpWire {
     /** 輸入 Schema 字元上限：超限拒絕（拋 [McpProtocol]），不靜默截斷。 */
     internal const val INPUT_SCHEMA_MAX_CHARS = 8_192
 
+    /** JSON 字面量（true/false/null/number）校驗：非法字面量一律視為無效。 */
+    private val NUMBER_RE = Regex("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")
+
     /**
-     * 使用者自訂完整 URL（僅去尾斜線，不附加任何 suffix，原樣使用）。
+     * 使用者自訂完整 URL（去尾斜線；bare-origin 自動補 `/mcp`）。
      *
-     * 呼叫方應在配置寫完整端點（含 path，如 `/mcp`）。
+     * 相容舊配置：舊只寫 origin（如 `https://host` 或 `https://host/`）的配置自動補 `/mcp`；
+     * 有 path 則原樣保留。query/fragment（`?`/`#`）保留並在前面插入 `/mcp`
+     *（如 `https://h?x=1` → `https://h/mcp?x=1`；`/` 視為 bare）。
+     * 呼叫方對自動補 path 的情況建議記 warning（見 [McpTransport]）。
      */
     fun endpoint(baseUrl: String): String {
-        return baseUrl.trimEnd('/')
+        val trimmed = baseUrl.trim()
+        val q = trimmed.indexOf('?')
+        val h = trimmed.indexOf('#')
+        val cut = when {
+            q >= 0 && h >= 0 -> minOf(q, h)
+            q >= 0 -> q
+            h >= 0 -> h
+            else -> -1
+        }
+        val main = if (cut >= 0) trimmed.substring(0, cut) else trimmed
+        val suffix = if (cut >= 0) trimmed.substring(cut) else ""
+        val mainTrimmed = main.trimEnd('/')
+        val schemeEnd = mainTrimmed.indexOf("://")
+        val pathStart = if (schemeEnd >= 0) {
+            mainTrimmed.indexOf('/', schemeEnd + 3)
+        } else {
+            mainTrimmed.indexOf('/')
+        }
+        // 無 path（bare-origin）→ 補 /mcp；有 path 原樣保留（僅去尾斜線，query/fragment 原樣接回）。
+        return if (pathStart < 0) "$mainTrimmed/mcp$suffix" else "$mainTrimmed$suffix"
+    }
+
+    /** endpoint() 是否會自動補 `/mcp`（bare-origin 判斷；供傳輸層 warning 用）。 */
+    internal fun isBareOrigin(baseUrl: String): Boolean {
+        val trimmed = baseUrl.trim()
+        val q = trimmed.indexOf('?')
+        val h = trimmed.indexOf('#')
+        val cut = when {
+            q >= 0 && h >= 0 -> minOf(q, h)
+            q >= 0 -> q
+            h >= 0 -> h
+            else -> -1
+        }
+        val main = if (cut >= 0) trimmed.substring(0, cut) else trimmed
+        val mainTrimmed = main.trimEnd('/')
+        val schemeEnd = mainTrimmed.indexOf("://")
+        val pathStart = if (schemeEnd >= 0) {
+            mainTrimmed.indexOf('/', schemeEnd + 3)
+        } else {
+            mainTrimmed.indexOf('/')
+        }
+        return pathStart < 0
     }
 
     fun listBody(id: Long = 1L): String =
@@ -47,14 +94,21 @@ internal object McpWire {
      * 不靜默 take 截斷；name/description 短欄位 take 裝飾保留。
      */
     fun parseList(serverId: String, json: String): List<McpTool> {
+        if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
+            throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
+        }
         val resultRaw = topLevelRawField(json, "result")
-            ?: throw IllegalArgumentException("mcp: missing result")
-        if (resultRaw == "null") throw IllegalArgumentException("mcp: missing result")
-        val toolsRaw = (if (resultRaw.startsWith("{")) topLevelRawField(resultRaw, "tools") else null)
-            ?: throw IllegalArgumentException("mcp: missing result.tools")
+            ?: throw IllegalArgumentException(
+                if (hasTopLevelKey(json, "result")) "mcp: bad result.tools" else "mcp: missing result",
+            )
+        val resultTrimmed = resultRaw.trim()
+        if (resultTrimmed == "null") throw IllegalArgumentException("mcp: missing result")
+        if (!resultTrimmed.startsWith("{")) throw IllegalArgumentException("mcp: bad result.tools")
+        val toolsRaw = topLevelRawField(resultTrimmed, "tools")
+            ?: throw IllegalArgumentException("mcp: bad result.tools")
         val toolsTrimmed = toolsRaw.trim()
         if (!toolsTrimmed.startsWith("[") || !toolsTrimmed.endsWith("]")) {
-            throw IllegalArgumentException("mcp: missing result.tools")
+            throw IllegalArgumentException("mcp: bad result.tools")
         }
         val toolsBlock = toolsTrimmed.substring(1, toolsTrimmed.length - 1)
         if (toolsBlock.isBlank()) return emptyList()
@@ -83,20 +137,49 @@ internal object McpWire {
      * 缺 `result` 即拋 IllegalArgumentException（fail-closed，呼叫方映射 PROTOCOL）。
      */
     fun parseCall(json: String): Pair<String?, Boolean> {
+        if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
+            throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
+        }
         val errRaw = topLevelRawField(json, "error")
-        if (errRaw != null && errRaw != "null") {
-            // message 取自 error 物件內，避免全域搜到 content 文字的同名鍵。
-            val msg = (if (errRaw.startsWith("{")) stringField(errRaw, "message") else null)
-                ?: "tool error"
-            throw McpToolFailure(msg.take(200))
+        if (errRaw != null) {
+            val errTrimmed = errRaw.trim()
+            if (errTrimmed != "null") {
+                // 只有 object 形狀才算 error 包；其他非 null 形狀（false/字串/數字等）一律 PROTOCOL。
+                if (!errTrimmed.startsWith("{")) throw McpProtocol("mcp: bad error")
+                // message 取自 error 物件內，避免全域搜到 content 文字的同名鍵。
+                val msg = stringField(errTrimmed, "message")
+                    ?: "tool error"
+                throw McpToolFailure(msg.take(200))
+            }
+        } else if (hasTopLevelKey(json, "error")) {
+            // error 鍵存在但值非法（非法字面量/截斷半 JSON）→ PROTOCOL，不當 OK。
+            throw McpProtocol("mcp: bad error")
         }
         val resultRaw = topLevelRawField(json, "result")
-            ?: throw IllegalArgumentException("mcp: missing result")
-        if (resultRaw == "null") throw IllegalArgumentException("mcp: missing result")
-        // result 非 object（如字串/陣列字面量）時無成員可取：isError 預設 false，直接回原文。
-        val contentRaw = if (resultRaw.startsWith("{")) topLevelRawField(resultRaw, "content") else null
-        val isErrorRaw = if (resultRaw.startsWith("{")) topLevelRawField(resultRaw, "isError") else null
-        val isError = isErrorRaw?.trim() == "true"
+            ?: throw IllegalArgumentException(
+                if (hasTopLevelKey(json, "result")) "mcp: bad result" else "mcp: missing result",
+            )
+        val resultTrimmed = resultRaw.trim()
+        if (resultTrimmed == "null") throw IllegalArgumentException("mcp: missing result")
+        // result 非 object（一律 fail-closed）：字串/數字/陣列/布林字面量不得回 OK。
+        if (!resultTrimmed.startsWith("{")) throw IllegalArgumentException("mcp: bad result")
+        val contentRaw = topLevelRawField(resultTrimmed, "content")
+        val isErrorRaw = topLevelRawField(resultTrimmed, "isError")
+        val isError = when {
+            isErrorRaw == null ->
+                if (hasTopLevelKey(resultTrimmed, "isError")) {
+                    throw McpProtocol("mcp: bad isError")
+                } else {
+                    false
+                }
+            isErrorRaw.trim().startsWith("\"") -> false
+            else -> when (isErrorRaw.trim()) {
+                "true" -> true
+                "false", "null" -> false
+                // 畸形字面量（True/1 等）不再靜默壓 false，一律 PROTOCOL。
+                else -> throw McpProtocol("mcp: bad isError")
+            }
+        }
         // 內存消費用：優先保留 content，否則整個 result；調用方用後即丟，不寫盤。
         // 上限由傳輸層雙上限保證（64k 字元內完整 JSON）：此處不靜默 take，
         // 缺頂層 result（截斷半 JSON 含）即拋 PROTOCOL，不回 OK(null) 假成功。
@@ -194,6 +277,10 @@ internal object McpWire {
         return rawValue(json, i)
     }
 
+    /** 頂層 object 是否含 `"key"` 成員（值合法與否不論；區分缺席與非法字面量）。 */
+    internal fun hasTopLevelKey(json: String, key: String): Boolean =
+        topLevelValueStart(json, key) >= 0
+
     /** 頂層 object 成員的值起點；缺席或形狀不合回 -1（字串感知）。 */
     private fun topLevelValueStart(json: String, key: String): Int {
         var p = 0
@@ -267,7 +354,8 @@ internal object McpWire {
                 return -1
             }
             '{', '[' -> {
-                var depth = 0
+                // `{` 只能 `}` 關、`[` 只能 `]` 關：stack 配對，mismatch 回 -1。
+                val stack = ArrayDeque<Char>()
                 var instr = false
                 var es = false
                 var p = from
@@ -280,10 +368,11 @@ internal object McpWire {
                     } else {
                         when (c) {
                             '"' -> instr = true
-                            '{', '[' -> depth++
+                            '{' -> stack.addLast('}')
+                            '[' -> stack.addLast(']')
                             '}', ']' -> {
-                                depth--
-                                if (depth == 0) return p + 1
+                                if (stack.isEmpty() || stack.removeLast() != c) return -1
+                                if (stack.isEmpty()) return p + 1
                             }
                         }
                     }
@@ -334,14 +423,7 @@ internal object McpWire {
         return when (json[p]) {
             '"', '{', '[' -> {
                 val open = json[p]
-                val close = when (open) {
-                    '"' -> '"'
-                    '{' -> '}'
-                    else -> ']'
-                }
-                var depth = 0
-                var inStr = open == '{' || open == '['
-                // 對 object/array：逐字掃描配對；對 string：找非轉義引號。
+                // 對 object/array：stack 配對逐字掃描；對 string：找非轉義引號。
                 if (open == '"') {
                     p++
                     val sb = StringBuilder()
@@ -357,6 +439,8 @@ internal object McpWire {
                 var instr = false
                 var es = false
                 val start = from
+                // `{` 只能 `}` 關、`[` 只能 `]` 關：stack 配對，mismatch 視為截斷（回 null）。
+                val stack = ArrayDeque<Char>()
                 while (p < json.length) {
                     val c = json[p]
                     if (instr) {
@@ -366,23 +450,25 @@ internal object McpWire {
                     } else {
                         when (c) {
                             '"' -> instr = true
-                            '{', '[' -> depth++
+                            '{' -> stack.addLast('}')
+                            '[' -> stack.addLast(']')
                             '}', ']' -> {
-                                depth--
-                                if (depth == 0) return json.substring(start, p + 1)
+                                if (stack.isEmpty() || stack.removeLast() != c) return null
+                                if (stack.isEmpty()) return json.substring(start, p + 1)
                             }
                         }
                     }
-                    // 外層 close 由 depth 計數處理；inStr 初始值不再使用。
-                    @Suppress("UNUSED_VARIABLE")
-                    val ignored = close
                     p++
                 }
                 return null
             }
             else -> {
                 while (p < json.length && ",}]".indexOf(json[p]) < 0) p++
-                json.substring(from, p).trim().ifEmpty { null }
+                val lit = json.substring(from, p).trim()
+                if (lit.isEmpty()) return null
+                // 合法字面量僅 true/false/null/number；其他（TRUE/undefined/NaN 等）回 null 使上層拋。
+                if (lit == "true" || lit == "false" || lit == "null" || NUMBER_RE.matches(lit)) return lit
+                return null
             }
         }
     }

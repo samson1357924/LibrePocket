@@ -18,7 +18,7 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
 
 /**
- * D03 Streamable HTTP 傳輸：POST `endpoint(baseUrl)`（使用者自訂完整 URL，不強制附加 `/mcp`）+ Bearer（舊 SSE 不做）。
+ * D03 Streamable HTTP 傳輸：POST `endpoint(baseUrl)`（使用者自訂完整 URL；bare-origin 自動補 `/mcp`，有 path 原樣保留）+ Bearer（舊 SSE 不做）。
  *
  * 安全約定：
  * - [bearer] 只放 `Authorization` 標頭，永不拼進 body，不寫 log；
@@ -74,7 +74,17 @@ class McpTransport(
         bodyJson: String,
         timeoutMs: Long,
     ): Pair<Int, String?>? {
+        // bare-origin 相容：無 path 時 endpoint() 自動補 /mcp（舊配置相容，建議記 warning 提醒手動補完整 path）。
         val url = McpWire.endpoint(baseUrl)
+        // 可觀測性：自動補 /mcp 時記 warning（runCatching 使 JVM 單測無 mocked Log 仍綠）。
+        if (McpWire.isBareOrigin(baseUrl)) {
+            runCatching {
+                android.util.Log.w(
+                    "McpTransport",
+                    "bare-origin baseUrl auto-appended /mcp; prefer full path",
+                )
+            }
+        }
         val request = Request.Builder()
             .url(url)
             .post(bodyJson.toRequestBody(JSON))

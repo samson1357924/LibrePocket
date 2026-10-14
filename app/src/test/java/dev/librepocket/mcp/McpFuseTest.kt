@@ -191,19 +191,161 @@ class McpFuseTest {
             val good = s.listTools()
             assertEquals(McpStatus.OK, good.status)
             assertEquals(listOf("search"), good.tools.map { it.name })
-            // 端點形狀：POST 使用者自訂完整 URL（此處 baseUrl 為根 path，故為 /，不強制改寫 /mcp）。
+            // 端點形狀：POST 使用者自訂完整 URL（此處 baseUrl 為 bare-origin，故自動補 /mcp 舊配置相容）。
             val first = web.takeRequest(5, TimeUnit.SECONDS)
             assertNotNull("expected first request within 5s", first)
             val second = web.takeRequest(5, TimeUnit.SECONDS)
             assertNotNull("expected second request within 5s", second)
             for (req in listOf(first!!, second!!)) {
-                assertEquals("/", req.path?.substringBefore("?"))
+                assertEquals("/mcp", req.path?.substringBefore("?"))
                 assertEquals("POST", req.method)
             }
-            // D1：endpoint() 保留自訂 path（無後綴不強制加 /mcp；已有不重複加）。
-            assertEquals("https://x.example", McpWire.endpoint("https://x.example/"))
+            // D1：endpoint() 語義（bare-origin 自動補 /mcp；有 path 原樣保留；已有不重複加）。
+            assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example"))
+            assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/"))
             assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/mcp"))
             assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/mcp/"))
+            assertEquals(
+                "https://x.example/custom/path",
+                McpWire.endpoint("https://x.example/custom/path/"),
+            )
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun customPathPreservedEndToEnd() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(MockResponse().setResponseCode(200).setBody(goodListBody()))
+            val clock = Clock(0L)
+            val s = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/custom/path").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(clockMs = clock::get),
+                clockMs = clock::get,
+            )
+            val r = s.listTools()
+            assertEquals(McpStatus.OK, r.status)
+            val req = web.takeRequest(5, TimeUnit.SECONDS)
+            assertNotNull("expected request within 5s", req)
+            assertEquals("/custom/path", req!!.path?.substringBefore("?"))
+            assertEquals("POST", req.method)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun bareOriginHitsMcpPathEndToEnd() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(okCall())
+            val clock = Clock(0L)
+            // bare-origin（根 path）：舊配置相容，實際打到 /mcp。
+            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val r = s.callTool("search", "{}")
+            assertEquals(McpStatus.OK, r.status)
+            val req = web.takeRequest(5, TimeUnit.SECONDS)
+            assertNotNull("expected request within 5s", req)
+            assertEquals("/mcp", req!!.path?.substringBefore("?"))
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun oversizeSchemaMapsToProtocolEndToEnd() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // inputSchema 9000 字元 > 8192 上限 → server 映射 PROTOCOL（wire 層 McpProtocol）。
+            val big = "x".repeat(9_000)
+            val schema = "{\"type\":\"object\",\"extra\":\"$big\"}"
+            val body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"search\",\"description\":\"d\",\"inputSchema\":$schema}]}}"
+            web.enqueue(MockResponse().setResponseCode(200).setBody(body))
+            val clock = Clock(0L)
+            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val r = s.listTools()
+            assertEquals(McpStatus.PROTOCOL, r.status)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun errorFalseMapsToProtocolEndToEnd() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":false," +
+                "\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":false}}"
+            web.enqueue(MockResponse().setResponseCode(200).setBody(body))
+            val clock = Clock(0L)
+            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val r = s.callTool("search", "{}")
+            assertEquals(McpStatus.PROTOCOL, r.status)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun malformedIsErrorTrueMapsToProtocolEndToEnd() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // wire 已拋 McpProtocol（bad isError）；server 層須映射 PROTOCOL，不當 OK/TOOL_ERROR。
+            val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":True}}"
+            web.enqueue(MockResponse().setResponseCode(200).setBody(body))
+            val clock = Clock(0L)
+            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val r = s.callTool("search", "{}")
+            assertEquals(McpStatus.PROTOCOL, r.status)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun oversizeTotalBodyMapsToProtocolEndToEnd() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 總長超 64k 字元 → PROTOCOL（不論走傳輸層雙上限或 wire 層 guard）。
+            val pad = "x".repeat(McpTransport.RESPONSE_MAX_CHARS + 1_000)
+            val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":" +
+                "[{\"type\":\"text\",\"text\":\"$pad\"}],\"isError\":false}}"
+            assertTrue(body.length > McpTransport.RESPONSE_MAX_CHARS)
+            web.enqueue(MockResponse().setResponseCode(200).setBody(body))
+            val clock = Clock(0L)
+            val s = server(web, clock, McpCircuitBreaker(clockMs = clock::get))
+            val r = s.callTool("search", "{}")
+            assertEquals(McpStatus.PROTOCOL, r.status)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun bareOriginWithoutSlashHitsMcpPathEndToEnd() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(okCall())
+            val clock = Clock(0L)
+            // bare-origin 無尾斜線（如 http://host:port）同樣打到 /mcp。
+            val bareNoSlash = web.url("/").toString().trimEnd('/')
+            val s = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = bareNoSlash),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(clockMs = clock::get),
+                clockMs = clock::get,
+            )
+            val r = s.callTool("search", "{}")
+            assertEquals(McpStatus.OK, r.status)
+            val req = web.takeRequest(5, TimeUnit.SECONDS)
+            assertNotNull("expected request within 5s", req)
+            assertEquals("/mcp", req!!.path?.substringBefore("?"))
         } finally {
             web.shutdown()
         }

@@ -215,6 +215,18 @@ internal class AnthropicMapper(val round: Int = 0) {
             "content_block_start" -> {
                 val index = root.int("index") ?: return emptyList()
                 val cb = root.obj("content_block") ?: return emptyList()
+                // C1: bound the blocks map itself. A distinct-index flood of
+                // non-tool blocks (text/thinking/other) must not grow memory
+                // without bound: without this, only TOOL blocks counted toward
+                // the cap and N distinct text blocks grew the map freely.
+                // Reuses the same distinct-index budget and typed failure
+                // (TOOL_ARGS_TOO_LARGE / AGG_TOO_LARGE) as tools — one
+                // semantics for every aggregation overflow. Checked BEFORE
+                // insert so the overflowing entry is never buffered;
+                // replacements at a known index do not grow the map.
+                if (!blocks.containsKey(index)) {
+                    requireToolCountBudget(blocks.size + 1)
+                }
                 val kind = when (cb.string("type")) {
                     "text" -> BlockKind.TEXT
                     "thinking", "redacted_thinking" -> BlockKind.THINKING

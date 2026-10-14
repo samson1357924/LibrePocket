@@ -6,6 +6,7 @@ import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
+import dev.librepocket.keystore.KeyVault
 import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyDecision
 import dev.librepocket.policy.PolicyRule
@@ -17,6 +18,8 @@ import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -298,5 +301,106 @@ class ChatViewModelKeyReadTest {
         onMain { vm.sendDirect("hi") }
         awaitCompletedTurn(vm, expectedTurns = 1)
         assertEquals(1, fake.streamCalls)
+    }
+
+    @Test
+    fun policyFailureBurnsConfirmationRequiresFreshConfirm() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val fake = KeyReadFakeProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "must not send"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val delegate = InMemoryPolicyStore()
+        val failPolicy = AtomicBoolean(true)
+        val policy = object : PolicyStore {
+            override fun evaluate(action: String, resource: String): PolicyDecision =
+                delegate.evaluate(action, resource)
+
+            override suspend fun setRule(rule: PolicyRule) = delegate.setRule(rule)
+            override suspend fun removeRule(pattern: String) = delegate.removeRule(pattern)
+            override suspend fun listRules(): List<PolicyRule> = delegate.listRules()
+            override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
+                if (failPolicy.get()) throw IllegalStateException("synthetic policy read failure")
+                return delegate.evaluateFresh(action, resource)
+            }
+        }
+        val backend = EncryptedPrefsVault(InMemoryPrefs())
+        backend.putKey("preset:openai", "test-key-123".toCharArray())
+        backend.putKey("preset:custom", "test-key-456".toCharArray())
+        val getKeyCalls = AtomicInteger(0)
+        val countingVault = object : KeyVault {
+            override suspend fun putKey(providerId: String, apiKey: CharArray) =
+                backend.putKey(providerId, apiKey)
+
+            override suspend fun getKey(providerId: String): CharArray? {
+                getKeyCalls.incrementAndGet()
+                return backend.getKey(providerId)
+            }
+
+            override suspend fun deleteKey(providerId: String) = backend.deleteKey(providerId)
+            override suspend fun hasKey(providerId: String): Boolean = backend.hasKey(providerId)
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { countingVault },
+            buildProvider = { _, _ -> fake },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
+        assertTrue(vm.confirmKeyRead())
+        onMain { vm.sendDirect("hi") }
+        awaitTrue { vm.notice.value == "POLICY_DENIED" }
+        assertEquals(0, fake.streamCalls)
+        assertEquals(0, getKeyCalls.get())
+        // Back on ASK without a fresh confirmation: the burned slot stays empty.
+        failPolicy.set(false)
+        onMain { vm.sendDirect("hi again") }
+        awaitTrue { vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" }
+        assertEquals(0, fake.streamCalls)
+        assertEquals(0, getKeyCalls.get())
+        assertTrue(vm.sessionState.value.messages.isEmpty())
+    }
+
+    @Test
+    fun dismissedConfirmationRequiresFreshConfirm() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val fake = KeyReadFakeProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "must not send"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val backend = EncryptedPrefsVault(InMemoryPrefs())
+        backend.putKey("preset:openai", "test-key-123".toCharArray())
+        backend.putKey("preset:custom", "test-key-456".toCharArray())
+        val getKeyCalls = AtomicInteger(0)
+        val countingVault = object : KeyVault {
+            override suspend fun putKey(providerId: String, apiKey: CharArray) =
+                backend.putKey(providerId, apiKey)
+
+            override suspend fun getKey(providerId: String): CharArray? {
+                getKeyCalls.incrementAndGet()
+                return backend.getKey(providerId)
+            }
+
+            override suspend fun deleteKey(providerId: String) = backend.deleteKey(providerId)
+            override suspend fun hasKey(providerId: String): Boolean = backend.hasKey(providerId)
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { countingVault },
+            buildProvider = { _, _ -> fake },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        assertTrue(vm.confirmKeyRead())
+        onMain { vm.dismissKeyReadConfirm() }
+        onMain { vm.sendDirect("hi") }
+        awaitTrue { vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" }
+        assertEquals(0, fake.streamCalls)
+        assertEquals(0, getKeyCalls.get())
+        assertTrue(vm.sessionState.value.messages.isEmpty())
     }
 }

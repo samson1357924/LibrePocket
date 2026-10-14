@@ -56,13 +56,14 @@ private const val HISTORY_SCAN_CAP = HISTORY_CAP * 4
  *
  * In-memory only: never persisted, carries no key material (connection
  * identity snapshot only). Bound to the immutable endpoint binding
- * observed at mint time ([confirmKeyRead]); consumed (nulled) on the first
- * authorization that takes it, so it can never be replayed or reused. Any
- * endpoint-identity difference fails the match and denies closed.
+ * observed at mint time ([confirmKeyRead]): action + providerId /
+ * effectiveBaseUrl / origin / protocol / apiKeyRef / configRevision /
+ * model. Consumed (nulled) on the first authorization that takes it, so it
+ * can never be replayed or reused. Any endpoint-identity difference fails
+ * the match and denies closed.
  */
 private data class KeyReadConsent(
     val action: String,
-    val resource: String,
     val providerId: String,
     val effectiveBaseUrl: String,
     val origin: String,
@@ -292,15 +293,17 @@ class ChatViewModel(
 
     /**
      * Mint a one-shot key.read confirmation bound to the currently persisted
-     * endpoint binding (providerId / effective baseUrl / apiKeyRef /
-     * configRevision).
+     * endpoint binding (providerId / effectiveBaseUrl / origin / protocol /
+     * apiKeyRef / configRevision / model).
      *
      * The next [authorizeEndpoint] that observes an ASK verdict consumes it:
      * a binding match allows that single read, any mismatch denies closed.
-     * DENY always wins and burns the consent; a policy read failure denies
-     * closed. Returns false when no usable endpoint is persisted (no
-     * consent minted). A later mint overwrites an unconsumed one; endpoint
-     * clear (logout/newChat) discards it.
+     * DENY always wins and burns the consent; a policy evaluation failure
+     * burns it too and denies closed. Returns false when no usable endpoint
+     * is persisted (no consent minted). A later mint overwrites an
+     * unconsumed one; an endpoint replacement keeps the slot (the binding
+     * match still rejects the stale snapshot), only a null endpoint
+     * (logout) or clearChat (newChat/open) discards it.
      *
      * TODO(#13 follow-up): no production caller yet — ChatScreen renders
      * KEY_READ_CONFIRM_REQUIRED as a hard-deny notice until a confirm
@@ -323,7 +326,6 @@ class ChatViewModel(
         if (!isGenerationCurrent(startedGeneration)) return false
         val consent = KeyReadConsent(
             action = "key.read",
-            resource = binding.providerId,
             providerId = binding.providerId,
             effectiveBaseUrl = binding.effectiveBaseUrl,
             origin = binding.origin,
@@ -354,7 +356,6 @@ class ChatViewModel(
 
     private fun keyReadConsentMatches(consent: KeyReadConsent, binding: EndpointSessionBinding): Boolean {
         if (consent.action != "key.read") return false
-        if (consent.resource != consent.providerId) return false
         return consent.providerId == binding.providerId &&
             consent.effectiveBaseUrl == binding.effectiveBaseUrl &&
             consent.origin == binding.origin &&
@@ -924,13 +925,16 @@ class ChatViewModel(
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
+            takePendingKeyReadConsent()
             return EndpointAccess.Denied
         }
         if (!isGenerationCurrent(authorizedGeneration)) return EndpointAccess.Stale
         // key.read ASK never passes through: it requires a bound one-shot
-        // confirmation minted by confirmKeyRead(). DENY always wins (and burns
-        // any minted consent); only an explicit ALLOW proceeds without one.
-        // No synthetic ALLOW is introduced here.
+        // confirmation minted by confirmKeyRead() (providerId /
+        // effectiveBaseUrl / origin / protocol / apiKeyRef / configRevision /
+        // model). DENY always wins (and burns any minted consent), as does a
+        // policy evaluation failure above; only an explicit ALLOW proceeds
+        // without one. No synthetic ALLOW is introduced here.
         when (decision.verdict) {
             Verdict.DENY -> {
                 takePendingKeyReadConsent()

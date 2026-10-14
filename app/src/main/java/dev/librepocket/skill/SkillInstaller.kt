@@ -21,7 +21,8 @@ import java.util.zip.ZipInputStream
  * - 校驗失敗拒裝：先在記憶體完整驗證，再原子提交；失敗時目標目錄保持不變；
  * - 原子提交：staging 目錄寫入並 best-effort fsync 後，同目錄 rename 切換
  *   （目錄項原子、可掉電丟失：fsync 失敗靜默忽略（best-effort，不影響呼叫方），
- *   不保證完整落盤）；
+ *   不保證完整落盤；刻意不設 strict-fsync 開關——fsync 只關耐久不關正確性，
+ *   原子性由 rename 語義保證）；
  *   replace 時舊版先搬到 `.bak`，成功後刪 bak，失敗回滾 bak；rename 失敗
  *   直接失敗並保留 from→to 根因，不退回拷貝；
  * - 同 skill 安裝互斥（per-skill 鎖），防併發交錯；Current 為錯誤回傳路徑原子

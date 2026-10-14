@@ -17,6 +17,9 @@ package dev.librepocket.mcp
  *
  * Stage D：單一嚴格遞迴 JSON parser（raw-span DOM）取代全部手寫掃描器。
  * P1（巢狀同名鍵遮蔽）與 P2（巢狀形狀錯誤回 OK）皆由 DOM 層級正確性關閉。
+ *
+ * 已知非目標（follow-up，不在本層驗證）：`jsonrpc == "2.0"` 版本斷言、
+ * response id 與 request id 對應（呼叫方以 HTTP 一問一答配對，不做 id 複用檢查）。
  */
 internal object McpWire {
 

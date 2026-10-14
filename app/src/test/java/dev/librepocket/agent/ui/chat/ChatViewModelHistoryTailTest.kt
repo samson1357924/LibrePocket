@@ -12,8 +12,10 @@ import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.session.FakeSessionStore
 import dev.librepocket.session.TranscriptEvent
+import java.io.IOException
 import java.nio.file.Files
 import java.util.Collections
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -27,6 +29,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -159,5 +162,93 @@ class ChatViewModelHistoryTailTest {
         // Omission observable via state (no silent short-context).
         awaitTrue { vm.historyOmittedCount.value == 2 }
         assertNull(vm.notice.value)
+    }
+
+    /**
+     * Finding1 VM probe symmetry: a wedged isPruneSuspect read (IOException)
+     * fails closed to the all-assistants suspect flag, matching Factory
+     * loadModelHistory so UI and model-context never disagree.
+     */
+    @Test
+    fun pruneSuspectIOException_flagsAssistantFailClosed() {
+        val store = newStore()
+        runBlocking { store.save(openaiEndpoint()) }
+        val transcripts = object : FakeSessionStore() {
+            override suspend fun isPruneSuspect(sessionId: String): Boolean =
+                throw IOException("vm probe wedged")
+        }
+        val sid = runBlocking {
+            val id = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+            transcripts.appendEvent(
+                TranscriptEvent(sessionId = id, runId = "r0", kind = "user", text = "u0", createdAt = 1L),
+            )
+            transcripts.appendEvent(
+                TranscriptEvent(sessionId = id, runId = "r0", kind = "assistant", text = "a0", createdAt = 1L),
+            )
+            id
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = VmTailFakeProvider()
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 2 }
+        val assistant = vm.messages.value.single { it.role == "assistant" }
+        assertTrue("wedged VM probe must fail closed to suspect flag", assistant.hasReasoning)
+    }
+
+    /**
+     * Finding1 VM probe CE symmetry: a CancellationException from
+     * isPruneSuspect must never be swallowed to a suspect-true history. The
+     * open aborts (no history) instead of flagging — a flagged assistant
+     * here would prove the CE was swallowed.
+     */
+    @Test
+    fun pruneSuspectCancellation_neverFlagsSuspect() {
+        val store = newStore()
+        runBlocking { store.save(openaiEndpoint()) }
+        val transcripts = object : FakeSessionStore() {
+            override suspend fun isPruneSuspect(sessionId: String): Boolean =
+                throw CancellationException("vm probe cancelled")
+        }
+        val sid = runBlocking {
+            val id = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+            transcripts.appendEvent(
+                TranscriptEvent(sessionId = id, runId = "r0", kind = "user", text = "u0", createdAt = 1L),
+            )
+            transcripts.appendEvent(
+                TranscriptEvent(sessionId = id, runId = "r0", kind = "assistant", text = "a0", createdAt = 1L),
+            )
+            id
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = VmTailFakeProvider()
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
+        // CE aborts the load: give the open a bounded window, then prove no
+        // suspect-flagged history was produced (swallowed CE would flag a0).
+        Thread.sleep(1500)
+        val flagged = vm.messages.value.filter { it.role == "assistant" && it.hasReasoning }
+        assertTrue(
+            "probe CE must never produce suspect-flagged history, was ${vm.messages.value}",
+            flagged.isEmpty(),
+        )
     }
 }

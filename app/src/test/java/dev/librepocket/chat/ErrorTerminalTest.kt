@@ -362,4 +362,277 @@ class ErrorTerminalTest {
       c.close()
     }
   }
+
+  /**
+   * Finding2 admission Error symmetry: a fatal Error from the delegate
+   * store on the admission path (onTurnStarted) marks INTERRUPTED like
+   * Exception and projects [TranscriptDurabilityException] (retryable, UI
+   * ERROR) — never a bare Error to the caller. VM-fatal and CE stay
+   * unwrapped (see the two negatives below).
+   */
+  @Test fun delegateThrowsErrorOnStarted_projectsDurabilityError() {
+    val provider = ErrorTerminalProvider()
+    var n = 0
+    // Delegate fails the admission write itself (user row never persists).
+    val failing = object : TranscriptSink {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        throw AssertionError("admission invariant broken")
+      }
+      override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnSucceeded(
+        runId: String,
+        text: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = Unit
+      override suspend fun onTurnFailed(runId: String, error: String) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+      ) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+      ) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+        hasReasoning: Boolean,
+      ) = Unit
+      override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+      override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnCancelled(
+        runId: String,
+        partialText: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = Unit
+      override suspend fun onSteerQueued(text: String) = Unit
+      override suspend fun onToolDone(
+        runId: String,
+        toolIndex: Int,
+        id: String,
+        name: String,
+        argumentsJson: String,
+      ) = Unit
+      override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+    }
+    val c = TurnController(
+      provider = provider,
+      policy = ErrorTerminalPolicy(),
+      transcript = failing,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "aderr-${n++}" },
+    )
+    try {
+      try {
+        runBlocking { withTimeout(8_000) { c.startOrEnqueue("hi-admission-error") } }
+        org.junit.Assert.fail("admission Error must project TranscriptDurabilityException, not return Started")
+      } catch (_: TranscriptDurabilityException) {
+        // Expected: bare AssertionError never escapes the admission path.
+      } catch (e: AssertionError) {
+        org.junit.Assert.fail("bare AssertionError must not escape admission, got $e")
+      }
+      assertTrue("admission Error must poison durability", c.hasDurableFailures())
+      assertFalse(
+        "admission Error must keep flushDurable false",
+        runBlocking { withTimeout(8_000) { c.flushDurable() } },
+      )
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals(
+        "admission Error must project the fixed rollback string, was ${c.uiState.value.error}",
+        "transcript store unavailable",
+        c.uiState.value.error,
+      )
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun delegateThrowsVirtualMachineErrorOnStarted_propagatesUnwrapped() {
+    val provider = ErrorTerminalProvider()
+    var n = 0
+    val vmFatal = object : TranscriptSink {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        throw OutOfMemoryError("vm down")
+      }
+      override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnSucceeded(
+        runId: String,
+        text: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = Unit
+      override suspend fun onTurnFailed(runId: String, error: String) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+      ) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+      ) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+        hasReasoning: Boolean,
+      ) = Unit
+      override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+      override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnCancelled(
+        runId: String,
+        partialText: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = Unit
+      override suspend fun onSteerQueued(text: String) = Unit
+      override suspend fun onToolDone(
+        runId: String,
+        toolIndex: Int,
+        id: String,
+        name: String,
+        argumentsJson: String,
+      ) = Unit
+      override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+    }
+    val c = TurnController(
+      provider = provider,
+      policy = ErrorTerminalPolicy(),
+      transcript = vmFatal,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "vmerr-${n++}" },
+    )
+    try {
+      try {
+        runBlocking { withTimeout(8_000) { c.startOrEnqueue("hi-vm-fatal") } }
+        org.junit.Assert.fail("VM-fatal must propagate, not return Started")
+      } catch (e: OutOfMemoryError) {
+        assertTrue(e.message?.contains("vm down") == true)
+      } catch (e: TranscriptDurabilityException) {
+        org.junit.Assert.fail("VM-fatal must not wrap as Durability, got $e")
+      }
+    } finally {
+      c.close()
+    }
+  }
+
+  /**
+   * Caller-side pre-send CancellationException symmetry: a CE thrown before
+   * the channel send (proven never-attempted) propagates unwrapped — never
+   * as [TranscriptDurabilityException] — with no writer involvement.
+   * Deliberately not thrown from the delegate block: a delegate-side CE
+   * kills the writer and seals, and the awaiting CE leg then races the seal
+   * into Durability (flake). The pre-send hook is the deterministic shape.
+   */
+  @Test fun callerPreSendCancellation_propagatesCancellation() {
+    val provider = ErrorTerminalProvider()
+    var n = 0
+    val healthy = object : TranscriptSink {
+      override suspend fun onTurnStarted(runId: String, text: String) = Unit
+      override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnSucceeded(
+        runId: String,
+        text: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = Unit
+      override suspend fun onTurnFailed(runId: String, error: String) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+      ) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+      ) = Unit
+      override suspend fun onTurnFailed(
+        runId: String,
+        partialText: String,
+        error: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        isFinal: Boolean,
+        hasReasoning: Boolean,
+      ) = Unit
+      override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+      override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+      override suspend fun onTurnCancelled(
+        runId: String,
+        partialText: String,
+        parentRunId: String?,
+        attemptIndex: Int?,
+        hasReasoning: Boolean,
+      ) = Unit
+      override suspend fun onSteerQueued(text: String) = Unit
+      override suspend fun onToolDone(
+        runId: String,
+        toolIndex: Int,
+        id: String,
+        name: String,
+        argumentsJson: String,
+      ) = Unit
+      override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+    }
+    val c = TurnController(
+      provider = provider,
+      policy = ErrorTerminalPolicy(),
+      transcript = healthy,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "ceerr-${n++}" },
+    )
+    // Caller-side pre-send CE: proven never-attempted, writer never touched.
+    c.beforeAdmissionSendForTest = { throw kotlinx.coroutines.CancellationException("admission cancelled") }
+    try {
+      try {
+        runBlocking { withTimeout(8_000) { c.startOrEnqueue("hi-cancelled") } }
+        org.junit.Assert.fail("CE must propagate, not return Started")
+      } catch (_: kotlinx.coroutines.CancellationException) {
+        // Expected: CE never wraps as Durability.
+      } catch (e: TranscriptDurabilityException) {
+        org.junit.Assert.fail("CE must not wrap as Durability, got $e")
+      }
+      // Deterministic shape: pre-send never seals the writer, never poisons.
+      assertFalse("pre-send CE must never seal the writer", c.isTranscriptSealed())
+      assertFalse("pre-send CE must never poison durability", c.hasDurableFailures())
+    } finally {
+      c.close()
+    }
+  }
 }

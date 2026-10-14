@@ -591,6 +591,22 @@ class CancelReceiptPreDispatchTest {
                 "promoted new session must flushDurable true",
                 withTimeout(10_000) { sNew.flushDurable() },
             )
+            // F-D INTERRUPTED-then-late-terminal coexistence: the owed
+            // terminal committed via the pre-#4 release (late relative to the
+            // cancel/close) and the #4 expiry added the INTERRUPTED marker —
+            // both rows coexist with the family closed (no dangle), the
+            // fail-safe SEALED receipt stays settled-visible, and the new
+            // session drains durable. The release stays pre-#4 (dead-proof
+            // prerequisite: the writer must complete before expiry promotes).
+            val afterPromote = rows(inner, oldId)
+            assertTrue(
+                "late terminal must have committed, kinds=${afterPromote.map { it.kind }}",
+                afterPromote.any { it.kind == "assistant" },
+            )
+            assertEquals(1, interruptedMarkers(inner, oldId).size)
+            assertTrue(findDanglingRunIds(afterPromote).isEmpty())
+            val promoteSize = afterPromote.size
+            val promoteDurable = withTimeout(10_000) { sNew.flushDurable() }
 
             // #5: ledger clean → backfill again, zero new markers.
             onMain { vm.openSession(oldId) }
@@ -609,6 +625,15 @@ class CancelReceiptPreDispatchTest {
             )
             assertTrue(findDanglingRunIds(rows(inner, oldId)).isEmpty())
             assertEquals(0, blockSize(vm))
+            // F-D second-open stability: coexisting terminal + marker gain
+            // zero rows, and durability reads consistent with the post-promote
+            // proof (true both times, never true-and-dangling).
+            assertEquals(promoteSize, rows(inner, oldId).size)
+            val sClean = sessions.attached.last()
+            assertTrue(
+                "clean reopen must stay flushDurable true like post-promote ($promoteDurable)",
+                withTimeout(10_000) { sClean.flushDurable() },
+            )
         } finally {
             parking.released = true
             parking.release.complete(Unit)

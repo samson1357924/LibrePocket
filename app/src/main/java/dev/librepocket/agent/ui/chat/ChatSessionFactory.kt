@@ -1286,6 +1286,8 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
     // wedged store cannot green-light a tool-dependent follow-up.
     val pruneSuspect = try {
         store.isPruneSuspect(sessionId)
+    } catch (e: CancellationException) {
+        throw e
     } catch (_: Exception) {
         true
     }
@@ -1455,6 +1457,8 @@ internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String
         val extraFloor = extra.minOfOrNull { it.seq } ?: beforeSeq
         val farSuspect = try {
             store.hasReasoningBefore(sessionId, extraFloor)
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             true
         }

@@ -297,6 +297,22 @@ class CancelReceiptCloseBarrierTest {
       assertTrue(findDanglingRunIds(store.events).isEmpty())
       assertFalse("failed batch must not be unsettled after handoff", c.hasUnsettledCancelReceipts())
       assertEquals("COMPENSATED", awaitReceiptTerminal(c))
+      // F-B family closure with poison retained: the compensation closed the
+      // family (no dangle, receipt settled) but the late store failure
+      // poisoned durability — flushDurable stays false via the fail-last
+      // failure read. Tier-symmetric with the doomed-timeout late-commit
+      // true case (FlushDurableObligationBarrierTest): there the timeout mark
+      // lifts on the proven commit (durable true); here a genuine store
+      // failure never lifts (durable false).
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      assertFalse(
+        "failed-batch immediate close must not flushDurable true (poison retained)",
+        runBlocking { withTimeout(8_000) { c.flushDurable() } },
+      )
+      assertTrue(
+        "failed-batch store failure must poison durability",
+        c.hasDurableFailures(),
+      )
     } finally {
       runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
     }
@@ -1075,6 +1091,73 @@ class CancelReceiptCloseBarrierTest {
       )
       assertTrue("handed-off ledger must drain durable, was $durable", durable)
     } finally {
+      runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
+    }
+    openTwiceConsistent(store, sid)
+    assertCrossOriginForkClean(store, sid)
+  }
+
+  @Test fun sealedSettledFinalIntent_closeSealBeforeHandoff_flushTrue_reopenTwiceConsistent() {
+    // F-C SEALED-settled allowed branch: final intent (Done) whose terminal
+    // commits AFTER the close seal still counts as settled when the
+    // per-entry outcome proves final-commit (suppressedFinal + outcome true,
+    // system SKIPPED) — SEALED alone is NOT unsettled there. R192GateStore
+    // parks the terminal pre-commit so cancel installs PENDING while
+    // SUBMITTING; afterCommitBeforeAckForTest latches the terminal commit
+    // (true post-commit window: commit landed, ack still in flight) so the
+    // test proves the commit object before asserting; close(small drain)
+    // exhausts the settle budget and seals first; releasing the gate lets
+    // the owed terminal commit post-seal via the independent writer. The
+    // waiter stays SEALED (seal raced) but hasSealedUncompensated is false,
+    // flushDurable is true, and reopen adds zero twice.
+    val store = R192GateStore(failWith = null)
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = R191Provider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val n = AtomicInteger(0)
+    val c = controller(provider, SessionTranscriptSink(store, sid), n, "r192-sealed-settled")
+    val entered = armWaiterGate(c)
+    // Terminal commit latch (commit#2: user is #1, terminal is #2 for the
+    // first attempt). No park — just proves the post-commit window so the
+    // SEALED-settled claim has a commit object, never a bare timeout.
+    val commits = AtomicInteger(0)
+    val terminalCommitted = CountDownLatch(1)
+    c.afterCommitBeforeAckForTest = {
+      if (commits.incrementAndGet() == 2) terminalCommitted.countDown()
+    }
+    try {
+      startedHost(c)
+      assertTrue("terminal never entered", store.entered.await(5, TimeUnit.SECONDS))
+      c.cancel()
+      awaitUnsettled(c)
+      awaitWaiterEntered(entered, "sealed-settled")
+      c.close(drainTimeoutMs = 450L)
+      awaitSealed(c)
+      assertFalse("seal must land while the terminal is still gated", store.gate.isCompleted)
+      store.gate.complete(Unit)
+      assertTrue("terminal must commit post-seal", terminalCommitted.await(5, TimeUnit.SECONDS))
+      awaitLedger(store) { evts -> evts.any { it.kind == "assistant" } }
+      runBlocking { withTimeout(8_000) { c.flushTranscript() } }
+      // Final intent keeps zero new rows: exactly user + terminal assistant.
+      assertEquals(listOf("user", "assistant"), store.events.map { it.kind })
+      assertEquals("ok", store.events.single { it.kind == "assistant" }.text)
+      assertTrue(findDanglingRunIds(store.events).isEmpty())
+      assertEquals("SEALED", awaitReceiptTerminal(c))
+      assertFalse(
+        "SEALED with proven final-commit must not read uncompensated",
+        c.hasSealedUncompensatedReceipts(),
+      )
+      assertFalse(c.hasUnsettledCancelReceipts())
+      val durable = runBlocking { withTimeout(8_000) { c.flushDurable() } }
+      assertNotTrueAndDangling(store, durable, "sealed-settled final")
+      assertTrue("settled SEALED family must drain durable, was $durable", durable)
+    } finally {
+      store.gate.complete(Unit)
+      runCatching { c.afterCommitBeforeAckForTest = null }
       runBlocking { runCatching { withTimeout(8_000) { c.flushTranscript() } } }
     }
     openTwiceConsistent(store, sid)

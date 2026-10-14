@@ -10,7 +10,9 @@ import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.session.FakeSessionStore
 import dev.librepocket.session.TranscriptEvent
+import java.io.IOException
 import java.util.Collections
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
@@ -18,6 +20,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 private class TailFakeProvider(
@@ -400,6 +403,73 @@ class ChatSessionFactoryHistoryTailTest {
         val snap = loadSwitchSnapshotEvents(transcripts, sid)
         assertEquals(listOf(Long.MAX_VALUE - 1, Long.MAX_VALUE), snap.events.map { it.seq })
         assertEquals(0, snap.droppedByBytes)
+    }
+
+    /**
+     * Finding1 probe CE symmetry (Factory isPruneSuspect): a
+     * CancellationException from the probe must propagate (lifecycle cancel,
+     * never swallowed to a history result), while an IOException still
+     * fails closed to reasoningIncomplete=true.
+     */
+    @Test fun pruneSuspectCancellation_propagatesNeverSwallowed() = runBlocking {
+        val transcripts = object : FakeSessionStore() {
+            override suspend fun isPruneSuspect(sessionId: String): Boolean =
+                throw CancellationException("probe cancelled")
+        }
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(sid, "r0", "user", "u0"))
+        transcripts.appendEvent(event(sid, "r0", "assistant", "a0"))
+        try {
+            loadModelHistory(transcripts, sid)
+            fail("probe CE must propagate, not return history")
+        } catch (_: CancellationException) {
+            // Expected: never swallowed to suspect-true history.
+        }
+    }
+
+    @Test fun pruneSuspectIOException_failsClosedToIncomplete() = runBlocking {
+        val transcripts = object : FakeSessionStore() {
+            override suspend fun isPruneSuspect(sessionId: String): Boolean =
+                throw IOException("store wedged")
+        }
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(sid, "r0", "user", "u0"))
+        transcripts.appendEvent(event(sid, "r0", "assistant", "a0"))
+        val loaded = loadModelHistory(transcripts, sid)
+        assertTrue("wedged suspect read must fail closed", loaded.reasoningIncomplete)
+    }
+
+    /**
+     * Finding1 probe CE symmetry (Factory hasReasoningBefore): CE
+     * propagates from the far-marker probe, while an IOException fails
+     * closed to reasoningIncomplete=true. Cap-exact ledger (2000 rows,
+     * dropped==0) so only the far probe decides.
+     */
+    @Test fun farProbeCancellation_propagatesNeverSwallowed() = runBlocking {
+        val transcripts = object : FakeSessionStore() {
+            override suspend fun hasReasoningBefore(sessionId: String, beforeSeq: Long): Boolean =
+                throw CancellationException("far probe cancelled")
+        }
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        seedPairs(transcripts, sid, 1000)
+        try {
+            loadModelHistory(transcripts, sid)
+            fail("far-probe CE must propagate, not return history")
+        } catch (_: CancellationException) {
+            // Expected.
+        }
+    }
+
+    @Test fun farProbeIOException_failsClosedToIncomplete() = runBlocking {
+        val transcripts = object : FakeSessionStore() {
+            override suspend fun hasReasoningBefore(sessionId: String, beforeSeq: Long): Boolean =
+                throw IOException("far probe wedged")
+        }
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        seedPairs(transcripts, sid, 1000)
+        val loaded = loadModelHistory(transcripts, sid)
+        assertEquals(0, loaded.droppedCount)
+        assertTrue("wedged far probe must fail closed", loaded.reasoningIncomplete)
     }
 
     /**

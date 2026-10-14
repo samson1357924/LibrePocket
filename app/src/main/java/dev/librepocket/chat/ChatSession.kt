@@ -122,8 +122,9 @@ interface ChatSession {
    *
    * Production ([ChatSessionImpl] over a real sink) conjoins all of the above
    * (see [dev.librepocket.chat.TurnController.flushDurable], which additionally
-   * re-reads the failure epoch after the admission proof for R22-3 TOCTOU
-   * linearization). The interface defaults below report no obligations (all
+   * re-reads the failure epoch after the admission proof, re-verifies the
+   * admission snapshot, and reads the failure epoch once more fail-last for
+   * R22-3 TOCTOU linearization). The interface defaults below report no obligations (all
    * guards false), so a `true` from a fake proves NOTHING about durability —
    * fakes must never stand in as durability evidence; only production with a
    * real sink is proof. Never assert ledger durability via a fake session.

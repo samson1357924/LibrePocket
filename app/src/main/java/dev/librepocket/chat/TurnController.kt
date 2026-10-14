@@ -1645,6 +1645,20 @@ class TurnController(
   internal var beforeFlushDurableReverifyForTest: (suspend () -> Unit)? = null
 
   /**
+   * Stage-2 return-window gate: runs inside [flushDurable] between the
+   * second admission snapshot and the final failure read (suspending, null
+   * in production). Lets the return-window regression deterministically
+   * admit a must-fail write after the last snapshot and prove the
+   * fail-last failure read still fails closed. With the fail-last order a
+   * failure is the monotonic consequence of an admission/receipt window, so
+   * ending on the failure read covers the snapshot-to-return gap the
+   * snapshot-last order left open; the snapshot-to-failure gap is the
+   * symmetric one-window residual closed only by the Target single-lock
+   * snapshot plus monotonic failure epoch. Must run outside the lock.
+   */
+  internal var beforeFlushDurableReturnForTest: (suspend () -> Unit)? = null
+
+  /**
    * Returns the live in-flight host job, lazily clearing a completed one.
    *
    * Has a lazy-clear side effect (`inFlight = null` when completed), so the
@@ -1799,6 +1813,12 @@ class TurnController(
    * send was never attempted); `!sent && sendAttempted` is fuzzy and maps to
    * UNKNOWN here and in the outer catches (no mark, no rollback — settle
    * claims or converts under the same id).
+   *
+   * Error symmetry (admission, S3-F1 with the terminal S3 trio): a fatal
+   * Error from the delegate store (e.g. AssertionError/LinkageError) marks
+   * INTERRUPTED like Exception and projects [TranscriptDurabilityException]
+   * (retryable, never a bare Error to the caller); VM-fatal
+   * (VirtualMachineError/ThreadDeath) always propagates unwrapped.
    */
   private suspend fun awaitUserRowDurable(
     logicalTurnId: String,
@@ -1868,6 +1888,27 @@ class TurnController(
       // R11-2: proven pre-send never entered the channel, so it uses the
       // non-poison mark (visible, never counted by hasDurableFailures);
       // only a sent (admitted) failure poisons durability.
+      if (!sent.get() && sendAttempted.get()) {
+        return DurableAdmission.UNKNOWN
+      }
+      try {
+        if (!sent.get() && !sendAttempted.get()) {
+          orderedTranscript.markNeverAdmitted(logicalTurnId)
+        } else {
+          orderedTranscript.markInterrupted(logicalTurnId)
+        }
+      } catch (_: Exception) {
+      }
+      throw TranscriptDurabilityException("transcript store failed", e)
+    } catch (e: Throwable) {
+      // Admission Error symmetry (with the S3 terminal trio): a fatal Error
+      // from the delegate store (e.g. AssertionError/LinkageError) follows
+      // the Exception leg above — fuzzy post-send maps to UNKNOWN (no mark,
+      // caller retains ownership), proven pre-send uses the non-poison mark,
+      // admitted failures mark INTERRUPTED and project
+      // TranscriptDurabilityException (retryable); VM-fatal always propagates
+      // unwrapped, and CancellationException never lands here (caught first).
+      if (e is VirtualMachineError || e is ThreadDeath) throw e
       if (!sent.get() && sendAttempted.get()) {
         return DurableAdmission.UNKNOWN
       }
@@ -3344,8 +3385,9 @@ class TurnController(
    * Returns true only when [flushTranscript] drains within [timeoutMs] AND all
    * of the following hold (Current: eight conjuncts; R22 Phase 1 — never
    * true-and-dangling across every terminal-obligation window):
-   * 1. [hasDurableFailures] is false (re-read AFTER the admission proof, see
-   *    the R22-3 note below);
+   * 1. [hasDurableFailures] is false (re-read AFTER the admission proof and
+   *    once more fail-last after the second snapshot, see the R22-3 note
+   *    below);
    * 2. [hasUnsettledCancelReceipts] is false (no PENDING/CLAIMED receipt —
    *    the R19-1 close-barrier guard);
    * 3. [hasSealedUncompensatedReceipts] is false (no SEALED receipt without
@@ -3368,14 +3410,18 @@ class TurnController(
    * through a single pass. The failure epoch is therefore re-read after the
    * admission proof (a failure admitted during the guard window still fails
    * closed), the test gate [beforeFlushDurableReverifyForTest] runs between
-   * the two failure reads, and the admission snapshot is re-verified once
-   * more before returning true (a window opened during the re-read still
-   * fails closed). Ending on the snapshot (rather than fail-last on the
-   * failure read) is equivalent, not weaker: either last-read leaves a
-   * symmetric one-window residual, so only the Target single-lock snapshot
-   * plus a monotonic failure epoch closes both directions. A single-lock
-   * snapshot plus a monotonic failure epoch is Target; Current is this
-   * double-read.
+   * the two failure reads, the admission snapshot is re-verified once more,
+   * and the failure epoch is read a final time before returning true (a
+   * failure admitted during the second snapshot window still fails closed).
+   * The return-window gate [beforeFlushDurableReturnForTest] runs between
+   * the second snapshot and the final failure read. Ending fail-last (on
+   * the failure read, rather than snapshot-last) is the symmetric move: a
+   * durable failure is the monotonic consequence of a receipt/admission
+   * obligation, so the fail-last order covers the snapshot-to-return gap the
+   * snapshot-last order left open; either last-read still leaves a symmetric
+   * one-window residual, so only the Target single-lock snapshot plus a
+   * monotonic failure epoch closes both directions. A single-lock snapshot
+   * plus a monotonic failure epoch is Target; Current is this triple-read.
    */
   suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
     if (!flushTranscript(timeoutMs)) return false
@@ -3384,13 +3430,16 @@ class TurnController(
     beforeFlushDurableReverifyForTest?.invoke()
     if (hasDurableFailures()) return false
     if (!admissionSettledSnapshot()) return false
+    beforeFlushDurableReturnForTest?.invoke()
+    if (hasDurableFailures()) return false
     return true
   }
 
   /**
    * One pass over every non-failure [flushDurable] obligation (see
    * [flushDurable] conjuncts 2–7). Read twice per call (before and after the
-   * failure-epoch re-read) for the R22-3 linearization.
+   * failure-epoch re-read, plus a final failure-epoch read) for the R22-3
+   * linearization.
    */
   private fun admissionSettledSnapshot(): Boolean =
     !hasUnsettledCancelReceipts() && !hasSealedUncompensatedReceipts() &&

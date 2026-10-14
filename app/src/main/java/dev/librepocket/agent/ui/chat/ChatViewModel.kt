@@ -4902,6 +4902,8 @@ class ChatViewModel(
         // model-context can never disagree.
         val pruneSuspect = try {
             backing.isPruneSuspect(sessionId)
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             true
         }

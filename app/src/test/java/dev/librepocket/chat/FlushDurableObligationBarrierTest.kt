@@ -869,4 +869,60 @@ class FlushDurableObligationBarrierTest {
       runCatching { c.close() }
     }
   }
+
+  @Test fun flushDurableReturnGateCatchesLateDurableFailure() {
+    // F-A return-window pin (fail-last order): a durable store failure
+    // admitted AFTER the second admission snapshot but BEFORE the final
+    // failure read must still fail closed via that final read, even though
+    // both snapshots ran clean. Parks flushDurable on the Stage-2 return
+    // gate [beforeFlushDurableReturnForTest], admits a must-fail user row
+    // (P1FailingStore手法), fences on the poison flag (no sleep), then
+    // releases and proves flushDurable==false && hasDurableFailures==true.
+    val store = P1FailingStore(failText = "p1-returnfail")
+    val sid = runBlocking { store.createSession("hi", MODEL) }
+    val provider = P1GateProvider(handler = {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "ok"))
+        emit(StreamEvent.Done("stop"))
+      }
+    })
+    val n = AtomicInteger(0)
+    val c = controller(provider, SessionTranscriptSink(store, sid), n, "p1-returnfail")
+    val returnEntered = CountDownLatch(1)
+    val returnGate = CompletableDeferred<Unit>()
+    c.beforeFlushDurableReturnForTest = {
+      returnEntered.countDown()
+      returnGate.await()
+    }
+    try {
+      runBlocking {
+        supervisorScope {
+          val durableDeferred = async(Dispatchers.Default) { withTimeout(8_000) { c.flushDurable() } }
+          assertTrue("flushDurable must park on the return gate", returnEntered.await(5, TimeUnit.SECONDS))
+          val late = async(Dispatchers.Default) { c.startOrEnqueue("p1-returnfail", opId = 1901L) }
+          awaitCond(8_000, "late failure must poison durability") { c.hasDurableFailures() }
+          try {
+            withTimeout(8_000) { late.await() }
+            fail("failed admission must throw TranscriptDurabilityException, not return Started")
+          } catch (_: TranscriptDurabilityException) {
+            // Expected admitted-write-failure path.
+          }
+          returnGate.complete(Unit)
+          val durable = withTimeout(8_000) { durableDeferred.await() }
+          assertFalse("failure landed in the return window must not flushDurable true", durable)
+          assertTrue("poison must still read back after the window", c.hasDurableFailures())
+          assertNotTrueAndDangling(store, sid, durable, "return-window durable failure")
+          assertTrue(
+            "failed user row must never land, kinds=${snapshot(store, sid).map { it.kind }}",
+            snapshot(store, sid).none { it.kind == "user" && it.text == "p1-returnfail" },
+          )
+        }
+      }
+      assertEquals("failed admission must never reach the provider", 0, provider.streamCalls.get())
+      openTwiceConsistent(store, sid)
+    } finally {
+      returnGate.complete(Unit)
+      runCatching { c.close() }
+    }
+  }
 }

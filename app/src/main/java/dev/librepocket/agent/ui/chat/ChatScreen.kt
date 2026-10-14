@@ -35,6 +35,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -76,6 +77,7 @@ import dev.librepocket.voice.shouldApplyUiEvent
 import dev.librepocket.voice.VoiceTts
 import dev.librepocket.voice.VoiceTtsConfirmState
 import dev.librepocket.voice.TtsConfirmDecision
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /** User-visible text for a chat notice code; unknown codes fall through raw. */
@@ -83,7 +85,7 @@ internal fun chatNoticeText(code: String): String =
     when (code) {
         "NO_ENDPOINT" -> "尚未設定端點，請先設定 API 金鑰。"
         "POLICY_DENIED" -> "政策拒絕讀取金鑰（key.read DENY），本次未發送任何請求。"
-        "KEY_READ_CONFIRM_REQUIRED" -> "讀取金鑰需要本次確認（key.read ASK），本次未送出（確認 UI 尚未提供，fail-closed；追蹤 #13）。"
+        "KEY_READ_CONFIRM_REQUIRED" -> "需要本次確認才可讀取金鑰，本次未送出。"
         "CHAT_SEND_DENIED" -> "對話送出被政策拒絕（chat.send DENY），本次未發送任何請求。"
         "CHAT_APPROVAL_REQUIRED" -> "此操作需要明確核准；目前沒有互動核准流程，本次未送出，也未自動允許。"
         "CHAT_POLICY_UNAVAILABLE" -> "無法驗證對話權限，本次未送出，請稍後重試"
@@ -121,6 +123,7 @@ fun ChatScreen(
     val messages by viewModel.messages.collectAsStateWithLifecycle()
     val input by viewModel.input.collectAsStateWithLifecycle()
     val notice by viewModel.notice.collectAsStateWithLifecycle()
+    val keyReadConfirmSeq by viewModel.keyReadConfirmSequence.collectAsStateWithLifecycle()
     val pendingRecoveryCount by viewModel.pendingRecoveryCount.collectAsStateWithLifecycle()
     val currentSessionId by viewModel.currentSessionId.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
@@ -141,6 +144,46 @@ fun ChatScreen(
     // 兼 TTS 引擎回呼的主線程投遞（見 speaker 接線）。
     val ttsConfirm = remember { VoiceTtsConfirmState() }
     val confirmScope = rememberCoroutineScope()
+    // S7 key.read 確認對話框狀態（notice＋sequence 觸發，非自動彈窗擋路）。
+    // snapshot 為不可變 binding（peekKeyReadBinding，只讀，不含金鑰內容）；
+    // confirming 為 mint 在途（按鈕 disable 防 double-tap）；
+    // confirmResult null=待確認、true=已確認請再按發送、false=已失效；
+    // dialogHidden 為本次 notice 的本地關閉（VM notice 在下次送出前保持，
+    // 故需本地隱藏；notice 離開 KEY_READ_CONFIRM_REQUIRED 即重置）。
+    // sequence 門：每次 deny sequence 單調遞增（VM 永不重置），故
+    // ConfirmRequired→null→ConfirmRequired 中間 null 被 StateFlow
+    // conflation 吃掉時仍以 seq 變化重置並重 peek；同 seq 內 effect 不重跑，
+    // confirm 進度不受影響。
+    var keyReadBinding by remember { mutableStateOf<EndpointSessionBinding?>(null) }
+    var keyReadBindingReady by remember { mutableStateOf(false) }
+    var keyReadConfirming by remember { mutableStateOf(false) }
+    var keyReadConfirmResult by remember { mutableStateOf<Boolean?>(null) }
+    var keyReadDialogHidden by remember { mutableStateOf(false) }
+    val keyReadScope = rememberCoroutineScope()
+    LaunchedEffect(notice, keyReadConfirmSeq) {
+        if (notice != "KEY_READ_CONFIRM_REQUIRED") {
+            keyReadBinding = null
+            keyReadBindingReady = false
+            keyReadConfirming = false
+            keyReadConfirmResult = null
+            keyReadDialogHidden = false
+        } else {
+            // 新 deny（seq 變化或 notice 新進 KEY）：無條件重置本地狀態後重 peek。
+            keyReadBinding = null
+            keyReadBindingReady = false
+            keyReadConfirming = false
+            keyReadConfirmResult = null
+            keyReadDialogHidden = false
+            keyReadBinding = try {
+                viewModel.peekKeyReadBinding()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+            keyReadBindingReady = true
+        }
+    }
     // #2 朗讀確認中待朗讀（null 即無待確認朗讀；單一待確認位，後按覆蓋前按）。
     // P2 身分防線：純文字無法區分同文不同訊息亦無 session 身分，改攜 messageId＋
     // sessionId＋單調 token（見 PendingSpeak）；確認協程 capture 後 token＋世代＋
@@ -609,6 +652,121 @@ fun ChatScreen(
             }
         }
     }
+
+    // S7 key.read 確認對話框：notice 觸發（非自動彈窗擋路），內容為不可變
+    // binding 快照（唯讀，不含金鑰內容）。確認僅 mint 一次性同意，不 auto-send；
+    // 拒絕/取消僅丟棄未消耗的同意，不發送。
+    if (notice == "KEY_READ_CONFIRM_REQUIRED" && !keyReadDialogHidden) {
+        KeyReadConfirmDialog(
+            binding = keyReadBinding,
+            loading = !keyReadBindingReady,
+            confirming = keyReadConfirming,
+            confirmResult = keyReadConfirmResult,
+            onConfirm = {
+                if (keyReadConfirming || keyReadConfirmResult != null) return@KeyReadConfirmDialog
+                keyReadConfirming = true
+                keyReadScope.launch {
+                    val ok = try {
+                        viewModel.confirmKeyRead()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        false
+                    }
+                    keyReadConfirming = false
+                    // 成功顯示已確認請再按發送，失敗（mint false／例外）顯示已失效；
+                    // 皆不 auto-send（restore 已在 input，需手動再按發送）。
+                    keyReadConfirmResult = ok
+                }
+            },
+            onReject = {
+                if (keyReadConfirming) return@KeyReadConfirmDialog
+                if (keyReadConfirmResult != true) viewModel.dismissKeyReadConfirm()
+                keyReadDialogHidden = true
+            },
+            onCancel = {
+                if (keyReadConfirming) return@KeyReadConfirmDialog
+                if (keyReadConfirmResult != true) viewModel.dismissKeyReadConfirm()
+                keyReadDialogHidden = true
+            },
+            onClose = {
+                if (keyReadConfirming) return@KeyReadConfirmDialog
+                if (keyReadConfirmResult != true) viewModel.dismissKeyReadConfirm()
+                keyReadDialogHidden = true
+            },
+        )
+    }
+}
+
+@Composable
+internal fun KeyReadConfirmDialog(
+    binding: EndpointSessionBinding?,
+    loading: Boolean,
+    confirming: Boolean,
+    confirmResult: Boolean?,
+    onConfirm: () -> Unit,
+    onReject: () -> Unit,
+    onCancel: () -> Unit,
+    onClose: () -> Unit,
+) {
+    // S7：key.read ASK 的一次性確認。快照欄位皆為連線身份（唯讀），不含金鑰內容。
+    // confirmResult true=已確認請再按發送、false=已失效；loading/confirming 期間
+    // 按鈕 disable 防 double-tap；binding null（peek 失敗／世代過期）顯示已失效。
+    AlertDialog(
+        onDismissRequest = {
+            if (confirmResult != null) onClose() else onCancel()
+        },
+        title = { Text("讀取金鑰確認") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                when {
+                    confirmResult == true -> {
+                        Text("已確認，請再按發送。")
+                    }
+                    confirmResult == false -> {
+                        Text("已失效，請重新送出。")
+                    }
+                    loading -> {
+                        Text("讀取連線資訊中…")
+                    }
+                    binding == null -> {
+                        Text("已失效，請重新送出。")
+                    }
+                    else -> {
+                        Text("本次送出需要讀取金鑰，請確認以下連線資訊（唯讀，不含金鑰內容）。")
+                        Text("供應商：${binding.providerId}")
+                        Text("伺服器位址：${binding.effectiveBaseUrl}")
+                        Text("來源：${binding.origin}")
+                        Text("協定：${binding.protocol}")
+                        Text("金鑰別名：${binding.apiKeyRef}")
+                        Text("設定版本：${binding.configRevision}")
+                        Text("模型：${binding.model}")
+                        if (confirming) {
+                            Text("確認中…")
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (confirmResult != null) {
+                TextButton(onClick = onClose, enabled = !confirming) { Text("關閉") }
+            } else {
+                TextButton(
+                    onClick = onConfirm,
+                    enabled = !confirming && !loading && binding != null,
+                ) { Text("確認本次讀取") }
+            }
+        },
+        dismissButton = {
+            if (confirmResult == null) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onReject, enabled = !confirming) { Text("拒絕") }
+                    TextButton(onClick = onCancel, enabled = !confirming) { Text("取消") }
+                }
+            }
+        },
+    )
 }
 
 @Composable

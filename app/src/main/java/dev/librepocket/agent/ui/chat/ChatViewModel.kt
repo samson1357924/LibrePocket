@@ -117,6 +117,14 @@ class ChatViewModel(
     private val _pendingRecoveryCount = MutableStateFlow(0)
     val pendingRecoveryCount: StateFlow<Int> = _pendingRecoveryCount.asStateFlow()
 
+    // S7：key.read 確認序列：每次 ConfirmRequired deny 單調遞增，永不重置
+    //（含 newChat/open/logout/endpoint 變更亦不重置）。ChatScreen 以
+    // (notice, sequence) 為 LaunchedEffect key，使 ConfirmRequired→null→
+    // ConfirmRequired 中間 null 被 StateFlow conflation 吃掉時仍能重置本地
+    // dialog 狀態並重 peek；同 sequence 內 confirm 進度不受影響。
+    private val _keyReadConfirmSequence = MutableStateFlow(0L)
+    val keyReadConfirmSequence: StateFlow<Long> = _keyReadConfirmSequence.asStateFlow()
+
     /** Restore the oldest recoverable text into a blank box. Never overwrites, never sends. */
     fun restoreNextRecovered(): Boolean {
         if (_input.value.isNotBlank()) return false
@@ -316,9 +324,11 @@ class ChatViewModel(
      * by a stale mint (the mint aborts) nor leave a stale consent behind
      * (the burn clears under the same lock).
      *
-     * TODO(#13 follow-up): no production caller yet — ChatScreen renders
-     * KEY_READ_CONFIRM_REQUIRED as a hard-deny notice until a confirm
-     * affordance showing the immutable binding snapshot is wired.
+     * S7: production caller is the ChatScreen key.read confirm dialog, which
+     * shows the immutable snapshot from [peekKeyReadBinding] and mints via
+     * this function. Minting never auto-sends: the denied text is already
+     * restored to the input box, and the user must explicitly send again to
+     * consume the consent.
      */
     suspend fun confirmKeyRead(): Boolean {
         // Capture identity before the IO read: an invalidation clearing or
@@ -356,6 +366,30 @@ class ChatViewModel(
     /** Abandon an unconsumed key.read confirmation, if any. */
     fun dismissKeyReadConfirm() {
         takePendingKeyReadConsent()
+    }
+
+    /**
+     * S7 read-only snapshot for the key.read confirm dialog.
+     *
+     * Reads the persisted endpoint and maps it to the immutable
+     * [EndpointSessionBinding] shown in the dialog (providerId /
+     * effectiveBaseUrl / origin / protocol / apiKeyRef / configRevision /
+     * model). Mints no consent, touches no consent slot, and is generation
+     * insensitive: a newer generation does not invalidate the returned
+     * snapshot (the later [confirmKeyRead] mint still fences on the current
+     * generation and fails closed when stale). Any read/mapping failure
+     * returns null (fail-closed: the dialog shows expired instead of a
+     * partial snapshot). Never carries key material.
+     */
+    suspend fun peekKeyReadBinding(): EndpointSessionBinding? {
+        return try {
+            val endpoint = readEndpoint()
+            bindingOf(endpoint)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** Consume-once take: the returned consent (if any) can never be used again. */
@@ -573,7 +607,7 @@ class ChatViewModel(
                         restoreOpForFailedSend(opId, "POLICY_DENIED")
                     }
                     EndpointAccess.ConfirmRequired -> {
-                        setNoticeIfCurrent(operationGeneration, "KEY_READ_CONFIRM_REQUIRED")
+                        emitKeyReadConfirmRequired(operationGeneration)
                         restoreOpForConfirmRequired(opId, "KEY_READ_CONFIRM_REQUIRED")
                     }
                     EndpointAccess.Missing -> {
@@ -771,7 +805,7 @@ class ChatViewModel(
                         restoreOpForFailedSend(opId, "POLICY_DENIED")
                     }
                     EndpointAccess.ConfirmRequired -> {
-                        setNoticeIfCurrent(operationGeneration, "KEY_READ_CONFIRM_REQUIRED")
+                        emitKeyReadConfirmRequired(operationGeneration)
                         restoreOpForConfirmRequired(opId, "KEY_READ_CONFIRM_REQUIRED")
                     }
                     EndpointAccess.Missing -> {
@@ -873,7 +907,7 @@ class ChatViewModel(
                         return@launch
                     }
                     EndpointAccess.ConfirmRequired -> {
-                        setNoticeIfCurrent(requestedGeneration, "KEY_READ_CONFIRM_REQUIRED")
+                        emitKeyReadConfirmRequired(requestedGeneration)
                         return@launch
                     }
                     EndpointAccess.Missing -> {
@@ -1488,6 +1522,18 @@ class ChatViewModel(
 
     private fun setNoticeIfCurrent(generation: Long, value: String) {
         if (isGenerationCurrent(generation)) _notice.value = value
+    }
+
+    /**
+     * S7：ConfirmRequired 發布單一入口。世代不符回 false（不碰
+     * notice/sequence）；否則設 notice 並單調遞增 sequence。confirm/dismiss/
+     * peek 永不經此（不 bump）。
+     */
+    private fun emitKeyReadConfirmRequired(generation: Long): Boolean {
+        if (!isGenerationCurrent(generation)) return false
+        _notice.value = "KEY_READ_CONFIRM_REQUIRED"
+        _keyReadConfirmSequence.value += 1
+        return true
     }
 
     // F2: retain visible user/assistant messages before dropping live state,

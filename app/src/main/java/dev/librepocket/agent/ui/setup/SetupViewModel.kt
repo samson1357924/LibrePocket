@@ -217,6 +217,12 @@ class SetupViewModel(
     // model-only saves keep working; the save path re-verifies against the
     // live store snapshot, never trusts this baseline for the ref).
     private var editBaseline: EndpointConfig? = null
+    // S3 typed-key/identity binding: (providerId, normalized effectiveBaseUrl)
+    // captured at the last non-blank onApiKeyChange. Blank key clears it (no
+    // binding, KeepExisting path). Preset/URL edits retain text but keep the
+    // old binding so entries fail closed. @Volatile: written on Main
+    // (key/prefill/logout/retry) and cleared on IO save success.
+    @Volatile private var keyBoundIdentity: Pair<String, String>? = null
     // Stage2 form fence: identity/key intent epoch. Bumped only by
     // selectPreset/onBaseUrlChange/onApiKeyChange/prefillForEdit/logout.
     // onModelChange/toggleShowKey deliberately do NOT bump (model edits are
@@ -495,6 +501,17 @@ class SetupViewModel(
     fun onApiKeyChange(v: String) {
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
+        // S3: (re)bind non-blank keys to the current identity; blank clears.
+        if (v.trim().isEmpty()) {
+            keyBoundIdentity = null
+        } else {
+            val cur = _form.value
+            keyBoundIdentity = try {
+                SetupValidation.deriveProviderId(cur.presetId) to effectiveBaseUrlOf(cur).trim()
+            } catch (_: Exception) {
+                null
+            }
+        }
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
@@ -537,6 +554,8 @@ class SetupViewModel(
         testConnectionJob = null
         val testRevision = testConnectionGeneration.incrementAndGet()
         editBaseline = config
+        // S3: prefill rebuilds a blank form — drop any typed-key binding.
+        keyBoundIdentity = null
         val preset = ProviderCatalog.preset(config.presetId)
         if (preset == null || config.presetId == ProviderCatalog.CUSTOM_ID) {
             _form.value = SetupUiState(
@@ -579,6 +598,18 @@ class SetupViewModel(
         }
     }
 
+    /**
+     * S3 binding check: blank key bypasses (KeepExisting path); non-blank
+     * requires a matching bound identity (strict trim-only, case/slash
+     * sensitive like [keepExistingModeFor]). Missing binding fails closed.
+     */
+    private fun keyIdentityChanged(form: SetupUiState, effectiveBaseUrl: String, providerId: String): Boolean {
+        if (form.apiKey.trim().isEmpty()) return false
+        val bound = keyBoundIdentity ?: return true
+        if (bound.first != providerId) return true
+        return bound.second != effectiveBaseUrl.trim()
+    }
+
     fun consumeSaved() {
         _form.value = _form.value.copy(saved = false)
     }
@@ -598,8 +629,9 @@ class SetupViewModel(
      * `testing` fence stays exact and a cancelled attempt writes nothing
      * (CancellationException rethrown unwritten).
      *
-     * S2 probe gate: validation runs first on Main (zero policy reads on
-     * failure); the IO coroutine then fences entryRevision, takes a fresh
+     * S2 probe gate: the S3 binding check runs first on Main (zero policy
+     * reads on failure), then validation, also on Main; the IO coroutine then
+     * fences entryRevision, takes a fresh
      * provider.call verdict (only ALLOW continues; ASK/DENY/read failure fail
      * closed with PROBE_POLICY_DENIED, zero provider construction), re-fences
      * with the generation guard, and re-checks fence + fresh verdict before
@@ -619,12 +651,6 @@ class SetupViewModel(
             _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
-        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
-        if (err != null) {
-            _form.value = cur.copy(errorCode = err)
-            return
-        }
-        val entryRevision = formRevision.get()
         // deriveProviderId is currently infallible (pure "preset:$presetId"
         // concat, never throws — dead-code guard); the try is retained
         // defensively so a future throwing mapping still fails closed here
@@ -636,6 +662,22 @@ class SetupViewModel(
             _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
+        // S3: typed key bound to another identity — zero requests. Checked
+        // before validation (aligned with save): a stale binding
+        // deterministically reports SETUP_KEY_IDENTITY_CHANGED even for a
+        // short key, so the user is told to re-paste rather than fix the
+        // length. S2 gate untouched (both checks are Main-thread, zero
+        // policy/provider I/O).
+        if (keyIdentityChanged(cur, effectiveBaseUrl, providerId)) {
+            _form.value = cur.copy(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+            return
+        }
+        val validationErr = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
+        if (validationErr != null) {
+            _form.value = cur.copy(errorCode = validationErr)
+            return
+        }
+        val entryRevision = formRevision.get()
         testConnectionJob?.cancel()
         testConnectionJob = null
         val generation = testConnectionGeneration.incrementAndGet()
@@ -703,7 +745,8 @@ class SetupViewModel(
     /**
      * Refresh the model candidates: live listing first, snapshot fills the rest.
      *
-     * S2 probe gate (same shape as [testConnection]): validation first on Main,
+     * S2 probe gate (same shape as [testConnection]): the S3 binding check
+     * runs first on Main (aligned with save), then validation, also on Main;
      * then fence + fresh provider.call verdict + fence + pre-IO re-check before
      * any provider construction/listModels plus a post-live re-gate before
      * directory fetch (triple-gate). Only ALLOW continues; otherwise
@@ -724,12 +767,6 @@ class SetupViewModel(
         }
         // NEW always (same rule as testConnection): the listing needs the key
         // in memory; a blank edit field requires a re-paste, never a vault read.
-        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
-        if (err != null) {
-            _form.value = cur.copy(errorCode = err)
-            return
-        }
-        val entryRevision = formRevision.get()
         // deriveProviderId is currently infallible (pure "preset:$presetId"
         // concat, never throws — dead-code guard); the try is retained
         // defensively so a future throwing mapping still fails closed here
@@ -741,6 +778,21 @@ class SetupViewModel(
             _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
+        // S3: typed key bound to another identity — zero requests. Checked
+        // before validation (aligned with save and testConnection): a stale
+        // binding deterministically reports SETUP_KEY_IDENTITY_CHANGED even
+        // for a short key. S2 gate untouched (both checks are Main-thread,
+        // zero policy/provider I/O).
+        if (keyIdentityChanged(cur, effectiveBaseUrl, providerId)) {
+            _form.value = cur.copy(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+            return
+        }
+        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
+        if (err != null) {
+            _form.value = cur.copy(errorCode = err)
+            return
+        }
+        val entryRevision = formRevision.get()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val generation = modelRefreshGeneration.incrementAndGet()
@@ -876,6 +928,18 @@ class SetupViewModel(
         }
         val cur = _form.value
         if (cur.saving || cur.testing || cur.modelsLoading) return
+        // S3: typed key bound to another identity — zero vault writes, no
+        // consent mint, distinct code (not POLICY_DENIED) for UX.
+        try {
+            val eff = effectiveBaseUrlOf(cur)
+            val pid = SetupValidation.deriveProviderId(cur.presetId)
+            if (keyIdentityChanged(cur, eff, pid)) {
+                _form.value = cur.copy(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+                return
+            }
+        } catch (_: Exception) {
+            // Fall through: unknown preset keeps existing behavior below.
+        }
         val effectiveBaseUrl = effectiveBaseUrlOf(cur)
         // Phase A2: blank key + unchanged edit identity validates as
         // EDIT_KEEP_EXISTING (reuse the stored vault key, metadata-only save);
@@ -1504,6 +1568,7 @@ class SetupViewModel(
             // fresh I/O instead of replaying a stale outcome over the new state.
             invalidateStartupSettled()
             _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+            keyBoundIdentity = null
         } catch (e: CancellationException) {
             if (!metadataCommitted) {
                 // Uncommitted or ambiguous (put-after / V2 / fence / CAS-threw-
@@ -1532,6 +1597,7 @@ class SetupViewModel(
                 if (livePointsAtStaged == true) {
                     invalidateStartupSettled()
                     _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                    keyBoundIdentity = null
                     return
                 }
                 if (livePointsAtStaged == false && vaultDirty) {
@@ -1562,6 +1628,7 @@ class SetupViewModel(
                 if (stillCommitted == true) {
                     invalidateStartupSettled()
                     _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                    keyBoundIdentity = null
                     return
                 }
                 _form.value = _form.value.copy(saving = false)
@@ -1725,6 +1792,7 @@ class SetupViewModel(
             reuseCommitted = true
             invalidateStartupSettled()
             _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+            keyBoundIdentity = null
         } catch (e: CancellationException) {
             if (!reuseCommitted) {
                 _form.value = _form.value.copy(saving = false)
@@ -1740,6 +1808,7 @@ class SetupViewModel(
             if (stillCommitted == true) {
                 invalidateStartupSettled()
                 _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                keyBoundIdentity = null
                 return
             }
             _form.value = _form.value.copy(saving = false)
@@ -2843,6 +2912,8 @@ class SetupViewModel(
         testConnectionGeneration.incrementAndGet()
         // Teardown in flight: a blank key must never reuse (baseline dropped).
         editBaseline = null
+        // S3: retained key text loses its binding (fail closed on next entry).
+        keyBoundIdentity = null
         val job = viewModelScope.launch(Dispatchers.IO) {
             // try-catch 在 withLock 之外（仿 save）：排隊等鎖時被取消（lambda
             // 未進入）仍能復位 inFlight；僅內層 catch 會漏此窗口。
@@ -3202,6 +3273,8 @@ class SetupViewModel(
         testConnectionGeneration.incrementAndGet()
         // Teardown-adjacent retry: same fail-closed baseline drop as logout.
         editBaseline = null
+        // S3: same binding drop as logout (retained text must re-bind).
+        keyBoundIdentity = null
         val job = viewModelScope.launch(Dispatchers.IO) {
             // try-catch 在 withLock 之外（仿 save／logout）：排隊等鎖時被取消仍復位。
             try {

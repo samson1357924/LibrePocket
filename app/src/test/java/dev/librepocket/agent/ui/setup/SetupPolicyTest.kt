@@ -43,6 +43,10 @@ import org.junit.Test
 /** Fixed-verdict PolicyStore stub for the key.write gate tests. */
 class VerdictPolicy(private val verdict: Verdict) : PolicyStore {
     var freshCalls = 0
+    var lastAction: String? = null
+        private set
+    var lastResource: String? = null
+        private set
 
     override fun evaluate(action: String, resource: String) =
         PolicyDecision(verdict, null, System.currentTimeMillis())
@@ -53,6 +57,8 @@ class VerdictPolicy(private val verdict: Verdict) : PolicyStore {
 
     override suspend fun evaluateFresh(action: String, resource: String): PolicyDecision {
         freshCalls++
+        lastAction = action
+        lastResource = resource
         return PolicyDecision(verdict, null, System.currentTimeMillis())
     }
 }
@@ -728,7 +734,17 @@ class SetupPolicyTest {
         assertFalse(vm.form.value.saved)
         assertEquals(1, policy.freshCalls)
         assertEquals(0, vault.putKeys)
-        // A fresh save re-evaluates and mints a new consent for the new identity.
+        // S3: retained text lost its binding — a fresh save without re-paste
+        // fails closed with SETUP_KEY_IDENTITY_CHANGED (zero writes, no mint).
+        vm.save()
+        awaitSettled(vm)
+        assertEquals("SETUP_KEY_IDENTITY_CHANGED", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals(1, policy.freshCalls)
+        assertEquals(0, vault.putKeys)
+        // Re-paste for the new identity rebinds; a fresh save mints again.
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -766,6 +782,15 @@ class SetupPolicyTest {
         assertFalse(vm.form.value.saved)
         assertEquals(1, policy.freshCalls)
         assertEquals(0, vault.putKeys)
+        // S3: retained text lost its binding — fail closed without mint.
+        vm.save()
+        awaitSettled(vm)
+        assertEquals("SETUP_KEY_IDENTITY_CHANGED", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals(1, policy.freshCalls)
+        assertEquals(0, vault.putKeys)
+        vm.onApiKeyChange("unit-test-key-123")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)

@@ -750,6 +750,16 @@ class SetupViewModel(
      */
     fun testConnection() {
         val cur = _form.value
+        // S5：對話框期間不可重入（UI disabled 為主，此為縱深）：silent return，
+        // 不啟動 listModels、不 mint、不碰 policy/vault，對話框與已 mint 同意書不動。
+        if (cur.confirmKeyWrite) return
+        // S5：logout teardown 在途擋新 probe（silent return；teardown 期間以
+        // typed key 發請求無意義且擾動清除語義）。save 仍經 saveMutex 與 logout
+        // 序列化，此處僅 probe。startup retry 在途則允許 probe：retry 無 journal
+        // （NO_OP）時僅重讀 store（零 vault key I/O），有 journal 時 reconcile
+        // 可能刪 journal alias（live）＋clear；probe 僅用記憶體內 typed key（零 vault 讀），
+        // 兩者無共享可變狀態，generation/fence 照常適用。
+        if (cur.logoutInFlight) return
         if (cur.testing || cur.saving || cur.modelsLoading) return
         // Unknown preset must fail closed on Main (fail-closed 落碼，不 crash)：
         // effectiveBaseUrlOf throws PRESET_UNKNOWN via requirePreset before
@@ -864,6 +874,11 @@ class SetupViewModel(
      */
     fun refreshModels() {
         val cur = _form.value
+        // S5：對話框期間不可重入（同 testConnection）：silent return，不啟動
+        // listModels／目錄抓取、不 mint、不碰 policy/vault。
+        if (cur.confirmKeyWrite) return
+        // S5：logout 在途擋新 probe（同 testConnection；startup retry 在途允許）。
+        if (cur.logoutInFlight) return
         if (cur.modelsLoading || cur.testing || cur.saving) return
         // Unknown preset must fail closed on Main (fail-closed 落碼，不 crash)：
         // effectiveBaseUrlOf throws PRESET_UNKNOWN via requirePreset before
@@ -1037,6 +1052,12 @@ class SetupViewModel(
             return
         }
         val cur = _form.value
+        // S5：對話框期間不可重入（UI disabled 為主，此為縱深）：對話框顯示中
+        // 的 save()（無 consent）silent return，不重估、不重 mint（不覆寫已
+        // mint 同意書）、不啟動寫入，對話框與 intent/summary 不動。confirm tap
+        // 經 confirmKeyWriteSave（先 hide 才調 saveWithConsent(consent)，到達
+        // 時已為 false），故不受影響。
+        if (cur.confirmKeyWrite) return
         if (cur.saving || cur.testing || cur.modelsLoading) return
         // S3: typed key bound to another identity — zero vault writes, no
         // consent mint, distinct code (not POLICY_DENIED) for UX.
@@ -1048,9 +1069,19 @@ class SetupViewModel(
                 return
             }
         } catch (_: Exception) {
-            // Fall through: unknown preset keeps existing behavior below.
+            // Fall through: unknown preset is mapped fail-closed below.
         }
-        val effectiveBaseUrl = effectiveBaseUrlOf(cur)
+        // S5：未知 preset fail-closed（與 probe 同形）：effectiveBaseUrlOf 經
+        // requirePreset 拋 PRESET_UNKNOWN（validate 之前）——落碼
+        // SETUP_UNKNOWN_PRESET，零 vault/policy I/O，saving 保持 false，絕不
+        // crash Main（此前裸調直接拋出）。UI 正常路徑到達不了（selectPreset 擋
+        // 未知、prefill 轉 custom），此為程式化／未來路徑的縱深。
+        val effectiveBaseUrl: String = try {
+            effectiveBaseUrlOf(cur)
+        } catch (_: Exception) {
+            _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
+            return
+        }
         // Phase A2: blank key + unchanged edit identity validates as
         // EDIT_KEEP_EXISTING (reuse the stored vault key, metadata-only save);
         // every other shape validates as NEW. Probes stay NEW (see
@@ -1329,6 +1360,11 @@ class SetupViewModel(
         // Existence-only orphan guard (no content read). Bounded by the same
         // total-mint budget; each redraw re-checks the snapshot inequality
         // synchronously before the next existence probe.
+        // S5 existence-oracle 豁免（文件化，刻意不移至 verdict 之後）：此 hasKey
+        // 僅測存在性（per-op UUID 新 staged alias，不讀內容），與 gate flow
+        // 查的 live alias 非同一 alias；但 random alias 的 oracle 值可忽略，
+        // 且 V1 DENY 已早返，真副作用（putKey／metadata CAS）仍由 vPut／vCommit
+        // verdict 閘守（DENY/ASK 即擋，零寫入）。
         while (true) {
             if (entryRevision != formRevision.get()) {
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
@@ -1837,6 +1873,10 @@ class SetupViewModel(
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
+        // S5 existence-oracle 豁免（文件化，刻意不移至 verdict 之後）：此 hasKey
+        // 僅為 reuse 前提的存在性檢查（live alias 取自同 emission 快照，不讀內容；
+        // 同 staged orphan-guard 與 gate flow 的無-policy hasKey 一致，不新增
+        // oracle）。真正副作用（metadata CAS）仍由其後 vCommit 閘守。
         val keyPresent: Boolean = try {
             vault().hasKey(oldAlias)
         } catch (e: CancellationException) {

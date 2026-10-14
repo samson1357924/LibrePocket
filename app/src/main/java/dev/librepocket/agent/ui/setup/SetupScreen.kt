@@ -187,7 +187,7 @@ fun SetupScreen(
 
         ExposedDropdownMenuBox(
             expanded = presetExpanded,
-            onExpandedChange = { if (!state.saving) presetExpanded = !presetExpanded },
+            onExpandedChange = { if (!state.saving && !state.confirmKeyWrite) presetExpanded = !presetExpanded },
         ) {
             OutlinedTextField(
                 value = selectedPreset.label,
@@ -219,7 +219,7 @@ fun SetupScreen(
             value = state.baseUrl,
             onValueChange = viewModel::onBaseUrlChange,
             readOnly = !baseUrlEditable,
-            enabled = baseUrlEditable && !state.saving,
+            enabled = baseUrlEditable && !state.saving && !state.confirmKeyWrite,
             label = { Text("伺服器位址") },
             supportingText = {
                 if (baseUrlEditable) Text("自訂位址必須是 https（本機/內網測試位址除外）。")
@@ -229,10 +229,11 @@ fun SetupScreen(
         )
 
         var modelExpanded by remember { mutableStateOf(false) }
-        // S4 非對稱閘：preset/baseUrl/apiKey/三按鈕只閘 saving，對話框期間靠
-        // bump＋invalidate 隱藏（key/identity edit 會 bump 並丟棄同意書）；
-        // model 因不 bump（#17 範圍外，見 onModelChange）故需顯式再閘
-        // confirmKeyWrite（UI 擋；VM 容忍 stale、entry 快照權威）。不可宣稱一致。
+        // S5 對稱閘：preset/baseUrl/apiKey/三按鈕（save/test/refresh）以
+        // `saving || confirmKeyWrite` 雙閘（UI 擋；VM entry 另有
+        // confirmKeyWrite／logoutInFlight silent-return 縱深，見 saveWithConsent／
+        // testConnection／refreshModels）；model 因不 bump（#17 範圍外，見
+        // onModelChange）故同樣雙閘。UI 與 VM 雙層，不宣稱單層充分。
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -279,7 +280,7 @@ fun SetupScreen(
             }
             IconButton(
                 onClick = viewModel::refreshModels,
-                enabled = !state.modelsLoading && !state.testing && !state.saving,
+                enabled = !state.modelsLoading && !state.testing && !state.saving && !state.confirmKeyWrite,
             ) {
                 if (state.modelsLoading) {
                     CircularProgressIndicator(strokeWidth = 2.dp)
@@ -299,7 +300,7 @@ fun SetupScreen(
         OutlinedTextField(
             value = state.apiKey,
             onValueChange = viewModel::onApiKeyChange,
-            enabled = !state.saving,
+            enabled = !state.saving && !state.confirmKeyWrite,
             label = { Text("API Key") },
             placeholder = { Text("貼上你的金鑰") },
             modifier = Modifier.fillMaxWidth(),
@@ -357,7 +358,7 @@ fun SetupScreen(
         ) {
             OutlinedButton(
                 onClick = viewModel::testConnection,
-                enabled = !state.testing && !state.saving && !state.modelsLoading,
+                enabled = !state.testing && !state.saving && !state.modelsLoading && !state.confirmKeyWrite,
                 modifier = Modifier.weight(1f),
             ) {
                 if (state.testing) {
@@ -370,7 +371,7 @@ fun SetupScreen(
             }
             Button(
                 onClick = viewModel::save,
-                enabled = !state.saving && !state.testing && !state.modelsLoading,
+                enabled = !state.saving && !state.testing && !state.modelsLoading && !state.confirmKeyWrite,
                 modifier = Modifier.weight(1f),
             ) {
                 if (state.saving) {

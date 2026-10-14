@@ -114,11 +114,17 @@ private class EarlyExitSessions(
     val openCalls = AtomicInteger()
     override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
     override suspend fun storeOrNull(): SessionStore? = transcripts
+    // D2 canonical form: create is unused in this test; keep it unused.
+    // The 3-arg shim rides the interface default into this body.
     override suspend fun create(
         endpoint: EndpointConfig,
         title: String,
+        initialHistory: List<dev.librepocket.provider.ChatMessage>,
         keyIsCurrent: suspend () -> Boolean,
-    ): CreatedSession = error("unused")
+    ): CreatedSession {
+        check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+        error("unused")
+    }
     override suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,
@@ -194,11 +200,17 @@ private class FromNullSessions(
     val openCalls = AtomicInteger()
     override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
     override suspend fun storeOrNull(): SessionStore? = transcripts
+    // D2 canonical form: create is unused in this test; keep it unused.
+    // The 3-arg shim rides the interface default into this body.
     override suspend fun create(
         endpoint: EndpointConfig,
         title: String,
+        initialHistory: List<dev.librepocket.provider.ChatMessage>,
         keyIsCurrent: suspend () -> Boolean,
-    ): CreatedSession = error("unused")
+    ): CreatedSession {
+        check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+        error("unused")
+    }
     override suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,

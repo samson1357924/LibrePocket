@@ -177,9 +177,11 @@ interface ChatSession {
    * [hasSealedUncompensatedReceipts] — so the promotion windows newly covered
    * here already reach the VM through this proof. The sibling proofs
    * [hasUnsettledPromotion], [hasActiveHost], and [hasClosedUnsettledAdmission]
-   * are [flushDurable]-conjoined (the VM observes them indirectly via a
-   * `false` downgrade); their direct VM wiring is follow-up work, not claimed
-   * here. Default false so test fakes stay
+   * are [flushDurable]-conjoined AND read directly by the ViewModel evidence
+   * checks (`isLedgerStreamingOrPending` consults the obligation proofs; the
+   * seal/completion proofs feed the writer-dead proof instead); there is no
+   * unwired follow-up — a fake `true` still proves nothing (see
+   * [flushDurable]). Default false so test fakes stay
    * source-compatible (a fake `true` proves nothing — see [flushDurable]);
    * production ([ChatSessionImpl]) overrides with the live
    * controller state.

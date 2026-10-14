@@ -53,6 +53,21 @@ private class FakeChatProvider(
 
 class ChatWiringTest {
 
+    // Scope note (D1): the storeless `newVm` helpers below (no
+    // `SessionStoreSource` → `NoOpTranscriptSink`, null session id) cover the
+    // provider loop ONLY — send/stream/cancel/steer/policy/switch noticing.
+    // A storeless `flushDurable == true` proves nothing about durability (see
+    // `ChatSession.flushDurable`); durability evidence lives in
+    // `TurnControllerLedgerTest`, `CancelReceiptCloseBarrierTest`,
+    // `FlushDurableObligationBarrierTest`, `SessionTranscriptSinkTest` and the
+    // Room store tests — never here. The with-store dual track (real
+    // `ChatSessionFactory` + `FakeSessionStore`, whose `SessionTranscriptSink`
+    // rides the real `OrderedTranscriptSink` inside `ChatSessionImpl`) runs
+    // end-to-end in `openSessionReplaysHistoryThenLiveAppends`,
+    // `sameProviderModelSwitchCarriesHistoryIntoNextRequest`,
+    // `crossProviderModelSwitchWithholdsHistoryAndSetsNotice` and
+    // `displayVsModelProjection_partialMarkerTruncation` below.
+
     private val tmpDirs = ArrayList<java.io.File>()
     private val scopes = ArrayList<CoroutineScope>()
     private val chatViewModels = ChatTestViewModelStore()
@@ -1387,5 +1402,114 @@ class ChatWiringTest {
         assertEquals(7, restartReq.messages.size)
         assertEquals("a3", restartReq.messages[5].text)
         assertTrue(restartReq.messages[6].text.startsWith("u4"))
+    }
+
+    // D6 display-vs-model dual-projection contrast (partial / marker /
+    // truncation axes, one ledger): the display replay and the model-context
+    // hydration intentionally disagree —
+    // - a terminal cancelled partial replays in the UI flagged but never
+    //   enters model context;
+    // - a payload-free reasoning marker restores hasReasoning on both sides
+    //   but never renders and never enters context itself;
+    // - an over-long row replays full in the UI but is truncated with a
+    //   visible marker in model context.
+    // The model side rides the real factory hydration (open + send request
+    // inspection through the VM), never a hand-built prefix.
+    @Test
+    fun displayVsModelProjection_partialMarkerTruncation() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val giant = "G".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE + 5000)
+        val sid = runBlocking {
+            val id = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r1", kind = "assistant", text = "a1", createdAt = 2L,
+                ),
+            )
+            // Payload-free resume marker for the reasoning-sourced turn.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r1", kind = "reasoning", text = "", createdAt = 3L,
+                ),
+            )
+            // Terminal cancelled partial (final fragment): replays flagged.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r2", kind = "user", text = "q2", createdAt = 4L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r2", kind = "assistant", text = "half", createdAt = 5L,
+                    isPartial = true,
+                ),
+            )
+            // Over-long completed turn.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r3", kind = "user", text = "q3", createdAt = 6L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r3", kind = "assistant", text = giant, createdAt = 7L,
+                ),
+            )
+            id
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = InMemoryPolicyStore(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 6 }
+        // Display axis: everything replays; marker restores the flag but never
+        // renders; the partial replays flagged; the giant row replays full.
+        val shown = vm.messages.value
+        assertEquals(listOf("q1", "a1", "q2", "half", "q3", giant), shown.map { it.text })
+        assertEquals(listOf(false, true, false, false, false, false), shown.map { it.hasReasoning })
+        assertEquals(listOf(false, false, false, true, false, false), shown.map { it.isPartial })
+        assertNull(vm.notice.value)
+        // Model axis: the next request carries the hydrated prefix — partial
+        // excluded, flag carried, giant truncated with a visible marker.
+        onMain { vm.onInputChange("q4") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 8 }
+        val req = fake.seenRequests.single()
+        assertEquals(
+            listOf("user", "assistant", "user", "user", "assistant", "user"),
+            req.messages.map { it.role },
+        )
+        assertEquals("q1", req.messages[0].text)
+        assertEquals("a1", req.messages[1].text)
+        assertEquals("q2", req.messages[2].text)
+        assertEquals("q3", req.messages[3].text)
+        assertEquals(listOf(false, true, false, false, false, false), req.messages.map { it.hasReasoning })
+        assertTrue(req.messages.none { it.text == "half" })
+        assertTrue(req.messages.none { it.role == "reasoning" })
+        val giantModel = req.messages[4].text
+        assertEquals(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE + HISTORY_TRUNCATION_MARKER.length, giantModel.length)
+        assertTrue(giantModel.endsWith(HISTORY_TRUNCATION_MARKER))
+        assertTrue(req.messages[5].text.startsWith("q4"))
     }
 }

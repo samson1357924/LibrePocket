@@ -3313,12 +3313,18 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
             val id = "controller-session-${created.incrementAndGet()}"
             createdModels.add(endpoint.model)
             val transcript = object : TranscriptSink by NoOpTranscriptSink() {
@@ -3342,6 +3348,14 @@ class ChatSessionLifecycleTest {
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
+
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3459,12 +3473,18 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
             if (createCount.incrementAndGet() == 1) {
                 val delegate = RecordingSession("old", { })
                 val session = object : ChatSession by delegate {
@@ -3505,6 +3525,14 @@ class ChatSessionLifecycleTest {
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
 
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
         override suspend fun storeOrNull(): SessionStore? = null
 
         suspend fun awaitReplacement(): RecordingSession = withTimeout(5_000) {
@@ -3518,12 +3546,20 @@ class ChatSessionLifecycleTest {
         val session = FreshDenyQueuedSession()
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
-        ) = CreatedSession("fresh-deny", session, endpoint.providerId, modelFor(endpoint))
+        ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+            return CreatedSession("fresh-deny", session, endpoint.providerId, modelFor(endpoint))
+        }
 
         override suspend fun open(
             endpoint: EndpointConfig,
@@ -3531,6 +3567,14 @@ class ChatSessionLifecycleTest {
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
+
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3588,12 +3632,20 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
-        ) = CreatedSession("needs-recovery", session, endpoint.providerId, modelFor(endpoint))
+        ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+            return CreatedSession("needs-recovery", session, endpoint.providerId, modelFor(endpoint))
+        }
 
         override suspend fun open(
             endpoint: EndpointConfig,
@@ -3601,6 +3653,14 @@ class ChatSessionLifecycleTest {
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
+
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3680,12 +3740,20 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
-        ) = CreatedSession("legacy-null-recovery", session, endpoint.providerId, modelFor(endpoint))
+        ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+            return CreatedSession("legacy-null-recovery", session, endpoint.providerId, modelFor(endpoint))
+        }
 
         override suspend fun open(
             endpoint: EndpointConfig,
@@ -3693,6 +3761,14 @@ class ChatSessionLifecycleTest {
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
+
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3760,12 +3836,18 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
             val ordinal = createCounter.incrementAndGet()
             val sessionId = "session-$ordinal"
             createAttemptIds.add(sessionId)
@@ -3790,6 +3872,17 @@ class ChatSessionLifecycleTest {
             opened.add(session)
             return CreatedSession(sessionId, session, endpoint.providerId, modelFor(endpoint))
         }
+
+        // D2 canonical form: this fake keeps no ledger marks of its own, so
+        // the gate is intentionally a no-op here (same as the old interface
+        // default); backfill behavior is pinned against the real factory in
+        // ChatSameIdReopenFenceTest, not here.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = backingStore
 

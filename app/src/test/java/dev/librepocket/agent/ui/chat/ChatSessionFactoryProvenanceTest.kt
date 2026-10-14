@@ -3,6 +3,7 @@ package dev.librepocket.agent.ui.chat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -12,9 +13,16 @@ import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.session.FakeSessionStore
+import dev.librepocket.session.SessionStore
 import dev.librepocket.session.TranscriptEvent
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Method
 import java.nio.file.Files
 import java.util.Collections
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,6 +32,7 @@ import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -43,6 +52,32 @@ private class ProvenanceFakeProvider(
     }
 
     override suspend fun listModels(): List<String> = emptyList()
+}
+
+/**
+ * Settle-path probe: the VM endpoint-switch fence+read only needs a store;
+ * create/open never run here (D2 canonical-only, both unused).
+ */
+private class SettleProbeSessions(var backing: FakeSessionStore) : ChatSessionProvider {
+    override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
+    override suspend fun storeOrNull(): SessionStore? = backing
+    override suspend fun create(
+        endpoint: EndpointConfig,
+        title: String,
+        initialHistory: List<dev.librepocket.provider.ChatMessage>,
+        keyIsCurrent: suspend () -> Boolean,
+    ): CreatedSession = error("settle probe never creates")
+    override suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        keyIsCurrent: suspend () -> Boolean,
+    ): CreatedSession = open(endpoint, sessionId, keyIsCurrent, true)
+    override suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        keyIsCurrent: suspend () -> Boolean,
+        backfillInterrupted: Boolean,
+    ): CreatedSession = error("settle probe never opens")
 }
 
 /**
@@ -165,6 +200,219 @@ class ChatSessionFactoryProvenanceTest {
         // Malformed / foreign / imported: fail-closed (all false)
         assertFalse(isSameProviderOrigin("/gpt-4o-mini", "preset:openai", openaiUrl))
         assertFalse(isSameProviderOrigin("imported/unknown", "preset:openai", openaiUrl))
+    }
+
+    @Test fun storedOrigin_normalizeOrigin_spellingVariants_agree() {
+        // The stored header is stamped normalized at create() time; the live
+        // side normalizes again idempotently. Spelling variants of one
+        // origin must agree; only a real origin change forks.
+        val stored = "preset:openai@https://api.openai.com/gpt-4o-mini"
+        assertTrue(isSameProviderOrigin(stored, "preset:openai", "https://api.openai.com/v1"))
+        assertTrue(isSameProviderOrigin(stored, "preset:openai", "https://api.openai.com:443/v1"))
+        assertTrue(isSameProviderOrigin(stored, "preset:openai", "https://api.openai.com/other/path"))
+        assertTrue(isSameProviderOrigin(stored, "preset:openai", "HTTPS://API.OPENAI.COM/v1"))
+        // A stored explicit default port still meets the live side.
+        assertTrue(
+            isSameProviderOrigin(
+                "preset:openai@https://api.openai.com:443/gpt-4o-mini",
+                "preset:openai",
+                "https://api.openai.com/v1",
+            ),
+        )
+        // Real origin changes still fork.
+        assertFalse(isSameProviderOrigin(stored, "preset:openai", "https://api.openai.com:8443/v1"))
+        assertFalse(isSameProviderOrigin(stored, "preset:openai", "http://api.openai.com/v1"))
+        assertFalse(isSameProviderOrigin(stored, "preset:openai", "https://evil.example.com/v1"))
+    }
+
+    @Test fun sameOriginDecision_factoryAndSettlePaths_agree() {
+        // D3: factory open() and VM settleDetachedLedger() decide through the
+        // single isSameOriginForResume choke point — one ledger, one verdict.
+        // This pins the helper against the inline derivation both call sites
+        // used before convergence, over legacy + foreign + port variants.
+        val storedModels = listOf(
+            "preset:openai@https://api.openai.com/gpt-4o-mini",
+            "preset:openai@https://api.openai.com:443/gpt-4o-mini",
+            "preset:custom@http://127.0.0.1:11434/local-model",
+            "preset:openai/gpt-4o-mini",
+            "m",
+            "preset:openai@https://proxy.example.com/gpt-4o-mini",
+        )
+        val endpoints = listOf(
+            openaiEndpoint(),
+            customEndpoint("http://127.0.0.1:11434/v1"),
+            customEndpoint("http://127.0.0.1:11435/v1"),
+        )
+        for (stored in storedModels) {
+            for (endpoint in endpoints) {
+                val factoryVerdict = isSameOriginForResume(stored, endpoint)
+                val settleVerdict = isSameProviderOrigin(
+                    stored,
+                    endpoint.providerId,
+                    endpoint.toProviderConfig().baseUrl,
+                )
+                assertEquals(
+                    "one ledger, one verdict for $stored vs ${endpoint.providerId}@${endpoint.baseUrl}",
+                    settleVerdict,
+                    factoryVerdict,
+                )
+            }
+        }
+        // Spot-check the decisions that matter.
+        assertTrue(isSameOriginForResume("preset:openai@https://api.openai.com/gpt-4o-mini", openaiEndpoint()))
+        assertTrue(
+            isSameOriginForResume(
+                "preset:custom@http://127.0.0.1:11434/local-model",
+                customEndpoint("http://127.0.0.1:11434/v1"),
+            ),
+        )
+        assertFalse(
+            isSameOriginForResume(
+                "preset:custom@http://127.0.0.1:11434/local-model",
+                customEndpoint("http://127.0.0.1:11435/v1"),
+            ),
+        )
+        assertFalse(isSameOriginForResume("preset:openai/gpt-4o-mini", openaiEndpoint()))
+    }
+
+    /**
+     * D3 two-path integration pin: the same stored ledger (stored `@origin`
+     * header + rows in one [FakeSessionStore]) drives BOTH verdicts — the
+     * real [ChatSessionFactory.open] fork-vs-sameId verdict AND the real VM
+     * [ChatViewModel.settleDetachedLedger] hydrate-vs-withheld verdict (via
+     * reflection; it is the private suspend function the endpoint-switch fork
+     * actually calls) — and the two must conclude identically, covering
+     * legacy no-`@origin` (must fork), port/case spelling variants, and the
+     * forked ledger reopening same-origin afterwards. The pure-function
+     * [sameOriginDecision_factoryAndSettlePaths_agree] pin above is kept;
+     * this test proves the two call sites consume one ledger identically
+     * instead of re-deriving the helper in isolation.
+     */
+    @Test fun sameOriginVerdicts_factoryOpenAndVmSettle_agreeOnOneLedger() = runBlocking {
+        val cases = listOf(
+            // Same @origin: factory reuses the id, VM hydrates.
+            Triple("preset:openai@https://api.openai.com/gpt-4o-mini", openaiEndpoint(), true),
+            // Stored explicit default port meets the live side.
+            Triple("preset:openai@https://api.openai.com:443/gpt-4o-mini", openaiEndpoint(), true),
+            // Custom spelling variants agree through the full stack
+            // (endpoint -> effective baseUrl -> normalized origin).
+            Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpoint("http://127.0.0.1:11434/v1"), true),
+            Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpoint("HTTP://127.0.0.1:11434/v1"), true),
+            Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpoint("http://127.0.0.1:11434/other/path"), true),
+            // Legacy headers without @origin: must fork on both paths, never hydrate.
+            Triple("preset:openai/gpt-4o-mini", openaiEndpoint(), false),
+            Triple("m", openaiEndpoint(), false),
+            // Foreign provider / host / port: must fork on both paths.
+            Triple("preset:deepseek/deepseek-chat", openaiEndpoint(), false),
+            Triple("preset:openai@https://proxy.example.com/gpt-4o-mini", openaiEndpoint(), false),
+            Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpoint("http://127.0.0.1:11435/v1"), false),
+        )
+        val probe = SettleProbeSessions(FakeSessionStore())
+        val vm = chatViewModels.own(ChatViewModel(newStore(), probe, InMemoryPolicyStore()))
+        for ((storedModel, endpoint, expectSameOrigin) in cases) {
+            val transcripts = FakeSessionStore()
+            val sid = transcripts.createSession("case ledger", storedModel)
+            transcripts.appendEvent(event(sid, "r1", "user", "q1"))
+            transcripts.appendEvent(event(sid, "r1", "assistant", "a1"))
+            probe.backing = transcripts
+            val factory = factoryWith(transcripts, ProvenanceFakeProvider())
+
+            // Path A: factory.open — a fork mints a new id and withholds;
+            // same-origin reuses the id and hydrates.
+            val opened = factory.open(endpoint, sid)
+            val factoryForked: Boolean
+            try {
+                factoryForked = opened.sessionId != sid
+                assertEquals(
+                    "factory.open must ${if (expectSameOrigin) "reuse" else "fork"} $storedModel",
+                    expectSameOrigin,
+                    opened.sessionId == sid,
+                )
+                assertEquals(expectSameOrigin, !opened.historyWithheld)
+            } finally {
+                opened.session.close()
+            }
+
+            // Path B: the VM endpoint-switch fence+read over the SAME stored
+            // meta and rows.
+            val vmSameOrigin = vmSettleSameOrigin(vm, endpoint, sid)
+            assertEquals(
+                "VM settle must see $storedModel as ${if (expectSameOrigin) "same-origin" else "foreign"}",
+                expectSameOrigin,
+                vmSameOrigin,
+            )
+
+            // The pin: one ledger, one verdict across the two call sites.
+            assertEquals(
+                "factory.open fork=$factoryForked and VM settle sameOrigin=$vmSameOrigin disagree on $storedModel",
+                factoryForked,
+                !vmSameOrigin,
+            )
+
+            // A forked ledger carries fresh provenance, so it reopens
+            // same-origin on both paths afterwards.
+            if (factoryForked) {
+                val forkedId = checkNotNull(opened.sessionId) { "fork must mint an id" }
+                val reopened = factory.open(endpoint, forkedId)
+                try {
+                    assertEquals("forked ledger must reopen same-id", forkedId, reopened.sessionId)
+                    assertFalse(reopened.historyWithheld)
+                } finally {
+                    reopened.session.close()
+                }
+                assertTrue(
+                    "VM settle must see the forked ledger as same-origin",
+                    vmSettleSameOrigin(vm, endpoint, forkedId),
+                )
+            }
+        }
+    }
+
+    private val settleMethod: Method by lazy {
+        ChatViewModel::class.java.getDeclaredMethod(
+            "settleDetachedLedger",
+            String::class.java,
+            EndpointConfig::class.java,
+            Job::class.java,
+            ChatSession::class.java,
+            Boolean::class.javaPrimitiveType,
+            String::class.java,
+            Long::class.javaPrimitiveType,
+            ChatSession::class.java,
+            Boolean::class.javaPrimitiveType,
+            Continuation::class.java,
+        ).apply { isAccessible = true }
+    }
+
+    /**
+     * Drives the real VM endpoint-switch fence+read for one ledger and
+     * returns its same-origin verdict. The target is a private suspend
+     * function, so it is invoked through reflection with the caller's
+     * continuation (a private signature change fails loudly here, which is
+     * the point: the pin must track the function the fork actually calls).
+     */
+    private suspend fun vmSettleSameOrigin(
+        vm: ChatViewModel,
+        endpoint: EndpointConfig,
+        sessionId: String,
+    ): Boolean {
+        val settled: Any? = suspendCancellableCoroutine { cont ->
+            val out = try {
+                settleMethod.invoke(vm, sessionId, endpoint, null, null, false, null, 0L, null, false, cont)
+            } catch (e: InvocationTargetException) {
+                cont.resumeWithException(e.targetException ?: e)
+                return@suspendCancellableCoroutine
+            } catch (e: Throwable) {
+                cont.resumeWithException(e)
+                return@suspendCancellableCoroutine
+            }
+            if (out !== COROUTINE_SUSPENDED) cont.resume(out)
+        }
+        checkNotNull(settled) { "settle must return a result" }
+        val read = settled.javaClass.getDeclaredField("read").apply { isAccessible = true }.get(settled)
+        checkNotNull(read) { "settle must produce a fork read for a known id" }
+        val fork = read.javaClass.getDeclaredField("fork").apply { isAccessible = true }.get(read)
+        return fork.javaClass.getDeclaredField("sameOrigin").apply { isAccessible = true }.getBoolean(fork)
     }
 
     @Test fun create_writesQualifiedProvenanceModel() = runBlocking {

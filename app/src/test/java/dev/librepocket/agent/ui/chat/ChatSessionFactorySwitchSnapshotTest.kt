@@ -697,4 +697,37 @@ class ChatSessionFactorySwitchSnapshotTest {
             opened.session.close()
         }
     }
+
+    // -- D3: cross-origin withheld snapshot carries zero old rows ----------
+
+    @Test fun withheldSnapshot_writesMarkerOnly_zeroOldRows() = runBlocking {
+        val transcripts = ExportingFakeStore()
+        val oldId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(oldId, "r0", "user", "q0"))
+        transcripts.appendEvent(event(oldId, "r0", "assistant", "a0"))
+        transcripts.appendEvent(event(oldId, "L", "user", "q-cancel"))
+        transcripts.appendEvent(event(oldId, "L", "assistant", "half-cancel", isPartial = true))
+        transcripts.appendEvent(event(oldId, "L", "reasoning", ""))
+        transcripts.appendEvent(event(oldId, "L", "system", "turn L cancelled"))
+        transcripts.appendEvent(event(oldId, "r0", "system", "usage input=1 output=2"))
+
+        val newId = transcripts.createSession("t", "preset:anthropic@https://api.anthropic.com/claude")
+        val copied = snapshotSwitchHistory(transcripts, oldId, newId, "gpt-4o-mini", "claude", true)
+        assertEquals(0, copied)
+
+        // Copy gate is origin-only: apart from the withheld switch marker
+        // (no incomplete marker rides a clean withheld write), the fork holds
+        // zero old rows — no user/assistant, no reasoning marker, no terminal
+        // mark, no usage row.
+        val forked = rows(transcripts, newId)
+        assertEquals(1, forked.size)
+        assertEquals("system", forked.single().kind)
+        assertTrue(modelSwitchMarkerWithheld(forked.single().text))
+        assertTrue(forked.none { it.kind == "user" || it.kind == "assistant" || it.kind == "reasoning" })
+        assertTrue(forked.none { it.text == "q0" || it.text == "a0" || it.text == "half-cancel" })
+        assertTrue(forked.none { it.text == "turn L cancelled" })
+        assertTrue(forked.none { it.text.startsWith("usage ") })
+        assertTrue(forked.none { isSnapshotIncompleteMarker(it.text) })
+        assertTrue(findDanglingRunIds(forked).isEmpty())
+    }
 }

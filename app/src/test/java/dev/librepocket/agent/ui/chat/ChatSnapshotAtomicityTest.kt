@@ -357,6 +357,10 @@ class ChatSnapshotAtomicityTest {
         assertEquals(listOf("QB", "a-next"), vm2.messages.value.map { it.text })
         assertTrue(interruptedMarkers(transcripts, forkId).isEmpty())
         assertTrue(findDanglingRunIds(rows(transcripts, forkId)).isEmpty())
+        // D5: the restart re-warns without re-copying — the incomplete marker
+        // count stays 1 and the fork row total is unchanged (no row growth).
+        assertEquals(1, rows(transcripts, forkId).count { it.kind == "system" && isSnapshotIncompleteMarker(it.text) })
+        assertEquals(forked.size, rows(transcripts, forkId).size)
     }
 
     // -- openSession decision chain ------------------------------------------

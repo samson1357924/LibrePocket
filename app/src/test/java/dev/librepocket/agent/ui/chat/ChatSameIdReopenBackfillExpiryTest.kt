@@ -236,11 +236,17 @@ private class FlipMarkingSessions(
     val backfillFlags = CopyOnWriteArrayList<Boolean>()
     override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
     override suspend fun storeOrNull(): SessionStore? = transcripts
+    // D2 canonical form: create is unused in this test; keep it unused.
+    // The 3-arg shim rides the interface default into this body.
     override suspend fun create(
         endpoint: EndpointConfig,
         title: String,
+        initialHistory: List<dev.librepocket.provider.ChatMessage>,
         keyIsCurrent: suspend () -> Boolean,
-    ): CreatedSession = error("unused")
+    ): CreatedSession {
+        check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+        error("unused")
+    }
 
     override suspend fun open(
         endpoint: EndpointConfig,
@@ -285,11 +291,17 @@ private class ExpiryMarkingSessions(
     val backfillFlags = CopyOnWriteArrayList<Boolean>()
     override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
     override suspend fun storeOrNull(): SessionStore? = transcripts
+    // D2 canonical form: create is unused in this test; keep it unused.
+    // The 3-arg shim rides the interface default into this body.
     override suspend fun create(
         endpoint: EndpointConfig,
         title: String,
+        initialHistory: List<dev.librepocket.provider.ChatMessage>,
         keyIsCurrent: suspend () -> Boolean,
-    ): CreatedSession = error("unused")
+    ): CreatedSession {
+        check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+        error("unused")
+    }
 
     override suspend fun open(
         endpoint: EndpointConfig,

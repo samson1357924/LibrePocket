@@ -2492,17 +2492,17 @@ class ChatViewModel(
      * an explicit discard (explicitDiscardEpoch moved, or the snapshot target
      * itself is gone) drops it. [fencedOwnerSessionId] is the slot owner at
      * consume time, re-filled on re-park so the next fork keeps the ledger
-     * lineage. [providerId]/[baseUrl] are the endpoint
-     * identity snapshot (effective baseUrl via `toProviderConfig()` at the
-     * call site). The pending-ledger inputs are passed by value with one-time
+     * lineage. [endpoint] is the endpoint identity snapshot (the effective
+     * baseUrl is derived inside [isSameOriginForResume], the same choke point
+     * the factory `open` path uses — one ledger never gets two verdicts).
+     * The pending-ledger inputs are passed by value with one-time
      * ownership (the caller already cleared the slots). Only store I/O plus
      * the ledger settle run here; `_history`/`_notice` writes stay with the
      * caller back on Main.
      */
     private suspend fun settleDetachedLedger(
         previousSessionId: String?,
-        providerId: String,
-        baseUrl: String,
+        endpoint: EndpointConfig,
         fencedJob: Job?,
         fencedSession: ChatSession?,
         fencedWasStreaming: Boolean,
@@ -2591,11 +2591,10 @@ class ChatViewModel(
                 // any further suspension.
                 fenceSettled = settleOk && durableOk
                 val previousMeta = store?.getSession(prevId)
-                val sameOrigin = previousMeta != null && isSameProviderOrigin(
-                    previousMeta.model,
-                    providerId,
-                    baseUrl,
-                )
+                // D3: same choke point as the factory `open` path — one
+                // ledger, one verdict, no drift between the fork read here
+                // and a later `open` of the same id.
+                val sameOrigin = previousMeta != null && isSameOriginForResume(previousMeta.model, endpoint)
                 val rep = loadHistory(prevId)
                 val hasHistory = (rep != null && rep.messages.isNotEmpty()) || (store != null && store.countHistoryEvents(prevId, includePartial = true) > 0)
                 val hist = if (sameOrigin) {
@@ -2924,8 +2923,7 @@ class ChatViewModel(
         // across segments as vars.
         val settled = settleDetachedLedger(
             previousSessionId,
-            endpoint.providerId,
-            endpoint.toProviderConfig().baseUrl,
+            endpoint,
             fencedJob,
             fencedSession,
             fencedWasStreaming,
@@ -4019,6 +4017,17 @@ class ChatViewModel(
      *
      * Idempotent and fail-closed: a probe failure keeps the block until its
      * deadline. Caller cancellation propagates.
+     *
+     * Notice scope: every `!backfillNow` here surfaces the same
+     * HISTORY_SNAPSHOT_INCOMPLETE as a failed fork snapshot (see the
+     * canonical-form `open` KDoc) — cause-agnostic by design, with different
+     * follow-ups (a defer retries the backfill on the next open; a snapshot
+     * failure persists its marker and re-warns without ever re-copying).
+     *
+     * Sealed alive-vs-dead bifurcation (R23-1): the expired-block
+     * sealed-dead vs sealed-but-obligated split is pinned end-to-end by
+     * `ChatSameIdReopenStickyDebtTest` (real ViewModel + real factory + real
+     * controller, ghost + sealed groups) — referenced, not re-pinned here.
      */
     private suspend fun gateBackfillForSession(
         sessionId: String,
@@ -4159,6 +4168,15 @@ class ChatViewModel(
      * PENDING-CLAIMED receipt evidence is never dead, so
      * [isLedgerStreamingOrPending] still reports alive and the block keeps
      * deferring. Best-effort, never throws.
+     *
+     * Defense-in-depth note (D7): this sealed-aware check and the raw
+     * [isLedgerStreamingOrPending] below are deliberately two answers — the
+     * dead-first short-circuit keeps expiry reachable under a stuck
+     * STREAMING status or unliftable sticky debt, while the raw evidence
+     * keeps `flushDurable` honest (never true-and-dangling). TODO: converge
+     * both call sites onto a single `promotionProof` value object when the
+     * call graph allows it without widening the barrier semantics; until
+     * then the split is documented here, not hidden.
      */
     private fun isWriterAliveEvidence(session: ChatSession?): Boolean {
         if (session == null) return false

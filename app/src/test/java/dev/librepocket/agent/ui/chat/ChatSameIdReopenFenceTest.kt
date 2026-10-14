@@ -40,6 +40,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -152,11 +153,17 @@ private class SameIdDeferSessions(
     val backfillFlags = CopyOnWriteArrayList<Boolean>()
     override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
     override suspend fun storeOrNull(): SessionStore? = transcripts
+    // D2 canonical form: create is unused in this test; keep it unused.
+    // The 3-arg shim rides the interface default into this body.
     override suspend fun create(
         endpoint: EndpointConfig,
         title: String,
+        initialHistory: List<dev.librepocket.provider.ChatMessage>,
         keyIsCurrent: suspend () -> Boolean,
-    ): CreatedSession = error("unused")
+    ): CreatedSession {
+        check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+        error("unused")
+    }
 
     override suspend fun open(
         endpoint: EndpointConfig,
@@ -185,7 +192,11 @@ private class SameIdDeferSessions(
  *   terminal lands, no false INTERRUPTED, and the replay hydrates it.
  * - T2: flushDurable==false defers (open called with backfill=false, warn
  *   notice, zero markers); the factory gate itself is pinned directly
- *   (false skips, true still marks a dangling ledger: fast path unchanged).
+ *   (false skips markers but still hydrates, a later true retries the
+ *   defer; true still marks a dangling ledger: fast path unchanged). The
+ *   snapshot-failure half of the shared HISTORY_SNAPSHOT_INCOMPLETE notice
+ *   (marker persists, re-warns without re-copying) is pinned in
+ *   ChatSnapshotAtomicityTest, not here.
  * - T3: a settled ledger reopens twice with zero new markers.
  */
 class ChatSameIdReopenFenceTest {
@@ -375,15 +386,52 @@ class ChatSameIdReopenFenceTest {
         assertTrue(interruptedMarkers(transcripts, oldId).isEmpty())
         assertEquals("HISTORY_SNAPSHOT_INCOMPLETE", vm.notice.value)
 
-        // Factory gate pin: false skips a dangling ledger, true still marks it.
-        val gateFactory = factoryWith(transcripts, SameIdAnsweringProvider())
+        // Factory gate pin (D2, real factory): false skips the backfill but
+        // still hydrates, and the next gated open retries the defer; true
+        // still marks a dangling ledger.
+        val seenGate = CopyOnWriteArrayList<ChatRequest>()
+        val gateProvider = object : LlmProvider {
+            override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
+            override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
+                seenGate.add(request)
+                emit(StreamEvent.TextDelta(0, 0, "a-next"))
+                emit(StreamEvent.Done("stop"))
+            }
+
+            override suspend fun listModels(): List<String> = emptyList()
+        }
+        val gateFactory = factoryWith(transcripts, gateProvider)
         val d1 = transcripts.createSession("g1", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(d1, "r0", "user", "q0"))
+        transcripts.appendEvent(event(d1, "r0", "assistant", "a0"))
         transcripts.appendEvent(event(d1, "L", "user", "q-cancel"))
         val skipped = gateFactory.open(sampleEndpoint(), d1, { true }, false)
         try {
-            assertTrue(interruptedMarkers(transcripts, d1).isEmpty())
+            assertTrue(
+                "gated open must skip the backfill",
+                interruptedMarkers(transcripts, d1).isEmpty(),
+            )
+            // Hydration still proceeds despite the skipped backfill.
+            assertFalse(skipped.historyWithheld)
+            assertEquals(0, skipped.historyDroppedCount)
+            skipped.session.send("q-new")
+            val req = seenGate.single()
+            assertEquals(listOf("user", "assistant", "user", "user"), req.messages.map { it.role })
+            assertEquals("q0", req.messages[0].text)
+            assertEquals("a0", req.messages[1].text)
+            assertEquals("q-cancel", req.messages[2].text)
+            assertTrue(req.messages[3].text.startsWith("q-new"))
         } finally {
             skipped.session.close()
+        }
+        // Deferred, not dropped: the next gated open retries and marks exactly L.
+        val retried = gateFactory.open(sampleEndpoint(), d1, { true }, true)
+        try {
+            assertEquals(1, interruptedMarkers(transcripts, d1).size)
+            assertEquals("turn L interrupted", interruptedMarkers(transcripts, d1).single().text)
+            assertTrue(findDanglingRunIds(rows(transcripts, d1)).isEmpty())
+        } finally {
+            retried.session.close()
         }
         val d2 = transcripts.createSession("g2", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(event(d2, "L", "user", "q-cancel"))

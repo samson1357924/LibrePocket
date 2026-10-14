@@ -382,9 +382,18 @@ class ChatSessionFactorySwitchStreamingTest {
         val createdNewIds = CopyOnWriteArrayList<String>()
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
         override suspend fun storeOrNull(): SessionStore? = transcripts
+        // D2 canonical form: this fake mints bare fork targets without
+        // hydrating. The VM legitimately passes a non-empty fork prefix here
+        // (same-origin switch carries the model prefix in memory); this canned
+        // stub session never consumes it — ledger coverage comes from the
+        // durable snapshot, pinned by the S2 row assertions below — so the
+        // prefix stays explicitly ignored, and the lossy canonical-to-compat
+        // delegate is deleted (the 3-arg shim rides the interface default
+        // into this body).
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
             val newId = transcripts.createSession(
@@ -403,6 +412,17 @@ class ChatSessionFactorySwitchStreamingTest {
             check(sessionId == oldId) { "only old resume is used" }
             return CreatedSession(oldId, oldSession, endpoint.providerId, endpoint.model)
         }
+
+        // D2 canonical form: this fake attaches pre-seeded sessions with no
+        // backfill of its own; the gate is intentionally a no-op here (same
+        // as the old interface default). Backfill behavior is pinned against
+        // the real factory in ChatSameIdReopenFenceTest, not here.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
     }
 
     private fun event(

@@ -278,6 +278,29 @@ internal fun isSameProviderOrigin(
 }
 
 /**
+ * Single same-origin decision choke point for resume (D3): both the
+ * same-ID path ([ChatSessionFactory.open]) and the endpoint-switch fork
+ * path ([dev.librepocket.agent.ui.chat.ChatViewModel.settleDetachedLedger])
+ * decide through this function, so the two can never drift apart (same
+ * stored header + same endpoint ⇒ same verdict). Derives the effective
+ * baseUrl from [endpoint] exactly like `create()` stamps it
+ * (`"${providerId}@${normalizeOrigin(baseUrl)}/${model}"`), so the stored
+ * side ([storedOriginOf], already normalized at write time, re-normalized
+ * here idempotently) and the live side ([normalizeOrigin]) always meet in
+ * the same normalized space — spelling variants (path, default port, case)
+ * agree; only a real host/scheme/port change forks. Pinned by
+ * `ChatSessionFactoryProvenanceTest.sameOriginDecision_*`.
+ */
+internal fun isSameOriginForResume(storedModel: String, endpoint: EndpointConfig): Boolean {
+    val effectiveBaseUrl = try {
+        endpoint.toProviderConfig().baseUrl
+    } catch (_: Exception) {
+        ""
+    }
+    return isSameProviderOrigin(storedModel, endpoint.providerId, effectiveBaseUrl)
+}
+
+/**
  * Phase 4: true when [storedModel] predates R2-3 provenance (no `@origin`
  * segment). Such ids predate R4-1 fork isolation and may already mix two
  * recipients' rows — callers must quarantine (fork, never hydrate).
@@ -334,17 +357,23 @@ class CaptureDeniedException(message: String = "ENDPOINT_BINDING_STALE") : Secur
 
 /** Injectable session-construction boundary used by the chat lifecycle tests.
  *
- * Implementors must override at least one [create] form.
- * The two defaults delegate to each other; overriding neither
- * recurses infinitely (StackOverflowError at runtime).
- * Canonical form is the 4-arg one (production caller ChatViewModel.ensureSession uses it).
+ * The canonical forms are the 4-arg [create] (production caller
+ * ChatViewModel.ensureSession uses it) and the 4-arg [open] (every
+ * `openSession` path passes the R8-3 gate). Implementors MUST override both
+ * canonical forms; the 3-arg [create] is a compat shim that forwards while
+ * carrying the compat default (`initialHistory = emptyList()`). The lossy
+ * direction (canonical → compat, silently dropping `initialHistory` /
+ * `backfillInterrupted`) is deleted: with no default body on the canonical
+ * forms, leaving one unimplemented is a compile error, never a runtime
+ * StackOverflowError or a silent param drop.
  */
 interface ChatSessionProvider {
     /**
-     * Implementors must override at least one [create] form.
-     * The two defaults delegate to each other; overriding neither
-     * recurses infinitely (StackOverflowError at runtime).
-     * Canonical form is the 4-arg one (production caller ChatViewModel.ensureSession uses it).
+     * Canonical create (production caller ChatViewModel.ensureSession uses
+     * it): [initialHistory] is the fork-carried model prefix the new live
+     * turn already sends on. Abstract — implementors must override it; a
+     * storeless/provider-loop-only fake that never hydrates documents the
+     * intentional ignore on its override (see ChatWiringTest scope note).
      */
     suspend fun create(
         endpoint: EndpointConfig,
@@ -352,13 +381,12 @@ interface ChatSessionProvider {
         initialHistory: List<ChatMessage> = emptyList(),
         allowAsk: Boolean = false,
         keyIsCurrent: suspend () -> Boolean = { true },
-    ): CreatedSession = create(endpoint, title, keyIsCurrent)
+    ): CreatedSession
 
     /**
-     * Implementors must override at least one [create] form.
-     * The two defaults delegate to each other; overriding neither
-     * recurses infinitely (StackOverflowError at runtime).
-     * Canonical form is the 4-arg one (production caller ChatViewModel.ensureSession uses it).
+     * Compat create: forwards to the canonical form with an empty prefix
+     * (carried, never dropped). Implementors override the canonical form
+     * instead; overriding only this shim breaks fork hydration.
      */
     suspend fun create(
         endpoint: EndpointConfig,
@@ -389,15 +417,26 @@ interface ChatSessionProvider {
      * same-origin resume backfill (dangling → INTERRUPTED marker). False
      * skips this open's backfill (the next open retries, see
      * backfillInterrupted best-effort); hydration still proceeds. The
-     * cross-origin fork path always backfills its fresh ledger. Default
-     * delegates to the 3-arg form (compat: pre-R8-3 fakes ignore the gate).
+     * cross-origin fork path always backfills its fresh ledger and is never
+     * gated. Canonical form — implementors must override it; fakes without a
+     * store/backfill document the intentional gate no-op on their override.
+     *
+     * Notice cause scope: a `false` defer and a failed fork snapshot surface
+     * the SAME `HISTORY_SNAPSHOT_INCOMPLETE` notice by design (the notice is
+     * cause-agnostic — deferred vs failed are not distinguished in the UI
+     * string). Subsequent behavior differs and is pinned separately: a defer
+     * retries the backfill on the next open (see
+     * `ChatSameIdReopenFenceTest.sameIdReopenWhenFlushFails_defersBackfillAndWarns`
+     * gate pin), while a failed snapshot persists its incomplete marker and
+     * re-warns on restart without ever re-copying (see
+     * `ChatSnapshotAtomicityTest.ensureSessionSnapshotFailure_marksIncompleteNoticesAndStaysFailOpen`).
      */
     suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,
         keyIsCurrent: suspend () -> Boolean,
         backfillInterrupted: Boolean,
-    ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+    ): CreatedSession
 
     /**
      * Full union: key.read policy gate ([allowAsk]) AND the R8-3 backfill
@@ -492,6 +531,11 @@ class ChatSessionFactory(
                 if (store != null && sessionId != null) {
                     SessionTranscriptSink(store, sessionId)
                 } else {
+                    // Storeless (tests): provider-loop only, never durability
+                    // evidence — a fake `flushDurable == true` proves nothing
+                    // (see [ChatSession.flushDurable]); durability is proven
+                    // by TurnControllerLedgerTest / CancelReceiptCloseBarrierTest
+                    // / FlushDurableObligationBarrierTest + Room tests, not here.
                     NoOpTranscriptSink()
                 }
             // Room SessionMeta.createdAt is the source of truth for `Session started`.
@@ -644,8 +688,10 @@ class ChatSessionFactory(
         // (provider-agnostic bookkeeping) and hydrate only on provenance
         // match; cross-origin resumes return early to openForked(), which
         // backfills only the NEW ledger while the old session stays a
-        // read-only archive.
-        val sameOrigin = isSameProviderOrigin(meta.model, endpoint.providerId, config.baseUrl)
+        // read-only archive. Decided through [isSameOriginForResume], the
+        // same choke point the VM fork path uses — the two never disagree
+        // on one ledger.
+        val sameOrigin = isSameOriginForResume(meta.model, endpoint)
         if (!sameOrigin) {
             return openForked(store, endpoint, config, sessionId, meta, keyIsCurrent)
         }

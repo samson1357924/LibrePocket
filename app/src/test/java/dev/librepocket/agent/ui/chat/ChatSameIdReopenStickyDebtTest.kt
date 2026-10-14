@@ -185,6 +185,8 @@ class ChatSameIdReopenStickyDebtTest {
         val attached = CopyOnWriteArrayList<ChatSession>()
         override fun modelFor(endpoint: EndpointConfig): String = inner.modelFor(endpoint)
         override suspend fun storeOrNull(): SessionStore? = inner.storeOrNull()
+        // D2: canonical create is the single source of truth (lossless into
+        // the real factory); the 3-arg shim rides the interface default here.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
@@ -192,13 +194,6 @@ class ChatSameIdReopenStickyDebtTest {
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession =
             inner.create(endpoint, title, initialHistory, keyIsCurrent).also { attached.add(it.session) }
-
-        override suspend fun create(
-            endpoint: EndpointConfig,
-            title: String,
-            keyIsCurrent: suspend () -> Boolean,
-        ): CreatedSession =
-            inner.create(endpoint, title, keyIsCurrent).also { attached.add(it.session) }
 
         override suspend fun open(
             endpoint: EndpointConfig,

@@ -54,9 +54,9 @@ class McpWireD1Test {
         // bare-origin（無 path）自動補 /mcp（舊配置相容）。
         assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example"))
         assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/"))
-        // 有 path 則原樣保留（僅去尾斜線）。
+        // 有 path 則原樣保留（尾斜線亦保留：/custom/path/ 與 /custom/path 不等價）。
         assertEquals(
-            "https://x.example/custom/path",
+            "https://x.example/custom/path/",
             McpWire.endpoint("https://x.example/custom/path/"),
         )
         assertEquals(
@@ -66,9 +66,9 @@ class McpWireD1Test {
     }
 
     @Test fun endpointDoesNotDuplicateMcpSuffix() {
-        // 已有 /mcp 後綴不重複加。
+        // 已有 /mcp 後綴不重複加；尾斜線原樣保留（不去尾斜線）。
         assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/mcp"))
-        assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/mcp/"))
+        assertEquals("https://x.example/mcp/", McpWire.endpoint("https://x.example/mcp/"))
     }
 
     // ---- c. inputSchema 超限拒絕（拋 McpProtocol，不靜默截斷） ----
@@ -286,40 +286,49 @@ class McpWireD1Test {
         assertEquals("https://h/mcp#frag", McpWire.endpoint("https://h#frag"))
         assertEquals("https://h/mcp?x=1", McpWire.endpoint("https://h/?x=1"))
         assertEquals("https://h/path?x=1", McpWire.endpoint("https://h/path?x=1"))
-        assertEquals("https://h/path?x=1", McpWire.endpoint("https://h/path/?x=1"))
+        assertEquals("https://h/path/?x=1", McpWire.endpoint("https://h/path/?x=1"))
     }
 
     @Test fun bracketMismatchRejectedAndDeepNestingAccepted() {
-        // `[1,2}`：array 用 `}` 關 → parseCall 拒絕（bad result）。
+        // `[1,2}`：array 用 `}` 關 → 頂層形狀驗證拒絕（McpProtocol，Stage B P2-1 新語義；
+        // 舊為一般 IAE "mcp: bad result"，server 層同映射 PROTOCOL，見 McpServer）。
         try {
             McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[1,2}")
             fail("bracket mismatch [1,2} 必須拒絕")
         } catch (e: McpWire.McpToolFailure) {
             fail("mismatch 不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
         } catch (e: IllegalArgumentException) {
-            assertEquals("mcp: bad result", e.message)
+            fail("bracket mismatch 必須拋 McpWire.McpProtocol，實際=${e.message}")
         }
-        // `{"a":[1}`：object 內 array 未關 → parseCall 拒絕。
+        // `{"a":[1}`：object 內 array 未關 → 同上 McpProtocol。
         try {
             McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"a\":[1}}")
             fail("bracket mismatch {\"a\":[1} 必須拒絕")
         } catch (e: McpWire.McpToolFailure) {
             fail("mismatch 不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
         } catch (e: IllegalArgumentException) {
-            assertEquals("mcp: bad result", e.message)
+            fail("bracket mismatch 必須拋 McpWire.McpProtocol，實際=${e.message}")
         }
-        // parseList 同樣拒絕 mismatch（result 非法 → bad result.tools）。
+        // parseList 同樣拒絕 mismatch（頂層形狀驗證 → McpProtocol）。
         try {
             McpWire.parseList("s1", "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":[1,2}")
             fail("parseList bracket mismatch 必須拒絕")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
         } catch (e: IllegalArgumentException) {
-            assertEquals("mcp: bad result.tools", e.message)
+            fail("parseList mismatch 必須拋 McpWire.McpProtocol，實際=${e.message}")
         }
         try {
             McpWire.parseList("s1", "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"a\":[1}}")
             fail("parseList bracket mismatch 必須拒絕")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
         } catch (e: IllegalArgumentException) {
-            assertEquals("mcp: bad result.tools", e.message)
+            fail("parseList mismatch 必須拋 McpWire.McpProtocol，實際=${e.message}")
         }
         // 合法深巢狀仍接受（parseCall 回 OK，不誤判 mismatch）。
         val ok = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"a\":[1,{\"b\":2}]}}"
@@ -361,5 +370,200 @@ class McpWireD1Test {
         } catch (e: IllegalArgumentException) {
             assertEquals("mcp: bad result.tools", e.message)
         }
+    }
+
+    // ---- h. Stage B P2-1：截斷/尾隨/缺逗號/重複頂層鍵一律 McpProtocol ----
+
+    @Test fun parseCallMissingOuterBraceIsProtocol() {
+        // 缺外層 }：舊 topLevelRawField 只取局部值會回 OK，必須擋。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[]}"
+        try {
+            McpWire.parseCall(json)
+            fail("缺外層 } 必須拋 McpProtocol（映射 PROTOCOL），不得回 OK")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("缺外層 } 不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("缺外層 } 必須拋 McpWire.McpProtocol（非一般 IllegalArgumentException）")
+        }
+    }
+
+    @Test fun parseListMissingOuterBraceIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("缺外層 } 必須拋 McpProtocol（映射 PROTOCOL），不得回工具列表")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("缺外層 } 必須拋 McpWire.McpProtocol（非一般 IllegalArgumentException）")
+        }
+    }
+
+    @Test fun parseCallTrailingGarbageIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[]}} garbage"
+        try {
+            McpWire.parseCall(json)
+            fail("尾隨 garbage 必須拋 McpProtocol，不得回 OK")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("尾隨 garbage 不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("尾隨 garbage 必須拋 McpWire.McpProtocol（非一般 IllegalArgumentException）")
+        }
+    }
+
+    @Test fun parseListTrailingGarbageIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}} trailing"
+        try {
+            McpWire.parseList("s1", json)
+            fail("尾隨 garbage 必須拋 McpProtocol，不得回工具列表")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("尾隨 garbage 必須拋 McpWire.McpProtocol（非一般 IllegalArgumentException）")
+        }
+    }
+
+    @Test fun parseCallMissingCommaIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2 \"result\":{\"content\":[]}}"
+        try {
+            McpWire.parseCall(json)
+            fail("成員間缺逗號必須拋 McpProtocol，不得回 OK")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("缺逗號不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("缺逗號必須拋 McpWire.McpProtocol（非一般 IllegalArgumentException）")
+        }
+    }
+
+    @Test fun parseCallDuplicateResultKeyIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[]},\"result\":{\"content\":[]}}"
+        try {
+            McpWire.parseCall(json)
+            fail("重複頂層 result 鍵必須拋 McpProtocol（嚴格拒絕，不做 first-wins），不得回 OK")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("重複鍵不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: duplicate key", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("重複鍵必須拋 McpWire.McpProtocol（非一般 IllegalArgumentException）")
+        }
+    }
+
+    @Test fun parseListDuplicateResultKeyIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]},\"result\":{\"tools\":[]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("重複頂層 result 鍵必須拋 McpProtocol，不得回工具列表")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: duplicate key", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("重複鍵必須拋 McpWire.McpProtocol（非一般 IllegalArgumentException）")
+        }
+    }
+
+    @Test fun whitespaceWrappedValidDocumentStillOk() {
+        // 合法含前導/尾隨空白與換行仍過（驗證器只擋形狀錯誤，不擋空白）。
+        val call = "  \n\t{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":false}}  \n"
+        val (_, isError) = McpWire.parseCall(call)
+        assertFalse(isError)
+        val list = " \n {\"jsonrpc\":\"2.0\" , \"id\" : 1 , \"result\" : { \"tools\" : [] } } \n "
+        assertTrue(McpWire.parseList("s1", list).isEmpty())
+    }
+
+    // ---- i. Stage B P2-2：tools 非 object 元素與非 object inputSchema 一律 PROTOCOL ----
+
+    @Test fun parseListNullItemIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[null]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("[null] 不得靜默忽略回空列表，必須拋 McpProtocol")
+        } catch (_: McpWire.McpProtocol) {
+            // 預期。
+        } catch (e: IllegalArgumentException) {
+            fail("[null] 必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun parseListScalarItemsAreProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[1,\"x\"]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("[1,\"x\"] 不得靜默忽略回空列表，必須拋 McpProtocol")
+        } catch (_: McpWire.McpProtocol) {
+            // 預期。
+        } catch (e: IllegalArgumentException) {
+            fail("[1,\"x\"] 必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun parseListMissingNameStillThrows() {
+        // [{}] 缺 name：舊行為（mcp: tool without name）保留，仍為 PROTOCOL 級。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{}]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("[{}] 缺 name 必須拒絕")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("mcp: tool without name", e.message)
+        }
+    }
+
+    @Test fun parseListStringInputSchemaIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"a\",\"inputSchema\":\"str\"}]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("inputSchema 為字串必須拋 McpProtocol（mcp: bad inputSchema）")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad inputSchema", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("inputSchema 為字串必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun parseListNumericInputSchemaIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"a\",\"inputSchema\":123}]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("inputSchema 為數字必須拋 McpProtocol（mcp: bad inputSchema）")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad inputSchema", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("inputSchema 為數字必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun parseListMultipleValidToolsStillOk() {
+        // 合法混合多 tool（含缺席 inputSchema 預設）仍過。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"a\",\"description\":\"da\",\"inputSchema\":{\"type\":\"object\"}}," +
+            "{\"name\":\"b\"}]}}"
+        val tools = McpWire.parseList("s1", json)
+        assertEquals(2, tools.size)
+        assertEquals("a", tools[0].name)
+        assertEquals("b", tools[1].name)
+        assertEquals("""{"type":"object"}""", tools[1].inputSchema)
+    }
+
+    // ---- j. Stage B P2-3：自訂 path 尾斜線原樣保留 ----
+
+    @Test fun endpointPreservesCustomTrailingSlash() {
+        assertEquals(
+            "https://h/api/mcp/",
+            McpWire.endpoint("https://h/api/mcp/"),
+        )
+        assertEquals(
+            "https://h/api/mcp/?x=1",
+            McpWire.endpoint("https://h/api/mcp/?x=1"),
+        )
+        // bare-origin 語義不變：仍自動補 /mcp。
+        assertEquals("https://h/mcp", McpWire.endpoint("https://h"))
+        assertEquals("https://h/mcp", McpWire.endpoint("https://h/"))
     }
 }

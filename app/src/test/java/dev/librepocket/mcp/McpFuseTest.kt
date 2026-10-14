@@ -200,13 +200,13 @@ class McpFuseTest {
                 assertEquals("/mcp", req.path?.substringBefore("?"))
                 assertEquals("POST", req.method)
             }
-            // D1：endpoint() 語義（bare-origin 自動補 /mcp；有 path 原樣保留；已有不重複加）。
+            // D1：endpoint() 語義（bare-origin 自動補 /mcp；有 path 原樣保留，尾斜線亦保留；已有不重複加）。
             assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example"))
             assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/"))
             assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/mcp"))
-            assertEquals("https://x.example/mcp", McpWire.endpoint("https://x.example/mcp/"))
+            assertEquals("https://x.example/mcp/", McpWire.endpoint("https://x.example/mcp/"))
             assertEquals(
-                "https://x.example/custom/path",
+                "https://x.example/custom/path/",
                 McpWire.endpoint("https://x.example/custom/path/"),
             )
         } finally {
@@ -346,6 +346,30 @@ class McpFuseTest {
             val req = web.takeRequest(5, TimeUnit.SECONDS)
             assertNotNull("expected request within 5s", req)
             assertEquals("/mcp", req!!.path?.substringBefore("?"))
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun customPathTrailingSlashPreservedEndToEnd() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(MockResponse().setResponseCode(200).setBody(goodListBody()))
+            val clock = Clock(0L)
+            // 自訂 path 尾斜線原樣保留：server 若區分 /api/mcp/ 與 /api/mcp，不得正規化掉。
+            val s = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/api/mcp/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = McpCircuitBreaker(clockMs = clock::get),
+                clockMs = clock::get,
+            )
+            val r = s.listTools()
+            assertEquals(McpStatus.OK, r.status)
+            val req = web.takeRequest(5, TimeUnit.SECONDS)
+            assertNotNull("expected request within 5s", req)
+            assertEquals("/api/mcp/", req!!.path)
         } finally {
             web.shutdown()
         }

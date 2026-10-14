@@ -144,6 +144,43 @@ private fun isLegacyFailureText(runId: String, text: String): Boolean =
 internal fun familyOf(event: TranscriptEvent): String = event.parentRunId ?: event.runId
 
 /**
+ * R26-1 family-aware head trim (pure, no I/O): drops leading user-less
+ * assistant families so kept never starts with an orphan assistant. The kept
+ * window (oldest-first) must start at a user boundary: while its first
+ * user/assistant row is an assistant, the whole logical family
+ * ([familyOf]) is removed (its user was cut by prune/tail-cap; marker-first
+ * implies user-less as the user row is older than its marker). Size-convergent:
+ * the loop breaks when an iteration removes nothing (`filtered.size ==
+ * kept.size`); the 10 cap only stops a pathological loop over crafted
+ * empty/blank families (a crafted ledger with >10 head orphan families keeps
+ * its 11th head family after one pass — needs a second pass, pinned by test
+ * and disclosed in P1_SPEC; production cuts split at most one family).
+ * Crafted runId-reuse over-drop (disclosed): rows sharing the head family id
+ * are removed wherever they sit (production runIds are unique + write-ordered;
+ * crafted exceptions over-drop conservatively). Callers decide when to apply:
+ * model history only with truncation/prune evidence (dropped>0 or suspect) to
+ * preserve the R24-2/R25 precise flags; snapshots unconditionally (row-cap drops
+ * are silent legacy, family drops stay silent too — with the same >10 crafted
+ * narrow window: an 11th crafted head orphan can enter a fork copy).
+ */
+internal fun dropHeadOrphanAssistantFamilies(events: List<TranscriptEvent>): List<TranscriptEvent> {
+    if (events.isEmpty()) return events
+    var kept: List<TranscriptEvent> = events
+    var guard = 0
+    while (guard++ < 10) {
+        val head = kept.firstOrNull { it.kind == "user" || it.kind == "assistant" } ?: break
+        if (head.kind == "user") break
+        val family = familyOf(head)
+        if (family.isBlank()) break
+        val filtered = kept.filterNot { familyOf(it) == family }
+        if (filtered.size == kept.size) break
+        kept = filtered
+        if (kept.isEmpty()) break
+    }
+    return kept
+}
+
+/**
  * User-owned logical families with no terminal record: no final assistant
  * row in the same family and no cancel/interrupted/legacy-failure system mark
  * for that family. First-seen order; empty when nothing was stranded. Pure
@@ -1185,10 +1222,28 @@ class ChatSessionFactory(
  * unaffected. This over-flags plain truncated ledgers by design (safe
  * direction); the omission stays observable via `droppedCount`.
  *
- * S4-F4(b): a prior prune that deleted rows ([SessionStore.isPruneSuspect])
- * forces the same conservative all-flag even when `droppedCount==0` (the
- * keep-newest prune may have cut a marker-first pair: marker pruned,
- * assistant kept). Memory-only hotfix; pair-aware prune stays Target (a).
+ * S4-F4(b) + R26-1 family-aware (Current): the LATEST prune sweep's
+ * outcome ([SessionStore.isPruneSuspect], pre-published before the DELETE to
+ * close the F4 race, per-sweep NOT sticky — a later clean sweep clears it,
+ * delete clears it, appends never clear it) forces the same conservative
+ * all-flag even when `droppedCount==0`. R26-1 prune deletes the cut head
+ * family (user boundary; head-only, at most 10 families, only on
+ * `deletes>0` sweeps), so new prunes leave no user-less assistant behind;
+ * readers additionally drop head orphan families when dropped>0 or suspect
+ * (far-only preserves the R25 precise flag), so no orphan reaches model
+ * context. Pre-R26/interior orphans below the head survive the fixup and,
+ * once suspect is cleared (clean sweep) or dropped (restart), resume compat
+ * without evidence (known limitation, disclosed in P1_SPEC/THREAT_MODEL).
+ *
+ * R26-1 F4 scan-then-count (Current): the filtered COUNT is taken before and
+ * after the backward scan and the max is used, so a concurrent prune/append
+ * between scan and count cannot under-flag (max is conservative; any
+ * difference already forces dropped>0). Pre-published suspect covers
+ * non-qualifying deletes with unchanged counts. The DELETE-commit →
+ * reconcile window itself is closed by pre-publish (latch-pinned by the
+ * single after-delete-hook test: a load interleaved between DELETE commit
+ * and flag reconcile/fixup observes suspect==true; post-publish code would
+ * report false-clean there).
  *
  * R25-1 far-marker guard (P2, fail-closed, bounded): when the kept window is
  * full (`kept == HISTORY_LOAD_CAP`) yet the filtered COUNT reports
@@ -1201,10 +1256,12 @@ class ChatSessionFactory(
  * forces suspect (fail-closed). Adjacent markers collected by the extra page
  * do not set it (R24-2 precise flag preserved). Over-flags by design when the
  * far marker's assistant is no longer kept (plain filler flags too);
- * pair-aware narrowing stays Target.
+ * family-aware head trim stays conditional (far-only never drops, preserving
+ * R25).
  *
  * Truncation is observable: [LoadedModelHistory.droppedCount] carries the
- * exact omitted-row total (filtered COUNT query, O(1) memory). A giant
+ * exact omitted-row total (filtered COUNT query, O(1) memory; head-orphan
+ * drops increase it honestly). A giant
  * single row is truncated to [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] with a
  * visible marker — fail-closed, never a silent unbounded payload (a
  * measured token budget is still TODO; the char bound is interim).
@@ -1214,12 +1271,17 @@ class ChatSessionFactory(
  * through the caller's UNKNOWN/NO_ENDPOINT path instead.
  */
 internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): LoadedModelHistory {
+    // R26-1 F4: snapshot the filtered total before AND after the scan; the max
+    // is conservative (concurrent prune shrinks, append grows – max never
+    // under-flags; any difference already forces dropped>0).
+    val totalBefore = store.countHistoryEvents(sessionId, includePartial = false)
     val scan = loadModelHistoryScan(store, sessionId)
-    val total = store.countHistoryEvents(sessionId, includePartial = false)
-    val dropped = (total - scan.events.size).coerceAtLeast(0)
-    // S4-F4(b): prune-suspect (prior prune deleted rows, marker-first pair may
-    // have been cut with dropped==0) forces conservative all-flag, matching
-    // dropped>0 fail-closed. Pair-aware prune stays Target (a).
+    val totalAfter = store.countHistoryEvents(sessionId, includePartial = false)
+    val totalMax = maxOf(totalBefore, totalAfter)
+    val prelimDropped = (totalMax - scan.events.size).coerceAtLeast(0)
+    // S4-F4(b): prune-suspect (the LATEST sweep deleted rows — per-sweep,
+    // not sticky) forces conservative all-flag, matching dropped>0
+    // fail-closed.
     // S4-R2: fail-closed on read failure (exception => suspect true) so a
     // wedged store cannot green-light a tool-dependent follow-up.
     val pruneSuspect = try {
@@ -1231,12 +1293,21 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
     // one page out (scan.hasFarReasoning, bounded COUNT below the extra-page
     // floor) forces the same conservative all-flag as dropped > 0. Adjacent
     // markers collected by the extra page do not set it (R24-2 preserved).
-    // Over-flags plain filler by design (Target: pair-aware).
-    val farMarkerSuspect = dropped == 0 && !pruneSuspect &&
+    // Over-flags plain filler by design (family-aware head trim stays
+    // conditional and never drops on far-only, preserving R25).
+    val farMarkerSuspect = prelimDropped == 0 && !pruneSuspect &&
         scan.events.size == SnapshotBudget.HISTORY_LOAD_CAP && scan.hasFarReasoning
+    // R26-1 family-aware head trim: with truncation/prune evidence, exclude
+    // head user-less families so no orphan assistant enters model context.
+    val filtered = if (prelimDropped > 0 || pruneSuspect) {
+        dropHeadOrphanAssistantFamilies(scan.events)
+    } else {
+        scan.events
+    }
+    val dropped = (totalMax - filtered.size).coerceAtLeast(0)
     val incomplete = dropped > 0 || pruneSuspect || farMarkerSuspect
     return LoadedModelHistory(
-        scan.events.map {
+        filtered.map {
             ChatMessage(
                 role = it.kind,
                 text = cappedHistoryText(it.text),
@@ -1528,7 +1599,15 @@ internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: St
         beforeSeq = pageMin
         if (page.size < HISTORY_PAGE) break
     }
-    return SwitchSnapshotLoad(keptNewestFirst.asReversed(), droppedByBytes)
+    return SwitchSnapshotLoad(
+        // R26-1 family-aware (Current): never copy a head user-less assistant
+        // family (prune/tail-cap cut). Unconditional here (row-cap drops are
+        // silent legacy; family drops stay silent too); the existing dangling
+        // filter in snapshotSwitchHistory still drops user-without-terminal
+        // families separately.
+        dropHeadOrphanAssistantFamilies(keptNewestFirst.asReversed()),
+        droppedByBytes,
+    )
 }
 
 /** Marker kind for an R4-2 model-switch fork: hidden from chat replay, kept in export. */

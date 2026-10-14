@@ -1,7 +1,6 @@
 package dev.librepocket.session
 
 import androidx.test.core.app.ApplicationProvider
-import dev.librepocket.agent.ui.chat.SnapshotBudget
 import dev.librepocket.agent.ui.chat.loadModelHistory
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -14,11 +13,11 @@ import org.robolectric.annotation.Config
 
 /**
  * S4 P1 persistence pins (Room, Robolectric).
- * - F4(b): keep-newest prune may cut a marker-first pair (reasoning seq1 +
- *   assistant seq2 + filler); dropped==0 yet the kept assistant must resume
- *   suspect (hasReasoning true or reasoningIncomplete true). Hotfix (b):
- *   prune generation deletedEvents>0 => isPruneSuspect => next loadModelHistory
- *   conservative all-flag. Pair-aware prune stays Target (a).
+ * - F4(b) + R26-1: keep-newest prune deletes a cut HEAD family whole
+ *   (marker-first pair can no longer strand its assistant); the deleting
+ *   sweep marks suspect (pre-published to close the DELETE→publish race,
+ *   per-sweep NOT sticky — clean sweep clears) so the next loadModelHistory
+ *   resumes conservative all-flag even with dropped==0.
  * - F10: auto-prune bulk counts per ROWS (appendsSincePrune += events.size),
  *   not one per bulk; head marker documented in store KDoc.
  */
@@ -67,21 +66,23 @@ class RoomS4PruneBulkTest {
         )
         assertEquals(2001, store.countEvents(sid))
         val result = store.prune(PrunePolicy())
-        assertEquals(1, result.deletedEvents)
-        assertEquals(2000, store.countEvents(sid))
+        // R26-1 family-aware: raw cut deletes the marker (1) plus the whole cut
+        // head family (orphan a-old, 1) so kept starts at a user boundary.
+        assertEquals(2, result.deletedEvents)
+        assertEquals(1999, store.countEvents(sid))
         assertTrue("prune deleted rows => suspect generation must hold", store.isPruneSuspect(sid))
         val loaded = loadModelHistory(store, sid)
-        // dropped==0 post-prune (qualifying total == kept == CAP) yet suspect.
+        // Post-fixup qualifying total == kept == 1999 => dropped==0 yet suspect.
         assertEquals(0, loaded.droppedCount)
         assertTrue(
-            "pruned marker-first pair must resume suspect (incomplete or flagged oldest)",
-            loaded.reasoningIncomplete ||
-                loaded.messages.filter { it.role == "assistant" }.firstOrNull()?.hasReasoning == true,
+            "pruned head family must resume suspect (incomplete via suspect)",
+            loaded.reasoningIncomplete,
         )
         val assistants = loaded.messages.filter { it.role == "assistant" }
-        assertEquals(SnapshotBudget.HISTORY_LOAD_CAP / 2, assistants.size)
-        assertEquals("a-old", assistants.first().text)
-        assertTrue("oldest kept assistant lost its marker to prune – must stay suspect", assistants.first().hasReasoning)
+        assertEquals(999, assistants.size)
+        assertTrue("cut head family must be gone whole (no orphan assistant)", assistants.none { it.text == "a-old" })
+        assertEquals("u-fill-0", loaded.messages.first().text)
+        assertEquals("user", loaded.messages.first().role)
     }
 
     @Test
@@ -120,14 +121,17 @@ class RoomS4PruneBulkTest {
     }
 
     /**
-     * S4-R2 SuspectFakeStore dual (dropped==0 + suspect all-flag, Room same
-     * semantics). Fake itself stays no-prune per S1 F9 (prune throws); this
-     * subclass simulates the keep-newest row cut. Same shape as
-     * pruneCutsMarkerFirstPair above: marker pruned, assistant kept,
-     * dropped==0 yet every kept assistant stays suspect.
+     * S4-R2 SuspectFakeStore dual (R26-1 family-aware BOTH sides: raw cut drops
+     * the marker, the in-storage head-family fixup drops the orphan a-old, so
+     * BOTH report deleted==2 / count==1999 / loaded dropped==0 + suspect
+     * all-flag — the old DB-delete vs read-filter `dropped` gap is eliminated
+     * by construction). Fake itself stays no-prune per S1 F9 (prune throws);
+     * this subclass simulates the keep-newest row cut + fixup. Same shape as
+     * pruneCutsMarkerFirstPair_keptAssistantStaysSuspect above; asserts the
+     * SAME numbers (parity is exact, not analogous).
      */
     @Test
-    fun suspectFake_droppedZeroSuspect_allFlag_matchesRoom() = runBlocking {
+    fun suspectFake_familyFixupParity_matchesRoom() = runBlocking {
         val store = SuspectFakeStore()
         val sid = store.createSession("t", "m")
         store.appendEvent(
@@ -149,26 +153,30 @@ class RoomS4PruneBulkTest {
         )
         assertEquals(2001, store.countEvents(sid))
         val dropped = store.simulatePruneCut(sid, keepNewestRows = 2000)
-        assertEquals(1, dropped)
-        assertEquals(2000, store.countEvents(sid))
+        // Room-convergent: raw 1 (marker) + fixup 1 (orphan a-old) = 2.
+        assertEquals(2, dropped)
+        assertEquals(1999, store.countEvents(sid))
         assertTrue("simulated cut must mark suspect", store.isPruneSuspect(sid))
         val loaded = loadModelHistory(store, sid)
+        // Same as Room: post-fixup qualifying total == kept == 1999.
         assertEquals(0, loaded.droppedCount)
         assertTrue(
-            "fake cut marker-first pair must resume suspect like Room",
-            loaded.reasoningIncomplete ||
-                loaded.messages.filter { it.role == "assistant" }.firstOrNull()?.hasReasoning == true,
+            "fake cut head family must resume suspect like Room",
+            loaded.reasoningIncomplete,
         )
         val assistants = loaded.messages.filter { it.role == "assistant" }
-        assertEquals(SnapshotBudget.HISTORY_LOAD_CAP / 2, assistants.size)
-        assertEquals("a-old", assistants.first().text)
-        assertTrue("oldest kept assistant lost its marker – must stay suspect", assistants.first().hasReasoning)
+        assertEquals(999, assistants.size)
+        assertTrue("cut head family must be gone whole (no orphan assistant)", assistants.none { it.text == "a-old" })
+        assertEquals("u-fill-0", loaded.messages.first().text)
+        assertEquals("user", loaded.messages.first().role)
     }
 
     /**
-     * S4-R2 suspect lifecycle: delete clears, append never clears.
-     * Limits: memory-only (restart drops it) + pair-aware prune stays Target –
-     * see [SessionStore.isPruneSuspect] KDoc follow-up. Covers Room + Fake.
+     * S4-R2 suspect lifecycle: delete clears, append never clears, clean
+     * sweep clears (per-sweep, NOT sticky — see
+     * `RoomR26FamilyAwarePruneTest.throwThenCleanSweep_clearsSuspect`).
+     * Memory-only (restart drops it; new prunes leave no orphan behind so
+     * the flag is never load-bearing across restart). Covers Room + Fake.
      */
     @Test
     fun suspectLifecycle_deleteClears_appendKeeps() = runBlocking {

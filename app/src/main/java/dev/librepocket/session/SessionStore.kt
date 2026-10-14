@@ -269,12 +269,23 @@ interface SessionStore {
     suspend fun prune(policy: PrunePolicy): PruneResult
 
     /**
-     * S4-F4 prune-marker suspect (hotfix b, small): true when a prior [prune]
-     * deleted rows for [sessionId], so the marker-first pair may have been cut
-     * (marker pruned, assistant kept) with `dropped==0`. Callers ([loadModelHistory])
-     * treat kept assistants as reasoning-suspect (fail-closed) when true.
-     * Memory-only like the backfill block (a restart drops it – noted follow-up);
-     * pair-aware prune (marker+assistant same life/death) stays Target (a).
+     * S4-F4 prune-marker suspect (hotfix b, small) + R26-1 family-aware
+     * (Current): true when the LATEST [prune] sweep deleted rows for
+     * [sessionId], so a cut family may have existed. Callers
+     * ([loadModelHistory]) treat kept assistants as reasoning-suspect
+     * (fail-closed) when true. Per-sweep, NOT sticky: a later clean sweep
+     * (`deleted==0`) clears it, [deleteSession] clears it, appends never
+     * clear it. R26-1 prune deletes the cut HEAD family only (user
+     * boundary; at most 10 head families per `deletes>0` sweep), so new
+     * prunes leave no user-less assistant behind and restart needs no
+     * durable flag for new prunes (orphan shape durably absent; memory
+     * pre-publish only closes the delete→publish race). Pre-R26/interior
+     * orphans below the head are NOT deleted by the fixup: while suspect is
+     * held they hide behind the all-flag, but a clean sweep or a restart
+     * (memory-only set is dropped) resumes them compat when no truncation
+     * evidence exists (known limitation). Readers additionally drop head
+     * orphans when `dropped>0` or suspect (far-only never drops, preserving
+     * R25 precision).
      * Default false so hand-written fakes without prune stay clean.
      */
     suspend fun isPruneSuspect(sessionId: String): Boolean = false

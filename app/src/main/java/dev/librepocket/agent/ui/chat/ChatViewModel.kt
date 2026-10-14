@@ -4895,10 +4895,11 @@ class ChatViewModel(
         val total = backing.countHistoryEvents(sessionId, includePartial = true)
         val dropped = (total - out.size).coerceAtLeast(0)
         // S4-F5 + S4-R2: dropped>0 => conservative all-assistants reasoning
-        // flag. A prior prune may have cut a marker-first pair with dropped==0
-        // (marker pruned, assistant kept) – consult isPruneSuspect best-effort
-        // (fail-closed: read failure => suspect true), matching Factory
-        // loadModelHistory so UI and model-context can never disagree.
+        // flag. The latest prune sweep may have deleted rows with dropped==0
+        // (R26-1: cut head family deleted whole) – consult isPruneSuspect
+        // best-effort (per-sweep, not sticky; fail-closed: read failure =>
+        // suspect true), matching Factory loadModelHistory so UI and
+        // model-context can never disagree.
         val pruneSuspect = try {
             backing.isPruneSuspect(sessionId)
         } catch (_: Exception) {

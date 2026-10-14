@@ -158,25 +158,59 @@ open class FakeSessionStore : SessionStore {
 /**
  * S4-R2 prune-suspect test fake (Fake itself stays no-prune per S1 F9 Target:
  * [FakeSessionStore.prune] always throws, never silent success – use Room for
- * real prune paths). This subclass simulates the Room keep-newest row cut for
- * the marker-first pair: [simulatePruneCut] drops the oldest rows beyond
- * [keepNewestRows] and marks the session suspect, mirroring
- * [RoomSessionStore.isPruneSuspect] (delete>0 => suspect). [deleteSession]
- * clears suspect (Room parity); appends never clear (a later append cannot
- * resurrect a pruned marker). Memory-only like Room (restart drops it);
- * pair-aware prune stays Target.
+ * real prune paths). This subclass simulates the Room keep-newest row cut
+ * PLUS the R26-1 head-family fixup: [simulatePruneCut] drops the oldest rows
+ * beyond [keepNewestRows], then while the oldest kept user/assistant row is
+ * an assistant deletes that whole logical family (`parentRunId ?: runId`,
+ * bounded loop, mirroring `RoomSessionStore`'s `oldestHistory` +
+ * `deleteFamily`), and marks the session suspect iff the total dropped > 0
+ * (per-sweep, NOT sticky — a later clean cut clears, mirroring Room).
+ * [deleteSession] clears suspect (Room parity); appends never clear (a later
+ * append cannot resurrect a pruned marker). Memory-only like Room (restart
+ * drops it); the DB/delete-vs-read-filter `dropped` gap is eliminated by
+ * construction (both sides delete the family in storage, so both report
+ * `dropped==0` + suspect with the head family gone whole).
  */
 open class SuspectFakeStore : FakeSessionStore() {
     private val suspect = HashSet<String>()
 
-    /** Simulate a keep-newest prune cut: drop oldest rows beyond keep, mark suspect iff dropped>0. */
+    /**
+     * Simulate a keep-newest prune cut with the R26-1 family fixup: drop
+     * oldest rows beyond keep, then delete whole cut head families. Returns
+     * the TOTAL dropped (raw cut + family fixup), matching Room's
+     * `PruneResult.deletedEvents`. Crafted duplicate-`seq` ties (production
+     * `seq` is unique) resolve by list order here vs `rowId` order in Room.
+     */
     fun simulatePruneCut(sessionId: String, keepNewestRows: Int): Int {
         val rows = events.filter { it.sessionId == sessionId }.sortedBy { it.seq }
-        val drop = (rows.size - keepNewestRows).coerceAtLeast(0)
+        var drop = (rows.size - keepNewestRows).coerceAtLeast(0)
         if (drop > 0) {
             val dropSeqs = rows.take(drop).map { it.seq }.toSet()
             events.removeAll { it.sessionId == sessionId && it.seq in dropSeqs }
+            // Isomorphic head-family fixup (Room parity): head non-user ⇒
+            // delete the whole parentRunId?:runId family, bounded loop,
+            // size-convergent (breaks on no progress).
+            var guard = 0
+            while (guard++ < 10) {
+                val head = events.filter { it.sessionId == sessionId && (it.kind == "user" || it.kind == "assistant") }
+                    .minByOrNull { it.seq } ?: break
+                if (head.kind == "user") break
+                val family = (head.parentRunId ?: head.runId)
+                if (family.isBlank()) break
+                val before = events.size
+                // Room-isomorphic predicate (SessionDao.deleteFamily): match
+                // on either side of the family id, not just familyOf.
+                events.removeAll {
+                    it.sessionId == sessionId && (it.runId == family || it.parentRunId == family)
+                }
+                val removed = before - events.size
+                if (removed <= 0) break
+                drop += removed
+            }
             suspect.add(sessionId)
+        } else {
+            // Clean cut: per-sweep, not sticky (Room parity).
+            suspect.remove(sessionId)
         }
         return drop
     }

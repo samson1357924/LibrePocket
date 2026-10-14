@@ -89,14 +89,66 @@ class RoomSessionStore(
     // whenever an auto-prune sweep is attempted (success or failure).
     private var appendsSincePrune = 0
     /**
-     * S4-F4 prune-marker suspect (hotfix b): sessionIds whose prior [prune]
-     * deleted rows (marker-first pair may have been cut: marker pruned,
-     * assistant kept, dropped==0). [loadModelHistory] treats them as
-     * reasoning-suspect (all kept assistants fail-closed). Memory-only (a
-     * restart drops it – noted follow-up); pair-aware prune stays Target (a).
+     * S4-F4 prune-marker suspect (hotfix b) + R26-1 family-aware (Current):
+     * sessionIds whose LATEST [prune] sweep deleted rows. [loadModelHistory]
+     * treats them as reasoning-suspect (all kept assistants fail-closed) when
+     * truncation evidence exists. Per-sweep (NOT sticky): a sweep with
+     * `deletedEvents==0` clears the flag, [deleteSession] clears it, and
+     * appends never clear it (a later append cannot resurrect a pruned
+     * pair). Clearing on a clean sweep is safe for new prunes because the
+     * R26-1 fixup durably deletes the cut head family (user boundary,
+     * marker-first implies user-less as the user row is older), so no
+     * user-less assistant survives for the flag to protect — restart needs
+     * no durable flag for new prunes (memory pre-publish is only a race
+     * closer, see [prune], never load-bearing across restart).
+     *
+     * Head-only scope (at most 10 head families per sweep, only sweeps with
+     * `deletes>0` run the fixup): pre-R26/interior orphans below the head are
+     * NOT deleted by the fixup. While suspect is held they stay hidden behind
+     * the conservative all-flag; after a clean sweep clears suspect (or after
+     * restart, which drops this memory-only set) an interior orphan with no
+     * truncation evidence resumes compat (known limitation, disclosed in
+     * P1_SPEC/THREAT_MODEL — not a fail-open of new prunes).
+     *
+     * Crafted-ledger over-drop (disclosed): the family delete keys on
+     * `parentRunId ?: runId` and assumes production write order + unique
+     * runIds; a crafted ledger reusing one runId across turns or interleaved
+     * out of order loses every remaining row sharing the head family id
+     * (conservative direction). `oldestHistory` has no `isPartial` filter,
+     * so a crafted head partial steers the fixup (readers ignore partials
+     * anyway). The family delete matches any kind (`runId == fid OR
+     * parentRunId == fid`), so the cut family's retry notices and cancel
+     * marks go with it; tool/usage rows keyed by a bare attempt id
+     * (`parentRunId == null`, `runId == attemptId` ≠ logical family id)
+     * survive as DB residue (P2-3, disclosed in P1_SPEC — never model
+     * context, never a family terminal).
      * Concurrent set, no suspension while held.
      */
     private val pruneSuspectSessions = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * R26-1 prune event-cap mutex: serializes ONLY the per-session
+     * keep-newest + family-fixup segment across concurrent [prune] sweeps
+     * (separate from [appendMutex], which guards append accounting). The
+     * flag is pre-published before the DELETE, so without serialization two
+     * overlapping sweeps could interleave publish/delete/clear and leave the
+     * flag reflecting the earlier sweep instead of the last completed one
+     * (last-finisher-wins is the documented semantic: the flag always
+     * mirrors the latest completed sweep's `deleted>0`). Session-expiry
+     * deletes stay outside this mutex (single-statement conditional SQL).
+     */
+    private val pruneEventCapMutex = Mutex()
+
+    /**
+     * R26-1 F4 test seam: invoked synchronously after the conditional DELETE
+     * commits for a session but before the suspect flag is reconciled and the
+     * family fixup runs. Tests block here to interleave a concurrent load
+     * that observes post-delete totals: pre-publish code reports suspect
+     * (green); legacy post-publish code would report a false clean here
+     * (red — logic argument, no revert run against old code was executed).
+     * Production leaves it `null`.
+     */
+    internal var afterEventDeleteHookForTest: ((String) -> Unit)? = null
 
     /**
      * R6-4 test seam: invoked synchronously on the IO thread after the
@@ -670,26 +722,112 @@ class RoomSessionStore(
                 )
                 if (deleted > 0) {
                     deletedSessions += deleted // CASCADE clears events atomically
+                    // Session gone – no kept assistant to stay suspect.
+                    pruneSuspectSessions.remove(session.sessionId)
                 } else {
                     survivors.add(session.sessionId)
                 }
             }
-            for (sid in survivors) {
-                // Imported seq values may be sparse. Keep N actual newest rows by
-                // ordering the current rows, rather than deriving a cutoff from MAX(seq).
-                // S4-F4(b): per-session delete>0 marks prune-suspect (marker-first
-                // pair may have been cut); pair-aware prune stays Target (a).
-                val deleted = dao.deleteEventsBeyondLimit(
-                    sid,
-                    policy.maxEventsPerSession.coerceAtLeast(0),
-                )
-                if (deleted > 0) pruneSuspectSessions.add(sid)
-                deletedEvents += deleted
+            // Serialized by [pruneEventCapMutex]: the publish→delete→clear
+            // sequence below is one critical section, so the flag always
+            // mirrors the latest COMPLETED sweep (last-finisher-wins, by
+            // design — concurrent sweeps with mixed outcomes resolve to the
+            // last finisher's deleted>0, never a stale earlier value).
+            pruneEventCapMutex.withLock {
+                for (sid in survivors) {
+                    // Imported seq values may be sparse. Keep N actual newest rows by
+                    // ordering the current rows, rather than deriving a cutoff from MAX(seq).
+                    // R26-1 F4: pre-publish suspect BEFORE the conditional DELETE to
+                    // close the DB-delete→publish race (a concurrent loadModelHistory
+                    // between commit and post-publish would otherwise see post-delete
+                    // totals with suspect==false → under-flag). A sweep that deletes
+                    // nothing clears the flag again below (per-sweep, NOT sticky);
+                    // a throw removes the pre-published flag unless a prior sweep
+                    // had set it (fail-closed for proven evidence only), then
+                    // rethrows — never a silent success.
+                    // R26-1 family-aware (Current): when the raw keep-newest cut splits
+                    // a user/assistant family (marker-first implies user-less, as the
+                    // user row is older than its marker), delete the whole head family
+                    // so kept starts at a user boundary and no user-less assistant
+                    // reaches loadModelHistory/snapshot (no restart fail-open).
+                    val alreadySuspect = pruneSuspectSessions.contains(sid)
+                    pruneSuspectSessions.add(sid)
+                    val deleted: Int
+                    try {
+                        deleted = dao.deleteEventsBeyondLimit(
+                            sid,
+                            policy.maxEventsPerSession.coerceAtLeast(0),
+                        )
+                    } catch (t: Throwable) {
+                        if (!alreadySuspect) pruneSuspectSessions.remove(sid)
+                        throw t
+                    }
+                    // Test-only interleave point (F4 deterministic test): observes
+                    // post-delete totals with the pre-published flag still held.
+                    try {
+                        afterEventDeleteHookForTest?.invoke(sid)
+                    } catch (ce: CancellationException) {
+                        if (!alreadySuspect) pruneSuspectSessions.remove(sid)
+                        throw ce
+                    } catch (_: RuntimeException) {
+                        // Fall through to flag reconcile + fixup.
+                    }
+                    if (deleted == 0) {
+                        // Clean sweep: no truncation evidence from THIS sweep, so
+                        // the pre-published flag (and any prior one — per-sweep,
+                        // not sticky) is cleared. Safe for new prunes: the fixup
+                        // below already durably removed cut head families, so no
+                        // orphan survives for the flag to protect. Appends still
+                        // never clear (only sweeps publish).
+                        pruneSuspectSessions.remove(sid)
+                    } else {
+                        deletedEvents += deleted
+                        // Head-only fixup (at most 10 head families): while the
+                        // oldest kept user/assistant row is an assistant, its
+                        // whole logical family goes. Breaks on no progress
+                        // (famDeleted<=0 — size-convergent); the 10 cap only stops
+                        // a pathological loop over crafted empty families. A
+                        // crafted ledger with >10 head orphan families needs a
+                        // second sweep for the 11th (pinned by test, disclosed in
+                        // P1_SPEC). Only runs when deleted>0, so a small ledger
+                        // with a large keep (deleted==0) keeps its head orphan
+                        // (conditional gate — pinned by test).
+                        var guard = 0
+                        while (guard++ < 10) {
+                            val oldest = try {
+                                dao.oldestHistory(sid, 1)
+                            } catch (_: Exception) {
+                                break
+                            }
+                            if (oldest.isEmpty()) break
+                            val head = oldest[0]
+                            if (head.kind == "user") break
+                            val family = try {
+                                head.parentRunId ?: head.runId
+                            } catch (_: Exception) {
+                                break
+                            }
+                            if (family.isBlank()) break
+                            val famDeleted = try {
+                                dao.deleteFamily(sid, family)
+                            } catch (_: Exception) {
+                                break
+                            }
+                            if (famDeleted <= 0) break
+                            deletedEvents += famDeleted
+                        }
+                    }
+                }
             }
             PruneResult(deletedEvents = deletedEvents, deletedSessions = deletedSessions)
         }
 
-    /** S4-F4(b): true when a prior [prune] deleted rows for [sessionId]. */
+    /**
+     * S4-F4(b) + R26-1: true when the LATEST [prune] sweep deleted rows for
+     * [sessionId]. Per-sweep, NOT sticky: a later clean sweep (`deleted==0`)
+     * clears it (new prunes leave no orphan behind, so nothing needs
+     * protecting); [deleteSession] clears it; appends never clear it.
+     */
     override suspend fun isPruneSuspect(sessionId: String): Boolean =
         pruneSuspectSessions.contains(sessionId)
 
@@ -699,8 +837,11 @@ class RoomSessionStore(
         }
         // S4-R2 suspect lifecycle: delete clears (session gone – no kept
         // assistant to stay suspect). Appends never clear (a later append
-        // cannot resurrect a pruned marker-first pair); pair-aware prune +
-        // durable suspect stay Target/follow-up (memory-only noted in KDoc).
+        // cannot resurrect a pruned pair); only sweeps publish — a clean
+        // sweep (deleted==0) clears, a deleting sweep sets. R26-1
+        // family-aware leaves no orphan behind, so restart needs no durable
+        // flag for new prunes (memory-only set is race-closer, not
+        // load-bearing).
         pruneSuspectSessions.remove(sessionId)
     }
 

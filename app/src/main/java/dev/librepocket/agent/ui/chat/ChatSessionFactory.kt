@@ -168,6 +168,18 @@ internal fun familyOf(event: TranscriptEvent): String = event.parentRunId ?: eve
  * marker. Pre-F rows and JSONL lines without the key read back as final
  * (old single-terminal semantics). Marker writes stay idempotent: a marked
  * family owns its marker row and is skipped next time.
+ *
+ * S2 F3 (implemented): the system leg requires `isFinal=1` exactly like the
+ * assistant leg — production system marks are always final (see
+ * `SessionTranscriptSink`: cancel/interrupted/legacy-failure rows all write
+ * `isFinal=1`, and the import F2 gate rejects `isFinal=false` on system
+ * rows), so a crafted non-final system mark must not close its family.
+ * Pre-F rows without the key still default to final and are unaffected.
+ * Current (S2 F3 implemented): non-final system marks dangle; Target keeps
+ * this rule unchanged —
+ * `isSwitchSnapshotTerminalMark` intentionally stays text-only: its kept rows
+ * still funnel through this same finality rule via the snapshot dangling
+ * filter, so a copied non-final mark can never close a family either.
  */
 internal fun findDanglingRunIds(events: List<TranscriptEvent>): List<String> {
     val terminalFamilies = HashSet<String>()
@@ -177,9 +189,9 @@ internal fun findDanglingRunIds(events: List<TranscriptEvent>): List<String> {
         when (e.kind) {
             "assistant" -> if (e.isFinal) terminalFamilies.add(family)
             "system" -> {
-                if (e.text == interruptedMarkerText(e.runId) ||
+                if (e.isFinal && (e.text == interruptedMarkerText(e.runId) ||
                     e.text == cancelledMarkerText(e.runId) ||
-                    isLegacyFailureText(e.runId, e.text)
+                    isLegacyFailureText(e.runId, e.text))
                 ) {
                     terminalFamilies.add(family)
                 }

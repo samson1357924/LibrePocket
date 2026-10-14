@@ -393,8 +393,9 @@ fun SetupScreen(
     }
 
     if (state.confirmKeyWrite) {
-        // S4: STAGED 沿用 key-write 文案；KEEP_EXISTING 顯示保留文案＋身份列
-        // （provider label、baseUrl、model 變更前後），不提「存入」。
+        // S4: STAGED 與 KEEP_EXISTING 皆顯示身份列（provider label、baseUrl、
+        // model；STAGED 的 oldModel 為 null 故僅顯示 newModel），STAGED 另沿用
+        // key-write「存入」文案，KEEP_EXISTING 用保留文案（不提「存入」）。
         val keepExistingConfirm = state.pendingKeyWriteIntent == KeyWriteIntent.KEEP_EXISTING
         AlertDialog(
             onDismissRequest = viewModel::dismissKeyWriteConfirm,
@@ -402,7 +403,7 @@ fun SetupScreen(
             text = {
                 if (keepExistingConfirm) {
                     Column {
-                        Text("保留既有金鑰，僅更新設定（不會讀取或寫入金鑰內容）。")
+                        Text("保留既有金鑰，僅更新設定（不會讀取金鑰內容，僅確認存在；零 put/get/delete；不會寫入金鑰內容）。")
                         state.confirmSummary?.let { summary ->
                             Text("供應商：${summary.providerLabel}")
                             Text("伺服器位址：${summary.baseUrl}")
@@ -421,6 +422,11 @@ fun SetupScreen(
                 } else {
                     Column {
                         Text("即將把此 API Key 存入本機加密儲存（key.write）。換機或還原後需重輸；向你設定的 AI API 端點發出聊天或模型列表等需驗證的請求時，會傳送 API Key（包含自訂端點）。確定繼續嗎？")
+                        state.confirmSummary?.let { summary ->
+                            Text("供應商：${summary.providerLabel}")
+                            Text("伺服器位址：${summary.baseUrl}")
+                            Text("模型：${summary.newModel}")
+                        }
                         TextButton(onClick = { uriHandler.openUri(THREAT_MODEL_URL) }) {
                             Text("查看威脅模型說明（docs/THREAT_MODEL.md）")
                         }

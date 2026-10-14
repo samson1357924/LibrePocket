@@ -144,7 +144,8 @@ class SetupKeyWriteConfirmUiTest {
     @Test
     fun stagedConfirmDisablesModelFieldAndKeepsCopy() {
         // STAGED 對話框：model 欄 disabled，沿用 key-write 文案（含「存入」），
-        // title/確認鈕為寫入字樣。
+        // title/確認鈕為寫入字樣；S6 起另顯示身份列（provider label、baseUrl、
+        // newModel，與 KEEP_EXISTING 對齊）。
         val (vm, _) = newVm(VerdictPolicy(Verdict.ASK), CountingVault())
         setScreen(vm)
         vm.onApiKeyChange("unit-test-key-123")
@@ -156,6 +157,9 @@ class SetupKeyWriteConfirmUiTest {
         composeRule.onNodeWithText("寫入金鑰確認").assertIsDisplayed()
         composeRule.onNodeWithText("確定寫入").assertIsDisplayed()
         composeRule.onNodeWithText("存入本機加密儲存", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("供應商：OpenAI").assertIsDisplayed()
+        composeRule.onNodeWithText("伺服器位址：https://api.openai.com/v1").assertIsDisplayed()
+        composeRule.onNodeWithText("模型：s4-model-staged").assertIsDisplayed()
         composeRule.onAllNodesWithText("保留既有金鑰", substring = true).assertCountEquals(0)
     }
 
@@ -180,6 +184,8 @@ class SetupKeyWriteConfirmUiTest {
         composeRule.onNodeWithText("確認更新設定").assertIsDisplayed()
         composeRule.onNodeWithText("確定更新").assertIsDisplayed()
         composeRule.onNodeWithText("保留既有金鑰", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("不會讀取金鑰內容", substring = true).assertIsDisplayed()
+        composeRule.onNodeWithText("零 put/get", substring = true).assertIsDisplayed()
         composeRule.onAllNodesWithText("存入", substring = true).assertCountEquals(0)
         composeRule.onNodeWithText("供應商：OpenAI").assertIsDisplayed()
         composeRule.onNodeWithText("伺服器位址：https://api.openai.com/v1").assertIsDisplayed()

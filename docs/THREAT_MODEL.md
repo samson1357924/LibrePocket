@@ -1,6 +1,6 @@
 # 威脅模型：目前資料流與安全邊界
 
-> **狀態：Current snapshot**，依 `d5a98bd35e919083b0475027c9b2e74b703e4e58`（2026-10-13 提交，2026-10-14 核對）。這不是正式安全認證，也不代表所有列出的防護均已驗證。B1/B2 有界切片（PR #80）僅經 JVM 單測驗證，裝置 smoke 與快照更新待後續。
+> **狀態：Current snapshot**，依 `ce4b6af`（2026-10-15 核對）。這不是正式安全認證，也不代表所有列出的防護均已驗證。B1/B2 有界切片（PR #80）僅經 JVM 單測驗證，裝置 smoke 與快照更新待後續。
 >
 > - **範圍：** Android app 的聊天、provider、Room transcript、Android backup 與已宣告工具邊界。
 > - **Owner role：** app/runtime 維護者；目前未指派個人或安全團隊。
@@ -35,6 +35,14 @@
 - Credential 綁定 endpoint origin/config revision；讀取、解析或持久化故障採 fail-closed，不得靜默沿用其他 endpoint 的 credential。
 - S4-B typed-key 身份守衛（方案 B，見 `SetupViewModel.boundKeyHash`）：已貼明文 key 綁定輸入時 endpoint 身份（providerId＋effectiveBaseUrl）；preset/URL 切換保留文字但保留舊綁定，探測／儲存入口先比綁定（`SETUP_KEY_IDENTITY_CHANGED` 零請求／零寫入）。`onApiKeyChange` 僅在 `sha256(trimmed)` 改變時重綁——尾端空白或同 key 重貼（hash 不變）不重綁，空白鍵清空後重貼同一字串亦不重綁（blank 清 binding 但保留 hash），維持擋下，關閉 S3「任意非空即重綁」bypass。身份比對為 trim 後全字串相等、case-sensitive（host 大小寫、尾端斜線、有無預設埠皆視為不同身份，不做其他正規化）。選 B 而非 A（切換即清空明文強制重貼）：S3 蓄意保留文字以支援 switch-back 免重貼（`backSwitchWithoutRepasteAllows`）且 `String` 不可抹除（清空僅丟引用，堆積殘留至 GC），清空的衛生收益邊際但常用流失；B 以最小 churn 關閉外洩（擋下後零 `provider.call`／零 vault I/O 仍成立）。已知代價：同一 key 字串跨 endpoint 合法共用被擋（hash 不變永不重綁）——affordance：先貼任一不同 key 觸發重綁再貼回，或切回原 endpoint（binding 仍在，免重貼），或經 prefill/save 成功/logout 成功後的新鮮貼上（hash 已清）；UI 文案已明示同字串重貼（含僅加空白、清空後重貼同一字串）不會解除（見 `setupErrorText`）。未選 C（降級為 nudge）：探測會把 key 明文送往當前 endpoint，屬外洩邊界，必須 fail-closed。
 - `ASK` 不可默認成 `ALLOW`。高風險確認必須綁定不可變操作快照，副作用前重新評估授權。
+- Setup／chat 授權門（S6 Current，JVM 單測覆蓋、未經裝置端到端驗證）：
+  - probe 閘：`testConnection`／`refreshModels` 先經 typed-key 身份綁定比對（零 policy I/O），再取新鮮 `provider.call` verdict；僅 `ALLOW` 繼續，`ASK`／`DENY`／讀失敗皆 `PROBE_POLICY_DENIED` 且零 provider 建構、零請求；IO 內另有 fence＋pre-IO 複驗，`refreshModels` 另有 live 後、目錄抓取前第三閘。
+  - `EDIT_KEEP_EXISTING` metadata-only：空白 key＋身份不變（providerId＋effectiveBaseUrl 全字串相等）時重用 live vault key，僅 metadata CAS；唯一 vault 接觸為存在性 `hasKey` 前提（不讀內容），零 put/get/delete；`ASK` 時同樣經 one-shot 確認對話框（身份列＋保留文案「不會讀取金鑰內容，僅確認存在；零 put/get/delete」），STAGED 對話框亦顯示身份列（label＋baseUrl＋newModel）。
+  - chat `key.read` one-shot consent：T0 新鮮評估 `ASK` 需綁定一次性確認（對話框＋`confirmKeyRead`，綁 providerId／baseUrl／origin／protocol／apiKeyRef／configRevision／model＋mint generation）；`DENY`／評估失敗恆拒並丟棄已 mint 同意書；T1 capture 邊界重驗：`ALLOW` 直通、`ASK` 僅憑 T0 同操作 proof 放行（`ALLOW`→`ASK` 翻轉拒絕），T1 拒絕丟棄殘留同意書槽位防重放；重驗與 vault 讀之間殘留 CPU-only 窗口（屬已知殘留，未持有門控跨越 vault 讀）。
+  - `hasKey` 存在性檢查位置（刻意）：gate flow 的 live-alias `hasKey`、staged orphan-guard `hasKey`、keep reuse 前提 `hasKey` 皆置於 verdict 之前——僅測存在性（per-op 新 alias 或同 emission 快照 alias，不讀內容），oracle 值可忽略；真正副作用（putKey／metadata CAS／provider 建構）仍由其後新鮮 verdict 閘守。
+  - providerId 粗粒度（已知限制）：`deriveProviderId` 為純 `preset:` 拼接；自訂端點共用同一 resource，不同自訂 URL 間政策無法區分；端點綁定仍以全字串身份比對 fail-closed（綁定≠授權粒度）。
+  - `POLICY_DENIED_KEY_WRITE` 收斂理由（刻意不拆）：全 save 拒絕（`DENY`／`ASK` 失配／fence／快照讀失敗／vault 失敗／CAS 競爭）收斂至單一碼，避免以錯誤碼區分洩漏門控狀態（policy vs revision vs vault oracle）；teardown 競爭另立 `SAVE_BLOCKED_BY_TEARDOWN`（可重試語義不同），未知 preset／身份綁定另立 `SETUP_*`（policy 未被諮詢）。
+- 測試衛生／掃描殘留（S6）：倉庫內 `unit-test-key-*`、`test-key-123`、`unit-test-device-roundtrip` 等皆為合成假字串（fake vault／本機回放，無付費或 production endpoint，無真 key）；其餘 `sk-` 字面皆為合成測試向量（詳見 `grep -rn 'sk-' app/src/test app/src/androidTest`），刻意保留作掃描器面向向量；會觸發 secret 掃描誤報，屬已知噪音而非洩漏。
 - Tool readiness 逐項推進並以負向控制驗證；未 verified 的工具保持不可執行。不能以設定開關、projection 或一般單測取代端到端安全證據。
 - Session 初始化採 single-flight/generation；過期 callback 不得接入新 session。取消須解除 HTTP blocking I/O。
 - 路徑權限以實體路徑、可信 executable 和 OS 邊界判斷；Root/Shizuku/PRoot 不可描述為 sandbox。

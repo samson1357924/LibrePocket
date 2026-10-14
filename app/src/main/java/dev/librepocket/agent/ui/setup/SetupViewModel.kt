@@ -73,7 +73,8 @@ enum class KeyWriteIntent {
  *
  * [providerLabel]／[baseUrl]／[newModel] 取自 save entry 表單；
  * [oldModel] 取自 entry 時的編輯基線（Main 線程快照，
- * 僅 keepExisting 意圖有值，新建流程為 null）。STAGED 分支不渲染此快照。
+ * 僅 keepExisting 意圖有值，新建流程為 null）。STAGED 與 KEEP_EXISTING
+ * 分支皆渲染此快照（STAGED 僅顯示 newModel，不顯示 old→new 箭頭）。
  */
 data class KeyWriteConfirmSummary(
     val providerLabel: String,
@@ -137,8 +138,8 @@ data class SetupUiState(
      * S4：確認對話框的身份快照（見 [KeyWriteConfirmSummary]）。
      *
      * 與 [pendingKeyWriteIntent] 同一 emission 設置／清除；KEEP_EXISTING
-     * 分支渲染身份列（provider label、baseUrl、model old→new），STAGED
-     * 分支忽略。顯示用，不參與 gate。
+     * 與 STAGED 分支皆渲染身份列（KEEP_EXISTING 另含 model old→new，
+     * STAGED 僅 newModel）。顯示用，不參與 gate。
      */
     val confirmSummary: KeyWriteConfirmSummary? = null,
     val errorCode: String? = null,
@@ -2152,7 +2153,8 @@ class SetupViewModel(
      *
      * 與 `confirmKeyWrite = true` 同一 emission 設置 [KeyWriteIntent] 與
      * [KeyWriteConfirmSummary]（entry 快照：label／baseUrl 取自 entry，
-     * oldModel 取自 entry 基線）。顯示用，不參與 gate。5 設對應 8 清
+     * oldModel 取自 entry 基線，僅 keepExisting 有值）。兩分支皆渲染身份列
+     * （STAGED 僅 newModel），顯示用，不參與 gate。5 設對應 8 清
      * （5 post-show fence＋confirm／dismiss／invalidate，見 [hideKeyWriteConfirm]）。
      */
     private fun showKeyWriteConfirm(

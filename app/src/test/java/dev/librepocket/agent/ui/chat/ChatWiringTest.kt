@@ -112,7 +112,7 @@ class ChatWiringTest {
         fake: FakeChatProvider = FakeChatProvider(),
     ): ChatViewModel {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        runBlocking { vault.putKey("preset:openai", "unit-test-key-123".toCharArray()) }
         // S1: T0/T1 share one store so the factory T1 recheck enforces the
         // same verdict the ViewModel authorized (see KeyReadTest newRig).
         val policy = allowKeyReadPolicy()
@@ -161,7 +161,7 @@ class ChatWiringTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
             store.save(sampleEndpoint())
-            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         }
         val fake = FakeChatProvider { _ ->
             flow {
@@ -201,7 +201,7 @@ class ChatWiringTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
             store.save(sampleEndpoint())
-            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         }
         var failFirst = true
         val fake = FakeChatProvider { _ ->
@@ -238,7 +238,7 @@ class ChatWiringTest {
     @Test
     fun factoryCancellationAfterDurableCreateDeletesOnlyTheNewTranscriptRow() = runBlocking {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         val rowCreated = CompletableDeferred<Unit>()
         val allowCreateReturn = CompletableDeferred<Unit>()
         val transcripts = object : dev.librepocket.session.FakeSessionStore() {
@@ -275,7 +275,7 @@ class ChatWiringTest {
     @Test
     fun discardingAnUnattachedNewSessionDeletesItsTranscriptRow() = runBlocking {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         val transcripts = dev.librepocket.session.FakeSessionStore()
         // S1: direct create needs explicit ALLOW (fail-closed default).
         val factory = ChatSessionFactory(
@@ -297,7 +297,7 @@ class ChatWiringTest {
     @Test
     fun discardingAnOpenedSessionNeverDeletesItsExistingTranscriptRow() = runBlocking {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         val transcripts = dev.librepocket.session.FakeSessionStore()
         val sessionId = transcripts.createSession("existing", "gpt-4o-mini")
         // S1: direct open needs explicit ALLOW (fail-closed default).
@@ -358,7 +358,7 @@ class ChatWiringTest {
             )
         }
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        runBlocking { vault.putKey("preset:openai", "unit-test-key-123".toCharArray()) }
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "ok"))
@@ -422,7 +422,7 @@ class ChatWiringTest {
             )
         }
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        runBlocking { vault.putKey("preset:openai", "unit-test-key-123".toCharArray()) }
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "ok"))
@@ -477,7 +477,7 @@ class ChatWiringTest {
             )
         }
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        runBlocking { vault.putKey("preset:openai", "unit-test-key-123".toCharArray()) }
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "ok"))
@@ -536,7 +536,7 @@ class ChatWiringTest {
             )
         }
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        runBlocking { vault.putKey("preset:openai", "unit-test-key-123".toCharArray()) }
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "ok"))
@@ -581,7 +581,7 @@ class ChatWiringTest {
             )
         }
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        runBlocking { vault.putKey("preset:openai", "unit-test-key-123".toCharArray()) }
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "ok"))
@@ -724,7 +724,7 @@ class ChatWiringTest {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        runBlocking { vault.putKey("preset:openai", "unit-test-key-123".toCharArray()) }
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "ok"))
@@ -769,8 +769,8 @@ class ChatWiringTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
             store.save(sampleEndpoint())
-            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
-            vault.putKey("preset:custom", "sk-test-key-456".toCharArray())
+            vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
+            vault.putKey("preset:custom", "unit-test-key-456".toCharArray())
         }
         val fake = FakeChatProvider { _ ->
             flow {

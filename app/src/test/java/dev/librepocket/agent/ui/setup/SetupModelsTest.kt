@@ -94,7 +94,7 @@ class SetupModelsTest {
     @Test
     fun livePlusSnapshotMergesDefaultFirst() {
         val vm = newVm(FakeModelProvider(models = listOf("live-x")))
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.refreshModels()
         awaitModelsIdle(vm)
         val options = vm.form.value.modelOptions
@@ -122,7 +122,7 @@ class SetupModelsTest {
             buildProvider = { _, _ -> FakeModelProvider(failure = java.io.IOException("offline")) },
             fetchDirectory = { throw java.io.IOException("offline") },
         )
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.refreshModels()
         awaitModelsIdle(vm)
         val options = vm.form.value.modelOptions
@@ -145,7 +145,7 @@ class SetupModelsTest {
     @Test
     fun freeTextModelPreserved() {
         val vm = newVm(FakeModelProvider(models = listOf("live-x")))
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.onModelChange("my-custom-model")
         vm.refreshModels()
         awaitModelsIdle(vm)

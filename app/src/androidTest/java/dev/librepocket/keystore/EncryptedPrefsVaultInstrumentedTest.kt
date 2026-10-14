@@ -41,7 +41,7 @@ class EncryptedPrefsVaultInstrumentedTest {
     @Test
     fun put_get_delete_roundTripOnRealKeystore() = runBlocking {
         val v = vault()
-        val secret = "sk-live-device-roundtrip-0123456789".toCharArray()
+        val secret = "unit-test-device-roundtrip-0123456789".toCharArray()
         v.putKey("prov-1", secret)
 
         // Caller array is wiped after write.
@@ -49,7 +49,7 @@ class EncryptedPrefsVaultInstrumentedTest {
 
         val read = v.getKey("prov-1")
         assertArrayEquals(
-            "sk-live-device-roundtrip-0123456789".toCharArray(),
+            "unit-test-device-roundtrip-0123456789".toCharArray(),
             read,
         )
         read?.fill('\u0000')

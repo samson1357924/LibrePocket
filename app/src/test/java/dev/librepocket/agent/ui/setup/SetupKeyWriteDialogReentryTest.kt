@@ -231,7 +231,7 @@ class SetupKeyWriteDialogReentryTest {
         assertTrue(vm.form.value.logoutInFlight)
         // 有效 typed key 下的新 probe：未設閘時會構造 provider（ALLOW），
         // 設閘後必須 silent return、零構造。
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.testConnection()
         vm.refreshModels()
         Thread.sleep(300)

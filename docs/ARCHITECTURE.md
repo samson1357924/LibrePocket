@@ -32,6 +32,8 @@ Built-in ToolRegistry: 41 declared definitions; executionReady=false for all
 - 朗讀首次點按顯示內聯確認（`VoiceTts.ttsConfirmMessage`，確認狀態持久化、只問一次；朗讀鈕無障礙文案與設定頁語音卡維持揭露）。
 - 引擎失敗經分離的 `sttError`／`ttsError` 可觀察（TTS 成功／新 speak 發起／關閉輸出清除 TTS 錯誤；STT 成功不清 TTS 錯誤）；TTS 細分：無引擎 `NO_ENGINE` fail-closed（空表；查詢未知維持原流程）、缺中文語料走降級提醒（`LANG_UNAVAILABLE` 警告非失敗、仍朗讀）、listener 掛載失敗僅警告（`LISTENER_FAILED`，引擎仍可用）；系統引擎的資料處理取決於已安裝引擎。
 - 未來雲端語音分派（Azure fallback）落地時走 dispatcher + 新鮮政策評估 + 送雲前 redact（見 `VoiceTools.redactForCloud`）。
+- Setup 保存管線（S6 Current）：entry 快照→V1 新鮮 `key.write` 評估→form fence→ASK 時 mint one-shot 同意書＋確認對話框（STAGED／KEEP_EXISTING 皆帶身份列）→confirm 攜 consent 第二 entry→staged 路徑（per-op staged alias put＋V2＋metadata CAS＋舊 alias 退役）或 KEEP_EXISTING 路徑（存在性 `hasKey` 前提＋metadata-only CAS，零 put/get/delete）；探測（測試連線／模型列表）走獨立 `provider.call` 新鮮閘，僅 `ALLOW` 放行。拒絕收斂至單一 `POLICY_DENIED_KEY_WRITE`（防 oracle，見威脅模型），teardown 競爭另立可重試碼。
+- Chat 讀 key 管線（S6 Current）：T0 新鮮 `key.read` 評估＋綁定式 one-shot 確認→T1 capture 邊界重驗→vault 讀→會話建構；`ALLOW`→`ASK` 翻轉拒絕，重驗與 vault 讀之間殘留 CPU-only 窗口（已知殘留）。
 
 ## Target：現有設計文件描述的方向
 
@@ -42,6 +44,7 @@ Before enabling any external side effect, preserve these boundaries:
 - capability state must distinguish declared, implemented, wired, and verified;
 - permission and flavor checks must fail closed, and user confirmation must bind to the exact operation snapshot;
 - credential selection must remain bound to endpoint identity/configuration;
+- setup/chat policy gates keep their documented shape: custom endpoints share one policy resource (coarse granularity, known limitation); save denials converge to a single code (oracle avoidance) with teardown-blocked kept distinct; existence-only `hasKey` checks stay ahead of the verdict (deliberate, see Threat Model);
 - cancellation and session-generation changes must prevent stale network work or callbacks from attaching to a later session;
 - filesystem and process boundaries must use canonical paths/trusted executables, not Root/Shizuku/PRoot as a claim of OS sandboxing.
 

@@ -687,7 +687,7 @@ class SetupPolicyTest {
         awaitSettled(vm)
         assertTrue(vm.form.value.saved)
         // Editing the key resets the one-shot confirmation.
-        vm.onApiKeyChange("sk-test-key-456")
+        vm.onApiKeyChange("unit-test-key-456")
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -846,7 +846,7 @@ class SetupPolicyTest {
         assertTrue(policy.entered.await(10, TimeUnit.SECONDS))
         // Race: edit the key while the first fresh evaluation is in flight.
         // The pre-mint form fence must abort the mint.
-        vm.onApiKeyChange("sk-edited-key-456")
+        vm.onApiKeyChange("unit-test-key-456")
         policy.release.countDown()
         awaitSettled(vm)
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)
@@ -878,7 +878,7 @@ class SetupPolicyTest {
         assertTrue(policy.entered.await(10, TimeUnit.SECONDS))
         // Race: edit key + URL; the confirm path must re-validate against the
         // LATEST form (not the entry snapshot) and fail closed.
-        vm.onApiKeyChange("sk-edited-key-456")
+        vm.onApiKeyChange("unit-test-key-456")
         vm.onBaseUrlChange("https://custom-b.example.com/v1")
         policy.release.countDown()
         awaitSettled(vm)
@@ -1280,7 +1280,7 @@ class SetupPolicyTest {
         // Race: edit the key after mint completed but before the dialog shows.
         // Pre-fix this revived the dialog with a discarded consent; post-fix the
         // pre-show fence must discard the just-minted consent and fail closed.
-        vm.onApiKeyChange("sk-edited-key-456")
+        vm.onApiKeyChange("unit-test-key-456")
         release.countDown()
         awaitSettled(vm)
         assertFalse(vm.form.value.confirmKeyWrite)
@@ -1321,7 +1321,7 @@ class SetupPolicyTest {
         vault.release.countDown()
         assertTrue(mintEntered.await(10, TimeUnit.SECONDS))
         // Race: edit after the flip mint but before its dialog shows.
-        vm.onApiKeyChange("sk-edited-key-456")
+        vm.onApiKeyChange("unit-test-key-456")
         mintRelease.countDown()
         awaitSettled(vm)
         assertFalse(vm.form.value.confirmKeyWrite)
@@ -1454,7 +1454,7 @@ class SetupPolicyTest {
         // external live key is intact regardless of timing.
         assertTrue(policy.entered.await(10, TimeUnit.SECONDS))
         runBlocking {
-            delegate.putKey("preset:openai", "sk-ext-key-789012".toCharArray())
+            delegate.putKey("preset:openai", "unit-test-ext-key-789012".toCharArray())
             store.save(preseedConfig(model = "m-ext"))
         }
         val extObserved = runBlocking { store.observe().first() }
@@ -1469,7 +1469,7 @@ class SetupPolicyTest {
         assertEquals(1, vault.putKeys)
         assertEquals(1, vault.deleteKeys)
         assertEquals(0, vault.getKeys)
-        assertVaultKeyEquals(vault, "preset:openai", "sk-ext-key-789012")
+        assertVaultKeyEquals(vault, "preset:openai", "unit-test-ext-key-789012")
         runBlocking {
             assertTrue(vault.hasKey("preset:openai"))
             assertEquals(extObserved, store.observe().first())
@@ -1489,7 +1489,7 @@ class SetupPolicyTest {
         // Race an edit while the staged putKey is in flight: the post-write
         // generation fence aborts the metadata write and deletes only the
         // attempt's own staged alias (live was never written).
-        vm.onApiKeyChange("sk-edited-key-654321")
+        vm.onApiKeyChange("unit-test-key-654321")
         vault.release.countDown()
         awaitSettled(vm)
         assertEquals("POLICY_DENIED_KEY_WRITE", vm.form.value.errorCode)

@@ -101,7 +101,7 @@ class SetupConnectionTest {
     @Test
     fun successReportsModelCountAndPersistsNothing() {
         val (vm, store) = newVm()
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.testConnection()
         awaitIdle(vm)
         assertEquals(2, vm.form.value.testModels)
@@ -113,7 +113,7 @@ class SetupConnectionTest {
     fun unauthorizedMapsToKeyError() {
         val fake = FakeListProvider(failure = ProviderFailure(false, "HTTP 401 invalid_api_key"))
         val (vm, _) = newVm(fake)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.testConnection()
         awaitIdle(vm)
         assertEquals("TEST_UNAUTHORIZED", vm.form.value.errorCode)
@@ -124,7 +124,7 @@ class SetupConnectionTest {
     fun retryableMapsToServerBusy() {
         val fake = FakeListProvider(failure = ProviderFailure(true, "HTTP 503"))
         val (vm, _) = newVm(fake)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.testConnection()
         awaitIdle(vm)
         assertEquals("TEST_RETRYABLE", vm.form.value.errorCode)
@@ -134,7 +134,7 @@ class SetupConnectionTest {
     fun fatalUnknownMapsToFailed() {
         val fake = FakeListProvider(failure = ProviderFailure(false, "weird"))
         val (vm, _) = newVm(fake)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.testConnection()
         awaitIdle(vm)
         assertEquals("TEST_FAILED", vm.form.value.errorCode)
@@ -150,7 +150,7 @@ class SetupConnectionTest {
             ),
         )
         val (vm, _) = newVm(fake)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.testConnection()
         awaitIdle(vm)
         assertEquals("TEST_TOO_LARGE", vm.form.value.errorCode)
@@ -163,7 +163,7 @@ class SetupConnectionTest {
             failure = ProviderFailure(false, "TOO_LARGE provider model-list response"),
         )
         val (vm, _) = newVm(fake)
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.testConnection()
         awaitIdle(vm)
         assertEquals("TEST_FAILED", vm.form.value.errorCode)
@@ -183,7 +183,7 @@ class SetupConnectionTest {
     @Test
     fun testResultClearsOnInputChange() {
         val (vm, _) = newVm()
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("unit-test-key-123")
         vm.testConnection()
         awaitIdle(vm)
         assertEquals(2, vm.form.value.testModels)
@@ -197,12 +197,12 @@ class SetupConnectionTest {
         var captured: CharArray? = null
         val keys = KeyProvider { ref ->
             assertEquals("provider_key/preset:openai", ref)
-            captured = "sk-test-key-123".toCharArray()
+            captured = "unit-test-key-123".toCharArray()
             captured!!
         }
         runBlocking {
             val got = keys.keyFor("provider_key/preset:openai")
-            assertEquals("sk-test-key-123", String(got!!))
+            assertEquals("unit-test-key-123", String(got!!))
             got.fill('\u0000')
             assertTrue(captured!!.all { it == '\u0000' })
         }

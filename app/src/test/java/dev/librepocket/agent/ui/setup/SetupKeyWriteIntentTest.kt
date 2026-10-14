@@ -250,6 +250,42 @@ class SetupKeyWriteIntentTest {
     }
 
     @Test
+    fun keepExistingConfirmSuccessIsMetadataOnly() {
+        // S6：KEEP_EXISTING confirm 成功為 metadata-only：live ref 保留、
+        // hasKey==1（存在性前提，僅確認存在）、get/put/delete==0。
+        val vault = CountingVault()
+        val store = newStore()
+        runBlocking {
+            vault.putKey("preset:openai", "test-key-123".toCharArray())
+            store.save(openAiConfig())
+        }
+        val putsBefore = vault.putKeys
+        val vm = newVm(store, vault, VerdictPolicy(Verdict.ASK))
+        vm.prefillForEdit(openAiConfig())
+        vm.onModelChange("m-new-keep")
+        vm.save()
+        awaitDialog(vm)
+        assertEquals(KeyWriteIntent.KEEP_EXISTING, vm.form.value.pendingKeyWriteIntent)
+        vm.confirmKeyWriteSave()
+        awaitSettled(vm)
+        assertNull(vm.form.value.errorCode)
+        assertTrue(vm.form.value.saved)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertNull(vm.form.value.pendingKeyWriteIntent)
+        assertNull(vm.form.value.confirmSummary)
+        assertEquals(putsBefore, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(1, vault.hasKeys)
+        runBlocking {
+            val live = store.snapshotStrict()
+            assertEquals("provider_key/preset:openai", live?.apiKeyRef)
+            assertEquals("m-new-keep", live?.model)
+        }
+        assertEquals("m-new-keep", vm.form.value.model)
+    }
+
+    @Test
     fun confirmReplayWritesOnce() {
         // 順序重放（非併發）：consume-once，第二次為 early-return（dialog 已關），
         // 單寫且 intent/summary 已清；前後 freshCalls 皆 5（第二次零 policy I/O）。
@@ -292,7 +328,7 @@ class SetupKeyWriteIntentTest {
         }
         vm.save()
         assertTrue(entered.await(10, TimeUnit.SECONDS))
-        vm.onApiKeyChange("sk-edited-key-456")
+        vm.onApiKeyChange("unit-test-key-456")
         release.countDown()
         awaitSettled(vm)
         assertFalse(vm.form.value.confirmKeyWrite)

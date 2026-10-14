@@ -12,6 +12,7 @@ import dev.librepocket.chat.ApprovalRequiredException
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
+import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.policy.Verdict
 import dev.librepocket.session.SessionStore
 import dev.librepocket.session.TranscriptEvent
@@ -64,8 +65,11 @@ private data class KeyReadConsent(
     val resource: String,
     val providerId: String,
     val effectiveBaseUrl: String,
+    val origin: String,
+    val protocol: ProviderProtocol,
     val apiKeyRef: String,
     val configRevision: Long,
+    val model: String,
 )
 
 /**
@@ -303,6 +307,10 @@ class ChatViewModel(
      * affordance showing the immutable binding snapshot is wired.
      */
     suspend fun confirmKeyRead(): Boolean {
+        // Capture identity before the IO read: an invalidation clearing or
+        // replacing the endpoint during the read (newChat/open/logout) must
+        // stop this mint. Returning false keeps the consent absent.
+        val startedGeneration = lifecycleGeneration
         val endpoint = try {
             readEndpoint()
         } catch (cancelled: CancellationException) {
@@ -310,16 +318,22 @@ class ChatViewModel(
         } catch (_: Exception) {
             return false
         } ?: return false
+        if (!isGenerationCurrent(startedGeneration)) return false
         val binding = bindingOf(endpoint) ?: return false
+        if (!isGenerationCurrent(startedGeneration)) return false
         val consent = KeyReadConsent(
             action = "key.read",
             resource = binding.providerId,
             providerId = binding.providerId,
             effectiveBaseUrl = binding.effectiveBaseUrl,
+            origin = binding.origin,
+            protocol = binding.protocol,
             apiKeyRef = binding.apiKeyRef,
             configRevision = binding.configRevision,
+            model = binding.model,
         )
         synchronized(keyReadConsentLock) {
+            if (!isGenerationCurrent(startedGeneration)) return false
             pendingKeyReadConsent = consent
         }
         return true
@@ -343,8 +357,11 @@ class ChatViewModel(
         if (consent.resource != consent.providerId) return false
         return consent.providerId == binding.providerId &&
             consent.effectiveBaseUrl == binding.effectiveBaseUrl &&
+            consent.origin == binding.origin &&
+            consent.protocol == binding.protocol &&
             consent.apiKeyRef == binding.apiKeyRef &&
-            consent.configRevision == binding.configRevision
+            consent.configRevision == binding.configRevision &&
+            consent.model == binding.model
     }
 
     fun send() {

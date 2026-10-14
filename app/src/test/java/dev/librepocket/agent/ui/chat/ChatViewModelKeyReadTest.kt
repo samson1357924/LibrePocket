@@ -79,7 +79,7 @@ class ChatViewModelKeyReadTest {
     }
 
     private fun newStore(): EndpointStore {
-        val dir = Files.createTempDirectory("keyread-ask-test").toFile()
+        val dir = Files.createTempDirectory("keyread-atest").toFile()
         tmpDirs.add(dir)
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         dataScopes.add(scope)
@@ -123,8 +123,8 @@ class ChatViewModelKeyReadTest {
     ): ChatViewModel {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
-            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
-            vault.putKey("preset:custom", "sk-test-key-456".toCharArray())
+            vault.putKey("preset:openai", "test-key-123".toCharArray())
+            vault.putKey("preset:custom", "test-key-456".toCharArray())
         }
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
@@ -269,7 +269,7 @@ class ChatViewModelKeyReadTest {
                 throw IllegalStateException("synthetic policy read failure")
         }
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        runBlocking { vault.putKey("preset:openai", "test-key-123".toCharArray()) }
         val factory = ChatSessionFactory(
             policy = InMemoryPolicyStore(),
             vaultSource = VaultSource { vault },

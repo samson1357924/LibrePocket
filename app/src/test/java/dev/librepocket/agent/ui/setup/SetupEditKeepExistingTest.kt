@@ -166,7 +166,7 @@ class SetupEditKeepExistingTest {
         val store = newStore()
         val vault = CountingVault(EncryptedPrefsVault(InMemoryPrefs()))
         runBlocking {
-            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:openai", "test-key-123".toCharArray())
             store.save(openAiConfig())
         }
         val putsBefore = vault.putKeys
@@ -210,7 +210,7 @@ class SetupEditKeepExistingTest {
             apiKeyRef = "provider_key/preset:custom",
         )
         runBlocking {
-            vault.putKey("preset:custom", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:custom", "test-key-123".toCharArray())
             store.save(custom)
         }
         val vm = newVm(store, vault, VerdictPolicy(Verdict.ALLOW)) { _, _ ->
@@ -233,7 +233,7 @@ class SetupEditKeepExistingTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         val fake = SlowThenFastListProvider()
         val vm = newVm(store, vault, VerdictPolicy(Verdict.ALLOW)) { _, _ -> fake }
-        vm.onApiKeyChange("sk-test-key-aaa-123")
+        vm.onApiKeyChange("test-key-aaa-123")
         vm.testConnection()
         assertTrue(vm.form.value.testing)
         // Deterministic gate: wait until the slow attempt has ENTERED
@@ -243,7 +243,7 @@ class SetupEditKeepExistingTest {
         assertTrue("slow attempt never entered", fake.entered.await(10, TimeUnit.SECONDS))
         // Identity/key edit while the slow attempt is blocked, then a fresh
         // attempt with the new key: the slow attempt must not overwrite it.
-        vm.onApiKeyChange("sk-test-key-bbb-123")
+        vm.onApiKeyChange("test-key-bbb-123")
         vm.testConnection()
         // Release slow AFTER fast launched so slow always finishes last: pre-A2
         // overwrites to 5 (RED), post-A2 discards to 2 (GREEN).
@@ -269,7 +269,7 @@ class SetupEditKeepExistingTest {
         val vm = newVm(store, vault, VerdictPolicy(Verdict.ALLOW)) { _, _ ->
             error("no provider needed") as LlmProvider
         }
-        vm.onApiKeyChange("sk-test-key-123")
+        vm.onApiKeyChange("test-key-123")
         val before = vm.form.value.modelRefreshRevision
         val testBefore = vm.form.value.testConnectionRevision
         // Model edits are out of scope for the identity/key fence (#17): they
@@ -278,7 +278,7 @@ class SetupEditKeepExistingTest {
         assertEquals(before, vm.form.value.modelRefreshRevision)
         assertEquals(testBefore, vm.form.value.testConnectionRevision)
         assertEquals("my-custom-model", vm.form.value.model)
-        vm.onApiKeyChange("sk-test-key-456")
+        vm.onApiKeyChange("test-key-456")
         assertTrue(vm.form.value.modelRefreshRevision != before)
         assertTrue(vm.form.value.testConnectionRevision != testBefore)
     }
@@ -288,7 +288,7 @@ class SetupEditKeepExistingTest {
         val store = newStore()
         val vault = CountingVault(EncryptedPrefsVault(InMemoryPrefs()))
         runBlocking {
-            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:openai", "test-key-123".toCharArray())
             store.save(openAiConfig())
         }
         val vm = newVm(store, vault, VerdictPolicy(Verdict.ASK)) { _, _ ->
@@ -423,7 +423,7 @@ class SetupEditKeepExistingTest {
         val store = newStore()
         val vault = CountingVault(EncryptedPrefsVault(InMemoryPrefs()))
         runBlocking {
-            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:openai", "test-key-123".toCharArray())
             store.save(openAiConfig())
         }
         val vm = newVm(store, vault, VerdictPolicy(Verdict.ALLOW)) { _, _ ->

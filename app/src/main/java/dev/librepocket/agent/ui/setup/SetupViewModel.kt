@@ -572,7 +572,7 @@ class SetupViewModel(
             val baseline = editBaseline ?: return SetupValidation.KeyMode.NEW
             val providerId = SetupValidation.deriveProviderId(form.presetId)
             if (providerId != baseline.providerId) return SetupValidation.KeyMode.NEW
-            if (effectiveBaseUrlOf(form) != baseline.baseUrl) return SetupValidation.KeyMode.NEW
+            if (effectiveBaseUrlOf(form).trim() != baseline.baseUrl.trim()) return SetupValidation.KeyMode.NEW
             return SetupValidation.KeyMode.EDIT_KEEP_EXISTING
         } catch (_: Exception) {
             return SetupValidation.KeyMode.NEW

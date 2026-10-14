@@ -2,6 +2,10 @@ package dev.librepocket.shell
 
 import dev.librepocket.files.FileScope
 import dev.librepocket.tool.Flavor
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Paths
+import java.nio.file.attribute.BasicFileAttributes
 
 /**
  * 受限 shell 策略（BACKLOG D05，矩陣「終端命令」行）。
@@ -10,6 +14,13 @@ import dev.librepocket.tool.Flavor
  *  （argv 直接交 [ProcessRunner]，不拼字串、不走 `sh -c`）。
  * - 黑名單先於白名單判定：`rm -rf /` 類必須回 [ShellDeny.BLACKLISTED]，
  *   而不是普通的「不在白名單」。
+ * - 操作數實體解析門（B1，#9 有界切片）：絕對路徑先過 [FileScope.decide]
+ *   詞法門，通過後再走實體門（逐段 NOFOLLOW 三態拒絕＋未知即拒 +
+ *   存在即 `toRealPath()` 重裁＋real 身分獨立；任何失敗 fail-closed 拒絕）。
+ *   直接／提權／guest host-tree 同門，不共享詞法 allow 就放行。
+ *   Java 無 `O_NOFOLLOW`／`openat`：逐段 lstat 與 `toRealPath` 之間、
+ *   驗證與實際 open/spawn 之間仍有併發 `rename`／`symlink` 替換窗口，
+ *   本門只能縮窗、不能消除（殘餘 TOCTOU，見 [checkPhysicalOperandGate]）。
  * - 本檔案零 Android 依賴，JVM 單測可直接斷言 [validate]。
  */
 object ShellPolicy {
@@ -199,13 +210,15 @@ object ShellPolicy {
     }
 
     /**
-     * 純函數校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ 白名單
+     * 校驗：依次判空 → 黑名單（二進位/全文片段/特殊字元）→ 白名單
      * → argv[0] 可信路徑門（同名不同路徑封堵，詞法；僅直接通道，
      *   guest 跳過——guest argv[0] 是容器命名空間路徑）→ find 高危謂詞
-     * → 檔案域（絕對路徑經 [FileScope.decide]）。
+     * → 檔案域（絕對路徑經 [FileScope.decide] 詞法門 + [checkPhysicalOperandGate]
+     *   實體門；B1）。
      * 呼叫方（[RestrictedShell]）必須先調此函數，拒絕時不得建子進程；
      * 放行後仍須經 [ShellExecutables.resolve] 把 `argv[0]` 換成驗證後絕對路徑
-     * 再 spawn（本函數不管落地實體，純詞法）。
+     * 再 spawn（argv[0] 落地實體由 resolve 側驗；操作數實體由本函數實體門驗，
+     * 驗→用窗口殘餘見 [checkPhysicalOperandGate]）。
      *
      * @param allowedBinaries 白名單集合（預設 [ALLOWED_BINARIES]；S4
      *   `linux.exec` 傳聯集，黑名單/參數衛生/find 封堵/檔案域邏輯完全繼承，
@@ -226,8 +239,12 @@ object ShellPolicy {
      *   [ShellExecutables.TRUSTED_BIN_DIRS]；產品碼一律用預設值，單測可注入
      *   暫存目錄以覆蓋絕對 `argv[0]` 的全鏈路徑，呼叫方須同步把同表傳給
      *   [ShellExecutables.resolve] 的 `searchDirs`）。
+     *
+     * 測試接縫：[preRealPathHook] 僅供單測在步驟 1 後置換路徑段（見
+     * [checkPhysicalOperandGate]）；生產一律經公開 [validate]（無注入點，
+     * 內轉調本函數傳 null）。
      */
-    fun validate(
+    fun validateInternal(
         argv: List<String>,
         privateRoot: String? = null,
         safRoots: List<String> = emptyList(),
@@ -236,6 +253,7 @@ object ShellPolicy {
         allowedBinaries: Set<String> = ALLOWED_BINARIES,
         isGuest: Boolean = false,
         trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
@@ -317,10 +335,26 @@ object ShellPolicy {
             isElevated = false,
             allowedBinaries = allowedBinaries,
             isGuest = isGuest,
+            preRealPathHook = preRealPathHook,
         )
         if (pathDenial != null) return pathDenial
         return Validation.Allowed(base)
     }
+
+    /**
+     * 公開直接通道校驗（無注入點；生產呼叫方一律走此函數）。
+     * 本體單行委派 [validateInternal]（`preRealPathHook = null`）。
+     */
+    fun validate(
+        argv: List<String>,
+        privateRoot: String? = null,
+        safRoots: List<String> = emptyList(),
+        flavor: Flavor = Flavor.PLAY,
+        bridgeGranted: Boolean = false,
+        allowedBinaries: Set<String> = ALLOWED_BINARIES,
+        isGuest: Boolean = false,
+        trustedBinDirs: List<String> = ShellExecutables.TRUSTED_BIN_DIRS,
+    ): Validation = validateInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, allowedBinaries, isGuest, trustedBinDirs, null)
 
     /**
      * 提權通道校驗（S3，BACKLOG D09，矩陣 §3）。
@@ -336,14 +370,18 @@ object ShellPolicy {
      *
      * 預設 [flavor] 為 PLAY（fail-closed：未指明風味時跨域一律拒；
      * 自裝風味呼叫方必須顯式傳 FOSS/GITHUB + bridgeGranted）。
+     *
+     * 測試接縫：[preRealPathHook] 僅供單測在步驟 1 後置換路徑段；生產一律經公開
+     * [validateElevated]（無注入點，內轉調本函數傳 null）。
      */
-    fun validateElevated(
+    fun validateElevatedInternal(
         argv: List<String>,
         privateRoot: String? = null,
         safRoots: List<String> = emptyList(),
         flavor: Flavor = Flavor.PLAY,
         bridgeGranted: Boolean = false,
         isGuest: Boolean = false,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation {
         if (argv.isEmpty() || argv.all { it.isBlank() }) {
             return Validation.Denied(ShellDeny.EMPTY_COMMAND, "empty command")
@@ -400,10 +438,24 @@ object ShellPolicy {
             isElevated = true,
             allowedBinaries = ALLOWED_BINARIES,
             isGuest = isGuest,
+            preRealPathHook = preRealPathHook,
         )
         if (pathDenialElevated != null) return pathDenialElevated
         return Validation.Allowed(base)
     }
+
+    /**
+     * 公開提權通道校驗（無注入點；生產呼叫方一律走此函數）。
+     * 本體單行委派 [validateElevatedInternal]（`preRealPathHook = null`）。
+     */
+    fun validateElevated(
+        argv: List<String>,
+        privateRoot: String? = null,
+        safRoots: List<String> = emptyList(),
+        flavor: Flavor = Flavor.PLAY,
+        bridgeGranted: Boolean = false,
+        isGuest: Boolean = false,
+    ): Validation = validateElevatedInternal(argv, privateRoot, safRoots, flavor, bridgeGranted, isGuest, null)
 
     /**
      * 宿主外掛點前綴（guest 容器內路徑豁免的例外，縱深保留拒絕）：
@@ -447,6 +499,17 @@ object ShellPolicy {
         }
         return emptyList()
     }
+
+    /**
+     * 原始操作數是否含 `..` 段（F1 fail-closed，不先做詞法 normalize 折疊）。
+     *
+     * spawn 用原始操作數（[RestrictedShell] 不重寫操作數），詞法折疊後再驗會把
+     * `/scope/sub/../outside`（`sub` 為指域外 symlink）誤判為域內，故驗側必須
+     * 嚴於用側：原始字串以 `/` 切段含 `..` 即拒（與 [FileScope] 詞法門一致的
+     * 拒絕語義）。
+     */
+    private fun hasDotDotSegment(rawCandidate: String): Boolean =
+        rawCandidate.split('/').any { it == ".." }
 
     /**
      * 相對路徑值是否像路徑（P0 fail-closed，PR#1 review blocker）：
@@ -507,6 +570,7 @@ object ShellPolicy {
         isElevated: Boolean,
         allowedBinaries: Set<String>,
         isGuest: Boolean = false,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
         // grep 顯式 pattern 旗標預掃：-e/--regexp/-f 存在時無 positional pattern 槽。
         var grepPatternSeen = (base != "grep")
@@ -538,16 +602,33 @@ object ShellPolicy {
                 )
             }
             for (candidate in absoluteCandidates(arg)) {
+                // F1：原始操作數含 `..` 段即 fail-closed 拒絕（不先做詞法 normalize
+                // 折疊；拒絕訊息帶原因碼 DOTDOT）。spawn 用原始操作數，故驗側嚴於
+                // 用側；guest 容器內路徑亦同門先判，不因 `continue` 放行。
+                // belt-and-suspenders：內層 checkFileScope／checkFileScopeElevated／
+                // checkPhysicalOperandGate 重檢同條件，刻意冗餘，刪任一層需同步更新測試。
+                if (hasDotDotSegment(candidate)) {
+                    return Validation.Denied(
+                        ShellDeny.BLACKLISTED,
+                        "dotdot segment denied (reason=DOTDOT): $candidate",
+                    )
+                }
                 // Guest 容器內路徑（PR#1 blocker 2）：isGuest 且作用域已知時，
                 // 宿主樹外的絕對路徑是容器內路徑，直接放行（proot -r 約束；
                 // host inbox 前綴另由執行入口擋，外掛點由下式保留拒絕）。
+                // B1 揭露：容器內路徑是 guest namespace，宿主實體門無法同門驗證
+                // （宿主 FS 上無對應實體，無法 `toRealPath` 重裁）；其邊界是
+                // `proot -r rootfs` 無 bind 約束 + 執行入口的 host 樹封堵
+                // （`LinuxInboxStager.hostLinuxAbsoluteRef`／`unstagedInboxRef`）
+                // + spawn 持同容器鎖（見 `ProotExec.execute`），宿主 symlink 語義
+                // 不適用。容器內 symlink／TOCTOU 殘餘見 `ProotExec` KDoc。
                 if (isGuest && privateRoot != null && isContainerInternalPath(candidate, privateRoot)) {
                     continue
                 }
                 val denial = if (isElevated) {
-                    checkFileScopeElevated(candidate, privateRoot, safRoots, flavor, bridgeGranted)
+                    checkFileScopeElevated(candidate, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
                 } else {
-                    checkFileScope(candidate, privateRoot, safRoots, flavor, bridgeGranted)
+                    checkFileScope(candidate, privateRoot, safRoots, flavor, bridgeGranted, preRealPathHook)
                 }
                 if (denial != null) return denial
             }
@@ -711,14 +792,24 @@ object ShellPolicy {
         return null
     }
 
-    /** 絕對路徑經 [FileScope.decide]；跨域 / 需橋接 / 無作用域一律拒絕。 */
+    /** 絕對路徑經 [FileScope.decide]；跨域 / 需橋接 / 無作用域一律拒絕。
+     * 詞法通過後再走實體解析門（見 [checkPhysicalOperandGate]；B1）。
+     * 原始含 `..` 段先 fail-closed 拒（見 [hasDotDotSegment]），不依賴折疊後詞法。 */
     private fun checkFileScope(
         path: String,
         privateRoot: String?,
         safRoots: List<String>,
         flavor: Flavor,
         bridgeGranted: Boolean,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
+        // 刻意冗餘：外層 checkPathArgs 已先拒同條件（見 checkPathArgs 內 hasDotDotSegment 外層檢查）；保留作縱深。
+        if (hasDotDotSegment(path)) {
+            return Validation.Denied(
+                ShellDeny.BLACKLISTED,
+                "dotdot segment denied (reason=DOTDOT): $path",
+            )
+        }
         if (privateRoot == null) {
             return Validation.Denied(
                 ShellDeny.BLACKLISTED,
@@ -732,6 +823,184 @@ object ShellPolicy {
                 "cross-domain denied: $path",
             )
         }
+        return checkPhysicalOperandGate(
+            candidate = path,
+            privateRoot = privateRoot,
+            safRoots = safRoots,
+            flavor = flavor,
+            bridgeGranted = bridgeGranted,
+            isElevated = false,
+            preRealPathHook = preRealPathHook,
+        )
+    }
+
+    /** lstat 三態：LINK（是連結）／PRESENT（存在非連結）／ABSENT（確定缺席）／UNKNOWN（不可判定，fail-closed）。 */
+    private enum class LstatState { LINK, PRESENT, ABSENT, UNKNOWN }
+
+    /**
+     * NOFOLLOW 讀屬性三態（fail-closed：不可判定即 UNKNOWN，不當缺席）。
+     * [Files.isSymbolicLink] 不可判定回 false、exists 步 EACCES 回 false 皆會把
+     * unknown 當 nonexistent 而降級，提權通道（權限高於檢查者）可繞行，故此處
+     * 以 `readAttributes(NOFOLLOW)` 區分：[NoSuchFileException] 才為 ABSENT，
+     * 含 `AccessDeniedException`／`SecurityException`／I/O 未知一律 UNKNOWN。
+     */
+    private fun lstatNoFollow(path: java.nio.file.Path): LstatState {
+        return try {
+            val attrs = Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+            if (attrs.isSymbolicLink) LstatState.LINK else LstatState.PRESENT
+        } catch (_: java.nio.file.NoSuchFileException) {
+            LstatState.ABSENT
+        } catch (_: Exception) {
+            LstatState.UNKNOWN
+        }
+    }
+
+    /**
+     * 實體解析門（B1，#9 有界切片；直接／提權／guest host-tree 同門）。
+     *
+     * 前提：呼叫方已過 [FileScope.decide] 詞法門（本函數不放寬詞法拒絕）。
+     * `..` 拒絕政策：原始操作數含 `..` 段一律 fail-closed 拒絕，不先做詞法
+     * normalize 折疊（spawn 用原始操作數，故驗側嚴於用側；與 [FileScope] 詞法門
+     * 一致的拒絕語義；拒絕訊息帶原因碼 `DOTDOT`）。
+     * 步驟（fail-closed，任一步失敗即拒）：
+     * 0. `..` 段檢查（見上）：原始字串以 `/` 切段含 `..` 即拒；含反斜線 `\` 即拒（見 F-backslash，Linux 語義）。
+     *    例外：guest 容器內路徑在外層先 `continue` 跳過本門（含 backslash 門），
+     *    由容器邊界（proot -r 無 bind＋host 樹封堵＋同容器鎖）覆蓋，宿主無逃逸。
+     * 1. 逐段 symlink 拒絕（三態＋未知即拒）：候選全鏈（`/` 至本體）與 [privateRoot]
+     *    全鏈逐段 [lstatNoFollow]（NOFOLLOW，不跟隨）；LINK 即拒（含懸空連結），
+     *    UNKNOWN 即拒（`AccessDeniedException`／`SecurityException`／I/O 未知
+     *    （含 NotDirectory／瞬時 I/O 錯），關閉 EACCES 混同為缺席的繞行；ABSENT 等同舊 false 語義繼續，PRESENT 繼續；
+     *    超深仍拒）。提權注記：app UID 不可判定者雙通道皆拒，需提權側預檢者走
+     *    Refs #10 follow-up（刻意不在本 PR 碰 github source set）。
+     * 2. 存在即 `toRealPath()` 全解析固定，再驗 real 身分獨立條件＋同語義重裁
+     *    [FileScope.decide]（[isElevated] 為 true 時沿提權語義
+     *    `allowed==true` 即放行，否則要求 `allowed && !needsBridge`）；
+     *    兩條件獨立且皆須通過（不得經連結 AND real 授權）：`real != normCandidate`
+     *    即拒（未經連結則 real 恆等於正規候選；提權橋已授權亦不放寬 symlink
+     *    operand），real 逃出詞法域即拒；解析抛異常即拒。存在判定三態
+     *    （[lstatNoFollow]；懸空視為 LINK 早在步驟1即拒，此僅縱深）。
+     *    併發 delete（消失）降級為允許但 spawn 將 ENOENT（無逃逸）；併發 swap
+     *    （仍存在但指別處）經 real 身分條件拒。
+     * 3. 確定缺席才降級為第 1 步（父鏈 symlink Walk）：ABSENT 才回 null，
+     *    不以 `NoSuchFileException` 誤殺合法未建檔查詢（如 `ls` 未建檔名、
+     *    單測假根）；LINK 即拒，UNKNOWN 即拒（未知即拒，不降級）；
+     *    其殘餘（檢查後建鏈、父目錄被換）見下。
+     *    hardlink／mount 不改字串故仍走舊語義（列 out-of-scope，與 ScopedFileStore 同）。
+     *
+     * 誠實揭露（Java 無 `O_NOFOLLOW`／`openat`，TOCTOU 只能縮窗不能消除）：
+     * 逐段 lstat → `toRealPath` → 實際 open／spawn 非原子，驗證與使用之間
+     * 攻擊者仍可能以 `rename`／`symlink` 替换路徑段（單次替換多數轉為下次
+     * 調用拒絕，雙重替換〈驗→換入連結→用→換回〉仍可能穿出）；併發替換不在
+     * 本門消除承諾內。訊息只攜詞法候選，不內插實體路徑（不洩敏）。
+     *
+     * hardlink 揭露：本門不解 hardlink；同 FS 域內 hardlink 指到域外（硬連結
+     * 指向域外 inode）在承諾外，不在消除保證內。
+     * 遞迴後代揭露（Refs #9；殘餘列 out-of-scope，不擋跟隨旗標的理由見下）：
+     * 本門只驗操作數本鏈，不驗遞迴走訪的後代（find/du/ls -R、grep -r 在 spawn 後
+     * 走訪後代，後代內 interior symlink + 跟隨旗標〈find -L、grep -R（含
+     * --dereference-recursive）等，ls/stat/du -L（含 --dereference）等〉可讀域外；
+     * 註：find -H 僅跟隨命令列參數、不跟隨 interior 後代，不在此列；find 預設 -P
+     * 不跟隨。Android 實為 toybox applet 語義，旗標可用性未經裝置驗證）。
+     * interior link 需併發植入或帶外植入；直接通道 `ln` 不在允許命令內
+     * （ALLOWED_BINARIES 無 ln），直接通道模型無法直接建鏈，但 guest 通道
+     * python3/tar/unzip 可在容器內建鏈（見 ProotExec KDoc 容器內殘餘）。
+     * 不擋 -L/-R 的理由：擋 grep -R 將誤殺合法遞迴、有可用性成本，已超本次
+     * 有界切片；未來以工作區無 symlink 不變量或遞迴白名單收斂（Refs #9
+     * follow-up）。提權（Root/Shizuku，見 app/src/github）走同一門
+     * （isElevated=true），同殘餘適用，其 Failed 去路徑化等收斂見 Refs #10
+     * follow-up（刻意不在本 PR 碰 github source set）。
+     * F-NORMWALK：步驟 1 walk 的對象為 [FileScope.normalize] 後鏈，原始 `..`
+     * 由步驟 0 先拒，順序不可調換（先 normalize 再驗 `..` 會把
+     * `/scope/sub/../outside` 誤判為域內，見 F1）。
+     * 段間競態點名：逐段 lstat 非原子，中間段跟隨檢查、前段驗過仍可被
+     * `rename` 換掉；段間安全網僅為終態 `toRealPath()`＋重裁，僅反映 toRealPath() 呼叫瞬間終態，不與逐段 lstat 原子一致，中間段在兩次檢查之間仍可被 rename 換掉。
+     * mount／bind 不解（與 hardlink 同為 out-of-scope：`toRealPath()` 不解
+     * mount，bind 到域外仍顯示域內）。
+     *
+     * 測試接縫：[preRealPathHook] 在步驟 1 迴圈後、exists 步前調用（預設 null，
+     * 生產行為零變；測試用來在 lstat 後、toRealPath 前置換路徑段）。
+     */
+    private fun checkPhysicalOperandGate(
+        candidate: String,
+        privateRoot: String,
+        safRoots: List<String>,
+        flavor: Flavor,
+        bridgeGranted: Boolean,
+        isElevated: Boolean,
+        preRealPathHook: (() -> Unit)? = null,
+    ): Validation.Denied? {
+        fun deny(reason: String): Validation.Denied =
+            Validation.Denied(ShellDeny.BLACKLISTED, reason)
+        // F-backslash：候選含 `\` 即拒。FileScope.normalize 會把 `\` 轉 `/`（Windows 相容口徑），
+        // 但 Linux/Android 上 `\` 是合法檔名字元、非分隔符；門若驗 normalize 後路徑、
+        // spawn 用原始操作數，即驗用分叉。Linux 檔名含 `\` 極罕見，fail-closed 誤殺可接受。
+        if (candidate.contains('\\')) {
+            return deny("backslash denied (fail-closed, no normalization): $candidate")
+        }
+        // 0. F1：原始含 `..` 即拒，不先做詞法 normalize 折疊。
+        // 刻意冗餘：外層 checkPathArgs 已先拒同條件（見 checkPathArgs 內 hasDotDotSegment 外層檢查）；保留作縱深。
+        if (hasDotDotSegment(candidate)) {
+            return deny("dotdot segment denied (reason=DOTDOT): $candidate")
+        }
+        // 1. 逐段 NOFOLLOW 三態：候選鏈 + 私有根鏈（防別名根讓詞法前綴失效）。
+        // LINK→deny(symlink denied)；UNKNOWN→deny(symlink check failed)；
+        // ABSENT/PRESENT→繼續（ABSENT 等同舊 false 語義；PRESENT 繼續；超深仍拒）。
+        for (target in listOf(candidate, privateRoot)) {
+            val norm = try {
+                FileScope.normalize(target)
+            } catch (_: Exception) {
+                return deny("symlink check failed: $candidate")
+            }
+            if (!norm.startsWith("/")) return deny("symlink check failed: $candidate")
+            val parts = norm.split("/").filter { it.isNotEmpty() }
+            var cur = "/"
+            // 根自身先驗（罕見但 fail-closed；三態）。
+            when (lstatNoFollow(Paths.get(cur))) {
+                LstatState.LINK -> return deny("symlink denied: $candidate")
+                LstatState.UNKNOWN -> return deny("symlink check failed: $candidate")
+                LstatState.ABSENT, LstatState.PRESENT -> Unit
+            }
+            for (seg in parts) {
+                cur = if (cur == "/") "/$seg" else "$cur/$seg"
+                when (lstatNoFollow(Paths.get(cur))) {
+                    LstatState.LINK -> return deny("symlink denied: $candidate")
+                    LstatState.UNKNOWN -> return deny("symlink check failed: $candidate")
+                    LstatState.ABSENT, LstatState.PRESENT -> Unit
+                }
+                // 步數上限外的超深路徑 fail-closed（不應發生，防病態輸入）。
+                if (cur.length > 4096) return deny("symlink check failed: $candidate")
+            }
+        }
+        // 測試 seam：步驟 1 迴圈後、exists 步前調用（lstat 後置換路徑段用）。
+        preRealPathHook?.invoke()
+        // 2./3. 三態 exists＋實體固定 + 同語義重裁；確定缺席才降級（見 KDoc）。
+        val normCandidate = try {
+            FileScope.normalize(candidate)
+        } catch (_: Exception) {
+            return deny("symlink check failed: $candidate")
+        }
+        when (lstatNoFollow(Paths.get(normCandidate))) {
+            LstatState.ABSENT -> return null
+            LstatState.LINK -> return deny("symlink denied: $candidate")
+            LstatState.UNKNOWN -> return deny("symlink check failed: $candidate")
+            LstatState.PRESENT -> Unit
+        }
+        val real = try {
+            Paths.get(normCandidate).toRealPath().toString()
+        } catch (_: Exception) {
+            return deny("symlink check failed: $candidate")
+        }
+        // F3/WARN1 elevated real 身分獨立條件（雙通道）：未經連結則 real 恆等於
+        // 正規候選；經連結（lstat 後換入跨域 symlink）即使橋接已授權亦拒。
+        // hardlink/mount 不改字串故仍走舊語義；併發 rename 到他處轉為拒絕。
+        if (real != normCandidate) return deny("real identity mismatch (symlink/rename, fail-closed): $candidate")
+        val realDecision = try {
+            FileScope.decide(real, privateRoot, safRoots, flavor, bridgeGranted)
+        } catch (_: Exception) {
+            return deny("cross-domain denied: $candidate")
+        }
+        val realOk = if (isElevated) realDecision.allowed else (realDecision.allowed && !realDecision.needsBridge)
+        if (!realOk) return deny("cross-domain denied: $candidate")
         return null
     }
 
@@ -742,6 +1011,8 @@ object ShellPolicy {
      * needsBridge 且已授權（[FileScope.decide] 內已按風味與
      * bridgeGranted 裁決，`allowed == true` 即放行條件）才放行，
      * 其餘跨域仍拒。無作用域（privateRoot == null）fail-closed。
+     * 詞法通過後再走同一實體解析門（見 [checkPhysicalOperandGate]；
+     * B1：提權不共享詞法 allow 就放行，real 同樣按提權語義重裁）。
      */
     private fun checkFileScopeElevated(
         path: String,
@@ -749,7 +1020,15 @@ object ShellPolicy {
         safRoots: List<String>,
         flavor: Flavor,
         bridgeGranted: Boolean,
+        preRealPathHook: (() -> Unit)? = null,
     ): Validation.Denied? {
+        // 刻意冗餘：外層 checkPathArgs 已先拒同條件；保留作縱深（與 checkFileScope/checkPhysicalOperandGate 同）。
+        if (hasDotDotSegment(path)) {
+            return Validation.Denied(
+                ShellDeny.BLACKLISTED,
+                "dotdot segment denied (reason=DOTDOT): $path",
+            )
+        }
         if (privateRoot == null) {
             return Validation.Denied(
                 ShellDeny.BLACKLISTED,
@@ -757,7 +1036,15 @@ object ShellPolicy {
             )
         }
         val decision = FileScope.decide(path, privateRoot, safRoots, flavor, bridgeGranted)
-        if (decision.allowed) return null
+        if (decision.allowed) return checkPhysicalOperandGate(
+            candidate = path,
+            privateRoot = privateRoot,
+            safRoots = safRoots,
+            flavor = flavor,
+            bridgeGranted = bridgeGranted,
+            isElevated = true,
+            preRealPathHook = preRealPathHook,
+        )
         return Validation.Denied(
             ShellDeny.BLACKLISTED,
             "cross-domain denied: $path",

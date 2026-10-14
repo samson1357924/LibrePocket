@@ -231,9 +231,10 @@ class ProviderTransportC1Test {
      * `AGG_TOO_LARGE` terminal, with early abort (consumed well below the
      * ~1.2 MiB queued body), no `Done`/`ToolDone`, and a single wire request.
      *
-     * Latch math: each value is 4096 chars; the joined payload trips when
-     * (pending + value + separators) x3 exceeds 1 MiB, i.e. by the 86th line
-     * at the latest (86 x 4096 = 352256 chars, separators only trip earlier).
+     * Latch math: each value is 4096 chars; the joined payload trips at the
+     * 86th line (86 x 4096 = 352256 chars, separators only trip earlier).
+     * Code uses 87 as a conservative upper bound (+1) so the early-read
+     * budget never underestimates the trip point.
      * Wire bytes before the latch are therefore at most 86 x ("data: " + 4096
      * + "\n") = 86 x 4103, plus the in-flight chunks the pump already pulled.
      */

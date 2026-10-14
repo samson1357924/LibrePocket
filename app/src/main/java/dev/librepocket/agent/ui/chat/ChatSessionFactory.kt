@@ -1151,6 +1151,11 @@ class ChatSessionFactory(
  * unaffected. This over-flags plain truncated ledgers by design (safe
  * direction); the omission stays observable via `droppedCount`.
  *
+ * S4-F4(b): a prior prune that deleted rows ([SessionStore.isPruneSuspect])
+ * forces the same conservative all-flag even when `droppedCount==0` (the
+ * keep-newest prune may have cut a marker-first pair: marker pruned,
+ * assistant kept). Memory-only hotfix; pair-aware prune stays Target (a).
+ *
  * Truncation is observable: [LoadedModelHistory.droppedCount] carries the
  * exact omitted-row total (filtered COUNT query, O(1) memory). A giant
  * single row is truncated to [MODEL_HISTORY_MAX_CHARS_PER_MESSAGE] with a
@@ -1165,7 +1170,17 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
     val scan = loadModelHistoryScan(store, sessionId)
     val total = store.countHistoryEvents(sessionId, includePartial = false)
     val dropped = (total - scan.events.size).coerceAtLeast(0)
-    val incomplete = dropped > 0
+    // S4-F4(b): prune-suspect (prior prune deleted rows, marker-first pair may
+    // have been cut with dropped==0) forces conservative all-flag, matching
+    // dropped>0 fail-closed. Pair-aware prune stays Target (a).
+    // S4-R2: fail-closed on read failure (exception => suspect true) so a
+    // wedged store cannot green-light a tool-dependent follow-up.
+    val pruneSuspect = try {
+        store.isPruneSuspect(sessionId)
+    } catch (_: Exception) {
+        true
+    }
+    val incomplete = dropped > 0 || pruneSuspect
     return LoadedModelHistory(
         scan.events.map {
             ChatMessage(

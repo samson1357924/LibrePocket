@@ -235,6 +235,17 @@ interface SessionStore {
     /** Apply [PrunePolicy] (spec §8.3). */
     suspend fun prune(policy: PrunePolicy): PruneResult
 
+    /**
+     * S4-F4 prune-marker suspect (hotfix b, small): true when a prior [prune]
+     * deleted rows for [sessionId], so the marker-first pair may have been cut
+     * (marker pruned, assistant kept) with `dropped==0`. Callers ([loadModelHistory])
+     * treat kept assistants as reasoning-suspect (fail-closed) when true.
+     * Memory-only like the backfill block (a restart drops it – noted follow-up);
+     * pair-aware prune (marker+assistant same life/death) stays Target (a).
+     * Default false so hand-written fakes without prune stay clean.
+     */
+    suspend fun isPruneSuspect(sessionId: String): Boolean = false
+
     /** Delete a session; events cascade. */
     suspend fun deleteSession(sessionId: String)
 }

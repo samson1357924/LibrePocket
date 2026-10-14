@@ -480,8 +480,8 @@ class ChatViewModel(
             // erase ownership while a commit is still possible. Overdue-but-
             // live entries slide their deadline (same renew semantics as
             // pendingBackfillBlock); only provably-dead/clean entries are
-            // removed.
-            if (isOutstandingEntryLive(e.value)) {
+            // removed. S4-F1: shares [outstandingLiveness] with peek.
+            if (outstandingLiveness(e.value)) {
                 e.value.parkedAtMs = nowMs
             } else {
                 it.remove()
@@ -503,8 +503,12 @@ class ChatViewModel(
      *   despite bounded caller waits and empty session-side flags).
      * - Fence completed + session null or sealed-dead → dead.
      * Best-effort reads only, never throws.
+     *
+     * S4-F1: single shared liveness ([outstandingLiveness]); [purgeExpiredOutstanding]
+     * and [peekOutstandingLive] both consult it so the two can never fork
+     * (fence==null + session!=null unexpired stays live/defer, never promote).
      */
-    private fun isOutstandingEntryLive(entry: OutstandingTeardown): Boolean {
+    private fun outstandingLiveness(entry: OutstandingTeardown): Boolean {
         try {
             if (entry.fence?.isCompleted == false) return true
         } catch (_: Exception) {
@@ -546,6 +550,9 @@ class ChatViewModel(
             true
         }
     }
+    /** S4-F1 alias: historic name for the shared [outstandingLiveness]. */
+    private fun isOutstandingEntryLive(entry: OutstandingTeardown): Boolean =
+        outstandingLiveness(entry)
     private fun rememberOutstandingTeardown(
         owner: String?,
         fence: Job?,
@@ -1528,10 +1535,9 @@ class ChatViewModel(
         val fencedSession0: ChatSession? = pendingLedgerSession
         val fencedWasStreaming0: Boolean = pendingLedgerWasStreaming
         val fencedOwner0: String? = pendingLedgerOwnerSessionId
-        pendingLedgerFence = null
-        pendingLedgerSession = null
-        pendingLedgerWasStreaming = false
-        pendingLedgerOwnerSessionId = null
+        // S4-R2 preamble: snapshot slot/table hints here (no take/clear yet –
+        // authoritative take/remember/clear live under sessionMutex below);
+        // the sync ticket + sync parks run after the ticket (see below).
         val isSameIdReopen = prevId != null && prevId == sessionId
         // R9-2 from-null owner-match: an abort/early-exit already nulled
         // _currentSessionId, so prevId==null even though the parked fence
@@ -1542,7 +1548,7 @@ class ChatViewModel(
         // owner-matched reopen therefore retains the fence and is treated
         // as the same-ID slow path (fence join + parked flushDurable
         // re-check, no live needed), even when prevLive==null.
-        val isOwnerMatchedReopen = !isSameIdReopen &&
+        var isOwnerMatchedReopen = !isSameIdReopen &&
             fencedOwner0 != null &&
             fencedOwner0 == sessionId &&
             (fencedJob0 != null || fencedSession0 != null)
@@ -1553,17 +1559,117 @@ class ChatViewModel(
         // is still settling. Consult the table (single ownership via take);
         // an unrelated id never waits. Take before stashing the unrelated
         // slot below so the requested entry is never merged into another id.
-        val takenOutstanding = takeOutstanding(sessionId)
-        val outstandingFence: Job? = takenOutstanding?.fence
-        val outstandingSession: ChatSession? = takenOutstanding?.session
-        val outstandingWasStreaming: Boolean = takenOutstanding?.wasStreaming ?: false
-        val hasOutstanding = outstandingFence != null || outstandingSession != null
+        // S4-F2: read-only hint here (no purge/remove); authoritative take
+        // happens inside withLock (first segment) under mutex.
+        val takenOutstandingHint = outstandingTeardowns[sessionId]
+        val outstandingFenceHint: Job? = takenOutstandingHint?.fence
+        val outstandingSessionHint: ChatSession? = takenOutstandingHint?.session
+        val outstandingWasStreamingHint: Boolean = takenOutstandingHint?.wasStreaming ?: false
+        val hasOutstandingHint = outstandingFenceHint != null || outstandingSessionHint != null
+        // Authoritative locals (set under lock below, overwrite hints).
+        // Placeholders so closure captures compile; real values assigned
+        // in the withLock first segment.
+        var takenOutstanding: OutstandingTeardown? = null
+        var outstandingFence: Job? = null
+        var outstandingSession: ChatSession? = null
+        var outstandingWasStreaming: Boolean = false
+        var hasOutstanding: Boolean = false
         if (!isSameIdReopen && !isOwnerMatchedReopen) {
             // Preserve an unrelated slot fence for its own future reopen
             // instead of dropping it (R10-1: per-id consult only). When this
             // branch runs with a non-null slot, its owner differs from the
             // requested id (otherwise it would have been owner-matched), so
             // stashing cannot pollute this open's settle.
+            // S4-R2: stashed sync after the ticket below (see sync parks) so a
+            // pre-dispatch cancel cannot leak it; the lock re-checks idempotently.
+        }
+        // Effective slot fence for this open's settle: only when it targets
+        // the requested ledger. An unrelated slot (stashed above) must not
+        // gate this ledger's backfill. Hint values here; authoritative
+        // recompute under lock below overwrites them.
+        var effectiveFencedJob: Job? = if (isSameIdReopen || isOwnerMatchedReopen) fencedJob0 else null
+        var effectiveFencedSession: ChatSession? =
+            if (isSameIdReopen || isOwnerMatchedReopen) fencedSession0 else null
+        var effectiveFencedWasStreaming: Boolean =
+            if (isSameIdReopen || isOwnerMatchedReopen) fencedWasStreaming0 else false
+        var effectiveFencedOwner: String? =
+            if (isSameIdReopen || isOwnerMatchedReopen) fencedOwner0 else null
+        var isOutstandingReopen = hasOutstandingHint
+        var isSlowReopen = isSameIdReopen || isOwnerMatchedReopen || isOutstandingReopen
+        // R9-2: same-ID reopen owns its teardown eagerly (sync area). The
+        // live turn is cancelled IO-free via cancelAndDetachSync (semantics
+        // unchanged), then close+flush launches immediately on viewModelScope
+        // (NOT lifecycleScope, so cancelLifecycleOperations below cannot kill
+        // it; TurnController.close is idempotent, double-close safe). The
+        // closure hands sameIdTeardown+prevLive to the slow path, which joins
+        // (2x) + flushDurable re-checks (parked pattern) instead of a second
+        // closeThenFlushDurable. Early-exit/cancel re-parks (owner=prevId).
+        // S4-R2 sync ticket (last-wins): bump generation + cancel prev open
+        // synchronously in the preamble (Main, no suspension). A double-tap
+        // while the first open suspends on IO cancels the first (its generation
+        // goes stale + its openJob is cancelled); the lock below only does
+        // authoritative slot/table ownership, never generation/UI.
+        var prevWasStreaming = if (prevLive != null) {
+            try {
+                isLedgerStreamingOrPending(prevLive)
+            } catch (_: Exception) {
+                false
+            }
+        } else {
+            false
+        }
+        // Launch deferred to the lock first segment (no pre-dispatch leak:
+        // nothing launched here, so a cancel before dispatch owns nothing).
+        var sameIdTeardown: Job? = null
+        // Sync ticket: explicit discard + new lifecycle scope (retryInFlight
+        // null + scope renew, same as invalidateLifecycle) + cancel prev open.
+        // A teardown launch below lives on viewModelScope, never the
+        // just-invalidated lifecycle scope, so it survives this cancel.
+        lifecycleGeneration += 1
+        explicitDiscardEpoch += 1
+        cancelLifecycleOperations()
+        openJob?.cancel()
+        openJob = null
+        // Sync detach (UI never waits, IO-free): VM state detached now so the
+        // UI updates immediately; the close-then-flush launch + slot/table
+        // ownership happen under the mutex below (same-ID and different-ID
+        // alike – ownership only in lock).
+        if (prevLive != null) {
+            cancelAndDetachSync(prevLive)
+        }
+        // Sync UI clear (no lock): history/binding/ops reset now, never while
+        // holding sessionMutex (lock below touches only slot/table).
+        _sessionState.value = EMPTY_SESSION_STATE
+        _notice.value = null
+        _history.value = emptyList()
+        _historyOmittedCount.value = 0
+        _requestTrimmedCount.value = 0
+        _currentSessionId.value = null
+        pendingOps.clear()
+        recoverableOps.clear()
+        syncRecoveryCount()
+        retryableOp = null
+        retryFallbackTarget = null
+        retryTargetCandidate = null
+        latestAcceptedStartedTarget = null
+        inputDraft = null
+        val requestedGeneration = lifecycleGeneration
+        // R9-2 discard-scoped entry: post-ticket epoch. The re-park in the
+        // lock + defensive finally only parks when no newer explicit discard
+        // crossed it; _currentSessionId is already null here so owner uses
+        // prevId / retained owner.
+        val sameIdEntryDiscardEpoch = explicitDiscardEpoch
+        var sameIdCombinedWasStreaming =
+            effectiveFencedWasStreaming || prevWasStreaming || outstandingWasStreamingHint
+        // S4-R2 sync parks (pre-dispatch coverage, no leak): preamble detached
+        // above, so launch + park synchronously – ownership already sits in
+        // slot/table even if openJob is cancelled before dispatch. The lock
+        // below re-takes authoritatively (idempotent, never relaunches):
+        // single launch, fence joins exactly once. Unrelated slot stashed
+        // per-id; same-ID/owner/outstanding parked to slot (same-owner merge);
+        // different-ID live launched + remembered under prevId (future reopen
+        // fences it, never this open's settle).
+        if (!isSameIdReopen && !isOwnerMatchedReopen) {
             if (fencedJob0 != null || fencedSession0 != null) {
                 rememberOutstandingTeardown(
                     fencedOwner0,
@@ -1573,96 +1679,54 @@ class ChatViewModel(
                 )
             }
         }
-        // Effective slot fence for this open's settle: only when it targets
-        // the requested ledger. An unrelated slot (stashed above) must not
-        // gate this ledger's backfill.
-        val effectiveFencedJob: Job? = if (isSameIdReopen || isOwnerMatchedReopen) fencedJob0 else null
-        val effectiveFencedSession: ChatSession? =
-            if (isSameIdReopen || isOwnerMatchedReopen) fencedSession0 else null
-        val effectiveFencedWasStreaming: Boolean =
-            if (isSameIdReopen || isOwnerMatchedReopen) fencedWasStreaming0 else false
-        val effectiveFencedOwner: String? =
-            if (isSameIdReopen || isOwnerMatchedReopen) fencedOwner0 else null
-        val isOutstandingReopen = hasOutstanding
-        val isSlowReopen = isSameIdReopen || isOwnerMatchedReopen || isOutstandingReopen
-        // R9-2: same-ID reopen owns its teardown eagerly (sync area). The
-        // live turn is cancelled IO-free via cancelAndDetachSync (semantics
-        // unchanged), then close+flush launches immediately on viewModelScope
-        // (NOT lifecycleScope, so cancelLifecycleOperations below cannot kill
-        // it; TurnController.close is idempotent, double-close safe). The
-        // closure hands sameIdTeardown+prevLive to the slow path, which joins
-        // (2x) + flushDurable re-checks (parked pattern) instead of a second
-        // closeThenFlushDurable. Early-exit/cancel re-parks (owner=prevId).
-        val prevWasStreaming = if (isSameIdReopen && prevLive != null) {
-            isLedgerStreamingOrPending(prevLive)
-        } else {
-            false
-        }
-        var sameIdTeardown: Job? = null
+        pendingLedgerFence = null
+        pendingLedgerSession = null
+        pendingLedgerWasStreaming = false
+        pendingLedgerOwnerSessionId = null
         if (isSameIdReopen && prevLive != null) {
-            cancelAndDetachSync(prevLive)
+            // Detach already sync above; launch survives the ticket cancel
+            // (viewModelScope, never lifecycleScope; close idempotent).
             sameIdTeardown = launchCloseThenFlush(prevLive)
         }
-        invalidateLifecycle(clearChat = true)
-        val requestedGeneration = lifecycleGeneration
-        // R9-2 discard-scoped entry: post-invalidate epoch. The re-park below
-        // (sync + finally) only parks when no newer explicit discard crossed
-        // it; _currentSessionId is already null here so owner uses prevId.
-        val sameIdEntryDiscardEpoch = explicitDiscardEpoch
-        val sameIdCombinedWasStreaming =
-            effectiveFencedWasStreaming || prevWasStreaming || outstandingWasStreaming
         if (isSameIdReopen && prevLive != null && sameIdTeardown != null) {
-            // Sync park for pre-dispatch cancel coverage: openJob may be
-            // cancelled before its body dispatches (no catch/finally runs),
-            // so ownership must already sit in the slot. The slow-path settle
-            // consumes via locals (closure) and clears on success (existing
-            // attach-window clear); abort paths keep this park via the
-            // defensive finally below (idempotent). Slot is empty here
-            // (preamble + invalidate cleared), so direct park. Fence merges
-            // the prior slot fence (effectiveFencedJob, same ledger only) +
-            // the outstanding table fence (same source id) with the fresh
-            // teardown; session prefers prevLive (snapshot-target ledger)
-            // while older sessions keep draining via their own jobs unfenced
-            // (mirrors reparkUnsettledLedger).
             var mergedFence: Job? = sameIdTeardown
             if (effectiveFencedJob != null) {
                 mergedFence = compositeLedgerJoin(effectiveFencedJob, mergedFence)
             }
-            if (outstandingFence != null) {
-                mergedFence = compositeLedgerJoin(outstandingFence, mergedFence)
+            if (outstandingFenceHint != null) {
+                mergedFence = compositeLedgerJoin(outstandingFenceHint, mergedFence)
             }
             pendingLedgerFence = mergedFence
             pendingLedgerSession = prevLive
             pendingLedgerWasStreaming = sameIdCombinedWasStreaming
             pendingLedgerOwnerSessionId = prevId
-        } else if (isOwnerMatchedReopen || isOutstandingReopen) {
-            // From-null slow sync park: same pre-dispatch coverage for the
-            // retained fence(s). No eager teardown exists (prevLive is null,
-            // or a different-ID live already stashed to the outstanding table
-            // by the preamble/invalidate above), so park the retained
-            // fence(s)/session(s) as-is; the slow-path settle joins them via
-            // locals. R10-1: merges the slot fence (same ledger only) with
-            // the outstanding table fence (same source id); the slot session
-            // wins the re-check slot while the other drains via its own job
-            // unfenced.
-            var parkFence: Job? = effectiveFencedJob ?: outstandingFence
-            if (effectiveFencedJob != null && outstandingFence != null &&
-                effectiveFencedJob !== outstandingFence
+        } else if (isOwnerMatchedReopen || hasOutstandingHint) {
+            var parkFence: Job? = effectiveFencedJob ?: outstandingFenceHint
+            if (effectiveFencedJob != null && outstandingFenceHint != null &&
+                effectiveFencedJob !== outstandingFenceHint
             ) {
-                parkFence = compositeLedgerJoin(effectiveFencedJob, outstandingFence)
+                parkFence = compositeLedgerJoin(effectiveFencedJob, outstandingFenceHint)
             }
-            // R10-1: same-ID eager + outstanding merge above already handled;
-            // here prefer the slot session (snapshot target) when present.
-            val parkSession: ChatSession? = effectiveFencedSession ?: outstandingSession
+            val parkSession: ChatSession? = effectiveFencedSession ?: outstandingSessionHint
             if (parkFence != null || parkSession != null) {
                 pendingLedgerFence = parkFence
                 pendingLedgerSession = parkSession
                 pendingLedgerWasStreaming = sameIdCombinedWasStreaming
-                pendingLedgerOwnerSessionId = when {
-                    isOwnerMatchedReopen -> effectiveFencedOwner
-                    // Outstanding owner is the requested id by construction.
-                    else -> sessionId
+                pendingLedgerOwnerSessionId = if (isOwnerMatchedReopen) {
+                    effectiveFencedOwner
+                } else {
+                    sessionId
                 }
+            }
+        }
+        if (!isSameIdReopen && prevLive != null) {
+            // Different-ID live (UI already detached sync above): launch +
+            // remember under its own id now so a pre-dispatch cancel cannot
+            // leak it; the lock below skips relaunch when it sees this entry.
+            // Unrelated to this open's settle (different key, never merged).
+            val diffFenceSync = launchCloseThenFlush(prevLive)
+            if (prevId != null) {
+                rememberOutstandingTeardown(prevId, diffFenceSync, prevLive, prevWasStreaming)
             }
         }
         openJob = lifecycleScope.launch {
@@ -1726,6 +1790,130 @@ class ChatViewModel(
 
                 sessionMutex.withLock {
                     if (!isGenerationCurrent(requestedGeneration)) return@withLock
+                    // S4-R2 authoritative ownership only (ticket + UI already
+                    // done sync in the preamble above; cancelling scope/job here
+                    // would kill self – generation check suffices, and the
+                    // preamble already cancelled the previous open for last-wins).
+                    // S4-R2 authoritative ownership (first segment under mutex):
+                    // fresh take with purge; stash unrelated slot (no-op when the
+                    // preamble already stashed); recompute effective/slow; parks
+                    // overwrite slot (single ownership, fence join exactly once).
+                    // The preamble above already ticketed (generation bump +
+                    // prev-open cancel for last-wins) + parked sync for
+                    // pre-dispatch coverage; this re-take is idempotent (same
+                    // fence/session instances merge without a second launch),
+                    // so a double-tap while the first open suspends on IO cannot
+                    // steal ownership here.
+                    val takenAuth = takeOutstanding(sessionId)
+                    takenOutstanding = takenAuth
+                    outstandingFence = takenAuth?.fence
+                    outstandingSession = takenAuth?.session
+                    outstandingWasStreaming = takenAuth?.wasStreaming ?: false
+                    hasOutstanding = outstandingFence != null || outstandingSession != null
+                    val freshSlotJob: Job? = pendingLedgerFence
+                    val freshSlotSession: ChatSession? = pendingLedgerSession
+                    val freshSlotWasStreaming: Boolean = pendingLedgerWasStreaming
+                    val freshSlotOwner: String? = pendingLedgerOwnerSessionId
+                    val isOwnerMatchedAuth = !isSameIdReopen &&
+                        freshSlotOwner != null &&
+                        freshSlotOwner == sessionId &&
+                        (freshSlotJob != null || freshSlotSession != null)
+                    // Publish authoritative owner-match for the abort finally below.
+                    isOwnerMatchedReopen = isOwnerMatchedAuth
+                    if (!isSameIdReopen && !isOwnerMatchedAuth) {
+                        if (freshSlotJob != null || freshSlotSession != null) {
+                            rememberOutstandingTeardown(
+                                freshSlotOwner,
+                                freshSlotJob,
+                                freshSlotSession,
+                                freshSlotWasStreaming,
+                            )
+                        }
+                    }
+                    // Different-live ownership (authoritative, idempotent): preamble
+                    // already detached sync (UI immediate) + launched +
+                    // remembered under prevId (no pre-dispatch leak). Skip
+                    // relaunch when the preamble entry already owns prevLive
+                    // (single launch, fence joins exactly once); otherwise
+                    // launch here (e.g. preamble raced – defensive, same key,
+                    // never merged into this open's settle).
+                    if (!isSameIdReopen && prevLive != null) {
+                        val alreadyOwns = if (prevId != null) {
+                            outstandingTeardowns[prevId]?.session === prevLive
+                        } else {
+                            false
+                        }
+                        if (!alreadyOwns) {
+                            val diffFence = launchCloseThenFlush(prevLive)
+                            if (prevId != null) {
+                                rememberOutstandingTeardown(prevId, diffFence, prevLive, prevWasStreaming)
+                            }
+                        }
+                    }
+                    effectiveFencedJob =
+                        if (isSameIdReopen || isOwnerMatchedAuth) freshSlotJob else null
+                    effectiveFencedSession =
+                        if (isSameIdReopen || isOwnerMatchedAuth) freshSlotSession else null
+                    effectiveFencedWasStreaming =
+                        if (isSameIdReopen || isOwnerMatchedAuth) freshSlotWasStreaming else false
+                    effectiveFencedOwner =
+                        if (isSameIdReopen || isOwnerMatchedAuth) freshSlotOwner else null
+                    isOutstandingReopen = hasOutstanding
+                    // Authoritative slow recompute overwrites the preload hint;
+                    // hint-slow/auth-fast is safe (extra settle, still correct).
+                    isSlowReopen = isSameIdReopen || isOwnerMatchedAuth || isOutstandingReopen
+                    sameIdCombinedWasStreaming =
+                        effectiveFencedWasStreaming || prevWasStreaming || outstandingWasStreaming
+                    // Clear the slot before authoritative parks (single ownership;
+                    // parks below overwrite). Stashed unrelated slot already
+                    // preserved above, so clearing cannot lose it.
+                    pendingLedgerFence = null
+                    pendingLedgerSession = null
+                    pendingLedgerWasStreaming = false
+                    pendingLedgerOwnerSessionId = null
+                    // Same-ID teardown re-use (single launch in the preamble sync
+                    // park above – no pre-dispatch leak, no second launch here;
+                    // TurnController.close idempotent, double-close safe). The
+                    // authoritative park below re-merges the preamble launch
+                    // with the fresh slot + authoritative outstanding take
+                    // (idempotent joins, exactly-once fence ownership).
+                    if (isSameIdReopen && prevLive != null && sameIdTeardown != null) {
+                        var mergedFence: Job? = sameIdTeardown
+                        val effJobPark: Job? = effectiveFencedJob
+                        if (effJobPark != null && effJobPark !== mergedFence) {
+                            mergedFence = compositeLedgerJoin(effJobPark, mergedFence)
+                        }
+                        val outFencePark: Job? = outstandingFence
+                        if (outFencePark != null && outFencePark !== mergedFence &&
+                            outFencePark !== effJobPark
+                        ) {
+                            mergedFence = compositeLedgerJoin(outFencePark, mergedFence)
+                        }
+                        pendingLedgerFence = mergedFence
+                        pendingLedgerSession = prevLive
+                        pendingLedgerWasStreaming = sameIdCombinedWasStreaming
+                        pendingLedgerOwnerSessionId = prevId
+                    } else if (isOwnerMatchedAuth || isOutstandingReopen) {
+                        val effJobPark2: Job? = effectiveFencedJob
+                        val outFencePark2: Job? = outstandingFence
+                        var parkFence: Job? = effJobPark2 ?: outFencePark2
+                        if (effJobPark2 != null && outFencePark2 != null &&
+                            effJobPark2 !== outFencePark2
+                        ) {
+                            parkFence = compositeLedgerJoin(effJobPark2, outFencePark2)
+                        }
+                        val parkSession: ChatSession? = effectiveFencedSession ?: outstandingSession
+                        if (parkFence != null || parkSession != null) {
+                            pendingLedgerFence = parkFence
+                            pendingLedgerSession = parkSession
+                            pendingLedgerWasStreaming = sameIdCombinedWasStreaming
+                            pendingLedgerOwnerSessionId = if (isOwnerMatchedAuth) {
+                                effectiveFencedOwner
+                            } else {
+                                sessionId
+                            }
+                        }
+                    }
                     val latest = readEndpoint()
                     if (!isGenerationCurrent(requestedGeneration)) return@withLock
                     if (bindingOf(latest) != access.binding || latest == null) {
@@ -1784,7 +1972,21 @@ class ChatViewModel(
                         // while the durable ledger holds only the withheld
                         // marker + new turns. A restart of the forked id then
                         // shows only its own rows.
-                        val fastHistory = checkNotNull(fastLoaded)
+                        // S4-F2: hint-slow/auth-fast over-conservative case
+                        // (preload skipped on hint, authoritative fast) falls
+                        // back to an in-lock load (rare, safe – same fenced
+                        // read the slow path does, just without settle).
+                        val fastHistory = fastLoaded ?: try {
+                            withContext(Dispatchers.IO) { loadHistory(sessionId) }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            null
+                        }
+                        if (fastHistory == null) {
+                            _notice.value = "UNKNOWN_SESSION"
+                            return@withLock
+                        }
                         _history.value = fastHistory.messages
                         _historyOmittedCount.value = fastHistory.droppedCount
                         attach(created, access.binding, creationGeneration)
@@ -1867,6 +2069,12 @@ class ChatViewModel(
                     // swallow to false.
                     var settleOk = true
                     var durableOk = true
+                    // S4-F2: snapshot authoritative vars to locals for smart-cast
+                    // across suspension (mutex held, no concurrent mutation).
+                    val settleEffJob: Job? = effectiveFencedJob
+                    val settleEffSession: ChatSession? = effectiveFencedSession
+                    val settleOutFence: Job? = outstandingFence
+                    val settleOutSession: ChatSession? = outstandingSession
                     withContext(Dispatchers.IO) {
                         // R10-1: settle every teardown owned for the requested
                         // ledger — the slot fence (same ledger only, unrelated
@@ -1875,9 +2083,9 @@ class ChatViewModel(
                         // discard ownership). Each phase is bounded (~2x);
                         // any miss degrades to defer (R9-3 block), never to a
                         // false INTERRUPTED.
-                        if (effectiveFencedJob != null) {
+                        if (settleEffJob != null) {
                             val joined = try {
-                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { effectiveFencedJob.join() } != null
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { settleEffJob.join() } != null
                             } catch (cancelled: CancellationException) {
                                 throw cancelled
                             } catch (_: Exception) {
@@ -1885,7 +2093,7 @@ class ChatViewModel(
                             }
                             if (!joined) settleOk = false
                         }
-                        val parked = effectiveFencedSession
+                        val parked = settleEffSession
                         if (parked != null) {
                             // The background job already closed+flushed;
                             // re-check durability bounded (idempotent seal).
@@ -1900,9 +2108,9 @@ class ChatViewModel(
                             }
                             if (!durable) durableOk = false
                         }
-                        if (outstandingFence != null && outstandingFence !== effectiveFencedJob) {
+                        if (settleOutFence != null && settleOutFence !== settleEffJob) {
                             val joined = try {
-                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { outstandingFence.join() } != null
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { settleOutFence.join() } != null
                             } catch (cancelled: CancellationException) {
                                 throw cancelled
                             } catch (_: Exception) {
@@ -1910,7 +2118,7 @@ class ChatViewModel(
                             }
                             if (!joined) settleOk = false
                         }
-                        val outstandingParked = outstandingSession
+                        val outstandingParked = settleOutSession
                         if (outstandingParked != null && outstandingParked !== parked) {
                             val durable = try {
                                 withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
@@ -2151,11 +2359,12 @@ class ChatViewModel(
                     // slot (snapshot target) while the other drains via its
                     // own job unfenced.
                     var abortFence: Job? = effectiveFencedJob
-                    if (outstandingFence != null && outstandingFence !== abortFence) {
+                    val abortOutFence: Job? = outstandingFence
+                    if (abortOutFence != null && abortOutFence !== abortFence) {
                         abortFence = if (abortFence != null) {
-                            compositeLedgerJoin(abortFence, outstandingFence)
+                            compositeLedgerJoin(abortFence, abortOutFence)
                         } else {
-                            outstandingFence
+                            abortOutFence
                         }
                     }
                     val abortSession: ChatSession? =
@@ -4211,23 +4420,16 @@ class ChatViewModel(
         pendingBackfillWriter[sessionId] = evidence
     }
 
-    /** R10-2: peek without consuming — true while the same-id teardown still settles. */
+    /**
+     * R10-2: peek without consuming — true while the same-id teardown still settles.
+     * S4-F1: shares [outstandingLiveness] with [purgeExpiredOutstanding] (fence==null
+     * + session!=null unexpired stays live/defer, never promote); B2 sealed-dead
+     * short-circuit lives inside the shared helper so the two can never fork.
+     */
     private fun peekOutstandingLive(sessionId: String): Boolean {
         purgeExpiredOutstanding()
         val entry = outstandingTeardowns[sessionId] ?: return false
-        try {
-            if (entry.fence?.isCompleted == false) return true
-        } catch (_: Exception) {
-        }
-        // B2: a sealed-dead outstanding session is not live — its stuck
-        // STREAMING status must not shadow the expiry dead-proof.
-        try {
-            val s = entry.session
-            if (s != null && isWriterSealedDead(s)) return false
-            if (isLedgerStreamingOrPending(s)) return true
-        } catch (_: Exception) {
-        }
-        return false
+        return outstandingLiveness(entry)
     }
 
     /**
@@ -4618,9 +4820,13 @@ class ChatViewModel(
         // restores hasReasoning so resumed reasoning-origin turns still fail
         // closed on tool-dependent / thinking-mode follow-ups (ordinary
         // no-tools follow-ups continue). This replay is display UiMessages;
-        // the provider-visible flag rides loadModelHistory into TurnController,
-        // so a missing marker fail-opens to plain-text continuation on a
-        // tool-dependent follow-up instead of failing closed. Backward scan sees each marker before its
+        // the provider-visible flag rides loadModelHistory into TurnController.
+        // S4-F5: when the tail cap omits older rows (dropped>0) the marker scan
+        // may have missed an older reasoning marker whose assistant is still
+        // kept – every kept assistant is then conservatively resumed with
+        // hasReasoning=true, matching Factory loadModelHistory (dropped>0 all
+        // true) so UI and model-context can never disagree (fail-closed).
+        // Backward scan sees each marker before its
         // assistant (markers append right after), so the pending path is the
         // live one; the patch path stays for reorder tolerance. Cancelled /
         // failed fragments replay with their persisted partial flag (never as
@@ -4684,6 +4890,24 @@ class ChatViewModel(
         // Exact omitted-row total via one filtered COUNT (O(1) memory).
         val total = backing.countHistoryEvents(sessionId, includePartial = true)
         val dropped = (total - out.size).coerceAtLeast(0)
+        // S4-F5 + S4-R2: dropped>0 => conservative all-assistants reasoning
+        // flag. A prior prune may have cut a marker-first pair with dropped==0
+        // (marker pruned, assistant kept) – consult isPruneSuspect best-effort
+        // (fail-closed: read failure => suspect true), matching Factory
+        // loadModelHistory so UI and model-context can never disagree.
+        val pruneSuspect = try {
+            backing.isPruneSuspect(sessionId)
+        } catch (_: Exception) {
+            true
+        }
+        if (dropped > 0 || pruneSuspect) {
+            for (i in out.indices) {
+                val m = out[i]
+                if (m.role == "assistant" && !m.hasReasoning) {
+                    out[i] = m.copy(hasReasoning = true)
+                }
+            }
+        }
         return LoadedUiHistory(out.asReversed(), dropped)
     }
 

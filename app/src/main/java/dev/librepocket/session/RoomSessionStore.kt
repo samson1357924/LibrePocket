@@ -88,6 +88,15 @@ class RoomSessionStore(
     // Guarded by [appendMutex]: incremented on every committed append, reset
     // whenever an auto-prune sweep is attempted (success or failure).
     private var appendsSincePrune = 0
+    /**
+     * S4-F4 prune-marker suspect (hotfix b): sessionIds whose prior [prune]
+     * deleted rows (marker-first pair may have been cut: marker pruned,
+     * assistant kept, dropped==0). [loadModelHistory] treats them as
+     * reasoning-suspect (all kept assistants fail-closed). Memory-only (a
+     * restart drops it – noted follow-up); pair-aware prune stays Target (a).
+     * Concurrent set, no suspension while held.
+     */
+    private val pruneSuspectSessions = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /**
      * R6-4 test seam: invoked synchronously on the IO thread after the
@@ -275,14 +284,18 @@ class RoomSessionStore(
      * transactions would nest (and Room flattens nested transactions, losing
      * the all-or-nothing boundary) and would touch/prune per row.
      *
-     * Auto-prune accounting counts one bulk as ONE append toward
-     * [AUTO_PRUNE_EVERY] and the sweep (if due) runs once after commit,
-     * exactly like the single-row path: a committed bulk is never un-done by
-     * a prune failure ([Log.w] only, including post-commit cancellation,
-     * rowIds still returned). Only a CE actually thrown by the entry gate or
-     * thrown inside the transaction itself propagates (rollback → zero rows
-     * → ack must fail); a bare in-tx cancel request commit-wins (blocking
-     * body, deferred delivery swallowed after the flag is set).
+     * Auto-prune accounting counts per ROWS toward [AUTO_PRUNE_EVERY]
+     * (S4-F10: `appendsSincePrune += events.size`, not one per bulk), and the
+     * sweep (if due) runs once after commit, exactly like the single-row path:
+     * a committed bulk is never un-done by a prune failure ([Log.w] only,
+     * including post-commit cancellation, rowIds still returned). Head-anchored
+     * markers (model-switched row 1) are oldest-first pruned first like any old
+     * row; per-row accounting keeps the prune horizon row-accurate so a full
+     * snapshot's head-marker lifetime matches the single-row path. Only a CE
+     * actually thrown by the entry gate or thrown inside the transaction itself
+     * propagates (rollback → zero rows → ack must fail); a bare in-tx cancel
+     * request commit-wins (blocking body, deferred delivery swallowed after the
+     * flag is set).
      * R8-5: like [appendEvent], the bulk runs via blocking
      * [androidx.room.RoomDatabase.runInTransaction] with the same entry
      * [ensureActive] gate, so the COMMIT→flag resume hole is closed here
@@ -371,14 +384,14 @@ class RoomSessionStore(
                 throw e
             }
         }
-        // Same throttled sweep as appendEvent, but one bulk counts once.
+        // Same throttled sweep as appendEvent, counted per ROWS (S4-F10).
         // R5-6: same post-commit best-effort rule — a cancel observed here
         // (counter or sweep) only emits Log.w and the committed rowIds are
         // still returned. No withContext(NonCancellable): the sweep is
         // O(sessions) and must not hold the shutdown bound.
         try {
             val shouldPrune = appendMutex.withLock {
-                appendsSincePrune++
+                appendsSincePrune += events.size
                 if (appendsSincePrune >= AUTO_PRUNE_EVERY) {
                     appendsSincePrune = 0
                     true
@@ -395,7 +408,7 @@ class RoomSessionStore(
                     // swallows post-commit cancellation), so the durable core
                     // ack stays a success. The counter was already reset, so
                     // the failed sweep is retried (throttled) after the next
-                    // AUTO_PRUNE_EVERY bulks/appends instead of retrying hot.
+                    // AUTO_PRUNE_EVERY rows instead of retrying hot.
                     Log.w(TAG, "auto-prune failed; bulk already durable, will retry later", e)
                 }
             }
@@ -655,18 +668,31 @@ class RoomSessionStore(
             for (sid in survivors) {
                 // Imported seq values may be sparse. Keep N actual newest rows by
                 // ordering the current rows, rather than deriving a cutoff from MAX(seq).
-                deletedEvents += dao.deleteEventsBeyondLimit(
+                // S4-F4(b): per-session delete>0 marks prune-suspect (marker-first
+                // pair may have been cut); pair-aware prune stays Target (a).
+                val deleted = dao.deleteEventsBeyondLimit(
                     sid,
                     policy.maxEventsPerSession.coerceAtLeast(0),
                 )
+                if (deleted > 0) pruneSuspectSessions.add(sid)
+                deletedEvents += deleted
             }
             PruneResult(deletedEvents = deletedEvents, deletedSessions = deletedSessions)
         }
+
+    /** S4-F4(b): true when a prior [prune] deleted rows for [sessionId]. */
+    override suspend fun isPruneSuspect(sessionId: String): Boolean =
+        pruneSuspectSessions.contains(sessionId)
 
     override suspend fun deleteSession(sessionId: String) {
         withContext(Dispatchers.IO) {
             dao.deleteSession(sessionId)
         }
+        // S4-R2 suspect lifecycle: delete clears (session gone – no kept
+        // assistant to stay suspect). Appends never clear (a later append
+        // cannot resurrect a pruned marker-first pair); pair-aware prune +
+        // durable suspect stay Target/follow-up (memory-only noted in KDoc).
+        pruneSuspectSessions.remove(sessionId)
     }
 
     private fun TranscriptEventEntity.toEvent(): TranscriptEvent = TranscriptEvent(

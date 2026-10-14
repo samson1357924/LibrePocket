@@ -149,6 +149,40 @@ open class FakeSessionStore : SessionStore {
     }
 }
 
+/**
+ * S4-R2 prune-suspect test fake (Fake itself stays no-prune per S1 F9 Target:
+ * [FakeSessionStore.prune] always throws, never silent success – use Room for
+ * real prune paths). This subclass simulates the Room keep-newest row cut for
+ * the marker-first pair: [simulatePruneCut] drops the oldest rows beyond
+ * [keepNewestRows] and marks the session suspect, mirroring
+ * [RoomSessionStore.isPruneSuspect] (delete>0 => suspect). [deleteSession]
+ * clears suspect (Room parity); appends never clear (a later append cannot
+ * resurrect a pruned marker). Memory-only like Room (restart drops it);
+ * pair-aware prune stays Target.
+ */
+open class SuspectFakeStore : FakeSessionStore() {
+    private val suspect = HashSet<String>()
+
+    /** Simulate a keep-newest prune cut: drop oldest rows beyond keep, mark suspect iff dropped>0. */
+    fun simulatePruneCut(sessionId: String, keepNewestRows: Int): Int {
+        val rows = events.filter { it.sessionId == sessionId }.sortedBy { it.seq }
+        val drop = (rows.size - keepNewestRows).coerceAtLeast(0)
+        if (drop > 0) {
+            val dropSeqs = rows.take(drop).map { it.seq }.toSet()
+            events.removeAll { it.sessionId == sessionId && it.seq in dropSeqs }
+            suspect.add(sessionId)
+        }
+        return drop
+    }
+
+    override suspend fun isPruneSuspect(sessionId: String): Boolean = suspect.contains(sessionId)
+
+    override suspend fun deleteSession(sessionId: String) {
+        super.deleteSession(sessionId)
+        suspect.remove(sessionId)
+    }
+}
+
 class SessionTranscriptSinkTest {
 
     @Test

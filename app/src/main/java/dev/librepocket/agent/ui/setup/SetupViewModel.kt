@@ -597,14 +597,43 @@ class SetupViewModel(
      * (see selectPreset/onBaseUrlChange/onApiKeyChange), so the entry
      * `testing` fence stays exact and a cancelled attempt writes nothing
      * (CancellationException rethrown unwritten).
+     *
+     * S2 probe gate: validation runs first on Main (zero policy reads on
+     * failure); the IO coroutine then fences entryRevision, takes a fresh
+     * provider.call verdict (only ALLOW continues; ASK/DENY/read failure fail
+     * closed with PROBE_POLICY_DENIED, zero provider construction), re-fences
+     * with the generation guard, and re-checks fence + fresh verdict before
+     * provider I/O (narrows the ALLOW→DENY flip window, mirrors save
+     * vPut/vCommit).
      */
     fun testConnection() {
         val cur = _form.value
         if (cur.testing || cur.saving || cur.modelsLoading) return
-        val effectiveBaseUrl = effectiveBaseUrlOf(cur)
+        // Unknown preset must fail closed on Main (fail-closed 落碼，不 crash)：
+        // effectiveBaseUrlOf throws PRESET_UNKNOWN via requirePreset before
+        // validate runs — map it to SETUP_UNKNOWN_PRESET, never to
+        // PROBE_POLICY_DENIED (policy was never consulted).
+        val effectiveBaseUrl: String = try {
+            effectiveBaseUrlOf(cur)
+        } catch (_: Exception) {
+            _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
+            return
+        }
         val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
         if (err != null) {
             _form.value = cur.copy(errorCode = err)
+            return
+        }
+        val entryRevision = formRevision.get()
+        // deriveProviderId is currently infallible (pure "preset:$presetId"
+        // concat, never throws — dead-code guard); the try is retained
+        // defensively so a future throwing mapping still fails closed here
+        // without crashing Main (mapped to SETUP_UNKNOWN_PRESET: policy was
+        // never consulted).
+        val providerId = try {
+            SetupValidation.deriveProviderId(cur.presetId)
+        } catch (_: Exception) {
+            _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
         testConnectionJob?.cancel()
@@ -613,12 +642,37 @@ class SetupViewModel(
         _form.value = cur.copy(testing = true, errorCode = null, testModels = null, testConnectionRevision = generation)
         testConnectionJob = viewModelScope.launch(Dispatchers.IO) {
             try {
+                if (entryRevision != formRevision.get()) return@launch
+                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                    if (entryRevision != formRevision.get() || generation != testConnectionGeneration.get()) return@launch
+                    _form.update { current ->
+                        if (entryRevision == formRevision.get() && generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
+                            current.copy(testing = false, errorCode = "PROBE_POLICY_DENIED")
+                        } else {
+                            current
+                        }
+                    }
+                    return@launch
+                }
+                if (entryRevision != formRevision.get() || generation != testConnectionGeneration.get()) return@launch
+                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                    if (entryRevision != formRevision.get() || generation != testConnectionGeneration.get()) return@launch
+                    _form.update { current ->
+                        if (entryRevision == formRevision.get() && generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
+                            current.copy(testing = false, errorCode = "PROBE_POLICY_DENIED")
+                        } else {
+                            current
+                        }
+                    }
+                    return@launch
+                }
+                if (entryRevision != formRevision.get() || generation != testConnectionGeneration.get()) return@launch
                 val config = providerConfigOf(cur, effectiveBaseUrl)
                 val typed = cur.apiKey.trim()
                 val keys = KeyProvider { typed.toCharArray() }
                 val count = buildProvider(config, keys).listModels().size
                 _form.update { current ->
-                    if (generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
+                    if (entryRevision == formRevision.get() && generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
                         current.copy(testing = false, testModels = count)
                     } else {
                         current
@@ -626,7 +680,7 @@ class SetupViewModel(
                 }
             } catch (e: ProviderFailure) {
                 _form.update { current ->
-                    if (generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
+                    if (entryRevision == formRevision.get() && generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
                         current.copy(testing = false, errorCode = classifyTestError(e))
                     } else {
                         current
@@ -636,7 +690,7 @@ class SetupViewModel(
                 throw e
             } catch (_: Exception) {
                 _form.update { current ->
-                    if (generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
+                    if (entryRevision == formRevision.get() && generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
                         current.copy(testing = false, errorCode = "TEST_FAILED")
                     } else {
                         current
@@ -646,16 +700,45 @@ class SetupViewModel(
         }
     }
 
-    /** Refresh the model candidates: live listing first, snapshot fills the rest. */
+    /**
+     * Refresh the model candidates: live listing first, snapshot fills the rest.
+     *
+     * S2 probe gate (same shape as [testConnection]): validation first on Main,
+     * then fence + fresh provider.call verdict + fence + pre-IO re-check before
+     * any provider construction/listModels plus a post-live re-gate before
+     * directory fetch (triple-gate). Only ALLOW continues; otherwise
+     * PROBE_POLICY_DENIED with zero further I/O.
+     */
     fun refreshModels() {
         val cur = _form.value
         if (cur.modelsLoading || cur.testing || cur.saving) return
-        val effectiveBaseUrl = effectiveBaseUrlOf(cur)
+        // Unknown preset must fail closed on Main (fail-closed 落碼，不 crash)：
+        // effectiveBaseUrlOf throws PRESET_UNKNOWN via requirePreset before
+        // validate runs — map it to SETUP_UNKNOWN_PRESET, never to
+        // PROBE_POLICY_DENIED (policy was never consulted).
+        val effectiveBaseUrl: String = try {
+            effectiveBaseUrlOf(cur)
+        } catch (_: Exception) {
+            _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
+            return
+        }
         // NEW always (same rule as testConnection): the listing needs the key
         // in memory; a blank edit field requires a re-paste, never a vault read.
         val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
         if (err != null) {
             _form.value = cur.copy(errorCode = err)
+            return
+        }
+        val entryRevision = formRevision.get()
+        // deriveProviderId is currently infallible (pure "preset:$presetId"
+        // concat, never throws — dead-code guard); the try is retained
+        // defensively so a future throwing mapping still fails closed here
+        // without crashing Main (mapped to SETUP_UNKNOWN_PRESET: policy was
+        // never consulted).
+        val providerId = try {
+            SetupValidation.deriveProviderId(cur.presetId)
+        } catch (_: Exception) {
+            _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
         modelRefreshJob?.cancel()
@@ -669,6 +752,31 @@ class SetupViewModel(
         )
         modelRefreshJob = viewModelScope.launch(Dispatchers.IO) {
             try {
+                if (entryRevision != formRevision.get()) return@launch
+                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                    if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
+                    _form.update { current ->
+                        if (entryRevision == formRevision.get() && generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
+                            current.copy(modelsLoading = false, errorCode = "PROBE_POLICY_DENIED")
+                        } else {
+                            current
+                        }
+                    }
+                    return@launch
+                }
+                if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
+                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                    if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
+                    _form.update { current ->
+                        if (entryRevision == formRevision.get() && generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
+                            current.copy(modelsLoading = false, errorCode = "PROBE_POLICY_DENIED")
+                        } else {
+                            current
+                        }
+                    }
+                    return@launch
+                }
+                if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
                 val config = providerConfigOf(cur, effectiveBaseUrl)
                 val typed = cur.apiKey.trim()
                 val keys = KeyProvider { typed.toCharArray() }
@@ -679,13 +787,28 @@ class SetupViewModel(
                 } catch (_: Exception) {
                     emptyList()
                 }
+                // Post-live re-gate before any directory fetch: a policy flip
+                // landing during listModels must block with zero directory I/O.
+                if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
+                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                    if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
+                    _form.update { current ->
+                        if (entryRevision == formRevision.get() && generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
+                            current.copy(modelsLoading = false, errorCode = "PROBE_POLICY_DENIED")
+                        } else {
+                            current
+                        }
+                    }
+                    return@launch
+                }
+                if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
                 val fetcher = fetchDirectory ?: { url: String ->
                     ModelDirectory.fetchBody(directoryClient, url)
                 }
                 val outcome = ModelsDevSnapshot.fetchSnapshotOutcome(fetcher = fetcher)
                 val options = ProviderCatalog.listedModels(cur.presetId, live, outcome.snapshot)
                 _form.update { current ->
-                    if (generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
+                    if (entryRevision == formRevision.get() && generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
                         current.copy(
                             modelsLoading = false,
                             modelOptions = options,
@@ -706,7 +829,7 @@ class SetupViewModel(
                 // Validation passed but mapping failed (unknown preset race):
                 // keep the free-text model, clear the spinner.
                 _form.update { current ->
-                    if (generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
+                    if (entryRevision == formRevision.get() && generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
                         current.copy(modelsLoading = false)
                     } else {
                         current

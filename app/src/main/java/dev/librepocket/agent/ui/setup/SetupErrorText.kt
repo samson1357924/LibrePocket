@@ -25,6 +25,8 @@ package dev.librepocket.agent.ui.setup
  *   不需重試。
  * - `SAVE_BLOCKED_BY_TEARDOWN`：有待清理的登出狀態擋下本次儲存（未寫入任何
  *   資料，可重試；重試前由 reconcile 解決該登出狀態）。
+ * - `PROBE_POLICY_DENIED`（Stage S2）：provider.call 非 ALLOW（ASK／DENY／讀失敗），
+ *   零 provider 構造、零 listModels（refreshModels 亦零目錄抓取），可重試（請檢查權限設定後重試）。
  */
 fun setupErrorText(code: String): String = when (code) {
     "SETUP_UNKNOWN_PRESET" -> "未知的供應商，請重新選擇。"
@@ -38,6 +40,7 @@ fun setupErrorText(code: String): String = when (code) {
     "TEST_TOO_LARGE" -> "模型列表過大，未能完整載入，請重試。"
     "TEST_RETRYABLE" -> "伺服器忙碌或網路不穩，請稍後重試。"
     "POLICY_DENIED_KEY_WRITE" -> "政策拒絕寫入金鑰（key.write DENY），請檢查權限設定。"
+    "PROBE_POLICY_DENIED" -> "政策未允許連線探測（provider.call 非 ALLOW），未發出任何請求，請檢查權限設定後重試。"
     "LOGOUT_READ_FAILED" -> "讀取端點設定失敗，未做任何變更，請重試。"
     "LOGOUT_DELETE_FAILED" -> "刪除本機金鑰失敗，端點設定未清除，請重試。"
     "LOGOUT_CLEAR_FAILED" -> "部分清除：本機金鑰已刪除、但端點設定仍在，請重試以完成清除。"

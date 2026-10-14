@@ -84,9 +84,10 @@ gates are retained (defense in depth, still reject wasteful huge loops).
 What runs by edit type:
 
 - Docs-only (neither `code` nor `policy`, e.g. `docs/**` or `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.
-- Policy-script-only (any `policy` path edit, `code == false`): build/policy and the stdlib Python policy harness run; unit tests and lint are skipped and resolved as pass by `pr-gate`. A scanner-only diff (`scripts/apk_policy_inspect.py` or `scripts/tests/test_apk_policy_check.py`) therefore cannot pass with all policy validation skipped.
+- Policy-script-only (any `policy` path edit, `code == false`): build/policy and the stdlib Python policy harness run; unit tests and lint are skipped and resolved as pass by `pr-gate`. The harness runs both the Python unit tests AND the repo-wide `python3 scripts/check_test_budgets.py` scan (PR #87 P2-4: script-only diffs skip the `unit-tests` job that otherwise hosts that gate, so the scan is wired into `policy-harness` too — pinned by `PolicyCiGateControl.test_policy_harness_runs_repo_budget_guard`). A scanner-only diff therefore cannot pass with all policy validation skipped.
 - Workflow-only edit to `pr-check.yml`: counts as both `code` and `policy`, so all Gradle stages plus the Python policy harness run. The harness pin tests therefore execute exactly when the wiring they validate changes.
 - Mixed docs + code/policy edits: full Gradle stages plus `docs-guard` run.
+- Stacked PRs (base is not `main`, e.g. a fix branch targeting a feature branch): `pr-check.yml` only triggers on `main`, so no PR Check runs attach to the stacked PR itself — verification rests on local runs (base SHA, exact commands, exit status recorded) plus `workflow_dispatch` evidence; merging the stack into the feature branch re-enters that branch's own `main`-targeted gate, which is where the three-flavor green must be observed before closing the related issue.
 
 Static analysis lives outside `pr-check.yml`: CodeQL runs in
 `.github/workflows/codeql.yml`, which skips docs-only push/PR events via

@@ -962,8 +962,12 @@ class PolicyCiGateControl(unittest.TestCase):
             "scripts/play_policy_check.sh",
             "scripts/apk_policy_inspect.py",
             "scripts/summarize_junit.py",
+            "scripts/check_test_budgets.py",
+            "scripts/check_junit_durations.py",
             "scripts/tests/test_apk_policy_check.py",
             "scripts/tests/test_summarize_junit.py",
+            "scripts/tests/test_check_test_budgets.py",
+            "scripts/tests/test_check_junit_durations.py",
             ".github/workflows/pr-check.yml",
         ):
             with self.subTest(path=required):
@@ -977,6 +981,10 @@ class PolicyCiGateControl(unittest.TestCase):
             ["scripts/apk_policy_inspect.py", "scripts/tests/test_apk_policy_check.py"],
             ["scripts/summarize_junit.py"],
             ["scripts/tests/test_summarize_junit.py"],
+            ["scripts/check_test_budgets.py"],
+            ["scripts/check_junit_durations.py"],
+            ["scripts/tests/test_check_test_budgets.py"],
+            ["scripts/tests/test_check_junit_durations.py"],
             [".github/workflows/pr-check.yml"],
         ):
             with self.subTest(diff=tuple(diff)):
@@ -986,6 +994,22 @@ class PolicyCiGateControl(unittest.TestCase):
                     for pattern in patterns
                 )
                 self.assertTrue(matched, f"scanner-only diff {diff} must set policy=true")
+
+    def test_policy_harness_runs_repo_budget_guard(self) -> None:
+        """PR #87 P2-4: script-only diffs skip unit-tests, so the repo-wide
+        write-budget scan must run inside policy-harness (harness unit tests
+        alone never scan the current tree).
+
+        Pins the EXACT harness-step line (env prefix included): the bare
+        `run: python3 scripts/check_test_budgets.py` form also exists in the
+        `unit-tests` job, so a bare-substring assertion would stay green if
+        this step were ever removed.
+        """
+        workflow = PR_CHECK_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_test_budgets.py",
+            workflow,
+        )
 
     def test_docs_only_diff_does_not_trigger_policy_gate(self) -> None:
         patterns = _pr_check_policy_patterns()

@@ -227,6 +227,13 @@ jobs:
       - name: Run APK policy and release-identity harnesses (stdlib only)
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py
 
+      # PR #87 P2-4: script-only diffs (code == false) skip the unit-tests job
+      # that hosts the write-budget gate, so the repo-wide scan runs here too —
+      # the harness tests alone only cover the scripts' own logic, never the
+      # current tree.
+      - name: Run test-budget repo guard (Issue #86, gate)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_test_budgets.py
+
   build-and-policy-gate:
     name: Build & Policy Gates
     needs: changes

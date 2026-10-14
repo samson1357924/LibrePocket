@@ -229,6 +229,11 @@ object Redactor {
      * an anchored domain `lookingAt()` finds exactly the `replaceAll` matches
      * in order, continuing after each match end. The replacement is literal
      * (no `$` groups), so manual splicing equals `appendReplacement`.
+     *
+     * Note on the RULES EMAIL pattern's possessive `++`: it is defense-in-depth
+     * only (that pattern no longer drives `redact()` matching) — language
+     * equivalence holds via the maximal-run + anchored-domain argument above,
+     * pinned by the EMAIL differential test.
      */
     private const val EMAIL_REPLACEMENT_LITERAL = "⟦REDACTED:EMAIL⟧"
     private val EMAIL_DOMAIN = Regex("""[A-Za-z0-9.\-]+\.[A-Za-z]{2,}""")
@@ -242,6 +247,9 @@ object Redactor {
         var cursor = 0
         var copiedThrough = 0
         var out: StringBuilder? = null
+        // Reuse a single Matcher instance: region() resets its state for each
+        // @-anchored probe (Kotlin Regex.toPattern() returns the cached
+        // compiled Pattern, so no recompilation happens here).
         val domainMatcher = EMAIL_DOMAIN.toPattern().matcher(text)
         while (true) {
             val at = text.indexOf('@', cursor)
@@ -344,6 +352,12 @@ object Redactor {
         // Keep the same R1/R2-then-scanner ordering as redact() so the final
         // whole-value marker choice stays consistent (scanner overwrites any
         // partial R1/R2 marker inside a quoted secret value).
+        // NOTE (PocketGuard WARN disposition, PR #87): EMAIL is intentionally
+        // NOT in ERROR_RULE_IDS (R6 is out of the §6.5 error scope by design —
+        // redactError keeps emails, pinned by redactError_keepsNonKeyContent),
+        // so no linear EMAIL scan is needed here; the regex path is never
+        // reached for EMAIL, and inputs are additionally bounded by
+        // ERROR_MAX_CHARS (500).
         var text = input
         for (rule in RULES.subList(0, 2)) {
             if (rule.id in ERROR_RULE_IDS && !ruleCannotMatch(rule.id, text)) {

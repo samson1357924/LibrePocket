@@ -270,10 +270,9 @@ def _line_has_big_inline_fixture(line: str) -> bool:
     return False
 
 
-def _huge_loop_violation(lines: list[str], fixture_vars: set[str]) -> bool:
-    var_res = [
-        re.compile(r"\b" + re.escape(name) + r"\b") for name in sorted(fixture_vars)
-    ]
+def _huge_loop_violation(
+    lines: list[str], var_res: list[re.Pattern[str]]
+) -> bool:
     for idx, line in enumerate(lines):
         m = REPEAT_RE.search(line)
         if not m or _repeat_count(m.group(1)) < HUGE_REPEAT_MIN:
@@ -329,9 +328,14 @@ def check_file(path: str) -> list[str]:
     base = os.path.basename(path)
     lines = content.splitlines()
     deltas, has_brace = _mask_kotlin_braces(lines)
+    # Compile once per file (not per loop): PocketGuard perf suggestion.
+    var_res = [
+        re.compile(r"\b" + re.escape(name) + r"\b")
+        for name in sorted(_fixture_vars(content))
+    ]
     violations: list[str] = []
     if base not in ALLOWLIST_HUGE_TRUE_PATH and _huge_loop_violation(
-        lines, _fixture_vars(content)
+        lines, var_res
     ):
         violations.append(
             f"{path}: H1 huge-string loop via true appendEvent "

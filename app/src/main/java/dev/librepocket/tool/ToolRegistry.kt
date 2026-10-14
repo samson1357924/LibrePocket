@@ -266,7 +266,7 @@ object ToolRegistry {
             name = "calendar.update",
             description = "Update a calendar event via system calendar EDIT delegation preferred; direct provider write needs WRITE_CALENDAR.",
             jsonSchema = schema(
-                prop("eventId", "string", "Event row id"),
+                prop("eventId", "string", "Event row id, decimal digits only (十進位數字行 id)"),
                 prop("title", "string", "New title, if changing"),
                 prop("start", "string", "ISO-8601 start, if changing"),
                 prop("end", "string", "ISO-8601 end, if changing"),
@@ -284,7 +284,7 @@ object ToolRegistry {
             name = "calendar.delete",
             description = "Delete a calendar event via system calendar delegation preferred; direct provider delete needs WRITE_CALENDAR.",
             jsonSchema = schema(
-                prop("eventId", "string", "Event row id"),
+                prop("eventId", "string", "Event row id, decimal digits only (十進位數字行 id)"),
                 required = "\"eventId\"",
             ),
             sideEffect = SideEffect.WRITE,

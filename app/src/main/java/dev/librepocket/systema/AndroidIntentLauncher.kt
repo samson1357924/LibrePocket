@@ -13,6 +13,10 @@ import android.net.Uri
  * toIntent / resolve / start 任一拋錯 → [LaunchResult.Internal]
  * （含 `resolveActivity` 自身拋錯，D1 此處在 runCatching 之外會直接外洩）。
  * 呼叫方接 [FallbackSpec]。
+ *
+ * 已接受風險（文件化，不改行為）：隱式 Intent handler 劫持——系統依預設
+ * App 選擇處理者，本層不代選；高風險操作由呼叫方經使用者確認後才發起，
+ * 不靜默轉發。
  */
 class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
 
@@ -61,6 +65,14 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
     }.getOrDefault(false)
   }
 
+  /**
+   * 純映射（便於 Robolectric 斷言 extras/flags）。生產路徑必須走 [launch]，
+   * 不得繞過 resolveActivity/try-catch 直調 `startActivity`。
+   *
+   * toIntent 拋錯分支目前近乎 dead code：現有映射（action/data/package/
+   * extras allowlist flags）對合法 [IntentSpec] 不拋；保留作 fail-closed 防禦，
+   * 故無針對性拋錯測試，僅由 resolve/start 拋錯測試覆蓋同層收斂語義。
+   */
   fun toIntent(spec: IntentSpec): Intent {
     val intent = Intent(spec.action)
     spec.dataUri?.let { intent.data = Uri.parse(it) }

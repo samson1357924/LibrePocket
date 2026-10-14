@@ -17,6 +17,25 @@ sealed interface IntentExtra {
 }
 
 /**
+ * 型別化讀取：讀側必須用 `is`/`requireExtra`，禁 unsafe cast。
+ *
+ * 錯型別或缺 key 一律拋 [IllegalStateException]（帶 key + 期望型別），
+ * 避免 `ClassCastException` 訊息無 key 難定位。
+ *
+ * 目前生產側尚未採用此 helper 讀 extras，後續接線 PR 需遷移讀側。
+ */
+inline fun <reified T : IntentExtra> Map<String, IntentExtra>.requireExtra(key: String): T {
+  val v = this[key]
+    ?: throw IllegalStateException("extra missing: key=$key expected=${T::class.simpleName}")
+  if (v !is T) {
+    throw IllegalStateException(
+      "extra type mismatch: key=$key expected=${T::class.simpleName} actual=${v::class.simpleName}",
+    )
+  }
+  return v
+}
+
+/**
  * Intent flags allowlist（純 JVM 常量，數值與 `android.content.Intent` 對齊，
  * 避免本層依賴 android.*）。
  *
@@ -81,7 +100,11 @@ internal fun LaunchResult.toToolResult(
   LaunchResult.NoHandler ->
     ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到$verb（${ReasonCodes.NO_HANDLER}）")
   is LaunchResult.Internal ->
-    ToolResult(false, false, spec, ReasonCodes.INTERNAL, "做不到$verb（${ReasonCodes.INTERNAL}）")
+    ToolResult(
+      false, false, spec, ReasonCodes.INTERNAL,
+      // 可行動：附加 cause 類名（不含 PII），區分拒絕/崩潰；仍保留「（INTERNAL）」子串供既有斷言。
+      "做不到$verb（${ReasonCodes.INTERNAL}）[${cause?.javaClass?.simpleName ?: "Unknown"}]",
+    )
 }
 
 data class ToolResult(

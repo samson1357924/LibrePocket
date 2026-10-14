@@ -12,6 +12,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -239,5 +240,271 @@ class IntentTypedD2Test {
       ReasonCodes.INTERNAL,
       MusicTool.execute(MusicTool.Params(control = MusicTool.Control.NEXT), env, internal).reasonCode,
     )
+  }
+
+  // ---- 7. Stage 3：typed getter ----
+
+  @Test fun extras_requireExtra_roundTrip() {
+    val extras: Map<String, IntentExtra> = mapOf(
+      "s" to IntentExtra.Str("x"),
+      "l" to IntentExtra.LongVal(9L),
+    )
+    assertEquals(IntentExtra.Str("x"), extras.requireExtra<IntentExtra.Str>("s"))
+    assertEquals(IntentExtra.LongVal(9L), extras.requireExtra<IntentExtra.LongVal>("l"))
+  }
+
+  @Test fun extras_requireExtra_mismatchThrows() {
+    val extras: Map<String, IntentExtra> = mapOf("k" to IntentExtra.LongVal(1L))
+    try {
+      extras.requireExtra<IntentExtra.Str>("k")
+      fail("expected IllegalStateException for mistyped extra")
+    } catch (e: IllegalStateException) {
+      assertTrue(e.message ?: "", "k" in (e.message ?: ""))
+      assertTrue(e.message ?: "", "Str" in (e.message ?: ""))
+    }
+  }
+
+  @Test fun extras_requireExtra_missingThrows() {
+    try {
+      emptyMap<String, IntentExtra>().requireExtra<IntentExtra.Str>("nope")
+      fail("expected IllegalStateException for missing extra")
+    } catch (e: IllegalStateException) {
+      assertTrue(e.message ?: "", "nope" in (e.message ?: ""))
+    }
+  }
+
+  // ---- 8. Stage 3：calendar edit 排序 + eventId 數字校驗 ----
+
+  @Test(expected = IllegalArgumentException::class)
+  fun calendar_edit_endBeforeBegin_throws() {
+    CalendarTool.buildEditIntent(
+      CalendarTool.UpdateParams(eventId = "42", beginTimeMillis = 2000L, endTimeMillis = 1000L),
+    )
+  }
+
+  @Test fun calendar_edit_singleSidedTime_ok() {
+    // 單端 null 表不改，不觸發排序校驗。
+    val spec = CalendarTool.buildEditIntent(
+      CalendarTool.UpdateParams(eventId = "42", beginTimeMillis = 2000L),
+    )
+    assertEquals(IntentExtra.LongVal(2000L), spec.extras[CalendarTool.EXTRA_BEGIN_TIME])
+  }
+
+  @Test fun calendar_eventId_nonNumeric_throws() {
+    for (bad in listOf("1/2", "1?x=1", "../0", "abc", "12 34")) {
+      try {
+        CalendarTool.eventUri(bad)
+        fail("expected IllegalArgumentException for eventId=$bad")
+      } catch (e: IllegalArgumentException) {
+        // expected
+      }
+    }
+  }
+
+  @Test fun calendar_eventId_numeric_ok() {
+    assertEquals("${CalendarTool.EVENTS_CONTENT_URI}/42", CalendarTool.eventUri("42"))
+    assertEquals("${CalendarTool.EVENTS_CONTENT_URI}/007", CalendarTool.eventUri("  007  "))
+  }
+
+  @Test fun calendar_delete_nonNumeric_throws() {
+    // 與 edit 共用 eventUri，同受益。
+    try {
+      CalendarTool.buildDeleteDescriptor(CalendarTool.DeleteParams("../0"))
+      fail("expected IllegalArgumentException for delete eventId")
+    } catch (e: IllegalArgumentException) {
+      // expected
+    }
+  }
+
+  // ---- 9. Stage 3：Internal 訊息帶 cause 類名 ----
+
+  @Test fun toolResult_internal_includesCauseName() {
+    val spec = IntentSpec(action = IntentActions.VIEW)
+    val sec = LaunchResult.Internal(SecurityException("deny")).toToolResult(spec, "開啟 App")
+    val run = LaunchResult.Internal(RuntimeException("boom")).toToolResult(spec, "開啟 App")
+    assertEquals(ReasonCodes.INTERNAL, sec.reasonCode)
+    assertEquals(ReasonCodes.INTERNAL, run.reasonCode)
+    assertTrue(sec.message, "SecurityException" in sec.message)
+    assertTrue(run.message, "RuntimeException" in run.message)
+    assertTrue(sec.message, "（${ReasonCodes.INTERNAL}）" in sec.message)
+    assertFalse(sec.message == run.message)
+  }
+
+  @Test fun toolResult_internal_nullCause_showsUnknown() {
+    val spec = IntentSpec(action = IntentActions.VIEW)
+    val r = LaunchResult.Internal(null).toToolResult(spec, "開啟 App")
+    assertFalse(r.ok)
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+    assertTrue(r.message, "（${ReasonCodes.INTERNAL}）" in r.message)
+    assertTrue(r.message, "[Unknown]" in r.message)
+  }
+
+  // ---- 10. Stage 3：flags mirror + 丟棄語義 ----
+
+  @Test fun flags_mirrorMatchesFramework() {
+    assertEquals(Intent.FLAG_GRANT_READ_URI_PERMISSION, IntentFlags.GRANT_READ_URI_PERMISSION)
+    assertEquals(Intent.FLAG_GRANT_WRITE_URI_PERMISSION, IntentFlags.GRANT_WRITE_URI_PERMISSION)
+    assertEquals(Intent.FLAG_ACTIVITY_CLEAR_TASK, IntentFlags.ACTIVITY_CLEAR_TASK)
+    assertEquals(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS, IntentFlags.ACTIVITY_EXCLUDE_FROM_RECENTS)
+    assertEquals(Intent.FLAG_ACTIVITY_CLEAR_TOP, IntentFlags.ACTIVITY_CLEAR_TOP)
+    assertEquals(Intent.FLAG_ACTIVITY_NEW_TASK, IntentFlags.ACTIVITY_NEW_TASK)
+    assertEquals(Intent.FLAG_ACTIVITY_SINGLE_TOP, IntentFlags.ACTIVITY_SINGLE_TOP)
+    assertEquals(Intent.FLAG_ACTIVITY_NO_HISTORY, IntentFlags.ACTIVITY_NO_HISTORY)
+    assertEquals(
+      Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP,
+      IntentFlags.ALLOWED_MASK,
+    )
+  }
+
+  @Test fun flags_extraDisallowed_droppedViaToIntent() {
+    // PERSISTABLE/PREFIX 無純側常量，以框架實際值為準，經 toIntent 一律丟棄。
+    val launcher = AndroidIntentLauncher(appContext())
+    val spec = IntentSpec(
+      action = IntentActions.VIEW,
+      flags = Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
+        Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
+        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+        Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+    )
+    val intent = launcher.toIntent(spec)
+    assertEquals(0, intent.flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+    assertEquals(0, intent.flags and Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
+    assertEquals(0, intent.flags and Intent.FLAG_ACTIVITY_MULTIPLE_TASK)
+    assertEquals(0, intent.flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+    assertEquals(0, intent.flags and Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)
+    // NEW_TASK 預設仍在。
+    assertTrue(intent.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0)
+  }
+
+  @Test fun flags_minusOne_mapsToMaskViaToIntent() {
+    val launcher = AndroidIntentLauncher(appContext())
+    val intent = launcher.toIntent(IntentSpec(action = IntentActions.VIEW, flags = -1))
+    assertEquals(IntentFlags.ALLOWED_MASK, intent.flags)
+  }
+
+  // ---- 11. Stage 3：resolve 拋錯 ----
+
+  @Test fun launch_resolveThrows_returnsInternal() {
+    val app = appContext()
+    val throwingPm = object : ContextWrapper(app) {
+      override fun getPackageManager() = throw RuntimeException("pm boom")
+    }
+    val r = AndroidIntentLauncher(throwingPm).launch(
+      IntentSpec(action = Intent.ACTION_VIEW, dataUri = "https://example.com"),
+    )
+    assertTrue(r is LaunchResult.Internal)
+  }
+
+  // ---- 12. Stage 3：工具覆蓋 ----
+
+  @Test fun launchApp_single_noHandlerAndInternal_codes() {
+    val singleEnv = SystemEnv(installedPackages = setOf("com.google.android.apps.maps"))
+    val noHandler = IntentLauncher { LaunchResult.NoHandler }
+    val r1 = LaunchAppTool.execute(LaunchAppTool.Params("com.google.android.apps.maps"), singleEnv, noHandler)
+    assertFalse(r1.ok)
+    assertFalse(r1.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, r1.reasonCode)
+    val internal = IntentLauncher { LaunchResult.Internal(RuntimeException("boom")) }
+    val r2 = LaunchAppTool.execute(LaunchAppTool.Params("com.google.android.apps.maps"), singleEnv, internal)
+    assertFalse(r2.ok)
+    assertEquals(ReasonCodes.INTERNAL, r2.reasonCode)
+  }
+
+  @Test fun navigation_degradedSuccess_locksFallbackSemantics() {
+    val noMap = env.copy(hasMapApp = false)
+    val r = NavigationTool.execute(
+      NavigationTool.Params(query = "夜市"), noMap, IntentLauncher { LaunchResult.Success },
+    )
+    assertTrue(r.ok)
+    assertTrue(r.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, r.reasonCode)
+  }
+
+  @Test fun music_degradedPlaySuccess_locksFallbackSemantics() {
+    val noMusic = env.copy(hasMusicApp = false)
+    val play = MusicTool.execute(
+      MusicTool.Params(query = "周杰倫"), noMusic, IntentLauncher { LaunchResult.Success },
+    )
+    assertTrue(play.ok)
+    assertTrue(play.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, play.reasonCode)
+    // 控制路徑現語義：成功不帶 fallback/reason（成功分支 reasonCode 重構列 follow-up，不在此改）。
+    val control = MusicTool.execute(
+      MusicTool.Params(control = MusicTool.Control.NEXT), noMusic, IntentLauncher { LaunchResult.Success },
+    )
+    assertTrue(control.ok)
+    assertFalse(control.usedFallback)
+    assertNull(control.reasonCode)
+  }
+
+  // ---- 13. Stage 3：navigation geo ----
+
+  @Test fun navigation_latLng_outOfRange_throws() {
+    for (p in listOf(
+      NavigationTool.Params(latitude = 91.0, longitude = 0.0),
+      NavigationTool.Params(latitude = -91.0, longitude = 0.0),
+      NavigationTool.Params(latitude = 0.0, longitude = 181.0),
+      NavigationTool.Params(latitude = 0.0, longitude = -181.0),
+    )) {
+      try {
+        NavigationTool.buildGeoIntent(p)
+        fail("expected IllegalArgumentException for $p")
+      } catch (e: IllegalArgumentException) {
+        // expected
+      }
+    }
+  }
+
+  @Test fun navigation_latLng_nonFinite_throws() {
+    for (p in listOf(
+      NavigationTool.Params(latitude = Double.NaN, longitude = 0.0),
+      NavigationTool.Params(latitude = 0.0, longitude = Double.POSITIVE_INFINITY),
+      NavigationTool.Params(latitude = Double.NEGATIVE_INFINITY, longitude = 0.0),
+      NavigationTool.Params(latitude = 0.0, longitude = Double.NaN),
+    )) {
+      try {
+        NavigationTool.buildGeoIntent(p)
+        fail("expected IllegalArgumentException for $p")
+      } catch (e: IllegalArgumentException) {
+        // expected
+      }
+    }
+  }
+
+  @Test fun navigation_latLng_boundary_ok() {
+    val spec = NavigationTool.buildGeoIntent(NavigationTool.Params(latitude = 90.0, longitude = 180.0))
+    assertTrue(spec.dataUri ?: "", (spec.dataUri ?: "").startsWith("geo:90.0,180.0"))
+    val neg = NavigationTool.buildGeoIntent(NavigationTool.Params(latitude = -90.0, longitude = -180.0))
+    assertTrue(neg.dataUri ?: "", (neg.dataUri ?: "").startsWith("geo:-90.0,-180.0"))
+  }
+
+  @Test fun navigation_singleSidedCoord_throws() {
+    // 單側座標 fail-fast：禁靜默丟棄，geo 與 web 兩路徑皆拋。
+    for (p in listOf(
+      NavigationTool.Params(latitude = 25.0),
+      NavigationTool.Params(longitude = 121.0),
+    )) {
+      try {
+        NavigationTool.buildGeoIntent(p)
+        fail("expected IllegalArgumentException for single-sided $p")
+      } catch (e: IllegalArgumentException) {
+        // expected
+      }
+      try {
+        NavigationTool.buildWebIntent(p)
+        fail("expected IllegalArgumentException for single-sided $p")
+      } catch (e: IllegalArgumentException) {
+        // expected
+      }
+    }
+  }
+
+  @Test fun navigation_labelEncoding_locksUrlEncoderPlus() {
+    // 鎖定現行 URLEncoder 行為（空格→`+`），見 NavigationTool KDoc；不硬改為 Uri.encode。
+    val spec = NavigationTool.buildGeoIntent(
+      NavigationTool.Params(latitude = 25.0, longitude = 121.0, label = "a b"),
+    )
+    assertEquals("geo:25.0,121.0?q=a+b", spec.dataUri)
   }
 }

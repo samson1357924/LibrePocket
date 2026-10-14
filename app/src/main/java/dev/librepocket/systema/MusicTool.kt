@@ -5,7 +5,8 @@ package dev.librepocket.systema
  *
  * - 點播：VIEW Intent 帶曲目/搜尋 URI，交給系統播放器。
  * - 控制（暫停/下一首等）：MEDIA_BUTTON 語義的 [ControlSpec]，
- *   端側經 MediaSession 回調落地。
+ *   端側經 MediaSession 回調落地。斷言僅自洽，未接真實播放器：
+ *   單元測試只鎖 keyCode 映射與 Intent 形狀，未驗證端側 MediaSession 回調落地。
  * - 前台要求：實際播放必須跑在前台服務（`FOREGROUND_SERVICE_MEDIA_PLAYBACK`
  *   + 常駐通知），否則後台會被系統回收；本層僅建模，端側強制。
  * - 模糊目標（如「放點輕音樂」）不猜包名：先澄清或走預設播放器。

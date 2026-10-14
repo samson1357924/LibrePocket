@@ -125,6 +125,42 @@ class CheckTestBudgetsTest(unittest.TestCase):
             )
             self.assertEqual([], check_test_budgets.check_file(p))
 
+    def test_h2_big_compute_loop_plus_unrelated_single_append_passes(self) -> None:
+        # PR #87 P2-2: a big pure-compute loop and an unrelated single write
+        # in another method must NOT count as a 2000-row write loop.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MixedTest.kt",
+                (
+                    "@Test fun bigCompute() {\n"
+                    '    repeat(2000) { println("ok $it") }\n'
+                    "}\n" + "\n" * 20
+                    + "@Test fun singleWrite() = runBlocking {\n"
+                    '    store.appendEvent(event(sid, "hello"))\n'
+                    "}\n"
+                ),
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_boundary_1999_passes_2000_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            ok = _write(
+                Path(d),
+                "Boundary1999.kt",
+                'repeat(1999) { store.appendEvent(event(sid, "q")) }\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(ok))
+            bad = _write(
+                Path(d),
+                "Boundary2000Fast.kt",
+                "repeat(2000) {\n"
+                "    store.appendPreRedactedForBudgetTest(event(sid, huge))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(bad)
+            self.assertTrue(any("H2" in x for x in v), v)
+
 
 if __name__ == "__main__":
     unittest.main()

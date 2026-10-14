@@ -17,9 +17,14 @@ Rules (test sources only, no prod change):
   fixtures passed through helper parameters or built indirectly (no
   `val/var = ... .repeat(100_00x)` shape) are not tracked — H1 is a tripwire,
   not a coverage proof.
-- H2 (unbounded row count): no file may `repeat(N>=2000)` with `.appendEvent(`.
-  Current max is `repeat(1000)` (small-string row-cap pins, cheap); anything at
-  or above 2000 needs explicit review + nightly placement.
+- H2 (unbounded row count, loop-local): a single `repeat(N>=2000)` loop must
+  NOT contain a store write (`.appendEvent(` or the pre-redacted fast path)
+  within its 12-line body window. The old file-level `max(repeat)` check
+  misfired when a big pure-compute loop and an unrelated single write shared
+  a file. Current max is `repeat(1000)` (small-string row-cap pins, cheap);
+  anything at or above 2000 needs explicit review + nightly placement.
+  Limitation: nested-loop products (e.g. 100x100) are not multiplied — each
+  loop is judged alone.
 
 Run with: python3 scripts/check_test_budgets.py
 Test with: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_check_test_budgets
@@ -97,6 +102,20 @@ def _huge_loop_violation(lines: list[str], fixture_vars: set[str]) -> bool:
     return False
 
 
+def _h2_loop_violation(lines: list[str]) -> str | None:
+    """Single-loop H2: repeat(N>=2000) with a store write in its body window."""
+    for idx, line in enumerate(lines):
+        m = REPEAT_RE.search(line)
+        if not m or int(m.group(1)) < ROW_REPEAT_MAX:
+            continue
+        window = lines[idx : idx + REPEAT_WINDOW_LINES]
+        if any(
+            APPEND_EVENT_RE.search(w) or FAST_PATH_RE.search(w) for w in window
+        ):
+            return f"repeat({m.group(1)})"
+    return None
+
+
 def check_file(path: str) -> list[str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -105,8 +124,6 @@ def check_file(path: str) -> list[str]:
         return [f"{path}: unreadable ({e})"]
     base = os.path.basename(path)
     lines = content.splitlines()
-    repeats = [int(m.group(1)) for m in REPEAT_RE.finditer(content)]
-    has_append = APPEND_EVENT_RE.search(content) is not None
     violations: list[str] = []
     if base not in ALLOWLIST_HUGE_TRUE_PATH and _huge_loop_violation(
         lines, _fixture_vars(content)
@@ -116,11 +133,11 @@ def check_file(path: str) -> list[str]:
             f"(repeat>={HUGE_REPEAT_MIN} with .appendEvent on a huge fixture; "
             f"use appendPreRedactedForBudgetTest or move to nightly)"
         )
-    max_repeat = max(repeats) if repeats else 0
-    if has_append and max_repeat >= ROW_REPEAT_MAX:
+    h2_loop = _h2_loop_violation(lines)
+    if h2_loop is not None:
         violations.append(
-            f"{path}: H2 unbounded write loop (repeat({max_repeat}) + "
-            f".appendEvent >= {ROW_REPEAT_MAX}; needs review + nightly)"
+            f"{path}: H2 unbounded write loop ({h2_loop} with a store write "
+            f"in its body; needs review + nightly)"
         )
     return violations
 

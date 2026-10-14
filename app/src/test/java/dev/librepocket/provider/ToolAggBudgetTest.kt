@@ -17,7 +17,10 @@ import org.junit.Test
  * shares one per-call memory budget ([MAX_TOOL_CALL_AGG_BYTES]); exceeding it
  * is a typed non-retryable failure ([TOOL_ARGS_TOO_LARGE]), distinct from
  * malformed payloads (ignored) and clean-EOF truncation (`SSE_TRUNCATED`,
- * retryable). Nothing is silently truncated.
+ * retryable). Nothing is silently truncated. Over-ceiling JSON nesting (S2)
+ * throws the same typed triple via the MiniJson depth subtype, latched per
+ * attempt so no later terminal becomes Done; done-path ToolDone resends of an
+ * already-emitted pair emit nothing (emit-once).
  *
  * Finding #1 adds the per-attempt whole-round total
  * ([requireTotalToolAggBudget]) and the distinct-tool cap
@@ -637,10 +640,11 @@ class ToolAggBudgetTest {
     }
 
     @Test
-    fun responsesDoneResendAcceptedIdAtCapIsNoOp() {
-        // At-cap re-send of an already-admitted (toolIndex, id) must stay a
-        // dedup no-op: the guard charges only genuinely-new pairs, so a legal
-        // duplicate after the cap is never misread as an overflow.
+    fun responsesDoneResendAcceptedIdAtCapDuplicateIsTrueNoOp() {
+        // Emit-once per (toolIndex, id) pair: at-cap re-send of an
+        // already-emitted pair emits NOTHING (true no-op, no throw) — the
+        // guard charges only genuinely-new pairs, so a legal duplicate after
+        // the cap is never misread as an overflow and never re-emits.
         val mapper = ResponsesMapper()
         for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
             mapper.mapPayload(
@@ -650,7 +654,7 @@ class ToolAggBudgetTest {
         val out = mapper.mapPayload(
             """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c000","name":"f"}}""",
         )
-        assertEquals(1, out.filterIsInstance<StreamEvent.ToolDone>().size)
+        assertTrue("duplicate of an already-emitted pair emits nothing", out.isEmpty())
     }
 
     // ---- Stage 1 (F4): Anthropic TOOL->TOOL restart re-bills id/name ----
@@ -1138,5 +1142,134 @@ class ToolAggBudgetTest {
             """{"type":"response.output_item.added","item_id":"","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
         )
         assertEquals(1, out3.filterIsInstance<StreamEvent.ToolDelta>().size)
+    }
+
+    // ---- S2: JSON depth fail-closed (typed, sticky) + done emit-once ----
+    //
+    // Over-ceiling frames throw MiniJsonDepthException (a MiniJsonException
+    // subtype). Mappers translate ONLY the depth subtype into the typed
+    // non-retryable aggregation failure; plain malformed frames still drop
+    // per frame. The breach latches per attempt: later terminals can never
+    // become Done, and finish() reports the typed failure — never a retryable
+    // SSE_TRUNCATED. Done-path resends of an already-emitted (toolIndex, id)
+    // pair emit nothing (emit-once, mirroring the drain).
+
+    /** `levels` nested arrays wrapping a `0` scalar (over-ceiling junk). */
+    private fun deepJunk(levels: Int = MiniJson.MAX_DEPTH + 1): String =
+        "[".repeat(levels) + "0" + "]".repeat(levels)
+
+    private fun assertDepthFailed(e: ProviderFailure) {
+        assertEquals(TOOL_ARGS_TOO_LARGE, e.message)
+        assertFalse("depth breach must not retry the poisoned stream", e.retryable)
+        assertEquals(ProviderFailureCode.AGG_TOO_LARGE, e.code)
+    }
+
+    private fun assertDepthFailedTerminal(events: List<StreamEvent>) {
+        val failed = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertEquals(TOOL_ARGS_TOO_LARGE, failed.message)
+        assertFalse("depth breach must not retry the poisoned stream", failed.retryable)
+        assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, failed.code)
+        assertTrue("no Done after a depth breach", events.none { it is StreamEvent.Done })
+        assertTrue("no ToolDone after a depth breach", events.none { it is StreamEvent.ToolDone })
+        assertTrue(
+            "depth breach is never the retryable truncation",
+            events.none { it == StreamEvent.Failed("SSE_TRUNCATED", retryable = true) },
+        )
+    }
+
+    @Test
+    fun plainMalformedFrameStillDropsAndStreamContinues() {
+        // Negative control for the depth branch: a NON-deep malformed frame
+        // still drops per frame (emptyList) and the stream keeps projecting —
+        // only the depth subtype throws.
+        val mapper = ResponsesMapper()
+        assertTrue(mapper.mapPayload("{not json").isEmpty())
+        val ok = mapper.mapPayload("""{"type":"response.output_text.delta","delta":"ok"}""")
+        val texts = ok.filterIsInstance<StreamEvent.TextDelta>()
+        assertEquals(1, texts.size)
+        assertEquals("ok", texts[0].delta)
+    }
+
+    @Test
+    fun responsesDeepFrameWithValidDeltaThrowsTypedAndTerminalNeverDone() {
+        // The poisoned frame carries a VALID delta ("hi"): pre-fix the whole
+        // frame was dropped and a later terminal succeeded without it (fake
+        // success). Now the frame throws typed, the valid delta is never
+        // surfaced, and the legal authoritative terminal rethrows instead of
+        // becoming Done.
+        val mapper = ResponsesMapper()
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_text.delta","delta":"hi","junk":${deepJunk()}}""",
+            )
+        }
+        assertDepthFailed(over)
+        val terminalThrow = toolFailureOf {
+            mapper.mapPayload("""{"type":"response.completed","response":{"output":[]}}""")
+        }
+        assertDepthFailed(terminalThrow)
+        assertDepthFailedTerminal(mapper.finish())
+    }
+
+    @Test
+    fun chatCompletionsDeepFrameThrowsTypedAndDoneNeverFollows() {
+        // Same fake-success shape on the Chat Completions mapper: a deep frame
+        // with valid content throws typed, and a later finish_reason + [DONE]
+        // pair can never become Done.
+        val mapper = ChatCompletionsMapper()
+        val over = toolFailureOf {
+            mapper.mapPayload("""{"choices":[{"delta":{"content":"hi"}}],"junk":${deepJunk()}}""")
+        }
+        assertDepthFailed(over)
+        val terminalThrow = toolFailureOf {
+            mapper.mapPayload("""{"choices":[{"finish_reason":"stop"}]}""")
+        }
+        assertDepthFailed(terminalThrow)
+        // Even a transport-level [DONE] after the breach cannot resurrect it.
+        mapper.markDone()
+        assertDepthFailedTerminal(mapper.finish())
+    }
+
+    @Test
+    fun anthropicOnlyDeepFrameThenEofIsTypedNonRetryable() {
+        // Only an over-deep frame, then EOF: finish() is the typed
+        // non-retryable failure — never the retryable SSE_TRUNCATED that
+        // would retry the poisoned stream — and message_stop can never Done.
+        val mapper = AnthropicMapper()
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"},"junk":${deepJunk()}}""",
+            )
+        }
+        assertDepthFailed(over)
+        val stopThrow = toolFailureOf {
+            mapper.mapPayload("""{"type":"message_stop"}""")
+        }
+        assertDepthFailed(stopThrow)
+        assertDepthFailedTerminal(mapper.finish())
+    }
+
+    @Test
+    fun responsesDuplicateToolDoneReplayEmitsOnce() {
+        // N=100 resends of the SAME (toolIndex, id) pair: exactly one ToolDone
+        // total, no throw, and the drain stays silent (already-emitted). The
+        // honest EOF terminal is unchanged.
+        val mapper = ResponsesMapper()
+        var emitted = 0
+        repeat(100) {
+            emitted += mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
+            ).filterIsInstance<StreamEvent.ToolDone>().size
+        }
+        assertEquals("one pair emits exactly once across 100 resends", 1, emitted)
+        val tail = mapper.finish()
+        assertTrue(
+            "already-emitted pair drains silently",
+            tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty(),
+        )
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
     }
 }

@@ -197,14 +197,33 @@ internal class ResponsesMapper(val round: Int = 0) {
     private var totalAggChars = 0
     private var usage: StreamEvent.Usage? = null
     private var terminal: StreamEvent? = null
+    // Sticky JSON-depth breach latch (fail-closed): once a frame exceeds
+    // MiniJson.MAX_DEPTH, mapPayload throws typed non-retryable and every
+    // later mapPayload rethrows the same way, so no later terminal frame can
+    // become Done; finish() reports the typed failure instead of
+    // SSE_TRUNCATED. Set only from the MiniJsonDepthException branch below.
+    private var jsonDepthFailed = false
     var terminalReached: Boolean = false
         private set
 
     fun mapPayload(payload: String): List<StreamEvent> {
+        if (jsonDepthFailed) throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
         if (terminal != null) return emptyList()
         val root = try {
             MiniJson.parse(payload) as? MiniJson.JObj ?: return emptyList()
-        } catch (_: MiniJson.MiniJsonException) {
+        } catch (e: MiniJson.MiniJsonException) {
+            if (e is MiniJson.MiniJsonDepthException) {
+                // A depth breach is NOT a droppable malformed frame: dropping
+                // it would lose its delta and let a later terminal succeed
+                // without it (fake success), or degrade at EOF to a retryable
+                // SSE_TRUNCATED that retries the poisoned stream. Fail the
+                // attempt with the same typed non-retryable failure as every
+                // aggregation-budget overflow; streamingFlow converts the throw
+                // into a single Failed terminal. Other malformed input still
+                // drops just this frame below.
+                jsonDepthFailed = true
+                throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+            }
             return emptyList()
         }
         val type = root.string("type") ?: return emptyList()
@@ -352,17 +371,24 @@ internal class ResponsesMapper(val round: Int = 0) {
                 // the SAME distinct per-attempt cap + typed failure; check a
                 // genuinely-new (toolIndex, id) BEFORE insert so the overflowing
                 // entry is never retained (no set insert; duplicates are dedup
-                // no-ops, not new admissions), mirroring the callsByItem guard above.
+                // no-ops — neither new admissions nor new emits, mirroring the
+                // callsByItem guard above and the drain below).
                 if ((agg.toolIndex to effectiveId) !in emittedToolIds) {
                     requireToolCountBudget(emittedToolIds.size + 1)
                 }
-                // All guards passed: single write-back, then emit.
+                // All guards passed: single write-back, then emit-once per
+                // (toolIndex, id) pair — only a genuinely-new admission emits.
+                // A resend of an already-emitted pair is a true no-op (no
+                // event, no throw, no set growth), mirroring the
+                // finishPendingTools drain below: at most one ToolDone per
+                // pair per attempt, however often the server repeats it.
                 agg.id = effectiveId
                 agg.name = effectiveName
                 if (useFull) agg.args.append(full!!)
                 totalAggChars += growth
-                emittedToolIds.add(agg.toolIndex to agg.id)
-                out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))
+                if (emittedToolIds.add(agg.toolIndex to agg.id)) {
+                    out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))
+                }
             }
             "response.completed" -> {
                 val response = root.obj("response")
@@ -403,6 +429,20 @@ internal class ResponsesMapper(val round: Int = 0) {
     }
 
     fun finish(): List<StreamEvent> {
+        // A latched depth breach dominates the honest-EOF path: the poisoned
+        // attempt reports the typed non-retryable failure, never a retryable
+        // SSE_TRUNCATED (which would retry the poisoned stream) and never a
+        // success. Carries the AGG_TOO_LARGE code so TurnController's
+        // pending-flush guard treats it like every other budget overflow.
+        if (jsonDepthFailed) {
+            return listOf(
+                StreamEvent.Failed(
+                    TOOL_ARGS_TOO_LARGE,
+                    retryable = false,
+                    code = ProviderFailureCode.AGG_TOO_LARGE.name,
+                ),
+            )
+        }
         terminal?.let { return emptyList() } // already terminal
         val out = ArrayList<StreamEvent>()
         finishPendingTools(out)

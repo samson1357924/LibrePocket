@@ -6,12 +6,15 @@ package dev.librepocket.provider
  * Zero dependencies on purpose: the provider module must stay JVM-unit-testable
  * (android.jar `org.json` stubs throw under plain JUnit) and must not gain new
  * Gradle dependencies in P1. Only the subset needed for event projection is
- * supported; malformed input throws [MiniJsonException].
+ * supported; malformed input throws [MiniJsonException]. Over-ceiling nesting
+ * throws the [MiniJsonDepthException] subtype (still caught by existing
+ * [MiniJsonException] catches); protocol mappers translate the depth subtype
+ * into a typed non-retryable aggregation failure instead of dropping the frame.
  */
 internal object MiniJson {
     /**
      * Maximum nesting depth (nested objects/arrays) accepted before parsing
-     * fails closed with [MiniJsonException].
+     * fails closed with [MiniJsonDepthException].
      *
      * A hostile ≤1 MiB SSE frame can nest hundreds of thousands of containers
      * (up to ~524k array levels, ~131k with object keys); recursive descent
@@ -19,8 +22,15 @@ internal object MiniJson {
      * before that. The protocol mappers only catch [MiniJsonException] per
      * frame, so an escaping [StackOverflowError] would instead be swallowed by
      * the transport's general branch and mislabeled a retryable failure. Ceiling
-     * the depth keeps the failure on the existing fail-closed path: the frame
-     * is treated as malformed and dropped, never retried, never crashing.
+     * the depth keeps the failure typed and fail-closed: over-ceiling input
+     * throws [MiniJsonDepthException] (a [MiniJsonException] subtype, so the
+     * existing per-frame catches still catch it), and the mappers translate
+     * the depth subtype into a typed non-retryable `ProviderFailure`
+     * (`TOOL_ARGS_TOO_LARGE` / `AGG_TOO_LARGE`) — the same semantics as every
+     * aggregation-budget overflow. The poisoned attempt then fails without
+     * re-requesting that frame, without folding a later terminal into a
+     * success `Done` (the mapper latches the breach), and without degrading
+     * to a retryable `SSE_TRUNCATED` at EOF.
      *
      * The value is deliberately generous: the deepest legitimate payload in
      * project fixtures nests 7 (`chat-basic.txt` tool_calls.function); even a
@@ -39,7 +49,16 @@ internal object MiniJson {
     data class JBool(val v: Boolean) : J
     object JNull : J
 
-    class MiniJsonException(message: String) : IllegalArgumentException(message)
+    open class MiniJsonException(message: String) : IllegalArgumentException(message)
+
+    /**
+     * Nesting-depth ceiling breach ([MAX_DEPTH]). A subtype of
+     * [MiniJsonException], so pre-existing `catch (MiniJsonException)` sites
+     * still catch it — but the protocol mappers discriminate this subtype and
+     * fail the poisoned attempt with a typed non-retryable aggregation failure
+     * instead of dropping the frame and continuing.
+     */
+    class MiniJsonDepthException(message: String) : MiniJsonException(message)
 
     fun parse(text: String): J = Parser(text).parseValue().also { it }
 
@@ -67,11 +86,13 @@ internal object MiniJson {
          * level here (the only two recursive productions); the [try]/[finally]
          * restores [depth] on every exit path — normal return or thrown — so a
          * sibling container never inherits a leaked depth. Over-ceiling input
-         * throws the same [MiniJsonException] as any malformed frame, which
-         * the mappers already catch and drop per frame.
+         * throws [MiniJsonDepthException] (not the plain [MiniJsonException]
+         * used for malformed frames) so the mappers fail the poisoned attempt
+         * typed non-retryable instead of dropping one frame and later
+         * succeeding without its delta.
          */
         private inline fun <T> withDepth(block: () -> T): T {
-            if (depth >= MAX_DEPTH) fail("nesting exceeds $MAX_DEPTH")
+            if (depth >= MAX_DEPTH) throw MiniJsonDepthException("nesting exceeds $MAX_DEPTH at offset $pos")
             depth++
             try {
                 return block()

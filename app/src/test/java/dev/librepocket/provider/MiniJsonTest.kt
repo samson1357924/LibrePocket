@@ -1,6 +1,7 @@
 package dev.librepocket.provider
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -15,15 +16,18 @@ import org.junit.Test
 private const val CEILING = 64
 
 /**
- * MiniJson recursion-depth guard (Stage 1, F3).
+ * MiniJson recursion-depth guard (Stage 1, F3; S2 typed fail-closed).
  *
  * A hostile SSE frame can nest JSON far deeper than the JVM call stack
  * tolerates (hundreds of thousands of levels fit in 1 MiB); without a ceiling
  * the parser throws [StackOverflowError], which the mappers (catching only
  * [MiniJson.MiniJsonException]) do not swallow, so the transport mislabels the
- * whole poisoned stream as a retryable failure. The parser now fails closed at
- * CEILING with the same [MiniJson.MiniJsonException] used for any malformed
- * frame, so a mapper drops just that frame and the stream continues.
+ * whole poisoned stream as a retryable failure. The parser fails closed at
+ * CEILING with [MiniJson.MiniJsonDepthException] (a [MiniJson.MiniJsonException]
+ * subtype, so old catches still catch it), and the mappers translate the depth
+ * subtype into a typed non-retryable aggregation failure
+ * (`TOOL_ARGS_TOO_LARGE` / `AGG_TOO_LARGE`) — never a dropped frame folded
+ * into a later success, never a retryable `SSE_TRUNCATED`.
  *
  * Depth rationale: the deepest legitimate payload in the project fixtures
  * nests 7 (`sse/chat-basic.txt` `tool_calls[].function`), so 64 leaves ample
@@ -100,16 +104,46 @@ class MiniJsonTest {
     }
 
     @Test
-    fun mapperDropsOverDeepFrameAndStreamContinues() {
-        // (a) An over-deep frame is dropped (emptyList) by the mapper's existing
-        // MiniJsonException catch — no StackOverflowError escapes — and (b) the
-        // stream keeps projecting later legal frames.
+    fun depthBreachIsADistinctSubtypeOfMiniJsonException() {
+        // The depth signal must survive old `catch (MiniJsonException)` sites
+        // (it IS one) while letting mappers discriminate it from malformed
+        // frames.
+        try {
+            MiniJson.parse(nest(ceiling + 1))
+            fail("over-ceiling nesting must fail closed")
+        } catch (e: MiniJson.MiniJsonException) {
+            assertTrue(
+                "depth breach must be the discriminable depth subtype",
+                e is MiniJson.MiniJsonDepthException,
+            )
+        }
+    }
+
+    @Test
+    fun mapperFailsClosedTypedOnOverDeepFrame() {
+        // (a) An over-deep frame throws the typed non-retryable aggregation
+        // failure (same triple as every budget overflow) — no
+        // StackOverflowError escapes and the valid delta riding the poisoned
+        // frame is never surfaced — and (b) the breach latches: a later legal
+        // frame still throws instead of projecting, so the attempt can never
+        // fold the loss into a success.
         val mapper = ResponsesMapper()
         val deep = """{"type":"response.output_text.delta","delta":"hi","junk":${nest(ceiling + 1)}}"""
-        assertTrue(mapper.mapPayload(deep).isEmpty())
-        val ok = mapper.mapPayload("""{"type":"response.output_text.delta","delta":"ok"}""")
-        val texts = ok.filterIsInstance<StreamEvent.TextDelta>()
-        assertEquals(1, texts.size)
-        assertEquals("ok", texts[0].delta)
+        try {
+            mapper.mapPayload(deep)
+            fail("over-deep frame must fail closed with typed ProviderFailure")
+        } catch (e: ProviderFailure) {
+            assertEquals(TOOL_ARGS_TOO_LARGE, e.message)
+            assertFalse("depth breach must not retry the poisoned stream", e.retryable)
+            assertEquals(ProviderFailureCode.AGG_TOO_LARGE, e.code)
+        }
+        try {
+            mapper.mapPayload("""{"type":"response.output_text.delta","delta":"ok"}""")
+            fail("post-breach frames must keep failing closed, never project")
+        } catch (e: ProviderFailure) {
+            assertEquals(TOOL_ARGS_TOO_LARGE, e.message)
+            assertFalse(e.retryable)
+            assertEquals(ProviderFailureCode.AGG_TOO_LARGE, e.code)
+        }
     }
 }

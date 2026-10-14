@@ -220,16 +220,36 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
     private var usage: StreamEvent.Usage? = null
     private var sawDone = false
     private var failed: StreamEvent.Failed? = null
+    // Sticky JSON-depth breach latch (fail-closed): once a frame exceeds
+    // MiniJson.MAX_DEPTH, mapPayload throws typed non-retryable and every
+    // later mapPayload rethrows the same way, so no finish_reason + [DONE]
+    // pair can become Done; finish() reports the typed failure instead of
+    // SSE_TRUNCATED. Set only from the MiniJsonDepthException branch below.
+    private var jsonDepthFailed = false
 
     fun markDone() {
         sawDone = true
     }
 
     fun mapPayload(payload: String): List<StreamEvent> {
+        if (jsonDepthFailed) throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
         if (failed != null) return emptyList()
         val root = try {
             MiniJson.parse(payload) as? MiniJson.JObj ?: return emptyList()
-        } catch (_: MiniJson.MiniJsonException) {
+        } catch (e: MiniJson.MiniJsonException) {
+            if (e is MiniJson.MiniJsonDepthException) {
+                // A depth breach is NOT a droppable malformed frame: dropping
+                // it would lose its delta and let a later finish_reason +
+                // [DONE] succeed without it (fake success), or degrade at EOF
+                // to a retryable SSE_TRUNCATED that retries the poisoned
+                // stream. Fail the attempt with the same typed non-retryable
+                // failure as every aggregation-budget overflow; streamingFlow
+                // converts the throw into a single Failed terminal. Other
+                // malformed input still drops just this frame below
+                // (sniffing rule §3.4: not our shape, ignore).
+                jsonDepthFailed = true
+                throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+            }
             return emptyList() // sniffing rule §3.4: not our shape, ignore
         }
         val out = ArrayList<StreamEvent>()
@@ -297,6 +317,20 @@ internal class ChatCompletionsMapper(val round: Int = 0) {
 
     /** Terminal projection: ToolDones -> Usage? -> Done, else Failed(retryable). */
     fun finish(): List<StreamEvent> {
+        // A latched depth breach dominates the honest-EOF path: the poisoned
+        // attempt reports the typed non-retryable failure, never a retryable
+        // SSE_TRUNCATED (which would retry the poisoned stream) and never a
+        // success. Carries the AGG_TOO_LARGE code so TurnController's
+        // pending-flush guard treats it like every other budget overflow.
+        if (jsonDepthFailed) {
+            return listOf(
+                StreamEvent.Failed(
+                    TOOL_ARGS_TOO_LARGE,
+                    retryable = false,
+                    code = ProviderFailureCode.AGG_TOO_LARGE.name,
+                ),
+            )
+        }
         failed?.let { return listOf(it) }
         val out = ArrayList<StreamEvent>()
         val usedIds = LinkedHashSet<String>()

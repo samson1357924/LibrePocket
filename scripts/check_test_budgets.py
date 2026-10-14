@@ -19,10 +19,12 @@ Rules (test sources only, no prod change):
   not a coverage proof.
 - H2 (unbounded row count, loop-local): a single `repeat(N>=2000)` loop must
   NOT contain a store write (`.appendEvent(` or the pre-redacted fast path)
-  within its 12-line body window. The old file-level `max(repeat)` check
-  misfired when a big pure-compute loop and an unrelated single write shared
-  a file. Current max is `repeat(1000)` (small-string row-cap pins, cheap);
-  anything at or above 2000 needs explicit review + nightly placement.
+  inside its actual brace-delimited body (single-line loops close on their own
+  line; strings/comments never count as braces). The old file-level
+  `max(repeat)` check misfired when a big pure-compute loop and an unrelated
+  single write shared a file. Current max is `repeat(1000)` (small-string
+  row-cap pins, cheap); anything at or above 2000 needs explicit review +
+  nightly placement.
   Limitation: nested-loop products (e.g. 100x100) are not multiplied — each
   loop is judged alone.
 
@@ -59,10 +61,125 @@ FIXTURE_VAR_RE = re.compile(
 
 HUGE_REPEAT_MIN = 10
 ROW_REPEAT_MAX = 2000
-# How many lines after `repeat(N)` to scan for a true-path huge write. Covers
-# `repeat(100) {` + `store.appendEvent(... huge ...)` shapes without parsing
-# Kotlin braces.
+# Fixed lookback for H1's loop-local window (H1 is a tripwire over the common
+# `repeat(N) { ...writes... }` shape; H2 below is brace-aware instead).
 REPEAT_WINDOW_LINES = 12
+
+
+def _mask_kotlin_braces(lines: list[str]) -> tuple[list[int], list[bool]]:
+    """Per-line brace deltas and has-brace flags, ignoring Kotlin strings and
+    comments (so `{`/`}` inside `"..."`, `\"\"\"...\"\"\"`, `'c'`, `//...` and
+    `/*...*/` never open or close a counted block). Tracks block comments and
+    raw strings across lines; `$"..."` template braces are string content."""
+    deltas: list[int] = []
+    has_brace: list[bool] = []
+    in_block = False
+    in_raw = False
+    for line in lines:
+        depth = 0
+        braced = False
+        i, n = 0, len(line)
+        in_str = False
+        in_char = False
+        while i < n:
+            c = line[i]
+            nxt = line[i + 1] if i + 1 < n else ""
+            if in_block:
+                if c == "*" and nxt == "/":
+                    in_block = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if in_raw:
+                if line[i : i + 3] == '"""':
+                    in_raw = False
+                    i += 3
+                    continue
+                i += 1
+                continue
+            if in_str:
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == '"':
+                    in_str = False
+                i += 1
+                continue
+            if in_char:
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == "'":
+                    in_char = False
+                i += 1
+                continue
+            if c == "/" and nxt == "/":
+                break
+            if c == "/" and nxt == "*":
+                in_block = True
+                i += 2
+                continue
+            if line[i : i + 3] == '"""':
+                in_raw = True
+                i += 3
+                continue
+            if c == '"':
+                in_str = True
+                i += 1
+                continue
+            if c == "'":
+                in_char = True
+                i += 1
+                continue
+            if c == "{":
+                depth += 1
+                braced = True
+            elif c == "}":
+                depth -= 1
+                braced = True
+            i += 1
+        deltas.append(depth)
+        has_brace.append(braced)
+    return deltas, has_brace
+
+
+def _repeat_body_lines(
+    deltas: list[int], has_brace: list[bool], idx: int
+) -> tuple[int, int]:
+    """Inclusive (start, end) line range of a `repeat(N)` loop body.
+
+    Single-line `repeat(N) { ... }` closes on its own line; otherwise the body
+    runs until the matching close (the closing line included). A header whose
+    `{` sits on a following line (up to +5) is supported; anything more exotic
+    falls back to the header line alone (documented fail-open)."""
+    n = len(deltas)
+    cum = [0] * (n + 1)
+    for i, d in enumerate(deltas):
+        cum[i + 1] = cum[i] + d
+    d0 = cum[idx]
+    if has_brace[idx] and cum[idx + 1] == d0:
+        return (idx, idx)
+    open_idx = idx
+    if not has_brace[idx]:
+        open_idx = idx + 1
+        while (
+            open_idx < n
+            and open_idx <= idx + 5
+            and not has_brace[open_idx]
+        ):
+            open_idx += 1
+        if open_idx >= n or open_idx > idx + 5 or not has_brace[open_idx]:
+            return (idx, idx)
+        d0 = cum[open_idx]
+    end = open_idx
+    k = open_idx + 1
+    while k < n and cum[k] > d0:
+        end = k
+        k += 1
+    if k < n and k > open_idx and has_brace[k] and cum[k + 1] <= d0:
+        end = k
+    return (idx, end)
 
 
 def _fixture_vars(content: str) -> set[str]:
@@ -102,15 +219,20 @@ def _huge_loop_violation(lines: list[str], fixture_vars: set[str]) -> bool:
     return False
 
 
-def _h2_loop_violation(lines: list[str]) -> str | None:
-    """Single-loop H2: repeat(N>=2000) with a store write in its body window."""
+def _h2_loop_violation(
+    lines: list[str], deltas: list[int], has_brace: list[bool]
+) -> str | None:
+    """Single-loop H2: repeat(N>=2000) with a store write inside its actual
+    brace-delimited body (not a fixed line window, so adjacent methods and
+    long bodies are both handled)."""
     for idx, line in enumerate(lines):
         m = REPEAT_RE.search(line)
         if not m or int(m.group(1)) < ROW_REPEAT_MAX:
             continue
-        window = lines[idx : idx + REPEAT_WINDOW_LINES]
+        _, end = _repeat_body_lines(deltas, has_brace, idx)
         if any(
-            APPEND_EVENT_RE.search(w) or FAST_PATH_RE.search(w) for w in window
+            APPEND_EVENT_RE.search(w) or FAST_PATH_RE.search(w)
+            for w in lines[idx : end + 1]
         ):
             return f"repeat({m.group(1)})"
     return None
@@ -124,6 +246,7 @@ def check_file(path: str) -> list[str]:
         return [f"{path}: unreadable ({e})"]
     base = os.path.basename(path)
     lines = content.splitlines()
+    deltas, has_brace = _mask_kotlin_braces(lines)
     violations: list[str] = []
     if base not in ALLOWLIST_HUGE_TRUE_PATH and _huge_loop_violation(
         lines, _fixture_vars(content)
@@ -133,7 +256,7 @@ def check_file(path: str) -> list[str]:
             f"(repeat>={HUGE_REPEAT_MIN} with .appendEvent on a huge fixture; "
             f"use appendPreRedactedForBudgetTest or move to nightly)"
         )
-    h2_loop = _h2_loop_violation(lines)
+    h2_loop = _h2_loop_violation(lines, deltas, has_brace)
     if h2_loop is not None:
         violations.append(
             f"{path}: H2 unbounded write loop ({h2_loop} with a store write "

@@ -125,6 +125,22 @@ class CheckTestBudgetsTest(unittest.TestCase):
             )
             self.assertEqual([], check_test_budgets.check_file(p))
 
+    def test_h2_adjacent_methods_unrelated_single_append_passes(self) -> None:
+        # PR #87 Round2 P2-1: adjacent independent methods — the closed
+        # single-line compute loop must not capture the next method's write.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "AdjacentTest.kt",
+                "@Test fun compute() {\n"
+                '    repeat(2000) { println(it) }\n'
+                "}\n"
+                "@Test fun write() = runBlocking {\n"
+                '    store.appendEvent(event(sid, "foo"))\n'
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
     def test_h2_big_compute_loop_plus_unrelated_single_append_passes(self) -> None:
         # PR #87 P2-2: a big pure-compute loop and an unrelated single write
         # in another method must NOT count as a 2000-row write loop.
@@ -142,6 +158,51 @@ class CheckTestBudgetsTest(unittest.TestCase):
                 ),
             )
             self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_late_write_in_long_body_fails(self) -> None:
+        # PR #87 Round2 P2-1: a genuine write past the old 12-line window,
+        # inside one open block, must still fail.
+        setup = "".join(f"    // setup line {i}\n" for i in range(15))
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "LateWriteTest.kt",
+                "repeat(2000) {\n" + setup
+                + '    store.appendEvent(event(sid, "q"))\n'
+                + "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h2_braces_in_strings_and_comments_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "BracesTest.kt",
+                "@Test fun compute() {\n"
+                '    repeat(2000) { println("{ not a block }") }\n'
+                '    // } stray closer in comment\n'
+                "    /* { stray opener in block */\n"
+                "}\n"
+                "@Test fun write() = runBlocking {\n"
+                '    store.appendEvent(event(sid, "foo"))\n'
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_newline_brace_style_write_fails(self) -> None:
+        # Non-idiomatic header whose `{` sits on the next line.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NewlineBraceTest.kt",
+                "repeat(2000)\n"
+                "{\n"
+                '    store.appendEvent(event(sid, "q"))\n'
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
 
     def test_h2_boundary_1999_passes_2000_fails(self) -> None:
         with tempfile.TemporaryDirectory() as d:

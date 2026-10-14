@@ -4699,12 +4699,19 @@ class ChatViewModel(
      * Current (S3-F2): bounded immediate + orphan drain share the 5s
      * production bound (tests inject 1s). Target: single shared ledger
      * budget.
-     * Best-effort (never throws): a failed read means "no evidence", never
-     * "incomplete" — fail-open toward clean by contract (a wedged read must
-     * not pin every fork to incomplete; the fence-failure path via
-     * settleOk/durableOk still degrades independently). Per-session
-     * ownership: only the passed (source) session's receipts are consulted,
-     * so a fresh session never inherits an old session's evidence.
+     * Read-failure contract (split, never throws except CancellationException
+     * rethrow): the best-effort probes below (uiState projection, sticky
+     * close debt, cancel receipts, pending runIds) treat a failed read as
+     * "no evidence", never "incomplete" — fail-open toward clean by contract
+     * (a wedged read must not pin every fork to incomplete; the
+     * fence-failure path via settleOk/durableOk still degrades
+     * independently). The three non-sticky obligation probes (admission /
+     * promotion / active-host) instead fail closed (see below): a wedged
+     * obligation read must never report clean. Per-session ownership: only
+     * the passed (source) session's receipts are consulted, so a fresh
+     * session never inherits an old session's evidence. Cancellation is
+     * never swallowed: every catch below rethrows CancellationException
+     * before applying its branch contract.
      */
     private fun isLedgerStreamingOrPending(session: ChatSession?): Boolean {
         if (session == null) return false
@@ -4713,38 +4720,83 @@ class ChatViewModel(
                 ChatStatus.STREAMING, ChatStatus.CANCELLED, ChatStatus.WAITING_STEERED -> return true
                 else -> Unit
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
         }
+        // Stage-3 F-E fail-closed: the three non-sticky obligation probes
+        // below (admission / promotion / active-host) return true on read
+        // failure (a wedged read must never report clean). Other probes keep
+        // their best-effort skip (sticky debt is fail-closed elsewhere via
+        // flushDurable conjunction; uiState/pending reads stay no-evidence).
+        // Failures are logged once for observability (best-effort Log).
         try {
             if (session.hasPendingAdmission()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
         }
         try {
             if (session.hasUnsettledAdmission()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
+            runCatching {
+                android.util.Log.w(
+                    "ChatViewModel",
+                    "isLedgerStreamingOrPending: hasUnsettledAdmission read failed, fail-closed true",
+                )
+            }
+            return true
         }
         try {
             if (session.hasUnsettledPromotion()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
+            runCatching {
+                android.util.Log.w(
+                    "ChatViewModel",
+                    "isLedgerStreamingOrPending: hasUnsettledPromotion read failed, fail-closed true",
+                )
+            }
+            return true
         }
         try {
             if (session.hasActiveHost()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
+            runCatching {
+                android.util.Log.w(
+                    "ChatViewModel",
+                    "isLedgerStreamingOrPending: hasActiveHost read failed, fail-closed true",
+                )
+            }
+            return true
         }
         try {
             if (session.hasClosedUnsettledAdmission()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
         }
         try {
             if (session.hasUnsettledCancelReceipts()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
         }
         try {
             if (session.hasSealedUncompensatedReceipts()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
         }
         return try {
             session.pendingTranscriptRunIds().isNotEmpty()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             false
         }
@@ -4898,8 +4950,16 @@ class ChatViewModel(
         // flag. The latest prune sweep may have deleted rows with dropped==0
         // (R26-1: cut head family deleted whole) – consult isPruneSuspect
         // best-effort (per-sweep, not sticky; fail-closed: read failure =>
-        // suspect true), matching Factory loadModelHistory so UI and
-        // model-context can never disagree.
+        // suspect true), matching Factory loadModelHistory on the dropped>0 /
+        // pruneSuspect paths.
+        // Stage-3 honesty (R26-2/F4): the two paths agree on dropped>0 and
+        // pruneSuspect, but may disagree on the exact-cap far-marker (R25-1):
+        // the model path probes hasReasoningBefore(extraFloor) boundedly and
+        // over-flags all kept assistants, while this UI replay stays
+        // display-only there (no extra probe; enforcement always uses the
+        // model-context flag). COUNT basis also differs by design: the model
+        // path counts includePartial=false (provider payload), this replay
+        // counts includePartial=true (visible messages).
         val pruneSuspect = try {
             backing.isPruneSuspect(sessionId)
         } catch (e: CancellationException) {

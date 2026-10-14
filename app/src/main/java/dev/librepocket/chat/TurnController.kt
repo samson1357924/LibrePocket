@@ -924,6 +924,20 @@ class TurnController(
       AtomicReference(SystemMarkOutcome.SKIPPED),
     val state: AtomicReference<CancelReceiptState> = AtomicReference(CancelReceiptState.PENDING),
   )
+  /**
+   * R19-1 cancel receipts: one entry per cancel attempt, never removed
+   * within the session lifetime, hence bounded by the session's attempt
+   * count (not by wall-clock time or ledger size).
+   *
+   * Stage-3 resource note (P2-6, Current): no session-level FIFO cap is
+   * enforced — a pathological session with N cancels holds N small receipt
+   * cells (+ N waiter Job handles in [cancelReceiptWaiters]) until close.
+   * Each entry is a few AtomicReferences (no payload, no transcript rows),
+   * so production cancel counts stay negligible; a session-level cap (e.g.
+   * 128 entries, FIFO-evicting sealed-and-backfilled first) stays Target,
+   * not claimed here. Kill recovery never depends on this map (reopen
+   * INTERRUPTED backfill owns cross-restart durability).
+   */
   private val cancelReceipts: java.util.concurrent.ConcurrentHashMap<String, CancelReceipt> =
     java.util.concurrent.ConcurrentHashMap()
 
@@ -2267,9 +2281,10 @@ class TurnController(
    * [hasSealedUncompensatedReceipts] — so the promotion windows newly covered
    * here already reach the VM through this proof. The sibling proofs
    * [hasUnsettledPromotion], [hasActiveHost], and [hasClosedUnsettledAdmission]
-   * are [flushDurable]-conjoined (the VM observes them indirectly via a
-   * `false` downgrade); their direct VM wiring is follow-up work, not claimed
-   * here.
+   * are [flushDurable]-conjoined and — since Stage-3 F-E — also wired
+   * directly into the VM's `isLedgerStreamingOrPending` (admission /
+   * promotion / host fail closed on read failure; sticky close debt stays
+   * best-effort skip, fail-closed via the flush conjunction instead).
    */
   internal fun hasUnsettledAdmission(): Boolean = synchronized(lock) {
     pendingAdmission != null || promotionPending != null || unknownAdmission != null ||
@@ -3323,6 +3338,14 @@ class TurnController(
                 }
               } != null
             } catch (_: Throwable) {
+              // Security Finding3 (Stage-3): intentional teardown swallow —
+              // the waiter join above must never abort the close fence (an
+              // unhanded receipt stays PENDING/CLAIMED and fails
+              // hasUnsettledCancelReceipts fail-closed below). VM-fatal
+              // (VirtualMachineError/ThreadDeath) is not specially rethrown
+              // here because the shutdown runs on the session-owned writer
+              // scope whose cancel below converges teardown anyway; the
+              // flush barrier below still drains what was admitted.
               true
             }
             joinedWaiters.add(waiter)
@@ -3334,9 +3357,11 @@ class TurnController(
           if (exhausted) break
         }
       } catch (_: Throwable) {
-        // Best effort: the flush barrier below still drains what was admitted;
-        // an unhanded receipt stays PENDING/CLAIMED and fails
+        // Security Finding3 (Stage-3): intentional teardown swallow — the
+        // flush barrier below still drains what was admitted; an unhanded
+        // receipt stays PENDING/CLAIMED and fails
         // [hasUnsettledCancelReceipts] instead of reporting true-and-dangling.
+        // Best effort: only the notice/fence is at stake, never durability.
       }
     }
     shutdown?.invokeOnCompletion {

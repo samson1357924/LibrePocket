@@ -242,9 +242,19 @@ class ChatViewModelHistoryTailTest {
         )
         val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
         onMain { vm.openSession(sid) }
-        // CE aborts the load: give the open a bounded window, then prove no
-        // suspect-flagged history was produced (swallowed CE would flag a0).
-        Thread.sleep(1500)
+        // P1-1 (Stage-3): fixed sleeps are deprecated — this bounded
+        // stability window polls (10ms cadence, 1.5s horizon) instead of a
+        // single Thread.sleep guess, so a late suspect-flagged history would
+        // still be caught. CE aborts the load: no history may ever appear.
+        val end = System.currentTimeMillis() + 1500L
+        while (System.currentTimeMillis() < end) {
+            val flagged = vm.messages.value.filter { it.role == "assistant" && it.hasReasoning }
+            assertTrue(
+                "probe CE must never produce suspect-flagged history, was ${vm.messages.value}",
+                flagged.isEmpty(),
+            )
+            Thread.sleep(10)
+        }
         val flagged = vm.messages.value.filter { it.role == "assistant" && it.hasReasoning }
         assertTrue(
             "probe CE must never produce suspect-flagged history, was ${vm.messages.value}",

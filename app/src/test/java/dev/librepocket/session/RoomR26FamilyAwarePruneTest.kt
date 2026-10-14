@@ -1,6 +1,7 @@
 package dev.librepocket.session
 
 import android.content.Context
+import androidx.room.InvalidationTracker
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.chat.ChatSessionFactory
@@ -299,6 +300,11 @@ class RoomR26FamilyAwarePruneTest {
         val store = RoomSessionStore(
             object : LibrePocketDb() {
                 override fun sessionDao(): SessionDao = throwing
+                // Room 2.8 RoomDatabase abstract members unused by this
+                // DAO-delegating fake (never opened, only sessionDao() read).
+                override fun createInvalidationTracker(): InvalidationTracker =
+                    throw UnsupportedOperationException("fake db: no tracker")
+                override fun clearAllTables() = Unit
             },
         ) { now }
         // Throw with no prior suspect: rethrows, flag NOT left behind.

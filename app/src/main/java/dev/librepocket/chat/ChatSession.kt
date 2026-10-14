@@ -217,6 +217,15 @@ interface ChatSession {
    * holds). Conjoined into [flushDurable]. Default false so test fakes stay
    * source-compatible (never durability evidence — see [flushDurable]);
    * production ([ChatSessionImpl]) overrides with the live controller state.
+   *
+   * Stage-3 F-F cost note: a pre-send attempt that never reaches admission
+   * (policy deny / input-too-long / store-unavailable throw before reserve)
+   * does NOT set the flag — [dev.librepocket.chat.TurnController.close] only
+   * flags live terminal obligations (pendingAdmission / active host /
+   * in-flight orphan drain), so a never-admitted attempt leaves no dangling
+   * row: no block, no backfill owed. Consistent with the two sticky tiers
+   * (liftable controller-observed families vs permanent ghost/promotion —
+   * see the `closedWithUnsettledAdmission` / `closedWithUnknownGhost` KDocs).
    */
   fun hasClosedUnsettledAdmission(): Boolean = false
 

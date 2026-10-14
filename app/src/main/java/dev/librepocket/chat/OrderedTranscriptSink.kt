@@ -1208,7 +1208,8 @@ class OrderedTranscriptSink(
         try {
           withTimeoutOrNull(drainTimeoutMs) { settle() }
         } catch (_: Throwable) {
-          // D15-4 fail-closed: settle is best-effort, so an Error from it
+          // D15-4 fail-closed + Security Finding3 (Stage-3, intentional
+          // teardown swallow): settle is best-effort, so an Error from it
           // (like an Exception, including a CancellationException from a
           // cancelled settle — the NonCancellable context above makes that
           // a settle bug, never an outer-scope cancel) still falls through
@@ -1251,7 +1252,8 @@ class OrderedTranscriptSink(
           try {
             writer.join()
           } catch (_: Throwable) {
-            // D15-4 fail-closed: a failed writer (including a fatal Error
+            // D15-4 fail-closed + Security Finding3 (Stage-3, intentional
+            // teardown swallow): a failed writer (including a fatal Error
             // it rethrew to seal) still falls through to the scope cancel
             // below instead of aborting the teardown. Best effort: the
             // ack/interrupt marks already carry the failure.

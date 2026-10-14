@@ -1742,10 +1742,16 @@ class SetupViewModel(
      *   metadata-gate; ASK without a carried consent mints the same one-shot
      *   dialog and writes nothing).
      *
-     * Cancellation mirrors the staged compensation at metadata scope: nothing
-     * was written before the CAS, so a pre-commit cancel only unsticks
-     * `saving`; a committed-then-cancelled commit is re-probed journal-aware
-     * (same [probeStagedCommit] helper) and only then swallowed to success.
+     * Cancellation is ambiguous at metadata scope: [EndpointStore.saveIfRevision]
+     * may have committed and then thrown [CancellationException] (including
+     * `TimeoutCancellation`). Both the ambiguous (`!reuseCommitted`) and the
+     * committed (`reuseCommitted`) cancel paths re-probe journal-aware via the
+     * S5 [probeKeepExistingCommit] (never the ref-only [probeStagedCommit]) and
+     * only then swallow to success: `true` invalidates the startup cache and
+     * reports `saved=true`; `false`/`null` unsticks `saving` and rethrows (a
+     * revision-advanced but config-mismatched winner never swallows; the
+     * ambiguous path additionally invalidates the startup cache so a moved
+     * generation never replays stale).
      */
     private suspend fun executeKeepExistingCommit(
         form: SetupUiState,
@@ -1879,11 +1885,25 @@ class SetupViewModel(
             keyBoundIdentity = null
         } catch (e: CancellationException) {
             if (!reuseCommitted) {
+                val ambiguous: Boolean? = try {
+                    withContext(NonCancellable) { probeKeepExistingCommit(config, expectedRevision) }
+                } catch (_: CancellationException) {
+                    null
+                } catch (_: Exception) {
+                    null
+                }
+                if (ambiguous == true) {
+                    invalidateStartupSettled()
+                    _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
+                    keyBoundIdentity = null
+                    return
+                }
+                invalidateStartupSettled()
                 _form.value = _form.value.copy(saving = false)
                 throw e
             }
             val stillCommitted: Boolean? = try {
-                withContext(NonCancellable) { probeStagedCommit(liveRef) }
+                withContext(NonCancellable) { probeKeepExistingCommit(config, expectedRevision) }
             } catch (_: CancellationException) {
                 null
             } catch (_: Exception) {
@@ -1952,6 +1972,63 @@ class SetupViewModel(
                 return if (state.second?.apiKeyRef == stagedRef) null else false
             }
             return state.second?.apiKeyRef == stagedRef
+        } catch (_: CancellationException) {
+            return null
+        } catch (_: Exception) {
+            // Includes the malformed-journal throw: no-touch.
+            return null
+        }
+    }
+
+    /**
+     * S5 KeepExisting commit probe for the ambiguous-cancel compensation in
+     * [executeKeepExistingCommit] (Finding #6). Parallel to [probeStagedCommit],
+     * never shared: the reuse path commits under the live alias, so a ref-only
+     * check cannot distinguish "our commit won" from "nothing committed yet"
+     * (the ref is identical before and after) and would swallow a
+     * before-commit cancel to `saved=true`.
+     *
+     * Must be called inside `withContext(NonCancellable)` (callers own that).
+     * Single [EndpointStore.snapshotDeleteStateStrict] emission supplies
+     * journal+config+revision together (no TOCTOU split):
+     * - journal present → `null` (a teardown owns the outcome now, even over a
+     *   matching commit — the live key may already be deleted);
+     * - read failure or malformed journal → `null` (no-touch);
+     * - `Math.addExact(expectedRevision ?: 0L, 1L)` overflow → `null` (never
+     *   throws outward);
+     * - `true` only when the journal is absent AND the live revision equals the
+     *   post-commit generation AND the live config equals [attempted] field by
+     *   field except `configRevision` (at least providerId/baseUrl/model/
+     *   apiKeyRef; here all seven non-revision fields);
+     * - everything else → `false` (provably not our commit: before-commit with
+     *   the revision still at [expectedRevision], or a revision-advanced but
+     *   config-mismatched winner in place — both must rethrow, never swallow).
+     */
+    private suspend fun probeKeepExistingCommit(
+        attempted: EndpointConfig,
+        expectedRevision: Long?,
+    ): Boolean? {
+        try {
+            val state = store.snapshotDeleteStateStrict()
+            if (state.first != null) {
+                return null
+            }
+            val live = state.second
+            val liveRev = state.third
+            val nextRev = try {
+                Math.addExact(expectedRevision ?: 0L, 1L)
+            } catch (_: ArithmeticException) {
+                return null
+            }
+            if (liveRev != nextRev) return false
+            if (live == null) return false
+            return live.providerId == attempted.providerId &&
+                live.presetId == attempted.presetId &&
+                live.label == attempted.label &&
+                live.baseUrl == attempted.baseUrl &&
+                live.protocol == attempted.protocol &&
+                live.model == attempted.model &&
+                live.apiKeyRef == attempted.apiKeyRef
         } catch (_: CancellationException) {
             return null
         } catch (_: Exception) {

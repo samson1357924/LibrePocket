@@ -1,5 +1,6 @@
 package dev.librepocket.agent.ui.chat
 
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.librepocket.agent.ui.setup.EndpointConfig
@@ -344,11 +345,54 @@ class ChatViewModel(
      *
      * S7: production caller is the ChatScreen key.read confirm dialog, which
      * shows the immutable snapshot from [peekKeyReadBinding] and mints via
-     * this function. Minting never auto-sends: the denied text is already
-     * restored to the input box, and the user must explicitly send again to
-     * consume the consent.
+     * [confirmKeyRead(expected)][confirmKeyRead]. Minting never auto-sends:
+     * the denied text is already restored to the input box, and the user must
+     * explicitly send again to consume the consent.
+     *
+     * S3: production must call [confirmKeyRead(expected)][confirmKeyRead]
+     * with the displayed snapshot. The mint fences on full-field equality
+     * against the freshly re-read binding: any mismatch fails closed with no
+     * mint and no burn (see below). The no-arg confirmKeyReadForTest below
+     * is test-only (@VisibleForTesting internal).
      */
-    suspend fun confirmKeyRead(): Boolean {
+    suspend fun confirmKeyRead(expected: EndpointSessionBinding?): Boolean {
+        // S3: null snapshot (peek failure/expired) never mints.
+        if (expected == null) return false
+        val startedGeneration = lifecycleGeneration
+        val endpoint = try {
+            readEndpoint()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return false
+        } ?: return false
+        if (!isGenerationCurrent(startedGeneration)) return false
+        val binding = bindingOf(endpoint) ?: return false
+        if (!isGenerationCurrent(startedGeneration)) return false
+        // S3 snapshot fence: the displayed snapshot must equal the mint-time
+        // binding on every field (data-class equality covers providerId /
+        // effectiveBaseUrl / origin / protocol / apiKeyRef / configRevision /
+        // model). A mismatch (peek A, endpoint now B) fails closed: no mint.
+        // Deliberately no burn here: the mismatch is a display-stale no-op,
+        // and the slot (if any) belongs to another generation/binding whose
+        // own match still rejects it. Burning on a stale click would conflate
+        // it with an explicit dismiss and could destroy a just-minted valid
+        // consent racing the click.
+        if (binding != expected) return false
+        return mintKeyReadConsent(startedGeneration, binding)
+    }
+
+    /**
+     * Test-only mint without a snapshot fence (no displayed binding to check).
+     * Production (ChatScreen dialog) must use [confirmKeyRead(expected)][confirmKeyRead]
+     * so a stale dialog snapshot can never mint for a replaced endpoint.
+     * Renamed + internal (cf. VoiceSpeaker preEmitHook/postCheckHook
+     * @VisibleForTesting internal convention) so a production call site cannot
+     * accidentally use the unfenced overload: only confirmKeyRead(expected)
+     * is public.
+     */
+    @VisibleForTesting
+    internal suspend fun confirmKeyReadForTest(): Boolean {
         // Capture identity before the IO read: an invalidation clearing or
         // replacing the endpoint during the read (newChat/open/logout) must
         // stop this mint. Returning false keeps the consent absent.
@@ -363,6 +407,11 @@ class ChatViewModel(
         if (!isGenerationCurrent(startedGeneration)) return false
         val binding = bindingOf(endpoint) ?: return false
         if (!isGenerationCurrent(startedGeneration)) return false
+        return mintKeyReadConsent(startedGeneration, binding)
+    }
+
+    /** Final mint shared by both overloads (generation recheck + slot assign under lock). */
+    private fun mintKeyReadConsent(startedGeneration: Long, binding: EndpointSessionBinding): Boolean {
         val consent = KeyReadConsent(
             action = "key.read",
             providerId = binding.providerId,
@@ -1256,7 +1305,7 @@ class ChatViewModel(
         }
         if (!isGenerationCurrent(authorizedGeneration)) return EndpointAccess.Stale
         // key.read ASK never passes through: it requires a bound one-shot
-        // confirmation minted by confirmKeyRead() (providerId /
+        // confirmation minted by confirmKeyRead(expected) (providerId /
         // effectiveBaseUrl / origin / protocol / apiKeyRef / configRevision /
         // model + mint generation). DENY always wins (and burns any minted
         // consent), as does a policy evaluation failure above; only an
@@ -1595,6 +1644,12 @@ class ChatViewModel(
      * must immediately return Stale; subsequent user actions use the new scope.
      */
     private fun invalidateForEndpointChange(binding: EndpointSessionBinding?) {
+        // S3: capture the pre-invalidation notice BEFORE mutating anything: a
+        // replacement that lands while a ConfirmRequired dialog is showing must
+        // retain that notice (and bump the sequence for a forced re-peek of the
+        // new binding) instead of clearing to null/SEND_CANCELLED, which would
+        // strand the dialog on a stale snapshot.
+        val hadConfirmNotice = _notice.value == "KEY_READ_CONFIRM_REQUIRED"
         observedBinding = binding
         // N1: reclaim queued-but-unstarted intents BEFORE close() drops the
         // FIFO. Queued is not acceptance, so the caller still owns the text:
@@ -1659,8 +1714,21 @@ class ChatViewModel(
             // N1: queued-but-unstarted intents reclaimed above join the same
             // outbox via absorbDrainedQueued (pending preaccept entries first,
             // then controller-drained FIFO; never auto-sent).
+            //
+            // S3: replacement during ConfirmRequired retains the Confirm notice
+            // and bumps the sequence (forced re-peek of the new binding) rather
+            // than clearing to null/SEND_CANCELLED. The outbox is still
+            // absorbed first so no unaccepted text is lost; the input box keeps
+            // its restored Confirm text (absorb never overwrites non-blank).
+            // S2 compat: pendingOpen stays stale (kept above, not re-armed
+            // here), so an explicit resume still fails closed with a fresh
+            // ConfirmRequired via rearmPendingOpenAndRequireConfirm (one more
+            // sequence bump) until the user confirms the new binding.
             val hadUnaccepted = pendingOps.isNotEmpty() || queuedFromSession.isNotEmpty()
-            if (!hadUnaccepted) {
+            if (hadConfirmNotice) {
+                absorbDrainedQueued(queuedFromSession, fillInput = true)
+                emitKeyReadConfirmRequired(lifecycleGeneration)
+            } else if (!hadUnaccepted) {
                 _notice.value = null
             } else {
                 absorbDrainedQueued(queuedFromSession, fillInput = true)

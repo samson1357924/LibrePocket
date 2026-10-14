@@ -703,15 +703,27 @@ fun ChatScreen(
             resuming = keyReadResuming,
             onConfirm = {
                 if (keyReadConfirming || keyReadConfirmResult != null) return@KeyReadConfirmDialog
+                // S3: capture seq+binding at initiation; the mint runs against
+                // the displayed snapshot (null snapshot ⇒ fail-closed false).
+                val capturedSeq = viewModel.keyReadConfirmSequence.value
+                val capturedBinding = keyReadBinding
                 keyReadConfirming = true
                 keyReadScope.launch {
                     val ok = try {
-                        viewModel.confirmKeyRead()
+                        viewModel.confirmKeyRead(capturedBinding)
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (_: Exception) {
                         false
                     }
+                    // S3: stale completion must not overwrite a newer dialog
+                    // generation. A sequence advance (new deny or replacement
+                    // retention re-peek) or a notice departure (explicit
+                    // discard/logout) — which together proxy every generation
+                    // advance that matters — discards this in-flight result:
+                    // neither confirming nor result is written.
+                    if (capturedSeq != viewModel.keyReadConfirmSequence.value) return@launch
+                    if (viewModel.notice.value != "KEY_READ_CONFIRM_REQUIRED") return@launch
                     keyReadConfirming = false
                     // 有 pending open 顯示開啟歷史，無則顯示再按發送；
                     // 皆不 auto-send（S2 resume 需顯式按「開啟歷史」）。
@@ -720,21 +732,41 @@ fun ChatScreen(
             },
             onResumeOpen = {
                 if (keyReadResuming) return@KeyReadConfirmDialog
+                // S3: resume is a synchronous launch with no async completion
+                // write; the resuming flag set below belongs to the current
+                // dialog generation — LaunchedEffect(notice, seq) already resets
+                // it on any newer deny/retention, so a stale resume never
+                // leaves the new dialog stuck in "開啟中…".
                 keyReadResuming = true
                 pendingOpenSid?.let { viewModel.resumePendingOpen(it) }
             },
             onReject = {
                 if (keyReadConfirming) return@KeyReadConfirmDialog
+                // S3: only the current dialog generation may dismiss/hide. A
+                // click racing a just-bumped sequence (recomposition pending)
+                // must not burn-or-hide the new dialog's state. Dual gate with
+                // onConfirm: seq alone does not proxy notice departure —
+                // invalidateLifecycle clears the notice WITHOUT bumping seq —
+                // so a stale click racing logout/newChat/open must also fail
+                // on the notice check.
+                if (viewModel.keyReadConfirmSequence.value != keyReadConfirmSeq) return@KeyReadConfirmDialog
+                if (viewModel.notice.value != "KEY_READ_CONFIRM_REQUIRED") return@KeyReadConfirmDialog
                 if (keyReadConfirmResult != true) viewModel.dismissKeyReadConfirm()
                 keyReadDialogHidden = true
             },
             onCancel = {
                 if (keyReadConfirming) return@KeyReadConfirmDialog
+                // S3: same dual gate as onReject above.
+                if (viewModel.keyReadConfirmSequence.value != keyReadConfirmSeq) return@KeyReadConfirmDialog
+                if (viewModel.notice.value != "KEY_READ_CONFIRM_REQUIRED") return@KeyReadConfirmDialog
                 if (keyReadConfirmResult != true) viewModel.dismissKeyReadConfirm()
                 keyReadDialogHidden = true
             },
             onClose = {
                 if (keyReadConfirming) return@KeyReadConfirmDialog
+                // S3: same dual gate as onReject above.
+                if (viewModel.keyReadConfirmSequence.value != keyReadConfirmSeq) return@KeyReadConfirmDialog
+                if (viewModel.notice.value != "KEY_READ_CONFIRM_REQUIRED") return@KeyReadConfirmDialog
                 if (keyReadConfirmResult != true) viewModel.dismissKeyReadConfirm()
                 keyReadDialogHidden = true
             },

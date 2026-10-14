@@ -176,7 +176,7 @@ class ChatSessionLifecycleTest {
             chatMain.run { vm.newChat() }
             // key.read ASK needs a bound one-shot confirmation for the new
             // generation's send; the parked old evaluation still denies stale.
-            vm.confirmKeyRead()
+            vm.confirmKeyReadForTest()
             chatMain.run { vm.sendDirect("new generation positive control") }
             val fresh = sessions.awaitCreated(1)
             fresh.sendFinished.await()
@@ -687,7 +687,7 @@ class ChatSessionLifecycleTest {
             assertTrue(sessions.seenAllowAsk.isEmpty())
             assertEquals("hi", vm.input.value)
 
-            assertTrue(vm.confirmKeyRead())
+            assertTrue(vm.confirmKeyReadForTest())
             chatMain.run { vm.sendDirect("hi") }
             val live = sessions.awaitCreated(1)
             live.sendFinished.await()
@@ -720,7 +720,7 @@ class ChatSessionLifecycleTest {
             sessions.backingStore = history
             chatMain.run { vm.openSession("H2") }
             withTimeout(5_000) { history.entered.await() }
-            assertTrue(vm.confirmKeyRead())
+            assertTrue(vm.confirmKeyReadForTest())
             history.release.complete(Unit)
             sessions.awaitOpened("H2")
             withTimeout(5_000) { vm.currentSessionId.first { it == "H2" } }
@@ -953,7 +953,7 @@ class ChatSessionLifecycleTest {
 
             policy.release.complete(Unit)
             // The re-send runs under key.read ASK: confirm it one-shot first.
-            vm.confirmKeyRead()
+            vm.confirmKeyReadForTest()
             chatMain.run { vm.send() }
             val created = sessions.awaitCreated(1)
             created.sendFinished.await()

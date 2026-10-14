@@ -104,6 +104,16 @@ class ChatKeyReadConfirmUiTest {
         apiKeyRef = "provider_key/preset:openai",
     )
 
+    private fun endpointB() = EndpointConfig(
+        providerId = "preset:custom",
+        presetId = "custom",
+        label = "自訂",
+        baseUrl = "http://127.0.0.1:11434/v1",
+        protocol = ProviderProtocol.CHAT_COMPLETIONS,
+        model = "local",
+        apiKeyRef = "provider_key/preset:custom",
+    )
+
     private fun newVm(fake: KeyReadUiFakeProvider): Pair<ChatViewModel, EndpointStore> {
         val dir = Files.createTempDirectory("keyread-confirm-ui").toFile()
         tmpDirs.add(dir)
@@ -368,5 +378,46 @@ class ChatKeyReadConfirmUiTest {
         composeRule.onNodeWithText("關閉").assertIsEnabled()
         composeRule.onNodeWithText("關閉").performClick()
         composeRule.runOnIdle { assertEquals(1, closed) }
+    }
+
+    /**
+     * S3：replacement 在對話框顯示期間保留 Confirm notice 並 bump sequence，
+     * 對話框重 peek 新 binding（而非關閉或顯示 SEND_CANCELLED）。
+     */
+    @Test
+    fun replacementRetainsDialogAndRepeeksNewBinding() {
+        val fake = KeyReadUiFakeProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val (vm, store) = newVm(fake)
+        setChat(vm)
+        vm.sendDirect("hi")
+        awaitNotice(vm, "KEY_READ_CONFIRM_REQUIRED")
+        awaitSupplierNode()
+        assertEquals(1L, vm.keyReadConfirmSequence.value)
+        runBlocking { store.save(endpointB()) }
+        // S3：保留 Confirm（sequence 1→2），對話框重現 B 快照。
+        awaitNotice(vm, "KEY_READ_CONFIRM_REQUIRED")
+        val end = System.currentTimeMillis() + 8000
+        while (vm.keyReadConfirmSequence.value != 2L) {
+            if (System.currentTimeMillis() > end) error("timed out waiting for seq=2")
+            Thread.sleep(10)
+        }
+        composeRule.waitUntil(timeoutMillis = 8000) {
+            try {
+                composeRule.onNodeWithText("供應商：preset:custom").assertIsDisplayed()
+                true
+            } catch (_: AssertionError) {
+                false
+            }
+        }
+        composeRule.onNodeWithText("伺服器位址：http://127.0.0.1:11434/v1").assertIsDisplayed()
+        composeRule.onNodeWithText("確認本次讀取").assertIsDisplayed()
+        // 本次未送出：零請求、輸入保留。
+        assertEquals(0, fake.streamCalls)
+        awaitInput(vm, "hi")
     }
 }

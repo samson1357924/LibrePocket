@@ -195,7 +195,7 @@ class ChatViewModelKeyReadTest {
             }
         }
         val vm = newVm(store, InMemoryPolicyStore(), fake)
-        assertTrue(vm.confirmKeyRead())
+        assertTrue(vm.confirmKeyReadForTest())
         onMain { vm.sendDirect("one") }
         awaitCompletedTurn(vm, expectedTurns = 1)
         assertEquals(1, fake.streamCalls.get())
@@ -216,19 +216,19 @@ class ChatViewModelKeyReadTest {
             }
         }
         val vm = newVm(store, InMemoryPolicyStore(), fake)
-        assertTrue(vm.confirmKeyRead())
+        assertTrue(vm.confirmKeyReadForTest())
         onMain { vm.sendDirect("on A") }
         awaitCompletedTurn(vm, expectedTurns = 1)
         assertEquals(1, fake.streamCalls.get())
         // Fresh confirmation bound to A, then the endpoint moves to B.
-        assertTrue(vm.confirmKeyRead())
+        assertTrue(vm.confirmKeyReadForTest())
         store.save(endpointB())
         awaitTrue { vm.sessionState.value.messages.isEmpty() }
         onMain { vm.sendDirect("on B") }
         awaitTrue { vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" }
         assertEquals(1, fake.streamCalls.get())
         // Re-confirming on B allows exactly one send there.
-        assertTrue(vm.confirmKeyRead())
+        assertTrue(vm.confirmKeyReadForTest())
         onMain { vm.sendDirect("on B again") }
         awaitTrue { fake.streamCalls.get() == 2 }
         awaitTrue { vm.messages.value.count { it.role == "user" } == 2 }
@@ -246,7 +246,7 @@ class ChatViewModelKeyReadTest {
         }
         val policy = InMemoryPolicyStore()
         val vm = newVm(store, policy, fake)
-        assertTrue(vm.confirmKeyRead())
+        assertTrue(vm.confirmKeyReadForTest())
         policy.setRule(PolicyRule("key.read:*", Verdict.DENY, 20))
         onMain { vm.sendDirect("hi") }
         awaitTrue { vm.notice.value == "POLICY_DENIED" }
@@ -358,7 +358,7 @@ class ChatViewModelKeyReadTest {
             buildProvider = { _, _ -> fake },
         )
         val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
-        assertTrue(vm.confirmKeyRead())
+        assertTrue(vm.confirmKeyReadForTest())
         onMain { vm.sendDirect("hi") }
         awaitTrue { vm.notice.value == "POLICY_DENIED" }
         assertEquals(0, fake.streamCalls.get())
@@ -406,7 +406,7 @@ class ChatViewModelKeyReadTest {
             buildProvider = { _, _ -> fake },
         )
         val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
-        assertTrue(vm.confirmKeyRead())
+        assertTrue(vm.confirmKeyReadForTest())
         onMain { vm.dismissKeyReadConfirm() }
         onMain { vm.sendDirect("hi") }
         awaitTrue { vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" }
@@ -679,7 +679,7 @@ class ChatViewModelKeyReadTest {
             }
         }
         val rig = newRig(store, InMemoryPolicyStore(), fake)
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         onMain { rig.vm.sendDirect("one") }
         awaitCompletedTurn(rig.vm, expectedTurns = 1)
         // S1 absolute pass cost: exactly one vault read, one build, one stream.
@@ -713,7 +713,7 @@ class ChatViewModelKeyReadTest {
             listOf(Verdict.ALLOW, Verdict.DENY, Verdict.ASK),
         )
         val rig = newRig(store, policy, fake)
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         onMain { rig.vm.sendDirect("hi") }
         awaitTrue { rig.vm.notice.value == "POLICY_DENIED" }
         assertEquals("hi", rig.vm.input.value)
@@ -744,7 +744,7 @@ class ChatViewModelKeyReadTest {
             listOf(Verdict.ASK, Verdict.DENY, Verdict.ASK),
         )
         val rig = newRig(store, policy, fake)
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         onMain { rig.vm.sendDirect("hi") }
         awaitTrue { rig.vm.notice.value == "POLICY_DENIED" }
         assertEquals(0, rig.getKeyCalls.get())
@@ -776,7 +776,7 @@ class ChatViewModelKeyReadTest {
         val policy = InMemoryPolicyStore()
         policy.setRule(PolicyRule("key.read:*", Verdict.ALLOW, 20))
         val rig = newRig(store, policy, fake)
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         onMain { rig.vm.sendDirect("one") }
         awaitCompletedTurn(rig.vm, expectedTurns = 1)
         // S1 absolute pass cost under ALLOW (consent burned, not used).
@@ -817,7 +817,7 @@ class ChatViewModelKeyReadTest {
             listOf(Verdict.ALLOW, Verdict.DENY, Verdict.ASK),
         )
         val rig = newRig(store, policy, fake, transcripts)
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         onMain { rig.vm.openSession(sid) }
         awaitTrue { rig.vm.notice.value == "POLICY_DENIED" }
         assertNull(rig.vm.currentSessionId.value)
@@ -852,7 +852,7 @@ class ChatViewModelKeyReadTest {
         onMain { rig.vm.sendDirect("hi") }
         withTimeout(5_000) { t1Entered.await() }
         // Minted after T0 ALLOW, before the gated T1 DENY lands.
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         releaseT1.complete(Unit)
         awaitTrue { rig.vm.notice.value == "POLICY_DENIED" }
         assertEquals("hi", rig.vm.input.value)
@@ -883,7 +883,7 @@ class ChatViewModelKeyReadTest {
         val rig = newRig(store, GatedDenyKeyReadPolicy(t1Entered, releaseT1), fake)
         onMain { rig.vm.steer("hi") }
         withTimeout(5_000) { t1Entered.await() }
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         releaseT1.complete(Unit)
         awaitTrue { rig.vm.notice.value == "POLICY_DENIED" }
         assertEquals("hi", rig.vm.input.value)
@@ -919,7 +919,7 @@ class ChatViewModelKeyReadTest {
         val rig = newRig(store, GatedDenyKeyReadPolicy(t1Entered, releaseT1), fake, transcripts)
         onMain { rig.vm.openSession(sid) }
         withTimeout(5_000) { t1Entered.await() }
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         releaseT1.complete(Unit)
         awaitTrue { rig.vm.notice.value == "POLICY_DENIED" }
         assertNull(rig.vm.currentSessionId.value)
@@ -963,7 +963,7 @@ class ChatViewModelKeyReadTest {
         val rig = newRig(store, InMemoryPolicyStore(), fake, gated)
         onMain { rig.vm.openSession(sid) }
         withTimeout(5_000) { historyEntered.await() }
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         historyRelease.complete(Unit)
         awaitTrue { rig.vm.currentSessionId.value == sid }
         awaitTrue { rig.vm.messages.value.size == 2 }
@@ -990,7 +990,7 @@ class ChatViewModelKeyReadTest {
         store.save(endpointA())
         val fake = mustNotSendFake()
         val rig = newRig(store, InMemoryPolicyStore(), fake)
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         onMain { rig.vm.newChat() }
         onMain { rig.vm.sendDirect("hi") }
         awaitTrue { rig.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" }
@@ -1020,7 +1020,7 @@ class ChatViewModelKeyReadTest {
         )
         val fake = mustNotSendFake()
         val rig = newRig(store, InMemoryPolicyStore(), fake, transcripts)
-        assertTrue(rig.vm.confirmKeyRead())
+        assertTrue(rig.vm.confirmKeyReadForTest())
         onMain { rig.vm.openSession(sid) }
         awaitTrue { rig.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" }
         assertNull(rig.vm.currentSessionId.value)

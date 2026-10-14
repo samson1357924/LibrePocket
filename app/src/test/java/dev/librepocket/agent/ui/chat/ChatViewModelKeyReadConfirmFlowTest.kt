@@ -208,7 +208,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
         store.save(endpointA())
         val h = newHarness(store)
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         // confirm 不 bump sequence。
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
         // 確認僅 mint，不 auto-send：送出前零請求。
@@ -229,7 +229,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
         assertEquals(buildBeforeDeny, h.buildCalls.get())
         assertEquals("two", h.vm.input.value)
         // 重 confirm 後手動重送放行（confirm 不 bump）。
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
         assertEquals(1, h.fake.streamCalls)
         onMain { h.vm.sendDirect("two") }
@@ -272,7 +272,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
         store.save(endpointA())
         val h = newHarness(store)
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
         assertEquals(0, h.fake.streamCalls)
         onMain { h.vm.dismissKeyReadConfirm() }
@@ -293,7 +293,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
         store.save(endpointA())
         val h = newHarness(store)
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
         assertEquals(0, h.fake.streamCalls)
         store.save(endpointB())
@@ -321,7 +321,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
         // B 上的 deny 使 sequence 0→1（Stale 路徑不 bump）。
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
         // 在 B 上重 confirm 後恰放行一次（confirm 不 bump）。
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
         assertEquals(0, h.fake.streamCalls)
         onMain { h.vm.sendDirect("on B again") }
@@ -370,7 +370,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
         assertNull(h.vm.peekKeyReadBinding())
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
-        assertEquals(false, h.vm.confirmKeyRead())
+        assertEquals(false, h.vm.confirmKeyReadForTest())
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
     }
 
@@ -414,7 +414,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
         assertNull(h.vm.currentSessionId.value)
         assertTrue(h.vm.messages.value.isEmpty())
         // 確認僅 mint，不 auto-open：零新增請求、sequence 不動。
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
         assertEquals(0, h.fake.streamCalls)
         assertEquals(0, h.getKeyCalls.get())
@@ -458,7 +458,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
                 h.vm.pendingOpenSessionId.value == sid
         }
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
         onMain { h.vm.dismissKeyReadConfirm() }
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
@@ -478,6 +478,10 @@ class ChatViewModelKeyReadConfirmFlowTest {
     /**
      * S2：endpoint 切換後顯式 resume 仍 ConfirmRequired（binding 全欄位 fence，
      * 零 transport、不開啟）。
+     *
+     * S3：取代失效在 ConfirmRequired 顯示期間落地時保留 notice 並 bump
+     * sequence（強制重 peek 新 binding），故 save B 後直接是 seq2 的
+     * ConfirmRequired（而非 null）；未重確認即 resume 再 re-arm 為 seq3。
      */
     @Test
     fun switchEndpointThenResumeStillRequiresFreshConfirm() = runBlocking {
@@ -492,15 +496,19 @@ class ChatViewModelKeyReadConfirmFlowTest {
                 h.vm.pendingOpenSessionId.value == sid
         }
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
         store.save(endpointB())
-        // 等待取代失效落地（無未接受 op 時 notice 清空），再顯式 resume。
-        awaitTrue { h.vm.notice.value == null }
-        onMain { h.vm.resumePendingOpen(sid) }
+        // S3：取代保留 Confirm notice 並 bump（重 peek B），pendingOpen 仍 stale。
         awaitTrue {
             h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
                 h.vm.keyReadConfirmSequence.value == 2L
+        }
+        assertEquals(sid, h.vm.pendingOpenSessionId.value)
+        onMain { h.vm.resumePendingOpen(sid) }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 3L
         }
         assertNull(h.vm.currentSessionId.value)
         assertEquals(0, h.fake.streamCalls)
@@ -512,6 +520,8 @@ class ChatViewModelKeyReadConfirmFlowTest {
     /**
      * S2：ABA（A→B→A 回到相同 binding 但新 generation）後顯式 resume 仍
      * ConfirmRequired（generation fence，零 transport、不開啟）。
+     *
+     * S3：兩次取代各保留一次（seq 1→2→3），未重確認即 resume 再 re-arm 為 seq4。
      */
     @Test
     fun abaThenResumeStillRequiresFreshConfirm() = runBlocking {
@@ -526,14 +536,19 @@ class ChatViewModelKeyReadConfirmFlowTest {
                 h.vm.pendingOpenSessionId.value == sid
         }
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
         store.save(endpointB())
         store.save(endpointA())
+        // S3：兩次取代保留各 bump 一次，落地後為 seq3 的 ConfirmRequired。
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 3L
+        }
         onMain { h.vm.resumePendingOpen(sid) }
         awaitTrue {
             h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
-                h.vm.keyReadConfirmSequence.value == 2L
+                h.vm.keyReadConfirmSequence.value == 4L
         }
         assertNull(h.vm.currentSessionId.value)
         assertEquals(0, h.fake.streamCalls)
@@ -559,7 +574,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
             h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
                 h.vm.pendingOpenSessionId.value == sid
         }
-        assertTrue(h.vm.confirmKeyRead())
+        assertTrue(h.vm.confirmKeyReadForTest())
         onMain { h.vm.resumePendingOpen(other) }
         awaitTrue { h.vm.keyReadConfirmSequence.value == 2L }
         assertNull(h.vm.currentSessionId.value)

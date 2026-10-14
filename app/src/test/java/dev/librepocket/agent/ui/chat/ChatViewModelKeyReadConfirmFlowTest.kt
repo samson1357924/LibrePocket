@@ -373,4 +373,200 @@ class ChatViewModelKeyReadConfirmFlowTest {
         assertEquals(false, h.vm.confirmKeyRead())
         assertEquals(0L, h.vm.keyReadConfirmSequence.value)
     }
+
+    private suspend fun seedHistory(transcripts: FakeSessionStore): String {
+        val sid = transcripts.createSession("old", "gpt-4o-mini")
+        transcripts.appendEvent(
+            dev.librepocket.session.TranscriptEvent(
+                sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+            ),
+        )
+        transcripts.appendEvent(
+            dev.librepocket.session.TranscriptEvent(
+                sessionId = sid, runId = "r1", kind = "assistant", text = "a1", createdAt = 2L,
+            ),
+        )
+        return sid
+    }
+
+    /**
+     * S2：歷史 session 在預設 ASK 下確認後可顯式 resume（不經第二次
+     * invalidate，不燒剛 mint 的 consent）。open→ConfirmRequired(seq1,
+     * 零 transport)→confirm→resume→attach（恰一次 getKey/build、history
+     * 已載、sequence 不再+1）；後續送出仍需重確認。
+     */
+    @Test
+    fun openConfirmThenExplicitResumeOpensOnceWithoutSequenceBump() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val transcripts = FakeSessionStore()
+        val sid = seedHistory(transcripts)
+        val h = newHarness(store, transcripts)
+        onMain { h.vm.openSession(sid) }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.pendingOpenSessionId.value == sid
+        }
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        assertEquals(0, h.fake.streamCalls)
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+        assertNull(h.vm.currentSessionId.value)
+        assertTrue(h.vm.messages.value.isEmpty())
+        // 確認僅 mint，不 auto-open：零新增請求、sequence 不動。
+        assertTrue(h.vm.confirmKeyRead())
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        assertEquals(0, h.fake.streamCalls)
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+        assertNull(h.vm.currentSessionId.value)
+        // 顯式 resume：同一 generation，不經第二次 invalidate。
+        onMain { h.vm.resumePendingOpen(sid) }
+        awaitTrue { h.vm.currentSessionId.value == sid }
+        awaitTrue { h.vm.messages.value.size == 2 }
+        assertEquals("q1", h.vm.messages.value[0].text)
+        assertEquals("a1", h.vm.messages.value[1].text)
+        assertEquals(1, h.getKeyCalls.get())
+        assertEquals(1, h.buildCalls.get())
+        assertEquals(0, h.fake.streamCalls)
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        assertNull(h.vm.pendingOpenSessionId.value)
+        assertNull(h.vm.notice.value)
+        // Slot 已消耗一次：下次送出需重確認、零新增請求。
+        onMain { h.vm.sendDirect("next") }
+        awaitTrue { h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" && h.vm.input.value == "next" }
+        assertEquals(2L, h.vm.keyReadConfirmSequence.value)
+        assertEquals(1, h.getKeyCalls.get())
+        assertEquals(1, h.buildCalls.get())
+        assertEquals(0, h.fake.streamCalls)
+    }
+
+    /**
+     * S2：cancel（dismiss 燒 consent）後顯式 resume 仍 ConfirmRequired
+     *（sequence+1、零 transport、不開啟）。
+     */
+    @Test
+    fun dismissThenResumeStillRequiresConfirmWithZeroRequests() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val transcripts = FakeSessionStore()
+        val sid = seedHistory(transcripts)
+        val h = newHarness(store, transcripts)
+        onMain { h.vm.openSession(sid) }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.pendingOpenSessionId.value == sid
+        }
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        assertTrue(h.vm.confirmKeyRead())
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        onMain { h.vm.dismissKeyReadConfirm() }
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        // cancel 燒掉後 resume：無有效 consent，仍 ConfirmRequired。
+        onMain { h.vm.resumePendingOpen(sid) }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 2L
+        }
+        assertNull(h.vm.currentSessionId.value)
+        assertEquals(0, h.fake.streamCalls)
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+        assertTrue(h.vm.messages.value.isEmpty())
+    }
+
+    /**
+     * S2：endpoint 切換後顯式 resume 仍 ConfirmRequired（binding 全欄位 fence，
+     * 零 transport、不開啟）。
+     */
+    @Test
+    fun switchEndpointThenResumeStillRequiresFreshConfirm() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val transcripts = FakeSessionStore()
+        val sid = seedHistory(transcripts)
+        val h = newHarness(store, transcripts)
+        onMain { h.vm.openSession(sid) }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.pendingOpenSessionId.value == sid
+        }
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        assertTrue(h.vm.confirmKeyRead())
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        store.save(endpointB())
+        // 等待取代失效落地（無未接受 op 時 notice 清空），再顯式 resume。
+        awaitTrue { h.vm.notice.value == null }
+        onMain { h.vm.resumePendingOpen(sid) }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 2L
+        }
+        assertNull(h.vm.currentSessionId.value)
+        assertEquals(0, h.fake.streamCalls)
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+        assertTrue(h.vm.messages.value.isEmpty())
+    }
+
+    /**
+     * S2：ABA（A→B→A 回到相同 binding 但新 generation）後顯式 resume 仍
+     * ConfirmRequired（generation fence，零 transport、不開啟）。
+     */
+    @Test
+    fun abaThenResumeStillRequiresFreshConfirm() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val transcripts = FakeSessionStore()
+        val sid = seedHistory(transcripts)
+        val h = newHarness(store, transcripts)
+        onMain { h.vm.openSession(sid) }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.pendingOpenSessionId.value == sid
+        }
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        assertTrue(h.vm.confirmKeyRead())
+        assertEquals(1L, h.vm.keyReadConfirmSequence.value)
+        store.save(endpointB())
+        store.save(endpointA())
+        onMain { h.vm.resumePendingOpen(sid) }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.keyReadConfirmSequence.value == 2L
+        }
+        assertNull(h.vm.currentSessionId.value)
+        assertEquals(0, h.fake.streamCalls)
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+        assertTrue(h.vm.messages.value.isEmpty())
+    }
+
+    /**
+     * S2：resume 必須比對 sessionId：錯誤 sid 永不開啟（零 transport），
+     * 原 pending 保留。
+     */
+    @Test
+    fun resumeWithWrongSessionIdNeverOpens() = runBlocking {
+        val store = newStore()
+        store.save(endpointA())
+        val transcripts = FakeSessionStore()
+        val sid = seedHistory(transcripts)
+        val other = transcripts.createSession("other", "gpt-4o-mini")
+        val h = newHarness(store, transcripts)
+        onMain { h.vm.openSession(sid) }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.pendingOpenSessionId.value == sid
+        }
+        assertTrue(h.vm.confirmKeyRead())
+        onMain { h.vm.resumePendingOpen(other) }
+        awaitTrue { h.vm.keyReadConfirmSequence.value == 2L }
+        assertNull(h.vm.currentSessionId.value)
+        assertEquals(sid, h.vm.pendingOpenSessionId.value)
+        assertEquals(0, h.fake.streamCalls)
+        assertEquals(0, h.getKeyCalls.get())
+        assertEquals(0, h.buildCalls.get())
+        assertTrue(h.vm.messages.value.isEmpty())
+    }
 }

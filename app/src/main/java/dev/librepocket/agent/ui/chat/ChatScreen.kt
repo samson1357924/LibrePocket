@@ -126,6 +126,8 @@ fun ChatScreen(
     val keyReadConfirmSeq by viewModel.keyReadConfirmSequence.collectAsStateWithLifecycle()
     val pendingRecoveryCount by viewModel.pendingRecoveryCount.collectAsStateWithLifecycle()
     val currentSessionId by viewModel.currentSessionId.collectAsStateWithLifecycle()
+    // S2: pending history open retained across ConfirmRequired (explicit resume target).
+    val pendingOpenSid by viewModel.pendingOpenSessionId.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     val streaming = session.status == ChatStatus.STREAMING
     var wasActive by remember { mutableStateOf(false) }
@@ -147,18 +149,22 @@ fun ChatScreen(
     // S7 key.read 確認對話框狀態（notice＋sequence 觸發，非自動彈窗擋路）。
     // snapshot 為不可變 binding（peekKeyReadBinding，只讀，不含金鑰內容）；
     // confirming 為 mint 在途（按鈕 disable 防 double-tap）；
-    // confirmResult null=待確認、true=已確認請再按發送、false=已失效；
+    // confirmResult null=待確認、true=已確認（有 pending open 顯示開啟歷史，
+    // 無則請再按發送）、false=已失效；
     // dialogHidden 為本次 notice 的本地關閉（VM notice 在下次送出前保持，
     // 故需本地隱藏；notice 離開 KEY_READ_CONFIRM_REQUIRED 即重置）。
     // sequence 門：每次 deny sequence 單調遞增（VM 永不重置），故
     // ConfirmRequired→null→ConfirmRequired 中間 null 被 StateFlow
     // conflation 吃掉時仍以 seq 變化重置並重 peek；同 seq 內 effect 不重跑，
     // confirm 進度不受影響。
+    // S2 resuming：顯式 resume 在途（按鈕 disable 防 double-tap；成功後
+    // notice 離開 KEY 即重置，失敗 bump seq 即重置重 peek）。
     var keyReadBinding by remember { mutableStateOf<EndpointSessionBinding?>(null) }
     var keyReadBindingReady by remember { mutableStateOf(false) }
     var keyReadConfirming by remember { mutableStateOf(false) }
     var keyReadConfirmResult by remember { mutableStateOf<Boolean?>(null) }
     var keyReadDialogHidden by remember { mutableStateOf(false) }
+    var keyReadResuming by remember { mutableStateOf(false) }
     val keyReadScope = rememberCoroutineScope()
     LaunchedEffect(notice, keyReadConfirmSeq) {
         if (notice != "KEY_READ_CONFIRM_REQUIRED") {
@@ -167,6 +173,7 @@ fun ChatScreen(
             keyReadConfirming = false
             keyReadConfirmResult = null
             keyReadDialogHidden = false
+            keyReadResuming = false
         } else {
             // 新 deny（seq 變化或 notice 新進 KEY）：無條件重置本地狀態後重 peek。
             keyReadBinding = null
@@ -174,6 +181,7 @@ fun ChatScreen(
             keyReadConfirming = false
             keyReadConfirmResult = null
             keyReadDialogHidden = false
+            keyReadResuming = false
             keyReadBinding = try {
                 viewModel.peekKeyReadBinding()
             } catch (cancelled: CancellationException) {
@@ -465,6 +473,33 @@ fun ChatScreen(
             )
         }
 
+        // S2: pending history open 的顯式 resume 入口（對話框隱藏後仍可開啟；
+        // 不自動 send；成功後 notice 離開 KEY 即消失）。
+        if (notice == "KEY_READ_CONFIRM_REQUIRED" && pendingOpenSid != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "歷史會話待開啟",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f),
+                )
+                Button(
+                    onClick = {
+                        if (keyReadResuming) return@Button
+                        keyReadResuming = true
+                        pendingOpenSid?.let { viewModel.resumePendingOpen(it) }
+                    },
+                    enabled = !keyReadResuming,
+                ) { Text(if (keyReadResuming) "開啟中…" else "開啟歷史") }
+            }
+        }
+
         // Q3: outbox recovery entry. Restoring fills a blank box only and
         // never sends; both actions cost zero provider calls.
         if (pendingRecoveryCount > 0) {
@@ -656,12 +691,16 @@ fun ChatScreen(
     // S7 key.read 確認對話框：notice 觸發（非自動彈窗擋路），內容為不可變
     // binding 快照（唯讀，不含金鑰內容）。確認僅 mint 一次性同意，不 auto-send；
     // 拒絕/取消僅丟棄未消耗的同意，不發送。
+    // S2: 有 pending open 時確認後顯示「已確認，開啟歷史」並提供顯式 resume
+    //（不自動 send、不自動 resume）。
     if (notice == "KEY_READ_CONFIRM_REQUIRED" && !keyReadDialogHidden) {
         KeyReadConfirmDialog(
             binding = keyReadBinding,
             loading = !keyReadBindingReady,
             confirming = keyReadConfirming,
             confirmResult = keyReadConfirmResult,
+            pendingOpenSessionId = pendingOpenSid,
+            resuming = keyReadResuming,
             onConfirm = {
                 if (keyReadConfirming || keyReadConfirmResult != null) return@KeyReadConfirmDialog
                 keyReadConfirming = true
@@ -674,10 +713,15 @@ fun ChatScreen(
                         false
                     }
                     keyReadConfirming = false
-                    // 成功顯示已確認請再按發送，失敗（mint false／例外）顯示已失效；
-                    // 皆不 auto-send（restore 已在 input，需手動再按發送）。
+                    // 有 pending open 顯示開啟歷史，無則顯示再按發送；
+                    // 皆不 auto-send（S2 resume 需顯式按「開啟歷史」）。
                     keyReadConfirmResult = ok
                 }
+            },
+            onResumeOpen = {
+                if (keyReadResuming) return@KeyReadConfirmDialog
+                keyReadResuming = true
+                pendingOpenSid?.let { viewModel.resumePendingOpen(it) }
             },
             onReject = {
                 if (keyReadConfirming) return@KeyReadConfirmDialog
@@ -708,10 +752,15 @@ internal fun KeyReadConfirmDialog(
     onReject: () -> Unit,
     onCancel: () -> Unit,
     onClose: () -> Unit,
+    pendingOpenSessionId: String? = null,
+    resuming: Boolean = false,
+    onResumeOpen: () -> Unit = {},
 ) {
     // S7：key.read ASK 的一次性確認。快照欄位皆為連線身份（唯讀），不含金鑰內容。
-    // confirmResult true=已確認請再按發送、false=已失效；loading/confirming 期間
-    // 按鈕 disable 防 double-tap；binding null（peek 失敗／世代過期）顯示已失效。
+    // confirmResult true=已確認（有 pending open 顯示開啟歷史，無則請再按發送）、
+    // false=已失效；loading/confirming/resuming 期間按鈕 disable 防 double-tap；
+    // binding null（peek 失敗／世代過期）顯示已失效。
+    val hasPendingOpen = pendingOpenSessionId != null
     AlertDialog(
         onDismissRequest = {
             if (confirmResult != null) onClose() else onCancel()
@@ -720,6 +769,12 @@ internal fun KeyReadConfirmDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 when {
+                    confirmResult == true && hasPendingOpen -> {
+                        Text("已確認，開啟歷史。")
+                        if (resuming) {
+                            Text("開啟中…")
+                        }
+                    }
                     confirmResult == true -> {
                         Text("已確認，請再按發送。")
                     }
@@ -749,8 +804,12 @@ internal fun KeyReadConfirmDialog(
             }
         },
         confirmButton = {
-            if (confirmResult != null) {
-                TextButton(onClick = onClose, enabled = !confirming) { Text("關閉") }
+            if (confirmResult == true && hasPendingOpen) {
+                TextButton(onClick = onResumeOpen, enabled = !confirming && !resuming) {
+                    Text(if (resuming) "開啟中…" else "開啟歷史")
+                }
+            } else if (confirmResult != null) {
+                TextButton(onClick = onClose, enabled = !confirming && !resuming) { Text("關閉") }
             } else {
                 TextButton(
                     onClick = onConfirm,
@@ -764,6 +823,8 @@ internal fun KeyReadConfirmDialog(
                     TextButton(onClick = onReject, enabled = !confirming) { Text("拒絕") }
                     TextButton(onClick = onCancel, enabled = !confirming) { Text("取消") }
                 }
+            } else if (confirmResult == true && hasPendingOpen) {
+                TextButton(onClick = onClose, enabled = !confirming && !resuming) { Text("關閉") }
             }
         },
     )

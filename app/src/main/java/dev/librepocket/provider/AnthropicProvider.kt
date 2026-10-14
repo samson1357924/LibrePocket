@@ -184,7 +184,10 @@ internal class AnthropicMapper(val round: Int = 0) {
 
     private val blocks = LinkedHashMap<Int, Block>()
     // Per-attempt whole-round tool total across all block indexes (Finding
-    // #1), monotonic: content_block_stop arrivals never decrement it.
+    // #1). Monotonic across arrivals — content_block_stop never decrements it.
+    // The one non-monotonic transition is TOOL→TOOL re-start at a known index,
+    // which retires the outgoing block's id/name and re-bills the incoming
+    // pair, so the total stays the true sum of currently-buffered chars.
     private var totalAggChars = 0
     // Distinct TOOL-kind blocks (TEXT/THINKING/OTHER blocks are not tools and
     // stay outside the count cap; replacement at one index adjusts the count).
@@ -234,8 +237,22 @@ internal class AnthropicMapper(val round: Int = 0) {
                     else -> BlockKind.OTHER
                 }
                 val b = Block(kind)
+                val prev = blocks[index]
+                if (prev?.kind == BlockKind.TOOL) {
+                    // Retire the outgoing TOOL block's counted chars whenever
+                    // its index is re-started as TOOL (re-billed below) or
+                    // demoted to a non-TOOL kind: totalAggChars then stays the
+                    // true sum of the chars still buffered, so a hostile cycle
+                    // re-sending one index with equal-length id/name (or
+                    // tool→text→tool churn) cannot inflate it into a spurious
+                    // TOOL_ARGS_TOO_LARGE. Floored at 0 defensively: those
+                    // chars were counted when the block arrived.
+                    totalAggChars = (
+                        totalAggChars - prev.toolId.length - prev.toolName.length - prev.args.length
+                        ).coerceAtLeast(0)
+                }
                 if (kind == BlockKind.TOOL) {
-                    if (blocks[index]?.kind != BlockKind.TOOL) {
+                    if (prev?.kind != BlockKind.TOOL) {
                         requireToolCountBudget(toolBlockCount + 1)
                         toolBlockCount++
                     }
@@ -244,7 +261,7 @@ internal class AnthropicMapper(val round: Int = 0) {
                     requireTotalToolAggBudget(totalAggChars, b.toolId.length + b.toolName.length)
                     totalAggChars += b.toolId.length + b.toolName.length
                     out.add(StreamEvent.ToolDelta(index, b.toolId.ifEmpty { null }, b.toolName.ifEmpty { null }, ""))
-                } else if (blocks[index]?.kind == BlockKind.TOOL) {
+                } else if (prev?.kind == BlockKind.TOOL) {
                     toolBlockCount--
                 }
                 if (kind == BlockKind.THINKING) {

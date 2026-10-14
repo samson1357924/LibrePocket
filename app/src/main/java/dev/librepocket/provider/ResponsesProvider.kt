@@ -309,6 +309,19 @@ internal class ResponsesMapper(val round: Int = 0) {
                 val oldBuffered = agg.id.length + agg.name.length + agg.args.length
                 val growth = (candidateTotal - oldBuffered).coerceAtLeast(0)
                 requireTotalToolAggBudget(totalAggChars, growth)
+                // Dedup-set bound (same per-attempt collection invariant as
+                // callsByItem): a hostile stream re-sending one item_id's
+                // output_item.done with a rotating equal-length call_id keeps
+                // per-candidate growth 0 and item_id fixed, so every char and
+                // distinct-count guard above stays silent while emittedToolIds
+                // — and the emitted ToolDone count — grows without bound. Reuse
+                // the SAME distinct per-attempt cap + typed failure; check a
+                // genuinely-new (toolIndex, id) BEFORE insert so the overflowing
+                // entry is never buffered (duplicates are dedup no-ops, not new
+                // admissions), mirroring the callsByItem guard above.
+                if ((agg.toolIndex to effectiveId) !in emittedToolIds) {
+                    requireToolCountBudget(emittedToolIds.size + 1)
+                }
                 // All guards passed: single write-back, then emit.
                 agg.id = effectiveId
                 agg.name = effectiveName

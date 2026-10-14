@@ -9,6 +9,27 @@ package dev.librepocket.provider
  * supported; malformed input throws [MiniJsonException].
  */
 internal object MiniJson {
+    /**
+     * Maximum nesting depth (nested objects/arrays) accepted before parsing
+     * fails closed with [MiniJsonException].
+     *
+     * A hostile ≤1 MiB SSE frame can nest hundreds of thousands of containers
+     * (up to ~524k array levels, ~131k with object keys); recursive descent
+     * overflows the native stack ([StackOverflowError]) orders of magnitude
+     * before that. The protocol mappers only catch [MiniJsonException] per
+     * frame, so an escaping [StackOverflowError] would instead be swallowed by
+     * the transport's general branch and mislabeled a retryable failure. Ceiling
+     * the depth keeps the failure on the existing fail-closed path: the frame
+     * is treated as malformed and dropped, never retried, never crashing.
+     *
+     * The value is deliberately generous: the deepest legitimate payload in
+     * project fixtures nests 7 (`chat-basic.txt` tool_calls.function); even a
+     * very deep real envelope stays an order of magnitude below 64, so a
+     * well-formed event never trips this while a hostile one is rejected far
+     * below the native stack limit.
+     */
+    internal const val MAX_DEPTH = 64
+
     sealed interface J
 
     data class JObj(val map: Map<String, J>) : J
@@ -24,19 +45,38 @@ internal object MiniJson {
 
     private class Parser(val s: String) {
         var pos = 0
+        private var depth = 0
 
         fun parseValue(): J {
             skipWs()
             if (pos >= s.length) fail("unexpected end")
             return when (val c = s[pos]) {
-                '{' -> parseObj()
-                '[' -> parseArr()
+                '{' -> withDepth { parseObj() }
+                '[' -> withDepth { parseArr() }
                 '"' -> JStr(parseString())
                 't' -> { expect("true"); JBool(true) }
                 'f' -> { expect("false"); JBool(false) }
                 'n' -> { expect("null"); JNull }
                 '-', in '0'..'9' -> parseNum()
                 else -> fail("unexpected char '$c'")
+            }
+        }
+
+        /**
+         * Fail-closed recursion guard. Objects and arrays each enter a nesting
+         * level here (the only two recursive productions); the [try]/[finally]
+         * restores [depth] on every exit path — normal return or thrown — so a
+         * sibling container never inherits a leaked depth. Over-ceiling input
+         * throws the same [MiniJsonException] as any malformed frame, which
+         * the mappers already catch and drop per frame.
+         */
+        private inline fun <T> withDepth(block: () -> T): T {
+            if (depth >= MAX_DEPTH) fail("nesting exceeds $MAX_DEPTH")
+            depth++
+            try {
+                return block()
+            } finally {
+                depth--
             }
         }
 

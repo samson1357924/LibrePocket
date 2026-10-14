@@ -594,4 +594,104 @@ class ToolAggBudgetTest {
         assertEquals("f", done.name)
         assertEquals("{}", done.argumentsJson)
     }
+
+    // ---- Stage 1 (F2): emittedToolIds dedup-set bound (same distinct cap) ----
+
+    @Test
+    fun responsesDoneRotatingCallIdTripsEmittedIdCapTyped() {
+        // Hostile: one fixed item_id re-done with a rotating equal-length
+        // call_id. Per-candidate round-total growth stays 0 (equal lengths) and
+        // item_id is fixed, so requireToolAggBudget / requireTotalToolAggBudget
+        // / the callsByItem distinct count all stay silent. The only unbounded
+        // surface is emittedToolIds (and the emitted ToolDone count), which the
+        // same distinct per-attempt cap must now bound: the 65th distinct
+        // (toolIndex, id) throws typed, non-retryable.
+        val mapper = ResponsesMapper()
+        val over = toolFailureOf {
+            for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT + 1) {
+                val callId = String.format("c%03d", i) // 4 chars throughout
+                mapper.mapPayload(
+                    """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$callId","name":"f"}}""",
+                )
+            }
+        }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun responsesDoneDistinctIdsAtCapAllEmit() {
+        // Up to MAX_TOOL_CALLS_PER_ATTEMPT distinct (toolIndex, id) ToolDones
+        // are legal: 64 equal-length rotating re-dones all emit, none throw,
+        // and the round total never grows beyond one candidate (growth 0), so
+        // the emitted-id cap fires only on the 65th — not before it.
+        val mapper = ResponsesMapper()
+        var emitted = 0
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            val callId = String.format("c%03d", i)
+            val out = mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$callId","name":"f"}}""",
+            )
+            emitted += out.filterIsInstance<StreamEvent.ToolDone>().size
+        }
+        assertEquals(MAX_TOOL_CALLS_PER_ATTEMPT, emitted)
+    }
+
+    @Test
+    fun responsesDoneResendAcceptedIdAtCapIsNoOp() {
+        // At-cap re-send of an already-admitted (toolIndex, id) must stay a
+        // dedup no-op: the guard charges only genuinely-new pairs, so a legal
+        // duplicate after the cap is never misread as an overflow.
+        val mapper = ResponsesMapper()
+        for (i in 0 until MAX_TOOL_CALLS_PER_ATTEMPT) {
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"${String.format("c%03d", i)}","name":"f"}}""",
+            )
+        }
+        val out = mapper.mapPayload(
+            """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"c000","name":"f"}}""",
+        )
+        assertEquals(1, out.filterIsInstance<StreamEvent.ToolDone>().size)
+    }
+
+    // ---- Stage 1 (F4): Anthropic TOOL->TOOL restart re-bills id/name ----
+
+    @Test
+    fun anthropicToolRestartCyclingEqualLenIdStaysBounded() {
+        // TOOL→TOOL re-start at one index must retire the outgoing id/name
+        // before re-billing the incoming pair. A hostile cycle of equal-length
+        // id restarts (only one block is buffered, then replaced) previously
+        // re-added the id/name length every time, inflating totalAggChars by
+        // ~10k chars per restart and tripping a spurious TOOL_ARGS_TOO_LARGE
+        // well before any real overflow. Now the total tracks the real
+        // one-block sum, so 100 restarts never throw and the block still
+        // closes cleanly.
+        val mapper = AnthropicMapper()
+        for (i in 0 until 100) {
+            val id = "x".repeat(9_988) + String.format("%012d", i) // 10_000 chars, rotating tail
+            val start = mapper.mapPayload(
+                """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"$id","name":"n"}}""",
+            )
+            assertEquals(1, start.filterIsInstance<StreamEvent.ToolDelta>().size)
+        }
+        val done = mapper.mapPayload("""{"type":"content_block_stop","index":0}""")
+            .filterIsInstance<StreamEvent.ToolDone>().single()
+        assertEquals(10_000, done.id.length)
+        assertEquals("n", done.name)
+    }
+
+    @Test
+    fun anthropicSingleOversizedToolIdNameStillThrowsTyped() {
+        // Negative control: the re-bill fix must not weaken the single-shot
+        // oversized guard. One start whose id+name alone exceed the round total
+        // (300k+60k=360k chars, x3 = 1.08 MiB) still fails closed.
+        val mapper = AnthropicMapper()
+        val bigId = "i".repeat(300_000)
+        val bigName = "n".repeat(60_000)
+        val over = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"$bigId","name":"$bigName"}}""",
+            )
+        }
+        assertAggOverflow(over)
+    }
 }

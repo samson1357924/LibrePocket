@@ -201,11 +201,50 @@ class IntentTypedD2Test {
     assertTrue(r is LaunchResult.Internal)
   }
 
+  @Test fun launch_startActivityNotFound_mapsToNoHandler() {
+    val app = appContext()
+    addResolve(app, Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com")))
+    val gone = object : ContextWrapper(app) {
+      override fun startActivity(intent: Intent): Unit =
+        throw android.content.ActivityNotFoundException("handler gone")
+    }
+    val r = AndroidIntentLauncher(gone).launch(
+      IntentSpec(action = Intent.ACTION_VIEW, dataUri = "https://example.com"),
+    )
+    assertEquals(LaunchResult.NoHandler, r)
+  }
+
+  @Test fun launch_startActivitySecurityException_mapsToInternal() {
+    val app = appContext()
+    addResolve(app, Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com")))
+    val denied = object : ContextWrapper(app) {
+      override fun startActivity(intent: Intent): Unit =
+        throw SecurityException("deny")
+    }
+    val r = AndroidIntentLauncher(denied).launch(
+      IntentSpec(action = Intent.ACTION_VIEW, dataUri = "https://example.com"),
+    )
+    assertTrue(r is LaunchResult.Internal)
+  }
+
   @Test fun launch_fakeThrowingLauncher_convergesToInternal() {
     val throwingLauncher = IntentLauncher { throw RuntimeException("fake boom") }
     val r = AlarmTool.execute(AlarmTool.Params(7, 30), env, throwingLauncher)
     assertFalse(r.ok)
     assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+  }
+
+  @Test fun launchCatching_rethrowsCancellation() {
+    val cancelling = IntentLauncher {
+      throw kotlin.coroutines.cancellation.CancellationException("gone")
+    }
+    val spec = IntentSpec(action = Intent.ACTION_VIEW, dataUri = "https://example.com")
+    try {
+      cancelling.launchCatching(spec)
+      fail("CancellationException must propagate, not converge to Internal")
+    } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+      // 預期：取消直接外洩。
+    }
   }
 
   // ---- 6. tool 層原因碼分型 ----

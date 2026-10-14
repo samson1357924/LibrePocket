@@ -94,10 +94,10 @@ object SkillInstaller {
     private val STAGING_RE = Regex("^\\.(.+)\\.tmp-\\d+-\\d+$")
     private val BACKUP_RE = Regex("^\\.(.+)\\.bak-\\d+-\\d+$")
 
-    /** best-effort fsync：失敗吞掉，不影響安裝結果（掉電語義見類 KDoc）。 */
+    /** best-effort fsync（檔與目錄統一走 `FileChannel.force(true)`；失敗吞掉，不影響安裝結果（掉電語義見類 KDoc））。 */
     private fun fsyncBestEffort(f: File) {
         try {
-            java.io.FileInputStream(f).use { it.fd.sync() }
+            java.nio.channels.FileChannel.open(f.toPath()).use { it.force(true) }
         } catch (_: Exception) {
             // best-effort：sync 不到就留下，呼叫方不受影響。
         }

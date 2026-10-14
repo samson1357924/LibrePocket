@@ -1,5 +1,6 @@
 package dev.librepocket.systema
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
@@ -10,9 +11,15 @@ import android.net.Uri
  * resolveActivity → startActivity；音量走 AudioManager 直調。
  *
  * 失敗分型（D2）：resolve 無處理者 → [LaunchResult.NoHandler]；
- * toIntent / resolve / start 任一拋錯 → [LaunchResult.Internal]
+ * `startActivity` 拋 [ActivityNotFoundException]（resolve 後 handler 被移除/
+ * 停用）同樣視為無處理者 → [LaunchResult.NoHandler]（舊 boolean false 語義）；
+ * toIntent / resolve / start 其餘拋錯 → [LaunchResult.Internal]
  * （含 `resolveActivity` 自身拋錯，D1 此處在 runCatching 之外會直接外洩）。
  * 呼叫方接 [FallbackSpec]。
+ *
+ * 例外收斂說明：三處 catch 皆只收 `Exception`（`OutOfMemoryError` 等 VM fatal
+ * 直接外洩）；`CancellationException` 同屬 `Exception`，本層不吞（launchCatching
+ * 明確重拋），structured concurrency 由呼叫方維持。
  *
  * 已接受風險（文件化，不改行為）：隱式 Intent handler 劫持——系統依預設
  * App 選擇處理者，本層不代選；高風險操作由呼叫方經使用者確認後才發起，
@@ -23,20 +30,22 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
   override fun launch(spec: IntentSpec): LaunchResult {
     val intent = try {
       toIntent(spec)
-    } catch (t: Throwable) {
-      return LaunchResult.Internal(t)
+    } catch (e: Exception) {
+      return LaunchResult.Internal(e)
     }
     val resolved = try {
       intent.resolveActivity(context.packageManager)
-    } catch (t: Throwable) {
-      return LaunchResult.Internal(t)
+    } catch (e: Exception) {
+      return LaunchResult.Internal(e)
     }
     if (resolved == null) return LaunchResult.NoHandler
     return try {
       context.startActivity(intent)
       LaunchResult.Success
-    } catch (t: Throwable) {
-      LaunchResult.Internal(t)
+    } catch (e: ActivityNotFoundException) {
+      LaunchResult.NoHandler
+    } catch (e: Exception) {
+      LaunchResult.Internal(e)
     }
   }
 
@@ -87,6 +96,8 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
         is IntentExtra.LongVal -> intent.putExtra(k, v.value)
         is IntentExtra.IntVal -> intent.putExtra(k, v.value)
         is IntentExtra.Bool -> intent.putExtra(k, v.value)
+        // statement-position when 不窮舉檢查：未知子類 fail-closed，不靜默掉 extra。
+        else -> throw IllegalStateException("unknown IntentExtra: ${v.javaClass.simpleName}")
       }
     }
     // 預設恆加 NEW_TASK（維持 D1 行為）；spec.flags 僅套用 allowlist。

@@ -8,6 +8,10 @@ package dev.librepocket.systema
  * D2 型別化 extras：D1 的全 String 會讓端側 `getIntExtra /
  * getLongExtra / getBooleanExtra` 讀回預設值（系統鬧鐘/日曆 App 直接忽略），
  * 故改為密封型別，launcher 按型別 putExtra。
+ *
+ * 決策註記：float/double 需求出現時再加 DoubleVal + toIntent 分支
+ * （不預先加型別；此處 when 為 statement position，新增子類不會編譯期
+ * 報錯，故 toIntent 另以 `else -> throw` 保底，防靜默掉 extra）。
  */
 sealed interface IntentExtra {
   data class Str(val value: String) : IntentExtra
@@ -85,9 +89,16 @@ fun interface IntentLauncher {
   fun launch(spec: IntentSpec): LaunchResult
 }
 
-/** 防禦：假實現自身拋錯時一律收斂為 [LaunchResult.Internal]。 */
-internal fun IntentLauncher.launchCatching(spec: IntentSpec): LaunchResult =
-  runCatching { launch(spec) }.getOrElse { LaunchResult.Internal(it) }
+/** 防禦：假實現自身拋錯時收斂為 [LaunchResult.Internal]；取消與 VM fatal 直接外洩。 */
+internal fun IntentLauncher.launchCatching(spec: IntentSpec): LaunchResult {
+  try {
+    return launch(spec)
+  } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+    throw e
+  } catch (e: Exception) {
+    return LaunchResult.Internal(e)
+  }
+}
 
 /** 把啟動分型轉為工具結果（成功分支保留呼叫方指定的 fallback/原因語義）。 */
 internal fun LaunchResult.toToolResult(

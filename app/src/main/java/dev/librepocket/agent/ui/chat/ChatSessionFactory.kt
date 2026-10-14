@@ -363,12 +363,13 @@ class ChatSessionFactory(
      * binding- and generation-matched consent; every other T0 outcome
      * passes false.
      *
-     * Residual window (documented): a policy/generation/binding flip
-     * landing after this recheck but before `vault.getKey` still passes
-     * (a DENY verdict flip, a lifecycle-generation bump, or an endpoint
-     * binding flip that the later keyIsCurrent gates would otherwise
-     * catch). Narrowing it further would require holding the policy gate
-     * across the vault read, out of scope for this light recheck.
+     * Residual window (documented): a flip landing after this recheck
+     * but before `getKey` returns still passes. T1→`vault()`→`getKey`
+     * contains suspend/IO (dispatcher hop plus Keystore/disk IO); no
+     * gate is held across it. A DENY flip after the recheck has no
+     * later gate to catch it; a binding/generation flip blocks attach
+     * via the later `keyIsCurrent` gates but not the vault read that
+     * already happened (only `close` wipes the captured secret).
      */
     private suspend fun requireKeyReadAllowed(providerId: String, allowAsk: Boolean) {
         val verdict = try {

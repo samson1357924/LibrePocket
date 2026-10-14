@@ -191,11 +191,17 @@ class ChatViewModelKeyReadS3Test {
         store.save(endpointA())
         val h = newHarness(store)
         onMain { h.vm.sendDirect("hi") }
-        awaitTrue { h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" && h.vm.input.value == "hi" }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.input.value == "hi" &&
+                h.vm.keyReadConfirmSequence.value == 1L
+        }
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
         val snapshotA = h.vm.peekKeyReadBinding()
         assertNotNull(snapshotA)
         assertEquals("preset:openai", snapshotA!!.providerId)
+        val tokenA = h.vm.peekKeyReadConfirmToken()
+        assertNotNull(tokenA)
 
         // 端點切到 B：S3 保留 Confirm notice 並 bump（重 peek B）。
         store.save(endpointB())
@@ -203,8 +209,8 @@ class ChatViewModelKeyReadS3Test {
             h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
                 h.vm.keyReadConfirmSequence.value == 2L
         }
-        // 過期快照確認：失敗 closed，不 mint（sequence 不動）。
-        assertFalse(h.vm.confirmKeyRead(snapshotA))
+        // 過期快照＋舊 token 確認：失敗 closed，不 mint（sequence 不動）。
+        assertFalse(h.vm.confirmKeyRead(snapshotA, tokenA))
         assertEquals(2L, h.vm.keyReadConfirmSequence.value)
         assertEquals(0, h.getKeyCalls.get())
         assertEquals(0, h.buildCalls.get())
@@ -219,11 +225,13 @@ class ChatViewModelKeyReadS3Test {
         assertEquals(0, h.buildCalls.get())
         assertEquals(0, h.fake.streamCalls)
 
-        // 重 peek B 並確認：放行，後續送出恰一次成功。
+        // 重 peek B＋新 token 並確認：放行，後續送出恰一次成功。
         val snapshotB = h.vm.peekKeyReadBinding()
         assertNotNull(snapshotB)
         assertEquals("preset:custom", snapshotB!!.providerId)
-        assertTrue(h.vm.confirmKeyRead(snapshotB))
+        val tokenB = h.vm.peekKeyReadConfirmToken()
+        assertNotNull(tokenB)
+        assertTrue(h.vm.confirmKeyRead(snapshotB, tokenB))
         assertEquals(3L, h.vm.keyReadConfirmSequence.value)
         onMain { h.vm.sendDirect("hi") }
         awaitCompletedTurn(h.vm, expectedTurns = 1)
@@ -241,19 +249,25 @@ class ChatViewModelKeyReadS3Test {
         store.save(endpointA())
         val h = newHarness(store)
         onMain { h.vm.sendDirect("one") }
-        awaitTrue { h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" && h.vm.input.value == "one" }
+        awaitTrue {
+            h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
+                h.vm.input.value == "one" &&
+                h.vm.keyReadConfirmSequence.value == 1L
+        }
         assertEquals(1L, h.vm.keyReadConfirmSequence.value)
         val snapshotA = h.vm.peekKeyReadBinding()
         assertNotNull(snapshotA)
+        val tokenA = h.vm.peekKeyReadConfirmToken()
+        assertNotNull(tokenA)
 
-        // 切到 B 並等待保留落地（seq2），此後 snapshotA 已過期。
+        // 切到 B 並等待保留落地（seq2），此後 snapshotA＋tokenA 已過期。
         store.save(endpointB())
         awaitTrue {
             h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
                 h.vm.keyReadConfirmSequence.value == 2L
         }
-        // 舊快照的 confirm 在途時，新的 deny 交錯落地。
-        val staleConfirm = async { h.vm.confirmKeyRead(snapshotA) }
+        // 舊快照＋舊 token 的 confirm 在途時，新的 deny 交錯落地。
+        val staleConfirm = async { h.vm.confirmKeyRead(snapshotA, tokenA) }
         onMain { h.vm.sendDirect("two") }
         awaitTrue {
             h.vm.notice.value == "KEY_READ_CONFIRM_REQUIRED" &&
@@ -301,8 +315,9 @@ class ChatViewModelKeyReadS3Test {
         assertNotNull(snapshot)
         assertEquals("preset:custom", snapshot!!.providerId)
         assertEquals("http://127.0.0.1:11434/v1", snapshot.effectiveBaseUrl)
-        // 顯示期間的 null 快照確認永遠失敗 closed。
-        assertFalse(h.vm.confirmKeyRead(null))
+        // 顯示期間的 null 快照／null token 確認永遠失敗 closed。
+        assertFalse(h.vm.confirmKeyRead(null, null))
+        assertFalse(h.vm.confirmKeyRead(snapshot, null))
         assertEquals(2L, h.vm.keyReadConfirmSequence.value)
         assertEquals(0, h.getKeyCalls.get())
     }

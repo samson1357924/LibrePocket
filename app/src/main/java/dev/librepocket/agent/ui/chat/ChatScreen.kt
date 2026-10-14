@@ -147,8 +147,9 @@ fun ChatScreen(
     val ttsConfirm = remember { VoiceTtsConfirmState() }
     val confirmScope = rememberCoroutineScope()
     // S7 key.read 確認對話框狀態（notice＋sequence 觸發，非自動彈窗擋路）。
-    // snapshot 為不可變 binding（peekKeyReadBinding，只讀，不含金鑰內容）；
-    // confirming 為 mint 在途（按鈕 disable 防 double-tap）；
+    // snapshot 為不可變 binding（peekKeyReadBinding，只讀，不含金鑰內容）＋
+    // P2 pending token（peekKeyReadConfirmToken，只讀，綁 binding＋generation＋
+    // sequence＋opId/openSessionId）；confirming 為 mint 在途（按鈕 disable 防 double-tap）；
     // confirmResult null=待確認、true=已確認（有 pending open 顯示開啟歷史，
     // 無則請再按發送）、false=已失效；
     // dialogHidden 為本次 notice 的本地關閉（VM notice 在下次送出前保持，
@@ -160,6 +161,7 @@ fun ChatScreen(
     // S2 resuming：顯式 resume 在途（按鈕 disable 防 double-tap；成功後
     // notice 離開 KEY 即重置，失敗 bump seq 即重置重 peek）。
     var keyReadBinding by remember { mutableStateOf<EndpointSessionBinding?>(null) }
+    var keyReadToken by remember { mutableStateOf<PendingKeyReadConfirm?>(null) }
     var keyReadBindingReady by remember { mutableStateOf(false) }
     var keyReadConfirming by remember { mutableStateOf(false) }
     var keyReadConfirmResult by remember { mutableStateOf<Boolean?>(null) }
@@ -169,6 +171,7 @@ fun ChatScreen(
     LaunchedEffect(notice, keyReadConfirmSeq) {
         if (notice != "KEY_READ_CONFIRM_REQUIRED") {
             keyReadBinding = null
+            keyReadToken = null
             keyReadBindingReady = false
             keyReadConfirming = false
             keyReadConfirmResult = null
@@ -177,6 +180,7 @@ fun ChatScreen(
         } else {
             // 新 deny（seq 變化或 notice 新進 KEY）：無條件重置本地狀態後重 peek。
             keyReadBinding = null
+            keyReadToken = null
             keyReadBindingReady = false
             keyReadConfirming = false
             keyReadConfirmResult = null
@@ -184,6 +188,15 @@ fun ChatScreen(
             keyReadResuming = false
             keyReadBinding = try {
                 viewModel.peekKeyReadBinding()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+            // P2: token 與 snapshot 同 emission 捕獲；任一為 null 即 fail-closed
+            //（confirm 攜 null token 必 false，顯示已失效）。
+            keyReadToken = try {
+                viewModel.peekKeyReadConfirmToken()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -689,8 +702,8 @@ fun ChatScreen(
     }
 
     // S7 key.read 確認對話框：notice 觸發（非自動彈窗擋路），內容為不可變
-    // binding 快照（唯讀，不含金鑰內容）。確認僅 mint 一次性同意，不 auto-send；
-    // 拒絕/取消僅丟棄未消耗的同意，不發送。
+    // binding 快照（唯讀，不含金鑰內容）＋ P2 pending token。確認僅 mint 一次性同意，不 auto-send；
+    // 拒絕/取消僅丟棄未消耗的同意＋token，不發送。
     // S2: 有 pending open 時確認後顯示「已確認，開啟歷史」並提供顯式 resume
     //（不自動 send、不自動 resume）。
     if (notice == "KEY_READ_CONFIRM_REQUIRED" && !keyReadDialogHidden) {
@@ -703,14 +716,17 @@ fun ChatScreen(
             resuming = keyReadResuming,
             onConfirm = {
                 if (keyReadConfirming || keyReadConfirmResult != null) return@KeyReadConfirmDialog
-                // S3: capture seq+binding at initiation; the mint runs against
-                // the displayed snapshot (null snapshot ⇒ fail-closed false).
+                // S3+P2: capture seq+binding+token at initiation; the mint runs
+                // against the displayed snapshot + pending token (null ⇒
+                // fail-closed false). Mint 前先驗新鮮由 VM 執行（三者全等才
+                // mint）；mint 後的 stale completion 丟棄維持（雙保險）。
                 val capturedSeq = viewModel.keyReadConfirmSequence.value
                 val capturedBinding = keyReadBinding
+                val capturedToken = keyReadToken
                 keyReadConfirming = true
                 keyReadScope.launch {
                     val ok = try {
-                        viewModel.confirmKeyRead(capturedBinding)
+                        viewModel.confirmKeyRead(capturedBinding, capturedToken)
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (_: Exception) {

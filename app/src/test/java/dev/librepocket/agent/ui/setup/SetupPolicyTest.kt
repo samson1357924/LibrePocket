@@ -226,6 +226,8 @@ class HasKeyGatingVault(
 ) : KeyVault {
     var putKeys = 0
         private set
+    var getKeys = 0
+        private set
     var deleteKeys = 0
         private set
     var hasKeys = 0
@@ -239,7 +241,10 @@ class HasKeyGatingVault(
         delegate.putKey(providerId, apiKey)
     }
 
-    override suspend fun getKey(providerId: String): CharArray? = delegate.getKey(providerId)
+    override suspend fun getKey(providerId: String): CharArray? {
+        getKeys++
+        return delegate.getKey(providerId)
+    }
     override suspend fun deleteKey(providerId: String) {
         deleteKeys++
         deletedIds.add(providerId)

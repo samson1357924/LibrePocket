@@ -56,6 +56,31 @@ private data class KeyWriteConsent(
     val formRevision: Long,
 )
 
+/**
+ * S4：key.write 確認對話框的寫入意圖（與 [SetupUiState.confirmKeyWrite]
+ * 同步設置／清除，僅供對話框分支文案用，不參與任何 gate）。
+ */
+enum class KeyWriteIntent {
+    /** 新 key：確認後執行 staged vault 寫入＋metadata CAS。 */
+    STAGED,
+    /** 空白 key＋身份不變：確認後僅 metadata CAS，零 key-material I/O。 */
+    KEEP_EXISTING,
+}
+
+/**
+ * S4：確認對話框的身份快照（entry 快照，顯示用，不參與 gate）。
+ *
+ * [providerLabel]／[baseUrl]／[newModel] 取自 save entry 表單；
+ * [oldModel] 取自 entry 時的編輯基線（Main 線程快照，
+ * 僅 keepExisting 意圖有值，新建流程為 null）。STAGED 分支不渲染此快照。
+ */
+data class KeyWriteConfirmSummary(
+    val providerLabel: String,
+    val baseUrl: String,
+    val oldModel: String?,
+    val newModel: String,
+)
+
 /** Gate state for startup navigation. Loading and NoEndpoint are distinct (no FOUC). */
 sealed interface EndpointGate {
     data object Loading : EndpointGate
@@ -98,6 +123,23 @@ data class SetupUiState(
     // Phase A2 stale-test guard). Not endpoint/configuration revision.
     internal val testConnectionRevision: Long = 0L,
     val confirmKeyWrite: Boolean = false,
+    /**
+     * S4：確認對話框的寫入意圖（見 [KeyWriteIntent]）。
+     *
+     * 與 [confirmKeyWrite] 同步設置／清除（5 mint 站點同 `true` 一起設，
+     * 8 清除站點同步清：5 post-show fence＋confirm／dismiss／invalidate）；
+     * 僅供 [SetupScreen] 對話框分支文案用，不參與任何 gate。所有變動必須經
+     * [showKeyWriteConfirm]／[hideKeyWriteConfirm]，禁手寫 copy。
+     */
+    val pendingKeyWriteIntent: KeyWriteIntent? = null,
+    /**
+     * S4：確認對話框的身份快照（見 [KeyWriteConfirmSummary]）。
+     *
+     * 與 [pendingKeyWriteIntent] 同一 emission 設置／清除；KEEP_EXISTING
+     * 分支渲染身份列（provider label、baseUrl、model old→new），STAGED
+     * 分支忽略。顯示用，不參與 gate。
+     */
+    val confirmSummary: KeyWriteConfirmSummary? = null,
     val errorCode: String? = null,
     /**
      * `LOGOUT_*` 橫幅的 journal 身份標籤（Stage C C2）。
@@ -489,9 +531,19 @@ class SetupViewModel(
      * model edit racing save falls into three cases: (1) included in the
      * snapshot (saved); (2) fenced only when it rides an identity/key edit
      * (which does bump, fail closed with POLICY_DENIED); (3) a pure model
-     * edit landing after the save entry is silently ignored for this attempt
-     * (the entry snapshot is authoritative) -- the edit stays in the form for
-     * the next save.
+     * edit landing after the save entry is not persisted for this attempt
+     * (the entry snapshot is authoritative) -- and on success the display is
+     * written back to the persisted value (S4), so the raced edit is
+     * overwritten rather than left forking persisted=A/displayed=B; re-apply
+     * it after the save for the next attempt.
+     *
+     * Dialog-period semantics (S4 方案 b)：對話框顯示中 model 欄由 UI 擋
+     * ([SetupScreen] 以 `saving || confirmKeyWrite` disabled；連選單展開一併擋）；
+     * VM 層容忍 stale——此函數不 bump、不設 gate、不 invalidate 對話框／同意書，
+     * 各 entry 快照權威：已顯示的對話框 summary 為顯示時快照（舊值，顯示用）；
+     * confirm 為全新 entry（重讀 live form），故提交 raced 新值（見
+     * `dialogModelRaceCommitsLiveSnapshot` 鎖定），成功後回寫 persisted 覆蓋顯示，
+     * 保證 persisted==displayed。不改 gate、不 bump。
      * Clears only the last test count (it may describe a different model).
      */
     fun onModelChange(v: String) {
@@ -947,6 +999,10 @@ class SetupViewModel(
         // testConnection/refreshModels).
         val keepExistingMode = keepExistingModeFor(cur)
         val keepExisting = keepExistingMode == SetupValidation.KeyMode.EDIT_KEEP_EXISTING
+        // S4：對話框身份快照的 oldModel（Main 線程快照，顯示用，不參與 gate）。
+        // 僅 keepExisting 意圖攜帶（此時基線身份已於 keepExistingModeFor 驗證
+        // 與 entry 一致）；STAGED 意圖為 null（基線可能屬於另一端點，不可顯示）。
+        val baselineModel: String? = if (keepExisting) editBaseline?.model else null
         val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, keepExistingMode)
         if (err != null) {
             _form.value = cur.copy(errorCode = err)
@@ -963,7 +1019,7 @@ class SetupViewModel(
             // inner-only catch would leave saving=true in that window.
             try {
                 saveMutex.withLock {
-                    executeKeyWrite(cur, effectiveBaseUrl, consent, entryRevision, keepExisting)
+                    executeKeyWrite(cur, effectiveBaseUrl, consent, entryRevision, keepExisting, baselineModel)
                 }
             } catch (e: CancellationException) {
                 // Any cancel path (VM alive) must unstick saving and must
@@ -992,6 +1048,8 @@ class SetupViewModel(
         consent: KeyWriteConsent?,
         entryRevision: Long,
         keepExisting: Boolean,
+        // S4：entry 時編輯基線的 model（顯示用，僅對話框快照；不參與 gate）。
+        baselineModel: String?,
     ) {
         val providerId = try {
             SetupValidation.deriveProviderId(form.presetId)
@@ -1046,14 +1104,14 @@ class SetupViewModel(
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
-            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+            showKeyWriteConfirm(keepExisting, form, effectiveBaseUrl, baselineModel)
             // Post-show fence: an edit racing the dialog set must not leave a
             // stale dialog. invalidateKeyWriteConsent() hides a shown dialog,
             // but an edit landing between the pre-show check and this set would
             // otherwise revive it; re-verify and hide again.
             if (entryRevision != formRevision.get()) {
                 takePendingConsent()
-                _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                hideKeyWriteConfirm(errorCode = "POLICY_DENIED_KEY_WRITE", resetSaving = true)
                 return
             }
             return
@@ -1127,6 +1185,7 @@ class SetupViewModel(
                 expectedRevision,
                 oldConfig,
                 oldAlias,
+                baselineModel,
             )
             return
         }
@@ -1302,10 +1361,10 @@ class SetupViewModel(
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
-            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+            showKeyWriteConfirm(keepExisting, form, effectiveBaseUrl, baselineModel)
             if (entryRevision != formRevision.get()) {
                 takePendingConsent()
-                _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                hideKeyWriteConfirm(errorCode = "POLICY_DENIED_KEY_WRITE", resetSaving = true)
                 return
             }
             return
@@ -1322,6 +1381,9 @@ class SetupViewModel(
         // live rollback).
         var vaultDirty = false
         var metadataCommitted = false
+        // S4：cancel 補償成功路徑的 persisted model 回寫（entry snapshot 經
+        // [config]；catch scope 無 [config]，故此外層暫存）。
+        var committedModel: String? = null
         try {
             try {
                 vault().putKey(stagedAlias, keyCopy)
@@ -1426,13 +1488,13 @@ class SetupViewModel(
                 // Do NOT save metadata and do NOT set saved=true here: delete
                 // the staged key, then ask for confirmation.
                 deleteStagedBestEffort(stagedAlias)
-                _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+                showKeyWriteConfirm(keepExisting, form, effectiveBaseUrl, baselineModel)
                 // Post-show fence: hide a stale dialog revived by an edit racing
                 // the dialog set (see initial-ASK path). The staged key is already
                 // deleted, so only the dialog state needs hiding here.
                 if (entryRevision != formRevision.get()) {
                     takePendingConsent()
-                    _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    hideKeyWriteConfirm(errorCode = "POLICY_DENIED_KEY_WRITE", resetSaving = true)
                     return
                 }
                 return
@@ -1490,15 +1552,16 @@ class SetupViewModel(
                     return
                 }
                 deleteStagedBestEffort(stagedAlias)
-                _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+                showKeyWriteConfirm(keepExisting, form, effectiveBaseUrl, baselineModel)
                 if (entryRevision != formRevision.get()) {
                     takePendingConsent()
-                    _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                    hideKeyWriteConfirm(errorCode = "POLICY_DENIED_KEY_WRITE", resetSaving = true)
                     return
                 }
                 return
             }
             val config = endpointConfigOf(form, effectiveBaseUrl, providerId, stagedRef)
+            committedModel = config.model
             val wrote = try {
                 store.saveIfRevision(config, expectedRevision)
             } catch (e: CancellationException) {
@@ -1567,7 +1630,10 @@ class SetupViewModel(
             // any cached startup-reconcile round so a rotation relaunch runs
             // fresh I/O instead of replaying a stale outcome over the new state.
             invalidateStartupSettled()
-            _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+            // S4: display writes back the persisted value (entry snapshot via
+            // [config]): a pure model edit racing the save entry (no fence bump
+            // per #17) must not fork persisted=A/displayed=B.
+            _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
             keyBoundIdentity = null
         } catch (e: CancellationException) {
             if (!metadataCommitted) {
@@ -1596,7 +1662,14 @@ class SetupViewModel(
                 }
                 if (livePointsAtStaged == true) {
                     invalidateStartupSettled()
-                    _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                    // S4: cancel 補償成功亦回寫 persisted model（entry snapshot
+                    // 經 committedModel；同主路徑 config.model）。
+                    _form.value = _form.value.copy(
+                        saving = false,
+                        apiKey = "",
+                        model = committedModel ?: form.model,
+                        saved = true,
+                    )
                     keyBoundIdentity = null
                     return
                 }
@@ -1627,7 +1700,13 @@ class SetupViewModel(
                 }
                 if (stillCommitted == true) {
                     invalidateStartupSettled()
-                    _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                    // S4: 同上，committed-then-cancelled 成功亦回寫 persisted model。
+                    _form.value = _form.value.copy(
+                        saving = false,
+                        apiKey = "",
+                        model = committedModel ?: form.model,
+                        saved = true,
+                    )
                     keyBoundIdentity = null
                     return
                 }
@@ -1677,6 +1756,8 @@ class SetupViewModel(
         expectedRevision: Long?,
         oldConfig: EndpointConfig?,
         oldAlias: String?,
+        // S4：entry 時編輯基線的 model（顯示用，僅對話框快照；不參與 gate）。
+        baselineModel: String?,
     ) {
         if (oldConfig == null || oldAlias == null) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
@@ -1731,10 +1812,10 @@ class SetupViewModel(
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
-            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+            showKeyWriteConfirm(keepExisting = true, form, effectiveBaseUrl, baselineModel)
             if (entryRevision != formRevision.get()) {
                 takePendingConsent()
-                _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                hideKeyWriteConfirm(errorCode = "POLICY_DENIED_KEY_WRITE", resetSaving = true)
                 return
             }
             return
@@ -1791,7 +1872,10 @@ class SetupViewModel(
             }
             reuseCommitted = true
             invalidateStartupSettled()
-            _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+            // S4: display writes back the persisted value (entry snapshot via
+            // [config]) — same persisted=A/displayed=B fork fix as the staged
+            // path above.
+            _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
             keyBoundIdentity = null
         } catch (e: CancellationException) {
             if (!reuseCommitted) {
@@ -1807,7 +1891,9 @@ class SetupViewModel(
             }
             if (stillCommitted == true) {
                 invalidateStartupSettled()
-                _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                // S4: cancel 補償成功亦回寫 persisted model（[config] 在 scope，
+                // 同主路徑 config.model）。
+                _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
                 keyBoundIdentity = null
                 return
             }
@@ -1874,12 +1960,60 @@ class SetupViewModel(
         }
     }
 
+    /**
+     * S4：顯示 key.write 確認對話框的唯一入口（5 mint 站點共用，禁手寫 copy）。
+     *
+     * 與 `confirmKeyWrite = true` 同一 emission 設置 [KeyWriteIntent] 與
+     * [KeyWriteConfirmSummary]（entry 快照：label／baseUrl 取自 entry，
+     * oldModel 取自 entry 基線）。顯示用，不參與 gate。5 設對應 8 清
+     * （5 post-show fence＋confirm／dismiss／invalidate，見 [hideKeyWriteConfirm]）。
+     */
+    private fun showKeyWriteConfirm(
+        keepExisting: Boolean,
+        entry: SetupUiState,
+        baseUrl: String,
+        oldModel: String?,
+    ) {
+        _form.value = _form.value.copy(
+            saving = false,
+            confirmKeyWrite = true,
+            pendingKeyWriteIntent = if (keepExisting) KeyWriteIntent.KEEP_EXISTING else KeyWriteIntent.STAGED,
+            confirmSummary = KeyWriteConfirmSummary(
+                providerLabel = ProviderCatalog.preset(entry.presetId)?.label ?: entry.presetId,
+                baseUrl = baseUrl,
+                oldModel = oldModel,
+                newModel = entry.model,
+            ),
+        )
+    }
+
+    /**
+     * S4：隱藏確認對話框的唯一入口（8 清除站點共用：5 post-show fence＋
+     * confirm／dismiss／invalidate，禁手寫 copy）。
+     *
+     * 單 emission 同步清除 [pendingKeyWriteIntent] 與 [confirmSummary]；
+     * [errorCode] 非 null 時落碼（post-show fence），[resetSaving] 時同步復位
+     * `saving`（post-show fence；confirm／dismiss／invalidate 到達時已為 false）。
+     * 同意書的 consume／abandon（[takePendingConsent]）由呼叫方負責，本函數
+     * 只處理 StateFlow 狀態。
+     */
+    private fun hideKeyWriteConfirm(errorCode: String? = null, resetSaving: Boolean = false) {
+        val cur = _form.value
+        _form.value = cur.copy(
+            confirmKeyWrite = false,
+            pendingKeyWriteIntent = null,
+            confirmSummary = null,
+            saving = if (resetSaving) false else cur.saving,
+            errorCode = errorCode ?: cur.errorCode,
+        )
+    }
+
     /** Second tap of the key.write confirmation dialog: single-use, snapshot-bound. */
     fun confirmKeyWriteSave() {
         if (!_form.value.confirmKeyWrite) return
         // Consume-once: this tap burns the consent even if the write below is refused.
         val consent = takePendingConsent()
-        _form.value = _form.value.copy(confirmKeyWrite = false)
+        hideKeyWriteConfirm()
         if (consent == null) {
             // Stale or replayed confirm (identity edited mid-dialog, double tap
             // racing the save, or programmatic misuse): fail closed, touch nothing.
@@ -1892,14 +2026,14 @@ class SetupViewModel(
     fun dismissKeyWriteConfirm() {
         // Abandon the minted consent: a later save() must re-evaluate fresh.
         takePendingConsent()
-        _form.value = _form.value.copy(confirmKeyWrite = false)
+        hideKeyWriteConfirm()
     }
 
     /** Discard any unconsumed consent and hide the confirm dialog. */
     private fun invalidateKeyWriteConsent() {
         takePendingConsent()
         if (_form.value.confirmKeyWrite) {
-            _form.value = _form.value.copy(confirmKeyWrite = false)
+            hideKeyWriteConfirm()
         }
     }
 

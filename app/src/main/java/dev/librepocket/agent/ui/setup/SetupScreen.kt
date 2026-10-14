@@ -229,20 +229,25 @@ fun SetupScreen(
         )
 
         var modelExpanded by remember { mutableStateOf(false) }
-        // Stage2: model stays editable while saving (out of scope, see #17);
-        // only preset/baseUrl/apiKey are fenced by saving.
+        // S4 非對稱閘：preset/baseUrl/apiKey/三按鈕只閘 saving，對話框期間靠
+        // bump＋invalidate 隱藏（key/identity edit 會 bump 並丟棄同意書）；
+        // model 因不 bump（#17 範圍外，見 onModelChange）故需顯式再閘
+        // confirmKeyWrite（UI 擋；VM 容忍 stale、entry 快照權威）。不可宣稱一致。
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             ExposedDropdownMenuBox(
                 expanded = modelExpanded,
-                onExpandedChange = { modelExpanded = !modelExpanded },
+                onExpandedChange = {
+                    if (!state.saving && !state.confirmKeyWrite) modelExpanded = !modelExpanded
+                },
                 modifier = Modifier.weight(1f),
             ) {
                 OutlinedTextField(
                     value = state.model,
                     onValueChange = viewModel::onModelChange,
+                    enabled = !state.saving && !state.confirmKeyWrite,
                     label = { Text("模型") },
                     trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelExpanded) },
                     modifier = Modifier
@@ -387,19 +392,44 @@ fun SetupScreen(
     }
 
     if (state.confirmKeyWrite) {
+        // S4: STAGED 沿用 key-write 文案；KEEP_EXISTING 顯示保留文案＋身份列
+        // （provider label、baseUrl、model 變更前後），不提「存入」。
+        val keepExistingConfirm = state.pendingKeyWriteIntent == KeyWriteIntent.KEEP_EXISTING
         AlertDialog(
             onDismissRequest = viewModel::dismissKeyWriteConfirm,
-            title = { Text("寫入金鑰確認") },
+            title = { Text(if (keepExistingConfirm) "確認更新設定" else "寫入金鑰確認") },
             text = {
-                Column {
-                    Text("即將把此 API Key 存入本機加密儲存（key.write）。換機或還原後需重輸；向你設定的 AI API 端點發出聊天或模型列表等需驗證的請求時，會傳送 API Key（包含自訂端點）。確定繼續嗎？")
-                    TextButton(onClick = { uriHandler.openUri(THREAT_MODEL_URL) }) {
-                        Text("查看威脅模型說明（docs/THREAT_MODEL.md）")
+                if (keepExistingConfirm) {
+                    Column {
+                        Text("保留既有金鑰，僅更新設定（不會讀取或寫入金鑰內容）。")
+                        state.confirmSummary?.let { summary ->
+                            Text("供應商：${summary.providerLabel}")
+                            Text("伺服器位址：${summary.baseUrl}")
+                            Text(
+                                if (summary.oldModel != null) {
+                                    "模型：${summary.oldModel} → ${summary.newModel}"
+                                } else {
+                                    "模型：${summary.newModel}"
+                                },
+                            )
+                        }
+                        TextButton(onClick = { uriHandler.openUri(THREAT_MODEL_URL) }) {
+                            Text("查看威脅模型說明（docs/THREAT_MODEL.md）")
+                        }
+                    }
+                } else {
+                    Column {
+                        Text("即將把此 API Key 存入本機加密儲存（key.write）。換機或還原後需重輸；向你設定的 AI API 端點發出聊天或模型列表等需驗證的請求時，會傳送 API Key（包含自訂端點）。確定繼續嗎？")
+                        TextButton(onClick = { uriHandler.openUri(THREAT_MODEL_URL) }) {
+                            Text("查看威脅模型說明（docs/THREAT_MODEL.md）")
+                        }
                     }
                 }
             },
             confirmButton = {
-                TextButton(onClick = viewModel::confirmKeyWriteSave) { Text("確定寫入") }
+                TextButton(onClick = viewModel::confirmKeyWriteSave) {
+                    Text(if (keepExistingConfirm) "確定更新" else "確定寫入")
+                }
             },
             dismissButton = {
                 TextButton(onClick = viewModel::dismissKeyWriteConfirm) { Text("取消") }

@@ -903,4 +903,240 @@ class ToolAggBudgetTest {
             mapper.mapPayload("""{"type":"message_stop"}"""),
         )
     }
+
+    // ---- S1 (P1 blocking): Responses String-key heap amplification ----
+    //
+    // First three payload tests are RED-phase: they use only literal lengths
+    // (no new API symbols) so they compile before the fix and must FAIL
+    // (no throw, silent multi-MB retention) until the per-key guard lands.
+    // The last two are post-fix boundary controls using the new
+    // requireToolIdBudget / MAX_TOOL_ID_CHARS symbols (compile only after).
+
+    @Test
+    fun responsesGiantItemIdFailsClosedBeforeInsert() {
+        // Hostile: one 300KB item_id key with an empty delta. Every char
+        // budget stays silent (total only counts agg id/name/args, here
+        // "c1"+"f" = 3 chars) and the count cap sees a single admission,
+        // so the pre-fix mapper retains ~300KB with zero failure.
+        val mapper = ResponsesMapper()
+        val giant = "k".repeat(300_000)
+        val failure = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_item.added","item_id":"$giant","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
+            )
+        }
+        assertAggOverflow(failure)
+        // Giant key never retained: the drain emits nothing tool-shaped and
+        // the honest terminal is the retryable truncation, never a Done.
+        val tail = mapper.finish()
+        assertTrue("giant key must leave no buffered ToolDone", tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty())
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
+    }
+
+    @Test
+    fun responsesRotatingGiantCallIdFailsOnFirstDone() {
+        // Hostile rotation: a fixed short item_id re-done with two different
+        // same-length 10KB call_ids. Pre-fix, the second arrival would have
+        // per-candidate growth 0 (equal lengths, had the first been buffered)
+        // so char/total/count guards stay silent while emittedToolIds retains
+        // 10KB per pair — the first step toward 64 x 300KB ~= 19.2M retained.
+        // The per-key guard must fire on EACH giant id, including the second
+        // with (hypothetical) growth 0, long before the 65th-entry count cap.
+        val mapper = ResponsesMapper()
+        val giantA = "c".repeat(9_999) + "A"
+        val giantB = "c".repeat(9_999) + "B"
+        assertEquals(10_000, giantA.length)
+        assertEquals(giantA.length, giantB.length)
+        val first = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$giantA","name":"f"}}""",
+            )
+        }
+        assertAggOverflow(first)
+        // Second same-length rotation still fails closed via the per-key cap
+        // even though (had the first been retained) growth would be 0.
+        val second = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"it1","item":{"type":"function_call","call_id":"$giantB","name":"f"}}""",
+            )
+        }
+        assertAggOverflow(second)
+        val tail = mapper.finish()
+        assertTrue(
+            "retired giant ids must leave no buffered ToolDone",
+            tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty(),
+        )
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
+    }
+
+    @Test
+    fun responsesDrainGuardsGiantPendingId() {
+        // Drain backstop: pre-fix, a 10KB call_id was admitted via added
+        // (per-call/total char budgets both admit a single 10KB id) with a
+        // non-empty name so finishPendingTools wanted to emit it, and only
+        // the drain per-key guard could fail closed. With the added fail-fast,
+        // this shape now throws AT added (before write-back), so the drain
+        // never sees it — the drain guard remains as defense-in-depth and is
+        // asserted here via the same typed failure.
+        val mapper = ResponsesMapper()
+        val giantCall = "c".repeat(10_000)
+        // Fail-fast now fires at added (not at completed): wrap both so the
+        // test locks fail-closed regardless of which gate fires first.
+        val failure = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_item.added","item_id":"it1","item":{"type":"function_call","call_id":"$giantCall","name":"f"}}""",
+            )
+            mapper.mapPayload("""{"type":"response.completed","response":{"output":[]}}""")
+        }
+        assertAggOverflow(failure)
+        val tail = mapper.finish()
+        assertTrue(
+            "giant pending id must leave no buffered ToolDone",
+            tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty(),
+        )
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
+    }
+
+    @Test
+    fun requireToolIdBudgetBoundary() {
+        requireToolIdBudget(0)
+        requireToolIdBudget(MAX_TOOL_ID_CHARS)
+        val over = toolFailureOf { requireToolIdBudget(MAX_TOOL_ID_CHARS + 1) }
+        assertAggOverflow(over)
+    }
+
+    @Test
+    fun responsesCapBoundaryItemIdAdmitted() {
+        // Exact-boundary positive control: an item_id of exactly
+        // MAX_TOOL_ID_CHARS is admitted (proves the 200x headroom does not
+        // break legal shapes); one char more fails closed before insert.
+        val mapper = ResponsesMapper()
+        val atCap = "k".repeat(MAX_TOOL_ID_CHARS)
+        val out = mapper.mapPayload(
+            """{"type":"response.output_item.added","item_id":"$atCap","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
+        )
+        assertEquals(1, out.filterIsInstance<StreamEvent.ToolDelta>().size)
+        val mapper2 = ResponsesMapper()
+        val over = toolFailureOf {
+            mapper2.mapPayload(
+                """{"type":"response.output_item.added","item_id":"${atCap}x","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
+            )
+        }
+        assertAggOverflow(over)
+        val tail = mapper2.finish()
+        assertTrue(tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty())
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
+    }
+
+    // ---- S1 follow-up: added-carried id + delta/done item_id + empty control ----
+    //
+    // Literals-only payload tests (compile pre-fix, fail pre-fix): the added
+    // call_id fail-fast, the delta item_id guard, and the done item_id guard
+    // (with a short call_id so only the map-key guard can fire) each throw
+    // typed with no ToolDelta/ToolDone pollution; finish stays the retryable
+    // truncation. The empty-id test is the positive control (no throw).
+
+    @Test
+    fun responsesAddedGiantCallIdFailsClosed() {
+        // Added fail-fast: a 10KB call_id carried in added (short item_id)
+        // fits the per-call/total char budgets, so only the per-key cap can
+        // fail closed. Must throw typed BEFORE char/total checks and BEFORE
+        // write-back: no ToolDelta emitted, giant never retained, finish is
+        // the retryable truncation with no ToolDone.
+        val mapper = ResponsesMapper()
+        val giantCall = "c".repeat(10_000)
+        val failure = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_item.added","item_id":"it1","item":{"type":"function_call","call_id":"$giantCall","name":"f"}}""",
+            )
+        }
+        assertAggOverflow(failure)
+        val tail = mapper.finish()
+        assertTrue(
+            "giant added id must leave no buffered ToolDone",
+            tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty(),
+        )
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
+    }
+
+    @Test
+    fun responsesDeltaGiantItemIdFailsClosed() {
+        // Delta path: a 300KB item_id with a tiny fragment. Char/total/count
+        // all stay silent (single admission, tiny frag), so only the per-key
+        // cap fails closed BEFORE insert — giant key never retained.
+        val mapper = ResponsesMapper()
+        val giant = "k".repeat(300_000)
+        val failure = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.function_call_arguments.delta","item_id":"$giant","delta":"x"}""",
+            )
+        }
+        assertAggOverflow(failure)
+        val tail = mapper.finish()
+        assertTrue(tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty())
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
+    }
+
+    @Test
+    fun responsesDoneGiantItemIdFailsClosed() {
+        // Done path map-key guard: a 300KB item_id with a short call_id.
+        // The emitted-id guard would pass (short "c1"), so this locks that
+        // the ITEM_ID guard fires first, BEFORE insert — no entry, no emit.
+        val mapper = ResponsesMapper()
+        val giant = "k".repeat(300_000)
+        val failure = toolFailureOf {
+            mapper.mapPayload(
+                """{"type":"response.output_item.done","item_id":"$giant","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
+            )
+        }
+        assertAggOverflow(failure)
+        val tail = mapper.finish()
+        assertTrue(tail.filterIsInstance<StreamEvent.ToolDone>().isEmpty())
+        assertEquals(
+            StreamEvent.Failed("SSE_TRUNCATED", retryable = true),
+            tail.single(),
+        )
+    }
+
+    @Test
+    fun responsesEmptyIdsStillAdmitted() {
+        // Positive control: empty/missing ids keep current quota behavior
+        // (still admitted, still billed) — the per-key cap only rejects
+        // OVERLONG keys, never empty ones.
+        val mapper = ResponsesMapper()
+        // Missing call_id/name: emits ToolDelta with nulls, no throw.
+        val out = mapper.mapPayload(
+            """{"type":"response.output_item.added","item_id":"it1","item":{"type":"function_call"}}""",
+        )
+        assertEquals(1, out.filterIsInstance<StreamEvent.ToolDelta>().size)
+        // Empty call_id/name strings are treated as missing (not billed, not thrown).
+        val out2 = mapper.mapPayload(
+            """{"type":"response.output_item.added","item_id":"it1","item":{"type":"function_call","call_id":"","name":""}}""",
+        )
+        assertEquals(1, out2.filterIsInstance<StreamEvent.ToolDelta>().size)
+        // Empty item_id string is admitted (length 0 <= cap), not rejected.
+        val mapper2 = ResponsesMapper()
+        val out3 = mapper2.mapPayload(
+            """{"type":"response.output_item.added","item_id":"","item":{"type":"function_call","call_id":"c1","name":"f"}}""",
+        )
+        assertEquals(1, out3.filterIsInstance<StreamEvent.ToolDelta>().size)
+    }
 }

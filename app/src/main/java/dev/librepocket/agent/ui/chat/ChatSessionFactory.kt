@@ -155,9 +155,12 @@ internal fun familyOf(event: TranscriptEvent): String = event.parentRunId ?: eve
  * empty/blank families (a crafted ledger with >10 head orphan families keeps
  * its 11th head family after one pass — needs a second pass, pinned by test
  * and disclosed in P1_SPEC; production cuts split at most one family).
- * Crafted runId-reuse over-drop (disclosed): rows sharing the head family id
+ * Crafted runId-reuse over-drop (disclosed, reuse pin is Target): rows sharing the head family id
  * are removed wherever they sit (production runIds are unique + write-ordered;
- * crafted exceptions over-drop conservatively). Callers decide when to apply:
+ * crafted exceptions over-drop conservatively). Predicate difference vs the DB fixup
+ * (P2-1, disclosed): [SessionDao.deleteFamily] matches runId==fid OR parentRunId==fid
+ * while this helper matches familyOf==fid — they diverge on a crafted row with runId==fid
+ * but a different non-null parentRunId (production never takes that shape). Callers decide when to apply:
  * model history only with truncation/prune evidence (dropped>0 or suspect) to
  * preserve the R24-2/R25 precise flags; snapshots unconditionally (row-cap drops
  * are silent legacy, family drops stay silent too — with the same >10 crafted
@@ -1228,7 +1231,9 @@ class ChatSessionFactory(
  * delete clears it, appends never clear it) forces the same conservative
  * all-flag even when `droppedCount==0`. R26-1 prune deletes the cut head
  * family (user boundary; head-only, at most 10 families, only on
- * `deletes>0` sweeps), so new prunes leave no user-less assistant behind;
+ * `deletes>0` sweeps), so new prunes leave no user-less assistant behind
+ * (crash-mid-fixup window excepted: raw cut and fixup are separate DAO
+ * statements, see `RoomSessionStore` KDoc and P1_SPEC/THREAT_MODEL);
  * readers additionally drop head orphan families when dropped>0 or suspect
  * (far-only preserves the R25 precise flag), so no orphan reaches model
  * context. Pre-R26/interior orphans below the head survive the fixup and,

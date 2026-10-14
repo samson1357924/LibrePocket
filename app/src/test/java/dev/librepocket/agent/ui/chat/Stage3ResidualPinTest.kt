@@ -18,6 +18,7 @@ import dev.librepocket.session.SuspectFakeStore
 import dev.librepocket.session.TranscriptEvent
 import java.io.File
 import java.nio.file.Files
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -33,6 +34,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 
@@ -232,9 +234,8 @@ class Stage3ResidualPinTest {
      * (hasUnsettledAdmission / hasUnsettledPromotion / hasActiveHost) fail
      * closed — a throwing read reports streaming/pending (true), never clean.
      * CancellationException is always rethrown, never mapped to true (see
-     * `isLedgerStreamingOrPending` KDoc). Known limitation (Stage-3,
-     * non-blocking): RuntimeException probes only — the CE rethrow path has
-     * no dedicated case here.
+     * `isLedgerStreamingOrPending` KDoc), pinned by
+     * `ledgerProbeFailClosed_cancellationRethrown` below.
      */
     @Test fun ledgerProbeFailClosed_throwingObligationsReadTrue() {
         val store = newStore()
@@ -281,6 +282,65 @@ class Stage3ResidualPinTest {
             var out = false
             runBlocking { chatMain.run { out = m.invoke(vm, throwingSession(name)) as Boolean } }
             assertTrue("wedged $name probe must fail closed to true", out)
+        }
+    }
+
+    /**
+     * Durability F-E (CE rethrow pin): a CancellationException from any of
+     * the three non-sticky obligation probes propagates out of
+     * `isLedgerStreamingOrPending` — never mapped to fail-closed true (see
+     * its KDoc: every catch rethrows CE before its branch contract).
+     * Reflection wraps the escape in InvocationTargetException, so the pin
+     * asserts on the cause.
+     */
+    @Test fun ledgerProbeFailClosed_cancellationRethrown() {
+        val store = newStore()
+        runBlocking { store.save(endpoint()) }
+        val vm = chatViewModels.own(
+            ChatViewModel(store, factoryWith(FakeSessionStore(), Stage3FakeProvider()), InMemoryPolicyStore()),
+        )
+        val m = ChatViewModel::class.java.getDeclaredMethod("isLedgerStreamingOrPending", ChatSession::class.java)
+        m.isAccessible = true
+        fun ceSession(throwOn: String): ChatSession = object : ChatSession {
+            override val uiState: kotlinx.coroutines.flow.StateFlow<ChatUiState> =
+                kotlinx.coroutines.flow.MutableStateFlow(ChatUiState(emptyList(), ChatStatus.IDLE, 0, null))
+            override suspend fun send(text: String, images: List<dev.librepocket.chat.ChatImageRef>) = Unit
+            override suspend fun startTurn(text: String, images: List<dev.librepocket.chat.ChatImageRef>) =
+                throw UnsupportedOperationException()
+            override suspend fun startOrEnqueue(
+                text: String,
+                images: List<dev.librepocket.chat.ChatImageRef>,
+                opId: Long?,
+            ): dev.librepocket.chat.TurnStart = throw UnsupportedOperationException()
+            override fun drainQueued(): List<dev.librepocket.chat.QueuedIntent> = emptyList()
+            override fun cancel() = Unit
+            override suspend fun flush(timeoutMs: Long): Boolean = true
+            override fun hasDurableFailures(): Boolean = false
+            override suspend fun flushDurable(timeoutMs: Long): Boolean = true
+            override fun steer(text: String) = Unit
+            override suspend fun settlePendingAdmission(timeoutMs: Long): Boolean = true
+            override fun hasPendingAdmission(): Boolean = false
+            override fun hasUnsettledAdmission(): Boolean =
+                if (throwOn == "admission") throw CancellationException("ce-admission") else false
+            override fun hasUnsettledPromotion(): Boolean =
+                if (throwOn == "promotion") throw CancellationException("ce-promotion") else false
+            override fun hasActiveHost(): Boolean =
+                if (throwOn == "host") throw CancellationException("ce-host") else false
+            override fun hasClosedUnsettledAdmission(): Boolean = false
+            override fun hasUnsettledCancelReceipts(): Boolean = false
+            override fun hasSealedUncompensatedReceipts(): Boolean = false
+            override fun pendingTranscriptRunIds(): List<String> = emptyList()
+            override fun isTranscriptSealed(): Boolean = false
+            override fun isTranscriptWriterCompleted(): Boolean = true
+            override fun close() = Unit
+        }
+        for (name in listOf("admission", "promotion", "host")) {
+            try {
+                runBlocking { chatMain.run { m.invoke(vm, ceSession(name)) } }
+                fail("CE from wedged $name probe must propagate, never map to true")
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                assertTrue("CE cause expected for $name, was ${e.cause}", e.cause is CancellationException)
+            }
         }
     }
 

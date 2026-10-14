@@ -93,7 +93,8 @@ public interface SessionDao {
      * family delete is exact. Crafted ledgers that reuse one {@code runId}
      * across unrelated turns or interleave rows out of order over-delete
      * (every remaining row sharing the head family id goes, even mid-ledger
-     * rows) — conservative fail-closed direction, pinned by test.
+     * rows) — conservative fail-closed direction, disclosed (no dedicated
+     * reuse-import→prune over-drop pin exists; such a pin is Target).
      *
      * <p>Partial caveat: no {@code isPartial} filter here, so a crafted head
      * partial row counts as the boundary family; readers exclude partials

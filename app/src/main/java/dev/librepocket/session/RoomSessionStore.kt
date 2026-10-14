@@ -102,6 +102,18 @@ class RoomSessionStore(
      * no durable flag for new prunes (memory pre-publish is only a race
      * closer, see [prune], never load-bearing across restart).
      *
+     * Crash-mid-fixup window (known limitation, disclosed in
+     * P1_SPEC/THREAT_MODEL): the raw keep-newest cut
+     * (`deleteEventsBeyondLimit`) and the family fixup (`oldestHistory` +
+     * `deleteFamily` loop) are separate DAO statements, NOT one Room
+     * transaction. A kill landing between them leaves the raw-cut head
+     * orphan assistant durably stored while this memory-only set is lost
+     * on restart → reopen sees `dropped==0` + suspect false → the
+     * conditional head trim in `loadModelHistory` does not trigger → the
+     * head orphan resumes compat (`hasReasoning=false`). Follow-up: wrap
+     * raw+fixup in one Room `@Transaction` or make the suspect flag
+     * durable (separate PR, no large refactor here).
+     *
      * Head-only scope (at most 10 head families per sweep, only sweeps with
      * `deletes>0` run the fixup): pre-R26/interior orphans below the head are
      * NOT deleted by the fixup. While suspect is held they stay hidden behind

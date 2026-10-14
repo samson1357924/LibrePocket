@@ -35,15 +35,17 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
   fun buildSetAlarmIntent(params: Params): IntentSpec {
     require(params.hour in 0..23) { "hour out of range: ${params.hour}" }
     require(params.minute in 0..59) { "minute out of range: ${params.minute}" }
-    val extras = mutableMapOf(
-      IntentActions.EXTRA_ALARM_HOUR to params.hour.toString(),
-      IntentActions.EXTRA_ALARM_MINUTES to params.minute.toString(),
+    // D2 型別化：HOUR/MINUTES 用 Int（AlarmClock.EXTRA_* 為 int），
+    // SKIP_UI 用 Boolean；系統鬧鐘 App 才能正確讀回（getIntExtra/getBooleanExtra）。
+    val extras = mutableMapOf<String, IntentExtra>(
+      IntentActions.EXTRA_ALARM_HOUR to IntentExtra.IntVal(params.hour),
+      IntentActions.EXTRA_ALARM_MINUTES to IntentExtra.IntVal(params.minute),
     )
     if (params.message.isNotBlank()) {
-      extras[IntentActions.EXTRA_ALARM_MESSAGE] = params.message
+      extras[IntentActions.EXTRA_ALARM_MESSAGE] = IntentExtra.Str(params.message)
     }
     if (params.skipUi) {
-      extras[IntentActions.EXTRA_ALARM_SKIP_UI] = "true"
+      extras[IntentActions.EXTRA_ALARM_SKIP_UI] = IntentExtra.Bool(true)
     }
     return IntentSpec(action = IntentActions.SET_ALARM, extras = extras)
   }
@@ -60,9 +62,7 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
       )
     }
     val spec = buildSetAlarmIntent(params)
-    val ok = runCatching { launcher.launch(spec) }.getOrDefault(false)
-    return if (ok) ToolResult(true, false, spec)
-    else ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到設定鬧鐘（${ReasonCodes.NO_HANDLER}）")
+    return launcher.launchCatching(spec).toToolResult(spec, "設定鬧鐘")
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec {

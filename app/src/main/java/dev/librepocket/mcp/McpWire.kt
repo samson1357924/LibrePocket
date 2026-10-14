@@ -14,12 +14,306 @@ package dev.librepocket.mcp
  *     "content":[...],"isError":false}}`；或 `{"error":{"code":..,"message":".."}}`。
  *
  * 注意：Token 永不進 body（builder 不收 token 參數，傳輸層只放標頭）。
+ *
+ * Stage D：單一嚴格遞迴 JSON parser（raw-span DOM）取代全部手寫掃描器。
+ * P1（巢狀同名鍵遮蔽）與 P2（巢狀形狀錯誤回 OK）皆由 DOM 層級正確性關閉。
+ *
+ * 已知非目標（follow-up，不在本層驗證）：`jsonrpc == "2.0"` 版本斷言、
+ * response id 與 request id 對應（呼叫方以 HTTP 一問一答配對，不做 id 複用檢查）。
  */
 internal object McpWire {
 
+    /** 輸入 Schema 字元上限：超限拒絕（拋 [McpProtocol]），不靜默截斷。 */
+    internal const val INPUT_SCHEMA_MAX_CHARS = 8_192
+
+    /**
+     * RFC 8259 §2 的空白：僅 space/tab/LF/CR。Kotlin `isWhitespace()` 另接受
+     * VT/FF/NBSP 等，parser 全程必須用此函數，不可用 `isWhitespace()`。
+     */
+    private fun isJsonWs(c: Char): Boolean = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+    /** JSON 字面量（true/false/null/number）校驗：非法字面量一律視為無效。 */
+    private val NUMBER_RE = Regex("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")
+
+    /** 遞迴深度上限：超過拋 `mcp: too deep`（防 StackOverflow；MCP payload 不可能 64 層）。 */
+    private const val MAX_DEPTH = 64
+
+    // ---- raw-span DOM（最小；每節點記原文子串，inputSchema/content 原樣保留） ----
+
+    internal sealed interface JVal {
+        val raw: String
+    }
+
+    internal data class JObj(
+        val members: List<Pair<String, JVal>>,
+        override val raw: String,
+    ) : JVal {
+        fun find(key: String): JVal? = members.firstOrNull { it.first == key }?.second
+    }
+
+    internal data class JArr(
+        val items: List<JVal>,
+        override val raw: String,
+    ) : JVal
+
+    internal data class JStr(
+        val v: String,
+        override val raw: String,
+    ) : JVal
+
+    internal data class JNum(
+        override val raw: String,
+    ) : JVal
+
+    internal data class JBool(
+        val v: Boolean,
+        override val raw: String,
+    ) : JVal
+
+    internal data class JNull(
+        override val raw: String,
+    ) : JVal
+
+    /**
+     * 嚴格解析整份文件為 DOM。
+     *
+     * 要求前導空白 + `{` 或 `[`（頂層必須是值；[parseList]/[parseCall] 再要求 object）、
+     * 嚴格走訪、尾隨僅空白；每層重複 key（解碼後比對）拋 `mcp: duplicate key`；
+     * 深度 > 64 拋 `mcp: too deep`；其餘形狀錯誤拋 `mcp: bad envelope`。
+     */
+    internal fun parseStrictDoc(json: String): JVal {
+        if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
+            throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
+        }
+        var p = 0
+        while (p < json.length && isJsonWs(json[p])) p++
+        if (p >= json.length) throw McpProtocol("mcp: bad envelope")
+        val c = json[p]
+        if (c != '{' && c != '[') throw McpProtocol("mcp: bad envelope")
+        val (v, next) = parseValue(json, p, 0)
+        var q = next
+        while (q < json.length && isJsonWs(json[q])) q++
+        if (q != json.length) throw McpProtocol("mcp: bad envelope")
+        return v
+    }
+
+    private fun parseValue(json: String, pos: Int, depth: Int): Pair<JVal, Int> {
+        if (depth > MAX_DEPTH) throw McpProtocol("mcp: too deep")
+        var p = pos
+        while (p < json.length && isJsonWs(json[p])) p++
+        if (p >= json.length) throw McpProtocol("mcp: bad envelope")
+        return when (val c = json[p]) {
+            '"' -> parseString(json, p)
+            '{' -> parseObject(json, p, depth)
+            '[' -> parseArray(json, p, depth)
+            't', 'f', 'n' -> parseLiteral(json, p)
+            '-', in '0'..'9' -> parseNumber(json, p)
+            else -> throw McpProtocol("mcp: bad envelope")
+        }
+    }
+
+    private fun parseString(json: String, start: Int): Pair<JStr, Int> {
+        // start 指向開引號；嚴格轉義，raw 含引號原樣保留。
+        var p = start + 1
+        val sb = StringBuilder()
+        while (p < json.length) {
+            val c = json[p++]
+            when (c) {
+                '"' -> return JStr(sb.toString(), json.substring(start, p)) to p
+                '\\' -> {
+                    if (p >= json.length) throw McpProtocol("mcp: bad envelope")
+                    when (val e = json[p++]) {
+                        '"', '\\', '/' -> sb.append(e)
+                        'b' -> sb.append('\b')
+                        'f' -> sb.append('\u000C')
+                        'n' -> sb.append('\n')
+                        'r' -> sb.append('\r')
+                        't' -> sb.append('\t')
+                        'u' -> {
+                            if (p + 4 > json.length) throw McpProtocol("mcp: bad envelope")
+                            val hex = json.substring(p, p + 4)
+                            sb.append(hex.toIntOrNull(16)?.toChar() ?: throw McpProtocol("mcp: bad envelope"))
+                            p += 4
+                        }
+                        else -> throw McpProtocol("mcp: bad envelope")
+                    }
+                }
+                else -> {
+                    // 未轉義控制字元（U+0000..U+001F）非法。
+                    if (c.code < 0x20) throw McpProtocol("mcp: bad envelope")
+                    sb.append(c)
+                }
+            }
+        }
+        throw McpProtocol("mcp: bad envelope")
+    }
+
+    private fun parseObject(json: String, start: Int, depth: Int): Pair<JObj, Int> {
+        // start 指向 `{`；值遞迴 depth+1；同層重複 key 拋 duplicate key。
+        var p = start + 1
+        while (p < json.length && isJsonWs(json[p])) p++
+        if (p >= json.length) throw McpProtocol("mcp: bad envelope")
+        if (json[p] == '}') {
+            p++
+            return JObj(emptyList(), json.substring(start, p)) to p
+        }
+        val members = ArrayList<Pair<String, JVal>>()
+        val seen = HashSet<String>()
+        while (true) {
+            while (p < json.length && isJsonWs(json[p])) p++
+            if (p >= json.length || json[p] != '"') throw McpProtocol("mcp: bad envelope")
+            val (keyVal, keyEnd) = parseString(json, p)
+            p = keyEnd
+            while (p < json.length && isJsonWs(json[p])) p++
+            if (p >= json.length || json[p] != ':') throw McpProtocol("mcp: bad envelope")
+            p++
+            while (p < json.length && isJsonWs(json[p])) p++
+            if (p >= json.length) throw McpProtocol("mcp: bad envelope")
+            val (v, vEnd) = parseValue(json, p, depth + 1)
+            p = vEnd
+            if (!seen.add(keyVal.v)) throw McpProtocol("mcp: duplicate key")
+            members.add(keyVal.v to v)
+            while (p < json.length && isJsonWs(json[p])) p++
+            if (p >= json.length) throw McpProtocol("mcp: bad envelope")
+            when (json[p]) {
+                ',' -> {
+                    p++
+                    var q = p
+                    while (q < json.length && isJsonWs(json[q])) q++
+                    if (q >= json.length) throw McpProtocol("mcp: bad envelope")
+                    if (json[q] == '}') throw McpProtocol("mcp: bad envelope")
+                    p = q
+                    // 下一輪頂端要求 `"`；若為 `,`/結尾等一律 bad envelope。
+                }
+                '}' -> {
+                    p++
+                    return JObj(members.toList(), json.substring(start, p)) to p
+                }
+                else -> throw McpProtocol("mcp: bad envelope")
+            }
+        }
+    }
+
+    private fun parseArray(json: String, start: Int, depth: Int): Pair<JArr, Int> {
+        var p = start + 1
+        while (p < json.length && isJsonWs(json[p])) p++
+        if (p >= json.length) throw McpProtocol("mcp: bad envelope")
+        if (json[p] == ']') {
+            p++
+            return JArr(emptyList(), json.substring(start, p)) to p
+        }
+        val items = ArrayList<JVal>()
+        while (true) {
+            while (p < json.length && isJsonWs(json[p])) p++
+            if (p >= json.length) throw McpProtocol("mcp: bad envelope")
+            // 空元素（`,,`/`[,]`）非法。
+            if (json[p] == ',' || json[p] == ']') throw McpProtocol("mcp: bad envelope")
+            val (v, vEnd) = parseValue(json, p, depth + 1)
+            items.add(v)
+            p = vEnd
+            while (p < json.length && isJsonWs(json[p])) p++
+            if (p >= json.length) throw McpProtocol("mcp: bad envelope")
+            when (json[p]) {
+                ',' -> {
+                    p++
+                    var q = p
+                    while (q < json.length && isJsonWs(json[q])) q++
+                    if (q >= json.length) throw McpProtocol("mcp: bad envelope")
+                    if (json[q] == ']') throw McpProtocol("mcp: bad envelope")
+                    p = q
+                }
+                ']' -> {
+                    p++
+                    return JArr(items.toList(), json.substring(start, p)) to p
+                }
+                else -> throw McpProtocol("mcp: bad envelope")
+            }
+        }
+    }
+
+    private fun parseNumber(json: String, start: Int): Pair<JNum, Int> {
+        var p = start
+        while (p < json.length && (json[p].isLetterOrDigit() || json[p] == '-' || json[p] == '+' ||
+                json[p] == '.' || json[p] == '_' || json[p] == 'e' || json[p] == 'E')
+        ) {
+            p++
+        }
+        val lit = json.substring(start, p)
+        if (lit.isEmpty() || !NUMBER_RE.matches(lit)) throw McpProtocol("mcp: bad envelope")
+        return JNum(lit) to p
+    }
+
+    private fun parseLiteral(json: String, start: Int): Pair<JVal, Int> {
+        fun delimOk(end: Int): Boolean {
+            if (end > json.length) return false
+            if (end == json.length) return true
+            val c = json[end]
+            return isJsonWs(c) || c == ',' || c == ']' || c == '}'
+        }
+        if (json.startsWith("true", start)) {
+            val end = start + 4
+            if (!delimOk(end)) throw McpProtocol("mcp: bad envelope")
+            return JBool(true, "true") to end
+        }
+        if (json.startsWith("false", start)) {
+            val end = start + 5
+            if (!delimOk(end)) throw McpProtocol("mcp: bad envelope")
+            return JBool(false, "false") to end
+        }
+        if (json.startsWith("null", start)) {
+            val end = start + 4
+            if (!delimOk(end)) throw McpProtocol("mcp: bad envelope")
+            return JNull("null") to end
+        }
+        throw McpProtocol("mcp: bad envelope")
+    }
+
+    /**
+     * 使用者自訂完整 URL（bare-origin 自動補 `/mcp`；有 path 原樣保留）。
+     *
+     * 相容舊配置：舊只寫 origin（如 `https://host` 或 `https://host/`）的配置自動補 `/mcp`；
+     * 有 path 則整段原樣保留（尾斜線、大小寫、query/fragment 全不動：
+     * `https://h/api/mcp/` 與 `https://h/api/mcp` 對某些 server 不等價，不得正規化）。
+     * query/fragment（`?`/`#`）保留並在前面插入 `/mcp`
+     *（如 `https://h?x=1` → `https://h/mcp?x=1`；`/` 視為 bare）。
+     * 呼叫方對自動補 path 的情況建議記 warning（見 [McpTransport]）。
+     */
     fun endpoint(baseUrl: String): String {
-        val b = baseUrl.trimEnd('/')
-        return if (b.endsWith("/mcp")) b else b + "/mcp"
+        val (main, suffix) = splitMainAndSuffix(baseUrl)
+        // 無 path（bare-origin）→ 補 /mcp；有 path 原樣保留（尾斜線亦保留，query/fragment 原樣接回）。
+        // bare-origin 判斷複用 isBareOrigin()（單一真相來源；行為見 endpoint 測試鎖定）。
+        return if (isBareOrigin(baseUrl)) "${main.trimEnd('/')}/mcp$suffix" else "$main$suffix"
+    }
+
+    /** URL 切分：`?`/`#` 之前為 main，之後（含符號）為 suffix；供 [endpoint] 與 [isBareOrigin] 共用。 */
+    internal data class UrlParts(val main: String, val suffix: String)
+
+    internal fun splitMainAndSuffix(url: String): UrlParts {
+        val trimmed = url.trim()
+        val q = trimmed.indexOf('?')
+        val h = trimmed.indexOf('#')
+        val cut = when {
+            q >= 0 && h >= 0 -> minOf(q, h)
+            q >= 0 -> q
+            h >= 0 -> h
+            else -> -1
+        }
+        return UrlParts(
+            if (cut >= 0) trimmed.substring(0, cut) else trimmed,
+            if (cut >= 0) trimmed.substring(cut) else "",
+        )
+    }
+
+    /** endpoint() 是否會自動補 `/mcp`（bare-origin 判斷；供傳輸層 warning 用）。 */
+    internal fun isBareOrigin(baseUrl: String): Boolean {
+        val mainTrimmed = splitMainAndSuffix(baseUrl).main.trimEnd('/')
+        val schemeEnd = mainTrimmed.indexOf("://")
+        val pathStart = if (schemeEnd >= 0) {
+            mainTrimmed.indexOf('/', schemeEnd + 3)
+        } else {
+            mainTrimmed.indexOf('/')
+        }
+        return pathStart < 0
     }
 
     fun listBody(id: Long = 1L): String =
@@ -31,46 +325,101 @@ internal object McpWire {
             ""","params":{"name":"${esc(toolName)}","arguments":$args}}"""
     }
 
-    /** 解析 tools/list；惡形輸入拋 IllegalArgumentException（呼叫方映射為 PROTOCOL）。 */
+    /**
+     * 解析 tools/list；惡形輸入拋 IllegalArgumentException（呼叫方映射為 PROTOCOL）。
+     *
+     * 經 [parseStrictDoc] 嚴格走訪全文（截斷/尾隨 garbage/缺逗號/重複鍵/非法字面量/
+     * 非法 escape/超深一律 [McpProtocol]）；只認頂層 `result` 包裝，
+     * 再從 `result` 內取 `tools` 陣列；層級一律經 DOM 直接成員查找，
+     * 巢狀同名鍵不得遮蔽外層。inputSchema 超限拒絕不截斷；name/description 短欄位 take 保留。
+     */
     fun parseList(serverId: String, json: String): List<McpTool> {
-        val toolsBlock = sectionArray(json, "\"tools\"")
-            ?: throw IllegalArgumentException("mcp: missing result.tools")
-        if (toolsBlock.isBlank()) return emptyList()
-        return splitObjects(toolsBlock).map { obj ->
-            val name = stringField(obj, "name")
-                ?: throw IllegalArgumentException("mcp: tool without name")
-            val desc = stringField(obj, "description") ?: ""
-            val schema = rawField(obj, "inputSchema") ?: """{"type":"object"}"""
+        if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
+            throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
+        }
+        val doc = parseStrictDoc(json)
+        if (doc !is JObj) throw McpProtocol("mcp: bad envelope")
+        val resultVal = doc.find("result")
+            ?: throw IllegalArgumentException("mcp: missing result")
+        if (resultVal is JNull) throw IllegalArgumentException("mcp: missing result")
+        if (resultVal !is JObj) throw IllegalArgumentException("mcp: bad result.tools")
+        val toolsVal = resultVal.find("tools")
+            ?: throw IllegalArgumentException("mcp: bad result.tools")
+        if (toolsVal !is JArr) throw IllegalArgumentException("mcp: bad result.tools")
+        if (toolsVal.items.isEmpty()) return emptyList()
+        return toolsVal.items.map { item ->
+            if (item !is JObj) throw McpProtocol("mcp: bad tools item")
+            val nameVal = item.find("name")
+            if (nameVal !is JStr) throw IllegalArgumentException("mcp: tool without name")
+            val descVal = item.find("description")
+            val desc = if (descVal is JStr) descVal.v else ""
+            val schemaVal = item.find("inputSchema")
+            val schema = when {
+                schemaVal == null -> """{"type":"object"}"""
+                schemaVal is JObj -> schemaVal.raw
+                else -> throw McpProtocol("mcp: bad inputSchema")
+            }
+            if (schema.length > INPUT_SCHEMA_MAX_CHARS) {
+                throw McpProtocol("mcp: inputSchema exceeds $INPUT_SCHEMA_MAX_CHARS chars")
+            }
             McpTool(
                 serverId = serverId,
-                name = name.take(128),
+                name = nameVal.v.take(128),
                 description = desc.take(500),
-                inputSchema = schema.take(8_192),
+                inputSchema = schema,
             )
         }
     }
 
-    /** 解析 tools/call：回傳 (resultJson, isError)；只有頂層 error 鍵才算 error 包。 */
+    /**
+     * 解析 tools/call：回傳 (resultJson, isError)。
+     *
+     * 經 [parseStrictDoc] 嚴格走訪全文；只有頂層 `error` 鍵才算 error 包；
+     * `isError`/`content` 只認頂層 `result` 物件的直接成員（DOM depth-1），
+     * 巢狀同名鍵不得誤判；缺 `result` 即拋 IllegalArgumentException（fail-closed）。
+     * 回傳的 resultJson 用 DOM 節點 `raw`（content 優先，否則整包 result）。
+     */
     fun parseCall(json: String): Pair<String?, Boolean> {
-        val errRaw = topLevelRawField(json, "error")
-        if (errRaw != null && errRaw != "null") {
-            // message 取自 error 物件內，避免全域搜到 content 文字的同名鍵。
-            val msg = (if (errRaw.startsWith("{")) stringField(errRaw, "message") else null)
-                ?: "tool error"
-            throw McpToolFailure(msg.take(200))
+        if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
+            throw McpProtocol("mcp: response body exceeds ${McpTransport.RESPONSE_MAX_CHARS} chars")
         }
-        val isError = boolField(json, "isError") ?: false
-        val content = rawField(json, "content")
-        val result = rawField(json, "result")
+        val doc = parseStrictDoc(json)
+        if (doc !is JObj) throw McpProtocol("mcp: bad envelope")
+        val errVal = doc.find("error")
+        if (errVal != null) {
+            if (errVal is JNull) {
+                // 忽略，續走 result（既有 nullTopLevelErrorIsOk 語義）。
+            } else if (errVal is JObj) {
+                val msgVal = errVal.find("message")
+                val msg = if (msgVal is JStr) msgVal.v else "tool error"
+                throw McpToolFailure(msg.take(200))
+            } else {
+                throw McpProtocol("mcp: bad error")
+            }
+        }
+        val resultVal = doc.find("result")
+            ?: throw IllegalArgumentException("mcp: missing result")
+        if (resultVal is JNull) throw IllegalArgumentException("mcp: missing result")
+        if (resultVal !is JObj) throw IllegalArgumentException("mcp: bad result")
+        val contentVal = resultVal.find("content")
+        if (contentVal != null && contentVal !is JArr) {
+            throw McpProtocol("mcp: bad content")
+        }
+        val isErrorVal = resultVal.find("isError")
+        val isError = when {
+            isErrorVal == null -> false
+            isErrorVal is JBool -> isErrorVal.v
+            isErrorVal is JNull -> false
+            else -> throw McpProtocol("mcp: bad isError")
+        }
         // 內存消費用：優先保留 content，否則整個 result；調用方用後即丟，不寫盤。
-        // 上限由傳輸層雙上限保證（64k 字元內完整 JSON）：此處不靜默 take，
-        // content/result 雙缺（截斷半 JSON）必須拋 PROTOCOL，不回 OK(null) 假成功。
-        return ((content ?: result) ?: throw IllegalArgumentException("mcp: missing result.content")) to isError
+        return ((contentVal?.raw ?: resultVal.raw)) to isError
     }
 
     class McpToolFailure(message: String) : IllegalArgumentException(message)
 
-    // ---- 極簡 JSON 掃描器（只夠本包兩種回應形狀；完整 JSON 解析不在此做） ----
+    /** 協議形狀錯誤（inputSchema 超限、缺 result 等）：[McpServer] 映射為 PROTOCOL。 */
+    class McpProtocol(message: String) : IllegalArgumentException(message)
 
     internal fun esc(raw: String): String {
         val sb = StringBuilder(raw.length)
@@ -85,302 +434,5 @@ internal object McpWire {
             }
         }
         return sb.toString()
-    }
-
-    /** 找 `"key":` 後的值起點（跳過空白）。 */
-    private fun valueStart(json: String, key: String): Int {
-        val k = json.indexOf(key)
-        if (k < 0) return -1
-        var i = json.indexOf(':', k + key.length)
-        if (i < 0) return -1
-        i++
-        while (i < json.length && json[i].isWhitespace()) i++
-        return i
-    }
-
-    internal fun stringField(json: String, key: String): String? {
-        val i = valueStart(json, "\"$key\"")
-        if (i < 0 || i >= json.length || json[i] != '"') return null
-        val sb = StringBuilder()
-        var p = i + 1
-        while (p < json.length) {
-            val c = json[p++]
-            when (c) {
-                '"' -> return sb.toString()
-                '\\' -> {
-                    if (p >= json.length) return null
-                    when (val e = json[p++]) {
-                        '"', '\\', '/' -> sb.append(e)
-                        'n' -> sb.append('\n')
-                        'r' -> sb.append('\r')
-                        't' -> sb.append('\t')
-                        'u' -> {
-                            if (p + 4 > json.length) return null
-                            val hex = json.substring(p, p + 4)
-                            sb.append(hex.toIntOrNull(16)?.toChar() ?: return null)
-                            p += 4
-                        }
-                        else -> sb.append(e)
-                    }
-                }
-                else -> sb.append(c)
-            }
-        }
-        return null
-    }
-
-    internal fun boolField(json: String, key: String): Boolean? {
-        val i = valueStart(json, "\"$key\"")
-        if (i < 0) return null
-        return when {
-            json.startsWith("true", i) -> true
-            json.startsWith("false", i) -> false
-            else -> null
-        }
-    }
-
-    /** 取 `"key":` 後的原始值文本（object/array/string/字面量均可）。 */
-    internal fun rawField(json: String, key: String): String? {
-        val i = valueStart(json, "\"$key\"")
-        if (i < 0 || i >= json.length) return null
-        return rawValue(json, i)
-    }
-
-    /**
-     * 取頂層 object `"key":` 後的原始值（只認 depth 1 成員鍵）。
-     * 巢狀同名鍵（如 result.content 內的 `"error"`）不算，避免誤判丟資料。
-     */
-    internal fun topLevelRawField(json: String, key: String): String? {
-        val i = topLevelValueStart(json, key)
-        if (i < 0 || i >= json.length) return null
-        return rawValue(json, i)
-    }
-
-    /** 頂層 object 成員的值起點；缺席或形狀不合回 -1（字串感知）。 */
-    private fun topLevelValueStart(json: String, key: String): Int {
-        var p = 0
-        while (p < json.length && json[p].isWhitespace()) p++
-        if (p >= json.length || json[p] != '{') return -1
-        p++
-        while (true) {
-            var q = p
-            while (q < json.length && json[q].isWhitespace()) q++
-            if (q >= json.length) return -1
-            if (json[q] == '}') return -1
-            if (json[q] == ',') {
-                p = q + 1
-                continue
-            }
-            if (json[q] != '"') return -1
-            val kb = StringBuilder()
-            var r = q + 1
-            var closed = false
-            while (r < json.length) {
-                val c = json[r++]
-                if (c == '\\') {
-                    if (r >= json.length) return -1
-                    when (val e = json[r++]) {
-                        '"', '\\', '/' -> kb.append(e)
-                        'n' -> kb.append('\n')
-                        'r' -> kb.append('\r')
-                        't' -> kb.append('\t')
-                        'u' -> {
-                            if (r + 4 > json.length) return -1
-                            kb.append(json.substring(r, r + 4).toIntOrNull(16)?.toChar() ?: return -1)
-                            r += 4
-                        }
-                        else -> kb.append(e)
-                    }
-                } else if (c == '"') {
-                    closed = true
-                    break
-                } else {
-                    kb.append(c)
-                }
-            }
-            if (!closed) return -1
-            var s = r
-            while (s < json.length && json[s].isWhitespace()) s++
-            if (s >= json.length || json[s] != ':') return -1
-            s++
-            while (s < json.length && json[s].isWhitespace()) s++
-            if (s >= json.length) return -1
-            if (kb.toString() == key) return s
-            val end = skipValue(json, s)
-            if (end < 0) return -1
-            p = end
-        }
-    }
-
-    /** 跳過一個 JSON 值，回值後索引；失敗回 -1。 */
-    private fun skipValue(json: String, from: Int): Int {
-        if (from >= json.length) return -1
-        when (json[from]) {
-            '"' -> {
-                var p = from + 1
-                while (p < json.length) {
-                    val c = json[p++]
-                    if (c == '\\') {
-                        if (p < json.length) p++ else return -1
-                    } else if (c == '"') {
-                        return p
-                    }
-                }
-                return -1
-            }
-            '{', '[' -> {
-                var depth = 0
-                var instr = false
-                var es = false
-                var p = from
-                while (p < json.length) {
-                    val c = json[p]
-                    if (instr) {
-                        if (es) es = false
-                        else if (c == '\\') es = true
-                        else if (c == '"') instr = false
-                    } else {
-                        when (c) {
-                            '"' -> instr = true
-                            '{', '[' -> depth++
-                            '}', ']' -> {
-                                depth--
-                                if (depth == 0) return p + 1
-                            }
-                        }
-                    }
-                    p++
-                }
-                return -1
-            }
-            else -> {
-                var p = from
-                while (p < json.length && ",}]".indexOf(json[p]) < 0) p++
-                return p
-            }
-        }
-    }
-
-    /** 取 `"key": [` 陣列的內部文本（不含外括號）；缺席回 null。 */
-    internal fun sectionArray(json: String, key: String): String? {
-        val i = valueStart(json, key)
-        if (i < 0 || i >= json.length || json[i] != '[') return null
-        var depth = 0
-        var inStr = false
-        var esc = false
-        var p = i
-        while (p < json.length) {
-            val c = json[p]
-            if (inStr) {
-                if (esc) esc = false
-                else if (c == '\\') esc = true
-                else if (c == '"') inStr = false
-            } else {
-                when (c) {
-                    '"' -> inStr = true
-                    '[' -> depth++
-                    ']' -> {
-                        depth--
-                        if (depth == 0) return json.substring(i + 1, p)
-                    }
-                }
-            }
-            p++
-        }
-        return null
-    }
-
-    private fun rawValue(json: String, from: Int): String? {
-        var p = from
-        if (p >= json.length) return null
-        return when (json[p]) {
-            '"', '{', '[' -> {
-                val open = json[p]
-                val close = when (open) {
-                    '"' -> '"'
-                    '{' -> '}'
-                    else -> ']'
-                }
-                var depth = 0
-                var inStr = open == '{' || open == '['
-                // 對 object/array：逐字掃描配對；對 string：找非轉義引號。
-                if (open == '"') {
-                    p++
-                    val sb = StringBuilder()
-                    sb.append('"')
-                    while (p < json.length) {
-                        val c = json[p++]
-                        sb.append(c)
-                        if (c == '\\' && p < json.length) sb.append(json[p++])
-                        else if (c == '"') return sb.toString()
-                    }
-                    return null
-                }
-                var instr = false
-                var es = false
-                val start = from
-                while (p < json.length) {
-                    val c = json[p]
-                    if (instr) {
-                        if (es) es = false
-                        else if (c == '\\') es = true
-                        else if (c == '"') instr = false
-                    } else {
-                        when (c) {
-                            '"' -> instr = true
-                            '{', '[' -> depth++
-                            '}', ']' -> {
-                                depth--
-                                if (depth == 0) return json.substring(start, p + 1)
-                            }
-                        }
-                    }
-                    // 外層 close 由 depth 計數處理；inStr 初始值不再使用。
-                    @Suppress("UNUSED_VARIABLE")
-                    val ignored = close
-                    p++
-                }
-                return null
-            }
-            else -> {
-                while (p < json.length && ",}]".indexOf(json[p]) < 0) p++
-                json.substring(from, p).trim().ifEmpty { null }
-            }
-        }
-    }
-
-    /** 切分陣列內部文本為頂層 object 列表（字串感知）。 */
-    internal fun splitObjects(inner: String): List<String> {
-        val out = ArrayList<String>()
-        var depth = 0
-        var instr = false
-        var es = false
-        var start = -1
-        var p = 0
-        while (p < inner.length) {
-            val c = inner[p]
-            if (instr) {
-                if (es) es = false
-                else if (c == '\\') es = true
-                else if (c == '"') instr = false
-            } else {
-                when (c) {
-                    '"' -> instr = true
-                    '{' -> {
-                        if (depth == 0) start = p
-                        depth++
-                    }
-                    '}' -> {
-                        depth--
-                        if (depth == 0 && start >= 0) {
-                            out.add(inner.substring(start, p + 1))
-                            start = -1
-                        }
-                    }
-                }
-            }
-            p++
-        }
-        return out
     }
 }

@@ -13,6 +13,10 @@ package dev.librepocket.systema
  * ```
  * 白名單外不可見 → [LaunchResolution.NeedClarification] 或 Unknown，
  * 禁止猜測包名（ARCH §9.1）。
+ *
+ * Target 缺口（本 PR 不改 manifest）：API 30+ 包可見性下，若 manifest
+ * `<queries>` 未覆蓋 [QUERY_WHITELIST]，真機 resolve 恐集體 NoHandler；
+ * 需裝置驗證後再補宣告。
  */
 object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
 
@@ -55,7 +59,14 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
   override val descriptor: ToolDescriptor
     get() = ToolRegistry.get(ToolRegistry.LAUNCH_APP)!!
 
-  /** 解析使用者輸入：精確包名/別名 → Single；多命中 → 澄清；零命中 → Unknown。 */
+  /**
+   * 解析使用者輸入：精確包名/別名 → Single；多命中 → 澄清；零命中 → Unknown。
+   *
+   * 精確包名須在可見集內才直達；別名經靜態表 [QUERY_WHITELIST] 映射。
+   *
+   * @param visiblePackages 唯一合法來源：PackageManager 可見集；
+   *   禁透傳 LLM/MCP 輸出的包名（防包名猜測/劫持）。
+   */
   fun resolve(query: String, visiblePackages: Set<String>): LaunchResolution {
     val q = query.trim().lowercase()
     if (q.isEmpty()) return LaunchResolution.Unknown
@@ -100,9 +111,7 @@ object LaunchAppTool : SystemTool<LaunchAppTool.Params> {
     }
     return when (val r = resolve(params.query, env.installedPackages)) {
       is LaunchResolution.Single -> {
-        val ok = runCatching { launcher.launch(r.spec) }.getOrDefault(false)
-        if (ok) ToolResult(true, false, r.spec)
-        else ToolResult(false, false, r.spec, ReasonCodes.NO_HANDLER, "做不到開啟 App（${ReasonCodes.NO_HANDLER}）")
+        launcher.launchCatching(r.spec).toToolResult(r.spec, "開啟 App")
       }
       is LaunchResolution.NeedClarification -> ToolResult(
         false, false, null, ReasonCodes.NEED_CLARIFICATION,

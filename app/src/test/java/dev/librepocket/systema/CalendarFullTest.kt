@@ -17,7 +17,7 @@ import org.junit.Test
  */
 class CalendarFullTest {
 
-    private val okLauncher = IntentLauncher { true }
+    private val okLauncher = IntentLauncher { LaunchResult.Success }
     private val env = SystemEnv(hasCalendarApp = true)
 
     // ---- 註冊 ----
@@ -113,7 +113,7 @@ class CalendarFullTest {
         )
         assertEquals("android.intent.action.EDIT", spec.action)
         assertEquals("${CalendarTool.EVENTS_CONTENT_URI}/42", spec.dataUri)
-        assertEquals("新標題", spec.extras["title"])
+        assertEquals(IntentExtra.Str("新標題"), spec.extras["title"])
     }
 
     @Test fun updateWithoutAppNeedsWriteGrant() {
@@ -149,7 +149,7 @@ class CalendarFullTest {
         val r = CalendarTool.executeUpdate(
             CalendarTool.UpdateParams(eventId = "7", title = "例會"),
             env,
-            IntentLauncher { launched = it; true },
+            IntentLauncher { launched = it; LaunchResult.Success },
         )
         assertTrue(r.ok)
         assertEquals("android.intent.action.EDIT", launched?.action)
@@ -165,14 +165,14 @@ class CalendarFullTest {
             val r = CalendarTool.executeUpdate(
                 CalendarTool.UpdateParams(eventId = "7", title = "例會"),
                 noApp,
-                IntentLauncher { launched++; true },
+                IntentLauncher { launched++; LaunchResult.Success },
             )
             assertEquals("writeGranted=$writeGranted", false, r.ok)
             assertEquals("writeGranted=$writeGranted", true, r.usedFallback)
             assertEquals("writeGranted=$writeGranted", ReasonCodes.NEED_PERMISSION, r.reasonCode)
             assertTrue("writeGranted=$writeGranted", r.spec != null)
             assertTrue("writeGranted=$writeGranted", (r.spec!!.dataUri ?: "").endsWith("/7"))
-            assertEquals("writeGranted=$writeGranted", "例會", r.spec!!.extras["title"])
+            assertEquals("writeGranted=$writeGranted", IntentExtra.Str("例會"), r.spec!!.extras["title"])
             assertEquals("writeGranted=$writeGranted", 0, launched)
         }
     }
@@ -185,7 +185,7 @@ class CalendarFullTest {
             val r = CalendarTool.executeDelete(
                 CalendarTool.DeleteParams("9"),
                 noApp,
-                IntentLauncher { launched++; true },
+                IntentLauncher { launched++; LaunchResult.Success },
             )
             assertEquals("writeGranted=$writeGranted", false, r.ok)
             assertEquals("writeGranted=$writeGranted", true, r.usedFallback)
@@ -200,7 +200,7 @@ class CalendarFullTest {
         val r = CalendarTool.executeDelete(
             CalendarTool.DeleteParams("9"),
             env,
-            IntentLauncher { launched = it; true },
+            IntentLauncher { launched = it; LaunchResult.Success },
         )
         assertTrue(r.ok)
         assertTrue((launched?.dataUri ?: "").endsWith("/9"))

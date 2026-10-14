@@ -36,8 +36,12 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     if (env.hasMapApp) buildGeoIntent(params) else buildWebIntent(params)
 
   fun buildGeoIntent(params: Params): IntentSpec {
-    val data = if (params.latitude != null && params.longitude != null) {
-      val base = "geo:${params.latitude},${params.longitude}"
+    val lat = params.latitude
+    val lng = params.longitude
+    requirePairedCoords(lat, lng)
+    if (lat != null && lng != null) requireLatLng(lat, lng)
+    val data = if (lat != null && lng != null) {
+      val base = "geo:$lat,$lng"
       if (params.label.isNotBlank()) "$base?q=${encode(params.label)}" else base
     } else {
       "geo:0,0?q=${encode(params.query)}"
@@ -46,6 +50,11 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
   }
 
   fun buildWebIntent(params: Params): IntentSpec {
+    requirePairedCoords(params.latitude, params.longitude)
+    val lat = params.latitude
+    val lng = params.longitude
+    // 與 geo 一致：web 分支同樣收斂座標守衛（有限值 + 範圍），禁越界座標經 OSM URL 外洩。
+    if (lat != null && lng != null) requireLatLng(lat, lng)
     val q = when {
       params.query.isNotBlank() -> params.query
       params.label.isNotBlank() -> params.label
@@ -65,12 +74,10 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
       return ToolResult(false, false, null, check.reasonCode, "做不到導航（${check.reasonCode}）")
     }
     val spec = resolve(params, env)
-    val ok = runCatching { launcher.launch(spec) }.getOrDefault(false)
-    return if (ok) {
-      ToolResult(true, !env.hasMapApp, spec, check.reasonCode)
-    } else {
-      ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到導航（${ReasonCodes.NO_HANDLER}）")
-    }
+    return launcher.launchCatching(spec).toToolResult(
+      spec, "導航",
+      usedFallbackOnSuccess = !env.hasMapApp, successReason = check.reasonCode,
+    )
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec {
@@ -83,5 +90,22 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
     )
   }
 
+  /**
+   * 編碼偏差（已鎖定現行，不硬改）：此處用 `URLEncoder`（空格→`+`），
+   * 與 `Uri.encode`（空格→`%20`）不同；改動牽涉 Android 層且影響純 JVM 可測性，
+   * 故僅加註 + 測試鎖定現行為（見 `navigation_labelEncoding_locksUrlEncoderPlus`）。
+   */
   private fun encode(s: String): String = URLEncoder.encode(s, Charsets.UTF_8.name())
+
+  /** 單側座標 fail-fast：經緯度須同時為空或同時非空，禁靜默丟棄。 */
+  private fun requirePairedCoords(lat: Double?, lng: Double?) {
+    require((lat == null) == (lng == null)) { "latitude/longitude must both be null or both non-null" }
+  }
+
+  /** geo 座標守衛：有限值 + 緯度 -90..90 + 經度 -180..180。 */
+  private fun requireLatLng(lat: Double, lng: Double) {
+    require(lat.isFinite() && lng.isFinite()) { "lat/lng must be finite" }
+    require(lat in -90.0..90.0) { "latitude out of range: $lat" }
+    require(lng in -180.0..180.0) { "longitude out of range: $lng" }
+  }
 }

@@ -12,7 +12,7 @@ import org.junit.Test
  */
 class SystemIntentMappingTest {
 
-  private val okLauncher = IntentLauncher { true }
+  private val okLauncher = IntentLauncher { LaunchResult.Success }
   private val fullEnv = SystemEnv(
     hasMapApp = true,
     installedPackages = setOf("com.google.android.apps.maps", "com.spotify.music"),
@@ -68,7 +68,7 @@ class SystemIntentMappingTest {
     val env = fullEnv.copy(hasMapApp = false)
     var launched: IntentSpec? = null
     val r = NavigationTool.execute(
-      NavigationTool.Params(query = "夜市"), env, IntentLauncher { launched = it; true },
+      NavigationTool.Params(query = "夜市"), env, IntentLauncher { launched = it; LaunchResult.Success },
     )
     assertTrue(r.ok)
     assertTrue(r.usedFallback)
@@ -120,9 +120,9 @@ class SystemIntentMappingTest {
   @Test fun alarm_mapsToSetAlarmIntent() {
     val spec = AlarmTool.buildSetAlarmIntent(AlarmTool.Params(7, 30, "起床"))
     assertEquals("android.intent.action.SET_ALARM", spec.action)
-    assertEquals("7", spec.extras["android.intent.extra.alarm.HOUR"])
-    assertEquals("30", spec.extras["android.intent.extra.alarm.MINUTES"])
-    assertEquals("起床", spec.extras["android.intent.extra.alarm.MESSAGE"])
+    assertEquals(IntentExtra.IntVal(7), spec.extras["android.intent.extra.alarm.HOUR"])
+    assertEquals(IntentExtra.IntVal(30), spec.extras["android.intent.extra.alarm.MINUTES"])
+    assertEquals(IntentExtra.Str("起床"), spec.extras["android.intent.extra.alarm.MESSAGE"])
   }
 
   @Test fun alarm_noAlarmApp_degradesToOwnReminder() {
@@ -150,7 +150,7 @@ class SystemIntentMappingTest {
     )
     assertEquals("android.intent.action.INSERT", spec.action)
     assertEquals("content://com.android.calendar/events", spec.dataUri)
-    assertEquals("例會", spec.extras["title"])
+    assertEquals(IntentExtra.Str("例會"), spec.extras["title"])
   }
 
   @Test fun calendar_queryWithoutGrant_needsPermission() {
@@ -166,7 +166,7 @@ class SystemIntentMappingTest {
     val r = CalendarTool.execute(
       CalendarTool.EventParams("面試", 1000, 2000),
       fullEnv.copy(calendarReadGranted = false),
-      IntentLauncher { launched = it; true },
+      IntentLauncher { launched = it; LaunchResult.Success },
     )
     assertTrue(r.ok)
     assertEquals("android.intent.action.INSERT", (launched?.action ?: ""))
@@ -201,7 +201,7 @@ class SystemIntentMappingTest {
   @Test fun music_control_mapsToMediaButton() {
     val spec = MusicTool.buildControlIntent(MusicTool.Control.NEXT)
     assertEquals("android.intent.action.MEDIA_BUTTON", spec.action)
-    assertEquals("87", spec.extras["keyCode"])
+    assertEquals(IntentExtra.IntVal(87), spec.extras["keyCode"])
     assertEquals(127, MusicTool.buildControl(MusicTool.Control.PAUSE).keyCode)
   }
 

@@ -4,20 +4,119 @@ package dev.librepocket.systema
  * 平台無關的 Intent 描述（純 JVM）。Android 側由
  * [AndroidIntentLauncher] 轉成真正的 `android.content.Intent` 並執行
  * resolveActivity → startActivity；單元測試只斷言本層映射。
+ *
+ * D2 型別化 extras：D1 的全 String 會讓端側 `getIntExtra /
+ * getLongExtra / getBooleanExtra` 讀回預設值（系統鬧鐘/日曆 App 直接忽略），
+ * 故改為密封型別，launcher 按型別 putExtra。
+ *
+ * 決策註記：float/double 需求出現時再加 DoubleVal + toIntent 分支
+ * （不預先加型別；此處 when 為 statement position，新增子類不會編譯期
+ * 報錯，故 toIntent 另以 `else -> throw` 保底，防靜默掉 extra；實測編譯器
+ * 拒絕測試源集新增子類，故該分支僅未來主模組新增子類時可達，刻意不單測）。
  */
+sealed interface IntentExtra {
+  data class Str(val value: String) : IntentExtra
+  data class LongVal(val value: Long) : IntentExtra
+  data class IntVal(val value: Int) : IntentExtra
+  data class Bool(val value: Boolean) : IntentExtra
+}
+
+/**
+ * 型別化讀取：讀側必須用 `is`/`requireExtra`，禁 unsafe cast。
+ *
+ * 錯型別或缺 key 一律拋 [IllegalStateException]（帶 key + 期望型別），
+ * 避免 `ClassCastException` 訊息無 key 難定位。
+ *
+ * 目前生產側尚未採用此 helper 讀 extras，後續接線 PR 需遷移讀側。
+ */
+inline fun <reified T : IntentExtra> Map<String, IntentExtra>.requireExtra(key: String): T {
+  val v = this[key]
+    ?: throw IllegalStateException("extra missing: key=$key expected=${T::class.simpleName}")
+  if (v !is T) {
+    throw IllegalStateException(
+      "extra type mismatch: key=$key expected=${T::class.simpleName} actual=${v::class.simpleName}",
+    )
+  }
+  return v
+}
+
+/**
+ * Intent flags allowlist（純 JVM 常量，數值與 `android.content.Intent` 對齊，
+ * 避免本層依賴 android.*）。
+ *
+ * 只允許安全子集（[ALLOWED_MASK]）：`NEW_TASK`（非 Activity context 啟動必需，
+ * 維持 D1 預設行為）+ 無害的任務棧提示（`CLEAR_TOP` / `SINGLE_TOP`）。
+ * 其餘一律 fail-closed 丟棄：`CLEAR_TASK` 會清空任務棧、`NO_HISTORY` /
+ * `EXCLUDE_FROM_RECENTS` 改變歷史/最近頁語義、`GRANT_*` 擴大 URI 授權，
+ * 皆不由工具層攜帶。
+ */
+object IntentFlags {
+  const val GRANT_READ_URI_PERMISSION: Int = 0x00000001
+  const val GRANT_WRITE_URI_PERMISSION: Int = 0x00000002
+  const val ACTIVITY_CLEAR_TASK: Int = 0x00008000
+  const val ACTIVITY_EXCLUDE_FROM_RECENTS: Int = 0x00800000
+  const val ACTIVITY_CLEAR_TOP: Int = 0x04000000
+  const val ACTIVITY_NEW_TASK: Int = 0x10000000
+  const val ACTIVITY_SINGLE_TOP: Int = 0x20000000
+  const val ACTIVITY_NO_HISTORY: Int = 0x40000000
+
+  const val ALLOWED_MASK: Int = ACTIVITY_NEW_TASK or ACTIVITY_CLEAR_TOP or ACTIVITY_SINGLE_TOP
+
+  /** fail-closed：只保留允許位。 */
+  fun sanitize(flags: Int): Int = flags and ALLOWED_MASK
+}
+
 data class IntentSpec(
   val action: String,
   val dataUri: String? = null,
   val mimeType: String? = null,
   val targetPackage: String? = null,
-  val extras: Map<String, String> = emptyMap(),
+  val extras: Map<String, IntentExtra> = emptyMap(),
   val flags: Int = 0,
 )
 
+/**
+ * 啟動結果分型（D2）：`resolveActivity == null`（無處理者）與執行期拋錯
+ * 不再混同為同一個 `false`。
+ */
+sealed interface LaunchResult {
+  data object Success : LaunchResult
+  data object NoHandler : LaunchResult
+  data class Internal(val cause: Throwable? = null) : LaunchResult
+}
+
 /** 啟動器抽象：JVM 測試用假實現，端側用 [AndroidIntentLauncher]。 */
 fun interface IntentLauncher {
-  /** 回傳 true 表已交給系統處理（startActivity 未拋錯）。 */
-  fun launch(spec: IntentSpec): Boolean
+  fun launch(spec: IntentSpec): LaunchResult
+}
+
+/** 防禦：假實現自身拋錯時收斂為 [LaunchResult.Internal]；取消與 VM fatal 直接外洩。 */
+internal fun IntentLauncher.launchCatching(spec: IntentSpec): LaunchResult {
+  try {
+    return launch(spec)
+  } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+    throw e
+  } catch (e: Exception) {
+    return LaunchResult.Internal(e)
+  }
+}
+
+/** 把啟動分型轉為工具結果（成功分支保留呼叫方指定的 fallback/原因語義）。 */
+internal fun LaunchResult.toToolResult(
+  spec: IntentSpec,
+  verb: String,
+  usedFallbackOnSuccess: Boolean = false,
+  successReason: String? = null,
+): ToolResult = when (this) {
+  LaunchResult.Success -> ToolResult(true, usedFallbackOnSuccess, spec, successReason)
+  LaunchResult.NoHandler ->
+    ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到$verb（${ReasonCodes.NO_HANDLER}）")
+  is LaunchResult.Internal ->
+    ToolResult(
+      false, false, spec, ReasonCodes.INTERNAL,
+      // 可行動：附加 cause 類名（不含 PII），區分拒絕/崩潰；仍保留「（INTERNAL）」子串供既有斷言。
+      "做不到$verb（${ReasonCodes.INTERNAL}）[${cause?.javaClass?.simpleName ?: "Unknown"}]",
+    )
 }
 
 data class ToolResult(

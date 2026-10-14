@@ -29,9 +29,9 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
   )
 
   /**
-   * 更新參數：僅攜帶要改的欄位（S1-C）。`eventId` 為 Events 表行 id；
-   * 時間欄位 null 表不改，非 null 時 `endTimeMillis > beginTimeMillis`
-   * 由呼叫方保證（委託 Intent 不校驗，Provider 端再斷言）。
+   * 更新參數：僅攜帶要改的欄位（S1-C）。`eventId` 為 Events 表數字行 id
+   *（[eventUri] 做嚴格數字校驗）；時間欄位 null 表不改，兩者皆非 null 時
+   * [buildEditIntent] 要求 `endTimeMillis > beginTimeMillis`（與 insert 一致）。
    */
   data class UpdateParams(
     val eventId: String,
@@ -54,6 +54,9 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
   const val EXTRA_EVENT_TITLE = "title"
   const val EXTRA_EVENT_LOCATION = "eventLocation"
   const val EXTRA_EVENT_DESCRIPTION = "description"
+
+  /** Events `_id` 數字校驗（避免每次呼叫重配 Regex）。 */
+  private val EVENT_ID_PATTERN = Regex("[0-9]+")
 
   override val descriptor: ToolDescriptor
     get() = ToolRegistry.get(ToolRegistry.CALENDAR)!!
@@ -110,13 +113,14 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
   fun buildInsertIntent(params: EventParams): IntentSpec {
     require(params.title.isNotBlank()) { "title must not be blank" }
     require(params.endTimeMillis > params.beginTimeMillis) { "endTime must be after beginTime" }
-    val extras = mutableMapOf(
-      EXTRA_BEGIN_TIME to params.beginTimeMillis.toString(),
-      EXTRA_END_TIME to params.endTimeMillis.toString(),
-      EXTRA_EVENT_TITLE to params.title,
+    // D2 型別化：begin/end 保持 Long（CalendarContract.EXTRA_* 為 long）。
+    val extras = mutableMapOf<String, IntentExtra>(
+      EXTRA_BEGIN_TIME to IntentExtra.LongVal(params.beginTimeMillis),
+      EXTRA_END_TIME to IntentExtra.LongVal(params.endTimeMillis),
+      EXTRA_EVENT_TITLE to IntentExtra.Str(params.title),
     )
-    if (params.location.isNotBlank()) extras[EXTRA_EVENT_LOCATION] = params.location
-    if (params.description.isNotBlank()) extras[EXTRA_EVENT_DESCRIPTION] = params.description
+    if (params.location.isNotBlank()) extras[EXTRA_EVENT_LOCATION] = IntentExtra.Str(params.location)
+    if (params.description.isNotBlank()) extras[EXTRA_EVENT_DESCRIPTION] = IntentExtra.Str(params.description)
     return IntentSpec(
       action = IntentActions.INSERT,
       dataUri = EVENTS_CONTENT_URI,
@@ -133,8 +137,11 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
 
   /** 單事件 URI（EDIT 委託與 Provider 直接寫共用）。 */
   fun eventUri(eventId: String): String {
-    require(eventId.isNotBlank()) { "eventId must not be blank" }
-    return "$EVENTS_CONTENT_URI/${eventId.trim()}"
+    val id = eventId.trim()
+    require(id.isNotBlank()) { "eventId must not be blank" }
+    // Events _id 本來數字行 id：嚴格數字校驗，擋 `1/2`/`1?x=1`/`../0` 等路徑/查詢注入。
+    require(id.matches(EVENT_ID_PATTERN)) { "eventId must be numeric" }
+    return "$EVENTS_CONTENT_URI/$id"
   }
 
   /**
@@ -142,13 +149,17 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
    * 免 WRITE_CALENDAR，由系統 App 完成最後一步。僅攜帶非空變更欄位。
    */
   fun buildEditIntent(params: UpdateParams): IntentSpec {
-    require(params.eventId.isNotBlank()) { "eventId must not be blank" }
-    val extras = mutableMapOf<String, String>()
-    params.title?.takeIf { it.isNotBlank() }?.let { extras[EXTRA_EVENT_TITLE] = it }
-    params.beginTimeMillis?.let { extras[EXTRA_BEGIN_TIME] = it.toString() }
-    params.endTimeMillis?.let { extras[EXTRA_END_TIME] = it.toString() }
-    params.location?.takeIf { it.isNotBlank() }?.let { extras[EXTRA_EVENT_LOCATION] = it }
-    params.description?.takeIf { it.isNotBlank() }?.let { extras[EXTRA_EVENT_DESCRIPTION] = it }
+    require(params.eventId.trim().isNotBlank()) { "eventId must not be blank" }
+    val begin = params.beginTimeMillis
+    val end = params.endTimeMillis
+    // 與 insert 一致：兩端皆給時要求排序（單端 null 表不改，不校驗）。
+    if (begin != null && end != null) require(end > begin) { "endTime must be after beginTime" }
+    val extras = mutableMapOf<String, IntentExtra>()
+    params.title?.takeIf { it.isNotBlank() }?.let { extras[EXTRA_EVENT_TITLE] = IntentExtra.Str(it) }
+    params.beginTimeMillis?.let { extras[EXTRA_BEGIN_TIME] = IntentExtra.LongVal(it) }
+    params.endTimeMillis?.let { extras[EXTRA_END_TIME] = IntentExtra.LongVal(it) }
+    params.location?.takeIf { it.isNotBlank() }?.let { extras[EXTRA_EVENT_LOCATION] = IntentExtra.Str(it) }
+    params.description?.takeIf { it.isNotBlank() }?.let { extras[EXTRA_EVENT_DESCRIPTION] = IntentExtra.Str(it) }
     return IntentSpec(
       action = IntentActions.EDIT,
       dataUri = eventUri(params.eventId),
@@ -167,9 +178,7 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
       return ToolResult(false, false, null, check.reasonCode, "做不到建日曆事件（${check.reasonCode}）")
     }
     val spec = buildInsertIntent(params)
-    val ok = runCatching { launcher.launch(spec) }.getOrDefault(false)
-    return if (ok) ToolResult(true, false, spec)
-    else ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到建日曆事件（${ReasonCodes.NO_HANDLER}）")
+    return launcher.launchCatching(spec).toToolResult(spec, "建日曆事件")
   }
 
   /**
@@ -185,9 +194,7 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     }
     if (env.hasCalendarApp) {
       val spec = buildEditIntent(params)
-      val ok = runCatching { launcher.launch(spec) }.getOrDefault(false)
-      return if (ok) ToolResult(true, false, spec)
-      else ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到更新日曆事件（${ReasonCodes.NO_HANDLER}）")
+      return launcher.launchCatching(spec).toToolResult(spec, "更新日曆事件")
     }
     // 無系統日曆 App：純側僅回待寫描述，不算成功（spec 攜帶目標 URI + 變更欄位）。
     val pending = buildEditIntent(params)
@@ -207,9 +214,7 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     }
     if (env.hasCalendarApp) {
       val spec = IntentSpec(action = IntentActions.EDIT, dataUri = eventUri(params.eventId))
-      val ok = runCatching { launcher.launch(spec) }.getOrDefault(false)
-      return if (ok) ToolResult(true, false, spec)
-      else ToolResult(false, false, spec, ReasonCodes.NO_HANDLER, "做不到刪除日曆事件（${ReasonCodes.NO_HANDLER}）")
+      return launcher.launchCatching(spec).toToolResult(spec, "刪除日曆事件")
     }
     val (uri, _) = buildDeleteDescriptor(params)
     return ToolResult(false, true, IntentSpec(action = IntentActions.DELETE, dataUri = uri), ReasonCodes.NEED_PERMISSION, "做不到刪除日曆事件（${ReasonCodes.NEED_PERMISSION}）")

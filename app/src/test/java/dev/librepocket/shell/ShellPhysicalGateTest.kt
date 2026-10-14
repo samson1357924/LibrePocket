@@ -460,4 +460,18 @@ class ShellPhysicalGateTest {
             outside.deleteRecursively()
         }
     }
+
+    @Test fun backslashOutside_deniedDirect() {
+        // F-backslash：候選含 `\` 即拒（Linux 上 \ 非分隔符，normalize 轉 / 即驗用分叉）。
+        // Linux 檔名含 \ 極罕見，fail-closed 誤殺可接受；本案只鎖拒絕，不建真檔。
+        // `\` 在 Windows 是分隔符、語義不同，故整案限非 Windows。
+        assumeTrue(!System.getProperty("os.name", "").startsWith("Windows"))
+        val scope = tempDir("b1-backslash-scope").canonicalFile
+        try {
+            val evil = scope.absolutePath + "\\evil.txt"
+            val v = ShellPolicy.validate(listOf("cat", evil), scope.absolutePath)
+            assertTrue("backslash operand must be denied, got $v", v is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (v as Validation.Denied).reason)
+        } finally { scope.deleteRecursively() }
+    }
 }

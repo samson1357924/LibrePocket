@@ -25,9 +25,9 @@
 | Provider key | 裝置或 app 私有資料遭讀取、錯誤匯出、雲端/裝置轉移備份 | Android backup 規則排除特定 key 檔；不是對所有匯出路徑或遭 root 裝置的保證。 |
 | Transcript、附件與 provider 請求 | Provider 接收敏感內容；備份或匯出副本外流；本機帳號/裝置遭存取 | Room 寫入 redaction 不等於送出前 redaction；`allowBackup=true` 且 transcript 未列入 key-only exclusions。 |
 | 外部副作用 | 模型輸出、錯誤授權或競態導致不當操作 | 目前 built-in tools 全部 not-ready；未來接線必須逐工具驗證 permission、fresh evaluation、不可變確認快照及實際副作用。 |
-| App workspace（`ScopedFileStore` 根） | 毒根別名（`alias/.`、`alias/sub`）、workspace 內 symlink 穿出、併發 `rename`/`symlink` 替換 | 單線程 NOFOLLOW 確定性保證（根鏈+段鏈全驗，毒根拒絕，缺席根單層建，單線程 symlink 穿出已擋（hardlink/mount 除外，見同行尾））；B2 刪前重驗最終目標（NOFOLLOW lstat 是 link 即拒不刪、正規域內 containment，單次置換的誤刪替換後外部檔已修為拒絕（單線程確定性放置；併發仍可穿，僅有界））、寫入暫存建立前與落盤搬移前再驗整鏈、列目僅回相對路徑不洩全路徑（DirectoryStream 單遍 best-effort，不保證單遍快照隔離與跨調一致，短暫洩名窗口已揭露）；非 app UID 的併發 symlink 交換為 out-of-scope，Java 無 `O_NOFOLLOW/openat`，併發 TOCTOU 僅有界不消除；hardlink/mount 不在門內（與 ShellPolicy 同，列 out-of-scope）。 |
+| App workspace（`ScopedFileStore` 根） | 毒根別名（`alias/.`、`alias/sub`）、workspace 內 symlink 穿出、併發 `rename`/`symlink` 替換 | 單線程 NOFOLLOW 確定性保證（根鏈+段鏈全驗，毒根拒絕，缺席根單層建，單線程 symlink 穿出已擋（hardlink/mount 除外，見同行尾））；B2 刪前重驗最終目標（NOFOLLOW lstat 是 link 即拒不刪、正規域內 containment，單次置換的誤刪替換後外部檔已修為拒絕（單線程確定性放置；併發仍可穿，僅有界））、寫入暫存建立前與落盤搬移前再驗整鏈、列目僅回相對路徑不洩全路徑（DirectoryStream 單遍 best-effort，不保證單遍快照隔離與跨調一致，短暫洩名窗口已揭露）；非 app UID 的併發 symlink 交換為 out-of-scope，Java 無 `O_NOFOLLOW/openat`，併發 TOCTOU 僅有界不消除；hardlink/mount 不在門內（與 ShellPolicy 同，列 out-of-scope）；遞迴後代 interior-link + 跟隨旗標（find -L、grep -R 等）不在 B1 門內（二階殘餘，見 ShellPolicy KDoc，Refs #9）。 |
 | Flavor / 發布產物 | 不同 channel 意外帶入依賴、權限或錯誤 artifact | source-set 與 policy checks 存在；本機已有 staged final-byte signature/certificate/package/version/debug fail-closed gate（`scripts/verify_release_apk.py`+`scripts/release_artifact_stage.py` 對 staged snapshot bytes 驗證，policy 跑在 staged bytes 上並重核 checksum，見 [Release](RELEASE.md)）；正式 key custody/provenance 與 signer-pin registry 未建立，public release workflow 仍停用（github 僅 signature/identity/checksum，無 artifact policy）。 |
- 4eabd9a (fix(review-80-s1): NOFOLLOW exists, applet-full reverify, Failed de-path, dotdot redundancy notes, dangling regression, order lock, doc honesty)
+ 10d647b (fix(review-80-s3): backslash fail-closed gate, recursive-descendant + operand-no-reverify disclosure)
 
 威脅主體包括惡意或遭入侵的 provider/MCP endpoint、提示注入內容、取得裝置或備份副本的人、以及錯誤配置或被替換的發布產物。本清單不宣稱每項攻擊都有防護。
 

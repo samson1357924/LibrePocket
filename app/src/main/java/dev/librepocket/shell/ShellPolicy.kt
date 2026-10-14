@@ -799,7 +799,7 @@ object ShellPolicy {
      * normalize 折疊（spawn 用原始操作數，故驗側嚴於用側；與 [FileScope] 詞法門
      * 一致的拒絕語義；拒絕訊息帶原因碼 `DOTDOT`）。
      * 步驟（fail-closed，任一步失敗即拒）：
-     * 0. `..` 段檢查（見上）：原始字串以 `/` 切段含 `..` 即拒。
+     * 0. `..` 段檢查（見上）：原始字串以 `/` 切段含 `..` 即拒；含反斜線 `\` 即拒（見 F-backslash，Linux 語義）。
      * 1. 逐段 symlink 拒絕：候選全鏈（`/` 至本體）與 [privateRoot] 全鏈逐段
      *    `Files.isSymbolicLink`（NOFOLLOW lstat，不跟隨）；任一段是連結
      *    （含懸空連結）即拒。判定抛異常視為可疑而拒。
@@ -819,6 +819,20 @@ object ShellPolicy {
      *
      * hardlink 揭露：本門不解 hardlink；同 FS 域內 hardlink 指到域外（硬連結
      * 指向域外 inode）在承諾外，不在消除保證內。
+     * 遞迴後代揭露（Refs #9；殘餘列 out-of-scope，不擋跟隨旗標的理由見下）：
+     * 本門只驗操作數本鏈，不驗遞迴走訪的後代（find/du/ls -R、grep -r 在 spawn 後
+     * 走訪後代，後代內 interior symlink + 跟隨旗標〈find -L、grep -R（含
+     * --dereference-recursive）等，ls/stat/du -L（含 --dereference）等〉可讀域外；
+     * 註：find -H 僅跟隨命令列參數、不跟隨 interior 後代，不在此列；find 預設 -P
+     * 不跟隨。Android 實為 toybox applet 語義，旗標可用性未經裝置驗證）。
+     * interior link 需併發植入或帶外植入；直接通道 `ln` 不在允許命令內
+     * （ALLOWED_BINARIES 無 ln），直接通道模型無法直接建鏈，但 guest 通道
+     * python3/tar/unzip 可在容器內建鏈（見 ProotExec KDoc 容器內殘餘）。
+     * 不擋 -L/-R 的理由：擋 grep -R 將誤殺合法遞迴、有可用性成本，已超本次
+     * 有界切片；未來以工作區無 symlink 不變量或遞迴白名單收斂（Refs #9
+     * follow-up）。提權（Root/Shizuku，見 app/src/github）走同一門
+     * （isElevated=true），同殘餘適用，其 Failed 去路徑化等收斂見 Refs #10
+     * follow-up（刻意不在本 PR 碰 github source set）。
      * F-NORMWALK：步驟 1 walk 的對象為 [FileScope.normalize] 後鏈，原始 `..`
      * 由步驟 0 先拒，順序不可調換（先 normalize 再驗 `..` 會把
      * `/scope/sub/../outside` 誤判為域內，見 F1）。
@@ -837,6 +851,12 @@ object ShellPolicy {
     ): Validation.Denied? {
         fun deny(reason: String): Validation.Denied =
             Validation.Denied(ShellDeny.BLACKLISTED, reason)
+        // F-backslash：候選含 `\` 即拒。FileScope.normalize 會把 `\` 轉 `/`（Windows 相容口徑），
+        // 但 Linux/Android 上 `\` 是合法檔名字元、非分隔符；門若驗 normalize 後路徑、
+        // spawn 用原始操作數，即驗用分叉。Linux 檔名含 `\` 極罕見，fail-closed 誤殺可接受。
+        if (candidate.contains('\\')) {
+            return deny("backslash denied (fail-closed, no normalization): $candidate")
+        }
         // 0. F1：原始含 `..` 即拒，不先做詞法 normalize 折疊。
         // 刻意冗餘：外層 checkPathArgs 已先拒同條件（見 checkPathArgs 內 hasDotDotSegment 外層檢查）；保留作縱深。
         if (hasDotDotSegment(candidate)) {

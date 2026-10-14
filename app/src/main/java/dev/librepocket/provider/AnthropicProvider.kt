@@ -184,10 +184,11 @@ internal class AnthropicMapper(val round: Int = 0) {
 
     private val blocks = LinkedHashMap<Int, Block>()
     // Per-attempt whole-round tool total across all block indexes (Finding
-    // #1). Monotonic across arrivals — content_block_stop never decrements it.
-    // The one non-monotonic transition is TOOL→TOOL re-start at a known index,
-    // which retires the outgoing block's id/name and re-bills the incoming
-    // pair, so the total stays the true sum of currently-buffered chars.
+    // #1). Monotonic across content_block_delta / content_block_stop arrivals.
+    // The two non-monotonic transitions are TOOL→TOOL re-start at a known
+    // index (retires the outgoing block, then re-bills the incoming pair) and
+    // TOOL→non-TOOL demotion (retires only), so the total stays the true sum
+    // of currently-buffered chars.
     private var totalAggChars = 0
     // Distinct TOOL-kind blocks only; TEXT/THINKING/OTHER do not bump it.
     // The shared cap is broader: any distinct block index of any kind is

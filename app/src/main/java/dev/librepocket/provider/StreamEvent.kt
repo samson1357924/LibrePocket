@@ -124,8 +124,12 @@ internal fun requireToolAggBudget(currentChars: Int, incomingChars: Int) {
  * ([TOOL_ARGS_TOO_LARGE] / [ProviderFailureCode.AGG_TOO_LARGE],
  * retryable=false) — one semantics, two scopes (per-call + per-attempt
  * total), so no second error meaning is introduced. [ToolDone] arrivals
- * never decrement it (monotonic per attempt); terminal `finish()` /
- * `finishPendingTools()` traversals only read already-bounded buffers.
+ * never decrement it; the total is monotonic per attempt in Chat
+ * Completions / Responses / TurnController, while `AnthropicMapper` retires
+ * a replaced TOOL block's chars on TOOL→TOOL re-start / TOOL→non-TOOL
+ * demotion so its total stays equal to the LIVE buffered sum (see
+ * `AnthropicMapper`). Terminal `finish()` / `finishPendingTools()`
+ * traversals only read already-bounded buffers.
  *
  * @throws ProviderFailure non-retryable, [ProviderFailureCode.AGG_TOO_LARGE].
  */
@@ -147,7 +151,8 @@ internal fun requireTotalToolAggBudget(totalChars: Int, incomingChars: Int) =
  *   index restarts as TOOL;
  * - Responses `emittedToolIds`: one entry per distinct (`toolIndex`, id)
  *   pair already emitted (its `output_item.done` path is pre-checked here;
- *   the `finishPendingTools` drain only replays already-capped entries).
+ *   the `finishPendingTools` drain adds at most one pair per already-capped
+ *   `callsByItem` entry, so the set stays within 2x the cap).
  * Admissions are checked BEFORE insert, so the overflowing entry is never
  * buffered; a key that only replaces a known one is not re-billed.
  *

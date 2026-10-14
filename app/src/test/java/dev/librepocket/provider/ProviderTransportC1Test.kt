@@ -5,6 +5,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.toList
@@ -125,7 +126,7 @@ class ProviderTransportC1Test {
         private val countingInterceptor = object : Interceptor {
             override fun intercept(chain: Interceptor.Chain): Response {
                 val response = chain.proceed(chain.request())
-                val delegate = response.body
+                val delegate = response.body ?: return response
                 val counted = object : ResponseBody() {
                     private val countedSource: BufferedSource = object : ForwardingSource(delegate.source()) {
                         override fun read(sink: Buffer, byteCount: Long): Long {
@@ -338,9 +339,9 @@ class ProviderTransportC1Test {
                 append("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
                 append("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
                 append("data: [DONE]\n\n")
-                // Trailing over-long line, unterminated: the EOF flush emits
-                // [DONE] and latches the budget in one step, and the terminal
-                // already reached must suppress the latched overflow.
+                // Trailing over-long line, NEVER READ: the pump stopped after
+                // [DONE], so the latch cannot fire and this only locks the
+                // provider-side STOP contract (see the KDoc above).
                 append("data: ")
                 append("x".repeat(SseFrameParser.MAX_LINE_BYTES + 1024))
             }
@@ -420,8 +421,9 @@ class ProviderTransportC1Test {
      */
     @Test
     fun cancellationWhilePartialOverlongLineBuffersEmitsNoTerminal() = runBlocking {
-        // 340_006 chars => ~1.02MiB estimated: below MAX_LINE_BYTES, so the
-        // tail latch has not tripped and the very next bytes would trip it.
+        // "data: " (6) + 340_000 chars => ~1.02MiB estimated: below
+        // MAX_LINE_BYTES, so the tail latch has not tripped and the very next
+        // bytes would trip it.
         val partialChars = 340_000
         // The peer must stay blocked: an unknown-length (chunked) body whose
         // last period is stalled server-side. A fixed-length body would EOF
@@ -470,7 +472,7 @@ class ProviderTransportC1Test {
             assertTrue("cancelling emits no terminal event, got: $events", events.isEmpty())
             assertTrue(
                 "cancelling is not converted into a retryable transport failure, threw: $thrown",
-                thrown == null || thrown is kotlinx.coroutines.CancellationException,
+                thrown == null || thrown is CancellationException,
             )
             assertEquals("cancelled stream remains one request", 1, server.requestCount)
         } finally {
@@ -610,6 +612,13 @@ class ProviderTransportC1Test {
         }
     }
 
+    /**
+     * Original RED case of the blocks-map cap: 65 distinct TEXT block indexes
+     * (a legal small SSE line each) must trip the shared distinct-index budget
+     * with the same typed non-retryable failure as tool overflows.
+     * [ToolAggBudgetTest] adds the discriminating variants (thinking flood,
+     * mixed kinds, restart-is-not-admission, demotion).
+     */
     @Test
     fun anthropicManyDistinctTextBlocksTripBlockCapTyped() {
         val mapper = AnthropicMapper()

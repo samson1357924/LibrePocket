@@ -812,6 +812,23 @@ class ToolAggBudgetTest {
             """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t0b","name":"n"}}""",
         )
         assertEquals(1, promoted.filterIsInstance<StreamEvent.ToolDelta>().size)
+        // Char-total half of the SAME retirement: demotion must also retire the
+        // outgoing TOOL block's id/name, so re-promoting the index with an
+        // equally large id re-bills one block instead of two (removing the
+        // demotion-side retirement makes this throw a spurious
+        // TOOL_ARGS_TOO_LARGE at 2 x 349_000 chars).
+        val mapper2 = AnthropicMapper()
+        val bigId = "i".repeat(349_000)
+        mapper2.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"$bigId","name":"n"}}""",
+        )
+        mapper2.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}""",
+        )
+        val rePromoted = mapper2.mapPayload(
+            """{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"$bigId","name":"n"}}""",
+        )
+        assertEquals(1, rePromoted.filterIsInstance<StreamEvent.ToolDelta>().size)
         // Negative control: the shared cap stays live. A genuinely new index
         // after 64 admissions is still refused, so nothing above disabled it.
         val over = toolFailureOf {

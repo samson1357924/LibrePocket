@@ -490,11 +490,19 @@ class ChatViewModel(
                             ensureSession(access.endpoint, clean)
                         } catch (cancelled: CancellationException) {
                             throw cancelled
-                        } catch (_: SecurityException) {
+                        } catch (_: CaptureDeniedException) {
+                            // S1: burn a consent minted between T0 and T1 so
+                            // a T1 deny leaves no residual slot for replay.
+                            // CancellationException stays on its own branch
+                            // above and never burns.
+                            takePendingKeyReadConsent()
                             // S6 capture-boundary T1 DENY/failure (factory
                             // CaptureDeniedException): T0 key.read passed but
                             // T1 failed. Distinct from chat.send CHAT_SEND_DENIED
                             // below (the inner startOrEnqueue catch stays).
+                            // Only CaptureDeniedException maps to POLICY_DENIED
+                            // here; a non-Capture SecurityException falls
+                            // through to the outer NO_ENDPOINT branch.
                             setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                             restoreOpForFailedSend(opId, "POLICY_DENIED")
                             return@launch
@@ -695,11 +703,19 @@ class ChatViewModel(
                             ensureSession(access.endpoint, text)
                         } catch (cancelled: CancellationException) {
                             throw cancelled
-                        } catch (_: SecurityException) {
+                        } catch (_: CaptureDeniedException) {
+                            // S1: burn a consent minted between T0 and T1 so
+                            // a T1 deny leaves no residual slot for replay.
+                            // CancellationException stays on its own branch
+                            // above and never burns.
+                            takePendingKeyReadConsent()
                             // S6 capture-boundary T1 DENY/failure (factory
                             // CaptureDeniedException): T0 key.read passed but
                             // T1 failed. Distinct from chat.send CHAT_SEND_DENIED
                             // below (the inner startOrEnqueue catch stays).
+                            // Only CaptureDeniedException maps to POLICY_DENIED
+                            // here; a non-Capture SecurityException falls
+                            // through to the outer NO_ENDPOINT branch.
                             setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                             restoreOpForFailedSend(opId, "POLICY_DENIED")
                             return@launch
@@ -932,14 +948,20 @@ class ChatViewModel(
                     val creationGeneration = requestedGeneration
                     try {
                         withContext(Dispatchers.IO) {
-                            candidate = sessions.open(latest, sessionId) {
+                            candidate = sessions.open(latest, sessionId, allowAsk = access.allowAsk) {
                                 isBindingCurrent(access.binding, creationGeneration)
                             }
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
-                    } catch (_: SecurityException) {
-                        // S6 capture-boundary T1 DENY/failure on open.
+                    } catch (_: CaptureDeniedException) {
+                        // S1: burn a consent minted between T0 and T1 so a
+                        // T1 deny on open leaves no residual slot for replay.
+                        takePendingKeyReadConsent()
+                        // S6 capture-boundary T1 DENY/failure on open. Only
+                        // CaptureDeniedException maps to POLICY_DENIED here;
+                        // a non-Capture SecurityException falls through to
+                        // the outer NO_ENDPOINT branch.
                         setNoticeIfCurrent(requestedGeneration, "POLICY_DENIED")
                         return@withLock
                     }
@@ -1030,17 +1052,27 @@ class ChatViewModel(
         // consent), as does a policy evaluation failure above; only an
         // explicit ALLOW proceeds without one. No synthetic ALLOW is
         // introduced here.
-        when (decision.verdict) {
+        // S1: every authorization consumes the one-shot slot at most once.
+        // DENY, ALLOW, and evaluation failure all burn an unconsumed
+        // consent; ASK takes it and passes only on a binding- and
+        // generation-matched consent (allowAsk proof for the T1 recheck).
+        // An ALLOW→ASK flip between T0 and T1 must not pass: T0 ALLOW
+        // carries no proof, so T1 ASK denies.
+        val allowAsk = when (decision.verdict) {
             Verdict.DENY -> {
                 takePendingKeyReadConsent()
                 return EndpointAccess.Denied
             }
-            Verdict.ALLOW -> Unit
+            Verdict.ALLOW -> {
+                takePendingKeyReadConsent()
+                false
+            }
             Verdict.ASK -> {
                 val consent = takePendingKeyReadConsent()
                 if (consent == null || !keyReadConsentMatches(consent, binding, authorizedGeneration)) {
                     return EndpointAccess.ConfirmRequired
                 }
+                true
             }
         }
 
@@ -1058,7 +1090,7 @@ class ChatViewModel(
             reconcileReadBinding(bindingOf(latest))
             return EndpointAccess.Stale
         }
-        return EndpointAccess.Ready(AuthorizedEndpoint(latest, binding, authorizedGeneration))
+        return EndpointAccess.Ready(AuthorizedEndpoint(latest, binding, authorizedGeneration, allowAsk))
     }
 
     /** Single-flight construction. All mutable ViewModel state stays on Main. */
@@ -1126,7 +1158,7 @@ class ChatViewModel(
         var failure: Throwable? = null
         try {
             withContext(Dispatchers.IO) {
-                candidate = sessions.create(endpoint, title) {
+                candidate = sessions.create(endpoint, title, allowAsk = authorized.allowAsk) {
                     isBindingCurrent(authorized.binding, creationGeneration)
                 }
             }
@@ -1873,6 +1905,10 @@ class ChatViewModel(
         val config: EndpointConfig,
         val binding: EndpointSessionBinding,
         val generation: Long,
+        // S1 T0 proof: true only when T0 observed ASK plus a bound,
+        // generation-matched one-shot consent. Threaded into the factory
+        // T1 recheck; every other T0 outcome passes false.
+        val allowAsk: Boolean,
     )
 
     private data class SessionHandle(

@@ -153,6 +153,9 @@ class ChatSessionLifecycleTest {
             fresh.sendFinished.await()
             assertEquals(listOf("positive control"), fresh.sent.toList())
             assertEquals("session-2", vm.currentSessionId.value)
+            // S1: ALLOW threads no ASK proof (fail-closed default).
+            assertTrue(sessions.seenAllowAsk.isNotEmpty())
+            assertTrue(sessions.seenAllowAsk.all { !it })
         } finally {
             releaseCreate.complete(Unit)
             chatMain.run { vm.newChat() }
@@ -221,6 +224,8 @@ class ChatSessionLifecycleTest {
             assertEquals(1, sessions.created.size)
             assertEquals(1, session.sent.size)
             assertEquals(setOf("first", "second"), (session.sent + steered).toSet())
+            // S1: ALLOW threads no ASK proof.
+            assertTrue(sessions.seenAllowAsk.all { !it })
 
             releaseFirstTurn.complete(Unit)
             session.sendFinished.await()
@@ -657,6 +662,71 @@ class ChatSessionLifecycleTest {
             assertEquals("A", vm.currentSessionId.value)
             assertTrue(b.closed.isCompleted)
             assertTrue(newestA.closed.isCompleted.not())
+            // S1: ALLOW open threads no ASK proof.
+            assertTrue(sessions.seenAllowAsk.isNotEmpty())
+            assertTrue(sessions.seenAllowAsk.all { !it })
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // S1 lifecycle negative control (create): ASK without a bound one-shot
+    // never reaches the factory (allowAsk=false would deny, but the T0 gate
+    // stops first); a consented ASK threads allowAsk=true exactly once.
+    @Test
+    fun askCreateThreadsProofOnce() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val vm = newViewModel(store, sessions, InMemoryPolicyStore())
+        try {
+            chatMain.run { vm.sendDirect("hi") }
+            withTimeout(5_000) { vm.notice.first { it == "KEY_READ_CONFIRM_REQUIRED" } }
+            assertEquals(0, sessions.createCalls)
+            assertEquals(0, sessions.openCalls)
+            assertTrue(sessions.seenAllowAsk.isEmpty())
+            assertEquals("hi", vm.input.value)
+
+            assertTrue(vm.confirmKeyRead())
+            chatMain.run { vm.sendDirect("hi") }
+            val live = sessions.awaitCreated(1)
+            live.sendFinished.await()
+            assertEquals(1, sessions.createCalls)
+            assertEquals(listOf(true), sessions.seenAllowAsk.toList())
+            assertEquals(listOf("hi"), live.sent.toList())
+        } finally {
+            chatMain.run { vm.newChat() }
+        }
+    }
+
+    // S1 lifecycle negative control (open): same proof threading on resume.
+    // openSession invalidates first (burning any pre-minted slot), so the
+    // consented half mints after the second open's invalidate by gating
+    // loadHistory.
+    @Test
+    fun askOpenThreadsProofOnce() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val vm = newViewModel(store, sessions, InMemoryPolicyStore())
+        try {
+            chatMain.run { vm.openSession("H1") }
+            withTimeout(5_000) { vm.notice.first { it == "KEY_READ_CONFIRM_REQUIRED" } }
+            assertEquals(0, sessions.openCalls)
+            assertEquals(0, sessions.createCalls)
+            assertTrue(sessions.seenAllowAsk.isEmpty())
+
+            val history = GatedHistoryStore()
+            sessions.backingStore = history
+            chatMain.run { vm.openSession("H2") }
+            withTimeout(5_000) { history.entered.await() }
+            assertTrue(vm.confirmKeyRead())
+            history.release.complete(Unit)
+            sessions.awaitOpened("H2")
+            withTimeout(5_000) { vm.currentSessionId.first { it == "H2" } }
+            assertEquals(1, sessions.openCalls)
+            assertEquals(listOf(true), sessions.seenAllowAsk.toList())
+            assertEquals("H2", vm.currentSessionId.value)
         } finally {
             chatMain.run { vm.newChat() }
         }
@@ -3190,6 +3260,7 @@ class ChatSessionLifecycleTest {
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
             val id = "controller-session-${created.incrementAndGet()}"
@@ -3212,6 +3283,7 @@ class ChatSessionLifecycleTest {
         override suspend fun open(
             endpoint: EndpointConfig,
             sessionId: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
 
@@ -3334,6 +3406,7 @@ class ChatSessionLifecycleTest {
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
             if (createCount.incrementAndGet() == 1) {
@@ -3372,6 +3445,7 @@ class ChatSessionLifecycleTest {
         override suspend fun open(
             endpoint: EndpointConfig,
             sessionId: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
 
@@ -3391,12 +3465,14 @@ class ChatSessionLifecycleTest {
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ) = CreatedSession("fresh-deny", session, endpoint.providerId, modelFor(endpoint))
 
         override suspend fun open(
             endpoint: EndpointConfig,
             sessionId: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
 
@@ -3457,12 +3533,14 @@ class ChatSessionLifecycleTest {
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ) = CreatedSession("needs-recovery", session, endpoint.providerId, modelFor(endpoint))
 
         override suspend fun open(
             endpoint: EndpointConfig,
             sessionId: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
 
@@ -3546,12 +3624,14 @@ class ChatSessionLifecycleTest {
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ) = CreatedSession("legacy-null-recovery", session, endpoint.providerId, modelFor(endpoint))
 
         override suspend fun open(
             endpoint: EndpointConfig,
             sessionId: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
 
@@ -3596,6 +3676,10 @@ class ChatSessionLifecycleTest {
         private val createCounter = AtomicInteger()
         private val openCounter = AtomicInteger()
         val createAttemptIds = CopyOnWriteArrayList<String>()
+        // S1: records the T0 allowAsk proof threaded into each factory call.
+        // ALLOW authorizations must thread false (no proof); a consented ASK
+        // threads true exactly once. Asserted by the S1 lifecycle tests.
+        val seenAllowAsk = CopyOnWriteArrayList<Boolean>()
         val createCalls: Int get() = createCounter.get()
         val openCalls: Int get() = openCounter.get()
         var createGate: suspend (Int) -> Unit = {}
@@ -3619,11 +3703,13 @@ class ChatSessionLifecycleTest {
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
             val ordinal = createCounter.incrementAndGet()
             val sessionId = "session-$ordinal"
             createAttemptIds.add(sessionId)
+            seenAllowAsk.add(allowAsk)
             createGate(ordinal)
             val session = RecordingSession(sessionId, sendGate, acceptGate)
             created.add(session)
@@ -3634,9 +3720,11 @@ class ChatSessionLifecycleTest {
         override suspend fun open(
             endpoint: EndpointConfig,
             sessionId: String,
+            allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
             val ordinal = openCounter.incrementAndGet()
+            seenAllowAsk.add(allowAsk)
             openGate(sessionId, ordinal)
             val session = RecordingSession(sessionId, sendGate, acceptGate)
             opened.add(session)

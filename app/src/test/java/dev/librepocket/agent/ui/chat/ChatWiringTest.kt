@@ -6,7 +6,6 @@ import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -38,11 +37,13 @@ private class FakeChatProvider(
     var handler: (ChatRequest) -> Flow<StreamEvent> = { emptyFlow() },
 ) : LlmProvider {
     override val protocol: ProviderProtocol = ProviderProtocol.CHAT_COMPLETIONS
-    var streamCalls = 0
+    // S1: incremented from the provider IO path; AtomicInteger so concurrent
+    // turn assertions never miss an increment.
+    val streamCalls = java.util.concurrent.atomic.AtomicInteger(0)
     val seenRequests: MutableList<ChatRequest> = java.util.Collections.synchronizedList(mutableListOf())
 
     override fun stream(request: ChatRequest): Flow<StreamEvent> = flow {
-        streamCalls++
+        streamCalls.incrementAndGet()
         seenRequests.add(request)
         emitAll(handler(request))
     }
@@ -112,12 +113,15 @@ class ChatWiringTest {
     ): ChatViewModel {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        // S1: T0/T1 share one store so the factory T1 recheck enforces the
+        // same verdict the ViewModel authorized (see KeyReadTest newRig).
+        val policy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = policy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        return chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        return chatViewModels.own(ChatViewModel(store, factory, policy))
     }
 
     private fun awaitTrue(timeoutMs: Long = 8000, cond: () -> Boolean) {
@@ -166,12 +170,14 @@ class ChatWiringTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
+        // S1: shared T0/T1 store (see newVm).
+        val policy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = policy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
         try {
             onMain { vm.onInputChange("first") }
             onMain { vm.send() }
@@ -208,22 +214,24 @@ class ChatWiringTest {
                 }
             }
         }
+        // S1: shared T0/T1 store (see newVm).
+        val policy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = policy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
         onMain { vm.onInputChange("hi") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.ERROR }
         assertTrue(vm.sessionState.value.error != null)
-        assertEquals(1, fake.streamCalls)
+        assertEquals(1, fake.streamCalls.get())
         assertTrue(vm.canRetry)
         failFirst = false
         onMain { vm.retry() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE }
-        assertEquals(2, fake.streamCalls)
+        assertEquals(2, fake.streamCalls.get())
         assertNull(vm.sessionState.value.error)
     }
 
@@ -241,13 +249,17 @@ class ChatWiringTest {
                 return id
             }
         }
+        // S1: direct factory.create passes explicit fail-closed
+        // allowAsk=false (Kotlin forbids defaults on overrides, so the
+        // interface default does not apply to the concrete type) with an
+        // explicit ALLOW verdict; never forge proof with allowAsk=true.
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> FakeChatProvider() },
             sessionStores = SessionStoreSource { transcripts },
         )
-        val creation = async { factory.create(sampleEndpoint(), "cancel after row") }
+        val creation = async { factory.create(sampleEndpoint(), "cancel after row", allowAsk = false, keyIsCurrent = { true }) }
 
         try {
             withTimeout(5_000) { rowCreated.await() }
@@ -265,14 +277,15 @@ class ChatWiringTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
         val transcripts = dev.librepocket.session.FakeSessionStore()
+        // S1: direct create needs explicit ALLOW (fail-closed default).
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> FakeChatProvider() },
             sessionStores = SessionStoreSource { transcripts },
         )
 
-        val created = factory.create(sampleEndpoint(), "not attached")
+        val created = factory.create(sampleEndpoint(), "not attached", allowAsk = false, keyIsCurrent = { true })
         val sessionId = checkNotNull(created.sessionId)
         assertNotNull(transcripts.getSession(sessionId))
 
@@ -287,14 +300,15 @@ class ChatWiringTest {
         vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
         val transcripts = dev.librepocket.session.FakeSessionStore()
         val sessionId = transcripts.createSession("existing", "gpt-4o-mini")
+        // S1: direct open needs explicit ALLOW (fail-closed default).
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> FakeChatProvider() },
             sessionStores = SessionStoreSource { transcripts },
         )
 
-        val opened = factory.open(sampleEndpoint(), sessionId)
+        val opened = factory.open(sampleEndpoint(), sessionId, allowAsk = false, keyIsCurrent = { true })
         factory.discardUnattached(opened, deleteTranscriptRow = false)
 
         assertNotNull(transcripts.getSession(sessionId))
@@ -302,14 +316,16 @@ class ChatWiringTest {
 
     @Test
     fun factoryRejectsMalformedRef() {
+        // S1: malformed ref throws before the policy gate; ALLOW keeps the
+        // verdict path explicit under fail-closed defaults.
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
             buildProvider = { _, _ -> FakeChatProvider() },
         )
         runBlocking {
             try {
-                factory.create(sampleEndpoint().copy(apiKeyRef = "sk-pasted-key-material"), "hi")
+                factory.create(sampleEndpoint().copy(apiKeyRef = "sk-pasted-key-material"), "hi", allowAsk = false, keyIsCurrent = { true })
                 error("expected PROVIDER_KEY_REF_MALFORMED")
             } catch (e: IllegalArgumentException) {
                 assertEquals("PROVIDER_KEY_REF_MALFORMED", e.message)
@@ -349,15 +365,17 @@ class ChatWiringTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
+        // S1: T0/T1 share one store (see newVm).
+        val policy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = policy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
@@ -411,15 +429,17 @@ class ChatWiringTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
+        // S1: T0/T1 share one store (see newVm).
+        val policy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = policy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 4 }
         val replayed = vm.messages.value
@@ -464,15 +484,17 @@ class ChatWiringTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
+        // S1: T0/T1 share one store (see newVm).
+        val policy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = policy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         val replayed = vm.messages.value
@@ -521,15 +543,17 @@ class ChatWiringTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
+        // S1: T0/T1 share one store (see newVm).
+        val policy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = policy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
@@ -564,15 +588,17 @@ class ChatWiringTest {
                 emit(StreamEvent.Done("stop"))
             }
         }
+        // S1: T0/T1 share one store (see newVm).
+        val policy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = policy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, policy))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
@@ -641,8 +667,11 @@ class ChatWiringTest {
                     dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
                 )
         }
+        // S1: T0/T1 share the same deny store; the factory is never
+        // reached (T0 denies), but the shared instance keeps the wiring
+        // explicit (see newVm).
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = deny,
             vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
             buildProvider = { _, _ -> fake },
         )
@@ -650,7 +679,7 @@ class ChatWiringTest {
         onMain { vm.onInputChange("hi") }
         onMain { vm.send() }
         awaitTrue { vm.notice.value == "POLICY_DENIED" }
-        assertEquals(0, fake.streamCalls)
+        assertEquals(0, fake.streamCalls.get())
         assertTrue(vm.sessionState.value.messages.isEmpty())
     }
 
@@ -678,15 +707,16 @@ class ChatWiringTest {
                     dev.librepocket.policy.Verdict.DENY, null, System.currentTimeMillis(),
                 )
         }
+        // S1: shared deny store (see policyDenyBlocksSendWithZeroRequests).
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = deny,
             vaultSource = VaultSource { EncryptedPrefsVault(InMemoryPrefs()) },
             buildProvider = { _, _ -> fake },
         )
         val vm = chatViewModels.own(ChatViewModel(store, factory, deny))
         onMain { vm.steer("queued-evil") }
         awaitTrue { vm.notice.value == "POLICY_DENIED" }
-        assertEquals(0, fake.streamCalls)
+        assertEquals(0, fake.streamCalls.get())
     }
 
     @Test
@@ -703,8 +733,10 @@ class ChatWiringTest {
         }
         var creates = 0
         val transcripts = dev.librepocket.session.FakeSessionStore()
+        // S1: shared T0/T1 store (see newVm).
+        val modelPolicy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = modelPolicy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ ->
                 creates++
@@ -714,7 +746,7 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, modelPolicy))
         onMain { vm.onInputChange("one") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.messages.isNotEmpty() }
@@ -747,15 +779,17 @@ class ChatWiringTest {
             }
         }
         var creates = 0
+        // S1: shared T0/T1 store (see newVm).
+        val switchPolicy = allowKeyReadPolicy()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = switchPolicy,
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ ->
                 creates++
                 fake
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, switchPolicy))
         onMain { vm.onInputChange("one") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.messages.isNotEmpty() }

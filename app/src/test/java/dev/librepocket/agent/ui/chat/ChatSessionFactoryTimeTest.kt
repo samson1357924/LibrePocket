@@ -3,7 +3,6 @@ package dev.librepocket.agent.ui.chat
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -110,7 +109,7 @@ class ChatSessionFactoryTimeTest {
         val fixedClock = Clock.fixed(Instant.parse("2026-01-15T12:00:00Z"), ZoneId.of("UTC"))
         val fake = ok()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
@@ -120,7 +119,7 @@ class ChatSessionFactoryTimeTest {
             userTimezone = "UTC",
             systemZone = { ZoneId.of("UTC") },
         )
-        val created = factory.create(sampleEndpoint(), "hi")
+        val created = factory.create(sampleEndpoint(), "hi", allowAsk = false, keyIsCurrent = { true })
         created.session.send("hi")
 
         val sent = lastUserText(fake.seenRequests.single())!!
@@ -143,7 +142,7 @@ class ChatSessionFactoryTimeTest {
         val clock = ManualClock(Instant.parse("2026-01-15T12:00:00Z"), ZoneId.of("UTC"))
         val fake = ok()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
@@ -153,14 +152,14 @@ class ChatSessionFactoryTimeTest {
             userTimezone = "UTC",
             systemZone = { ZoneId.of("UTC") },
         )
-        val created = factory.create(sampleEndpoint(), "hi")
+        val created = factory.create(sampleEndpoint(), "hi", allowAsk = false, keyIsCurrent = { true })
         val sid = created.sessionId!!
         created.session.send("first")
         val firstSession = sessionLine(lastUserText(fake.seenRequests.single()))
 
         // Advance the wall clock 5 days; resume must keep the original Room time.
         clock.advanceBy(Duration.ofDays(5))
-        val opened = factory.open(sampleEndpoint(), sid)
+        val opened = factory.open(sampleEndpoint(), sid, allowAsk = false, keyIsCurrent = { true })
         opened.session.send("second")
 
         assertEquals(2, fake.seenRequests.size)
@@ -177,7 +176,7 @@ class ChatSessionFactoryTimeTest {
     @Test fun storelessOmitsSessionStarted() = runBlocking {
         val fake = ok()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = null,
@@ -185,7 +184,7 @@ class ChatSessionFactoryTimeTest {
             userTimezone = "UTC",
             systemZone = { ZoneId.of("UTC") },
         )
-        val created = factory.create(sampleEndpoint(), "hi")
+        val created = factory.create(sampleEndpoint(), "hi", allowAsk = false, keyIsCurrent = { true })
         assertNull(created.sessionId)
         created.session.send("hi")
 
@@ -201,7 +200,7 @@ class ChatSessionFactoryTimeTest {
             val transcripts = FakeSessionStore().apply { now = bad }
             val fake = ok()
             val factory = ChatSessionFactory(
-                policy = InMemoryPolicyStore(),
+                policy = allowKeyReadPolicy(),
                 vaultSource = testVaultSource(),
                 buildProvider = { _, _ -> fake },
                 sessionStores = object : SessionStoreSource {
@@ -211,7 +210,7 @@ class ChatSessionFactoryTimeTest {
                 userTimezone = "UTC",
                 systemZone = { ZoneId.of("UTC") },
             )
-            val created = factory.create(sampleEndpoint(), "hi")
+            val created = factory.create(sampleEndpoint(), "hi", allowAsk = false, keyIsCurrent = { true })
             // Must not throw; the turn still sends.
             created.session.send("hi")
             val sent = lastUserText(fake.seenRequests.single())!!
@@ -224,7 +223,7 @@ class ChatSessionFactoryTimeTest {
         val transcripts = FakeSessionStore()
         val fake = ok()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
@@ -234,12 +233,12 @@ class ChatSessionFactoryTimeTest {
             userTimezone = "UTC",
             systemZone = { ZoneId.of("UTC") },
         )
-        val created = factory.create(sampleEndpoint(), "hi")
+        val created = factory.create(sampleEndpoint(), "hi", allowAsk = false, keyIsCurrent = { true })
         val sid = created.sessionId!!
         // Corrupt the stored header after creation; resume must omit, not throw.
         val old = transcripts.metas[sid]!!
         transcripts.metas[sid] = old.copy(createdAt = 0L)
-        val opened = factory.open(sampleEndpoint(), sid)
+        val opened = factory.open(sampleEndpoint(), sid, allowAsk = false, keyIsCurrent = { true })
         opened.session.send("hi")
         val sent = lastUserText(fake.seenRequests.single())!!
         assertFalse(sent.contains("Session started:"))
@@ -254,7 +253,7 @@ class ChatSessionFactoryTimeTest {
         // createSession still works; only the sessionStart lookup throws.
         val fake = ok()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
@@ -266,7 +265,7 @@ class ChatSessionFactoryTimeTest {
             systemZone = { ZoneId.of("UTC") },
         )
         // Must not throw (fail-closed to omit); the turn still sends.
-        val created = factory.create(sampleEndpoint(), "hi")
+        val created = factory.create(sampleEndpoint(), "hi", allowAsk = false, keyIsCurrent = { true })
         created.session.send("hi")
         val sent = lastUserText(fake.seenRequests.single())!!
         assertFalse(sent.contains("Session started:"))
@@ -277,7 +276,7 @@ class ChatSessionFactoryTimeTest {
     @Test fun openUnknownStillThrowsUnknownSession() = runBlocking {
         val transcripts = FakeSessionStore()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> ok() },
             sessionStores = object : SessionStoreSource {
@@ -288,7 +287,7 @@ class ChatSessionFactoryTimeTest {
             systemZone = { ZoneId.of("UTC") },
         )
         try {
-            factory.open(sampleEndpoint(), "no-such-id")
+            factory.open(sampleEndpoint(), "no-such-id", allowAsk = false, keyIsCurrent = { true })
             fail("expected UNKNOWN_SESSION")
         } catch (e: IllegalArgumentException) {
             assertEquals("UNKNOWN_SESSION", e.message)
@@ -299,7 +298,7 @@ class ChatSessionFactoryTimeTest {
                 error("db down")
         }
         val throwingFactory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> ok() },
             sessionStores = object : SessionStoreSource {
@@ -310,7 +309,7 @@ class ChatSessionFactoryTimeTest {
             systemZone = { ZoneId.of("UTC") },
         )
         try {
-            throwingFactory.open(sampleEndpoint(), "any-id")
+            throwingFactory.open(sampleEndpoint(), "any-id", allowAsk = false, keyIsCurrent = { true })
             fail("expected UNKNOWN_SESSION for throwing getSession")
         } catch (e: IllegalArgumentException) {
             assertEquals("UNKNOWN_SESSION", e.message)
@@ -323,7 +322,7 @@ class ChatSessionFactoryTimeTest {
         val clock = ManualClock(Instant.parse("2026-01-15T12:00:00Z"), ZoneId.of("UTC"))
         val fake = ok()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
@@ -334,7 +333,7 @@ class ChatSessionFactoryTimeTest {
             systemZone = { ZoneId.of("UTC") },
         )
         // Same live session reused (no re-stamp, mirrors ChatViewModel.ensureSession).
-        val created = factory.create(sampleEndpoint(), "hi")
+        val created = factory.create(sampleEndpoint(), "hi", allowAsk = false, keyIsCurrent = { true })
         created.session.send("one")
         clock.advanceBy(Duration.ofHours(1))
         created.session.send("two")
@@ -370,7 +369,7 @@ class ChatSessionFactoryTimeTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
@@ -380,7 +379,7 @@ class ChatSessionFactoryTimeTest {
             userTimezone = "UTC",
             systemZone = { ZoneId.of("UTC") },
         )
-        val created = factory.create(sampleEndpoint(), "hi")
+        val created = factory.create(sampleEndpoint(), "hi", allowAsk = false, keyIsCurrent = { true })
         // Default retry budget sleeps 2s before the retry; wait generously.
         withTimeout(15000) {
             created.session.send("hi")
@@ -414,7 +413,7 @@ class ChatSessionFactoryTimeTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = testVaultSource(),
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
@@ -424,7 +423,7 @@ class ChatSessionFactoryTimeTest {
             userTimezone = "UTC",
             systemZone = { ZoneId.of("UTC") },
         )
-        val created = factory.create(sampleEndpoint(), "hi")
+        val created = factory.create(sampleEndpoint(), "hi", allowAsk = false, keyIsCurrent = { true })
         val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
         try {
             val first = outer.async { created.session.send("first") }

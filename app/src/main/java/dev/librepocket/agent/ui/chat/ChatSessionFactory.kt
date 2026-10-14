@@ -85,12 +85,14 @@ interface ChatSessionProvider {
     suspend fun create(
         endpoint: EndpointConfig,
         title: String,
+        allowAsk: Boolean = false,
         keyIsCurrent: suspend () -> Boolean = { true },
     ): CreatedSession
 
     suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,
+        allowAsk: Boolean = false,
         keyIsCurrent: suspend () -> Boolean = { true },
     ): CreatedSession
 
@@ -123,9 +125,14 @@ class ChatSessionFactory(
     private val userTimezone: String? = null,
     private val systemZone: () -> ZoneId = ZoneId::systemDefault,
 ) : ChatSessionProvider {
+    // S1: no defaults on overrides (Kotlin forbids defaults on overriding
+    // functions): the fail-closed default allowAsk=false lives on the
+    // interface only. Concrete-type callers must pass an explicit
+    // allowAsk=false; only the ViewModel threads true (T0 ASK proof).
     override suspend fun create(
         endpoint: EndpointConfig,
         title: String,
+        allowAsk: Boolean,
         keyIsCurrent: suspend () -> Boolean,
     ): CreatedSession {
         val config = endpoint.toProviderConfig()
@@ -138,8 +145,9 @@ class ChatSessionFactory(
         try {
             requireCurrentBinding(keyIsCurrent)
             // S6 capture-boundary T1 recheck (see requireKeyReadAllowed):
-            // narrowed to DENY/failure only; ALLOW/ASK pass through.
-            requireKeyReadAllowed(endpoint.providerId)
+            // DENY/failure always deny; ASK needs the T0 one-shot proof
+            // (allowAsk); ALLOW passes without proof.
+            requireKeyReadAllowed(endpoint.providerId, allowAsk)
             val captured = captureCredential(endpoint)
             credential = captured
             val store = sessionStores?.store()
@@ -219,6 +227,7 @@ class ChatSessionFactory(
     override suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,
+        allowAsk: Boolean,
         keyIsCurrent: suspend () -> Boolean,
     ): CreatedSession {
         val config = endpoint.toProviderConfig()
@@ -240,8 +249,9 @@ class ChatSessionFactory(
         requireCurrentBinding(keyIsCurrent)
         val model = modelFor(endpoint)
         // S6 capture-boundary T1 recheck (see requireKeyReadAllowed):
-        // narrowed to DENY/failure only; ALLOW/ASK pass through.
-        requireKeyReadAllowed(endpoint.providerId)
+        // DENY/failure always deny; ASK needs the T0 one-shot proof
+        // (allowAsk); ALLOW passes without proof.
+        requireKeyReadAllowed(endpoint.providerId, allowAsk)
         val credential = captureCredential(endpoint)
         var session: ChatSession? = null
         try {
@@ -343,18 +353,24 @@ class ChatSessionFactory(
      * S6 capture-boundary T1 recheck: a second `key.read` fresh evaluation
      * immediately before the vault read (after the first binding gate).
      *
-     * Only DENY or an evaluation failure aborts (fail-closed as
-     * [CaptureDeniedException], no vault read, no session built). ALLOW and
-     * ASK both pass: ASK relies on the T0 one-shot consent already consumed
-     * by [dev.librepocket.agent.ui.chat.ChatViewModel.authorizeEndpoint], so
-     * a still-ASK verdict at T1 is treated as a stable pass.
+     * DENY or an evaluation failure aborts fail-closed as
+     * [CaptureDeniedException] (no vault read, no session built). ALLOW
+     * passes without proof. ASK passes only with the T0 one-shot proof
+     * ([allowAsk]: the ViewModel's T0 gate already consumed a bound
+     * consent for this same operation); a still-ASK verdict at T1 without
+     * that proof denies (an ALLOW→ASK flip between T0 and T1 must not
+     * pass through). [allowAsk] is true only when T0 observed ASK plus a
+     * binding- and generation-matched consent; every other T0 outcome
+     * passes false.
      *
-     * Residual window (documented): a DENY flip landing after this recheck
-     * but before `vault.getKey` still passes. Narrowing it further would
-     * require holding the policy gate across the vault read, out of scope
-     * for this light recheck.
+     * Residual window (documented): a policy/generation/binding flip
+     * landing after this recheck but before `vault.getKey` still passes
+     * (a DENY verdict flip, a lifecycle-generation bump, or an endpoint
+     * binding flip that the later keyIsCurrent gates would otherwise
+     * catch). Narrowing it further would require holding the policy gate
+     * across the vault read, out of scope for this light recheck.
      */
-    private suspend fun requireKeyReadAllowed(providerId: String) {
+    private suspend fun requireKeyReadAllowed(providerId: String, allowAsk: Boolean) {
         val verdict = try {
             policy.evaluateFresh("key.read", providerId).verdict
         } catch (cancelled: CancellationException) {
@@ -363,6 +379,7 @@ class ChatSessionFactory(
             throw CaptureDeniedException()
         }
         if (verdict == Verdict.DENY) throw CaptureDeniedException()
+        if (verdict == Verdict.ASK && !allowAsk) throw CaptureDeniedException()
     }
 
     private suspend fun captureCredential(endpoint: EndpointConfig): SessionCredential {

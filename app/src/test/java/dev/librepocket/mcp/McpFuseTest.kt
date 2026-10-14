@@ -295,7 +295,7 @@ class McpFuseTest {
         val web = MockWebServer()
         web.start()
         try {
-            // wire 已拋 McpProtocol（bad isError）；server 層須映射 PROTOCOL，不當 OK/TOOL_ERROR。
+            // wire 已拋 McpProtocol（bad envelope）；server 層須映射 PROTOCOL，不當 OK/TOOL_ERROR。
             val body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":True}}"
             web.enqueue(MockResponse().setResponseCode(200).setBody(body))
             val clock = Clock(0L)

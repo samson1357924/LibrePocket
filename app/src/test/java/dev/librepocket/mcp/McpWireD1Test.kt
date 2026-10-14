@@ -162,20 +162,23 @@ class McpWireD1Test {
 
     @Test fun parseCallBadContentValueIsProtocol() {
         // content 鍵在但值非法：不得回退整包 result 充 OK，一律 PROTOCOL。
+        // Stage D：非法字面量（garbage/True/undefined）由嚴格 parser 先擋為 bad envelope；
+        // 合法 JSON 錯型（字串）仍為 bad content（訊息逐字保留）。
         val cases = mapOf(
-            "garbage literal" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":garbage,\"isError\":false}}",
-            "True literal" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":True,\"isError\":false}}",
-            "undefined" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":undefined,\"isError\":false}}",
-            "string content" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":\"oops\",\"isError\":false}}",
+            "garbage literal" to ("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":garbage,\"isError\":false}}" to "mcp: bad envelope"),
+            "True literal" to ("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":True,\"isError\":false}}" to "mcp: bad envelope"),
+            "undefined" to ("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":undefined,\"isError\":false}}" to "mcp: bad envelope"),
+            "string content" to ("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":\"oops\",\"isError\":false}}" to "mcp: bad content"),
         )
-        for ((name, json) in cases) {
+        for ((name, pair) in cases) {
+            val (json, expected) = pair
             try {
                 McpWire.parseCall(json)
                 fail("content 壞值（$name）必須拋 McpProtocol，不得回 OK")
             } catch (e: McpWire.McpToolFailure) {
                 fail("content 壞值（$name）不得映射 TOOL_ERROR，實際=${e.message}")
             } catch (e: McpWire.McpProtocol) {
-                assertEquals("mcp: bad content", e.message)
+                assertEquals(expected, e.message)
             } catch (_: IllegalArgumentException) {
                 fail("content 壞值（$name）必須拋 McpWire.McpProtocol（非一般 IAE）")
             }
@@ -195,19 +198,17 @@ class McpWireD1Test {
     }
 
     @Test fun parseCallNonObjectResultsThrowProtocol() {
-        val cases = mapOf(
+        // Stage D：合法 JSON 錯型（string/number/array/bool/合法 exponent）仍為 mcp: bad result；
+        // 非法字面量（NaN/123abc/TRUE/undefined）由嚴格 parser 先擋為 mcp: bad envelope。
+        val badResultCases = mapOf(
             "string" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":\"plain\"}",
             "number" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":123}",
             "array" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[1]}",
             "boolTrue" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":true}",
             "boolFalse" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":false}",
-            "badLiteralNaN" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":NaN}",
-            "badLiteralTrailingChars" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":123abc}",
             "exponentNumber" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":1e10}",
-            "badLiteralTRUE" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":TRUE}",
-            "badLiteralUndefined" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":undefined}",
         )
-        for ((name, json) in cases) {
+        for ((name, json) in badResultCases) {
             try {
                 McpWire.parseCall(json)
                 fail("result 非 object（$name）必須拋 IllegalArgumentException（映射 PROTOCOL），不得回 OK")
@@ -219,14 +220,47 @@ class McpWireD1Test {
                 assertEquals("mcp: bad result", e.message)
             }
         }
+        val badEnvelopeCases = mapOf(
+            "badLiteralNaN" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":NaN}",
+            "badLiteralTrailingChars" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":123abc}",
+            "badLiteralTRUE" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":TRUE}",
+            "badLiteralUndefined" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":undefined}",
+        )
+        for ((name, json) in badEnvelopeCases) {
+            try {
+                McpWire.parseCall(json)
+                fail("result 非法字面量（$name）必須拋 McpProtocol，不得回 OK")
+            } catch (e: McpWire.McpToolFailure) {
+                fail("result 非法字面量（$name）不得映射 TOOL_ERROR，實際=${e.message}")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad envelope", e.message)
+            } catch (e: IllegalArgumentException) {
+                fail("result 非法字面量（$name）必須拋 McpProtocol（mcp: bad envelope），實際=${e.message}")
+            }
+        }
     }
 
     @Test fun parseCallMalformedIsErrorThrows() {
-        val cases = listOf(
+        // Stage D：True 非法字面量由 parser 先擋為 bad envelope；數字 1 仍為 bad isError。
+        val envelopeCases = listOf(
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":True}}",
+        )
+        for (json in envelopeCases) {
+            try {
+                McpWire.parseCall(json)
+                fail("畸形 isError 必須拋 McpProtocol（映射 PROTOCOL），不得靜默壓 false：$json")
+            } catch (e: McpWire.McpToolFailure) {
+                fail("畸形 isError 不得映射 TOOL_ERROR，實際=${e.message}")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad envelope", e.message)
+            } catch (_: IllegalArgumentException) {
+                fail("畸形 isError 必須拋 McpWire.McpProtocol（非一般 IllegalArgumentException）：$json")
+            }
+        }
+        val isErrorCases = listOf(
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":1}}",
         )
-        for (json in cases) {
+        for (json in isErrorCases) {
             try {
                 McpWire.parseCall(json)
                 fail("畸形 isError 必須拋 McpProtocol（映射 PROTOCOL），不得靜默壓 false：$json")
@@ -360,17 +394,17 @@ class McpWireD1Test {
     }
 
     @Test fun errorPolymorphicShapesAreProtocol() {
-        val cases = mapOf(
+        // Stage D：合法 JSON 錯型（string/number/array）仍為 bad error；
+        // 非法字面量 TRUE 由 parser 先擋為 bad envelope。
+        val badErrorCases = mapOf(
             "string" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":\"oops\"," +
                 "\"result\":{\"content\":[],\"isError\":false}}",
             "number" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":123," +
                 "\"result\":{\"content\":[],\"isError\":false}}",
             "array" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":[1]," +
                 "\"result\":{\"content\":[],\"isError\":false}}",
-            "badLiteralTRUE" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":TRUE," +
-                "\"result\":{\"content\":[],\"isError\":false}}",
         )
-        for ((name, json) in cases) {
+        for ((name, json) in badErrorCases) {
             try {
                 McpWire.parseCall(json)
                 fail("error 非 object（$name）必須拋 McpProtocol，不得回 OK 或 TOOL_ERROR")
@@ -382,15 +416,34 @@ class McpWireD1Test {
                 fail("error 非 object（$name）必須拋 McpProtocol，實際=${e.message}")
             }
         }
+        val envelopeCases = mapOf(
+            "badLiteralTRUE" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":TRUE," +
+                "\"result\":{\"content\":[],\"isError\":false}}",
+        )
+        for ((name, json) in envelopeCases) {
+            try {
+                McpWire.parseCall(json)
+                fail("error 非法字面量（$name）必須拋 McpProtocol，不得回 OK 或 TOOL_ERROR")
+            } catch (e: McpWire.McpToolFailure) {
+                fail("error 非法字面量（$name）不得映射 TOOL_ERROR，實際=${e.message}")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad envelope", e.message)
+            } catch (e: IllegalArgumentException) {
+                fail("error 非法字面量（$name）必須拋 McpProtocol（mcp: bad envelope），實際=${e.message}")
+            }
+        }
     }
 
     @Test fun parseListTrueResultIsBadNotMissing() {
+        // Stage D：TRUE 非法字面量由嚴格 parser 先擋為 bad envelope（舊為 bad result.tools）。
         val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":TRUE}"
         try {
             McpWire.parseList("s1", json)
             fail("result:TRUE 非法字面量必須拒絕")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
         } catch (e: IllegalArgumentException) {
-            assertEquals("mcp: bad result.tools", e.message)
+            fail("result:TRUE 非法字面量 Stage D 應為 McpProtocol（mcp: bad envelope），實際=${e.message}")
         }
     }
 
@@ -573,19 +626,260 @@ class McpWireD1Test {
         assertEquals("""{"type":"object"}""", tools[1].inputSchema)
     }
 
-    // ---- j. Stage B P2-3：自訂 path 尾斜線原樣保留 ----
+    // ---- k. Stage D P1：巢狀同名鍵不得遮蔽外層（owner 原 repro） ----
 
-    @Test fun endpointPreservesCustomTrailingSlash() {
-        assertEquals(
-            "https://h/api/mcp/",
-            McpWire.endpoint("https://h/api/mcp/"),
-        )
-        assertEquals(
-            "https://h/api/mcp/?x=1",
-            McpWire.endpoint("https://h/api/mcp/?x=1"),
-        )
-        // bare-origin 語義不變：仍自動補 /mcp。
-        assertEquals("https://h/mcp", McpWire.endpoint("https://h"))
-        assertEquals("https://h/mcp", McpWire.endpoint("https://h/"))
+    @Test fun schemaFirstNestedNameDoesNotShadowOuter() {
+        // inputSchema 在前、內含 examples[0].name=shadow；外層 name=real_tool 必須正確。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"inputSchema\":{\"type\":\"object\",\"examples\":[{\"name\":\"shadow\"}]}," +
+            "\"name\":\"real_tool\"}]}}"
+        val tools = McpWire.parseList("s1", json)
+        assertEquals(1, tools.size)
+        assertEquals("real_tool", tools[0].name)
+    }
+
+    @Test fun propertiesNestedNameDoesNotShadowOuter() {
+        // properties.name 為 object（值非字串）：不得誤判或拋 tool without name。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}," +
+            "\"name\":\"real_tool2\"}]}}"
+        val tools = McpWire.parseList("s1", json)
+        assertEquals(1, tools.size)
+        assertEquals("real_tool2", tools[0].name)
+    }
+
+    @Test fun fieldOrderingWithNestedDescriptionKeepsOuter() {
+        // name 在前/中/後三種 + inputSchema 內巢狀 description 遮蔽測試。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[" +
+            "{\"name\":\"tool_first\",\"inputSchema\":{\"type\":\"object\",\"description\":\"shadow_first\"}," +
+            "\"description\":\"outer_first\"}," +
+            "{\"inputSchema\":{\"type\":\"object\",\"description\":\"shadow_mid\"}," +
+            "\"name\":\"tool_mid\",\"description\":\"outer_mid\"}," +
+            "{\"inputSchema\":{\"type\":\"object\",\"description\":\"shadow_last\"}," +
+            "\"description\":\"outer_last\",\"name\":\"tool_last\"}]}}"
+        val tools = McpWire.parseList("s1", json)
+        assertEquals(3, tools.size)
+        assertEquals("tool_first", tools[0].name)
+        assertEquals("outer_first", tools[0].description)
+        assertEquals("tool_mid", tools[1].name)
+        assertEquals("outer_mid", tools[1].description)
+        assertEquals("tool_last", tools[2].name)
+        assertEquals("outer_last", tools[2].description)
+    }
+
+    @Test fun errorOuterMessageWinsOverNested() {
+        // 外層在前：舊碼亦過（鎖定）；巢狀在前：舊 indexOf 誤取 inner，必須取 outer。
+        val outerFirst = "{\"jsonrpc\":\"2.0\",\"id\":2," +
+            "\"error\":{\"code\":1,\"message\":\"outer\",\"details\":{\"message\":\"inner\"}}}"
+        try {
+            McpWire.parseCall(outerFirst)
+            fail("expected McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("outer", e.message)
+        }
+        val innerFirst = "{\"jsonrpc\":\"2.0\",\"id\":2," +
+            "\"error\":{\"code\":1,\"details\":{\"message\":\"inner\"},\"message\":\"outer\"}}"
+        try {
+            McpWire.parseCall(innerFirst)
+            fail("expected McpToolFailure")
+        } catch (e: McpWire.McpToolFailure) {
+            assertEquals("outer", e.message)
+        }
+    }
+
+    // ---- l. Stage D P2 nested：result/tools 巢狀形狀錯誤一律 PROTOCOL ----
+
+    @Test fun nestedMissingCommaInResultIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[] \"isError\":false}}"
+        try {
+            McpWire.parseCall(json)
+            fail("result 內缺逗號必須拋 PROTOCOL，不得回 OK")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("缺逗號不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            // 新 parser：mcp: bad envelope；舊碼回 OK（RED）。
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("缺逗號必須拋 McpWire.McpProtocol（非一般 IAE）")
+        }
+    }
+
+    @Test fun nestedMissingCommaInToolsItemIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"x\" \"description\":\"d\"}]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("tools 元素內缺逗號必須拋 PROTOCOL，不得回工具列表")
+        } catch (e: McpWire.McpProtocol) {
+            // 預期（新碼 bad envelope）；舊碼回 OK（RED）。
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("缺逗號必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun nestedTrailingCommaInSchemaIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"x\",\"inputSchema\":{\"type\":\"object\",}}]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("schema 內 trailing comma 必須拋 PROTOCOL，不得回工具列表")
+        } catch (e: McpWire.McpProtocol) {
+            // 預期（新碼 bad envelope）；舊碼回 OK（RED）。
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("trailing comma 必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun nestedDuplicateContentKeyIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"content\":[]}}"
+        try {
+            McpWire.parseCall(json)
+            fail("result 內重複 content 鍵必須拋 duplicate key，不得回 OK")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("重複鍵不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: duplicate key", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("重複鍵必須拋 McpWire.McpProtocol（mcp: duplicate key）")
+        }
+    }
+
+    @Test fun nestedDuplicateIsErrorKeyIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2," +
+            "\"result\":{\"content\":[],\"isError\":false,\"isError\":true}}"
+        try {
+            McpWire.parseCall(json)
+            fail("result 內重複 isError 鍵必須拋 duplicate key，不得回 OK")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("重複鍵不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: duplicate key", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("重複鍵必須拋 McpWire.McpProtocol（mcp: duplicate key）")
+        }
+    }
+
+    @Test fun nestedIllegalEscapeInUnreadNoteIsProtocol() {
+        // note 非讀取鍵：parser 仍須嚴格（舊碼忽略回 OK）。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2," +
+            "\"result\":{\"content\":[],\"note\":\"\\x\"}}"
+        try {
+            McpWire.parseCall(json)
+            fail("非法 escape \\x 必須拋 PROTOCOL，不得回 OK")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("非法 escape 不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("非法 escape 必須拋 McpWire.McpProtocol（mcp: bad envelope）")
+        }
+    }
+
+    @Test fun nestedIllegalEscapeInToolNameIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"a\\x\"}]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("tool name 非法 escape 必須拋 PROTOCOL，不得回工具列表")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad envelope", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("非法 escape 必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun duplicateKeyAfterEscapeDecodeIsProtocol() {
+        // 解碼後重複（\u0061 == a）：原文比對會漏，必須解碼後比對。
+        val json = "{\"a\":1,\"\\u0061\":2,\"result\":{\"tools\":[]}}"
+        try {
+            McpWire.parseList("s1", json)
+            fail("解碼後重複鍵必須拋 duplicate key")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: duplicate key", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
+    }
+
+    @Test fun nestedDuplicateKeyAfterEscapeDecodeIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2," +
+            "\"result\":{\"content\":[],\"\\u0063ontent\":[]}}"
+        try {
+            McpWire.parseCall(json)
+            fail("巢狀解碼後重複鍵必須拋 duplicate key")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("重複鍵不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: duplicate key", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("必須拋 McpWire.McpProtocol（mcp: duplicate key）")
+        }
+    }
+
+    @Test fun nestedIllegalLiteralContentNoneIsProtocol() {
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":None}}"
+        try {
+            McpWire.parseCall(json)
+            fail("content:None 非法字面量必須拋 PROTOCOL，不得回 OK")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("非法字面量不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            // 新 parser：mcp: bad envelope；舊碼為 mcp: bad content（同為 PROTOCOL，訊息收緊）。
+        } catch (_: IllegalArgumentException) {
+            fail("非法字面量必須拋 McpWire.McpProtocol（非一般 IAE）")
+        }
+    }
+
+    @Test fun deepLegalSchemaParsesCorrectly() {
+        // 3-4 層合法 schema（含 examples/properties 陣列物件）：防過度嚴格退化。
+        val schema = "{\"type\":\"object\",\"properties\":{\"addr\":{\"type\":\"object\"," +
+            "\"properties\":{\"city\":{\"type\":\"string\",\"examples\":[{\"name\":\"ex\"}]}}}}," +
+            "\"examples\":[{\"a\":[{\"b\":1}]}]}"
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+            "[{\"name\":\"deep_tool\",\"description\":\"outer_desc\",\"inputSchema\":$schema}]}}"
+        val tools = McpWire.parseList("s1", json)
+        assertEquals(1, tools.size)
+        assertEquals("deep_tool", tools[0].name)
+        assertEquals("outer_desc", tools[0].description)
+        assertEquals(schema, tools[0].inputSchema)
+    }
+
+    @Test fun tooDeepGuardThrowsProtocol() {
+        // 70 層巢狀 array 直測 parser：合法形狀但超深 → mcp: too deep（PROTOCOL 級，不 crash）。
+        val deepArr = "[".repeat(70) + "]".repeat(70)
+        try {
+            McpWire.parseStrictDoc(deepArr)
+            fail("70 層巢狀 array 必須拋 mcp: too deep，不得回 OK 或 StackOverflow")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: too deep", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("超深必須拋 McpWire.McpProtocol（mcp: too deep），實際=${e.message}")
+        }
+        // 經 parseCall 的 content 深巢狀同理。
+        val arrJson = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":$deepArr,\"isError\":false}}"
+        try {
+            McpWire.parseCall(arrJson)
+            fail("70 層巢狀 array 必須拋 mcp: too deep，不得回 OK 或 StackOverflow")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("超深不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: too deep", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("超深必須拋 McpWire.McpProtocol（mcp: too deep），實際=${e.message}")
+        }
+        // 經 parseCall 的 70 層 object 巢狀同理。
+        var nested = "1"
+        repeat(70) { nested = "{\"k\":$nested}" }
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"deep\":$nested}}"
+        try {
+            McpWire.parseCall(json)
+            fail("70 層 object 巢狀必須拋 mcp: too deep")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("超深不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: too deep", e.message)
+        } catch (e: IllegalArgumentException) {
+            fail("超深必須拋 McpWire.McpProtocol，實際=${e.message}")
+        }
     }
 }

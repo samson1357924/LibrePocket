@@ -56,6 +56,47 @@ class CheckTestBudgetsTest(unittest.TestCase):
             )
             self.assertEqual([], check_test_budgets.check_file(p))
 
+    def test_h1_aliased_payload_outside_window_fails(self) -> None:
+        # PR #87 P2-1: the fixture variable is defined far above the loop
+        # (outside the 12-line window) and referenced by an alias-free name.
+        filler = "".join(f'// filler line {i}\n' for i in range(20))
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "AliasTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                + filler
+                + "repeat(100) {\n"
+                + "    store.appendEvent(event(sid, payload))\n"
+                + "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_unrelated_huge_var_with_small_loop_passes(self) -> None:
+        # A huge fixture exists in the file but the loop writes small rows.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "UnrelatedTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                'repeat(50) { store.appendEvent(event(sid, "q-$it")) }\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_fixture_var_extraction(self) -> None:
+        self.assertEqual(
+            {"payload", "big"},
+            check_test_budgets._fixture_vars(
+                'val payload = "x".repeat(100_000)\n'
+                "var big = \"z\".repeat(100_001)\n"
+                'val small = "q"\n',
+            ),
+        )
+        self.assertEqual(
+            set(), check_test_budgets._fixture_vars('val n = 100_000\n')
+        )
+
     def test_h1_single_huge_row_passes(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             p = _write(

@@ -4,13 +4,19 @@ Stdlib only. Gate (exit non-zero fails CI) — never silently downgrades to
 unredacted writes; it only rejects / alerts.
 
 Rules (test sources only, no prod change):
-- H1 (huge-string via true shaping): a `repeat(N>=10)` loop must NOT contain a
-  true-path `.appendEvent(` write on a huge fixture (`100_000` / `100_001` /
-  `huge` / `big`) within its 12-line window. Huge homogeneous strings through
-  the true `redact` shaping are O(n^2) pre-Redactor-fix and amplified per row;
-  PR tests must use the fast path (`appendPreRedactedForBudgetTest`, skipped
-  per-line) or slim the loop. The nightly-only full stress
-  (`ChatSnapshotByteCapFullStressTest.kt`, NIGHTLY_STRESS-gated) is allowlisted.
+- H1 (huge-string via true shaping, heuristic tripwire): a `repeat(N>=10)`
+  loop must NOT contain a true-path `.appendEvent(` write referencing a huge
+  fixture — either a literal hint on the write line (`100_000` / `100_001` /
+  `huge` / `big`) or a file-level `val`/`var <name> = ... .repeat(100_00x)`
+  variable used by the write — within its 12-line window. Huge homogeneous
+  strings through the true `redact` shaping are O(n^2) pre-Redactor-fix and
+  amplified per row; PR tests must use the fast path
+  (`appendPreRedactedForBudgetTest`, skipped per-line) or slim the loop. The
+  nightly-only full stress (`ChatSnapshotByteCapFullStressTest.kt`,
+  NIGHTLY_STRESS-gated) is allowlisted. Known gap (documented, not silent):
+  fixtures passed through helper parameters or built indirectly (no
+  `val/var = ... .repeat(100_00x)` shape) are not tracked — H1 is a tripwire,
+  not a coverage proof.
 - H2 (unbounded row count): no file may `repeat(N>=2000)` with `.appendEvent(`.
   Current max is `repeat(1000)` (small-string row-cap pins, cheap); anything at
   or above 2000 needs explicit review + nightly placement.
@@ -40,7 +46,12 @@ ALLOWLIST_HUGE_TRUE_PATH = {
     "ChatSnapshotByteCapFullStressTest.kt",
 }
 
-HUGE_MARKER = "100_000"
+# `val payload = "x".repeat(100_000)` assigned anywhere in the file (String.repeat
+# fixture bound to a variable, even far above the loop that uses it).
+FIXTURE_VAR_RE = re.compile(
+    r"(?:val|var)\s+(\w+)\s*=[^\n]*\.repeat\s*\(\s*100_00[01]"
+)
+
 HUGE_REPEAT_MIN = 10
 ROW_REPEAT_MAX = 2000
 # How many lines after `repeat(N)` to scan for a true-path huge write. Covers
@@ -49,7 +60,15 @@ ROW_REPEAT_MAX = 2000
 REPEAT_WINDOW_LINES = 12
 
 
-def _huge_loop_violation(lines: list[str]) -> bool:
+def _fixture_vars(content: str) -> set[str]:
+    """Variable names bound to a 100k String.repeat fixture anywhere in the file."""
+    return {m.group(1) for m in FIXTURE_VAR_RE.finditer(content)}
+
+
+def _huge_loop_violation(lines: list[str], fixture_vars: set[str]) -> bool:
+    var_res = [
+        re.compile(r"\b" + re.escape(name) + r"\b") for name in sorted(fixture_vars)
+    ]
     for idx, line in enumerate(lines):
         m = REPEAT_RE.search(line)
         if not m or int(m.group(1)) < HUGE_REPEAT_MIN:
@@ -58,7 +77,10 @@ def _huge_loop_violation(lines: list[str]) -> bool:
         for follow in window:
             if FAST_PATH_RE.search(follow):
                 continue
-            if APPEND_EVENT_RE.search(follow) and HUGE_HINT_RE.search(follow):
+            if APPEND_EVENT_RE.search(follow) and (
+                HUGE_HINT_RE.search(follow)
+                or any(v.search(follow) for v in var_res)
+            ):
                 return True
         # Fixture defined inside the loop then used by a later write:
         # `val huge = "x".repeat(100_000)` in-window plus a true-path write.
@@ -86,7 +108,9 @@ def check_file(path: str) -> list[str]:
     repeats = [int(m.group(1)) for m in REPEAT_RE.finditer(content)]
     has_append = APPEND_EVENT_RE.search(content) is not None
     violations: list[str] = []
-    if base not in ALLOWLIST_HUGE_TRUE_PATH and _huge_loop_violation(lines):
+    if base not in ALLOWLIST_HUGE_TRUE_PATH and _huge_loop_violation(
+        lines, _fixture_vars(content)
+    ):
         violations.append(
             f"{path}: H1 huge-string loop via true appendEvent "
             f"(repeat>={HUGE_REPEAT_MIN} with .appendEvent on a huge fixture; "

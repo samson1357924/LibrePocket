@@ -60,6 +60,27 @@ Slim tests use `FakeSessionStore.appendPreRedactedForBudgetTest`
 | `SnapshotFiveDimPhase4Test.byteCapOverBudget_fiveDim` (11 turns) | `ChatSnapshotByteCapFullStressTest.byteCapOverBudget_fiveDim_full200Rows` (100 turns) |
 | `ChatSnapshotByteCapTest.cleanFenceOverBudgetFork_surfacesIncompleteNoticeImmediately` (12 turns, pre-redacted fast path) | (same ledger shape covered by the two full tests above; no separate nightly) |
 
+Issue #86 Phase A root fix (Current, production change — `Redactor` only):
+single-scan per rule (`replaceAndCount`, replacing the
+`findAll().count()`+`replace()` double scan; `$1` semantics unchanged),
+fail-closed literal prechecks per rule (miss-then-skip only on necessary
+conditions: `@`+`.tld`-dot, `bearer`, `://`+`@`, `?`/`&`+`=`, `09`, `+`,
+`1`/`2`, key words, path prefixes, digit presence), a linear `@`-anchored
+EMAIL scan (equivalent to the regex `replaceAll` — maximal local run +
+anchored domain per `@`, disjoint runs keep it O(n); possessive local part
+kept as defense in depth), and a digit precheck in `applyCardRule`. Output
+text and per-rule hit counts are bit-identical (pinned by `RedactorTest` 71
+tests + corpus + `SecretValueRedactionRegressionTest` 15 tests + new
+`RedactorPerfRegressionTest` 6 tests: homogeneous 100k passthrough with zero
+hits, single 100k <500ms, `@`-bearing probes <500ms with dotless passthrough,
+21-shape EMAIL differential vs the legacy greedy regex, 200-row equivalent
+<60s). Measured (Foss, post-fix, `testFossDebugUnitTest` JUnit XML):
+`RedactorPerfRegressionTest` 6/6 in ~1.2s (incl. 200-row equivalent ~1.0s,
+`@`-probes ~0.01s); PR-slim `ChatSnapshotByteCapTest` 4/4 in ~0.5s;
+nightly-only `ChatSnapshotByteCapFullStressTest` 2/2 in ~1.4s with
+`NIGHTLY_STRESS=1` (true shaping). The Phase B slim/nightly split and Phase C
+gates are retained (defense in depth, still reject wasteful huge loops).
+
 What runs by edit type:
 
 - Docs-only (neither `code` nor `policy`, e.g. `docs/**` or `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.

@@ -69,7 +69,12 @@ object Redactor {
         ),
         Rule(
             "EMAIL",
-            Regex("""[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"""),
+            // Possessive `++` on the local-part class (Issue #86 Phase A):
+            // `@` is not in the class, so possessive accepts exactly the same
+            // language as greedy here while never backtracking the local part
+            // on `@`-bearing long runs. Inputs without `@` never reach the
+            // engine at all (ruleCannotMatch fail-fast below).
+            Regex("""[A-Za-z0-9._%+\-]++@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"""),
             "⟦REDACTED:EMAIL⟧",
         ),
         Rule(
@@ -148,6 +153,142 @@ object Redactor {
     const val ERROR_MAX_CHARS = 500
 
     /**
+     * Fail-closed literal prechecks (Issue #86 Phase A): each predicate is a
+     * NECESSARY condition of its rule — a match implies the predicate holds, so
+     * miss-then-skip is behavior-preserving (output text and hit counts are
+     * bit-identical with or without the skip). EMAIL additionally requires the
+     * `.tld` dot, closing the `@`-bearing homogeneous residual (e.g. `a@aaa…`).
+     * Predicates do only O(n) `indexOf`/char scans, never regex. They only skip
+     * rules that provably cannot match; a redaction timeout or failure must
+     * never fall back to writing the original text, and these prechecks create
+     * no such path.
+     */
+    private fun ruleCannotMatch(ruleId: String, text: String): Boolean = when (ruleId) {
+        "API_KEY_VALUE" ->
+            !text.contains("sk-", ignoreCase = true) &&
+                !text.contains("xoxb-", ignoreCase = true) &&
+                !text.contains("xoxp-", ignoreCase = true) &&
+                !text.contains("xoxa-", ignoreCase = true) &&
+                !text.contains("xoxs-", ignoreCase = true) &&
+                !text.contains("ghp_", ignoreCase = true) &&
+                !text.contains("gsk_", ignoreCase = true) &&
+                !text.contains("AIza", ignoreCase = true)
+        "BEARER_TOKEN" -> !text.contains("bearer", ignoreCase = true)
+        // The quoted-JSON scanner below always runs (linear); this gates only
+        // the legacy unquoted key=value regex, which needs a key word and a
+        // `:`/`=` delimiter.
+        "JSON_KEY_FIELD" ->
+            !(
+                text.contains("api_key", ignoreCase = true) ||
+                    text.contains("api-key", ignoreCase = true) ||
+                    text.contains("apikey", ignoreCase = true) ||
+                    text.contains("secret", ignoreCase = true) ||
+                    text.contains("token", ignoreCase = true) ||
+                    text.contains("password", ignoreCase = true) ||
+                    text.contains("passwd", ignoreCase = true) ||
+                    text.contains("auth", ignoreCase = true)
+            ) || (':' !in text && '=' !in text)
+        "URL_CREDENTIAL" -> "://" !in text || '@' !in text
+        "URL_TOKEN_PARAM" -> ('?' !in text && '&' !in text) || '=' !in text
+        // Every EMAIL match contains both `@` and the `.tld` dot.
+        "EMAIL" -> '@' !in text || '.' !in text
+        // `09` is a mandatory literal of every PHONE_GENERIC match.
+        "PHONE_GENERIC" -> "09" !in text
+        // Every PHONE_INTL match starts with a literal `+`.
+        "PHONE_INTL" -> '+' !in text
+        // `[A-Z][12]\d{8}` always contains a `1` or a `2`.
+        "ID_TW" -> '1' !in text && '2' !in text
+        "IPV4_PRIVATE" ->
+            "10." !in text && "192." !in text && "172." !in text
+        // `android[_-]?id` / `device[_-]?id` / `imei` / `serial`, any case.
+        "ANDROID_ID_LIKE" ->
+            !text.contains("android", ignoreCase = true) &&
+                !text.contains("device", ignoreCase = true) &&
+                !text.contains("imei", ignoreCase = true) &&
+                !text.contains("serial", ignoreCase = true)
+        // Every GEO branch needs a digit (bare pairs and labels need more, but
+        // `geo:1,2` has no dot, so digit presence is the only global anchor).
+        "GEO_COORD" -> text.none { it.isDigit() }
+        "ANDROID_PATH" ->
+            "/data/" !in text && "/storage/" !in text && "/sdcard/" !in text
+        else -> false
+    }
+
+    /**
+     * Linear `@`-anchored EMAIL matcher (Issue #86 Phase A follow-up): provably
+     * equivalent to the EMAIL regex `replaceAll`, but O(n) instead of O(n^2)
+     * on `@`-bearing long tails (the regex engine re-tries every start
+     * position; each tail position re-consumes to end-of-input).
+     *
+     * Equivalence argument: every EMAIL match contains exactly one `@`
+     * separator with a maximal local-class run on its left (the local class
+     * excludes `@`, so runs for distinct `@`s are disjoint and the regex's
+     * greedy local part always takes the whole run — a shorter local part can
+     * never rescue a failed domain, since the domain attempt starts after the
+     * same `@`). Hence trying, per `@` left-to-right, the maximal run start +
+     * an anchored domain `lookingAt()` finds exactly the `replaceAll` matches
+     * in order, continuing after each match end. The replacement is literal
+     * (no `$` groups), so manual splicing equals `appendReplacement`.
+     */
+    private const val EMAIL_REPLACEMENT_LITERAL = "⟦REDACTED:EMAIL⟧"
+    private val EMAIL_DOMAIN = Regex("""[A-Za-z0-9.\-]+\.[A-Za-z]{2,}""")
+
+    private fun isEmailLocalChar(c: Char): Boolean =
+        c in 'a'..'z' || c in 'A'..'Z' || c in '0'..'9' ||
+            c == '.' || c == '_' || c == '%' || c == '+' || c == '-'
+
+    private fun applyEmailRule(text: String): Pair<String, Int> {
+        var count = 0
+        var cursor = 0
+        var copiedThrough = 0
+        var out: StringBuilder? = null
+        val domainMatcher = EMAIL_DOMAIN.toPattern().matcher(text)
+        while (true) {
+            val at = text.indexOf('@', cursor)
+            if (at < 0) break
+            var start = at
+            while (start > cursor && isEmailLocalChar(text[start - 1])) start--
+            if (start < at) {
+                domainMatcher.region(at + 1, text.length)
+                if (domainMatcher.lookingAt()) {
+                    val end = domainMatcher.end()
+                    if (out == null) out = StringBuilder(text.length)
+                    out.append(text, copiedThrough, start)
+                    out.append(EMAIL_REPLACEMENT_LITERAL)
+                    copiedThrough = end
+                    cursor = end
+                    count++
+                    continue
+                }
+            }
+            cursor = at + 1
+        }
+        if (count == 0) return text to 0
+        out!!.append(text, copiedThrough, text.length)
+        return out.toString() to count
+    }
+
+    /**
+     * Single regex scan that counts and replaces (Issue #86 Phase A: replaces
+     * the `findAll().count()` + `replace()` double scan). Semantics are exactly
+     * `replace()`'s — the loop is what `Matcher.replaceAll` does internally —
+     * so `$1` group references in replacements behave identically.
+     */
+    private fun replaceAndCount(text: String, rule: Rule): Pair<String, Int> {
+        val matcher = rule.pattern.toPattern().matcher(text)
+        var count = 0
+        var buffer: StringBuffer? = null
+        while (matcher.find()) {
+            count++
+            if (buffer == null) buffer = StringBuffer(text.length)
+            matcher.appendReplacement(buffer, rule.replacement)
+        }
+        if (count == 0) return text to 0
+        matcher.appendTail(buffer!!)
+        return buffer.toString() to count
+    }
+
+    /**
      * Full redaction: applies R1–R14 in order (R13 GEO is beyond-spec; R14
      * ANDROID_PATH is the S4 addition, see class KDoc).
      */
@@ -156,22 +297,33 @@ object Redactor {
         // overlapping key shapes (e.g. sk-... inside a "password" value) are
         // counted before whole-field normalization. The quoted-JSON scanner runs
         // at the R3 position; its hits are attributed to JSON_KEY_FIELD.
+        // Issue #86 Phase A: single scan per rule (replaceAndCount) plus
+        // fail-closed literal prechecks — output text and hit counts are
+        // bit-identical to the old double scan.
         var text = input
         val hits = LinkedHashMap<String, Int>()
         for (rule in RULES.subList(0, 2)) {
-            val count = rule.pattern.findAll(text).count()
-            if (count > 0) {
-                text = rule.pattern.replace(text, rule.replacement)
+            if (ruleCannotMatch(rule.id, text)) {
+                hits[rule.id] = 0
+                continue
             }
+            val (replaced, count) = replaceAndCount(text, rule)
+            text = replaced
             hits[rule.id] = count
         }
         val (prepared, quotedJsonHits) = redactQuotedJsonSecretValues(text)
         text = prepared
         for (rule in RULES.subList(2, RULES.size)) {
-            val count = rule.pattern.findAll(text).count()
-            if (count > 0) {
-                text = rule.pattern.replace(text, rule.replacement)
+            val (replaced, count) = if (ruleCannotMatch(rule.id, text)) {
+                text to 0
+            } else if (rule.id == "EMAIL") {
+                // Linear @-anchored scan (see applyEmailRule): same matches as
+                // the EMAIL regex, without per-position re-scans of long tails.
+                applyEmailRule(text)
+            } else {
+                replaceAndCount(text, rule)
             }
+            text = replaced
             hits[rule.id] = count + if (rule.id == "JSON_KEY_FIELD") quotedJsonHits else 0
             if (rule.id == "ID_TW") {
                 // R10 runs here in table position (after ID_TW, before IPV4_PRIVATE).
@@ -194,13 +346,13 @@ object Redactor {
         // partial R1/R2 marker inside a quoted secret value).
         var text = input
         for (rule in RULES.subList(0, 2)) {
-            if (rule.id in ERROR_RULE_IDS) {
+            if (rule.id in ERROR_RULE_IDS && !ruleCannotMatch(rule.id, text)) {
                 text = rule.pattern.replace(text, rule.replacement)
             }
         }
         text = redactQuotedJsonSecretValues(text).first
         for (rule in RULES.subList(2, RULES.size)) {
-            if (rule.id in ERROR_RULE_IDS) {
+            if (rule.id in ERROR_RULE_IDS && !ruleCannotMatch(rule.id, text)) {
                 text = rule.pattern.replace(text, rule.replacement)
             }
         }
@@ -411,6 +563,9 @@ object Redactor {
     }
 
     private fun applyCardRule(text: String): Pair<String, Int> {
+        // Fail-closed digit precheck (Issue #86 Phase A): the candidate pattern
+        // needs 15+ digits, so a digit-free input cannot match.
+        if (text.none { it.isDigit() }) return text to 0
         var count = 0
         val out = StringBuilder(text.length)
         var cursor = 0

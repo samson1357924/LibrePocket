@@ -19,7 +19,6 @@ import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderConfig
 import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ProviderFailureCode
-import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -83,6 +82,57 @@ data class KeyWriteConfirmSummary(
     val newModel: String,
 )
 
+/**
+ * S4-C：顯式重綁確認的身份快照（顯示用，不參與 gate）。
+ *
+ * [oldLabel]／[oldBaseUrl] 為舊綁定身份（[PendingRebind.oldBound]，
+ * null 表示尚無綁定）；[newLabel]／[newBaseUrl]／[newModel] 為 entry 當時
+ * 表單身份。零 key material，in-memory only，禁持久化／SavedState。
+ */
+data class RebindConfirmSummary(
+    val oldLabel: String?,
+    val oldBaseUrl: String?,
+    val newLabel: String,
+    val newBaseUrl: String,
+    val newModel: String,
+)
+
+/**
+ * S4-C：顯式重綁待確認（in-memory，禁持久化／SavedState，零 key material）。
+ *
+ * [oldBound] 為 mint 時 holder 的綁定（null 表示尚無綁定）；
+ * [newIdentity] 為 entry 當時表單身份（providerId＋trim 後 effectiveBaseUrl）；
+ * 快照欄位（old/new label、old/new baseUrl、newModel）僅供對話框顯示，不參與 gate；
+ * [formRevision] 綁 mint 世代；[nonce] 單調區分連續 mint（display/debug 用，
+ * 不參與 gate；gate 以 pending 是否為 null＋formRevision＋身份比對為準）。
+ */
+private data class PendingRebind(
+    val oldBound: Pair<String, String>?,
+    val newIdentity: Pair<String, String>,
+    val oldLabel: String?,
+    val oldBaseUrl: String?,
+    val newLabel: String,
+    val newBaseUrl: String,
+    val newModel: String,
+    val formRevision: Long,
+    val nonce: Long,
+)
+
+/**
+ * S4-C：binding＋pending 單一 holder（消除雙 @Volatile tearing）。
+ *
+ * [bound] 為已綁定身份（null 表示尚無）；[pending] 為待確認重綁（null 表示無）。
+ * 單一 @Volatile 引用原子發布：entries 讀快照（bound＋pending 同步），
+ * Main（paste／confirm／invalidate）與 IO 終端（save／logout／retry 成功）
+ * 以整體替換更新，不再有舊雙欄位混合快照。
+ * Main-vs-IO 交錯僅耗可用性（spurious 擋下），永不跨端點外洩（見
+ * [keyIdentityChanged]：任何快照要麼等於顯示端點、要麼擋下，永不指向第三端點）。
+ */
+private data class KeyBindingHolder(
+    val bound: Pair<String, String>?,
+    val pending: PendingRebind?,
+)
+
 /** Gate state for startup navigation. Loading and NoEndpoint are distinct (no FOUC). */
 sealed interface EndpointGate {
     data object Loading : EndpointGate
@@ -142,6 +192,23 @@ data class SetupUiState(
      * STAGED 僅 newModel）。顯示用，不參與 gate。
      */
     val confirmSummary: KeyWriteConfirmSummary? = null,
+    /**
+     * S4-C：顯式重綁確認對話框開關（見 [PendingRebind]）。
+     *
+     * 與 [rebindSummary] 同一 emission 設置／清除；所有變動必須經
+     * [showRebindConfirm]／[hideRebindConfirm]／[confirmRebind]／
+     * [dismissRebindConfirm]／[invalidateRebind]，禁手寫 copy。
+     * 與 [confirmKeyWrite] 互斥（雙對話框永不同時為 true：entries 以
+     * `confirmKeyWrite || confirmRebind` silent-return 縱深，見
+     * [testConnection]／[refreshModels]／[saveWithConsent]）。
+     */
+    val confirmRebind: Boolean = false,
+    /**
+     * S4-C：重綁對話框的舊→新身份快照（見 [RebindConfirmSummary]）。
+     *
+     * 與 [confirmRebind] 同一 emission 設置／清除；顯示用，不參與 gate。
+     */
+    val rebindSummary: RebindConfirmSummary? = null,
     val errorCode: String? = null,
     /**
      * `LOGOUT_*` 橫幅的 journal 身份標籤（Stage C C2）。
@@ -261,52 +328,32 @@ class SetupViewModel(
     // model-only saves keep working; the save path re-verifies against the
     // live store snapshot, never trusts this baseline for the ref).
     private var editBaseline: EndpointConfig? = null
-    // S3 typed-key/identity binding: (providerId, normalized effectiveBaseUrl)
-    // captured at the last non-blank onApiKeyChange. Blank key clears it (no
-    // binding, KeepExisting path). Preset/URL edits retain text but keep the
-    // old binding so entries fail closed. @Volatile: written on Main
-    // (key/prefill/logout/retry) and cleared on IO save success.
-    @Volatile private var keyBoundIdentity: Pair<String, String>? = null
-    // S4-B typed-key hash gate (whitespace/reinsert bypass fix, 方案 B):
-    // sha256(trimmed) of the last rebinding key. onApiKeyChange rebinds
-    // [keyBoundIdentity] ONLY when this hash changes; whitespace-only or
-    // same-key re-paste (trimmed hash equal) keeps the old binding so
-    // preset/URL-switched entries stay SETUP_KEY_IDENTITY_CHANGED with zero
-    // I/O. Blank key clears the binding but RETAINS the hash, so
-    // clear→reinsertSameK also stays blocked (same hash, no rebind); a
-    // different key (hash change) rebinds to the current identity (explicit
-    // new intent, allowed). Fresh starts clear it: prefillForEdit (blank
-    // edit form), every save success (apiKey="" terminal), logout/retry
-    // success (fresh form reset) — so a post-success/post-prefill paste of
-    // the same string rebinds (prevHash null). Logout/retry entry,
-    // selectPreset/onBaseUrlChange and blank retain it (blocking preserved).
-    // In-memory only, never logged/persisted; SHA-256 preimage-resistant so
-    // the retained hash never exposes key material. Chose B over A (clear
-    // text on switch): S3's retain-for-backSwitch convenience
-    // (backSwitchWithoutRepasteAllows) and String-immutable non-wipe reality
-    // make clearing marginal hygiene but common-flow churn; B closes the
-    // exfil (zero I/O still holds) with minimal churn. Known cost: same key
-    // legitimately shared across endpoints stays blocked until a different
-    // key is typed first (hash must change) or the VM is recreated
-    // (restart/prefill/save-success clears); see THREAT_MODEL S4-B note and
-    // SetupErrorText affordance (same-string repaste never unblocks; paste a
-    // different key to rebind, or switch back to the original endpoint).
-    // @Volatile: same threads as [keyBoundIdentity].
-    // Tearing note: this pair ([keyBoundIdentity], [boundKeyHash]) is NOT
-    // atomic — two @Volatile fields written sequentially (Main paste writes
-    // identity then hash; IO save/logout/retry terminals clear one or both;
-    // logout/retry entries clear identity only). A Main-paste vs IO-clear
-    // interleave may publish a mixed snapshot. This costs availability only,
-    // never cross-endpoint exfiltration: (a) entries read identity only and
-    // a missing binding fails closed; (b) identity is ever only the
-    // live-form identity at paste time or null, so any snapshot either
-    // matches the displayed endpoint or blocks — never a third endpoint;
-    // (c) the hash gate only decides rebind-to-displayed-identity. Worst
-    // case is a spurious SETUP_KEY_IDENTITY_CHANGED (paste a different key
-    // or switch back to proceed). Converging to a single @Volatile holder is
-    // a follow-up (it touches every save/logout/retry terminal); deferred to
-    // keep this diff minimal.
-    @Volatile private var boundKeyHash: ByteArray? = null
+    // S4-C 顯式重綁：typed-key 身份綁定＋待確認重綁的單一 holder（見 [KeyBindingHolder]）。
+    //
+    // - [bound]：已綁定身份（providerId＋trim 後 effectiveBaseUrl），null 表示尚無。
+    //   寫入收斂：[onApiKeyChange] 僅當目前為 null 且 trimmed 非空白才綁到當前身份；
+    //   非 null 時任何文字變化（含空白、清空、K→Kx 追加）一律不動 binding——擋下條件
+    //   與 key 內容脫鉤，關閉 BLOCKER-1（K→切 B→加 x 變 Kx 即重綁送 B 的前綴外洩）。
+    //   [selectPreset]／[onBaseUrlChange] 永不碰 binding（保留文字＋保留舊綁定，
+    //   切回免確認；見 [keyIdentityChanged]）。
+    // - [pending]：待確認重綁（[PendingRebind]，null 表示無）。entries  mismatch 時
+    //   mint（同 emission 設 [SetupUiState.confirmRebind]＋errorCode，零 I/O）；
+    //   對話框期間任何 selectPreset／onBaseUrlChange／onApiKeyChange 經
+    //   [invalidateRebind] 丟 pending＋藏框（binding 保留，下次 entry 重 mint）；
+    //   [confirmRebind] 消費時驗 formRevision＋I==pending.newIdentity＋
+    //   binding==oldBound＋T 非空，二次點按 fail-closed；[dismissRebindConfirm]
+    //   丟 pending＋藏框（保留 binding＋擋下碼，下次 entry 重 mint）；
+    //   prefill／logout／retry 成功／save 成功同批清 binding＋pending＋藏框
+    //   （fresh 終端，後續重貼為無對話框新綁定）。
+    // - 形式化：擋下 ⟺ T 非空 ∧ (B==null ∨ B!=I)，與內容無關。解除僅三途：
+    //   switch-back（I 回到 B，免確認藏框清錯）、顯式 [confirmRebind]、
+    //   fresh 終端清 B 後重貼。
+    // - In-memory only，禁持久化／SavedState，零 key material（pending 僅身份快照）。
+    // - @Volatile 單一引用原子發布；Main（paste／confirm／invalidate）與 IO 終端
+    //   （save／logout／retry 成功）以整體替換更新。交錯僅耗可用性，永不外洩。
+    @Volatile private var keyBinding = KeyBindingHolder(null, null)
+    // S4-C 重綁 mint 單調 nonce（display/debug 用，不參與 gate）。
+    private val rebindNonce = AtomicLong(0L)
     // Stage2 form fence: identity/key intent epoch. Bumped only by
     // selectPreset/onBaseUrlChange/onApiKeyChange/prefillForEdit/logout.
     // onModelChange/toggleShowKey deliberately do NOT bump (model edits are
@@ -515,6 +562,8 @@ class SetupViewModel(
         val preset = ProviderCatalog.preset(presetId) ?: return
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
+        // S4-C：對話框期間身份編輯→丟 pending＋藏框（binding 保留）；非對話框期間亦永不碰 binding。
+        invalidateRebind()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
@@ -539,6 +588,8 @@ class SetupViewModel(
     fun onBaseUrlChange(v: String) {
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
+        // S4-C：同 selectPreset（對話框期間 invalidate，永不碰 binding）。
+        invalidateRebind()
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
@@ -595,23 +646,22 @@ class SetupViewModel(
     fun onApiKeyChange(v: String) {
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
-        // S4-B: hash-gated (re)bind. Blank clears the binding but retains
-        // the hash (clear→reinsertSameK stays blocked); non-blank rebinds
-        // ONLY on trimmed-hash change (whitespace-only/same-key keeps the
-        // old binding, fail closed after a preset/URL switch).
-        if (v.trim().isEmpty()) {
-            keyBoundIdentity = null
-        } else {
-            val newHash = sha256Trimmed(v.trim())
-            val prevHash = boundKeyHash
-            if (prevHash == null || !MessageDigest.isEqual(prevHash, newHash)) {
-                val cur = _form.value
-                keyBoundIdentity = try {
-                    SetupValidation.deriveProviderId(cur.presetId) to effectiveBaseUrlOf(cur).trim()
-                } catch (_: Exception) {
-                    null
-                }
-                boundKeyHash = newHash
+        // S4-C：寫入收斂＋對話框期間 invalidate（見 holder KDoc）。
+        // - 對話框期間：丟 pending＋藏框，永不重綁（下次 entry 重 mint 新快照）。
+        // - 非對話框：僅當目前 bound==null 且 trimmed 非空白才綁到當前身份；
+        //   非 null 時任何文字變化（含空白、清空、K→Kx）一律不動 binding——
+        //   擋下條件與 key 內容脫鉤（BLOCKER-1 關閉：Kx 不再自動重綁送 B）。
+        // - 空白保留 binding（fail-closed；空白經 keyIdentityChanged bypass，
+        //   KeepExisting 路徑不受影響）。
+        if (_form.value.confirmRebind) {
+            invalidateRebind()
+        } else if (v.trim().isNotEmpty() && keyBinding.bound == null) {
+            val cur = _form.value
+            try {
+                val newBound = SetupValidation.deriveProviderId(cur.presetId) to effectiveBaseUrlOf(cur).trim()
+                keyBinding = keyBinding.copy(bound = newBound)
+            } catch (_: Exception) {
+                // Unknown preset：保持 null（entries 以 SETUP_UNKNOWN_PRESET fail-closed）。
             }
         }
         modelRefreshJob?.cancel()
@@ -656,11 +706,9 @@ class SetupViewModel(
         testConnectionJob = null
         val testRevision = testConnectionGeneration.incrementAndGet()
         editBaseline = config
-        // S3: prefill rebuilds a blank form — drop any typed-key binding.
-        // S4-B: fresh start — also drop the hash so the next paste (even the
-        // same string) rebinds to the prefill identity.
-        keyBoundIdentity = null
-        boundKeyHash = null
+        // S4-C fresh 終端：清 binding＋pending；新表單預設即藏框（同 emission 語義：
+        // 同 Main 線程無 suspend 間隔，先清 holder 再發新表單）。
+        keyBinding = KeyBindingHolder(null, null)
         val preset = ProviderCatalog.preset(config.presetId)
         if (preset == null || config.presetId == ProviderCatalog.CUSTOM_ID) {
             _form.value = SetupUiState(
@@ -704,22 +752,112 @@ class SetupViewModel(
     }
 
     /**
-     * S3 binding check: blank key bypasses (KeepExisting path); non-blank
-     * requires a matching bound identity (strict trim-only, case/slash
-     * sensitive like [keepExistingModeFor]). Missing binding fails closed.
-     * S4-B unchanged: the hash gate in [onApiKeyChange] decides *whether* to
-     * rebind; this check only compares the (possibly stale) binding.
+     * S4-C 顯式重綁檢查（與 key 內容脫鉤，僅看空／綁定／身份）：
+     * 空白 key bypass（KeepExisting 路徑）；非空白要求已綁定且全字串相等
+     * （trim 後、case/slash sensitive，同 [keepExistingModeFor]）。
+     * Missing binding（B==null）fail-closed。形式化：擋下 ⟺ T 非空 ∧
+     * (B==null ∨ B!=I)。K→Kx 追加、空白、清空重貼皆不改變 B，故仍擋下；
+     * 解除僅 switch-back／顯式 confirm／fresh 終端清 B 後重貼。
      */
     private fun keyIdentityChanged(form: SetupUiState, effectiveBaseUrl: String, providerId: String): Boolean {
         if (form.apiKey.trim().isEmpty()) return false
-        val bound = keyBoundIdentity ?: return true
+        val bound = keyBinding.bound ?: return true
         if (bound.first != providerId) return true
         return bound.second != effectiveBaseUrl.trim()
     }
 
-    /** S4-B: sha256(trimmed UTF-8), never logged/persisted. */
-    private fun sha256Trimmed(trimmed: String): ByteArray =
-        MessageDigest.getInstance("SHA-256").digest(trimmed.toByteArray(Charsets.UTF_8))
+    /**
+     * S4-C：顯示重綁確認對話框的唯一入口（entries mismatch mint 共用，禁手寫 copy）。
+     *
+     * 與 `confirmRebind = true` 同一 emission 設置 [rebindSummary]＋
+     * `SETUP_KEY_IDENTITY_CHANGED`；holder 的 pending 同線程先行寫入。
+     * 雙對話框互斥：[confirmKeyWrite] 為 true 時不 mint（entries 已 silent-return，
+     * 此為縱深）。
+     */
+    private fun showRebindConfirm(pending: PendingRebind) {
+        if (_form.value.confirmKeyWrite) return
+        keyBinding = keyBinding.copy(pending = pending)
+        val cur = _form.value
+        _form.value = cur.copy(
+            confirmRebind = true,
+            rebindSummary = RebindConfirmSummary(
+                oldLabel = pending.oldLabel,
+                oldBaseUrl = pending.oldBaseUrl,
+                newLabel = pending.newLabel,
+                newBaseUrl = pending.newBaseUrl,
+                newModel = pending.newModel,
+            ),
+            errorCode = "SETUP_KEY_IDENTITY_CHANGED",
+        )
+    }
+
+    /**
+     * S4-C：隱藏重綁對話框的唯一入口（confirm／dismiss／invalidate 共用，禁手寫 copy）。
+     *
+     * 單步清 pending（binding 保留）＋同 emission 藏框＋清 summary；
+     * [errorCode] 非 null 時落碼（mint／confirm 失敗／dismiss 保持擋下），
+     * null 時保留現碼（invalidate：呼叫方已清碼）。不碰 [pendingConsent]
+     *（KeyWrite 同意書）與 testing／saving。
+     */
+    private fun hideRebindConfirm(errorCode: String? = null) {
+        keyBinding = keyBinding.copy(pending = null)
+        val cur = _form.value
+        _form.value = cur.copy(
+            confirmRebind = false,
+            rebindSummary = null,
+            errorCode = errorCode ?: cur.errorCode,
+        )
+    }
+
+    /**
+     * S4-C：對話框期間編輯的 invalidate（selectPreset／onBaseUrlChange／
+     * onApiKeyChange 對話框分支共用）。
+     *
+     * 丟 pending＋藏框，binding 保留（下次 entry 依現行 I 重 mint），現碼保留
+     * （呼叫方編輯已置 errorCode=null；confirm 失敗路徑另行落碼）。
+     * 不碰 [pendingConsent]。
+     */
+    private fun invalidateRebind() {
+        if (keyBinding.pending != null) {
+            keyBinding = keyBinding.copy(pending = null)
+        }
+        if (_form.value.confirmRebind) {
+            hideRebindConfirm()
+        }
+    }
+
+    /**
+     * S4-C：entries mismatch 的 mint＋顯示（test／refresh／save 共用）。
+     *
+     * 以 entry 快照 [cur]＋已求得 [effectiveBaseUrl]／[providerId] 鑄造
+     * [PendingRebind]（舊綁定快照＋新身份＋顯示快照＋formRevision＋nonce），
+     * 經 [showRebindConfirm] 同 emission 設框＋碼，零 I/O 返回。
+     * 呼叫方須已過 `confirmKeyWrite || confirmRebind` 與 logoutInFlight（probe）
+     * 閘，且位於 validate／policy／vault／provider I/O 之前。
+     */
+    private fun mintRebindAndShow(cur: SetupUiState, effectiveBaseUrl: String, providerId: String) {
+        if (cur.confirmKeyWrite || cur.confirmRebind) return
+        val snap = keyBinding
+        val oldBound = snap.bound
+        val newIdentity = providerId to effectiveBaseUrl.trim()
+        val newLabel = ProviderCatalog.preset(cur.presetId)?.label ?: cur.presetId
+        val oldLabel: String? = oldBound?.let { (pid, _) ->
+            val presetId = pid.removePrefix("preset:")
+            ProviderCatalog.preset(presetId)?.label ?: pid
+        }
+        val pending = PendingRebind(
+            oldBound = oldBound,
+            newIdentity = newIdentity,
+            oldLabel = oldLabel,
+            oldBaseUrl = oldBound?.second,
+            newLabel = newLabel,
+            newBaseUrl = effectiveBaseUrl,
+            newModel = cur.model,
+            formRevision = formRevision.get(),
+            nonce = rebindNonce.incrementAndGet(),
+        )
+        showRebindConfirm(pending)
+    }
 
     fun consumeSaved() {
         _form.value = _form.value.copy(saved = false)
@@ -751,9 +889,10 @@ class SetupViewModel(
      */
     fun testConnection() {
         val cur = _form.value
-        // S5：對話框期間不可重入（UI disabled 為主，此為縱深）：silent return，
-        // 不啟動 listModels、不 mint、不碰 policy/vault，對話框與已 mint 同意書不動。
-        if (cur.confirmKeyWrite) return
+        // S5＋S4-C：任一對話框期間不可重入（UI disabled 為主，此為縱深）：
+        // silent return，不啟動 listModels、不 mint、不碰 policy/vault，
+        // 對話框與已 mint 同意書／待確認重綁不動。
+        if (cur.confirmKeyWrite || cur.confirmRebind) return
         // S5：logout teardown 在途擋新 probe（silent return；teardown 期間以
         // typed key 發請求無意義且擾動清除語義）。save 仍經 saveMutex 與 logout
         // 序列化，此處僅 probe。startup retry 在途則允許 probe：retry 無 journal
@@ -783,14 +922,12 @@ class SetupViewModel(
             _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
-        // S3: typed key bound to another identity — zero requests. Checked
-        // before validation (aligned with save): a stale binding
-        // deterministically reports SETUP_KEY_IDENTITY_CHANGED even for a
-        // short key, so the user is told to re-paste rather than fix the
-        // length. S2 gate untouched (both checks are Main-thread, zero
-        // policy/provider I/O).
+        // S4-C：typed key 綁定不符即 mint 顯式重綁對話框，零請求。先於 validate、
+        // 先於任何 policy/vault/provider I/O（短 key 亦報
+        // SETUP_KEY_IDENTITY_CHANGED）。成功只設框＋碼，testing 保持 false、
+        // 零 provider 呼叫；確認後不 auto-send（需再按一次測試）。
         if (keyIdentityChanged(cur, effectiveBaseUrl, providerId)) {
-            _form.value = cur.copy(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+            mintRebindAndShow(cur, effectiveBaseUrl, providerId)
             return
         }
         val validationErr = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
@@ -875,9 +1012,9 @@ class SetupViewModel(
      */
     fun refreshModels() {
         val cur = _form.value
-        // S5：對話框期間不可重入（同 testConnection）：silent return，不啟動
+        // S5＋S4-C：對話框期間不可重入（同 testConnection）：silent return，不啟動
         // listModels／目錄抓取、不 mint、不碰 policy/vault。
-        if (cur.confirmKeyWrite) return
+        if (cur.confirmKeyWrite || cur.confirmRebind) return
         // S5：logout 在途擋新 probe（同 testConnection；startup retry 在途允許）。
         if (cur.logoutInFlight) return
         if (cur.modelsLoading || cur.testing || cur.saving) return
@@ -904,13 +1041,10 @@ class SetupViewModel(
             _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
-        // S3: typed key bound to another identity — zero requests. Checked
-        // before validation (aligned with save and testConnection): a stale
-        // binding deterministically reports SETUP_KEY_IDENTITY_CHANGED even
-        // for a short key. S2 gate untouched (both checks are Main-thread,
-        // zero policy/provider I/O).
+        // S4-C：同 testConnection（先於 validate、先於任何 policy/vault/provider I/O，
+        // 短 key 亦報 SETUP_KEY_IDENTITY_CHANGED＋對話框，零 I/O）。
         if (keyIdentityChanged(cur, effectiveBaseUrl, providerId)) {
-            _form.value = cur.copy(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+            mintRebindAndShow(cur, effectiveBaseUrl, providerId)
             return
         }
         val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
@@ -1053,20 +1187,22 @@ class SetupViewModel(
             return
         }
         val cur = _form.value
-        // S5：對話框期間不可重入（UI disabled 為主，此為縱深）：對話框顯示中
-        // 的 save()（無 consent）silent return，不重估、不重 mint（不覆寫已
-        // mint 同意書）、不啟動寫入，對話框與 intent/summary 不動。confirm tap
-        // 經 confirmKeyWriteSave（先 hide 才調 saveWithConsent(consent)，到達
-        // 時已為 false），故不受影響。
-        if (cur.confirmKeyWrite) return
+        // S5＋S4-C：任一對話框期間不可重入（UI disabled 為主，此為縱深）：
+        // 對話框顯示中的 save()（無 consent）silent return，不重估、不重 mint
+        //（不覆寫已 mint 同意書／待確認重綁）、不啟動寫入，對話框與
+        // intent/summary／rebindSummary 不動。confirm taps 經
+        // confirmKeyWriteSave／confirmRebind（先 hide 才調 save／只重綁不寫入，
+        // 到達時已為 false），故不受影響。
+        if (cur.confirmKeyWrite || cur.confirmRebind) return
         if (cur.saving || cur.testing || cur.modelsLoading) return
-        // S3: typed key bound to another identity — zero vault writes, no
-        // consent mint, distinct code (not POLICY_DENIED) for UX.
+        // S4-C: typed key 綁定不符即 mint 重綁對話框——零 vault 寫、不 mint
+        // consent、distinct 碼（非 POLICY_DENIED）。先於 validate、先於任何
+        // policy/vault I/O（短 key 亦報 SETUP_KEY_IDENTITY_CHANGED＋對話框）。
         try {
             val eff = effectiveBaseUrlOf(cur)
             val pid = SetupValidation.deriveProviderId(cur.presetId)
             if (keyIdentityChanged(cur, eff, pid)) {
-                _form.value = cur.copy(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+                mintRebindAndShow(cur, eff, pid)
                 return
             }
         } catch (_: Exception) {
@@ -1728,10 +1864,17 @@ class SetupViewModel(
             // S4: display writes back the persisted value (entry snapshot via
             // [config]): a pure model edit racing the save entry (no fence bump
             // per #17) must not fork persisted=A/displayed=B.
-            _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
-            keyBoundIdentity = null
-            // S4-B fresh start: drop the hash so the next paste rebinds.
-            boundKeyHash = null
+            // S4-C fresh 終端：同 emission 清 binding＋pending＋藏框（holder 先清，
+            // 同線程無 suspend 間隔；新貼為無對話框新綁定）。
+            keyBinding = KeyBindingHolder(null, null)
+            _form.value = _form.value.copy(
+                saving = false,
+                apiKey = "",
+                model = config.model,
+                saved = true,
+                confirmRebind = false,
+                rebindSummary = null,
+            )
         } catch (e: CancellationException) {
             if (!metadataCommitted) {
                 // Uncommitted or ambiguous (put-after / V2 / fence / CAS-threw-
@@ -1761,15 +1904,16 @@ class SetupViewModel(
                     invalidateStartupSettled()
                     // S4: cancel 補償成功亦回寫 persisted model（entry snapshot
                     // 經 committedModel；同主路徑 config.model）。
+                    // S4-C fresh 終端（同主路徑，同 emission 清 holder＋藏框）。
+                    keyBinding = KeyBindingHolder(null, null)
                     _form.value = _form.value.copy(
                         saving = false,
                         apiKey = "",
                         model = committedModel ?: form.model,
                         saved = true,
+                        confirmRebind = false,
+                        rebindSummary = null,
                     )
-                    keyBoundIdentity = null
-                    // S4-B fresh start (同主路徑)。
-                    boundKeyHash = null
                     return
                 }
                 if (livePointsAtStaged == false && vaultDirty) {
@@ -1800,15 +1944,16 @@ class SetupViewModel(
                 if (stillCommitted == true) {
                     invalidateStartupSettled()
                     // S4: 同上，committed-then-cancelled 成功亦回寫 persisted model。
+                    // S4-C fresh 終端（同主路徑）。
+                    keyBinding = KeyBindingHolder(null, null)
                     _form.value = _form.value.copy(
                         saving = false,
                         apiKey = "",
                         model = committedModel ?: form.model,
                         saved = true,
+                        confirmRebind = false,
+                        rebindSummary = null,
                     )
-                    keyBoundIdentity = null
-                    // S4-B fresh start (同主路徑)。
-                    boundKeyHash = null
                     return
                 }
                 _form.value = _form.value.copy(saving = false)
@@ -1986,10 +2131,16 @@ class SetupViewModel(
             // S4: display writes back the persisted value (entry snapshot via
             // [config]) — same persisted=A/displayed=B fork fix as the staged
             // path above.
-            _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
-            keyBoundIdentity = null
-            // S4-B fresh start: drop the hash so the next paste rebinds.
-            boundKeyHash = null
+            // S4-C fresh 終端（同 staged，同 emission 清 holder＋藏框）。
+            keyBinding = KeyBindingHolder(null, null)
+            _form.value = _form.value.copy(
+                saving = false,
+                apiKey = "",
+                model = config.model,
+                saved = true,
+                confirmRebind = false,
+                rebindSummary = null,
+            )
         } catch (e: CancellationException) {
             if (!reuseCommitted) {
                 val ambiguous: Boolean? = try {
@@ -2001,10 +2152,16 @@ class SetupViewModel(
                 }
                 if (ambiguous == true) {
                     invalidateStartupSettled()
-                    _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
-                    keyBoundIdentity = null
-                    // S4-B fresh start (同主路徑)。
-                    boundKeyHash = null
+                    // S4-C fresh 終端（同主路徑）。
+                    keyBinding = KeyBindingHolder(null, null)
+                    _form.value = _form.value.copy(
+                        saving = false,
+                        apiKey = "",
+                        model = config.model,
+                        saved = true,
+                        confirmRebind = false,
+                        rebindSummary = null,
+                    )
                     return
                 }
                 invalidateStartupSettled()
@@ -2022,10 +2179,16 @@ class SetupViewModel(
                 invalidateStartupSettled()
                 // S4: cancel 補償成功亦回寫 persisted model（[config] 在 scope，
                 // 同主路徑 config.model）。
-                _form.value = _form.value.copy(saving = false, apiKey = "", model = config.model, saved = true)
-                keyBoundIdentity = null
-                // S4-B fresh start (同主路徑)。
-                boundKeyHash = null
+                // S4-C fresh 終端（同主路徑）。
+                keyBinding = KeyBindingHolder(null, null)
+                _form.value = _form.value.copy(
+                    saving = false,
+                    apiKey = "",
+                    model = config.model,
+                    saved = true,
+                    confirmRebind = false,
+                    rebindSummary = null,
+                )
                 return
             }
             _form.value = _form.value.copy(saving = false)
@@ -2163,6 +2326,9 @@ class SetupViewModel(
         baseUrl: String,
         oldModel: String?,
     ) {
+        // S4-C 雙對話框互斥縱深：重綁框顯示中不疊加 key.write 框（entries 已擋，
+        // 此為 IO 內 mint 競爭的最後防線；到達即不顯示，呼叫方 fence 會 fail-closed）。
+        if (_form.value.confirmRebind) return
         _form.value = _form.value.copy(
             saving = false,
             confirmKeyWrite = true,
@@ -2216,6 +2382,72 @@ class SetupViewModel(
         // Abandon the minted consent: a later save() must re-evaluate fresh.
         takePendingConsent()
         hideKeyWriteConfirm()
+    }
+
+    /**
+     * S4-C：顯式重綁確認（對話框確認鈕，唯一重綁入口）。
+     *
+     * 成功只重綁＋清錯＋藏框：holder 設 bound=newIdentity＋清 pending，
+     * 同 emission 藏框＋清 summary＋清 errorCode；testing／saving 保持 false、
+     * 零 provider 呼叫、不 auto-send（需再按一次測試／儲存）、不碰
+     * [pendingConsent]（KeyWrite 同意書）。
+     * 消費時驗：T 非空、formRevision==pending.formRevision、
+     * I==pending.newIdentity、binding==pending.oldBound；任一失配 fail-closed
+     * （藏框＋落 `SETUP_KEY_IDENTITY_CHANGED`／未知 preset 另落碼，零 I/O）；
+     * 二次點按（框已藏）silent return。
+     */
+    fun confirmRebind() {
+        val cur = _form.value
+        if (!cur.confirmRebind) return
+        val snap = keyBinding
+        val pending = snap.pending
+        if (pending == null) {
+            hideRebindConfirm(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+            return
+        }
+        if (cur.apiKey.trim().isEmpty()) {
+            hideRebindConfirm(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+            return
+        }
+        if (pending.formRevision != formRevision.get()) {
+            hideRebindConfirm(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+            return
+        }
+        val eff: String
+        val pid: String
+        try {
+            eff = effectiveBaseUrlOf(cur)
+            pid = SetupValidation.deriveProviderId(cur.presetId)
+        } catch (_: Exception) {
+            hideRebindConfirm(errorCode = "SETUP_UNKNOWN_PRESET")
+            return
+        }
+        if ((pid to eff.trim()) != pending.newIdentity) {
+            hideRebindConfirm(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+            return
+        }
+        if (snap.bound != pending.oldBound) {
+            hideRebindConfirm(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
+            return
+        }
+        keyBinding = KeyBindingHolder(bound = pending.newIdentity, pending = null)
+        _form.value = cur.copy(
+            confirmRebind = false,
+            rebindSummary = null,
+            errorCode = null,
+        )
+    }
+
+    /**
+     * S4-C：重綁對話框取消（唯一放棄入口）。
+     *
+     * 丟 pending＋藏框，binding 保留，擋下碼保留（下次 entry 重 mint 新快照；
+     * [dismissKeepsBlocked] 鎖定）。testing／saving 不動，零 I/O，不碰
+     * [pendingConsent]。
+     */
+    fun dismissRebindConfirm() {
+        if (!_form.value.confirmRebind) return
+        hideRebindConfirm(errorCode = "SETUP_KEY_IDENTITY_CHANGED")
     }
 
     /** Discard any unconsumed consent and hide the confirm dialog. */
@@ -3219,6 +3451,8 @@ class SetupViewModel(
             logoutErrorSourceJournal = null,
             testing = false,
             modelsLoading = false,
+            confirmRebind = false,
+            rebindSummary = null,
         )
         // 入口即失效 settled：journal 寫入後被取消時走不到終端失效點，殘留快照
         // 會使 rotation 重 launch 回放過期輪；入口在 Main、worker 寫 settled 在
@@ -3227,6 +3461,12 @@ class SetupViewModel(
         invalidateStartupSettled()
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()
+        // S4-C：teardown 入口清 binding＋pending＋藏框（保留文字 fail-closed，
+        // 下次 entry mint 新對話框；成功終端再 fresh 化）。
+        keyBinding = KeyBindingHolder(null, null)
+        if (_form.value.confirmRebind) {
+            hideRebindConfirm()
+        }
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         modelRefreshGeneration.incrementAndGet()
@@ -3234,12 +3474,8 @@ class SetupViewModel(
         testConnectionJob = null
         testConnectionGeneration.incrementAndGet()
         // Teardown in flight: a blank key must never reuse (baseline dropped).
+        // S4-C binding 已於入口首 emission 清除（含 pending＋藏框），此處不重複。
         editBaseline = null
-        // S3: retained key text loses its binding (fail closed on next entry).
-        // S4-B: hash retained on purpose — a whitespace-only/same-key edit
-        // after logout must NOT rebind (stays blocked); only a different key
-        // (hash change) rebinds. Cleared on logout success (fresh reset below).
-        keyBoundIdentity = null
         val job = viewModelScope.launch(Dispatchers.IO) {
             // try-catch 在 withLock 之外（仿 save）：排隊等鎖時被取消（lambda
             // 未進入）仍能復位 inFlight；僅內層 catch 會漏此窗口。
@@ -3520,8 +3756,8 @@ class SetupViewModel(
                     return@launch
                 }
                 _form.value = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
-                // S4-B fresh start: logout success drops the hash (next paste rebinds).
-                boundKeyHash = null
+                // S4-C fresh 終端：清 holder（新表單預設即藏框，同 emission 語義）。
+                keyBinding = KeyBindingHolder(null, null)
                 // Committed-then-cancel swallow must still report success: the
                 // job was cancelled, so a plain Main dispatch would rethrow
                 // Cancel before onDone runs. NonCancellable preserves the
@@ -3587,7 +3823,14 @@ class SetupViewModel(
         // 持鎖前同步置 inFlight（仿 logout 入口）：排隊等鎖時被取消亦能被外層
         // catch 復位。與 logout() 不同：此處不清 errorCode／tag——終端同源清／報
         // STALE 需比對現碼（入口清會丟失身份，使 Absent 同源清永不命中）。
-        _form.value = _form.value.copy(logoutInFlight = true, testing = false, modelsLoading = false)
+        // S4-C：仍需藏重綁框（保留現碼供同源比對）＋清 holder。
+        _form.value = _form.value.copy(
+            logoutInFlight = true,
+            testing = false,
+            modelsLoading = false,
+            confirmRebind = false,
+            rebindSummary = null,
+        )
         // 入口即失效 settled（同 logout：journal 存否可能變化處同步重讀 pending
         // domain；bump 含於 invalidate 內）。
         invalidateStartupSettled()
@@ -3601,9 +3844,8 @@ class SetupViewModel(
         testConnectionGeneration.incrementAndGet()
         // Teardown-adjacent retry: same fail-closed baseline drop as logout.
         editBaseline = null
-        // S3: same binding drop as logout (retained text must re-bind).
-        // S4-B: hash retained (same reason as logout entry above).
-        keyBoundIdentity = null
+        // S4-C：同 logout 入口（保留文字 fail-closed，清 binding＋pending＋藏框）。
+        keyBinding = KeyBindingHolder(null, null)
         val job = viewModelScope.launch(Dispatchers.IO) {
             // try-catch 在 withLock 之外（仿 save／logout）：排隊等鎖時被取消仍復位。
             try {
@@ -3677,8 +3919,8 @@ class SetupViewModel(
                 val final = result ?: RetryResult.ReadUnknown
                 if (replayedCommitted) {
                     _form.value = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
-                    // S4-B fresh start (同 logout 成功)。
-                    boundKeyHash = null
+                    // S4-C fresh 終端（同 logout 成功）。
+                    keyBinding = KeyBindingHolder(null, null)
                     withContext(NonCancellable + Dispatchers.Main) { onDone(final) }
                     return@launch
                 }

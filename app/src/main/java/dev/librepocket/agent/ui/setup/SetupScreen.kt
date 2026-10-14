@@ -187,7 +187,7 @@ fun SetupScreen(
 
         ExposedDropdownMenuBox(
             expanded = presetExpanded,
-            onExpandedChange = { if (!state.saving && !state.confirmKeyWrite) presetExpanded = !presetExpanded },
+            onExpandedChange = { if (!state.saving && !state.confirmKeyWrite && !state.confirmRebind) presetExpanded = !presetExpanded },
         ) {
             OutlinedTextField(
                 value = selectedPreset.label,
@@ -219,7 +219,7 @@ fun SetupScreen(
             value = state.baseUrl,
             onValueChange = viewModel::onBaseUrlChange,
             readOnly = !baseUrlEditable,
-            enabled = baseUrlEditable && !state.saving && !state.confirmKeyWrite,
+            enabled = baseUrlEditable && !state.saving && !state.confirmKeyWrite && !state.confirmRebind,
             label = { Text("伺服器位址") },
             supportingText = {
                 if (baseUrlEditable) Text("自訂位址必須是 https（本機/內網測試位址除外）。")
@@ -229,9 +229,9 @@ fun SetupScreen(
         )
 
         var modelExpanded by remember { mutableStateOf(false) }
-        // S5 對稱閘：preset/baseUrl/apiKey/三按鈕（save/test/refresh）以
-        // `saving || confirmKeyWrite` 雙閘（UI 擋；VM entry 另有
-        // confirmKeyWrite／logoutInFlight silent-return 縱深，見 saveWithConsent／
+        // S5＋S4-C 對稱閘：preset/baseUrl/apiKey/三按鈕（save/test/refresh）以
+        // `saving || confirmKeyWrite || confirmRebind` 三閘（UI 擋；VM entry 另有
+        // confirmKeyWrite／confirmRebind／logoutInFlight silent-return 縱深，見 saveWithConsent／
         // testConnection／refreshModels）；model 因不 bump（#17 範圍外，見
         // onModelChange）故同樣雙閘。UI 與 VM 雙層，不宣稱單層充分。
         Row(
@@ -241,14 +241,14 @@ fun SetupScreen(
             ExposedDropdownMenuBox(
                 expanded = modelExpanded,
                 onExpandedChange = {
-                    if (!state.saving && !state.confirmKeyWrite) modelExpanded = !modelExpanded
+                    if (!state.saving && !state.confirmKeyWrite && !state.confirmRebind) modelExpanded = !modelExpanded
                 },
                 modifier = Modifier.weight(1f),
             ) {
                 OutlinedTextField(
                     value = state.model,
                     onValueChange = viewModel::onModelChange,
-                    enabled = !state.saving && !state.confirmKeyWrite,
+                    enabled = !state.saving && !state.confirmKeyWrite && !state.confirmRebind,
                     label = { Text("模型") },
                     trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelExpanded) },
                     modifier = Modifier
@@ -280,7 +280,7 @@ fun SetupScreen(
             }
             IconButton(
                 onClick = viewModel::refreshModels,
-                enabled = !state.modelsLoading && !state.testing && !state.saving && !state.confirmKeyWrite,
+                enabled = !state.modelsLoading && !state.testing && !state.saving && !state.confirmKeyWrite && !state.confirmRebind,
             ) {
                 if (state.modelsLoading) {
                     CircularProgressIndicator(strokeWidth = 2.dp)
@@ -300,7 +300,7 @@ fun SetupScreen(
         OutlinedTextField(
             value = state.apiKey,
             onValueChange = viewModel::onApiKeyChange,
-            enabled = !state.saving && !state.confirmKeyWrite,
+            enabled = !state.saving && !state.confirmKeyWrite && !state.confirmRebind,
             label = { Text("API Key") },
             placeholder = { Text("貼上你的金鑰") },
             modifier = Modifier.fillMaxWidth(),
@@ -358,7 +358,7 @@ fun SetupScreen(
         ) {
             OutlinedButton(
                 onClick = viewModel::testConnection,
-                enabled = !state.testing && !state.saving && !state.modelsLoading && !state.confirmKeyWrite,
+                enabled = !state.testing && !state.saving && !state.modelsLoading && !state.confirmKeyWrite && !state.confirmRebind,
                 modifier = Modifier.weight(1f),
             ) {
                 if (state.testing) {
@@ -371,7 +371,7 @@ fun SetupScreen(
             }
             Button(
                 onClick = viewModel::save,
-                enabled = !state.saving && !state.testing && !state.modelsLoading && !state.confirmKeyWrite,
+                enabled = !state.saving && !state.testing && !state.modelsLoading && !state.confirmKeyWrite && !state.confirmRebind,
                 modifier = Modifier.weight(1f),
             ) {
                 if (state.saving) {
@@ -440,6 +440,42 @@ fun SetupScreen(
             },
             dismissButton = {
                 TextButton(onClick = viewModel::dismissKeyWriteConfirm) { Text("取消") }
+            },
+        )
+    }
+
+    if (state.confirmRebind) {
+        // S4-C：顯式重綁確認（舊→新快照＋確認／取消）。確認後只重綁＋清錯＋藏框，
+        // 不 auto-send（需再按一次測試／儲存）；輸入與按鈕在期間 disabled（上）。
+        AlertDialog(
+            onDismissRequest = viewModel::dismissRebindConfirm,
+            title = { Text("確認重綁金鑰") },
+            text = {
+                Column {
+                    Text("此金鑰先前綁定至另一伺服器。確認後才會將此次輸入的金鑰綁定至目前伺服器，不會立即傳送或儲存，需再按一次測試／儲存。")
+                    state.rebindSummary?.let { summary ->
+                        Text(
+                            if (summary.oldLabel != null && summary.oldBaseUrl != null) {
+                                "原綁定：${summary.oldLabel} ${summary.oldBaseUrl}"
+                            } else {
+                                "原綁定：（無）"
+                            },
+                        )
+                        Text("目前：${summary.newLabel} ${summary.newBaseUrl}")
+                        Text("模型：${summary.newModel}")
+                    }
+                    TextButton(onClick = { uriHandler.openUri(THREAT_MODEL_URL) }) {
+                        Text("查看威脅模型說明（docs/THREAT_MODEL.md）")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = viewModel::confirmRebind) {
+                    Text("確認重綁")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::dismissRebindConfirm) { Text("取消") }
             },
         )
     }

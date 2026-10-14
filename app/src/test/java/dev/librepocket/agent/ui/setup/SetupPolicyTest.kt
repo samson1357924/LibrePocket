@@ -748,10 +748,22 @@ class SetupPolicyTest {
         assertFalse(vm.form.value.confirmKeyWrite)
         assertEquals(1, policy.freshCalls)
         assertEquals(0, vault.putKeys)
-        // Re-paste for the new identity rebinds; a fresh save mints again.
-        // S4-B: must differ (trimmed-hash change) — same-key re-paste keeps
-        // the old binding (stays SETUP_KEY_IDENTITY_CHANGED); see S4-B note.
+        // S4-C: different-key re-paste does NOT auto-rebind (content-agnostic);
+        // a fresh save mints the explicit rebind dialog first (zero policy I/O).
         vm.onApiKeyChange("unit-test-key-456")
+        vm.save()
+        awaitSettled(vm)
+        assertEquals("SETUP_KEY_IDENTITY_CHANGED", vm.form.value.errorCode)
+        assertTrue(vm.form.value.confirmRebind)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        assertEquals(1, policy.freshCalls)
+        assertEquals(0, vault.putKeys)
+        // Explicit confirm rebinds to the new identity (zero I/O, no auto-send);
+        // the next save mints the KeyWrite dialog again.
+        vm.confirmRebind()
+        assertFalse(vm.form.value.confirmRebind)
+        assertNull(vm.form.value.errorCode)
+        assertEquals(1, policy.freshCalls)
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)
@@ -797,8 +809,15 @@ class SetupPolicyTest {
         assertFalse(vm.form.value.confirmKeyWrite)
         assertEquals(1, policy.freshCalls)
         assertEquals(0, vault.putKeys)
-        // S4-B: re-paste must differ (same reason as above).
+        // S4-C: different-key re-paste does NOT auto-rebind; save mints rebind first.
         vm.onApiKeyChange("unit-test-key-456")
+        vm.save()
+        awaitSettled(vm)
+        assertEquals("SETUP_KEY_IDENTITY_CHANGED", vm.form.value.errorCode)
+        assertTrue(vm.form.value.confirmRebind)
+        assertFalse(vm.form.value.confirmKeyWrite)
+        vm.confirmRebind()
+        assertFalse(vm.form.value.confirmRebind)
         vm.save()
         awaitSettled(vm)
         assertTrue(vm.form.value.confirmKeyWrite)

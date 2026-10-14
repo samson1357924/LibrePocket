@@ -2536,7 +2536,8 @@ class ChatViewModel(
                         reconcileReadBinding(bindingOf(afterCreate))
                         return@withLock
                     }
-                    _history.value = loaded
+                    _history.value = loaded.messages
+                    _historyOmittedCount.value = loaded.droppedCount
                     attach(created, access.binding, creationGeneration)
                     attached = true
                     candidate = null

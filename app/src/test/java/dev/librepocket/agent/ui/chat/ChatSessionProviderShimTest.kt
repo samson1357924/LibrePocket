@@ -31,6 +31,7 @@ class ChatSessionProviderShimTest {
   private class CanonicalOnlyProvider : ChatSessionProvider {
     var lastInitialHistory: List<ChatMessage>? = null
     var lastBackfill: Boolean? = null
+    var lastAllowAsk: Boolean? = null
 
     override suspend fun create(
       endpoint: EndpointConfig,
@@ -50,6 +51,19 @@ class ChatSessionProviderShimTest {
     ): CreatedSession {
       lastBackfill = backfillInterrupted
       throw UnsupportedOperationException("open shim probe: backfill=$backfillInterrupted")
+    }
+
+    // P0-1 open-full-union: explicit route to the open-backfill-canonical
+    // above (records both the proof and the fence — neither is dropped).
+    override suspend fun open(
+      endpoint: EndpointConfig,
+      sessionId: String,
+      allowAsk: Boolean,
+      keyIsCurrent: suspend () -> Boolean,
+      backfillInterrupted: Boolean,
+    ): CreatedSession {
+      lastAllowAsk = allowAsk
+      return open(endpoint, sessionId, keyIsCurrent, backfillInterrupted)
     }
 
     override suspend fun storeOrNull(): SessionStore? = null
@@ -77,5 +91,26 @@ class ChatSessionProviderShimTest {
       assertTrue(e.message!!.contains("backfill=true"))
     }
     assertEquals(true, provider.lastBackfill)
+  }
+
+  @Test fun fullUnionOpen_threadsProofAndFenceToCanonical() = runBlocking {
+    // P0-1 pin: open-full-union must deliver BOTH params — the T0 allowAsk
+    // proof and the R8-3 backfill fence. The deleted default body dropped
+    // backfillInterrupted via open-allowAsk (false silently became true).
+    val provider = CanonicalOnlyProvider()
+    try {
+      provider.open(
+        sampleEndpoint(),
+        "sid",
+        allowAsk = true,
+        keyIsCurrent = { true },
+        backfillInterrupted = false,
+      )
+      throw AssertionError("canonical probe must throw")
+    } catch (e: UnsupportedOperationException) {
+      assertTrue(e.message!!.contains("backfill=false"))
+    }
+    assertEquals(true, provider.lastAllowAsk)
+    assertEquals(false, provider.lastBackfill)
   }
 }

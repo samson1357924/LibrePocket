@@ -3366,6 +3366,17 @@ class ChatSessionLifecycleTest {
             backfillInterrupted: Boolean,
         ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
 
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
+
         override suspend fun storeOrNull(): SessionStore? = null
     }
 
@@ -3551,6 +3562,17 @@ class ChatSessionLifecycleTest {
             backfillInterrupted: Boolean,
         ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
 
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
+
         override suspend fun storeOrNull(): SessionStore? = null
 
         suspend fun awaitReplacement(): RecordingSession = withTimeout(5_000) {
@@ -3602,6 +3624,17 @@ class ChatSessionLifecycleTest {
             keyIsCurrent: suspend () -> Boolean,
             backfillInterrupted: Boolean,
         ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3697,6 +3730,17 @@ class ChatSessionLifecycleTest {
             keyIsCurrent: suspend () -> Boolean,
             backfillInterrupted: Boolean,
         ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3814,6 +3858,17 @@ class ChatSessionLifecycleTest {
             keyIsCurrent: suspend () -> Boolean,
             backfillInterrupted: Boolean,
         ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3937,6 +3992,17 @@ class ChatSessionLifecycleTest {
             keyIsCurrent: suspend () -> Boolean,
             backfillInterrupted: Boolean,
         ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = backingStore
 

@@ -409,18 +409,35 @@ class CaptureDeniedException(message: String = "ENDPOINT_BINDING_STALE") : Secur
 
 /** Injectable session-construction boundary used by the chat lifecycle tests.
  *
- * The canonical forms are the 4-arg [create] (policy-agnostic core) and the
- * 4-arg [open] (every `openSession` path passes the R8-3 gate). Implementors
- * MUST override both canonical forms; the 3-arg [create] and 3-arg [open]
- * are compat shims that forward while carrying the compat defaults
- * (`initialHistory = emptyList()`, `backfillInterrupted = true`, symmetric).
- * The key.read policy entries (5-arg [create], allowAsk [open], full-union
- * [open]) are concrete and delegate with explicit fail-closed defaults
- * (`allowAsk = false`); production overrides them to thread the proof.
- * The lossy direction (canonical → compat, silently dropping
- * `initialHistory` / `backfillInterrupted`) is deleted: with no default
- * body on the canonical forms, leaving one unimplemented is a compile
- * error, never a runtime StackOverflowError or a silent param drop.
+ * Shape names (fixed vocabulary; KDoc below uses them):
+ * - `create-policy-entry` — 5-arg [create] (`allowAsk`).
+ * - `create-canonical` — 4-arg [create] (policy-agnostic core).
+ * - `open-allowAsk` — 4-arg [open] (`allowAsk`, concrete shim).
+ * - `open-backfill-canonical` — 4-arg [open] (`backfillInterrupted`, abstract).
+ * - `open-full-union` — 5-arg [open] (`allowAsk` + `backfillInterrupted`, abstract).
+ *
+ * Delegation graph (concrete → abstract only; the reverse never happens):
+ * - 3-arg [create] → `create-canonical` (carries `initialHistory = emptyList()`).
+ * - `create-policy-entry` → `create-canonical` (drops `allowAsk`: fail-closed —
+ *   the proof-less canonical denies ASK at T1; production overrides the entry
+ *   to thread the proof).
+ * - 3-arg [open] → `open-allowAsk` with `allowAsk = false` (fail-closed).
+ * - `open-allowAsk` → `open-backfill-canonical` with `backfillInterrupted = true`
+ *   (drops `allowAsk`: fail-closed, same T1 reason as above).
+ * - `open-full-union` has NO default body: every implementor overrides it with
+ *   an explicit one-line route — production threads both params into `openImpl`,
+ *   backfill-modeling fakes route to `open-backfill-canonical` (honor the fence,
+ *   explicitly discard `allowAsk` as a policy-agnostic double), policy-modeling
+ *   fakes route to `open-allowAsk` (keep the proof, explicitly discard the gate
+ *   they have no store for). P0-1 fix: the old default body dropped
+ *   `backfillInterrupted` via `open-allowAsk`, silently upgrading `false` to
+ *   `true` — a fail-OPEN fence bypass. No default body means no silent drop:
+ *   leaving the union unimplemented is a compile error, never a runtime
+ *   StackOverflowError or a quiet param loss.
+ *
+ * Call-shape rule: production ViewModel calls `open-full-union` with full
+ * named args (`allowAsk =`, `keyIsCurrent =`, `backfillInterrupted =`); tests
+ * call the narrower forms positionally.
  */
 interface ChatSessionProvider {
     /**
@@ -516,10 +533,15 @@ interface ChatSessionProvider {
     ): CreatedSession
 
     /**
-     * Full union: key.read policy gate ([allowAsk]) AND the R8-3 backfill
+     * `open-full-union`: key.read policy gate ([allowAsk]) AND the R8-3 backfill
      * fence ([backfillInterrupted]) in one call. Production ViewModel open
-     * paths use this; the other overloads are compat shims that delegate
-     * here (production) or to fakes' narrower overrides (tests).
+     * paths call this shape (full named args); it is abstract — every
+     * implementor routes it explicitly with one line. Production threads both
+     * params into `openImpl`; fakes route to exactly one canonical (see the
+     * interface preamble). There is deliberately no default body: the deleted
+     * P0-1 default dropped [backfillInterrupted] via `open-allowAsk`, which
+     * re-pinned it to `true` — a silent fail-open fence bypass (a deferred
+     * `false` backfilled anyway and stamped a false INTERRUPTED).
      */
     suspend fun open(
         endpoint: EndpointConfig,
@@ -527,7 +549,7 @@ interface ChatSessionProvider {
         allowAsk: Boolean,
         keyIsCurrent: suspend () -> Boolean,
         backfillInterrupted: Boolean,
-    ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
+    ): CreatedSession
 
     suspend fun storeOrNull(): SessionStore?
 
@@ -769,6 +791,15 @@ class ChatSessionFactory(
         }
         require(meta != null) { "UNKNOWN_SESSION" }
         requireCurrentBinding(keyIsCurrent)
+        // P0-2: S6 capture-boundary T1 recheck BEFORE the same-origin fork
+        // branch, so both paths share it. The pre-fix order branched into
+        // openForked() first, which read the vault via captureCredential
+        // without any key.read recheck (compat-shim allowAsk=false never
+        // denied on the fork path). Read-only recheck (evaluateFresh only;
+        // it never consumes the one-shot consent — takePendingKeyReadConsent
+        // runs at T0 authorize/burn time only), so evaluating twice is safe;
+        // the second check below stays as defense in depth.
+        requireKeyReadAllowed(endpoint.providerId, allowAsk)
         // Stage G (R2-3): cross-provider / cross-origin resume hydrates nothing.
         // Same-origin resumes run the local INTERRUPTED backfill below
         // (provider-agnostic bookkeeping) and hydrate only on provenance
@@ -799,7 +830,11 @@ class ChatSessionFactory(
         val model = modelFor(endpoint)
         // S6 capture-boundary T1 recheck (see requireKeyReadAllowed):
         // DENY/failure always deny; ASK needs the T0 one-shot proof
-        // (allowAsk); ALLOW passes without proof.
+        // (allowAsk); ALLOW passes without proof. Second evaluation as
+        // defense in depth: the pre-branch check above already gated the
+        // fork path, and this recheck narrows the TOCTOU window before the
+        // vault read on the same-origin path. Safe to run twice — the
+        // recheck is read-only (no consent slot consumed).
         requireKeyReadAllowed(endpoint.providerId, allowAsk)
         val credential = captureCredential(endpoint)
         var session: ChatSession? = null
@@ -850,6 +885,11 @@ class ChatSessionFactory(
      * This path never splits, migrates, or backfills the archived session:
      * already-mixed pre-R4-1 ids stay archived as-is (quarantined, never
      * re-hydrated whole-batch into a live provider context).
+     *
+     * Key.read gate: covered by the pre-branch T1 recheck in [openImpl]
+     * (single call site, directly above the branch) — the compat-shim
+     * `allowAsk = false` denies here too (default key.read is ASK), so a
+     * 3-arg open on a cross-origin ledger fails closed before any vault read.
      */
     private suspend fun openForked(
         store: SessionStore,

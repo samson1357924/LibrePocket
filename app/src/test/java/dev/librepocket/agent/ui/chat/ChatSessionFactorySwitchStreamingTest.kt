@@ -475,6 +475,18 @@ class ChatSessionFactorySwitchStreamingTest {
             return CreatedSession(oldId, oldSession, endpoint.providerId, endpoint.model)
         }
 
+        // P0-1 open-full-union: explicit route to the open-backfill-canonical
+        // below, which keeps this fake's documented gate no-op (pre-seeded
+        // sessions, no backfill of its own). allowAsk is intentionally
+        // discarded: this is a policy-agnostic test double with no key.read gate.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent, backfillInterrupted)
+
         // D2 canonical form: this fake attaches pre-seeded sessions with no
         // backfill of its own; the gate is intentionally a no-op here (same
         // as the old interface default). Backfill behavior is pinned against

@@ -202,6 +202,18 @@ class ChatSameIdReopenStickyDebtTest {
         ): CreatedSession =
             inner.open(endpoint, sessionId, keyIsCurrent).also { attached.add(it.session) }
 
+        // P0-1 open-full-union: explicit route to the open-backfill-canonical
+        // below, honoring backfillInterrupted (recorded, then threaded into
+        // the real factory). allowAsk is intentionally discarded: this is a
+        // policy-agnostic test double with no key.read gate of its own.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent, backfillInterrupted)
+
         override suspend fun open(
             endpoint: EndpointConfig,
             sessionId: String,

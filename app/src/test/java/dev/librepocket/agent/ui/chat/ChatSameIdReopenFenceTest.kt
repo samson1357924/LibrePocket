@@ -171,6 +171,17 @@ private class SameIdDeferSessions(
         keyIsCurrent: suspend () -> Boolean,
     ): CreatedSession = open(endpoint, sessionId, keyIsCurrent, true)
 
+    // P0-1 open-full-union: explicit route to the open-backfill-canonical
+    // below, honoring backfillInterrupted. allowAsk is intentionally
+    // discarded: this is a policy-agnostic test double with no key.read gate.
+    override suspend fun open(
+        endpoint: EndpointConfig,
+        sessionId: String,
+        allowAsk: Boolean,
+        keyIsCurrent: suspend () -> Boolean,
+        backfillInterrupted: Boolean,
+    ): CreatedSession = open(endpoint, sessionId, keyIsCurrent, backfillInterrupted)
+
     override suspend fun open(
         endpoint: EndpointConfig,
         sessionId: String,

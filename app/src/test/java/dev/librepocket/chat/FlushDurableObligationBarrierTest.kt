@@ -705,8 +705,11 @@ class FlushDurableObligationBarrierTest {
         assertFalse("doomed settle timeout without terminal must not flushDurable true", durable)
         assertNotTrueAndDangling(store, sid, durable, "doomed host timeout")
         awaitCond(8_000, "transcript seal") { c.isTranscriptSealed() }
-        // Release both gates: the late terminal seals (no duplicate user row),
-        // durability stays poisoned (provable INTERRUPTED), reopen stays safe.
+        // Release both gates: the late terminal commits (no duplicate user
+        // row). R23-1: the drain-timeout mark clears on the proven commit —
+        // the row IS durable now — so durability clears too (every row is
+        // durable, the family is closed); only a genuine store failure would
+        // stay poisoned. Reopen stays safe (nothing dangles).
         providerGate.complete(Unit)
         termGate.complete(Unit)
         withTimeout(8_000) { (started as TurnStart.Started).host.join() }
@@ -718,7 +721,11 @@ class FlushDurableObligationBarrierTest {
           snapshot(store, sid).count { it.kind == "user" },
         )
         val sealed = withTimeout(8_000) { c.flushDurable(400L) }
-        assertFalse("interrupted doomed family must still not flushDurable true", sealed)
+        // R23-1: the late terminal committed, so every row is durable and the
+        // doomed family is closed — flushDurable honestly reports true (still
+        // never true-and-dangling, see below). The pre-release check above
+        // pins the timeout path stays fail-closed while the terminal is gated.
+        assertTrue("committed doomed family must flushDurable true", sealed)
         assertNotTrueAndDangling(store, sid, sealed, "doomed host sealed")
       }
       assertEquals("doomed host must reach the provider exactly once", 1, provider.streamCalls.get())

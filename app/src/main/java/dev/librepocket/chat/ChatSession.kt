@@ -261,10 +261,12 @@ interface ChatSession {
    * backfill gate treats `isTranscriptSealed() && pending empty &&
    * !hasPendingAdmission()` as proof the old writer can never land a late
    * terminal ONLY together with [isTranscriptWriterCompleted] (R14-1) and no
-   * Phase 1 obligation evidence ([hasUnsettledAdmission],
-   * [hasUnsettledPromotion], [hasActiveHost], [hasClosedUnsettledAdmission],
-   * [hasUnsettledCancelReceipts], [hasSealedUncompensatedReceipts] — R22
-   * Phase 2 barrier-aware), so an expired block may promote even while the
+   * non-sticky obligation evidence ([hasUnsettledAdmission],
+   * [hasUnsettledPromotion], [hasActiveHost],
+   * [hasUnsettledCancelReceipts] — R22
+   * Phase 2 barrier-aware, R23-1 sticky split: [hasClosedUnsettledAdmission]
+   * and [hasSealedUncompensatedReceipts] stay [flushDurable]-conjoined but
+   * never block the dead proof), so an expired block may promote even while the
    * ledger still dangles (marking INTERRUPTED is then correct, never a
    * mis-mark), while a sealed-but-still-obligated writer keeps deferring.
    *

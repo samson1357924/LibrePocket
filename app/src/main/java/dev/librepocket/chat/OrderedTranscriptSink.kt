@@ -84,9 +84,12 @@ class OrderedTranscriptSink(
   /**
    * R17-1 P1 review: leaf monitor for the writer success-path commit pair
    * (commit count increment + pending clear) and the atomic snapshot below.
-   * Never nests [poisonLock], [admissionLock], or the controller lock, and no
-   * suspend/delegate/channel work runs inside — increment + remove + two
-   * concurrent-map reads only — so no new lock-order edge exists.
+   * Nests [poisonLock] for the R23-1 late-commit clear / drain-timeout guard
+   * pair (commit-then-clear vs check-then-mark under one order,
+   * submitTruthLock → poisonLock, never reversed: no poisonLock section below
+   * takes submitTruthLock), and no suspend/delegate/channel work runs inside
+   * — increment + remove + two concurrent-map reads plus the poison clear
+   * only — so no new lock-order edge exists.
    */
   private val submitTruthLock = Any()
   /**
@@ -145,6 +148,20 @@ class OrderedTranscriptSink(
    * this set and semantics — visible but never a durable failure.
    */
   private val resolvedUndelivered = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+  /**
+   * R23-1 genuine store-failure poison (guarded by [poisonLock], same compound
+   * discipline as [interrupted]): runIds whose writer block threw (store
+   * IOException, teardown/fatal mid-entry) as opposed to drain-timeout /
+   * seal-race / fail-fast marks (an admitted entry the writer never got to
+   * run before the bounded teardown gave up on waiting). A late commit clears
+   * a timeout mark (the row IS durable — see the success-path
+   * [clearTimeoutMarkOnCommit] clear below) but
+   * must never clear a genuine failure: with the first-attempt id shared by
+   * the user row and its terminal, a failed user row plus a later committed
+   * terminal would otherwise read clean while the family still dangles.
+   * Append-only, bounded by the session's failed core count; never cleared.
+   */
+  private val storeFailed = java.util.Collections.synchronizedSet(mutableSetOf<String>())
   private val shutdownGuard = AtomicBoolean(false)
   /**
    * Stage 3 (R4-5) unified admission sequencer shared by every admission
@@ -393,7 +410,7 @@ class OrderedTranscriptSink(
             val outcome = entry.outcome ?: coreOutcomes.remove(ack)
             if (!ack.isCompleted) {
               if (failure != null) {
-                entry.runId?.let(::markInterrupted)
+                entry.runId?.let(::markStoreFailure)
                 outcome?.compareAndSet(null, false)
                 coreOutcomes.remove(ack)
                 ack.completeExceptionally(failure)
@@ -406,10 +423,15 @@ class OrderedTranscriptSink(
                 // true post-commit window. The pair is committed under
                 // [submitTruthLock] so [coreSubmitTruth] never observes the
                 // torn (old count + cleared pending) mix (see its KDoc).
+                // R23-1: the same section clears a drain-timeout mark for a
+                // genuinely committed row (never a store failure — see
+                // [clearTimeoutMarkOnCommit]), so a mark-then-commit race
+                // converges clean instead of poisoning durability forever.
                 entry.runId?.let { id ->
                   synchronized(submitTruthLock) {
                     commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
                     pendingCore.remove(id)
+                    clearTimeoutMarkOnCommit(id)
                   }
                 }
                 // D15-2 test seam: widens the commit→ack window for the
@@ -428,7 +450,7 @@ class OrderedTranscriptSink(
                 ack.complete(Unit)
               }
             } else if (failure != null) {
-              entry.runId?.let(::markInterrupted)
+              entry.runId?.let(::markStoreFailure)
               (entry.outcome ?: coreOutcomes.remove(ack))?.compareAndSet(null, false)
             } else {
               // D15-2: the ack was already completed (abandoned waiter) but
@@ -436,11 +458,15 @@ class OrderedTranscriptSink(
               // pending so a racing cancel handler observes COMMITTED,
               // never a false NOT_COMMITTED. Same [submitTruthLock] pair as
               // above: the snapshot below sees either pre- or post-commit,
-              // never the torn mix.
+              // never the torn mix. Same R23-1 late-commit clear as above:
+              // a drain-timeout mark (whose waiter ack was failed first)
+              // lifts on the proven commit, a store failure never does
+              // (see [clearTimeoutMarkOnCommit]).
               entry.runId?.let { id ->
                 synchronized(submitTruthLock) {
                   commitCounts.computeIfAbsent(id) { AtomicInteger(0) }.incrementAndGet()
                   pendingCore.remove(id)
+                  clearTimeoutMarkOnCommit(id)
                 }
               }
               (entry.outcome ?: coreOutcomes.remove(ack))?.compareAndSet(null, true)
@@ -1140,6 +1166,11 @@ class OrderedTranscriptSink(
 
   /**
    * True if any admitted core event failed during persistence or was interrupted by teardown/timeout.
+   *
+   * R23-1: a drain-timeout/seal mark is not a persistence failure — when the
+   * still-running writer later commits the row, the success path clears that
+   * id (the row is durable); a genuine store failure ([markStoreFailure])
+   * never clears. Either way a failing read stays fail-closed (true).
    */
   fun hasDurableFailures(): Boolean = synchronized(poisonLock) { interrupted.isNotEmpty() }
 
@@ -1188,7 +1219,30 @@ class OrderedTranscriptSink(
         if (!flush(drainTimeoutMs)) {
           val cause = CancellationException("transcript drain timeout")
           for (runId in pendingCore.toList()) {
-            markInterrupted(runId)
+            // R23-1 late-commit race: the writer may commit between the
+            // snapshot above and this mark. Re-check pending membership under
+            // the same [submitTruthLock] the success path uses for its
+            // commit-then-clear: a commit that already landed removed pending
+            // (and cleared any mark) → skip, never re-poison a durable row.
+            // A still-pending id is a genuine timeout orphan → mark (a later
+            // commit still clears it via the success path). Pending-gone also
+            // covers the already-settled shapes (store failure marked,
+            // resolve/seal settled) — skipping them is a no-op either way.
+            // Membership (not the aggregate commit count) is the discriminator:
+            // a first-attempt id shares its user row and terminal, so a
+            // committed user row must never shield its still-pending terminal
+            // from the mark. Acks still fail for every id (waiters must unpark
+            // either way).
+            // Snapshot→mark gap note (no extra seam): ids admitted after the
+            // snapshot above are not in this loop, but they are not lost —
+            // the [sealWriter] integration gate below (outstanding-ack sweep
+            // + orphan-buffered drain after channel.close()) marks every
+            // still-unacked core, so the gap stays fail-closed without a
+            // flaky admission-vs-snapshot seam. A concurrent late commit for
+            // such an id still clears a timeout mark via the success path.
+            synchronized(submitTruthLock) {
+              if (pendingCore.contains(runId)) markInterrupted(runId)
+            }
             failAcksFor(runId, cause)
           }
         }
@@ -1310,6 +1364,44 @@ class OrderedTranscriptSink(
       }
       pendingCore.remove(runId)
       if (!interrupted.contains(runId)) interrupted.add(runId)
+    }
+  }
+
+  /**
+   * R23-1 genuine store-failure poison: the writer block for [runId] threw
+   * (store IOException, teardown/fatal mid-entry), so the row provably never
+   * persisted. Records the durable mark like [markInterrupted] plus the
+   * [storeFailed] tier, which the success-path late-commit clear honors: a
+   * drain-timeout/seal orphan that later commits lifts its mark (the row is
+   * durable), a genuine failure never does — even when a later entry reuses
+   * the same first-attempt id (user row failed, terminal committed: the
+   * family still dangles). Compound under [poisonLock] like every other
+   * poison mutation (A1 order).
+   */
+  internal fun markStoreFailure(runId: String) {
+    synchronized(poisonLock) {
+      if (resolvedUndelivered.contains(runId)) {
+        pendingCore.remove(runId)
+        return
+      }
+      pendingCore.remove(runId)
+      if (!interrupted.contains(runId)) interrupted.add(runId)
+      storeFailed.add(runId)
+    }
+  }
+
+  /**
+   * R23-1 late-commit clear for a genuinely committed row: lifts a
+   * drain-timeout/seal orphan mark (the row IS durable now) but never a
+   * genuine store failure ([storeFailed]). Must be called under
+   * [submitTruthLock] as part of the commit-then-clear pair; nests
+   * [poisonLock] (submitTruthLock → poisonLock order, never reversed, same
+   * as the previous inline sections this replaces — no new lock-order edge,
+   * no suspend/delegate/channel work inside).
+   */
+  private fun clearTimeoutMarkOnCommit(runId: String) {
+    synchronized(poisonLock) {
+      if (!storeFailed.contains(runId)) interrupted.remove(runId)
     }
   }
 

@@ -1005,7 +1005,11 @@ class ChatSessionFactorySwitchStreamingTest {
      * trips exactly one seam with an IDLE projection and everything else
      * clean, so a `true` isolates the VM branch (without the new conjunct it
      * would read `false`). The sealed-shape negatives pin the expanded dead
-     * proof conjunct-by-conjunct, and the sealed-clean positive control pins
+     * proof conjunct-by-conjunct for every NON-STICKY obligation, the
+     * R23-1 sticky positives pin that permanent close debt and
+     * SEALED-uncompensated receipts alone still read dead (evidence still
+     * trips, writer still reads not-alive), and the sealed-clean positive
+     * control pins
      * that a truly settled writer still reads dead (the expansion must not
      * over-block the R10-2/R14-1 dead path). Production wiring for each seam
      * is proven by the real-controller tests above, not here.
@@ -1078,7 +1082,12 @@ class ChatSessionFactorySwitchStreamingTest {
             evidence(Phase2SeamSession(closedUnsettled = true)),
         )
 
-        // Expanded dead proof: sealed + any single open obligation → not dead.
+        // Expanded dead proof: sealed + any single NON-STICKY open obligation
+        // → not dead. Permanent sticky debt (close-dropped UNKNOWN/promotion
+        // fates, SEALED-uncompensated receipts — R23-1) is liveness-split: it
+        // stays conjoined into flushDurable and still trips the evidence, but
+        // never blocks the dead proof, so the expired deferred-backfill can
+        // promote its single INTERRUPTED.
         assertFalse(
             "sealed + unsettled admission must not be dead",
             dead(Phase2SeamSession(sealed = true, writerCompleted = true, unsettledAdmission = true)),
@@ -1092,16 +1101,38 @@ class ChatSessionFactorySwitchStreamingTest {
             dead(Phase2SeamSession(sealed = true, writerCompleted = true, activeHost = true)),
         )
         assertFalse(
-            "sealed + sticky close debt must not be dead",
-            dead(Phase2SeamSession(sealed = true, writerCompleted = true, closedUnsettled = true)),
-        )
-        assertFalse(
             "sealed + unsettled receipts must not be dead",
             dead(Phase2SeamSession(sealed = true, writerCompleted = true, unsettledReceipts = true)),
         )
+        // R23-1 sticky split: sealed + ONLY permanent sticky debt still reads
+        // dead (its terminal will never land), while the evidence still trips
+        // (flushDurable stays false — never true-and-dangling) and therefore
+        // the writer reads not-alive via the dead-first order.
+        val stickyClose = Phase2SeamSession(sealed = true, writerCompleted = true, closedUnsettled = true)
+        assertTrue(
+            "sealed + permanent sticky close debt alone must still be dead",
+            dead(stickyClose),
+        )
         assertFalse(
-            "sealed + uncompensated receipts must not be dead",
-            dead(Phase2SeamSession(sealed = true, writerCompleted = true, sealedUncompensated = true)),
+            "sticky-only dead writer must not read alive",
+            alive(stickyClose),
+        )
+        assertTrue(
+            "sticky close debt must still trip the streaming evidence",
+            evidence(stickyClose),
+        )
+        val stickySealed = Phase2SeamSession(sealed = true, writerCompleted = true, sealedUncompensated = true)
+        assertTrue(
+            "sealed + SEALED-uncompensated receipt alone must still be dead",
+            dead(stickySealed),
+        )
+        assertFalse(
+            "sticky-SEALED dead writer must not read alive",
+            alive(stickySealed),
+        )
+        assertTrue(
+            "SEALED-uncompensated receipt must still trip the streaming evidence",
+            evidence(stickySealed),
         )
 
         // Positive control: sealed + fully clean + completed still reads dead

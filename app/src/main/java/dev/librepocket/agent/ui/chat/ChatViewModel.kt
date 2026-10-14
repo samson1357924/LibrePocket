@@ -4004,8 +4004,10 @@ class ChatViewModel(
      *   the verifiable promotion ([tryPromoteExpiredBlock]): ledger clean +
      *   fresh live clean + old writer not alive + no live outstanding
      *   teardown promotes (or writer-dead proof — sealed + pending empty +
-     *   writer completed (R14-1) + no Phase 1 obligation evidence (R22
-     *   Phase 2 barrier-aware) —
+     *   writer completed (R14-1) + no non-sticky obligation evidence (R22
+     *   Phase 2 barrier-aware, R23-1 sticky split: permanent close debt and
+     *   SEALED-uncompensated receipts stay in [ChatSession.flushDurable] but never block
+     *   the dead proof) —
      *   promotes even with a dangling ledger, since its terminal will never
      *   land and marking INTERRUPTED is then correct). Anything unverified
      *   renews the deadline and defers again (fail-closed: the caller keeps
@@ -4081,7 +4083,9 @@ class ChatViewModel(
      * - the stored old writer (see [pendingBackfillWriter]) shows none, AND
      * - either the ledger proves its terminal (no dangling family) OR a
      *   stored/slot old writer is provably dead (sealed + pending empty +
-     *   writer completed + no Phase 1 obligation evidence, so
+     *   writer completed + no non-sticky obligation evidence — R23-1: sticky
+     *   close debt and SEALED-uncompensated receipts never block the dead
+     *   proof — so
      *   its terminal will never land and an INTERRUPTED mark is correct).
      * B1: liveness is verified BEFORE the probe (fast fail) and re-verified
      * AFTER it — a probe suspension window that lands a new dangling must
@@ -4141,13 +4145,16 @@ class ChatViewModel(
 
     /**
      * B2 sealed-aware liveness: a provably-dead writer (sealed + pending
-     * empty + writer completed AND no Phase 1 obligation evidence, see
+     * empty + writer completed AND no non-sticky obligation evidence, see
      * [isWriterSealedDead]) is NOT alive, even when its uiState still sticks
-     * at STREAMING after the seal. Lets the expiry dead-proof stay reachable
-     * instead of being shadowed by the stuck status. Dead-first order is
-     * safe for the barrier shape because the dead proof itself is
-     * barrier-aware (R22 Phase 2): sealed + still-unsettled admission /
-     * promotion / host / close-debt / receipt evidence is never dead, so
+     * at STREAMING after the seal — and even while permanent sticky debt
+     * (close-dropped UNKNOWN/promotion fates, SEALED-uncompensated receipts)
+     * still trips [isLedgerStreamingOrPending] below. Lets the expiry
+     * dead-proof stay reachable instead of being shadowed by the stuck status
+     * or by unliftable debt. Dead-first order is safe for the barrier shape
+     * because the dead proof itself stays barrier-aware (R22 Phase 2, R23-1
+     * split): sealed + still-unsettled admission / promotion / host /
+     * PENDING-CLAIMED receipt evidence is never dead, so
      * [isLedgerStreamingOrPending] still reports alive and the block keeps
      * deferring. Best-effort, never throws.
      */
@@ -4205,7 +4212,7 @@ class ChatViewModel(
 
     /**
      * R10-2 writer-dead proof: sealed AND no pending admission AND no unacked
-     * cores AND no Phase 1 terminal-obligation evidence. Best-effort, never throws.
+     * cores AND no non-sticky terminal-obligation evidence. Best-effort, never throws.
      *
      * R14-1 fourth conjunct: the writer itself must have completed
      * ([ChatSession.isTranscriptWriterCompleted]). Seal + empty pending
@@ -4215,19 +4222,28 @@ class ChatViewModel(
      * state as dead writes a false INTERRUPTED. Unknown/completed-proof
      * failures stay fail-closed (false → entry kept).
      *
-     * R22 Phase 2 barrier-aware (P1-1/P1-3): seal + empty UNKNOWN/pending is
-     * ALSO observable while a Phase 1 terminal obligation is still open — a
-     * direct/promotion admission window ([ChatSession.hasUnsettledAdmission]),
-     * a promotion reservation/ghost ([ChatSession.hasUnsettledPromotion]), a
-     * live host ([ChatSession.hasActiveHost]), sticky close debt
-     * ([ChatSession.hasClosedUnsettledAdmission]), a PENDING/CLAIMED receipt
-     * ([ChatSession.hasUnsettledCancelReceipts]), or a SEALED-uncompensated
-     * receipt ([ChatSession.hasSealedUncompensatedReceipts]). Any such
-     * evidence forces false (not dead), so the expiry promotion
+     * R22 Phase 2 barrier-aware (P1-1/P1-3), R23-1 sticky split: seal + empty
+     * UNKNOWN/pending is ALSO observable while a live terminal obligation is
+     * still open — a direct/promotion admission window
+     * ([ChatSession.hasUnsettledAdmission]), a promotion reservation/ghost
+     * ([ChatSession.hasUnsettledPromotion]), a live host
+     * ([ChatSession.hasActiveHost]), or a PENDING/CLAIMED receipt
+     * ([ChatSession.hasUnsettledCancelReceipts]). Any such evidence forces
+     * false (not dead), so the expiry promotion
      * ([tryPromoteExpiredBlock]) keeps deferring and [isWriterAliveEvidence]
      * (dead-first but barrier-aware) still reports alive for the barrier
-     * shape. All reads share one best-effort try: any failure stays
-     * fail-closed (false → entry kept).
+     * shape. Permanent sticky debt is NOT liveness evidence and never blocks
+     * this proof: a close-dropped UNKNOWN/promotion fate
+     * ([ChatSession.hasClosedUnsettledAdmission]) and a SEALED-uncompensated
+     * receipt ([ChatSession.hasSealedUncompensatedReceipts]) stay conjoined
+     * into [ChatSession.flushDurable] (never true-and-dangling) and still trip
+     * [isLedgerStreamingOrPending], but a sealed + pending-empty + completed
+     * writer with no live obligation above is dead even while they hold —
+     * its terminal will never land, so the expired deferred-backfill's single
+     * INTERRUPTED is correct. Never clear the sticky flags to reach this
+     * (that would read false-clean); they lift only via reopen backfill.
+     * All reads share one best-effort try: any failure stays fail-closed
+     * (false → entry kept).
      */
     private fun isWriterSealedDead(session: ChatSession): Boolean {
         return try {
@@ -4237,9 +4253,7 @@ class ChatViewModel(
             if (session.hasUnsettledAdmission()) return false
             if (session.hasUnsettledPromotion()) return false
             if (session.hasActiveHost()) return false
-            if (session.hasClosedUnsettledAdmission()) return false
             if (session.hasUnsettledCancelReceipts()) return false
-            if (session.hasSealedUncompensatedReceipts()) return false
             session.isTranscriptWriterCompleted()
         } catch (_: Exception) {
             false

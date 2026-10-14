@@ -1579,9 +1579,10 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * Concurrency: callers hold the single-flight session mutex, and every fork
  * targets a brand-new session id, so overlapping switches cannot interleave
  * rows. Rollback rides on the existing `discardUnattached(deleteTranscriptRow
- * = true)` path (`deleteSession` cascades the copied events in Room; the
- * in-memory fake only drops the header — orphaned rows under a deleted id are
- * never loaded because every read is session-gated).
+ * = true)` path (`deleteSession` cascades the copied events per the
+ * [SessionStore] interface contract, enforced in Room by the FK CASCADE —
+ * the in-memory test fake mirrors the cascade; no orphan rows survive under
+ * the deleted id).
  *
  * Redaction: [RoomSessionStore] re-runs the redactor on every write; the
  * copied texts are already redacted and replacements carry no secret shapes,

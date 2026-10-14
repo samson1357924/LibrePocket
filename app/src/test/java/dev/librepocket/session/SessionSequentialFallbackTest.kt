@@ -13,6 +13,7 @@ import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.redact.Redactor
 import java.io.File
 import java.io.IOException
 import java.util.UUID
@@ -57,6 +58,17 @@ class SessionSequentialFallbackTest {
      * [SessionStore.appendEvents]: it inherits the interface-default
      * sequential loop (non-atomic). Fault injection targets the `assistant`
      * row (2nd row of a marker-first batch) with [IOException].
+     *
+     * S1 parity note: write shaping mirrors [RoomSessionStore] (kind gate
+     * with Room message, reasoning empty-only, redact + 100k truncate,
+     * redactError reason; title redacted + blank-model gate on create) and
+     * [deleteSession] cascades like Room CASCADE. Prune/export/import are
+     * unsupported targets that always throw `UnsupportedOperationException` (use
+     * Room); they are never silent successes.
+     *
+     * Explicit non-goal: list/get reads return stored titles as-is (no
+     * read-time re-redact, unlike [FakeSessionStore] which re-redacts titles
+     * on get/list like Room); only the write-time title redact is mirrored.
      */
     private class SequentialStore : SessionStore {
         val metas = LinkedHashMap<String, SessionMeta>()
@@ -65,8 +77,9 @@ class SessionSequentialFallbackTest {
         var failAssistantRunIds = HashSet<String>()
 
         override suspend fun createSession(title: String, model: String): String {
+            require(model.isNotBlank()) { "model must not be blank" }
             val id = UUID.randomUUID().toString()
-            metas[id] = SessionMeta(id, title, now, now, model)
+            metas[id] = SessionMeta(id, Redactor.redact(title).text, now, now, model)
             return id
         }
 
@@ -76,26 +89,47 @@ class SessionSequentialFallbackTest {
         override suspend fun getSession(sessionId: String): SessionMeta? = metas[sessionId]
 
         override suspend fun appendEvent(event: TranscriptEvent): Long {
-            require(event.kind in VALID_KINDS)
+            require(event.kind in VALID_KINDS) { "unknown event kind: ${event.kind}" }
+            require(event.kind != "reasoning" || event.text.isEmpty()) { "reasoning marker must have empty text" }
+            val redacted = Redactor.redact(event.text).text
+            val text = if (redacted.length > RoomSessionStore.MAX_TEXT_CHARS) {
+                redacted.take(RoomSessionStore.MAX_TEXT_CHARS)
+            } else {
+                redacted
+            }
+            val reason = event.failureReason?.let { Redactor.redactError(it) }
+            require(metas.containsKey(event.sessionId)) { "unknown session" }
+            // Fault AFTER shaping AND the unknown-session gate, BEFORE seq
+            // assignment: mirrors Room (prepareEvent shaping, then the session
+            // check, then the I/O transaction), so the injected second-row
+            // failure lands where a real I/O fault would — an unknown session
+            // still reports the gate, never the injected fault.
             if (event.kind == "assistant" && event.runId in failAssistantRunIds) {
                 throw IOException("injected second-row fault")
             }
             val max = events.filter { it.sessionId == event.sessionId }.maxOfOrNull { it.seq } ?: 0L
             check(max < Long.MAX_VALUE) { "seq exhausted" }
-            events.add(event.copy(seq = max + 1))
+            events.add(event.copy(seq = max + 1, text = text, failureReason = reason))
             return events.size.toLong()
         }
 
         // NOTE: no appendEvents override — inherits the default sequential loop.
 
-        override suspend fun loadEvents(sessionId: String, afterSeq: Long, limit: Int): List<TranscriptEvent> =
-            events.filter { it.sessionId == sessionId && it.seq > afterSeq }.take(limit)
+        override suspend fun loadEvents(sessionId: String, afterSeq: Long, limit: Int): List<TranscriptEvent> {
+            require(limit > 0) { "limit must be positive" }
+            return events.filter { it.sessionId == sessionId && it.seq > afterSeq }.take(limit)
+        }
 
-        override suspend fun exportJsonl(sessionId: String, destFile: File) = Unit
-        override suspend fun importJsonl(srcFile: File): String = error("unused")
-        override suspend fun prune(policy: PrunePolicy): PruneResult = PruneResult(0, 0)
+        override suspend fun exportJsonl(sessionId: String, destFile: File) {
+            throw UnsupportedOperationException("unsupported in test fake (SequentialStore), use Room")
+        }
+        override suspend fun importJsonl(srcFile: File): String =
+            throw UnsupportedOperationException("unsupported in test fake (SequentialStore), use Room")
+        override suspend fun prune(policy: PrunePolicy): PruneResult =
+            throw UnsupportedOperationException("unsupported in test fake (SequentialStore), use Room")
         override suspend fun deleteSession(sessionId: String) {
             metas.remove(sessionId)
+            events.removeAll { it.sessionId == sessionId }
         }
     }
 

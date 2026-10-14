@@ -20,12 +20,14 @@ import java.util.zip.ZipOutputStream
  * 原子提交測試：覆蓋 [SkillInstaller.installFiles] 的原子提交區。
  *
  * - replace 成功：新版完整、無 `.tmp`/`.bak` 殘留；
- * - replace 失敗回滾：staging→target 失敗時舊版位元組一致、無半成品、`.bak` 被消費；
+ * - replace 失敗回滾：staging→target 失敗時舊版位元組一致、無半成品、`.bak` 被消費
+ *   （回傳 false 與拋 SecurityException 兩種失敗語義皆覆蓋，雙重失敗訊息含根因與 backup 名）；
  * - backup 步失敗：舊版原地、staging 已清、訊息含 `backup old version`；
  * - 回滾亦失敗：訊息含 `backup kept at`、`.bak` 保留舊版；
  * - 新鮮安裝 rename 失敗：無 target、staging 已清；
  * - 併發安裝同一 skill 序列化（per-skill 鎖 + hook 內最大並發斷言）；
- * - 重啟清理：過期 staging／孤兒 bak 收斂、嚴格檔名形狀、崩潰三窗口調 cleanup 即恢復。
+ * - 重啟清理：過期 staging／孤兒 bak 收斂、嚴格檔名形狀、崩潰三窗口調 cleanup 即恢復、
+ *   同 id 多份 orphan backup 歧義全保留；
  *
  * 測試 hook 採委託式：只擋指定 rename，其餘走真實 `from.renameTo(to)`，
  * 禁止「hook 回 true 卻沒搬」的空轉假成功。
@@ -189,6 +191,116 @@ class SkillAtomicCommitTest {
             assertEquals(1, removed)
             assertTrue(File(root, "atomic-skill/SKILL.md").readBytes().contentEquals(before))
             SkillParser.parse(File(root, "atomic-skill/SKILL.md").readText(Charsets.UTF_8))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun replaceStagingRenameThrows_rollsBack_oldBytesIntact() {
+        val root = tempRoot()
+        try {
+            installV1(root)
+            val before = File(root, "atomic-skill/SKILL.md").readBytes()
+
+            // P1-1：第二次 rename 拋 SecurityException（非回傳 false）。
+            // target→backup 與回滾走真實搬移。
+            SkillInstaller.renameHook = { from, to ->
+                if (from.name.contains(".tmp-")) throw SecurityException("denied staging commit")
+                else from.renameTo(to)
+            }
+            val v2 = zipOf(
+                "atomic-skill/SKILL.md" to skillMd(body = "正文 v2 半成品").toByteArray(Charsets.UTF_8),
+                "atomic-skill/refs/new.md" to "半成品附檔".toByteArray(Charsets.UTF_8),
+            )
+            val r = SkillInstaller.installZip(v2, root, replace = true)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            val f = r as SkillInstaller.Result.Failure
+            assertEquals(SkillInstaller.Failure.IO_ERROR, f.reason)
+            assertTrue("message should name from→to: ${f.message}", "rename staging" in f.message)
+            assertTrue("message should confirm rollback: ${f.message}", "rolled back" in f.message)
+
+            // 舊版位元組一致、target 無半成品、staging 與 .bak 皆被消費。
+            assertTrue(File(root, "atomic-skill/SKILL.md").readBytes().contentEquals(before))
+            assertFalse(File(root, "atomic-skill/refs/new.md").exists())
+            val stagingLeft = root.listFiles()!!.filter { it.name.contains(".tmp-") }
+            assertTrue("staging leftovers: $stagingLeft", stagingLeft.isEmpty())
+            val bakLeft = root.listFiles()!!.filter { it.name.contains(".bak-") }
+            assertTrue("bak leftovers: $bakLeft", bakLeft.isEmpty())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun replaceStagingRenameThrowsAndRollbackThrows_reportsBackupKept() {
+        val root = tempRoot()
+        try {
+            installV1(root)
+            val before = File(root, "atomic-skill/SKILL.md").readBytes()
+
+            // P1-1 雙重失敗：target→backup 真實搬移；staging→target 與 bak→target 皆拋例外。
+            SkillInstaller.renameHook = { from, to ->
+                if (to.name.contains(".bak-")) from.renameTo(to)
+                else throw SecurityException("denied commit and rollback")
+            }
+            val v2 = zipOf(
+                "atomic-skill/SKILL.md" to skillMd(body = "正文 v2").toByteArray(Charsets.UTF_8),
+            )
+            val r = SkillInstaller.installZip(v2, root, replace = true)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            val f = r as SkillInstaller.Result.Failure
+            assertEquals(SkillInstaller.Failure.IO_ERROR, f.reason)
+            assertTrue("message should keep backup location: ${f.message}", "backup kept at" in f.message)
+            assertTrue("message should carry root cause: ${f.message}", "denied commit" in f.message)
+            assertTrue("message should mark rollback failure: ${f.message}", "rollback failed" in f.message)
+            val baks = root.listFiles()!!.filter { it.name.contains(".bak-") }
+            assertEquals("expected exactly one retained bak: $baks", 1, baks.size)
+            assertTrue(
+                "message should name retained bak: ${f.message}",
+                baks.single().name in f.message,
+            )
+
+            // target 缺席（雙重失敗）、staging 已清、.bak 保留舊版位元組。
+            assertFalse(File(root, "atomic-skill").exists())
+            assertTrue(root.listFiles()!!.none { it.name.contains(".tmp-") })
+            assertTrue(baks.single().resolve("SKILL.md").readBytes().contentEquals(before))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun multipleExpiredBaksSameId_keptAmbiguous_noRestore() {
+        val root = tempRoot()
+        try {
+            // P1-2：同 id 兩份不同內容 expired .bak + target 缺席。
+            // nanoTime 後綴非 wall-clock，不可用於選「最新」；歧義時全保留、不還原、不刪除。
+            val tid = Thread.currentThread().id
+            val bakV1 = File(root, ".dup-skill.bak-111-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(
+                    skillMd(name = "dup-skill", body = "舊版正文 v1"),
+                    Charsets.UTF_8,
+                )
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            val bakV2 = File(root, ".dup-skill.bak-999-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(
+                    skillMd(name = "dup-skill", body = "舊版正文 v2"),
+                    Charsets.UTF_8,
+                )
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            assertFalse(File(root, "dup-skill").exists())
+
+            val removed = SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L)
+
+            // target 仍缺席、兩份 .bak 都保留、計數不含它們。
+            assertEquals(0, removed)
+            assertFalse(File(root, "dup-skill").exists())
+            assertTrue("bakV1 must be kept", bakV1.exists())
+            assertTrue("bakV2 must be kept", bakV2.exists())
+            assertTrue(bakV1.resolve("SKILL.md").readText(Charsets.UTF_8).contains("舊版正文 v1"))
+            assertTrue(bakV2.resolve("SKILL.md").readText(Charsets.UTF_8).contains("舊版正文 v2"))
         } finally {
             root.deleteRecursively()
         }

@@ -73,6 +73,13 @@ object SkillInstaller {
     /** 同 skill 互斥鎖（per-skill 序列化併發安裝；skill 數量有界，條目永不驅逐）。 */
     private val skillLocks = ConcurrentHashMap<String, ReentrantLock>()
 
+    /**
+     * 取 per-skill 鎖。呼叫方必須只傳 [SkillParser] NAME_RE 合法 id：
+     * [installFiles] 在 [SkillParser.parse] 校驗＋NAME_MISMATCH 比對之後才取鎖
+     *（`root == manifest.name`，已受 NAME_RE 約束），[cleanupStaleStaging]
+     * 僅對 [SkillParser.isValidName] 通過者取鎖；故 key 空間有界（長度/字符集受限），
+     * 條目永不驅逐。
+     */
     internal fun lockFor(skillId: String): ReentrantLock =
         skillLocks.computeIfAbsent(skillId) { ReentrantLock() }
 
@@ -105,9 +112,17 @@ object SkillInstaller {
      *
      * 形狀不符（`.nomedia`／`.random`／`.my.bakery`／`x.bak-y` 等）一律不碰；
      * 形狀符合但 id 非法者只刪不恢復。真實 skill 目錄永不以 `.` 開頭
-     *（見 [SkillParser] 的 name 規則），不會被誤刪。
+     * （見 [SkillParser] 的 name 規則），不會被誤刪。
      *
-     * @return 刪除或恢復的條目數。
+     * 同 id 有多份過期 `.bak` 候選時視為歧義：一律保留、不還原、不刪除、
+     * 不計數，需人工介入。檔名 nanoTime 後綴是單調計數器而非 wall-clock
+     * 時間戳，不可跨重啟比較新舊，故不用後綴數字選「最新」。
+     *
+     * 呼叫方契約：不應與 [installZip]/[installFiles] 對同一 [destRoot] 併發調用；
+     * 本函式內僅對同一 id 取 per-skill 鎖做 best-effort 互斥（防與安裝提交交錯），
+     * 跨 id 操作與 destRoot 建立仍需外部序列化。
+     *
+     * @return 刪除或恢復的條目數（歧義保留者不計入）。
      */
     fun cleanupStaleStaging(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): Int {
         if (!destRoot.isDirectory) return 0
@@ -117,6 +132,15 @@ object SkillInstaller {
             null
         } ?: return 0
         val now = System.currentTimeMillis()
+        // 先按 skill id 分組過期 .bak 候選：同 id 多份時無法證明新舊，
+        // 列舉順序未定義，逕行還原其一併刪除其餘會造成資料遺失，故全保留。
+        val bakCountById = HashMap<String, Int>()
+        for (f in entries) {
+            val bakId = BACKUP_RE.matchEntire(f.name)?.groupValues?.get(1) ?: continue
+            if (!SkillParser.isValidName(bakId)) continue
+            if (now - f.lastModified() < maxAgeMillis) continue
+            bakCountById[bakId] = (bakCountById[bakId] ?: 0) + 1
+        }
         var removed = 0
         for (f in entries) {
             val n = f.name
@@ -124,26 +148,61 @@ object SkillInstaller {
             val bakId = if (stagingId != null) null else BACKUP_RE.matchEntire(n)?.groupValues?.get(1)
             if (stagingId == null && bakId == null) continue
             if (now - f.lastModified() < maxAgeMillis) continue
-            if (bakId != null && SkillParser.isValidName(bakId)) {
-                val target = File(destRoot, bakId)
-                if (!target.exists() && f.isDirectory) {
-                    // 崩潰窗口遺留：舊版已搬離、target 缺席 → 盡力恢復。
-                    if (rename(f, target)) {
-                        removed++
-                        continue
-                    }
-                    // 恢復失敗則保留供人工處理，不計數。
-                    continue
+            // 有效 id 的條目在 per-skill 鎖下操作，防與同 id 安裝提交交錯。
+            val opId = stagingId?.takeIf { SkillParser.isValidName(it) }
+                ?: bakId?.takeIf { SkillParser.isValidName(it) }
+            if (opId != null) {
+                val lock = lockFor(opId)
+                lock.lock()
+                try {
+                    if (handleCleanupEntry(f, stagingId, bakId, destRoot, bakCountById)) removed++
+                } finally {
+                    lock.unlock()
                 }
+                continue
             }
-            // staging、target 仍在的孤兒 bak、或 id 非法者：只刪不恢復。
-            try {
-                if (f.deleteRecursively()) removed++
-            } catch (_: Exception) {
-                // best-effort：刪不掉就留下，不影響呼叫方。
-            }
+            if (handleCleanupEntry(f, stagingId, bakId, destRoot, bakCountById)) removed++
         }
         return removed
+    }
+
+    /**
+     * 單一清理條目的實際處置（呼叫方已按 id 取鎖或 id 非法無需取鎖）。
+     *
+     * @return true 表示已刪除或已恢復（計入回傳計數）。
+     */
+    private fun handleCleanupEntry(
+        f: File,
+        stagingId: String?,
+        bakId: String?,
+        destRoot: File,
+        bakCountById: Map<String, Int>,
+    ): Boolean {
+        if (bakId != null && SkillParser.isValidName(bakId)) {
+            if ((bakCountById[bakId] ?: 0) > 1) {
+                // 歧義：同 id 多份候選，全保留、不還原、不刪除、不計數，需人工介入。
+                return false
+            }
+            val target = File(destRoot, bakId)
+            if (!target.exists() && f.isDirectory) {
+                // 崩潰窗口遺留：舊版已搬離、target 缺席 → 盡力恢復。
+                val restored = try {
+                    rename(f, target)
+                } catch (_: Exception) {
+                    false
+                }
+                if (restored) return true
+                // 恢復失敗則保留供人工處理，不計數。
+                return false
+            }
+        }
+        // staging、target 仍在的孤兒 bak、或 id 非法者：只刪不恢復。
+        return try {
+            f.deleteRecursively()
+        } catch (_: Exception) {
+            // best-effort：刪不掉就留下，不影響呼叫方。
+            false
+        }
     }
 
     /**
@@ -344,24 +403,37 @@ object SkillInstaller {
                             "commit failed: backup old version ${target.name} -> ${backup.name}",
                         )
                     }
-                    if (!rename(staging, target)) {
-                        val restored = try {
-                            rename(backup, target)
-                        } catch (_: Exception) {
-                            false
+                    // 第二次 rename：回傳 false 與拋例外（renameTo 的 SecurityException、
+                    // renameHook 拋錯）統一走同一回滾區塊，維持「失敗保留舊版」。
+                    val commitError: String? = try {
+                        if (rename(staging, target)) null else "rename returned false"
+                    } catch (e: Exception) {
+                        e.message ?: e.javaClass.simpleName
+                    }
+                    if (commitError != null) {
+                        val rollbackError: String? = try {
+                            if (rename(backup, target)) null else "rename returned false"
+                        } catch (e: Exception) {
+                            e.message ?: e.javaClass.simpleName
                         }
-                        staging.deleteRecursively()
-                        return if (restored) {
+                        try {
+                            staging.deleteRecursively()
+                        } catch (_: Exception) {
+                            // best-effort：清不掉不影響已組好的失敗訊息與回滾結果。
+                        }
+                        return if (rollbackError == null) {
                             fsyncBestEffort(destRoot)
                             Result.Failure(
                                 Failure.IO_ERROR,
-                                "commit failed: rename staging ${staging.name} -> ${target.name}, rolled back",
+                                "commit failed: rename staging ${staging.name} -> ${target.name} " +
+                                    "failed ($commitError), rolled back",
                             )
                         } else {
                             Result.Failure(
                                 Failure.IO_ERROR,
-                                "commit failed: rename staging ${staging.name} -> ${target.name}, " +
-                                    "rollback failed, backup kept at ${backup.name}",
+                                "commit failed: rename staging ${staging.name} -> ${target.name} " +
+                                    "failed ($commitError), rollback failed ($rollbackError), " +
+                                    "backup kept at ${backup.name}",
                             )
                         }
                     }

@@ -308,13 +308,14 @@ class RestrictedShell(
             } else {
                 runner
             }
-        // spawn 前重驗：同一解析再跑一次，實體路徑不一致即拒（零 spawn）。
+        // spawn 前重驗：同一解析再跑一次，全字段不一致即拒（零 spawn；
+        // ResolvedExec 為 data class，全相等比分段比對多覆未來新增欄位）。
         val fresh = try {
             reverify()
         } catch (_: Exception) {
             null
         }
-        if (fresh == null || fresh.path != resolved.path) {
+        if (fresh != resolved) {
             return ShellResult.Denied(
                 ShellDeny.BLACKLISTED,
                 "untrusted executable: ${argv[0].trim()}",
@@ -334,8 +335,9 @@ class RestrictedShell(
         }
         val raw: RawOutput = try {
             effectiveRunner.run(spawnArgv, timeoutMs, ShellExecutables.CLEAN_ENV)
-        } catch (e: Exception) {
-            return ShellResult.Failed("spawn failed: ${e.message}")
+        } catch (_: Exception) {
+            // 診斷如需保留只可進 log；目前直接丟棄，回執固定字串不內插異常訊息（防路徑外洩）。
+            return ShellResult.Failed("spawn failed")
         }
         val out = ShellPolicy.truncate(raw.stdout)
         val err = ShellPolicy.truncate(raw.stderr)

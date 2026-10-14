@@ -219,8 +219,9 @@ object ProotExec {
                     timeoutMs,
                     LinuxEnv.GUEST_ENV,
                 )
-            } catch (e: Exception) {
-                return ShellResult.Failed("spawn failed: ${e.message}")
+            } catch (_: Exception) {
+                // e.message 只可進 log 不可進回執：回執固定字串，不內插異常訊息（防路徑外洩，與 RestrictedShell 同策；診斷如需保留只可進 log，目前直接丟棄）。
+                return ShellResult.Failed("spawn failed")
             }
         } finally {
             containerLock.unlock()

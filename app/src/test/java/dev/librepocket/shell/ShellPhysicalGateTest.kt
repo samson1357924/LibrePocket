@@ -176,6 +176,44 @@ class ShellPhysicalGateTest {
         }
     }
 
+    @Test fun danglingLink_deniedDirectAndElevated() {
+        // 懸空連結回歸鎖定（非 exists 行差分證明）：單線程下步驟1逐段 lstat 已對懸空
+        // final-link 回 true 即拒（symlink denied），根本到不了 exists 行；修前 following
+        // exists 回 false 亦同樣被步驟1拒。exists NOFOLLOW 僅收斂步驟1→exists→toRealPath
+        // 競態窗口（窗口內換入懸空鏈時 following 回 false 誤放行，NOFOLLOW 回 true 進
+        // toRealPath 拒），屬縱深。fixture 用 canonicalFile（防 macOS /var→/private/var 詞法誤殺）。
+        val scope = tempDir("b1-dangling-scope").canonicalFile
+        try {
+            val missing = File(scope, "no-such-target.txt")
+            val dangling = File(scope, "dangling.txt").toPath()
+            Files.createSymbolicLink(dangling, missing.toPath())
+            val direct = ShellPolicy.validate(
+                listOf("cat", dangling.toString()),
+                scope.absolutePath,
+            )
+            assertTrue("dangling link must be denied, got $direct", direct is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (direct as Validation.Denied).reason)
+            assertTrue(
+                "message must mention symlink, got ${direct.message}",
+                direct.message.contains("symlink"),
+            )
+            val elevated = ShellPolicy.validateElevated(
+                listOf("cat", dangling.toString()),
+                scope.absolutePath,
+                flavor = Flavor.GITHUB,
+                bridgeGranted = true,
+            )
+            assertTrue("elevated dangling link must be denied, got $elevated", elevated is Validation.Denied)
+            assertEquals(ShellDeny.BLACKLISTED, (elevated as Validation.Denied).reason)
+            assertTrue(
+                "message must mention symlink, got ${elevated.message}",
+                elevated.message.contains("symlink"),
+            )
+        } finally {
+            scope.deleteRecursively()
+        }
+    }
+
     @Test fun spawnReverify_mismatchDeniedWithoutSpawn() {
         val scope = tempDir("b1-reverify-scope")
         try {

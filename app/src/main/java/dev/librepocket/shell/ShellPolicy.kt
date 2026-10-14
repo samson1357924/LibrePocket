@@ -3,6 +3,7 @@ package dev.librepocket.shell
 import dev.librepocket.files.FileScope
 import dev.librepocket.tool.Flavor
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Paths
 
 /**
@@ -563,6 +564,8 @@ object ShellPolicy {
                 // F1：原始操作數含 `..` 段即 fail-closed 拒絕（不先做詞法 normalize
                 // 折疊；拒絕訊息帶原因碼 DOTDOT）。spawn 用原始操作數，故驗側嚴於
                 // 用側；guest 容器內路徑亦同門先判，不因 `continue` 放行。
+                // belt-and-suspenders：內層 checkFileScope／checkFileScopeElevated／
+                // checkPhysicalOperandGate 重檢同條件，刻意冗餘，刪任一層需同步更新測試。
                 if (hasDotDotSegment(candidate)) {
                     return Validation.Denied(
                         ShellDeny.BLACKLISTED,
@@ -758,6 +761,7 @@ object ShellPolicy {
         flavor: Flavor,
         bridgeGranted: Boolean,
     ): Validation.Denied? {
+        // 刻意冗餘：外層 checkPathArgs 已先拒同條件（見 checkPathArgs 內 hasDotDotSegment 外層檢查）；保留作縱深。
         if (hasDotDotSegment(path)) {
             return Validation.Denied(
                 ShellDeny.BLACKLISTED,
@@ -802,7 +806,7 @@ object ShellPolicy {
      * 2. 存在即 `toRealPath()` 全解析固定，再以同一語義重裁
      *    [FileScope.decide]（[isElevated] 為 true 時沿提權語義
      *    `allowed==true` 即放行，否則要求 `allowed && !needsBridge`）；
-     *    real 逃出詞法域即拒；解析抛異常即拒。
+     *    real 逃出詞法域即拒；解析抛異常即拒。存在判定用 NOFOLLOW（懸空視為存在；但懸空早在步驟1即拒，此僅縱深）。
      * 3. 不存在時降級為第 1 步（父鏈 symlink Walk）：leaf 無實體可固定，
      *    不以 `NoSuchFileException` 誤殺合法未建檔查詢（如 `ls` 未建檔名、
      *    單測假根）；其殘餘（檢查後建鏈、父目錄被換）見下。
@@ -815,6 +819,13 @@ object ShellPolicy {
      *
      * hardlink 揭露：本門不解 hardlink；同 FS 域內 hardlink 指到域外（硬連結
      * 指向域外 inode）在承諾外，不在消除保證內。
+     * F-NORMWALK：步驟 1 walk 的對象為 [FileScope.normalize] 後鏈，原始 `..`
+     * 由步驟 0 先拒，順序不可調換（先 normalize 再驗 `..` 會把
+     * `/scope/sub/../outside` 誤判為域內，見 F1）。
+     * 段間競態點名：逐段 lstat 非原子，中間段跟隨檢查、前段驗過仍可被
+     * `rename` 換掉；段間安全網僅為終態 `toRealPath()`＋重裁，僅反映 toRealPath() 呼叫瞬間終態，不與逐段 lstat 原子一致，中間段在兩次檢查之間仍可被 rename 換掉。
+     * mount／bind 不解（與 hardlink 同為 out-of-scope：`toRealPath()` 不解
+     * mount，bind 到域外仍顯示域內）。
      */
     private fun checkPhysicalOperandGate(
         candidate: String,
@@ -827,6 +838,7 @@ object ShellPolicy {
         fun deny(reason: String): Validation.Denied =
             Validation.Denied(ShellDeny.BLACKLISTED, reason)
         // 0. F1：原始含 `..` 即拒，不先做詞法 normalize 折疊。
+        // 刻意冗餘：外層 checkPathArgs 已先拒同條件（見 checkPathArgs 內 hasDotDotSegment 外層檢查）；保留作縱深。
         if (hasDotDotSegment(candidate)) {
             return deny("dotdot segment denied (reason=DOTDOT): $candidate")
         }
@@ -865,7 +877,7 @@ object ShellPolicy {
             return deny("symlink check failed: $candidate")
         }
         val exists = try {
-            Files.exists(Paths.get(normCandidate))
+            Files.exists(Paths.get(normCandidate), LinkOption.NOFOLLOW_LINKS)
         } catch (_: Exception) {
             return deny("symlink check failed: $candidate")
         }
@@ -902,6 +914,7 @@ object ShellPolicy {
         flavor: Flavor,
         bridgeGranted: Boolean,
     ): Validation.Denied? {
+        // 刻意冗餘：外層 checkPathArgs 已先拒同條件；保留作縱深（與 checkFileScope/checkPhysicalOperandGate 同）。
         if (hasDotDotSegment(path)) {
             return Validation.Denied(
                 ShellDeny.BLACKLISTED,

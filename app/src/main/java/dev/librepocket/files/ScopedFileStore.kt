@@ -80,7 +80,12 @@ enum class FileBudgetCode(val detail: String) {
  *   仍可瞬時外寫（僅能事後刪暫存），殘餘 TOCTOU 僅有界）；[exists] 的第二次驗證與
  *   `isFile` 之間同樣存在窗口。[delete] 刪前重驗最終目標（NOFOLLOW lstat
  *   是 link 即拒不刪、正規化後不在域內／逸出即拒）：單次置換的誤刪替換後外部檔已修
- *   （轉為拒絕），重驗→刪除之間仍有極小併發窗口，僅有界不消除。
+ *   （轉為拒絕），重驗→刪除之間仍有有界併發窗口（攻擊者可無限重試，
+ *   rename 原子，窗口非時間極小，僅有界不消除）。
+ *   hardlink／mount 均不在門內（isSymbolicLink=false、canon 域內：同 FS 硬鏈讀可見
+ *   外部 inode 內容，刪只解域內項；canonicalPath／toRealPath 均不解 mount／bind，
+ *   bind 到域外仍顯示域內）；與 symlink 分開論述，列 out-of-scope，與
+ *   ShellPolicy 同。
  *   本類只保證有界行為：併發替換可能造成本次呼叫被拒
  *   （[IllegalArgumentException]）、讀到舊內容、讀到替換後外部內容、
  *   把本次寫入落在鏈外，或短暫列出鏈外檔名
@@ -373,6 +378,8 @@ class ScopedFileStore(val root: File) {
      * B2 落盤門：驗最終目標非連結（NOFOLLOW lstat）、暫存非連結，
      * 且兩者正規路徑仍在域內（防父段替換後指向外部）。失敗 fail-closed。
      * 僅做單次檢查，不消除檢查-搬移之間的併發窗口（見類註解）。
+     * 注意 File.getCanonicalPath 對懸空連結不跟隨（返回詞法域內），故 containment
+     * 不能替代 lstat，兩者缺一不可，順序不得對調；方法內 lstat→canonical 亦非原子。
      */
     private fun ensurePreMoveNoSymlinkAndContained(target: File, tmp: File, original: String) {
         try {
@@ -444,11 +451,13 @@ class ScopedFileStore(val root: File) {
      * 基址及遍歷途中遇 symlink 一律略過不下鑽，不跟隨；
      * 以祖先鏈正規目錄集合防循環（兄弟 diamond 可重入、真環裁剪；
      * canonical 取不到時 fail-closed 跳過該子樹）。
-     * 條目僅回相對路徑（不含 root 絕對前綴，不洩全路徑；單檔基址同樣只回相對）；
+     * 條目僅回相對路徑（不含 root 絕對前綴，不洩全路徑；絕對路徑永不回，
+     * 此為守衛保證；單檔基址同樣只回相對）；
      * DirectoryStream 單遍 best-effort，不保證單遍快照隔離；併發增刪中途可見，不保證跨調一致。
      * 殘餘：回傳檔名本身即洩露存在性，呼叫方不得將列目結果視為授權證明；
-     * 併發替換下僅保證單遍有界（不跟隨、不懸掛），不保證與某次檢查原子一致；
-     * 併發替換下可能短暫列出鏈外檔名（短暫洩名窗口已揭露，僅單遍 best-effort、不跨調一致）。
+     * 併發替換下僅保證單遍有界（不跟隨；blocking 呼叫仍只到下一檢查點，見上），不保證與某次檢查原子一致；
+     * 併發替換下鏈外名可短暫以域內相對形回（sub→out 後已開流，守衛擋不住，
+     * 僅揭露存在性（授權證明限制見上；僅單遍 best-effort、不跨調一致））。
      * 開流失敗的子目錄視為空（沿舊 `listFiles()==null` 語義），不中斷兄弟列舉。
      * 最終排序僅在成功路徑最後一步做一次 `out.sorted()`（預算按發現序，
      * 不做 per-dir 預排序）。
@@ -643,8 +652,11 @@ class ScopedFileStore(val root: File) {
     /** 刪除檔案；不存在回 false（冪等語義：重複刪不報錯）。
      * 實際刪除前重驗一次整鏈（[resolve] 內已驗第一次）；刪前再做最終目標
      * NOFOLLOW lstat（是 link 即拒不刪）＋正規路徑域內 containment：
-     * 單次置換的誤刪替換後外部檔已修（轉為拒絕）。重驗→刪除之間仍有極小
-     * 併發窗口，僅有界不消除（Java 無 O_NOFOLLOW/openat，見類註解），
+     * 單次置換的誤刪替換後外部檔已修（轉為拒絕）。其中 final-link 置換
+     * （刪鏈本身，unlink 不跟隨）是 fail-closed 政策選擇，parent-link 置換
+     * （跟隨父鏈刪外部）才是真正安全修復。重驗→刪除之間仍有有界併發窗口
+     * （攻擊者可無限重試，rename 原子，窗口非時間極小，僅有界不消除；
+     * Java 無 O_NOFOLLOW/openat，見類註解），
      * 此為變更操作固有風險，呼叫方不得假設檢查後路徑不可變。 */
     fun delete(relativePath: String): Boolean {
         val target = resolve(relativePath)

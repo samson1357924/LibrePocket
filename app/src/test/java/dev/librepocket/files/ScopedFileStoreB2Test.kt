@@ -64,7 +64,10 @@ class ScopedFileStoreB2Test {
         link(File(ws, "sub"), out)
         assertRejected({ store.delete("sub/secret.txt") }, "delete via replaced parent link")
         assertEquals("OUTSIDE", secret.readText())
-        assertFalse(File(out, "inner.txt").exists())
+        // 注：舊 `assertFalse(File(out, "inner.txt").exists())` 為 vacuous
+        //（inner.txt 從未在外部存在過，永遠 pass），已移除，改斷言連結本身存活。
+        // parent-link 即拒不刪：連結本身仍在（fail-closed，不跟隨父鏈刪外部）。
+        assertTrue(Files.isSymbolicLink(File(ws, "sub").toPath()))
     }
 
     @Test fun deletePreDeleteGateExists() {
@@ -81,6 +84,14 @@ class ScopedFileStoreB2Test {
         assertTrue(
             "delete must re-verify canonical containment before delete",
             deleteBody.contains("canonicalPath") && deleteBody.contains(".delete()"),
+        )
+        // 順序鎖定：lstat＋canonical 重驗必須先於實際 delete，否則重排 bug 可穿透。
+        val lstatIdx = deleteBody.indexOf("Files.isSymbolicLink(target.toPath())")
+        val canonIdx = deleteBody.indexOf("target.canonicalPath")
+        val delIdx = deleteBody.indexOf("return target.delete()")
+        assertTrue(
+            "lstat + canonical 必須先於 delete，否則重排 bug 可穿透 (got indices $lstatIdx/$canonIdx/$delIdx)",
+            lstatIdx >= 0 && canonIdx > lstatIdx && delIdx > canonIdx,
         )
     }
 

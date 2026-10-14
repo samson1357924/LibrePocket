@@ -6,9 +6,40 @@ package dev.librepocket.provider
  * Zero dependencies on purpose: the provider module must stay JVM-unit-testable
  * (android.jar `org.json` stubs throw under plain JUnit) and must not gain new
  * Gradle dependencies in P1. Only the subset needed for event projection is
- * supported; malformed input throws [MiniJsonException].
+ * supported; malformed input throws [MiniJsonException]. Over-ceiling nesting
+ * throws the [MiniJsonDepthException] subtype (still caught by existing
+ * [MiniJsonException] catches); protocol mappers translate the depth subtype
+ * into a typed non-retryable aggregation failure instead of dropping the frame.
  */
 internal object MiniJson {
+    /**
+     * Maximum nesting depth (nested objects/arrays) accepted before parsing
+     * fails closed with [MiniJsonDepthException].
+     *
+     * A hostile ≤1 MiB SSE frame can nest hundreds of thousands of containers
+     * (up to ~524k array levels, ~131k with object keys); recursive descent
+     * overflows the native stack ([StackOverflowError]) orders of magnitude
+     * before that. The protocol mappers only catch [MiniJsonException] per
+     * frame, so an escaping [StackOverflowError] would instead be swallowed by
+     * the transport's general branch and mislabeled a retryable failure. Ceiling
+     * the depth keeps the failure typed and fail-closed: over-ceiling input
+     * throws [MiniJsonDepthException] (a [MiniJsonException] subtype, so the
+     * existing per-frame catches still catch it), and the mappers translate
+     * the depth subtype into a typed non-retryable `ProviderFailure`
+     * (`TOOL_ARGS_TOO_LARGE` / `AGG_TOO_LARGE`) — the same semantics as every
+     * aggregation-budget overflow. The poisoned attempt then fails without
+     * re-requesting that frame, without folding a later terminal into a
+     * success `Done` (the mapper latches the breach), and without degrading
+     * to a retryable `SSE_TRUNCATED` at EOF.
+     *
+     * The value is deliberately generous: the deepest legitimate payload in
+     * project fixtures nests 7 (`chat-basic.txt` tool_calls.function); even a
+     * very deep real envelope stays an order of magnitude below 64, so a
+     * well-formed event never trips this while a hostile one is rejected far
+     * below the native stack limit.
+     */
+    internal const val MAX_DEPTH = 64
+
     sealed interface J
 
     data class JObj(val map: Map<String, J>) : J
@@ -18,25 +49,55 @@ internal object MiniJson {
     data class JBool(val v: Boolean) : J
     object JNull : J
 
-    class MiniJsonException(message: String) : IllegalArgumentException(message)
+    open class MiniJsonException(message: String) : IllegalArgumentException(message)
+
+    /**
+     * Nesting-depth ceiling breach ([MAX_DEPTH]). A subtype of
+     * [MiniJsonException], so pre-existing `catch (MiniJsonException)` sites
+     * still catch it — but the protocol mappers discriminate this subtype and
+     * fail the poisoned attempt with a typed non-retryable aggregation failure
+     * instead of dropping the frame and continuing.
+     */
+    class MiniJsonDepthException(message: String) : MiniJsonException(message)
 
     fun parse(text: String): J = Parser(text).parseValue().also { it }
 
     private class Parser(val s: String) {
         var pos = 0
+        private var depth = 0
 
         fun parseValue(): J {
             skipWs()
             if (pos >= s.length) fail("unexpected end")
             return when (val c = s[pos]) {
-                '{' -> parseObj()
-                '[' -> parseArr()
+                '{' -> withDepth { parseObj() }
+                '[' -> withDepth { parseArr() }
                 '"' -> JStr(parseString())
                 't' -> { expect("true"); JBool(true) }
                 'f' -> { expect("false"); JBool(false) }
                 'n' -> { expect("null"); JNull }
                 '-', in '0'..'9' -> parseNum()
                 else -> fail("unexpected char '$c'")
+            }
+        }
+
+        /**
+         * Fail-closed recursion guard. Objects and arrays each enter a nesting
+         * level here (the only two recursive productions); the [try]/[finally]
+         * restores [depth] on every exit path — normal return or thrown — so a
+         * sibling container never inherits a leaked depth. Over-ceiling input
+         * throws [MiniJsonDepthException] (not the plain [MiniJsonException]
+         * used for malformed frames) so the mappers fail the poisoned attempt
+         * typed non-retryable instead of dropping one frame and later
+         * succeeding without its delta.
+         */
+        private inline fun <T> withDepth(block: () -> T): T {
+            if (depth >= MAX_DEPTH) throw MiniJsonDepthException("nesting exceeds $MAX_DEPTH at offset $pos")
+            depth++
+            try {
+                return block()
+            } finally {
+                depth--
             }
         }
 

@@ -84,9 +84,12 @@ sealed interface StreamEvent {
  * [ProviderFailure] ([TOOL_ARGS_TOO_LARGE]) instead of silently truncating.
  *
  * Companion scopes live beside it: [requireTotalToolAggBudget] (same budget
- * summed across ALL tool indexes per attempt) and [requireToolCountBudget]
- * ([MAX_TOOL_CALLS_PER_ATTEMPT] distinct tools per attempt). All three share
- * one failure semantics (message + code + retryable=false).
+ * summed across ALL tool indexes per attempt), [requireToolCountBudget]
+ * ([MAX_TOOL_CALLS_PER_ATTEMPT] distinct admissions per attempt — the
+ * collections it bounds are listed on that constant), and
+ * [requireToolIdBudget] ([MAX_TOOL_ID_CHARS] per single Responses
+ * String key — the orthogonal length half of the admission guard). All four
+ * share one failure semantics (message + code + retryable=false).
  */
 internal const val MAX_TOOL_CALL_AGG_BYTES = 1024 * 1024
 
@@ -123,8 +126,12 @@ internal fun requireToolAggBudget(currentChars: Int, incomingChars: Int) {
  * ([TOOL_ARGS_TOO_LARGE] / [ProviderFailureCode.AGG_TOO_LARGE],
  * retryable=false) — one semantics, two scopes (per-call + per-attempt
  * total), so no second error meaning is introduced. [ToolDone] arrivals
- * never decrement it (monotonic per attempt); terminal `finish()` /
- * `finishPendingTools()` traversals only read already-bounded buffers.
+ * never decrement it; the total is monotonic per attempt in Chat
+ * Completions / Responses / TurnController, while `AnthropicMapper` retires
+ * a replaced TOOL block's chars on TOOL→TOOL re-start / TOOL→non-TOOL
+ * demotion so its total stays equal to the LIVE buffered sum (see
+ * `AnthropicMapper`). Terminal `finish()` / `finishPendingTools()`
+ * traversals only read already-bounded buffers.
  *
  * @throws ProviderFailure non-retryable, [ProviderFailureCode.AGG_TOO_LARGE].
  */
@@ -133,12 +140,26 @@ internal fun requireTotalToolAggBudget(totalChars: Int, incomingChars: Int) =
     requireToolAggBudget(totalChars, incomingChars)
 
 /**
- * Conservative per-attempt distinct-tool cap: at most this many tool indexes
- * (Chat Completions `index` / Responses `item_id` / Anthropic block `index`
- * / TurnController `toolIndex`) may appear in one attempt.
+ * Conservative per-attempt distinct-admission budget — a memory bound on
+ * fail-closed per-attempt collections, not a tool-count feature limit. At
+ * most this many keys may be admitted per attempt into any of:
+ * - Chat Completions `tools` (streamed tool `index`), Responses
+ *   `callsByItem` (`item_id`) and TurnController `distinctToolIndexes`
+ *   (`toolIndex`): one entry per distinct tool index / item id;
+ * - Anthropic `blocks` (content block `index`): one entry per distinct
+ *   index of ANY kind (TEXT / THINKING / TOOL / OTHER), so a flood of
+ *   non-tool blocks cannot grow the map freely; the TOOL-only tally
+ *   `toolBlockCount` shares the same cap and is not re-billed when one
+ *   index restarts as TOOL;
+ * - Responses `emittedToolIds`: one entry per distinct (`toolIndex`, id)
+ *   pair already emitted (its `output_item.done` path is pre-checked here;
+ *   the `finishPendingTools` drain adds at most one pair per already-capped
+ *   `callsByItem` entry, so the set stays within 2x the cap).
+ * Admissions are checked BEFORE insert, so the overflowing entry is never
+ * buffered; a key that only replaces a known one is not re-billed.
  *
- * No measured multi-tool fan-out budget exists yet (TODO #16: measure real
- * session fan-out before fixing a dedicated number), so the value is
+ * No measured fan-out budget exists yet (TODO #16: measure real session
+ * fan-out before fixing a dedicated number), so the value stays
  * deliberately conservative: legitimate single-turn fan-out is single
  * digits, and 64 leaves ample headroom while bounding map/entry growth
  * against a distinct-index flood. Exceeding it throws the SAME
@@ -149,15 +170,65 @@ internal fun requireTotalToolAggBudget(totalChars: Int, incomingChars: Int) =
 internal const val MAX_TOOL_CALLS_PER_ATTEMPT = 64
 
 /**
- * Fail-closed distinct-tool guard: [distinctCount] is the attempt's tool
- * count AFTER admitting the new index (i.e. callers pass `size + 1` for a
- * genuinely new key). Callers check BEFORE `getOrPut`/insert so the
+ * Fail-closed distinct-admission guard: [distinctCount] is the admitted
+ * collection size AFTER admitting the new key (i.e. callers pass `size + 1`
+ * for a genuinely new key — tool index, item id, content block index or an
+ * already-emitted pair). Callers check BEFORE `getOrPut`/insert so the
  * overflowing entry is never buffered.
  *
  * @throws ProviderFailure non-retryable, [ProviderFailureCode.AGG_TOO_LARGE].
  */
 internal fun requireToolCountBudget(distinctCount: Int) {
     if (distinctCount > MAX_TOOL_CALLS_PER_ATTEMPT) {
+        throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+    }
+}
+
+/**
+ * Per-key length cap (chars) for Responses String-keyed tool collections:
+ * each `item_id` map key and each emitted `(toolIndex, id)` pair id may
+ * hold at most this many chars.
+ *
+ * 4096 rationale: legitimate fixture ids are all < 20 chars, so 4096 leaves
+ * ~200x headroom for real provider ids while bounding retention.
+ * Per collection: at most 64 admissions x 4096 chars = 262144 chars
+ * (256 Ki chars) of key retention. The two Responses keyed collections
+ * (`callsByItem` keys + `emittedToolIds` pair ids — the latter up to 2x the
+ * admission cap, because the `output_item.done` pre-check and the
+ * `finishPendingTools` drain can each admit one pair per item) merge to at
+ * most 786432 chars worst-case (262144 + 524288 = 786432 = 192 x 4096), still ~24x
+ * below the pre-fix 19.2M hostile shape (64 x 300KB) and bounded where the
+ * pre-fix retention was unbounded. Synthetic fallbacks (`"item_"` / `"call_"`
+ * + 8 random chars, 13 chars) are far below it and unaffected; empty strings
+ * keep their current quota behavior (still admitted, still billed — not
+ * separately repaired here).
+ *
+ * Orthogonal dual guard with [requireToolCountBudget]: the count cap bounds
+ * HOW MANY keys are admitted, this cap bounds HOW LONG each single key may
+ * be. Merely adding key lengths into `totalAggChars` would NOT close
+ * `emittedToolIds` — retired old ids leave the live aggregate (equal-length
+ * rotation keeps per-candidate growth at 0) while staying retained in the
+ * emitted set — so a per-key length cap, not a summed total, is the correct
+ * primitive. Same typed non-retryable failure as every other aggregation
+ * overflow ([TOOL_ARGS_TOO_LARGE] / [ProviderFailureCode.AGG_TOO_LARGE]),
+ * thrown BEFORE insert (BEFORE write-back/emit on the added-carried-id and
+ * done paths) so the giant key is never retained, never emitted, and never
+ * mutates the aggregate or the round total (fail-closed; on the added path
+ * an empty placeholder may remain but holds no giant chars).
+ */
+internal const val MAX_TOOL_ID_CHARS = 4096
+
+/**
+ * Fail-closed per-key length guard: [idLength] is the length of one
+ * `item_id` map key or one emitted tool-call id about to be admitted.
+ * Callers check BEFORE `getOrPut`/insert (and, on the done path, before
+ * any aggregate write-back or emit) so the overflowing key is never
+ * retained.
+ *
+ * @throws ProviderFailure non-retryable, [ProviderFailureCode.AGG_TOO_LARGE].
+ */
+internal fun requireToolIdBudget(idLength: Int) {
+    if (idLength > MAX_TOOL_ID_CHARS) {
         throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
     }
 }

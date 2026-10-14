@@ -184,23 +184,49 @@ internal class AnthropicMapper(val round: Int = 0) {
 
     private val blocks = LinkedHashMap<Int, Block>()
     // Per-attempt whole-round tool total across all block indexes (Finding
-    // #1), monotonic: content_block_stop arrivals never decrement it.
+    // #1). Monotonic across content_block_delta / content_block_stop arrivals.
+    // The two non-monotonic transitions are TOOL→TOOL re-start at a known
+    // index (retires the outgoing block, then re-bills the incoming pair) and
+    // TOOL→non-TOOL demotion (retires only), so the total stays the true sum
+    // of currently-buffered chars.
     private var totalAggChars = 0
-    // Distinct TOOL-kind blocks (TEXT/THINKING/OTHER blocks are not tools and
-    // stay outside the count cap; replacement at one index adjusts the count).
+    // Distinct TOOL-kind blocks only; TEXT/THINKING/OTHER do not bump it.
+    // The shared cap is broader: any distinct block index of any kind is
+    // charged pre-insert against MAX_TOOL_CALLS_PER_ATTEMPT, while a
+    // replacement at a known index is not charged a new admission (the char
+    // total above still re-bills a TOOL->TOOL pair, by design).
     private var toolBlockCount = 0
     private var inputTokens: Int? = null
     private var outputTokens: Int? = null
     private var stopReason: String? = null
     private var terminal: StreamEvent? = null
+    // Sticky JSON-depth breach latch (fail-closed): once a frame exceeds
+    // MiniJson.MAX_DEPTH, mapPayload throws typed non-retryable and every
+    // later mapPayload rethrows the same way, so message_stop can never
+    // become Done; finish() reports the typed failure instead of
+    // SSE_TRUNCATED. Set only from the MiniJsonDepthException branch below.
+    private var jsonDepthFailed = false
     var terminalReached: Boolean = false
         private set
 
     fun mapPayload(payload: String): List<StreamEvent> {
+        if (jsonDepthFailed) throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
         if (terminal != null) return emptyList()
         val root = try {
             MiniJson.parse(payload) as? MiniJson.JObj ?: return emptyList()
-        } catch (_: MiniJson.MiniJsonException) {
+        } catch (e: MiniJson.MiniJsonException) {
+            if (e is MiniJson.MiniJsonDepthException) {
+                // A depth breach is NOT a droppable malformed frame: dropping
+                // it would lose its delta and let message_stop succeed without
+                // it (fake success), or degrade at EOF to a retryable
+                // SSE_TRUNCATED that retries the poisoned stream. Fail the
+                // attempt with the same typed non-retryable failure as every
+                // aggregation-budget overflow; streamingFlow converts the throw
+                // into a single Failed terminal. Other malformed input still
+                // drops just this frame below.
+                jsonDepthFailed = true
+                throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+            }
             return emptyList()
         }
         val type = root.string("type") ?: return emptyList()
@@ -215,6 +241,18 @@ internal class AnthropicMapper(val round: Int = 0) {
             "content_block_start" -> {
                 val index = root.int("index") ?: return emptyList()
                 val cb = root.obj("content_block") ?: return emptyList()
+                // C1: bound the blocks map itself. A distinct-index flood of
+                // non-tool blocks (text/thinking/other) must not grow memory
+                // without bound: without this, only TOOL blocks counted toward
+                // the cap and N distinct text blocks grew the map freely.
+                // Reuses the same distinct-index budget and typed failure
+                // (TOOL_ARGS_TOO_LARGE / AGG_TOO_LARGE) as tools — one
+                // semantics for every aggregation overflow. Checked BEFORE
+                // insert so the overflowing entry is never buffered;
+                // replacements at a known index do not grow the map.
+                if (!blocks.containsKey(index)) {
+                    requireToolCountBudget(blocks.size + 1)
+                }
                 val kind = when (cb.string("type")) {
                     "text" -> BlockKind.TEXT
                     "thinking", "redacted_thinking" -> BlockKind.THINKING
@@ -222,8 +260,31 @@ internal class AnthropicMapper(val round: Int = 0) {
                     else -> BlockKind.OTHER
                 }
                 val b = Block(kind)
+                val prev = blocks[index]
+                if (prev?.kind == BlockKind.TOOL) {
+                    // Retire the outgoing TOOL block's counted chars whenever
+                    // its index is re-started as TOOL (re-billed below) or
+                    // demoted to a non-TOOL kind: totalAggChars then stays the
+                    // true sum of the chars still buffered, so a hostile cycle
+                    // re-sending one index with equal-length id/name (or
+                    // tool→text→tool churn) cannot inflate it into a spurious
+                    // TOOL_ARGS_TOO_LARGE. Floored at 0 defensively: those
+                    // chars were counted when the block arrived.
+                    totalAggChars = (
+                        totalAggChars - prev.toolId.length - prev.toolName.length - prev.args.length
+                        ).coerceAtLeast(0)
+                }
                 if (kind == BlockKind.TOOL) {
-                    if (blocks[index]?.kind != BlockKind.TOOL) {
+                    if (prev?.kind != BlockKind.TOOL) {
+                        // Belt-and-braces: toolBlockCount equals the number of
+                        // TOOL entries in blocks after every applied event (a
+                        // TOOL start adds one, a demotion drops one, a re-start
+                        // re-bills chars only), and blocks.size is capped
+                        // pre-insert above, so on entry here the pre-charge
+                        // tally is <= 63 and after the increment below the
+                        // post-insert total is <= 64: this charge never
+                        // rejects; an all-TOOL flood is stopped by the
+                        // pre-insert check.
                         requireToolCountBudget(toolBlockCount + 1)
                         toolBlockCount++
                     }
@@ -232,7 +293,7 @@ internal class AnthropicMapper(val round: Int = 0) {
                     requireTotalToolAggBudget(totalAggChars, b.toolId.length + b.toolName.length)
                     totalAggChars += b.toolId.length + b.toolName.length
                     out.add(StreamEvent.ToolDelta(index, b.toolId.ifEmpty { null }, b.toolName.ifEmpty { null }, ""))
-                } else if (blocks[index]?.kind == BlockKind.TOOL) {
+                } else if (prev?.kind == BlockKind.TOOL) {
                     toolBlockCount--
                 }
                 if (kind == BlockKind.THINKING) {
@@ -309,6 +370,20 @@ internal class AnthropicMapper(val round: Int = 0) {
     }
 
     fun finish(): List<StreamEvent> {
+        // A latched depth breach dominates the honest-EOF path: the poisoned
+        // attempt reports the typed non-retryable failure, never a retryable
+        // SSE_TRUNCATED (which would retry the poisoned stream) and never a
+        // success. Carries the AGG_TOO_LARGE code so TurnController's
+        // pending-flush guard treats it like every other budget overflow.
+        if (jsonDepthFailed) {
+            return listOf(
+                StreamEvent.Failed(
+                    TOOL_ARGS_TOO_LARGE,
+                    retryable = false,
+                    code = ProviderFailureCode.AGG_TOO_LARGE.name,
+                ),
+            )
+        }
         terminal?.let { return emptyList() }
         return listOf(StreamEvent.Failed("SSE_TRUNCATED", retryable = true))
     }

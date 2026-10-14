@@ -75,6 +75,22 @@ class SseParserTest {
     }
 
     @Test
+    fun incompleteTrailingUtf8SequenceIsHeldBackNotReplaced() {
+        // completeUtf8PrefixLen must HOLD an incomplete trailing sequence
+        // instead of decoding it as U+FFFD. ProviderTransportC1Test's EOF-latch
+        // boundary case depends on exactly this: the final char of a line must
+        // stay undecoded (and thus uncounted toward the tail latch) until its
+        // continuation bytes arrive.
+        val raw = "data: 嘿\n\n".toByteArray(Charsets.UTF_8) // "嘿" = E5 98 BF
+        val cut = raw.size - 4 // "data: " + lead byte only: nothing completes yet
+        val p = SseFrameParser()
+        assertTrue("an incomplete trailing sequence yields no frame", p.feed(raw, 0, cut).isEmpty())
+        val frames = p.feed(raw, cut, raw.size - cut) + p.flush()
+        assertEquals(1, frames.size)
+        assertEquals("嘿", frames[0].data)
+    }
+
+    @Test
     fun singleLineOverOneMiBLatchesError() {
         val p = SseFrameParser()
         val big = "data: " + "x".repeat(SseFrameParser.MAX_LINE_BYTES)

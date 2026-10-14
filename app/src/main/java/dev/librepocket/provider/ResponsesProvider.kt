@@ -197,14 +197,33 @@ internal class ResponsesMapper(val round: Int = 0) {
     private var totalAggChars = 0
     private var usage: StreamEvent.Usage? = null
     private var terminal: StreamEvent? = null
+    // Sticky JSON-depth breach latch (fail-closed): once a frame exceeds
+    // MiniJson.MAX_DEPTH, mapPayload throws typed non-retryable and every
+    // later mapPayload rethrows the same way, so no later terminal frame can
+    // become Done; finish() reports the typed failure instead of
+    // SSE_TRUNCATED. Set only from the MiniJsonDepthException branch below.
+    private var jsonDepthFailed = false
     var terminalReached: Boolean = false
         private set
 
     fun mapPayload(payload: String): List<StreamEvent> {
+        if (jsonDepthFailed) throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
         if (terminal != null) return emptyList()
         val root = try {
             MiniJson.parse(payload) as? MiniJson.JObj ?: return emptyList()
-        } catch (_: MiniJson.MiniJsonException) {
+        } catch (e: MiniJson.MiniJsonException) {
+            if (e is MiniJson.MiniJsonDepthException) {
+                // A depth breach is NOT a droppable malformed frame: dropping
+                // it would lose its delta and let a later terminal succeed
+                // without it (fake success), or degrade at EOF to a retryable
+                // SSE_TRUNCATED that retries the poisoned stream. Fail the
+                // attempt with the same typed non-retryable failure as every
+                // aggregation-budget overflow; streamingFlow converts the throw
+                // into a single Failed terminal. Other malformed input still
+                // drops just this frame below.
+                jsonDepthFailed = true
+                throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+            }
             return emptyList()
         }
         val type = root.string("type") ?: return emptyList()
@@ -240,10 +259,29 @@ internal class ResponsesMapper(val round: Int = 0) {
                     return out
                 }
                 val itemId = root.string("item_id") ?: item.string("id") ?: ("item_" + UUID.randomUUID().toString().take(8))
+                // S1 per-key length guard (orthogonal to the count cap below):
+                // a 300KB item_id with an empty delta keeps every char/total
+                // budget silent while retaining ~300KB per entry (64 x 300KB
+                // ~= 19.2M chars). Check BEFORE insert so the giant key is
+                // never retained (no entry inserted). Synthetic "item_"+8
+                // fallbacks are far below the cap; empty strings still
+                // admitted/billed (unchanged).
+                requireToolIdBudget(itemId.length)
                 if (!callsByItem.containsKey(itemId)) requireToolCountBudget(callsByItem.size + 1)
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 val addedId = item.string("call_id")?.takeIf { it.isNotEmpty() }
                 val addedName = item.string("name")?.takeIf { it.isNotEmpty() }
+                // S1 per-key fail-fast on the carried call_id: when agg.id is
+                // still empty, the incoming addedId WOULD become the retained
+                // id and the emitted (toolIndex, id) pair. A 10KB call_id fits
+                // the per-call/total char budgets, so check its length BEFORE
+                // the char/total guards and BEFORE write-back. On overflow the
+                // giant call_id is never retained (the empty AggCall placeholder
+                // may remain but holds no id chars, emits nothing, and drains
+                // nothing); first-wins resends (agg.id already set) skip this.
+                // Cap value and rationale live with MAX_TOOL_ID_CHARS in
+                // StreamEvent.kt.
+                if (addedId != null && agg.id.isEmpty()) requireToolIdBudget(addedId.length)
                 val addedIncoming =
                     (if (addedId != null && agg.id.isEmpty()) addedId.length else 0) +
                         (if (addedName != null && agg.name.isEmpty()) addedName.length else 0)
@@ -262,6 +300,10 @@ internal class ResponsesMapper(val round: Int = 0) {
             }
             "response.function_call_arguments.delta" -> {
                 val itemId = root.string("item_id") ?: return emptyList()
+                // S1 per-key length guard: same orthogonal admission half as
+                // the added path — checked BEFORE insert, giant key never
+                // retained (no entry inserted).
+                requireToolIdBudget(itemId.length)
                 if (!callsByItem.containsKey(itemId)) requireToolCountBudget(callsByItem.size + 1)
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 val frag = root.string("delta").orEmpty()
@@ -285,6 +327,9 @@ internal class ResponsesMapper(val round: Int = 0) {
                     return out
                 }
                 val itemId = root.string("item_id") ?: item.string("id") ?: return emptyList()
+                // S1 per-key length guard on the map key (same as added/delta:
+                // BEFORE insert, giant key never retained — no entry inserted).
+                requireToolIdBudget(itemId.length)
                 if (!callsByItem.containsKey(itemId)) requireToolCountBudget(callsByItem.size + 1)
                 val agg = callsByItem.getOrPut(itemId) { AggCall(toolIndex = nextToolIndex++) }
                 // Finding #4: terminal full payloads arrive without prior delta
@@ -301,6 +346,16 @@ internal class ResponsesMapper(val round: Int = 0) {
                 val effectiveName = newName ?: agg.name
                 val effectiveArgsLen = if (useFull) full!!.length else agg.args.length
                 if (effectiveId.isEmpty()) effectiveId = "call_" + UUID.randomUUID().toString().take(8)
+                // S1 per-key length guard on the emitted id: a rotating
+                // equal-length giant call_id keeps per-candidate growth at 0
+                // (old id retired, lengths equal) so char/total/count guards
+                // all stay silent while emittedToolIds retains ~300KB per
+                // pair. Merely summing key lengths into totalAggChars cannot
+                // close this — retired ids are already out of the live total —
+                // so the per-key cap is the correct primitive. Checked BEFORE
+                // any write-back/emit: overflow neither mutates agg/total nor
+                // enters the emitted set. Synthetic "call_"+8 unaffected.
+                requireToolIdBudget(effectiveId.length)
                 val candidateTotal = effectiveId.length + effectiveName.length + effectiveArgsLen
                 // Whole-ToolDone per-call guard: catches terminal-only
                 // oversized payloads (e.g. 200k id + 60k name + 120k args).
@@ -309,13 +364,35 @@ internal class ResponsesMapper(val round: Int = 0) {
                 val oldBuffered = agg.id.length + agg.name.length + agg.args.length
                 val growth = (candidateTotal - oldBuffered).coerceAtLeast(0)
                 requireTotalToolAggBudget(totalAggChars, growth)
-                // All guards passed: single write-back, then emit.
+                // Dedup-set bound (same per-attempt collection invariant as
+                // callsByItem): a hostile stream re-sending one item_id's
+                // output_item.done with a rotating equal-length call_id keeps
+                // per-candidate growth 0 and item_id fixed, so every char and
+                // distinct-count guard above stays silent while emittedToolIds
+                // — and the emitted ToolDone count — grows without bound. Reuse
+                // the SAME distinct per-attempt cap + typed failure; check a
+                // genuinely-new (toolIndex, id) BEFORE insert so the overflowing
+                // entry is never retained (no set insert; duplicates are dedup
+                // no-ops — neither new admissions nor new emits, mirroring the
+                // callsByItem guard above and the drain below).
+                if ((agg.toolIndex to effectiveId) !in emittedToolIds) {
+                    requireToolCountBudget(emittedToolIds.size + 1)
+                }
+                // All guards passed: single write-back, then emit-once per
+                // (toolIndex, id) pair — only a genuinely-new admission emits.
+                // A resend of an already-emitted pair is an output no-op (no
+                // event, no throw, no set growth; the agg write-back above
+                // still refreshes id/name/args and the round total, but
+                // nothing is emitted), mirroring the
+                // finishPendingTools drain below: at most one ToolDone per
+                // pair per attempt, however often the server repeats it.
                 agg.id = effectiveId
                 agg.name = effectiveName
                 if (useFull) agg.args.append(full!!)
                 totalAggChars += growth
-                emittedToolIds.add(agg.toolIndex to agg.id)
-                out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))
+                if (emittedToolIds.add(agg.toolIndex to agg.id)) {
+                    out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))
+                }
             }
             "response.completed" -> {
                 val response = root.obj("response")
@@ -356,6 +433,20 @@ internal class ResponsesMapper(val round: Int = 0) {
     }
 
     fun finish(): List<StreamEvent> {
+        // A latched depth breach dominates the honest-EOF path: the poisoned
+        // attempt reports the typed non-retryable failure, never a retryable
+        // SSE_TRUNCATED (which would retry the poisoned stream) and never a
+        // success. Carries the AGG_TOO_LARGE code so TurnController's
+        // pending-flush guard treats it like every other budget overflow.
+        if (jsonDepthFailed) {
+            return listOf(
+                StreamEvent.Failed(
+                    TOOL_ARGS_TOO_LARGE,
+                    retryable = false,
+                    code = ProviderFailureCode.AGG_TOO_LARGE.name,
+                ),
+            )
+        }
         terminal?.let { return emptyList() } // already terminal
         val out = ArrayList<StreamEvent>()
         finishPendingTools(out)
@@ -367,7 +458,17 @@ internal class ResponsesMapper(val round: Int = 0) {
     private fun finishPendingTools(out: MutableList<StreamEvent>) {
         for ((_, agg) in callsByItem) {
             if (agg.args.isNotEmpty() || agg.name.isNotEmpty()) {
+                // Synthetic fallback first: "call_"+8 is 13 chars, far below
+                // the per-key cap, so this assignment itself never throws —
+                // the guard below only fires on a previously admitted giant id.
                 if (agg.id.isEmpty()) agg.id = "call_" + UUID.randomUUID().toString().take(8)
+                // S1 per-key backstop on the drain: with the added fail-fast
+                // above, a giant call_id is normally rejected at added BEFORE
+                // write-back, so this is defense-in-depth for any future
+                // admission path. Enforced BEFORE emit — overflow throws typed
+                // with no emit and no set insert, giant id never retained in
+                // the emitted set.
+                requireToolIdBudget(agg.id.length)
                 // Terminal guard (Finding #4): whole pending ToolDone must fit
                 // the per-call budget before emit; fail-closed typed throw.
                 requireToolAggBudget(0, agg.id.length + agg.name.length + agg.args.length)
@@ -375,6 +476,18 @@ internal class ResponsesMapper(val round: Int = 0) {
                 // callers track ToolDone ids; duplicates collapse downstream by
                 // (toolIndex, id). Only emit when never emitted — mappers own
                 // this set per stream.
+                //
+                // Bounded without a local budget check: this drain adds at most
+                // one pair per callsByItem entry, every entry's item_id was
+                // admitted through the same distinct cap above. finish() sets
+                // no terminal latch, so a repeated finish() re-runs this drain;
+                // the re-run converges idempotently via the emittedToolIds
+                // dedup (already-emitted pairs add nothing), so the set stays
+                // within 2x MAX_TOOL_CALLS_PER_ATTEMPT overall (loose safe
+                // upper bound, at most 128 total pairs: interleavings such as
+                // 64 done-path pairs plus 63 pending drain pairs can exceed
+                // 64 actually emitted, but never exceed 128; each pair is
+                // emitted at most once).
                 if (emittedToolIds.add(agg.toolIndex to agg.id)) {
                     out.add(StreamEvent.ToolDone(agg.toolIndex, agg.id, agg.name, agg.args.toString()))
                 }

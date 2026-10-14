@@ -15,9 +15,12 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
 `.github/workflows/pr-check.yml`) and `policy`
 (`scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
-`scripts/summarize_junit.py`,
+`scripts/summarize_junit.py`, `scripts/check_test_budgets.py`,
+`scripts/check_junit_durations.py`,
 `scripts/tests/test_apk_policy_check.py`,
 `scripts/tests/test_summarize_junit.py`,
+`scripts/tests/test_check_test_budgets.py`,
+`scripts/tests/test_check_junit_durations.py`,
 `.github/workflows/pr-check.yml`) outputs. `docs-guard` always runs the
 static grep guard `scripts/docs_claim_check.sh` (no Gradle, no emulator);
 `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
@@ -75,7 +78,34 @@ including docs-only ones.
 No branch-protection required checks are configured on `main`; `pr-gate`
 and the checks above are informational until protection is configured.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+
+Issue #86 Phase C guardrails (Current, gates — only reject/alert, never
+silently downgrade redaction or writes):
+- `scripts/check_test_budgets.py` (covered by
+  `scripts/tests/test_check_test_budgets.py`) runs BEFORE the unit-test suite in
+  each flavor job: H1 rejects `repeat(N>=10)` loops writing huge fixtures
+  (`100_000`/`100_001`/`huge`/`big`) through the true `.appendEvent(` shaping
+  (use `appendPreRedactedForBudgetTest` or move to nightly; only
+  `ChatSnapshotByteCapFullStressTest.kt` is allowlisted); H2 rejects
+  `repeat(N>=2000)` with `.appendEvent(`. Local: `python3
+  scripts/check_test_budgets.py`.
+- `scripts/check_junit_durations.py` (covered by
+  `scripts/tests/test_check_junit_durations.py`) runs AFTER the suite in each
+  flavor job and fails when any single test class exceeds 120s (same JUnit XML
+  glob as `summarize_junit.py`, which stays reporting-only). No XML skips green
+  (Gradle governs that case). Local: `python3 scripts/check_junit_durations.py`
+  (needs `app/build/test-results/**/TEST-*.xml` from a prior Gradle run).
+- Known slow classes (budgets, Current): PR-slim byte-cap
+  (`ChatSnapshotByteCapTest`, 11-turn + 12-turn + 2000 small rows) and
+  `SnapshotFiveDimPhase4Test.byteCapOverBudget_fiveDim` must stay well under
+  120s per class; nightly-only `ChatSnapshotByteCapFullStressTest` (200 rows,
+  true shaping) is exempt from the PR gate by construction (skips without
+  `NIGHTLY_STRESS=1`) and has its own 35-minute nightly timeout.
+- Per-class Gradle sharding with independent per-class timeouts is Proposed
+  (not wired): today the per-flavor job timeout (`timeout-minutes: 20`) plus
+  the two gates above are the enforcement. Do not claim sharded execution until
+  it is wired and run.
 
 ## Local commands
 
@@ -87,7 +117,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   scripts/tests/test_apk_policy_check.py \
   scripts/tests/test_release_artifact_verifier.py \
   scripts/tests/test_build_release_identity.py \
-  scripts/tests/test_summarize_junit.py
+  scripts/tests/test_summarize_junit.py \
+  scripts/tests/test_check_test_budgets.py \
+  scripts/tests/test_check_junit_durations.py
+
+# Issue #86 Phase C guardrails (static, no Gradle)
+python3 scripts/check_test_budgets.py
+python3 scripts/check_junit_durations.py
 
 # Flavor unit/Robolectric tests
 ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --max-workers=1 --no-daemon

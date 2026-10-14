@@ -208,7 +208,9 @@ class RetryableCancelNoticeFirstTest {
   private fun flushTwiceAssertStable(c: TurnController, store: FakeSessionStore) {
     runBlocking { withTimeout(8_000) { c.flushTranscript() } }
     val before = synchronized(store.events) { ArrayList(store.events).size }
-    runCatching { awaitReceiptState(c, timeoutMs = 8_000L) }
+    // Strict fence (never swallowed): every caller already awaits its ledger
+    // shape + receipt terminal above, so a timeout here is a real wedge.
+    awaitReceiptState(c, timeoutMs = 8_000L)
     runBlocking { withTimeout(8_000) { c.flushTranscript() } }
     val after = synchronized(store.events) { ArrayList(store.events).size }
     assertEquals("two flush drains must add zero rows (fence, not sleep)", before, after)

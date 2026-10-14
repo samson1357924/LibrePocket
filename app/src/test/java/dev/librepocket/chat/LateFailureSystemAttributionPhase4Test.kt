@@ -70,8 +70,9 @@ private class P4AttrPolicy : PolicyStore {
  * - D: A形 x reasoning=true (RetryableCancelReasoningMarker只測batch不測attribution;
  *   B/C無reasoning twins)。
  *
- * 五維每案: DB kinds/text/flags+無dangling (或預期dangling)、JSONL round-trip、
- * reopen reload、flushDurable；UI僅A正/A反(shape-pin)/D正/D反 (B/C無UI斷言)。
+ * 每案DB+JSONL+reopen+flush (DB kinds/text/flags+無dangling或預期dangling、
+ * JSONL round-trip、reopen reload、flushDurable)；UI僅A/D
+ * (A正/A反shape-pin/D正/D反具UI斷言，B/C無UI斷言)。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])

@@ -219,8 +219,10 @@ class LateFailureCompensationTest {
     val before = synchronized(store.events) { ArrayList(store.events).size }
     // Fence on the receipt terminal state instead of a fixed sleep: the
     // waiter has settled (REVOKED for benign commit-wins, COMPENSATED for
-    // late-FAIL, SEALED for wedge) before we measure stability.
-    runCatching { awaitReceiptTerminalState(c, timeoutMs = 8_000L) }
+    // late-FAIL, SEALED for wedge) before we measure stability. Strict:
+    // a fence timeout fails the test (never swallowed) — every caller
+    // already awaits its ledger shape, so a timeout is a real wedge.
+    awaitReceiptTerminalState(c, timeoutMs = 8_000L)
     runBlocking { withTimeout(8_000) { c.flushTranscript() } }
     val after = synchronized(store.events) { ArrayList(store.events).size }
     assertEquals("two flush drains must add zero rows (fence, not sleep)", before, after)

@@ -1,6 +1,6 @@
 # 威脅模型：目前資料流與安全邊界
 
-> **狀態：Current snapshot**，依 `ce4b6af`（2026-10-15 核對）。這不是正式安全認證，也不代表所有列出的防護均已驗證。B1/B2 有界切片（PR #80）僅經 JVM 單測驗證，裝置 smoke 與快照更新待後續。
+> **狀態：Current snapshot**，依 `0f9003b8a332cc18d0fcb3cd89340db55a11ad65`（2026-10-15 核對）。這不是正式安全認證，也不代表所有列出的防護均已驗證。B1/B2 有界切片（PR #80）僅經 JVM 單測驗證，裝置 smoke 與快照更新待後續。
 >
 > - **範圍：** Android app 的聊天、provider、Room transcript、Android backup 與已宣告工具邊界。
 > - **Owner role：** app/runtime 維護者；目前未指派個人或安全團隊。

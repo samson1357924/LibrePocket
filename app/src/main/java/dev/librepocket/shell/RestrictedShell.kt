@@ -148,11 +148,13 @@ class ShellQuota(
 /**
  * 受限 shell 入口（BACKLOG D05，矩陣「終端命令」行 play 可用部分）。
  *
- * 執行順序：[ShellPolicy.validate]（含 argv[0] 詞法可信門）→
+ * 執行順序：[ShellPolicy.validate]（含 argv[0] 詞法可信門 + 操作數實體門）→
  * 可信 executable 映射（[ShellExecutables.resolve]：logical command →
  * [ShellExecutables.ResolvedExec]，拒 `PATH` 劫持；含 real containment +
  * app-writability 閘，逃逸/可寫即拒且零 spawn、不佔配額）→
- * 配額 → 建子進程（argv[0] 已改寫為固定絕對路徑 + [ShellExecutables.CLEAN_ENV]
+ * 配額 → spawn 前重驗 executable（B1：同一解析再跑一次並比對實體路徑，
+ * 縮小驗過→spawn 窗口；見 [executeResolved] 殘餘揭露）→
+ * 建子進程（argv[0] 已改寫為固定絕對路徑 + [ShellExecutables.CLEAN_ENV]
  * 乾淨 env + cwd 釘死到 [privateRoot]）→ 超時殺 → 輸出截斷。
  * spawn 固定形態：非 multicall 為 `[real, ...args]`；實體 basename 落
  * [ShellExecutables.MULTICALL_BINARIES]（toybox / toolbox / busybox）時為
@@ -164,9 +166,9 @@ class ShellQuota(
  * 沿 [ShellPolicy] 既有嚴格語義，本類不放寬、不重寫。
  *
  * 檔案域：[privateRoot] 為 App 私有域根（例 `context.filesDir.absolutePath`），
- * 檔案參數凡絕對路徑一律先過 `FileScope.decide`（見 [ShellPolicy.validate]）。
- * 未配置（null，預設）時任何絕對路徑一律拒絕，且隱式讀 cwd 的命令無明確
- * 路徑時亦拒絕（fail-closed）；play 跨域拒絕，
+ * 檔案參數凡絕對路徑一律先過 `FileScope.decide` 詞法門 + 實體解析門
+ * （見 [ShellPolicy.validate]）。未配置（null，預設）時任何絕對路徑一律拒絕，
+ * 且隱式讀 cwd 的命令無明確路徑時亦拒絕（fail-closed）；play 跨域拒絕，
  * foss/github 跨域即使橋接已授權，直接 exec 仍拒絕（需改走 D09 橋）。
  */
 class RestrictedShell(
@@ -229,7 +231,14 @@ class RestrictedShell(
                 ShellDeny.BLACKLISTED,
                 "untrusted executable: ${argv[0].trim()}",
             )
-            return executeResolved(argv, binary, resolved, timeoutMs)
+            val reverify: () -> ShellExecutables.ResolvedExec? = {
+                try {
+                    custom(argv[0].trim())
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            return executeResolved(argv, binary, resolved, timeoutMs, reverify)
         }
         val outcome = try {
             ShellExecutables.resolveDetailed(
@@ -250,14 +259,41 @@ class RestrictedShell(
                     else "untrusted executable: ${argv[0].trim()}",
                 )
             }
-        return executeResolved(argv, binary, resolved, timeoutMs)
+        val reverify: () -> ShellExecutables.ResolvedExec? = {
+            try {
+                (ShellExecutables.resolveDetailed(
+                    argv[0].trim(),
+                    execSearchDirs,
+                    execAllowedRoots,
+                    execIsWritable,
+                ) as? ShellExecutables.ResolveOutcome.Ok)?.exec
+            } catch (_: Exception) {
+                null
+            }
+        }
+        return executeResolved(argv, binary, resolved, timeoutMs, reverify)
     }
 
+    /**
+     * spawn 前重驗（B1）：配額通過後、建子進程前把同一解析再跑一次並比對
+     * 實體路徑（自訂映射即重調映射，預設即重跑 `resolveDetailed` 同參），
+     * 不一致／失敗即拒且零 spawn。目的只為縮小「驗過→spawn」窗口
+     * （[ShellExecutables] 檔頭殘餘：resolve 與 `ProcessBuilder.start()` 非原子）。
+     *
+     * 誠實揭露（殘餘 TOCTOU）：重驗與 `runner.run(spawnArgv)` 仍非原子；
+     * Java 無 `O_NOFOLLOW`／`openat` 可持鎖，驗→spawn 間的二進位替換／link
+     * 置換／同路徑內容覆寫仍可能發生，重驗只能縮窗、不能消除。直接通道沒有
+     * 可持的容器鎖（不像 scoped-file 可持 fd 語義）；提權／guest 通道另見
+     * 各自入口（`ProotExec` 持同容器鎖，仍只覆 spawn 臨界、不覆政策驗證）。
+     * 重驗失敗不洩路徑（通用訊息，僅攜原始 `argv[0]`）；配額已在重驗前扣除
+     * （攻擊性重驗失敗亦計次，兼作速率限制）。
+     */
     private fun executeResolved(
         argv: List<String>,
         binary: String,
         resolved: ShellExecutables.ResolvedExec,
         timeoutMs: Long,
+        reverify: () -> ShellExecutables.ResolvedExec?,
     ): ShellResult {
         if (!quota.tryAcquire()) {
             return ShellResult.Denied(ShellDeny.QUOTA_EXCEEDED, "shell quota exceeded")
@@ -272,6 +308,18 @@ class RestrictedShell(
             } else {
                 runner
             }
+        // spawn 前重驗：同一解析再跑一次，實體路徑不一致即拒（零 spawn）。
+        val fresh = try {
+            reverify()
+        } catch (_: Exception) {
+            null
+        }
+        if (fresh == null || fresh.path != resolved.path) {
+            return ShellResult.Denied(
+                ShellDeny.BLACKLISTED,
+                "untrusted executable: ${argv[0].trim()}",
+            )
+        }
         // spawn 固定形態：argv[0] 已改寫為驗證後實體路徑（可執行目標不再由
         // OS 經 `PATH`/cwd 解析）+ 乾淨 env（固定 `PATH`、無危險變數，
         // 不繼承宿主）。操作數（drop(1)）原樣傳遞，不重寫、不放寬。

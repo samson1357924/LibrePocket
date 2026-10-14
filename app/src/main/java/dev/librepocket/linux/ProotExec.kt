@@ -43,6 +43,15 @@ import dev.librepocket.tool.Flavor
  * - 風味：foss/github NATIVE；play FLAVOR_BLOCKED。門禁經 [denyReasonFor]
  *   統一裁決（執行入口不得另寫風味/開關分支）。
  * - 降級回覆尾必附 [FALLBACK_HINT] 與 [LinuxTools.PERF_NOTICE]，單測斷言。
+ * - B1 揭露（#9 有界切片）：guest namespace 路徑（`/inbox/...`、`/etc` 等
+ *   容器內路徑）無法走宿主操作數實體門（宿主 FS 無對應實體，`toRealPath`
+ *   重裁不適用；`ShellPolicy` 內對容器內路徑維持放行、host-tree 路徑同門重裁）。
+ *   其邊界是 `proot -r rootfs` 無 bind 約束 + 本入口的 host 樹封堵
+ *   （`hostLinuxAbsoluteRef`／`unstagedInboxRef`，guest argv 一律 guest
+ *   namespace）+ spawn 持同容器鎖（與 `LinuxInboxStager` 同臨界）。
+ *   容器內 symlink／驗→spawn 窗口殘餘仍在：Java 無 `O_NOFOLLOW`／`openat`，
+ *   只能縮窗、不能消除；容器內 symlink 逃逸（指到 rootfs 外需 bind 才可達，
+ *   本命令無 bind）與併發替換不在消除承諾內。
  *
  * 本檔案零 Android 依賴；子進程縫沿用 [ProcessRunner]，單測可注入假實現。
  */

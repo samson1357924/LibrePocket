@@ -75,13 +75,19 @@ enum class FileBudgetCode(val detail: String) {
  *   攻擊者仍可能以 `rename`/`symlink` 替換路徑段。[read] 在回傳前重驗
  *   一次鏈上無連結並丟棄可疑結果，可將單次替換轉為拒絕，但雙重替換
  *   （檢查→換入連結→IO→換回真檔）仍可能穿出；[write] 的父目錄逐段建立、
- *   暫存建立與搬移之間亦有同類窗口；[exists] 的第二次驗證與 `isFile` 之間、
- *   [delete] 的第二次驗證與實際刪除之間同樣存在窗口（[delete] 為變更操作，
- *   殘餘窗口內可能誤刪替換後的外部檔）。本類只保證有界行為：併發替換可能造成本次呼叫被拒
+ *   暫存建立與搬移之間亦有同類窗口（B2 在暫存建立前先驗整鏈再建暫存＋寫入，
+ *   寫完搬移前再驗整鏈＋最終目標非連結＋暫存域內擋落鏈外；建暫存→寫入窗口
+ *   仍可瞬時外寫（僅能事後刪暫存），殘餘 TOCTOU 僅有界）；[exists] 的第二次驗證與
+ *   `isFile` 之間同樣存在窗口。[delete] 刪前重驗最終目標（NOFOLLOW lstat
+ *   是 link 即拒不刪、正規化後不在域內／逸出即拒）：單次置換的誤刪替換後外部檔已修
+ *   （轉為拒絕），重驗→刪除之間仍有極小併發窗口，僅有界不消除。
+ *   本類只保證有界行為：併發替換可能造成本次呼叫被拒
  *   （[IllegalArgumentException]）、讀到舊內容、讀到替換後外部內容、
- *   把本次寫入落在鏈外、誤刪替換後的外部檔，或短暫列出鏈外檔名
- *   （後四者為殘餘小機率，寫穿出與列目洩露另見壓力測試說明），
+ *   把本次寫入落在鏈外，或短暫列出鏈外檔名
+ *   （後兩者為殘餘小機率，寫穿出與列目洩露另見壓力測試說明），
  *   不保證檢查後鏈上零變動；呼叫方不得假設檢查後路徑不可變。
+ *   [list] 條目僅回相對路徑（不含 root 絕對前綴，不洩全路徑）；DirectoryStream 單遍
+ *   best-effort，不保證單遍快照隔離；併發增刪中途可見，不保證跨調一致；併發替換下短暫洩名窗口已揭露（見 [list]）。
  *   併發壓力測試僅證明行為有界（無未處理異常、無懸掛、store 事後仍可用、
  *   固定 `secret.txt` 未被竄改，`outsideExtra` 僅診斷），不宣稱消除競態；翻轉路徑上的併發寫入仍有殘餘小機率
  *   把本次內容落在鏈外、併發列目仍有殘餘小機率短暫列出鏈外檔名
@@ -273,7 +279,9 @@ class ScopedFileStore(val root: File) {
      *
      * 殘餘：建前二驗→逐段建→建後三驗與暫存建立/搬移之間仍有窗口，
      * 併發 `rename`/`symlink` 替換理論上仍可能把暫存或目標落在鏈外，
-     * 見類註解 TOCTOU 說明。
+     * 見類註解 TOCTOU 說明。B2 在暫存建立前先驗整鏈再建暫存＋寫入，
+     * 寫完搬移前再驗整鏈（NOFOLLOW）＋最終目標非連結＋暫存域內擋落鏈外；
+     * 建暫存→寫入窗口仍可瞬時外寫（僅能事後刪暫存），殘餘 TOCTOU 僅有界。
      */
     fun write(relativePath: String, bytes: ByteArray): WriteOutcome {
         val target = resolve(relativePath)
@@ -285,10 +293,18 @@ class ScopedFileStore(val root: File) {
         if (target.isFile && target.length() == bytes.size.toLong() && contentEquals(target, bytes)) {
             return WriteOutcome.Unchanged
         }
+        // B2 寫入前先驗暫存目錄鏈，再建暫存＋寫入：比對→暫存建立窗口內父鏈可能被換成連結。
+        // 建暫存→寫入窗口仍可瞬時外寫（僅能事後刪暫存），見類註解。
+        ensureNoSymlinkChain(safe, relativePath)
         val created = !target.exists()
         val tmp = File.createTempFile(TMP_NAME_PREFIX, ".tmp", target.parentFile ?: root)
         try {
             tmp.writeBytes(bytes)
+            // B2 寫完搬移前再驗：暫存建立→搬移窗口內父鏈可能被換成連結；
+            // 沿用 NOFOLLOW 語義再驗一次整鏈，並驗最終目標非連結、暫存仍在域內擋落鏈外；
+            // 驗失敗拋出後由 finally 刪暫存，殘餘 TOCTOU 僅有界。
+            ensureNoSymlinkChain(safe, relativePath)
+            ensurePreMoveNoSymlinkAndContained(target, tmp, relativePath)
             try {
                 Files.move(
                     tmp.toPath(),
@@ -354,6 +370,35 @@ class ScopedFileStore(val root: File) {
     }
 
     /**
+     * B2 落盤門：驗最終目標非連結（NOFOLLOW lstat）、暫存非連結，
+     * 且兩者正規路徑仍在域內（防父段替換後指向外部）。失敗 fail-closed。
+     * 僅做單次檢查，不消除檢查-搬移之間的併發窗口（見類註解）。
+     */
+    private fun ensurePreMoveNoSymlinkAndContained(target: File, tmp: File, original: String) {
+        try {
+            if (Files.isSymbolicLink(target.toPath())) {
+                throw IllegalArgumentException("symlink not allowed: $original")
+            }
+            if (Files.isSymbolicLink(tmp.toPath())) {
+                throw IllegalArgumentException("symlink not allowed: $original")
+            }
+            val rootCanon = root.canonicalPath
+            val targetCanon = target.canonicalPath
+            val tmpCanon = tmp.canonicalPath
+            if (targetCanon != rootCanon && !targetCanon.startsWith("$rootCanon/")) {
+                throw IllegalArgumentException("path escapes root: $original")
+            }
+            if (!tmpCanon.startsWith("$rootCanon/")) {
+                throw IllegalArgumentException("path escapes root: $original")
+            }
+        } catch (e: IllegalArgumentException) {
+            throw e
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $original", e)
+        }
+    }
+
+    /**
      * 缺席根的安全建立：僅用單層 `mkdir`（不用跟隨連結的 `mkdirs`），
      * 建後驗為目錄且非連結。併發競建由建後驗自然容忍（他線程建好即通過）。
      * 毒根先由 [ensureRootChainNoSymlink] 拒絕；已存在普通檔亦 fail-closed。
@@ -399,8 +444,11 @@ class ScopedFileStore(val root: File) {
      * 基址及遍歷途中遇 symlink 一律略過不下鑽，不跟隨；
      * 以祖先鏈正規目錄集合防循環（兄弟 diamond 可重入、真環裁剪；
      * canonical 取不到時 fail-closed 跳過該子樹）。
+     * 條目僅回相對路徑（不含 root 絕對前綴，不洩全路徑；單檔基址同樣只回相對）；
+     * DirectoryStream 單遍 best-effort，不保證單遍快照隔離；併發增刪中途可見，不保證跨調一致。
      * 殘餘：回傳檔名本身即洩露存在性，呼叫方不得將列目結果視為授權證明；
-     * 併發替換下僅保證快照有界（不跟隨、不懸掛），不保證與某次檢查原子一致。
+     * 併發替換下僅保證單遍有界（不跟隨、不懸掛），不保證與某次檢查原子一致；
+     * 併發替換下可能短暫列出鏈外檔名（短暫洩名窗口已揭露，僅單遍 best-effort、不跨調一致）。
      * 開流失敗的子目錄視為空（沿舊 `listFiles()==null` 語義），不中斷兄弟列舉。
      * 最終排序僅在成功路徑最後一步做一次 `out.sorted()`（預算按發現序，
      * 不做 per-dir 預排序）。
@@ -466,7 +514,12 @@ class ScopedFileStore(val root: File) {
         if (Files.isSymbolicLink(base.toPath())) return emptyList()
         if (!base.isDirectory) {
             if (!base.isFile || base.name.startsWith(TMP_NAME_PREFIX)) return emptyList()
-            val rel = base.relativeTo(root).path.replace('\\', '/')
+            val rel = try {
+                base.relativeTo(root).path.replace('\\', '/')
+            } catch (_: IllegalArgumentException) {
+                return emptyList()
+            }
+            if (rel.startsWith("/")) return emptyList()
             return if (FileScope.sanitizeRelative(rel) != null) listOf(rel) else emptyList()
         }
         val deadlineNanos = nowNanos() + deadlineMs * 1_000_000L
@@ -521,7 +574,14 @@ class ScopedFileStore(val root: File) {
                 if (Files.isSymbolicLink(childPath)) continue
                 val child = childPath.toFile()
                 if (child.isFile && !child.name.startsWith(TMP_NAME_PREFIX)) {
-                    val rel = child.relativeTo(root).path.replace('\\', '/')
+                    // B2：條目只回相對路徑，不洩絕對全路徑；競態下偏出域的相對化
+                    // 失敗或含穿越段一律略過（fail-closed，不洩全路徑）。
+                    val rel = try {
+                        child.relativeTo(root).path.replace('\\', '/')
+                    } catch (_: IllegalArgumentException) {
+                        continue
+                    }
+                    if (rel.startsWith("/")) continue
                     if (FileScope.sanitizeRelative(rel) == null) continue
                     out.add(rel)
                     if (out.size > maxEntries) {
@@ -581,14 +641,34 @@ class ScopedFileStore(val root: File) {
     }
 
     /** 刪除檔案；不存在回 false（冪等語義：重複刪不報錯）。
-     * 實際刪除前重驗一次整鏈（[resolve] 內已驗第一次）；重驗→刪除之間
-     * 仍有殘餘窗口，併發替換下可能誤刪替換後的外部檔（見類註解），
+     * 實際刪除前重驗一次整鏈（[resolve] 內已驗第一次）；刪前再做最終目標
+     * NOFOLLOW lstat（是 link 即拒不刪）＋正規路徑域內 containment：
+     * 單次置換的誤刪替換後外部檔已修（轉為拒絕）。重驗→刪除之間仍有極小
+     * 併發窗口，僅有界不消除（Java 無 O_NOFOLLOW/openat，見類註解），
      * 此為變更操作固有風險，呼叫方不得假設檢查後路徑不可變。 */
     fun delete(relativePath: String): Boolean {
         val target = resolve(relativePath)
         val safe = FileScope.sanitizeRelative(relativePath)
             ?: throw IllegalArgumentException("unsafe path: $relativePath")
         ensureNoSymlinkChain(safe, relativePath)
+        // B2 刪前重驗：NOFOLLOW lstat 最終目標，是 link 即拒不刪；
+        // 再驗正規路徑仍在域內（防父段替換後指向外部）。
+        if (Files.isSymbolicLink(target.toPath())) {
+            throw IllegalArgumentException("symlink not allowed: $relativePath")
+        }
+        val rootCanon = try {
+            root.canonicalPath
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $relativePath", e)
+        }
+        val targetCanon = try {
+            target.canonicalPath
+        } catch (e: Exception) {
+            throw IllegalArgumentException("symlink check failed: $relativePath", e)
+        }
+        if (targetCanon != rootCanon && !targetCanon.startsWith("$rootCanon/")) {
+            throw IllegalArgumentException("path escapes root: $relativePath")
+        }
         return target.delete()
     }
 

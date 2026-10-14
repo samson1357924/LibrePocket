@@ -290,7 +290,8 @@ class ShellTrustedExecTest {
         val shell = RestrictedShell(runner = runner, execResolver = stub)
         val r = shell.execute(listOf("echo", "hi"))
         assertTrue("$r", r is ShellResult.Ok)
-        assertEquals(1, resolves)
+        // B1 spawn 前重驗：初解 + spawn 前重解各一次，故計 2（拒絕路徑仍零解析不斷言受影響）。
+        assertEquals(2, resolves)
         assertEquals(listOf("/trusted/echo", "hi"), runner.lastArgv)
         assertEquals(ShellExecutables.CLEAN_ENV, runner.lastEnv)
     }

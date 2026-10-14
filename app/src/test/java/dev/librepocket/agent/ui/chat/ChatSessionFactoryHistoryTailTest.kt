@@ -236,6 +236,63 @@ class ChatSessionFactoryHistoryTailTest {
     }
 
     /**
+     * R24-2 oldest-boundary regression (fake): exactly HISTORY_LOAD_CAP
+     * (2000) qualifying rows where the oldest retained assistant's marker
+     * sits just outside the last backward page — seq=1 `reasoning(r-old)` +
+     * seq=2 `assistant(r-old)` + seq=3..2001 filler (1999 qualifying rows).
+     * The 200-row DESC reader fills 2000 kept at seq=2 and stops before
+     * seq=1, so without the boundary scan `dropped == 0` yet `a-old`
+     * resumes `hasReasoning == false` (pre-fix gap).
+     *
+     * Production writes marker-first (`reasoning` seq N, `assistant` seq N+1,
+     * adjacent — see SessionTranscriptSinkTest); this test pins that order.
+     * The retained newest exact-2000 test above uses marker-after (newest
+     * pair) and stays green. Room JSONL import validates per-row only (no
+     * pairing/order rule), so this marker-first layout is a legal import
+     * shape.
+     */
+    @Test fun open_exactCap2000WithOldestMarkerJustOutside_flagsOldest() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val cap = SnapshotBudget.HISTORY_LOAD_CAP
+        val old = "r-old"
+        // Marker-first production order: seq=1 marker, seq=2 assistant.
+        transcripts.appendEvent(
+            TranscriptEvent(
+                sessionId = sid,
+                runId = old,
+                kind = "reasoning",
+                text = "",
+                createdAt = 1L,
+            ),
+        )
+        transcripts.appendEvent(event(sid, old, "assistant", "a-old"))
+        // Filler: 999 plain pairs (1998 rows) + one trailing user = 1999
+        // rows (seq=3..2001). Total qualifying = 1 + 1999 = CAP exactly.
+        for (i in 0 until cap / 2 - 1) {
+            transcripts.appendEvent(event(sid, "fill-$i", "user", "u-fill-$i"))
+            transcripts.appendEvent(event(sid, "fill-$i", "assistant", "a-fill-$i"))
+        }
+        transcripts.appendEvent(event(sid, "tail", "user", "u-tail"))
+
+        val scan = loadModelHistoryScan(transcripts, sid)
+        assertEquals(cap, scan.events.size)
+        assertTrue("cap saturated: scan stays suspect", scan.reasoningIncomplete)
+        assertTrue("boundary scan must collect the adjacent marker", old in scan.reasoningRunIds)
+
+        val loaded = loadModelHistory(transcripts, sid)
+        assertEquals(0, loaded.droppedCount)
+        assertEquals(false, loaded.reasoningIncomplete)
+        assertEquals(cap, loaded.messages.size)
+        val assistants = loaded.messages.filter { it.role == "assistant" }
+        assertEquals(cap / 2, assistants.size)
+        assertEquals("a-old", assistants.first().text)
+        assertTrue("oldest marker just outside the page must restore the flag", assistants.first().hasReasoning)
+        assertTrue("plain filler turns must stay unflagged", assistants.drop(1).none { it.hasReasoning })
+        assertTrue(loaded.messages.none { it.role == "reasoning" })
+    }
+
+    /**
      * D15-5: a legally imported `seq = Long.MAX_VALUE` row must survive the
      * model-context backward scan (first page starts at the MAX sentinel).
      */

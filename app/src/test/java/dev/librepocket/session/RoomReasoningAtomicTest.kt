@@ -3,7 +3,10 @@ package dev.librepocket.session
 import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.chat.SnapshotBudget
 import dev.librepocket.agent.ui.chat.loadModelHistory
+import dev.librepocket.agent.ui.chat.loadModelHistoryScan
+import java.io.File
 import java.io.IOException
+import java.nio.file.Files
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -233,5 +236,104 @@ class RoomReasoningAtomicTest {
         assertTrue("newest in-window marker must restore the flag", assistants.last().hasReasoning)
         assertEquals("a-newest", assistants.last().text)
         assertTrue("older plain turns must stay unflagged", assistants.dropLast(1).none { it.hasReasoning })
+    }
+
+    /**
+     * R24-2 oldest-boundary regression via Room JSONL round-trip: exactly
+     * HISTORY_LOAD_CAP (2000) qualifying rows where the oldest retained
+     * assistant's marker sits just outside the last backward page — seq=1
+     * `reasoning(r-old)` + seq=2 `assistant(r-old)` + seq=3..2001 filler
+     * (1999 qualifying rows). The 200-row DESC reader fills 2000 kept at
+     * seq=2 and stops before seq=1, so without the boundary scan
+     * `dropped == 0` yet `a-old` resumes `hasReasoning == false`.
+     *
+     * Production writes marker-first (`reasoning` seq N, `assistant` seq N+1,
+     * adjacent); this test pins that order through the real import path.
+     * The retained newest exact-2000 test above uses marker-after and stays
+     * green. Room JSONL import validates per-row only (no pairing/order
+     * rule), so this marker-first layout imports legally.
+     */
+    @Test
+    fun exactCap2000WithOldestMarkerJustOutsideViaJsonlImport_flagsOldest() = runBlocking {
+        val store = openStore()
+        val cap = SnapshotBudget.HISTORY_LOAD_CAP
+        val rows = ArrayList<TranscriptEvent>(cap + 1)
+        rows.add(
+            TranscriptEvent(
+                seq = 1L,
+                sessionId = "ignored-on-import",
+                runId = "r-old",
+                kind = "reasoning",
+                text = "",
+                createdAt = 1L,
+            ),
+        )
+        rows.add(
+            TranscriptEvent(
+                seq = 2L,
+                sessionId = "ignored-on-import",
+                runId = "r-old",
+                kind = "assistant",
+                text = "a-old",
+                createdAt = 1L,
+            ),
+        )
+        var seq = 3L
+        for (i in 0 until cap / 2 - 1) {
+            rows.add(
+                TranscriptEvent(
+                    seq = seq++,
+                    sessionId = "ignored-on-import",
+                    runId = "fill-$i",
+                    kind = "user",
+                    text = "u-fill-$i",
+                    createdAt = 1L,
+                ),
+            )
+            rows.add(
+                TranscriptEvent(
+                    seq = seq++,
+                    sessionId = "ignored-on-import",
+                    runId = "fill-$i",
+                    kind = "assistant",
+                    text = "a-fill-$i",
+                    createdAt = 1L,
+                ),
+            )
+        }
+        rows.add(
+            TranscriptEvent(
+                seq = seq,
+                sessionId = "ignored-on-import",
+                runId = "tail",
+                kind = "user",
+                text = "u-tail",
+                createdAt = 1L,
+            ),
+        )
+        val tmpDir = Files.createTempDirectory("room-oldest-boundary-test").toFile()
+        try {
+            val src = File(tmpDir, "oldest-boundary.jsonl")
+            src.writeText(rows.joinToString("\n") { JsonlCodec.encode(it) } + "\n", Charsets.UTF_8)
+            val sid = store.importJsonl(src)
+
+            val scan = loadModelHistoryScan(store, sid)
+            assertEquals(cap, scan.events.size)
+            assertTrue("cap saturated: scan stays suspect", scan.reasoningIncomplete)
+            assertTrue("boundary scan must collect the adjacent marker", "r-old" in scan.reasoningRunIds)
+
+            val loaded = loadModelHistory(store, sid)
+            assertEquals(0, loaded.droppedCount)
+            assertEquals(false, loaded.reasoningIncomplete)
+            assertEquals(cap, loaded.messages.size)
+            val assistants = loaded.messages.filter { it.role == "assistant" }
+            assertEquals(cap / 2, assistants.size)
+            assertEquals("a-old", assistants.first().text)
+            assertTrue("oldest marker just outside the page must restore the flag", assistants.first().hasReasoning)
+            assertTrue("plain filler turns must stay unflagged", assistants.drop(1).none { it.hasReasoning })
+            assertTrue(loaded.messages.none { it.role == "reasoning" })
+        } finally {
+            tmpDir.deleteRecursively()
+        }
     }
 }

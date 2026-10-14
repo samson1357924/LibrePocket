@@ -1184,6 +1184,13 @@ internal suspend fun loadModelHistory(store: SessionStore, sessionId: String): L
  * assistant; direct [ModelHistoryScan] callers must treat a true flag the
  * same way (suspect, fail closed on tool-dependent follow-ups, never silent
  * `hasReasoning=false`).
+ *
+ * R24-2 boundary: the kept scan stops once 2000 qualifying rows are held,
+ * so a marker-first production pair (`reasoning` at seq N, `assistant` at
+ * seq N+1) whose assistant is the oldest kept row leaves its marker one row
+ * below the window. One extra marker-only page plus same-page remainder
+ * collection closes that adjacent gap; a marker more than one page out stays
+ * suspect (covered by the COUNT fail-closed when `dropped > 0`).
  */
 internal data class ModelHistoryScan(
     /**
@@ -1194,8 +1201,10 @@ internal data class ModelHistoryScan(
     val events: List<TranscriptEvent>,
     /**
      * Exact-`runId` `reasoning`-marker owners (`isFinal` / `isPartial`
-     * ignored, never [familyOf]). A marker outside the CAP window is not
-     * collected (suspect when [reasoningIncomplete]; see the class note).
+     * ignored, never [familyOf]). R24-2 covers the adjacent boundary marker
+     * (oldest kept assistant's marker-first row, one extra page + the fill
+     * page remainder); a marker more than one page out stays uncollected
+     * (suspect when [reasoningIncomplete]; see the class note).
      */
     val reasoningRunIds: Set<String>,
     /**
@@ -1211,7 +1220,7 @@ internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String
     val reasoningRunIds = HashSet<String>()
     var beforeSeq = Long.MAX_VALUE
     var capHit = false
-    outer@ while (keptNewestFirst.size < SnapshotBudget.HISTORY_LOAD_CAP) {
+    while (keptNewestFirst.size < SnapshotBudget.HISTORY_LOAD_CAP) {
         val page = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
         if (page.isEmpty()) break
         for (event in page) {
@@ -1223,10 +1232,15 @@ internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String
             }
             if ((event.kind == "user" || event.kind == "assistant") && !event.isPartial) {
                 if (keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) {
+                    // R24-2: cap already full mid-page — skip the kept row
+                    // but keep collecting markers in this page's remainder
+                    // (the oldest kept assistant's marker may sit below the
+                    // fill point in the same 200-row page).
                     capHit = true
-                    break@outer
+                    continue
                 }
                 keptNewestFirst.add(event)
+                if (keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) capHit = true
             }
         }
         // Pages are newest-first with distinct seqs; the next window ends
@@ -1236,8 +1250,31 @@ internal suspend fun loadModelHistoryScan(store: SessionStore, sessionId: String
         if (pageMin >= beforeSeq) break
         beforeSeq = pageMin
         if (page.size < HISTORY_PAGE) break
+        // Cap filled: the kept window is done; the marker boundary scan
+        // below collects the adjacent row. No further kept pages.
+        if (keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) break
     }
     if (!capHit && keptNewestFirst.size >= SnapshotBudget.HISTORY_LOAD_CAP) capHit = true
+    if (capHit) {
+        // R24-2 boundary marker scan (scan-side small fix, chosen over
+        // import pairing/order validation): production writes marker-first
+        // (`reasoning` seq N, `assistant` seq N+1, adjacent), so when the
+        // oldest kept assistant is reasoning-origin its marker sits exactly
+        // one row below the kept window — just outside the last backward
+        // page when the cap fills on a page boundary (e.g. seq=1 marker +
+        // seq=2 assistant + seq=3..2001 filler: DESC pages fill 2000 kept at
+        // seq=2 and stop before seq=1). One extra marker-only page restores
+        // that flag with `dropped == 0` (no over-flagging of plain turns).
+        // A marker more than one page out stays missed by design; when older
+        // qualifying rows exist (`dropped > 0`) the COUNT fail-closed flags
+        // every kept assistant anyway. Room JSONL import validates per-row
+        // only (no pairing/order rule), so this marker-first ordering is a
+        // legal import shape (no import UI yet, tools unenabled: narrow P2).
+        val extra = store.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
+        for (event in extra) {
+            if (event.kind == "reasoning") reasoningRunIds.add(event.runId)
+        }
+    }
     return ModelHistoryScan(keptNewestFirst.asReversed(), reasoningRunIds, capHit)
 }
 

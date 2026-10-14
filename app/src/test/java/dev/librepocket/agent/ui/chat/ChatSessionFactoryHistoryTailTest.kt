@@ -193,6 +193,49 @@ class ChatSessionFactoryHistoryTailTest {
     }
 
     /**
+     * R23-2 exact-cap boundary: exactly HISTORY_LOAD_CAP (2000) qualifying
+     * rows plus the newest pair's payload-free `reasoning` marker. Nothing is
+     * truncated (`dropped == 0`, `reasoningIncomplete == false`), yet the
+     * newest assistant still resumes `hasReasoning == true` via its in-window
+     * marker (exact-`runId`), while older plain assistants stay false.
+     * Existing HistoryTail tests cover only 2002-over and 3-under.
+     */
+    @Test fun open_exactCap2000WithNewestMarker_reportsZeroDroppedAndFlagsNewest() = runBlocking {
+        val transcripts = FakeSessionStore()
+        val sid = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        val cap = SnapshotBudget.HISTORY_LOAD_CAP
+        // Exactly CAP qualifying rows: 999 plain pairs + the newest pair.
+        for (i in 0 until cap / 2 - 1) {
+            transcripts.appendEvent(event(sid, "r$i", "user", "u$i"))
+            transcripts.appendEvent(event(sid, "r$i", "assistant", "a$i"))
+        }
+        val newest = "r-newest"
+        transcripts.appendEvent(event(sid, newest, "user", "q-newest"))
+        transcripts.appendEvent(event(sid, newest, "assistant", "a-newest"))
+        transcripts.appendEvent(
+            TranscriptEvent(
+                sessionId = sid,
+                runId = newest,
+                kind = "reasoning",
+                text = "",
+                createdAt = 1L,
+            ),
+        )
+
+        val loaded = loadModelHistory(transcripts, sid)
+        assertEquals(0, loaded.droppedCount)
+        assertEquals(false, loaded.reasoningIncomplete)
+        assertEquals(cap, loaded.messages.size)
+        val assistants = loaded.messages.filter { it.role == "assistant" }
+        assertEquals(cap / 2, assistants.size)
+        assertTrue("newest in-window marker must restore the flag", assistants.last().hasReasoning)
+        assertEquals("a-newest", assistants.last().text)
+        assertTrue("older plain turns must stay unflagged", assistants.dropLast(1).none { it.hasReasoning })
+        // The marker itself never enters model context.
+        assertTrue(loaded.messages.none { it.text.isEmpty() && it.role == "reasoning" })
+    }
+
+    /**
      * D15-5: a legally imported `seq = Long.MAX_VALUE` row must survive the
      * model-context backward scan (first page starts at the MAX sentinel).
      */

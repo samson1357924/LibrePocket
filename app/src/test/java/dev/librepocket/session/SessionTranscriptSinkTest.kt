@@ -132,7 +132,7 @@ class SessionTranscriptSinkTest {
     }
 
     @Test
-    fun reasoningTurnAppendsEmptyMarkerAfterAssistant() = runBlocking {
+    fun reasoningTurnAppendsEmptyMarkerBeforeAssistant() = runBlocking {
         val store = FakeSessionStore()
         val sid = store.createSession("hi", "m")
         val sink = SessionTranscriptSink(store, sid) { 42L }
@@ -140,8 +140,11 @@ class SessionTranscriptSinkTest {
         sink.onTurnStarted("r1", "hello")
         sink.onTurnSucceeded("r1", "thoughtful answer", hasReasoning = true)
 
-        assertEquals(listOf("user", "assistant", "reasoning"), store.events.map { it.kind })
-        val marker = store.events.last()
+        // Phase2 marker-first: [reasoning, assistant] so a non-atomic
+        // fallback leaves an orphan marker (fail-closed), never an orphan
+        // assistant (fail-open).
+        assertEquals(listOf("user", "reasoning", "assistant"), store.events.map { it.kind })
+        val marker = store.events[1]
         assertEquals("r1", marker.runId)
         assertEquals("", marker.text)
     }
@@ -166,8 +169,9 @@ class SessionTranscriptSinkTest {
 
         sink.onTurnCancelled("r9", "partial thought", hasReasoning = true)
 
-        assertEquals(listOf("assistant", "reasoning"), store.events.map { it.kind })
-        assertEquals("r9", store.events.last().runId)
-        assertEquals("", store.events.last().text)
+        // Phase2 marker-first: [reasoning, assistant].
+        assertEquals(listOf("reasoning", "assistant"), store.events.map { it.kind })
+        assertEquals("r9", store.events.first().runId)
+        assertEquals("", store.events.first().text)
     }
 }

@@ -488,29 +488,32 @@ class ChatSessionFactorySwitchSnapshotTest {
         transcripts.appendEvent(event(oldId, "steer-x", "steer", "be brief"))
         transcripts.appendEvent(event(oldId, "r0", "retry", "attempt 1/3 after 2000ms"))
         transcripts.appendEvent(event(oldId, "switch-old", "system", "model switched m0 -> m1"))
-        // Genuine kill: stranded user with no terminal must still backfill.
+        // Stranded user: Phase2 drops it at fork time (unconditional filter)
+        // with the "dangling excluded" incomplete marker instead of copying
+        // it for a later backfill — see cleanForkWithDanglingPrefix below.
         transcripts.appendEvent(event(oldId, "Lstrand", "user", "q-strand"))
 
         val newId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o")
         val copied = snapshotSwitchHistory(transcripts, oldId, newId, "gpt-4o-mini", "gpt-4o", false)
-        assertEquals(3, copied)
+        assertEquals(2, copied)
 
         val forked = rows(transcripts, newId)
-        assertEquals(listOf("system", "user", "assistant", "user"), forked.map { it.kind })
-        assertEquals(listOf("q0", "a0", "q-strand"), forked.drop(1).map { it.text })
+        assertEquals(listOf("system", "system", "user", "assistant"), forked.map { it.kind })
+        assertEquals(listOf("q0", "a0"), forked.drop(2).map { it.text })
+        assertTrue(forked[1].text.startsWith("snapshot incomplete "))
+        assertTrue(forked[1].text.contains("dangling excluded"))
+        assertTrue("orphan user(Lstrand) must never copy", forked.none { it.runId == "Lstrand" && it.kind == "user" })
         // Each fork owns exactly one switch marker: the old one never copies.
         assertEquals(1, forked.count { it.kind == "system" && it.text.startsWith("model switched ") })
         assertTrue(forked.none { it.text.startsWith("usage ") })
         assertTrue(forked.none { it.kind == "tool" || it.kind == "steer" || it.kind == "retry" })
 
-        // Reopen: the genuine stranded turn still gains exactly one marker;
+        // Reopen: the dropped strand stays dropped (no false INTERRUPTED);
         // completed families gain none.
         val opened = factory.open(sampleEndpoint(), newId)
         try {
             val markers = interruptedMarkers(transcripts, newId)
-            assertEquals(1, markers.size)
-            assertEquals("Lstrand", markers.single().runId)
-            assertEquals("turn Lstrand interrupted", markers.single().text)
+            assertEquals(0, markers.size)
             assertTrue(findDanglingRunIds(rows(transcripts, newId)).isEmpty())
 
             opened.session.send("q-next")
@@ -626,5 +629,72 @@ class ChatSessionFactorySwitchSnapshotTest {
         assertEquals(listOf(false, false, false, true), loaded.messages.map { it.hasReasoning })
         // Markers never count as model rows.
         assertEquals(0, loaded.droppedCount)
+    }
+
+    /**
+     * Phase2 clean-fork fail-closed: a settled-fence fork (the exact
+     * `durableSnapshotOrWarn` clean-path call: `wasStreaming=false`,
+     * `settleOk=durableOk=true` → `excludeDanglingFamilies=false`,
+     * `markIncomplete=false`) whose prefix still dangles must NOT copy the
+     * orphan `user(L)` — the unconditional in-memory filter drops it and the
+     * batch rides the "dangling excluded" incomplete marker instead. Existing
+     * SwitchSnapshot/SwitchStreaming tests only cover the streaming-triggered
+     * (flag-true) shape, never this clean-flag shape.
+     */
+    @Test fun cleanForkWithDanglingPrefix_dropsOrphanAndMarksIncomplete() = runBlocking {
+        val transcripts = ExportingFakeStore()
+        val fake = answeringFake()
+        val factory = factoryWith(transcripts, fake)
+        val oldId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
+        transcripts.appendEvent(event(oldId, "r0", "user", "q0"))
+        transcripts.appendEvent(event(oldId, "r0", "assistant", "a0"))
+        // Stranded turn: user(L) with no terminal (kill before any terminal
+        // record, fence already settled clean).
+        transcripts.appendEvent(event(oldId, "L", "user", "q-strand"))
+
+        val newId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o")
+        // Clean-path call shape (wasStreaming=false, settleOk=durableOk=true).
+        val copied = snapshotSwitchHistory(
+            transcripts, oldId, newId, "gpt-4o-mini", "gpt-4o", false,
+            excludeDanglingFamilies = false, markIncomplete = false,
+        )
+        assertEquals(2, copied)
+
+        val forked = rows(transcripts, newId)
+        // Marker row 1, incomplete row 2, then the completed family only.
+        assertEquals(listOf("system", "system", "user", "assistant"), forked.map { it.kind })
+        assertTrue(forked[0].text.startsWith("model switched gpt-4o-mini -> gpt-4o"))
+        assertTrue(forked[1].text.startsWith("snapshot incomplete "))
+        assertTrue("dangling drop must ride the dangling-excluded cause", forked[1].text.contains("dangling excluded"))
+        // The orphan user row never crosses: no false INTERRUPTED can follow.
+        assertTrue("orphan user(L) must never copy", forked.none { it.kind == "user" && it.runId == "L" })
+        assertTrue(findDanglingRunIds(forked).isEmpty())
+
+        // Export: marker + incomplete mark + the completed family only.
+        val newLines = exportLines(transcripts, newId)
+        assertEquals(4, newLines.size)
+        assertTrue(newLines[0].text.startsWith("model switched "))
+        assertTrue(newLines[1].text.startsWith("snapshot incomplete "))
+        assertTrue("dangling drop must ride the dangling-excluded cause", newLines[1].text.contains("dangling excluded"))
+        assertExportMatchesSource(rows(transcripts, oldId).take(2), newLines.drop(2))
+
+        // Reopen: the dropped strand stays dropped (no false INTERRUPTED);
+        // the clean fork ledger stays clean (mirrors the
+        // switchSnapshot_excludes reopen section).
+        val opened = factory.open(sampleEndpoint(), newId)
+        try {
+            assertEquals(0, interruptedMarkers(transcripts, newId).size)
+            assertTrue(findDanglingRunIds(rows(transcripts, newId)).isEmpty())
+
+            opened.session.send("q-next")
+            val req = fake.seenRequests.single()
+            assertEquals(listOf("user", "assistant", "user"), req.messages.map { it.role })
+            assertEquals("q0", req.messages[0].text)
+            assertEquals("a0", req.messages[1].text)
+            assertTrue(req.messages[2].text.startsWith("q-next"))
+            assertEquals(0, interruptedMarkers(transcripts, newId).size)
+        } finally {
+            opened.session.close()
+        }
     }
 }

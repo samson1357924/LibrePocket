@@ -1,6 +1,8 @@
 package dev.librepocket.session
 
 import androidx.test.core.app.ApplicationProvider
+import dev.librepocket.agent.ui.chat.SnapshotBudget
+import dev.librepocket.agent.ui.chat.loadModelHistory
 import java.io.IOException
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -78,7 +80,8 @@ class RoomReasoningAtomicTest {
         // Control: the same hasReasoning batch without the fault commits both rows.
         sink.onTurnSucceeded("r1", "answer", hasReasoning = true)
         val rows = store.loadEvents(sid)
-        assertEquals(listOf("assistant", "reasoning"), rows.map { it.kind })
+        // Phase2 marker-first: [reasoning, assistant].
+        assertEquals(listOf("reasoning", "assistant"), rows.map { it.kind })
     }
 
     @Test
@@ -102,8 +105,8 @@ class RoomReasoningAtomicTest {
         // Control: the same hasReasoning batch without the fault commits both rows.
         sink.onTurnCancelled("r1", "partial", hasReasoning = true)
         val rows = store.loadEvents(sid)
-        assertEquals(listOf("assistant", "reasoning"), rows.map { it.kind })
-        assertTrue("cancel assistant keeps its partial text", rows.first().isPartial)
+        assertEquals(listOf("reasoning", "assistant"), rows.map { it.kind })
+        assertTrue("cancel assistant keeps its partial text", rows.last().isPartial)
     }
 
     @Test
@@ -127,12 +130,12 @@ class RoomReasoningAtomicTest {
         // Control: without the fault the failed batch commits assistant + marker.
         sink.onTurnFailed("r1", "half", "boom", null, 0, false, true)
         val rows = store.loadEvents(sid)
-        assertEquals(listOf("assistant", "reasoning"), rows.map { it.kind })
-        assertTrue("failed assistant keeps its partial text", rows.first().isPartial)
-        assertEquals("boom", rows.first().failureReason)
-        assertEquals(false, rows.first().isFinal)
+        assertEquals(listOf("reasoning", "assistant"), rows.map { it.kind })
+        assertTrue("failed assistant keeps its partial text", rows.last().isPartial)
+        assertEquals("boom", rows.last().failureReason)
         assertEquals(false, rows.last().isFinal)
-        assertTrue("reasoning marker must stay payload-free", rows.last().text.isEmpty())
+        assertEquals(false, rows.first().isFinal)
+        assertTrue("reasoning marker must stay payload-free", rows.first().text.isEmpty())
     }
 
     @Test
@@ -185,5 +188,50 @@ class RoomReasoningAtomicTest {
         val rows = store.loadEvents(sid)
         assertEquals(listOf("assistant", "system"), rows.map { it.kind })
         assertEquals("turn L cancelled", rows.last().text)
+    }
+
+    /**
+     * R23-2 exact-cap boundary against real Room: exactly
+     * HISTORY_LOAD_CAP (2000) qualifying rows plus the newest pair's
+     * payload-free `reasoning` marker. Nothing is truncated (`dropped == 0`,
+     * `reasoningIncomplete == false`), yet the newest assistant still resumes
+     * `hasReasoning == true` via its in-window marker, while older plain
+     * assistants stay false. Mirrors the fake variant in
+     * ChatSessionFactoryHistoryTailTest (which covers 2002-over / 3-under).
+     */
+    @Test
+    fun exactCap2000WithNewestMarker_reportsZeroDroppedAndFlagsNewest() = runBlocking {
+        val store = openStore()
+        val sid = store.createSession("t", "m")
+        val cap = SnapshotBudget.HISTORY_LOAD_CAP
+        // Exactly CAP qualifying rows: 999 plain pairs + the newest pair.
+        for (i in 0 until cap / 2 - 1) {
+            store.appendEvent(
+                TranscriptEvent(sessionId = sid, runId = "r$i", kind = "user", text = "u$i", createdAt = 1L),
+            )
+            store.appendEvent(
+                TranscriptEvent(sessionId = sid, runId = "r$i", kind = "assistant", text = "a$i", createdAt = 1L),
+            )
+        }
+        val newest = "r-newest"
+        store.appendEvent(
+            TranscriptEvent(sessionId = sid, runId = newest, kind = "user", text = "q-newest", createdAt = 1L),
+        )
+        store.appendEvent(
+            TranscriptEvent(sessionId = sid, runId = newest, kind = "assistant", text = "a-newest", createdAt = 1L),
+        )
+        store.appendEvent(
+            TranscriptEvent(sessionId = sid, runId = newest, kind = "reasoning", text = "", createdAt = 1L),
+        )
+
+        val loaded = loadModelHistory(store, sid)
+        assertEquals(0, loaded.droppedCount)
+        assertEquals(false, loaded.reasoningIncomplete)
+        assertEquals(cap, loaded.messages.size)
+        val assistants = loaded.messages.filter { it.role == "assistant" }
+        assertEquals(cap / 2, assistants.size)
+        assertTrue("newest in-window marker must restore the flag", assistants.last().hasReasoning)
+        assertEquals("a-newest", assistants.last().text)
+        assertTrue("older plain turns must stay unflagged", assistants.dropLast(1).none { it.hasReasoning })
     }
 }

@@ -1521,12 +1521,15 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * char cap adopts fail-loud instead.
  *
  * R6-3 streaming-switch hardening (no schema change):
- * - [excludeDanglingFamilies]: when true, families that dangle inside the
- *   loaded prefix ([findDanglingRunIds]) are dropped before the copy, so a
+ * - Dangling families ([findDanglingRunIds] on the loaded prefix) are ALWAYS
+ *   dropped before the copy (Phase2 fail-closed: unconditional pure-memory
+ *   filter, no I/O — no longer gated on [excludeDanglingFamilies]), so a
  *   fork taken while the old live turn had not settled yet never copies an
  *   orphan `user(L)` that the reopen backfill would mis-stamp as INTERRUPTED
  *   (degrades to pre-R4-2: new rows only for that family, with the warning
  *   below). No-op when the prefix has no dangling families.
+ *   [excludeDanglingFamilies] is retained for call-site compat but no longer
+ *   gates the filter (passing false with a dangling prefix still drops + warns).
  * - [markIncomplete]: when true, one system incomplete row
  *   ([snapshotIncompleteMarkerText] with reason `"ledger unsettled"`) rides
  *   inside the SAME atomic batch right after the switch marker, so a later
@@ -1571,7 +1574,16 @@ internal suspend fun snapshotSwitchHistory(
     val carried: List<TranscriptEvent> = if (byteAbandoned) emptyList() else snapshot.events
     // R6-3: drop orphan families before the copy (see above). Withheld and
     // byte-abandoned forks already copy zero rows, so this is a no-op there.
-    val prefix: List<TranscriptEvent> = if (excludeDanglingFamilies && carried.isNotEmpty()) {
+    // Phase2 fail-closed: the filter runs UNCONDITIONALLY (no longer gated on
+    // excludeDanglingFamilies) — a pure in-memory findDanglingRunIds pass, no
+    // I/O. A clean-fence fork whose prefix still dangles (settled-live race,
+    // or a genuine stranded turn) degrades the same way as a streaming fork:
+    // the orphan user row never copies (it would gain a false INTERRUPTED on
+    // reopen) and the batch rides the "dangling excluded" incomplete marker.
+    // No-op when the prefix has no dangling families. The
+    // excludeDanglingFamilies flag is retained for call-site compat but no
+    // longer gates the filter.
+    val prefix: List<TranscriptEvent> = if (carried.isNotEmpty()) {
         val dangling = findDanglingRunIds(carried).toSet()
         if (dangling.isEmpty()) carried else carried.filterNot { familyOf(it) in dangling }
     } else {

@@ -203,8 +203,9 @@ class SessionReasoningAtomicTest {
         assertEquals(listOf(1, 2, 2, 1, 2), store.batchSizes)
 
         assertEquals(5, store.batchCalls)
+        // Phase2 marker-first: each reasoning batch leads with the marker.
         assertEquals(
-            listOf("assistant", "assistant", "reasoning", "assistant", "reasoning", "assistant", "assistant", "reasoning"),
+            listOf("assistant", "reasoning", "assistant", "reasoning", "assistant", "assistant", "reasoning", "assistant"),
             store.events.map { it.kind },
         )
         // Marker linkage: the payload-free `reasoning` row inherits its
@@ -254,8 +255,9 @@ class SessionReasoningAtomicTest {
         sink.onTurnFailed("r2", "frag", "down", "L", 1, true, true)
 
         assertEquals(listOf(2, 2), store.batchSizes.takeLast(2))
+        // Phase2 marker-first: [reasoning, assistant] per batch.
         assertEquals(
-            listOf("assistant", "reasoning", "assistant", "reasoning"),
+            listOf("reasoning", "assistant", "reasoning", "assistant"),
             store.events.map { it.kind },
         )
         val markers = store.events.filter { it.kind == "reasoning" }

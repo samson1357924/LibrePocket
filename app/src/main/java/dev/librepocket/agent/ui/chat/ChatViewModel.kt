@@ -2748,7 +2748,9 @@ class ChatViewModel(
                 // returns prefix.size only, so 0 is ambiguous with a
                 // clean empty history) — bounded scan re-surfaces
                 // HISTORY_SNAPSHOT_INCOMPLETE live, never silent until
-                // restart. Same best-effort scan as the branch above:
+                // restart. Phase2: the snapshot filter is now unconditional,
+                // so a clean-path "dangling excluded" marker lands here too
+                // (same notice; only the cause tag differs). Same best-effort scan as the branch above:
                 // only the notice is at stake.
                 val byteWarn = try {
                     withContext(Dispatchers.IO) {

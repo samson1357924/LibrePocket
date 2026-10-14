@@ -1062,7 +1062,7 @@ class ChatWiringTest {
         )
         val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
 
-        // Round 1: reasoning-origin turn writes assistant + marker.
+        // Round 1: reasoning-origin turn writes marker + assistant (marker-first).
         onMain { vm.onInputChange("u1") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
@@ -1091,14 +1091,14 @@ class ChatWiringTest {
             } == 4
         }
         awaitTrue { transcripts.events.count { it.sessionId == newId && it.kind == "reasoning" } == 1 }
-        // Fork ledger carries the marker verbatim between its assistant and the next turn.
+        // Fork ledger carries the marker verbatim before its assistant.
         val forkedRows = transcripts.events.filter { it.sessionId == newId }
         assertEquals(
-            listOf("system", "user", "assistant", "reasoning", "user", "assistant"),
+            listOf("system", "user", "reasoning", "assistant", "user", "assistant"),
             forkedRows.map { it.kind },
         )
         assertEquals(forkedRows[2].runId, forkedRows[3].runId)
-        assertEquals("", forkedRows[3].text)
+        assertEquals("", forkedRows[2].text)
         assertTrue(vm.messages.value[1].hasReasoning)
         assertFalse(vm.messages.value[3].hasReasoning)
         assertNull(vm.notice.value)

@@ -102,9 +102,22 @@ interface SessionStore {
      * sequential [appendEvent] loop (NON-ATOMIC: a mid-batch failure leaves
      * the earlier rows behind); only [RoomSessionStore] (single DB
      * transaction) and the in-memory test fake (snapshot + rollback) upgrade
-     * this to a true atomic commit. External [SessionStore] implementations
-     * inherit the sequential fallback, so callers must still treat a throw as
-     * a possibly-partial batch unless the store documents atomicity.
+     * this to a true atomic commit. Current: 2-row marker-first batches
+     * ([reasoning] before `assistant`, same partial-first precedent as
+     * [dev.librepocket.chat.TranscriptSink.onTurnFailedAndCancelled]) leave
+     * only an orphan `reasoning` marker on a mid-batch throw — harmless by
+     * construction (no `user` family, never model context, ignored by
+     * `findDanglingRunIds`, bounded UI pending set) and the family stays
+     * dangling. The 3-row [partial, `reasoning`, cancel] batch of
+     * [dev.librepocket.chat.TranscriptSink.onTurnFailedAndCancelled] is the
+     * exception: a 2nd-row fault there leaves an orphan non-final partial
+     * (`isPartial=1`, `isFinal=0`) — still fail-closed (never model context,
+     * never a family terminal, so the family still dangles and reopen still
+     * backfills INTERRUPTED). Target (atomic Room/fake) still commits
+     * all-or-zero; this paragraph pins only the fallback shape. Concrete
+     * caller obligation: treat a throw as a possibly-partial batch (never
+     * assume rollback) unless the store documents atomicity; do NOT reorder
+     * a batch assistant-first.
      * [snapshotSwitchHistory][dev.librepocket.agent.ui.chat.snapshotSwitchHistory]
      * funnels its marker + prefix through this one call, so Room/fake forks
      * can never strand a half snapshot.

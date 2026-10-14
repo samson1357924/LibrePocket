@@ -45,11 +45,14 @@ import kotlinx.coroutines.CancellationException
  * via [SessionStore.appendEvents] (single transaction on [RoomSessionStore],
  * snapshot + rollback on the in-memory test fake): a second-row failure
  * leaves zero rows, never an orphaned `assistant` that would read back as a
- * complete plain-text result. External [SessionStore] implementations that
- * keep the default sequential [SessionStore.appendEvents] fallback may still
- * leave a partial batch behind — callers must treat a throw as a
- * possibly-partial batch unless the store documents atomicity (fail-closed
- * handling on the caller side; the default itself is unchanged).
+ * complete plain-text result. Phase2 marker-first: the batch order is
+ * [`reasoning`?, `assistant`] (same partial-first precedent as
+ * [TranscriptSink.onTurnFailedAndCancelled]), so an external [SessionStore]
+ * keeping the default sequential [SessionStore.appendEvents] fallback that
+ * fails on the 2nd row leaves only an orphan `reasoning` marker behind —
+ * harmless by construction (no `user` family, never model context, ignored
+ * by `findDanglingRunIds`, bounded UI `pendingMarkers`), and the family
+ * stays dangling (fail-closed) instead of completing as plain text.
  *
  * The controller routes every call through its session-owned
  * [dev.librepocket.chat.OrderedTranscriptSink] (single session writer:
@@ -134,12 +137,13 @@ class SessionTranscriptSink(
      * D15-3 atomic batch core write: persists every event as one
      * all-or-nothing unit via [SessionStore.appendEvents].
      * [RoomSessionStore] (single DB transaction) and the in-memory test
-     * fake (snapshot + rollback) commit all rows or zero; an external
-     * [SessionStore] keeping the default sequential fallback may leave the
-     * earlier rows behind, so callers must treat a throw as a
-     * possibly-partial batch unless the store documents atomicity
-     * (fail-closed handling on the caller side; the default itself is
-     * unchanged here). Store failures propagate so the writer fails the ack
+     * fake (snapshot + rollback) commit all rows or zero. Phase2 marker-first
+     * (see the class note): reasoning batches lead with the marker, so an
+     * external [SessionStore] keeping the default sequential fallback leaves
+     * at most an orphan marker (fail-closed) on a mid-batch throw — callers
+     * must still treat a throw as a possibly-partial batch unless the store
+     * documents atomicity, but the partial is harmless by construction.
+     * Store failures propagate so the writer fails the ack
      * instead of reporting a false durable write. Cancellation always
      * propagates.
      */
@@ -215,8 +219,15 @@ class SessionTranscriptSink(
     override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) {
         val now = clock()
         val batch = ArrayList<TranscriptEvent>(2)
-        batch.add(coreEvent(runId, "assistant", text, now, isFinal = true))
+        // Phase2 marker-first: the payload-free `reasoning` marker leads so a
+        // non-atomic fallback store (default sequential loop) that fails on
+        // the 2nd row leaves only an orphan marker behind — harmless (no user
+        // family, never model context, ignored by findDanglingRunIds, bounded
+        // UI pendingMarkers) instead of an orphan final `assistant` that would
+        // resume as a complete plain-text result (fail-open). Atomic stores
+        // (Room single tx, fake snapshot + rollback) still commit all-or-zero.
         if (hasReasoning) batch.add(coreEvent(runId, "reasoning", "", now, isFinal = true))
+        batch.add(coreEvent(runId, "assistant", text, now, isFinal = true))
         appendDurableBatch(batch)
     }
 
@@ -229,10 +240,12 @@ class SessionTranscriptSink(
     ) {
         val now = clock()
         val batch = ArrayList<TranscriptEvent>(2)
-        batch.add(coreEvent(runId, "assistant", text, now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
+        // Phase2 marker-first (see the 3-arg form above): orphan marker is
+        // harmless, orphan assistant would fail open.
         if (hasReasoning) {
             batch.add(coreEvent(runId, "reasoning", "", now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
         }
+        batch.add(coreEvent(runId, "assistant", text, now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
         appendDurableBatch(batch)
     }
 
@@ -309,17 +322,21 @@ class SessionTranscriptSink(
         }
         val now = clock()
         val batch = ArrayList<TranscriptEvent>(2)
+        // Phase2 marker-first (see onTurnSucceeded): the marker inherits
+        // `parentRunId` / `attemptIndex` / `isFinal` verbatim (flag-only,
+        // empty text) and leads, so a non-atomic fallback leaves only an
+        // orphan marker (fail-closed) instead of an orphan partial assistant.
         batch.add(
             coreEvent(
-                runId, "assistant", partialText, now,
-                isPartial = true, failureReason = error,
+                runId, "reasoning", "", now,
                 parentRunId = parentRunId, attemptIndex = attemptIndex,
                 isFinal = isFinal,
             ),
         )
         batch.add(
             coreEvent(
-                runId, "reasoning", "", now,
+                runId, "assistant", partialText, now,
+                isPartial = true, failureReason = error,
                 parentRunId = parentRunId, attemptIndex = attemptIndex,
                 isFinal = isFinal,
             ),
@@ -334,8 +351,9 @@ class SessionTranscriptSink(
     override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) {
         val now = clock()
         val batch = ArrayList<TranscriptEvent>(2)
-        batch.add(coreEvent(runId, "assistant", partialText, now, isPartial = true, isFinal = true))
+        // Phase2 marker-first (see onTurnSucceeded): orphan marker harmless.
         if (hasReasoning) batch.add(coreEvent(runId, "reasoning", "", now, isFinal = true))
+        batch.add(coreEvent(runId, "assistant", partialText, now, isPartial = true, isFinal = true))
         appendDurableBatch(batch)
     }
 
@@ -348,6 +366,10 @@ class SessionTranscriptSink(
     ) {
         val now = clock()
         val batch = ArrayList<TranscriptEvent>(2)
+        // Phase2 marker-first (see onTurnSucceeded): orphan marker harmless.
+        if (hasReasoning) {
+            batch.add(coreEvent(runId, "reasoning", "", now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
+        }
         batch.add(
             coreEvent(
                 runId, "assistant", partialText, now,
@@ -355,9 +377,6 @@ class SessionTranscriptSink(
                 isFinal = true,
             ),
         )
-        if (hasReasoning) {
-            batch.add(coreEvent(runId, "reasoning", "", now, parentRunId = parentRunId, attemptIndex = attemptIndex, isFinal = true))
-        }
         appendDurableBatch(batch)
     }
 

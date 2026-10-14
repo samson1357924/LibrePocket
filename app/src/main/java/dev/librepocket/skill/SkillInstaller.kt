@@ -31,6 +31,8 @@ import java.util.zip.ZipInputStream
  *   未呼叫則孤兒留存，
  *   成功路徑的 `.bak` 殘留由下次清理收斂）；
  * - 同名 Skill 預設保持不變（需 `replace=true` 才覆蓋）。
+ * - 已知限制（Target）：`expectedHashes=null` 跳過雜湊比對、無版本比較，
+ *   `replace=true` 可靜默降版（舊版覆蓋不擋低版本）。
  */
 object SkillInstaller {
     const val MAX_ENTRIES = 64

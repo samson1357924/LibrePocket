@@ -218,12 +218,20 @@ class McpWireD1Test {
         }
     }
 
-    @Test fun parseCallStringIsErrorStaysFalse() {
-        // 型別嚴格：字串 "true" 不是布林 true，保持 false（鎖定現行語義）。
+    @Test fun parseCallStringIsErrorRejected() {
+        // 型別嚴格（fail-closed，與 True/1 一致）：字串 "true" 不是布林 true，一律 PROTOCOL。
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
             "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"isError\":\"true\"}}"
-        val (_, isError) = McpWire.parseCall(json)
-        assertFalse("字串 isError 不得當布林 true", isError)
+        try {
+            McpWire.parseCall(json)
+            fail("字串 isError 必須拋 McpProtocol（映射 PROTOCOL），不得靜默壓 false")
+        } catch (e: McpWire.McpToolFailure) {
+            fail("字串 isError 不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad isError", e.message)
+        } catch (_: IllegalArgumentException) {
+            fail("字串 isError 必須拋 McpWire.McpProtocol（非一般 IllegalArgumentException）")
+        }
     }
 
     @Test fun parseCallFalseErrorShapeIsProtocolNotToolError() {

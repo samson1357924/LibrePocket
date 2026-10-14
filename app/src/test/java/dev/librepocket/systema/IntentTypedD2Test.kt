@@ -296,7 +296,7 @@ class IntentTypedD2Test {
         CalendarTool.eventUri(bad)
         fail("expected IllegalArgumentException for eventId=$bad")
       } catch (e: IllegalArgumentException) {
-        // expected
+        assertTrue("eventId=$bad 錯誤訊息須指明 numeric，實際=${e.message}", "numeric" in (e.message ?: ""))
       }
     }
   }
@@ -312,7 +312,7 @@ class IntentTypedD2Test {
       CalendarTool.buildDeleteDescriptor(CalendarTool.DeleteParams("../0"))
       fail("expected IllegalArgumentException for delete eventId")
     } catch (e: IllegalArgumentException) {
-      // expected
+      assertTrue("delete eventId 錯誤訊息須指明 numeric，實際=${e.message}", "numeric" in (e.message ?: ""))
     }
   }
 
@@ -451,7 +451,7 @@ class IntentTypedD2Test {
         NavigationTool.buildGeoIntent(p)
         fail("expected IllegalArgumentException for $p")
       } catch (e: IllegalArgumentException) {
-        // expected
+        assertTrue("$p 錯誤訊息須指明 out of range，實際=${e.message}", "out of range" in (e.message ?: ""))
       }
     }
   }
@@ -467,7 +467,24 @@ class IntentTypedD2Test {
         NavigationTool.buildGeoIntent(p)
         fail("expected IllegalArgumentException for $p")
       } catch (e: IllegalArgumentException) {
-        // expected
+        assertTrue("$p 錯誤訊息須指明 finite，實際=${e.message}", "finite" in (e.message ?: ""))
+      }
+    }
+  }
+
+  @Test fun navigation_web_latLng_outOfRange_throws() {
+    // 與 geo 一致：web 分支同樣拒絕越界/非有限座標，禁經 OSM URL 外洩。
+    for (p in listOf(
+      NavigationTool.Params(latitude = 91.0, longitude = 0.0),
+      NavigationTool.Params(latitude = 0.0, longitude = 181.0),
+      NavigationTool.Params(latitude = Double.NaN, longitude = 0.0),
+      NavigationTool.Params(latitude = 0.0, longitude = Double.POSITIVE_INFINITY),
+    )) {
+      try {
+        NavigationTool.buildWebIntent(p)
+        fail("expected IllegalArgumentException for web $p")
+      } catch (e: IllegalArgumentException) {
+        assertTrue("web $p 錯誤訊息須指明範圍（out of range/finite），實際=${e.message}", "out of range" in (e.message ?: "") || "finite" in (e.message ?: ""))
       }
     }
   }
@@ -489,13 +506,13 @@ class IntentTypedD2Test {
         NavigationTool.buildGeoIntent(p)
         fail("expected IllegalArgumentException for single-sided $p")
       } catch (e: IllegalArgumentException) {
-        // expected
+        assertTrue("單側 $p 錯誤訊息須指明 paired（both null/both non-null），實際=${e.message}", "both" in (e.message ?: ""))
       }
       try {
         NavigationTool.buildWebIntent(p)
         fail("expected IllegalArgumentException for single-sided $p")
       } catch (e: IllegalArgumentException) {
-        // expected
+        assertTrue("單側 $p（web）錯誤訊息須指明 paired（both null/both non-null），實際=${e.message}", "both" in (e.message ?: ""))
       }
     }
   }

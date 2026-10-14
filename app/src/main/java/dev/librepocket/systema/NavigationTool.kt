@@ -51,6 +51,10 @@ object NavigationTool : SystemTool<NavigationTool.Params> {
 
   fun buildWebIntent(params: Params): IntentSpec {
     requirePairedCoords(params.latitude, params.longitude)
+    val lat = params.latitude
+    val lng = params.longitude
+    // 與 geo 一致：web 分支同樣收斂座標守衛（有限值 + 範圍），禁越界座標經 OSM URL 外洩。
+    if (lat != null && lng != null) requireLatLng(lat, lng)
     val q = when {
       params.query.isNotBlank() -> params.query
       params.label.isNotBlank() -> params.label

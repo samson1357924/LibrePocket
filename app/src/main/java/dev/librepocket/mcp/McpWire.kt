@@ -44,14 +44,9 @@ internal object McpWire {
         val main = if (cut >= 0) trimmed.substring(0, cut) else trimmed
         val suffix = if (cut >= 0) trimmed.substring(cut) else ""
         val mainTrimmed = main.trimEnd('/')
-        val schemeEnd = mainTrimmed.indexOf("://")
-        val pathStart = if (schemeEnd >= 0) {
-            mainTrimmed.indexOf('/', schemeEnd + 3)
-        } else {
-            mainTrimmed.indexOf('/')
-        }
         // 無 path（bare-origin）→ 補 /mcp；有 path 原樣保留（僅去尾斜線，query/fragment 原樣接回）。
-        return if (pathStart < 0) "$mainTrimmed/mcp$suffix" else "$mainTrimmed$suffix"
+        // bare-origin 判斷複用 isBareOrigin()（單一真相來源；行為不變，見 endpoint 測試鎖定）。
+        return if (isBareOrigin(baseUrl)) "$mainTrimmed/mcp$suffix" else "$mainTrimmed$suffix"
     }
 
     /** endpoint() 是否會自動補 `/mcp`（bare-origin 判斷；供傳輸層 warning 用）。 */
@@ -172,11 +167,11 @@ internal object McpWire {
                 } else {
                     false
                 }
-            isErrorRaw.trim().startsWith("\"") -> false
+            isErrorRaw.trim().startsWith("\"") -> throw McpProtocol("mcp: bad isError")
             else -> when (isErrorRaw.trim()) {
                 "true" -> true
                 "false", "null" -> false
-                // 畸形字面量（True/1 等）不再靜默壓 false，一律 PROTOCOL。
+                // 畸形字面量（字串 "true"、True/1 等）不再靜默壓 false，一律 PROTOCOL。
                 else -> throw McpProtocol("mcp: bad isError")
             }
         }

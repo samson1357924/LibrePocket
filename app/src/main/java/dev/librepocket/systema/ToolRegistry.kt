@@ -3,6 +3,11 @@ package dev.librepocket.systema
 /**
  * 快通道工具契約：每個 A 組工具都實現 check / execute / fallback 三件套。
  *
+ * builder 的 `require` IAE 目前由呼叫方直接外洩、不收斂為 [ToolResult]
+ *（[execute]/[fallback] 內調 builder 無 try-catch；生產尚無 dispatcher 接線，
+ * 目前不可達，僅測試直調）。Target：未來 dispatcher（或 caller-catch）須將
+ * builder IAE 收斂為 `ToolResult`，不讓 IAE 穿透生產迴圈。
+ *
  * @param P 該工具的參數型別（純資料）。
  */
 interface SystemTool<P> {

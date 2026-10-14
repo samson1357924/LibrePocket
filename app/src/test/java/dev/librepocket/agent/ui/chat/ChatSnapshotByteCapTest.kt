@@ -218,6 +218,10 @@ class ChatSnapshotByteCapTest {
         // exceed the SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP row cap (SnapshotBudget.HISTORY_LOAD_CAP - 1) while total chars
         // (~120k) stay far below the byte cap: newest-first must drop exactly
         // the oldest (huge) row, with no byte marker.
+        // Rebased-head R26-1 composition: the row-cap cut drops the oldest
+        // huge *user* row, leaving its "a-old" assistant head user-less, so
+        // dropHeadOrphanAssistantFamilies trims that one-row "hold" family as
+        // well — loaded/copied are CAP-1 (1998), not CAP (1999).
         // Issue #86 Phase B: the single huge fixture uses the pre-redacted
         // fast path (bytes identical, skips O(n^2) EMAIL scan); small rows keep
         // the true appendEvent shaping.
@@ -255,6 +259,9 @@ class ChatSnapshotByteCapTest {
         val store = FakeSessionStore()
         val oldId = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
         // 1000 small turns x 10 chars = 2000 rows / ~20k chars: row cap only.
+        // Rebased-head R26-1 composition: the row-cap cut drops the oldest
+        // (t0 user) row, orphaning the t0 assistant head, which the family
+        // trim removes — loaded/copied are CAP-1 (1998).
         repeat(1000) { i ->
             store.appendEvent(event(oldId, "t$i", "user", "0123456789"))
             store.appendEvent(event(oldId, "t$i", "assistant", "abcdefghij"))

@@ -162,25 +162,30 @@ class ChatSnapshotByteCapTest {
     @Test fun overBudgetPrefix_loadBoundedAndSnapshotAbandonsWholeWithMarker() = runBlocking {
         val store = FakeSessionStore()
         val oldId = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
-        // 100 complete turns x 100k chars = 200 rows / 20M chars: rows far
-        // below the SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP row cap (1999) while bytes blow the 2M aggregate cap. One
-        // shared 100k instance keeps the test heap small (lengths still sum
-        // to 20M, which is what the budget measures).
+        // Issue #86 Phase B (PR slim): 11 turns x 100k = 22 rows / 2.2M chars.
+        // Rows stay far below SWITCH_SNAPSHOT_COPY_CAP (1999) while bytes blow
+        // the 2M cap — same behavior as the original 100-turn / 200-row / 20M
+        // version (full stress lives in ChatSnapshotByteCapFullStressTest,
+        // NIGHTLY_STRESS=1). One shared 100k instance keeps the heap small.
+        // Budget arithmetic pin stays identical: 2M / 100k = 20 rows fit, the
+        // 21st overflows. Fixture "x".repeat is already redacted (identity),
+        // so the pre-redacted fast path preserves bytes exactly while skipping
+        // the O(n^2) EMAIL scan (appendEvent 本體不動，F8 parity 不受影響）.
         val huge = "x".repeat(100_000)
-        repeat(100) { i ->
-            store.appendEvent(event(oldId, "r$i", "user", huge))
-            store.appendEvent(event(oldId, "r$i", "assistant", huge))
+        repeat(11) { i ->
+            store.appendPreRedactedForBudgetTest(event(oldId, "r$i", "user", huge))
+            store.appendPreRedactedForBudgetTest(event(oldId, "r$i", "assistant", huge))
         }
 
         val loaded = loadSwitchSnapshotEvents(store, oldId)
         // Bounded: newest-first prefix within both budgets, oldest dropped.
-        assertTrue(loaded.events.size < 200)
+        assertTrue(loaded.events.size < 22)
         assertTrue(loaded.events.sumOf { it.text.length } <= SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS)
-        assertEquals(200 - loaded.events.size, loaded.droppedByBytes)
+        assertEquals(22 - loaded.events.size, loaded.droppedByBytes)
         assertTrue(loaded.droppedByBytes > 0)
-        // Pin the arithmetic: 2M / 100k rows fit, the 21st overflows.
+        // Pin the arithmetic: 2M / 100k = 20 rows fit, the 21st overflows.
         assertEquals(20, loaded.events.size)
-        assertEquals(180, loaded.droppedByBytes)
+        assertEquals(2, loaded.droppedByBytes)
 
         val newId = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o")
         val copied = snapshotSwitchHistory(store, oldId, newId, "gpt-4o-mini", "gpt-4o", false)
@@ -213,7 +218,10 @@ class ChatSnapshotByteCapTest {
         // exceed the SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP row cap (SnapshotBudget.HISTORY_LOAD_CAP - 1) while total chars
         // (~120k) stay far below the byte cap: newest-first must drop exactly
         // the oldest (huge) row, with no byte marker.
-        store.appendEvent(event(oldId, "hold", "user", "x".repeat(100_000)))
+        // Issue #86 Phase B: the single huge fixture uses the pre-redacted
+        // fast path (bytes identical, skips O(n^2) EMAIL scan); small rows keep
+        // the true appendEvent shaping.
+        store.appendPreRedactedForBudgetTest(event(oldId, "hold", "user", "x".repeat(100_000)))
         store.appendEvent(event(oldId, "hold", "assistant", "a-old"))
         repeat(999) { i ->
             store.appendEvent(event(oldId, "s$i", "user", "q-$i"))
@@ -294,11 +302,12 @@ class ChatSnapshotByteCapTest {
         // 2.4M chars over the 2M cap, rows (26) far below the SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP row cap (1999).
         // The live turn stays IDLE (clean fence, non-streaming). One shared
         // instance keeps the heap small; the budget measures lengths.
+        // Issue #86 Phase B: pre-redacted fast path (bytes identical).
         val huge = "x".repeat(100_000)
         runBlocking {
             repeat(12) { i ->
-                transcripts.appendEvent(event(firstId, "huge-${i}u", "user", huge))
-                transcripts.appendEvent(event(firstId, "huge-${i}a", "assistant", huge))
+                transcripts.appendPreRedactedForBudgetTest(event(firstId, "huge-${i}u", "user", huge))
+                transcripts.appendPreRedactedForBudgetTest(event(firstId, "huge-${i}a", "assistant", huge))
             }
         }
 

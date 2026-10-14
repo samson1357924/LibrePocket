@@ -305,13 +305,15 @@ class SnapshotFiveDimPhase4Test {
   // ---- ByteCap五維 (非cleanFence): over-budget全棄 + marker. ----
 
   @Test fun byteCapOverBudget_fiveDim() = runBlocking {
-    // Given: 100 turn x 100k (200列/20M字，列內、字超)。
+    // Given: Issue #86 Phase B (PR slim): 11 turn x 100k (22列/2.2M字，列內、字超)。
+    // 原 100 turn / 200列 / 20M 全量版移至 ChatSnapshotByteCapFullStressTest
+    // (NIGHTLY_STRESS=1)。Fixture "x" 已是 redacted-identical，走預 redact 快道。
     val transcripts = FakeSessionStore()
     val oldId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
     val huge = "x".repeat(100_000)
-    repeat(100) { i ->
-      transcripts.appendEvent(event(oldId, "r$i", "user", huge))
-      transcripts.appendEvent(event(oldId, "r$i", "assistant", huge))
+    repeat(11) { i ->
+      transcripts.appendPreRedactedForBudgetTest(event(oldId, "r$i", "user", huge))
+      transcripts.appendPreRedactedForBudgetTest(event(oldId, "r$i", "assistant", huge))
     }
     // When: fork。
     val newId = transcripts.createSession("t", "preset:openai@https://api.openai.com/gpt-4o")

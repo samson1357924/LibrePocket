@@ -38,6 +38,25 @@ a separate higher-API smoke pass (Proposed, not a current CI gate). The pin
 itself and any `@Config` SDK matrix expansion are out of scope for the
 current deflake work — do not change them here.
 
+Issue #86 byte-cap PR/nightly split (Current, Phase B stop-gap, zero prod change):
+PR runs slimmed byte-cap versions (11-turn / 22-row / 2.2M-char over-budget
+prefix plus the 12-turn cleanFence; same 20-fit / 21st-overflow arithmetic,
+same all-or-nothing + marker + clean-reopen assertions); the original 100-turn
+/ 200-row / 20M-char full stress runs only in the nightly `nightly-unit-stress`
+job (`NIGHTLY_STRESS=1`, Foss flavor only — shaping is flavor-independent,
+independent 35-minute timeout, JUnit XML retained 14 days, red requires filing
+an issue manually and never blocks merge — not in `pr-check.yml` `pr-gate`).
+Slim tests use `FakeSessionStore.appendPreRedactedForBudgetTest`
+(pre-redacted `"x"` fixture, bytes identical, skips the O(n²) EMAIL scan;
+`appendEvent` 本體不動，F8 parity unaffected); nightly stress uses the true
+`appendEvent` shaping.
+
+| PR slim (fast, gate) | Nightly full (`NIGHTLY_STRESS=1`, non-gate) |
+|---|---|
+| `ChatSnapshotByteCapTest.overBudgetPrefix_loadBoundedAndSnapshotAbandonsWholeWithMarker` (11 turns, 20 fit / 2 dropped) | `ChatSnapshotByteCapFullStressTest.overBudgetPrefix_full200Rows_abandonsWholeWithMarker` (100 turns, 20 fit / 180 dropped) |
+| `SnapshotFiveDimPhase4Test.byteCapOverBudget_fiveDim` (11 turns) | `ChatSnapshotByteCapFullStressTest.byteCapOverBudget_fiveDim_full200Rows` (100 turns) |
+| `ChatSnapshotByteCapTest.cleanFenceOverBudgetFork_surfacesIncompleteNoticeImmediately` (12 turns, pre-redacted fast path) | (same ledger shape covered by the two full tests above; no separate nightly) |
+
 What runs by edit type:
 
 - Docs-only (neither `code` nor `policy`, e.g. `docs/**` or `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.
@@ -99,7 +118,11 @@ pull requests (types `labeled`, `synchronize`, `opened`, `reopened`) the
 `instrumented-test` job executes only when the PR carries the
 `run-instrumented` label (the job `if:` requires that label for PR
 events, so an unlabeled PR shows as Skipped/neutral — not a pass — and
-does not enter `pr-gate` merge evaluation). The emulator matrix is API
+does not enter `pr-gate` merge evaluation). The `nightly-unit-stress` job
+(Issue #86 Phase B, Foss `ChatSnapshotByteCapFullStressTest` with
+`NIGHTLY_STRESS=1`) runs on schedule / `workflow_dispatch` only
+(`if: github.event_name != 'pull_request'`), never on PR; JUnit XML retained
+14 days, non-gating (not in `pr-check.yml` `pr-gate`). The emulator matrix is API
 levels 33 and 34 only, across the Play/Foss/Github flavors — while
 `minSdk` is 33, `compileSdk` is 37 and `targetSdk` is 36
 (`app/build.gradle.kts`), so there is currently no API 35, 36, or 37

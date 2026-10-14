@@ -103,6 +103,37 @@ open class FakeSessionStore : SessionStore {
     }
 
     /**
+     * Issue #86 Phase B (PR stop-gap, zero prod change): test-only fast path
+     * for snapshot-budget fixtures that are already known-redacted
+     * (e.g. `"x".repeat(100_000)`, where `Redactor.redact` is identity).
+     *
+     * `appendEvent` 本體不動 — F8 parity tests keep exercising the true
+     * `redact + truncate + redactError` shaping, so Room parity is unaffected.
+     * This channel keeps the same kind / reasoning-empty / unknown-session /
+     * seq gates and the same `MAX_TEXT_CHARS` truncation (cheap `take`, no
+     * regex), but skips `Redactor.redact` / `redactError`. Callers must only
+     * pass fixtures with `failureReason == null` and text that needs no
+     * redaction; anything else must go through [appendEvent]. Must not be used
+     * with fault-injecting subclasses (`appendEvents` does not route here;
+     * only [appendEvent] is virtual).
+     */
+    suspend fun appendPreRedactedForBudgetTest(event: TranscriptEvent): Long {
+        require(event.kind in VALID_KINDS) { "unknown event kind: ${event.kind}" }
+        require(event.kind != "reasoning" || event.text.isEmpty()) { "reasoning marker must have empty text" }
+        require(event.failureReason == null) { "budget fixture must not carry failureReason (use appendEvent)" }
+        val text = if (event.text.length > RoomSessionStore.MAX_TEXT_CHARS) {
+            event.text.take(RoomSessionStore.MAX_TEXT_CHARS)
+        } else {
+            event.text
+        }
+        require(metas.containsKey(event.sessionId)) { "unknown session" }
+        val max = events.filter { it.sessionId == event.sessionId }.maxOfOrNull { it.seq } ?: 0L
+        check(max < Long.MAX_VALUE) { "seq exhausted" }
+        events.add(event.copy(seq = max + 1, text = text, failureReason = null))
+        return events.size.toLong()
+    }
+
+    /**
      * R5-4 atomic batch: mirrors [RoomSessionStore.appendEvents] single-
      * transaction semantics without Room — the pre-batch list is snapshotted
      * and any throw (including [CancellationException]) restores it before

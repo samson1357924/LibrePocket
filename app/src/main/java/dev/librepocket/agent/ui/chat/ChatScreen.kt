@@ -83,6 +83,7 @@ internal fun chatNoticeText(code: String): String =
     when (code) {
         "NO_ENDPOINT" -> "尚未設定端點，請先設定 API 金鑰。"
         "POLICY_DENIED" -> "政策拒絕讀取金鑰（key.read DENY），本次未發送任何請求。"
+        "KEY_READ_CONFIRM_REQUIRED" -> "讀取金鑰需要本次確認（key.read ASK），本次未送出（確認 UI 尚未提供，fail-closed；追蹤 #13）。"
         "CHAT_SEND_DENIED" -> "對話送出被政策拒絕（chat.send DENY），本次未發送任何請求。"
         "CHAT_APPROVAL_REQUIRED" -> "此操作需要明確核准；目前沒有互動核准流程，本次未送出，也未自動允許。"
         "CHAT_POLICY_UNAVAILABLE" -> "無法驗證對話權限，本次未送出，請稍後重試"

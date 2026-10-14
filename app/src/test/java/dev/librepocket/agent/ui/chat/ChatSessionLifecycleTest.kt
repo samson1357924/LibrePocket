@@ -115,7 +115,7 @@ class ChatSessionLifecycleTest {
     private fun newViewModel(
         store: EndpointStore,
         sessions: ChatSessionProvider,
-        policy: PolicyStore = InMemoryPolicyStore(),
+        policy: PolicyStore = allowKeyReadPolicy(),
     ): ChatViewModel = chatViewModels.own(ChatViewModel(store, sessions, policy))
 
     @Test
@@ -171,6 +171,9 @@ class ChatSessionLifecycleTest {
             policy.firstEvaluationEntered.await()
 
             chatMain.run { vm.newChat() }
+            // key.read ASK needs a bound one-shot confirmation for the new
+            // generation's send; the parked old evaluation still denies stale.
+            vm.confirmKeyRead()
             chatMain.run { vm.sendDirect("new generation positive control") }
             val fresh = sessions.awaitCreated(1)
             fresh.sendFinished.await()
@@ -879,6 +882,8 @@ class ChatSessionLifecycleTest {
             assertEquals("fresh text", vm.input.value)
 
             policy.release.complete(Unit)
+            // The re-send runs under key.read ASK: confirm it one-shot first.
+            vm.confirmKeyRead()
             chatMain.run { vm.send() }
             val created = sessions.awaitCreated(1)
             created.sendFinished.await()

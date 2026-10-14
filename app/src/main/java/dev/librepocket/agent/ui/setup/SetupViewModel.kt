@@ -42,7 +42,7 @@ import kotlinx.coroutines.withContext
  * One-shot key.write consent minted when [PolicyStore.evaluateFresh] returns ASK.
  *
  * In-memory only: never persisted, never placed in SavedState, and carries no
- * key material (identity snapshot + nonce only). Bound to the immutable
+ * key material (identity snapshot only). Bound to the immutable
  * endpoint snapshot observed at mint time; consumed (nulled) on the first
  * confirm or abandon tap, so it can never be replayed or reused. Any
  * endpoint-identity edit discards it before use.
@@ -54,7 +54,6 @@ private data class KeyWriteConsent(
     val baseUrl: String,
     val configRevision: Long?,
     val formRevision: Long,
-    val nonce: Long,
 )
 
 /** Gate state for startup navigation. Loading and NoEndpoint are distinct (no FOUC). */
@@ -95,6 +94,9 @@ data class SetupUiState(
     val modelDirectoryStatus: ModelDirectoryStatus = ModelDirectoryStatus.NotLoaded,
     // Transient model-refresh CAS epoch only; not endpoint/configuration revision.
     internal val modelRefreshRevision: Long = 0L,
+    // Transient test-connection CAS epoch only (mirrors modelRefreshRevision;
+    // Phase A2 stale-test guard). Not endpoint/configuration revision.
+    internal val testConnectionRevision: Long = 0L,
     val confirmKeyWrite: Boolean = false,
     val errorCode: String? = null,
     /**
@@ -195,6 +197,26 @@ class SetupViewModel(
     private var startupPendingGen: Long = 0L
     private val modelRefreshGeneration = AtomicLong(0L)
     private var modelRefreshJob: Job? = null
+    // Phase A2: testConnection carries the same generation-guard shape as
+    // refreshModels (immutable captured revision + stale discard), so a slow
+    // attempt can never overwrite a newer form. Bumped by the same edit
+    // points that bump modelRefreshGeneration; testConnection bumps only its
+    // own generation and refreshModels only its own (independent operations).
+    private val testConnectionGeneration = AtomicLong(0L)
+    private var testConnectionJob: Job? = null
+    // Phase A2 KeepExisting baseline: the live endpoint observed by the last
+    // prefillForEdit (key field intentionally left blank). A blank key means
+    // "reuse the securely stored key" ONLY while the form identity
+    // (providerId + effectiveBaseUrl 全字串相等（嚴於 origin）) still matches this baseline;
+    // any endpoint change invalidates it (fail closed, re-paste required).
+    // Main-thread only (written by prefillForEdit/logout entries, read by
+    // save/test entries on Main before launching IO). Cleared on logout entry
+    // (teardown in flight must never reuse) — never cleared by identity edits
+    // (the mismatch itself is the invalidation signal) nor by save success
+    // (identity and ref are unchanged on the reuse path, so repeated
+    // model-only saves keep working; the save path re-verifies against the
+    // live store snapshot, never trusts this baseline for the ref).
+    private var editBaseline: EndpointConfig? = null
     // Stage2 form fence: identity/key intent epoch. Bumped only by
     // selectPreset/onBaseUrlChange/onApiKeyChange/prefillForEdit/logout.
     // onModelChange/toggleShowKey deliberately do NOT bump (model edits are
@@ -213,7 +235,6 @@ class SetupViewModel(
     // stays a coroutine `Mutex` as the save/logout serialization fence.
     private val consentLock = Any()
     private var pendingConsent: KeyWriteConsent? = null
-    private val consentNonces = AtomicLong(0L)
 
     companion object {
         /**
@@ -407,9 +428,14 @@ class SetupViewModel(
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
+        testConnectionJob?.cancel()
+        testConnectionJob = null
+        val testRevision = testConnectionGeneration.incrementAndGet()
         _form.value = _form.value.copy(
             presetId = presetId,
             modelRefreshRevision = revision,
+            testConnectionRevision = testRevision,
+            testing = false,
             baseUrl = preset.baseUrl,
             model = ProviderCatalog.defaultModelFor(presetId),
             errorCode = null,
@@ -426,9 +452,14 @@ class SetupViewModel(
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
+        testConnectionJob?.cancel()
+        testConnectionJob = null
+        val testRevision = testConnectionGeneration.incrementAndGet()
         _form.value = _form.value.copy(
             baseUrl = v,
             modelRefreshRevision = revision,
+            testConnectionRevision = testRevision,
+            testing = false,
             errorCode = null,
             testModels = null,
             modelOptions = emptyList(),
@@ -437,6 +468,26 @@ class SetupViewModel(
         )
     }
 
+    /**
+     * Model-only edit: intentionally bumps NO generation (Phase A2 revision
+     * rule, unified with the [formRevision] fence documented above).
+     *
+     * Rationale: the model string is not consent identity (key.write consent
+     * binds providerId/baseUrl only) and neither probe result depends on it —
+     * testConnection lists models with the key/URL (unchanged here) and
+     * refreshModels offers options separately while preserving free text (see
+     * `freeTextModelPreserved`). Bumping here would needlessly discard a valid
+     * in-flight test/refresh and would invalidate a KeepExisting intent whose
+     * identity is unchanged. Save is unaffected: it consumes the entry
+     * snapshot, and the model value is read from that same snapshot, so a
+     * model edit racing save falls into three cases: (1) included in the
+     * snapshot (saved); (2) fenced only when it rides an identity/key edit
+     * (which does bump, fail closed with POLICY_DENIED); (3) a pure model
+     * edit landing after the save entry is silently ignored for this attempt
+     * (the entry snapshot is authoritative) -- the edit stays in the form for
+     * the next save.
+     * Clears only the last test count (it may describe a different model).
+     */
     fun onModelChange(v: String) {
         _form.value = _form.value.copy(model = v, errorCode = null, testModels = null)
     }
@@ -447,9 +498,14 @@ class SetupViewModel(
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
+        testConnectionJob?.cancel()
+        testConnectionJob = null
+        val testRevision = testConnectionGeneration.incrementAndGet()
         _form.value = _form.value.copy(
             apiKey = v,
             modelRefreshRevision = revision,
+            testConnectionRevision = testRevision,
+            testing = false,
             errorCode = null,
             testModels = null,
             modelOptions = emptyList(),
@@ -466,6 +522,10 @@ class SetupViewModel(
      * Prefill the form from the live endpoint for "edit" entries. The key
      * always stays blank (dots display "already set"; retype to rotate).
      * Unknown presetIds fall back to custom with the stored URL editable.
+     *
+     * Also captures the KeepExisting baseline ([editBaseline]): a blank key
+     * reuses the stored vault key only while the form identity still matches
+     * this snapshot (see [keepExistingModeFor]).
      */
     fun prefillForEdit(config: EndpointConfig) {
         formRevision.incrementAndGet()
@@ -473,6 +533,10 @@ class SetupViewModel(
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         val revision = modelRefreshGeneration.incrementAndGet()
+        testConnectionJob?.cancel()
+        testConnectionJob = null
+        val testRevision = testConnectionGeneration.incrementAndGet()
+        editBaseline = config
         val preset = ProviderCatalog.preset(config.presetId)
         if (preset == null || config.presetId == ProviderCatalog.CUSTOM_ID) {
             _form.value = SetupUiState(
@@ -480,6 +544,7 @@ class SetupViewModel(
                 baseUrl = config.baseUrl,
                 model = config.model,
                 modelRefreshRevision = revision,
+                testConnectionRevision = testRevision,
             )
         } else {
             _form.value = SetupUiState(
@@ -487,7 +552,30 @@ class SetupViewModel(
                 baseUrl = preset.baseUrl,
                 model = config.model.ifBlank { preset.defaultModel },
                 modelRefreshRevision = revision,
+                testConnectionRevision = testRevision,
             )
+        }
+    }
+
+    /**
+     * Phase A2 KeepExisting gate (Main-thread only; pure read of [editBaseline]).
+     *
+     * Returns EDIT_KEEP_EXISTING only when ALL hold: the key field is blank,
+     * an edit baseline exists, and the current form identity (derived
+     * providerId + effectiveBaseUrl 全字串相等（嚴於 origin）) still matches it. Anything else —
+     * no baseline (first-run/fresh), a pasted key, an identity change, or any
+     * evaluation failure — falls back to NEW (fail closed, re-paste required).
+     */
+    private fun keepExistingModeFor(form: SetupUiState): SetupValidation.KeyMode {
+        try {
+            if (form.apiKey.trim().isNotEmpty()) return SetupValidation.KeyMode.NEW
+            val baseline = editBaseline ?: return SetupValidation.KeyMode.NEW
+            val providerId = SetupValidation.deriveProviderId(form.presetId)
+            if (providerId != baseline.providerId) return SetupValidation.KeyMode.NEW
+            if (effectiveBaseUrlOf(form) != baseline.baseUrl) return SetupValidation.KeyMode.NEW
+            return SetupValidation.KeyMode.EDIT_KEEP_EXISTING
+        } catch (_: Exception) {
+            return SetupValidation.KeyMode.NEW
         }
     }
 
@@ -495,30 +583,65 @@ class SetupViewModel(
         _form.value = _form.value.copy(saved = false)
     }
 
-    /** One-shot connectivity check (P1_SPEC listModels); persists nothing. */
+    /**
+     * One-shot connectivity check (P1_SPEC listModels); persists nothing.
+     *
+     * Always validates in [SetupValidation.KeyMode.NEW]: the probe needs the
+     * key material in memory and a blank field can never reuse the stored key
+     * here (that would require a vault read on this path — out of scope;
+     * re-paste to test). Carries the same generation-guard shape as
+     * [refreshModels]: the captured [generation] plus the state's
+     * [SetupUiState.testConnectionRevision] discard a stale attempt whose form
+     * moved underneath it (slow A never overwrites newer B). Identity/key
+     * edits cancel the in-flight attempt and reset `testing` synchronously
+     * (see selectPreset/onBaseUrlChange/onApiKeyChange), so the entry
+     * `testing` fence stays exact and a cancelled attempt writes nothing
+     * (CancellationException rethrown unwritten).
+     */
     fun testConnection() {
         val cur = _form.value
         if (cur.testing || cur.saving || cur.modelsLoading) return
         val effectiveBaseUrl = effectiveBaseUrlOf(cur)
-        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey)
+        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
         if (err != null) {
             _form.value = cur.copy(errorCode = err)
             return
         }
-        _form.value = cur.copy(testing = true, errorCode = null, testModels = null)
-        viewModelScope.launch(Dispatchers.IO) {
+        testConnectionJob?.cancel()
+        testConnectionJob = null
+        val generation = testConnectionGeneration.incrementAndGet()
+        _form.value = cur.copy(testing = true, errorCode = null, testModels = null, testConnectionRevision = generation)
+        testConnectionJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 val config = providerConfigOf(cur, effectiveBaseUrl)
                 val typed = cur.apiKey.trim()
                 val keys = KeyProvider { typed.toCharArray() }
                 val count = buildProvider(config, keys).listModels().size
-                _form.value = _form.value.copy(testing = false, testModels = count)
+                _form.update { current ->
+                    if (generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
+                        current.copy(testing = false, testModels = count)
+                    } else {
+                        current
+                    }
+                }
             } catch (e: ProviderFailure) {
-                _form.value = _form.value.copy(testing = false, errorCode = classifyTestError(e))
+                _form.update { current ->
+                    if (generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
+                        current.copy(testing = false, errorCode = classifyTestError(e))
+                    } else {
+                        current
+                    }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                _form.value = _form.value.copy(testing = false, errorCode = "TEST_FAILED")
+                _form.update { current ->
+                    if (generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
+                        current.copy(testing = false, errorCode = "TEST_FAILED")
+                    } else {
+                        current
+                    }
+                }
             }
         }
     }
@@ -528,7 +651,9 @@ class SetupViewModel(
         val cur = _form.value
         if (cur.modelsLoading || cur.testing || cur.saving) return
         val effectiveBaseUrl = effectiveBaseUrlOf(cur)
-        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey)
+        // NEW always (same rule as testConnection): the listing needs the key
+        // in memory; a blank edit field requires a re-paste, never a vault read.
+        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, SetupValidation.KeyMode.NEW)
         if (err != null) {
             _form.value = cur.copy(errorCode = err)
             return
@@ -629,7 +754,13 @@ class SetupViewModel(
         val cur = _form.value
         if (cur.saving || cur.testing || cur.modelsLoading) return
         val effectiveBaseUrl = effectiveBaseUrlOf(cur)
-        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey)
+        // Phase A2: blank key + unchanged edit identity validates as
+        // EDIT_KEEP_EXISTING (reuse the stored vault key, metadata-only save);
+        // every other shape validates as NEW. Probes stay NEW (see
+        // testConnection/refreshModels).
+        val keepExistingMode = keepExistingModeFor(cur)
+        val keepExisting = keepExistingMode == SetupValidation.KeyMode.EDIT_KEEP_EXISTING
+        val err = SetupValidation.validate(cur.presetId, effectiveBaseUrl, cur.apiKey, keepExistingMode)
         if (err != null) {
             _form.value = cur.copy(errorCode = err)
             return
@@ -645,7 +776,7 @@ class SetupViewModel(
             // inner-only catch would leave saving=true in that window.
             try {
                 saveMutex.withLock {
-                    executeKeyWrite(cur, effectiveBaseUrl, consent, entryRevision)
+                    executeKeyWrite(cur, effectiveBaseUrl, consent, entryRevision, keepExisting)
                 }
             } catch (e: CancellationException) {
                 // Any cancel path (VM alive) must unstick saving and must
@@ -673,6 +804,7 @@ class SetupViewModel(
         effectiveBaseUrl: String,
         consent: KeyWriteConsent?,
         entryRevision: Long,
+        keepExisting: Boolean,
     ) {
         val providerId = try {
             SetupValidation.deriveProviderId(form.presetId)
@@ -790,6 +922,25 @@ class SetupViewModel(
         // and here, so a second identical check would be redundant.
         if (entryRevision != formRevision.get()) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // 4b. Phase A2 KeepExisting reuse (blank key + unchanged edit
+        // identity): metadata-only CAS preserving the live apiKeyRef. Zero
+        // vault key-material I/O (no staged put, no retire, no getKey) — only
+        // an existence-only hasKey precondition plus the same fail-closed
+        // gates as the staged path's final metadata-gate. See
+        // [executeKeepExistingCommit]. The staged write below is skipped.
+        if (keepExisting) {
+            executeKeepExistingCommit(
+                form,
+                effectiveBaseUrl,
+                providerId,
+                consent,
+                entryRevision,
+                expectedRevision,
+                oldConfig,
+                oldAlias,
+            )
             return
         }
         // 5. Staged vault write (versioned-alias scheme). The new key is written
@@ -1297,6 +1448,183 @@ class SetupViewModel(
     }
 
     /**
+     * Phase A2 KeepExisting commit: blank-key edit with unchanged endpoint
+     * identity reuses the live vault key via a metadata-only CAS.
+     *
+     * Vault-material guarantee: this path performs NO putKey/deleteKey/getKey
+     * — the stored key bytes are never read or rewritten. The only vault
+     * contact is an existence-only `hasKey` precondition (never content).
+     * The committed `apiKeyRef` is always the live snapshot's own ref (never
+     * the baseline's, never a new alias), so there is nothing to retire: the
+     * live alias is unchanged and deleting it here would destroy the reused
+     * key.
+     *
+     * Fail-closed preconditions (any failure reports POLICY_DENIED_KEY_WRITE
+     * with zero writes — re-paste/re-prefill to proceed; CAS contention maps
+     * to SAVE_BLOCKED_BY_TEARDOWN vs POLICY_DENIED exactly like the staged
+     * path):
+     * - live snapshot still carries a well-formed ref whose providerId/baseUrl
+     *   match the entry form (a concurrent writer moving the endpoint, or an
+     *   emptied store after a raced logout, aborts here);
+     * - the live alias provably still holds a key (`hasKey`; false or host
+     *   failure aborts — a missing key cannot be reused);
+     * - fresh key.write verdict + generation fence + carried-consent
+     *   re-verification immediately before the CAS (mirrors the staged final
+     *   metadata-gate; ASK without a carried consent mints the same one-shot
+     *   dialog and writes nothing).
+     *
+     * Cancellation mirrors the staged compensation at metadata scope: nothing
+     * was written before the CAS, so a pre-commit cancel only unsticks
+     * `saving`; a committed-then-cancelled commit is re-probed journal-aware
+     * (same [probeStagedCommit] helper) and only then swallowed to success.
+     */
+    private suspend fun executeKeepExistingCommit(
+        form: SetupUiState,
+        effectiveBaseUrl: String,
+        providerId: String,
+        consent: KeyWriteConsent?,
+        entryRevision: Long,
+        expectedRevision: Long?,
+        oldConfig: EndpointConfig?,
+        oldAlias: String?,
+    ) {
+        if (oldConfig == null || oldAlias == null) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        if (oldConfig.providerId != providerId || oldConfig.baseUrl != effectiveBaseUrl) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        val keyPresent: Boolean = try {
+            vault().hasKey(oldAlias)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        if (!keyPresent) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        if (entryRevision != formRevision.get()) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        val vCommit = freshVerdictOrDeny("key.write", providerId)
+        if (vCommit == Verdict.DENY) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        if (entryRevision != formRevision.get()) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        if (vCommit == Verdict.ASK && consent == null) {
+            val liveCommit = _form.value
+            val liveBaseUrlCommit = try {
+                effectiveBaseUrlOf(liveCommit)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrlCommit, entryRevision)) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            afterMintBeforeDialogForTest?.invoke()
+            if (entryRevision != formRevision.get()) {
+                takePendingConsent()
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            _form.value = _form.value.copy(saving = false, confirmKeyWrite = true)
+            if (entryRevision != formRevision.get()) {
+                takePendingConsent()
+                _form.value = _form.value.copy(saving = false, confirmKeyWrite = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            return
+        }
+        if (consent != null) {
+            val live2 = _form.value
+            val liveBaseUrl2 = try {
+                effectiveBaseUrlOf(live2)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (!consentMatches(consent, live2, liveBaseUrl2)) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+        }
+        if (entryRevision != formRevision.get()) {
+            _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+            return
+        }
+        // Uses the entry snapshot: model may be stale only via onModelChange
+        // (not consent identity, same note as the staged path) — read from the
+        // same snapshot so the fence above stays exact.
+        val liveRef = oldConfig.apiKeyRef
+        val config = endpointConfigOf(form, effectiveBaseUrl, providerId, liveRef)
+        var reuseCommitted = false
+        try {
+            val wrote = try {
+                store.saveIfRevision(config, expectedRevision)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: IllegalArgumentException) {
+                throw e
+            } catch (_: Exception) {
+                _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
+                return
+            }
+            if (!wrote) {
+                val blockedByTeardown: Boolean = try {
+                    store.pendingDelete() != null
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    true
+                }
+                _form.value = _form.value.copy(
+                    saving = false,
+                    errorCode = if (blockedByTeardown) "SAVE_BLOCKED_BY_TEARDOWN" else "POLICY_DENIED_KEY_WRITE",
+                )
+                return
+            }
+            reuseCommitted = true
+            invalidateStartupSettled()
+            _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+        } catch (e: CancellationException) {
+            if (!reuseCommitted) {
+                _form.value = _form.value.copy(saving = false)
+                throw e
+            }
+            val stillCommitted: Boolean? = try {
+                withContext(NonCancellable) { probeStagedCommit(liveRef) }
+            } catch (_: CancellationException) {
+                null
+            } catch (_: Exception) {
+                null
+            }
+            if (stillCommitted == true) {
+                invalidateStartupSettled()
+                _form.value = _form.value.copy(saving = false, apiKey = "", saved = true)
+                return
+            }
+            _form.value = _form.value.copy(saving = false)
+            throw e
+        }
+    }
+
+    /**
      * Best-effort delete of an attempt-owned staged alias.
      *
      * Safe by construction: staged aliases are per-operation restart-unique
@@ -1421,7 +1749,6 @@ class SetupViewModel(
                 baseUrl = baseUrl,
                 configRevision = rev,
                 formRevision = entryRevision,
-                nonce = consentNonces.incrementAndGet(),
             )
             synchronized(consentLock) {
                 // Re-verify inside the lock: an edit racing the revision read
@@ -2371,7 +2698,13 @@ class SetupViewModel(
         // 持鎖前同步置 inFlight（仿 saving 入口語義）：排隊等鎖時被取消也能被
         // 外層 catch 復位。前次失敗碼在此清為 fresh attempt；失敗保留、成功
         // 重置、取消不蓋碼（見結尾與外層 catch）。
-        _form.value = _form.value.copy(logoutInFlight = true, errorCode = null, logoutErrorSourceJournal = null)
+        _form.value = _form.value.copy(
+            logoutInFlight = true,
+            errorCode = null,
+            logoutErrorSourceJournal = null,
+            testing = false,
+            modelsLoading = false,
+        )
         // 入口即失效 settled：journal 寫入後被取消時走不到終端失效點，殘留快照
         // 會使 rotation 重 launch 回放過期輪；入口在 Main、worker 寫 settled 在
         // IO，兩種到達順序皆 benign（失效後 worker 寫新鮮值；寫後失效則本輪
@@ -2382,6 +2715,11 @@ class SetupViewModel(
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         modelRefreshGeneration.incrementAndGet()
+        testConnectionJob?.cancel()
+        testConnectionJob = null
+        testConnectionGeneration.incrementAndGet()
+        // Teardown in flight: a blank key must never reuse (baseline dropped).
+        editBaseline = null
         val job = viewModelScope.launch(Dispatchers.IO) {
             // try-catch 在 withLock 之外（仿 save）：排隊等鎖時被取消（lambda
             // 未進入）仍能復位 inFlight；僅內層 catch 會漏此窗口。
@@ -2727,7 +3065,7 @@ class SetupViewModel(
         // 持鎖前同步置 inFlight（仿 logout 入口）：排隊等鎖時被取消亦能被外層
         // catch 復位。與 logout() 不同：此處不清 errorCode／tag——終端同源清／報
         // STALE 需比對現碼（入口清會丟失身份，使 Absent 同源清永不命中）。
-        _form.value = _form.value.copy(logoutInFlight = true)
+        _form.value = _form.value.copy(logoutInFlight = true, testing = false, modelsLoading = false)
         // 入口即失效 settled（同 logout：journal 存否可能變化處同步重讀 pending
         // domain；bump 含於 invalidate 內）。
         invalidateStartupSettled()
@@ -2736,6 +3074,11 @@ class SetupViewModel(
         modelRefreshJob?.cancel()
         modelRefreshJob = null
         modelRefreshGeneration.incrementAndGet()
+        testConnectionJob?.cancel()
+        testConnectionJob = null
+        testConnectionGeneration.incrementAndGet()
+        // Teardown-adjacent retry: same fail-closed baseline drop as logout.
+        editBaseline = null
         val job = viewModelScope.launch(Dispatchers.IO) {
             // try-catch 在 withLock 之外（仿 save／logout）：排隊等鎖時被取消仍復位。
             try {
@@ -2911,6 +3254,7 @@ class SetupViewModel(
 
     override fun onCleared() {
         modelRefreshJob?.cancel()
+        testConnectionJob?.cancel()
         super.onCleared()
     }
 }

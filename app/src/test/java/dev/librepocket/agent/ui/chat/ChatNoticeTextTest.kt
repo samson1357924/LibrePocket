@@ -9,6 +9,7 @@ class ChatNoticeTextTest {
     fun mapsKnownNoticeCodesToUserMessages() {
         assertEquals("尚未設定端點，請先設定 API 金鑰。", chatNoticeText("NO_ENDPOINT"))
         assertEquals("政策拒絕讀取金鑰（key.read DENY），本次未發送任何請求。", chatNoticeText("POLICY_DENIED"))
+        assertEquals("讀取金鑰需要本次確認（key.read ASK），本次未送出（確認 UI 尚未提供，fail-closed；追蹤 #13）。", chatNoticeText("KEY_READ_CONFIRM_REQUIRED"))
         assertEquals("對話送出被政策拒絕（chat.send DENY），本次未發送任何請求。", chatNoticeText("CHAT_SEND_DENIED"))
         assertEquals(
             "此操作需要明確核准；目前沒有互動核准流程，本次未送出，也未自動允許。",

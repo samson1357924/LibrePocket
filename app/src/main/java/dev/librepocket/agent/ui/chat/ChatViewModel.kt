@@ -50,6 +50,25 @@ private const val HISTORY_CAP = 2000
 private const val HISTORY_SCAN_CAP = HISTORY_CAP * 4
 
 /**
+ * One-shot key.read consent for an ASK verdict, mirroring the key.write
+ * consent in SetupViewModel (SetupViewModel KeyWriteConsent).
+ *
+ * In-memory only: never persisted, carries no key material (connection
+ * identity snapshot only). Bound to the immutable endpoint binding
+ * observed at mint time ([confirmKeyRead]); consumed (nulled) on the first
+ * authorization that takes it, so it can never be replayed or reused. Any
+ * endpoint-identity difference fails the match and denies closed.
+ */
+private data class KeyReadConsent(
+    val action: String,
+    val resource: String,
+    val providerId: String,
+    val effectiveBaseUrl: String,
+    val apiKeyRef: String,
+    val configRevision: Long,
+)
+
+/**
  * Chat UI state holder wired to the real [ChatSession] plus the transcript store.
  *
  * Exposes replayed history ([messages] = stored history + live session messages),
@@ -151,6 +170,12 @@ class ChatViewModel(
     private var currentSessionGeneration: Long? = null
     private var sessionCollectJob: Job? = null
     private var openJob: Job? = null
+    // One-shot key.read consent (ASK path). Minted by [confirmKeyRead] from a
+    // suspending context and taken by [authorizeEndpoint] on Main, so all
+    // access goes through [keyReadConsentLock] (same shape as the key.write
+    // consentLock in SetupViewModel). Never persisted, never leaves this VM.
+    private val keyReadConsentLock = Any()
+    private var pendingKeyReadConsent: KeyReadConsent? = null
     // R2: unsent texts are owned per send/steer operation, never by a single
     // global String. Cleared only when the controller accepts that exact op
     // (startOrEnqueue Started/Queued verdict); pre-accept endpoint
@@ -259,6 +284,67 @@ class ChatViewModel(
     fun prefill(text: String) {
         if (text.isBlank()) return
         setInput(text)
+    }
+
+    /**
+     * Mint a one-shot key.read confirmation bound to the currently persisted
+     * endpoint binding (providerId / effective baseUrl / apiKeyRef /
+     * configRevision).
+     *
+     * The next [authorizeEndpoint] that observes an ASK verdict consumes it:
+     * a binding match allows that single read, any mismatch denies closed.
+     * DENY always wins and burns the consent; a policy read failure denies
+     * closed. Returns false when no usable endpoint is persisted (no
+     * consent minted). A later mint overwrites an unconsumed one; endpoint
+     * clear (logout/newChat) discards it.
+     *
+     * TODO(#13 follow-up): no production caller yet — ChatScreen renders
+     * KEY_READ_CONFIRM_REQUIRED as a hard-deny notice until a confirm
+     * affordance showing the immutable binding snapshot is wired.
+     */
+    suspend fun confirmKeyRead(): Boolean {
+        val endpoint = try {
+            readEndpoint()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return false
+        } ?: return false
+        val binding = bindingOf(endpoint) ?: return false
+        val consent = KeyReadConsent(
+            action = "key.read",
+            resource = binding.providerId,
+            providerId = binding.providerId,
+            effectiveBaseUrl = binding.effectiveBaseUrl,
+            apiKeyRef = binding.apiKeyRef,
+            configRevision = binding.configRevision,
+        )
+        synchronized(keyReadConsentLock) {
+            pendingKeyReadConsent = consent
+        }
+        return true
+    }
+
+    /** Abandon an unconsumed key.read confirmation, if any. */
+    fun dismissKeyReadConfirm() {
+        takePendingKeyReadConsent()
+    }
+
+    /** Consume-once take: the returned consent (if any) can never be used again. */
+    private fun takePendingKeyReadConsent(): KeyReadConsent? =
+        synchronized(keyReadConsentLock) {
+            val consent = pendingKeyReadConsent
+            pendingKeyReadConsent = null
+            consent
+        }
+
+    private fun keyReadConsentMatches(consent: KeyReadConsent, binding: EndpointSessionBinding): Boolean {
+        if (consent.action != "key.read") return false
+        if (consent.resource != consent.providerId) return false
+        return consent.providerId == binding.providerId &&
+            consent.effectiveBaseUrl == binding.effectiveBaseUrl &&
+            consent.apiKeyRef == binding.apiKeyRef &&
+            consent.configRevision == binding.configRevision
     }
 
     fun send() {
@@ -433,6 +519,10 @@ class ChatViewModel(
                     EndpointAccess.Denied -> {
                         setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                         restoreOpForFailedSend(opId, "POLICY_DENIED")
+                    }
+                    EndpointAccess.ConfirmRequired -> {
+                        setNoticeIfCurrent(operationGeneration, "KEY_READ_CONFIRM_REQUIRED")
+                        restoreOpForFailedSend(opId, "KEY_READ_CONFIRM_REQUIRED")
                     }
                     EndpointAccess.Missing -> {
                         setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
@@ -616,6 +706,10 @@ class ChatViewModel(
                         setNoticeIfCurrent(operationGeneration, "POLICY_DENIED")
                         restoreOpForFailedSend(opId, "POLICY_DENIED")
                     }
+                    EndpointAccess.ConfirmRequired -> {
+                        setNoticeIfCurrent(operationGeneration, "KEY_READ_CONFIRM_REQUIRED")
+                        restoreOpForFailedSend(opId, "KEY_READ_CONFIRM_REQUIRED")
+                    }
                     EndpointAccess.Missing -> {
                         setNoticeIfCurrent(operationGeneration, "NO_ENDPOINT")
                         restoreOpForFailedSend(opId, "NO_ENDPOINT")
@@ -712,6 +806,10 @@ class ChatViewModel(
                     is EndpointAccess.Ready -> result.endpoint
                     EndpointAccess.Denied -> {
                         setNoticeIfCurrent(requestedGeneration, "POLICY_DENIED")
+                        return@launch
+                    }
+                    EndpointAccess.ConfirmRequired -> {
+                        setNoticeIfCurrent(requestedGeneration, "KEY_READ_CONFIRM_REQUIRED")
                         return@launch
                     }
                     EndpointAccess.Missing -> {
@@ -812,9 +910,23 @@ class ChatViewModel(
             return EndpointAccess.Denied
         }
         if (!isGenerationCurrent(authorizedGeneration)) return EndpointAccess.Stale
-        // Preserve existing ASK semantics; only an explicit DENY blocks. No
-        // synthetic ALLOW is introduced here.
-        if (decision.verdict == Verdict.DENY) return EndpointAccess.Denied
+        // key.read ASK never passes through: it requires a bound one-shot
+        // confirmation minted by confirmKeyRead(). DENY always wins (and burns
+        // any minted consent); only an explicit ALLOW proceeds without one.
+        // No synthetic ALLOW is introduced here.
+        when (decision.verdict) {
+            Verdict.DENY -> {
+                takePendingKeyReadConsent()
+                return EndpointAccess.Denied
+            }
+            Verdict.ALLOW -> Unit
+            Verdict.ASK -> {
+                val consent = takePendingKeyReadConsent()
+                if (consent == null || !keyReadConsentMatches(consent, binding)) {
+                    return EndpointAccess.ConfirmRequired
+                }
+            }
+        }
 
         // Fresh policy evaluation suspended. Re-read the complete connection
         // identity so a save/logout racing that suspension fails closed.
@@ -1065,9 +1177,11 @@ class ChatViewModel(
     }
 
     /**
-     * key.read is ASK-by-default (consented at setup); only a DENY rule blocks
-     * here. The endpoint revision/origin is revalidated immediately before a
-     * provider receives its session-frozen credential snapshot.
+     * key.read ASK requires a bound one-shot confirmation ([confirmKeyRead]);
+     * without it authorization denies closed before any vault read. Only an
+     * explicit ALLOW proceeds unconsumed; DENY always wins. The endpoint
+     * revision/origin is revalidated immediately before a provider receives
+     * its session-frozen credential snapshot.
      */
     private suspend fun readEndpoint(): EndpointConfig? = withContext(Dispatchers.IO) {
         store.observe().first()
@@ -1134,6 +1248,10 @@ class ChatViewModel(
         lifecycleGeneration += 1
         if (binding == null) explicitDiscardEpoch += 1
         else endpointReplacementEpoch += 1
+        // A cleared endpoint (logout) discards any minted key.read consent. A
+        // replacement keeps it: the consent's own binding match still rejects
+        // the stale snapshot, so the mismatch path stays genuinely enforced.
+        if (binding == null) takePendingKeyReadConsent()
         retryFallbackTarget = null
         retryTargetCandidate = null
         latestAcceptedStartedTarget = null
@@ -1234,6 +1352,7 @@ class ChatViewModel(
     private fun invalidateLifecycle(clearChat: Boolean) {
         lifecycleGeneration += 1
         if (clearChat) explicitDiscardEpoch += 1
+        if (clearChat) takePendingKeyReadConsent()
         cancelLifecycleOperations()
         openJob?.cancel()
         openJob = null
@@ -1597,6 +1716,8 @@ class ChatViewModel(
     private sealed class EndpointAccess {
         data class Ready(val endpoint: AuthorizedEndpoint) : EndpointAccess()
         object Denied : EndpointAccess()
+        /** key.read ASK without a valid bound one-shot confirmation. */
+        object ConfirmRequired : EndpointAccess()
         object Missing : EndpointAccess()
         object Stale : EndpointAccess()
     }

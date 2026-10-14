@@ -117,7 +117,7 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        return chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        return chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
     }
 
     private fun awaitTrue(timeoutMs: Long = 8000, cond: () -> Boolean) {
@@ -171,7 +171,7 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         try {
             onMain { vm.onInputChange("first") }
             onMain { vm.send() }
@@ -213,7 +213,7 @@ class ChatWiringTest {
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.onInputChange("hi") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.status == ChatStatus.ERROR }
@@ -357,7 +357,7 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
@@ -419,7 +419,7 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 4 }
         val replayed = vm.messages.value
@@ -472,7 +472,7 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         val replayed = vm.messages.value
@@ -529,7 +529,7 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
@@ -572,7 +572,7 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "a1"), vm.messages.value.map { it.text })
@@ -714,7 +714,7 @@ class ChatWiringTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.onInputChange("one") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.messages.isNotEmpty() }
@@ -755,7 +755,7 @@ class ChatWiringTest {
                 fake
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.onInputChange("one") }
         onMain { vm.send() }
         awaitTrue { vm.sessionState.value.messages.isNotEmpty() }

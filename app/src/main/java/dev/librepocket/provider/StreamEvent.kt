@@ -85,7 +85,8 @@ sealed interface StreamEvent {
  *
  * Companion scopes live beside it: [requireTotalToolAggBudget] (same budget
  * summed across ALL tool indexes per attempt) and [requireToolCountBudget]
- * ([MAX_TOOL_CALLS_PER_ATTEMPT] distinct tools per attempt). All three share
+ * ([MAX_TOOL_CALLS_PER_ATTEMPT] distinct admissions per attempt — the
+ * collections it bounds are listed on that constant). All three share
  * one failure semantics (message + code + retryable=false).
  */
 internal const val MAX_TOOL_CALL_AGG_BYTES = 1024 * 1024
@@ -133,12 +134,25 @@ internal fun requireTotalToolAggBudget(totalChars: Int, incomingChars: Int) =
     requireToolAggBudget(totalChars, incomingChars)
 
 /**
- * Conservative per-attempt distinct-tool cap: at most this many tool indexes
- * (Chat Completions `index` / Responses `item_id` / Anthropic block `index`
- * / TurnController `toolIndex`) may appear in one attempt.
+ * Conservative per-attempt distinct-admission budget — a memory bound on
+ * fail-closed per-attempt collections, not a tool-count feature limit. At
+ * most this many keys may be admitted per attempt into any of:
+ * - Chat Completions `tools` (streamed tool `index`), Responses
+ *   `callsByItem` (`item_id`) and TurnController `distinctToolIndexes`
+ *   (`toolIndex`): one entry per distinct tool index / item id;
+ * - Anthropic `blocks` (content block `index`): one entry per distinct
+ *   index of ANY kind (TEXT / THINKING / TOOL / OTHER), so a flood of
+ *   non-tool blocks cannot grow the map freely; the TOOL-only tally
+ *   `toolBlockCount` shares the same cap and is not re-billed when one
+ *   index restarts as TOOL;
+ * - Responses `emittedToolIds`: one entry per distinct (`toolIndex`, id)
+ *   pair already emitted (its `output_item.done` path is pre-checked here;
+ *   the `finishPendingTools` drain only replays already-capped entries).
+ * Admissions are checked BEFORE insert, so the overflowing entry is never
+ * buffered; a key that only replaces a known one is not re-billed.
  *
- * No measured multi-tool fan-out budget exists yet (TODO #16: measure real
- * session fan-out before fixing a dedicated number), so the value is
+ * No measured fan-out budget exists yet (TODO #16: measure real session
+ * fan-out before fixing a dedicated number), so the value stays
  * deliberately conservative: legitimate single-turn fan-out is single
  * digits, and 64 leaves ample headroom while bounding map/entry growth
  * against a distinct-index flood. Exceeding it throws the SAME
@@ -149,9 +163,10 @@ internal fun requireTotalToolAggBudget(totalChars: Int, incomingChars: Int) =
 internal const val MAX_TOOL_CALLS_PER_ATTEMPT = 64
 
 /**
- * Fail-closed distinct-tool guard: [distinctCount] is the attempt's tool
- * count AFTER admitting the new index (i.e. callers pass `size + 1` for a
- * genuinely new key). Callers check BEFORE `getOrPut`/insert so the
+ * Fail-closed distinct-admission guard: [distinctCount] is the admitted
+ * collection size AFTER admitting the new key (i.e. callers pass `size + 1`
+ * for a genuinely new key — tool index, item id, content block index or an
+ * already-emitted pair). Callers check BEFORE `getOrPut`/insert so the
  * overflowing entry is never buffered.
  *
  * @throws ProviderFailure non-retryable, [ProviderFailureCode.AGG_TOO_LARGE].

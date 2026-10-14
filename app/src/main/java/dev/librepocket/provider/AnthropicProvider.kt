@@ -189,8 +189,11 @@ internal class AnthropicMapper(val round: Int = 0) {
     // which retires the outgoing block's id/name and re-bills the incoming
     // pair, so the total stays the true sum of currently-buffered chars.
     private var totalAggChars = 0
-    // Distinct TOOL-kind blocks (TEXT/THINKING/OTHER blocks are not tools and
-    // stay outside the count cap; replacement at one index adjusts the count).
+    // Distinct TOOL-kind blocks only; TEXT/THINKING/OTHER do not bump it.
+    // The shared cap is broader: any distinct block index of any kind is
+    // charged pre-insert against MAX_TOOL_CALLS_PER_ATTEMPT, while a
+    // replacement at a known index is not charged a new admission (the char
+    // total above still re-bills a TOOL->TOOL pair, by design).
     private var toolBlockCount = 0
     private var inputTokens: Int? = null
     private var outputTokens: Int? = null

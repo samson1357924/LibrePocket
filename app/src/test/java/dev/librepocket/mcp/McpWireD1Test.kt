@@ -160,6 +160,28 @@ class McpWireD1Test {
         assertTrue("content 必須保留", result != null && result.contains("nope"))
     }
 
+    @Test fun parseCallBadContentValueIsProtocol() {
+        // content 鍵在但值非法：不得回退整包 result 充 OK，一律 PROTOCOL。
+        val cases = mapOf(
+            "garbage literal" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":garbage,\"isError\":false}}",
+            "True literal" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":True,\"isError\":false}}",
+            "undefined" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":undefined,\"isError\":false}}",
+            "string content" to "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":\"oops\",\"isError\":false}}",
+        )
+        for ((name, json) in cases) {
+            try {
+                McpWire.parseCall(json)
+                fail("content 壞值（$name）必須拋 McpProtocol，不得回 OK")
+            } catch (e: McpWire.McpToolFailure) {
+                fail("content 壞值（$name）不得映射 TOOL_ERROR，實際=${e.message}")
+            } catch (e: McpWire.McpProtocol) {
+                assertEquals("mcp: bad content", e.message)
+            } catch (_: IllegalArgumentException) {
+                fail("content 壞值（$name）必須拋 McpWire.McpProtocol（非一般 IAE）")
+            }
+        }
+    }
+
     @Test fun parseCallNullResultThrows() {
         val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"
         try {
@@ -483,8 +505,8 @@ class McpWireD1Test {
         try {
             McpWire.parseList("s1", json)
             fail("[null] 不得靜默忽略回空列表，必須拋 McpProtocol")
-        } catch (_: McpWire.McpProtocol) {
-            // 預期。
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad tools item", e.message)
         } catch (e: IllegalArgumentException) {
             fail("[null] 必須拋 McpWire.McpProtocol，實際=${e.message}")
         }
@@ -495,8 +517,8 @@ class McpWireD1Test {
         try {
             McpWire.parseList("s1", json)
             fail("[1,\"x\"] 不得靜默忽略回空列表，必須拋 McpProtocol")
-        } catch (_: McpWire.McpProtocol) {
-            // 預期。
+        } catch (e: McpWire.McpProtocol) {
+            assertEquals("mcp: bad tools item", e.message)
         } catch (e: IllegalArgumentException) {
             fail("[1,\"x\"] 必須拋 McpWire.McpProtocol，實際=${e.message}")
         }

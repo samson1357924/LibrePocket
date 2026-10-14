@@ -11,7 +11,8 @@ package dev.librepocket.systema
  *
  * 決策註記：float/double 需求出現時再加 DoubleVal + toIntent 分支
  * （不預先加型別；此處 when 為 statement position，新增子類不會編譯期
- * 報錯，故 toIntent 另以 `else -> throw` 保底，防靜默掉 extra）。
+ * 報錯，故 toIntent 另以 `else -> throw` 保底，防靜默掉 extra；實測編譯器
+ * 拒絕測試源集新增子類，故該分支僅未來主模組新增子類時可達，刻意不單測）。
  */
 sealed interface IntentExtra {
   data class Str(val value: String) : IntentExtra

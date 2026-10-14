@@ -234,6 +234,9 @@ class IntentTypedD2Test {
     assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
   }
 
+  // 註：未知子類分支無法單測——實測編譯器拒絕測試源集新增 sealed 子類；
+  // else-throw 是給未來主模組新增子類的 runtime 保底。
+
   @Test fun launchCatching_rethrowsCancellation() {
     val cancelling = IntentLauncher {
       throw kotlin.coroutines.cancellation.CancellationException("gone")
@@ -433,6 +436,23 @@ class IntentTypedD2Test {
       IntentSpec(action = Intent.ACTION_VIEW, dataUri = "https://example.com"),
     )
     assertTrue(r is LaunchResult.Internal)
+  }
+
+  @Test fun launch_resolveThrowsCancellation_propagates() {
+    // launch 本體三處 catch 不吞取消：PackageManager 拋取消必須外洩，而非 Internal。
+    val app = appContext()
+    val cancellingPm = object : ContextWrapper(app) {
+      override fun getPackageManager() =
+        throw kotlin.coroutines.cancellation.CancellationException("pm gone")
+    }
+    try {
+      AndroidIntentLauncher(cancellingPm).launch(
+        IntentSpec(action = Intent.ACTION_VIEW, dataUri = "https://example.com"),
+      )
+      fail("CancellationException must propagate from launch()")
+    } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+      // 預期。
+    }
   }
 
   // ---- 12. Stage 3：工具覆蓋 ----

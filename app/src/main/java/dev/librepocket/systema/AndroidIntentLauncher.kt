@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * 端側執行適配：把純側 [IntentSpec] 轉成真正的 Intent 並走
@@ -18,8 +19,8 @@ import android.net.Uri
  * 呼叫方接 [FallbackSpec]。
  *
  * 例外收斂說明：三處 catch 皆只收 `Exception`（`OutOfMemoryError` 等 VM fatal
- * 直接外洩）；`CancellationException` 同屬 `Exception`，本層不吞（launchCatching
- * 明確重拋），structured concurrency 由呼叫方維持。
+ * 直接外洩）；`CancellationException` 在 launch 與 launchCatching 皆明確重拋，
+ * structured concurrency 由呼叫方維持。
  *
  * 已接受風險（文件化，不改行為）：隱式 Intent handler 劫持——系統依預設
  * App 選擇處理者，本層不代選；高風險操作由呼叫方經使用者確認後才發起，
@@ -30,11 +31,15 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
   override fun launch(spec: IntentSpec): LaunchResult {
     val intent = try {
       toIntent(spec)
+    } catch (e: CancellationException) {
+      throw e
     } catch (e: Exception) {
       return LaunchResult.Internal(e)
     }
     val resolved = try {
       intent.resolveActivity(context.packageManager)
+    } catch (e: CancellationException) {
+      throw e
     } catch (e: Exception) {
       return LaunchResult.Internal(e)
     }
@@ -44,6 +49,8 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
       LaunchResult.Success
     } catch (e: ActivityNotFoundException) {
       LaunchResult.NoHandler
+    } catch (e: CancellationException) {
+      throw e
     } catch (e: Exception) {
       LaunchResult.Internal(e)
     }

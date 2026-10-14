@@ -70,7 +70,7 @@ object SkillInstaller {
     /** 過期 staging 的預設保留期限（啟動清理用）。 */
     const val STALE_STAGING_MAX_AGE_MILLIS = 24L * 60 * 60 * 1000L
 
-    /** 同 skill 互斥鎖（per-skill 序列化併發安裝；skill 數量有界，條目永不驅逐）。 */
+    /** 同 skill 互斥鎖（per-skill 序列化併發安裝；實務 skill 數量有界，條目永不驅逐，洩漏可接受）。 */
     private val skillLocks = ConcurrentHashMap<String, ReentrantLock>()
 
     /**
@@ -94,7 +94,7 @@ object SkillInstaller {
     private val STAGING_RE = Regex("^\\.(.+)\\.tmp-\\d+-\\d+$")
     private val BACKUP_RE = Regex("^\\.(.+)\\.bak-\\d+-\\d+$")
 
-    /** best-effort fsync（檔與目錄統一走 `FileChannel.force(true)`；失敗吞掉，不影響安裝結果（掉電語義見類 KDoc））。 */
+    /** best-effort fsync（檔與目錄統一走 `FileChannel.force(true)`；目錄 fsync 依平台而定，失敗吞掉，不影響安裝結果（掉電語義見類 KDoc））。 */
     private fun fsyncBestEffort(f: File) {
         try {
             java.nio.channels.FileChannel.open(f.toPath()).use { it.force(true) }
@@ -114,7 +114,7 @@ object SkillInstaller {
      * 形狀符合但 id 非法者只刪不恢復。真實 skill 目錄永不以 `.` 開頭
      * （見 [SkillParser] 的 name 規則），不會被誤刪。
      *
-     * 同 id 有多份過期 `.bak` 候選時視為歧義：一律保留、不還原、不刪除、
+     * 同 id 有多份 `.bak` 候選時視為歧義：一律保留、不還原、不刪除、
      * 不計數，需人工介入。檔名 nanoTime 後綴是單調計數器而非 wall-clock
      * 時間戳，不可跨重啟比較新舊，故不用後綴數字選「最新」。
      *
@@ -132,13 +132,14 @@ object SkillInstaller {
             null
         } ?: return 0
         val now = System.currentTimeMillis()
-        // 先按 skill id 分組過期 .bak 候選：同 id 多份時無法證明新舊，
+        // 先按 skill id 分組同形 .bak 候選：同 id 多份時無法證明新舊，
         // 列舉順序未定義，逕行還原其一併刪除其餘會造成資料遺失，故全保留。
+        // 計數含未過期者——「一份新鮮 + 一份過期」同樣無法判定，逕行恢復過期版
+        // 可能是錯版勝出，故亦視為歧義。
         val bakCountById = HashMap<String, Int>()
         for (f in entries) {
             val bakId = BACKUP_RE.matchEntire(f.name)?.groupValues?.get(1) ?: continue
             if (!SkillParser.isValidName(bakId)) continue
-            if (now - f.lastModified() < maxAgeMillis) continue
             bakCountById[bakId] = (bakCountById[bakId] ?: 0) + 1
         }
         var removed = 0

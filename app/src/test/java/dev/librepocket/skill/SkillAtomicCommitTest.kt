@@ -306,6 +306,40 @@ class SkillAtomicCommitTest {
         }
     }
 
+    @Test fun freshPlusExpiredBakSameId_keptAmbiguous_noRestore() {
+        val root = tempRoot()
+        try {
+            // 一份新鮮 + 一份過期同 id .bak + target 缺席：同樣無法判定，
+            // 逕行恢復過期版可能是錯版勝出，故全保留、不還原、不計數。
+            val tid = Thread.currentThread().id
+            val bakFresh = File(root, ".dup-skill.bak-111-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(
+                    skillMd(name = "dup-skill", body = "舊版正文 fresh"),
+                    Charsets.UTF_8,
+                )
+            }
+            val bakOld = File(root, ".dup-skill.bak-999-$tid").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText(
+                    skillMd(name = "dup-skill", body = "舊版正文 old"),
+                    Charsets.UTF_8,
+                )
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            assertFalse(File(root, "dup-skill").exists())
+
+            val removed = SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L)
+
+            assertEquals(0, removed)
+            assertFalse(File(root, "dup-skill").exists())
+            assertTrue("fresh bak must be kept", bakFresh.exists())
+            assertTrue("expired bak must be kept", bakOld.exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
     @Test fun freshInstallRenameFailure_noTargetLeft() {
         val root = tempRoot()
         try {

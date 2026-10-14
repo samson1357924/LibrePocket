@@ -174,6 +174,14 @@ internal object McpWire {
         // result 非 object（一律 fail-closed）：字串/數字/陣列/布林字面量不得回 OK。
         if (!resultTrimmed.startsWith("{")) throw IllegalArgumentException("mcp: bad result")
         val contentRaw = topLevelRawField(resultTrimmed, "content")
+        if (contentRaw == null && hasTopLevelKey(resultTrimmed, "content")) {
+            // content 鍵在但值非法（非法字面量/截斷）→ PROTOCOL，不回退整包 result 充 OK。
+            throw McpProtocol("mcp: bad content")
+        }
+        if (contentRaw != null && !contentRaw.trim().startsWith("[")) {
+            // content 必須是陣列（字串/數字/null/object 一律拒，不回 OK）。
+            throw McpProtocol("mcp: bad content")
+        }
         val isErrorRaw = topLevelRawField(resultTrimmed, "isError")
         val isError = when {
             isErrorRaw == null ->

@@ -20,12 +20,15 @@ package dev.librepocket.skill
  * - `permissions` 同上，缺省為空表；`version` 選填。
  */
 object SkillParser {
-    private val NAME_RE = Regex("^[a-z0-9][a-z0-9._-]{1,63}$")
+    internal val NAME_RE = Regex("^[a-z0-9][a-z0-9._-]{1,63}$")
     private const val MAX_FRONTMATTER_CHARS = 8_192
     private const val MAX_BODY_CHARS = 64_000
     private const val MAX_DESCRIPTION_CHARS = 500
 
     class ParseException(message: String) : IllegalArgumentException(message)
+
+    /** 供 [dev.librepocket.skill.SkillInstaller] 反解內部檔名時重驗 id 用。 */
+    internal fun isValidName(name: String): Boolean = NAME_RE.matches(name)
 
     /** L1：只解析 frontmatter 的 name/description，不碰正文。 */
     fun parseIndex(markdown: String): SkillIndex {

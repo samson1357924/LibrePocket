@@ -4825,7 +4825,11 @@ class ChatViewModel(
         // may have missed an older reasoning marker whose assistant is still
         // kept – every kept assistant is then conservatively resumed with
         // hasReasoning=true, matching Factory loadModelHistory (dropped>0 all
-        // true) so UI and model-context can never disagree (fail-closed).
+        // true) so UI and model-context agree on truncation (fail-closed).
+        // Known gap (follow-up): exact-cap far-marker beyond one extra page
+        // (R25-1) is over-flagged only on the model-context path; UI replay
+        // stays display-only there and may disagree. Enforcement always uses
+        // the model-context flag.
         // Backward scan sees each marker before its
         // assistant (markers append right after), so the pending path is the
         // live one; the patch path stays for reorder tolerance. Cancelled /

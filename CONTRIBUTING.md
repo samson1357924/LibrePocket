@@ -1,6 +1,6 @@
 # Contributing
 
-**Status:** Current contributor workflow for this alpha repository, checked 2026-10-14 at `d5a98bd35e919083b0475027c9b2e74b703e4e58`.
+**Status:** Current contributor workflow for this alpha repository, checked 2026-10-14 against `d5a98bd35e919083b0475027c9b2e74b703e4e58` (committed 2026-10-13).
 
 - **Scope:** Changes to this repository, including code, tests, and documentation.
 - **Owner role:** Project maintainers; individual ownership is not assigned by this document.

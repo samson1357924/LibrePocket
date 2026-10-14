@@ -1,6 +1,6 @@
 # Build Environment — LibrePocket
 
-**Status:** Current checked-in build baseline, checked 2026-10-14 at `d5a98bd35e919083b0475027c9b2e74b703e4e58`.
+**Status:** Current checked-in build baseline, checked 2026-10-14 against `d5a98bd35e919083b0475027c9b2e74b703e4e58` (committed 2026-10-13).
 
 - **Scope:** Local build prerequisites and checked-in Android toolchain values.
 - **Owner role:** Build/CI maintainer; no individual assigned.

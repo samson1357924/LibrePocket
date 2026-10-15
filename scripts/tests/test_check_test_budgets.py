@@ -282,6 +282,40 @@ class CheckTestBudgetsTest(unittest.TestCase):
             )
             self.assertEqual([], check_test_budgets.check_file(p))
 
+    def test_h2_commented_repeat_with_write_passes(self) -> None:
+        # Stage 1 masked lines: a commented-out loop must not count.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "CommentedTest.kt",
+                "// repeat(2000){ store.appendEvent(event(sid, \"q\")) }\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_string_demo_repeat_with_write_passes(self) -> None:
+        # Stage 1 masked lines: demo code inside a string must not count.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "StringDemoTest.kt",
+                'val s = "repeat(2000){ store.appendEvent(e) }"\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_prefixed_single_line_loop_with_outer_write_passes(self) -> None:
+        # Stage 1 column-aware body: `fun test() { repeat(2000) { ... }`
+        # closes on its own line, so the following write outside the loop
+        # (but inside the function) must not count.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "PrefixedTest.kt",
+                "fun test() { repeat(2000) { println(it) }\n"
+                '    store.appendEvent(event(sid, "foo"))\n'
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
     def test_h2_newline_brace_style_write_fails(self) -> None:
         # Non-idiomatic header whose `{` sits on the next line.
         with tempfile.TemporaryDirectory() as d:

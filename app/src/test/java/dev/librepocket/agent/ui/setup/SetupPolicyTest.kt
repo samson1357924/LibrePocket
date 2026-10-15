@@ -1834,7 +1834,7 @@ class SetupPolicyTest {
         runBlocking {
             assertEquals(1L, store.currentRevision())
             val meta = store.observe().first()!!
-            assertEquals("preset:custom", meta.providerId)
+            assertEquals(SetupValidation.deriveEndpointId("custom", urlB), meta.providerId)
             assertEquals(urlB, meta.baseUrl)
             assertEquals("provider_key/$winnerStaged", meta.apiKeyRef)
             assertTrue(delegate.hasKey(winnerStaged))

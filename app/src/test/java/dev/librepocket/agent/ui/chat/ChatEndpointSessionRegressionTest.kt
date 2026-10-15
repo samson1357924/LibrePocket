@@ -3,6 +3,7 @@ package dev.librepocket.agent.ui.chat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.provider.ProviderProtocol
@@ -20,7 +21,10 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Before
 import org.junit.Test
 
@@ -77,14 +81,19 @@ class ChatEndpointSessionRegressionTest {
         servers.add(it)
     }
 
-    private fun endpoint(server: MockWebServer) = EndpointConfig(
-        providerId = "preset:custom",
+    private fun baseUrlOf(server: MockWebServer): String = server.url("/v1").toString().trimEnd('/')
+
+    private fun endpoint(server: MockWebServer, alias: String) = EndpointConfig(
+        // Stage1: stable per-endpoint entity id derived from the custom URL —
+        // distinct servers never share the providerId namespace; each Key is
+        // scoped to its own vault alias (production staged shape).
+        providerId = SetupValidation.deriveEndpointId("custom", baseUrlOf(server)),
         presetId = "custom",
         label = "local test endpoint",
-        baseUrl = server.url("/v1").toString().trimEnd('/'),
+        baseUrl = baseUrlOf(server),
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         model = "test-model",
-        apiKeyRef = "provider_key/shared-test-alias",
+        apiKeyRef = "provider_key/$alias",
     )
 
     private fun response() = MockResponse()
@@ -129,8 +138,11 @@ class ChatEndpointSessionRegressionTest {
         endpointB.enqueue(response())
 
         val vault = EncryptedPrefsVault(InMemoryPrefs())
-        vault.putKey("shared-test-alias", "test-key-A-123".toCharArray())
-        store.save(endpoint(endpointA))
+        val aliasA = "stage1-test-alias-a"
+        val aliasB = "stage1-test-alias-b"
+        vault.putKey(aliasA, "test-key-A-123".toCharArray())
+        vault.putKey(aliasB, "test-key-B-456".toCharArray())
+        store.save(endpoint(endpointA, aliasA))
 
         val policy = allowKeyReadPolicy()
         val sessions = ChatSessionFactory(
@@ -148,7 +160,7 @@ class ChatEndpointSessionRegressionTest {
 
             // Setup writes the mutable alias before endpoint metadata. The
             // already-live A session must retain only its captured A key.
-            vault.putKey("shared-test-alias", "test-key-B-456".toCharArray())
+            vault.putKey(aliasA, "test-key-B-456".toCharArray())
             chatMain.run { viewModel.sendDirect("still bound to A") }
             val second = endpointA.takeRequest(10, TimeUnit.SECONDS)
             assertNotNull(second)
@@ -158,7 +170,7 @@ class ChatEndpointSessionRegressionTest {
 
             // Metadata save advances configRevision. The retained ViewModel
             // observes the shared DataStore and rebuilds to B before send.
-            store.save(endpoint(endpointB))
+            store.save(endpoint(endpointB, aliasB))
             awaitNoAttachedSession(viewModel)
             chatMain.run { viewModel.sendDirect("now on B") }
             val third = endpointB.takeRequest(10, TimeUnit.SECONDS)
@@ -171,8 +183,8 @@ class ChatEndpointSessionRegressionTest {
             assertEquals(1, endpointB.requestCount)
 
             endpointA.enqueue(response())
-            vault.putKey("shared-test-alias", "test-key-A-123".toCharArray())
-            store.save(endpoint(endpointA))
+            vault.putKey(aliasA, "test-key-A-123".toCharArray())
+            store.save(endpoint(endpointA, aliasA))
             awaitNoAttachedSession(viewModel)
             chatMain.run { viewModel.sendDirect("back on A") }
             val fourth = endpointA.takeRequest(10, TimeUnit.SECONDS)
@@ -181,6 +193,147 @@ class ChatEndpointSessionRegressionTest {
             awaitCompletedTurn(viewModel, expectedTurnsInSession = 1)
             assertEquals(3, endpointA.requestCount)
             assertEquals(1, endpointB.requestCount)
+        } finally {
+            chatMain.run { viewModel.newChat() }
+        }
+    }
+
+    /**
+     * Stage1 (R2): same preset + same model, different custom URLs — every
+     * switch rebuilds and each destination receives only its own key.
+     * Extends A->B->A with a same-URL rotation (entity id stable, vault alias
+     * rotates) and a failed save (stale CAS loses → binding unchanged, the
+     * loser URL sees nothing new). Asserts the real request target + the
+     * Authorization header on both MockWebServers; zero real keys/endpoints.
+     */
+    @Test
+    fun customPerUrlKeyIsolationAcrossSwitchRotationAndFailedSave() = runBlocking {
+        val store = newStore()
+        val serverA = newServer()
+        val serverB = newServer()
+
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        val aliasA = "stage1-iso-alias-a"
+        val aliasB = "stage1-iso-alias-b"
+        val aliasA2 = "stage1-iso-alias-a-rotated"
+        val keyA1 = "stage1-fake-key-A-11111111"
+        val keyB = "stage1-fake-key-B-22222222"
+        val keyA2 = "stage1-fake-key-A-rotated-33333333"
+        vault.putKey(aliasA, keyA1.toCharArray())
+        vault.putKey(aliasB, keyB.toCharArray())
+        vault.putKey(aliasA2, keyA2.toCharArray())
+
+        val cfgA1 = endpoint(serverA, aliasA)
+        val cfgB = endpoint(serverB, aliasB)
+        val cfgA2 = endpoint(serverA, aliasA2)
+        // Per-endpoint namespaces: distinct URLs never share the entity id;
+        // rotation on the same URL keeps it (stable) while the vault alias
+        // — and hence the binding — rotates.
+        assertNotEquals(cfgA1.providerId, cfgB.providerId)
+        assertEquals(cfgA1.providerId, cfgA2.providerId)
+        assertNotEquals(cfgA1.apiKeyRef, cfgA2.apiKeyRef)
+        store.save(cfgA1)
+
+        val policy = allowKeyReadPolicy()
+        val sessions = ChatSessionFactory(
+            policy = policy,
+            vaultSource = VaultSource { vault },
+        )
+        val viewModel = own(ChatViewModel(store, sessions, policy))
+        try {
+            // 1) First turn on A carries KA1 to A only.
+            serverA.enqueue(response())
+            chatMain.run { viewModel.sendDirect("first on A") }
+            val first = serverA.takeRequest(10, TimeUnit.SECONDS)
+            assertNotNull(first)
+            assertEquals("/v1/chat/completions", first!!.path)
+            assertEquals("Bearer $keyA1", first.getHeader("Authorization"))
+            awaitCompletedTurn(viewModel, expectedTurnsInSession = 1)
+            assertEquals(1, serverA.requestCount)
+            assertEquals(0, serverB.requestCount)
+
+            // 2) Switch to B (same preset, same model, different URL): the
+            // session must rebuild and B must receive only KB.
+            serverB.enqueue(response())
+            store.save(cfgB)
+            awaitNoAttachedSession(viewModel)
+            chatMain.run { viewModel.sendDirect("now on B") }
+            val second = serverB.takeRequest(10, TimeUnit.SECONDS)
+            assertNotNull(second)
+            assertEquals("/v1/chat/completions", second!!.path)
+            assertEquals("Bearer $keyB", second!!.getHeader("Authorization"))
+            awaitCompletedTurn(viewModel, expectedTurnsInSession = 1)
+            assertEquals(1, serverA.requestCount)
+            assertEquals(1, serverB.requestCount)
+
+            // 3) Rotation back on A: same entity id, new alias/key — A must
+            // receive only the rotated key.
+            serverA.enqueue(response())
+            val revBeforeRotation = store.currentRevision()
+            store.save(cfgA2)
+            awaitNoAttachedSession(viewModel)
+            chatMain.run { viewModel.sendDirect("back on A rotated") }
+            val third = serverA.takeRequest(10, TimeUnit.SECONDS)
+            assertNotNull(third)
+            assertEquals("Bearer $keyA2", third!!.getHeader("Authorization"))
+            awaitCompletedTurn(viewModel, expectedTurnsInSession = 1)
+            assertEquals(2, serverA.requestCount)
+            assertEquals(1, serverB.requestCount)
+
+            // 4) Failed save to B (a stale writer's revision loses the CAS and
+            // writes nothing): the live binding stays on A — the next turn
+            // still reaches A with the rotated key and B sees nothing new.
+            val committed = store.saveIfRevision(cfgB, expectedRevision = revBeforeRotation)
+            assertFalse(committed)
+            serverA.enqueue(response())
+            chatMain.run { viewModel.sendDirect("still on A after failed save") }
+            val fourth = serverA.takeRequest(10, TimeUnit.SECONDS)
+            assertNotNull(fourth)
+            assertEquals("Bearer $keyA2", fourth!!.getHeader("Authorization"))
+            awaitCompletedTurn(viewModel, expectedTurnsInSession = 1)
+            assertEquals(3, serverA.requestCount)
+            assertEquals(1, serverB.requestCount)
+        } finally {
+            chatMain.run { viewModel.newChat() }
+        }
+    }
+
+    /**
+     * Stage1 compat: a pre-Stage1 custom row (shared `preset:custom` entity
+     * id over the fixed vault slot, whose content may belong to any custom
+     * URL ever saved) is never sent — the send fails closed with NO_ENDPOINT
+     * (input preserved for re-entry in Setup), and neither server observes a
+     * request.
+     */
+    @Test
+    fun legacyCustomRowNeverSendsAndSurfacesNoEndpoint() = runBlocking {
+        val store = newStore()
+        val serverA = newServer()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        vault.putKey("preset:custom", "stage1-fake-legacy-key".toCharArray())
+        store.save(
+            EndpointConfig(
+                providerId = "preset:custom",
+                presetId = "custom",
+                label = "legacy endpoint",
+                baseUrl = baseUrlOf(serverA),
+                protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                model = "test-model",
+                apiKeyRef = "provider_key/preset:custom",
+            ),
+        )
+        val policy = allowKeyReadPolicy()
+        val sessions = ChatSessionFactory(
+            policy = policy,
+            vaultSource = VaultSource { vault },
+        )
+        val viewModel = own(ChatViewModel(store, sessions, policy))
+        try {
+            chatMain.run { viewModel.sendDirect("must not send") }
+            withTimeout(5_000) { viewModel.notice.first { it == "NO_ENDPOINT" } }
+            assertEquals("must not send", viewModel.input.value)
+            assertEquals(0, serverA.requestCount)
+            assertNull(serverA.takeRequest(1, TimeUnit.SECONDS))
         } finally {
             chatMain.run { viewModel.newChat() }
         }

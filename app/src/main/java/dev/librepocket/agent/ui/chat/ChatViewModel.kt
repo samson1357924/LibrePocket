@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.PolicyEvaluationException
 import dev.librepocket.chat.ChatStatus
@@ -2625,7 +2626,10 @@ class ChatViewModel(
 
         val decision = try {
             withContext(Dispatchers.IO) {
-                policy.evaluateFresh("key.read", endpoint.providerId)
+                // Stage1 entity/policy split: transport identity is the
+                // per-endpoint binding, but authorization stays preset-shared
+                // (granularity frozen for Stage2 #13 — never the endpoint id).
+                policy.evaluateFresh("key.read", SetupValidation.policyResourceForPreset(endpoint.presetId))
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -3388,6 +3392,12 @@ class ChatViewModel(
 
     private fun bindingOf(endpoint: EndpointConfig?): EndpointSessionBinding? {
         val config = endpoint ?: return null
+        // Stage1 compat: a legacy custom row (stored entity id predates
+        // per-endpoint ids, e.g. `preset:custom`) never forms a live binding
+        // — fail closed as absent (Missing/NO_ENDPOINT, session detached) so
+        // its shared-slot key is never sent to any URL; Setup re-keys it via
+        // the gate. Pure check, no vault I/O.
+        if (SetupValidation.isLegacyEndpoint(config)) return null
         return try {
             config.toSessionBinding(sessions.modelFor(config))
         } catch (_: Exception) {

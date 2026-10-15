@@ -149,8 +149,12 @@ enum class EndpointReadiness {
  * [SetupValidation.newStagedAlias]). Readers MUST resolve the alias
  * from [apiKeyRef] and MUST NOT re-derive it from [providerId]: after a staged
  * commit the live alias and the providerId-derived alias differ.
- * [providerId] follows `ProviderCatalog.fromPreset` convention
- * (`preset:<presetId>`). The local
+ * [providerId] is the stable per-endpoint entity id (Stage1):
+ * `preset:<presetId>` for built-in presets (fixed catalog URL, unchanged),
+ * `custom:<sha256-32hex>` derived per custom baseUrl (see
+ * [SetupValidation.deriveEndpointId]). Pre-Stage1 custom rows stored the
+ * shared `preset:custom` id (see [SetupValidation.isLegacyEndpoint]) and
+ * must be re-keyed, never silently reused. The local
  * [configRevision] is atomically advanced by [EndpointStore.save]/[clear] and
  * is for stale-session fencing, not endpoint identity or vault-write atomicity.
  */
@@ -596,6 +600,12 @@ class EndpointStore(
         } catch (_: IllegalArgumentException) {
             return EndpointReadiness.INVALID_BASE_URL
         }
+        // Stage1 compat: a legacy custom row (pre-per-endpoint id) is proven
+        // unusable without vault I/O — its shared fixed slot may hold
+        // another URL's key — so it fails closed as NO_KEY (never READY, never
+        // a vault read here). Re-key via Setup. Checked after URL validity so
+        // a malformed endpoint still reports INVALID_BASE_URL.
+        if (SetupValidation.isLegacyEndpoint(config)) return EndpointReadiness.NO_KEY
         if (!config.apiKeyRef.startsWith("provider_key/")) return EndpointReadiness.NO_KEY
         val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
         if (alias.isBlank()) return EndpointReadiness.NO_KEY

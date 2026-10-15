@@ -3,6 +3,7 @@ package dev.librepocket.agent.ui.chat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -905,7 +906,8 @@ class ChatWiringTest {
         runBlocking {
             store.save(
                 sampleEndpoint().copy(
-                    providerId = "preset:custom",
+                    // Stage1: per-endpoint entity id for the custom URL.
+                    providerId = SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
                     presetId = "custom",
                     label = "自訂",
                     baseUrl = "http://127.0.0.1:11434/v1",

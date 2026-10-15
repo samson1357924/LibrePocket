@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatSessionImpl
 import dev.librepocket.chat.HistoryWindowCap
@@ -254,7 +255,7 @@ internal fun findDanglingRunIds(events: List<TranscriptEvent>): List<String> {
  *
  * The first-`/` split remains load bearing for old-style rows: model ids
  * themselves may contain `/` (e.g. `"preset:openrouter/openrouter/auto"`),
- * while providerIds (`"preset:<presetId>"`) never do.
+ * while providerIds (`"preset:<presetId>"`, Stage1 `"custom:<hash>"`) never do.
  */
 internal fun storedProviderOf(storedModel: String): String? {
     if ("/" !in storedModel) return null
@@ -340,9 +341,11 @@ internal fun isSameProviderOrigin(
  * (`"${providerId}@${normalizeOrigin(baseUrl)}/${model}"`), so the stored
  * side ([storedOriginOf], already normalized at write time, re-normalized
  * here idempotently) and the live side ([normalizeOrigin]) always meet in
- * the same normalized space — spelling variants (path, default port, case)
- * agree; only a real host/scheme/port change forks. Pinned by
- * `ChatSessionFactoryProvenanceTest.sameOriginDecision_*`.
+ * the same normalized space. [isSameProviderOrigin] compares providerId
+ * first, then normalized origin: custom endpoint ids are URL-string-exact
+ * (see [SetupValidation.deriveEndpointId]), so a respelling (path, default
+ * port, case) forks via id mismatch even when the origin matches
+ * (fail-closed). Pinned by `ChatSessionFactoryProvenanceTest.sameOriginDecision_*`.
  */
 internal fun isSameOriginForResume(storedModel: String, endpoint: EndpointConfig): Boolean {
     val effectiveBaseUrl = try {
@@ -592,6 +595,9 @@ class ChatSessionFactory(
         allowAsk: Boolean,
         keyIsCurrent: suspend () -> Boolean,
     ): CreatedSession {
+        // Stage1 compat (see requireCurrentEndpointId): legacy rows never
+        // reach the vault read below.
+        requireCurrentEndpointId(endpoint)
         val config = endpoint.toProviderConfig()
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         val model = modelFor(endpoint)
@@ -604,7 +610,7 @@ class ChatSessionFactory(
             // S6 capture-boundary T1 recheck (see requireKeyReadAllowed):
             // DENY/failure always deny; ASK needs the T0 one-shot proof
             // (allowAsk); ALLOW passes without proof.
-            requireKeyReadAllowed(endpoint.providerId, allowAsk)
+            requireKeyReadAllowed(SetupValidation.policyResourceForPreset(endpoint.presetId), allowAsk)
             val captured = captureCredential(endpoint)
             credential = captured
             val store = sessionStores?.store()
@@ -775,6 +781,9 @@ class ChatSessionFactory(
         keyIsCurrent: suspend () -> Boolean,
         backfillInterrupted: Boolean,
     ): CreatedSession {
+        // Stage1 compat (see requireCurrentEndpointId): legacy rows never
+        // reach the vault read below.
+        requireCurrentEndpointId(endpoint)
         val config = endpoint.toProviderConfig()
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         requireCurrentBinding(keyIsCurrent)
@@ -800,7 +809,7 @@ class ChatSessionFactory(
         // it never consumes the one-shot consent — takePendingKeyReadConsent
         // runs at T0 authorize/burn time only), so evaluating twice is safe;
         // the second check below stays as defense in depth.
-        requireKeyReadAllowed(endpoint.providerId, allowAsk)
+        requireKeyReadAllowed(SetupValidation.policyResourceForPreset(endpoint.presetId), allowAsk)
         // Stage G (R2-3): cross-provider / cross-origin resume hydrates nothing.
         // Same-origin resumes run the local INTERRUPTED backfill below
         // (provider-agnostic bookkeeping) and hydrate only on provenance
@@ -836,7 +845,7 @@ class ChatSessionFactory(
         // fork path, and this recheck narrows the TOCTOU window before the
         // vault read on the same-origin path. Safe to run twice — the
         // recheck is read-only (no consent slot consumed).
-        requireKeyReadAllowed(endpoint.providerId, allowAsk)
+        requireKeyReadAllowed(SetupValidation.policyResourceForPreset(endpoint.presetId), allowAsk)
         val credential = captureCredential(endpoint)
         var session: ChatSession? = null
         try {
@@ -1055,6 +1064,19 @@ class ChatSessionFactory(
         }
     }
 
+    /**
+     * Stage1 compat: a legacy custom row (stored entity id predates
+     * per-endpoint ids, e.g. `preset:custom`) is never given a live session.
+     * Fails closed as [CaptureDeniedException] before any vault read — the
+     * pre-staged fixed slot may hold another URL's key, so the row's
+     * URL/key binding is unprovable. The ViewModel already withholds the
+     * binding ([bindingOf] returns null); this is defense in depth for
+     * direct factory callers. Pure check, zero vault I/O on deny.
+     */
+    private fun requireCurrentEndpointId(endpoint: EndpointConfig) {
+        if (SetupValidation.isLegacyEndpoint(endpoint)) throw CaptureDeniedException("ENDPOINT_ID_LEGACY")
+    }
+
     private suspend fun requireCurrentBinding(keyIsCurrent: suspend () -> Boolean) {
         if (!keyIsCurrent()) throw CancellationException("ENDPOINT_BINDING_STALE")
     }
@@ -1062,6 +1084,12 @@ class ChatSessionFactory(
     /**
      * S6 capture-boundary T1 recheck: a second `key.read` fresh evaluation
      * immediately before the vault read (after the first binding gate).
+     *
+     * Stage1 entity/policy split: [policyResource] is the preset-shared
+     * authorization scope (see [SetupValidation.policyResourceForPreset],
+     * granularity frozen for Stage2 #13) — never the per-endpoint transport
+     * identity, which is fenced separately by the binding gates and
+     * [requireCurrentEndpointId].
      *
      * DENY or an evaluation failure aborts fail-closed as
      * [CaptureDeniedException] (no vault read, no session built). ALLOW
@@ -1081,9 +1109,9 @@ class ChatSessionFactory(
      * via the later `keyIsCurrent` gates but not the vault read that
      * already happened (only `close` wipes the captured secret).
      */
-    private suspend fun requireKeyReadAllowed(providerId: String, allowAsk: Boolean) {
+    private suspend fun requireKeyReadAllowed(policyResource: String, allowAsk: Boolean) {
         val verdict = try {
-            policy.evaluateFresh("key.read", providerId).verdict
+            policy.evaluateFresh("key.read", policyResource).verdict
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {

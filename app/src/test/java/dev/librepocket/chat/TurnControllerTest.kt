@@ -1147,6 +1147,82 @@ class TurnControllerTest {
     )
   }
 
+  // AGG-dominance pin (Current): an aggregation-overflow marker forces
+  // non-retryable even through the IOException classifier, on the direct
+  // path, the streamingFlow path, and a legacy retryable=true Failed event
+  // (defensive retry invariant). Poisoned streams never burn retry budget.
+  @Test fun directIOExceptionWithOverflowMarkerDoesNotRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      flow { throw java.io.IOException("boom TOOL_ARGS_TOO_LARGE boom") }
+    }
+    val sink = RecordingSink()
+    val c = controller(
+      provider,
+      delays = delays,
+      retry = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+      transcript = sink,
+    )
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertTrue(delays.isEmpty())
+    assertTrue(sink.retried.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"))
+  }
+
+  @Test fun streamingFlowIOExceptionWithOverflowMarkerDoesNotRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      streamingFlow { throw java.io.IOException("boom SSE_FRAME_TOO_LARGE boom") }
+    }
+    val sink = RecordingSink()
+    val c = controller(
+      provider,
+      delays = delays,
+      retry = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+      transcript = sink,
+    )
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertTrue(delays.isEmpty())
+    assertTrue(sink.retried.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+  }
+
+  @Test fun retryableFlaggedAggFailureStillTerminates() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      flow { emit(StreamEvent.Failed("x TOOL_ARGS_TOO_LARGE y", retryable = true)) }
+    }
+    val sink = RecordingSink()
+    val c = controller(
+      provider,
+      delays = delays,
+      retry = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+      transcript = sink,
+    )
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertTrue(delays.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+  }
+
   // IAE/unknown flush asymmetry pin (Current): IAE keeps the historical
   // flush (validation = request shape, same observable pending-tool behavior
   // as the pre-split generic branch), except legacy overflow-marker messages

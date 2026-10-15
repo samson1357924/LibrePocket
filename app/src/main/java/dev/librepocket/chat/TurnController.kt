@@ -4402,7 +4402,8 @@ class TurnController(
         // marker/transcript side effect, so a later index overflowing cannot
         // leave an earlier index committed. Already-completed ToolDone
         // records are skipped in both passes (written inline at collection).
-        data class PendingTool(val index: Int, val id: String, val name: String, val args: String)
+        // (Plain holder class: no copy/componentN needed.)
+        class PendingTool(val index: Int, val id: String, val name: String, val args: String)
         val pending = toolArgText.mapNotNull { (index, args) ->
           if (index in toolDoneSeen) null
           else {
@@ -4576,6 +4577,10 @@ class TurnController(
         // P1 residual: an unknown-runtime Failed (typed UNKNOWN_RUNTIME code
         // from streamingFlow) must also not flush, while other fatal events
         // (401/validation with code == null) keep the historical flush.
+        // If this flush throws ProviderFailure (budget overflow), the catch
+        // below records it as the typed terminal and the helper there
+        // short-circuits (the new failure already discards), so no second
+        // flush can occur.
         if (!shouldDiscardPendingTools(failed)) {
           flushPendingTools()
         }
@@ -4620,15 +4625,17 @@ class TurnController(
         // Direct transport failure (synchronously thrown by stream() or by
         // the returned Flow before any terminal event): classify like
         // streamingFlow's IOException branch so transient failures retry
-        // regardless of throw site. The pending flush stays, guarded by the
-        // same discard predicate as the Failed-event path (code == null
-        // without overflow markers flushes on both paths).
+        // regardless of throw site. An aggregation-overflow marker dominates
+        // the classifier (poisoned streams never retry). The pending flush
+        // stays, guarded by the same discard predicate as the Failed-event
+        // path (code == null without overflow markers flushes on both paths).
         coroutineContext.ensureActive()
         val kind = ProviderErrorClassifier.classify(null, e, null)
+        val aggCode = inferAggFailureCodeName(e.message)
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
-          retryable = kind == FailureKind.RETRYABLE,
-          code = inferAggFailureCodeName(e.message),
+          retryable = kind == FailureKind.RETRYABLE && aggCode == null,
+          code = aggCode,
         )
         flushCatchingBudgetOverflow()
       } catch (e: Exception) {
@@ -4695,7 +4702,10 @@ class TurnController(
       // persists the failed partial structurally: the ledger row keeps the
       // partial text with isPartial=1 plus the sanitized reason (parent-aware
       // onTurnFailed), while UI memory keeps the same fragment flagged.
-      if (!failure.retryable || attempt >= retryConfig.maxRetries) {
+      // Defensive invariant: a resource-exhausted terminal never retries,
+      // even if a legacy/custom path marks it retryable (poisoned streams
+      // must not burn the retry budget).
+      if (!failure.retryable || isResourceExhausted(failure) || attempt >= retryConfig.maxRetries) {
         val clean = sanitizeError(failure.message)
         synchronized(lock) {
           activityRevision++

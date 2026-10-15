@@ -428,7 +428,18 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                 )
                 is IOException -> {
                     val kind = ProviderErrorClassifier.classify(null, e, null)
-                    emit(StreamEvent.Failed(redactedError("PROVIDER_TRANSPORT", e.message), kind == FailureKind.RETRYABLE))
+                    // Aggregation-budget overflow markers dominate transport
+                    // classification: an AGG_TOO_LARGE stream is poisoned and
+                    // never retries, even when the classifier sees a plain
+                    // IOException shape.
+                    val aggCode = inferAggFailureCodeName(e.message)
+                    emit(
+                        StreamEvent.Failed(
+                            redactedError("PROVIDER_TRANSPORT", e.message),
+                            retryable = kind == FailureKind.RETRYABLE && aggCode == null,
+                            code = aggCode,
+                        ),
+                    )
                 }
                 else -> emit(
                     StreamEvent.Failed(

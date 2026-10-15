@@ -613,5 +613,54 @@ class CheckTestBudgetsTest(unittest.TestCase):
             self.assertTrue(any("H1" in x for x in v), v)
 
 
+    def test_h1_small_text_large_timestamp_passes(self) -> None:
+        # P2-3: numeric metadata (createdAt/runId/kind/sessionId) is never
+        # huge evidence — a bare 100_000-class number alone must pass.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "TimestampMetaTest.kt",
+                "repeat(100){store.appendEvent(TranscriptEvent(sessionId=sid, "
+                'runId="r$it", kind="user", text="q", createdAt=100_000L))}\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_small_var_named_huge_passes(self) -> None:
+        # P2-3: a small variable merely named `huge` is a gate, not proof —
+        # with no scope-visible huge definition it must pass.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SmallHugeTest.kt",
+                'val huge = "q"\n'
+                "repeat(100) { store.appendEvent(event(sid, huge)) }\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_small_var_named_big_passes(self) -> None:
+        # P2-3: same gate semantics for the `big` name.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SmallBigTest.kt",
+                'val big = "q"\n'
+                "repeat(100) { store.appendEvent(event(sid, big)) }\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_inline_huge_in_loop_still_fails(self) -> None:
+        # P2-3 retention: an inline >=100k repeat constructor in the write
+        # span still fails after the bare-number branch is removed.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "InlineHugeLoopTest.kt",
+                "repeat(100) { store.appendEvent(event(sid, "
+                'text="y".repeat(100_001))) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,9 +9,11 @@ Rules (test sources only, no prod change):
   fixture inside its actual brace-delimited body (column-aware pairing shared
   with H2; `repeat`/write matches run on masked lines so strings/comments
   never count). A write counts only when its own span carries huge evidence:
-  an inline `.repeat(N>=100000)` constructor (underscores normalized), a
-  legacy `huge`/`big` hint, or a variable whose nearest scope-visible
-  definition builds a >=100k repeat — top-level definitions are visible
+  an inline `.repeat(N>=100000)` constructor (underscores normalized), or a
+  variable whose nearest scope-visible definition builds a >=100k repeat —
+  a bare `100_000`-class number (e.g. timestamps) is never evidence, and a
+  `huge`/`big` name counts only when it resolves to such a scope-visible
+  huge definition — top-level definitions are visible
   everywhere, same/enclosing-function and loop-body definitions are visible
   to their loop, sibling-function definitions are excluded, a definition
   inside a `run`/`if`/`also`/`let`-style `{...}` block that already ended
@@ -72,7 +74,10 @@ def _repeat_count(raw: str) -> int:
         return 0
 APPEND_EVENT_RE = re.compile(r"\.appendEvent\s*\(")
 FAST_PATH_RE = re.compile(r"appendPreRedactedForBudgetTest")
-HUGE_HINT_RE = re.compile(r"100_000|100_001|\bhuge\b|\bbig\b")
+# Gate-only name hint: a bare `100_000`-class number (e.g. createdAt
+# timestamps) is never huge evidence; `huge`/`big` counts only when the name
+# resolves to a scope-visible huge definition (checked at the use site).
+HUGE_HINT_RE = re.compile(r"\bhuge\b|\bbig\b")
 
 # Nightly-only full stress: true shaping intentionally, NIGHTLY_STRESS-gated,
 # independent 35-minute timeout, non-gating. Must stay out of the PR path.
@@ -729,9 +734,9 @@ def _huge_loop_violation(
     (same column-aware `_repeat_body_lines` pairing as H2, header line
     through the closing line) — never a fixed cross-method window. A body
     write fails only when its own `.appendEvent(` span carries huge evidence
-    (inline `huge`/`big`/`100_000`-class hint, an inline `>=100k` repeat, or
-    a referenced variable whose nearest scope-visible definition builds a
-    `>=100k` repeat). The old second disjunct (big fixture anywhere near any
+    (an inline `>=100k` repeat, or a referenced variable — including a
+    `huge`/`big` name — whose nearest scope-visible definition builds a
+    `>=100k` repeat; bare numbers never count). The old second disjunct (big fixture anywhere near any
     write) is deleted: building huge on one body line while writing small on
     another is not a costly path. Fast-path spans are blanked first, keeping
     the per-call exemption without shifting span offsets.
@@ -779,11 +784,14 @@ def _huge_loop_violation(
             # counting is exact.
             stripped = _strip_fast_path_spans(body_text)
             for span, off in _append_event_spans_with_offsets(stripped):
-                if HUGE_HINT_RE.search(span) or _line_has_big_inline_fixture(
-                    span
-                ):
+                if _line_has_big_inline_fixture(span):
                     return True
                 span_line = line_map[stripped[:off].count("\n")]
+                for hm in HUGE_HINT_RE.finditer(span):
+                    if _nearest_visible_is_huge(
+                        defs, hm.group(0), span_line, idx, ranges, def_blocks
+                    ):
+                        return True
                 for name, v in var_res.items():
                     if v.search(span) and _nearest_visible_is_huge(
                         defs, name, span_line, idx, ranges, def_blocks

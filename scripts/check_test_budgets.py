@@ -6,21 +6,33 @@ unredacted writes; it only rejects / alerts.
 Rules (test sources only, no prod change):
 - H1 (huge-string via true shaping, heuristic tripwire): a `repeat(N>=10)`
   loop must NOT contain a true-path `.appendEvent(` write referencing a huge
-  fixture — either an inline/literal hint on the write line (`100_000`-class
-  `.repeat(N>=100000)` constructors with underscores normalized, or the
-  legacy `huge`/`big` names) or a file-level `val`/`var <name>[: Type] =
-  ... .repeat(N>=100000)` variable used by the write — within its 12-line
-  window. The fast-path exemption is per-call (stripped call segments), so a
-  same-line true-path write is still examined. Huge homogeneous strings
+  fixture inside its actual brace-delimited body (column-aware pairing shared
+  with H2; `repeat`/write matches run on masked lines so strings/comments
+  never count). A write counts only when its own span carries huge evidence:
+  an inline `.repeat(N>=100000)` constructor (underscores normalized), a
+  legacy `huge`/`big` hint, or a variable whose nearest scope-visible
+  definition builds a >=100k repeat — top-level definitions are visible
+  everywhere, same/enclosing-function and loop-body definitions are visible
+  to their loop, sibling-function definitions are excluded, and the closest
+  preceding visible definition wins (so a shadowing small redefinition
+  clears the flag). A body line that merely builds huge without the write
+  span referencing it does NOT count (no cross-line disjunction). The
+  fast-path exemption is per-call (spans blanked with offsets preserved), so
+  a same-line true-path write is still examined. Huge homogeneous strings
   through the true `redact` shaping are O(n^2) pre-Redactor-fix and
   amplified per row; PR tests must use the fast path
   (`appendPreRedactedForBudgetTest`) or slim the loop. The
   nightly-only full stress (`ChatSnapshotByteCapFullStressTest.kt`,
-  NIGHTLY_STRESS-gated) is allowlisted. Known gaps (documented, not silent):
-  fixtures passed through helper parameters, built indirectly, or sized via
-  constants (no `.repeat(N)` literal shape) are not tracked — H1 is a tripwire,
-  not a coverage proof; shadowed same-name variables in different methods are
-  treated as one name (flag-for-review direction).
+  NIGHTLY_STRESS-gated) is allowlisted. Fallback (fail-closed): a header
+  whose brace block cannot be paired (no `{...}` on the header line and no
+  block found in the following lines) is scanned over the legacy
+  REPEAT_WINDOW_LINES window instead of silently passing — the same
+  span-evidence + scope rules still apply there. Known gaps (documented, not
+  silent): fixtures passed through helper parameters, built indirectly,
+  sized via constants, or defined after the write (no `.repeat(N)` literal
+  shape / not visible) are not tracked — H1 is a tripwire, not a coverage
+  proof; a reference with no scope-visible huge definition passes
+  (precision: only a definite in-scope huge path fails).
 - H2 (unbounded row count, loop-local): a single `repeat(N>=2000)` loop must
   NOT contain a store write (`.appendEvent(` or the pre-redacted fast path)
   inside its actual brace-delimited body (column-aware single-line close;
@@ -78,8 +90,10 @@ STRING_REPEAT_N_RE = re.compile(r"\.repeat\s*\(\s*([\d_]+)")
 
 HUGE_REPEAT_MIN = 10
 ROW_REPEAT_MAX = 2000
-# Fixed lookback for H1's loop-local window (H1 is a tripwire over the common
-# `repeat(N) { ...writes... }` shape; H2 below is brace-aware instead).
+# Fallback-only lookahead for H1 headers whose brace block cannot be paired
+# (H1 is body-local otherwise, like H2). Fail-closed: an unparseable header
+# is scanned over this window instead of silently passing; span-evidence +
+# scope rules still apply inside the window, so unknown scope never fails.
 REPEAT_WINDOW_LINES = 12
 
 
@@ -354,10 +368,17 @@ def _strip_fast_path_spans(text: str) -> str:
     string-awareness is unnecessary. Fail-closed: only a `(` reached with
     nothing but spaces/tabs/newlines in between counts as a fast-path call;
     a bare name followed by other code is kept as ordinary text (never skip
-    to a distant unrelated paren)."""
+    to a distant unrelated paren). Spans are blanked (non-newline chars to
+    spaces, 1:1) rather than deleted so span offsets stay aligned with the
+    joined body/window text for scope-aware line mapping (Stage 3); blanking
+    (vs deletion) also never fuses the surrounding text into phantom tokens."""
     out: list[str] = []
     i = 0
     n = len(text)
+
+    def _blank(s: str) -> str:
+        return "".join(c if c in "\r\n" else " " for c in s)
+
     while True:
         m = FAST_PATH_RE.search(text, i)
         if not m:
@@ -385,15 +406,20 @@ def _strip_fast_path_spans(text: str) -> str:
                 if depth == 0:
                     break
             k += 1
-        i = k + 1 if k < n else n
+        if k < n:
+            out.append(_blank(text[m.start() : k + 1]))
+            i = k + 1
+        else:
+            out.append(_blank(text[m.start() :]))
+            break
     return "".join(out)
 
 
-def _append_event_spans(text: str) -> list[str]:
-    """Full `.appendEvent(...)` spans in joined masked text (balanced
-    parens, window-local). Each span may cross newlines; callers join the
-    span into one string before judging huge evidence."""
-    spans: list[str] = []
+def _append_event_spans_with_offsets(text: str) -> list[tuple[str, int]]:
+    """Full `.appendEvent(...)` spans in joined masked text with their start
+    offsets (balanced parens, window-local). Offsets let callers map a span
+    back to its source line for scope-aware fixture resolution (Stage 3)."""
+    spans: list[tuple[str, int]] = []
     pos = 0
     n = len(text)
     while True:
@@ -402,7 +428,7 @@ def _append_event_spans(text: str) -> list[str]:
             break
         j = text.find("(", m.start())
         if j < 0:
-            spans.append(text[m.start() :])
+            spans.append((text[m.start() :], m.start()))
             break
         depth = 0
         k = j
@@ -416,12 +442,19 @@ def _append_event_spans(text: str) -> list[str]:
                     break
             k += 1
         if k < n:
-            spans.append(text[m.start() : k + 1])
+            spans.append((text[m.start() : k + 1], m.start()))
             pos = k + 1
         else:
-            spans.append(text[m.start() :])
+            spans.append((text[m.start() :], m.start()))
             break
     return spans
+
+
+def _append_event_spans(text: str) -> list[str]:
+    """Full `.appendEvent(...)` spans in joined masked text (balanced
+    parens, window-local). Each span may cross newlines; callers join the
+    span into one string before judging huge evidence."""
+    return [span for span, _ in _append_event_spans_with_offsets(text)]
 
 
 def _line_has_big_inline_fixture(line: str) -> bool:
@@ -434,35 +467,179 @@ def _line_has_big_inline_fixture(line: str) -> bool:
     return False
 
 
-def _huge_loop_violation(
-    masked: list[str], var_res: list[re.Pattern[str]]
+# Any `val`/`var <name> = ...` declaration (typed or not) on one masked line;
+# huge-ness is decided separately by FIXTURE_VAR_RE + HUGE_FIXTURE_MIN, so a
+# small redefinition of the same name is recorded too (shadowing).
+VAL_DEF_RE = re.compile(r"(?:val|var)\s+(\w+)\s*(?::\s*[^=\n]+?)?=")
+FUN_RE = re.compile(r"\bfun\b")
+
+
+def _function_ranges(masked: list[str]) -> list[tuple[int, int]]:
+    """Inclusive [start, end] line ranges of `fun ... { ... }` bodies on
+    masked lines (strings/comments already blanked, so `{`/`}` pairing is
+    exact). An expression body (`fun f() = g()`, no brace within +5 lines)
+    covers its own line. An unclosed body extends to EOF (fail-closed: its
+    contents stay function-local rather than leaking to top-level scope)."""
+    ranges: list[tuple[int, int]] = []
+    n = len(masked)
+    for f in range(n):
+        for m in FUN_RE.finditer(masked[f]):
+            open_line, open_col = -1, -1
+            c0 = masked[f].find("{", m.end())
+            if c0 != -1:
+                open_line, open_col = f, c0
+            else:
+                for g in range(f + 1, min(n, f + 6)):
+                    c0 = masked[g].find("{")
+                    if c0 != -1:
+                        open_line, open_col = g, c0
+                        break
+            if open_line < 0:
+                ranges.append((f, f))
+                continue
+            depth = 0
+            closed = -1
+            for li in range(open_line, n):
+                text = masked[li]
+                sc = open_col if li == open_line else 0
+                for ch in text[sc:]:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            closed = li
+                            break
+                if closed >= 0:
+                    break
+            ranges.append((f, closed if closed >= 0 else n - 1))
+    return ranges
+
+
+def _scoped_var_defs(masked: list[str]) -> dict[str, list[tuple[int, bool]]]:
+    """All `val`/`var` definitions on masked lines: name -> sorted
+    [(def_line, is_huge)], where huge means the same line builds a
+    `>=HUGE_FIXTURE_MIN` String.repeat fixture (typed or untyped). Runs on
+    masked lines so commented-out or string-demo declarations never count."""
+    defs: dict[str, list[tuple[int, bool]]] = {}
+    for idx, line in enumerate(masked):
+        huge_here: set[str] = set()
+        for m in FIXTURE_VAR_RE.finditer(line):
+            try:
+                size = int(m.group(2).replace("_", ""))
+            except ValueError:
+                continue
+            if size >= HUGE_FIXTURE_MIN:
+                huge_here.add(m.group(1))
+        for m in VAL_DEF_RE.finditer(line):
+            name = m.group(1)
+            defs.setdefault(name, []).append((idx, name in huge_here))
+    for entries in defs.values():
+        entries.sort()
+    return defs
+
+
+def _def_visible(
+    ranges: list[tuple[int, int]], def_line: int, loop_line: int
 ) -> bool:
+    """A definition is visible to a loop iff every `fun` body containing the
+    definition also contains the loop: top-level definitions (no containing
+    body) are visible everywhere, same/enclosing-function and loop-body
+    definitions are visible, sibling-function definitions are excluded."""
+    for a, b in ranges:
+        if a <= def_line <= b and not (a <= loop_line <= b):
+            return False
+    return True
+
+
+def _nearest_visible_is_huge(
+    defs: dict[str, list[tuple[int, bool]]],
+    name: str,
+    span_line: int,
+    loop_idx: int,
+    ranges: list[tuple[int, int]],
+) -> bool:
+    """Nearest-visible-definition rule: among scope-visible definitions of
+    `name` on or before the write span's line, the closest one decides — a
+    nearer small redefinition (shadowing) clears an outer huge fixture, and
+    no visible definition means unknown (precision: not huge, never fails)."""
+    best: tuple[int, bool] | None = None
+    for ln, huge in defs.get(name, []):
+        if ln <= span_line and _def_visible(ranges, ln, loop_idx):
+            best = (ln, huge)
+    return best is not None and best[1]
+
+
+def _single_line_closed_body(header: str, match_end: int) -> bool:
+    """Trust a `(idx, idx)` body as a genuine single-line loop only when the
+    header line pairs `{...}` after the `repeat(...)` match; otherwise the
+    header is unparseable and the caller falls back to the legacy window
+    (fail-closed)."""
+    open_col = header.find("{", match_end)
+    return open_col != -1 and "}" in header[open_col + 1 :]
+
+
+def _huge_loop_violation(
+    masked: list[str], deltas: list[int], has_brace: list[bool]
+) -> bool:
+    """H1 tripwire, body-local and scope-aware (Stage 3).
+
+    Each `repeat(N>=10)` loop is judged over its actual brace-delimited body
+    (same column-aware `_repeat_body_lines` pairing as H2, header line
+    through the closing line) — never a fixed cross-method window. A body
+    write fails only when its own `.appendEvent(` span carries huge evidence
+    (inline `huge`/`big`/`100_000`-class hint, an inline `>=100k` repeat, or
+    a referenced variable whose nearest scope-visible definition builds a
+    `>=100k` repeat). The old second disjunct (big fixture anywhere near any
+    write) is deleted: building huge on one body line while writing small on
+    another is not a costly path. Fast-path spans are blanked first, keeping
+    the per-call exemption without shifting span offsets.
+    """
+    ranges = _function_ranges(masked)
+    defs = _scoped_var_defs(masked)
+    # Compile once per file (not per loop): PocketGuard perf suggestion.
+    var_res = {
+        name: re.compile(r"\b" + re.escape(name) + r"\b")
+        for name in defs
+    }
     for idx, line in enumerate(masked):
         m = REPEAT_RE.search(line)
         if not m or _repeat_count(m.group(1)) < HUGE_REPEAT_MIN:
             continue
-        window = masked[idx : idx + REPEAT_WINDOW_LINES]
-        # Multiline span scan (window-local): strip fast-path spans first to
+        start, end = _repeat_body_lines(
+            deltas, has_brace, masked, idx, m.start(), m.end()
+        )
+        if (start, end) == (idx, idx) and not _single_line_closed_body(
+            line, m.end()
+        ):
+            # Fail-closed fallback for headers whose block cannot be paired:
+            # scan the legacy window instead of silently passing. Span
+            # evidence + scope rules still apply, so unknown scope never
+            # fails here either.
+            end = min(len(masked) - 1, idx + REPEAT_WINDOW_LINES - 1)
+        # Multiline span scan (body-local): blank fast-path spans first to
         # keep the per-call exemption, then pair parens from each
         # `.appendEvent(` start and judge the whole span as one string so a
         # huge hint/varref on a following line is not missed. Masked lines
         # have strings/comments blanked, so naive paren counting is exact.
-        window_text = "\n".join(window)
-        stripped = _strip_fast_path_spans(window_text)
-        for span in _append_event_spans(stripped):
-            if (
-                HUGE_HINT_RE.search(span)
-                or _line_has_big_inline_fixture(span)
-                or any(v.search(span) for v in var_res)
+        body_text = "\n".join(masked[start : end + 1])
+        stripped = _strip_fast_path_spans(body_text)
+        for span, off in _append_event_spans_with_offsets(stripped):
+            if HUGE_HINT_RE.search(span) or _line_has_big_inline_fixture(
+                span
             ):
                 return True
-        # Fixture defined inside the loop then used by a later write:
-        # `val huge = "x".repeat(100_000)` in-window plus a true-path write.
+            span_line = start + stripped[:off].count("\n")
+            for name, v in var_res.items():
+                if v.search(span) and _nearest_visible_is_huge(
+                    defs, name, span_line, idx, ranges
+                ):
+                    return True
+        # NOTE: no cross-line disjunction — a body line that builds a huge
+        # fixture while a *different* write span carries no huge evidence is
+        # not a definite costly path (precision over flag-for-review).
         # (Bare `== 100_000` length assertions do NOT count — only fixture
         # creation via String.repeat, any size >= threshold.)
-        if any(_line_has_big_inline_fixture(w) for w in window):
-            if APPEND_EVENT_RE.search(stripped):
-                return True
     return False
 
 
@@ -497,14 +674,9 @@ def check_file(path: str) -> list[str]:
     lines = content.splitlines()
     masked = _masked_kotlin_lines(lines)
     deltas, has_brace = _mask_kotlin_braces(lines)
-    # Compile once per file (not per loop): PocketGuard perf suggestion.
-    var_res = [
-        re.compile(r"\b" + re.escape(name) + r"\b")
-        for name in sorted(_fixture_vars(content))
-    ]
     violations: list[str] = []
     if base not in ALLOWLIST_HUGE_TRUE_PATH and _huge_loop_violation(
-        masked, var_res
+        masked, deltas, has_brace
     ):
         violations.append(
             f"{path}: H1 huge-string loop via true appendEvent "

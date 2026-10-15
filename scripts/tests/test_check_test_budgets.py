@@ -201,6 +201,82 @@ class CheckTestBudgetsTest(unittest.TestCase):
             )
             self.assertEqual([], check_test_budgets.check_file(p))
 
+    def test_h1_compute_loop_plus_unrelated_single_huge_write_passes(
+        self,
+    ) -> None:
+        # Stage 3 (a1): a pure-compute repeat loop and an unrelated single
+        # huge write in a sibling method share a 12-line span but no data
+        # flow — the old fixed-window check misfired; the body-local check
+        # must pass.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "ComputePlusSingleTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "@Test fun bigCompute() {\n"
+                '    repeat(100) { println("ok $it") }\n'
+                "}\n"
+                "@Test fun singleWrite() = runBlocking {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_compute_loop_plus_unrelated_single_inline_huge_passes(
+        self,
+    ) -> None:
+        # Stage 3 (a2): inline variant — the unrelated single write carries
+        # its own inline huge constructor, still outside the compute loop's
+        # body, so no H1.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "ComputePlusInlineTest.kt",
+                "@Test fun bigCompute() {\n"
+                '    repeat(100) { println("ok $it") }\n'
+                "}\n"
+                "@Test fun singleWrite() = runBlocking {\n"
+                '    store.appendEvent(event(sid, text = "y".repeat(100_001)))\n'
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_shadowed_payload_small_loop_passes(self) -> None:
+        # Stage 3 (b): same-name shadowing — the loop's function redefines
+        # `payload` as small, so the top-level huge fixture of the same name
+        # is not on the write's visible path.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "ShadowedTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "@Test fun smallLoop() = runBlocking {\n"
+                '    val payload = "ok"\n'
+                "    repeat(100) {\n"
+                '        store.appendEvent(event(sid, payload))\n'
+                "    }\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_late_write_in_long_body_fails(self) -> None:
+        # Stage 3 (c): a genuine huge write on the 16th body line — past the
+        # old 12-line window — must still fail via the brace-aware body.
+        setup = "".join(f"        // setup line {i}\n" for i in range(15))
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "LateHugeWriteTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "@Test fun lateWrite() = runBlocking {\n"
+                "    repeat(100) {\n" + setup
+                + "        store.appendEvent(event(sid, payload))\n"
+                + "    }\n"
+                + "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
     def test_h2_repeat_2000_fails(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             p = _write(

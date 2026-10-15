@@ -1,6 +1,7 @@
 package dev.librepocket.agent.ui.setup
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.edit
 import androidx.lifecycle.viewModelScope
 import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.keystore.EncryptedPrefsVault
@@ -219,5 +220,155 @@ class SetupEndpointIdMigrationTest {
         assertNotEquals(aliasB, aliasB2)
         assertFalse(vault.hasKey(aliasB))
         assertTrue(vault.hasKey(aliasB2))
+    }
+
+    /**
+     * Stage1 read-layer ordering (M3/M4): URL validity is checked before the
+     * legacy detector, so a malformed legacy row still reports
+     * INVALID_BASE_URL readiness (never READY, zero vault reads). The Setup
+     * gate maps the same row to NoEndpoint (legacy short-circuits there).
+     * Seeded via direct dirty write — save() validation would reject the
+     * malformed URL before the ordering is even reached.
+     */
+    @Test
+    fun malformedLegacyUrlReportsInvalidBaseUrlAndGatesNoEndpoint() = runBlocking {
+        val store = newStore()
+        store.dataStore.edit { prefs ->
+            prefs[ENDPOINT_PROVIDER_ID_V1] = "preset:custom"
+            prefs[ENDPOINT_PRESET_ID_V1] = "custom"
+            prefs[ENDPOINT_LABEL_V1] = "自訂"
+            prefs[ENDPOINT_BASE_URL_V1] = "http://[::1"
+            prefs[ENDPOINT_PROTOCOL_V1] = "CHAT_COMPLETIONS"
+            prefs[ENDPOINT_MODEL_V1] = "local"
+            prefs[ENDPOINT_API_KEY_REF_V1] = "provider_key/preset:custom"
+        }
+        val vault = CountingVault()
+        assertEquals(EndpointReadiness.INVALID_BASE_URL, store.readiness(vault))
+        assertEquals(0, vault.hasKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+        val gate = withTimeout(10_000) { vm.gate.first { it !is EndpointGate.Loading } }
+        assertTrue("malformed legacy row must gate NoEndpoint, got $gate", gate is EndpointGate.NoEndpoint)
+        assertEquals(0, vault.hasKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
+    }
+
+    /**
+     * Legacy quarantine performs zero vault I/O (C3): readiness and the gate
+     * both fail closed on a legacy custom row without reading, writing, or
+     * probing the vault — even though the legacy fixed slot holds a key.
+     */
+    @Test
+    fun legacyQuarantineTouchesNoVault() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val store = newStore()
+        val vault = CountingVault()
+        vault.putKey("preset:custom", "stage1-legacy-key-12345678".toCharArray())
+        val seededPuts = vault.putKeys
+        store.save(legacyCustom(url))
+
+        assertEquals(EndpointReadiness.NO_KEY, store.readiness(vault))
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+        val gate = withTimeout(10_000) { vm.gate.first { it !is EndpointGate.Loading } }
+        assertTrue("legacy custom row must gate NoEndpoint, got $gate", gate is EndpointGate.NoEndpoint)
+
+        // Only the explicit test seeding touched the vault; every production
+        // read path above observed without I/O.
+        assertEquals(seededPuts, vault.putKeys)
+        assertEquals(0, vault.hasKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.deleteKeys)
+    }
+
+    /**
+     * Keep-existing fallback on a legacy row writes nothing (M11): a blank
+     * save over a legacy custom row falls back to NEW, demands a re-paste,
+     * and performs zero vault reads/writes while leaving the stored row
+     * untouched.
+     */
+    @Test
+    fun keepExistingLegacyFallbackWritesNothing() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val store = newStore()
+        val vault = CountingVault()
+        vault.putKey("preset:custom", "stage1-legacy-key-12345678".toCharArray())
+        val seededPuts = vault.putKeys
+        store.save(legacyCustom(url))
+
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+        val stored = withTimeout(10_000) { store.snapshotStrict() }
+        assertNotNull(stored)
+        vm.prefillForEdit(stored!!)
+        vm.save()
+        awaitSaveIdle(vm)
+        assertEquals("SETUP_KEY_TOO_SHORT", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+
+        assertEquals(seededPuts, vault.putKeys)
+        assertEquals(0, vault.hasKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.deleteKeys)
+        val after = withTimeout(10_000) { store.snapshotStrict() }
+        assertEquals("preset:custom", after?.providerId)
+    }
+
+    /**
+     * Built-in control (M3): the legacy detector never misfires on built-in
+     * presets — a well-formed openai row with its key present is READY and
+     * gates Ready.
+     */
+    @Test
+    fun builtinRowIsNotLegacyAndGatesReady() = runBlocking {
+        val store = newStore()
+        val vault = CountingVault()
+        vault.putKey("preset:openai", "stage1-builtin-key-12345678".toCharArray())
+        store.save(
+            EndpointConfig(
+                providerId = "preset:openai",
+                presetId = "openai",
+                label = "OpenAI",
+                baseUrl = "https://api.openai.com/v1",
+                protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                model = "gpt-4o-mini",
+                apiKeyRef = "provider_key/preset:openai",
+            ),
+        )
+        assertFalse(
+            SetupValidation.isLegacyEndpointId("preset:openai", "openai", "https://api.openai.com/v1"),
+        )
+        assertEquals(EndpointReadiness.READY, store.readiness(vault))
+
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+        val gate = withTimeout(10_000) { vm.gate.first { it !is EndpointGate.Loading } }
+        assertTrue("builtin row must gate Ready, got $gate", gate is EndpointGate.Ready)
     }
 }

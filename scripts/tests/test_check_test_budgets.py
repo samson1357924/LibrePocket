@@ -159,6 +159,39 @@ class CheckTestBudgetsTest(unittest.TestCase):
             )
             self.assertEqual([], check_test_budgets.check_file(p))
 
+    def test_h1_multiline_appendEvent_varref_fails(self) -> None:
+        # Stage 2: cross-line leak — `.appendEvent(` opens on one line and
+        # the huge varref sits on a following line of the same span.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MultilineTest.kt",
+                'val payload: String = "x".repeat(100_000)\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(\n"
+                "        event(sid, payload)\n"
+                "    )\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_multiline_appendEvent_fastpath_passes(self) -> None:
+        # Stage 2 guard: a multiline fast-path call wrapping huge keeps its
+        # per-call exemption (fix A must not break E).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MultilineFastTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "repeat(100) {\n"
+                "    store.appendPreRedactedForBudgetTest(\n"
+                "        event(sid, payload)\n"
+                "    )\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
     def test_h1_single_huge_row_passes(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             p = _write(

@@ -347,51 +347,81 @@ def _fixture_vars(content: str) -> set[str]:
     return found
 
 
-def _strip_fast_path_calls(line: str) -> str:
-    """Remove `appendPreRedactedForBudgetTest(...)` call segments (balanced
-    parens, string-aware) so a same-line true-path write is still examined."""
+def _strip_fast_path_spans(text: str) -> str:
+    """Remove `appendPreRedactedForBudgetTest(...)` spans from joined masked
+    text (balanced parens, window-local). Masked text has no live strings or
+    comments (blanked to spaces), so naive `(`/`)` counting is exact and
+    string-awareness is unnecessary. Fail-closed: only a `(` reached with
+    nothing but spaces/tabs/newlines in between counts as a fast-path call;
+    a bare name followed by other code is kept as ordinary text (never skip
+    to a distant unrelated paren)."""
     out: list[str] = []
     i = 0
+    n = len(text)
     while True:
-        m = FAST_PATH_RE.search(line, i)
+        m = FAST_PATH_RE.search(text, i)
         if not m:
-            out.append(line[i:])
+            out.append(text[i:])
             break
-        out.append(line[i : m.start()])
-        j = line.find("(", m.end())
+        out.append(text[i : m.start()])
+        j = text.find("(", m.end())
         if j < 0:
+            out.append(text[m.start() :])
             break
+        if any(c not in " \t\r\n" for c in text[m.end() : j]):
+            # Not a call (e.g. stray name before unrelated code): keep the
+            # name as ordinary text and keep scanning after it.
+            out.append(text[m.start() : m.end()])
+            i = m.end()
+            continue
         depth = 0
         k = j
-        in_str = False
-        in_char = False
-        while k < len(line):
-            c = line[k]
-            if in_str:
-                if c == "\\":
-                    k += 2
-                    continue
-                if c == '"':
-                    in_str = False
-            elif in_char:
-                if c == "\\":
-                    k += 2
-                    continue
-                if c == "'":
-                    in_char = False
-            elif c == '"':
-                in_str = True
-            elif c == "'":
-                in_char = True
-            elif c == "(":
+        while k < n:
+            c = text[k]
+            if c == "(":
                 depth += 1
             elif c == ")":
                 depth -= 1
                 if depth == 0:
                     break
             k += 1
-        i = k + 1 if k < len(line) else len(line)
+        i = k + 1 if k < n else n
     return "".join(out)
+
+
+def _append_event_spans(text: str) -> list[str]:
+    """Full `.appendEvent(...)` spans in joined masked text (balanced
+    parens, window-local). Each span may cross newlines; callers join the
+    span into one string before judging huge evidence."""
+    spans: list[str] = []
+    pos = 0
+    n = len(text)
+    while True:
+        m = APPEND_EVENT_RE.search(text, pos)
+        if not m:
+            break
+        j = text.find("(", m.start())
+        if j < 0:
+            spans.append(text[m.start() :])
+            break
+        depth = 0
+        k = j
+        while k < n:
+            c = text[k]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if k < n:
+            spans.append(text[m.start() : k + 1])
+            pos = k + 1
+        else:
+            spans.append(text[m.start() :])
+            break
+    return spans
 
 
 def _line_has_big_inline_fixture(line: str) -> bool:
@@ -412,14 +442,18 @@ def _huge_loop_violation(
         if not m or _repeat_count(m.group(1)) < HUGE_REPEAT_MIN:
             continue
         window = masked[idx : idx + REPEAT_WINDOW_LINES]
-        for follow in window:
-            # Per-call (not per-line) fast-path exemption: strip the fast-path
-            # call segments, then examine what remains.
-            code = _strip_fast_path_calls(follow)
-            if APPEND_EVENT_RE.search(code) and (
-                HUGE_HINT_RE.search(code)
-                or _line_has_big_inline_fixture(code)
-                or any(v.search(code) for v in var_res)
+        # Multiline span scan (window-local): strip fast-path spans first to
+        # keep the per-call exemption, then pair parens from each
+        # `.appendEvent(` start and judge the whole span as one string so a
+        # huge hint/varref on a following line is not missed. Masked lines
+        # have strings/comments blanked, so naive paren counting is exact.
+        window_text = "\n".join(window)
+        stripped = _strip_fast_path_spans(window_text)
+        for span in _append_event_spans(stripped):
+            if (
+                HUGE_HINT_RE.search(span)
+                or _line_has_big_inline_fixture(span)
+                or any(v.search(span) for v in var_res)
             ):
                 return True
         # Fixture defined inside the loop then used by a later write:
@@ -427,9 +461,7 @@ def _huge_loop_violation(
         # (Bare `== 100_000` length assertions do NOT count — only fixture
         # creation via String.repeat, any size >= threshold.)
         if any(_line_has_big_inline_fixture(w) for w in window):
-            if any(
-                APPEND_EVENT_RE.search(_strip_fast_path_calls(w)) for w in window
-            ):
+            if APPEND_EVENT_RE.search(stripped):
                 return True
     return False
 

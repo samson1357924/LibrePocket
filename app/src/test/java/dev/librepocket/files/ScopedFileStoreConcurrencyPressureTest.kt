@@ -10,8 +10,13 @@ import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
 import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileVisitResult
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -89,6 +94,83 @@ class ScopedFileStoreConcurrencyPressureTest {
         }
     }
 
+    /**
+     * NOFOLLOW 遞迴刪除：絕不跟隨目錄 symlink（`File.deleteRecursively()` 會跟隨，
+     * 在 `race-sub -> out` 殘留時會越界刪 outside）。以 `walkFileTree` 預設
+     * 不傳 `FOLLOW_LINKS` 語義：遇連結只刪連結本體並跳過子樹。best-effort。
+     */
+    private fun deleteNoFollowRecursively(root: File) {
+        try {
+            val start = root.toPath()
+            if (Files.isSymbolicLink(start)) {
+                Files.deleteIfExists(start)
+                return
+            }
+            if (!Files.exists(start, LinkOption.NOFOLLOW_LINKS)) return
+            Files.walkFileTree(
+                start,
+                object : SimpleFileVisitor<Path>() {
+                    override fun preVisitDirectory(
+                        dir: Path,
+                        attrs: BasicFileAttributes,
+                    ): FileVisitResult {
+                        // walk 預設不跟隨連結；此處若 provider 仍回目錄屬性，以 link 檢查兜底。
+                        if (Files.isSymbolicLink(dir)) {
+                            try {
+                                Files.deleteIfExists(dir)
+                            } catch (_: Exception) {
+                            }
+                            return FileVisitResult.SKIP_SUBTREE
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun visitFile(
+                        file: Path,
+                        attrs: BasicFileAttributes,
+                    ): FileVisitResult {
+                        try {
+                            Files.deleteIfExists(file)
+                        } catch (_: Exception) {
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun postVisitDirectory(
+                        dir: Path,
+                        exc: IOException?,
+                    ): FileVisitResult {
+                        try {
+                            Files.deleteIfExists(dir)
+                        } catch (_: Exception) {
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+                },
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 移除可能被翻轉為 symlink 的路徑：先刪連結本體，殘留為實目錄才 NOFOLLOW 遞迴。 */
+    private fun removePossiblyFlipped(sub: File) {
+        try {
+            if (Files.isSymbolicLink(sub.toPath())) {
+                Files.deleteIfExists(sub.toPath())
+                return
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            if (sub.isDirectory) {
+                deleteNoFollowRecursively(sub)
+                return
+            }
+        } catch (_: Exception) {
+        }
+        deleteQuietly(sub)
+    }
+
     private fun workspace(): File =
         Files.createTempDirectory("ws-pressure").toFile().apply { deleteOnExit() }
 
@@ -150,6 +232,10 @@ class ScopedFileStoreConcurrencyPressureTest {
 
     @Test fun renameSymlinkPressureBounded() {
         assumeNonWindows()
+        // 生產常數耦合守衛：staging／清理／列目斷言皆由此派生，空洞即 fail-fast。
+        assertTrue(ScopedFileStore.TMP_NAME_PREFIX.isNotEmpty())
+        assertTrue(stageFilePrefix().startsWith(ScopedFileStore.TMP_NAME_PREFIX))
+        assertTrue(stageDirPrefix().startsWith(ScopedFileStore.TMP_NAME_PREFIX))
         val ws = workspace()
         val out = outside()
         try {
@@ -158,16 +244,23 @@ class ScopedFileStoreConcurrencyPressureTest {
             store.write("stable/file.txt", "seed".toByteArray(Charsets.UTF_8))
 
             val startGate = CountDownLatch(1)
+            // ready 屏障：確保 7 workers 皆已啟動再同時放行，縮小零交錯窗口。
+            // 非嚴格同步（放行後仍由排程器決定交錯），僅防 flipper 早退空轉。
+            val readyLatch = CountDownLatch(POOL_SIZE)
             val errors = AtomicReference<Throwable?>(null)
             val denied = AtomicInteger(0)
             val rejected = AtomicInteger(0)
             val firstRejection = AtomicReference<String?>(null)
             val observedOutside = AtomicInteger(0)
             val observedInside = AtomicInteger(0)
+            val readAttempts = AtomicInteger(0)
             val listOk = AtomicInteger(0)
             val deleteOk = AtomicInteger(0)
-            val flipOk = AtomicInteger(0)
-            val dirFlipOk = AtomicInteger(0)
+            // 雙態計數：symlink 與實檔／實目錄各至少成功一次，證明翻轉非單態空轉。
+            val fileLinkOk = AtomicInteger(0)
+            val fileRealOk = AtomicInteger(0)
+            val dirLinkOk = AtomicInteger(0)
+            val dirRealOk = AtomicInteger(0)
 
             fun noteDenied(e: IllegalArgumentException) {
                 denied.incrementAndGet()
@@ -180,6 +273,7 @@ class ScopedFileStoreConcurrencyPressureTest {
             // 目錄暫存為空故無條目，見 ScopedFileStore list 過濾段）。
             val fileFlipper = Runnable {
                 try {
+                    readyLatch.countDown()
                     if (!startGate.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
                         errors.compareAndSet(null, AssertionError("startGate timeout"))
                         return@Runnable
@@ -191,11 +285,9 @@ class ScopedFileStoreConcurrencyPressureTest {
                         val tid = Thread.currentThread().id
                         val staged = File(ws, stageFilePrefix() + "${tid}-$i")
                         try {
-                            try {
-                                Files.deleteIfExists(staged.toPath())
-                            } catch (_: Exception) {
-                            }
-                            if (i % 2 == 0) {
+                            deleteQuietly(staged)
+                            val isLink = (i % 2 == 0)
+                            if (isLink) {
                                 Files.createSymbolicLink(
                                     staged.toPath(),
                                     File(out, "secret.txt").toPath(),
@@ -203,12 +295,11 @@ class ScopedFileStoreConcurrencyPressureTest {
                             } else {
                                 staged.writeText("inside-$i", Charsets.UTF_8)
                             }
-                            if (renameReplace(staged, flip)) flipOk.incrementAndGet()
-                        } catch (_: Exception) {
-                            try {
-                                Files.deleteIfExists(staged.toPath())
-                            } catch (_: Exception) {
+                            if (renameReplace(staged, flip)) {
+                                if (isLink) fileLinkOk.incrementAndGet() else fileRealOk.incrementAndGet()
                             }
+                        } catch (_: Exception) {
+                            deleteQuietly(staged)
                         }
                     }
                 } catch (t: Throwable) {
@@ -221,6 +312,7 @@ class ScopedFileStoreConcurrencyPressureTest {
             // staged rename 進來；失敗即下一輪重試（壓力來源，不保證每次翻轉成功）。
             val dirFlipper = Runnable {
                 try {
+                    readyLatch.countDown()
                     if (!startGate.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
                         errors.compareAndSet(null, AssertionError("startGate timeout"))
                         return@Runnable
@@ -232,32 +324,21 @@ class ScopedFileStoreConcurrencyPressureTest {
                         val tid = Thread.currentThread().id
                         val staged = File(ws, stageDirPrefix() + "${tid}-$i")
                         try {
+                            deleteQuietly(staged)
+                            // NOFOLLOW 移除現態：絕不跟隨 symlink 進 outside（見人審 P2#1）。
+                            removePossiblyFlipped(sub)
                             try {
-                                Files.deleteIfExists(staged.toPath())
-                            } catch (_: Exception) {
-                            }
-                            try {
-                                if (Files.isSymbolicLink(sub.toPath())) {
-                                    Files.deleteIfExists(sub.toPath())
-                                } else if (sub.isDirectory) {
-                                    sub.deleteRecursively()
-                                } else {
-                                    Files.deleteIfExists(sub.toPath())
-                                }
-                            } catch (_: Exception) {
-                            }
-                            try {
-                                if (i % 2 == 0) {
+                                val isLink = (i % 2 == 0)
+                                if (isLink) {
                                     Files.createSymbolicLink(staged.toPath(), out.toPath())
                                 } else {
                                     staged.mkdirs()
                                 }
-                                if (renameReplace(staged, sub)) dirFlipOk.incrementAndGet()
-                            } catch (_: Exception) {
-                                try {
-                                    Files.deleteIfExists(staged.toPath())
-                                } catch (_: Exception) {
+                                if (renameReplace(staged, sub)) {
+                                    if (isLink) dirLinkOk.incrementAndGet() else dirRealOk.incrementAndGet()
                                 }
+                            } catch (_: Exception) {
+                                deleteQuietly(staged)
                             }
                         } catch (t: Throwable) {
                             errors.compareAndSet(null, t)
@@ -273,11 +354,13 @@ class ScopedFileStoreConcurrencyPressureTest {
             // IAE／找不到／併發 IO 窗口計入有界桶。
             val reader = Runnable {
                 try {
+                    readyLatch.countDown()
                     if (!startGate.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
                         errors.compareAndSet(null, AssertionError("startGate timeout"))
                         return@Runnable
                     }
                     repeat(READER_ROUNDS) {
+                        readAttempts.incrementAndGet()
                         try {
                             val text = String(store.read("flip"), Charsets.UTF_8)
                             when {
@@ -310,6 +393,7 @@ class ScopedFileStoreConcurrencyPressureTest {
             // 穩定路徑穿出即真缺陷（下文嚴格斷言）；翻轉路徑殘餘僅診斷。
             val writer = Runnable {
                 try {
+                    readyLatch.countDown()
                     if (!startGate.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
                         errors.compareAndSet(null, AssertionError("startGate timeout"))
                         return@Runnable
@@ -345,8 +429,10 @@ class ScopedFileStoreConcurrencyPressureTest {
             }
 
             // 列目者：結構性質與競態無關，嚴格斷言（相對路徑、無穿越段、無暫存洩露）。
+            // `..` 以路徑段比對（合法名 `report..bak` 允許，見 FileScope.isSafeName）。
             val lister = Runnable {
                 try {
+                    readyLatch.countDown()
                     if (!startGate.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
                         errors.compareAndSet(null, AssertionError("startGate timeout"))
                         return@Runnable
@@ -354,7 +440,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                     repeat(LISTER_ROUNDS) {
                         try {
                             val listed = store.list()
-                            if (listed.any { it.startsWith("/") || it.contains("..") }) {
+                            if (listed.any { it.startsWith("/") || it.split("/").any { seg -> seg == ".." } }) {
                                 errors.compareAndSet(
                                     null,
                                     AssertionError("list malformed: $listed"),
@@ -387,6 +473,7 @@ class ScopedFileStoreConcurrencyPressureTest {
             // 刪除者：自有 ephemeral 檔寫後刪＋翻轉路徑刪除嘗試；IAE／併發窗口有界化。
             val deleter = Runnable {
                 try {
+                    readyLatch.countDown()
                     if (!startGate.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
                         errors.compareAndSet(null, AssertionError("startGate timeout"))
                         return@Runnable
@@ -430,14 +517,25 @@ class ScopedFileStoreConcurrencyPressureTest {
                 pool.submit(writer)
                 pool.submit(lister)
                 pool.submit(deleter)
+                // ready 屏障：7 workers 就緒後才放行；超時記錯並強制收尾。
+                if (!readyLatch.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+                    errors.compareAndSet(null, AssertionError("workers not ready"))
+                }
                 startGate.countDown()
                 pool.shutdown()
                 // 無懸掛：期限內必須收斂，否則超時失敗（非無限等待）。
                 // 失敗路徑先 shutdownNow 避免 non-daemon worker 洩漏並與清理段競爭。
+                // 清理段只在確認終止後執行（見下 await 成功分支），超時直接拋出不清理，
+                // 避免 worker 存活時 teardown 與翻轉競爭（人審 P2#1）。
+                val terminated = pool.awaitTermination(POOL_TIMEOUT_SEC, TimeUnit.SECONDS)
                 try {
-                    assertTrue("stress pool must terminate", pool.awaitTermination(POOL_TIMEOUT_SEC, TimeUnit.SECONDS))
+                    assertTrue("stress pool must terminate", terminated)
                 } finally {
-                    if (!pool.isTerminated) pool.shutdownNow()
+                    if (!terminated) pool.shutdownNow()
+                }
+                // 超時且 worker 仍存活時不得進清理／斷言（路徑競爭），直接失敗。
+                if (!pool.isTerminated) {
+                    throw AssertionError("stress pool leaked workers; skip teardown to avoid races")
                 }
             } catch (t: Throwable) {
                 try {
@@ -455,66 +553,67 @@ class ScopedFileStoreConcurrencyPressureTest {
             val outsideExtra = (out.listFiles()?.map { it.name }?.toSet() ?: emptySet()) -
                 setOf("secret.txt")
             println(
-                "pressure diagnostics: denied=${denied.get()} rejected=${rejected.get()} " +
-                    "inside=${observedInside.get()} " +
+                "[ConcurrencyPressure] denied=${denied.get()} rejected=${rejected.get()} " +
+                    "inside=${observedInside.get()} readAttempts=${readAttempts.get()} " +
                     "outsideReads=${observedOutside.get()} listOk=${listOk.get()} " +
-                    "deleteOk=${deleteOk.get()} flipOk=${flipOk.get()} " +
-                    "dirFlipOk=${dirFlipOk.get()} firstRejection=${firstRejection.get()} " +
+                    "deleteOk=${deleteOk.get()} fileLinkOk=${fileLinkOk.get()} " +
+                    "fileRealOk=${fileRealOk.get()} dirLinkOk=${dirLinkOk.get()} " +
+                    "dirRealOk=${dirRealOk.get()} firstRejection=${firstRejection.get()} " +
                     "outsideExtra=$outsideExtra",
             )
 
-            // 有界斷言二：重驗門有觸發拒絕。denied 為混合桶（IAE＋FNFE／IO 窗口），
-            // 真正門證據為 rejected（僅 IAE）＋首條鏈族訊息；root 定錨族
-            // mismatch／identity 由 B2Test T1／F1 確定性覆蓋，壓力下僅期望 symlink／escapes。
+            // 有界斷言二：拒絕門有觸發。denied 為混合桶（IAE＋FNFE／IO 窗口），
+            // 真正門證據為 rejected（僅 IAE）＋首條鏈族訊息；注意此僅證明「有呼叫被拒」，
+            // 不等於「初驗後重驗命中」（靜態毒鏈初驗亦同訊息），重驗命中由下文
+            // `writeRevalidationGateRefusesMidOperationSwap` 以 preGateHook 確定性證明；
+            // root 定錨族 mismatch／identity 由 B2Test T1／F1 確定性覆蓋。
             assertTrue(
                 "expected some rejections, got denied=${denied.get()} rejected=${rejected.get()} " +
                     "(inside=${observedInside.get()} outsideReads=${observedOutside.get()} " +
-                    "flipOk=${flipOk.get()} dirFlipOk=${dirFlipOk.get()})",
+                    "readAttempts=${readAttempts.get()})",
                 rejected.get() > 0,
             )
             assertTrue(
                 "first rejection must be a chain reverify family, got ${firstRejection.get()}",
                 isChainRejectionMessage(firstRejection.get()),
             )
-            // 壓力有效性與進度證明：翻轉確實發生、各操作確實執行（非零覆蓋空轉）。
-            // flipOk 為檔翻轉主訊號（REPLACE 恆可覆蓋）；dirFlipOk 受非空目錄競爭影響
-            // 拆訊息以利歸因；讀進度以 inside＋outsideReads 之和證明（全撞窗口亦算執行）。
+            // 壓力有效性與進度證明：雙態翻轉確實發生、各操作確實執行（非零覆蓋空轉）。
+            // 讀進度以 attempts（300 次嘗試必達）證明執行；成功讀零（inside＋outside＝0）
+            // 在高翻轉下為合法全拒，Foss 曾以此 flaky（人審 P1#3），不得計為失敗。
             assertTrue(
-                "expected file flips to happen, got flipOk=${flipOk.get()}",
-                flipOk.get() > 0,
+                "expected file link flips, got fileLinkOk=${fileLinkOk.get()}",
+                fileLinkOk.get() > 0,
             )
             assertTrue(
-                "expected dir flips to happen, got dirFlipOk=${dirFlipOk.get()}",
-                dirFlipOk.get() > 0,
+                "expected file real flips, got fileRealOk=${fileRealOk.get()}",
+                fileRealOk.get() > 0,
             )
             assertTrue(
-                "expected reads to happen, got inside=${observedInside.get()} " +
-                    "outsideReads=${observedOutside.get()}",
-                observedInside.get() + observedOutside.get() > 0,
+                "expected dir link flips, got dirLinkOk=${dirLinkOk.get()}",
+                dirLinkOk.get() > 0,
+            )
+            assertTrue(
+                "expected dir real flips, got dirRealOk=${dirRealOk.get()}",
+                dirRealOk.get() > 0,
+            )
+            assertTrue(
+                "expected readers to run, got readAttempts=${readAttempts.get()}",
+                readAttempts.get() == READER_ROUNDS * 2,
             )
             assertTrue("expected lists to happen, got listOk=${listOk.get()}", listOk.get() > 0)
             assertTrue("expected deletes to happen, got deleteOk=${deleteOk.get()}", deleteOk.get() > 0)
 
-            // 安全重試／恢復：清理競爭殘留後 store 仍可寫可讀；毒連結單線程仍拒。
-            try {
-                val sub = File(ws, "race-sub")
-                if (Files.isSymbolicLink(sub.toPath())) Files.deleteIfExists(sub.toPath())
-            } catch (_: Exception) {
-            }
-            try {
-                Files.deleteIfExists(File(ws, "flip").toPath())
-            } catch (_: Exception) {
-            }
-            try {
-                File(ws, "race-sub").deleteRecursively()
-            } catch (_: Exception) {
-            }
+            // 安全重試／恢復：先 NOFOLLOW 移除翻轉殘留（絕不跟隨 symlink 進 outside，
+            // 人審 P2#1），再驗清理確實完成；store 仍可寫可讀證明恢復。
+            removePossiblyFlipped(File(ws, "race-sub"))
+            deleteQuietly(File(ws, "flip"))
             (ws.listFiles()?.toList() ?: emptyList())
                 .filter { it.name.startsWith(stageAnyPrefix()) }
                 .forEach {
-                    try {
-                        if (it.isDirectory) it.deleteRecursively() else it.delete()
-                    } catch (_: Exception) {
+                    if (it.isDirectory && !Files.isSymbolicLink(it.toPath())) {
+                        deleteNoFollowRecursively(it)
+                    } else {
+                        deleteQuietly(it)
                     }
                 }
             // 清理後毒鏈必須已除，否則恢復證明空洞。
@@ -559,14 +658,9 @@ class ScopedFileStoreConcurrencyPressureTest {
             }
             assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
         } finally {
-            try {
-                ws.deleteRecursively()
-            } catch (_: Exception) {
-            }
-            try {
-                out.deleteRecursively()
-            } catch (_: Exception) {
-            }
+            // NOFOLLOW 終兜：ws 可能殘留 race-sub 指外連結，絕不跟隨進 outside。
+            deleteNoFollowRecursively(ws)
+            deleteNoFollowRecursively(out)
         }
     }
 }

@@ -15,6 +15,7 @@ import dev.librepocket.provider.ProviderHttpConfig
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.provider.streamingFlow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -1013,6 +1014,46 @@ class TurnControllerTest {
       "unknown failure must not persist possibly-poisoned pending tools",
       sink.tools.isEmpty(),
     )
+  }
+
+  // P1 residual cross-layer pin (Current): production adapters wrap the
+  // stream in streamingFlow, so an unknown RuntimeException arrives as a
+  // Failed(UNKNOWN_RUNTIME) event — not as a direct throw. The controller
+  // must discard poison-adjacent pending ToolDeltas on that path too, while
+  // keeping visible text and without retrying.
+  @Test fun unknownRuntimeViaStreamingFlowDoesNotFlushNorRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      streamingFlow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw RuntimeException("boom-unknown")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, delays = delays, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertEquals(1, provider.streamCalls.get())
+    assertTrue("unknown failure schedules no backoff", delays.isEmpty())
+    assertTrue("unknown failure must not emit a retry notice", sink.retried.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertNotNull(c.uiState.value.error)
+    assertEquals(
+      "visible text stays, pending-tool marker is dropped",
+      "partial",
+      assistantsOf(c).single().text,
+    )
+    assertTrue(
+      "unknown failure via Failed event must not persist possibly-poisoned pending tools",
+      sink.tools.isEmpty(),
+    )
+    assertEquals("terminal failure must be recorded", 1, sink.failed.size)
   }
 
   @Test fun policyDenyBlocksSend() {

@@ -908,8 +908,15 @@ class ProviderTransportTest {
                 throw RuntimeException("boom-unknown")
             }.toList()
         }
+        assertEquals(2, events.size)
+        assertTrue(events[0] is StreamEvent.TextDelta)
         val failure = events.filterIsInstance<StreamEvent.Failed>().single()
         assertFalse("unknown runtime failure must not retry", failure.retryable)
+        assertEquals(
+            "unknown runtime must carry provenance so the controller can discard pending tools",
+            ProviderFailureCode.UNKNOWN_RUNTIME.name,
+            failure.code,
+        )
     }
 
     @Test

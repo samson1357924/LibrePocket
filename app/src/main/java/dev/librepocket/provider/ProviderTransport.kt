@@ -30,6 +30,14 @@ internal enum class ProviderFailureCode {
     /** Bounded finite body (model list) exceeded its byte budget. */
     TOO_LARGE,
     /**
+     * Unknown runtime failure from the provider stream (e.g. an unexpected
+     * `RuntimeException` that is neither a typed `ProviderFailure`, validation
+     * `IllegalArgumentException`, nor classified `IOException`). Always
+     * non-retryable and never flushes poison-adjacent pending tool fragments
+     * (see `shouldDiscardPendingTools`); the typed terminal is the record.
+     */
+    UNKNOWN_RUNTIME,
+    /**
      * A streaming aggregate exceeded its memory budget (per-tool-call
      * ToolDelta fragments, the per-attempt whole-round tool total, the
      * distinct-tool count, or one SSE event's total `data:` payload).
@@ -389,7 +397,10 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * so aggregation/SSE budget overflows (`AGG_TOO_LARGE` with distinct
  * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
  * messages) stay typed end-to-end for TurnController's pending-flush guard.
- * Other branches keep `code = null` (legacy/classified failures).
+ * Other branches keep `code = null` (legacy/classified failures), except the
+ * unknown-runtime fallback which carries `UNKNOWN_RUNTIME` so the controller
+ * can discard poison-adjacent pending tools without changing retry semantics
+ * of other fatal events (401/validation stay flushable).
  * Unknown runtime failures fail closed (`retryable = false`): only the
  * typed branches above may retry, and TurnController owns that budget.
  */
@@ -413,7 +424,13 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     val kind = ProviderErrorClassifier.classify(null, e, null)
                     emit(StreamEvent.Failed(redactedError("PROVIDER_TRANSPORT", e.message), kind == FailureKind.RETRYABLE))
                 }
-                else -> emit(StreamEvent.Failed(redactedError(e.message ?: "PROVIDER_FAILURE"), retryable = false))
+                else -> emit(
+                    StreamEvent.Failed(
+                        redactedError(e.message ?: "PROVIDER_FAILURE"),
+                        retryable = false,
+                        code = ProviderFailureCode.UNKNOWN_RUNTIME.name,
+                    ),
+                )
             }
         }
         .flowOn(Dispatchers.IO)

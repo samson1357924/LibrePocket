@@ -11,6 +11,7 @@ import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.SseFrameParser
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
+import dev.librepocket.provider.inferAggFailureCodeName
 import dev.librepocket.provider.requireToolAggBudget
 import dev.librepocket.provider.requireToolCountBudget
 import dev.librepocket.provider.requireTotalToolAggBudget
@@ -4536,8 +4537,11 @@ class TurnController(
         // code or overflow markers) must not flush poison-adjacent pending
         // ToolDeltas; already-completed ToolDone records stay (emitted inline
         // at collection time). Truncated fallback (failed == null) still
-        // flushes: isResourceExhausted(null) is false.
-        if (!isResourceExhausted(failed)) {
+        // flushes: shouldDiscardPendingTools(null) is false.
+        // P1 residual: an unknown-runtime Failed (typed UNKNOWN_RUNTIME code
+        // from streamingFlow) must also not flush, while other fatal events
+        // (401/validation with code == null) keep the historical flush.
+        if (!shouldDiscardPendingTools(failed)) {
           flushPendingTools()
         }
         if (!done && failed == null) {
@@ -4546,8 +4550,15 @@ class TurnController(
       } catch (e: CancellationException) {
         throw e
       } catch (e: ProviderFailure) {
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = e.retryable)
-        if (e.code != ProviderFailureCode.AGG_TOO_LARGE) {
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = e.retryable,
+          code = e.code?.name ?: inferAggFailureCodeName(e.message),
+        )
+        // Single source of truth with the Failed-event path above: discard
+        // covers typed AGG_TOO_LARGE (incl. message-inferred legacy shape)
+        // and UNKNOWN_RUNTIME; other ProviderFailures (e.g. 401) flush.
+        if (!shouldDiscardPendingTools(failed)) {
           flushPendingTools()
         }
         // AGG_TOO_LARGE is this collector's own guard: fail closed without
@@ -4564,8 +4575,13 @@ class TurnController(
         // Unknown runtime failure fails closed: never retry, never persist
         // possibly-poisoned pending tool fragments (mirrors the Error branch
         // below). TurnController is the sole retry owner; only explicit
-        // retryable Failed terminals retry.
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
+        // retryable Failed terminals retry. Carries UNKNOWN_RUNTIME so a
+        // forwarded terminal stays distinguishable from flushable fatals.
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = false,
+          code = ProviderFailureCode.UNKNOWN_RUNTIME.name,
+        )
       } catch (e: Throwable) {
         // S3-F1 Error symmetry (Current, option (a)): fatal Error from the
         // provider stream (e.g. AssertionError/LinkageError from a buggy
@@ -4578,7 +4594,11 @@ class TurnController(
         // (rethrown first above), so CE semantics are unchanged. VM-fatal
         // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
         if (e is VirtualMachineError || e is ThreadDeath) throw e
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = false,
+          code = ProviderFailureCode.UNKNOWN_RUNTIME.name,
+        )
       }
       val failure = failed
       if (failure == null) {
@@ -4942,4 +4962,22 @@ internal fun isResourceExhausted(failed: StreamEvent.Failed?): Boolean {
   return failed.message.contains(TOOL_ARGS_TOO_LARGE, ignoreCase = true) ||
     failed.message.contains(SseFrameParser.FRAME_TOO_LARGE_MESSAGE, ignoreCase = true) ||
     failed.message.contains("SSE_LINE_TOO_LONG", ignoreCase = true)
+}
+
+/**
+ * P1 residual: should a collected [StreamEvent.Failed] terminal discard
+ * poison-adjacent pending (never-`ToolDone`) tool fragments instead of
+ * flushing them?
+ *
+ * True when [isResourceExhausted] holds, or when `failed.code` is the typed
+ * `UNKNOWN_RUNTIME` name (`streamingFlow` unknown fallback and the
+ * direct-throw unknown/Error catches). Other fatal events with
+ * `code == null` (401/validation) keep the historical flush; already-emitted
+ * `ToolDone` records are unaffected (written inline at collection time).
+ * Null (truncated fallback, not yet failed) never discards.
+ */
+internal fun shouldDiscardPendingTools(failed: StreamEvent.Failed?): Boolean {
+  if (failed == null) return false
+  if (isResourceExhausted(failed)) return true
+  return failed.code?.equals(ProviderFailureCode.UNKNOWN_RUNTIME.name, ignoreCase = true) == true
 }

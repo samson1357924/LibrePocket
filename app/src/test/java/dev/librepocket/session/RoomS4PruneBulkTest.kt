@@ -2,6 +2,8 @@ package dev.librepocket.session
 
 import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.chat.loadModelHistory
+import java.io.File
+import java.nio.file.Files
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -40,30 +42,54 @@ class RoomS4PruneBulkTest {
         return RoomSessionStore(db) { now }
     }
 
+    /**
+     * R27-2 auto-prune-proof seeding (Current): head-orphan ledgers MUST be
+     * seeded via import (NOT appends) — appends auto-prune every 100 rows and
+     * the unconditional fixup would converge the head orphan mid-seed, so an
+     * append-seeded count never reaches 2001. Same pattern as
+     * `RoomR26FamilyAwarePruneTest.importRows` (deletePublishRace,
+     * fifteenHeadOrphans). Import bypasses the append counter, so the DB holds
+     * the exact pre-prune shape for the explicit prune under test.
+     */
+    private suspend fun importRows(rows: List<TranscriptEvent>): Pair<RoomSessionStore, String> {
+        val store = openStore()
+        val tmpDir = Files.createTempDirectory("s4-prune-test").toFile()
+        try {
+            val src = File(tmpDir, "seed.jsonl")
+            src.writeText(rows.joinToString("\n") { JsonlCodec.encode(it) } + "\n", Charsets.UTF_8)
+            val sid = store.importJsonl(src)
+            return store to sid
+        } finally {
+            tmpDir.deleteRecursively()
+        }
+    }
+
     @Test
     fun pruneCutsMarkerFirstPair_keptAssistantStaysSuspect() = runBlocking {
-        val store = openStore()
-        val sid = store.createSession("t", "m")
         // Marker-first production pair at head: reasoning seq1 + assistant seq2,
         // then 1999 qualifying filler rows (999 pairs + 1 user) => 2000 qualifying,
         // 2001 raw rows total. Prune keep-2000 raw deletes exactly the marker.
-        store.appendEvent(
-            TranscriptEvent(sessionId = sid, runId = "r-old", kind = "reasoning", text = "", createdAt = 1L),
+        // Seeded via import (NOT appends): see importRows KDoc above.
+        var seq = 1L
+        val rows = ArrayList<TranscriptEvent>(2001)
+        rows.add(
+            TranscriptEvent(seq = seq++, sessionId = "x", runId = "r-old", kind = "reasoning", text = "", createdAt = 1L),
         )
-        store.appendEvent(
-            TranscriptEvent(sessionId = sid, runId = "r-old", kind = "assistant", text = "a-old", createdAt = 1L),
+        rows.add(
+            TranscriptEvent(seq = seq++, sessionId = "x", runId = "r-old", kind = "assistant", text = "a-old", createdAt = 1L),
         )
         for (i in 0 until 999) {
-            store.appendEvent(
-                TranscriptEvent(sessionId = sid, runId = "fill-$i", kind = "user", text = "u-fill-$i", createdAt = 1L),
+            rows.add(
+                TranscriptEvent(seq = seq++, sessionId = "x", runId = "fill-$i", kind = "user", text = "u-fill-$i", createdAt = 1L),
             )
-            store.appendEvent(
-                TranscriptEvent(sessionId = sid, runId = "fill-$i", kind = "assistant", text = "a-fill-$i", createdAt = 1L),
+            rows.add(
+                TranscriptEvent(seq = seq++, sessionId = "x", runId = "fill-$i", kind = "assistant", text = "a-fill-$i", createdAt = 1L),
             )
         }
-        store.appendEvent(
-            TranscriptEvent(sessionId = sid, runId = "tail", kind = "user", text = "u-tail", createdAt = 1L),
+        rows.add(
+            TranscriptEvent(seq = seq, sessionId = "x", runId = "tail", kind = "user", text = "u-tail", createdAt = 1L),
         )
+        val (store, sid) = importRows(rows)
         assertEquals(2001, store.countEvents(sid))
         val result = store.prune(PrunePolicy())
         // R26-1 family-aware: raw cut deletes the marker (1) plus the whole cut
@@ -180,20 +206,24 @@ class RoomS4PruneBulkTest {
      */
     @Test
     fun suspectLifecycle_deleteClears_appendKeeps() = runBlocking {
-        // Room.
-        val room = openStore()
-        val rid = room.createSession("t", "m")
-        room.appendEvent(
-            TranscriptEvent(sessionId = rid, runId = "r", kind = "reasoning", text = "", createdAt = 1L),
+        // Room (seeded via import, NOT appends: appends auto-prune every 100
+        // rows and the R27-2 unconditional fixup would converge the head
+        // reasoning+assistant orphan mid-seed, so an append-seeded explicit
+        // prune would see deleted==0; see importRows KDoc above).
+        var seq = 1L
+        val seedRows = ArrayList<TranscriptEvent>(2001)
+        seedRows.add(
+            TranscriptEvent(seq = seq++, sessionId = "x", runId = "r", kind = "reasoning", text = "", createdAt = 1L),
         )
-        room.appendEvent(
-            TranscriptEvent(sessionId = rid, runId = "r", kind = "assistant", text = "a", createdAt = 1L),
+        seedRows.add(
+            TranscriptEvent(seq = seq++, sessionId = "x", runId = "r", kind = "assistant", text = "a", createdAt = 1L),
         )
         for (i in 0 until 1999) {
-            room.appendEvent(
-                TranscriptEvent(sessionId = rid, runId = "f-$i", kind = "user", text = "u$i", createdAt = 1L),
+            seedRows.add(
+                TranscriptEvent(seq = seq++, sessionId = "x", runId = "f-$i", kind = "user", text = "u$i", createdAt = 1L),
             )
         }
+        val (room, rid) = importRows(seedRows)
         val res = room.prune(PrunePolicy(maxEventsPerSession = 2000))
         assertTrue(res.deletedEvents > 0)
         assertTrue(room.isPruneSuspect(rid))

@@ -1105,6 +1105,48 @@ class TurnControllerTest {
     assertEquals(1, sink.failed.size)
   }
 
+  // Done-then-flush-failure pin (Current): finalization waits until the
+  // post-collection flush succeeds, so a flush budget failure after Done
+  // keeps isPartial=true and the failed fragment never replays as settled
+  // history. Boundary: delta bills 349520*3=1048560 (legal), the flush adds
+  // 21 synthetic chars (349541*3 overflows).
+  @Test fun doneThenFlushOverflowKeepsPartialAndExcludesHistory() {
+    val calls = AtomicInteger(0)
+    val provider = FakeLlmProvider { _ ->
+      if (calls.incrementAndGet() == 1) {
+        flow {
+          emit(StreamEvent.TextDelta(0, 0, "visible"))
+          emit(StreamEvent.ToolDelta(0, null, null, "y".repeat(349_520)))
+          emit(StreamEvent.Done("stop"))
+        }
+      } else {
+        flow { emit(StreamEvent.Done("stop")) }
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(
+      "flush overflow must surface the typed terminal, got: ${c.uiState.value.error}",
+      c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"),
+    )
+    assertTrue("no pending tool may be partially committed", sink.tools.isEmpty())
+    val failedBlock = assistantsOf(c).single()
+    assertTrue("failed fragment must stay partial", failedBlock.isPartial)
+    runBlocking {
+      c.send("next")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertTrue(
+      "failed partial must not replay as settled history, got: ${provider.seenRequests[1].messages}",
+      provider.seenRequests[1].messages.none { it.role == "assistant" },
+    )
+  }
+
   // IAE/unknown flush asymmetry pin (Current): IAE keeps the historical
   // flush (validation = request shape, same observable pending-tool behavior
   // as the pre-split generic branch), except legacy overflow-marker messages

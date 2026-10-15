@@ -4553,7 +4553,10 @@ class TurnController(
               writeNotice { orderedTranscript.onUsage(attemptRunId, event.inputTokens, event.outputTokens) }
             }
             is StreamEvent.Done -> {
-              finalizeAssistant(attemptRunId)
+              // Finalization waits until post-collection flush succeeds and
+              // no failure terminal exists (see the success block below): a
+              // flush budget failure after Done must keep isPartial=true so
+              // the failed fragment is never replayed as settled history.
               done = true
             }
             is StreamEvent.Failed -> failed = event
@@ -4663,6 +4666,11 @@ class TurnController(
       }
       val failure = failed
       if (failure == null) {
+        // Done arrived and post-collection flush succeeded: the fragment is
+        // genuinely settled. Finalize here (not at Done receipt) so a flush
+        // budget failure keeps isPartial=true per the failed-fragment
+        // contract below.
+        finalizeAssistant(attemptRunId)
         // Snapshot text: assistantTextOf reads uiState at execution time.
         val successText = assistantTextOf(attemptRunId)
         val successReasoning = assistantReasoningOf(attemptRunId)

@@ -33,10 +33,12 @@ Rules (test sources only, no prod change):
   REPEAT_WINDOW_LINES window instead of silently passing — the same
   span-evidence + scope rules still apply there. Known gaps (documented, not
   silent): fixtures passed through helper parameters, built indirectly,
-  sized via constants, or defined after the write (no `.repeat(N)` literal
-  shape / not visible) are not tracked — H1 is a tripwire, not a coverage
-  proof; a reference with no scope-visible huge definition passes
-  (precision: only a definite in-scope huge path fails).
+  sized via constants, built inside a `let`/`run` initializer
+  (`val x = cond.let { "x".repeat(100_000) }`, judged small by the
+  nested-block filter), or defined after the write (no `.repeat(N)`
+  literal shape / not visible) are not tracked — H1 is a tripwire, not
+  a coverage proof; a reference with no scope-visible huge definition
+  passes (precision: only a definite in-scope huge path fails).
 - H2 (unbounded row count, loop-local): a single `repeat(N>=2000)` loop must
   NOT contain a store write (`.appendEvent(` or the pre-redacted fast path)
   inside its actual brace-delimited body (column-aware single-line close;
@@ -127,14 +129,14 @@ ALLOWLIST_HUGE_TRUE_PATH = {
     "ChatSnapshotByteCapFullStressTest.kt",
 }
 
-# `val payload = "x".repeat(100_000)` (optionally typed:
-# `val payload: String = ...`) assigned anywhere in the file, with the repeat
-# count normalized (underscores stripped) against HUGE_FIXTURE_MIN. `.` and
-# `repeat` may split over spaces/tabs/masked comments (legal Kotlin), so the
-# dot-post gap is `\s*` (masked lines: comments already blank to spaces). The
-# fixture expression never crosses `;` (statement separator), so a same-line
-# `val a = huge; val b = small` attributes each count to its own definition
-# instead of greedily binding the last count to the first name.
+# Legacy single-match fixture recognizer, superseded for attribution (kept
+# for compatibility; new code enumerates per-def segments, see
+# `_scoped_var_defs`). A single `[^;\n]*` match cannot own a whole line:
+# it greedily binds the last `.repeat` on the line to the first name and
+# consumes the inner `val`, so `val payload = "q".also { val extra =
+# "x".repeat(100_000) }` misattributes. `.` and `repeat` may split over
+# spaces/tabs/masked comments (legal Kotlin), so the dot-post gap is
+# `\s*` (masked lines: comments already blank to spaces).
 HUGE_FIXTURE_MIN = 100_000
 FIXTURE_VAR_RE = re.compile(
     r"(?:val|var)\s+(\w+)\s*(?::\s*[^=\n]+?)?=[^;\n]*\.\s*repeat\s*\(\s*([\d_]+)"
@@ -499,18 +501,16 @@ def _repeat_block_slices(
 
 
 def _fixture_vars(content: str) -> set[str]:
-    """Variable names bound to a >=100k String.repeat fixture anywhere in the
-    file (typed or untyped declarations; `100000`/`100_000`/`150_000` all
-    normalize to the same threshold)."""
-    found: set[str] = set()
-    for m in FIXTURE_VAR_RE.finditer(content):
-        try:
-            size = int(m.group(2).replace("_", ""))
-        except ValueError:
-            continue
-        if size >= HUGE_FIXTURE_MIN:
-            found.add(m.group(1))
-    return found
+    """Test-only helper: names with any huge definition in the file.
+
+    Deprecated wrapper over `_scoped_var_defs` (same per-def segment +
+    nested-block attribution, so no dual source). Runs on masked lines,
+    so commented-out or string-demo declarations never count."""
+    masked = _masked_kotlin_lines(content.splitlines())
+    defs = _scoped_var_defs(masked, _brace_blocks(masked))
+    return {
+        name for name, entries in defs.items() if any(h for _, _, h in entries)
+    }
 
 
 def _strip_fast_path_spans(text: str) -> str:
@@ -620,8 +620,9 @@ def _line_has_big_inline_fixture(line: str) -> bool:
 
 
 # Any `val`/`var <name> = ...` declaration (typed or not) on one masked line;
-# huge-ness is decided separately by FIXTURE_VAR_RE + HUGE_FIXTURE_MIN, so a
-# small redefinition of the same name is recorded too (shadowing).
+# huge-ness is decided per def by its `;`-separated segment (see
+# `_scoped_var_defs`), so a small redefinition of the same name is recorded
+# too (shadowing).
 VAL_DEF_RE = re.compile(r"(?:val|var)\s+(\w+)\s*(?::\s*[^=\n]+?)?=")
 FUN_RE = re.compile(r"\bfun\b")
 
@@ -668,31 +669,55 @@ def _function_ranges(masked: list[str]) -> list[tuple[int, int]]:
     return ranges
 
 
-def _scoped_var_defs(masked: list[str]) -> dict[str, list[tuple[int, int, bool]]]:
+def _scoped_var_defs(
+    masked: list[str],
+    blocks: list[tuple[int, int, int, int]] | None = None,
+) -> dict[str, list[tuple[int, int, bool]]]:
     """All `val`/`var` definitions on masked lines: name -> sorted
     [(def_line, match_col, is_huge)], where huge means the definition's own
-    `;`-separated segment builds a `>=HUGE_FIXTURE_MIN` String.repeat fixture
-    (typed or untyped; the FIXTURE match starts at the same `val`/`var` with
-    the same name). Runs on masked lines so commented-out or string-demo
+    `;`-separated segment (its `=` through the next `;` or end of line)
+    builds a `>=HUGE_FIXTURE_MIN` String.repeat fixture at its own level
+    (typed or untyped; counts normalized with underscores stripped).
+    Every `.repeat(N)` in the segment is enumerated (one match per line no
+    longer owns the whole line), and a repeat inside a nested `{...}` block
+    whose `{` opens after this def's `=` does not count for the outer def —
+    so `val payload = "q".also { val extra = "x".repeat(100_000) }` leaves
+    the outer small while the inner `val` (whose `=` sits after the `{`)
+    owns the fixture. Runs on masked lines so commented-out or string-demo
     declarations never count. A same-line small redefinition of the same name
     is recorded as small (no line-level bleed), so shadowing still clears.
     The match column locates the def inside its lexical `{...}` block (see
-    `_def_enclosing_blocks`)."""
+    `_def_enclosing_blocks`). Known gap: a `let`/`run` initializer whose
+    huge repeat sits inside its own lambda
+    (`val x = cond.let { "x".repeat(100_000) }`) is judged small."""
+    if blocks is None:
+        blocks = _brace_blocks(masked)
     defs: dict[str, list[tuple[int, int, bool]]] = {}
     for idx, line in enumerate(masked):
-        fixtures: list[tuple[int, str, bool]] = []
-        for m in FIXTURE_VAR_RE.finditer(line):
-            try:
-                size = int(m.group(2).replace("_", ""))
-            except ValueError:
-                continue
-            fixtures.append((m.start(), m.group(1), size >= HUGE_FIXTURE_MIN))
         for m in VAL_DEF_RE.finditer(line):
             name = m.group(1)
-            is_huge = any(
-                fs == m.start() and fn == name and fh
-                for fs, fn, fh in fixtures
-            )
+            eq_col = m.end() - 1
+            semi = line.find(";", eq_col)
+            seg_end = semi if semi != -1 else len(line)
+            segment = line[eq_col:seg_end]
+            is_huge = False
+            for rm in STRING_REPEAT_N_RE.finditer(segment):
+                try:
+                    size = int(rm.group(1).replace("_", ""))
+                except ValueError:
+                    continue
+                if size < HUGE_FIXTURE_MIN:
+                    continue
+                r_col = eq_col + rm.start()
+                nested = any(
+                    (sl, sc) > (idx, eq_col)
+                    and (sl, sc) < (idx, r_col)
+                    and (el, ec) > (idx, r_col)
+                    for sl, sc, el, ec in blocks
+                )
+                if not nested:
+                    is_huge = True
+                    break
             defs.setdefault(name, []).append((idx, m.start(), is_huge))
     for entries in defs.values():
         entries.sort()
@@ -856,8 +881,9 @@ def _huge_loop_violation(
     single-line check).
     """
     ranges = _function_ranges(masked)
-    defs = _scoped_var_defs(masked)
-    def_blocks = _def_enclosing_blocks(masked, _brace_blocks(masked))
+    blocks = _brace_blocks(masked)
+    defs = _scoped_var_defs(masked, blocks)
+    def_blocks = _def_enclosing_blocks(masked, blocks)
     # Compile once per file (not per loop): PocketGuard perf suggestion.
     var_res = {
         name: re.compile(r"\b" + re.escape(name) + r"\b")

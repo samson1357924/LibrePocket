@@ -1365,6 +1365,162 @@ class CheckTestBudgetsTest(unittest.TestCase):
                     p = _write(Path(d), f"NamedMember{i}Test.kt", content)
                     self.assertEqual([], check_test_budgets.check_file(p))
 
+    def test_scoped_var_defs_also_fp_outer_small_inner_huge(self) -> None:
+        # R6P2-2 FP unit: the inner huge repeat lives inside the `also`
+        # block, so the outer def stays small and the inner owns it.
+        line = 'val payload = "q".also { val extra = "x".repeat(100_000) }'
+        defs = check_test_budgets._scoped_var_defs(
+            check_test_budgets._masked_kotlin_lines([line])
+        )
+        self.assertEqual([(0, 0, False)], defs["payload"])
+        self.assertEqual(
+            [(0, line.find("val", 1), True)], defs["extra"]
+        )
+
+    def test_scoped_var_defs_also_fn_outer_huge_inner_small(self) -> None:
+        # R6P2-2 FN unit: the outer huge repeat precedes the `also` block
+        # (top-level for this def), so it still counts; the inner small
+        # repeat is its own def.
+        line = (
+            'val payload = "x".repeat(100_000).also { '
+            'val small = "q".repeat(1) }'
+        )
+        defs = check_test_budgets._scoped_var_defs(
+            check_test_budgets._masked_kotlin_lines([line])
+        )
+        self.assertEqual([(0, 0, True)], defs["payload"])
+        self.assertEqual(
+            [(0, line.find("val", 1), False)], defs["small"]
+        )
+
+    def test_scoped_var_defs_same_root_two_repeats_huge(self) -> None:
+        # R6P2-2 third FN unit: two top-level repeats on one def — any
+        # top-level huge counts, in both orders.
+        for line in (
+            'val x = "b".repeat(100_000) + "a".repeat(1)',
+            'val x = "a".repeat(1) + "b".repeat(100_000)',
+        ):
+            with self.subTest(line=line):
+                defs = check_test_budgets._scoped_var_defs(
+                    check_test_budgets._masked_kotlin_lines([line])
+                )
+                self.assertEqual([(0, 0, True)], defs["x"])
+
+    def test_scoped_var_defs_multilayer_nested_inner_owns(self) -> None:
+        # R6P2-2 multilayer: the huge repeat sits two blocks deep, so only
+        # the innermost val owns it.
+        line = (
+            'val a = "q".also { val b = "w".also { '
+            'val c = "x".repeat(100_000) } }'
+        )
+        defs = check_test_budgets._scoped_var_defs(
+            check_test_budgets._masked_kotlin_lines([line])
+        )
+        self.assertEqual([(0, 0, False)], defs["a"])
+        second = line.find("val", 1)
+        third = line.find("val", second + 1)
+        self.assertEqual([(0, second, False)], defs["b"])
+        self.assertEqual([(0, third, True)], defs["c"])
+
+    def test_h1_also_fp_outer_small_passes(self) -> None:
+        # R6P2-2 end-to-end FP: the loop writes the outer small value; the
+        # huge fixture is block-local to `also` and invisible.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "AlsoFpTest.kt",
+                'val payload = "q".also { val extra = "x".repeat(100_000) }\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_also_fn_outer_huge_fails(self) -> None:
+        # R6P2-2 end-to-end FN: the loop writes the outer huge value; the
+        # trailing small `also` temporary must not clear it.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "AlsoFnTest.kt",
+                'val payload = "x".repeat(100_000).also { '
+                'val small = "q".repeat(1) }\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_same_root_two_repeats_fail(self) -> None:
+        # R6P2-2 same-root FN end-to-end, both orders: a def mixing a huge
+        # and a small top-level repeat is huge either way.
+        for i, rhs in enumerate(
+            (
+                '"b".repeat(100_000) + "a".repeat(1)',
+                '"a".repeat(1) + "b".repeat(100_000)',
+            )
+        ):
+            with self.subTest(i=i):
+                with tempfile.TemporaryDirectory() as d:
+                    p = _write(
+                        Path(d),
+                        f"SameRoot{i}Test.kt",
+                        f"val x = {rhs}\n"
+                        "repeat(100) {\n"
+                        "    store.appendEvent(event(sid, x))\n"
+                        "}\n",
+                    )
+                    v = check_test_budgets.check_file(p)
+                    self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_also_var_outer_huge_fails(self) -> None:
+        # R6P2-2 `var` variant: attribution is `val`/`var`-agnostic.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "AlsoVarTest.kt",
+                'var payload = "x".repeat(100_000).also { '
+                'var small = "q".repeat(1) }\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_also_typed_outer_huge_fails(self) -> None:
+        # R6P2-2 typed variant: the `: String` annotation does not move the
+        # `=` baseline for nested filtering.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "AlsoTypedTest.kt",
+                'val payload: String = "x".repeat(100_000).also { '
+                'val small = "q".repeat(1) }\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_let_initializer_huge_is_documented_gap(self) -> None:
+        # R6P2-2 documented gap: a `let` initializer returns the lambda
+        # result, so its huge repeat is nested and the outer def reads
+        # small. Pin the behavior so the gap is not "fixed" without a
+        # docstring update.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "LetGapTest.kt",
+                'val x = cond.let { "x".repeat(100_000) }\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, x))\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
     def test_main_scans_all_test_source_sets(self) -> None:
         # Stage 4C pin: the repo-wide scan covers all four test source sets,
         # not just `app/src/test`.

@@ -363,6 +363,96 @@ class CheckTestBudgetsTest(unittest.TestCase):
             v = check_test_budgets.check_file(p)
             self.assertTrue(any("H1" in x for x in v), v)
 
+    def test_h1_same_line_run_huge_does_not_leak(self) -> None:
+        # Stage P2-2 same-line close (FP): the huge `run` temporary ends
+        # on the same line before the write, so the outer small stays.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SameLineRunLeakTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                '    val payload = "q"\n'
+                "    repeat(100) { run { val payload = "
+                '"x".repeat(100_000) }; '
+                "store.appendEvent(event(sid, payload)) }\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_same_line_run_small_does_not_shadow_outer_huge(self) -> None:
+        # Stage P2-2 same-line close (FN): the small `run` temporary ends
+        # on the same line before the write, so the outer huge stays.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SameLineRunShadowTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                '    val payload = "x".repeat(100_000)\n'
+                '    repeat(100) { run { val payload = "q" }; '
+                "store.appendEvent(event(sid, payload)) }\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_same_line_def_after_use_passes(self) -> None:
+        # Stage P2-2 def-after-use: a huge def after the write on the
+        # same line is not visible to it (column-ordered, no backflow).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SameLineDefAfterUseTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                "    repeat(100) { store.appendEvent(event(sid, payload)); "
+                'val payload = "x".repeat(100_000) }\n'
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_multiline_span_same_line_close_huge_does_not_leak(
+        self,
+    ) -> None:
+        # Stage P2-2 multiline span (FP): the huge `run` block closes on
+        # the span's first line while the `payload` reference sits on the
+        # next line — per-reference columns keep it out of scope.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MultilineCloseLeakTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                '    val payload = "q"\n'
+                "    repeat(100) {\n"
+                '        run { val payload = "x".repeat(100_000) }; '
+                "store.appendEvent(\n"
+                "            event(sid, payload)\n"
+                "        )\n"
+                "    }\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_multiline_span_same_line_close_small_does_not_shadow(
+        self,
+    ) -> None:
+        # Stage P2-2 multiline span (FN): the small `run` block closes on
+        # the span's first line while the huge reference sits on the next
+        # line — the outer huge stays visible.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MultilineCloseShadowTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                '    val payload = "x".repeat(100_000)\n'
+                "    repeat(100) {\n"
+                '        run { val payload = "q" }; store.appendEvent(\n'
+                "            event(sid, payload)\n"
+                "        )\n"
+                "    }\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
     def test_h1_late_write_in_long_body_fails(self) -> None:
         # Stage 3 (c): a genuine huge write on the 16th body line — past the
         # old 12-line window — must still fail via the brace-aware body.

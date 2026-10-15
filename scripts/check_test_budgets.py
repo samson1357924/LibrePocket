@@ -367,16 +367,19 @@ def _repeat_body_lines(
 
 def _repeat_block_slices(
     masked: list[str], idx: int, match_end: int
-) -> list[tuple[int, str]] | None:
+) -> list[tuple[int, int, str]] | None:
     """Column-precise body slices for one `repeat` match.
 
-    Returns [(orig_line, substring)] covering only the brace-delimited
-    body: single-line bodies slice `{...}` (open col through the paired
-    `}`), multiline bodies take the header tail from `{`, full middle
-    lines, and the closer head through `}`. Runs on masked lines so
-    pairing is exact. Returns None when the header cannot be paired
-    (no `{` on the header line and none within +5 lines, or no close
-    found) — the caller keeps the legacy fail-closed window semantics.
+    Returns [(orig_line, start_col, substring)] covering only the
+    brace-delimited body: single-line bodies slice `{...}` (open col
+    through the paired `}`), multiline bodies take the header tail from
+    `{`, full middle lines, and the closer head through `}`. `start_col`
+    is the masked-line column where `substring` starts, so a body-text
+    offset maps back to `(orig_line, start_col + col_in_body)` for
+    same-line scope checks. Runs on masked lines so pairing is exact.
+    Returns None when the header cannot be paired (no `{` on the header
+    line and none within +5 lines, or no close found) — the caller keeps
+    the legacy fail-closed window semantics.
     """
     n = len(masked)
     if idx < 0 or idx >= n:
@@ -399,11 +402,11 @@ def _repeat_block_slices(
                     depth -= 1
                     if depth == 0:
                         if li == idx:
-                            return [(idx, text[open_col : col + 1])]
-                        segs = [(idx, masked[idx][open_col:])]
+                            return [(idx, open_col, text[open_col : col + 1])]
+                        segs = [(idx, open_col, masked[idx][open_col:])]
                         for mid in range(idx + 1, li):
-                            segs.append((mid, masked[mid]))
-                        segs.append((li, masked[li][: col + 1]))
+                            segs.append((mid, 0, masked[mid]))
+                        segs.append((li, 0, masked[li][: col + 1]))
                         return segs
                     if depth < 0:
                         return None
@@ -431,11 +434,11 @@ def _repeat_block_slices(
                 depth -= 1
                 if depth == 0:
                     if li == open_idx:
-                        return [(open_idx, text[first : col + 1])]
-                    segs = [(open_idx, masked[open_idx][first:])]
+                        return [(open_idx, first, text[first : col + 1])]
+                    segs = [(open_idx, first, masked[open_idx][first:])]
                     for mid in range(open_idx + 1, li):
-                        segs.append((mid, masked[mid]))
-                    segs.append((li, masked[li][: col + 1]))
+                        segs.append((mid, 0, masked[mid]))
+                    segs.append((li, 0, masked[li][: col + 1]))
                     return segs
                 if depth < 0:
                     return None
@@ -700,29 +703,35 @@ def _def_visible(
 def _nearest_visible_is_huge(
     defs: dict[str, list[tuple[int, int, bool]]],
     name: str,
-    span_line: int,
+    use_pos: tuple[int, int],
     loop_idx: int,
     ranges: list[tuple[int, int]],
     def_blocks: dict[tuple[int, int], tuple[int, int, int, int] | None] | None = None,
 ) -> bool:
     """Nearest-visible-definition rule: among scope-visible definitions of
-    `name` on or before the write span's line, the closest one decides — a
-    nearer small redefinition (shadowing) clears an outer huge fixture, and
-    no visible definition means unknown (precision: not huge, never fails).
+    `name` strictly before the variable reference `use_pos`
+    (use_line, use_col), the closest one decides — a nearer small
+    redefinition (shadowing) clears an outer huge fixture, and no visible
+    definition means unknown (precision: not huge, never fails).
 
     Besides the `fun`-level rule (`_def_visible`), a def is visible only
-    when its innermost enclosing `{...}` block still contains the write
-    span's line (top-level defs, block None, are visible everywhere): a
-    `run`/`if`/`also`/`let` temporary whose block already ended is never on
-    the write's path, while a def in the same function body or inside the
-    loop body before the write stays visible. A missing block entry is
-    treated as visible (fail-open for unmapped defs, never a new fail)."""
+    when its innermost enclosing `{...}` block still contains the
+    reference: `(end_line, end_col) > use_pos` (top-level defs, block
+    None, are visible everywhere). Column comparison keeps a same-line
+    `run { val payload = ... }; store.appendEvent(payload)` temporary
+    from leaking past its `}`, and a same-line
+    `store.appendEvent(payload); val payload = huge` definition from
+    flowing backwards. A missing block entry is treated as visible
+    (fail-open for unmapped defs, never a new fail)."""
+    use_line, use_col = use_pos
     best: tuple[int, int, bool] | None = None
     for ln, col, huge in defs.get(name, []):
-        if ln <= span_line and _def_visible(ranges, ln, loop_idx):
+        if (ln, col) < (use_line, use_col) and _def_visible(ranges, ln, loop_idx):
             if def_blocks is not None:
                 blk = def_blocks.get((ln, col))
-                if blk is not None and blk[2] < span_line:
+                if blk is not None and not (
+                    (blk[2], blk[3]) > (use_line, use_col)
+                ):
                     continue
             best = (ln, col, huge)
     return best is not None and best[2]
@@ -735,6 +744,29 @@ def _single_line_closed_body(header: str, match_end: int) -> bool:
     (fail-closed)."""
     open_col = header.find("{", match_end)
     return open_col != -1 and "}" in header[open_col + 1 :]
+
+
+def _body_offset_to_use_pos(
+    offset: int,
+    stripped: str,
+    line_map: list[int],
+    start_cols: list[int],
+) -> tuple[int, int]:
+    """Map a body-text offset to the `(orig_line, orig_col)` reference
+    position. `line_map[i]`/`start_cols[i]` locate body line `i` in the
+    masked source, so column `c` in the slice maps to
+    `start_cols[i] + c` — same-line `{...}` closes stay ordered against
+    the actual `payload` occurrence. Clamped to the last line (fail-open
+    for out-of-range offsets, never a new fail)."""
+    line_idx = stripped.count("\n", 0, offset)
+    if line_idx >= len(line_map):
+        line_idx = len(line_map) - 1
+    if line_idx < 0:
+        line_idx = 0
+    line_start = stripped.rfind("\n", 0, offset) + 1
+    orig_line = line_map[line_idx]
+    orig_col = start_cols[line_idx] + (offset - line_start)
+    return (orig_line, orig_col)
 
 
 def _huge_loop_violation(
@@ -751,7 +783,11 @@ def _huge_loop_violation(
     `>=100k` repeat; bare numbers never count). The old second disjunct (big fixture anywhere near any
     write) is deleted: building huge on one body line while writing small on
     another is not a costly path. Fast-path spans are blanked first, keeping
-    the per-call exemption without shifting span offsets.
+    the per-call exemption without shifting span offsets. Scope is
+    per-reference: each variable occurrence maps to its own
+    `(orig_line, orig_col)` via the slice `start_col`s, so a same-line
+    `run { ... }; store.appendEvent(payload)` close and a same-line
+    def-after-use order correctly.
     """
     ranges = _function_ranges(masked)
     defs = _scoped_var_defs(masked)
@@ -778,6 +814,7 @@ def _huge_loop_violation(
                 end = min(len(masked) - 1, idx + REPEAT_WINDOW_LINES - 1)
                 body_text = "\n".join(masked[start : end + 1])
                 line_map = list(range(start, end + 1))
+                start_cols = [0] * len(line_map)
             else:
                 slices = _repeat_block_slices(masked, idx, m.end())
                 if slices is None:
@@ -785,9 +822,11 @@ def _huge_loop_violation(
                     # open without a close): keep the legacy line range.
                     body_text = "\n".join(masked[start : end + 1])
                     line_map = list(range(start, end + 1))
+                    start_cols = [0] * len(line_map)
                 else:
-                    body_text = "\n".join(sub for _, sub in slices)
-                    line_map = [orig for orig, _ in slices]
+                    body_text = "\n".join(sub for _, _, sub in slices)
+                    line_map = [orig for orig, _, _ in slices]
+                    start_cols = [sc for _, sc, _ in slices]
             # Multiline span scan (body-local): blank fast-path spans first
             # to keep the per-call exemption, then pair parens from each
             # `.appendEvent(` start and judge the whole span as one string
@@ -798,17 +837,23 @@ def _huge_loop_violation(
             for span, off in _append_event_spans_with_offsets(stripped):
                 if _line_has_big_inline_fixture(span):
                     return True
-                span_line = line_map[stripped[:off].count("\n")]
                 for hm in HUGE_HINT_RE.finditer(span):
+                    use_pos = _body_offset_to_use_pos(
+                        off + hm.start(), stripped, line_map, start_cols
+                    )
                     if _nearest_visible_is_huge(
-                        defs, hm.group(0), span_line, idx, ranges, def_blocks
+                        defs, hm.group(0), use_pos, idx, ranges, def_blocks
                     ):
                         return True
                 for name, v in var_res.items():
-                    if v.search(span) and _nearest_visible_is_huge(
-                        defs, name, span_line, idx, ranges, def_blocks
-                    ):
-                        return True
+                    for vm in v.finditer(span):
+                        use_pos = _body_offset_to_use_pos(
+                            off + vm.start(), stripped, line_map, start_cols
+                        )
+                        if _nearest_visible_is_huge(
+                            defs, name, use_pos, idx, ranges, def_blocks
+                        ):
+                            return True
         # NOTE: no cross-line disjunction — a body line that builds a huge
         # fixture while a *different* write span carries no huge evidence is
         # not a definite costly path (precision over flag-for-review).
@@ -849,7 +894,7 @@ def _h2_loop_violation(
                     return f"repeat({m.group(1)})"
             elif any(
                 APPEND_EVENT_RE.search(sub) or FAST_PATH_RE.search(sub)
-                for _, sub in slices
+                for _, _, sub in slices
             ):
                 return f"repeat({m.group(1)})"
     return None

@@ -842,6 +842,126 @@ class CheckTestBudgetsTest(unittest.TestCase):
             v = check_test_budgets.check_file(p)
             self.assertTrue(any("H1" in x for x in v), v)
 
+    def test_h2_multiline_header_fails(self) -> None:
+        # P2-1 multiline: `repeat(` / count / `)` split across lines must
+        # still trip H2 (joined masked-text iteration, end-based pairing).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MultilineH2Test.kt",
+                "repeat(\n"
+                "  2000\n"
+                '){ store.appendEvent(event(sid, "q")) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h1_multiline_header_fails(self) -> None:
+        # P2-1 multiline H1: small-shape count split across lines with a
+        # huge write in the braced body.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MultilineH1Test.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "repeat(\n"
+                "  100\n"
+                ") {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h2_multiline_underscored_count_fails(self) -> None:
+        # `repeat(\\n 2_000\\n)` normalizes to 2000 across lines.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MultilineUnderTest.kt",
+                "repeat(\n"
+                "  2_000\n"
+                '){ store.appendEvent(event(sid, "q")) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h2_newline_before_paren_fails(self) -> None:
+        # `repeat\\n(2000)` — whitespace between the name and `(`.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NewlineParenTest.kt",
+                "repeat\n"
+                '(2000){ store.appendEvent(event(sid, "q")) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h2_block_comment_between_paren_and_count_fails(self) -> None:
+        # `repeat(/*c*/\\n 2000)` — masked comment is whitespace for `\\s*`.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "BlockCommentCountTest.kt",
+                "repeat(/*c*/\n"
+                "  2000)"
+                '{ store.appendEvent(event(sid, "q")) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h2_line_comment_between_paren_and_count_fails(self) -> None:
+        # `repeat( //...\\n 2000)` — line comment blanks to end of line.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "LineCommentCountTest.kt",
+                "repeat( // hi\n"
+                "  2000)"
+                '{ store.appendEvent(event(sid, "q")) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h2_multiline_small_count_passes(self) -> None:
+        # Threshold unchanged: multiline `1000` stays under H2.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MultilineSmallH2Test.kt",
+                "repeat(\n"
+                "  1000\n"
+                '){ store.appendEvent(event(sid, "q")) }\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_multiline_small_count_passes(self) -> None:
+        # Threshold unchanged: multiline `5` stays under H1.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MultilineSmallH1Test.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "repeat(\n"
+                "  5\n"
+                ") {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_dot_newline_repeat_passes(self) -> None:
+        # `foo.\\nrepeat(2000)` is member access, not a loop (post-filter).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotNewlineTest.kt",
+                "foo.\n"
+                'repeat(2000){ store.appendEvent(event(sid, "q")) }\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
 
 if __name__ == "__main__":
     unittest.main()

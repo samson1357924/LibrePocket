@@ -54,11 +54,21 @@ import java.util.concurrent.atomic.AtomicReference
  *   inode fileKey 語義，見 `assumeNonWindows`）。
  * - 宿主機語義≠裝置語義：裝置 ext4／f2fs、排程器、SELinux、程序隔離皆不同，
  *   本測試不宣稱任何裝置結論；裝置行為另由 `androidTest`／裝置驗證覆蓋。
+ * - flipper 僅建模 symlink＋rename（hardlink／mount 同生產列 out-of-scope，
+ *   見 [ScopedFileStore] 類註解）；`outsideExtra` 僅頂層診斷（`deep` 穿出落
+ *   `out/deep` 下只見頂層名，內容遞迴未驗，刻意 flakiness 取捨）。
  */
 class ScopedFileStoreConcurrencyPressureTest {
 
     private companion object {
         const val SECRET = "OUTSIDE-SECRET-pressure"
+        // staging 前綴錨定生產常數：若 TMP_NAME_PREFIX 變更，此處同步跟隨，
+        // 避免清理塊靜默變 no-op（PocketGuard PR91 WARN）。
+        val STAGE_FILE_INFIX = "stage-f-"
+        val STAGE_DIR_INFIX = "stage-d-"
+        fun stageFilePrefix(): String = ScopedFileStore.TMP_NAME_PREFIX + STAGE_FILE_INFIX
+        fun stageDirPrefix(): String = ScopedFileStore.TMP_NAME_PREFIX + STAGE_DIR_INFIX
+        fun stageAnyPrefix(): String = ScopedFileStore.TMP_NAME_PREFIX + "stage-"
     }
 
     private fun workspace(): File =
@@ -128,9 +138,9 @@ class ScopedFileStoreConcurrencyPressureTest {
         val ws = workspace()
         val out = outside()
         try {
-            File(out, "secret.txt").writeText(SECRET)
+            File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
             val store = ScopedFileStore(ws)
-            store.write("stable/file.txt", "seed".toByteArray())
+            store.write("stable/file.txt", "seed".toByteArray(Charsets.UTF_8))
 
             val startGate = CountDownLatch(1)
             val errors = AtomicReference<Throwable?>(null)
@@ -151,7 +161,8 @@ class ScopedFileStoreConcurrencyPressureTest {
             }
 
             // 攻擊者一：rename 式檔案翻轉（真檔 ↔ 指外 symlink），暫存前綴
-            // `.lp-` 使列目守衛忽略 staging 殘留（見 TMP_NAME_PREFIX）。
+            // 以 ScopedFileStore.TMP_NAME_PREFIX 錨定（檔暫存被列目守衛忽略；
+            // 目錄暫存為空故無條目，見 ScopedFileStore list 過濾段）。
             val fileFlipper = Runnable {
                 try {
                     if (!startGate.await(30, TimeUnit.SECONDS)) {
@@ -161,7 +172,9 @@ class ScopedFileStoreConcurrencyPressureTest {
                     repeat(150) { i ->
                         val flip = File(ws, "flip")
                         // JDK17 相容：threadId() 需 19+，測試僅需唯一性用 deprecated id 即可。
-                        val staged = File(ws, ".lp-stage-f-${Thread.currentThread().id}-$i")
+                        @Suppress("DEPRECATION")
+                        val tid = Thread.currentThread().id
+                        val staged = File(ws, stageFilePrefix() + "${tid}-$i")
                         try {
                             try {
                                 Files.deleteIfExists(staged.toPath())
@@ -173,7 +186,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                                     File(out, "secret.txt").toPath(),
                                 )
                             } else {
-                                staged.writeText("inside-$i")
+                                staged.writeText("inside-$i", Charsets.UTF_8)
                             }
                             if (renameReplace(staged, flip)) flipOk.incrementAndGet()
                         } catch (_: Exception) {
@@ -200,7 +213,9 @@ class ScopedFileStoreConcurrencyPressureTest {
                     repeat(100) { i ->
                         val sub = File(ws, "race-sub")
                         // JDK17 相容：見 fileFlipper 註解。
-                        val staged = File(ws, ".lp-stage-d-${Thread.currentThread().id}-$i")
+                        @Suppress("DEPRECATION")
+                        val tid = Thread.currentThread().id
+                        val staged = File(ws, stageDirPrefix() + "${tid}-$i")
                         try {
                             try {
                                 Files.deleteIfExists(staged.toPath())
@@ -287,15 +302,15 @@ class ScopedFileStoreConcurrencyPressureTest {
                     repeat(80) { i ->
                         // 穩定路徑永不翻轉：任何 IAE 皆為誤拒（false-positive），記 errors 不進 denied。
                         try {
-                            store.write("stable/file.txt", "v$i".toByteArray())
+                            store.write("stable/file.txt", "v$i".toByteArray(Charsets.UTF_8))
                         } catch (t: Throwable) {
                             errors.compareAndSet(null, t)
                         }
                         try {
                             if (i % 2 == 0) {
-                                store.write("race-sub/race-file.txt", "race-v$i".toByteArray())
+                                store.write("race-sub/race-file.txt", "race-v$i".toByteArray(Charsets.UTF_8))
                             } else {
-                                store.write("race-sub/deep/file-$i.txt", "race-v$i".toByteArray())
+                                store.write("race-sub/deep/file-$i.txt", "race-v$i".toByteArray(Charsets.UTF_8))
                             }
                         } catch (e: IllegalArgumentException) {
                             noteDenied(e)
@@ -314,7 +329,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                 }
             }
 
-            // 列目者：結構性質與競態無關，嚴格斷言（相對路徑、無穿越段）。
+            // 列目者：結構性質與競態無關，嚴格斷言（相對路徑、無穿越段、無暫存洩露）。
             val lister = Runnable {
                 try {
                     if (!startGate.await(30, TimeUnit.SECONDS)) {
@@ -334,6 +349,14 @@ class ScopedFileStoreConcurrencyPressureTest {
                                 errors.compareAndSet(
                                     null,
                                     AssertionError("list unsanitized: $listed"),
+                                )
+                            }
+                            // staging 過濾：檔暫存以前綴被守衛忽略（BudgetTest.listSkipsTmpFiles
+                            // 靜態覆蓋，本處併發覆蓋）；目錄暫存為空故無條目。
+                            if (listed.any { it.contains(ScopedFileStore.TMP_NAME_PREFIX) }) {
+                                errors.compareAndSet(
+                                    null,
+                                    AssertionError("list leaks staging: $listed"),
                                 )
                             }
                             listOk.incrementAndGet()
@@ -357,7 +380,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                         val ephemeral = "ephemeral-$i.txt"
                         // ephemeral 為 deleter 獨佔檔名（flipper 不碰）：IAE 屬誤拒記 errors。
                         try {
-                            store.write(ephemeral, "e".toByteArray())
+                            store.write(ephemeral, "e".toByteArray(Charsets.UTF_8))
                         } catch (t: Throwable) {
                             errors.compareAndSet(null, t)
                         }
@@ -412,7 +435,7 @@ class ScopedFileStoreConcurrencyPressureTest {
             errors.get()?.let { throw AssertionError("stress failed", it) }
 
             // 有界斷言一：outside 秘密未被竄改；穩定路徑寫入未穿出。
-            assertEquals(SECRET, File(out, "secret.txt").readText())
+            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
             assertFalse("stable writer must not escape", File(out, "file.txt").exists())
             val outsideExtra = (out.listFiles()?.map { it.name }?.toSet() ?: emptySet()) -
                 setOf("secret.txt")
@@ -472,16 +495,31 @@ class ScopedFileStoreConcurrencyPressureTest {
             } catch (_: Exception) {
             }
             (ws.listFiles()?.toList() ?: emptyList())
-                .filter { it.name.startsWith(".lp-stage-") }
+                .filter { it.name.startsWith(stageAnyPrefix()) }
                 .forEach {
                     try {
                         if (it.isDirectory) it.deleteRecursively() else it.delete()
                     } catch (_: Exception) {
                     }
                 }
-            store.write("after-pressure.txt", "ok".toByteArray())
+            // 清理後毒鏈必須已除，否則恢復證明空洞。
+            assertFalse(
+                "race-sub staging must be cleaned",
+                File(ws, "race-sub").let { Files.isSymbolicLink(it.toPath()) } ||
+                    (ws.listFiles()?.any { it.name.startsWith(stageAnyPrefix()) } == true),
+            )
+            store.write("after-pressure.txt", "ok".toByteArray(Charsets.UTF_8))
             assertEquals("ok", String(store.read("after-pressure.txt"), Charsets.UTF_8))
-            // 確定性錨點：事後毒鏈仍拒（併發 denied>0 為壓力證據，本段為確定性對照）。
+            // 恢復後列目 sane＋刪除往返。
+            assertTrue(store.list().none { it.contains(ScopedFileStore.TMP_NAME_PREFIX) })
+            assertTrue(store.delete("after-pressure.txt"))
+            store.write("after-pressure.txt", "ok".toByteArray(Charsets.UTF_8))
+            assertEquals("ok", String(store.read("after-pressure.txt"), Charsets.UTF_8))
+            // 確定性錨點：事後毒鏈四操作仍拒（併發 rejected>0 為壓力證據，本段為確定性對照）。
+            try {
+                Files.deleteIfExists(File(ws, "post-link").toPath())
+            } catch (_: Exception) {
+            }
             Files.createSymbolicLink(
                 File(ws, "post-link").toPath(),
                 File(out, "secret.txt").toPath(),
@@ -492,7 +530,19 @@ class ScopedFileStoreConcurrencyPressureTest {
             } catch (e: IllegalArgumentException) {
                 assertTrue(isRejectionMessage(e.message))
             }
-            assertEquals(SECRET, File(out, "secret.txt").readText())
+            try {
+                store.write("post-link", "x".toByteArray(Charsets.UTF_8))
+                fail("expected IllegalArgumentException: post-link write")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(isRejectionMessage(e.message))
+            }
+            try {
+                store.delete("post-link")
+                fail("expected IllegalArgumentException: post-link delete")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(isRejectionMessage(e.message))
+            }
+            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
         } finally {
             try {
                 ws.deleteRecursively()

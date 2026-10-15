@@ -1,6 +1,8 @@
 package dev.librepocket.agent.ui.setup
 
+import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.lifecycle.viewModelScope
 import dev.librepocket.agent.ui.chat.VaultSource
@@ -11,14 +13,23 @@ import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
+import java.io.IOException
 import java.nio.file.Files
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -587,5 +598,116 @@ class SetupEndpointIdMigrationTest {
         }
     }
 
+    /**
+     * P2 retry: a transient read failure leaves the prefill unmarked, so a
+     * later entry recovers the legacy address instead of staying disabled.
+     */
+    @Test
+    fun legacyMigrationPrefillRetriesAfterTransientReadFailure() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val dir = Files.createTempDirectory("setup-migration-retry").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val raw = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "migration-retry.preferences_pb") },
+        )
+        EndpointStore(raw).save(legacyCustom(url))
+        // The probe and the first prefill each consume one failing read
+        // (the probe reads first); every later read succeeds.
+        val store = EndpointStore(FailFirstReadsDataStore(raw, failReads = 2))
+        val vault = CountingVault()
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
 
+        assertTrue(vm.probeLegacyMigration() is SetupViewModel.LegacyMigrationProbe.RetryLater)
+        vm.prefillLegacyMigrationIfNeeded()
+        assertEquals(ProviderCatalog.OPENAI_ID, vm.form.value.presetId)
+
+        assertTrue(vm.probeLegacyMigration() is SetupViewModel.LegacyMigrationProbe.Available)
+        vm.prefillLegacyMigrationIfNeeded()
+        assertEquals(url, vm.form.value.baseUrl)
+        assertEquals("SETUP_MIGRATION_REKEY_REQUIRED", vm.form.value.errorCode)
+    }
+
+    /**
+     * P2 cancellation: cancelling the prefill mid-read releases the
+     * in-flight guard without marking success, so a re-entered Setup entry
+     * still recovers.
+     */
+    @Test
+    fun legacyMigrationPrefillRetriesAfterCancellation() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val dir = Files.createTempDirectory("setup-migration-cancel").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val raw = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "migration-cancel.preferences_pb") },
+        )
+        EndpointStore(raw).save(legacyCustom(url))
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val store = EndpointStore(GateFirstReadDataStore(raw, entered, release))
+        val vault = CountingVault()
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+
+        val job = launch { vm.prefillLegacyMigrationIfNeeded() }
+        withTimeout(10_000) { entered.await() }
+        job.cancelAndJoin()
+        release.complete(Unit)
+        assertEquals(ProviderCatalog.OPENAI_ID, vm.form.value.presetId)
+
+        vm.prefillLegacyMigrationIfNeeded()
+        assertEquals(url, vm.form.value.baseUrl)
+        assertEquals("SETUP_MIGRATION_REKEY_REQUIRED", vm.form.value.errorCode)
+    }
+}
+
+/** DataStore wrapper failing the first [failReads] reads, then delegating. */
+private class FailFirstReadsDataStore(
+    private val delegate: DataStore<Preferences>,
+    failReads: Int,
+    private val error: IOException = IOException("STRICT_READ_FAILED"),
+) : DataStore<Preferences> {
+    private val remaining = AtomicInteger(failReads)
+    override val data: Flow<Preferences>
+        get() = flow {
+            if (remaining.getAndDecrement() > 0) throw error
+            emitAll(delegate.data)
+        }
+    override suspend fun updateData(transform: suspend (Preferences) -> Preferences): Preferences =
+        delegate.updateData(transform)
+}
+
+/** DataStore wrapper suspending the first read until [release], then delegating. */
+private class GateFirstReadDataStore(
+    private val delegate: DataStore<Preferences>,
+    private val entered: CompletableDeferred<Unit>,
+    private val release: CompletableDeferred<Unit>,
+) : DataStore<Preferences> {
+    private val gated = AtomicBoolean(true)
+    override val data: Flow<Preferences>
+        get() = flow {
+            if (gated.compareAndSet(true, false)) {
+                entered.complete(Unit)
+                release.await()
+            }
+            emitAll(delegate.data)
+        }
+    override suspend fun updateData(transform: suspend (Preferences) -> Preferences): Preferences =
+        delegate.updateData(transform)
 }

@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -127,6 +128,49 @@ private class RecordingSink : TranscriptSink {
     cancelled.add(runId to partialText)
     cancelledReasoning.add(hasReasoning)
   }
+  // S5 production-like sink: overrides every full form it can receive (the
+  // lossy interface defaults throw instead of downgrading; a base-only sink
+  // fails closed — pinned by TranscriptSinkLegacyFailClosedTest). Each
+  // override forwards exactly as the pre-S5 defaults did, so retry /
+  // reasoning / attempt-bound rows keep landing in the recorded lists.
+  override suspend fun onTurnSucceeded(
+    runId: String,
+    text: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = onTurnSucceeded(runId, text, hasReasoning)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) = onTurnFailed(runId, partialText, error)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+  ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+    hasReasoning: Boolean,
+  ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
+  override suspend fun onTurnCancelled(
+    runId: String,
+    partialText: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = onTurnCancelled(runId, partialText, hasReasoning)
   override suspend fun onSteerQueued(text: String) { steerQueued.add(text) }
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) {
     tools.add(Tool(runId, toolIndex, id, name, argumentsJson))
@@ -2451,6 +2495,98 @@ class TurnControllerTest {
     }
   }
 
+  @Test fun promotionProjectsStreamingOnlyAfterDurableUserRowAck() {
+    val firstTurnGate = CompletableDeferred<Unit>()
+    val promotionParked = CountDownLatch(1)
+    val releasePromotionAwait = CountDownLatch(1)
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    c.beforePromotionAwaitForTest = {
+      promotionParked.countDown()
+      check(releasePromotionAwait.await(30, TimeUnit.SECONDS))
+    }
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls.get() == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow", opId = 174) })
+      firstTurnGate.complete(Unit)
+      assertTrue("promotion did not reach its durable await", promotionParked.await(5, TimeUnit.SECONDS))
+      // R5-2 SIGKILL-window property: STREAMING stays behind the durable ack —
+      // the intent still sits in the FIFO, the UI waits, nothing launched.
+      assertEquals(ChatStatus.WAITING_STEERED, c.uiState.value.status)
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(1, provider.streamCalls.get())
+      releasePromotionAwait.countDown()
+      runBlocking { withTimeout(5_000) { first.join() } }
+      awaitTrue { c.uiState.value.status == ChatStatus.IDLE && usersOf(c).size == 2 }
+      assertEquals(listOf("first", "follow"), usersOf(c))
+      assertEquals(2, provider.streamCalls.get())
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      assertTrue(c.drainQueued().isEmpty())
+    } finally {
+      releasePromotionAwait.countDown()
+      firstTurnGate.complete(Unit)
+      outer.cancel()
+      c.close()
+    }
+  }
+
+  @Test fun closeDuringPromotionAwaitNeverLaunchesFollowUp() {
+    val firstTurnGate = CompletableDeferred<Unit>()
+    val promotionParked = CountDownLatch(1)
+    val releasePromotionAwait = CountDownLatch(1)
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = AllowPolicy(),
+      transcript = sink,
+      dispatcher = Dispatchers.Default,
+      newId = { "id-${n++}" },
+    )
+    c.beforePromotionAwaitForTest = {
+      promotionParked.countDown()
+      check(releasePromotionAwait.await(30, TimeUnit.SECONDS))
+    }
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls.get() == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow", opId = 75) })
+      firstTurnGate.complete(Unit)
+      assertTrue("promotion did not reach its durable await", promotionParked.await(5, TimeUnit.SECONDS))
+      // Close wins while the follow-up user row is still undurable: the
+      // intent is dropped by lifecycle contract (drain-before-close was
+      // skipped), but the follow-up must never launch nor append.
+      c.close()
+      releasePromotionAwait.countDown()
+      runBlocking { withTimeout(5_000) { first.join() } }
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(1, provider.streamCalls.get())
+      assertTrue(c.drainQueued().isEmpty())
+      assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+      assertEquals(listOf("first"), sink.started.map { it.second })
+    } finally {
+      releasePromotionAwait.countDown()
+      firstTurnGate.complete(Unit)
+      outer.cancel()
+      c.close()
+    }
+  }
+
   @Test fun cancelAfterSuccessfulPromotionCancelsFollowUpExactlyOnce() {
     val firstTurnGate = CompletableDeferred<Unit>()
     val gatePassed = CountDownLatch(1)
@@ -2509,6 +2645,362 @@ class TurnControllerTest {
       assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
     } finally {
       releaseHandoff.countDown()
+      c.close()
+    }
+  }
+
+  /**
+   * R6-1 promotion UNKNOWN late-commit: the follow-up user-row send already
+   * entered the channel (send proof true) but its ack timed out. Ownership is
+   * retained under the SAME logical id (not dropped like the old
+   * `failPromotion("transcript store pending")`): the FIFO head stays queued
+   * with pending (NOT recovery, so it is not reclaimable), the same-opId
+   * resend is blocked, and bounded settle claims the ghost (Lock-2 commit,
+   * same id, single UI row, single provider call).
+   */
+  @Test fun promotionUnknownLateCommitMustNotDuplicateOnReclaimRetry() {
+    val firstGate = CompletableDeferred<Unit>()
+    val followStoreGate = CompletableDeferred<Unit>()
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "first") firstGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    val blockingSink = object : TranscriptSink by sink {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        if (text == "follow") followStoreGate.await()
+        sink.onTurnStarted(runId, text)
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = AllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "puk-${n++}" },
+      acceptTimeoutMs = 305L,
+    )
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls.get() == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow", opId = 77L) })
+      firstGate.complete(Unit)
+      // Promotion await times out after send (ghost parked in the delegate):
+      // UNKNOWN ownership retained, pending — not recovery.
+      awaitTrue(timeoutMs = 8000) { c.hasPendingAdmission() }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals("transcript store pending", c.uiState.value.error)
+      assertTrue(c.hasPendingAdmission())
+      assertFalse(
+        "UNKNOWN must not project recovery (only definitely-unwritten work is reclaimable)",
+        c.uiState.value.queuedRecoveryRequired,
+      )
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertEquals(listOf("first"), usersOf(c))
+      // FIFO must NOT be reclaimable while UNKNOWN: same-id settle owns it.
+      try {
+        c.drainQueued()
+        fail("drainQueued during promotion UNKNOWN must throw TranscriptPendingException")
+      } catch (_: TranscriptPendingException) {
+        // Expected: ownership retained, no steal.
+      }
+      assertEquals("blocked reclaim must retain the head", 1, c.uiState.value.pendingSteerCount)
+      // Same-opId explicit retry is blocked (no second row, no resend).
+      try {
+        runBlocking { c.startOrEnqueue("follow", opId = 77L) }
+        fail("same-opId retry during promotion UNKNOWN must throw TranscriptPendingException")
+      } catch (_: TranscriptPendingException) {
+        // Expected: ghost already owns opId 77.
+      }
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(1, provider.streamCalls.get())
+      // Late commit: unblock the writer, settle claims under the SAME id.
+      followStoreGate.complete(Unit)
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.hasPendingAdmission()) {
+            c.settlePendingAdmission(500L)
+            delay(25)
+          }
+        }
+        withTimeout(8_000) {
+          while (c.uiState.value.status != ChatStatus.IDLE) delay(10)
+        }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals(listOf("first", "follow"), usersOf(c))
+      assertEquals(1, usersOf(c).count { it == "follow" })
+      assertEquals("follow must reach the provider exactly once", 2, provider.streamCalls.get())
+      assertEquals(
+        "claimed ghost keeps exactly one ledger row (no resend duplicate)",
+        1,
+        sink.started.count { it.second == "follow" },
+      )
+      assertEquals(2, sink.started.size)
+      assertTrue(c.drainQueued().isEmpty())
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      assertFalse(c.uiState.value.queuedRecoveryRequired)
+      runBlocking { withTimeout(5_000) { first.join() } }
+    } finally {
+      firstGate.complete(Unit)
+      followStoreGate.complete(Unit)
+      outer.cancel()
+      c.close()
+    }
+  }
+
+  /**
+   * R6-1 promotion UNKNOWN cancel wins: the user presses cancel while the
+   * follow-up ghost is still pending (ERROR `transcript store pending`,
+   * predecessor already completed so [cancel] would previously be a no-op).
+   * Settle must abort the follow-up launch (mirror Lock-2 CANCELLED guard) and
+   * take the convert-like transition — FIFO retained, ERROR +
+   * reclaimable, no second ledger row, no provider call.
+   */
+  @Test fun cancelWinsDuringPromotionUnknownRetainsFifoWithoutLaunch() {
+    val firstGate = CompletableDeferred<Unit>()
+    val followStoreGate = CompletableDeferred<Unit>()
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "first") firstGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    val blockingSink = object : TranscriptSink by sink {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        if (text == "follow") followStoreGate.await()
+        sink.onTurnStarted(runId, text)
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = AllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "pcuk-${n++}" },
+      acceptTimeoutMs = 305L,
+    )
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls.get() == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow", opId = 77L) })
+      firstGate.complete(Unit)
+      awaitTrue(timeoutMs = 8000) { c.hasPendingAdmission() }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals("transcript store pending", c.uiState.value.error)
+      assertFalse(c.uiState.value.queuedRecoveryRequired)
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertEquals(listOf("first"), usersOf(c))
+
+      // Cancel in the promotion UNKNOWN window (no active host, no direct
+      // pending): must record the promotion id, not be a no-op.
+      c.cancel()
+      assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+      // Ownership still pending until settle: reclaim stays blocked.
+      try {
+        c.drainQueued()
+        fail("drainQueued during promotion UNKNOWN cancel must still throw TranscriptPendingException")
+      } catch (_: TranscriptPendingException) {
+        // Expected.
+      }
+
+      // Late commit races the recorded cancel: settle must NOT launch.
+      followStoreGate.complete(Unit)
+      runBlocking {
+        withTimeout(8_000) {
+          while (c.hasPendingAdmission()) {
+            c.settlePendingAdmission(500L)
+            delay(25)
+          }
+        }
+        withTimeout(8_000) {
+          while (!(c.uiState.value.status == ChatStatus.ERROR && c.uiState.value.queuedRecoveryRequired)) delay(10)
+        }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals("cancel must abort the follow-up launch", 1, provider.streamCalls.get())
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertEquals("turn admission cancelled", c.uiState.value.error)
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertTrue(c.uiState.value.queuedRecoveryRequired)
+      assertEquals(
+        "cancelled ghost keeps exactly one ledger row (no duplicate follow row)",
+        1,
+        sink.started.count { it.second == "follow" },
+      )
+      // FIFO retained for explicit recovery (reclaimable now that ownership cleared).
+      assertEquals(listOf(QueuedIntent(77L, "follow")), c.drainQueued())
+      assertTrue(c.drainQueued().isEmpty())
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(1, provider.streamCalls.get())
+      runBlocking { withTimeout(5_000) { first.join() } }
+    } finally {
+      firstGate.complete(Unit)
+      followStoreGate.complete(Unit)
+      outer.cancel()
+      c.close()
+    }
+  }
+
+  /**
+   * R6-1 promotion UNKNOWN close wins (aligns with
+   * `closeDuringPromotionAwaitNeverLaunchesFollowUp` for the await window):
+   * close drops the FIFO per the drain-before-close contract (UNKNOWN heads
+   * are excepted from reclaim — see [TurnController.close]), never launches
+   * the follow-up, and leaves at most the single ghost orphan row.
+   */
+  @Test fun closeWinsDuringPromotionUnknownDropsFifoWithoutLaunch() {
+    val firstGate = CompletableDeferred<Unit>()
+    val followStoreGate = CompletableDeferred<Unit>()
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "first") firstGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    val blockingSink = object : TranscriptSink by sink {
+      override suspend fun onTurnStarted(runId: String, text: String) {
+        if (text == "follow") followStoreGate.await()
+        sink.onTurnStarted(runId, text)
+      }
+    }
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = AllowPolicy(),
+      transcript = blockingSink,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "cuk-${n++}" },
+      acceptTimeoutMs = 305L,
+    )
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls.get() == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow", opId = 78L) })
+      firstGate.complete(Unit)
+      awaitTrue(timeoutMs = 8000) { c.hasPendingAdmission() }
+      assertEquals(listOf("first"), usersOf(c))
+
+      // Close wins while the ghost is still pending: FIFO dropped, ownership cleared.
+      c.close()
+      assertFalse(c.hasPendingAdmission())
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      assertTrue(c.drainQueued().isEmpty())
+
+      followStoreGate.complete(Unit)
+      runBlocking {
+        withTimeout(5_000) { first.join() }
+        withTimeout(5_000) { c.flushTranscript() }
+      }
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals("close must never launch the follow-up", 1, provider.streamCalls.get())
+      assertTrue(
+        "acked ghost survives as at most one orphan row (no duplicate, no follow-up launch)",
+        sink.started.count { it.second == "follow" } <= 1,
+      )
+      assertTrue(c.drainQueued().isEmpty())
+    } finally {
+      firstGate.complete(Unit)
+      followStoreGate.complete(Unit)
+      outer.cancel()
+      c.close()
+    }
+  }
+
+  /**
+   * Round 10 H1 PromoAwait drain guard: while the promotion reservation holds
+   * (promotionPending set, no UNKNOWN yet — Lock-1 already minted the follow
+   * id and the await may have sent it) the FIFO head is NOT reclaimable:
+   * drainQueued() throws TranscriptPendingException and drainRecoveryLocked()
+   * returns null, with the head retained. Releasing the await commits via
+   * Lock-2 normally with exactly one follow row and one provider call.
+   */
+  @Test fun promotionAwaitWindowBlocksDrainAndCommitsSingleRowAfterRelease() {
+    val firstTurnGate = CompletableDeferred<Unit>()
+    val promotionParked = CountDownLatch(1)
+    val releasePromotionAwait = CountDownLatch(1)
+    val provider = FakeLlmProvider { request ->
+      flow {
+        if (baseUserTextOf(request) == "first") firstTurnGate.await()
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = RecordingSink()
+    var n = 0
+    val c = TurnController(
+      provider = provider,
+      policy = AllowPolicy(),
+      transcript = sink,
+      dispatcher = Dispatchers.Default,
+      newId = { "h1-${n++}" },
+    )
+    c.beforePromotionAwaitForTest = {
+      promotionParked.countDown()
+      check(releasePromotionAwait.await(30, TimeUnit.SECONDS))
+    }
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val first = outer.async { c.send("first") }
+      awaitTrue { provider.streamCalls.get() == 1 }
+      assertEquals(TurnStart.Queued, runBlocking { c.startOrEnqueue("follow", opId = 181L) })
+      firstTurnGate.complete(Unit)
+      assertTrue("promotion did not reach its durable await", promotionParked.await(5, TimeUnit.SECONDS))
+      // PromoAwait window: reservation held, no UNKNOWN ownership yet.
+      assertFalse(c.hasPendingAdmission())
+      val promotionPendingField =
+        TurnController::class.java.getDeclaredField("promotionPending").apply { isAccessible = true }
+      val unknownField =
+        TurnController::class.java.getDeclaredField("unknownAdmission").apply { isAccessible = true }
+      assertNotNull(promotionPendingField.get(c))
+      assertNull(unknownField.get(c))
+      // The head is NOT reclaimable in this window.
+      try {
+        c.drainQueued()
+        fail("drainQueued during PromoAwait must throw TranscriptPendingException")
+      } catch (_: TranscriptPendingException) {
+        // Expected: Lock-1 already minted the follow id.
+      }
+      assertEquals(1, c.uiState.value.pendingSteerCount)
+      assertFalse(c.uiState.value.queuedRecoveryRequired)
+      val drainRecovery =
+        TurnController::class.java.getDeclaredMethod("drainRecoveryLocked").apply { isAccessible = true }
+      assertNull(drainRecovery.invoke(c))
+      assertEquals("blocked reclaim must retain the head", 1, c.uiState.value.pendingSteerCount)
+      assertEquals(ChatStatus.WAITING_STEERED, c.uiState.value.status)
+      assertEquals(listOf("first"), usersOf(c))
+      assertEquals(1, provider.streamCalls.get())
+      // Release: Lock-2 commits normally — single follow row, single launch.
+      releasePromotionAwait.countDown()
+      runBlocking { withTimeout(5_000) { first.join() } }
+      awaitTrue { c.uiState.value.status == ChatStatus.IDLE && usersOf(c).size == 2 }
+      assertEquals(listOf("first", "follow"), usersOf(c))
+      assertEquals(1, usersOf(c).count { it == "follow" })
+      assertEquals("follow must reach the provider exactly once", 2, provider.streamCalls.get())
+      assertEquals(0, c.uiState.value.pendingSteerCount)
+      assertTrue(c.drainQueued().isEmpty())
+      assertEquals(
+        "Lock-2 commit keeps exactly one follow ledger row (no resend duplicate)",
+        1,
+        sink.started.count { it.second == "follow" },
+      )
+      assertEquals(2, sink.started.size)
+    } finally {
+      releasePromotionAwait.countDown()
+      firstTurnGate.complete(Unit)
+      outer.cancel()
       c.close()
     }
   }

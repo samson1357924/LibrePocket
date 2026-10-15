@@ -205,4 +205,49 @@ class ChatSessionTest {
       outer.cancel()
     }
   }
+
+  @Test fun chatSessionExposesDurableFailureStatusAndFlushDurable() {
+    val store = object : dev.librepocket.session.FakeSessionStore() {
+      override suspend fun appendEvent(event: dev.librepocket.session.TranscriptEvent): Long {
+        if (event.runId == "fail-run") throw java.io.IOException("store down")
+        return super.appendEvent(event)
+      }
+    }
+    val sid = runBlocking { store.createSession("title", "model") }
+    val transcript = dev.librepocket.session.SessionTranscriptSink(store, sid)
+    val provider = FakeSessionLlm {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "Hello"))
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val session = ChatSessionImpl(
+      provider = provider,
+      policy = ChatAllowPolicy(),
+      transcript = transcript,
+      dispatcher = Dispatchers.Default,
+      sleeper = {},
+      newId = { "fail-run" },
+    )
+    try {
+      assertFalse(session.hasDurableFailures())
+      runBlocking {
+        // Stage 6: admission-time durable failure is fail-closed (throws, like
+        // InputTooLong) instead of returning with an ERROR turn — the caller
+        // retains the text. The controller still projects ERROR + marks.
+        try {
+          session.send("hi")
+          fail("send must throw TranscriptDurabilityException when the user row cannot persist")
+        } catch (e: TranscriptDurabilityException) {
+          // Expected fail-closed path (caused by the store IOException).
+        }
+        assertEquals(ChatStatus.ERROR, session.uiState.value.status)
+        assertTrue("hasDurableFailures must be true", session.hasDurableFailures())
+        assertTrue("flush barrier must drain", session.flush())
+        assertFalse("flushDurable must be false when store failed", session.flushDurable())
+      }
+    } finally {
+      session.close()
+    }
+  }
 }

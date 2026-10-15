@@ -54,9 +54,47 @@ private class TimeRecordingSink : TranscriptSink {
 
   override suspend fun onTurnStarted(runId: String, text: String) { started.add(runId to text) }
   override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+  override suspend fun onTurnSucceeded(
+    runId: String,
+    text: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = onTurnSucceeded(runId, text, hasReasoning)
   override suspend fun onTurnFailed(runId: String, error: String) = Unit
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+  ) = onTurnFailed(runId, partialText, error)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+  ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex)
+  override suspend fun onTurnFailed(
+    runId: String,
+    partialText: String,
+    error: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    isFinal: Boolean,
+    hasReasoning: Boolean,
+  ) = onTurnFailed(runId, partialText, error, parentRunId, attemptIndex, isFinal)
   override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
   override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+  override suspend fun onTurnCancelled(
+    runId: String,
+    partialText: String,
+    parentRunId: String?,
+    attemptIndex: Int?,
+    hasReasoning: Boolean,
+  ) = onTurnCancelled(runId, partialText, hasReasoning)
   override suspend fun onSteerQueued(text: String) = Unit
   override suspend fun onToolDone(runId: String, toolIndex: Int, id: String, name: String, argumentsJson: String) = Unit
   override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
@@ -380,8 +418,11 @@ class TurnControllerTimeContextTest {
     assertTrue(second.contains("- User timezone: America/New_York"))
     // 2026-01-15 is EST (-05:00).
     assertTrue(second.contains("(UTC-05:00)"))
-    // Transcript keeps the raw text across the retry, no time residue.
-    awaitTrue { sink.started.size >= 2 }
+    // Transcript keeps the raw text across the retry, no time residue. One
+    // logical turn owns exactly one user row; the retry only adds an attempt
+    // record bound to that id (see TurnControllerLedgerTest).
+    awaitTrue { sink.started.isNotEmpty() }
+    assertEquals(1, sink.started.size)
     for ((_, text) in sink.started) {
       assertEquals("hi", text)
       assertFalse(text.contains("Runtime time context"))

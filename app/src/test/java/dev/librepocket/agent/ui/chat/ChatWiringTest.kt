@@ -53,6 +53,21 @@ private class FakeChatProvider(
 
 class ChatWiringTest {
 
+    // Scope note (D1): the storeless `newVm` helpers below (no
+    // `SessionStoreSource` → `NoOpTranscriptSink`, null session id) cover the
+    // provider loop ONLY — send/stream/cancel/steer/policy/switch noticing.
+    // A storeless `flushDurable == true` proves nothing about durability (see
+    // `ChatSession.flushDurable`); durability evidence lives in
+    // `TurnControllerLedgerTest`, `CancelReceiptCloseBarrierTest`,
+    // `FlushDurableObligationBarrierTest`, `SessionTranscriptSinkTest` and the
+    // Room store tests — never here. The with-store dual track (real
+    // `ChatSessionFactory` + `FakeSessionStore`, whose `SessionTranscriptSink`
+    // rides the real `OrderedTranscriptSink` inside `ChatSessionImpl`) runs
+    // end-to-end in `openSessionReplaysHistoryThenLiveAppends`,
+    // `sameProviderModelSwitchCarriesHistoryIntoNextRequest`,
+    // `crossProviderModelSwitchWithholdsHistoryAndSetsNotice` and
+    // `displayVsModelProjection_partialMarkerTruncation` below.
+
     private val tmpDirs = ArrayList<java.io.File>()
     private val scopes = ArrayList<CoroutineScope>()
     private val chatViewModels = ChatTestViewModelStore()
@@ -163,10 +178,15 @@ class ChatWiringTest {
             store.save(sampleEndpoint())
             vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         }
+        // P0-1 Phase4 fence: gate-latch replaces `delay(5000)`. The old fixed
+        // stall guessed the turn was still streaming when steer/cancel land;
+        // the gate proves it: steer/cancel await STREAMING below, and the
+        // gate stays held until the test's teardown cancel drains it.
+        val streamGate = CompletableDeferred<Unit>()
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "partial"))
-                delay(5000)
+                streamGate.await()
                 emit(StreamEvent.Done("stop"))
             }
         }
@@ -191,6 +211,7 @@ class ChatWiringTest {
             val partial = vm.sessionState.value.messages.first { it.role == "assistant" }
             assertTrue(partial.isPartial)
         } finally {
+            streamGate.complete(Unit)
             onMain { vm.newChat() } // close session: drains the queued steer, no background leak
         }
     }
@@ -299,7 +320,7 @@ class ChatWiringTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
         val transcripts = dev.librepocket.session.FakeSessionStore()
-        val sessionId = transcripts.createSession("existing", "gpt-4o-mini")
+        val sessionId = transcripts.createSession("existing", "preset:openai@https://api.openai.com/gpt-4o-mini")
         // S1: direct open needs explicit ALLOW (fail-closed default).
         val factory = ChatSessionFactory(
             policy = allowKeyReadPolicy(),
@@ -338,7 +359,7 @@ class ChatWiringTest {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }
         val transcripts = dev.librepocket.session.FakeSessionStore()
-        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        val sid = runBlocking { transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini") }
         runBlocking {
             transcripts.appendEvent(
                 dev.librepocket.session.TranscriptEvent(
@@ -385,6 +406,48 @@ class ChatWiringTest {
         assertEquals("ok", vm.messages.value.last().text)
         // Live turn persisted into the same transcript session.
         assertTrue(transcripts.events.count { it.kind == "user" } == 2)
+    }
+
+    // Phase 2 baseline (fake store, synthetic rows only): open replays
+    // pre-existing rows as-is and invents no INTERRUPTED markers.
+    // Cross-restart RUNNING -> INTERRUPTED backfill needs the Phase-3
+    // persisted partial/status bits and lands in Phase 3 (see
+    // ChatSessionFactory.open KDoc); this pins the baseline it extends.
+    @Test
+    fun openReplaysDanglingPartialAsIsWithoutInventedMarks() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sid = runBlocking { transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini") }
+        runBlocking {
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+                ),
+            )
+            // Dangling partial from a killed process: no terminal row follows.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = sid, runId = "r1", kind = "assistant", text = "half answer", createdAt = 2L,
+                ),
+            )
+        }
+        val before = transcripts.events.size
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> FakeChatProvider() },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 2 }
+        assertEquals(listOf("q1", "half answer"), vm.messages.value.map { it.text })
+        assertEquals("Phase 2 invents no backfill rows", before, transcripts.events.size)
     }
 
     @Test
@@ -607,6 +670,50 @@ class ChatWiringTest {
     }
 
     @Test
+    fun openSessionRestoresReasoningMarkerOnFailedPartial() {
+        // R18-3: the post-compensation ledger shape for a reasoning-sourced
+        // retryable partial (user + cancel notice + batch partial + marker +
+        // system mark) must replay the partial flagged — never reopened as
+        // plain text — and the marker itself must never render.
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val sid = runBlocking { transcripts.createSession("old chat", "m") }
+        runBlocking {
+            val sink = dev.librepocket.session.SessionTranscriptSink(transcripts, sid) { 1L }
+            sink.onTurnStarted("L", "q1")
+            sink.onTurnCancelRequested("L", "L", 0)
+            sink.onTurnFailedAndCancelled("L", "L", "half answer", "partial lost (store failure)", null, 0, true)
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 2 }
+        val replayed = vm.messages.value
+        // The marker restores the flag but never renders as a message; the
+        // system mark and the retry notice stay hidden too.
+        assertEquals(listOf("q1", "half answer"), replayed.map { it.text })
+        assertFalse(replayed[0].hasReasoning)
+        assertTrue("failed partial must replay reasoning-sourced", replayed[1].hasReasoning)
+        assertTrue("failed fragment must replay flagged, never as completed", replayed[1].isPartial)
+    }
+
+    @Test
     fun steerWhenIdleSends() {
         val store = newStore()
         runBlocking { store.save(sampleEndpoint()) }
@@ -629,6 +736,7 @@ class ChatWiringTest {
         val fake = FakeChatProvider { _ ->
             flow {
                 emit(StreamEvent.TextDelta(0, 0, "part"))
+                // Provider stub stimulus: bounded streaming gap, fenced by awaitTrue below.
                 delay(300)
                 emit(StreamEvent.Done("stop"))
             }
@@ -809,5 +917,606 @@ class ChatWiringTest {
         onMain { vm.onInputChange("two") }
         onMain { vm.send() }
         awaitTrue { creates == 2 }
+    }
+
+    @Test
+    fun sameProviderModelSwitchCarriesHistoryIntoNextRequest() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                if (userMsg.startsWith("u1")) {
+                    emit(StreamEvent.TextDelta(0, 0, "a1"))
+                } else {
+                    emit(StreamEvent.TextDelta(0, 0, "a2"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+
+        // Round 1: send u1
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        assertEquals("a1", vm.messages.value.last().text)
+        assertEquals(1, fake.seenRequests.size)
+
+        // Wait for transcript persistence
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+
+        // Switch model within same provider
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o"))
+        }
+
+        // Round 2: send u2
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        assertEquals("a2", vm.messages.value.last().text)
+        assertEquals(2, fake.seenRequests.size)
+
+        // Provider spy asserts seenRequests[1].messages contains round 1 history (u1, a1, u2)
+        val secondReq = fake.seenRequests[1]
+        assertEquals(3, secondReq.messages.size)
+        assertEquals("user", secondReq.messages[0].role)
+        assertTrue(secondReq.messages[0].text.startsWith("u1"))
+        assertEquals("assistant", secondReq.messages[1].role)
+        assertEquals("a1", secondReq.messages[1].text)
+        assertEquals("user", secondReq.messages[2].role)
+        assertTrue(secondReq.messages[2].text.startsWith("u2"))
+        assertNull(vm.notice.value)
+    }
+
+    @Test
+    fun crossProviderModelSwitchWithholdsHistoryAndSetsNotice() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:anthropic", "sk-ant-test-key".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                if (userMsg.startsWith("u1")) {
+                    emit(StreamEvent.TextDelta(0, 0, "a1"))
+                } else {
+                    emit(StreamEvent.TextDelta(0, 0, "a2"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+
+        // Round 1: send u1
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        assertEquals("a1", vm.messages.value.last().text)
+        assertEquals(1, fake.seenRequests.size)
+
+        // Wait for transcript persistence
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+
+        // Switch to different provider (Anthropic)
+        val anthropicEndpoint = EndpointConfig(
+            providerId = "preset:anthropic",
+            presetId = "anthropic",
+            label = "Anthropic",
+            baseUrl = "https://api.anthropic.com/v1",
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            model = "claude-3-5-sonnet",
+            apiKeyRef = "provider_key/preset:anthropic",
+        )
+        runBlocking {
+            store.save(anthropicEndpoint)
+        }
+
+        // Round 2: send u2
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        assertEquals("a2", vm.messages.value.last().text)
+        assertEquals(2, fake.seenRequests.size)
+
+        // Provider spy asserts seenRequests[1].messages contains ONLY new message (u2)
+        val secondReq = fake.seenRequests[1]
+        assertEquals(1, secondReq.messages.size)
+        assertEquals("user", secondReq.messages[0].role)
+        assertTrue(secondReq.messages[0].text.startsWith("u2"))
+        assertEquals("RESUME_CROSS_PROVIDER_HISTORY_WITHHELD", vm.notice.value)
+    }
+
+    @Test
+    fun reasoningLiveTurn_switchCarriesMarker_reopenRestoresFlags() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        }
+        // R8-4 live provenance: u1 exercises both reasoning event shapes
+        // (opaque ReasoningPresent + visible ReasoningDelta); later turns
+        // stay plain so the flag pairing stays exact.
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                when {
+                    userMsg.startsWith("u1") -> {
+                        emit(StreamEvent.ReasoningPresent)
+                        emit(StreamEvent.ReasoningDelta(0, 0, "think-"))
+                        emit(StreamEvent.TextDelta(0, 0, "a1"))
+                    }
+                    userMsg.startsWith("u2") -> emit(StreamEvent.TextDelta(0, 0, "a2"))
+                    else -> emit(StreamEvent.TextDelta(0, 0, "a3"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+
+        // Round 1: reasoning-origin turn writes marker + assistant (marker-first).
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        assertTrue(vm.messages.value[1].hasReasoning)
+        awaitTrue {
+            transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 &&
+                transcripts.events.count { it.kind == "reasoning" } == 1
+        }
+        val oldId = vm.currentSessionId.value
+        assertNotNull(oldId)
+        val marker = transcripts.events.single { it.kind == "reasoning" }
+        assertEquals("", marker.text)
+        assertEquals(transcripts.events.single { it.kind == "assistant" }.runId, marker.runId)
+
+        // Same-provider switch, then a plain round 2.
+        runBlocking { store.save(sampleEndpoint().copy(model = "gpt-4o")) }
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        val newId = vm.currentSessionId.value
+        assertNotNull(newId)
+        assertFalse(newId == oldId)
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == newId && (it.kind == "user" || it.kind == "assistant")
+            } == 4
+        }
+        awaitTrue { transcripts.events.count { it.sessionId == newId && it.kind == "reasoning" } == 1 }
+        // Fork ledger carries the marker verbatim before its assistant.
+        val forkedRows = transcripts.events.filter { it.sessionId == newId }
+        assertEquals(
+            listOf("system", "user", "reasoning", "assistant", "user", "assistant"),
+            forkedRows.map { it.kind },
+        )
+        assertEquals(forkedRows[2].runId, forkedRows[3].runId)
+        assertEquals("", forkedRows[2].text)
+        assertTrue(vm.messages.value[1].hasReasoning)
+        assertFalse(vm.messages.value[3].hasReasoning)
+        assertNull(vm.notice.value)
+
+        // Restart: UI flag survives, and the next request carries it.
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { vm2.openSession(newId!!) }
+        awaitTrue { vm2.currentSessionId.value == newId && vm2.messages.value.size == 4 }
+        assertTrue(vm2.messages.value[1].hasReasoning)
+        assertFalse(vm2.messages.value[3].hasReasoning)
+        assertNull(vm2.notice.value)
+        onMain { vm2.onInputChange("u3") }
+        onMain { vm2.send() }
+        awaitTrue { vm2.sessionState.value.status == ChatStatus.IDLE && vm2.messages.value.size == 6 }
+        val restartReq = fake.seenRequests.last()
+        assertEquals(
+            listOf("user", "assistant", "user", "assistant", "user"),
+            restartReq.messages.map { it.role },
+        )
+        assertEquals(listOf(false, true, false, false, false), restartReq.messages.map { it.hasReasoning })
+        assertTrue(restartReq.messages[1].text.contains("a1"))
+    }
+
+    @Test
+    fun sameProviderSwitch_survivesRestart() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                when {
+                    userMsg.startsWith("u1") -> emit(StreamEvent.TextDelta(0, 0, "a1"))
+                    userMsg.startsWith("u2") -> emit(StreamEvent.TextDelta(0, 0, "a2"))
+                    else -> emit(StreamEvent.TextDelta(0, 0, "a3"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+
+        // Round 1 on the old model.
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+        val oldId = vm.currentSessionId.value
+        assertNotNull(oldId)
+
+        // Same-provider model switch, then round 2.
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o"))
+        }
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        val newId = vm.currentSessionId.value
+        assertNotNull(newId)
+        assertFalse(newId == oldId)
+        // The durable snapshot lands before the new turn's rows.
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == newId && (it.kind == "user" || it.kind == "assistant")
+            } == 4
+        }
+        val forkedRows = transcripts.events.filter { it.sessionId == newId }
+        assertEquals(listOf("system", "user", "assistant", "user", "assistant"), forkedRows.map { it.kind })
+        assertTrue(forkedRows[0].text.startsWith("model switched "))
+        assertTrue(forkedRows[0].text.contains("gpt-4o-mini"))
+        assertTrue(forkedRows[0].text.contains("gpt-4o"))
+        assertFalse(forkedRows[0].text.contains("withheld"))
+        assertTrue(forkedRows[1].text.startsWith("u1"))
+        assertEquals("a1", forkedRows[2].text)
+        assertTrue(forkedRows[3].text.startsWith("u2"))
+        assertEquals("a2", forkedRows[4].text)
+        assertNull(vm.notice.value)
+
+        // Restart: a fresh ViewModel reopens the forked session id.
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { vm2.openSession(newId!!) }
+        awaitTrue { vm2.currentSessionId.value == newId && vm2.messages.value.size == 4 }
+        val reopened = vm2.messages.value
+        assertTrue(reopened[0].text.startsWith("u1"))
+        assertEquals("a1", reopened[1].text)
+        assertTrue(reopened[2].text.startsWith("u2"))
+        assertEquals("a2", reopened[3].text)
+        assertNull(vm2.notice.value)
+
+        // The first request after restart still carries the old prefix.
+        onMain { vm2.onInputChange("u3") }
+        onMain { vm2.send() }
+        awaitTrue { vm2.sessionState.value.status == ChatStatus.IDLE && vm2.messages.value.size == 6 }
+        val restartReq = fake.seenRequests.last()
+        assertEquals(
+            listOf("user", "assistant", "user", "assistant", "user"),
+            restartReq.messages.map { it.role },
+        )
+        assertTrue(restartReq.messages[0].text.startsWith("u1"))
+        assertEquals("a1", restartReq.messages[1].text)
+        assertTrue(restartReq.messages[2].text.startsWith("u2"))
+        assertEquals("a2", restartReq.messages[3].text)
+        assertTrue(restartReq.messages[4].text.startsWith("u3"))
+    }
+
+    @Test
+    fun crossProviderSwitch_stillWithholdsAfterRestart() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "gpt-4o-mini"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+            vault.putKey("preset:anthropic", "sk-ant-test-key".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                if (userMsg.startsWith("u1")) {
+                    emit(StreamEvent.TextDelta(0, 0, "a1"))
+                } else {
+                    emit(StreamEvent.TextDelta(0, 0, "a2"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+
+        runBlocking {
+            store.save(
+                EndpointConfig(
+                    providerId = "preset:anthropic",
+                    presetId = "anthropic",
+                    label = "Anthropic",
+                    baseUrl = "https://api.anthropic.com/v1",
+                    protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                    model = "claude-3-5-sonnet",
+                    apiKeyRef = "provider_key/preset:anthropic",
+                ),
+            )
+        }
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        val newId = vm.currentSessionId.value
+        assertNotNull(newId)
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == newId && (it.kind == "user" || it.kind == "assistant")
+            } == 2
+        }
+        // Only the marker plus the new turn: the old prefix never crosses providers.
+        val forkedRows = transcripts.events.filter { it.sessionId == newId }
+        assertEquals(listOf("system", "user", "assistant"), forkedRows.map { it.kind })
+        assertTrue(forkedRows[0].text.startsWith("model switched "))
+        assertTrue(forkedRows[0].text.contains("withheld"))
+        assertTrue(forkedRows[1].text.startsWith("u2"))
+        assertEquals("a2", forkedRows[2].text)
+        assertEquals(1, fake.seenRequests[1].messages.size)
+        assertEquals("RESUME_CROSS_PROVIDER_HISTORY_WITHHELD", vm.notice.value)
+
+        // Restart: the forked session still withholds, and the notice returns.
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { vm2.openSession(newId!!) }
+        awaitTrue { vm2.currentSessionId.value == newId && vm2.messages.value.size == 2 }
+        assertTrue(vm2.messages.value[0].text.startsWith("u2"))
+        assertEquals("a2", vm2.messages.value[1].text)
+        assertEquals("RESUME_CROSS_PROVIDER_HISTORY_WITHHELD", vm2.notice.value)
+        onMain { vm2.onInputChange("u3") }
+        onMain { vm2.send() }
+        awaitTrue { vm2.sessionState.value.status == ChatStatus.IDLE && vm2.messages.value.size == 4 }
+        val restartReq = fake.seenRequests.last()
+        assertEquals(listOf("user", "assistant", "user"), restartReq.messages.map { it.role })
+        assertTrue(restartReq.messages[0].text.startsWith("u2"))
+        assertEquals("a2", restartReq.messages[1].text)
+        assertTrue(restartReq.messages[2].text.startsWith("u3"))
+    }
+
+    @Test
+    fun sameProviderSwitchChainDoesNotDuplicate() {
+        val store = newStore()
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            store.save(sampleEndpoint().copy(model = "m1"))
+            vault.putKey("preset:openai", "sk-test-key-123".toCharArray())
+        }
+        val fake = FakeChatProvider { req ->
+            flow {
+                val userMsg = req.messages.last { it.role == "user" }.text
+                when {
+                    userMsg.startsWith("u1") -> emit(StreamEvent.TextDelta(0, 0, "a1"))
+                    userMsg.startsWith("u2") -> emit(StreamEvent.TextDelta(0, 0, "a2"))
+                    else -> emit(StreamEvent.TextDelta(0, 0, "a3"))
+                }
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = SessionStoreSource { transcripts },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+
+        onMain { vm.onInputChange("u1") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 2 }
+        awaitTrue { transcripts.events.count { it.kind == "user" || it.kind == "assistant" } == 2 }
+        val idA = vm.currentSessionId.value
+        assertNotNull(idA)
+
+        runBlocking { store.save(sampleEndpoint().copy(model = "m2")) }
+        onMain { vm.onInputChange("u2") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 4 }
+        val idB = vm.currentSessionId.value
+        assertNotNull(idB)
+        assertFalse(idB == idA)
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == idB && (it.kind == "user" || it.kind == "assistant")
+            } == 4
+        }
+
+        runBlocking { store.save(sampleEndpoint().copy(model = "m3")) }
+        onMain { vm.onInputChange("u3") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 6 }
+        val idC = vm.currentSessionId.value
+        assertNotNull(idC)
+        awaitTrue {
+            transcripts.events.count {
+                it.sessionId == idC && (it.kind == "user" || it.kind == "assistant")
+            } == 6
+        }
+        // Each turn exactly once: old prefix + middle turn + new turn, one fork marker.
+        val rowsC = transcripts.events.filter { it.sessionId == idC }
+        assertEquals(
+            listOf("system", "user", "assistant", "user", "assistant", "user", "assistant"),
+            rowsC.map { it.kind },
+        )
+        assertEquals(1, rowsC.count { it.kind == "system" })
+        assertTrue(rowsC[0].text.startsWith("model switched m2 -> m3"))
+        assertTrue(rowsC[1].text.startsWith("u1"))
+        assertEquals("a1", rowsC[2].text)
+        assertTrue(rowsC[3].text.startsWith("u2"))
+        assertEquals("a2", rowsC[4].text)
+        assertTrue(rowsC[5].text.startsWith("u3"))
+        assertEquals("a3", rowsC[6].text)
+        // The middle session keeps its own marker plus the first prefix; markers never copy.
+        val rowsB = transcripts.events.filter { it.sessionId == idB }
+        assertEquals(1, rowsB.count { it.kind == "system" })
+        assertNull(vm.notice.value)
+
+        // Restart on the chain tip: full history, one copy each, then a live follow-up.
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { vm2.openSession(idC!!) }
+        awaitTrue { vm2.currentSessionId.value == idC && vm2.messages.value.size == 6 }
+        assertNull(vm2.notice.value)
+        onMain { vm2.onInputChange("u4") }
+        onMain { vm2.send() }
+        awaitTrue { vm2.sessionState.value.status == ChatStatus.IDLE && vm2.messages.value.size == 8 }
+        val restartReq = fake.seenRequests.last()
+        assertEquals(7, restartReq.messages.size)
+        assertEquals("a3", restartReq.messages[5].text)
+        assertTrue(restartReq.messages[6].text.startsWith("u4"))
+    }
+
+    // D6 display-vs-model dual-projection contrast (partial / marker /
+    // truncation axes, one ledger): the display replay and the model-context
+    // hydration intentionally disagree —
+    // - a terminal cancelled partial replays in the UI flagged but never
+    //   enters model context;
+    // - a payload-free reasoning marker restores hasReasoning on both sides
+    //   but never renders and never enters context itself;
+    // - an over-long row replays full in the UI but is truncated with a
+    //   visible marker in model context.
+    // The model side rides the real factory hydration (open + send request
+    // inspection through the VM), never a hand-built prefix.
+    @Test
+    fun displayVsModelProjection_partialMarkerTruncation() {
+        val store = newStore()
+        runBlocking { store.save(sampleEndpoint()) }
+        val transcripts = dev.librepocket.session.FakeSessionStore()
+        val giant = "G".repeat(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE + 5000)
+        val sid = runBlocking {
+            val id = transcripts.createSession("old chat", "preset:openai@https://api.openai.com/gpt-4o-mini")
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r1", kind = "user", text = "q1", createdAt = 1L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r1", kind = "assistant", text = "a1", createdAt = 2L,
+                ),
+            )
+            // Payload-free resume marker for the reasoning-sourced turn.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r1", kind = "reasoning", text = "", createdAt = 3L,
+                ),
+            )
+            // Terminal cancelled partial (final fragment): replays flagged.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r2", kind = "user", text = "q2", createdAt = 4L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r2", kind = "assistant", text = "half", createdAt = 5L,
+                    isPartial = true,
+                ),
+            )
+            // Over-long completed turn.
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r3", kind = "user", text = "q3", createdAt = 6L,
+                ),
+            )
+            transcripts.appendEvent(
+                dev.librepocket.session.TranscriptEvent(
+                    sessionId = id, runId = "r3", kind = "assistant", text = giant, createdAt = 7L,
+                ),
+            )
+            id
+        }
+        val vault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
+        val fake = FakeChatProvider { _ ->
+            flow {
+                emit(StreamEvent.TextDelta(0, 0, "ok"))
+                emit(StreamEvent.Done("stop"))
+            }
+        }
+        val factory = ChatSessionFactory(
+            policy = allowKeyReadPolicy(),
+            vaultSource = VaultSource { vault },
+            buildProvider = { _, _ -> fake },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = transcripts
+            },
+        )
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
+        onMain { vm.openSession(sid) }
+        awaitTrue { vm.messages.value.size == 6 }
+        // Display axis: everything replays; marker restores the flag but never
+        // renders; the partial replays flagged; the giant row replays full.
+        val shown = vm.messages.value
+        assertEquals(listOf("q1", "a1", "q2", "half", "q3", giant), shown.map { it.text })
+        assertEquals(listOf(false, true, false, false, false, false), shown.map { it.hasReasoning })
+        assertEquals(listOf(false, false, false, true, false, false), shown.map { it.isPartial })
+        assertNull(vm.notice.value)
+        // Model axis: the next request carries the hydrated prefix — partial
+        // excluded, flag carried, giant truncated with a visible marker.
+        onMain { vm.onInputChange("q4") }
+        onMain { vm.send() }
+        awaitTrue { vm.sessionState.value.status == ChatStatus.IDLE && vm.messages.value.size == 8 }
+        val req = fake.seenRequests.single()
+        assertEquals(
+            listOf("user", "assistant", "user", "user", "assistant", "user"),
+            req.messages.map { it.role },
+        )
+        assertEquals("q1", req.messages[0].text)
+        assertEquals("a1", req.messages[1].text)
+        assertEquals("q2", req.messages[2].text)
+        assertEquals("q3", req.messages[3].text)
+        assertEquals(listOf(false, true, false, false, false, false), req.messages.map { it.hasReasoning })
+        assertTrue(req.messages.none { it.text == "half" })
+        assertTrue(req.messages.none { it.role == "reasoning" })
+        val giantModel = req.messages[4].text
+        assertEquals(MODEL_HISTORY_MAX_CHARS_PER_MESSAGE + HISTORY_TRUNCATION_MARKER.length, giantModel.length)
+        assertTrue(giantModel.endsWith(HISTORY_TRUNCATION_MARKER))
+        assertTrue(req.messages[5].text.startsWith("q4"))
     }
 }

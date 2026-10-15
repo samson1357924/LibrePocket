@@ -1,6 +1,11 @@
 package dev.librepocket.chat
 
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/** Shared zero trim flow for [ChatSession.requestTrimmedCount]'s default (read-only, safe to share). */
+private val ZeroRequestTrimmedCount: StateFlow<Int> = MutableStateFlow(0).asStateFlow()
 
 /**
  * Single-turn chat controller: send / stream / cancel / steering.
@@ -18,6 +23,15 @@ interface ChatSession {
   /** Messages for UI (collect; includes streaming placeholders). */
   val uiState: StateFlow<ChatUiState>
 
+  /**
+   * R5-5: send-time per-request trim count (oldest-first messages dropped to
+   * fit MAX_REQUEST_CHARS), published by the controller on every attempt.
+   * Distinct from load-time resume omission (DB tail cap): never summed with
+   * it. Default is a shared zero flow so test fakes stay source-compatible;
+   * production ([ChatSessionImpl]) overrides with the live controller flow.
+   */
+  val requestTrimmedCount: StateFlow<Int> get() = ZeroRequestTrimmedCount
+
   /** Send one user message and stream the reply. One in-flight turn at a time. */
   suspend fun send(text: String, images: List<ChatImageRef> = emptyList())
 
@@ -25,8 +39,11 @@ interface ChatSession {
    * Start a turn and return once the text is accepted (fresh `chat.send`
    * policy passed, user message appended, STREAMING) without waiting for the
    * hosted turn to finish. A [CancellationException]/[SecurityException]/
-   * [IllegalStateException]/[IllegalArgumentException] before return means
-   * the text was NOT accepted.
+   * [IllegalStateException]/[IllegalArgumentException]/[TranscriptDurabilityException] before return means
+   * the text was NOT accepted. A [TranscriptPendingException] means UNKNOWN
+   * (R5-1 timeout-after-send / R6-2 external-cancel-after-send): ownership retained, do NOT immediately resend
+   * the same opId — await [settlePendingAdmission] (claimed under the same id
+   * without resend, or converted to retryable).
    */
   suspend fun startTurn(text: String, images: List<ChatImageRef> = emptyList()): kotlinx.coroutines.Job
 
@@ -65,6 +82,59 @@ interface ChatSession {
   fun cancel()
 
   /**
+   * Bounded ledger drain: suspends until every transcript event admitted so
+   * far is persisted (true = drained, false = timed out). Two sequential
+   * per-call budgets of [timeoutMs] — the [close] shutdown-join first
+   * (doomed-host settle + admitted drain + seal), then the admitted-event
+   * drain — so a flush after [close] waits up to ~2x[timeoutMs], while a
+   * flush before/without [close] only runs the second phase (~1x[timeoutMs]).
+   * Caller cancellation still propagates. The ViewModel awaits this
+   * (bounded) before [close] on newChat / openSession / endpoint-switch so
+   * admitted notices are not lost with the session, without ever blocking
+   * the UI unboundedly.
+   */
+  suspend fun flush(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean
+
+  /**
+   * Returns true if any admitted transcript event encountered a durable persistence failure
+   * (e.g. store IOException) or seal/interruption mark.
+   */
+  fun hasDurableFailures(): Boolean = false
+
+  /**
+   * Suspends until every transcript event admitted so far is persisted and verifies
+   * that no durable store failure occurred, no cancel receipt is still unsettled,
+   * no SEALED receipt is still uncompensated, and no terminal obligation is
+   * still open.
+   *
+   * Returns true only when [flush] drains within [timeoutMs], [hasDurableFailures] is false,
+   * [hasUnsettledCancelReceipts] is false (no PENDING/CLAIMED receipt),
+   * [hasSealedUncompensatedReceipts] is false (no SEALED receipt without
+   * proven family-final; SEALED alone is NOT settled),
+   * [hasUnsettledAdmission] is false (no direct pending, promotion
+   * reservation, UNKNOWN ghost, or orphan drain — R21-1 Phase 1 barrier,
+   * R22-broadened from direct-only: a family without its terminal never
+   * reports true-and-dangling),
+   * [hasUnsettledPromotion] is false (no promotion await / promotion ghost),
+   * [hasActiveHost] is false (no live host: a running host owns a user
+   * row with no proven terminal yet),
+   * and [hasClosedUnsettledAdmission] is false (no sticky close obligation).
+   *
+   * Production ([ChatSessionImpl] over a real sink) conjoins all of the above
+   * (see [dev.librepocket.chat.TurnController.flushDurable], which additionally
+   * re-reads the failure epoch after the admission proof, re-verifies the
+   * admission snapshot, and reads the failure epoch once more fail-last for
+   * R22-3 TOCTOU linearization). The interface defaults below report no obligations (all
+   * guards false), so a `true` from a fake proves NOTHING about durability —
+   * fakes must never stand in as durability evidence; only production with a
+   * real sink is proof. Never assert ledger durability via a fake session.
+   */
+  suspend fun flushDurable(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
+    flush(timeoutMs) && !hasDurableFailures() && !hasUnsettledCancelReceipts() &&
+      !hasSealedUncompensatedReceipts() && !hasUnsettledAdmission() &&
+      !hasUnsettledPromotion() && !hasActiveHost() && !hasClosedUnsettledAdmission()
+
+  /**
    * Steering: queue an instruction for the next round.
    * Never cancels the current HTTP request or the current turn; the queued
    * instruction is sent automatically once the current turn fully ends. When
@@ -75,6 +145,158 @@ interface ChatSession {
    * surfaced in [uiState].
    */
   fun steer(text: String)
+
+  /**
+   * R5-1 bounded settle for an UNKNOWN/PENDING_COMMIT admission
+   * (timeout-after-send). Ticket-tracked flush: success without an
+   * INTERRUPTED mark claims the ghost under the same id (no resend);
+   * INTERRUPTED/seal converts to retryable. Returns true when resolved
+   * (claimed, failed, or nothing pending), false when still unknown (flush
+   * timed out — keep ownership, no false mark; retry re-settles).
+   *
+   * M2: caller cancellation is never swallowed — a caller-cancelled settle
+   * rethrows CancellationException directly (never TranscriptPendingException);
+   * false only means the bounded flush timed out with ownership retained.
+   */
+  suspend fun settlePendingAdmission(timeoutMs: Long = OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS): Boolean =
+    true
+
+  /** R5-1: true while an UNKNOWN admission still owns the single-flight slot. */
+  fun hasPendingAdmission(): Boolean = false
+
+  /**
+   * R21-1 Phase 1 admission settle proof, R22-broadened from direct-only to
+   * every terminal-obligation window: true while a direct admission still
+   * owns the single-flight slot (durable await or finalize barrier, host not
+   * yet entered), while a promotion reservation holds it (Lock-1 await), while
+   * any UNKNOWN ownership exists (direct ghost or promotion ghost), or while
+   * an orphan cancel drain is still in flight. A running host alone (pending
+   * cleared at host entry) never trips this — that window is owned by
+   * [hasActiveHost] instead. Conjoined into [flushDurable] and consulted by the
+   * ViewModel incomplete fallback alongside [hasPendingAdmission] (which stays
+   * UNKNOWN-only), [hasUnsettledCancelReceipts], and
+   * [hasSealedUncompensatedReceipts] — so the promotion windows newly covered
+   * here already reach the VM through this proof. The sibling proofs
+   * [hasUnsettledPromotion], [hasActiveHost], and [hasClosedUnsettledAdmission]
+   * are [flushDurable]-conjoined AND read directly by the ViewModel evidence
+   * checks (`isLedgerStreamingOrPending` consults the obligation proofs; the
+   * seal/completion proofs feed the writer-dead proof instead); there is no
+   * unwired follow-up — a fake `true` still proves nothing (see
+   * [flushDurable]). Default false so test fakes stay
+   * source-compatible (a fake `true` proves nothing — see [flushDurable]);
+   * production ([ChatSessionImpl]) overrides with the live
+   * controller state.
+   */
+  fun hasUnsettledAdmission(): Boolean = false
+
+  /**
+   * R22 Phase 1 promotion settle proof: true while a promotion reservation
+   * still holds the single-flight slot (Lock-1 await) or a promotion ghost
+   * still owns it. Named subset of [hasUnsettledAdmission], conjoined into
+   * [flushDurable] explicitly. Default false so test fakes stay
+   * source-compatible (never durability evidence — see [flushDurable]);
+   * production ([ChatSessionImpl]) overrides with the live controller state.
+   */
+  fun hasUnsettledPromotion(): Boolean = false
+
+  /**
+   * R22 Phase 1 live-host proof: true while a hosted turn is still running.
+   * A live host owns a user row with no proven terminal yet, so [flushDurable]
+   * stays false while this is true (never true-and-dangling for a streaming
+   * turn). Default false so test fakes stay source-compatible (never
+   * durability evidence — see [flushDurable]); production
+   * ([ChatSessionImpl]) overrides with the live controller state.
+   */
+  fun hasActiveHost(): Boolean = false
+
+  /**
+   * R22 Phase 1 sticky close proof: true while [close] dropped a terminal
+   * obligation this session can no longer prove final (UNKNOWN ghost or
+   * promotion reservation — permanent until reopen backfill; direct pending,
+   * live host, or orphan drain — until the settle+drain+seal clean proof
+   * holds). Conjoined into [flushDurable]. Default false so test fakes stay
+   * source-compatible (never durability evidence — see [flushDurable]);
+   * production ([ChatSessionImpl]) overrides with the live controller state.
+   *
+   * Stage-3 F-F cost note: a pre-send attempt that never reaches admission
+   * (policy deny / input-too-long / store-unavailable throw before reserve)
+   * does NOT set the flag — [dev.librepocket.chat.TurnController.close] only
+   * flags live terminal obligations (pendingAdmission / active host /
+   * in-flight orphan drain), so a never-admitted attempt leaves no dangling
+   * row: no block, no backfill owed. Consistent with the two sticky tiers
+   * (liftable controller-observed families vs permanent ghost/promotion —
+   * see the `closedWithUnsettledAdmission` / `closedWithUnknownGhost` KDocs).
+   */
+  fun hasClosedUnsettledAdmission(): Boolean = false
+
+  /**
+   * R19-1 read-only receipt settle proof: true while any cancel receipt on
+   * this session is still PENDING (awaiting the terminal outcome) or CLAIMED
+   * (compensation write in flight). REVOKED/COMPENSATED are settled; SEALED
+   * is settled only with proven family-final (see
+   * [hasSealedUncompensatedReceipts]) and otherwise still blocks
+   * [flushDurable]. Per-session ownership: a fresh session never claims an
+   * old session's receipts (its own map starts empty), so new-session
+   * liveness checks are unaffected. Default false so test fakes stay
+   * source-compatible; production ([ChatSessionImpl]) overrides with the
+   * live controller state.
+   */
+  fun hasUnsettledCancelReceipts(): Boolean = false
+
+  /**
+   * Phase 1 SEALED truth contract: true while any cancel receipt on this
+   * session is SEALED without proven family-final (final intent, terminal
+   * committed, no system repair owed — anything else stays uncompensated
+   * until reopen INTERRUPTED backfill). Conjoined into [flushDurable] and
+   * consulted by the ViewModel incomplete fallback alongside
+   * [hasUnsettledCancelReceipts]. Default false so test fakes stay
+   * source-compatible; production ([ChatSessionImpl]) overrides with the
+   * live controller state.
+   */
+  fun hasSealedUncompensatedReceipts(): Boolean = false
+
+  /**
+   * R6-3 streaming-switch fence: core runIds admitted but still awaiting the
+   * session writer. Non-empty means the old ledger may still be missing its
+   * cancel terminal (the doomed host has not settled yet), so a same-origin
+   * fork must await settle + durable flush before reading the ledger and must
+   * degrade (skip dangling families + incomplete marker) when the wait fails.
+   * Default is empty so test fakes stay source-compatible; production
+   * ([ChatSessionImpl]) overrides with the live controller set.
+   */
+  fun pendingTranscriptRunIds(): List<String> = emptyList()
+
+  /**
+   * R10-2 writer-dead proof: true once the session writer is sealed/torn
+   * down. Default false so test fakes stay source-compatible; production
+   * ([ChatSessionImpl]) overrides with the live controller state. The
+   * backfill gate treats `isTranscriptSealed() && pending empty &&
+   * !hasPendingAdmission()` as proof the old writer can never land a late
+   * terminal ONLY together with [isTranscriptWriterCompleted] (R14-1) and no
+   * non-sticky obligation evidence ([hasUnsettledAdmission],
+   * [hasUnsettledPromotion], [hasActiveHost],
+   * [hasUnsettledCancelReceipts] — R22
+   * Phase 2 barrier-aware, R23-1 sticky split: [hasClosedUnsettledAdmission]
+   * and [hasSealedUncompensatedReceipts] stay [flushDurable]-conjoined but
+   * never block the dead proof), so an expired block may promote even while the
+   * ledger still dangles (marking INTERRUPTED is then correct, never a
+   * mis-mark), while a sealed-but-still-obligated writer keeps deferring.
+   *
+   * R14-1: seal alone is NOT that proof — a timed-out shutdown closes the
+   * channel (sealed) and empties pending while the writer is still inside a
+   * blocking store block — so the gate additionally requires
+   * [isTranscriptWriterCompleted].
+   */
+  fun isTranscriptSealed(): Boolean = false
+
+  /**
+   * R14-1 writer-completion proof: true only once the session writer can no
+   * longer execute a store block. Default false (fail-closed: unknown
+   * writers keep their outstanding ownership) so test fakes stay
+   * source-compatible; production ([ChatSessionImpl]) overrides with the
+   * live controller state.
+   */
+  fun isTranscriptWriterCompleted(): Boolean = false
 
   /** Release (close HTTP call, drop queue). */
   fun close()

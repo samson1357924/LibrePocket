@@ -1,6 +1,6 @@
 # LibrePocket 能力與接線狀態
 
-> **Current snapshot**：依 `6658e63086ea5b1af25ffe5bca4aaf28d6cee78e`（2026-10-15 提交，2026-10-15 核對）。本文件不把規格列出的能力當成已可用功能。
+> **Current snapshot**：依 `0185935` 核對（2026-10-16，S1–S7＋R27＋R28-1）。本文件不把規格列出的能力當成已可用功能。
 >
 > - **範圍：** built-in tools、provider adapters、三個 flavor 的 source/manifest 邊界。
 > - **Owner role：** app/runtime 維護者；未指派個人。
@@ -22,6 +22,9 @@
 |---|---|---|
 | Chat provider adapters | `Chat Completions`, `Responses`, `Anthropic Messages` adapter 與 factory 存在 | 對每個相容宣稱的 endpoint 均已互通或認證 |
 | Session transcript | production chat/session path 使用 Room；JSONL codec/import-export 有 library code | JSONL 是 canonical store；有可供使用者操作的匯出/遷移 UI |
+| Ledger durability (`flushDurable`) | `TurnController.flushDurable` 八檢查合取（排空＋無 PENDING/CLAIMED receipt＋無未補償 SEALED＋admission／promotion／host／sticky 證明＋failure epoch 三讀 fail-last），永不 true-and-dangling；close 以 cancel-receipt barrier＋remaining-budget 線性化交接；同源 hydrate 保證僅限 R4-1 後新建/fork 的 ledger（pre-R4-1 混雜 id 須手動隔離，見威脅模型） | `true` 代表跨重啟耐久；fake session 的 `true` 可作耐久證據；SEALED 等同 settled |
+| Prune family-aware（R27） | Room raw cut＋family fixup 同一 tx（kill→rollback→pre-prune）；fixup 無條件、無界收斂、shape-aware suspect；新 prune 跨重啟無頭孤兒進 model context／快照 | crash-mid-fixup 仍是已知限制；interior／pre-R26 既有孤兒會被 fixup 刪除；測試 fake 的 suspect 可作耐久證據 |
+| Cancel receipt / admission proofs | `hasUnsettledCancelReceipts`（PENDING/CLAIMED）、`hasSealedUncompensatedReceipts`（SEALED truth）、`hasUnsettledAdmission`（direct／promotion／UNKNOWN ghost／orphan；R22 由 direct-only 擴大）皆為 production 實作並合取進 `flushDurable`，且由 ViewModel 證據檢查直接讀取（無未接線 follow-up）；同源 hydrate 保證僅限 R4-1 後新建/fork 的 ledger（pre-R4-1 混雜 id 須手動隔離，見威脅模型） | 僅有 KDoc／介面預設即代表已接線；介面預設 `false` 可作耐久證據 |
 | Built-in tools | registry 有 41 個 definitions；目前 `executionReady=false` 全部未啟用；model-visible built-in tool 集合為空 | 模型可以執行 schema 中描述的動作 |
 | `play` | base application ID；Play overlay 移除高風險權限/service | 商店已上架或政策已被商店批准 |
 | `foss` | `.foss` application ID；Foss manifest/source set 有 accessibility service 與 OSS vision dependencies | 與 `github` 有相同能力或已由 F-Droid 發布 |

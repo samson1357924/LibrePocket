@@ -10,11 +10,15 @@ import dev.librepocket.chat.PolicyEvaluationException
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.ChatUiState
 import dev.librepocket.chat.ApprovalRequiredException
+import dev.librepocket.chat.InputTooLongException
+import dev.librepocket.chat.TranscriptDurabilityException
+import dev.librepocket.chat.TranscriptPendingException
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.policy.PolicyStore
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.policy.Verdict
+import dev.librepocket.provider.ChatMessage
 import dev.librepocket.session.SessionStore
 import dev.librepocket.session.TranscriptEvent
 import kotlinx.coroutines.CancellationException
@@ -30,10 +34,12 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 private val EMPTY_SESSION_STATE = ChatUiState(
     messages = emptyList(),
@@ -50,6 +56,12 @@ private const val HISTORY_CAP = 2000
 // unbounded I/O and hold unbounded memory on open. Stop at the bound and
 // build messages from what was scanned.
 private const val HISTORY_SCAN_CAP = HISTORY_CAP * 4
+
+/** Stage E: tail-loaded replay prefix with its exact omitted-row count. */
+internal data class LoadedUiHistory(
+    val messages: List<UiMessage>,
+    val droppedCount: Int,
+)
 
 /**
  * One-shot key.read consent for an ASK verdict, mirroring the key.write
@@ -93,6 +105,124 @@ data class PendingKeyReadConfirm(
     val opId: Long?,
     val openSessionId: String?,
 )
+/**
+ * R4-2 (Stage 4): provenance captured before an endpoint-switch fork creates
+ * its fresh transcript session, consumed after creation by the durable
+ * snapshot. [oldModelShort] is the previous session's short model id
+ * ("unknown" when its header is gone); [sameOrigin] is the
+ * [isSameProviderOrigin] gate outcome; [crossProviderWithheld] is the copy
+ * gate (`!sameOrigin`): a cross-origin fork never copies old rows — not even
+ * terminal/reasoning-only ledgers — and persists only the withheld marker.
+ * It is deliberately NOT diluted by history presence; history presence gates
+ * only the switch-time notice ([ForkRead.crossProviderWithheld]).
+ */
+private data class ForkPrefix(
+    val oldModelShort: String,
+    val sameOrigin: Boolean,
+    val crossProviderWithheld: Boolean,
+)
+
+/**
+ * R4-2: one IO round-trip's fork inputs — display replay, model prefix,
+ * notice verdict, snapshot provenance. [crossProviderWithheld] is the
+ * notice gate (`!sameOrigin && hasHistory`): an empty old ledger withholds
+ * nothing visible, so no RESUME_CROSS_PROVIDER_HISTORY_WITHHELD notice is
+ * shown at switch time (the persisted marker still records the withhold, so
+ * a later restart re-surfaces the notice via the marker scan).
+ */
+private data class ForkRead(
+    val replay: LoadedUiHistory?,
+    val modelHistory: List<ChatMessage>,
+    val crossProviderWithheld: Boolean,
+    val fork: ForkPrefix,
+)
+
+/**
+ * PG-S1: endpoint-switch fork fence outcome (ensureSession segment C).
+ * [read] is null when there is no previous session to fork from; otherwise
+ * it carries the ledger read for the caller to apply on Main.
+ * [wasStreaming]/[settleOk]/[durableOk] feed the durable snapshot fallback.
+ */
+private data class SettledFork(
+    val read: ForkRead?,
+    val wasStreaming: Boolean,
+    val settleOk: Boolean,
+    val durableOk: Boolean,
+)
+
+/**
+ * PG-S1: durable fork snapshot outcome (ensureSession segment E).
+ * The callee performs store I/O only and returns the verdict; the caller
+ * writes `_notice` on Main (keeps the four warn branches distinct for tests).
+ * Values: SKIPPED (null-gate defense, unreachable via ensureSession),
+ * CLEAN (snapshot copied, no warning), DANGLING_WARNED (streaming-settled
+ * but dangling families excluded), FENCE_FAILED_WARNED (settle/flush failed),
+ * BYTE_WARNED (byte over-budget abandon), FAILED_WARNED (batch threw).
+ */
+private enum class SnapshotOutcome {
+    SKIPPED,
+    CLEAN,
+    DANGLING_WARNED,
+    FENCE_FAILED_WARNED,
+    BYTE_WARNED,
+    FAILED_WARNED,
+}
+
+/**
+ * Stage 5 (R4-1) stale-fork cleanup decision for [ChatViewModel.openSession]:
+ * a cross-origin `open()` mints a fresh provider-owned transcript id inside
+ * the call, so a binding change that lands after the fork but before attach
+ * (the post-`open()` stale check) must roll that new row back
+ * (`deleteTranscriptRow = true`), or the empty fork (marker only) leaks into
+ * the session list. Same-id resumes reuse the archived row and must never
+ * delete it (`false`); storeless results (`sessionId == null`) likewise never
+ * delete. Mirrors `ensureSession`'s always-new `create()` row, which already
+ * discards with `deleteTranscriptRow = true`.
+ */
+internal fun shouldDeleteStaleFork(requestedSessionId: String, created: CreatedSession): Boolean =
+    created.sessionId != null && created.sessionId != requestedSessionId
+
+/**
+ * Per-phase budget for the bounded pre-close ledger drain (Phase 2
+ * conversation-ledger wiring): newChat / openSession / endpoint-switch /
+ * transport-replace flush the detached live session before closing it, so
+ * admitted transcript events are not lost with the session.
+ * [ChatSession.flush] spends one such budget on the close shutdown-join and
+ * another on the admitted-event drain, so one flush-then-close waits up to
+ * ~2x this value after close (~1x when nothing was closed yet). An
+ * endpoint-switch fork fences up to three such bounded waits in series on
+ * IO — the prior parked fence join (~2x), its session re-flush (~2x), and
+ * the just-detached close-then-flush (~2x) — so the single-flight mutex is
+ * held up to ~6x this value (~30s) worst case before the snapshot read. A
+ * same-ID openSession reopen fences the same three waits (~6x) inside the
+ * mutex before its gated backfill; a different-ID open keeps the fast path
+ * (no fence: the backfill targets another ledger). The
+ * UI never waits on any of it: VM state is detached synchronously and each
+ * wait is bounded — a stalled store only delays the background close / the
+ * next fork's snapshot, never user interaction. Mirrors
+ * [dev.librepocket.chat.OrderedTranscriptSink.DEFAULT_FLUSH_TIMEOUT_MS].
+ */
+private const val SESSION_FLUSH_TIMEOUT_MS = 5_000L
+
+/**
+ * R9-3 deferred-backfill block horizon: a same-ID reopen whose pre-read
+ * settle failed (flush-timeout: the old writer may still land its terminal
+ * late) parks `pendingBackfillBlock[sessionId] = now + this`. A later open
+ * whose settle trivially succeeds (fresh idle live) must NOT backfill while
+ * the block holds — the ledger still dangles — until promotion (the ledger
+ * proves its terminal) or this deadline (old writer truly dead/restarted;
+ * bounded, never a permanent ban). 6x the flush budget (~30s) so a slow but
+ * live writer has room to settle across consecutive reopens. Each forced
+ * hold refreshes the deadline (idle-bounded: back-to-back premature reopens
+ * keep sliding it); R10-2 expiry still requires verifiable proof (ledger
+ * terminal or writer-dead via seal + empty pending) — the deadline alone
+ * never promotes an unsettled ledger, so the block can outlive the horizon
+ * while the old writer is provably alive (fail-closed defer, never a
+ * mis-mark). A restart inside the window drops the memory-only block,
+ * so the first post-restart reopen of a still-dangling id may backfill early
+ * (pre-existing behavior class, bounded by the same horizon).
+ */
+private const val PENDING_BACKFILL_BLOCK_MS = SESSION_FLUSH_TIMEOUT_MS * 6
 
 /**
  * Chat UI state holder wired to the real [ChatSession] plus the transcript store.
@@ -115,6 +245,25 @@ class ChatViewModel(
     val sessionState: StateFlow<ChatUiState> = _sessionState.asStateFlow()
 
     private val _history = MutableStateFlow<List<UiMessage>>(emptyList())
+
+    /**
+     * Stage E: exact number of older replay rows omitted by the tail cap.
+     * Observable truncation (never silent): surfaces "已省略N則" without a
+     * new UI flow. Reset alongside [_history] on every load path.
+     */
+    private val _historyOmittedCount = MutableStateFlow(0)
+    val historyOmittedCount: StateFlow<Int> = _historyOmittedCount.asStateFlow()
+
+    /**
+     * R5-5: send-time per-request trim count, collected from the attached
+     * [ChatSession.requestTrimmedCount]. Load-time resume omission
+     * ([historyOmittedCount], DB tail cap) and this send-time trim are
+     * orthogonal counters — never summed, reset independently. Reset to 0 on
+     * every attach (new session starts untrimmed) and on lifecycle/endpoint
+     * invalidation (the owning session is detached).
+     */
+    private val _requestTrimmedCount = MutableStateFlow(0)
+    val requestTrimmedCount: StateFlow<Int> = _requestTrimmedCount.asStateFlow()
 
     val messages: StateFlow<List<UiMessage>> =
         combine(_history, _sessionState) { history, live ->
@@ -203,6 +352,7 @@ class ChatViewModel(
     private var currentBinding: EndpointSessionBinding? = null
     private var currentSessionGeneration: Long? = null
     private var sessionCollectJob: Job? = null
+    private var requestTrimCollectJob: Job? = null
     private var openJob: Job? = null
     // One-shot key.read consent (ASK path). Minted by [confirmKeyRead] from a
     // suspending context and taken by [authorizeEndpoint] on Main, so all
@@ -236,6 +386,247 @@ class ChatViewModel(
     private var pendingOpen: PendingOpen? = null
     private val _pendingOpenSessionId = MutableStateFlow<String?>(null)
     val pendingOpenSessionId: StateFlow<String?> = _pendingOpenSessionId.asStateFlow()
+    /**
+     * R6-3 streaming-switch fence (Main-confined, guarded by [sessionMutex]
+     * like every other lifecycle field): the detached old ledger's background
+     * close-then-flush job plus the streaming evidence captured before its
+     * detach. [invalidateForEndpointChange] is synchronous and cannot suspend,
+     * so it parks the detached session here; the next `ensureSession` fork
+     * joins the fence (bounded, on IO) before reading the old ledger, so the
+     * doomed host's cancel terminal is already durable when the snapshot
+     * copies. Cleared once consumed. Null when no detached ledger is pending.
+     * Cancel-safety: a fork that consumed the fence but is lifecycle-cancelled
+     * before its settle completes re-parks the unfinished ledger
+     * ([reparkUnsettledLedger]); a fork whose history was discarded instead
+     * drops it ([invalidateLifecycle] with `clearChat`, `openSession` after
+     * attach, or [invalidateForEndpointChange] with `binding == null`) so a
+     * later unrelated fork never joins an ancient job.
+     *
+     * R8-2: the fence lifecycle is decoupled from [lifecycleGeneration]. A
+     * non-null endpoint switch only replaces the transport ([binding] != null
+     * keeps `_currentSessionId`/`_history`); it hands the fence over, never
+     * drops it. Only an explicit history discard (clearChat, openSession
+     * attach, binding == null) clears the slot. [pendingLedgerOwnerSessionId]
+     * is the `_currentSessionId` at park time (the ledger the next fork
+     * snapshots: the lineage the consume re-fills on re-park). The cancel
+     * re-park decision itself uses the caller's [explicitDiscardEpoch]
+     * snapshot (`entryDiscardEpoch` in `ensureSession`, taken before any
+     * suspension) plus `_currentSessionId == previousSessionId` — "same
+     * epoch" (no discard crossed) or "same owner" (snapshot target intact)
+     * re-parks, otherwise the ledger is dropped as abandoned.
+     */
+    private var pendingLedgerFence: Job? = null
+    private var pendingLedgerSession: ChatSession? = null
+    private var pendingLedgerWasStreaming: Boolean = false
+    private var pendingLedgerOwnerSessionId: String? = null
+    /**
+     * R10-1 outstanding-teardown table (Main-confined, guarded by [sessionMutex]
+     * like every other lifecycle field): source sessionId → detached ledger's
+     * background close-then-flush job + session + streaming evidence. An
+     * explicit history discard ([invalidateLifecycle] with `clearChat`,
+     * `openSession` preamble for a different id, or
+     * [invalidateForEndpointChange] with `binding == null`) clears only the
+     * UI/history binding ([pendingLedgerFence] slot + `_currentSessionId`);
+     * the detached writer's settle ownership moves here keyed by its source
+     * sessionId, even though the binding is gone. A later `openSession(id)`
+     * consults this table: a live (unexpired) entry for the requested id
+     * forces the slow-path settle (join + flushDurable re-check) before the
+     * gated backfill, so a `newChat → immediate reopen` cannot fast-path a
+     * false INTERRUPTED while the old writer is still alive. An unrelated id
+     * never waits (fast path unchanged). Entries are consumed by the slow
+     * settle (success/timeout/dead all remove; failure parks
+     * [pendingBackfillBlock] per R9-3), overdue entries are proof-gated on
+     * every park/consult (R11-1): an entry past [PENDING_BACKFILL_BLOCK_MS]
+     * is removed only with writer-dead/clean proof (fence completed AND
+     * session null or sealed-dead); a still-unsettled entry slides its
+     * deadline instead of being erased, so a clock deadline bounds UI
+     * waiting but never erases ownership while a commit is still possible —
+     * and [onCleared] drops the whole table. Never assume "discarded binding =
+     * old ledger never reopens".
+     */
+    private data class OutstandingTeardown(
+        var fence: Job?,
+        var session: ChatSession?,
+        var wasStreaming: Boolean,
+        var parkedAtMs: Long,
+    )
+    private val outstandingTeardowns = HashMap<String, OutstandingTeardown>()
+    /**
+     * R10-1 helpers (Main, never take [sessionMutex] — callers inside
+     * `withLock` already hold it; direct map access avoids deadlock).
+     */
+    /**
+     * R10-2 monotonic clock seam for every backfill/outstanding deadline.
+     * Default is [System.nanoTime]-based (monotonic, immune to wall-clock
+     * jumps); tests inject a manual clock to shrink the horizon or simulate
+     * jumps deterministically. Wall-clock ([System.currentTimeMillis]) must
+     * never gate ledger promotion — a jump would unconditionally drop the
+     * block and mis-mark a still-live writer's turn.
+     */
+    internal var backfillClockMs: () -> Long = { System.nanoTime() / 1_000_000L }
+    /**
+     * R10-2 horizon seam (default [PENDING_BACKFILL_BLOCK_MS]). Tests shrink
+     * this to exercise expiry-while-writer-alive without waiting ~30s.
+     */
+    internal var backfillBlockHorizonMs: Long = PENDING_BACKFILL_BLOCK_MS
+
+    private fun purgeExpiredOutstanding(nowMs: Long = backfillClockMs()) {
+        val it = outstandingTeardowns.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (nowMs - e.value.parkedAtMs < backfillBlockHorizonMs) continue
+            // R11-1: never erase a still-unsettled teardown on clock alone.
+            // A deadline may bound waiting/UI responsiveness, but must not
+            // erase ownership while a commit is still possible. Overdue-but-
+            // live entries slide their deadline (same renew semantics as
+            // pendingBackfillBlock); only provably-dead/clean entries are
+            // removed. S4-F1: shares [outstandingLiveness] with peek.
+            if (outstandingLiveness(e.value)) {
+                e.value.parkedAtMs = nowMs
+            } else {
+                it.remove()
+            }
+        }
+    }
+    /**
+     * R11-1 liveness for the outstanding table: true while the detached
+     * writer may still commit its terminal. Fail-closed: any uncertainty
+     * keeps the entry (renew, never purge).
+     * - Unfinished fence → live (the background close-then-flush still runs).
+     * - Sealed-dead session (sealed + no pending + writer completed) → dead:
+     *   its terminal can never land late, so a later backfill of its dangling
+     *   turn is correct. Seal + empty pending WITHOUT writer completion is
+     *   still live (R14-1: timed-out shutdown shape).
+     * - Streaming/pending evidence → live.
+     * - Unsealed session with no fence completion proof → live (a stalled
+     *   delegate / non-cancellable terminal persistence may still commit
+     *   despite bounded caller waits and empty session-side flags).
+     * - Fence completed + session null or sealed-dead → dead.
+     * Best-effort reads only, never throws.
+     *
+     * S4-F1: single shared liveness ([outstandingLiveness]); [purgeExpiredOutstanding]
+     * and [peekOutstandingLive] both consult it so the two can never fork
+     * (fence==null + session!=null unexpired stays live/defer, never promote).
+     */
+    private fun outstandingLiveness(entry: OutstandingTeardown): Boolean {
+        try {
+            if (entry.fence?.isCompleted == false) return true
+        } catch (_: Exception) {
+            return true
+        }
+        val s = entry.session
+        if (s == null) {
+            // No session left: with the fence finished (or absent) no writer
+            // remains to commit. An unfinished fence already returned true.
+            return false
+        }
+        try {
+            if (isWriterSealedDead(s)) return false
+        } catch (_: Exception) {
+        }
+        try {
+            if (isLedgerStreamingOrPending(s)) return true
+        } catch (_: Exception) {
+        }
+        // Unsealed without session-side evidence: only a completed fence
+        // proves the teardown ran to completion. No fence (or an unreadable
+        // fence) means no completion proof — keep the entry.
+        // R14-1: a sealed session here is NOT dead (sealed-dead above already
+        // returned false, i.e. the writer has not completed) — a timed-out
+        // shutdown seals and empties pending while the writer is still inside
+        // a blocking store block, so keep ownership. Unsealed + pending-empty
+        // implies no in-flight block (an in-flight core always occupies
+        // pendingCore until the writer's own finally; only the sealed
+        // shutdown path clears it early), so a completed fence still proves
+        // completion there. Seal reads fail closed (kept).
+        return try {
+            if (entry.fence == null) return true
+            try {
+                s.isTranscriptSealed()
+            } catch (_: Exception) {
+                true
+            }
+        } catch (_: Exception) {
+            true
+        }
+    }
+    /** S4-F1 alias: historic name for the shared [outstandingLiveness]. */
+    private fun isOutstandingEntryLive(entry: OutstandingTeardown): Boolean =
+        outstandingLiveness(entry)
+    private fun rememberOutstandingTeardown(
+        owner: String?,
+        fence: Job?,
+        session: ChatSession?,
+        wasStreaming: Boolean,
+    ) {
+        if (owner == null) return
+        if (fence == null && session == null) return
+        purgeExpiredOutstanding()
+        val nowMs = backfillClockMs()
+        val existing = outstandingTeardowns[owner]
+        if (existing == null) {
+            outstandingTeardowns[owner] = OutstandingTeardown(fence, session, wasStreaming, nowMs)
+        } else {
+            val mergedFence = when {
+                existing.fence != null && fence != null && existing.fence !== fence ->
+                    compositeLedgerJoin(existing.fence!!, fence)
+                fence != null -> fence
+                else -> existing.fence
+            }
+            existing.fence = mergedFence
+            if (session != null) existing.session = session
+            existing.wasStreaming = existing.wasStreaming || wasStreaming
+            existing.parkedAtMs = nowMs
+        }
+    }
+    /** Move the single-slot fence into the per-session table (single ownership). */
+    private fun stashPendingSlotToOutstanding() {
+        val fence = pendingLedgerFence
+        val session = pendingLedgerSession
+        val wasStreaming = pendingLedgerWasStreaming
+        val owner = pendingLedgerOwnerSessionId
+        if (fence == null && session == null) return
+        rememberOutstandingTeardown(owner, fence, session, wasStreaming)
+    }
+    /** Consume the table entry for [sessionId] (slow-path single ownership). */
+    private fun takeOutstanding(sessionId: String): OutstandingTeardown? {
+        purgeExpiredOutstanding()
+        return outstandingTeardowns.remove(sessionId)
+            ?.takeIf { it.fence != null || it.session != null }
+    }
+    /**
+     * R9-3 deferred-backfill block (Main-confined, guarded by [sessionMutex]
+     * like every other lifecycle field): sessionId → deadlineMs. A deferred
+     * same-ID reopen (`!backfillNow`: settle failed, terminal may land late)
+     * parks its id here; a later open with a trivially-successful settle
+     * (fresh idle live, old writer still alive) stays deferred while its
+     * entry holds. Promotion deletes the entry (ledger proves no dangling
+     * family AND the detached live shows no pending evidence); R10-2 expiry
+     * no longer deletes it on clock alone — it promotes only on verifiable
+     * proof ([tryPromoteExpiredBlock]: ledger clean, or writer-dead proof via
+     * seal + empty pending) and otherwise renews the deadline and keeps
+     * deferring. Memory-only: a process restart drops
+     * every entry (a durable marker would need a single-event delete for its
+     * clear semantics — no SessionStore API — and the head-anchored scan
+     * loses pruned markers anyway, so the marker stays a noted follow-up and
+     * this block is the enforcement).
+     */
+    private var pendingBackfillBlock = HashMap<String, Long>()
+    /**
+     * R10-2 pending-writer identity for expiry promotion: sessionId → the
+     * unsettled old-writer session observed when the block was parked (the
+     * same-ID defer's [detached] live, which still owned the ledger then).
+     * A later expiry must not promote on wall-clock alone: it re-reads this
+     * writer's liveness (streaming/pending evidence, seal + empty pending +
+     *   writer completion) so
+     * a still-alive writer keeps deferring while a provably-dead writer may
+     * promote even with a dangling ledger (its terminal will never land, so
+     * marking INTERRUPTED is correct). Only entries with pending/streaming
+     * evidence are stored (a clean fresh-idle detached never overwrites the
+     * old writer); cleared together with the block on promotion/expiry-allow
+     * and on [onCleared]. Memory-only like the block.
+     */
+    private var pendingBackfillWriter = HashMap<String, ChatSession?>()
     // R2: unsent texts are owned per send/steer operation, never by a single
     // global String. Cleared only when the controller accepts that exact op
     // (startOrEnqueue Started/Queued verdict); pre-accept endpoint
@@ -742,6 +1133,33 @@ class ChatViewModel(
                                 setNoticeIfCurrent(operationGeneration, "CHAT_SEND_DENIED")
                                 restoreOpForFailedSend(opId, "CHAT_SEND_DENIED")
                                 return@launch
+                            } catch (_: InputTooLongException) {
+                                // R4-4 admission fail-fast: single-turn input +
+                                // time block exceeds MAX_REQUEST_CHARS. Never
+                                // sent; keep the text recoverable (draft).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
+                                restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
+                                return@launch
+                            } catch (_: TranscriptPendingException) {
+                                // R5-1/R6-2 UNKNOWN/PENDING_COMMIT (timeout-after-send /
+                                // external-cancel-after-send):
+                                // ownership retained by the controller, same-opId
+                                // resend blocked until settle. Do NOT restore
+                                // (no draft, no retry yet); project pending and
+                                // flip on settle (claimed → accept, failed →
+                                // UNAVAILABLE retryable).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_PENDING")
+                                launchPendingSettleWaiter(opId, clean, handle, operationGeneration)
+                                return@launch
+                            } catch (_: TranscriptDurabilityException) {
+                                // Stage 6 (R4-3) admission fail-closed: the user
+                                // row could not be durably persisted within the
+                                // bounded timeout (store stall/seal). Same
+                                // restore semantics as InputTooLong (notice +
+                                // draft, caller retains the text for retry).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_UNAVAILABLE")
+                                restoreOpForFailedSend(opId, "CHAT_STORE_UNAVAILABLE")
+                                return@launch
                             }
                             if (verdict !is TurnStart.NeedsRecovery) {
                                 if (verdict is TurnStart.Started) {
@@ -951,6 +1369,25 @@ class ChatViewModel(
                                 setNoticeIfCurrent(operationGeneration, "CHAT_SEND_DENIED")
                                 restoreOpForFailedSend(opId, "CHAT_SEND_DENIED")
                                 return@launch
+                            } catch (_: InputTooLongException) {
+                                // R4-4 admission fail-fast: single-turn input +
+                                // time block exceeds MAX_REQUEST_CHARS. Never
+                                // sent; keep the text recoverable (draft).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_INPUT_TOO_LONG")
+                                restoreOpForFailedSend(opId, "CHAT_INPUT_TOO_LONG")
+                                return@launch
+                            } catch (_: TranscriptPendingException) {
+                                // R5-1/R6-2 UNKNOWN/PENDING_COMMIT: same as the steer
+                                // path above (no restore; settle waiter flips).
+                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_PENDING")
+                                launchPendingSettleWaiter(opId, text, handle, operationGeneration)
+                                return@launch
+                            } catch (_: TranscriptDurabilityException) {
+                                // Stage 6 (R4-3) admission fail-closed: same
+                                // restore semantics as InputTooLong.
+                                setNoticeIfCurrent(operationGeneration, "CHAT_STORE_UNAVAILABLE")
+                                restoreOpForFailedSend(opId, "CHAT_STORE_UNAVAILABLE")
+                                return@launch
                             }
                             if (verdict !is TurnStart.NeedsRecovery) {
                                 if (verdict is TurnStart.Queued) {
@@ -1082,24 +1519,243 @@ class ChatViewModel(
 
     /** Resume an existing transcript session (history replay + live binding). */
     fun openSession(sessionId: String) {
-        invalidateLifecycle(clearChat = true)
+        // R8-3 same-ID reopen fence: snapshot before invalidateLifecycle
+        // clears it. invalidate (clearChat=true) synchronously drops the
+        // fence slot and nulls _currentSessionId, so after it runs a reopen
+        // can no longer tell it targets the live ledger. Take one-time
+        // ownership of the fence slot here (mirrors the ensureSession
+        // consume); a different-ID reopen drops it (fast path: the backfill
+        // targets another ledger). A same-ID reopen detaches its live
+        // session now so the invalidate below does not launch a second
+        // concurrent teardown for it — the slow-path IO settles it exactly
+        // once, then reads, then backfills gated on the settle outcome.
+        val prevId: String? = _currentSessionId.value
+        val prevLive: ChatSession? = currentSession
+        val fencedJob0: Job? = pendingLedgerFence
+        val fencedSession0: ChatSession? = pendingLedgerSession
+        val fencedWasStreaming0: Boolean = pendingLedgerWasStreaming
+        val fencedOwner0: String? = pendingLedgerOwnerSessionId
+        // S4-R2 preamble: snapshot slot/table hints here (no take/clear yet –
+        // authoritative take/remember/clear live under sessionMutex below);
+        // the sync ticket + sync parks run after the ticket (see below).
+        val isSameIdReopen = prevId != null && prevId == sessionId
+        // R9-2 from-null owner-match: an abort/early-exit already nulled
+        // _currentSessionId, so prevId==null even though the parked fence
+        // still owns the requested ledger (owner==sessionId). Dropping it
+        // here would send the reopen down the different-ID fast path
+        // (unfenced loadHistory + open(...,true) hard backfill) while the
+        // teardown is still unsettled — a false INTERRUPTED. An
+        // owner-matched reopen therefore retains the fence and is treated
+        // as the same-ID slow path (fence join + parked flushDurable
+        // re-check, no live needed), even when prevLive==null.
+        var isOwnerMatchedReopen = !isSameIdReopen &&
+            fencedOwner0 != null &&
+            fencedOwner0 == sessionId &&
+            (fencedJob0 != null || fencedSession0 != null)
+        // R10-1 cross-discard ownership: a newChat/open-other already nulled
+        // _currentSessionId and stashed the detached writer into
+        // outstandingTeardowns keyed by its source id, so prevId==null and
+        // the slot is empty even though the old writer for the requested id
+        // is still settling. Consult the table (single ownership via take);
+        // an unrelated id never waits. Take before stashing the unrelated
+        // slot below so the requested entry is never merged into another id.
+        // S4-F2: read-only hint here (no purge/remove); authoritative take
+        // happens inside withLock (first segment) under mutex.
+        val takenOutstandingHint = outstandingTeardowns[sessionId]
+        val outstandingFenceHint: Job? = takenOutstandingHint?.fence
+        val outstandingSessionHint: ChatSession? = takenOutstandingHint?.session
+        val outstandingWasStreamingHint: Boolean = takenOutstandingHint?.wasStreaming ?: false
+        val hasOutstandingHint = outstandingFenceHint != null || outstandingSessionHint != null
+        // Authoritative locals (set under lock below, overwrite hints).
+        // Placeholders so closure captures compile; real values assigned
+        // in the withLock first segment.
+        var takenOutstanding: OutstandingTeardown? = null
+        var outstandingFence: Job? = null
+        var outstandingSession: ChatSession? = null
+        var outstandingWasStreaming: Boolean = false
+        var hasOutstanding: Boolean = false
+        if (!isSameIdReopen && !isOwnerMatchedReopen) {
+            // Preserve an unrelated slot fence for its own future reopen
+            // instead of dropping it (R10-1: per-id consult only). When this
+            // branch runs with a non-null slot, its owner differs from the
+            // requested id (otherwise it would have been owner-matched), so
+            // stashing cannot pollute this open's settle.
+            // S4-R2: stashed sync after the ticket below (see sync parks) so a
+            // pre-dispatch cancel cannot leak it; the lock re-checks idempotently.
+        }
+        // Effective slot fence for this open's settle: only when it targets
+        // the requested ledger. An unrelated slot (stashed above) must not
+        // gate this ledger's backfill. Hint values here; authoritative
+        // recompute under lock below overwrites them.
+        var effectiveFencedJob: Job? = if (isSameIdReopen || isOwnerMatchedReopen) fencedJob0 else null
+        var effectiveFencedSession: ChatSession? =
+            if (isSameIdReopen || isOwnerMatchedReopen) fencedSession0 else null
+        var effectiveFencedWasStreaming: Boolean =
+            if (isSameIdReopen || isOwnerMatchedReopen) fencedWasStreaming0 else false
+        var effectiveFencedOwner: String? =
+            if (isSameIdReopen || isOwnerMatchedReopen) fencedOwner0 else null
+        var isOutstandingReopen = hasOutstandingHint
+        var isSlowReopen = isSameIdReopen || isOwnerMatchedReopen || isOutstandingReopen
+        // R9-2: same-ID reopen owns its teardown eagerly (sync area). The
+        // live turn is cancelled IO-free via cancelAndDetachSync (semantics
+        // unchanged), then close+flush launches immediately on viewModelScope
+        // (NOT lifecycleScope, so cancelLifecycleOperations below cannot kill
+        // it; TurnController.close is idempotent, double-close safe). The
+        // closure hands sameIdTeardown+prevLive to the slow path, which joins
+        // (2x) + flushDurable re-checks (parked pattern) instead of a second
+        // closeThenFlushDurable. Early-exit/cancel re-parks (owner=prevId).
+        // S4-R2 sync ticket (last-wins): bump generation + cancel prev open
+        // synchronously in the preamble (Main, no suspension). A double-tap
+        // while the first open suspends on IO cancels the first (its generation
+        // goes stale + its openJob is cancelled); the lock below only does
+        // authoritative slot/table ownership, never generation/UI.
+        var prevWasStreaming = if (prevLive != null) {
+            try {
+                isLedgerStreamingOrPending(prevLive)
+            } catch (_: Exception) {
+                false
+            }
+        } else {
+            false
+        }
+        // Launch deferred to the lock first segment (no pre-dispatch leak:
+        // nothing launched here, so a cancel before dispatch owns nothing).
+        var sameIdTeardown: Job? = null
+        // Sync ticket: explicit discard + new lifecycle scope (retryInFlight
+        // null + scope renew, same as invalidateLifecycle) + cancel prev open.
+        // A teardown launch below lives on viewModelScope, never the
+        // just-invalidated lifecycle scope, so it survives this cancel.
+        lifecycleGeneration += 1
+        explicitDiscardEpoch += 1
+        cancelLifecycleOperations()
+        openJob?.cancel()
+        openJob = null
+        // Sync detach (UI never waits, IO-free): VM state detached now so the
+        // UI updates immediately; the close-then-flush launch + slot/table
+        // ownership happen under the mutex below (same-ID and different-ID
+        // alike – ownership only in lock).
+        if (prevLive != null) {
+            cancelAndDetachSync(prevLive)
+        }
+        // Sync UI clear (no lock): history/binding/ops reset now, never while
+        // holding sessionMutex (lock below touches only slot/table).
+        _sessionState.value = EMPTY_SESSION_STATE
+        _notice.value = null
+        _history.value = emptyList()
+        _historyOmittedCount.value = 0
+        _requestTrimmedCount.value = 0
+        _currentSessionId.value = null
+        pendingOps.clear()
+        recoverableOps.clear()
+        syncRecoveryCount()
+        retryableOp = null
+        retryFallbackTarget = null
+        retryTargetCandidate = null
+        latestAcceptedStartedTarget = null
+        inputDraft = null
         val requestedGeneration = lifecycleGeneration
+        // R9-2 discard-scoped entry: post-ticket epoch. The re-park in the
+        // lock + defensive finally only parks when no newer explicit discard
+        // crossed it; _currentSessionId is already null here so owner uses
+        // prevId / retained owner.
+        val sameIdEntryDiscardEpoch = explicitDiscardEpoch
+        var sameIdCombinedWasStreaming =
+            effectiveFencedWasStreaming || prevWasStreaming || outstandingWasStreamingHint
+        // S4-R2 sync parks (pre-dispatch coverage, no leak): preamble detached
+        // above, so launch + park synchronously – ownership already sits in
+        // slot/table even if openJob is cancelled before dispatch. The lock
+        // below re-takes authoritatively (idempotent, never relaunches):
+        // single launch, fence joins exactly once. Unrelated slot stashed
+        // per-id; same-ID/owner/outstanding parked to slot (same-owner merge);
+        // different-ID live launched + remembered under prevId (future reopen
+        // fences it, never this open's settle).
+        if (!isSameIdReopen && !isOwnerMatchedReopen) {
+            if (fencedJob0 != null || fencedSession0 != null) {
+                rememberOutstandingTeardown(
+                    fencedOwner0,
+                    fencedJob0,
+                    fencedSession0,
+                    fencedWasStreaming0,
+                )
+            }
+        }
+        pendingLedgerFence = null
+        pendingLedgerSession = null
+        pendingLedgerWasStreaming = false
+        pendingLedgerOwnerSessionId = null
+        if (isSameIdReopen && prevLive != null) {
+            // Detach already sync above; launch survives the ticket cancel
+            // (viewModelScope, never lifecycleScope; close idempotent).
+            sameIdTeardown = launchCloseThenFlush(prevLive)
+        }
+        if (isSameIdReopen && prevLive != null && sameIdTeardown != null) {
+            var mergedFence: Job? = sameIdTeardown
+            if (effectiveFencedJob != null) {
+                mergedFence = compositeLedgerJoin(effectiveFencedJob, mergedFence)
+            }
+            if (outstandingFenceHint != null) {
+                mergedFence = compositeLedgerJoin(outstandingFenceHint, mergedFence)
+            }
+            pendingLedgerFence = mergedFence
+            pendingLedgerSession = prevLive
+            pendingLedgerWasStreaming = sameIdCombinedWasStreaming
+            pendingLedgerOwnerSessionId = prevId
+        } else if (isOwnerMatchedReopen || hasOutstandingHint) {
+            var parkFence: Job? = effectiveFencedJob ?: outstandingFenceHint
+            if (effectiveFencedJob != null && outstandingFenceHint != null &&
+                effectiveFencedJob !== outstandingFenceHint
+            ) {
+                parkFence = compositeLedgerJoin(effectiveFencedJob, outstandingFenceHint)
+            }
+            val parkSession: ChatSession? = effectiveFencedSession ?: outstandingSessionHint
+            if (parkFence != null || parkSession != null) {
+                pendingLedgerFence = parkFence
+                pendingLedgerSession = parkSession
+                pendingLedgerWasStreaming = sameIdCombinedWasStreaming
+                pendingLedgerOwnerSessionId = if (isOwnerMatchedReopen) {
+                    effectiveFencedOwner
+                } else {
+                    sessionId
+                }
+            }
+        }
+        if (!isSameIdReopen && prevLive != null) {
+            // Different-ID live (UI already detached sync above): launch +
+            // remember under its own id now so a pre-dispatch cancel cannot
+            // leak it; the lock below skips relaunch when it sees this entry.
+            // Unrelated to this open's settle (different key, never merged).
+            val diffFenceSync = launchCloseThenFlush(prevLive)
+            if (prevId != null) {
+                rememberOutstandingTeardown(prevId, diffFenceSync, prevLive, prevWasStreaming)
+            }
+        }
         openJob = lifecycleScope.launch {
             var candidate: CreatedSession? = null
             var attached = false
             var cancellation: CancellationException? = null
             try {
-                val loaded = try {
-                    withContext(Dispatchers.IO) { loadHistory(sessionId) }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
+                // Fast path (different ID) preloads outside the mutex as
+                // before; the slow path reads AFTER its settle inside the
+                // mutex, so its snapshot can never see an orphan user row.
+                // Owner-matched from-null reopens take the slow path too
+                // (isSlowReopen), so their loadHistory is fenced.
+                val fastLoaded: LoadedUiHistory? = if (!isSlowReopen) {
+                    try {
+                        withContext(Dispatchers.IO) { loadHistory(sessionId) }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        null
+                    }
+                } else {
                     null
                 }
-                if (!isGenerationCurrent(requestedGeneration)) return@launch
-                if (loaded == null) {
-                    _notice.value = "UNKNOWN_SESSION"
-                    return@launch
+                if (!isSlowReopen) {
+                    if (!isGenerationCurrent(requestedGeneration)) return@launch
+                    if (fastLoaded == null) {
+                        _notice.value = "UNKNOWN_SESSION"
+                        return@launch
+                    }
                 }
 
                 val access = when (val result = authorizeEndpoint(requestedGeneration)) {
@@ -1134,6 +1790,130 @@ class ChatViewModel(
 
                 sessionMutex.withLock {
                     if (!isGenerationCurrent(requestedGeneration)) return@withLock
+                    // S4-R2 authoritative ownership only (ticket + UI already
+                    // done sync in the preamble above; cancelling scope/job here
+                    // would kill self – generation check suffices, and the
+                    // preamble already cancelled the previous open for last-wins).
+                    // S4-R2 authoritative ownership (first segment under mutex):
+                    // fresh take with purge; stash unrelated slot (no-op when the
+                    // preamble already stashed); recompute effective/slow; parks
+                    // overwrite slot (single ownership, fence join exactly once).
+                    // The preamble above already ticketed (generation bump +
+                    // prev-open cancel for last-wins) + parked sync for
+                    // pre-dispatch coverage; this re-take is idempotent (same
+                    // fence/session instances merge without a second launch),
+                    // so a double-tap while the first open suspends on IO cannot
+                    // steal ownership here.
+                    val takenAuth = takeOutstanding(sessionId)
+                    takenOutstanding = takenAuth
+                    outstandingFence = takenAuth?.fence
+                    outstandingSession = takenAuth?.session
+                    outstandingWasStreaming = takenAuth?.wasStreaming ?: false
+                    hasOutstanding = outstandingFence != null || outstandingSession != null
+                    val freshSlotJob: Job? = pendingLedgerFence
+                    val freshSlotSession: ChatSession? = pendingLedgerSession
+                    val freshSlotWasStreaming: Boolean = pendingLedgerWasStreaming
+                    val freshSlotOwner: String? = pendingLedgerOwnerSessionId
+                    val isOwnerMatchedAuth = !isSameIdReopen &&
+                        freshSlotOwner != null &&
+                        freshSlotOwner == sessionId &&
+                        (freshSlotJob != null || freshSlotSession != null)
+                    // Publish authoritative owner-match for the abort finally below.
+                    isOwnerMatchedReopen = isOwnerMatchedAuth
+                    if (!isSameIdReopen && !isOwnerMatchedAuth) {
+                        if (freshSlotJob != null || freshSlotSession != null) {
+                            rememberOutstandingTeardown(
+                                freshSlotOwner,
+                                freshSlotJob,
+                                freshSlotSession,
+                                freshSlotWasStreaming,
+                            )
+                        }
+                    }
+                    // Different-live ownership (authoritative, idempotent): preamble
+                    // already detached sync (UI immediate) + launched +
+                    // remembered under prevId (no pre-dispatch leak). Skip
+                    // relaunch when the preamble entry already owns prevLive
+                    // (single launch, fence joins exactly once); otherwise
+                    // launch here (e.g. preamble raced – defensive, same key,
+                    // never merged into this open's settle).
+                    if (!isSameIdReopen && prevLive != null) {
+                        val alreadyOwns = if (prevId != null) {
+                            outstandingTeardowns[prevId]?.session === prevLive
+                        } else {
+                            false
+                        }
+                        if (!alreadyOwns) {
+                            val diffFence = launchCloseThenFlush(prevLive)
+                            if (prevId != null) {
+                                rememberOutstandingTeardown(prevId, diffFence, prevLive, prevWasStreaming)
+                            }
+                        }
+                    }
+                    effectiveFencedJob =
+                        if (isSameIdReopen || isOwnerMatchedAuth) freshSlotJob else null
+                    effectiveFencedSession =
+                        if (isSameIdReopen || isOwnerMatchedAuth) freshSlotSession else null
+                    effectiveFencedWasStreaming =
+                        if (isSameIdReopen || isOwnerMatchedAuth) freshSlotWasStreaming else false
+                    effectiveFencedOwner =
+                        if (isSameIdReopen || isOwnerMatchedAuth) freshSlotOwner else null
+                    isOutstandingReopen = hasOutstanding
+                    // Authoritative slow recompute overwrites the preload hint;
+                    // hint-slow/auth-fast is safe (extra settle, still correct).
+                    isSlowReopen = isSameIdReopen || isOwnerMatchedAuth || isOutstandingReopen
+                    sameIdCombinedWasStreaming =
+                        effectiveFencedWasStreaming || prevWasStreaming || outstandingWasStreaming
+                    // Clear the slot before authoritative parks (single ownership;
+                    // parks below overwrite). Stashed unrelated slot already
+                    // preserved above, so clearing cannot lose it.
+                    pendingLedgerFence = null
+                    pendingLedgerSession = null
+                    pendingLedgerWasStreaming = false
+                    pendingLedgerOwnerSessionId = null
+                    // Same-ID teardown re-use (single launch in the preamble sync
+                    // park above – no pre-dispatch leak, no second launch here;
+                    // TurnController.close idempotent, double-close safe). The
+                    // authoritative park below re-merges the preamble launch
+                    // with the fresh slot + authoritative outstanding take
+                    // (idempotent joins, exactly-once fence ownership).
+                    if (isSameIdReopen && prevLive != null && sameIdTeardown != null) {
+                        var mergedFence: Job? = sameIdTeardown
+                        val effJobPark: Job? = effectiveFencedJob
+                        if (effJobPark != null && effJobPark !== mergedFence) {
+                            mergedFence = compositeLedgerJoin(effJobPark, mergedFence)
+                        }
+                        val outFencePark: Job? = outstandingFence
+                        if (outFencePark != null && outFencePark !== mergedFence &&
+                            outFencePark !== effJobPark
+                        ) {
+                            mergedFence = compositeLedgerJoin(outFencePark, mergedFence)
+                        }
+                        pendingLedgerFence = mergedFence
+                        pendingLedgerSession = prevLive
+                        pendingLedgerWasStreaming = sameIdCombinedWasStreaming
+                        pendingLedgerOwnerSessionId = prevId
+                    } else if (isOwnerMatchedAuth || isOutstandingReopen) {
+                        val effJobPark2: Job? = effectiveFencedJob
+                        val outFencePark2: Job? = outstandingFence
+                        var parkFence: Job? = effJobPark2 ?: outFencePark2
+                        if (effJobPark2 != null && outFencePark2 != null &&
+                            effJobPark2 !== outFencePark2
+                        ) {
+                            parkFence = compositeLedgerJoin(effJobPark2, outFencePark2)
+                        }
+                        val parkSession: ChatSession? = effectiveFencedSession ?: outstandingSession
+                        if (parkFence != null || parkSession != null) {
+                            pendingLedgerFence = parkFence
+                            pendingLedgerSession = parkSession
+                            pendingLedgerWasStreaming = sameIdCombinedWasStreaming
+                            pendingLedgerOwnerSessionId = if (isOwnerMatchedAuth) {
+                                effectiveFencedOwner
+                            } else {
+                                sessionId
+                            }
+                        }
+                    }
                     val latest = readEndpoint()
                     if (!isGenerationCurrent(requestedGeneration)) return@withLock
                     if (bindingOf(latest) != access.binding || latest == null) {
@@ -1141,12 +1921,326 @@ class ChatViewModel(
                         return@withLock
                     }
 
+                    if (!isSlowReopen) {
+                        val creationGeneration = requestedGeneration
+                        // R9-3: a from-null reopen of a still-blocked ledger
+                        // defers like the slow path (no live to settle here,
+                        // so settle evidence is vacuously clean; only the
+                        // ledger probe can promote). Different-ID opens check
+                        // their own id, so an unrelated ledger never inherits
+                        // this block.
+                        val fastBackfill = gateBackfillForSession(
+                            sessionId,
+                            settleOk = true,
+                            durableOk = true,
+                            detached = null,
+                        )
+                        try {
+                            withContext(Dispatchers.IO) {
+                                candidate = sessions.open(
+                                    latest,
+                                    sessionId,
+                                    allowAsk = access.allowAsk,
+                                    keyIsCurrent = { isBindingCurrent(access.binding, creationGeneration) },
+                                    backfillInterrupted = fastBackfill,
+                                )
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: CaptureDeniedException) {
+                            // S1/S6 (see the slow path below): burn a consent
+                            // minted between T0 and T1 so a T1 deny on open
+                            // leaves no residual slot for replay; only
+                            // CaptureDeniedException maps to POLICY_DENIED.
+                            takePendingKeyReadConsent()
+                            setNoticeIfCurrent(requestedGeneration, "POLICY_DENIED")
+                            return@withLock
+                        }
+                        val created = candidate ?: return@withLock
+                        if (!isGenerationCurrent(creationGeneration)) return@withLock
+                        val afterCreate = readEndpoint()
+                        if (!isGenerationCurrent(creationGeneration)) return@withLock
+                        if (bindingOf(afterCreate) != access.binding || afterCreate == null) {
+                            reconcileReadBinding(bindingOf(afterCreate))
+                            return@withLock
+                        }
+
+                        // Stage 5 (R4-1): cross-origin open() forks to a new
+                        // provider-owned transcript id; the display replay
+                        // above intentionally still shows the archived rows
+                        // (mirrors the ensureSession endpoint-switch path),
+                        // while the durable ledger holds only the withheld
+                        // marker + new turns. A restart of the forked id then
+                        // shows only its own rows.
+                        // S4-F2: hint-slow/auth-fast over-conservative case
+                        // (preload skipped on hint, authoritative fast) falls
+                        // back to an in-lock load (rare, safe – same fenced
+                        // read the slow path does, just without settle).
+                        val fastHistory = fastLoaded ?: try {
+                            withContext(Dispatchers.IO) { loadHistory(sessionId) }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            null
+                        }
+                        if (fastHistory == null) {
+                            _notice.value = "UNKNOWN_SESSION"
+                            return@withLock
+                        }
+                        _history.value = fastHistory.messages
+                        _historyOmittedCount.value = fastHistory.droppedCount
+                        attach(created, access.binding, creationGeneration)
+                        attached = true
+                        candidate = null
+                        // R6-3 (b): open loads the requested id's history —
+                        // not a fork of the previous ledger — so a fence
+                        // parked by an earlier endpoint-switch is stale for
+                        // every future fork. Drop it now (the pre-clear above
+                        // already dropped it via
+                        // invalidateLifecycle(clearChat=true); this covers the
+                        // attach window): otherwise the next fork would join
+                        // an ancient job, re-flush a long-sealed session, and
+                        // OR ancient wasStreaming into a new INCOMPLETE
+                        // decision. R8-2: the owner lineage goes with it.
+                        pendingLedgerFence = null
+                        pendingLedgerSession = null
+                        pendingLedgerWasStreaming = false
+                        pendingLedgerOwnerSessionId = null
+                        // Stage D: a cross-provider resume keeps the local
+                        // replay but withholds the model prefix; say so
+                        // visibly instead of resuming silently on a blank
+                        // context. R9-3: a fast-path defer (still-blocked
+                        // ledger, see fastBackfill above) warns like the slow
+                        // path instead of the marker scan.
+                        _notice.value = if (!fastBackfill) {
+                            "HISTORY_SNAPSHOT_INCOMPLETE"
+                        } else if (created.historyWithheld) {
+                            "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                        } else {
+                            // R4-2: a cross-provider fork marker persisted in
+                            // this session re-surfaces the withhold notice
+                            // after a restart (the switch-time notice lived in
+                            // the old process). The withhold itself is
+                            // structural — the old rows were never copied — so
+                            // a failed scan only drops the notice, never leaks
+                            // history. Stage 5 (R4-1): cross-origin open()
+                            // forks to a new provider-owned id (attach()
+                            // already points _currentSessionId at it), so scan
+                            // the ATTACHED id, not the requested one. R5-4: a
+                            // failed fork snapshot outranks a clean withhold
+                            // — check the incomplete marker first so a
+                            // restart re-warns HISTORY_SNAPSHOT_INCOMPLETE
+                            // even when no withheld marker exists.
+                            try {
+                                val attachedId = created.sessionId ?: sessionId
+                                withContext(Dispatchers.IO) {
+                                    val backing = sessions.storeOrNull()
+                                    when {
+                                        backing == null -> null
+                                        hasIncompleteSnapshotMarker(backing, attachedId) ->
+                                            "HISTORY_SNAPSHOT_INCOMPLETE"
+                                        hasWithheldSwitchMarker(backing, attachedId) ->
+                                            "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                                        else -> null
+                                    }
+                                }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                null
+                            }
+                        }
+                        return@withLock
+                    }
+
+                    // R8-3 slow path (same ID): settle the same ledger
+                    // BEFORE reading it, bounded on IO under the
+                    // single-flight mutex (same three waits as the
+                    // endpoint-switch fork: prior fence join ~2x, parked
+                    // re-flush ~2x, just-detached join + re-check ~2x).
+                    // R9-2: the just-detached ledger was already torn down
+                    // eagerly in the sync area (sameIdTeardown on
+                    // viewModelScope, double-close safe) — join it bounded
+                    // plus a flushDurable re-check (parked pattern), never a
+                    // second closeThenFlushDurable. Caller cancellation
+                    // propagates; a timeout or flushDurable==false degrades
+                    // to defer (skip this backfill, warn; the next open
+                    // retries), never to a false INTERRUPTED. Store throws
+                    // swallow to false.
+                    var settleOk = true
+                    var durableOk = true
+                    // S4-F2: snapshot authoritative vars to locals for smart-cast
+                    // across suspension (mutex held, no concurrent mutation).
+                    val settleEffJob: Job? = effectiveFencedJob
+                    val settleEffSession: ChatSession? = effectiveFencedSession
+                    val settleOutFence: Job? = outstandingFence
+                    val settleOutSession: ChatSession? = outstandingSession
+                    withContext(Dispatchers.IO) {
+                        // R10-1: settle every teardown owned for the requested
+                        // ledger — the slot fence (same ledger only, unrelated
+                        // slots were stashed, never settled here) plus the
+                        // outstanding-table fence (newChat/open-other cross-
+                        // discard ownership). Each phase is bounded (~2x);
+                        // any miss degrades to defer (R9-3 block), never to a
+                        // false INTERRUPTED.
+                        if (settleEffJob != null) {
+                            val joined = try {
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { settleEffJob.join() } != null
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (!joined) settleOk = false
+                        }
+                        val parked = settleEffSession
+                        if (parked != null) {
+                            // The background job already closed+flushed;
+                            // re-check durability bounded (idempotent seal).
+                            val durable = try {
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                    parked.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
+                                } ?: false
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (!durable) durableOk = false
+                        }
+                        if (settleOutFence != null && settleOutFence !== settleEffJob) {
+                            val joined = try {
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { settleOutFence.join() } != null
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (!joined) settleOk = false
+                        }
+                        val outstandingParked = settleOutSession
+                        if (outstandingParked != null && outstandingParked !== parked) {
+                            val durable = try {
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                    outstandingParked.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
+                                } ?: false
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (!durable) durableOk = false
+                        }
+                        // From-null owner-match has no live to settle: only the
+                        // fence join + parked flushDurable re-check above run.
+                        // A different-ID live (owner-matched but prevId !=
+                        // requested) is already detached unfenced by the
+                        // invalidate above, so it must not gate this ledger's
+                        // backfill — only a true same-ID live settles here.
+                        val detached = if (isSameIdReopen) prevLive else null
+                        val detachedTeardown = sameIdTeardown
+                        if (detached != null && detachedTeardown != null) {
+                            // Eager teardown handover: await the sync-area
+                            // close-then-flush (bounded 2x) then re-check
+                            // durability bounded (idempotent after seal).
+                            val joined = try {
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                    detachedTeardown.join()
+                                } != null
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (!joined) {
+                                settleOk = false
+                                durableOk = false
+                            } else {
+                                val durable = try {
+                                    withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                        detached.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
+                                    } ?: false
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    false
+                                }
+                                // closeThenFlushDurable parity: any unsettled
+                                // ledger (join miss or re-check false) fails
+                                // both gates so this open defers its backfill.
+                                if (!durable) {
+                                    settleOk = false
+                                    durableOk = false
+                                }
+                            }
+                        } else if (detached != null) {
+                            val ok = try {
+                                withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                    closeThenFlushDurable(detached, SESSION_FLUSH_TIMEOUT_MS)
+                                } ?: false
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                false
+                            }
+                            // closeThenFlushDurable returns flushDurable
+                            // (drain AND no durable failure); an outer
+                            // timeout (null) and a false both mean the ledger
+                            // may still miss its terminal.
+                            if (!ok) {
+                                settleOk = false
+                                durableOk = false
+                            }
+                        }
+                    }
+                    if (!isGenerationCurrent(requestedGeneration)) return@withLock
+                    val settledLoaded = try {
+                        withContext(Dispatchers.IO) { loadHistory(sessionId) }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (!isGenerationCurrent(requestedGeneration)) return@withLock
+                    if (settledLoaded == null) {
+                        _notice.value = "UNKNOWN_SESSION"
+                        return@withLock
+                    }
+                    // Gate ONLY the same-origin backfill: settleOk &&
+                    // durableOk backfills, otherwise this open skips it and
+                    // relies on the next open's retry (best-effort). The
+                    // cross-origin fork path always backfills its fresh
+                    // ledger and is never gated. R9-3: the gate is
+                    // sessionId-grained ([gateBackfillForSession]) — a live
+                    // defer block forces a second premature reopen to defer
+                    // again even though its fresh idle live settles cleanly
+                    // (flush-timeout vs flush-failure are indistinguishable
+                    // here; only the ledger state tells them apart).
+                    val detachedForGate = if (isSameIdReopen) prevLive else null
+                    // B4: slot evidence prefers the retained slot session over
+                    // the fresh detached live — a clean fresh-idle detached
+                    // must not shadow the true old-writer culprit. The gate
+                    // verifies both (plus stored + outstanding) and remembers
+                    // both, so a slot session distinct from stored and outside
+                    // the outstanding table is never missed.
+                    val slotEvidenceForGate = effectiveFencedSession ?: outstandingSession
+                    val backfillNow = gateBackfillForSession(
+                        sessionId,
+                        settleOk,
+                        durableOk,
+                        detachedForGate,
+                        slotEvidenceForGate ?: detachedForGate,
+                    )
                     val creationGeneration = requestedGeneration
                     try {
                         withContext(Dispatchers.IO) {
-                            candidate = sessions.open(latest, sessionId, allowAsk = access.allowAsk) {
-                                isBindingCurrent(access.binding, creationGeneration)
-                            }
+                            candidate = sessions.open(
+                                latest,
+                                sessionId,
+                                allowAsk = access.allowAsk,
+                                keyIsCurrent = { isBindingCurrent(access.binding, creationGeneration) },
+                                backfillInterrupted = backfillNow,
+                            )
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
@@ -1170,11 +2264,68 @@ class ChatViewModel(
                         return@withLock
                     }
 
-                    _history.value = loaded
+                    // Stage 5 (R4-1): cross-origin open() forks to a new
+                    // provider-owned transcript id; the display replay above
+                    // intentionally still shows the archived rows (mirrors the
+                    // ensureSession endpoint-switch path), while the durable
+                    // ledger holds only the withheld marker + new turns. A
+                    // restart of the forked id then shows only its own rows.
+                    _history.value = settledLoaded.messages
+                    _historyOmittedCount.value = settledLoaded.droppedCount
                     attach(created, access.binding, creationGeneration)
                     attached = true
                     candidate = null
-                    _notice.value = null
+                    // R6-3 (b): open loads the requested id's history — not a
+                    // fork of the previous ledger — so a fence parked by an
+                    // earlier endpoint-switch is stale for every future fork.
+                    // Drop it now (the pre-clear above already dropped it via
+                    // invalidateLifecycle(clearChat=true); this covers the
+                    // attach window): otherwise the next fork would join an
+                    // ancient job, re-flush a long-sealed session, and OR
+                    // ancient wasStreaming into a new INCOMPLETE decision.
+                    // R8-2: the owner lineage goes with it.
+                    pendingLedgerFence = null
+                    pendingLedgerSession = null
+                    pendingLedgerWasStreaming = false
+                    pendingLedgerOwnerSessionId = null
+                    if (!backfillNow) {
+                        // Deferred backfill: the ledger may still miss its
+                        // terminal, so warn visibly (reuse: the restart scan
+                        // re-warns the same notice once the marker regime
+                        // settles) and hydrate what exists. The skipped
+                        // backfill is retried by the next open.
+                        _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    } else {
+                        // Stage D: a cross-provider resume keeps the local replay
+                        // but withholds the model prefix; say so visibly instead
+                        // of resuming silently on a blank context.
+                        _notice.value = if (created.historyWithheld) {
+                            "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                        } else {
+                            // Same scan as the fast path above (R4-2/R5-4):
+                            // scan the ATTACHED id for a persisted incomplete
+                            // or withhold marker. A failed scan only drops the
+                            // notice, never leaks history.
+                            try {
+                                val attachedId = created.sessionId ?: sessionId
+                                withContext(Dispatchers.IO) {
+                                    val backing = sessions.storeOrNull()
+                                    when {
+                                        backing == null -> null
+                                        hasIncompleteSnapshotMarker(backing, attachedId) ->
+                                            "HISTORY_SNAPSHOT_INCOMPLETE"
+                                        hasWithheldSwitchMarker(backing, attachedId) ->
+                                            "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+                                        else -> null
+                                    }
+                                }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                null
+                            }
+                        }
+                    }
                 }
             } catch (cancelled: CancellationException) {
                 cancellation = cancelled
@@ -1182,10 +2333,66 @@ class ChatViewModel(
             } catch (_: Exception) {
                 setNoticeIfCurrent(requestedGeneration, "NO_ENDPOINT")
             } finally {
+                // R9-2 defensive re-park: every slow-path abort (auth
+                // Denied/Missing/Stale, fast-preload gate at 1008, auth
+                // gates at 1015-1025, access-generation gate at 1029,
+                // mutex gates at 1032-1037, or openJob cancel in slow IO)
+                // keeps the teardown owned. The sync area already parked it
+                // (so pre-dispatch cancel is covered even though this
+                // finally never runs for it); this is idempotent —
+                // already-parked stays, a newer discard suppresses via the
+                // epoch check, and success (attached) never re-parks (slot
+                // stays consumed). Runs on Main (lifecycleScope), same
+                // confinement as the slot; never takes sessionMutex (callers
+                // inside withLock already hold it — direct assign avoids
+                // deadlock).
+                if (!attached && isSlowReopen &&
+                    (prevLive != null || effectiveFencedJob != null || effectiveFencedSession != null ||
+                        outstandingFence != null || outstandingSession != null)
+                ) {
+                    // Same-ID owns its live teardown (owner==prevId);
+                    // from-null owner-match owns the retained slot fence
+                    // (owner==effectiveFencedOwner, no live to hand over);
+                    // R10-1 outstanding owns the table fence (owner==sessionId).
+                    // Merge the slot + table fences so an abort never drops an
+                    // unresolved same-ledger teardown; the session prefers the
+                    // slot (snapshot target) while the other drains via its
+                    // own job unfenced.
+                    var abortFence: Job? = effectiveFencedJob
+                    val abortOutFence: Job? = outstandingFence
+                    if (abortOutFence != null && abortOutFence !== abortFence) {
+                        abortFence = if (abortFence != null) {
+                            compositeLedgerJoin(abortFence, abortOutFence)
+                        } else {
+                            abortOutFence
+                        }
+                    }
+                    val abortSession: ChatSession? =
+                        effectiveFencedSession ?: outstandingSession
+                    reparkSameIdTeardownOnAbort(
+                        sameIdTeardown = sameIdTeardown,
+                        prevLive = if (isSameIdReopen) prevLive else null,
+                        fencedJob = abortFence,
+                        fencedSession = abortSession,
+                        combinedWasStreaming = sameIdCombinedWasStreaming,
+                        ownerSessionId = when {
+                            isSameIdReopen -> prevId
+                            isOwnerMatchedReopen -> effectiveFencedOwner
+                            else -> sessionId
+                        },
+                        entryDiscardEpoch = sameIdEntryDiscardEpoch,
+                    )
+                }
                 val unattached = candidate
                 if (!attached && unattached != null) {
+                    // Stage 5 (R4-1) stale-fork cleanup: same-id resumes reuse
+                    // the archived row (never delete), but a cross-origin fork
+                    // minted a fresh id inside open() — a stale binding after
+                    // that must roll it back (see shouldDeleteStaleFork), or
+                    // the empty fork leaks into the session list.
+                    val deleteForkRow = shouldDeleteStaleFork(sessionId, unattached)
                     try {
-                        sessions.discardUnattached(unattached, deleteTranscriptRow = false)
+                        sessions.discardUnattached(unattached, deleteTranscriptRow = deleteForkRow)
                     } catch (cleanupFailure: Throwable) {
                         val originalCancellation = cancellation
                         if (originalCancellation != null) {
@@ -1302,9 +2509,15 @@ class ChatViewModel(
                     val creationGeneration = pending.generation
                     try {
                         withContext(Dispatchers.IO) {
-                            candidate = sessions.open(latest, sessionId, allowAsk = access.allowAsk) {
-                                isBindingCurrent(access.binding, creationGeneration)
-                            }
+                            candidate = sessions.open(
+                                latest,
+                                sessionId,
+                                allowAsk = access.allowAsk,
+                                keyIsCurrent = { isBindingCurrent(access.binding, creationGeneration) },
+                                // Explicit resume: repair dangling rows like
+                                // the allowAsk-form default would.
+                                backfillInterrupted = true,
+                            )
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
@@ -1323,7 +2536,8 @@ class ChatViewModel(
                         reconcileReadBinding(bindingOf(afterCreate))
                         return@withLock
                     }
-                    _history.value = loaded
+                    _history.value = loaded.messages
+                    _historyOmittedCount.value = loaded.droppedCount
                     attach(created, access.binding, creationGeneration)
                     attached = true
                     candidate = null
@@ -1474,6 +2688,333 @@ class ChatViewModel(
         return EndpointAccess.Ready(AuthorizedEndpoint(latest, binding, authorizedGeneration, allowAsk))
     }
 
+    /**
+     * PG-S1 segment C: settle the detached old ledger(s) BEFORE reading it,
+     * then load the fork inputs. Pure move of the ensureSession fence + read
+     * block (zero behavior change).
+     *
+     * Must be called with sessionMutex held. The caller holds the mutex across
+     * this call; this callee never takes it. [entryDiscardEpoch] snapshots
+     * [explicitDiscardEpoch] before any suspension. The cancel re-park below
+     * is discard-scoped, not
+     * generation-scoped (R8-2): a non-null endpoint switch bumps the
+     * generation but keeps the history, so the fence must be re-parked; only
+     * an explicit discard (explicitDiscardEpoch moved, or the snapshot target
+     * itself is gone) drops it. [fencedOwnerSessionId] is the slot owner at
+     * consume time, re-filled on re-park so the next fork keeps the ledger
+     * lineage. [endpoint] is the endpoint identity snapshot (the effective
+     * baseUrl is derived inside [isSameOriginForResume], the same choke point
+     * the factory `open` path uses — one ledger never gets two verdicts).
+     * The pending-ledger inputs are passed by value with one-time
+     * ownership (the caller already cleared the slots). Only store I/O plus
+     * the ledger settle run here; `_history`/`_notice` writes stay with the
+     * caller back on Main.
+     */
+    private suspend fun settleDetachedLedger(
+        previousSessionId: String?,
+        endpoint: EndpointConfig,
+        fencedJob: Job?,
+        fencedSession: ChatSession?,
+        fencedWasStreaming: Boolean,
+        fencedOwnerSessionId: String?,
+        entryDiscardEpoch: Long,
+        mismatchedForSettle: ChatSession?,
+        mismatchedWasStreaming: Boolean,
+    ): SettledFork {
+        val wasStreaming = mismatchedWasStreaming || fencedWasStreaming
+        var settleOk = true
+        var durableOk = true
+        val prevId = previousSessionId
+            ?: return SettledFork(null, wasStreaming, settleOk, durableOk)
+        // R6-3 (a): the fence locals above were destructively consumed
+        // before any suspension. If this IO section is lifecycle-cancelled,
+        // close still runs under NonCancellable but flushDurable throws
+        // CancellationException, the mutex releases, and the locals would
+        // be lost (next fork: no fence to join, wasStreaming evidence
+        // gone). So a cancellation before [fenceSettled] re-parks the
+        // unfinished ledger below — R8-2 discard-scoped (explicit history
+        // abandon drops; a bare transport replacement re-parks even though
+        // the generation moved).
+        var fenceSettled = false
+        val read = try {
+            withContext(Dispatchers.IO) {
+                // R6-3 fence: settle the old ledger(s) BEFORE reading it.
+                // Prior invalidate fence first (background close-then-flush),
+                // then the just-detached mismatched session (close-then-flush
+                // here). Each phase gets SESSION_FLUSH_TIMEOUT_MS (~2x total
+                // after close); a timeout or flushDurable==false degrades to
+                // the incomplete path instead of copying a dangling family.
+                if (fencedJob != null || fencedSession != null) {
+                    val fence = fencedJob
+                    if (fence != null) {
+                        val joined = try {
+                            withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) { fence.join() } != null
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!joined) settleOk = false
+                    }
+                    val parked = fencedSession
+                    if (parked != null) {
+                        // The background job already closed+flushed; re-check
+                        // durability bounded (idempotent after seal).
+                        val durable = try {
+                            withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                                parked.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
+                            } ?: false
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!durable) durableOk = false
+                    }
+                }
+                val detached = mismatchedForSettle
+                if (detached != null) {
+                    val ok = try {
+                        withTimeoutOrNull(SESSION_FLUSH_TIMEOUT_MS * 2) {
+                            closeThenFlushDurable(detached, SESSION_FLUSH_TIMEOUT_MS)
+                        } ?: false
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        false
+                    }
+                    // closeThenFlushDurable returns flushDurable (drain AND no
+                    // durable failure); an outer timeout (null) and a false
+                    // both mean the ledger may still miss its terminal.
+                    if (!ok) {
+                        settleOk = false
+                        durableOk = false
+                    }
+                }
+                val store = sessions.storeOrNull()
+                // R6-3 (a) + R10: the re-park gate below must see the exact
+                // settle state. Only a fully durable settle clears it: a
+                // failed settle (timeout / flushDurable false) leaves the ledger
+                // possibly-dangling, so a later cancel in the ledger read must still re-park for the next
+                // fork's re-join + re-check (which re-derives the failure
+                // flags instead of copying an orphan row). Assigned before
+                // any further suspension.
+                fenceSettled = settleOk && durableOk
+                val previousMeta = store?.getSession(prevId)
+                // D3: same choke point as the factory `open` path — one
+                // ledger, one verdict, no drift between the fork read here
+                // and a later `open` of the same id.
+                val sameOrigin = previousMeta != null && isSameOriginForResume(previousMeta.model, endpoint)
+                val rep = loadHistory(prevId)
+                val hasHistory = (rep != null && rep.messages.isNotEmpty()) || (store != null && store.countHistoryEvents(prevId, includePartial = true) > 0)
+                val hist = if (sameOrigin) {
+                    loadModelHistory(checkNotNull(store), prevId).messages
+                } else {
+                    emptyList()
+                }
+                // Copy gate is origin-only: a cross-origin fork never copies
+                // old rows (even a terminal/reasoning-only ledger with no
+                // user/assistant left) — only the withheld marker. History
+                // presence gates only the switch-time notice below.
+                val historyWithheld = !sameOrigin
+                val noticeWithheld = !sameOrigin && hasHistory
+                ForkRead(
+                    rep,
+                    hist,
+                    noticeWithheld,
+                    ForkPrefix(
+                        oldModelShort = previousMeta?.model?.substringAfterLast('/')?.takeIf { it.isNotEmpty() } ?: "unknown",
+                        sameOrigin = sameOrigin,
+                        crossProviderWithheld = historyWithheld,
+                    ),
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            // R6-3 (a) + R8-2: re-park the unfinished ledger so the next fork
+            // still fences it (see reparkUnsettledLedger). Back on Main
+            // here with the mutex still held — same confinement as the
+            // pendingLedger* fields. Discard-scoped, NOT generation-scoped:
+            // a concurrent non-null endpoint switch bumps lifecycleGeneration
+            // but keeps the history (owner still the snapshot target), so the
+            // fence must survive for the next fork. Only an explicit history
+            // discard drops: the discard epoch moved AND the snapshot target
+            // is no longer current (clearChat / openSession reset /
+            // binding == null). Either "same epoch" (no discard crossed) or
+            // "same owner" (snapshot target intact) re-parks.
+            if (!fenceSettled &&
+                (explicitDiscardEpoch == entryDiscardEpoch || _currentSessionId.value == previousSessionId)
+            ) {
+                reparkUnsettledLedger(
+                    fencedJob,
+                    fencedSession,
+                    fencedWasStreaming,
+                    fencedOwnerSessionId ?: previousSessionId,
+                    mismatchedForSettle,
+                    mismatchedWasStreaming,
+                )
+            }
+            throw cancelled
+        }
+        return SettledFork(read, wasStreaming, settleOk, durableOk)
+    }
+
+    /**
+     * PG-S1 segment E: durable fork snapshot into the new transcript session.
+     * Pure move of the ensureSession snapshot block (zero behavior change;
+     * the three notice branches are kept distinct, never merged).
+     *
+     * R4-2: persist the carried prefix into the new transcript session so
+     * restart/openSession(newId) still sees the old context plus the new
+     * turns. Best-effort by contract (see snapshotSwitchHistory): the live
+     * turn already carries initialHistory in memory, so a bookkeeping failure
+     * must not fail the send. Runs before attach, so snapshot rows always
+     * sort below the new turn's rows; the single-flight sessionMutex fences
+     * concurrent switches. A stale generation here rolls back through the
+     * discardUnattached path (Room cascades the snapshot).
+     * R5-4: the snapshot batch is atomic (marker + copies commit together or
+     * not at all), so a failure leaves zero snapshot rows — never a silent
+     * half prefix. The catch below best-effort appends one system incomplete
+     * marker and surfaces HISTORY_SNAPSHOT_INCOMPLETE (fail-open: the send
+     * still proceeds on the in-memory prefix).
+     * R6-3 streaming-switch fallback (C): the fence awaited the old ledger,
+     * but a streaming old turn (STREAMING/CANCELLED/WAITING projection,
+     * UNKNOWN admission, or pending cores) or a fence timeout /
+     * flushDurable==false means the ledger may still miss its terminal. Then
+     * the snapshot degrades: it skips dangling families (never copies an
+     * orphan user row that would gain a false INTERRUPTED on reopen) and
+     * rides one incomplete marker in the same atomic batch so the restart
+     * scan re-warns. A clean streaming switch whose terminal already settled
+     * copies the full family with no warning (exclude is a no-op without
+     * dangling).
+     *
+     * Must be called with sessionMutex held. The caller holds the mutex across
+     * this call; this callee never takes it. [forkProvenance] is passed whole
+     * (never split into Booleans). Only store I/O runs here; the caller maps
+     * the returned [SnapshotOutcome] to `_notice` on Main (testability) and
+     * keeps the post-snapshot generation gate.
+     */
+    private suspend fun durableSnapshotOrWarn(
+        previousSessionId: String?,
+        forkTargetId: String?,
+        forkProvenance: ForkPrefix?,
+        newModel: String,
+        wasStreaming: Boolean,
+        settleOk: Boolean,
+        durableOk: Boolean,
+    ): SnapshotOutcome {
+        val prevId = previousSessionId ?: return SnapshotOutcome.SKIPPED
+        val targetId = forkTargetId ?: return SnapshotOutcome.SKIPPED
+        val provenance = forkProvenance ?: return SnapshotOutcome.SKIPPED
+        val fenceFailed = !settleOk || !durableOk
+        val excludeDangling = wasStreaming || fenceFailed
+        val markIncomplete = fenceFailed
+        try {
+            withContext(Dispatchers.IO) {
+                val backing = sessions.storeOrNull()
+                if (backing != null) {
+                    snapshotSwitchHistory(
+                        backing,
+                        prevId,
+                        targetId,
+                        provenance.oldModelShort,
+                        newModel,
+                        provenance.crossProviderWithheld,
+                        excludeDanglingFamilies = excludeDangling,
+                        markIncomplete = markIncomplete,
+                    )
+                }
+            }
+            if (markIncomplete) {
+                // The batch rode the incomplete marker atomically, so
+                // the restart scan will re-warn; surface it now too
+                // (overrides a withhold notice: the copy itself is
+                // what degraded).
+                return SnapshotOutcome.FENCE_FAILED_WARNED
+            } else if (excludeDangling) {
+                // Streaming switch whose terminal settled (no fence
+                // failure) but whose prefix still dangled: the snapshot
+                // auto-marks incomplete when it drops a family (see
+                // snapshotSwitchHistory) — re-surface that warning
+                // without another scan on the hot path unless needed.
+                // Best-effort bounded head/tail scan: only the notice
+                // is at stake.
+                val droppedWarn = try {
+                    withContext(Dispatchers.IO) {
+                        val backing = sessions.storeOrNull()
+                        backing != null && hasIncompleteSnapshotMarker(backing, targetId)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    false
+                }
+                if (droppedWarn) return SnapshotOutcome.DANGLING_WARNED
+                return SnapshotOutcome.CLEAN
+            } else {
+                // R6-5 byte-abandon: a clean fence + non-streaming fork
+                // whose prefix blew SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS still rides
+                // the byte marker atomically (snapshotSwitchHistory
+                // returns prefix.size only, so 0 is ambiguous with a
+                // clean empty history) — bounded scan re-surfaces
+                // HISTORY_SNAPSHOT_INCOMPLETE live, never silent until
+                // restart. Phase2: the snapshot filter is now unconditional,
+                // so a clean-path "dangling excluded" marker lands here too
+                // (same notice; only the cause tag differs). Same best-effort scan as the branch above:
+                // only the notice is at stake.
+                val byteWarn = try {
+                    withContext(Dispatchers.IO) {
+                        val backing = sessions.storeOrNull()
+                        backing != null && hasIncompleteSnapshotMarker(backing, targetId)
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    false
+                }
+                if (byteWarn) return SnapshotOutcome.BYTE_WARNED
+                return SnapshotOutcome.CLEAN
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // R5-4: the atomic batch failed, so the fork holds zero
+            // snapshot rows (no silent half prefix). Mark it
+            // explicitly with one system incomplete row so the
+            // restart scan (hasIncompleteSnapshotMarker) can re-warn;
+            // surface HISTORY_SNAPSHOT_INCOMPLETE now (overrides a
+            // withhold notice: the copy itself is what failed). Both
+            // are best-effort bookkeeping — the live turn already
+            // carries the prefix in memory, so a marker failure here
+            // still must not fail the send (fail-open, degrades to
+            // pre-R4-2 durability: new rows only after a restart).
+            try {
+                withContext(Dispatchers.IO) {
+                    val backing = sessions.storeOrNull()
+                    if (backing != null) {
+                        backing.appendEvent(
+                            TranscriptEvent(
+                                sessionId = targetId,
+                                runId = "snapshot-incomplete-${java.util.UUID.randomUUID()}",
+                                kind = SNAPSHOT_INCOMPLETE_MARKER_KIND,
+                                text = snapshotIncompleteMarkerText(
+                                    provenance.oldModelShort,
+                                    newModel,
+                                ),
+                                createdAt = System.currentTimeMillis(),
+                            ),
+                        )
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Degrades to an unmarked fork: isolation still holds,
+                // only the restart notice is lost.
+            }
+            return SnapshotOutcome.FAILED_WARNED
+        }
+    }
+
     /** Single-flight construction. All mutable ViewModel state stays on Main. */
     private suspend fun ensureSession(
         authorized: AuthorizedEndpoint,
@@ -1505,9 +3046,24 @@ class ChatViewModel(
         // N1: reclaim its queued-but-unstarted FIFO first (same ownership as
         // the invalidate path); the current op stays in pendingOps and is
         // never touched here.
+        // R6-3: streaming-switch ledger fence inputs, captured on Main before
+        // any suspension and consumed on IO before the ledger read/snapshot
+        // below. The just-detached mismatched session settles on IO (not
+        // fire-and-forget), and any prior invalidate-parked ledger is joined
+        // there too — otherwise the snapshot would copy a ledger still
+        // missing its cancel terminal and the reopen backfill would stamp a
+        // false INTERRUPTED.
+        var mismatchedForSettle: ChatSession? = null
+        var mismatchedWasStreaming = false
+        var fencedJob: Job? = null
+        var fencedSession: ChatSession? = null
+        var fencedWasStreaming = false
+        var fencedOwnerSessionId: String? = null
         if (currentSession != null) {
+            val mismatched = currentSession
+            mismatchedWasStreaming = isLedgerStreamingOrPending(mismatched)
             val queuedBeforeReplace: List<dev.librepocket.chat.QueuedIntent> = try {
-                currentSession?.drainQueued() ?: emptyList()
+                mismatched?.drainQueued() ?: emptyList()
             } catch (_: Exception) {
                 emptyList()
             }
@@ -1515,14 +3071,79 @@ class ChatViewModel(
             generation = lifecycleGeneration
             // F2: keep visible transcript when the transport is replaced.
             snapshotLiveToHistory()
-            closeLive()
+            // R6-3: synchronous detach now (UI immediate); the old ledger
+            // settles on IO below before any DB read (never a bare closeLive
+            // and never fire-and-forget here: admitted events must drain AND
+            // the doomed host must settle first, as on every other detach
+            // path — see closeThenFlushDurable).
+            if (mismatched != null) {
+                cancelAndDetachSync(mismatched)
+                mismatchedForSettle = mismatched
+            }
+            // Consume any prior invalidate-parked fence so the IO phase owns
+            // it exactly once. R8-2: the slot owner travels with the fence so
+            // a cancel re-park can restore the ledger lineage. Unconditional
+            // consume is safe: the slot is either empty or owned by the
+            // snapshot target below — a non-null switch never changes
+            // _currentSessionId (so owner == previousSessionId), and every
+            // history-abandoning path (clearChat, openSession attach,
+            // binding == null) clears the slot before the next fork.
+            fencedJob = pendingLedgerFence
+            fencedSession = pendingLedgerSession
+            fencedWasStreaming = pendingLedgerWasStreaming
+            fencedOwnerSessionId = pendingLedgerOwnerSessionId
+            pendingLedgerFence = null
+            pendingLedgerSession = null
+            pendingLedgerWasStreaming = false
+            pendingLedgerOwnerSessionId = null
             _sessionState.value = EMPTY_SESSION_STATE
+            // R5-5: the detached session's send-time trim no longer applies;
+            // zero now so a failed/slow replacement cannot leave a stale badge
+            // (mirrors invalidateForEndpointChange).
+            _requestTrimmedCount.value = 0
             absorbDrainedQueued(queuedBeforeReplace, fillInput = false, includePending = false)
+        } else {
+            // No live mismatched, but a prior invalidate may have parked a
+            // detached ledger whose settle the fork must still fence on.
+            // R8-2: consecutive non-null switches hand the fence over — the
+            // slot survives transport replacement (only an explicit discard
+            // clears it), so a fork racing a second switch still joins the
+            // first ledger's teardown instead of snapshotting early. Same
+            // empty-or-owner guarantee as the consume above.
+            fencedJob = pendingLedgerFence
+            fencedSession = pendingLedgerSession
+            fencedWasStreaming = pendingLedgerWasStreaming
+            fencedOwnerSessionId = pendingLedgerOwnerSessionId
+            pendingLedgerFence = null
+            pendingLedgerSession = null
+            pendingLedgerWasStreaming = false
+            pendingLedgerOwnerSessionId = null
         }
 
         val previousSessionId = _currentSessionId.value
-        if (previousSessionId != null) {
-            val replay = withContext(Dispatchers.IO) { loadHistory(previousSessionId) }
+        // R8-2 (A): snapshot the discard epoch before any suspension. The
+        // settle catch re-parks unless an explicit discard crossed this
+        // point AND the snapshot target is gone — a bare generation bump
+        // (endpoint replacement) must not read as abandonment.
+        val entryDiscardEpoch = explicitDiscardEpoch
+        var initialHistory: List<ChatMessage> = emptyList()
+        var fork: ForkPrefix? = null
+        // PG-S1: fence + read live in settleDetachedLedger (segment C); the
+        // outcome locals below are read by the snapshot call, never shared
+        // across segments as vars.
+        val settled = settleDetachedLedger(
+            previousSessionId,
+            endpoint,
+            fencedJob,
+            fencedSession,
+            fencedWasStreaming,
+            fencedOwnerSessionId,
+            entryDiscardEpoch,
+            mismatchedForSettle,
+            mismatchedWasStreaming,
+        )
+        val read = settled.read
+        if (read != null) {
             if (!isGenerationCurrent(generation)) return@withLock null
             val afterHistory = readEndpoint()
             if (!isGenerationCurrent(generation)) return@withLock null
@@ -1530,7 +3151,18 @@ class ChatViewModel(
                 reconcileReadBinding(bindingOf(afterHistory))
                 return@withLock null
             }
-            if (replay != null) _history.value = replay
+            val (replay, loadedHistory, crossProviderWithheld) = read
+            if (replay != null) {
+                _history.value = replay.messages
+                _historyOmittedCount.value = replay.droppedCount
+            }
+            initialHistory = loadedHistory
+            if (crossProviderWithheld) {
+                _notice.value = "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD"
+            } else if (_notice.value == "RESUME_CROSS_PROVIDER_HISTORY_WITHHELD") {
+                _notice.value = null
+            }
+            fork = read.fork
         }
 
         val creationGeneration = generation
@@ -1539,7 +3171,7 @@ class ChatViewModel(
         var failure: Throwable? = null
         try {
             withContext(Dispatchers.IO) {
-                candidate = sessions.create(endpoint, title, allowAsk = authorized.allowAsk) {
+                candidate = sessions.create(endpoint, title, initialHistory, allowAsk = authorized.allowAsk) {
                     isBindingCurrent(authorized.binding, creationGeneration)
                 }
             }
@@ -1550,6 +3182,32 @@ class ChatViewModel(
             if (afterCreate == null || bindingOf(afterCreate) != authorized.binding) {
                 reconcileReadBinding(bindingOf(afterCreate))
                 return@withLock null
+            }
+            // PG-S1: durable fork snapshot lives in durableSnapshotOrWarn
+            // (segment E). Detail comments (R4-2/R5-4/R6-3) moved with it;
+            // the post-snapshot generation gate stays here by contract.
+            val forkTargetId = created.sessionId
+            val forkProvenance = fork
+            if (forkTargetId != null && forkProvenance != null && previousSessionId != null) {
+                val snapshotOutcome = durableSnapshotOrWarn(
+                    previousSessionId,
+                    forkTargetId,
+                    forkProvenance,
+                    created.model,
+                    settled.wasStreaming,
+                    settled.settleOk,
+                    settled.durableOk,
+                )
+                // Four warn branches stay distinct (never merged): each
+                // cause re-warns the same notice for a different reason.
+                when (snapshotOutcome) {
+                    SnapshotOutcome.FENCE_FAILED_WARNED -> _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    SnapshotOutcome.DANGLING_WARNED -> _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    SnapshotOutcome.BYTE_WARNED -> _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    SnapshotOutcome.FAILED_WARNED -> _notice.value = "HISTORY_SNAPSHOT_INCOMPLETE"
+                    SnapshotOutcome.CLEAN, SnapshotOutcome.SKIPPED -> Unit
+                }
+                if (!isGenerationCurrent(creationGeneration)) return@withLock null
             }
             attach(created, authorized.binding, creationGeneration)
             attached = true
@@ -1597,15 +3255,12 @@ class ChatViewModel(
     ) {
         // F1: openSession() reads history before taking sessionMutex, so a
         // send() in that window can attach a live same-generation session.
-        // Close the replaced incumbent (credential wipe + hosted-turn cancel)
-        // instead of orphaning it past cancel()/newChat()/onCleared() reach.
-        // Its transcript row is retained: it already received user input.
+        // Flush-then-close the replaced incumbent (bounded, background) so its
+        // admitted transcript events still drain; its transcript row is
+        // retained: it already received user input.
         val incumbent = currentSession
         if (incumbent != null && incumbent !== created.session) {
-            try {
-                incumbent.close()
-            } catch (_: Exception) {
-            }
+            detachAndFlushClose(incumbent)
         }
         currentSession = created.session
         currentBinding = binding
@@ -1615,6 +3270,9 @@ class ChatViewModel(
         // success included, so a stale "開啟歷史" never lingers).
         pendingOpen = null
         _pendingOpenSessionId.value = null
+        // R5-5: the new session starts untrimmed; clear any stale count from
+        // the detached incumbent before the live flow re-emits.
+        _requestTrimmedCount.value = 0
         sessionCollectJob?.cancel()
         sessionCollectJob = viewModelScope.launch {
             created.session.uiState.collect { state ->
@@ -1625,6 +3283,14 @@ class ChatViewModel(
                         reclaimQueuedRecovery(created.session, generation)
                     }
                     _sessionState.value = state
+                }
+            }
+        }
+        requestTrimCollectJob?.cancel()
+        requestTrimCollectJob = viewModelScope.launch {
+            created.session.requestTrimmedCount.collect { trimmed ->
+                if (isGenerationCurrent(generation) && currentSession === created.session) {
+                    _requestTrimmedCount.value = trimmed
                 }
             }
         }
@@ -1776,9 +3442,11 @@ class ChatViewModel(
         // N1: reclaim queued-but-unstarted intents BEFORE close() drops the
         // FIFO. Queued is not acceptance, so the caller still owns the text:
         // it joins the recoverable outbox below (never auto-resent).
-        // Reclaim and closeLive() run back-to-back with no suspension on
+        // Reclaim and detach run back-to-back with no suspension on
         // this Main-confined path, so no admission slips between them; the
-        // generation bump below only fences generations.
+        // generation bump below only fences generations. The detached live
+        // session is flushed (bounded) before its background close, so no
+        // suspension here ever blocks the UI.
         val queuedFromSession: List<dev.librepocket.chat.QueuedIntent> = try {
             currentSession?.drainQueued() ?: emptyList()
         } catch (_: Exception) {
@@ -1820,10 +3488,29 @@ class ChatViewModel(
         }
         // F2: decouple transport invalidation from transcript display.
         if (binding != null) snapshotLiveToHistory()
-        closeLive()
+        releaseLiveAfterBoundedFlush()
         _sessionState.value = EMPTY_SESSION_STATE
+        // R5-5: the live session is detached on every endpoint change, so its
+        // send-time trim count no longer describes anything on screen. Reset
+        // unconditionally (unlike _history, which survives a non-null switch
+        // via snapshotLiveToHistory): the next attach re-emits from zero.
+        _requestTrimmedCount.value = 0
         if (binding == null) {
+            // R8-2: no endpoint means the history is abandoned (mirrors
+            // clearChat): move the parked slot into the per-session
+            // outstanding table (R10-1) instead of dropping it, so a later
+            // reopen of the same source id still fences it. Unrelated forks
+            // never join it (per-id consult only). The background
+            // close-then-flush keeps running fenced by sessionId. A non-null
+            // switch never lands here: it hands the fence over via
+            // releaseLiveAfterBoundedFlush above.
+            stashPendingSlotToOutstanding()
+            pendingLedgerFence = null
+            pendingLedgerSession = null
+            pendingLedgerWasStreaming = false
+            pendingLedgerOwnerSessionId = null
             _history.value = emptyList()
+            _historyOmittedCount.value = 0
             _currentSessionId.value = null
             pendingOps.clear()
             recoverableOps.clear()
@@ -1945,11 +3632,31 @@ class ChatViewModel(
         cancelLifecycleOperations()
         openJob?.cancel()
         openJob = null
-        closeLive()
+        // Flush (bounded, background) before close on the newChat / openSession
+        // reset path; the UI observes only the synchronous detach above.
+        releaseLiveAfterBoundedFlush()
         _sessionState.value = EMPTY_SESSION_STATE
         _notice.value = null
         if (clearChat) {
+            // R6-3 (b): the history is discarded below, so no future fork
+            // snapshots the detached ledger via the single slot — move the
+            // slot into the per-session outstanding table instead of dropping
+            // it (R10-1). The background close-then-flush keeps running fenced
+            // by sessionId: a later unrelated fork never joins it (its open
+            // consults only its own id), while a later reopen of the same
+            // source id still fences it (settle-or-defer, R9-3 block
+            // semantics). Only the UI/history binding is cleared here.
+            // R8-2: the slot owner lineage moves with the entry.
+            stashPendingSlotToOutstanding()
+            pendingLedgerFence = null
+            pendingLedgerSession = null
+            pendingLedgerWasStreaming = false
+            pendingLedgerOwnerSessionId = null
             _history.value = emptyList()
+            _historyOmittedCount.value = 0
+            // R5-5: the owning session is detached; a later attach restarts
+            // the trim count from zero.
+            _requestTrimmedCount.value = 0
             _currentSessionId.value = null
             pendingOpen = null
             _pendingOpenSessionId.value = null
@@ -2034,7 +3741,7 @@ class ChatViewModel(
     // Timing note: the VM projection (_sessionState) trails the controller by
     // one collector dispatch. A text already accepted (appended) but not yet
     // projected must still survive: also read the live session truth
-    // (synchronous StateFlow value) before closeLive() nulls it. Accepted
+    // (synchronous StateFlow value) before the detach below nulls it. Accepted
     // text belongs here in _history, never in the unsent outbox.
     private fun snapshotLiveToHistory() {
         val projected = _sessionState.value.messages.filter { it.role == "user" || it.role == "assistant" }
@@ -2115,6 +3822,56 @@ class ChatViewModel(
         }
         setInput(recoverable.text, recoverable.opId, recoverable.text, recoverable.recoverySequence)
         _notice.value = noticeValue
+    }
+    /**
+     * R5-1 UNKNOWN settle waiter (bounded, never blocks the UI). The admission
+     * already threw [TranscriptPendingException] with ownership retained
+     * (pendingOps kept, no draft restore). This waiter drives one bounded
+     * [ChatSession.settlePendingAdmission] and flips the notice:
+     * - claimed (ghost durable, UI row present, no resend): drop the pending
+     *   op as accepted and clear a stale PENDING notice;
+     * - failed/sealed (row rolled back): restore as `CHAT_STORE_UNAVAILABLE`
+     *   (retryable, same restore semantics as fail-closed);
+     * - still unknown (flush timeout): keep PENDING; a later explicit retry
+     *   re-settles via the controller guard.
+     */
+    private fun launchPendingSettleWaiter(opId: Long, text: String, handle: SessionHandle, generation: Long) {
+        lifecycleScope.launch {
+            val settled: Boolean = try {
+                handle.created.session.settlePendingAdmission(SESSION_FLUSH_TIMEOUT_MS)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
+            }
+            if (!isHandleCurrent(handle) || !isGenerationCurrent(generation)) return@launch
+            if (!settled) return@launch
+            val state = try {
+                handle.created.session.uiState.value
+            } catch (_: Exception) {
+                null
+            }
+            val hasRow = state?.messages?.any { it.role == "user" && it.operationId == opId } == true
+            if (hasRow) {
+                // Claimed under the same id: the text is accepted, nothing to
+                // restore and nothing to resend. Mirror Started bookkeeping so
+                // a stale gate cannot steal Retry afterwards.
+                pendingOps.remove(opId)
+                if (retryableOp?.opId == opId) retryableOp = null
+                if (_notice.value == "CHAT_STORE_PENDING") _notice.value = null
+                drainNextRecoverableToInput()
+                return@launch
+            }
+            // No row: settle converted to fail-closed (or a racing close
+            // dropped it). Flip to retryable UNAVAILABLE; the text is retained
+            // for explicit retry, never auto-resent.
+            if (pendingOps.containsKey(opId)) {
+                setNoticeIfCurrent(generation, "CHAT_STORE_UNAVAILABLE")
+                restoreOpForFailedSend(opId, "CHAT_STORE_UNAVAILABLE")
+            } else if (_notice.value == "CHAT_STORE_PENDING") {
+                _notice.value = "CHAT_STORE_UNAVAILABLE"
+            }
+        }
     }
 
     /** A stale gate restore cannot outrank a newer Started target or later retry attempt. */
@@ -2274,9 +4031,19 @@ class ChatViewModel(
         return stashed
     }
 
+    /**
+     * Synchronous detach + close, only for [onCleared]: ViewModel teardown
+     * cannot host background work (viewModelScope is cancelled there), so
+     * there is no background flush to await — the bounded drain relies on
+     * [dev.librepocket.chat.TurnController.close]'s internal bounded
+     * settle+drain+seal instead. Every other detach path uses
+     * [detachAndFlushClose] so admitted events drain before close.
+     */
     private fun closeLive() {
         sessionCollectJob?.cancel()
         sessionCollectJob = null
+        requestTrimCollectJob?.cancel()
+        requestTrimCollectJob = null
         try {
             currentSession?.close()
         } catch (_: Exception) {
@@ -2286,36 +4053,863 @@ class ChatViewModel(
         currentSessionGeneration = null
     }
 
-    private suspend fun loadHistory(sessionId: String): List<UiMessage>? {
-        val backing: SessionStore = sessions.storeOrNull() ?: return emptyList()
+    /**
+     * Detach + bounded close-then-flush for explicit lifecycle resets
+     * (newChat / openSession pre-clear), endpoint switches, transport
+     * replacement, and attach-time incumbent replacement. The live turn is
+     * cancelled synchronously (prompt stop, IO-free, a no-op when idle) and
+     * VM state is detached synchronously so the UI updates immediately; the
+     * detached session is then closed and flushed on [viewModelScope] —
+     * never the per-generation lifecycle scope, so a later invalidation
+     * cannot cancel another generation's teardown — strictly in that order.
+     *
+     * R6-3 order (close before flush): [ChatSession.flush] alone only drains
+     * barrier-reserved terminals; a cancel terminal whose host has not settled
+     * yet is still unreserved and would be missed. [close] first settles the
+     * doomed host (bounded: its NonCancellable terminal is admitted ahead of
+     * the flush barrier via the shutdown settle), then the flush drains it.
+     * No outer timeout wraps the background work: [ChatSession.flush] is
+     * already bounded (one [SESSION_FLUSH_TIMEOUT_MS] budget for the close
+     * shutdown-join plus one for the admitted-event drain, ~2x total after
+     * close). [close] runs under [NonCancellable] so teardown always seals
+     * the session even if the background launch is cancelled. A stalled
+     * store only delays that background close — the next generation is
+     * unaffected because all VM references were already detached above.
+     * Returns the background teardown job so a later `ensureSession` fork can
+     * fence on it (see [pendingLedgerFence]).
+     */
+    private fun detachAndFlushClose(session: ChatSession): Job {
+        cancelAndDetachSync(session)
+        return launchCloseThenFlush(session)
+    }
+
+    /**
+     * R6-3 synchronous half of [detachAndFlushClose]: prompt cancel (IO-free)
+     * plus VM-state detach, with no suspension so the UI updates immediately.
+     * The caller owns the ledger settle separately: either
+     * [launchCloseThenFlush] (fire-and-forget fence) or an IO-bounded
+     * close-then-flush await inside `ensureSession` before the snapshot read.
+     */
+    private fun cancelAndDetachSync(session: ChatSession) {
+        // Prompt stop first: cancel() is synchronous, IO-free, and a no-op
+        // when idle, so a running turn never lingers into the flush window.
+        try {
+            session.cancel()
+        } catch (_: Exception) {
+        }
+        if (currentSession === session) {
+            sessionCollectJob?.cancel()
+            sessionCollectJob = null
+            requestTrimCollectJob?.cancel()
+            requestTrimCollectJob = null
+            currentSession = null
+            currentBinding = null
+            currentSessionGeneration = null
+        }
+    }
+
+    /**
+     * R6-3 background half: close (settle, includes the doomed-host terminal
+     * admission) strictly before the durable flush, on [viewModelScope] so it
+     * survives per-generation invalidation. Callers that need the ledger
+     * before forking (same-origin `ensureSession`) await the returned job
+     * (bounded, on IO) instead of only launching it.
+     */
+    private fun launchCloseThenFlush(session: ChatSession): Job {
+        val job = viewModelScope.launch {
+            try {
+                withContext(NonCancellable) {
+                    session.close()
+                }
+            } catch (_: Exception) {
+            }
+            try {
+                session.flushDurable(SESSION_FLUSH_TIMEOUT_MS)
+            } catch (_: Exception) {
+                // Bounded: timeout or flush failure still leaves the session
+                // sealed via close above. A scope-teardown
+                // CancellationException is absorbed here on purpose: close()
+                // above is the teardown that matters and still runs under
+                // NonCancellable.
+            }
+            try {
+                withContext(NonCancellable) {
+                    session.close()
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return job
+    }
+
+    /**
+     * R9-2 composite fence join: await [prior] then [fresh] sequentially,
+     * swallowing store failures but propagating caller cancellation (same
+     * semantics as every inline composite-join launch it replaces). Runs on
+     * [viewModelScope] so it survives per-generation invalidation.
+     */
+    private fun compositeLedgerJoin(prior: Job, fresh: Job): Job = viewModelScope.launch {
+        try {
+            prior.join()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+        }
+        try {
+            fresh.join()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * R6-3 IO-bounded settle for a just-detached old session: close (settle)
+     * then durable flush, one [SESSION_FLUSH_TIMEOUT_MS] budget per phase
+     * (~2x total after close). Returns true only when the drain completed AND
+     * no durable failure was recorded AND no cancel receipt is still unsettled
+     * (R19-1 PENDING/CLAIMED via [ChatSession.hasUnsettledCancelReceipts],
+     * conjoined inside `flushDurable`); false (timeout / flushDurable false /
+     * store throw) means the fork must degrade via the incomplete path (see
+     * `ensureSession`). Caller cancellation still propagates.
+     */
+    private suspend fun closeThenFlushDurable(
+        session: ChatSession,
+        perPhaseTimeoutMs: Long = SESSION_FLUSH_TIMEOUT_MS,
+    ): Boolean {
+        try {
+            withContext(NonCancellable) {
+                session.close()
+            }
+        } catch (_: Exception) {
+        }
+        return try {
+            session.flushDurable(perPhaseTimeoutMs)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * R9-3 (A) sessionId-granularity backfill gate. Must be called with
+     * [sessionMutex] held on Main (same confinement as
+     * [pendingBackfillBlock]); the promotion probe suspends on IO internally
+     * and resumes on Main before touching the map.
+     *
+     * - `settleOk && durableOk` with no live block backfills (unchanged).
+     * - `!backfillNow` (settle failed: flush-timeout means the old writer
+     *   may still land its terminal late; flush-failure means it is sealed)
+     *   parks `block[sessionId] = now + horizon` and returns false. The caller
+     *   still hydrates and warns HISTORY_SNAPSHOT_INCOMPLETE; the next open
+     *   retries.
+     * - A later open with `backfillNow == true` but a live (unexpired) block
+     *   is forced to false UNLESS promotion proves the ledger already
+     *   terminal (no dangling family in the backfill window AND the detached
+     *   live shows no pending evidence) — this is the second-reopen fix: a
+     *   fresh idle live settles trivially while the old writer is still
+     *   alive, and only the ledger state tells the two apart.
+     * - R10-2 expired block: NEVER promotes on the clock alone. Expiry runs
+     *   the verifiable promotion ([tryPromoteExpiredBlock]): ledger clean +
+     *   fresh live clean + old writer not alive + no live outstanding
+     *   teardown promotes (or writer-dead proof — sealed + pending empty +
+     *   writer completed (R14-1) + no non-sticky obligation evidence (R22
+     *   Phase 2 barrier-aware, R23-1 sticky split: permanent close debt and
+     *   SEALED-uncompensated receipts stay in [ChatSession.flushDurable] but never block
+     *   the dead proof) —
+     *   promotes even with a dangling ledger, since its terminal will never
+     *   land and marking INTERRUPTED is then correct). Anything unverified
+     *   renews the deadline and defers again (fail-closed: the caller keeps
+     *   warning HISTORY_SNAPSHOT_INCOMPLETE). Deadlines use the monotonic
+     *   [backfillClockMs], never wall-clock, so a clock jump cannot prematurely
+     *   promote an unsettled ledger.
+     *
+     * Idempotent and fail-closed: a probe failure keeps the block until its
+     * deadline. Caller cancellation propagates.
+     *
+     * Notice scope: every `!backfillNow` here surfaces the same
+     * HISTORY_SNAPSHOT_INCOMPLETE as a failed fork snapshot (see the
+     * canonical-form `open` KDoc) — cause-agnostic by design, with different
+     * follow-ups (a defer retries the backfill on the next open; a snapshot
+     * failure persists its marker and re-warns without ever re-copying).
+     *
+     * Sealed alive-vs-dead bifurcation (R23-1): the expired-block
+     * sealed-dead vs sealed-but-obligated split is pinned end-to-end by
+     * `ChatSameIdReopenStickyDebtTest` (real ViewModel + real factory + real
+     * controller, ghost + sealed groups) — referenced, not re-pinned here.
+     */
+    private suspend fun gateBackfillForSession(
+        sessionId: String,
+        settleOk: Boolean,
+        durableOk: Boolean,
+        detached: ChatSession?,
+        writerEvidence: ChatSession? = null,
+    ): Boolean {
+        var backfillNow = settleOk && durableOk
+        val nowMs = backfillClockMs()
+        val blockedUntil = pendingBackfillBlock[sessionId]
+        if (blockedUntil != null) {
+            if (nowMs >= blockedUntil) {
+                if (tryPromoteExpiredBlock(sessionId, detached, writerEvidence)) {
+                    pendingBackfillBlock.remove(sessionId)
+                    pendingBackfillWriter.remove(sessionId)
+                } else {
+                    backfillNow = false
+                    pendingBackfillBlock[sessionId] = nowMs + backfillBlockHorizonMs
+                    rememberBlockWriter(sessionId, writerEvidence)
+                    rememberBlockWriter(sessionId, detached)
+                }
+            } else if (backfillNow) {
+                val ledgerClean = try {
+                    withContext(Dispatchers.IO) { probeLedgerHasNoDangling(sessionId) }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    false
+                }
+                // B1: re-read the fresh detached liveness AFTER the probe
+                // suspension — a new idle→streaming transition (fresh
+                // dangling) landing while the probe was suspended must not
+                // promote. Live-block verifies the fresh live only: the
+                // stored old writer may keep a stale STREAMING status after
+                // its terminal landed (pending empty, ledger clean), which
+                // must not shadow the ledger proof here — the stored writer
+                // is still fully verified on the expiry path below.
+                val liveClean = !isWriterAliveEvidence(detached)
+                if (ledgerClean && liveClean) {
+                    pendingBackfillBlock.remove(sessionId)
+                    pendingBackfillWriter.remove(sessionId)
+                } else {
+                    backfillNow = false
+                }
+            }
+        }
+        if (!backfillNow) {
+            pendingBackfillBlock[sessionId] = nowMs + backfillBlockHorizonMs
+            rememberBlockWriter(sessionId, writerEvidence)
+            rememberBlockWriter(sessionId, detached)
+        }
+        return backfillNow
+    }
+
+    /**
+     * R10-2 expiry promotion proof. Returns true only when the blocked ledger
+     * verifiably settled (or its writer verifiably can never settle):
+     * - the fresh [detached] live shows no streaming/pending evidence, AND
+     * - the slot evidence ([writerEvidence]: retained slot / outstanding
+     *   session, checked even when it differs from stored and sits outside
+     *   the outstanding table — B4) shows none, AND
+     * - no live outstanding teardown for [sessionId] is still settling, AND
+     * - the stored old writer (see [pendingBackfillWriter]) shows none, AND
+     * - either the ledger proves its terminal (no dangling family) OR a
+     *   stored/slot old writer is provably dead (sealed + pending empty +
+     *   writer completed + no non-sticky obligation evidence — R23-1: sticky
+     *   close debt and SEALED-uncompensated receipts never block the dead
+     *   proof — so
+     *   its terminal will never land and an INTERRUPTED mark is correct).
+     * B1: liveness is verified BEFORE the probe (fast fail) and re-verified
+     * AFTER it — a probe suspension window that lands a new dangling must
+     * not promote. B2: sealed-dead is decided FIRST: a stuck STREAMING
+     * status on a sealed writer never blocks the dead proof (dead is not
+     * alive). Anything else (probe failure, live writer, unknown writer
+     * with a still-dangling ledger) returns false so the caller renews the
+     * block and keeps deferring. Never throws (best-effort reads only);
+     * caller cancellation propagates from the ledger probe.
+     */
+    private suspend fun tryPromoteExpiredBlock(
+        sessionId: String,
+        detached: ChatSession?,
+        writerEvidence: ChatSession? = null,
+    ): Boolean {
+        // B2 first: dead is not alive — check liveness sealed-aware.
+        if (isWriterAliveEvidence(detached)) return false
+        if (writerEvidence !== detached && isWriterAliveEvidence(writerEvidence)) return false
+        run {
+            val s = pendingBackfillWriter[sessionId]
+            if (s !== detached && s !== writerEvidence && isWriterAliveEvidence(s)) return false
+        }
+        if (peekOutstandingLive(sessionId)) return false
+        val ledgerClean = try {
+            withContext(Dispatchers.IO) { probeLedgerHasNoDangling(sessionId) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+        // B1 post-probe re-verification: the probe suspended on IO while the
+        // mutex was held; a live transition in that window must fail closed.
+        if (isWriterAliveEvidence(detached)) return false
+        if (writerEvidence !== detached && isWriterAliveEvidence(writerEvidence)) return false
+        val stored = pendingBackfillWriter[sessionId]
+        if (stored !== detached && stored !== writerEvidence && isWriterAliveEvidence(stored)) {
+            return false
+        }
+        if (peekOutstandingLive(sessionId)) return false
+        if (ledgerClean) return true
+        if (stored != null && isWriterSealedDead(stored)) return true
+        if (writerEvidence !== stored && writerEvidence != null && isWriterSealedDead(writerEvidence)) {
+            return true
+        }
+        run {
+            purgeExpiredOutstanding()
+            val outstandingSession = outstandingTeardowns[sessionId]?.session
+            if (outstandingSession !== stored && outstandingSession !== writerEvidence &&
+                outstandingSession !== detached && outstandingSession != null &&
+                isWriterSealedDead(outstandingSession)
+            ) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * B2 sealed-aware liveness: a provably-dead writer (sealed + pending
+     * empty + writer completed AND no non-sticky obligation evidence, see
+     * [isWriterSealedDead]) is NOT alive, even when its uiState still sticks
+     * at STREAMING after the seal — and even while permanent sticky debt
+     * (close-dropped UNKNOWN/promotion fates, SEALED-uncompensated receipts)
+     * still trips [isLedgerStreamingOrPending] below. Lets the expiry
+     * dead-proof stay reachable instead of being shadowed by the stuck status
+     * or by unliftable debt. Dead-first order is safe for the barrier shape
+     * because the dead proof itself stays barrier-aware (R22 Phase 2, R23-1
+     * split): sealed + still-unsettled admission / promotion / host /
+     * PENDING-CLAIMED receipt evidence is never dead, so
+     * [isLedgerStreamingOrPending] still reports alive and the block keeps
+     * deferring. Best-effort, never throws.
+     *
+     * Defense-in-depth note (D7): this sealed-aware check and the raw
+     * [isLedgerStreamingOrPending] below are deliberately two answers — the
+     * dead-first short-circuit keeps expiry reachable under a stuck
+     * STREAMING status or unliftable sticky debt, while the raw evidence
+     * keeps `flushDurable` honest (never true-and-dangling). TODO: converge
+     * both call sites onto a single `promotionProof` value object when the
+     * call graph allows it without widening the barrier semantics; until
+     * then the split is documented here, not hidden.
+     */
+    private fun isWriterAliveEvidence(session: ChatSession?): Boolean {
+        if (session == null) return false
+        if (isWriterSealedDead(session)) return false
+        return isLedgerStreamingOrPending(session)
+    }
+
+    /**
+     * R10-2 pending-writer identity store. Keeps the FIRST unsettled writer
+     * observed for [sessionId] until the block lifts: later renewals carry a
+     * fresh idle detached (which proves nothing about the old writer) and
+     * must not overwrite it. A null evidence keeps whatever exists.
+     * B3: the first store is filtered — only a writer with live
+     * streaming/pending evidence or a sealed writer is kept; a clean
+     * fresh-idle detached (unsealed + no evidence) proves nothing about the
+     * old writer and must not occupy the slot ahead of the true culprit.
+     */
+    private fun rememberBlockWriter(sessionId: String, evidence: ChatSession?) {
+        if (evidence == null) return
+        if (pendingBackfillWriter[sessionId] != null) return
+        val alive = try {
+            isLedgerStreamingOrPending(evidence)
+        } catch (_: Exception) {
+            false
+        }
+        val sealed = try {
+            evidence.isTranscriptSealed()
+        } catch (_: Exception) {
+            false
+        }
+        if (!alive && !sealed) return
+        pendingBackfillWriter[sessionId] = evidence
+    }
+
+    /**
+     * R10-2: peek without consuming — true while the same-id teardown still settles.
+     * S4-F1: shares [outstandingLiveness] with [purgeExpiredOutstanding] (fence==null
+     * + session!=null unexpired stays live/defer, never promote); B2 sealed-dead
+     * short-circuit lives inside the shared helper so the two can never fork.
+     */
+    private fun peekOutstandingLive(sessionId: String): Boolean {
+        purgeExpiredOutstanding()
+        val entry = outstandingTeardowns[sessionId] ?: return false
+        return outstandingLiveness(entry)
+    }
+
+    /**
+     * R10-2 writer-dead proof: sealed AND no pending admission AND no unacked
+     * cores AND no non-sticky terminal-obligation evidence. Best-effort, never throws.
+     *
+     * R14-1 fourth conjunct: the writer itself must have completed
+     * ([ChatSession.isTranscriptWriterCompleted]). Seal + empty pending
+     * alone is observable right after a timed-out shutdown (channel closed,
+     * pending cleared via interrupt marks) while the writer is still inside
+     * a blocking store block whose COMMIT may still land — treating that
+     * state as dead writes a false INTERRUPTED. Unknown/completed-proof
+     * failures stay fail-closed (false → entry kept).
+     *
+     * R22 Phase 2 barrier-aware (P1-1/P1-3), R23-1 sticky split: seal + empty
+     * UNKNOWN/pending is ALSO observable while a live terminal obligation is
+     * still open — a direct/promotion admission window
+     * ([ChatSession.hasUnsettledAdmission]), a promotion reservation/ghost
+     * ([ChatSession.hasUnsettledPromotion]), a live host
+     * ([ChatSession.hasActiveHost]), or a PENDING/CLAIMED receipt
+     * ([ChatSession.hasUnsettledCancelReceipts]). Any such evidence forces
+     * false (not dead), so the expiry promotion
+     * ([tryPromoteExpiredBlock]) keeps deferring and [isWriterAliveEvidence]
+     * (dead-first but barrier-aware) still reports alive for the barrier
+     * shape. Permanent sticky debt is NOT liveness evidence and never blocks
+     * this proof: a close-dropped UNKNOWN/promotion fate
+     * ([ChatSession.hasClosedUnsettledAdmission]) and a SEALED-uncompensated
+     * receipt ([ChatSession.hasSealedUncompensatedReceipts]) stay conjoined
+     * into [ChatSession.flushDurable] (never true-and-dangling) and still trip
+     * [isLedgerStreamingOrPending], but a sealed + pending-empty + completed
+     * writer with no live obligation above is dead even while they hold —
+     * its terminal will never land, so the expired deferred-backfill's single
+     * INTERRUPTED is correct. Never clear the sticky flags to reach this
+     * (that would read false-clean); they lift only via reopen backfill.
+     * All reads share one best-effort try: any failure stays fail-closed
+     * (false → entry kept).
+     */
+    private fun isWriterSealedDead(session: ChatSession): Boolean {
+        return try {
+            if (!session.isTranscriptSealed()) return false
+            if (session.hasPendingAdmission()) return false
+            if (session.pendingTranscriptRunIds().isNotEmpty()) return false
+            if (session.hasUnsettledAdmission()) return false
+            if (session.hasUnsettledPromotion()) return false
+            if (session.hasActiveHost()) return false
+            if (session.hasUnsettledCancelReceipts()) return false
+            session.isTranscriptWriterCompleted()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * R9-3 promotion probe: true only when the ledger's backfill window
+     * holds no dangling family — the terminal already landed, so a gated
+     * backfill would no-op and the block may lift. Fail-closed (null store
+     * or any read failure keeps the block until its deadline). Scans the
+     * same [BACKFILL_SCAN_LIMIT] window the factory backfill marks, so the
+     * two can never disagree. Cancellation propagates; call from IO (see
+     * [gateBackfillForSession]).
+     */
+    private suspend fun probeLedgerHasNoDangling(sessionId: String): Boolean {
+        val backing = sessions.storeOrNull() ?: return false
+        return findDanglingRunIds(backing.loadTailEvents(sessionId, BACKFILL_SCAN_LIMIT)).isEmpty()
+    }
+
+    /**
+     * R6-3 (a) cancel re-park for the endpoint-switch fork fence. Runs on
+     * Main under [sessionMutex] (same confinement as [pendingLedgerFence]):
+     * the caller consumed the parked fence and detached the mismatched
+     * session before its IO section was lifecycle-cancelled, so neither
+     * settle completed — park them again for the next fork instead of losing
+     * the join evidence and the streaming flag.
+     *
+     * The just-detached mismatched session has no background teardown yet
+     * (its inline settle was interrupted), so it gets one here via
+     * [launchCloseThenFlush] on [viewModelScope] (survives the cancelled
+     * generation); the prior parked job ([fencedJob], already on
+     * [viewModelScope]) keeps running untouched, and the combined fence joins
+     * both. Only the mismatched session is re-parked for the next fork's
+     * bounded re-check: it owns the previous ledger (the one the next fork
+     * snapshots); the older fenced session keeps draining via its own
+     * background job, unfenced. `wasStreaming` is OR'd so the next fork still
+     * degrades instead of copying a possibly-dangling family.
+     *
+     * R8-2 owner carry: [ownerSessionId] (the consumed slot owner, falling
+     * back to the fork's snapshot target) is re-filled so the next fork keeps
+     * the ledger lineage across consecutive transport replacements. The slot
+     * must normally be empty here (a concurrent non-null switch with no live
+     * session early-returns in [releaseLiveAfterBoundedFlush] instead of
+     * parking), but a newer park is never dropped if one appears: same-owner
+     * evidence is join-merged (the combined fence awaits every pending job,
+     * so an unresolved same-ledger teardown is never lost); a different-owner
+     * leftover only background-settles unfenced while the newest owner wins
+     * the slot, and `wasStreaming` is always OR'd.
+     */
+    private fun reparkUnsettledLedger(
+        fencedJob: Job?,
+        fencedSession: ChatSession?,
+        fencedWasStreaming: Boolean,
+        ownerSessionId: String?,
+        mismatched: ChatSession?,
+        mismatchedWasStreaming: Boolean,
+    ) {
+        val wasStreaming = fencedWasStreaming || mismatchedWasStreaming
+        if (pendingLedgerFence == null && pendingLedgerSession == null) {
+            val settleJob = mismatched?.let { launchCloseThenFlush(it) }
+            pendingLedgerFence = when {
+                fencedJob != null && settleJob != null -> compositeLedgerJoin(fencedJob, settleJob)
+                fencedJob != null -> fencedJob
+                else -> settleJob
+            }
+            pendingLedgerSession = mismatched ?: fencedSession
+            pendingLedgerWasStreaming = wasStreaming
+            pendingLedgerOwnerSessionId = ownerSessionId
+        } else {
+            // Same-owner unresolved teardown must not be dropped: merge the
+            // join evidence so the next fork still awaits it. Different-owner
+            // leftovers keep draining unfenced; the slot keeps the newest
+            // owner while wasStreaming is always OR'd.
+            val existingFence = pendingLedgerFence
+            val settleJob = mismatched?.let { launchCloseThenFlush(it) }
+            val incomingFence = when {
+                fencedJob != null && settleJob != null -> compositeLedgerJoin(fencedJob, settleJob)
+                fencedJob != null -> fencedJob
+                else -> settleJob
+            }
+            val sameOwner = ownerSessionId != null &&
+                pendingLedgerOwnerSessionId != null &&
+                pendingLedgerOwnerSessionId == ownerSessionId
+            pendingLedgerFence = if (sameOwner && existingFence != null && incomingFence != null) {
+                // Same ledger still unsettled: one composite join awaits both
+                // so the next fork fences the full teardown.
+                compositeLedgerJoin(existingFence, incomingFence)
+            } else {
+                // Different owner (or nothing new to fence): the newest ledger
+                // wins the fence; the displaced job keeps running on
+                // viewModelScope to durability, just unfenced.
+                incomingFence ?: pendingLedgerFence
+            }
+            if (mismatched != null || fencedSession != null) {
+                pendingLedgerSession = mismatched ?: fencedSession ?: pendingLedgerSession
+            }
+            pendingLedgerWasStreaming = pendingLedgerWasStreaming || wasStreaming
+            if (ownerSessionId != null) pendingLedgerOwnerSessionId = ownerSessionId
+        }
+    }
+
+    /**
+     * R9-2 same-ID reopen abort re-park (idempotent, Main, never takes
+     * [sessionMutex] — callers inside `withLock` already hold it). The eager
+     * [sameIdTeardown] (viewModelScope close-then-flush, double-close safe)
+     * already runs; this only ensures the slot still owns it for the next
+     * open's fence. Discard-scoped (NOT generation-scoped): only parks when
+     * [entryDiscardEpoch] still matches [explicitDiscardEpoch] — a newer
+     * explicit discard (newChat / openSession reset / binding == null)
+     * abandons the ledger (teardown keeps running unfenced for durability).
+     * Owner is the snapshot target ([ownerSessionId] == prevId for a live
+     * same-ID reopen, == retained fence owner for a from-null owner-match)
+     * because `_currentSessionId` is already null after the pre-clear. The
+     * prior fence ([fencedJob]) merges into one composite join so an
+     * unresolved same-ledger teardown is never lost; only [prevLive] is kept
+     * for the next fence's bounded re-check (it owns the snapshot-target
+     * ledger — the older fenced session keeps draining via its own job,
+     * unfenced, mirroring [reparkUnsettledLedger]). For a from-null
+     * owner-match [prevLive] is null and the retained [fencedSession] is the
+     * snapshot target instead. `wasStreaming` is always OR'd.
+     * Unlike [reparkUnsettledLedger] this never launches a second teardown
+     * for [prevLive] — exactly one [launchCloseThenFlush] per same-ID reopen
+     * (tests assert teardownJobs==1, not closeCalls==1, since one job
+     * double-closes).
+     */
+    private fun reparkSameIdTeardownOnAbort(
+        sameIdTeardown: Job?,
+        prevLive: ChatSession?,
+        fencedJob: Job?,
+        fencedSession: ChatSession?,
+        combinedWasStreaming: Boolean,
+        ownerSessionId: String?,
+        entryDiscardEpoch: Long,
+    ) {
+        if (sameIdTeardown == null && fencedJob == null && prevLive == null && fencedSession == null) return
+        if (ownerSessionId == null) return
+        if (explicitDiscardEpoch != entryDiscardEpoch) return
+        // Sync-area park already owns this ledger: keep it (OR streaming,
+        // fill a missing fence). Covers every slow-path abort (auth
+        // Denied/Missing/Stale, fast-preload gate at 1008, auth gates at
+        // 1015-1025, access-generation gate at 1029, mutex gates at
+        // 1032-1037) and slow-IO cancel where the settle never completed.
+        // From-null owner-match parks the retained fenced session, so the
+        // slot matches either prevLive (live same-ID) or fencedSession
+        // (retained fence).
+        if ((pendingLedgerSession === prevLive ||
+                (fencedSession != null && pendingLedgerSession === fencedSession)
+            ) && pendingLedgerOwnerSessionId == ownerSessionId
+        ) {
+            pendingLedgerWasStreaming = pendingLedgerWasStreaming || combinedWasStreaming
+            if (pendingLedgerFence == null) {
+                pendingLedgerFence = when {
+                    fencedJob != null && sameIdTeardown != null ->
+                        compositeLedgerJoin(fencedJob, sameIdTeardown)
+                    fencedJob != null -> fencedJob
+                    else -> sameIdTeardown
+                }
+            }
+            return
+        }
+        if (pendingLedgerFence == null && pendingLedgerSession == null) {
+            val merged = when {
+                fencedJob != null && sameIdTeardown != null ->
+                    compositeLedgerJoin(fencedJob, sameIdTeardown)
+                fencedJob != null -> fencedJob
+                else -> sameIdTeardown
+            }
+            pendingLedgerFence = merged
+            pendingLedgerSession = prevLive ?: fencedSession
+            pendingLedgerWasStreaming = combinedWasStreaming
+            pendingLedgerOwnerSessionId = ownerSessionId
+        } else {
+            // Occupied by a newer park (concurrent op after our sync park):
+            // same-owner merges join evidence, different-owner preserves the
+            // newest slot (our job keeps draining unfenced) while OR-ing
+            // streaming evidence conservatively.
+            val incomingFence: Job? = when {
+                fencedJob != null && sameIdTeardown != null ->
+                    compositeLedgerJoin(fencedJob, sameIdTeardown)
+                fencedJob != null -> fencedJob
+                else -> sameIdTeardown
+            }
+            val sameOwner = pendingLedgerOwnerSessionId != null &&
+                pendingLedgerOwnerSessionId == ownerSessionId
+            val existingFence = pendingLedgerFence
+            if (sameOwner && existingFence != null && incomingFence != null) {
+                pendingLedgerFence = compositeLedgerJoin(existingFence, incomingFence)
+                if (prevLive != null) pendingLedgerSession = prevLive
+            }
+            pendingLedgerWasStreaming = pendingLedgerWasStreaming || combinedWasStreaming
+            if (sameOwner && ownerSessionId != null) pendingLedgerOwnerSessionId = ownerSessionId
+        }
+    }
+
+    /**
+     * R6-3 streaming evidence for the incomplete fallback: true while the old
+     * session may still be missing its terminal record — live STREAMING /
+     * CANCELLED / WAITING_STEERED projection, a pending UNKNOWN admission, a
+     * direct admission still in its durable/finalize window or orphan drain
+     * (R21-1 Phase 1 [ChatSession.hasUnsettledAdmission]: user row durable
+     * but no terminal yet), a promotion reservation/ghost (R22 Phase 1
+     * [ChatSession.hasUnsettledPromotion]: named subset of the admission
+     * proof, conjoined explicitly exactly like [TurnController.flushDurable],
+     * never via the admission branch alone), a live hosted turn (R22 Phase 1
+     * [ChatSession.hasActiveHost]: a running host owns a user row with no
+     * proven terminal yet), sticky close debt (R22 Phase 1
+     * [ChatSession.hasClosedUnsettledAdmission]: close-dropped terminal
+     * obligations stay evidence until proven), an unsettled cancel receipt
+     * (R19-1 PENDING/CLAIMED: the deferred system/batch write is still owed),
+     * a SEALED-but-uncompensated receipt (Phase 1 truth contract: SEALED
+     * without proven family-final still dangles), or admitted-but-unacked
+     * core runIds.
+     * S3-F2: the immediate cancel terminal itself is bounded
+     * (TurnController cancelCompensationTimeoutMs): a wedged writer no longer
+     * parks the cancelled host — timeout converges via the PENDING receipt
+     * (deferred notice-first) or markInterrupted, so this proof keeps
+     * returning true (CANCELLED status + unsettled/sealed receipts + pending
+     * runIds) until reopen INTERRUPTED backfill lands, never flipping clean
+     * on a dangling family.
+     * Current (S3-F2): bounded immediate + orphan drain share the 5s
+     * production bound (tests inject 1s). Target: single shared ledger
+     * budget.
+     * Read-failure contract (split, never throws except CancellationException
+     * rethrow): the best-effort probes below (uiState projection, sticky
+     * close debt, cancel receipts, pending runIds) treat a failed read as
+     * "no evidence", never "incomplete" — fail-open toward clean by contract
+     * (a wedged read must not pin every fork to incomplete; the
+     * fence-failure path via settleOk/durableOk still degrades
+     * independently). The three non-sticky obligation probes (admission /
+     * promotion / active-host) instead fail closed (see below): a wedged
+     * obligation read must never report clean. Per-session ownership: only
+     * the passed (source) session's receipts are consulted, so a fresh
+     * session never inherits an old session's evidence. Cancellation is
+     * never swallowed: every catch below rethrows CancellationException
+     * before applying its branch contract.
+     */
+    private fun isLedgerStreamingOrPending(session: ChatSession?): Boolean {
+        if (session == null) return false
+        try {
+            when (session.uiState.value.status) {
+                ChatStatus.STREAMING, ChatStatus.CANCELLED, ChatStatus.WAITING_STEERED -> return true
+                else -> Unit
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+        }
+        // Stage-3 F-E fail-closed: the three non-sticky obligation probes
+        // below (admission / promotion / active-host) return true on read
+        // failure (a wedged read must never report clean). Other probes keep
+        // their best-effort skip (sticky debt is fail-closed elsewhere via
+        // flushDurable conjunction; uiState/pending reads stay no-evidence).
+        // Failures are logged once for observability (best-effort Log).
+        try {
+            if (session.hasPendingAdmission()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+        }
+        try {
+            if (session.hasUnsettledAdmission()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            runCatching {
+                android.util.Log.w(
+                    "ChatViewModel",
+                    "isLedgerStreamingOrPending: hasUnsettledAdmission read failed, fail-closed true",
+                )
+            }
+            return true
+        }
+        try {
+            if (session.hasUnsettledPromotion()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            runCatching {
+                android.util.Log.w(
+                    "ChatViewModel",
+                    "isLedgerStreamingOrPending: hasUnsettledPromotion read failed, fail-closed true",
+                )
+            }
+            return true
+        }
+        try {
+            if (session.hasActiveHost()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            runCatching {
+                android.util.Log.w(
+                    "ChatViewModel",
+                    "isLedgerStreamingOrPending: hasActiveHost read failed, fail-closed true",
+                )
+            }
+            return true
+        }
+        try {
+            if (session.hasClosedUnsettledAdmission()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+        }
+        try {
+            if (session.hasUnsettledCancelReceipts()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+        }
+        try {
+            if (session.hasSealedUncompensatedReceipts()) return true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+        }
+        return try {
+            session.pendingTranscriptRunIds().isNotEmpty()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Detach + bounded close-then-flush for explicit lifecycle resets
+     * (newChat / openSession pre-clear) and endpoint switches. Thin wrapper
+     * over [detachAndFlushClose]: the live turn is cancelled synchronously
+     * and VM state is detached synchronously so the UI updates immediately,
+     * while the detached session closes (settle) before its background
+     * durable flush (R6-3 order). The teardown job + streaming evidence are
+     * parked in [pendingLedgerFence]/[pendingLedgerSession] so the next
+     * `ensureSession` fork fences on them before reading the old ledger.
+     * Callers cancel lifecycle operations first
+     * ([cancelLifecycleOperations] before this call); that order is load
+     * bearing — the teardown launch below lives on [viewModelScope], not the
+     * just-invalidated lifecycle scope, so it survives the cancel above.
+     */
+    private fun releaseLiveAfterBoundedFlush() {
+        val ownerAtPark = _currentSessionId.value
+        val detached = currentSession ?: return
+        val wasStreaming = isLedgerStreamingOrPending(detached)
+        val fence = detachAndFlushClose(detached)
+        // R8-2: park for the next fork's IO fence with the ledger lineage
+        // (the snapshot target at detach time). A non-null endpoint switch
+        // hands the fence over — it never clears this slot — while only an
+        // explicit history discard (clearChat / openSession attach /
+        // binding == null) drops it. Same-owner re-parks merge into one
+        // composite join so an unresolved same-ledger teardown is never lost;
+        // a different-owner park supersedes (the next fork snapshots only the
+        // latest previousSessionId's ledger, so the older parked ledger is
+        // irrelevant to it). The displaced job is NOT cancelled: it keeps
+        // running on viewModelScope to durability (close seals under
+        // NonCancellable, flush is bounded), just unfenced — the next fork
+        // only awaits the latest ledger.
+        if (pendingLedgerFence == null && pendingLedgerSession == null) {
+            pendingLedgerFence = fence
+            pendingLedgerSession = detached
+            pendingLedgerWasStreaming = wasStreaming
+            pendingLedgerOwnerSessionId = ownerAtPark
+        } else if (pendingLedgerOwnerSessionId != null && pendingLedgerOwnerSessionId == ownerAtPark) {
+            val prior = pendingLedgerFence
+            // Same ledger parked twice (e.g. re-park racing a late detach):
+            // join both teardowns under one fence instead of dropping either.
+            val incoming = fence
+            pendingLedgerFence = if (prior != null) {
+                compositeLedgerJoin(prior, incoming)
+            } else {
+                incoming
+            }
+            pendingLedgerSession = detached
+            pendingLedgerWasStreaming = pendingLedgerWasStreaming || wasStreaming
+        } else {
+            pendingLedgerFence = fence
+            pendingLedgerSession = detached
+            pendingLedgerWasStreaming = wasStreaming
+            pendingLedgerOwnerSessionId = ownerAtPark
+        }
+    }
+
+    private suspend fun loadHistory(sessionId: String): LoadedUiHistory? {
+        val backing: SessionStore = sessions.storeOrNull() ?: return LoadedUiHistory(emptyList(), 0)
         if (backing.getSession(sessionId) == null) return null
-        // Single-pass streaming replay: pages are consumed as they arrive. out
-        // text stays O(HISTORY_CAP); runIdToIndex stays O(CAP) with one index
-        // per emitted assistant; pendingMarkers holds only orphan runId short
-        // strings, worst case O(HISTORY_SCAN_CAP) entries, far smaller than full events.
+        // Single-pass streaming replay over the newest tail: backward paging
+        // keeps memory O(HISTORY_CAP), never O(session) (sparse seqs safe via
+        // `seq <` predicates, never offsets), then restored to oldest-first.
+        // out text stays O(HISTORY_CAP); runIdToIndex stays O(CAP) with one
+        // index per emitted assistant; pendingMarkers holds only orphan runId
+        // short strings, worst case O(HISTORY_SCAN_CAP) entries, far smaller
+        // than full events. The raw scan stays bounded by HISTORY_SCAN_CAP.
         // Marker events never render; an assistant event whose runId has a marker
         // restores hasReasoning so resumed reasoning-origin turns still fail
         // closed on tool-dependent / thinking-mode follow-ups (ordinary
-        // no-tools follow-ups continue). Resume history here is display-only
-        // (rebuilt UiMessages, never fed into provider requests), so the flag
-        // is defense-in-depth only. The message cap still counts user/assistant
-        // messages only, while the scan bound counts raw scanned events.
-        val out = ArrayList<UiMessage>()
+        // no-tools follow-ups continue). This replay is display UiMessages;
+        // the provider-visible flag rides loadModelHistory into TurnController.
+        // S4-F5: when the tail cap omits older rows (dropped>0) the marker scan
+        // may have missed an older reasoning marker whose assistant is still
+        // kept – every kept assistant is then conservatively resumed with
+        // hasReasoning=true, matching Factory loadModelHistory (dropped>0 all
+        // true) so UI and model-context agree on truncation (fail-closed).
+        // Known gap (follow-up): exact-cap far-marker beyond one extra page
+        // (R25-1) is over-flagged only on the model-context path; UI replay
+        // stays display-only there and may disagree. Enforcement always uses
+        // the model-context flag.
+        // Backward scan sees each marker before its
+        // assistant (markers append right after), so the pending path is the
+        // live one; the patch path stays for reorder tolerance. Cancelled /
+        // failed fragments replay with their persisted partial flag (never as
+        // completed answers); system markers stay hidden from the chat replay.
+        // The message cap counts user/assistant messages only, while the scan
+        // bound counts raw scanned events.
+        val out = ArrayList<UiMessage>(HISTORY_CAP)
         // Only already-emitted assistants, so a late marker can patch its flag.
         val runIdToIndex = HashMap<String, Int>()
-        // Markers seen before their assistant (reorder / cross-page tolerance).
+        // Markers seen before their assistant (reorder / cross-page tolerance;
+        // in backward order this is the common case: marker seq > assistant seq).
         val pendingMarkers = HashSet<String>()
         var scanned = 0
-        var afterSeq = 0L
-        outer@ while (scanned < HISTORY_SCAN_CAP) {
-            val page = backing.loadEvents(sessionId, afterSeq, HISTORY_PAGE)
+        var beforeSeq = Long.MAX_VALUE
+        outer@ while (out.size < HISTORY_CAP && scanned < HISTORY_SCAN_CAP) {
+            val page = backing.loadEventsBefore(sessionId, beforeSeq, HISTORY_PAGE)
             if (page.isEmpty()) break
             for (event in page) {
                 if (scanned >= HISTORY_SCAN_CAP) break@outer
                 scanned++
                 when (event.kind) {
+                    // Phase 3: restore the persisted partial flag (cancelled /
+                    // failed fragments replay flagged, never as completed
+                    // answers).
                     "user" -> if (out.size < HISTORY_CAP) {
-                        out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = false))
+                        out.add(UiMessage(id = "hist-${event.seq}", role = event.kind, text = event.text, isPartial = event.isPartial))
                     }
                     "assistant" -> if (out.size < HISTORY_CAP) {
                         val flagged = pendingMarkers.remove(event.runId)
@@ -2324,7 +4918,7 @@ class ChatViewModel(
                                 id = "hist-${event.seq}",
                                 role = event.kind,
                                 text = event.text,
-                                isPartial = false,
+                                isPartial = event.isPartial,
                                 hasReasoning = flagged,
                             ),
                         )
@@ -2336,20 +4930,53 @@ class ChatViewModel(
                             val cur = out[idx]
                             if (!cur.hasReasoning) out[idx] = cur.copy(hasReasoning = true)
                         } else if (out.size < HISTORY_CAP) {
-                            // out still has room, so a later assistant may consume
-                            // this marker. When out is full no further assistant
-                            // appends happen, so buffering would leave a dead entry.
+                            // out still has room, so a later (older) assistant
+                            // may consume this marker. When out is full no
+                            // further assistant appends happen, so buffering
+                            // would leave a dead entry.
                             pendingMarkers.add(event.runId)
                         }
                     }
                 }
             }
-            afterSeq = page.last().seq
+            val pageMin = page.minOf { it.seq }
+            if (pageMin >= beforeSeq) break
+            beforeSeq = pageMin
             if (page.size < HISTORY_PAGE) break
-            // When out is full no further appends happen, but scanning continues
-            // to SCAN_CAP/EOF so late markers still patch already-emitted flags.
         }
-        return out
+        // Exact omitted-row total via one filtered COUNT (O(1) memory).
+        val total = backing.countHistoryEvents(sessionId, includePartial = true)
+        val dropped = (total - out.size).coerceAtLeast(0)
+        // S4-F5 + S4-R2: dropped>0 => conservative all-assistants reasoning
+        // flag. The latest prune sweep may have deleted rows with dropped==0
+        // (R26-1: cut head family deleted whole) – consult isPruneSuspect
+        // best-effort (per-sweep, not sticky; fail-closed: read failure =>
+        // suspect true), matching Factory loadModelHistory on the dropped>0 /
+        // pruneSuspect paths.
+        // Stage-3 honesty (R26-2/F4): the two paths agree on dropped>0 and
+        // pruneSuspect, but may disagree on the exact-cap far-marker (R25-1):
+        // the model path probes hasReasoningBefore(extraFloor) boundedly and
+        // over-flags all kept assistants, while this UI replay stays
+        // display-only there (no extra probe; enforcement always uses the
+        // model-context flag). COUNT basis also differs by design: the model
+        // path counts includePartial=false (provider payload), this replay
+        // counts includePartial=true (visible messages).
+        val pruneSuspect = try {
+            backing.isPruneSuspect(sessionId)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            true
+        }
+        if (dropped > 0 || pruneSuspect) {
+            for (i in out.indices) {
+                val m = out[i]
+                if (m.role == "assistant" && !m.hasReasoning) {
+                    out[i] = m.copy(hasReasoning = true)
+                }
+            }
+        }
+        return LoadedUiHistory(out.asReversed(), dropped)
     }
 
     override fun onCleared() {
@@ -2357,6 +4984,14 @@ class ChatViewModel(
         retryInFlight = null
         lifecycleJob.cancel()
         openJob?.cancel()
+        // R10-1: drop per-session outstanding teardowns (bounded; viewModelScope
+        // teardown cancels their jobs anyway).
+        outstandingTeardowns.clear()
+        // R10-2: drop pending-writer identity alongside the block it explains.
+        pendingBackfillWriter.clear()
+        // Synchronous close only: background flush-then-close is infeasible
+        // here (viewModelScope is cancelled on teardown), so closeLive()
+        // relies on TurnController.close's internal bounded drain.
         closeLive()
         super.onCleared()
     }

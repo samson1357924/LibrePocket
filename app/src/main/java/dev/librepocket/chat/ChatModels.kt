@@ -36,10 +36,12 @@ data class UiMessage(
    * Known limitation: transcripts written before the marker existed carry no
    * marker, so resuming them restores hasReasoning=false even if the original
    * turn was reasoning-sourced; only sessions written since this marker
-   * landed persist the flag. On this branch that is defense-in-depth only:
-   * resumed history is display state, never fed back into the provider
-   * request, so a missing flag cannot smuggle a reasoning origin into a
-   * follow-up as plain text.
+   * landed persist the flag. Resume history feeds the provider via
+   * loadModelHistory into TurnController, so the restored flag is
+   * provider-visible: a missing flag fail-opens to plain-text continuation
+   * (a tool-dependent follow-up would mis-pass `requireNoReasoningHistory`
+   * instead of failing closed; ordinary no-tools follow-ups continue either
+   * way).
    */
   val hasReasoning: Boolean = false,
 )

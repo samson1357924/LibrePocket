@@ -15,9 +15,12 @@ with `dorny/paths-filter` into `code` (`app/src/**`,
 `settings.gradle.kts`, `build.gradle.kts`, `gradle.properties`,
 `.github/workflows/pr-check.yml`) and `policy`
 (`scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`,
-`scripts/summarize_junit.py`,
+`scripts/summarize_junit.py`, `scripts/check_test_budgets.py`,
+`scripts/check_junit_durations.py`,
 `scripts/tests/test_apk_policy_check.py`,
 `scripts/tests/test_summarize_junit.py`,
+`scripts/tests/test_check_test_budgets.py`,
+`scripts/tests/test_check_junit_durations.py`,
 `.github/workflows/pr-check.yml`) outputs. `docs-guard` always runs the
 static grep guard `scripts/docs_claim_check.sh` (no Gradle, no emulator);
 `pr-gate` (`always()`, needs all prior jobs) resolves a skipped Gradle
@@ -38,12 +41,53 @@ a separate higher-API smoke pass (Proposed, not a current CI gate). The pin
 itself and any `@Config` SDK matrix expansion are out of scope for the
 current deflake work — do not change them here.
 
+Issue #86 byte-cap PR/nightly split (Current, Phase B stop-gap, zero prod change):
+PR runs slimmed byte-cap versions (11-turn / 22-row / 2.2M-char over-budget
+prefix plus the 12-turn cleanFence; same 20-fit / 21st-overflow arithmetic,
+same all-or-nothing + marker + clean-reopen assertions); the original 100-turn
+/ 200-row / 20M-char full stress runs only in the nightly `nightly-unit-stress`
+job (`NIGHTLY_STRESS=1`, Foss flavor only — shaping is flavor-independent,
+independent 35-minute timeout, JUnit XML retained 14 days, red requires filing
+an issue manually and never blocks merge — not in `pr-check.yml` `pr-gate`).
+Slim tests use `FakeSessionStore.appendPreRedactedForBudgetTest`
+(pre-redacted `"x"` fixture, bytes identical, skips the O(n²) EMAIL scan;
+`appendEvent` 本體不動，F8 parity unaffected); nightly stress uses the true
+`appendEvent` shaping.
+
+| PR slim (fast, gate) | Nightly full (`NIGHTLY_STRESS=1`, non-gate) |
+|---|---|
+| `ChatSnapshotByteCapTest.overBudgetPrefix_loadBoundedAndSnapshotAbandonsWholeWithMarker` (11 turns, 20 fit / 2 dropped) | `ChatSnapshotByteCapFullStressTest.overBudgetPrefix_full200Rows_abandonsWholeWithMarker` (100 turns, 20 fit / 180 dropped) |
+| `SnapshotFiveDimPhase4Test.byteCapOverBudget_fiveDim` (11 turns) | `ChatSnapshotByteCapFullStressTest.byteCapOverBudget_fiveDim_full200Rows` (100 turns) |
+| `ChatSnapshotByteCapTest.cleanFenceOverBudgetFork_surfacesIncompleteNoticeImmediately` (12 turns, pre-redacted fast path) | (same ledger shape covered by the two full tests above; no separate nightly) |
+
+Issue #86 Phase A root fix (Current, production change — `Redactor` only):
+single-scan per rule (`replaceAndCount`, replacing the
+`findAll().count()`+`replace()` double scan; `$1` semantics unchanged),
+fail-closed literal prechecks per rule (miss-then-skip only on necessary
+conditions: `@`+`.tld`-dot, `bearer`, `://`+`@`, `?`/`&`+`=`, `09`, `+`,
+`1`/`2`, key words, path prefixes, digit presence), a linear `@`-anchored
+EMAIL scan (equivalent to the regex `replaceAll` — maximal local run +
+anchored domain per `@`, disjoint runs keep it O(n); possessive local part
+kept as defense in depth), and a digit precheck in `applyCardRule`. Output
+text and per-rule hit counts are bit-identical (pinned by `RedactorTest` 71
+tests + corpus + `SecretValueRedactionRegressionTest` 15 tests + new
+`RedactorPerfRegressionTest` 6 tests: homogeneous 100k passthrough with zero
+hits, single 100k <500ms, `@`-bearing probes <500ms with dotless passthrough,
+21-shape EMAIL differential vs the legacy greedy regex, 200-row equivalent
+<60s). Measured (Foss, post-fix, `testFossDebugUnitTest` JUnit XML):
+`RedactorPerfRegressionTest` 6/6 in ~1.2s (incl. 200-row equivalent ~1.0s,
+`@`-probes ~0.01s); PR-slim `ChatSnapshotByteCapTest` 4/4 in ~0.5s;
+nightly-only `ChatSnapshotByteCapFullStressTest` 2/2 in ~1.4s with
+`NIGHTLY_STRESS=1` (true shaping). The Phase B slim/nightly split and Phase C
+gates are retained (defense in depth, still reject wasteful huge loops).
+
 What runs by edit type:
 
 - Docs-only (neither `code` nor `policy`, e.g. `docs/**` or `*.md` edits): unit tests, lint, and build/policy are skipped; `docs-guard` and `pr-gate` still run.
-- Policy-script-only (any `policy` path edit, `code == false`): build/policy and the stdlib Python policy harness run; unit tests and lint are skipped and resolved as pass by `pr-gate`. A scanner-only diff (`scripts/apk_policy_inspect.py` or `scripts/tests/test_apk_policy_check.py`) therefore cannot pass with all policy validation skipped.
+- Policy-script-only (any `policy` path edit, `code == false`): build/policy and the stdlib Python policy harness run; unit tests and lint are skipped and resolved as pass by `pr-gate`. The harness runs both the Python unit tests AND the repo-wide `python3 scripts/check_test_budgets.py` scan (PR #87 P2-4: script-only diffs skip the `unit-tests` job that otherwise hosts that gate, so the scan is wired into `policy-harness` too — pinned by `PolicyCiGateControl.test_policy_harness_runs_repo_budget_guard`). A scanner-only diff therefore cannot pass with all policy validation skipped.
 - Workflow-only edit to `pr-check.yml`: counts as both `code` and `policy`, so all Gradle stages plus the Python policy harness run. The harness pin tests therefore execute exactly when the wiring they validate changes.
 - Mixed docs + code/policy edits: full Gradle stages plus `docs-guard` run.
+- Stacked PRs (base is not `main`, e.g. a fix branch targeting a feature branch): `pr-check.yml` only triggers on `main`, so no PR Check runs attach to the stacked PR itself — verification rests on local runs (base SHA, exact commands, exit status recorded) plus `workflow_dispatch` evidence; merging the stack into the feature branch re-enters that branch's own `main`-targeted gate, which is where the three-flavor green must be observed before closing the related issue.
 
 Static analysis lives outside `pr-check.yml`: CodeQL runs in
 `.github/workflows/codeql.yml`, which skips docs-only push/PR events via
@@ -56,7 +100,35 @@ including docs-only ones.
 No branch-protection required checks are configured on `main`; `pr-gate`
 and the checks above are informational until protection is configured.
 
-The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+The workflows do **not** run an Android emulator/device matrix on every pull request. The Python APK policy and release-identity harnesses (standard library only) run in CI as the `policy-harness` job whenever `policy == true`, and `pr-gate` requires its success in that case. The command is `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py`. These tests use synthetic APK-like files and fake Gradle/SDK/policy commands; they do not prove real APK or SDK behavior. A green unit/lint/policy workflow is not proof of runtime safety, provider compatibility, signing identity, or physical-device behavior.
+
+Issue #86 Phase C guardrails (Current, gates — only reject/alert, never
+silently downgrade redaction or writes):
+- `scripts/check_test_budgets.py` (covered by
+  `scripts/tests/test_check_test_budgets.py`) runs BEFORE the unit-test suite in
+  each flavor job over all test source sets (`app/src/test`, `app/src/testFoss`,
+  `app/src/testGithub`, `app/src/androidTest`): H1 rejects `repeat(N>=10)` loops writing huge fixtures
+  (`100_000`/`100_001`/`huge`/`big`) through the true `.appendEvent(` shaping
+  (use `appendPreRedactedForBudgetTest` or move to nightly; only
+  `ChatSnapshotByteCapFullStressTest.kt` is allowlisted); H2 rejects
+  `repeat(N>=2000)` with `.appendEvent(`. Local: `python3
+  scripts/check_test_budgets.py`.
+- `scripts/check_junit_durations.py` (covered by
+  `scripts/tests/test_check_junit_durations.py`) runs AFTER the suite in each
+  flavor job and fails when any single test class exceeds 120s (same JUnit XML
+  glob as `summarize_junit.py`, which stays reporting-only). No XML skips green
+  (Gradle governs that case). Local: `python3 scripts/check_junit_durations.py`
+  (needs `app/build/test-results/**/TEST-*.xml` from a prior Gradle run).
+- Known slow classes (budgets, Current): PR-slim byte-cap
+  (`ChatSnapshotByteCapTest`, 11-turn + 12-turn + 2000 small rows) and
+  `SnapshotFiveDimPhase4Test.byteCapOverBudget_fiveDim` must stay well under
+  120s per class; nightly-only `ChatSnapshotByteCapFullStressTest` (200 rows,
+  true shaping) is exempt from the PR gate by construction (skips without
+  `NIGHTLY_STRESS=1`) and has its own 35-minute nightly timeout.
+- Per-class Gradle sharding with independent per-class timeouts is Proposed
+  (not wired): today the per-flavor job timeout (`timeout-minutes: 20`) plus
+  the two gates above are the enforcement. Do not claim sharded execution until
+  it is wired and run.
 
 ## Local commands
 
@@ -68,7 +140,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   scripts/tests/test_apk_policy_check.py \
   scripts/tests/test_release_artifact_verifier.py \
   scripts/tests/test_build_release_identity.py \
-  scripts/tests/test_summarize_junit.py
+  scripts/tests/test_summarize_junit.py \
+  scripts/tests/test_check_test_budgets.py \
+  scripts/tests/test_check_junit_durations.py
+
+# Issue #86 Phase C guardrails (static, no Gradle)
+python3 scripts/check_test_budgets.py
+python3 scripts/check_junit_durations.py
 
 # Flavor unit/Robolectric tests
 ./gradlew :app:testPlayDebugUnitTest :app:testFossDebugUnitTest :app:testGithubDebugUnitTest --max-workers=1 --no-daemon
@@ -99,7 +177,11 @@ pull requests (types `labeled`, `synchronize`, `opened`, `reopened`) the
 `instrumented-test` job executes only when the PR carries the
 `run-instrumented` label (the job `if:` requires that label for PR
 events, so an unlabeled PR shows as Skipped/neutral — not a pass — and
-does not enter `pr-gate` merge evaluation). The emulator matrix is API
+does not enter `pr-gate` merge evaluation). The `nightly-unit-stress` job
+(Issue #86 Phase B, Foss `ChatSnapshotByteCapFullStressTest` with
+`NIGHTLY_STRESS=1`) runs on schedule / `workflow_dispatch` only
+(`if: github.event_name != 'pull_request'`), never on PR; JUnit XML retained
+14 days, non-gating (not in `pr-check.yml` `pr-gate`). The emulator matrix is API
 levels 33 and 34 only, across the Play/Foss/Github flavors — while
 `minSdk` is 33, `compileSdk` is 37 and `targetSdk` is 36
 (`app/build.gradle.kts`), so there is currently no API 35, 36, or 37

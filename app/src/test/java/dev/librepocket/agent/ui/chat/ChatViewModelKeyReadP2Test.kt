@@ -252,7 +252,11 @@ class ChatViewModelKeyReadP2Test {
         val store = newStore()
         store.save(endpointA())
         val transcripts = FakeSessionStore()
-        val sid = transcripts.createSession("old", "gpt-4o-mini")
+        // R4-1+ provenance-stamped header (as create() stamps it): the P2
+        // token-burn assertions need same-origin hydration (same-sid attach
+        // on resume). A legacy bare-model header would quarantine-fork by
+        // design (Phase 4, pinned by ChatSessionFactoryLegacyQuarantineTest).
+        val sid = transcripts.createSession("old", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(
             dev.librepocket.session.TranscriptEvent(
                 sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,

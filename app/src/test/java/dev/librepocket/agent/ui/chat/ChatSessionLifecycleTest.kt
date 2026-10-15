@@ -272,6 +272,42 @@ class ChatSessionLifecycleTest {
         }
     }
 
+    // Phase 2 ledger wiring, R6-3 order: an endpoint switch closes (settle,
+    // includes the doomed-host terminal admission) the detached live session
+    // strictly before its durable flush. The detach is synchronous (the UI
+    // never waits); close-then-flush runs bounded in the background, strictly
+    // in that order (a bare flush alone would miss an unreserved cancel
+    // terminal). The outbox recovery contract is unchanged.
+    @Test
+    fun endpointSwitchClosesLiveSessionBeforeFlush() = runBlocking {
+        val store = newStore()
+        store.save(endpoint())
+        val sessions = ControlledSessions()
+        val releaseTurn = CompletableDeferred<Unit>()
+        sessions.sendGate = { releaseTurn.await() }
+        val vm = newViewModel(store, sessions)
+        try {
+            chatMain.run { vm.sendDirect("first") }
+            val live = sessions.awaitCreated(1)
+            withTimeout(5_000) { live.hostEntered.await() }
+
+            store.save(endpoint().copy(model = "other-model"))
+            withTimeout(5_000) { live.closed.await() }
+            // R6-3 is close-then-flush: closed completes inside close() before
+            // the background flush runs, so await the flush barrier before
+            // asserting the strict order (awaiting closed alone races flush).
+            withTimeout(5_000) { while (live.flushCalls.get() != 1) delay(1) }
+            withTimeout(5_000) { while (live.lifecycle.size < 2) delay(1) }
+            assertEquals(listOf("close", "flush"), live.lifecycle.toList())
+            assertEquals(1, live.flushCalls.get())
+            assertEquals(1, live.closeCalls.get())
+            assertEquals(listOf("first"), live.sent.toList())
+        } finally {
+            releaseTurn.complete(Unit)
+            chatMain.run { vm.newChat() }
+        }
+    }
+
     // N1 negative control: newer typing is never overwritten by reclaimed
     // queued text; the queued intent waits in the outbox instead.
     @Test
@@ -770,7 +806,9 @@ class ChatSessionLifecycleTest {
             assertEquals("H", vm.currentSessionId.value)
 
             chatMain.run { vm.newChat() }
-            assertTrue(historySession.closed.isCompleted)
+            // Phase 2: newChat detaches synchronously but flushes (bounded)
+            // before closing in the background, so await the background close.
+            withTimeout(5_000) { historySession.closed.await() }
             assertTrue(!historySession.hostedTurnActive)
             assertTrue(!live.hostedTurnActive)
         } finally {
@@ -2790,19 +2828,37 @@ class ChatSessionLifecycleTest {
             val live = sessions.awaitCreated(1)
             // Flush Main: op1's deny→stash continuation was queued before
             // this barrier, so after it the outbox deterministically holds
-            // op1 and retryableOp is op1 (not op2). The box await below would
-            // otherwise pass vacuously on op2's restore alone.
+            // op1. Retry keeps newer-wins priority (setRetryableIfNewer), so
+            // its target is the box-tagged op2 rather than the stashed op1;
+            // the box await below would otherwise pass vacuously on op2's
+            // restore alone.
             chatMain.run { }
             // First op denies into the occupied box: stashed, not deleted.
             withTimeout(5_000) { vm.input.first { it == "same" } }
+            // R13: prove BOTH denials completed before retrying. The input
+            // gate above can be satisfied by op2's restore alone; only op1's
+            // stash into the occupied box raises recovery 0→1, so this gate
+            // is the deterministic proof that op1 is parked in the outbox.
+            withTimeout(5_000) { vm.pendingRecoveryCount.first { it == 1 } }
             assertTrue(live.sent.isEmpty())
 
             deny.set(false)
-            // Retry sends one intent; the box keeps the other identical text.
+            // Retry adopts the box-tagged (newer) intent under its own opId
+            // and clears the box synchronously; the stashed twin drains back
+            // only after the admitted turn's host completes. Gate the box
+            // assert on that drain — asserting immediately after `sent`
+            // appears races host.join/drain and flakes by scheduling. The two
+            // texts are identical by design (string equality must never drive
+            // ownership), so target correctness is proven structurally below:
+            // exactly one admission, the twin preserved in the box, and both
+            // delivered after the explicit send — any cross-consume would
+            // surface as loss or duplication.
             chatMain.run { vm.retry() }
             withTimeout(5_000) {
                 while (live.sent.isEmpty()) delay(1)
             }
+            assertEquals(listOf("same"), live.sent.toList())
+            withTimeout(5_000) { vm.input.first { it == "same" } }
             assertEquals(listOf("same"), live.sent.toList())
             assertEquals("same", vm.input.value)
             withTimeout(5_000) { live.sendFinished.await() }
@@ -3257,12 +3313,27 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
             val id = "controller-session-${created.incrementAndGet()}"
             createdModels.add(endpoint.model)
             val transcript = object : TranscriptSink by NoOpTranscriptSink() {
@@ -3286,6 +3357,25 @@ class ChatSessionLifecycleTest {
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
+
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3403,12 +3493,27 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
             if (createCount.incrementAndGet() == 1) {
                 val delegate = RecordingSession("old", { })
                 val session = object : ChatSession by delegate {
@@ -3449,6 +3554,25 @@ class ChatSessionLifecycleTest {
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
 
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
+
         override suspend fun storeOrNull(): SessionStore? = null
 
         suspend fun awaitReplacement(): RecordingSession = withTimeout(5_000) {
@@ -3462,12 +3586,29 @@ class ChatSessionLifecycleTest {
         val session = FreshDenyQueuedSession()
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
-        ) = CreatedSession("fresh-deny", session, endpoint.providerId, modelFor(endpoint))
+        ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+            return CreatedSession("fresh-deny", session, endpoint.providerId, modelFor(endpoint))
+        }
 
         override suspend fun open(
             endpoint: EndpointConfig,
@@ -3475,6 +3616,25 @@ class ChatSessionLifecycleTest {
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
+
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3519,6 +3679,8 @@ class ChatSessionLifecycleTest {
             return listOf(dev.librepocket.chat.QueuedIntent(77L, "queued"))
         }
 
+        override suspend fun flush(timeoutMs: Long): Boolean = true
+
         override fun cancel() = Unit
         override fun steer(text: String) = Unit
         override fun close() = Unit
@@ -3530,12 +3692,29 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
-        ) = CreatedSession("needs-recovery", session, endpoint.providerId, modelFor(endpoint))
+        ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+            return CreatedSession("needs-recovery", session, endpoint.providerId, modelFor(endpoint))
+        }
 
         override suspend fun open(
             endpoint: EndpointConfig,
@@ -3543,6 +3722,25 @@ class ChatSessionLifecycleTest {
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
+
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3610,6 +3808,7 @@ class ChatSessionLifecycleTest {
         }
 
         override fun drainQueued(): List<dev.librepocket.chat.QueuedIntent> = emptyList()
+        override suspend fun flush(timeoutMs: Long): Boolean = true
         override fun cancel() = Unit
         override fun steer(text: String) = Unit
         override fun close() = Unit
@@ -3621,12 +3820,29 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
-        ) = CreatedSession("legacy-null-recovery", session, endpoint.providerId, modelFor(endpoint))
+        ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
+            return CreatedSession("legacy-null-recovery", session, endpoint.providerId, modelFor(endpoint))
+        }
 
         override suspend fun open(
             endpoint: EndpointConfig,
@@ -3634,6 +3850,25 @@ class ChatSessionLifecycleTest {
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession = error("open is not used by this test")
+
+        // D2 canonical form: no store/backfill in this fake; gate intentionally no-op.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = null
     }
@@ -3665,6 +3900,7 @@ class ChatSessionLifecycleTest {
         }
 
         override fun drainQueued(): List<dev.librepocket.chat.QueuedIntent> = emptyList()
+        override suspend fun flush(timeoutMs: Long): Boolean = true
         override fun cancel() = Unit
         override fun steer(text: String) = Unit
         override fun close() = Unit
@@ -3700,12 +3936,27 @@ class ChatSessionLifecycleTest {
 
         override fun modelFor(endpoint: EndpointConfig): String = endpoint.model
 
+        // D2 canonical form: storeless provider-loop fake — never hydrates
+        // (see ChatWiringTest scope note), so a non-empty prefix fails fast
+        // instead of being silently dropped. The 3-arg shim rides the
+        // interface default into this body.
+        // Canonical 4-arg core (see ChatSessionProvider): explicit fail-closed
+        // policy default; this fake threads proofs through the 5-arg entry.
         override suspend fun create(
             endpoint: EndpointConfig,
             title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
+            keyIsCurrent: suspend () -> Boolean,
+        ): CreatedSession = create(endpoint, title, initialHistory, false, keyIsCurrent)
+
+        override suspend fun create(
+            endpoint: EndpointConfig,
+            title: String,
+            initialHistory: List<dev.librepocket.provider.ChatMessage>,
             allowAsk: Boolean,
             keyIsCurrent: suspend () -> Boolean,
         ): CreatedSession {
+            check(initialHistory.isEmpty()) { "non-hydrating fake discards fork prefix" }
             val ordinal = createCounter.incrementAndGet()
             val sessionId = "session-$ordinal"
             createAttemptIds.add(sessionId)
@@ -3730,6 +3981,28 @@ class ChatSessionLifecycleTest {
             opened.add(session)
             return CreatedSession(sessionId, session, endpoint.providerId, modelFor(endpoint))
         }
+
+        // D2 canonical form: this fake keeps no ledger marks of its own, so
+        // the gate is intentionally a no-op here (same as the old interface
+        // default); backfill behavior is pinned against the real factory in
+        // ChatSameIdReopenFenceTest, not here.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, keyIsCurrent)
+
+        // P0-1 open-full-union: explicit route to the open-allowAsk form,
+        // preserving the T0 allowAsk proof. backfillInterrupted is
+        // intentionally discarded: this storeless fake keeps no ledger marks.
+        override suspend fun open(
+            endpoint: EndpointConfig,
+            sessionId: String,
+            allowAsk: Boolean,
+            keyIsCurrent: suspend () -> Boolean,
+            backfillInterrupted: Boolean,
+        ): CreatedSession = open(endpoint, sessionId, allowAsk, keyIsCurrent)
 
         override suspend fun storeOrNull(): SessionStore? = backingStore
 
@@ -3817,6 +4090,11 @@ class ChatSessionLifecycleTest {
         val steerReceived = CompletableDeferred<String>()
         val closeCalls = AtomicInteger()
         val cancelCalls = AtomicInteger()
+        // R6-3 close-before-flush order record ("close" must precede "flush":
+        // close settles the doomed host so its terminal is admitted ahead of
+        // the flush barrier; a bare flush alone would miss it).
+        val flushCalls = AtomicInteger()
+        val lifecycle = CopyOnWriteArrayList<String>()
         @Volatile
         var hostedTurnActive = false
             private set
@@ -3983,6 +4261,12 @@ class ChatSessionLifecycleTest {
             hosted?.cancel()
         }
 
+        override suspend fun flush(timeoutMs: Long): Boolean {
+            flushCalls.incrementAndGet()
+            lifecycle.add("flush")
+            return true
+        }
+
         // Post-Q1 the VM never calls session.steer(): admission goes through
         // startOrEnqueue only. Kept for the ChatSession interface; records
         // receipt without modeling the controller FIFO.
@@ -3995,6 +4279,7 @@ class ChatSessionLifecycleTest {
                 if (closedFlag) return
                 closedFlag = true
                 closeCalls.incrementAndGet()
+                lifecycle.add("close")
                 fakeQueue.clear()
                 closed.complete(Unit)
             }

@@ -50,8 +50,12 @@ jobs:
               - 'scripts/play_policy_check.sh'
               - 'scripts/apk_policy_inspect.py'
               - 'scripts/summarize_junit.py'
+              - 'scripts/check_test_budgets.py'
+              - 'scripts/check_junit_durations.py'
               - 'scripts/tests/test_apk_policy_check.py'
               - 'scripts/tests/test_summarize_junit.py'
+              - 'scripts/tests/test_check_test_budgets.py'
+              - 'scripts/tests/test_check_junit_durations.py'
               - 'scripts/build_release.sh'
               - 'scripts/verify_release_apk.py'
               - 'scripts/release_artifact_stage.py'
@@ -94,6 +98,12 @@ jobs:
 
       # NOTE: keep the three literal task names below — scripts/docs_claim_check.sh
       # greps them from this file and requires TESTING.md to document each one.
+      # Issue #86 Phase C guardrails (gates, fail-closed; only reject/alert,
+      # never silently downgrade redaction): write-budget lint runs BEFORE the
+      # suite (static, no Gradle), duration gate runs AFTER (needs JUnit XML).
+      - name: Check test write budgets (Issue #86, gate)
+        run: python3 scripts/check_test_budgets.py
+
       - name: Run Unit Tests (${{ matrix.flavor }} flavor)
         run: |
           case "${{ matrix.flavor }}" in
@@ -102,6 +112,12 @@ jobs:
             github) ./gradlew :app:testGithubDebugUnitTest --stacktrace ;;
             *) echo "unknown flavor: ${{ matrix.flavor }}"; exit 1 ;;
           esac
+
+      - name: Check JUnit durations (Issue #86, gate)
+        # Gate (unlike the reporting-only summary below): any single test class
+        # over 120s fails the job. No XML (suite never ran) skips green — the
+        # Gradle step above already governs that case.
+        run: python3 scripts/check_junit_durations.py
 
       # 報告（非 gate）：flaky 取證要在 run 頁面直接可見——不必下載 artifact、
       # 不必翻 job log。這一步只讀 JUnit XML（app/build/test-results/**/TEST-*.xml），
@@ -209,7 +225,14 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Run APK policy and release-identity harnesses (stdlib only)
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_apk_policy_check.py scripts/tests/test_release_artifact_verifier.py scripts/tests/test_build_release_identity.py scripts/tests/test_summarize_junit.py scripts/tests/test_check_test_budgets.py scripts/tests/test_check_junit_durations.py
+
+      # PR #87 P2-4: script-only diffs (code == false) skip the unit-tests job
+      # that hosts the write-budget gate, so the repo-wide scan runs here too —
+      # the harness tests alone only cover the scripts' own logic, never the
+      # current tree.
+      - name: Run test-budget repo guard (Issue #86, gate)
+        run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_test_budgets.py
 
   build-and-policy-gate:
     name: Build & Policy Gates

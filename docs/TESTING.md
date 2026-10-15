@@ -106,7 +106,8 @@ Issue #86 Phase C guardrails (Current, gates — only reject/alert, never
 silently downgrade redaction or writes):
 - `scripts/check_test_budgets.py` (covered by
   `scripts/tests/test_check_test_budgets.py`) runs BEFORE the unit-test suite in
-  each flavor job: H1 rejects `repeat(N>=10)` loops writing huge fixtures
+  each flavor job over all test source sets (`app/src/test`, `app/src/testFoss`,
+  `app/src/testGithub`, `app/src/androidTest`): H1 rejects `repeat(N>=10)` loops writing huge fixtures
   (`100_000`/`100_001`/`huge`/`big`) through the true `.appendEvent(` shaping
   (use `appendPreRedactedForBudgetTest` or move to nightly; only
   `ChatSnapshotByteCapFullStressTest.kt` is allowlisted); H2 rejects

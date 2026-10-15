@@ -126,10 +126,13 @@ ALLOWLIST_HUGE_TRUE_PATH = {
 
 # `val payload = "x".repeat(100_000)` (optionally typed:
 # `val payload: String = ...`) assigned anywhere in the file, with the repeat
-# count normalized (underscores stripped) against HUGE_FIXTURE_MIN.
+# count normalized (underscores stripped) against HUGE_FIXTURE_MIN. The
+# fixture expression never crosses `;` (statement separator), so a same-line
+# `val a = huge; val b = small` attributes each count to its own definition
+# instead of greedily binding the last count to the first name.
 HUGE_FIXTURE_MIN = 100_000
 FIXTURE_VAR_RE = re.compile(
-    r"(?:val|var)\s+(\w+)\s*(?::\s*[^=\n]+?)?=[^\n]*\.repeat\s*\(\s*([\d_]+)"
+    r"(?:val|var)\s+(\w+)\s*(?::\s*[^=\n]+?)?=[^;\n]*\.repeat\s*\(\s*([\d_]+)"
 )
 # Inline `"x".repeat(150_000)` fixture constructor (any size; thresholded).
 STRING_REPEAT_N_RE = re.compile(r"\.repeat\s*\(\s*([\d_]+)")
@@ -661,24 +664,30 @@ def _function_ranges(masked: list[str]) -> list[tuple[int, int]]:
 
 def _scoped_var_defs(masked: list[str]) -> dict[str, list[tuple[int, int, bool]]]:
     """All `val`/`var` definitions on masked lines: name -> sorted
-    [(def_line, match_col, is_huge)], where huge means the same line builds a
-    `>=HUGE_FIXTURE_MIN` String.repeat fixture (typed or untyped). Runs on
-    masked lines so commented-out or string-demo declarations never count.
+    [(def_line, match_col, is_huge)], where huge means the definition's own
+    `;`-separated segment builds a `>=HUGE_FIXTURE_MIN` String.repeat fixture
+    (typed or untyped; the FIXTURE match starts at the same `val`/`var` with
+    the same name). Runs on masked lines so commented-out or string-demo
+    declarations never count. A same-line small redefinition of the same name
+    is recorded as small (no line-level bleed), so shadowing still clears.
     The match column locates the def inside its lexical `{...}` block (see
     `_def_enclosing_blocks`)."""
     defs: dict[str, list[tuple[int, int, bool]]] = {}
     for idx, line in enumerate(masked):
-        huge_here: set[str] = set()
+        fixtures: list[tuple[int, str, bool]] = []
         for m in FIXTURE_VAR_RE.finditer(line):
             try:
                 size = int(m.group(2).replace("_", ""))
             except ValueError:
                 continue
-            if size >= HUGE_FIXTURE_MIN:
-                huge_here.add(m.group(1))
+            fixtures.append((m.start(), m.group(1), size >= HUGE_FIXTURE_MIN))
         for m in VAL_DEF_RE.finditer(line):
             name = m.group(1)
-            defs.setdefault(name, []).append((idx, m.start(), name in huge_here))
+            is_huge = any(
+                fs == m.start() and fn == name and fh
+                for fs, fn, fh in fixtures
+            )
+            defs.setdefault(name, []).append((idx, m.start(), is_huge))
     for entries in defs.values():
         entries.sort()
     return defs
@@ -988,10 +997,25 @@ def check_file(path: str) -> list[str]:
     return violations
 
 
+# Test source sets covered by the repo-wide scan (unit + instrumented).
+TEST_SOURCE_SETS = ("test", "testFoss", "testGithub", "androidTest")
+
+
+def _test_source_files(root: str) -> list[str]:
+    """All `.kt` files under the scanned test source sets, deduplicated and
+    sorted (no prod change: `app/src/main` and flavor app sets are excluded)."""
+    files: list[str] = []
+    for src in TEST_SOURCE_SETS:
+        pattern = os.path.join(root, "app", "src", src, "**", "*.kt")
+        files.extend(glob.glob(pattern, recursive=True))
+    return sorted(set(files))
+
+
 def main() -> int:
+    """Scan every test source set (`test`, `testFoss`, `testGithub`,
+    `androidTest`) for H1/H2 violations."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    pattern = os.path.join(root, "app", "src", "test", "**", "*.kt")
-    files = sorted(glob.glob(pattern, recursive=True))
+    files = _test_source_files(root)
     if not files:
         print("check_test_budgets: no test files found (parser drift?)")
         return 1

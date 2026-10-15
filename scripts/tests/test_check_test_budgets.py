@@ -9,6 +9,7 @@ Run with: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/tests/test_check
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -961,6 +962,193 @@ class CheckTestBudgetsTest(unittest.TestCase):
                 'repeat(2000){ store.appendEvent(event(sid, "q")) }\n',
             )
             self.assertEqual([], check_test_budgets.check_file(p))
+
+
+    def test_h2_dot_space_fixture_no_loop_fp(self) -> None:
+        # Stage 4A: `val payload = "x" .repeat (100_000)` (space before the
+        # dot, legal Kotlin) is a fixture constructor, not a loop — the
+        # whitespace-skipping backscan discards it, so a later brace block
+        # with a write must not trip H2 (nor H1: the write is outside any
+        # loop).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotSpaceTest.kt",
+                'val payload = "x" .repeat (100_000)\n'
+                "fun f() {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_dot_space_fixture_still_fails(self) -> None:
+        # Stage 4A retention: the same dot-space fixture still resolves for
+        # H1 — a genuine huge write loop fails H1 (and only H1).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotSpaceHugeTest.kt",
+                'val payload = "x" .repeat (100_000)\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+            self.assertFalse(any("H2" in x for x in v), v)
+
+    def test_h2_dot_space_after_dot_no_loop_fp(self) -> None:
+        # Stage 4A: space between `.` and `repeat` (`"x". repeat(...)`) is
+        # also member access — never a loop, so no H2 from the fixture line.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotSpaceAfterTest.kt",
+                'val payload = "x". repeat (100_000)\n'
+                "fun f() {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertFalse(any("H2" in x for x in v), v)
+
+    def test_h2_myrepeat_name_passes(self) -> None:
+        # Stage 4A retention: only `.` discards — a `myrepeat` identifier
+        # stays excluded by the immediate `\\w` lookbehind, not by the
+        # backscan (no H2 either way: it is not a `repeat` loop at all).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "MyRepeatTest.kt",
+                'myrepeat(2000){ store.appendEvent(event(sid, "q")) }\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_two_statements_second_line_loop_fails(self) -> None:
+        # Stage 4A retention: `\\w` across a newline must NOT discard —
+        # `val x = 1\\nrepeat(2000){...}` is two statements and the second
+        # line is a genuine loop.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "TwoStmtsTest.kt",
+                "val x = 1\n"
+                'repeat(2000){ store.appendEvent(event(sid, "q")) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_fixture_vars_same_line_multi_defs(self) -> None:
+        # Stage 4B: the greedy fixture expression bound the last count on
+        # the line to the first name (`a` -> 50, `b` lost). With `;`
+        # excluded, each definition keeps its own count.
+        self.assertEqual(
+            {"a"},
+            check_test_budgets._fixture_vars(
+                'val a = "x".repeat(100_000); val b = "y".repeat(50)\n',
+            ),
+        )
+
+    def test_scoped_var_defs_same_line_per_def(self) -> None:
+        # Stage 4B: line-level huge marking bled across same-line defs.
+        line = 'val a = "x".repeat(100_000); val b = "ok"'
+        defs = check_test_budgets._scoped_var_defs(
+            check_test_budgets._masked_kotlin_lines([line])
+        )
+        self.assertEqual([(0, line.find("val a"), True)], defs["a"])
+        self.assertEqual([(0, line.find("val b"), False)], defs["b"])
+
+    def test_scoped_var_defs_same_line_same_name_redefinition(self) -> None:
+        # Stage 4B: same-line, same-name redefinition is per-def — the small
+        # half stays small in both orders.
+        line = 'val payload = "x".repeat(100_000); val payload = "q"'
+        defs = check_test_budgets._scoped_var_defs(
+            check_test_budgets._masked_kotlin_lines([line])
+        )
+        second = line.find("val", 1)
+        self.assertEqual([(0, 0, True), (0, second, False)], defs["payload"])
+        rev = 'val payload = "q"; val payload = "x".repeat(100_000)'
+        rev_defs = check_test_budgets._scoped_var_defs(
+            check_test_budgets._masked_kotlin_lines([rev])
+        )
+        rev_second = rev.find("val", 1)
+        self.assertEqual(
+            [(0, 0, False), (0, rev_second, True)], rev_defs["payload"]
+        )
+
+    def test_h1_same_line_huge_and_small_write_huge_fails(self) -> None:
+        # Stage 4B end-to-end (FN): `a`'s huge count was lost to greedy
+        # attribution, so writing `a` passed; now H1 fires.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SameLineHugeTest.kt",
+                'val a = "x".repeat(100_000); val b = "ok"\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, a))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_same_line_huge_and_small_write_small_passes(self) -> None:
+        # Stage 4B end-to-end (FP): line-level marking flagged `b` huge
+        # because it shared a line with `a`; now writing `b` passes.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SameLineSmallTest.kt",
+                'val a = "x".repeat(100_000); val b = "ok"\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, b))\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_same_line_shadow_small_after_huge_passes(self) -> None:
+        # Stage 4B end-to-end shadowing: the nearer same-line small
+        # redefinition clears the huge fixture for the later write.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SameLineShadowTest.kt",
+                'val payload = "x".repeat(100_000); val payload = "q"\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_same_line_shadow_huge_after_small_fails(self) -> None:
+        # Stage 4B end-to-end shadowing (reverse order): the nearer same-line
+        # huge redefinition is on the write's visible path.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SameLineReshadowTest.kt",
+                'val payload = "q"; val payload = "x".repeat(100_000)\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_main_scans_all_test_source_sets(self) -> None:
+        # Stage 4C pin: the repo-wide scan covers all four test source sets,
+        # not just `app/src/test`.
+        root = str(Path(check_test_budgets.__file__).resolve().parent.parent)
+        self.assertEqual(
+            ("test", "testFoss", "testGithub", "androidTest"),
+            check_test_budgets.TEST_SOURCE_SETS,
+        )
+        files = check_test_budgets._test_source_files(root)
+        posix = [p.replace(os.sep, "/") for p in files]
+        for src in check_test_budgets.TEST_SOURCE_SETS:
+            self.assertTrue(
+                any(f"app/src/{src}/" in p for p in posix),
+                f"source set {src} contributes no files",
+            )
 
 
 if __name__ == "__main__":

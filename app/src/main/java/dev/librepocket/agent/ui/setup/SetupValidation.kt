@@ -3,6 +3,7 @@ package dev.librepocket.agent.ui.setup
 import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.provider.validateBaseUrl
 import java.util.UUID
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * Pure setup-input validation (unit-testable without Android).
@@ -49,6 +50,8 @@ object SetupValidation {
     fun deriveEndpointId(presetId: String, effectiveBaseUrl: String): String {
         if (presetId != ProviderCatalog.CUSTOM_ID) return deriveProviderId(presetId)
         val digest = try {
+            // Fresh instance per call: MessageDigest is not thread-safe,
+            // do not refactor into a shared/cached instance.
             java.security.MessageDigest.getInstance("SHA-256")
         } catch (e: java.security.NoSuchAlgorithmException) {
             throw IllegalStateException("ENDPOINT_ID_HASH_UNAVAILABLE", e)
@@ -76,12 +79,15 @@ object SetupValidation {
      * included — is legacy: readers must NOT silently reuse it (chat/gate
      * treat it as absent, KeepExisting falls back to NEW) so the old key is
      * never sent to a new URL; the user re-pastes once and the next save
-     * mints the per-endpoint id. Never throws (any derivation failure is
-     * legacy = fail closed).
+     * mints the per-endpoint id. Never throws except CancellationException
+     * passthrough (to preserve structured concurrency); any other derivation
+     * failure is legacy = fail closed.
      */
     fun isLegacyEndpointId(providerId: String, presetId: String, baseUrl: String): Boolean =
         try {
             providerId != deriveEndpointId(presetId, baseUrl)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             true
         }

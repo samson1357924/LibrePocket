@@ -102,17 +102,22 @@ class RoomSessionStore(
      * no durable flag for new prunes (memory pre-publish is only a race
      * closer, see [prune], never load-bearing across restart).
      *
-     * Crash-mid-fixup window (known limitation, disclosed in
-     * P1_SPEC/THREAT_MODEL): the raw keep-newest cut
-     * (`deleteEventsBeyondLimit`) and the family fixup (`oldestHistory` +
-     * `deleteFamily` loop) are separate DAO statements, NOT one Room
-     * transaction. A kill landing between them leaves the raw-cut head
-     * orphan assistant durably stored while this memory-only set is lost
-     * on restart → reopen sees `dropped==0` + suspect false → the
-     * conditional head trim in `loadModelHistory` does not trigger → the
-     * head orphan resumes compat (`hasReasoning=false`). Follow-up: wrap
-     * raw+fixup in one Room `@Transaction` or make the suspect flag
-     * durable (separate PR, no large refactor here).
+     * R27-1 atomic raw-cut + family-fixup (Current, P1 BLOCK): the raw
+     * keep-newest cut (`deleteEventsBeyondLimit`) and the family fixup
+     * (`oldestHistory` + `deleteFamily` loop) run in ONE blocking Room
+     * transaction per session (`db.runInTransaction`, same R8-5 shape as
+     * append) inside [pruneEventCapMutex]. A kill landing between them rolls
+     * the whole tx back → restart sees the pre-prune shape (no durable head
+     * orphan) with this memory-only set dropped — correct, as nothing was
+     * durably cut, so no suspect flag is needed for the rolled-back shape.
+     * Fixup/hook failures are fail-closed: a DAO throw aborts the tx and
+     * propagates (never swallowed as success); only size-convergent stops
+     * (empty, user head, blank family, `famDeleted<=0`, 10-cap) end the loop
+     * normally.
+     *
+     * Still memory-only (NOT durable — no over-claim): restart drops this
+     * set. Phase 1 guarantees only the no-orphan SHAPE (rollback on
+     * crash-mid-fixup), not suspect durability across restart.
      *
      * Head-only scope (at most 10 head families per sweep, only sweeps with
      * `deletes>0` run the fixup): pre-R26/interior orphans below the head are
@@ -152,13 +157,23 @@ class RoomSessionStore(
     private val pruneEventCapMutex = Mutex()
 
     /**
-     * R26-1 F4 test seam: invoked synchronously after the conditional DELETE
-     * commits for a session but before the suspect flag is reconciled and the
-     * family fixup runs. Tests block here to interleave a concurrent load
-     * that observes post-delete totals: pre-publish code reports suspect
-     * (green); legacy post-publish code would report a false clean here
-     * (red — logic argument, no revert run against old code was executed).
-     * Production leaves it `null`.
+     * R26-1 F4 test seam (R27-1: invoked after suspect pre-publish but
+     * BEFORE the per-session prune transaction starts — deliberately NOT
+     * inside the tx: a blocked hook holding the write tx open starves
+     * concurrent readers, so the interleaved load never completes and the
+     * hook times out). Tests block here to interleave a concurrent load
+     * that observes the pre-published flag with live (pre-delete) totals:
+     * pre-publish code reports suspect (green); legacy post-publish code
+     * would report a false clean here (red — logic argument, no revert run
+     * against old code was executed). A throw here — including
+     * RuntimeException, no longer swallowed — happens before any write and
+     * propagates fail-closed with flag cleanup. Contract: the hook runs
+     * under the non-reentrant [pruneEventCapMutex] but outside any write
+     * tx — it must stay lock-free (no prune reentry, no write-tx
+     * acquisition); the F4 test parks on latches and issues reads only.
+     * In-tx crash injection stays covered by ThrowingDao (DAO throw inside
+     * the real tx → rollback), not by this seam. Production leaves it
+     * `null`.
      */
     internal var afterEventDeleteHookForTest: ((String) -> Unit)? = null
 
@@ -764,70 +779,97 @@ class RoomSessionStore(
                     // reaches loadModelHistory/snapshot (no restart fail-open).
                     val alreadySuspect = pruneSuspectSessions.contains(sid)
                     pruneSuspectSessions.add(sid)
-                    val deleted: Int
+                    // R27-1 (P1 BLOCK): the raw keep-newest cut + the whole
+                    // family fixup run in ONE blocking Room transaction (same
+                    // R8-5 `db.runInTransaction(Callable)` shape as append): a
+                    // kill landing between them rolls everything back, so
+                    // restart sees the pre-prune shape (no durable head
+                    // orphan) with this memory-only flag dropped — correct, as
+                    // nothing was durably cut.
                     try {
-                        deleted = dao.deleteEventsBeyondLimit(
-                            sid,
-                            policy.maxEventsPerSession.coerceAtLeast(0),
+                        // Test-only interleave point, BEFORE the tx starts
+                        // (F4 deterministic test; deliberately NOT inside the
+                        // tx: a blocked hook holding the write tx open starves
+                        // concurrent readers — the interleaved load never
+                        // completes and the hook times out instead, pinned red
+                        // by `deletePublishRace_interleavedLoad_observesSuspect`
+                        // against the in-tx placement). A throw here happens
+                        // before any write, so there is nothing to roll back;
+                        // the catch below still drops the pre-published flag
+                        // (unless prior evidence) and rethrows — including
+                        // RuntimeException, whose old fall-through to flag
+                        // reconcile + fixup success is gone — never a silent
+                        // success.
+                        afterEventDeleteHookForTest?.invoke(sid)
+                        val txDeleted = db.runInTransaction(
+                            Callable<Int> {
+                                var total = dao.deleteEventsBeyondLimit(
+                                    sid,
+                                    policy.maxEventsPerSession.coerceAtLeast(0),
+                                )
+                                if (total > 0) {
+                                    // Head-only fixup (at most 10 head
+                                    // families): while the oldest kept
+                                    // user/assistant row is an assistant, its
+                                    // whole logical family goes. The breaks
+                                    // below are size-convergent NORMAL
+                                    // termination only (empty, user head, blank
+                                    // family, famDeleted<=0, 10-cap) — a DAO
+                                    // throw is NEVER swallowed here: it aborts
+                                    // the tx (rollback) and propagates
+                                    // fail-closed via the catch below. The 10
+                                    // cap only stops a pathological loop over
+                                    // crafted empty families. A crafted ledger
+                                    // with >10 head orphan families needs a
+                                    // second sweep for the 11th (pinned by
+                                    // test, disclosed in P1_SPEC). Only runs
+                                    // when total>0, so a small ledger with a
+                                    // large keep (total==0) keeps its head
+                                    // orphan (conditional gate — pinned by
+                                    // test; the shape-aware change is Phase 2,
+                                    // not here).
+                                    var guard = 0
+                                    while (guard++ < 10) {
+                                        val oldest = dao.oldestHistory(sid, 1)
+                                        if (oldest.isEmpty()) break
+                                        val head = oldest[0]
+                                        if (head.kind == "user") break
+                                        val family = head.parentRunId ?: head.runId
+                                        if (family.isBlank()) break
+                                        val famDeleted = dao.deleteFamily(sid, family)
+                                        if (famDeleted <= 0) break
+                                        total += famDeleted
+                                    }
+                                }
+                                // NOTE (Phase 2 pending): total==0 runs NO
+                                // fixup (conditional gate, unchanged) — a
+                                // shape-aware sweep is a separate change.
+                                total
+                            },
                         )
+                        if (txDeleted == 0) {
+                            // Clean sweep: no truncation evidence from THIS sweep, so
+                            // the pre-published flag (and any prior one — per-sweep,
+                            // not sticky) is cleared. Safe: total==0 means the raw
+                            // cut deleted nothing, so the fixup (gated on
+                            // total>0) never ran — with no cut there is no cut
+                            // head family that could strand an orphan for the
+                            // flag to protect. Appends still
+                            // never clear (only sweeps publish).
+                            pruneSuspectSessions.remove(sid)
+                        } else {
+                            deletedEvents += txDeleted
+                        }
                     } catch (t: Throwable) {
+                        // Test hook, raw cut, and/or fixup failed: a hook
+                        // throw happened before any write (nothing durable),
+                        // a raw/fixup throw already rolled the tx back — in
+                        // both cases no partial shape is durable. Drop the
+                        // pre-published flag unless a prior sweep had proven
+                        // evidence (fail-closed for proven evidence only),
+                        // then rethrow — never a silent success.
                         if (!alreadySuspect) pruneSuspectSessions.remove(sid)
                         throw t
-                    }
-                    // Test-only interleave point (F4 deterministic test): observes
-                    // post-delete totals with the pre-published flag still held.
-                    try {
-                        afterEventDeleteHookForTest?.invoke(sid)
-                    } catch (ce: CancellationException) {
-                        if (!alreadySuspect) pruneSuspectSessions.remove(sid)
-                        throw ce
-                    } catch (_: RuntimeException) {
-                        // Fall through to flag reconcile + fixup.
-                    }
-                    if (deleted == 0) {
-                        // Clean sweep: no truncation evidence from THIS sweep, so
-                        // the pre-published flag (and any prior one — per-sweep,
-                        // not sticky) is cleared. Safe for new prunes: the fixup
-                        // below already durably removed cut head families, so no
-                        // orphan survives for the flag to protect. Appends still
-                        // never clear (only sweeps publish).
-                        pruneSuspectSessions.remove(sid)
-                    } else {
-                        deletedEvents += deleted
-                        // Head-only fixup (at most 10 head families): while the
-                        // oldest kept user/assistant row is an assistant, its
-                        // whole logical family goes. Breaks on no progress
-                        // (famDeleted<=0 — size-convergent); the 10 cap only stops
-                        // a pathological loop over crafted empty families. A
-                        // crafted ledger with >10 head orphan families needs a
-                        // second sweep for the 11th (pinned by test, disclosed in
-                        // P1_SPEC). Only runs when deleted>0, so a small ledger
-                        // with a large keep (deleted==0) keeps its head orphan
-                        // (conditional gate — pinned by test).
-                        var guard = 0
-                        while (guard++ < 10) {
-                            val oldest = try {
-                                dao.oldestHistory(sid, 1)
-                            } catch (_: Exception) {
-                                break
-                            }
-                            if (oldest.isEmpty()) break
-                            val head = oldest[0]
-                            if (head.kind == "user") break
-                            val family = try {
-                                head.parentRunId ?: head.runId
-                            } catch (_: Exception) {
-                                break
-                            }
-                            if (family.isBlank()) break
-                            val famDeleted = try {
-                                dao.deleteFamily(sid, family)
-                            } catch (_: Exception) {
-                                break
-                            }
-                            if (famDeleted <= 0) break
-                            deletedEvents += famDeleted
-                        }
                     }
                 }
             }

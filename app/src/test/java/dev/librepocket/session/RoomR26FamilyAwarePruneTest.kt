@@ -26,6 +26,7 @@ import dev.librepocket.provider.StreamEvent
 import java.io.File
 import java.nio.file.Files
 import java.util.UUID
+import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
@@ -305,6 +306,12 @@ class RoomR26FamilyAwarePruneTest {
                 override fun createInvalidationTracker(): InvalidationTracker =
                     throw UnsupportedOperationException("fake db: no tracker")
                 override fun clearAllTables() = Unit
+                // R27-1: the per-session raw-cut + family-fixup runs in one
+                // blocking Room transaction — delegate it to the real handle
+                // so the ThrowingDao fault injection still lands INSIDE tx
+                // semantics (throw → rollback + flag cleanup + rethrow).
+                override fun <V> runInTransaction(callable: Callable<V>): V =
+                    db.runInTransaction(callable)
             },
         ) { now }
         // Throw with no prior suspect: rethrows, flag NOT left behind.
@@ -384,22 +391,29 @@ class RoomR26FamilyAwarePruneTest {
     }
 
     /**
-     * P1-4 true F4 interleave: a load concurrent with the DELETE-commit →
-     * reconcile window observes post-delete totals. Latch blocks the sweep
-     * AFTER the conditional DELETE commits but BEFORE flag reconcile/fixup:
-     * pre-publish code reports suspect (green); legacy post-publish code
-     * would report suspect==false with dropped==0 here (false-clean RED —
-     * logic argument only, no revert run against old code was executed;
-     * the old test only covered scan-then-count max, never this window).
+     * P1-4 true F4 interleave: a load concurrent with the pre-publish → tx
+     * window observes live totals with the pre-published flag held. Latch
+     * blocks the sweep AFTER suspect pre-publish but BEFORE the prune tx
+     * starts (R27-1: deliberately pre-tx — an in-tx hook starves concurrent
+     * readers, pinning red via hook timeout instead): pre-publish code
+     * reports suspect (green); legacy post-publish code would report
+     * suspect==false with dropped==0 here (false-clean RED — logic argument
+     * only, no revert run against old code was executed; the old test only
+     * covered scan-then-count max, never this window). This is pre-publish
+     * coverage over live pre-delete totals, NOT a post-delete-window
+     * interleave: raw+fixup commit atomically in one tx, so no
+     * delete→publish gap exists — the covered window is flag-set →
+     * tx-commit.
      */
     @Test
     fun deletePublishRace_interleavedLoad_observesSuspect() = runBlocking {
-        // Marker-first 2001-row ledger: raw cut deletes exactly the marker, so
-        // the interleaved load sees total 2000 / scan 2000 headed by orphan
-        // a-old; pre-published suspect trims a-old (head-orphan drop counted
-        // honestly) → filtered 1999 → dropped==1 + suspect all-flag. Old
-        // post-publish code would see suspect==false, no trim, dropped==0
-        // false-clean (new 1+suspect vs old 0+clean).
+        // Marker-first 2001-row ledger: the raw cut will delete exactly the
+        // marker, so the interleaved load (pre-tx) sees total 2000 / scan
+        // 2000 headed by orphan a-old; pre-published suspect trims a-old
+        // (head-orphan drop counted honestly) → filtered 1999 → dropped==1
+        // + suspect all-flag. Old post-publish code would see
+        // suspect==false, no trim, dropped==0 false-clean (new 1+suspect vs
+        // old 0+clean).
         val store = openStore()
         val sid = store.createSession("t", "m")
         store.appendEvent(
@@ -425,12 +439,12 @@ class RoomR26FamilyAwarePruneTest {
         }
         try {
             val pruning = async(Dispatchers.IO) { store.prune(PrunePolicy()) }
-            assertTrue("prune must reach the post-delete hook", entered.await(15, TimeUnit.SECONDS))
+            assertTrue("prune must reach the pre-tx hook", entered.await(15, TimeUnit.SECONDS))
             try {
                 val loaded = loadModelHistory(store, sid)
                 assertEquals("interleaved load must honestly count the suspect-trimmed head orphan", 1, loaded.droppedCount)
                 assertTrue(
-                    "load between DELETE commit and flag reconcile/fixup must still see suspect (pre-publish closes the race)",
+                    "load between pre-publish and the prune tx must still see suspect (pre-publish closes the race)",
                     loaded.reasoningIncomplete,
                 )
             } finally {

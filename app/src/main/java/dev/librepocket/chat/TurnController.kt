@@ -4417,12 +4417,27 @@ class TurnController(
           // the per-call budget before any marker/transcript side effect.
           // Throws typed AGG_TOO_LARGE; the try-path catch turns it into
           // the typed terminal without poison-adjacent records.
-          // Stage E invariant: NO total/count billing here — the delta path
-          // already billed both at collection time; re-adding would
-          // double-count.
+          // Stage E invariant: NO full re-billing here — the delta path
+          // already billed received bytes; only the unbilled synthetic-default
+          // growth (see the round-total guard below) is billed, so nothing is
+          // double-counted.
           // currentChars=0: pending was never per-call-billed; delta path already counted total/count, Stage E here is per-call only.
           requireToolAggBudget(0, p.id.length + p.name.length + p.args.length)
         }
+        // Round-total guard: synthetic pending id/name defaults were never
+        // delta-billed, so bill their growth (projected minus already-billed,
+        // floor 0) against the per-attempt total before any side effect.
+        // No new indexes are admitted here, so the distinct-index cap needs
+        // no re-check. Throws typed AGG_TOO_LARGE like the per-call guard.
+        var totalGrowth = 0
+        for (p in pending) {
+          val billed =
+            p.args.length +
+              (toolIdText[p.index]?.length ?: 0) +
+              (toolNameText[p.index]?.length ?: 0)
+          totalGrowth += (p.id.length + p.name.length + p.args.length - billed).coerceAtLeast(0)
+        }
+        requireTotalToolAggBudget(totalToolAggChars, totalGrowth)
         for (p in pending) {
           appendAssistantText(attemptRunId, "\n[tool:${p.name} ${p.args}]")
           writeNotice { orderedTranscript.onToolDone(attemptRunId, p.index, p.id, p.name, p.args) }

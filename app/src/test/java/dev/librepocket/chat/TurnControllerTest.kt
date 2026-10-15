@@ -1076,6 +1076,33 @@ class TurnControllerTest {
     assertEquals("terminal failure must be recorded, not escape", 1, sink.failed.size)
   }
 
+  // Round-total pin (Current): synthetic pending id/name defaults were
+  // never delta-billed, so their growth counts against the per-attempt
+  // total. Both halves bill legally ((174762+174763)*3=1048575<=1048576);
+  // the flush adds 2*21 synthetic chars (349567*3 overflows).
+  @Test fun multiPendingSyntheticGrowthCountsAgainstRoundTotal() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ToolDelta(0, null, null, "a".repeat(174_762)))
+        emit(StreamEvent.ToolDelta(1, null, null, "b".repeat(174_763)))
+        emit(StreamEvent.Failed("http 401 unauthorized", retryable = false))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(
+      "round-total overflow must surface the typed terminal, got: ${c.uiState.value.error}",
+      c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"),
+    )
+    assertTrue("no pending tool may be partially committed", sink.tools.isEmpty())
+    assertEquals(1, sink.failed.size)
+  }
+
   // Atomicity pin (Current): the flush preflights every pending index
   // before any side effect, so a later index overflowing cannot leave an
   // earlier index committed. Both deltas are billing-legal

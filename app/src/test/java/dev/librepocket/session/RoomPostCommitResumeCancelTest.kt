@@ -38,7 +38,7 @@ import org.robolectric.annotation.Config
  * before the tail runs.
  *
  * Runs under Robolectric (in-memory Room). Verified green locally on
- * JDK21 (4/4) as well as for CI JDK17 — if the environment regresses to
+ * JDK21 (4/4) as well as for CI JDK 25 — if the environment regresses to
  * the old JDK21 native-SQLite UnsatisfiedLinkError, fall back to CI.
  */
 @RunWith(RobolectricTestRunner::class)

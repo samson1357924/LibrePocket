@@ -5,7 +5,6 @@ import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -125,12 +124,12 @@ class ChatStoreUnavailableTest {
         runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val transcripts = StallSessionStore()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = SessionStoreSource { transcripts },
         )
-        return chatViewModels.own(ChatViewModel(endpointStore, factory, InMemoryPolicyStore()))
+        return chatViewModels.own(ChatViewModel(endpointStore, factory, allowKeyReadPolicy()))
     }
 
     @Test

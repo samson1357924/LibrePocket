@@ -5,7 +5,6 @@ import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -124,11 +123,11 @@ class ChatInputTooLongTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
 
         // 100k + overhead unambiguously exceeds MAX_REQUEST_CHARS=100_000.
         val huge = "x".repeat(100_000 + 5_000)
@@ -154,11 +153,11 @@ class ChatInputTooLongTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
 
         val huge = "y".repeat(100_000 + 5_000)
         onMain { vm.sendDirect(huge) }

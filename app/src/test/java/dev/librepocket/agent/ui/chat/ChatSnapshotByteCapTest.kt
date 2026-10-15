@@ -6,7 +6,6 @@ import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -103,14 +102,14 @@ class ChatSnapshotByteCapTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "test-key-12345678".toCharArray()) }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        return chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        return chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
     }
 
     private fun awaitTrue(timeoutMs: Long = 8000, cond: () -> Boolean) {
@@ -132,7 +131,7 @@ class ChatSnapshotByteCapTest {
     )
 
     private fun factoryWith(transcripts: FakeSessionStore) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -222,19 +221,24 @@ class ChatSnapshotByteCapTest {
         }
 
         val loaded = loadSwitchSnapshotEvents(store, oldId)
-        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP, loaded.events.size)
+        // R26-1 family-aware head trim (Current): the row-cap cut drops the
+        // oldest user(hold), leaving assistant(hold,"a-old") a user-less head
+        // orphan, so the whole hold family trims: 1999 - 1 = 1998 rows, new
+        // head q-0 (s0 user). Row-cap drops stay silent (legacy): no byte
+        // marker, no incomplete marker.
+        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP - 1, loaded.events.size)
         assertEquals(0, loaded.droppedByBytes)
         assertTrue(loaded.events.sumOf { it.text.length } <= SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS)
         assertTrue(loaded.events.none { it.text.length == 100_000 })
-        assertEquals("a-old", loaded.events.first().text)
+        assertEquals("q-0", loaded.events.first().text)
         assertEquals("a-998", loaded.events.last().text)
 
         val newId = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o")
         val copied = snapshotSwitchHistory(store, oldId, newId, "gpt-4o-mini", "gpt-4o", false)
-        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP, copied)
+        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP - 1, copied)
         assertTrue(!hasIncompleteSnapshotMarker(store, newId))
         val forked = rows(store, newId)
-        assertEquals(2000, forked.size)
+        assertEquals(SnapshotBudget.HISTORY_LOAD_CAP - 1, forked.size)
         assertTrue(forked[0].text.startsWith("model switched "))
         assertTrue(forked.none { it.text.length == 100_000 })
     }
@@ -249,15 +253,19 @@ class ChatSnapshotByteCapTest {
         }
 
         val loaded = loadSwitchSnapshotEvents(store, oldId)
-        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP, loaded.events.size)
+        // R26-1 family-aware head trim (Current): the row-cap cut drops the
+        // oldest user(t0), leaving assistant(t0) a user-less head orphan, so
+        // the whole t0 family trims: 1999 - 1 = 1998 rows. Silent like all
+        // row-cap drops (no incomplete marker).
+        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP - 1, loaded.events.size)
         assertEquals(0, loaded.droppedByBytes)
 
         val newId = store.createSession("t", "preset:openai@https://api.openai.com/gpt-4o")
         val copied = snapshotSwitchHistory(store, oldId, newId, "gpt-4o-mini", "gpt-4o", false)
-        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP, copied)
+        assertEquals(SnapshotBudget.SWITCH_SNAPSHOT_COPY_CAP - 1, copied)
         assertTrue(!hasIncompleteSnapshotMarker(store, newId))
         val forked = rows(store, newId)
-        assertEquals(2000, forked.size)
+        assertEquals(SnapshotBudget.HISTORY_LOAD_CAP - 1, forked.size)
         assertTrue(forked[0].text.startsWith("model switched "))
     }
 

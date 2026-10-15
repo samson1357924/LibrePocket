@@ -944,7 +944,11 @@ class ChatViewModelKeyReadTest {
         val store = newStore()
         store.save(endpointA())
         val backing = FakeSessionStore()
-        val sid = backing.createSession("old", "gpt-4o-mini")
+        // R4-1+ provenance-stamped header (as create() stamps it): the S1
+        // consent-lifecycle assertions need same-origin hydration (same-sid
+        // attach). A legacy bare-model header would quarantine-fork by design
+        // (Phase 4, pinned by ChatSessionFactoryLegacyQuarantineTest).
+        val sid = backing.createSession("old", "preset:openai@https://api.openai.com/gpt-4o-mini")
         backing.appendEvent(
             TranscriptEvent(sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L),
         )
@@ -1068,6 +1072,14 @@ class ChatViewModelKeyReadTest {
     /**
      * S1: gates transcript history load so openSession's post-invalidate
      * consent mint lands before authorize. Delegates everything else.
+     *
+     * Rebase note: history scans ([loadModelHistoryScan],
+     * [loadSwitchSnapshotEvents], `ChatViewModel.loadHistory`) page backward
+     * via `loadEventsBefore`, so a `loadEvents`-only gate never fires. Both
+     * entries gate with the same semantics (`entered.complete` is idempotent;
+     * post-`release` awaits pass straight through, so sequential multi-page
+     * calls stay safe). The `loadEvents` gate stays for other paths (e.g.
+     * the `hasIncompleteSnapshotMarker` head scan).
      */
     private class GatedLoadTranscriptStore(
         private val delegate: FakeSessionStore,
@@ -1082,6 +1094,16 @@ class ChatViewModelKeyReadTest {
             entered.complete(Unit)
             release.await()
             return delegate.loadEvents(sessionId, afterSeq, limit)
+        }
+
+        override suspend fun loadEventsBefore(
+            sessionId: String,
+            beforeSeq: Long,
+            limit: Int,
+        ): List<TranscriptEvent> {
+            entered.complete(Unit)
+            release.await()
+            return delegate.loadEventsBefore(sessionId, beforeSeq, limit)
         }
     }
 }

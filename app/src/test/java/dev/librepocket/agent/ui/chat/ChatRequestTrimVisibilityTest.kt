@@ -8,7 +8,6 @@ import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.TurnController
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyDecision
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.PolicyStore
@@ -147,7 +146,7 @@ class ChatRequestTrimVisibilityTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         return ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
@@ -197,7 +196,7 @@ class ChatRequestTrimVisibilityTest {
             id
         }
         val fake = TrimFakeProvider(okHandler())
-        val vm = chatViewModels.own(ChatViewModel(store, newFactory(fake, transcripts), InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, newFactory(fake, transcripts), allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 6 }
         assertEquals(0, vm.historyOmittedCount.value)
@@ -243,7 +242,7 @@ class ChatRequestTrimVisibilityTest {
             id
         }
         val fake = TrimFakeProvider(okHandler())
-        val vm = chatViewModels.own(ChatViewModel(store, newFactory(fake, transcripts), InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, newFactory(fake, transcripts), allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2000 }
         awaitTrue { vm.historyOmittedCount.value == 2 }
@@ -282,7 +281,7 @@ class ChatRequestTrimVisibilityTest {
         }
         val fresh = runBlocking { transcripts.createSession("fresh", "preset:openai@https://api.openai.com/gpt-4o-mini") }
         val fake = TrimFakeProvider(okHandler())
-        val vm = chatViewModels.own(ChatViewModel(store, newFactory(fake, transcripts), InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, newFactory(fake, transcripts), allowKeyReadPolicy()))
         onMain { vm.openSession(big) }
         awaitTrue { vm.messages.value.size == 6 }
         onMain { vm.onInputChange("hi") }

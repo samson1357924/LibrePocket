@@ -5,7 +5,6 @@ import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -145,14 +144,14 @@ class ChatViewModelHistoryTailTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         assertEquals(0, vm.historyOmittedCount.value)
         onMain { vm.openSession(sid) }
         // Tail: newest 2000 replay rows, oldest-first restored.
@@ -191,14 +190,14 @@ class ChatViewModelHistoryTailTest {
         runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val fake = VmTailFakeProvider()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         val assistant = vm.messages.value.single { it.role == "assistant" }
@@ -233,14 +232,14 @@ class ChatViewModelHistoryTailTest {
         runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val fake = VmTailFakeProvider()
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         // P1-1 (Stage-3): fixed sleeps are deprecated — this bounded
         // stability window polls (10ms cadence, 1.5s horizon) instead of a

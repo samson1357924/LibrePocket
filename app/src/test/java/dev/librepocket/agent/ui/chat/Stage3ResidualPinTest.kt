@@ -110,7 +110,7 @@ class Stage3ResidualPinTest {
     }
 
     private fun factoryWith(transcripts: FakeSessionStore, provider: LlmProvider) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -170,7 +170,7 @@ class Stage3ResidualPinTest {
         )
         // True VM replay over the same ledger.
         val provider = Stage3FakeProvider()
-        val vm = chatViewModels.own(ChatViewModel(store, factoryWith(transcripts, provider), InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factoryWith(transcripts, provider), allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitCond(15_000) { vm.messages.value.size == 2000 }
         assertEquals(0, vm.historyOmittedCount.value)

@@ -8,11 +8,11 @@ import dev.librepocket.agent.ui.chat.ChatTestViewModelStore
 import dev.librepocket.agent.ui.chat.ChatViewModel
 import dev.librepocket.agent.ui.chat.SessionStoreSource
 import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.allowKeyReadPolicy
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -347,14 +347,14 @@ class SessionMaxSeqGapViewModelTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        return chatViewModels.own(ChatViewModel(newStore().also { runBlocking { it.save(openaiEndpoint()) } }, factory, InMemoryPolicyStore()))
+        return chatViewModels.own(ChatViewModel(newStore().also { runBlocking { it.save(openaiEndpoint()) } }, factory, allowKeyReadPolicy()))
     }
 
     @Test

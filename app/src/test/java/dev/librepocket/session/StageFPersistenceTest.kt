@@ -9,12 +9,12 @@ import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.chat.ChatSessionFactory
 import dev.librepocket.agent.ui.chat.SessionStoreSource
 import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.allowKeyReadPolicy
 import dev.librepocket.agent.ui.chat.cancelledMarkerText
 import dev.librepocket.agent.ui.chat.findDanglingRunIds
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -403,7 +403,7 @@ class StageFPersistenceTest {
         sink.onLogicalTurnCancelled("L", "A1", "half", 0)
 
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource {
                 val vault = EncryptedPrefsVault(InMemoryPrefs())
                 vault.putKey("preset:openai", "test-key-12345678".toCharArray())

@@ -13,7 +13,6 @@ import dev.librepocket.chat.UiMessage
 import dev.librepocket.chat.stripTimeBlock
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -264,7 +263,7 @@ class ChatSameIdReopenFenceTest {
         transcripts: FakeSessionStore,
         fake: LlmProvider,
     ) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -284,7 +283,7 @@ class ChatSameIdReopenFenceTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "test-key-12345678".toCharArray()) }
         val factory = factoryWith(transcripts, fake)
-        return chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        return chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
     }
 
     private fun awaitTrue(timeoutMs: Long = 10000, cond: () -> Boolean) {
@@ -391,7 +390,7 @@ class ChatSameIdReopenFenceTest {
         val oldSession = SameIdStuckSession()
         val newSession = SameIdIdleSession()
         val sessions = SameIdDeferSessions(transcripts, oldId, oldSession, newSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
 
         // Attach the stuck ledger (fast path: different from null).
         onMain { vm.openSession(oldId) }

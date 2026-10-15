@@ -8,7 +8,6 @@ import dev.librepocket.chat.TranscriptPendingException
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -121,7 +120,7 @@ class ChatSameIdReopenStickyDebtTest {
         transcripts: SessionStore,
         fake: LlmProvider,
     ) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -329,7 +328,7 @@ class ChatSameIdReopenStickyDebtTest {
         val gate = GhostParkingStore(inner)
         val provider = RecordingAnswerProvider()
         val sessions = RecordingFactorySessions(factoryWith(gate, provider))
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 10_000_000L
         onMain {
             vm.backfillClockMs = { fakeNow }
@@ -543,7 +542,7 @@ class ChatSameIdReopenStickyDebtTest {
         val oldId = inner.createSession("t", "preset:openai@https://api.openai.com/gpt-4o-mini")
         val provider = SealedPartialProvider()
         val sessions = RecordingFactorySessions(factoryWith(parking, provider))
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 20_000_000L
         onMain {
             vm.backfillClockMs = { fakeNow }

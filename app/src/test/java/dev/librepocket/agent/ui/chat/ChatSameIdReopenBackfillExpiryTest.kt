@@ -10,7 +10,6 @@ import dev.librepocket.chat.ChatUiState
 import dev.librepocket.chat.QueuedIntent
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.session.FakeSessionStore
 import dev.librepocket.session.SessionStore
@@ -464,7 +463,7 @@ class ChatSameIdReopenBackfillExpiryTest {
         val oldSession = ExpiryOldSession(releaseGate)
         val newSession = ExpiryIdleSession()
         val sessions = ExpiryMarkingSessions(transcripts, oldId, oldSession, newSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         // Short horizon + manual monotonic clock: shrinking the seam must not
         // change the fail-closed behavior, and freezing it must pin the block
         // no matter how much wall-clock passes (jump immunity).
@@ -584,7 +583,7 @@ class ChatSameIdReopenBackfillExpiryTest {
         val deadSession = ExpiryDeadSession()
         val newSession = ExpiryIdleSession()
         val sessions = ExpiryMarkingSessions(transcripts, oldId, deadSession, newSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 2_000_000L
         onMain {
             vm.backfillClockMs = { fakeNow }
@@ -647,7 +646,7 @@ class ChatSameIdReopenBackfillExpiryTest {
         val stuckSealed = ExpiryStuckSealedSession()
         val newSession = ExpiryIdleSession()
         val sessions = ExpiryMarkingSessions(transcripts, oldId, stuckSealed, newSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 3_000_000L
         onMain {
             vm.backfillClockMs = { fakeNow }
@@ -704,7 +703,7 @@ class ChatSameIdReopenBackfillExpiryTest {
         // fresh live is IDLE, post-probe it is STREAMING with pending evidence.
         val transcripts = FlipOnProbeStore(inner) { flipSession.flip() }
         val sessions = FlipMarkingSessions(transcripts, oldId, oldSession, flipSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 4_000_000L
         onMain {
             vm.backfillClockMs = { fakeNow }
@@ -764,7 +763,7 @@ class ChatSameIdReopenBackfillExpiryTest {
             ExpiryIdleSession(),
             ExpiryIdleSession(),
         )
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         val writerField = ChatViewModel::class.java.getDeclaredField("pendingBackfillWriter")
         writerField.isAccessible = true
         val remember = ChatViewModel::class.java.getDeclaredMethod(

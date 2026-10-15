@@ -6,7 +6,6 @@ import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -107,7 +106,7 @@ class SnapshotFiveDimPhase4Test {
   }
 
   private fun factoryWith(transcripts: FakeSessionStore, fake: FiveDimProvider) = ChatSessionFactory(
-    policy = InMemoryPolicyStore(),
+    policy = allowKeyReadPolicy(),
     vaultSource = VaultSource {
       val v = EncryptedPrefsVault(InMemoryPrefs())
       v.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -122,7 +121,7 @@ class SnapshotFiveDimPhase4Test {
   private fun newVm(store: EndpointStore, transcripts: FakeSessionStore, fake: FiveDimProvider): ChatViewModel {
     val vault = EncryptedPrefsVault(InMemoryPrefs())
     runBlocking { vault.putKey("preset:openai", "test-key-12345678".toCharArray()) }
-    return chatViewModels.own(ChatViewModel(store, factoryWith(transcripts, fake), InMemoryPolicyStore()))
+    return chatViewModels.own(ChatViewModel(store, factoryWith(transcripts, fake), allowKeyReadPolicy()))
   }
 
   private fun awaitTrue(timeoutMs: Long = 8000, cond: () -> Boolean) {

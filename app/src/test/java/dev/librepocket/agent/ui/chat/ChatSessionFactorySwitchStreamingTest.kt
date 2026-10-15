@@ -162,7 +162,7 @@ class ChatSessionFactorySwitchStreamingTest {
         transcripts: FakeSessionStore,
         fake: LlmProvider,
     ) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -182,7 +182,7 @@ class ChatSessionFactorySwitchStreamingTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "test-key-12345678".toCharArray()) }
         val factory = factoryWith(transcripts, fake)
-        return chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        return chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
     }
 
     private fun awaitTrue(timeoutMs: Long = 10000, cond: () -> Boolean) {
@@ -527,7 +527,7 @@ class ChatSessionFactorySwitchStreamingTest {
         val oldSession = TimeoutOldSession()
         val newSession = TimeoutNewSession()
         val sessions = TimeoutSessions(transcripts, oldId, oldSession, newSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         // Attach the old ledger.
         onMain { vm.openSession(oldId) }
         awaitTrue { vm.currentSessionId.value == oldId }
@@ -841,7 +841,7 @@ class ChatSessionFactorySwitchStreamingTest {
         val oldSession = UnsettledAdmissionOnlySession()
         val newSession = TimeoutNewSession()
         val sessions = TimeoutSessions(transcripts, oldId, oldSession, newSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         // Attach the old ledger.
         onMain { vm.openSession(oldId) }
         awaitTrue { vm.currentSessionId.value == oldId }
@@ -971,7 +971,7 @@ class ChatSessionFactorySwitchStreamingTest {
 
             val newSession = TimeoutNewSession()
             val sessions = TimeoutSessions(transcripts, oldId, oldSession, newSession)
-            val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+            val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
             onMain { vm.openSession(oldId) }
             awaitCond(10_000, "VM must attach the old ledger") { vm.currentSessionId.value == oldId }
 

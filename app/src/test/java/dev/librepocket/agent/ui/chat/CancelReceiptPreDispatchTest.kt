@@ -13,7 +13,6 @@ import dev.librepocket.chat.TurnRetryConfig
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyDecision
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.PolicyStore
@@ -152,7 +151,7 @@ class CancelReceiptPreDispatchTest {
         transcripts: SessionStore,
         fake: LlmProvider,
     ) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -397,7 +396,7 @@ class CancelReceiptPreDispatchTest {
                 cancelCompensationTimeoutMs = 5_000L,
             ).let { ControllerSession(it) }
         }
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 30_000_000L
         onMain {
             vm.backfillClockMs = { fakeNow }

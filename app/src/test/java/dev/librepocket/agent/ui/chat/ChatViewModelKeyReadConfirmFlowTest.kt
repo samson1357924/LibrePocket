@@ -375,7 +375,11 @@ class ChatViewModelKeyReadConfirmFlowTest {
     }
 
     private suspend fun seedHistory(transcripts: FakeSessionStore): String {
-        val sid = transcripts.createSession("old", "gpt-4o-mini")
+        // R4-1+ provenance-stamped header (as create() stamps it): the S2
+        // resume assertions need same-origin hydration (same-sid attach). A
+        // legacy bare-model header would quarantine-fork by design (Phase 4,
+        // pinned by ChatSessionFactoryLegacyQuarantineTest).
+        val sid = transcripts.createSession("old", "preset:openai@https://api.openai.com/gpt-4o-mini")
         transcripts.appendEvent(
             dev.librepocket.session.TranscriptEvent(
                 sessionId = sid, runId = "r1", kind = "user", text = "q1", createdAt = 1L,

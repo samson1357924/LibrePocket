@@ -436,14 +436,14 @@ class ChatWiringTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> FakeChatProvider() },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         assertEquals(listOf("q1", "half answer"), vm.messages.value.map { it.text })
@@ -694,14 +694,14 @@ class ChatWiringTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 2 }
         val replayed = vm.messages.value
@@ -940,12 +940,12 @@ class ChatWiringTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = SessionStoreSource { transcripts },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
 
         // Round 1: send u1
         onMain { vm.onInputChange("u1") }
@@ -1003,12 +1003,12 @@ class ChatWiringTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = SessionStoreSource { transcripts },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
 
         // Round 1: send u1
         onMain { vm.onInputChange("u1") }
@@ -1077,12 +1077,12 @@ class ChatWiringTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = SessionStoreSource { transcripts },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
 
         // Round 1: reasoning-origin turn writes marker + assistant (marker-first).
         onMain { vm.onInputChange("u1") }
@@ -1126,7 +1126,7 @@ class ChatWiringTest {
         assertNull(vm.notice.value)
 
         // Restart: UI flag survives, and the next request carries it.
-        val vm2 = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm2.openSession(newId!!) }
         awaitTrue { vm2.currentSessionId.value == newId && vm2.messages.value.size == 4 }
         assertTrue(vm2.messages.value[1].hasReasoning)
@@ -1165,12 +1165,12 @@ class ChatWiringTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = SessionStoreSource { transcripts },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
 
         // Round 1 on the old model.
         onMain { vm.onInputChange("u1") }
@@ -1209,7 +1209,7 @@ class ChatWiringTest {
         assertNull(vm.notice.value)
 
         // Restart: a fresh ViewModel reopens the forked session id.
-        val vm2 = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm2.openSession(newId!!) }
         awaitTrue { vm2.currentSessionId.value == newId && vm2.messages.value.size == 4 }
         val reopened = vm2.messages.value
@@ -1257,12 +1257,12 @@ class ChatWiringTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = SessionStoreSource { transcripts },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
 
         onMain { vm.onInputChange("u1") }
         onMain { vm.send() }
@@ -1303,7 +1303,7 @@ class ChatWiringTest {
         assertEquals("RESUME_CROSS_PROVIDER_HISTORY_WITHHELD", vm.notice.value)
 
         // Restart: the forked session still withholds, and the notice returns.
-        val vm2 = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm2.openSession(newId!!) }
         awaitTrue { vm2.currentSessionId.value == newId && vm2.messages.value.size == 2 }
         assertTrue(vm2.messages.value[0].text.startsWith("u2"))
@@ -1340,12 +1340,12 @@ class ChatWiringTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = SessionStoreSource { transcripts },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
 
         onMain { vm.onInputChange("u1") }
         onMain { vm.send() }
@@ -1398,7 +1398,7 @@ class ChatWiringTest {
         assertNull(vm.notice.value)
 
         // Restart on the chain tip: full history, one copy each, then a live follow-up.
-        val vm2 = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm2 = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm2.openSession(idC!!) }
         awaitTrue { vm2.currentSessionId.value == idC && vm2.messages.value.size == 6 }
         assertNull(vm2.notice.value)
@@ -1480,14 +1480,14 @@ class ChatWiringTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue { vm.messages.value.size == 6 }
         // Display axis: everything replays; marker restores the flag but never

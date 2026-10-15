@@ -11,7 +11,6 @@ import dev.librepocket.chat.QueuedIntent
 import dev.librepocket.chat.TurnStart
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.session.FakeSessionStore
@@ -131,7 +130,7 @@ class ChatNewChatReopenRaceTest {
     }
 
     private fun factoryWith(transcripts: FakeSessionStore, fake: LlmProvider) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -205,7 +204,7 @@ class ChatNewChatReopenRaceTest {
         val streamGate = CompletableDeferred<Unit>()
         val cleanupGate = CompletableDeferred<Unit>()
         val vm = chatViewModels.own(
-            ChatViewModel(store, factoryWith(transcripts, RaceStreamingProvider(streamGate, cleanupGate)), InMemoryPolicyStore()),
+            ChatViewModel(store, factoryWith(transcripts, RaceStreamingProvider(streamGate, cleanupGate)), allowKeyReadPolicy()),
         )
         try {
             onMain { vm.sendDirect("q-cancel") }
@@ -254,7 +253,7 @@ class ChatNewChatReopenRaceTest {
         val streamGate = CompletableDeferred<Unit>()
         val cleanupGate = CompletableDeferred<Unit>()
         val vm = chatViewModels.own(
-            ChatViewModel(store, factoryWith(transcripts, RaceStreamingProvider(streamGate, cleanupGate)), InMemoryPolicyStore()),
+            ChatViewModel(store, factoryWith(transcripts, RaceStreamingProvider(streamGate, cleanupGate)), allowKeyReadPolicy()),
         )
         try {
             onMain { vm.sendDirect("q-cancel") }
@@ -315,7 +314,7 @@ class ChatNewChatReopenRaceTest {
         val streamGate = CompletableDeferred<Unit>()
         val cleanupGate = CompletableDeferred<Unit>()
         val vm = chatViewModels.own(
-            ChatViewModel(store, factoryWith(transcripts, RaceStreamingProvider(streamGate, cleanupGate)), InMemoryPolicyStore()),
+            ChatViewModel(store, factoryWith(transcripts, RaceStreamingProvider(streamGate, cleanupGate)), allowKeyReadPolicy()),
         )
         try {
             var fakeNow = 1_000_000L
@@ -523,7 +522,7 @@ class ChatNewChatReopenRaceTest {
         val writerDone = AtomicBoolean(false)
         val oldSession = R14SealedUnfinishedSession(writerDone)
         val sessions = R14MarkingSessions(transcripts, oldId, oldSession, R14IdleSession())
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 5_000_000L
         onMain {
             vm.backfillClockMs = { fakeNow }
@@ -595,7 +594,7 @@ class ChatNewChatReopenRaceTest {
         val writerDone = AtomicBoolean(false)
         val oldSession = R14SealedUnfinishedSession(writerDone)
         val sessions = R14MarkingSessions(transcripts, oldId, oldSession, R14IdleSession())
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 6_000_000L
         onMain {
             vm.backfillClockMs = { fakeNow }

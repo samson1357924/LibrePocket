@@ -3,7 +3,6 @@ package dev.librepocket.agent.ui.chat
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.ChatRequest
@@ -55,7 +54,7 @@ class ChatBackfillWindowPhase4Test {
   )
 
   private fun factory(store: FakeSessionStore) = ChatSessionFactory(
-    policy = InMemoryPolicyStore(),
+    policy = allowKeyReadPolicy(),
     vaultSource = VaultSource {
       val v = EncryptedPrefsVault(InMemoryPrefs())
       v.putKey("preset:openai", "test-key-12345678".toCharArray())

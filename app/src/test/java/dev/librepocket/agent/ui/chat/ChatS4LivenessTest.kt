@@ -9,7 +9,6 @@ import dev.librepocket.chat.ChatStatus
 import dev.librepocket.chat.ChatUiState
 import dev.librepocket.chat.QueuedIntent
 import dev.librepocket.chat.TurnStart
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.session.FakeSessionStore
 import dev.librepocket.session.SessionStore
@@ -249,7 +248,7 @@ class ChatS4LivenessTest {
         val deadSession = S4SealedDeadSession()
         val idleSession = S4IdleSession()
         val sessions = S4MarkingSessions(transcripts, oldId, deadSession, idleSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 9_000_000L
         onMain {
             vm.backfillClockMs = { fakeNow }
@@ -321,7 +320,7 @@ class ChatS4LivenessTest {
         val prevLive = S4IdleSession()
         val later = S4IdleSession()
         val sessions = S4MarkingSessions(transcripts, oldId, prevLive, later, openGate = null)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         // Attach (fast, no hang).
         onMain { vm.openSession(oldId) }
         awaitTrue { vm.currentSessionId.value == oldId }
@@ -407,7 +406,7 @@ class ChatS4LivenessTest {
         val vault = dev.librepocket.keystore.EncryptedPrefsVault(dev.librepocket.keystore.InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "sk-test-key-123".toCharArray()) }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ ->
                 object : dev.librepocket.provider.LlmProvider {
@@ -424,7 +423,7 @@ class ChatS4LivenessTest {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         awaitTrue(timeoutMs = 20000) { vm.messages.value.size == 2000 }
         awaitTrue(timeoutMs = 10000) { vm.historyOmittedCount.value == 2 }

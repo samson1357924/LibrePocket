@@ -238,7 +238,7 @@ class WriterStuckExpiryPhase4Test {
 
         val newSession = StuckTimeoutNewSession()
         val sessions = StuckTimeoutSessions(transcripts, oldId, oldSession, newSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
         var fakeNow = 9_000_000L
         onMain {
           vm.backfillClockMs = { fakeNow }

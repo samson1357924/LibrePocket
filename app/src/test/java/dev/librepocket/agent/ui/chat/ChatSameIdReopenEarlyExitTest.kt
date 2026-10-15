@@ -13,7 +13,6 @@ import dev.librepocket.chat.UiMessage
 import dev.librepocket.chat.stripTimeBlock
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatRequest
@@ -358,7 +357,7 @@ class ChatSameIdReopenEarlyExitTest {
     }
 
     private fun factoryWith(transcripts: FakeSessionStore, fake: LlmProvider) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -425,7 +424,10 @@ class ChatSameIdReopenEarlyExitTest {
         val oldSession = EarlyExitCountingSession()
         val newSession = EarlyExitIdleSession()
         val sessions = EarlyExitSessions(transcripts, oldId, oldSession, newSession)
-        val policy = InMemoryPolicyStore()
+        // Non-DENY baseline is ALLOW (PR81 T1 gate: default ASK would stall
+        // phase-1 attach at ConfirmRequired); the DENY phase below sets an
+        // explicit DENY@100 rule, so the deny mechanics stay exact.
+        val policy = allowKeyReadPolicy()
         val vm = chatViewModels.own(ChatViewModel(store, sessions, policy))
 
         // Attach the streaming ledger (fast path).
@@ -471,8 +473,10 @@ class ChatSameIdReopenEarlyExitTest {
         // Known limits: a slow-path defer still clears the fence (next open
         // retries via a fresh read), and a pre-fix fast-path from-null drop
         // would have hard-backfilled unfenced — both now fenced via slow.
-        policy.removeRule("key.read:*")
-        // Restore default ASK for key.read (removal falls back to *:* ASK → not DENY → allows).
+        policy.setRule(PolicyRule("key.read:*", Verdict.ALLOW, 100))
+        // Explicit ALLOW (replaces the DENY@100 above): under the PR81 T1
+        // gate, default ASK no longer passes through, so removeRule would
+        // fall back to ASK and stall at ConfirmRequired.
         onMain { vm.openSession(oldId) }
         awaitTrue(timeoutMs = 15000) { vm.currentSessionId.value == oldId }
         assertEquals(listOf(true, true), sessions.backfillFlags.toList())
@@ -501,7 +505,7 @@ class ChatSameIdReopenEarlyExitTest {
         val oldSession = EarlyExitCountingSession()
         val newSession = EarlyExitIdleSession()
         val sessions = EarlyExitSessions(transcripts, oldId, oldSession, newSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
 
         onMain { vm.openSession(oldId) }
         awaitTrue { vm.currentSessionId.value == oldId }
@@ -535,7 +539,7 @@ class ChatSameIdReopenEarlyExitTest {
         val cleanupGate = CompletableDeferred<Unit>()
         val fake = EarlyExitStreamingProvider(streamGate, cleanupGate)
         val factory = factoryWith(transcripts, fake)
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         try {
             onMain { vm.sendDirect("q-cancel") }
             awaitTrue { vm.currentSessionId.value != null }
@@ -582,7 +586,7 @@ class ChatSameIdReopenEarlyExitTest {
         val cleanupGate = CompletableDeferred<Unit>()
         val fake = EarlyExitStreamingProvider(streamGate, cleanupGate)
         val factory = factoryWith(transcripts, fake)
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         try {
             onMain { vm.sendDirect("q-cancel") }
             awaitTrue { vm.currentSessionId.value != null }
@@ -653,7 +657,10 @@ class ChatSameIdReopenEarlyExitTest {
         val oldSession = FromNullBlockingSession(flushGate)
         val newSession = EarlyExitIdleSession()
         val sessions = FromNullSessions(transcripts, oldId, oldSession, newSession)
-        val policy = InMemoryPolicyStore()
+        // ALLOW baseline (same PR81 reason as denyEarlyExit above); the DENY
+        // phase below sets an explicit DENY@100 rule, so the deny mechanics
+        // stay exact.
+        val policy = allowKeyReadPolicy()
         val vm = chatViewModels.own(ChatViewModel(store, sessions, policy))
         try {
             // Phase 1: attach S1 (fast path from null, no fence yet).
@@ -685,7 +692,9 @@ class ChatSameIdReopenEarlyExitTest {
             // P0-1 fence: fence-latch (pendingSlot fence still incomplete) +
             // ledger fence (no mark) — replaces delay 500. The latch proves
             // the teardown is still unsettled, so a fast open would be a bug.
-            policy.removeRule("key.read:*")
+            // Explicit ALLOW (replaces DENY@100): removeRule would fall back
+            // to ASK and stall at ConfirmRequired under the PR81 T1 gate.
+            policy.setRule(PolicyRule("key.read:*", Verdict.ALLOW, 100))
             onMain { vm.openSession(oldId) }
             awaitTrue(timeoutMs = 10000) {
                 val (f, _, _) = pendingSlot(vm)

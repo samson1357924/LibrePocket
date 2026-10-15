@@ -6,7 +6,6 @@ import dev.librepocket.agent.ui.setup.EndpointStore
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -157,7 +156,7 @@ class ChatSnapshotAtomicityTest {
         transcripts: FakeSessionStore,
         fake: AtomicityFakeProvider,
     ) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -177,14 +176,14 @@ class ChatSnapshotAtomicityTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking { vault.putKey("preset:openai", "test-key-12345678".toCharArray()) }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        return chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        return chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
     }
 
     private fun awaitTrue(timeoutMs: Long = 8000, cond: () -> Boolean) {

@@ -7,7 +7,6 @@ import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -132,7 +131,7 @@ class ChatSessionFactoryProvenanceTest {
         transcripts: FakeSessionStore,
         provider: ProvenanceFakeProvider,
     ) = ChatSessionFactory(
-        policy = InMemoryPolicyStore(),
+        policy = allowKeyReadPolicy(),
         vaultSource = VaultSource {
             val vault = EncryptedPrefsVault(InMemoryPrefs())
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
@@ -319,7 +318,7 @@ class ChatSessionFactoryProvenanceTest {
             Triple("preset:custom@http://127.0.0.1:11434/local-model", customEndpoint("http://127.0.0.1:11435/v1"), false),
         )
         val probe = SettleProbeSessions(FakeSessionStore())
-        val vm = chatViewModels.own(ChatViewModel(newStore(), probe, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(newStore(), probe, allowKeyReadPolicy()))
         for ((storedModel, endpoint, expectSameOrigin) in cases) {
             val transcripts = FakeSessionStore()
             val sid = transcripts.createSession("case ledger", storedModel)
@@ -726,14 +725,14 @@ class ChatSessionFactoryProvenanceTest {
             }
         }
         val factory = ChatSessionFactory(
-            policy = InMemoryPolicyStore(),
+            policy = allowKeyReadPolicy(),
             vaultSource = VaultSource { vault },
             buildProvider = { _, _ -> fake },
             sessionStores = object : SessionStoreSource {
                 override suspend fun store() = transcripts
             },
         )
-        val vm = chatViewModels.own(ChatViewModel(store, factory, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, factory, allowKeyReadPolicy()))
         onMain { vm.openSession(sid) }
         // Local replay still shows the old rows; the visible notice explains
         // the withheld model context.

@@ -4,11 +4,11 @@ import androidx.test.core.app.ApplicationProvider
 import dev.librepocket.agent.ui.chat.ChatSessionFactory
 import dev.librepocket.agent.ui.chat.SessionStoreSource
 import dev.librepocket.agent.ui.chat.VaultSource
+import dev.librepocket.agent.ui.chat.allowKeyReadPolicy
 import dev.librepocket.agent.ui.chat.findDanglingRunIds
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.policy.PolicyDecision
 import dev.librepocket.policy.PolicyRule
 import dev.librepocket.policy.PolicyStore
@@ -103,7 +103,7 @@ class RoomKillPersistencePhase4Test {
   )
 
   private fun factory(store: SessionStore): ChatSessionFactory = ChatSessionFactory(
-    policy = InMemoryPolicyStore(),
+    policy = allowKeyReadPolicy(),
     vaultSource = VaultSource {
       val v = EncryptedPrefsVault(InMemoryPrefs())
       v.putKey("preset:openai", "test-key-12345678".toCharArray())

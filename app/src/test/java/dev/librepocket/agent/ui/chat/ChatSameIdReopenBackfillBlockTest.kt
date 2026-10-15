@@ -12,7 +12,6 @@ import dev.librepocket.chat.TurnStart
 import dev.librepocket.chat.UiMessage
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
-import dev.librepocket.policy.InMemoryPolicyStore
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.session.FakeSessionStore
 import dev.librepocket.session.SessionStore
@@ -292,7 +291,7 @@ class ChatSameIdReopenBackfillBlockTest {
         val oldSession = DelayedOldSession(releaseGate)
         val newSession = BlockIdleSession()
         val sessions = BlockMarkingSessions(transcripts, oldId, oldSession, newSession)
-        val vm = chatViewModels.own(ChatViewModel(store, sessions, InMemoryPolicyStore()))
+        val vm = chatViewModels.own(ChatViewModel(store, sessions, allowKeyReadPolicy()))
 
         // #1 attach (fast path from null): ledger empty, nothing to mark.
         onMain { vm.openSession(oldId) }

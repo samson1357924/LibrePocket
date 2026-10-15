@@ -1607,7 +1607,10 @@ internal data class SwitchSnapshotLoad(
  * and every older qualifying row is reported via [SwitchSnapshotLoad.droppedByBytes]
  * (counted in the same scan, transient pages only) so the caller abandons
  * the whole prefix instead of copying a half (see [snapshotSwitchHistory]).
- * Marker + copy never exceeds [SnapshotBudget.HISTORY_LOAD_CAP] (one slot reserved),
+ * Marker + copy never exceeds [SnapshotBudget.HISTORY_LOAD_CAP]: one slot is
+ * reserved for the head-anchored `model switched` marker, and a second slot
+ * for the `snapshot incomplete` marker when the copy is incomplete
+ * (R28-1 write-time clamp in [snapshotSwitchHistory]),
  * matching the prune ceiling.
  */
 internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: String): SwitchSnapshotLoad {
@@ -1769,7 +1772,10 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * [SnapshotBudget.SNAPSHOT_MAX_TOTAL_CHARS] total chars (R6-5: an over-budget prefix is
  * abandoned whole — zero rows + incomplete marker, never a half prefix, see
  * below), so marker + copy never exceeds
- * [SnapshotBudget.HISTORY_LOAD_CAP]; pre- and post-restart model contexts still agree
+ * [SnapshotBudget.HISTORY_LOAD_CAP] (R28-1: a full 1999-row prefix with an
+ * incomplete marker is clamped to 1998 carried rows + 2 markers before the
+ * atomic write, so the same-batch auto-prune never drops the head switch
+ * marker); pre- and post-restart model contexts still agree
  * because reopen re-applies the same `!isPartial` filter to the copied rows
  * (provider payload unchanged).
  *
@@ -1806,7 +1812,9 @@ internal suspend fun hasIncompleteSnapshotMarker(store: SessionStore, sessionId:
  * oldest rows first), so the head marker goes first; the marker + copy cap
  * now equals [dev.librepocket.session.PrunePolicy.maxEventsPerSession]
  * (2000), so a full snapshot only loses its marker when a LATER prune sweep
- * drops the head (same as before, but one slot safer).
+ * drops the head (same as before, but one slot safer). R28-1: the
+ * incomplete two-marker batch is clamped pre-write (1998 carried + 2
+ * markers), so the loss can no longer happen in the same batch's auto-prune.
  * [hasWithheldSwitchMarker] only scans the head 16. A pruned marker only
  * drops the restart notice — the withhold itself is structural (rows never
  * copied), so isolation is unchanged; an `openSession` scan failure stays
@@ -1922,6 +1930,22 @@ internal suspend fun snapshotSwitchHistory(
     }
     val droppedDangling = carried.size - prefix.size
     val incomplete = markIncomplete || droppedDangling > 0 || byteAbandoned
+    // R28-1 write-time clamp (Current): the batch is switch marker + optional
+    // incomplete marker + carried prefix. A full 1999-row prefix with
+    // markIncomplete=true would otherwise build a 2001-row batch, and the
+    // same-batch auto-prune (keep 2000) would delete the head switch audit
+    // marker. Clamp the carried prefix to the marker budget first, then
+    // re-run the head-orphan trim so the clamp cut never strands a user-less
+    // assistant at the head (the trim may shrink below the cap —
+    // conservative direction). Withheld/byte-abandoned forks carry zero rows
+    // and never clamp.
+    val markerCount = if (incomplete) 2 else 1
+    val maxPrefix = SnapshotBudget.HISTORY_LOAD_CAP - markerCount
+    val clampedPrefix: List<TranscriptEvent> = if (prefix.size > maxPrefix) {
+        dropHeadOrphanAssistantFamilies(prefix.drop(prefix.size - maxPrefix))
+    } else {
+        prefix
+    }
     // R6-3 cause tag (see snapshotIncompleteMarkerText): a fence failure
     // outranks a drop — when both hold, the ledger may miss its terminal.
     // A byte abandon outranks a dangling drop (the two are mutually exclusive
@@ -1934,7 +1958,7 @@ internal suspend fun snapshotSwitchHistory(
         } else {
             "dangling excluded"
         }
-    val batch = ArrayList<TranscriptEvent>(prefix.size + 2)
+    val batch = ArrayList<TranscriptEvent>(clampedPrefix.size + 2)
     batch.add(
         TranscriptEvent(
             sessionId = toSessionId,
@@ -1955,11 +1979,11 @@ internal suspend fun snapshotSwitchHistory(
             ),
         )
     }
-    for (event in prefix) {
+    for (event in clampedPrefix) {
         batch.add(event.copy(seq = 0, sessionId = toSessionId))
     }
     store.appendEvents(batch)
-    return prefix.size
+    return clampedPrefix.size
 }
 
 /**

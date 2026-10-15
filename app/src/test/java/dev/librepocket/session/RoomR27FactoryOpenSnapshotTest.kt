@@ -9,6 +9,9 @@ import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.agent.ui.chat.allowKeyReadPolicy
 import dev.librepocket.agent.ui.chat.familyOf
 import dev.librepocket.agent.ui.chat.findDanglingRunIds
+import dev.librepocket.agent.ui.chat.hasIncompleteSnapshotMarker
+import dev.librepocket.agent.ui.chat.isModelSwitchMarker
+import dev.librepocket.agent.ui.chat.isSnapshotIncompleteMarker
 import dev.librepocket.agent.ui.chat.loadModelHistory
 import dev.librepocket.agent.ui.chat.loadSwitchSnapshotEvents
 import dev.librepocket.agent.ui.chat.snapshotSwitchHistory
@@ -318,6 +321,65 @@ class RoomR27FactoryOpenSnapshotTest {
         assertEquals("user", forkQualifying.first().kind)
         assertEquals("u-fill-0", forkQualifying.first().text)
         assertTrue(findDanglingRunIds(forked).isEmpty())
+    }
+
+    /**
+     * R28-1 full-prefix incomplete fork (Room, Robolectric): a 1999-row
+     * user-headed family-clean prefix with `markIncomplete=true` builds a
+     * switch + incomplete + 1999 batch (2001 rows) without the write-time
+     * clamp — and the same-batch auto-prune (keep 2000) deletes the head
+     * switch audit marker. The clamp keeps <=1998 carried + 2 markers (plus a
+     * head-orphan re-trim when the clamp cut splits the head family), so the
+     * fork holds BOTH markers with raw <= 2000. Seeded via direct DAO (NOT
+     * appends) so the source holds the exact 1999-row shape; the fork uses a
+     * fresh store (counter 0) so the batch deterministically trips auto-prune.
+     */
+    @Test
+    fun fullPrefixIncompleteFork_keepsBothMarkers_withinCap() = runBlocking {
+        val db = LibrePocketDb.openInMemory(ApplicationProvider.getApplicationContext())
+        memDb = db
+        val store = RoomSessionStore(db) { now }
+        val sid = store.createSession("t", "m")
+        // 1999 qualifying rows, user-headed, family-clean (every user owns a
+        // final assistant; unique runIds => no dangling): head triple
+        // (user+reasoning+assistant) + 998 plain pairs. A lone tail user
+        // would dangle and be filtered by the unconditional R6-3 rule, so
+        // the seed ends with a complete pair instead.
+        val rows = ArrayList<TranscriptEvent>(1999)
+        rows.add(TranscriptEvent(sessionId = "seed", runId = "h", kind = "user", text = "u-h", createdAt = 1L))
+        rows.add(TranscriptEvent(sessionId = "seed", runId = "h", kind = "reasoning", text = "", createdAt = 1L))
+        rows.add(TranscriptEvent(sessionId = "seed", runId = "h", kind = "assistant", text = "a-h", createdAt = 1L))
+        for (i in 0 until 998) {
+            rows.add(TranscriptEvent(sessionId = "seed", runId = "fill-$i", kind = "user", text = "u-fill-$i", createdAt = 1L))
+            rows.add(TranscriptEvent(sessionId = "seed", runId = "fill-$i", kind = "assistant", text = "a-fill-$i", createdAt = 1L))
+        }
+        seedDirectDao(db, sid, rows)
+        assertEquals(1999, store.countEvents(sid))
+        val newId = store.createSession("t", "m")
+        val copied = snapshotSwitchHistory(store, sid, newId, "m0", "m1", historyWithheld = false, markIncomplete = true)
+        // Batch fits the cap: both markers survive the same-batch auto-prune.
+        val forkCount = store.countEvents(newId)
+        assertTrue("fork raw must fit keep-2000 (was $forkCount)", forkCount <= 2000)
+        val forked = store.loadEvents(newId, afterSeq = 0, limit = 3000)
+        assertTrue(
+            "switch audit marker must survive (pre-fix auto-prune deleted it)",
+            forked.any { it.kind == "system" && isModelSwitchMarker(it.text) },
+        )
+        assertTrue(
+            "incomplete marker must survive",
+            forked.any { it.kind == "system" && isSnapshotIncompleteMarker(it.text) },
+        )
+        assertTrue("incomplete re-warning must scan true", hasIncompleteSnapshotMarker(store, newId))
+        assertTrue("newest carried pair must survive", forked.any { it.text == "u-fill-997" })
+        assertTrue("clamped prefix starts at a user boundary", findDanglingRunIds(forked).isEmpty())
+        assertNoHeadOrphan(forked.filter { it.kind == "user" || it.kind == "assistant" }, "clamped fork")
+        // An explicit keep-2000 sweep must not drop either marker.
+        val swept = store.prune(PrunePolicy(maxEventsPerSession = 2000))
+        assertEquals(0, swept.deletedEvents)
+        val after = store.loadEvents(newId, afterSeq = 0, limit = 3000)
+        assertTrue(after.any { it.kind == "system" && isModelSwitchMarker(it.text) })
+        assertTrue(after.any { it.kind == "system" && isSnapshotIncompleteMarker(it.text) })
+        assertEquals(copied, forked.count { it.kind == "user" || it.kind == "assistant" || it.kind == "reasoning" })
     }
 }
 

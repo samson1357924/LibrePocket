@@ -39,6 +39,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -935,8 +936,15 @@ class ProviderTransportTest {
                 streamingFlow { throw CancellationException("cancel-test") }.toList()
             }
             fail("CancellationException must propagate, not become a Failed event")
-        } catch (_: CancellationException) {
+        } catch (e: CancellationException) {
             // Expected: cancellation stays cancellation, never a retryable failure.
+            // Guard against hang false-positives: a withTimeout hang raises
+            // TimeoutCancellationException, which must not pass as cancel-test.
+            assertFalse(
+                "hung instead of propagating cancel-test",
+                e is TimeoutCancellationException,
+            )
+            assertEquals("cancel-test", e.message)
         }
     }
 

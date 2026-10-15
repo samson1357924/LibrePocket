@@ -11,11 +11,14 @@ import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.SseFrameParser
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
+import dev.librepocket.provider.FailureKind
+import dev.librepocket.provider.ProviderErrorClassifier
 import dev.librepocket.provider.inferAggFailureCodeName
 import dev.librepocket.provider.requireToolAggBudget
 import dev.librepocket.provider.requireToolCountBudget
 import dev.librepocket.provider.requireTotalToolAggBudget
 import dev.librepocket.redact.Redactor
+import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -4550,6 +4553,7 @@ class TurnController(
       } catch (e: CancellationException) {
         throw e
       } catch (e: ProviderFailure) {
+        coroutineContext.ensureActive()
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
           retryable = e.retryable,
@@ -4569,7 +4573,22 @@ class TurnController(
         // Validation fail-closed (mirrors streamingFlow's IAE branch):
         // malformed request/arguments never retry. Flush stays: same
         // observable pending-tool behavior as the previous generic branch.
+        coroutineContext.ensureActive()
         failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
+        flushPendingTools()
+      } catch (e: IOException) {
+        // Direct transport failure (synchronously thrown by stream() or by
+        // the returned Flow before any terminal event): classify like
+        // streamingFlow's IOException branch so transient failures retry
+        // regardless of throw site. Transport failures are not
+        // poison-adjacent, so the pending flush stays (matches the
+        // Failed-event path, which flushes).
+        coroutineContext.ensureActive()
+        val kind = ProviderErrorClassifier.classify(null, e, null)
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = kind == FailureKind.RETRYABLE,
+        )
         flushPendingTools()
       } catch (e: Exception) {
         // Unknown runtime failure fails closed: never retry, never persist
@@ -4577,6 +4596,7 @@ class TurnController(
         // below). TurnController is the sole retry owner; only explicit
         // retryable Failed terminals retry. Carries UNKNOWN_RUNTIME so a
         // forwarded terminal stays distinguishable from flushable fatals.
+        coroutineContext.ensureActive()
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
           retryable = false,
@@ -4594,6 +4614,7 @@ class TurnController(
         // (rethrown first above), so CE semantics are unchanged. VM-fatal
         // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
         if (e is VirtualMachineError || e is ThreadDeath) throw e
+        coroutineContext.ensureActive()
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
           retryable = false,

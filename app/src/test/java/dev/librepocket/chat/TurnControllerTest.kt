@@ -985,6 +985,29 @@ class TurnControllerTest {
     assertNotNull(c.uiState.value.error)
   }
 
+  // S3 parity pin (Current): a direct transport failure thrown synchronously
+  // by stream() or by the returned Flow before any terminal event is
+  // classified like streamingFlow's IOException branch, so a transient (e.g.
+  // SocketTimeout) retries regardless of throw site.
+  @Test fun directTransportFailureRetriesLikeStreamingFlow() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      throw java.net.SocketTimeoutException("timed out")
+    }
+    val c = controller(
+      provider,
+      delays = delays,
+      retry = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(0L)),
+    )
+    runBlocking { c.send("hi") }
+    assertEquals(2, calls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertEquals(listOf(0L), delays)
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+  }
+
   // IAE/unknown flush asymmetry pin (Current): IAE keeps the historical
   // flush (validation = request shape, same observable pending-tool behavior
   // as the pre-split generic branch), while unknown runtime fails closed

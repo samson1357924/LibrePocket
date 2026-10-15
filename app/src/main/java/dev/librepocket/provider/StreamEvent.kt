@@ -63,10 +63,11 @@ sealed interface StreamEvent {
      * transport; null for legacy/classified failures. The transport fills it
      * in `streamingFlow` (`code?.name` or inferred from the
      * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
-     * markers; unknown runtime fallback uses `UNKNOWN_RUNTIME`) and `pumpSse`
-     * sets it for SSE budget overflows. TurnController uses `code` plus the
-     * same message markers to suppress poison-adjacent pending-tool flushes
-     * without changing retry semantics.
+     * markers; unknown runtime fallback uses `UNKNOWN_RUNTIME`; `pumpSse`
+     * throws typed `ProviderFailure` for SSE budget overflows which
+     * `streamingFlow` projects to `code`). TurnController uses `code` plus
+     * the same message markers to suppress poison-adjacent pending-tool
+     * flushes without changing retry semantics.
      */
     data class Failed(val message: String, val retryable: Boolean, val code: String? = null) : StreamEvent
 

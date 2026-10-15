@@ -59,10 +59,10 @@ class ScopedFileStoreConcurrencyPressureTest {
     }
 
     private fun workspace(): File =
-        Files.createTempDirectory("ws-pressure").toFile()
+        Files.createTempDirectory("ws-pressure").toFile().apply { deleteOnExit() }
 
     private fun outside(): File =
-        Files.createTempDirectory("outside-pressure").toFile()
+        Files.createTempDirectory("outside-pressure").toFile().apply { deleteOnExit() }
 
     /** symlink 需 POSIX 語義；Windows 下跳過（宿主機語義限制，非裝置結論）。 */
     private fun assumeNonWindows() {
@@ -125,17 +125,21 @@ class ScopedFileStoreConcurrencyPressureTest {
 
             fun noteDenied(e: IllegalArgumentException) {
                 denied.incrementAndGet()
-                firstRejection.compareAndSet(null, e.message)
+                firstRejection.compareAndSet(null, e.message ?: ("IAE:" + e.javaClass.simpleName))
             }
 
             // 攻擊者一：rename 式檔案翻轉（真檔 ↔ 指外 symlink），暫存前綴
             // `.lp-` 使列目守衛忽略 staging 殘留（見 TMP_NAME_PREFIX）。
             val fileFlipper = Runnable {
                 try {
-                    if (!startGate.await(30, TimeUnit.SECONDS)) return@Runnable
+                    if (!startGate.await(30, TimeUnit.SECONDS)) {
+                        errors.compareAndSet(null, AssertionError("startGate timeout"))
+                        return@Runnable
+                    }
                     repeat(150) { i ->
                         val flip = File(ws, "flip")
-                        val staged = File(ws, ".lp-stage-f-${Thread.currentThread().threadId()}-$i")
+                        // JDK17 相容：threadId() 需 19+，測試僅需唯一性用 deprecated id 即可。
+                        val staged = File(ws, ".lp-stage-f-${Thread.currentThread().id}-$i")
                         try {
                             try {
                                 Files.deleteIfExists(staged.toPath())
@@ -167,10 +171,14 @@ class ScopedFileStoreConcurrencyPressureTest {
             // staged rename 進來；失敗即下一輪重試（壓力來源，不保證每次翻轉成功）。
             val dirFlipper = Runnable {
                 try {
-                    if (!startGate.await(30, TimeUnit.SECONDS)) return@Runnable
+                    if (!startGate.await(30, TimeUnit.SECONDS)) {
+                        errors.compareAndSet(null, AssertionError("startGate timeout"))
+                        return@Runnable
+                    }
                     repeat(100) { i ->
                         val sub = File(ws, "race-sub")
-                        val staged = File(ws, ".lp-stage-d-${Thread.currentThread().threadId()}-$i")
+                        // JDK17 相容：見 fileFlipper 註解。
+                        val staged = File(ws, ".lp-stage-d-${Thread.currentThread().id}-$i")
                         try {
                             try {
                                 Files.deleteIfExists(staged.toPath())
@@ -213,7 +221,10 @@ class ScopedFileStoreConcurrencyPressureTest {
             // IAE／找不到／併發 IO 窗口計入有界桶。
             val reader = Runnable {
                 try {
-                    if (!startGate.await(30, TimeUnit.SECONDS)) return@Runnable
+                    if (!startGate.await(30, TimeUnit.SECONDS)) {
+                        errors.compareAndSet(null, AssertionError("startGate timeout"))
+                        return@Runnable
+                    }
                     repeat(150) {
                         try {
                             val text = String(store.read("flip"), Charsets.UTF_8)
@@ -229,6 +240,9 @@ class ScopedFileStoreConcurrencyPressureTest {
                             noteDenied(e)
                         } catch (_: FileNotFoundException) {
                             denied.incrementAndGet()
+                        } catch (e: FileBudgetException) {
+                            // 預算異常屬 IOException 子類但本測試資料量極小，命中即真 bug，不進有界桶。
+                            errors.compareAndSet(null, e)
                         } catch (_: IOException) {
                             denied.incrementAndGet()
                         } catch (t: Throwable) {
@@ -244,14 +258,16 @@ class ScopedFileStoreConcurrencyPressureTest {
             // 穩定路徑穿出即真缺陷（下文嚴格斷言）；翻轉路徑殘餘僅診斷。
             val writer = Runnable {
                 try {
-                    if (!startGate.await(30, TimeUnit.SECONDS)) return@Runnable
+                    if (!startGate.await(30, TimeUnit.SECONDS)) {
+                        errors.compareAndSet(null, AssertionError("startGate timeout"))
+                        return@Runnable
+                    }
                     repeat(80) { i ->
+                        // 穩定路徑永不翻轉：任何 IAE 皆為誤拒（false-positive），記 errors 不進 denied。
                         try {
                             store.write("stable/file.txt", "v$i".toByteArray())
-                        } catch (e: IllegalArgumentException) {
-                            noteDenied(e)
-                        } catch (_: Exception) {
-                            denied.incrementAndGet()
+                        } catch (t: Throwable) {
+                            errors.compareAndSet(null, t)
                         }
                         try {
                             if (i % 2 == 0) {
@@ -261,8 +277,14 @@ class ScopedFileStoreConcurrencyPressureTest {
                             }
                         } catch (e: IllegalArgumentException) {
                             noteDenied(e)
-                        } catch (_: Exception) {
+                        } catch (_: FileNotFoundException) {
                             denied.incrementAndGet()
+                        } catch (e: FileBudgetException) {
+                            errors.compareAndSet(null, e)
+                        } catch (_: IOException) {
+                            denied.incrementAndGet()
+                        } catch (t: Throwable) {
+                            errors.compareAndSet(null, t)
                         }
                     }
                 } catch (t: Throwable) {
@@ -273,7 +295,10 @@ class ScopedFileStoreConcurrencyPressureTest {
             // 列目者：結構性質與競態無關，嚴格斷言（相對路徑、無穿越段）。
             val lister = Runnable {
                 try {
-                    if (!startGate.await(30, TimeUnit.SECONDS)) return@Runnable
+                    if (!startGate.await(30, TimeUnit.SECONDS)) {
+                        errors.compareAndSet(null, AssertionError("startGate timeout"))
+                        return@Runnable
+                    }
                     repeat(80) {
                         try {
                             val listed = store.list()
@@ -302,29 +327,33 @@ class ScopedFileStoreConcurrencyPressureTest {
             // 刪除者：自有 ephemeral 檔寫後刪＋翻轉路徑刪除嘗試；IAE／併發窗口有界化。
             val deleter = Runnable {
                 try {
-                    if (!startGate.await(30, TimeUnit.SECONDS)) return@Runnable
+                    if (!startGate.await(30, TimeUnit.SECONDS)) {
+                        errors.compareAndSet(null, AssertionError("startGate timeout"))
+                        return@Runnable
+                    }
                     repeat(80) { i ->
                         val ephemeral = "ephemeral-$i.txt"
+                        // ephemeral 為 deleter 獨佔檔名（flipper 不碰）：IAE 屬誤拒記 errors。
                         try {
                             store.write(ephemeral, "e".toByteArray())
-                        } catch (e: IllegalArgumentException) {
-                            noteDenied(e)
-                        } catch (_: Exception) {
-                            denied.incrementAndGet()
+                        } catch (t: Throwable) {
+                            errors.compareAndSet(null, t)
                         }
                         try {
                             if (store.delete(ephemeral)) deleteOk.incrementAndGet()
-                        } catch (e: IllegalArgumentException) {
-                            noteDenied(e)
-                        } catch (_: Exception) {
-                            denied.incrementAndGet()
+                        } catch (t: Throwable) {
+                            errors.compareAndSet(null, t)
                         }
                         try {
                             store.delete("race-sub/race-file.txt")
                         } catch (e: IllegalArgumentException) {
                             noteDenied(e)
-                        } catch (_: Exception) {
+                        } catch (_: FileNotFoundException) {
                             denied.incrementAndGet()
+                        } catch (_: IOException) {
+                            denied.incrementAndGet()
+                        } catch (t: Throwable) {
+                            errors.compareAndSet(null, t)
                         }
                     }
                 } catch (t: Throwable) {
@@ -332,18 +361,32 @@ class ScopedFileStoreConcurrencyPressureTest {
                 }
             }
 
-            val pool = Executors.newFixedThreadPool(8)
-            pool.submit(fileFlipper)
-            pool.submit(dirFlipper)
-            pool.submit(reader)
-            pool.submit(reader)
-            pool.submit(writer)
-            pool.submit(lister)
-            pool.submit(deleter)
-            startGate.countDown()
-            pool.shutdown()
-            // 無懸掛：期限內必須收斂，否則超時失敗（非無限等待）。
-            assertTrue("stress pool must terminate", pool.awaitTermination(60, TimeUnit.SECONDS))
+            val pool = Executors.newFixedThreadPool(7)
+            try {
+                pool.submit(fileFlipper)
+                pool.submit(dirFlipper)
+                pool.submit(reader)
+                pool.submit(reader)
+                pool.submit(writer)
+                pool.submit(lister)
+                pool.submit(deleter)
+                startGate.countDown()
+                pool.shutdown()
+                // 無懸掛：期限內必須收斂，否則超時失敗（非無限等待）。
+                // 失敗路徑先 shutdownNow 避免 non-daemon worker 洩漏並與清理段競爭。
+                try {
+                    assertTrue("stress pool must terminate", pool.awaitTermination(60, TimeUnit.SECONDS))
+                } finally {
+                    if (!pool.isTerminated) pool.shutdownNow()
+                }
+            } catch (t: Throwable) {
+                try {
+                    startGate.countDown()
+                } catch (_: Exception) {
+                }
+                pool.shutdownNow()
+                throw t
+            }
             errors.get()?.let { throw AssertionError("stress failed", it) }
 
             // 有界斷言一：outside 秘密未被竄改；穩定路徑寫入未穿出。

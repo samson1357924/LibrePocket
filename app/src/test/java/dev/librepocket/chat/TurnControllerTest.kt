@@ -1076,6 +1076,35 @@ class TurnControllerTest {
     assertEquals("terminal failure must be recorded, not escape", 1, sink.failed.size)
   }
 
+  // Atomicity pin (Current): the flush preflights every pending index
+  // before any side effect, so a later index overflowing cannot leave an
+  // earlier index committed. Both deltas are billing-legal
+  // ((3+349522)*3=1048575<=1048576); the flush adds 21 synthetic chars to
+  // index 1 (349543*3=1048629 overflows).
+  @Test fun multiPendingFlushOverflowCommitsNothing() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ToolDelta(0, "i", "f", "a"))
+        emit(StreamEvent.ToolDelta(1, null, null, "x".repeat(349_522)))
+        emit(StreamEvent.Failed("http 401 unauthorized", retryable = false))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(
+      "flush overflow must surface the typed terminal, got: ${c.uiState.value.error}",
+      c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"),
+    )
+    assertTrue("no pending tool may be partially committed", sink.tools.isEmpty())
+    assertFalse(assistantsOf(c).single().text.contains("[tool:"))
+    assertEquals(1, sink.failed.size)
+  }
+
   // IAE/unknown flush asymmetry pin (Current): IAE keeps the historical
   // flush (validation = request shape, same observable pending-tool behavior
   // as the pre-split generic branch), except legacy overflow-marker messages

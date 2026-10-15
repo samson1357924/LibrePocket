@@ -434,7 +434,7 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     StreamEvent.Failed(
                         redactedError(e.message ?: "PROVIDER_FAILURE"),
                         retryable = false,
-                        code = ProviderFailureCode.UNKNOWN_RUNTIME.name,
+                        code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
                     ),
                 )
             }

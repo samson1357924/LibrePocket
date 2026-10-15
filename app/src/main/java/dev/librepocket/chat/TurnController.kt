@@ -4397,30 +4397,40 @@ class TurnController(
       var totalToolAggChars = 0
       val distinctToolIndexes = mutableSetOf<Int>()
       suspend fun flushPendingTools() {
-        for ((index, args) in toolArgText) {
-          if (index !in toolDoneSeen) {
+        // Atomicity: preflight every pending index (including the synthetic
+        // id/name defaults, which delta billing never sees) before any
+        // marker/transcript side effect, so a later index overflowing cannot
+        // leave an earlier index committed. Already-completed ToolDone
+        // records are skipped in both passes (written inline at collection).
+        data class PendingTool(val index: Int, val id: String, val name: String, val args: String)
+        val pending = toolArgText.mapNotNull { (index, args) ->
+          if (index in toolDoneSeen) null
+          else {
             val id = toolIdText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
             val name = toolNameText[index]?.toString().orEmpty().ifEmpty { "pending" }
-            val argsStr = args.toString()
-            // Terminal guard (Finding #4): whole pending ToolDone must fit
-            // the per-call budget before any marker/transcript side effect.
-            // Throws typed AGG_TOO_LARGE; the try-path catch turns it into
-            // the typed terminal without poison-adjacent records.
-            // Stage E invariant: NO total/count billing here — the delta path
-            // already billed both at collection time; re-adding would
-            // double-count.
-            // currentChars=0: pending was never per-call-billed; delta path already counted total/count, Stage E here is per-call only.
-            requireToolAggBudget(0, id.length + name.length + argsStr.length)
-            appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
-            writeNotice { orderedTranscript.onToolDone(attemptRunId, index, id, name, argsStr) }
+            PendingTool(index, id, name, args.toString())
           }
         }
+        for (p in pending) {
+          // Terminal guard (Finding #4): whole pending ToolDone must fit
+          // the per-call budget before any marker/transcript side effect.
+          // Throws typed AGG_TOO_LARGE; the try-path catch turns it into
+          // the typed terminal without poison-adjacent records.
+          // Stage E invariant: NO total/count billing here — the delta path
+          // already billed both at collection time; re-adding would
+          // double-count.
+          // currentChars=0: pending was never per-call-billed; delta path already counted total/count, Stage E here is per-call only.
+          requireToolAggBudget(0, p.id.length + p.name.length + p.args.length)
+        }
+        for (p in pending) {
+          appendAssistantText(attemptRunId, "\n[tool:${p.name} ${p.args}]")
+          writeNotice { orderedTranscript.onToolDone(attemptRunId, p.index, p.id, p.name, p.args) }
+        }
       }
-      // Flush pending tools unless the terminal says discard. A flush that
-      // itself trips the per-call budget (the synthetic pending id/name
-      // defaults are not delta-billed, so a boundary-sized buffer can
-      // overflow here) converts to the typed terminal instead of escaping
-      // the attempt scope and skipping terminal bookkeeping. Only
+      // Flush pending tools unless the terminal says discard. The preflight
+      // above throws before any side effect; this stays as a last-resort net
+      // converting a budget overflow to the typed terminal instead of
+      // escaping the attempt scope and skipping terminal bookkeeping. Only
       // ProviderFailure is converted; cancellation still propagates.
       suspend fun flushCatchingBudgetOverflow() {
         if (!shouldDiscardPendingTools(failed)) {
@@ -4594,9 +4604,14 @@ class TurnController(
         // Validation fail-closed (mirrors streamingFlow's IAE branch):
         // malformed request/arguments never retry. Flush stays, guarded by
         // the same discard predicate as the Failed-event path (an overflow
-        // marker in the message still discards).
+        // marker in the message still discards, reported as AGG_TOO_LARGE
+        // like every other projection).
         coroutineContext.ensureActive()
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = false,
+          code = inferAggFailureCodeName(e.message),
+        )
         flushCatchingBudgetOverflow()
       } catch (e: IOException) {
         // Direct transport failure (synchronously thrown by stream() or by
@@ -4610,6 +4625,7 @@ class TurnController(
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
           retryable = kind == FailureKind.RETRYABLE,
+          code = inferAggFailureCodeName(e.message),
         )
         flushCatchingBudgetOverflow()
       } catch (e: Exception) {

@@ -932,6 +932,18 @@ class ProviderTransportTest {
     }
 
     @Test
+    fun streamingFlowUnknownWithOverflowMarkerReportsAggCode() = runBlocking {
+        // Code-inference parity with the direct-throw catches: a legacy
+        // overflow marker still reports AGG_TOO_LARGE (discard either way).
+        val events = withTimeout(3_000) {
+            streamingFlow { throw RuntimeException("x TOOL_ARGS_TOO_LARGE y") }.toList()
+        }
+        val failure = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse(failure.retryable)
+        assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, failure.code)
+    }
+
+    @Test
     fun streamingFlowValidationFailureStaysFatal() = runBlocking {
         val events = withTimeout(3_000) {
             streamingFlow { throw IllegalArgumentException("bad-arg") }.toList()

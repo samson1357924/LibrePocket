@@ -3,10 +3,23 @@ package dev.librepocket.systema
 /**
  * 鬧鐘工具：`ALARM_CLOCK`（SET_ALARM）Intent 委託系統鬧鐘 App。
  *
- * 主路徑無需任何權限；降級「自有提醒」才需要精準鬧鐘申報
+ * 權限決策（#14：採「修正註解＋降級語義」，不加 manifest 宣告）：
+ * SET_ALARM 發送端無需任何 `<uses-permission>`——AOSP `AlarmClock` 只要求
+ * 接收端 activity 持有 `com.android.alarm.permission.SET_ALARM`（時鐘 App
+ * 自行宣告），發送端走 `startActivity` 交由使用者選擇器，無發送端宣告要求
+ * （`ACTION_SET_ALARM` 區塊無 `@RequiresPermission`；權限註記只出現在
+ * DISMISS/TIMER 動作）。故不為發送端加宣告（加了也是死重且擴大 Play 權限面）。
+ * 個別裝置時鐘若自行強制要求而觸發 `SecurityException`，[AndroidIntentLauncher]
+ * 已收斂為 `INTERNAL`（fail-closed，不靜默退回猜測執行）。
+ * 降級「自有提醒」才需要精準鬧鐘申報
  * （`SCHEDULE_EXACT_ALARM`，API 31+；或 `USE_EXACT_ALARM`，
  * Play 需在 Data Safety + 商店描述中披露用途，見 [fallback] 的
  * requiresDeclaration）。三風味皆允許。
+ *
+ * 可見性（#14）：主 manifest `<queries>` 已宣告 SET_ALARM；API 30+ 無宣告時
+ * `resolveActivity` 被過濾為 null → 誤判 NO_HANDLER。靜態 [check] 通過但發射
+ * 時仍無處理者（實現被移除/停用/不可見），一律走自有提醒降級（見 [execute]），
+ * 與靜態 DEGRADED 同語義。
  */
 object AlarmTool : SystemTool<AlarmTool.Params> {
 
@@ -50,6 +63,25 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
     return IntentSpec(action = IntentActions.SET_ALARM, extras = extras)
   }
 
+  /**
+   * 從 extras 還原 [Params]（#14 生產讀側採用 [requireExtra]，#19 猜測執行禁令）。
+   *
+   * HOUR/MINUTES 必填 Int（缺參/錯型拋 `IllegalStateException`，帶 key + 期望型別，
+   * 禁 `getIntExtra(key, 0)` 式預設猜測——缺 hour 就設 00:00 是猜測執行）；
+   * MESSAGE 選填（缺席=空）；SKIP_UI 選填（缺席=false，見 [Params.skipUi]）。
+   * 範圍守衛與 [buildSetAlarmIntent] 同訊息，dispatcher 不得繞過 builder 校驗。
+   * 未來 dispatcher 將模型參數轉 Params 的唯一入口；目前尚無生產呼叫方（接線 PR 啟用）。
+   */
+  fun parseParams(extras: Map<String, IntentExtra>): Params {
+    val hour = extras.requireExtra<IntentExtra.IntVal>(IntentActions.EXTRA_ALARM_HOUR).value
+    val minute = extras.requireExtra<IntentExtra.IntVal>(IntentActions.EXTRA_ALARM_MINUTES).value
+    val message = extras.optionalExtra<IntentExtra.Str>(IntentActions.EXTRA_ALARM_MESSAGE)?.value.orEmpty()
+    val skipUi = extras.optionalExtra<IntentExtra.Bool>(IntentActions.EXTRA_ALARM_SKIP_UI)?.value ?: false
+    require(hour in 0..23) { "hour out of range: $hour" }
+    require(minute in 0..59) { "minute out of range: $minute" }
+    return Params(hour, minute, message, skipUi)
+  }
+
   override fun execute(params: Params, env: SystemEnv, launcher: IntentLauncher): ToolResult {
     val check = check(env)
     if (!check.executable) {
@@ -62,7 +94,16 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
       )
     }
     val spec = buildSetAlarmIntent(params)
-    return launcher.launchCatching(spec).toToolResult(spec, "設定鬧鐘")
+    return when (val launched = launcher.launchCatching(spec)) {
+      // 發現式缺席（靜態 check 通過但 resolve 為空：實現被移除/停用/不可見）：
+      // 與靜態 DEGRADED 同語義（自有提醒降級），禁靜默吞掉或猜測執行。
+      LaunchResult.NoHandler -> ToolResult(
+        false, true, spec, ReasonCodes.NO_HANDLER,
+        "做不到呼叫系統鬧鐘（${ReasonCodes.NO_HANDLER}）→ 可替代自有提醒 → 需要你授權精準鬧鐘",
+      )
+      // Success/Internal 走共用收斂。
+      else -> launched.toToolResult(spec, "設定鬧鐘")
+    }
   }
 
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec {

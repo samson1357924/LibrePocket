@@ -22,16 +22,32 @@ sealed interface IntentExtra {
 }
 
 /**
- * 型別化讀取：讀側必須用 `is`/`requireExtra`，禁 unsafe cast。
+ * 型別化讀取：讀側必須用 `is`/`requireExtra`/`optionalExtra`，禁 unsafe cast。
  *
  * 錯型別或缺 key 一律拋 [IllegalStateException]（帶 key + 期望型別），
  * 避免 `ClassCastException` 訊息無 key 難定位。
  *
- * 目前生產側尚未採用此 helper 讀 extras，後續接線 PR 需遷移讀側。
+ * 生產採用（#14）：[AlarmTool.parseParams]、[CalendarTool.parseInsertParams]
+ * 以本 helper 讀必填 extra（缺參/錯型明確拋錯，禁預設猜測執行，#19）。
  */
 inline fun <reified T : IntentExtra> Map<String, IntentExtra>.requireExtra(key: String): T {
   val v = this[key]
     ?: throw IllegalStateException("extra missing: key=$key expected=${T::class.simpleName}")
+  if (v !is T) {
+    throw IllegalStateException(
+      "extra type mismatch: key=$key expected=${T::class.simpleName} actual=${v::class.simpleName}",
+    )
+  }
+  return v
+}
+
+/**
+ * 選填 extra 讀取（與 [requireExtra] 同錯誤形狀）：缺席回 null（呼叫方套用
+ * 各工具 Params 記載的預設值）；出現但錯型仍拋 [IllegalStateException]，禁靜默忽略
+ * 或退回預設（fail-closed，#19 猜測執行禁令）。
+ */
+inline fun <reified T : IntentExtra> Map<String, IntentExtra>.optionalExtra(key: String): T? {
+  val v = this[key] ?: return null
   if (v !is T) {
     throw IllegalStateException(
       "extra type mismatch: key=$key expected=${T::class.simpleName} actual=${v::class.simpleName}",

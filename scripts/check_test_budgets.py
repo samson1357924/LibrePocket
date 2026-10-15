@@ -13,7 +13,9 @@ Rules (test sources only, no prod change):
   legacy `huge`/`big` hint, or a variable whose nearest scope-visible
   definition builds a >=100k repeat — top-level definitions are visible
   everywhere, same/enclosing-function and loop-body definitions are visible
-  to their loop, sibling-function definitions are excluded, and the closest
+  to their loop, sibling-function definitions are excluded, a definition
+  inside a `run`/`if`/`also`/`let`-style `{...}` block that already ended
+  before the write is not visible to it, and the closest
   preceding visible definition wins (so a shadowing small redefinition
   clears the flag). A body line that merely builds huge without the write
   span referencing it does NOT count (no cross-line disjunction). The
@@ -593,12 +595,14 @@ def _function_ranges(masked: list[str]) -> list[tuple[int, int]]:
     return ranges
 
 
-def _scoped_var_defs(masked: list[str]) -> dict[str, list[tuple[int, bool]]]:
+def _scoped_var_defs(masked: list[str]) -> dict[str, list[tuple[int, int, bool]]]:
     """All `val`/`var` definitions on masked lines: name -> sorted
-    [(def_line, is_huge)], where huge means the same line builds a
+    [(def_line, match_col, is_huge)], where huge means the same line builds a
     `>=HUGE_FIXTURE_MIN` String.repeat fixture (typed or untyped). Runs on
-    masked lines so commented-out or string-demo declarations never count."""
-    defs: dict[str, list[tuple[int, bool]]] = {}
+    masked lines so commented-out or string-demo declarations never count.
+    The match column locates the def inside its lexical `{...}` block (see
+    `_def_enclosing_blocks`)."""
+    defs: dict[str, list[tuple[int, int, bool]]] = {}
     for idx, line in enumerate(masked):
         huge_here: set[str] = set()
         for m in FIXTURE_VAR_RE.finditer(line):
@@ -610,10 +614,57 @@ def _scoped_var_defs(masked: list[str]) -> dict[str, list[tuple[int, bool]]]:
                 huge_here.add(m.group(1))
         for m in VAL_DEF_RE.finditer(line):
             name = m.group(1)
-            defs.setdefault(name, []).append((idx, name in huge_here))
+            defs.setdefault(name, []).append((idx, m.start(), name in huge_here))
     for entries in defs.values():
         entries.sort()
     return defs
+
+
+def _brace_blocks(masked: list[str]) -> list[tuple[int, int, int, int]]:
+    """Every `{...}` pair on masked lines as (start_line, start_col,
+    end_line, end_col). Runs on masked lines (strings/comments blanked) so
+    pairing is exact. An unclosed `{` extends to EOF (fail-closed: its
+    contents stay block-local rather than leaking to outer scope). A stray
+    `}` with an empty stack is ignored."""
+    blocks: list[tuple[int, int, int, int]] = []
+    stack: list[tuple[int, int]] = []
+    for idx, line in enumerate(masked):
+        for col, ch in enumerate(line):
+            if ch == "{":
+                stack.append((idx, col))
+            elif ch == "}":
+                if stack:
+                    sline, scol = stack.pop()
+                    blocks.append((sline, scol, idx, col))
+    n = len(masked)
+    for sline, scol in stack:
+        blocks.append((sline, scol, n - 1, 1 << 30))
+    return blocks
+
+
+def _def_enclosing_blocks(
+    masked: list[str], blocks: list[tuple[int, int, int, int]]
+) -> dict[tuple[int, int], tuple[int, int, int, int] | None]:
+    """Innermost enclosing `{...}` block per `val`/`var` def, keyed by
+    (def_line, match_col), or None for top-level (file scope).
+
+    Column-aware: a block encloses a def only when its `{` opens strictly
+    before the def's match start, so `val x = foo.also { ... }` stays an
+    outer-scope def (the `also` block opens after it) while
+    `run { val payload = "q" }` is block-local. A def whose block ends
+    before the write span's line is not visible to that write
+    (`run`/`if`/`also`/`let` temporaries never leak past their `}`)."""
+    out: dict[tuple[int, int], tuple[int, int, int, int] | None] = {}
+    for idx, line in enumerate(masked):
+        for m in VAL_DEF_RE.finditer(line):
+            pos = (idx, m.start())
+            best: tuple[int, int, int, int] | None = None
+            for sl, sc, el, ec in blocks:
+                if (sl, sc) < pos and (el > idx or (el == idx and ec > m.start())):
+                    if best is None or (sl, sc) > (best[0], best[1]):
+                        best = (sl, sc, el, ec)
+            out[pos] = best
+    return out
 
 
 def _def_visible(
@@ -630,21 +681,34 @@ def _def_visible(
 
 
 def _nearest_visible_is_huge(
-    defs: dict[str, list[tuple[int, bool]]],
+    defs: dict[str, list[tuple[int, int, bool]]],
     name: str,
     span_line: int,
     loop_idx: int,
     ranges: list[tuple[int, int]],
+    def_blocks: dict[tuple[int, int], tuple[int, int, int, int] | None] | None = None,
 ) -> bool:
     """Nearest-visible-definition rule: among scope-visible definitions of
     `name` on or before the write span's line, the closest one decides — a
     nearer small redefinition (shadowing) clears an outer huge fixture, and
-    no visible definition means unknown (precision: not huge, never fails)."""
-    best: tuple[int, bool] | None = None
-    for ln, huge in defs.get(name, []):
+    no visible definition means unknown (precision: not huge, never fails).
+
+    Besides the `fun`-level rule (`_def_visible`), a def is visible only
+    when its innermost enclosing `{...}` block still contains the write
+    span's line (top-level defs, block None, are visible everywhere): a
+    `run`/`if`/`also`/`let` temporary whose block already ended is never on
+    the write's path, while a def in the same function body or inside the
+    loop body before the write stays visible. A missing block entry is
+    treated as visible (fail-open for unmapped defs, never a new fail)."""
+    best: tuple[int, int, bool] | None = None
+    for ln, col, huge in defs.get(name, []):
         if ln <= span_line and _def_visible(ranges, ln, loop_idx):
-            best = (ln, huge)
-    return best is not None and best[1]
+            if def_blocks is not None:
+                blk = def_blocks.get((ln, col))
+                if blk is not None and blk[2] < span_line:
+                    continue
+            best = (ln, col, huge)
+    return best is not None and best[2]
 
 
 def _single_line_closed_body(header: str, match_end: int) -> bool:
@@ -674,6 +738,7 @@ def _huge_loop_violation(
     """
     ranges = _function_ranges(masked)
     defs = _scoped_var_defs(masked)
+    def_blocks = _def_enclosing_blocks(masked, _brace_blocks(masked))
     # Compile once per file (not per loop): PocketGuard perf suggestion.
     var_res = {
         name: re.compile(r"\b" + re.escape(name) + r"\b")
@@ -721,7 +786,7 @@ def _huge_loop_violation(
                 span_line = line_map[stripped[:off].count("\n")]
                 for name, v in var_res.items():
                     if v.search(span) and _nearest_visible_is_huge(
-                        defs, name, span_line, idx, ranges
+                        defs, name, span_line, idx, ranges, def_blocks
                     ):
                         return True
         # NOTE: no cross-line disjunction — a body line that builds a huge

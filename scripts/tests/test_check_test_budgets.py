@@ -259,6 +259,110 @@ class CheckTestBudgetsTest(unittest.TestCase):
             )
             self.assertEqual([], check_test_budgets.check_file(p))
 
+    def test_h1_run_block_small_does_not_shadow_outer_huge(self) -> None:
+        # Stage P2-2 (FN): a `run { val payload = "q" }` temporary ends
+        # before the loop, so the outer huge fixture stays on the write's
+        # visible path and must fail.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "RunShadowTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                '    val payload = "x".repeat(100_000)\n'
+                '    run { val payload = "q" }\n'
+                "    repeat(100) {\n"
+                "        store.appendEvent(event(sid, payload))\n"
+                "    }\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_run_block_huge_does_not_leak(self) -> None:
+        # Stage P2-2 (FP): a huge fixture built inside `run { ... }` ends
+        # with its block, so the loop writing the outer small value passes.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "RunLeakTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                '    val payload = "q"\n'
+                '    run { val payload = "x".repeat(100_000) }\n'
+                "    repeat(100) {\n"
+                "        store.appendEvent(event(sid, payload))\n"
+                "    }\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_if_block_huge_does_not_leak(self) -> None:
+        # Stage P2-2 (FP): same ended-block shape via `if (cond) { ... }`.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "IfLeakTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                '    val payload = "q"\n'
+                '    if (cond) { val payload = "x".repeat(100_000) }\n'
+                "    repeat(100) {\n"
+                "        store.appendEvent(event(sid, payload))\n"
+                "    }\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_if_block_small_does_not_shadow_outer_huge(self) -> None:
+        # Stage P2-2 (FN): `if` variant — the ended small temporary must not
+        # shadow the outer huge fixture.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "IfShadowTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                '    val payload = "x".repeat(100_000)\n'
+                '    if (cond) { val payload = "q" }\n'
+                "    repeat(100) {\n"
+                "        store.appendEvent(event(sid, payload))\n"
+                "    }\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+    def test_h1_also_block_huge_does_not_leak(self) -> None:
+        # Stage P2-2 (FP): `also`/`let`-style scope-function temporaries end
+        # with their block too.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "AlsoLeakTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                '    val payload = "q"\n'
+                '    1.also { val payload = "x".repeat(100_000) }\n'
+                "    repeat(100) {\n"
+                "        store.appendEvent(event(sid, payload))\n"
+                "    }\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_loop_body_def_before_write_still_fails(self) -> None:
+        # Stage P2-2 retention: a huge def inside the loop body itself,
+        # before the write and in a still-open block, stays visible.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "LoopBodyDefTest.kt",
+                "@Test fun f() = runBlocking {\n"
+                "    repeat(100) {\n"
+                '        val payload = "x".repeat(100_000)\n'
+                "        store.appendEvent(event(sid, payload))\n"
+                "    }\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
     def test_h1_late_write_in_long_body_fails(self) -> None:
         # Stage 3 (c): a genuine huge write on the 16th body line — past the
         # old 12-line window — must still fail via the brace-aware body.

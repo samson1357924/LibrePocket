@@ -458,5 +458,56 @@ class CheckTestBudgetsTest(unittest.TestCase):
             self.assertTrue(any("H2" in x for x in v), v)
 
 
+    def test_h2_same_line_trailing_write_passes(self) -> None:
+        # A write after the loop's own `}` on the same line is outside the
+        # brace-delimited body and must not count.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "TrailingWriteTest.kt",
+                'repeat(2_000){println(it)}; store.appendEvent(event(sid,"q"))\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_same_line_second_loop_fails(self) -> None:
+        # Every repeat on a line is examined: the small first loop passes
+        # but the second big loop with a body write must fail.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "SecondLoopTest.kt",
+                'repeat(1){}; repeat(2_000){store.appendEvent(event(sid,"q"))}\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h1_same_line_trailing_write_passes(self) -> None:
+        # Huge-fixture variant of the trailing-write shape: the compute
+        # loop body is `{println(it)}`, the huge write after its `}` is
+        # outside and must not trip H1.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "HugeTrailingTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "repeat(100){println(it)}; store.appendEvent(event(sid,payload))\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_same_line_second_loop_fails(self) -> None:
+        # Huge-fixture variant: the first small loop is below the H1
+        # threshold, the second loop carries the huge write in its own
+        # `{...}` and must fail.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "HugeSecondLoopTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "repeat(1){}; repeat(100){store.appendEvent(event(sid,payload))}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+
+
 if __name__ == "__main__":
     unittest.main()

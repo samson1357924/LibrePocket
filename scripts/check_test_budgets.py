@@ -346,6 +346,83 @@ def _repeat_body_lines(
     return (idx, open_idx)
 
 
+def _repeat_block_slices(
+    masked: list[str], idx: int, match_end: int
+) -> list[tuple[int, str]] | None:
+    """Column-precise body slices for one `repeat` match.
+
+    Returns [(orig_line, substring)] covering only the brace-delimited
+    body: single-line bodies slice `{...}` (open col through the paired
+    `}`), multiline bodies take the header tail from `{`, full middle
+    lines, and the closer head through `}`. Runs on masked lines so
+    pairing is exact. Returns None when the header cannot be paired
+    (no `{` on the header line and none within +5 lines, or no close
+    found) — the caller keeps the legacy fail-closed window semantics.
+    """
+    n = len(masked)
+    if idx < 0 or idx >= n:
+        return None
+    cur = masked[idx] if idx < len(masked) else ""
+    hi = max(0, min(match_end, len(cur)))
+    open_col = cur.find("{", hi)
+    if open_col != -1:
+        depth = 0
+        for li in range(idx, n):
+            text = masked[li] if li < len(masked) else ""
+            sc = open_col if li == idx else 0
+            if sc > len(text):
+                continue
+            for col in range(sc, len(text)):
+                ch = text[col]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        if li == idx:
+                            return [(idx, text[open_col : col + 1])]
+                        segs = [(idx, masked[idx][open_col:])]
+                        for mid in range(idx + 1, li):
+                            segs.append((mid, masked[mid]))
+                        segs.append((li, masked[li][: col + 1]))
+                        return segs
+                    if depth < 0:
+                        return None
+        return None
+    open_idx = -1
+    first = -1
+    for g in range(idx + 1, min(n, idx + 6)):
+        c = masked[g].find("{") if g < len(masked) else -1
+        if c != -1:
+            open_idx, first = g, c
+            break
+    if open_idx < 0:
+        return None
+    depth = 0
+    for li in range(open_idx, n):
+        text = masked[li] if li < len(masked) else ""
+        sc = first if li == open_idx else 0
+        if sc > len(text):
+            continue
+        for col in range(sc, len(text)):
+            ch = text[col]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    if li == open_idx:
+                        return [(open_idx, text[first : col + 1])]
+                    segs = [(open_idx, masked[open_idx][first:])]
+                    for mid in range(open_idx + 1, li):
+                        segs.append((mid, masked[mid]))
+                    segs.append((li, masked[li][: col + 1]))
+                    return segs
+                if depth < 0:
+                    return None
+    return None
+
+
 def _fixture_vars(content: str) -> set[str]:
     """Variable names bound to a >=100k String.repeat fixture anywhere in the
     file (typed or untyped declarations; `100000`/`100_000`/`150_000` all
@@ -603,38 +680,50 @@ def _huge_loop_violation(
         for name in defs
     }
     for idx, line in enumerate(masked):
-        m = REPEAT_RE.search(line)
-        if not m or _repeat_count(m.group(1)) < HUGE_REPEAT_MIN:
-            continue
-        start, end = _repeat_body_lines(
-            deltas, has_brace, masked, idx, m.start(), m.end()
-        )
-        if (start, end) == (idx, idx) and not _single_line_closed_body(
-            line, m.end()
-        ):
-            # Fail-closed fallback for headers whose block cannot be paired:
-            # scan the legacy window instead of silently passing. Span
-            # evidence + scope rules still apply, so unknown scope never
-            # fails here either.
-            end = min(len(masked) - 1, idx + REPEAT_WINDOW_LINES - 1)
-        # Multiline span scan (body-local): blank fast-path spans first to
-        # keep the per-call exemption, then pair parens from each
-        # `.appendEvent(` start and judge the whole span as one string so a
-        # huge hint/varref on a following line is not missed. Masked lines
-        # have strings/comments blanked, so naive paren counting is exact.
-        body_text = "\n".join(masked[start : end + 1])
-        stripped = _strip_fast_path_spans(body_text)
-        for span, off in _append_event_spans_with_offsets(stripped):
-            if HUGE_HINT_RE.search(span) or _line_has_big_inline_fixture(
-                span
+        for m in REPEAT_RE.finditer(line):
+            if _repeat_count(m.group(1)) < HUGE_REPEAT_MIN:
+                continue
+            start, end = _repeat_body_lines(
+                deltas, has_brace, masked, idx, m.start(), m.end()
+            )
+            if (start, end) == (idx, idx) and not _single_line_closed_body(
+                line, m.end()
             ):
-                return True
-            span_line = start + stripped[:off].count("\n")
-            for name, v in var_res.items():
-                if v.search(span) and _nearest_visible_is_huge(
-                    defs, name, span_line, idx, ranges
+                # Fail-closed fallback for headers whose block cannot be
+                # paired: scan the legacy window instead of silently
+                # passing. Span evidence + scope rules still apply, so
+                # unknown scope never fails here either.
+                end = min(len(masked) - 1, idx + REPEAT_WINDOW_LINES - 1)
+                body_text = "\n".join(masked[start : end + 1])
+                line_map = list(range(start, end + 1))
+            else:
+                slices = _repeat_block_slices(masked, idx, m.end())
+                if slices is None:
+                    # Unpaired but not the window fallback (e.g. later-line
+                    # open without a close): keep the legacy line range.
+                    body_text = "\n".join(masked[start : end + 1])
+                    line_map = list(range(start, end + 1))
+                else:
+                    body_text = "\n".join(sub for _, sub in slices)
+                    line_map = [orig for orig, _ in slices]
+            # Multiline span scan (body-local): blank fast-path spans first
+            # to keep the per-call exemption, then pair parens from each
+            # `.appendEvent(` start and judge the whole span as one string
+            # so a huge hint/varref on a following line is not missed.
+            # Masked lines have strings/comments blanked, so naive paren
+            # counting is exact.
+            stripped = _strip_fast_path_spans(body_text)
+            for span, off in _append_event_spans_with_offsets(stripped):
+                if HUGE_HINT_RE.search(span) or _line_has_big_inline_fixture(
+                    span
                 ):
                     return True
+                span_line = line_map[stripped[:off].count("\n")]
+                for name, v in var_res.items():
+                    if v.search(span) and _nearest_visible_is_huge(
+                        defs, name, span_line, idx, ranges
+                    ):
+                        return True
         # NOTE: no cross-line disjunction — a body line that builds a huge
         # fixture while a *different* write span carries no huge evidence is
         # not a definite costly path (precision over flag-for-review).
@@ -650,17 +739,34 @@ def _h2_loop_violation(
     brace-delimited body (not a fixed line window, so adjacent methods and
     long bodies are both handled). All matches run on masked lines."""
     for idx, line in enumerate(masked):
-        m = REPEAT_RE.search(line)
-        if not m or _repeat_count(m.group(1)) < ROW_REPEAT_MAX:
-            continue
-        _, end = _repeat_body_lines(
-            deltas, has_brace, masked, idx, m.start(), m.end()
-        )
-        if any(
-            APPEND_EVENT_RE.search(w) or FAST_PATH_RE.search(w)
-            for w in masked[idx : end + 1]
-        ):
-            return f"repeat({m.group(1)})"
+        for m in REPEAT_RE.finditer(line):
+            if _repeat_count(m.group(1)) < ROW_REPEAT_MAX:
+                continue
+            start, end = _repeat_body_lines(
+                deltas, has_brace, masked, idx, m.start(), m.end()
+            )
+            if (start, end) == (idx, idx) and not _single_line_closed_body(
+                line, m.end()
+            ):
+                # Unparseable header: keep legacy single-line scan.
+                if any(
+                    APPEND_EVENT_RE.search(w) or FAST_PATH_RE.search(w)
+                    for w in masked[start : end + 1]
+                ):
+                    return f"repeat({m.group(1)})"
+                continue
+            slices = _repeat_block_slices(masked, idx, m.end())
+            if slices is None:
+                if any(
+                    APPEND_EVENT_RE.search(w) or FAST_PATH_RE.search(w)
+                    for w in masked[start : end + 1]
+                ):
+                    return f"repeat({m.group(1)})"
+            elif any(
+                APPEND_EVENT_RE.search(sub) or FAST_PATH_RE.search(sub)
+                for _, sub in slices
+            ):
+                return f"repeat({m.group(1)})"
     return None
 
 

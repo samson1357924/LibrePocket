@@ -393,7 +393,7 @@ sealed interface StreamEvent {
 | 正文增量 | `choices[].delta.content` → `TextDelta` | `response.output_text.delta` → `TextDelta` | `content_block_delta(text_delta)` → `TextDelta` |
 | 思考增量 | `delta.reasoning_content`（兼容 `reasoning` / `reasoning_details` 摘要；同分片多表示只取一次） → `ReasoningDelta` | `reasoning_summary_text.delta` / `reasoning_text.delta` → `ReasoningDelta` | `thinking_delta` → `ReasoningDelta`（簽名/加密塊不展示，工具回合透傳見 §3.3） |
 | 工具增量 | `delta.tool_calls[]`（按 `index` 聚合；空 ID 不覆蓋有效 ID） → `ToolDelta` | `response.output_item.added/done`（function_call） → `ToolDelta`/`ToolDone` | `content_block_start(tool_use)` + `input_json_delta` → `ToolDelta`；`content_block_stop` → `ToolDone` |
-| 工具聚合上限 | 三協議＋TurnController 收集層共用單 tool call 聚合預算（args+id+name，沿用 1 MiB 串流記憶體預算；超限 → `Failed(retryable=false, "TOOL_ARGS_TOO_LARGE")`，不靜默截斷、不重試、不記錄毒化片段） | 同左 | 同左 |
+| 工具聚合上限 | 三協議＋TurnController 收集層共用單 tool call 聚合預算（args+id+name，沿用 1 MiB 串流記憶體預算；超限 → `Failed("TOOL_ARGS_TOO_LARGE", retryable=false, code="AGG_TOO_LARGE")`，不靜默截斷、不重試、不記錄毒化片段） | 同左 | 同左 |
 | 用量 | 終態 `usage` → `Usage` | `response.completed.usage` → `Usage` | `message_start.message.usage` + `message_delta.usage` → `Usage` |
 | 終態成功 | `finish_reason` + `[DONE]` → `Done` | `response.completed`（非空 output 為權威） → `Done` | `message_stop`（前需 `message_delta stop_reason`） → `Done` |
 | 終態異常 | 缺 `[DONE]`/無合法 `finish_reason` → `Failed(retryable=true)` | `response.completed` 缺 `output`/空陣列 → 用流內已收增量恢復（記 `recovered=true`）；`response.failed/incomplete` → `Failed` | 缺 `message_stop` 或可見/工具塊未閉合 → `Failed(retryable=true)` |
@@ -413,8 +413,8 @@ sealed interface StreamEvent {
 - `:` 開頭行為註釋心跳（丟棄，不報錯）。
 - `data: [DONE]`（Chat）為流結束標記，不做 JSON 解析。
 - UTF-8 按位元組流解碼，不得按 Char 切分（多位元組字元跨 chunk 時緩衝未完成位元組）。
-- 單行上限 1 MiB（防惡意服務端撐爆內存；超限 → `Failed(retryable=false, "SSE_LINE_TOO_LONG")`）。
-- 單事件 `data:` 總量上限 1 MiB（沿用單行預算，非新數字；防多小行堆疊攻擊——每行合法但合併超限 → `Failed(retryable=false, "SSE_FRAME_TOO_LARGE")`，與單行超限／`SSE_TRUNCATED` 斷線區分）。
+- 單行上限 1 MiB（防惡意服務端撐爆內存；超限 → `Failed("SSE_LINE_TOO_LONG", retryable=false, code="AGG_TOO_LARGE")`）。
+- 單事件 `data:` 總量上限 1 MiB（沿用單行預算，非新數字；防多小行堆疊攻擊——每行合法但合併超限 → `Failed("SSE_FRAME_TOO_LARGE", retryable=false, code="AGG_TOO_LARGE")`，與單行超限／`SSE_TRUNCATED` 斷線區分）。
 - 空行 = 事件邊界；無 `event:` 欄位時按 payload 內容嗅探（Chat/Responses/Anthropic 各自 try-parse，順序見實現）。
 
 ### 3.5 Block 身份規則
@@ -430,7 +430,7 @@ sealed interface StreamEvent {
 
 | 順序 | 條件 | 動作 |
 |------|------|------|
-| 1 | 單圖 > 10 MiB 或邊長 > 8192px | 拒絕：`Failed("IMAGE_TOO_LARGE", retryable=false)`，不轉碼、不縮放 |
+| 1 | 單圖 > 10 MiB 或邊長 > 8192px | 拒絕：`Failed("IMAGE_TOO_LARGE", retryable=false, code=null)`（送前拒絕，非聚合預算），不轉碼、不縮放 |
 | 2 | `preserveOriginal=true`（預設） | 原位元組 + 原 MIME 直送；超 Provider 上限 → 拒絕（同上），不降質 |
 | 3 | `preserveOriginal=false` 且 Provider 支援 | 允許轉 JPEG（quality 85）+ 最長邊縮至 2048；轉換在 IO dispatcher 執行 |
 | 4 | Provider 不支援圖片（如純文本模型） | 剝離圖片、文本照發；transcript 記 `imagesOmitted=N` + 省略說明 |

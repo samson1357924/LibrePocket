@@ -42,8 +42,8 @@ internal enum class ProviderFailureCode {
      * ToolDelta fragments, the per-attempt whole-round tool total, the
      * distinct-tool count, or one SSE event's total `data:` payload).
      * Always pairs with a distinct non-retryable message
-     * (`TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE`), never silent
-     * truncation, and never a retry of the poisoned stream.
+     * (`TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`),
+     * never silent truncation, and never a retry of the poisoned stream.
      */
     AGG_TOO_LARGE,
 }
@@ -401,8 +401,10 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * unknown-runtime fallback which carries `UNKNOWN_RUNTIME` so the controller
  * can discard poison-adjacent pending tools without changing retry semantics
  * of other fatal events (401/validation stay flushable).
- * Unknown runtime failures fail closed (`retryable = false`): only the
- * typed branches above may retry, and TurnController owns that budget.
+ * Unknown runtime failures fail closed (`retryable = false`): only
+ * classifier-approved branches may retry (`ProviderFailure.retryable` /
+ * `IOException` via `ProviderErrorClassifier`; `IAE` and unknown never
+ * retry), and TurnController owns that budget.
  * `VM-fatal` (`VirtualMachineError`/`ThreadDeath`) and `CancellationException`
  * always propagate without conversion (never a `Failed` event), matching
  * TurnController's rethrow guarantees.

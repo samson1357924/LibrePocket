@@ -29,19 +29,22 @@ import java.util.concurrent.atomic.AtomicReference
  * `inside-*`／`v*`／`race-v*`），無真實個資、不碰生產端點。
  *
  * 有界斷言（僅證明行為有界，不宣稱消除競態；Java 無 O_NOFOLLOW／openat，
- * 見 [ScopedFileStore] 類註解 `:114` 限制）：
- * - 無未捕異常逃逸（[errors] 為空；預期內的 [IllegalArgumentException]／
- *   [FileNotFoundException]／併發窗口 [IOException] 計入 [denied] 有界桶）；
- * - 無懸掛（起跑閘＋[awaitTermination] 期限，失敗即超時斷言）；
+ * 見 [ScopedFileStore] 類註解 TOCTOU 段限制）：
+ * - 無未捕異常逃逸（[errors] 為空；翻轉路徑預期內的 [IllegalArgumentException]／
+ *   [FileNotFoundException]／併發窗口 [IOException] 計入 [denied] 混合桶，其中僅
+ *   [IllegalArgumentException] 計入 [rejected] 門證據桶；穩定路徑／ephemeral 獨佔
+ *   路徑任何異常皆進 [errors]；[FileBudgetException] 屬真 bug 進 [errors]）；
+ * - 無懸掛（起跑閘＋[awaitTermination] 期限，失敗先 shutdownNow 再超時斷言）；
  * - outside 秘密未被竄改（內容位元一致）且穩定路徑寫入未穿出
  *   （`out/file.txt` 不存在）；翻轉路徑的讀殘餘（`outsideReads`）與
  *   外部新增檔（`outsideExtra`）僅診斷記錄，不計為通過條件——系統性穿出由
  *   單線程確定性測試（`writeThroughParentSymlinkDenied`、
  *   `writeDoesNotMkdirThroughSymlink`）嚴格覆蓋；
- * - 拒絕或安全重試：併發 [denied] 計數含鏈重驗族（symlink／escapes）與
- *   root 定錨族（mismatch／identity，見 [ScopedFileStoreB2Test] T1／F1 確定性
- *   覆蓋），壓力下 `denied > 0` 證明重驗門有觸發；事後清理＋可寫可讀證明
- *   安全重試／恢復（store 事後仍可用）。
+ * - 拒絕或安全重試：併發 [rejected]（僅 IAE）為重驗門證據，首條須屬鏈族
+ *   symlink／escapes（本測試只翻轉 `flip`／`race-sub` 子路徑不動 root，
+ *   root 定錨族 mismatch／identity 由 [ScopedFileStoreB2Test] T1／F1 確定性
+ *   覆蓋）；事後清理＋可寫可讀證明安全重試／恢復（store 事後仍可用）。
+ *   壓力有效性另以 flipOk／dirFlipOk／讀寫列刪進度計數證明非零覆蓋空轉。
  *
  * 時序：起跑閘（[CountDownLatch]）＋背景線程池＋`await` 期限；全檔不用
  * 睡眠猜時序（僅 latch／await 期限）。
@@ -73,9 +76,9 @@ class ScopedFileStoreConcurrencyPressureTest {
     /**
      * 原子替換：暫存→目標。先試 `ATOMIC_MOVE＋REPLACE_EXISTING`，不支援原子
      * 搬移才退回普通覆蓋；其餘異常視為併發窗口（best-effort，呼叫方忽略），
-     * 並清理暫存殘留。
+     * 並清理暫存殘留。回傳是否成功，供壓力有效性計數（不計為通過條件）。
      */
-    private fun renameReplace(staged: File, target: File) {
+    private fun renameReplace(staged: File, target: File): Boolean {
         try {
             try {
                 Files.move(
@@ -90,12 +93,21 @@ class ScopedFileStoreConcurrencyPressureTest {
                     target.toPath(),
                     StandardCopyOption.REPLACE_EXISTING,
                 )
+            } catch (_: UnsupportedOperationException) {
+                // 部分 provider 拋裸 UOE 而非子類，語義同不支援原子搬移。
+                Files.move(
+                    staged.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
             }
+            return true
         } catch (_: Exception) {
             try {
                 Files.deleteIfExists(staged.toPath())
             } catch (_: Exception) {
             }
+            return false
         }
     }
 
@@ -103,6 +115,12 @@ class ScopedFileStoreConcurrencyPressureTest {
         val m = msg ?: return false
         return m.contains("symlink") || m.contains("escapes") ||
             m.contains("mismatch") || m.contains("identity")
+    }
+
+    /** 壓力下實際可達的鏈族（翻轉 flip/race-sub）；定錨族由 B2 T1/F1 確定性覆蓋。 */
+    private fun isChainRejectionMessage(msg: String?): Boolean {
+        val m = msg ?: return false
+        return m.contains("symlink") || m.contains("escapes")
     }
 
     @Test fun renameSymlinkPressureBounded() {
@@ -117,14 +135,18 @@ class ScopedFileStoreConcurrencyPressureTest {
             val startGate = CountDownLatch(1)
             val errors = AtomicReference<Throwable?>(null)
             val denied = AtomicInteger(0)
+            val rejected = AtomicInteger(0)
             val firstRejection = AtomicReference<String?>(null)
             val observedOutside = AtomicInteger(0)
             val observedInside = AtomicInteger(0)
             val listOk = AtomicInteger(0)
             val deleteOk = AtomicInteger(0)
+            val flipOk = AtomicInteger(0)
+            val dirFlipOk = AtomicInteger(0)
 
             fun noteDenied(e: IllegalArgumentException) {
                 denied.incrementAndGet()
+                rejected.incrementAndGet()
                 firstRejection.compareAndSet(null, e.message ?: ("IAE:" + e.javaClass.simpleName))
             }
 
@@ -153,7 +175,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                             } else {
                                 staged.writeText("inside-$i")
                             }
-                            renameReplace(staged, flip)
+                            if (renameReplace(staged, flip)) flipOk.incrementAndGet()
                         } catch (_: Exception) {
                             try {
                                 Files.deleteIfExists(staged.toPath())
@@ -200,7 +222,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                                 } else {
                                     staged.mkdirs()
                                 }
-                                renameReplace(staged, sub)
+                                if (renameReplace(staged, sub)) dirFlipOk.incrementAndGet()
                             } catch (_: Exception) {
                                 try {
                                     Files.deleteIfExists(staged.toPath())
@@ -209,7 +231,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                             }
                         } catch (t: Throwable) {
                             errors.compareAndSet(null, t)
-                            return@repeat
+                            return@Runnable
                         }
                     }
                 } catch (t: Throwable) {
@@ -395,24 +417,45 @@ class ScopedFileStoreConcurrencyPressureTest {
             val outsideExtra = (out.listFiles()?.map { it.name }?.toSet() ?: emptySet()) -
                 setOf("secret.txt")
             println(
-                "pressure diagnostics: denied=${denied.get()} inside=${observedInside.get()} " +
+                "pressure diagnostics: denied=${denied.get()} rejected=${rejected.get()} " +
+                    "inside=${observedInside.get()} " +
                     "outsideReads=${observedOutside.get()} listOk=${listOk.get()} " +
-                    "deleteOk=${deleteOk.get()} firstRejection=${firstRejection.get()} " +
+                    "deleteOk=${deleteOk.get()} flipOk=${flipOk.get()} " +
+                    "dirFlipOk=${dirFlipOk.get()} firstRejection=${firstRejection.get()} " +
                     "outsideExtra=$outsideExtra",
             )
 
-            // 有界斷言二：重驗門有觸發拒絕（鏈族 symlink／escapes；root 定錨族
-            // mismatch／identity 由 B2Test T1／F1 確定性覆蓋，本處首條拒絕訊息
-            // 須屬任一已知族，不接受裸 IO 計數零拒絕）。
+            // 有界斷言二：重驗門有觸發拒絕。denied 為混合桶（IAE＋FNFE／IO 窗口），
+            // 真正門證據為 rejected（僅 IAE）＋首條鏈族訊息；root 定錨族
+            // mismatch／identity 由 B2Test T1／F1 確定性覆蓋，壓力下僅期望 symlink／escapes。
             assertTrue(
-                "expected some rejections, got ${denied.get()} " +
-                    "(inside=${observedInside.get()} outsideReads=${observedOutside.get()})",
-                denied.get() > 0,
+                "expected some rejections, got denied=${denied.get()} rejected=${rejected.get()} " +
+                    "(inside=${observedInside.get()} outsideReads=${observedOutside.get()} " +
+                    "flipOk=${flipOk.get()} dirFlipOk=${dirFlipOk.get()})",
+                rejected.get() > 0,
             )
             assertTrue(
-                "first rejection must be a reverify family, got ${firstRejection.get()}",
-                isRejectionMessage(firstRejection.get()),
+                "first rejection must be a chain reverify family, got ${firstRejection.get()}",
+                isChainRejectionMessage(firstRejection.get()),
             )
+            // 壓力有效性與進度證明：翻轉確實發生、各操作確實執行（非零覆蓋空轉）。
+            // flipOk 為檔翻轉主訊號（REPLACE 恆可覆蓋）；dirFlipOk 受非空目錄競爭影響
+            // 拆訊息以利歸因；讀進度以 inside＋outsideReads 之和證明（全撞窗口亦算執行）。
+            assertTrue(
+                "expected file flips to happen, got flipOk=${flipOk.get()}",
+                flipOk.get() > 0,
+            )
+            assertTrue(
+                "expected dir flips to happen, got dirFlipOk=${dirFlipOk.get()}",
+                dirFlipOk.get() > 0,
+            )
+            assertTrue(
+                "expected reads to happen, got inside=${observedInside.get()} " +
+                    "outsideReads=${observedOutside.get()}",
+                observedInside.get() + observedOutside.get() > 0,
+            )
+            assertTrue("expected lists to happen, got listOk=${listOk.get()}", listOk.get() > 0)
+            assertTrue("expected deletes to happen, got deleteOk=${deleteOk.get()}", deleteOk.get() > 0)
 
             // 安全重試／恢復：清理競爭殘留後 store 仍可寫可讀；毒連結單線程仍拒。
             try {

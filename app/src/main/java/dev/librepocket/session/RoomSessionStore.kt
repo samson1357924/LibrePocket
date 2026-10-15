@@ -93,7 +93,9 @@ class RoomSessionStore(
      * sessionIds whose LATEST [prune] sweep deleted rows. [loadModelHistory]
      * treats them as reasoning-suspect (all kept assistants fail-closed) when
      * truncation evidence exists. Per-sweep (NOT sticky): a sweep with
-     * `deletedEvents==0` clears the flag, [deleteSession] clears it, and
+     * `deletedEvents==0` AND a clean (user/empty) post-fixup head clears
+     * the flag (R27-2 shape-aware; `deleted==0` residue keeps fail-closed),
+     * [deleteSession] clears it, and
      * appends never clear it (a later append cannot resurrect a pruned
      * pair). Clearing on a clean sweep is safe for new prunes because the
      * R26-1 fixup durably deletes the cut head family (user boundary,
@@ -112,20 +114,27 @@ class RoomSessionStore(
      * durably cut, so no suspect flag is needed for the rolled-back shape.
      * Fixup/hook failures are fail-closed: a DAO throw aborts the tx and
      * propagates (never swallowed as success); only size-convergent stops
-     * (empty, user head, blank family, `famDeleted<=0`, 10-cap) end the loop
-     * normally.
+     * (empty, user head, blank family, `famDeleted<=0`) end the loop
+     * normally (R27-2: unbounded, no guard cap — termination by strict
+     * decrease, see [prune]).
      *
      * Still memory-only (NOT durable — no over-claim): restart drops this
      * set. Phase 1 guarantees only the no-orphan SHAPE (rollback on
      * crash-mid-fixup), not suspect durability across restart.
      *
-     * Head-only scope (at most 10 head families per sweep, only sweeps with
-     * `deletes>0` run the fixup): pre-R26/interior orphans below the head are
-     * NOT deleted by the fixup. While suspect is held they stay hidden behind
-     * the conservative all-flag; after a clean sweep clears suspect (or after
-     * restart, which drops this memory-only set) an interior orphan with no
-     * truncation evidence resumes compat (known limitation, disclosed in
-     * P1_SPEC/THREAT_MODEL — not a fail-open of new prunes).
+     * Head-only convergent scope (R27-2, Current): the fixup runs
+     * unconditionally in the same tx (no `deleted>0` gate) and clears ALL
+     * head orphans in a single sweep (unbounded `while(true)` +
+     * break-on-no-progress — termination by strict decrease, see [prune]).
+     * Small-ledger `deleted==0` sweeps also converge: only a post-fixup
+     * user/empty head clears suspect; a still-assistant head (blank family
+     * or `famDeleted<=0` residue) keeps suspect fail-closed. Pre-R26/interior
+     * orphans below the head are still NOT deleted by the fixup. While
+     * suspect is held they stay hidden behind the conservative all-flag;
+     * after a clean sweep clears suspect (or after restart, which drops this
+     * memory-only set) an interior orphan with no truncation evidence
+     * resumes compat (known limitation, disclosed in P1_SPEC/THREAT_MODEL —
+     * not a fail-open of new prunes).
      *
      * Crafted-ledger over-drop (disclosed): the family delete keys on
      * `parentRunId ?: runId` and assumes production write order + unique
@@ -801,64 +810,67 @@ class RoomSessionStore(
                         // reconcile + fixup success is gone — never a silent
                         // success.
                         afterEventDeleteHookForTest?.invoke(sid)
-                        val txDeleted = db.runInTransaction(
-                            Callable<Int> {
+                        val (txDeleted, headClean) = db.runInTransaction(
+                            Callable<Pair<Int, Boolean>> {
                                 var total = dao.deleteEventsBeyondLimit(
                                     sid,
                                     policy.maxEventsPerSession.coerceAtLeast(0),
                                 )
-                                if (total > 0) {
-                                    // Head-only fixup (at most 10 head
-                                    // families): while the oldest kept
-                                    // user/assistant row is an assistant, its
-                                    // whole logical family goes. The breaks
-                                    // below are size-convergent NORMAL
-                                    // termination only (empty, user head, blank
-                                    // family, famDeleted<=0, 10-cap) — a DAO
-                                    // throw is NEVER swallowed here: it aborts
-                                    // the tx (rollback) and propagates
-                                    // fail-closed via the catch below. The 10
-                                    // cap only stops a pathological loop over
-                                    // crafted empty families. A crafted ledger
-                                    // with >10 head orphan families needs a
-                                    // second sweep for the 11th (pinned by
-                                    // test, disclosed in P1_SPEC). Only runs
-                                    // when total>0, so a small ledger with a
-                                    // large keep (total==0) keeps its head
-                                    // orphan (conditional gate — pinned by
-                                    // test; the shape-aware change is Phase 2,
-                                    // not here).
-                                    var guard = 0
-                                    while (guard++ < 10) {
-                                        val oldest = dao.oldestHistory(sid, 1)
-                                        if (oldest.isEmpty()) break
-                                        val head = oldest[0]
-                                        if (head.kind == "user") break
-                                        val family = head.parentRunId ?: head.runId
-                                        if (family.isBlank()) break
-                                        val famDeleted = dao.deleteFamily(sid, family)
-                                        if (famDeleted <= 0) break
-                                        total += famDeleted
-                                    }
+                                // R27-2 convergent head-only fixup (Current):
+                                // UNCONDITIONAL in the same tx (no total>0 gate)
+                                // — while the oldest kept user/assistant row is
+                                // an assistant, its whole logical family goes.
+                                // Unbounded while(true) + break-on-no-progress:
+                                // empty / user head / blank family /
+                                // famDeleted<=0 end the loop normally; a DAO
+                                // throw is NEVER swallowed here: it aborts the
+                                // tx (rollback) and propagates fail-closed via
+                                // the catch below. Termination by strict
+                                // decrease: every non-breaking iteration deletes
+                                // >=1 row (famDeleted>0), so the DB row count
+                                // strictly drops — the loop must end.
+                                // Pathological empty families are stopped by the
+                                // isBlank / famDeleted<=0 breaks, making the old
+                                // 10-cap redundant; one sweep converges
+                                // arbitrary N (crafted 15-orphan scale is fine,
+                                // production splits at most one family).
+                                while (true) {
+                                    val oldest = dao.oldestHistory(sid, 1)
+                                    if (oldest.isEmpty()) break
+                                    val head = oldest[0]
+                                    if (head.kind == "user") break
+                                    val family = head.parentRunId ?: head.runId
+                                    if (family.isBlank()) break
+                                    val famDeleted = dao.deleteFamily(sid, family)
+                                    if (famDeleted <= 0) break
+                                    total += famDeleted
                                 }
-                                // NOTE (Phase 2 pending): total==0 runs NO
-                                // fixup (conditional gate, unchanged) — a
-                                // shape-aware sweep is a separate change.
-                                total
+                                // Shape-aware clean decision (same tx, atomic —
+                                // never a raw-cut-only visible shape): the final
+                                // head determines clean. Empty/user = converged
+                                // (no orphan left); still-assistant = residue
+                                // (blank or famDeleted<=0 no-progress) → not clean.
+                                val tail = dao.oldestHistory(sid, 1)
+                                val clean = tail.isEmpty() || tail[0].kind == "user"
+                                total to clean
                             },
                         )
-                        if (txDeleted == 0) {
-                            // Clean sweep: no truncation evidence from THIS sweep, so
-                            // the pre-published flag (and any prior one — per-sweep,
-                            // not sticky) is cleared. Safe: total==0 means the raw
-                            // cut deleted nothing, so the fixup (gated on
-                            // total>0) never ran — with no cut there is no cut
-                            // head family that could strand an orphan for the
-                            // flag to protect. Appends still
-                            // never clear (only sweeps publish).
+                        if (txDeleted == 0 && headClean) {
+                            // Clean sweep: no deletions AND post-fixup head is
+                            // user/empty — no truncation evidence and no orphan
+                            // left for the flag to protect, so the pre-published
+                            // flag (and any prior one — per-sweep, not sticky)
+                            // is cleared. Appends still never clear (only sweeps
+                            // publish).
                             pruneSuspectSessions.remove(sid)
                         } else {
-                            deletedEvents += txDeleted
+                            // Deleting sweep (txDeleted>0): keep pre-published
+                            // suspect (truncation evidence) and count. Residue
+                            // sweep (txDeleted==0 but head still assistant):
+                            // keep suspect fail-closed (no clear, no count) —
+                            // a blank/famDeleted<=0 no-progress orphan stays
+                            // protected.
+                            if (txDeleted > 0) deletedEvents += txDeleted
                         }
                     } catch (t: Throwable) {
                         // Test hook, raw cut, and/or fixup failed: a hook
@@ -877,10 +889,11 @@ class RoomSessionStore(
         }
 
     /**
-     * S4-F4(b) + R26-1: true when the LATEST [prune] sweep deleted rows for
-     * [sessionId]. Per-sweep, NOT sticky: a later clean sweep (`deleted==0`)
-     * clears it (new prunes leave no orphan behind, so nothing needs
-     * protecting); [deleteSession] clears it; appends never clear it.
+     * S4-F4(b) + R26-1 + R27-2 shape-aware: true when the LATEST [prune] sweep
+     * deleted rows for [sessionId] (or left a `deleted==0` head-orphan residue).
+     * Per-sweep, NOT sticky: a later clean sweep (`deleted==0` AND user/empty
+     * post-fixup head) clears it (new prunes leave no orphan behind, so nothing
+     * needs protecting); [deleteSession] clears it; appends never clear it.
      */
     override suspend fun isPruneSuspect(sessionId: String): Boolean =
         pruneSuspectSessions.contains(sessionId)
@@ -892,8 +905,9 @@ class RoomSessionStore(
         // S4-R2 suspect lifecycle: delete clears (session gone – no kept
         // assistant to stay suspect). Appends never clear (a later append
         // cannot resurrect a pruned pair); only sweeps publish — a clean
-        // sweep (deleted==0) clears, a deleting sweep sets. R26-1
-        // family-aware leaves no orphan behind, so restart needs no durable
+        // sweep (deleted==0 AND user/empty head, R27-2 shape-aware) clears,
+        // a deleting sweep sets, a deleted==0 residue sweep keeps fail-closed.
+        // R26-1 family-aware leaves no orphan behind, so restart needs no durable
         // flag for new prunes (memory-only set is race-closer, not
         // load-bearing).
         pruneSuspectSessions.remove(sessionId)

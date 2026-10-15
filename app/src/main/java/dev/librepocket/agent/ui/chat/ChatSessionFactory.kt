@@ -149,12 +149,12 @@ internal fun familyOf(event: TranscriptEvent): String = event.parentRunId ?: eve
  * window (oldest-first) must start at a user boundary: while its first
  * user/assistant row is an assistant, the whole logical family
  * ([familyOf]) is removed (its user was cut by prune/tail-cap; marker-first
- * implies user-less as the user row is older than its marker). Size-convergent:
- * the loop breaks when an iteration removes nothing (`filtered.size ==
- * kept.size`); the 10 cap only stops a pathological loop over crafted
- * empty/blank families (a crafted ledger with >10 head orphan families keeps
- * its 11th head family after one pass — needs a second pass, pinned by test
- * and disclosed in P1_SPEC; production cuts split at most one family).
+ * implies user-less as the user row is older than its marker). Single-pass
+ * convergent (R27-2): the loop breaks when an iteration removes nothing
+ * (`filtered.size == kept.size`); every non-breaking iteration strictly
+ * shrinks `kept`, so termination needs no cap and a crafted ledger with any
+ * N head orphan families converges in one pass (production cuts split at
+ * most one family).
  * Crafted runId-reuse over-drop (disclosed, reuse pin is Target): rows sharing the head family id
  * are removed wherever they sit (production runIds are unique + write-ordered;
  * crafted exceptions over-drop conservatively). Predicate difference vs the DB fixup
@@ -163,14 +163,13 @@ internal fun familyOf(event: TranscriptEvent): String = event.parentRunId ?: eve
  * but a different non-null parentRunId (production never takes that shape). Callers decide when to apply:
  * model history only with truncation/prune evidence (dropped>0 or suspect) to
  * preserve the R24-2/R25 precise flags; snapshots unconditionally (row-cap drops
- * are silent legacy, family drops stay silent too — with the same >10 crafted
- * narrow window: an 11th crafted head orphan can enter a fork copy).
+ * are silent legacy, family drops stay silent too — the same convergent
+ * helper runs here, so snapshots benefit identically).
  */
 internal fun dropHeadOrphanAssistantFamilies(events: List<TranscriptEvent>): List<TranscriptEvent> {
     if (events.isEmpty()) return events
     var kept: List<TranscriptEvent> = events
-    var guard = 0
-    while (guard++ < 10) {
+    while (true) {
         val head = kept.firstOrNull { it.kind == "user" || it.kind == "assistant" } ?: break
         if (head.kind == "user") break
         val family = familyOf(head)
@@ -1265,15 +1264,18 @@ class ChatSessionFactory(
  * unaffected. This over-flags plain truncated ledgers by design (safe
  * direction); the omission stays observable via `droppedCount`.
  *
- * S4-F4(b) + R26-1 family-aware (Current): the LATEST prune sweep's
+ * S4-F4(b) + R26-1/R27 family-aware (Current): the LATEST prune sweep's
  * outcome ([SessionStore.isPruneSuspect], pre-published before the DELETE to
- * close the F4 race, per-sweep NOT sticky — a later clean sweep clears it,
- * delete clears it, appends never clear it) forces the same conservative
- * all-flag even when `droppedCount==0`. R26-1 prune deletes the cut head
- * family (user boundary; head-only, at most 10 families, only on
- * `deletes>0` sweeps), so new prunes leave no user-less assistant behind
- * (crash-mid-fixup window excepted: raw cut and fixup are separate DAO
- * statements, see `RoomSessionStore` KDoc and P1_SPEC/THREAT_MODEL);
+ * close the F4 race, per-sweep NOT sticky — a later clean sweep
+ * (`deleted==0` AND user/empty post-fixup head) clears it, delete clears
+ * it, appends never clear it) forces the same conservative all-flag even
+ * when `droppedCount==0`. R26-1/R27 prune deletes the cut head family
+ * (user boundary; head-only, convergent — unbounded, any N head orphans in
+ * one sweep, unconditionally in the same tx with no `deletes>0` gate), so
+ * new prunes leave no user-less assistant behind (no crash-mid-fixup
+ * window: raw cut and fixup run in a single Room transaction per session —
+ * a kill between them rolls back, see `RoomSessionStore` KDoc and
+ * P1_SPEC/THREAT_MODEL);
  * readers additionally drop head orphan families when dropped>0 or suspect
  * (far-only preserves the R25 precise flag), so no orphan reaches model
  * context. Pre-R26/interior orphans below the head survive the fixup and,
@@ -1649,11 +1651,12 @@ internal suspend fun loadSwitchSnapshotEvents(store: SessionStore, sessionId: St
         if (page.size < HISTORY_PAGE) break
     }
     return SwitchSnapshotLoad(
-        // R26-1 family-aware (Current): never copy a head user-less assistant
-        // family (prune/tail-cap cut). Unconditional here (row-cap drops are
-        // silent legacy; family drops stay silent too); the existing dangling
-        // filter in snapshotSwitchHistory still drops user-without-terminal
-        // families separately.
+        // R26-1 family-aware (Current, R27-2 convergent): never copy a head
+        // user-less assistant family (prune/tail-cap cut). Unconditional here
+        // (row-cap drops are silent legacy; family drops stay silent too);
+        // the convergent helper drops any N head orphans in one pass. The
+        // existing dangling filter in snapshotSwitchHistory still drops
+        // user-without-terminal families separately.
         dropHeadOrphanAssistantFamilies(keptNewestFirst.asReversed()),
         droppedByBytes,
     )

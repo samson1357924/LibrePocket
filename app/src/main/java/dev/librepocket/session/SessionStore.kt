@@ -269,23 +269,24 @@ interface SessionStore {
     suspend fun prune(policy: PrunePolicy): PruneResult
 
     /**
-     * S4-F4 prune-marker suspect (hotfix b, small) + R26-1 family-aware
+     * S4-F4 prune-marker suspect (hotfix b, small) + R26-1/R27 family-aware
      * (Current): true when the LATEST [prune] sweep deleted rows for
-     * [sessionId], so a cut family may have existed. Callers
-     * ([loadModelHistory]) treat kept assistants as reasoning-suspect
-     * (fail-closed) when true. Per-sweep, NOT sticky: a later clean sweep
-     * (`deleted==0`) clears it, [deleteSession] clears it, appends never
-     * clear it. R26-1 prune deletes the cut HEAD family only (user
-     * boundary; at most 10 head families per `deletes>0` sweep), so new
-     * prunes leave no user-less assistant behind and restart needs no
-     * durable flag for new prunes (orphan shape durably absent; memory
-     * pre-publish only closes the delete→publish race). Pre-R26/interior
-     * orphans below the head are NOT deleted by the fixup: while suspect is
-     * held they hide behind the all-flag, but a clean sweep or a restart
-     * (memory-only set is dropped) resumes them compat when no truncation
-     * evidence exists (known limitation). Readers additionally drop head
-     * orphans when `dropped>0` or suspect (far-only never drops, preserving
-     * R25 precision).
+     * [sessionId] (or left a `deleted==0` head-orphan residue), so a cut
+     * family may have existed. Callers ([loadModelHistory]) treat kept
+     * assistants as reasoning-suspect (fail-closed) when true. Per-sweep,
+     * NOT sticky: a later clean sweep (`deleted==0` AND user/empty
+     * post-fixup head) clears it, [deleteSession] clears it, appends never
+     * clear it. R26-1/R27 prune deletes the cut HEAD family only (user
+     * boundary; unbounded convergent fixup, unconditionally in the same tx
+     * with no `deletes>0` gate), so new prunes leave no user-less assistant
+     * behind and restart needs no durable flag for new prunes (orphan shape
+     * durably absent; memory pre-publish only closes the delete→publish
+     * race). Pre-R26/interior orphans below the head are NOT deleted by the
+     * fixup: while suspect is held they hide behind the all-flag, but a
+     * clean sweep or a restart (memory-only set is dropped) resumes them
+     * compat when no truncation evidence exists (known limitation). Readers
+     * additionally drop head orphans when `dropped>0` or suspect (far-only
+     * never drops, preserving R25 precision).
      * Default false so hand-written fakes without prune stay clean.
      */
     suspend fun isPruneSuspect(sessionId: String): Boolean = false

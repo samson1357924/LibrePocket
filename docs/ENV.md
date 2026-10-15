@@ -9,7 +9,7 @@
 
 ## JDK and Gradle
 
-CI uses JDK 17. Use JDK 17 for closest CI parity; JDK 21 may be used locally, but it is not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed.
+CI uses JDK 25. Use JDK 25 for closest CI parity; older local JDKs (such as 21) may still build locally, but they are not the CI baseline. The repository pins the Gradle wrapper; a system Gradle installation is not needed.
 
 ```sh
 java -version

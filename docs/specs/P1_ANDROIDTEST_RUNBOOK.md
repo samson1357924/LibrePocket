@@ -21,7 +21,7 @@ For relevant code/policy changes, the regular pull-request workflow gates unit/R
 
 ## Example execution
 
-Use JDK 17 for CI parity, set `ANDROID_HOME`, and confirm a device is connected. Run one Gradle/test process at a time.
+Use JDK 25 for CI parity, set `ANDROID_HOME`, and confirm a device is connected. Run one Gradle/test process at a time.
 
 ```sh
 export ANDROID_HOME="$HOME/Android/Sdk"

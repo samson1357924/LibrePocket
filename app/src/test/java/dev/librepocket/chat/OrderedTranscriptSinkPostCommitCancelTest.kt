@@ -40,7 +40,7 @@ import org.junit.Test
  * `RoomSessionStore` tail, so a future Room-side over-fix (e.g. swallowing an
  * in-transaction cancel) would still pass here. TODO(R5-6-followup): once
  * Robolectric runs (blocked locally by the JDK21 native-SQLite
- * UnsatisfiedLinkError; CI JDK17 must run it), add a true Room test — 100
+ * UnsatisfiedLinkError; CI JDK 25 must run it), add a true Room test — 100
  * appends with the prune sweep throwing [CancellationException] must still
  * return the rowId, and an in-transaction cancel must still propagate.
  */

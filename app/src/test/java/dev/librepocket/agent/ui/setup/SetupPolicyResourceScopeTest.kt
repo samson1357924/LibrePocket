@@ -22,11 +22,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
@@ -132,19 +135,15 @@ class SetupPolicyResourceScopeTest {
         )
     }
 
-    private fun awaitTestIdle(vm: SetupViewModel, timeoutMs: Long = 8000) {
-        val end = System.currentTimeMillis() + timeoutMs
-        while (vm.form.value.testing) {
-            if (System.currentTimeMillis() > end) error("timed out waiting for test")
-            Thread.sleep(10)
+    private suspend fun awaitTestIdle(vm: SetupViewModel) {
+        withTimeout(10_000) {
+            while (vm.form.value.testing) delay(5)
         }
     }
 
-    private fun awaitModelsIdle(vm: SetupViewModel, timeoutMs: Long = 8000) {
-        val end = System.currentTimeMillis() + timeoutMs
-        while (vm.form.value.modelsLoading) {
-            if (System.currentTimeMillis() > end) error("timed out waiting for models")
-            Thread.sleep(10)
+    private suspend fun awaitModelsIdle(vm: SetupViewModel) {
+        withTimeout(10_000) {
+            while (vm.form.value.modelsLoading) delay(5)
         }
     }
 
@@ -154,7 +153,7 @@ class SetupPolicyResourceScopeTest {
         vm.onApiKeyChange("unit-test-key-12345678")
     }
 
-    @Test fun testConnectionCustomUrlUsesPresetResource() {
+    @Test fun testConnectionCustomUrlUsesPresetResource() = runBlocking {
         val url = "http://127.0.0.1:11434/v1"
         val policy = RecordingAllowPolicy()
         val fake = CapturingProbeProvider()
@@ -171,7 +170,7 @@ class SetupPolicyResourceScopeTest {
         assertTrue(policy.actions.all { it == "provider.call" })
     }
 
-    @Test fun refreshModelsCustomUrlUsesPresetResource() {
+    @Test fun refreshModelsCustomUrlUsesPresetResource() = runBlocking {
         val url = "http://127.0.0.1:11434/v1"
         val policy = RecordingAllowPolicy()
         val fake = CapturingProbeProvider()
@@ -188,7 +187,7 @@ class SetupPolicyResourceScopeTest {
         assertTrue(policy.actions.all { it == "provider.call" })
     }
 
-    @Test fun probeTransportIdentityIsPerUrlWhileResourceStaysPreset() {
+    @Test fun probeTransportIdentityIsPerUrlWhileResourceStaysPreset() = runBlocking {
         val urlA = "http://127.0.0.1:11434/v1"
         val urlB = "http://127.0.0.1:11435/v1"
         val capturedA: Array<ProviderConfig?> = arrayOfNulls(1)
@@ -222,7 +221,7 @@ class SetupPolicyResourceScopeTest {
         assertNotEquals(configA.id, configB.id)
     }
 
-    @Test fun singlePresetAllowAuthorizesEveryCustomUrl_documented() {
+    @Test fun singlePresetAllowAuthorizesEveryCustomUrl_documented() = runBlocking {
         // Documents the Stage2-known residual: authorization is preset-shared,
         // so one `preset:custom` ALLOW covers distinct custom URLs. If Stage2
         // scopes authorization per endpoint, this test must change with it.

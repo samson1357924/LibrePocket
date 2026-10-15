@@ -28,6 +28,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -333,6 +334,63 @@ class SetupEndpointIdMigrationTest {
         assertEquals(0, vault.deleteKeys)
         val after = withTimeout(10_000) { store.snapshotStrict() }
         assertEquals("preset:custom", after?.providerId)
+    }
+
+    /**
+     * Triple rejection (write side): a non-legacy row whose vault alias falls
+     * outside its own providerId namespace is rejected by save() — the old
+     * mixed shape (per-URL id over the shared fixed slot) can never be
+     * written, even by hand.
+     */
+    @Test
+    fun mismatchedAliasRowIsRejectedOnSave() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val store = newStore()
+        val id = SetupValidation.deriveEndpointId("custom", url)
+        try {
+            store.save(
+                EndpointConfig(
+                    providerId = id,
+                    presetId = "custom",
+                    label = "自訂",
+                    baseUrl = url,
+                    protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                    model = "local",
+                    apiKeyRef = "provider_key/preset:custom",
+                ),
+            )
+            error("expected PROVIDER_KEY_REF_NAMESPACE_MISMATCH")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("PROVIDER_KEY_REF_NAMESPACE_MISMATCH", e.message)
+        }
+        assertNull(store.observe().first())
+    }
+
+    /**
+     * Triple rejection (read side): the same mixed shape, if present via a
+     * dirty write, reports NO_KEY readiness with zero vault reads — it can
+     * never become READY.
+     */
+    @Test
+    fun mismatchedAliasRowReadsAsNoKeyWithZeroVaultReads() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val id = SetupValidation.deriveEndpointId("custom", url)
+        val store = newStore()
+        store.dataStore.edit { prefs ->
+            prefs[ENDPOINT_PROVIDER_ID_V1] = id
+            prefs[ENDPOINT_PRESET_ID_V1] = "custom"
+            prefs[ENDPOINT_LABEL_V1] = "自訂"
+            prefs[ENDPOINT_BASE_URL_V1] = url
+            prefs[ENDPOINT_PROTOCOL_V1] = "CHAT_COMPLETIONS"
+            prefs[ENDPOINT_MODEL_V1] = "local"
+            prefs[ENDPOINT_API_KEY_REF_V1] = "provider_key/preset:custom"
+        }
+        val vault = CountingVault()
+        assertEquals(EndpointReadiness.NO_KEY, store.readiness(vault))
+        assertEquals(0, vault.hasKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.putKeys)
+        assertEquals(0, vault.deleteKeys)
     }
 
     /**

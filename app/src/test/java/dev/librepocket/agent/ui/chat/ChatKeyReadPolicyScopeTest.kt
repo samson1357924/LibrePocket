@@ -103,6 +103,26 @@ class ChatKeyReadPolicyScopeTest {
         }
     }
 
+    @Test fun createWithMismatchedAliasIsDeniedWithZeroVaultReads() = runBlocking {
+        // The old mixed shape (per-URL entity id over the shared fixed slot)
+        // fails closed in captureCredential before any vault read, even with
+        // a preset-scope ALLOW in place.
+        val id = SetupValidation.deriveEndpointId("custom", customUrl)
+        val mixed = customEndpoint().copy(apiKeyRef = "provider_key/preset:custom")
+        assertEquals(id, mixed.providerId)
+        val policy = InMemoryPolicyStore(
+            initialRules = listOf(PolicyRule("key.read:preset:custom", Verdict.ALLOW, 10)),
+        )
+        val vaultAcquisitions = AtomicInteger(0)
+        try {
+            factoryWith(policy, vaultAcquisitions).create(mixed, "must deny")
+            fail("cross-namespace ref must fail closed")
+        } catch (e: CaptureDeniedException) {
+            assertEquals("PROVIDER_KEY_REF_NAMESPACE_MISMATCH", e.message)
+            assertEquals(0, vaultAcquisitions.get())
+        }
+    }
+
     @Test fun openForkPathWithExactPresetScopeRuleSucceeds() = runBlocking {
         // Same pin through the fork path: a cross-origin ledger must fork
         // (not deny) when the preset scope allows.

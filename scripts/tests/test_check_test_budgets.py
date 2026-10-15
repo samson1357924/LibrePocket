@@ -543,6 +543,97 @@ class CheckTestBudgetsTest(unittest.TestCase):
             v = check_test_budgets.check_file(p)
             self.assertTrue(any("H2" in x for x in v), v)
 
+    def test_h2_single_line_nested_block_comment_passes(self) -> None:
+        # P2-3: Kotlin block comments nest — the inner `*/` closes only
+        # the inner level, so the `repeat` stays inside the outer comment.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NestedSingleTest.kt",
+                "/* outer /* inner */ "
+                'repeat(2_000){store.appendEvent(event(sid,"q"))} */\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_multiline_nested_block_comment_passes(self) -> None:
+        # P2-3: the inner `*/` must not close the outer level; the loop on
+        # the following line is still commented out.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NestedMultiTest.kt",
+                "/* outer\n"
+                "   /* inner */\n"
+                '   repeat(2_000){store.appendEvent(event(sid,"q"))}\n'
+                "*/\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_triple_nested_with_braces_and_quotes_passes(self) -> None:
+        # P2-3: 3 levels plus `{`/`}`/quotes inside the comment stay masked
+        # and never affect brace pairing.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NestedTripleTest.kt",
+                '/* a /* b /* c { " } " */\n'
+                '   repeat(2_000){store.appendEvent(event(sid,"q"))}\n'
+                "   */\n"
+                "   */\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_unclosed_outer_block_comment_passes(self) -> None:
+        # P2-3: unclosed outer level keeps EOF semantics — lines after the
+        # inner close are still in the comment.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NestedUnclosedTest.kt",
+                "/* outer /* inner */\n"
+                'repeat(2_000){store.appendEvent(event(sid,"q"))}\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_closed_block_then_real_loop_fails(self) -> None:
+        # P2-3 non-nested control: a closed `/* a */` must not over-mask —
+        # the real loop after it still triggers H2.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "ClosedBlockControlTest.kt",
+                "/* a */ "
+                'repeat(2_000){store.appendEvent(event(sid,"q"))}\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h2_line_comment_block_opener_ignored(self) -> None:
+        # P2-3: `/*` inside `//` never opens a block, so the real loop on
+        # the next line still triggers H2.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "LineCommentBlockTest.kt",
+                "// /* not a block\n"
+                'repeat(2_000){store.appendEvent(event(sid,"q"))}\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h2_string_block_opener_ignored(self) -> None:
+        # P2-3: `/*` inside a string never counts toward block depth, so
+        # the real loop after the string still triggers H2 (no over-mask).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "StringBlockTest.kt",
+                'val s = "/* not a block"\n'
+                'repeat(2_000){store.appendEvent(event(sid,"q"))}\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
     def test_h2_boundary_1999_passes_2000_fails(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             ok = _write(

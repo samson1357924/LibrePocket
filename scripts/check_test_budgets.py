@@ -107,11 +107,12 @@ REPEAT_WINDOW_LINES = 12
 def _mask_kotlin_braces(lines: list[str]) -> tuple[list[int], list[bool]]:
     """Per-line brace deltas and has-brace flags, ignoring Kotlin strings and
     comments (so `{`/`}` inside `"..."`, `\"\"\"...\"\"\"`, `'c'`, `//...` and
-    `/*...*/` never open or close a counted block). Tracks block comments and
-    raw strings across lines; `$"..."` template braces are string content."""
+    `/*...*/` never open or close a counted block). Tracks nested block
+    comments (integer depth, `/*` inside a block nests) and raw strings
+    across lines; `$"..."` template braces are string content."""
     deltas: list[int] = []
     has_brace: list[bool] = []
-    in_block = False
+    block_depth = 0
     in_raw = False
     for line in lines:
         depth = 0
@@ -122,9 +123,13 @@ def _mask_kotlin_braces(lines: list[str]) -> tuple[list[int], list[bool]]:
         while i < n:
             c = line[i]
             nxt = line[i + 1] if i + 1 < n else ""
-            if in_block:
+            if block_depth > 0:
+                if c == "/" and nxt == "*":
+                    block_depth += 1
+                    i += 2
+                    continue
                 if c == "*" and nxt == "/":
-                    in_block = False
+                    block_depth -= 1
                     i += 2
                     continue
                 i += 1
@@ -155,7 +160,7 @@ def _mask_kotlin_braces(lines: list[str]) -> tuple[list[int], list[bool]]:
             if c == "/" and nxt == "/":
                 break
             if c == "/" and nxt == "*":
-                in_block = True
+                block_depth += 1
                 i += 2
                 continue
             if line[i : i + 3] == '"""':
@@ -185,12 +190,13 @@ def _mask_kotlin_braces(lines: list[str]) -> tuple[list[int], list[bool]]:
 def _masked_kotlin_lines(lines: list[str]) -> list[str]:
     """Masked code lines: chars inside Kotlin strings/comments replaced with
     spaces, preserving column alignment (same state machine as
-    `_mask_kotlin_braces`: `"..."`, `'c'`, `\"\"\"raw\"\"\"`, `//`, `/* */`,
-    escapes, cross-line block/raw; `$"..."` template braces stay string
-    content). `REPEAT`/`appendEvent`/fast-path matches run on these lines so
-    commented-out or string-demo code never counts."""
+    `_mask_kotlin_braces`: `"..."`, `'c'`, `\"\"\"raw\"\"\"`, `//`, nested
+    `/* */` via integer depth, escapes, cross-line block/raw; `$"..."`
+    template braces stay string content). `REPEAT`/`appendEvent`/fast-path
+    matches run on these lines so commented-out or string-demo code never
+    counts."""
     masked: list[str] = []
-    in_block = False
+    block_depth = 0
     in_raw = False
     for line in lines:
         out = list(line)
@@ -200,11 +206,17 @@ def _masked_kotlin_lines(lines: list[str]) -> list[str]:
         while i < n:
             c = line[i]
             nxt = line[i + 1] if i + 1 < n else ""
-            if in_block:
+            if block_depth > 0:
+                if c == "/" and nxt == "*":
+                    out[i] = " "
+                    out[i + 1] = " "
+                    block_depth += 1
+                    i += 2
+                    continue
                 if c == "*" and nxt == "/":
                     out[i] = " "
                     out[i + 1] = " "
-                    in_block = False
+                    block_depth -= 1
                     i += 2
                     continue
                 out[i] = " "
@@ -251,7 +263,7 @@ def _masked_kotlin_lines(lines: list[str]) -> list[str]:
             if c == "/" and nxt == "*":
                 out[i] = " "
                 out[i + 1] = " "
-                in_block = True
+                block_depth += 1
                 i += 2
                 continue
             if line[i : i + 3] == '"""':

@@ -390,6 +390,8 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
  * messages) stay typed end-to-end for TurnController's pending-flush guard.
  * Other branches keep `code = null` (legacy/classified failures).
+ * Unknown runtime failures fail closed (`retryable = false`): only the
+ * typed branches above may retry, and TurnController owns that budget.
  */
 internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit): Flow<StreamEvent> =
     flow(block)
@@ -411,7 +413,7 @@ internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit)
                     val kind = ProviderErrorClassifier.classify(null, e, null)
                     emit(StreamEvent.Failed(redactedError("PROVIDER_TRANSPORT", e.message), kind == FailureKind.RETRYABLE))
                 }
-                else -> emit(StreamEvent.Failed(redactedError(e.message ?: "PROVIDER_FAILURE"), retryable = true))
+                else -> emit(StreamEvent.Failed(redactedError(e.message ?: "PROVIDER_FAILURE"), retryable = false))
             }
         }
         .flowOn(Dispatchers.IO)

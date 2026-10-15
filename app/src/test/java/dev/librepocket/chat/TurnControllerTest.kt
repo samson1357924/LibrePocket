@@ -952,6 +952,69 @@ class TurnControllerTest {
     assertTrue(c.uiState.value.error!!.length <= 500)
   }
 
+  @Test fun unknownRuntimeExceptionFromProviderDoesNotRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      throw RuntimeException("boom-unknown")
+    }
+    val c = controller(provider, delays = delays)
+    runBlocking { c.send("hi") }
+    assertEquals(1, calls.get())
+    assertEquals(1, provider.streamCalls.get())
+    assertTrue("unknown failure schedules no backoff", delays.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertNotNull(c.uiState.value.error)
+  }
+
+  @Test fun validationExceptionFromProviderDoesNotRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      throw IllegalArgumentException("bad request shape")
+    }
+    val c = controller(provider, delays = delays)
+    runBlocking { c.send("hi") }
+    assertEquals(1, calls.get())
+    assertEquals(1, provider.streamCalls.get())
+    assertTrue("validation failure schedules no backoff", delays.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertNotNull(c.uiState.value.error)
+  }
+
+  // IAE/unknown flush asymmetry pin (Current): IAE keeps the historical
+  // flush (validation = request shape, same observable pending-tool behavior
+  // as the pre-split generic branch), while unknown runtime fails closed
+  // with no flush — possibly-poisoned pending fragments are dropped like
+  // AGG_TOO_LARGE/Error, and the typed terminal error is the record.
+  @Test fun unknownRuntimeWithPendingToolDeltaDoesNotFlush() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw RuntimeException("boom-unknown")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertNotNull(c.uiState.value.error)
+    assertFalse(
+      "unknown failure must not leave a pending-tool marker",
+      assistantsOf(c).single().text.contains("[tool:"),
+    )
+    assertTrue(
+      "unknown failure must not persist possibly-poisoned pending tools",
+      sink.tools.isEmpty(),
+    )
+  }
+
   @Test fun policyDenyBlocksSend() {
     val provider = FakeLlmProvider {
       flow { emit(StreamEvent.Done("stop")) }

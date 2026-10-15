@@ -4554,15 +4554,25 @@ class TurnController(
         // recording poison-adjacent pending tools (the typed terminal error
         // is the observable record). Visible text is already current because
         // text updates stay per-delta (see uiTextUpdateCount).
-      } catch (e: Exception) {
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
+      } catch (e: IllegalArgumentException) {
+        // Validation fail-closed (mirrors streamingFlow's IAE branch):
+        // malformed request/arguments never retry. Flush stays: same
+        // observable pending-tool behavior as the previous generic branch.
+        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
         flushPendingTools()
+      } catch (e: Exception) {
+        // Unknown runtime failure fails closed: never retry, never persist
+        // possibly-poisoned pending tool fragments (mirrors the Error branch
+        // below). TurnController is the sole retry owner; only explicit
+        // retryable Failed terminals retry.
+        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
       } catch (e: Throwable) {
         // S3-F1 Error symmetry (Current, option (a)): fatal Error from the
         // provider stream (e.g. AssertionError/LinkageError from a buggy
         // adapter) is a non-retryable terminal like AGG_TOO_LARGE — never
-        // flush poison-adjacent pending ToolDeltas (unlike Exception, which
-        // flushes), never retry. The outer hostedTurn Throwable catch below
+        // flush poison-adjacent pending ToolDeltas (like the unknown-Exception
+        // branch above, which also fails closed), never retry. The outer
+        // hostedTurn Throwable catch below
         // (or the retry-exhausted terminal path here) still projects
         // sanitizeError → UI ERROR. CancellationException never lands here
         // (rethrown first above), so CE semantics are unchanged. VM-fatal

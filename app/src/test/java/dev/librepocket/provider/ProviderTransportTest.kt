@@ -900,6 +900,39 @@ class ProviderTransportTest {
         }
     }
 
+    @Test
+    fun streamingFlowUnknownRuntimeFailureFailsClosed() = runBlocking {
+        val events = withTimeout(3_000) {
+            streamingFlow {
+                emit(StreamEvent.TextDelta(0, 0, "hi"))
+                throw RuntimeException("boom-unknown")
+            }.toList()
+        }
+        val failure = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse("unknown runtime failure must not retry", failure.retryable)
+    }
+
+    @Test
+    fun streamingFlowValidationFailureStaysFatal() = runBlocking {
+        val events = withTimeout(3_000) {
+            streamingFlow { throw IllegalArgumentException("bad-arg") }.toList()
+        }
+        val failure = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse("validation failure must not retry", failure.retryable)
+    }
+
+    @Test
+    fun streamingFlowRethrowsCancellation() = runBlocking {
+        try {
+            withTimeout(3_000) {
+                streamingFlow { throw CancellationException("cancel-test") }.toList()
+            }
+            fail("CancellationException must propagate, not become a Failed event")
+        } catch (_: CancellationException) {
+            // Expected: cancellation stays cancellation, never a retryable failure.
+        }
+    }
+
     private fun providerFor(protocol: ProviderProtocol, server: MockWebServer, client: OkHttpClient? = null): LlmProvider {
         val base = server.url("/").toString().trimEnd('/')
         val cfg = config(protocol, base)

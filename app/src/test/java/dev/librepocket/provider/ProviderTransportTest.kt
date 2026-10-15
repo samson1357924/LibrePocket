@@ -921,6 +921,17 @@ class ProviderTransportTest {
     }
 
     @Test
+    fun streamingFlowNonFatalErrorFailsClosedWithProvenance() = runBlocking {
+        // S4对照 pin (Current): non-VM Error stays fail-closed with provenance.
+        val events = withTimeout(3_000) {
+            streamingFlow { throw AssertionError("boom-assert") }.toList()
+        }
+        val failure = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse(failure.retryable)
+        assertEquals(ProviderFailureCode.UNKNOWN_RUNTIME.name, failure.code)
+    }
+
+    @Test
     fun streamingFlowValidationFailureStaysFatal() = runBlocking {
         val events = withTimeout(3_000) {
             streamingFlow { throw IllegalArgumentException("bad-arg") }.toList()

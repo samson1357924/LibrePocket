@@ -1079,6 +1079,78 @@ class TurnControllerTest {
     assertEquals("terminal failure must be recorded", 1, sink.failed.size)
   }
 
+  // S4对照 pin (Current): IAE keeps the historical flush (validation path),
+  // asymmetric with unknown which discards.
+  @Test fun validationWithPendingToolDeltaDoesFlush() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw IllegalArgumentException("bad-arg")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertEquals(1, sink.tools.size)
+    assertTrue(
+      "validation flush must leave a pending-tool marker",
+      assistantsOf(c).single().text.contains("[tool:"),
+    )
+  }
+
+  // S4对照 pin (Current): completed ToolDone stays, only pending is
+  // discarded on unknown failure.
+  @Test fun unknownFailureKeepsCompletedToolDoneDropsPending() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ToolDone(0, "call_1", "lookup", "{\"q\":\"hi\"}"))
+        emit(StreamEvent.ToolDelta(1, "call_y", "lookup", "{\"q\":\"bye\"}"))
+        throw RuntimeException("boom-unknown")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertEquals(1, sink.tools.size)
+    assertEquals(0, sink.tools.single().toolIndex)
+    assertEquals("call_1", sink.tools.single().id)
+    val body = assistantsOf(c).single().text
+    assertTrue("completed ToolDone marker stays", body.contains("[tool:lookup"))
+    assertFalse("pending ToolDelta marker must be dropped", body.contains("bye"))
+  }
+
+  // S4对照 pin (Current): fatal Failed with code == null (e.g. 401) keeps
+  // the historical flush — over-discarding would break benign fatals.
+  @Test fun fatalFailedEventWithNullCodeStillFlushes() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        emit(StreamEvent.Failed("http 401 unauthorized", retryable = false))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertEquals(1, sink.tools.size)
+    assertTrue(
+      assistantsOf(c).single().text.contains("[tool:"),
+    )
+  }
+
   @Test fun policyDenyBlocksSend() {
     val provider = FakeLlmProvider {
       flow { emit(StreamEvent.Done("stop")) }

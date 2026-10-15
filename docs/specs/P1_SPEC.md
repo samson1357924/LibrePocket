@@ -356,8 +356,8 @@ sealed interface StreamEvent {
   data class Usage(val inputTokens: Int?, val outputTokens: Int?) : StreamEvent
   /** 終態：成功（攜帶 finish 原因；P1 不執行工具，tool_calls 僅記錄）。 */
   data class Done(val finishReason: String) : StreamEvent
-  /** 終態：失敗（已分類；retryable 指導 TurnController 是否重試）。 */
-  data class Failed(val message: String, val retryable: Boolean) : StreamEvent
+  /** 終態：失敗（已分類；retryable 指導 TurnController 是否重試；code 攜帶型別化失敗碼）(Current)。 */
+  data class Failed(val message: String, val retryable: Boolean, val code: String? = null) : StreamEvent
   /** 重試通知（第幾次、等待多久；UI 顯示「重試中 1/3…」）。 */
   data class Retrying(val attempt: Int, val maxAttempts: Int, val delayMs: Long) : StreamEvent
 }
@@ -471,7 +471,7 @@ object ProviderErrorClassifier {
 | RETRYABLE | 連接中斷、讀超時、提前 EOF、HTTP 408/409/425/429/5xx（除 501）、`SSE_TRUNCATED` | `true` |
 | FATAL | 401/403（認證）、402/402變體（額度/計費）、400/422（協議格式）、證書錯誤（SSLHandshake）、`IMAGE_TOO_LARGE`、`SSE_LINE_TOO_LONG`、`SSE_FRAME_TOO_LARGE`、`TOOL_ARGS_TOO_LARGE`、URL/協議配置錯 | `false` |
 | 啟發式 | body 含 `insufficient_quota|billing|invalid_api_key|unauthorized|image_too_large|sse_line_too_long|sse_frame_too_large|tool_args_too_large`（大小寫無關） → FATAL；含 `rate_limit|overloaded|timeout|temporarily` → RETRYABLE | — |
-- 型別化交叉引用（Current）：聚合／SSE 預算溢出另以型別化 `ProviderFailureCode.AGG_TOO_LARGE`（`ProviderFailure.code`／`StreamEvent.Failed.code`，見 §3.4 事件預算）傳遞，與上表 body 標記同義（`isResourceExhausted` 認 code 亦認 marker）。
+- 型別化交叉引用（Current）：聚合／SSE 預算溢出另以型別化 `ProviderFailureCode.AGG_TOO_LARGE`（`ProviderFailure.code`／`StreamEvent.Failed.code`）傳遞，與上表 body 標記同義（`isResourceExhausted` 認 code 亦認 marker；實作見 `StreamEvent.kt`／`ProviderTransport.streamingFlow`／`TurnController.shouldDiscardPendingTools`）。未知 runtime 失敗另以 `ProviderFailureCode.UNKNOWN_RUNTIME` 傳遞（`streamingFlow` unknown fallback／直接拋 unknown／Error），`shouldDiscardPendingTools` 認 `AGG_TOO_LARGE` 或 `UNKNOWN_RUNTIME`；其他 `code == null` 致命事件（401／validation）維持 flush。
 
 ### 5.3 重試語義
 

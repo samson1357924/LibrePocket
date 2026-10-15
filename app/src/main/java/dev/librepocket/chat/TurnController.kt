@@ -4416,6 +4416,25 @@ class TurnController(
           }
         }
       }
+      // Flush pending tools unless the terminal says discard. A flush that
+      // itself trips the per-call budget (the synthetic pending id/name
+      // defaults are not delta-billed, so a boundary-sized buffer can
+      // overflow here) converts to the typed terminal instead of escaping
+      // the attempt scope and skipping terminal bookkeeping. Only
+      // ProviderFailure is converted; cancellation still propagates.
+      suspend fun flushCatchingBudgetOverflow() {
+        if (!shouldDiscardPendingTools(failed)) {
+          try {
+            flushPendingTools()
+          } catch (e: ProviderFailure) {
+            failed = StreamEvent.Failed(
+              e.message ?: "provider error",
+              retryable = false,
+              code = e.code?.name ?: inferAggFailureCodeName(e.message),
+            )
+          }
+        }
+      }
       try {
         provider.stream(request).collect { event ->
           coroutineContext.ensureActive()
@@ -4560,47 +4579,52 @@ class TurnController(
           code = e.code?.name ?: inferAggFailureCodeName(e.message),
         )
         // Single source of truth with the Failed-event path above: discard
-        // covers typed AGG_TOO_LARGE (incl. message-inferred legacy shape)
-        // and UNKNOWN_RUNTIME; other ProviderFailures (e.g. 401) flush.
-        if (!shouldDiscardPendingTools(failed)) {
-          flushPendingTools()
-        }
+        // covers typed AGG_TOO_LARGE (incl. message-inferred legacy shape).
+        // UNKNOWN_RUNTIME arrives via the Failed-event path and the
+        // unknown-Exception/Throwable catches below (built-in adapters never
+        // throw it as a ProviderFailure; a custom one carrying it still
+        // discards via the same predicate); other ProviderFailures
+        // (e.g. 401) flush.
+        flushCatchingBudgetOverflow()
         // AGG_TOO_LARGE is this collector's own guard: fail closed without
         // recording poison-adjacent pending tools (the typed terminal error
         // is the observable record). Visible text is already current because
         // text updates stay per-delta (see uiTextUpdateCount).
       } catch (e: IllegalArgumentException) {
         // Validation fail-closed (mirrors streamingFlow's IAE branch):
-        // malformed request/arguments never retry. Flush stays: same
-        // observable pending-tool behavior as the previous generic branch.
+        // malformed request/arguments never retry. Flush stays, guarded by
+        // the same discard predicate as the Failed-event path (an overflow
+        // marker in the message still discards).
         coroutineContext.ensureActive()
         failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
-        flushPendingTools()
+        flushCatchingBudgetOverflow()
       } catch (e: IOException) {
         // Direct transport failure (synchronously thrown by stream() or by
         // the returned Flow before any terminal event): classify like
         // streamingFlow's IOException branch so transient failures retry
-        // regardless of throw site. Transport failures are not
-        // poison-adjacent, so the pending flush stays (matches the
-        // Failed-event path, which flushes).
+        // regardless of throw site. The pending flush stays, guarded by the
+        // same discard predicate as the Failed-event path (code == null
+        // without overflow markers flushes on both paths).
         coroutineContext.ensureActive()
         val kind = ProviderErrorClassifier.classify(null, e, null)
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
           retryable = kind == FailureKind.RETRYABLE,
         )
-        flushPendingTools()
+        flushCatchingBudgetOverflow()
       } catch (e: Exception) {
         // Unknown runtime failure fails closed: never retry, never persist
         // possibly-poisoned pending tool fragments (mirrors the Error branch
         // below). TurnController is the sole retry owner; only explicit
         // retryable Failed terminals retry. Carries UNKNOWN_RUNTIME so a
-        // forwarded terminal stays distinguishable from flushable fatals.
+        // forwarded terminal stays distinguishable from flushable fatals
+        // (an overflow marker in the message still reports AGG_TOO_LARGE,
+        // like the ProviderFailure projection above).
         coroutineContext.ensureActive()
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
           retryable = false,
-          code = ProviderFailureCode.UNKNOWN_RUNTIME.name,
+          code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
         )
       } catch (e: Throwable) {
         // S3-F1 Error symmetry (Current, option (a)): fatal Error from the
@@ -4618,7 +4642,7 @@ class TurnController(
         failed = StreamEvent.Failed(
           e.message ?: "provider error",
           retryable = false,
-          code = ProviderFailureCode.UNKNOWN_RUNTIME.name,
+          code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
         )
       }
       val failure = failed

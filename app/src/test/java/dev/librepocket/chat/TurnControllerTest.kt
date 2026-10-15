@@ -988,31 +988,101 @@ class TurnControllerTest {
   // S3 parity pin (Current): a direct transport failure thrown synchronously
   // by stream() or by the returned Flow before any terminal event is
   // classified like streamingFlow's IOException branch, so a transient (e.g.
-  // SocketTimeout) retries regardless of throw site.
+  // SocketTimeout) retries regardless of throw site — with the same pending
+  // flush as the Failed-event path (one flushed tool per attempt).
   @Test fun directTransportFailureRetriesLikeStreamingFlow() {
     val calls = AtomicInteger(0)
     val delays = mutableListOf<Long>()
     val provider = FakeLlmProvider {
       calls.incrementAndGet()
-      throw java.net.SocketTimeoutException("timed out")
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw java.net.SocketTimeoutException("timed out")
+      }
     }
+    val sink = RecordingSink()
     val c = controller(
       provider,
       delays = delays,
       retry = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(0L)),
+      transcript = sink,
     )
-    runBlocking { c.send("hi") }
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
     assertEquals(2, calls.get())
     assertEquals(2, provider.streamCalls.get())
     assertEquals(listOf(0L), delays)
     assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertEquals("each attempt flushes its pending tool like the Failed-event path", 2, sink.tools.size)
+  }
+
+  // Direct-path symmetry pin (Current): the IAE/IOException direct catches
+  // use the same discard predicate as the Failed-event path, so a legacy
+  // overflow marker in the message still discards instead of flushing.
+  @Test fun directValidationWithOverflowMarkerDoesNotFlush() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw IllegalArgumentException("boom TOOL_ARGS_TOO_LARGE boom")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, delays = delays, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertTrue(delays.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(sink.tools.isEmpty())
+    assertFalse(assistantsOf(c).single().text.contains("[tool:"))
+  }
+
+  // Boundary pin (Current): a pending buffer parked exactly at the per-call
+  // budget passes delta billing, but the flush adds unbilled synthetic
+  // pending id/name defaults and trips the same budget. The flush failure
+  // must convert to the typed terminal (no escape, no poison record).
+  @Test fun boundaryPendingFlushFailureConvertsToTypedTerminal() {
+    // MAX_TOOL_CALL_AGG_BYTES = 1MiB, x3 char->byte estimate: billable max
+    // is 349525 chars; the synthetic "call_pending_0"+"pending" defaults
+    // add 21 chars at flush time to overflow it.
+    val boundary = "x".repeat(349_525)
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ToolDelta(0, null, null, boundary))
+        throw IllegalArgumentException("bad-arg")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(
+      "flush budget overflow must surface the typed terminal, got: ${c.uiState.value.error}",
+      c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"),
+    )
+    assertTrue("poison-adjacent pending must not be recorded", sink.tools.isEmpty())
+    assertEquals("terminal failure must be recorded, not escape", 1, sink.failed.size)
   }
 
   // IAE/unknown flush asymmetry pin (Current): IAE keeps the historical
   // flush (validation = request shape, same observable pending-tool behavior
-  // as the pre-split generic branch), while unknown runtime fails closed
-  // with no flush — possibly-poisoned pending fragments are dropped like
-  // AGG_TOO_LARGE/Error, and the typed terminal error is the record.
+  // as the pre-split generic branch), except legacy overflow-marker messages
+  // which discard like the Failed-event path (see directValidation...);
+  // while unknown runtime fails closed with no flush — possibly-poisoned
+  // pending fragments are dropped like AGG_TOO_LARGE/Error, and the typed
+  // terminal error is the record.
   @Test fun unknownRuntimeWithPendingToolDeltaDoesNotFlush() {
     val provider = FakeLlmProvider {
       flow {

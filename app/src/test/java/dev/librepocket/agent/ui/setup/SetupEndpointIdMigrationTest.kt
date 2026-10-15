@@ -7,6 +7,7 @@ import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.keystore.KeyVault
+import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.LlmProvider
 import dev.librepocket.provider.ProviderProtocol
@@ -447,4 +448,144 @@ class SetupEndpointIdMigrationTest {
         val gate = withTimeout(10_000) { vm.gate.first { it !is EndpointGate.Loading } }
         assertTrue("builtin row must gate Ready, got $gate", gate is EndpointGate.Ready)
     }
+
+    /**
+     * P1 migration prefill: a quarantined legacy row prefills its URL/model
+     * into a pristine form (key stays blank, re-paste required), and the
+     * completed re-save mints the new per-endpoint id — without ever marking
+     * the legacy row Ready or reading its vault key.
+     */
+    @Test
+    fun legacyMigrationPrefillRecoversAddressAndRequiresRepaste() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val store = newStore()
+        val vault = CountingVault()
+        vault.putKey("preset:custom", "stage1-legacy-key-12345678".toCharArray())
+        store.save(legacyCustom(url))
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+
+        val source = vm.legacyMigrationSource()
+        assertNotNull(source)
+        assertEquals("preset:custom", source!!.providerId)
+        assertEquals(url, source.baseUrl)
+        assertEquals("local", source.model)
+        vm.prefillLegacyMigrationIfNeeded()
+        val form = vm.form.value
+        assertEquals("custom", form.presetId)
+        assertEquals(url, form.baseUrl)
+        assertEquals("local", form.model)
+        assertTrue(form.apiKey.isEmpty())
+        assertEquals("SETUP_MIGRATION_REKEY_REQUIRED", form.errorCode)
+
+        // Blank save still demands a re-paste (keep-existing impossible:
+        // the migration prefill never sets an edit baseline).
+        vm.save()
+        awaitSaveIdle(vm)
+        assertEquals("SETUP_KEY_TOO_SHORT", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+
+        // Re-paste + save completes the migration to the per-endpoint id.
+        vm.onApiKeyChange("stage1-migration-key-12345678")
+        vm.save()
+        awaitSaveIdle(vm)
+        assertTrue(vm.form.value.saved)
+        val expectedId = SetupValidation.deriveEndpointId("custom", url)
+        val meta = withTimeout(10_000) { store.snapshotStrict() }
+        assertEquals(expectedId, meta?.providerId)
+        assertTrue(meta!!.apiKeyRef.startsWith("provider_key/$expectedId#staged-"))
+        assertFalse(vault.hasKey("preset:custom"))
+    }
+
+    /**
+     * The migration prefill is one-shot and never clobbers user input; it is
+     * a no-op without a legacy row.
+     */
+    @Test
+    fun legacyMigrationPrefillIsOneShotAndNeverClobbers() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val store = newStore()
+        val vault = CountingVault()
+        store.save(legacyCustom(url))
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+
+        vm.prefillLegacyMigrationIfNeeded()
+        assertEquals(url, vm.form.value.baseUrl)
+        vm.onBaseUrlChange("http://127.0.0.1:9999/v1")
+        vm.prefillLegacyMigrationIfNeeded()
+        assertEquals("http://127.0.0.1:9999/v1", vm.form.value.baseUrl)
+
+        // Fresh store without a legacy row: source is null, form untouched.
+        val fresh = newStore()
+        val vm2 = SetupViewModel(
+            store = fresh,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm2)
+        assertNull(vm2.legacyMigrationSource())
+        vm2.prefillLegacyMigrationIfNeeded()
+        assertEquals(ProviderCatalog.OPENAI_ID, vm2.form.value.presetId)
+    }
+
+    /**
+     * The migration source is guarded: a teardown journal or a non-legacy
+     * row yields null (fail-closed to defaults).
+     */
+    @Test
+    fun legacyMigrationSourceGuardsJournalAndNonLegacy() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val vault = CountingVault()
+        val mkVm = suspend {
+            val store = newStore()
+            val vm = SetupViewModel(
+                store = store,
+                vaultSource = VaultSource { vault },
+                policy = VerdictPolicy(Verdict.ALLOW),
+                buildProvider = noProvider,
+            )
+            vms.add(vm)
+            store to vm
+        }
+        // Journal present (even malformed) blocks the source.
+        run {
+            val (store, vm) = mkVm()
+            store.dataStore.edit { prefs ->
+                prefs[ENDPOINT_PENDING_DELETE_V1] = "junk-journal"
+            }
+            store.save(legacyCustom(url))
+            assertNull(vm.legacyMigrationSource())
+        }
+        // A current-shape row is not a migration source.
+        run {
+            val (store, vm) = mkVm()
+            val id = SetupValidation.deriveEndpointId("custom", url)
+            store.save(
+                EndpointConfig(
+                    providerId = id,
+                    presetId = "custom",
+                    label = "自訂",
+                    baseUrl = url,
+                    protocol = ProviderProtocol.CHAT_COMPLETIONS,
+                    model = "local",
+                    apiKeyRef = SetupValidation.deriveApiKeyRef(id),
+                ),
+            )
+            assertNull(vm.legacyMigrationSource())
+        }
+    }
+
+
 }

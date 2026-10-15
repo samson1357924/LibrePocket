@@ -48,6 +48,22 @@ class SetupValidationTest {
     }
 
     @Test
+    fun deriveEndpointIdMatchesPinnedVectorsAcrossRestarts() {
+        // Hardcoded vectors: derivation must be restart-stable (same input,
+        // same id, forever) so persisted rows re-derive identically after an
+        // upgrade. Any algorithm change must migrate stored rows explicitly —
+        // it must never silently fork every custom endpoint into legacy.
+        assertEquals(
+            "custom:9b514b1a65f6ebfaa4da53a116ea0038",
+            SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+        )
+        assertEquals(
+            "custom:a0507cea99932bea43520239cdcd6e82",
+            SetupValidation.deriveEndpointId("custom", "https://custom-a.example.com/v1"),
+        )
+    }
+
+    @Test
     fun legacyEndpointIdDetectsOnlyPreStage1CustomRows() {
         // Exact old shape: shared preset:custom id.
         assertTrue(SetupValidation.isLegacyEndpointId("preset:custom", "custom", "http://127.0.0.1:8123/v1"))

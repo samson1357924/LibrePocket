@@ -714,6 +714,73 @@ class SetupViewModel(
      * reuses the stored vault key only while the form identity still matches
      * this snapshot (see [keepExistingModeFor]).
      */
+    /**
+     * Read-only legacy migration source (metadata only, never a vault read).
+     *
+     * Returns the stored row only when it is a quarantined pre-Stage1 custom
+     * row (shared `preset:custom` entity id): its URL/model may prefill the
+     * Setup form so an upgrade does not lose the address, but its key is
+     * never reused. Null on absent metadata, non-legacy rows, a pending
+     * teardown journal, or any read failure (fail-closed: the form keeps its
+     * defaults instead of showing partial/stale data).
+     */
+    suspend fun legacyMigrationSource(): EndpointConfig? {
+        try {
+            if (store.observePendingDelete().first() !is PendingTeardownState.Absent) return null
+            val config = store.snapshotStrict() ?: return null
+            if (config.presetId != ProviderCatalog.CUSTOM_ID) return null
+            if (!SetupValidation.isLegacyEndpoint(config)) return null
+            return config
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    /**
+     * One-shot legacy migration prefill (Main-thread only).
+     *
+     * Fills preset/URL/model from [legacyMigrationSource] so a quarantined
+     * row (which never gates Ready) still recovers its address in Setup;
+     * the key field stays blank and [editBaseline] is deliberately left
+     * untouched (null), so keep-existing is impossible and a blank save
+     * still demands a re-paste while any save derives the new per-endpoint
+     * identity. Runs at most once per ViewModel and only over a pristine
+     * form — user input is never clobbered.
+     */
+    private var migrationPrefillDone = false
+
+    suspend fun prefillLegacyMigrationIfNeeded() {
+        if (migrationPrefillDone) return
+        migrationPrefillDone = true
+        val pristine = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
+        if (_form.value != pristine) return
+        val entryRevision = formRevision.get()
+        val legacy = legacyMigrationSource() ?: return
+        // Re-verify after the suspend read: a keystroke landing in the read
+        // window must never be clobbered (field edits bump formRevision or
+        // break pristine equality).
+        if (_form.value != pristine || formRevision.get() != entryRevision) return
+        formRevision.incrementAndGet()
+        invalidateKeyWriteConsent()
+        modelRefreshJob?.cancel()
+        modelRefreshJob = null
+        val revision = modelRefreshGeneration.incrementAndGet()
+        testConnectionJob?.cancel()
+        testConnectionJob = null
+        val testRevision = testConnectionGeneration.incrementAndGet()
+        keyBinding = KeyBindingHolder(null, null)
+        _form.value = SetupUiState(
+            presetId = ProviderCatalog.CUSTOM_ID,
+            baseUrl = legacy.baseUrl,
+            model = legacy.model,
+            modelRefreshRevision = revision,
+            testConnectionRevision = testRevision,
+            errorCode = "SETUP_MIGRATION_REKEY_REQUIRED",
+        )
+    }
+
     fun prefillForEdit(config: EndpointConfig) {
         formRevision.incrementAndGet()
         invalidateKeyWriteConsent()

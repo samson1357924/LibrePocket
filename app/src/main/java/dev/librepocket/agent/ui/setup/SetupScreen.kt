@@ -111,6 +111,14 @@ fun SetupScreen(
     // First-run gate: no back escape (chat cannot work without an endpoint).
     BackHandler(enabled = isFirstRun) { }
 
+    // Legacy migration prefill: a quarantined pre-Stage1 custom row never
+    // gates Ready, so without this the form would show defaults and lose
+    // the saved address. One-shot + pristine-only inside the ViewModel: the
+    // key stays blank (re-paste required), user input is never clobbered.
+    LaunchedEffect(isFirstRun) {
+        if (isFirstRun) viewModel.prefillLegacyMigrationIfNeeded()
+    }
+
     LaunchedEffect(state.saved) {
         if (state.saved) {
             viewModel.consumeSaved()

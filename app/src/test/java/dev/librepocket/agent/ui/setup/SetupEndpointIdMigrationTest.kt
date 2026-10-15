@@ -391,6 +391,24 @@ class SetupEndpointIdMigrationTest {
         assertEquals(0, vault.getKeys)
         assertEquals(0, vault.putKeys)
         assertEquals(0, vault.deleteKeys)
+
+        // The live Setup gate agrees with readiness (one shared predicate):
+        // NoEndpoint with zero vault reads, even though the foreign slot
+        // holds a key.
+        vault.putKey("preset:custom", "stage1-fake-foreign-key".toCharArray())
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+        val gate = withTimeout(10_000) { vm.gate.first { it !is EndpointGate.Loading } }
+        assertTrue("mixed row must gate NoEndpoint, got $gate", gate is EndpointGate.NoEndpoint)
+        assertEquals(1, vault.putKeys)
+        assertEquals(0, vault.hasKeys)
+        assertEquals(0, vault.getKeys)
+        assertEquals(0, vault.deleteKeys)
     }
 
     /**

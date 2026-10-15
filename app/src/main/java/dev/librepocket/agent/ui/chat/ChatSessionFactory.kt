@@ -1147,7 +1147,7 @@ class ChatSessionFactory(
         // wrong key is never loaded even if the store row was hand-written.
         // Legacy rows never reach here (requireCurrentEndpointId guards every
         // create/open entry point, including the fork path below).
-        if (alias != endpoint.providerId && !alias.startsWith(endpoint.providerId + "#staged-")) {
+        if (!SetupValidation.aliasInNamespace(endpoint.providerId, endpoint.apiKeyRef)) {
             throw CaptureDeniedException("PROVIDER_KEY_REF_NAMESPACE_MISMATCH")
         }
         val vault = vaultSource.vault()

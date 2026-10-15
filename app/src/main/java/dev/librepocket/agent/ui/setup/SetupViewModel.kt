@@ -512,10 +512,15 @@ class SetupViewModel(
                         ) {
                             EndpointGate.NoEndpoint
                         } else {
-                            val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
-                            if (alias.isBlank()) {
+                            // Triple namespace parity with EndpointStore.readiness
+                            // and credential capture (one shared predicate): a
+                            // cross-namespace alias is proven unusable without
+                            // vault I/O — it must not even cost a hasKey probe
+                            // against the foreign slot, let alone gate Ready.
+                            if (!SetupValidation.aliasInNamespace(config.providerId, config.apiKeyRef)) {
                                 EndpointGate.NoEndpoint
                             } else {
+                                val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
                                 // Vault check failure propagates to the outer catch
                                 // → ReadFailure (unconfirmed, never NoEndpoint).
                                 // hasKey==false is proven keyless → NoEndpoint.

@@ -173,6 +173,21 @@ object SetupValidation {
      */
     fun aliasFromRef(apiKeyRef: String): String = apiKeyRef.removePrefix("provider_key/")
 
+    /**
+     * Vault-alias namespace check shared by the store ([EndpointStore]),
+     * the Setup gate ([SetupViewModel.gate]), and credential capture
+     * ([ChatSessionFactory.captureCredential]): the alias addressed by
+     * [apiKeyRef] must be the endpoint's own live alias or one of its
+     * per-operation staged aliases. Anything else (including a foreign
+     * endpoint's slot) fails closed before any vault I/O.
+     */
+    fun aliasInNamespace(providerId: String, apiKeyRef: String): Boolean {
+        if (!apiKeyRef.startsWith("provider_key/")) return false
+        val alias = aliasFromRef(apiKeyRef)
+        if (alias.isBlank()) return false
+        return alias == providerId || alias.startsWith("$providerId#staged-")
+    }
+
     fun validate(presetId: String, baseUrl: String, apiKey: String): String? =
         validate(presetId, baseUrl, apiKey, KeyMode.NEW)
 

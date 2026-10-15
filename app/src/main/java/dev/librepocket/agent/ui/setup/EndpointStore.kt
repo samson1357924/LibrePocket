@@ -606,16 +606,15 @@ class EndpointStore(
         // a vault read here). Re-key via Setup. Checked after URL validity so
         // a malformed endpoint still reports INVALID_BASE_URL.
         if (SetupValidation.isLegacyEndpoint(config)) return EndpointReadiness.NO_KEY
-        if (!config.apiKeyRef.startsWith("provider_key/")) return EndpointReadiness.NO_KEY
-        val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
-        if (alias.isBlank()) return EndpointReadiness.NO_KEY
         // Stage1 triple consistency (read side): a non-legacy row whose vault
         // alias falls outside its own providerId namespace can never be READY
         // (fail closed without vault I/O, same as legacy). Legacy rows already
-        // returned NO_KEY above.
-        if (alias != config.providerId && !alias.startsWith(config.providerId + "#staged-")) {
+        // returned NO_KEY above. Same predicate as the Setup gate and
+        // credential capture — the three never disagree.
+        if (!SetupValidation.aliasInNamespace(config.providerId, config.apiKeyRef)) {
             return EndpointReadiness.NO_KEY
         }
+        val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
         val hasKey = try {
             vault.hasKey(alias)
         } catch (_: Exception) {
@@ -811,9 +810,10 @@ class EndpointStore(
             require(config.providerId == SetupValidation.deriveEndpointId(config.presetId, config.baseUrl)) {
                 "ENDPOINT_ID_MISMATCH"
             }
-            val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
-            require(alias.isNotBlank()) { "PROVIDER_KEY_REF_MALFORMED" }
-            require(alias == config.providerId || alias.startsWith(config.providerId + "#staged-")) {
+            require(SetupValidation.aliasFromRef(config.apiKeyRef).isNotBlank()) {
+                "PROVIDER_KEY_REF_MALFORMED"
+            }
+            require(SetupValidation.aliasInNamespace(config.providerId, config.apiKeyRef)) {
                 "PROVIDER_KEY_REF_NAMESPACE_MISMATCH"
             }
         }

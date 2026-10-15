@@ -143,7 +143,9 @@ class ChatSessionFactoryProvenanceTest {
         baseUrl = baseUrl,
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         model = "local-model",
-        apiKeyRef = "provider_key/test-custom-alias",
+        apiKeyRef = SetupValidation.deriveApiKeyRef(
+            SetupValidation.deriveEndpointId("custom", baseUrl),
+        ),
     )
 
     /** New-shape stored header, mirroring `create()`'s provenance stamp. */
@@ -162,6 +164,25 @@ class ChatSessionFactoryProvenanceTest {
             vault.putKey("preset:openai", "test-key-12345678".toCharArray())
             vault.putKey("preset:custom", "test-key-12345678".toCharArray())
             vault.putKey("test-custom-alias", "test-key-12345678".toCharArray())
+            // Stage1 per-URL live aliases for customEndpointV2 open() tests.
+            vault.putKey(
+                SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+                "test-key-12345678".toCharArray(),
+            )
+            vault.putKey(
+                SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11435/v1"),
+                "test-key-12345678".toCharArray(),
+            )
+            // Respelling variants used by the fork-verdict matrix (each is a
+            // distinct entity id, so each needs its own vault key).
+            vault.putKey(
+                SetupValidation.deriveEndpointId("custom", "HTTP://127.0.0.1:11434/v1"),
+                "test-key-12345678".toCharArray(),
+            )
+            vault.putKey(
+                SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/other/path"),
+                "test-key-12345678".toCharArray(),
+            )
             vault
         },
         buildProvider = { _, _ -> provider },

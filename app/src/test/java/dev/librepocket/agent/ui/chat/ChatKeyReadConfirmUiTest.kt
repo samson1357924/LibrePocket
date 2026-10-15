@@ -113,7 +113,9 @@ class ChatKeyReadConfirmUiTest {
         baseUrl = "http://127.0.0.1:11434/v1",
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         model = "local",
-        apiKeyRef = "provider_key/preset:custom",
+        apiKeyRef = SetupValidation.deriveApiKeyRef(
+            SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+        ),
     )
 
     private fun newVm(fake: KeyReadUiFakeProvider): Pair<ChatViewModel, EndpointStore> {

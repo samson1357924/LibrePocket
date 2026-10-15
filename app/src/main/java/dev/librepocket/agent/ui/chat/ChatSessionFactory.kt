@@ -820,7 +820,7 @@ class ChatSessionFactory(
         // on one ledger.
         val sameOrigin = isSameOriginForResume(meta.model, endpoint)
         if (!sameOrigin) {
-            return openForked(store, endpoint, config, sessionId, meta, keyIsCurrent)
+            return openForked(store, endpoint, config, sessionId, meta, keyIsCurrent, allowAsk)
         }
         // R8-3: gated by the caller's same-ID settle outcome. False skips
         // this backfill (a still-unsettled live turn must not gain a false
@@ -896,10 +896,13 @@ class ChatSessionFactory(
      * already-mixed pre-R4-1 ids stay archived as-is (quarantined, never
      * re-hydrated whole-batch into a live provider context).
      *
-     * Key.read gate: covered by the pre-branch T1 recheck in [openImpl]
-     * (single call site, directly above the branch) — the compat-shim
-     * `allowAsk = false` denies here too (default key.read is ASK), so a
-     * 3-arg open on a cross-origin ledger fails closed before any vault read.
+     * Key.read gate: dual-gated — the pre-branch T1 recheck in [openImpl]
+     * plus a second recheck at the top of this body (binding + key.read
+     * before any vault read), so a policy flip landing during the
+     * [isSameOriginForResume] suspension still fails closed here. The
+     * compat-shim `allowAsk = false` denies on both gates too (default
+     * key.read is ASK), so a 3-arg open on a cross-origin ledger fails
+     * closed before any vault read.
      */
     private suspend fun openForked(
         store: SessionStore,
@@ -908,7 +911,17 @@ class ChatSessionFactory(
         oldSessionId: String,
         oldMeta: dev.librepocket.session.SessionMeta,
         keyIsCurrent: suspend () -> Boolean,
+        allowAsk: Boolean,
     ): CreatedSession {
+        // Fork-path T1 recheck parity with the same-origin path: the pre-branch
+        // recheck in openImpl may predate the suspensions between the branch
+        // and this body (store I/O, binding gates), so re-gate binding +
+        // key.read here before any vault read. A policy
+        // flip to DENY (or logout/endpoint switch) landing in that window must
+        // not trigger even one vault read on the fork path.
+        requireCurrentEndpointId(endpoint)
+        requireCurrentBinding(keyIsCurrent)
+        requireKeyReadAllowed(SetupValidation.policyResourceForPreset(endpoint.presetId), allowAsk)
         val model = modelFor(endpoint)
         val credential = captureCredential(endpoint)
         var session: ChatSession? = null
@@ -1122,8 +1135,21 @@ class ChatSessionFactory(
     }
 
     private suspend fun captureCredential(endpoint: EndpointConfig): SessionCredential {
+        // Callee-side invariant (callers also gate): legacy rows never yield a
+        // credential, even if a future call site forgets the entry-point check.
+        requireCurrentEndpointId(endpoint)
         val alias = endpoint.apiKeyRef.removePrefix("provider_key/")
         require(alias.isNotBlank() && alias != endpoint.apiKeyRef) { "PROVIDER_KEY_REF_MALFORMED" }
+        // Stage1 triple consistency (consume side): the vault alias must belong
+        // to the endpoint's own providerId namespace (live alias or staged
+        // alias). A cross-endpoint ref (e.g. custom:A metadata pointing at
+        // custom:B's slot) fails closed here before any vault read, so the
+        // wrong key is never loaded even if the store row was hand-written.
+        // Legacy rows never reach here (requireCurrentEndpointId guards every
+        // create/open entry point, including the fork path below).
+        if (alias != endpoint.providerId && !alias.startsWith(endpoint.providerId + "#staged-")) {
+            throw CaptureDeniedException("PROVIDER_KEY_REF_NAMESPACE_MISMATCH")
+        }
         val vault = vaultSource.vault()
         val key = vault.getKey(alias) ?: throw IllegalStateException("ENDPOINT_KEY_MISSING")
         return SessionCredential(endpoint.apiKeyRef, key)

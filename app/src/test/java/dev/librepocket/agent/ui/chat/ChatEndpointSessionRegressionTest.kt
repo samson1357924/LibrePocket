@@ -83,18 +83,28 @@ class ChatEndpointSessionRegressionTest {
 
     private fun baseUrlOf(server: MockWebServer): String = server.url("/v1").toString().trimEnd('/')
 
-    private fun endpoint(server: MockWebServer, alias: String) = EndpointConfig(
+    /** Production-shaped staged alias: `<providerId>#staged-<suffix>`. */
+    private fun namespacedAlias(server: MockWebServer, suffix: String): String {
+        val providerId = SetupValidation.deriveEndpointId("custom", baseUrlOf(server))
+        return SetupValidation.stagedAlias(providerId, suffix)
+    }
+
+    private fun endpoint(server: MockWebServer, alias: String): EndpointConfig {
         // Stage1: stable per-endpoint entity id derived from the custom URL —
         // distinct servers never share the providerId namespace; each Key is
-        // scoped to its own vault alias (production staged shape).
-        providerId = SetupValidation.deriveEndpointId("custom", baseUrlOf(server)),
-        presetId = "custom",
-        label = "local test endpoint",
-        baseUrl = baseUrlOf(server),
-        protocol = ProviderProtocol.CHAT_COMPLETIONS,
-        model = "test-model",
-        apiKeyRef = "provider_key/$alias",
-    )
+        // scoped to its own vault alias (production staged shape, so the
+        // triple passes the store/factory namespace checks).
+        val providerId = SetupValidation.deriveEndpointId("custom", baseUrlOf(server))
+        return EndpointConfig(
+            providerId = providerId,
+            presetId = "custom",
+            label = "local test endpoint",
+            baseUrl = baseUrlOf(server),
+            protocol = ProviderProtocol.CHAT_COMPLETIONS,
+            model = "test-model",
+            apiKeyRef = "provider_key/" + SetupValidation.stagedAlias(providerId, alias),
+        )
+    }
 
     private fun response() = MockResponse()
         .setHeader("Content-Type", "text/event-stream")
@@ -140,8 +150,10 @@ class ChatEndpointSessionRegressionTest {
         val vault = EncryptedPrefsVault(InMemoryPrefs())
         val aliasA = "stage1-test-alias-a"
         val aliasB = "stage1-test-alias-b"
-        vault.putKey(aliasA, "test-key-A-123".toCharArray())
-        vault.putKey(aliasB, "test-key-B-456".toCharArray())
+        val nsA = namespacedAlias(endpointA, aliasA)
+        val nsB = namespacedAlias(endpointB, aliasB)
+        vault.putKey(nsA, "test-key-A-123".toCharArray())
+        vault.putKey(nsB, "test-key-B-456".toCharArray())
         store.save(endpoint(endpointA, aliasA))
 
         val policy = allowKeyReadPolicy()
@@ -160,7 +172,7 @@ class ChatEndpointSessionRegressionTest {
 
             // Setup writes the mutable alias before endpoint metadata. The
             // already-live A session must retain only its captured A key.
-            vault.putKey(aliasA, "test-key-B-456".toCharArray())
+            vault.putKey(nsA, "test-key-B-456".toCharArray())
             chatMain.run { viewModel.sendDirect("still bound to A") }
             val second = endpointA.takeRequest(10, TimeUnit.SECONDS)
             assertNotNull(second)
@@ -183,7 +195,7 @@ class ChatEndpointSessionRegressionTest {
             assertEquals(1, endpointB.requestCount)
 
             endpointA.enqueue(response())
-            vault.putKey(aliasA, "test-key-A-123".toCharArray())
+            vault.putKey(nsA, "test-key-A-123".toCharArray())
             store.save(endpoint(endpointA, aliasA))
             awaitNoAttachedSession(viewModel)
             chatMain.run { viewModel.sendDirect("back on A") }
@@ -216,12 +228,15 @@ class ChatEndpointSessionRegressionTest {
         val aliasA = "stage1-iso-alias-a"
         val aliasB = "stage1-iso-alias-b"
         val aliasA2 = "stage1-iso-alias-a-rotated"
+        val nsA = namespacedAlias(serverA, aliasA)
+        val nsB = namespacedAlias(serverB, aliasB)
+        val nsA2 = namespacedAlias(serverA, aliasA2)
         val keyA1 = "stage1-fake-key-A-11111111"
         val keyB = "stage1-fake-key-B-22222222"
         val keyA2 = "stage1-fake-key-A-rotated-33333333"
-        vault.putKey(aliasA, keyA1.toCharArray())
-        vault.putKey(aliasB, keyB.toCharArray())
-        vault.putKey(aliasA2, keyA2.toCharArray())
+        vault.putKey(nsA, keyA1.toCharArray())
+        vault.putKey(nsB, keyB.toCharArray())
+        vault.putKey(nsA2, keyA2.toCharArray())
 
         val cfgA1 = endpoint(serverA, aliasA)
         val cfgB = endpoint(serverB, aliasB)

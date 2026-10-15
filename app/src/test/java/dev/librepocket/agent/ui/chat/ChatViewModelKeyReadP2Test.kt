@@ -117,7 +117,9 @@ class ChatViewModelKeyReadP2Test {
         baseUrl = "http://127.0.0.1:11434/v1",
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         model = "local",
-        apiKeyRef = "provider_key/preset:custom",
+        apiKeyRef = SetupValidation.deriveApiKeyRef(
+            SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+        ),
     )
 
     private class Harness(
@@ -140,7 +142,7 @@ class ChatViewModelKeyReadP2Test {
         val backend = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
             backend.putKey("preset:openai", "test-key-123".toCharArray())
-            backend.putKey("preset:custom", "test-key-456".toCharArray())
+            backend.putKey(SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"), "test-key-456".toCharArray())
         }
         val getKeyCalls = AtomicInteger(0)
         val countingVault = object : KeyVault {

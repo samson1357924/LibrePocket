@@ -879,7 +879,7 @@ class ChatWiringTest {
         runBlocking {
             store.save(sampleEndpoint())
             vault.putKey("preset:openai", "unit-test-key-123".toCharArray())
-            vault.putKey("preset:custom", "unit-test-key-456".toCharArray())
+            vault.putKey(SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"), "unit-test-key-456".toCharArray())
         }
         val fake = FakeChatProvider { _ ->
             flow {
@@ -912,7 +912,9 @@ class ChatWiringTest {
                     label = "自訂",
                     baseUrl = "http://127.0.0.1:11434/v1",
                     model = "local",
-                    apiKeyRef = "provider_key/preset:custom",
+                    apiKeyRef = SetupValidation.deriveApiKeyRef(
+                    SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+                ),
                 ),
             )
         }

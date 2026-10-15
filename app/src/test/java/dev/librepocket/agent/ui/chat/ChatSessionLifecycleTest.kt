@@ -111,7 +111,9 @@ class ChatSessionLifecycleTest {
         baseUrl = "http://127.0.0.1:4141/v1",
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         model = "test-model",
-        apiKeyRef = "provider_key/lifecycle-test",
+        apiKeyRef = SetupValidation.deriveApiKeyRef(
+            SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:4141/v1"),
+        ),
     )
 
     private fun newViewModel(

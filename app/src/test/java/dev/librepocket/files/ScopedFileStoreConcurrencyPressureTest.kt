@@ -172,6 +172,12 @@ class ScopedFileStoreConcurrencyPressureTest {
         deleteQuietly(sub)
     }
 
+    /**
+     * 宿主機暫存：沿用 `files/` 全目錄既有模式（`createTempDirectory＋deleteOnExit＋
+     * try-finally NOFOLLOW deleteNoFollowRecursively`）。`deleteOnExit` 非遞迴，
+     * 僅作 kill 殘留第二道網；主清理為 `finally`（bot TemporaryFolder 建議不採納：
+     * `files/` 全目錄皆手動模式，`@Rule` 混用反增分歧，且仍需 NOFOLLOW 語義自理）。
+     */
     private fun workspace(): File =
         Files.createTempDirectory("ws-pressure").toFile().apply { deleteOnExit() }
 
@@ -229,6 +235,64 @@ class ScopedFileStoreConcurrencyPressureTest {
     private fun isChainRejectionMessage(msg: String?): Boolean {
         val m = msg ?: return false
         return m.contains("symlink") || m.contains("escapes")
+    }
+
+    /** 壓力後清理＋恢復驗證抽取（bot 單體建議善意收斂；workers 閉包共享計數器保留內聯）。 */
+    private fun cleanupAfterPressure(ws: File) {
+        // 先 NOFOLLOW 移除翻轉殘留（絕不跟隨 symlink 進 outside，人審 P2#1）。
+        removePossiblyFlipped(File(ws, "race-sub"))
+        deleteQuietly(File(ws, "flip"))
+        (ws.listFiles()?.toList() ?: emptyList())
+            .filter { it.name.startsWith(stageAnyPrefix()) }
+            .forEach {
+                if (it.isDirectory && !Files.isSymbolicLink(it.toPath())) {
+                    deleteNoFollowRecursively(it)
+                } else {
+                    deleteQuietly(it)
+                }
+            }
+        // 清理後毒鏈必須已除，否則恢復證明空洞。
+        assertFalse(
+            "race-sub staging must be cleaned",
+            File(ws, "race-sub").let { Files.isSymbolicLink(it.toPath()) } ||
+                (ws.listFiles()?.any { it.name.startsWith(stageAnyPrefix()) } == true),
+        )
+    }
+
+    /** 恢復證明＋事後毒鏈錨點（讀寫刪三拒；exists 由單線程既有測試覆蓋）。 */
+    private fun verifyRecoveryAndAnchor(ws: File, out: File, store: ScopedFileStore) {
+        store.write("after-pressure.txt", "ok".toByteArray(Charsets.UTF_8))
+        assertEquals("ok", String(store.read("after-pressure.txt"), Charsets.UTF_8))
+        // 恢復後列目 sane＋刪除往返。
+        assertTrue(store.list().none { it.contains(ScopedFileStore.TMP_NAME_PREFIX) })
+        assertTrue(store.delete("after-pressure.txt"))
+        store.write("after-pressure.txt", "ok".toByteArray(Charsets.UTF_8))
+        assertEquals("ok", String(store.read("after-pressure.txt"), Charsets.UTF_8))
+        // 確定性錨點：事後毒鏈讀寫刪仍拒（併發 rejected>0 為壓力證據，本段為確定性對照）。
+        deleteQuietly(File(ws, "post-link"))
+        Files.createSymbolicLink(
+            File(ws, "post-link").toPath(),
+            File(out, "secret.txt").toPath(),
+        )
+        try {
+            store.read("post-link")
+            fail("expected IllegalArgumentException: post-link read")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(isRejectionMessage(e.message))
+        }
+        try {
+            store.write("post-link", "x".toByteArray(Charsets.UTF_8))
+            fail("expected IllegalArgumentException: post-link write")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(isRejectionMessage(e.message))
+        }
+        try {
+            store.delete("post-link")
+            fail("expected IllegalArgumentException: post-link delete")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(isRejectionMessage(e.message))
+        }
+        assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
     }
 
     @Test fun renameSymlinkPressureBounded() {
@@ -604,60 +668,10 @@ class ScopedFileStoreConcurrencyPressureTest {
             assertTrue("expected lists to happen, got listOk=${listOk.get()}", listOk.get() > 0)
             assertTrue("expected deletes to happen, got deleteOk=${deleteOk.get()}", deleteOk.get() > 0)
 
-            // 安全重試／恢復：先 NOFOLLOW 移除翻轉殘留（絕不跟隨 symlink 進 outside，
-            // 人審 P2#1），再驗清理確實完成；store 仍可寫可讀證明恢復。
-            removePossiblyFlipped(File(ws, "race-sub"))
-            deleteQuietly(File(ws, "flip"))
-            (ws.listFiles()?.toList() ?: emptyList())
-                .filter { it.name.startsWith(stageAnyPrefix()) }
-                .forEach {
-                    if (it.isDirectory && !Files.isSymbolicLink(it.toPath())) {
-                        deleteNoFollowRecursively(it)
-                    } else {
-                        deleteQuietly(it)
-                    }
-                }
-            // 清理後毒鏈必須已除，否則恢復證明空洞。
-            assertFalse(
-                "race-sub staging must be cleaned",
-                File(ws, "race-sub").let { Files.isSymbolicLink(it.toPath()) } ||
-                    (ws.listFiles()?.any { it.name.startsWith(stageAnyPrefix()) } == true),
-            )
-            store.write("after-pressure.txt", "ok".toByteArray(Charsets.UTF_8))
-            assertEquals("ok", String(store.read("after-pressure.txt"), Charsets.UTF_8))
-            // 恢復後列目 sane＋刪除往返。
-            assertTrue(store.list().none { it.contains(ScopedFileStore.TMP_NAME_PREFIX) })
-            assertTrue(store.delete("after-pressure.txt"))
-            store.write("after-pressure.txt", "ok".toByteArray(Charsets.UTF_8))
-            assertEquals("ok", String(store.read("after-pressure.txt"), Charsets.UTF_8))
-            // 確定性錨點：事後毒鏈讀寫刪仍拒（併發 rejected>0 為壓力證據，本段為確定性對照）。
-            try {
-                Files.deleteIfExists(File(ws, "post-link").toPath())
-            } catch (_: Exception) {
-            }
-            Files.createSymbolicLink(
-                File(ws, "post-link").toPath(),
-                File(out, "secret.txt").toPath(),
-            )
-            try {
-                store.read("post-link")
-                fail("expected IllegalArgumentException: post-link read")
-            } catch (e: IllegalArgumentException) {
-                assertTrue(isRejectionMessage(e.message))
-            }
-            try {
-                store.write("post-link", "x".toByteArray(Charsets.UTF_8))
-                fail("expected IllegalArgumentException: post-link write")
-            } catch (e: IllegalArgumentException) {
-                assertTrue(isRejectionMessage(e.message))
-            }
-            try {
-                store.delete("post-link")
-                fail("expected IllegalArgumentException: post-link delete")
-            } catch (e: IllegalArgumentException) {
-                assertTrue(isRejectionMessage(e.message))
-            }
-            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
+            // 安全重試／恢復（helpers 見 cleanupAfterPressure／verifyRecoveryAndAnchor；
+            // workers 閉包共享 10＋ 計數器，保留內聯以免參數透傳遮蔽門關係）。
+            cleanupAfterPressure(ws)
+            verifyRecoveryAndAnchor(ws, out, store)
         } finally {
             // NOFOLLOW 終兜：ws 可能殘留 race-sub 指外連結，絕不跟隨進 outside。
             deleteNoFollowRecursively(ws)

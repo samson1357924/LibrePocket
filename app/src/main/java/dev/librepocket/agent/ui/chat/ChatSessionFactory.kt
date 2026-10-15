@@ -49,7 +49,9 @@ private const val HISTORY_PAGE = 200
  * ([dev.librepocket.session.TranscriptEvent.text] `String.length` units, the
  * same unit as every other bound here). Marker + copy never exceeds
  * [SnapshotBudget.HISTORY_LOAD_CAP] (one slot reserved for the head-anchored
- * `model switched` marker), which equals
+ * `model switched` marker, plus a second slot for the `snapshot incomplete`
+ * marker when the copy is incomplete — R28-1 clamps the carried prefix to
+ * 1998 rows in that case), which equals
  * [dev.librepocket.session.PrunePolicy.maxEventsPerSession], so a full
  * snapshot would otherwise lose its head marker at the next prune sweep.
  * 2M chars is ~1/10 of [RoomSessionStore.EXPORT_MAX_BYTES] nominal (chars

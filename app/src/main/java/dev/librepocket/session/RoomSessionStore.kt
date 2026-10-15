@@ -148,6 +148,8 @@ class RoomSessionStore(
      * (`parentRunId == null`, `runId == attemptId` ≠ logical family id)
      * survive as DB residue (P2-3, disclosed in P1_SPEC — never model
      * context, never a family terminal).
+     * Test-fake divergence: `SuspectFakeStore.simulatePruneCut` stays R26-only
+     * (`drop>0` gate + 10-cap + unconditional clear); R27 proven by Room tests.
      * Concurrent set, no suspension while held.
      */
     private val pruneSuspectSessions = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()

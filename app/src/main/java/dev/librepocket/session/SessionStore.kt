@@ -113,7 +113,7 @@ interface SessionStore {
      * exception: a 2nd-row fault there leaves an orphan non-final partial
      * (`isPartial=1`, `isFinal=0`) — still fail-closed (never model context,
      * never a family terminal, so the family still dangles and reopen still
-     * backfills INTERRUPTED). Target (atomic Room/fake) still commits
+     * backfills INTERRUPTED). Current (atomic Room/fake) still commits
      * all-or-zero; this paragraph pins only the fallback shape. Concrete
      * caller obligation: treat a throw as a possibly-partial batch (never
      * assume rollback) unless the store documents atomicity; do NOT reorder
@@ -287,6 +287,8 @@ interface SessionStore {
      * compat when no truncation evidence exists (known limitation). Readers
      * additionally drop head orphans when `dropped>0` or suspect (far-only
      * never drops, preserving R25 precision).
+     * Test-fake divergence: `SuspectFakeStore.simulatePruneCut` stays R26-only
+     * (`drop>0` gate + 10-cap + unconditional clear); R27 proven by Room tests.
      * Default false so hand-written fakes without prune stay clean.
      */
     suspend fun isPruneSuspect(sessionId: String): Boolean = false

@@ -156,30 +156,41 @@ open class FakeSessionStore : SessionStore {
 }
 
 /**
- * S4-R2 prune-suspect test fake (Fake itself stays no-prune per S1 F9 Target:
- * [FakeSessionStore.prune] always throws, never silent success – use Room for
- * real prune paths). This subclass simulates the Room keep-newest row cut
- * PLUS the R26-1 head-family fixup: [simulatePruneCut] drops the oldest rows
- * beyond [keepNewestRows], then while the oldest kept user/assistant row is
- * an assistant deletes that whole logical family (`parentRunId ?: runId`,
- * bounded loop, mirroring `RoomSessionStore`'s `oldestHistory` +
- * `deleteFamily`), and marks the session suspect iff the total dropped > 0
- * (per-sweep, NOT sticky — a later clean cut clears, mirroring Room).
- * [deleteSession] clears suspect (Room parity); appends never clear (a later
- * append cannot resurrect a pruned marker). Memory-only like Room (restart
- * drops it); the DB/delete-vs-read-filter `dropped` gap is eliminated by
+ * S4-R2 prune-suspect test fake, R26-only frozen shape (NOT R27 Room behavior;
+ * Fake itself stays no-prune per S1 F9 Target: [FakeSessionStore.prune]
+ * always throws, never silent success – use Room for real prune paths).
+ * This subclass simulates a keep-newest row cut PLUS the R26-1 head-family
+ * fixup: [simulatePruneCut] drops the oldest rows beyond [keepNewestRows],
+ * then while the oldest kept user/assistant row is an assistant deletes that
+ * whole logical family (`parentRunId ?: runId`, bounded loop), and marks the
+ * session suspect iff the total dropped > 0 (per-sweep, NOT sticky — a later
+ * clean cut clears). [deleteSession] clears suspect; appends never clear (a
+ * later append cannot resurrect a pruned marker). Memory-only (restart drops
+ * it); the DB/delete-vs-read-filter `dropped` gap is eliminated by
  * construction (both sides delete the family in storage, so both report
- * `dropped==0` + suspect with the head family gone whole).
+ * `dropped==0` + suspect with the head family gone whole) for the shared
+ * intersection shape only. Known R26-vs-R27 divergences (frozen, do NOT sync
+ * to Room; R27 semantics proven by Room tests, not by this fake — see
+ * P1_SPEC R27 paragraph): (1) gate — fake runs fixup only when `drop > 0`,
+ * R27 Room runs fixup unconditionally in the same tx (no `deletes > 0`
+ * gate); (2) bound — fake uses a `guard < 10` bounded loop, R27 Room uses
+ * unbounded `while(true)` + break-on-no-progress convergence; (3) clear —
+ * fake clears suspect unconditionally on `drop == 0`, R27 Room clears only
+ * on shape-aware clean (post-fixup user/empty head) and keeps suspect on
+ * assistant-head residue (`deleted == 0` + assistant head).
  */
 open class SuspectFakeStore : FakeSessionStore() {
     private val suspect = HashSet<String>()
 
     /**
-     * Simulate a keep-newest prune cut with the R26-1 family fixup: drop
+     * Simulate a keep-newest prune cut with the R26-1 family fixup (R26-only
+     * frozen shape; see class KDoc for the three R27 divergences). Drop
      * oldest rows beyond keep, then delete whole cut head families. Returns
-     * the TOTAL dropped (raw cut + family fixup), matching Room's
-     * `PruneResult.deletedEvents`. Crafted duplicate-`seq` ties (production
-     * `seq` is unique) resolve by list order here vs `rowId` order in Room.
+     * the TOTAL dropped (raw cut + family fixup), equal to Room's
+     * `PruneResult.deletedEvents` only for the shared intersection shape —
+     * R27 semantics proven by Room tests. Crafted duplicate-`seq` ties
+     * (production `seq` is unique) resolve by list order here vs `rowId`
+     * order in Room.
      */
     fun simulatePruneCut(sessionId: String, keepNewestRows: Int): Int {
         val rows = events.filter { it.sessionId == sessionId }.sortedBy { it.seq }
@@ -187,9 +198,10 @@ open class SuspectFakeStore : FakeSessionStore() {
         if (drop > 0) {
             val dropSeqs = rows.take(drop).map { it.seq }.toSet()
             events.removeAll { it.sessionId == sessionId && it.seq in dropSeqs }
-            // Isomorphic head-family fixup (Room parity): head non-user ⇒
-            // delete the whole parentRunId?:runId family, bounded loop,
-            // size-convergent (breaks on no progress).
+            // R26-only frozen head-family fixup: head non-user ⇒ delete the
+            // whole parentRunId?:runId family, bounded loop, size-convergent
+            // (breaks on no progress). Differs from R27 Room (unconditional,
+            // unbounded convergent fixup in the same tx).
             var guard = 0
             while (guard++ < 10) {
                 val head = events.filter { it.sessionId == sessionId && (it.kind == "user" || it.kind == "assistant") }
@@ -198,8 +210,9 @@ open class SuspectFakeStore : FakeSessionStore() {
                 val family = (head.parentRunId ?: head.runId)
                 if (family.isBlank()) break
                 val before = events.size
-                // Room-isomorphic predicate (SessionDao.deleteFamily): match
-                // on either side of the family id, not just familyOf.
+                // Family predicate (same sides as SessionDao.deleteFamily):
+                // match on either side of the family id, not just familyOf.
+                // R26-only frozen shape; R27 Room behavior proven by Room tests.
                 events.removeAll {
                     it.sessionId == sessionId && (it.runId == family || it.parentRunId == family)
                 }
@@ -209,7 +222,9 @@ open class SuspectFakeStore : FakeSessionStore() {
             }
             suspect.add(sessionId)
         } else {
-            // Clean cut: per-sweep, not sticky (Room parity).
+            // Clean cut: per-sweep, not sticky. R26-only frozen: unconditional
+            // clear on drop==0; R27 Room clears only on shape-aware clean
+            // (user/empty head) and keeps suspect on assistant-head residue.
             suspect.remove(sessionId)
         }
         return drop

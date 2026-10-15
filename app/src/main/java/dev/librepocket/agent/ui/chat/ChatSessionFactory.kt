@@ -1281,6 +1281,8 @@ class ChatSessionFactory(
  * context. Pre-R26/interior orphans below the head survive the fixup and,
  * once suspect is cleared (clean sweep) or dropped (restart), resume compat
  * without evidence (known limitation, disclosed in P1_SPEC/THREAT_MODEL).
+ * Test-fake divergence: `SuspectFakeStore.simulatePruneCut` stays R26-only
+ * (`drop>0` gate + 10-cap + unconditional clear); R27 proven by Room tests.
  *
  * R26-1 F4 scan-then-count (Current): the filtered COUNT is taken before and
  * after the backward scan and the max is used, so a concurrent prune/append

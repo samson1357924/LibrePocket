@@ -11,6 +11,15 @@ package dev.librepocket.systema
  *  （ok=false + usedFallback=true，NEED_PERMISSION），由端側持
  *   `WRITE_CALENDAR` 再調 ContentResolver 直寫（[checkUpdate]/[checkDelete] 斷言）。
  * - 三風味皆允許；Play 需申報日曆權限 + 用途披露（矩陣 §1 列 7）。
+ * - 可見性（#14）：主 manifest `<queries>` 已宣告 INSERT（dir/event）/EDIT
+ *   （item/event）；API 30+ 無宣告時 `resolveActivity` 被過濾為 null。
+ * - 與 [AlarmTool] 的刻意差異（#14/#15 對齊決策）：建事件靜態無 App 時本工具
+ *   回 UNAVAILABLE（Alarm 回 DEGRADED），因建事件手動降級仍需一個日曆 App
+ *   可開（見 [fallback] 話術），無 App 時連手動都做不到；Alarm 自有提醒不需
+ *   外部 App，故可 DEGRADED。執行期 NoHandler（靜態有 App 但發射時無處理者：
+ *   被移除/停用/不可見，#14 可見性過濾即此類）則與 Alarm 同語義走降級
+ *   （ok=false + usedFallback=true + 手動話術，spec 保留），因 App 極可能
+ *   仍在（僅對我方不可見），使用者仍可手動開啟。
  */
 object CalendarTool : SystemTool<CalendarTool.EventParams> {
 
@@ -128,6 +137,25 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     )
   }
 
+  /**
+   * 從 extras 還原 [EventParams]（#14 生產讀側採用 [requireExtra]，#19 猜測執行禁令）。
+   *
+   * title/begin/end 必填（缺參/錯型拋 `IllegalStateException`，禁空標題或零時間
+   * 猜測建事件）；location/description 選填（缺席=空，錯型仍拋錯）。
+   * 排序守衛與 [buildInsertIntent] 同訊息。未來 dispatcher 唯一入口；目前尚無
+   * 生產呼叫方（接線 PR 啟用）。
+   */
+  fun parseInsertParams(extras: Map<String, IntentExtra>): EventParams {
+    val title = extras.requireExtra<IntentExtra.Str>(EXTRA_EVENT_TITLE).value
+    val begin = extras.requireExtra<IntentExtra.LongVal>(EXTRA_BEGIN_TIME).value
+    val end = extras.requireExtra<IntentExtra.LongVal>(EXTRA_END_TIME).value
+    val location = extras.optionalExtra<IntentExtra.Str>(EXTRA_EVENT_LOCATION)?.value.orEmpty()
+    val description = extras.optionalExtra<IntentExtra.Str>(EXTRA_EVENT_DESCRIPTION)?.value.orEmpty()
+    require(title.isNotBlank()) { "title must not be blank" }
+    require(end > begin) { "endTime must be after beginTime" }
+    return EventParams(title, begin, end, location, description)
+  }
+
   /** Provider 查詢的 content URI + selection 摘要（純側；端側再拼 Cursor）。 */
   fun buildQueryDescriptor(params: QueryParams): Pair<String, String> {
     val uri = "$EVENTS_CONTENT_URI?start=${params.startMillis}&end=${params.endMillis}"
@@ -178,7 +206,14 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
       return ToolResult(false, false, null, check.reasonCode, "做不到建日曆事件（${check.reasonCode}）")
     }
     val spec = buildInsertIntent(params)
-    return launcher.launchCatching(spec).toToolResult(spec, "建日曆事件")
+    return when (val launched = launcher.launchCatching(spec)) {
+      // 發現式缺席（靜態 check 通過但 resolve 為空：實現被移除/停用/不可見）：
+      // 與 AlarmTool 同語義走手動降級（ok=false + usedFallback=true，話術與
+      // [fallback] 一致，嘗試過的 spec 保留），禁靜默吞掉或猜測執行。
+      LaunchResult.NoHandler -> ToolResult(false, true, spec, ReasonCodes.NO_HANDLER, fallback(params, env).userMessage)
+      // Success/Internal 走共用收斂。
+      else -> launched.toToolResult(spec, "建日曆事件")
+    }
   }
 
   /**
@@ -194,7 +229,12 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     }
     if (env.hasCalendarApp) {
       val spec = buildEditIntent(params)
-      return launcher.launchCatching(spec).toToolResult(spec, "更新日曆事件")
+      return when (val launched = launcher.launchCatching(spec)) {
+        // 發現式缺席：與建事件同語義走手動降級（[fallbackUpdate] 話術，spec 保留）。
+        LaunchResult.NoHandler ->
+          ToolResult(false, true, spec, ReasonCodes.NO_HANDLER, fallbackUpdate(params, ReasonCodes.NO_HANDLER).userMessage)
+        else -> launched.toToolResult(spec, "更新日曆事件")
+      }
     }
     // 無系統日曆 App：純側僅回待寫描述，不算成功（spec 攜帶目標 URI + 變更欄位）。
     val pending = buildEditIntent(params)
@@ -214,7 +254,12 @@ object CalendarTool : SystemTool<CalendarTool.EventParams> {
     }
     if (env.hasCalendarApp) {
       val spec = IntentSpec(action = IntentActions.EDIT, dataUri = eventUri(params.eventId))
-      return launcher.launchCatching(spec).toToolResult(spec, "刪除日曆事件")
+      return when (val launched = launcher.launchCatching(spec)) {
+        // 發現式缺席：與建事件同語義走手動降級（[fallbackDelete] 話術，spec 保留）。
+        LaunchResult.NoHandler ->
+          ToolResult(false, true, spec, ReasonCodes.NO_HANDLER, fallbackDelete(params, ReasonCodes.NO_HANDLER).userMessage)
+        else -> launched.toToolResult(spec, "刪除日曆事件")
+      }
     }
     val (uri, _) = buildDeleteDescriptor(params)
     return ToolResult(false, true, IntentSpec(action = IntentActions.DELETE, dataUri = uri), ReasonCodes.NEED_PERMISSION, "做不到刪除日曆事件（${ReasonCodes.NEED_PERMISSION}）")

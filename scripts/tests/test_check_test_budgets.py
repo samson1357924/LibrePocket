@@ -1134,6 +1134,129 @@ class CheckTestBudgetsTest(unittest.TestCase):
             v = check_test_budgets.check_file(p)
             self.assertTrue(any("H1" in x for x in v), v)
 
+    def test_h1_dot_after_space_fixture_fails(self) -> None:
+        # R6P2-3: space between `.` and `repeat` (`"x". repeat(...)`, legal
+        # Kotlin) is still a huge fixture — the write loop must fail H1
+        # (and only H1: the fixture constructor is never a loop).
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotAfterSpaceTest.kt",
+                'val payload = "x". repeat(100_000)\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+            self.assertFalse(any("H2" in x for x in v), v)
+
+    def test_h1_dot_after_space_inline_fails(self) -> None:
+        # R6P2-3 inline: `appendEvent("x". repeat(100_001))` in the loop
+        # carries its own huge constructor across the dot-post gap.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotAfterSpaceInlineTest.kt",
+                "repeat(100) { store.appendEvent(event(sid, "
+                'text="y". repeat(100_001))) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+            self.assertFalse(any("H2" in x for x in v), v)
+
+    def test_h1_dot_after_tab_fixture_fails(self) -> None:
+        # R6P2-3 representative variant: tab between `.` and `repeat`.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotAfterTabTest.kt",
+                'val payload = "x".\trepeat(100_000)\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+            self.assertFalse(any("H2" in x for x in v), v)
+
+    def test_h1_dot_after_block_comment_fixture_fails(self) -> None:
+        # R6P2-3 representative variant: masked block comment between `.`
+        # and `repeat` blanks to spaces on masked lines, so `\s*` bridges it.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotAfterCommentTest.kt",
+                'val payload = "x". /*c*/ repeat(100_000)\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+            self.assertFalse(any("H2" in x for x in v), v)
+
+    def test_h1_dot_after_space_chained_fixture_fails(self) -> None:
+        # R6P2-3 representative variant: chained gaps at all three slots
+        # (`"x" . repeat (100_000)`) still resolves the huge fixture.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotAfterChainedTest.kt",
+                'val payload = "x" . repeat (100_000)\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+            self.assertFalse(any("H2" in x for x in v), v)
+
+    def test_h1_dot_after_block_comment_inline_fails(self) -> None:
+        # R6P2-3 inline masked-comment variant: the huge constructor inside
+        # the write span bridges the blanked comment.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotAfterCommentInlineTest.kt",
+                "repeat(100) { store.appendEvent(event(sid, "
+                'text="y". /*c*/ repeat(100_001))) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+            self.assertFalse(any("H2" in x for x in v), v)
+
+    def test_h2_dot_after_space_fixture_no_loop_fp(self) -> None:
+        # R6P2-3 H2 pin: the dot-post-space fixture constructor is member
+        # access, never a loop — the loop-side whitespace backscan discards
+        # it, so a lone fixture plus an out-of-loop write stays clean.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotAfterSpaceLoneTest.kt",
+                'val payload = "x". repeat(100_000)\n'
+                "fun f() {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertFalse(any("H2" in x for x in v), v)
+            self.assertEqual([], v)
+
+    def test_h1_dot_after_space_below_threshold_passes(self) -> None:
+        # R6P2-3 precision pin: dot-post-space shape at `99_999` stays
+        # under HUGE_FIXTURE_MIN and must pass.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "DotAfterSpaceBelowTest.kt",
+                'val payload = "x". repeat(99_999)\n'
+                "repeat(100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
     def test_main_scans_all_test_source_sets(self) -> None:
         # Stage 4C pin: the repo-wide scan covers all four test source sets,
         # not just `app/src/test`.

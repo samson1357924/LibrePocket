@@ -126,16 +126,19 @@ ALLOWLIST_HUGE_TRUE_PATH = {
 
 # `val payload = "x".repeat(100_000)` (optionally typed:
 # `val payload: String = ...`) assigned anywhere in the file, with the repeat
-# count normalized (underscores stripped) against HUGE_FIXTURE_MIN. The
+# count normalized (underscores stripped) against HUGE_FIXTURE_MIN. `.` and
+# `repeat` may split over spaces/tabs/masked comments (legal Kotlin), so the
+# dot-post gap is `\s*` (masked lines: comments already blank to spaces). The
 # fixture expression never crosses `;` (statement separator), so a same-line
 # `val a = huge; val b = small` attributes each count to its own definition
 # instead of greedily binding the last count to the first name.
 HUGE_FIXTURE_MIN = 100_000
 FIXTURE_VAR_RE = re.compile(
-    r"(?:val|var)\s+(\w+)\s*(?::\s*[^=\n]+?)?=[^;\n]*\.repeat\s*\(\s*([\d_]+)"
+    r"(?:val|var)\s+(\w+)\s*(?::\s*[^=\n]+?)?=[^;\n]*\.\s*repeat\s*\(\s*([\d_]+)"
 )
 # Inline `"x".repeat(150_000)` fixture constructor (any size; thresholded).
-STRING_REPEAT_N_RE = re.compile(r"\.repeat\s*\(\s*([\d_]+)")
+# `.`/`repeat` may split over spaces/tabs/masked comments (legal Kotlin).
+STRING_REPEAT_N_RE = re.compile(r"\.\s*repeat\s*\(\s*([\d_]+)")
 
 HUGE_REPEAT_MIN = 10
 ROW_REPEAT_MAX = 2000

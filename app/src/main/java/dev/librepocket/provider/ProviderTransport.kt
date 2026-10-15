@@ -403,13 +403,17 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * of other fatal events (401/validation stay flushable).
  * Unknown runtime failures fail closed (`retryable = false`): only the
  * typed branches above may retry, and TurnController owns that budget.
+ * `VM-fatal` (`VirtualMachineError`/`ThreadDeath`) and `CancellationException`
+ * always propagate without conversion (never a `Failed` event), matching
+ * TurnController's rethrow guarantees.
  */
 internal fun streamingFlow(block: suspend FlowCollector<StreamEvent>.() -> Unit): Flow<StreamEvent> =
     flow(block)
         .catch { e ->
+            if (e is VirtualMachineError || e is ThreadDeath) throw e
+            if (e is CancellationException) throw e
             currentCoroutineContext().ensureActive()
             when (e) {
-                is CancellationException -> throw e
                 is ProviderFailure -> emit(
                     StreamEvent.Failed(
                         redactedError(e.message ?: "PROVIDER_FAILED"),

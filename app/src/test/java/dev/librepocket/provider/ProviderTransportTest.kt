@@ -940,6 +940,38 @@ class ProviderTransportTest {
         }
     }
 
+    @Test
+    fun streamingFlowRethrowsVmFatal() = runBlocking {
+        try {
+            withTimeout(3_000) {
+                streamingFlow { throw OutOfMemoryError("synthetic-fatal") }.toList()
+            }
+            fail("OutOfMemoryError must propagate, not become a Failed event")
+        } catch (e: OutOfMemoryError) {
+            assertEquals("synthetic-fatal", e.message)
+        }
+        try {
+            withTimeout(3_000) {
+                streamingFlow { throw StackOverflowError("synthetic-fatal") }.toList()
+            }
+            fail("StackOverflowError must propagate, not become a Failed event")
+        } catch (e: StackOverflowError) {
+            assertEquals("synthetic-fatal", e.message)
+        }
+    }
+
+    @Test
+    fun streamingFlowRethrowsThreadDeath() = runBlocking {
+        try {
+            withTimeout(3_000) {
+                streamingFlow { throw ThreadDeath() }.toList()
+            }
+            fail("ThreadDeath must propagate, not become a Failed event")
+        } catch (_: ThreadDeath) {
+            // Expected: thread-death stays thread-death, never a failure terminal.
+        }
+    }
+
     private fun providerFor(protocol: ProviderProtocol, server: MockWebServer, client: OkHttpClient? = null): LlmProvider {
         val base = server.url("/").toString().trimEnd('/')
         val cfg = config(protocol, base)

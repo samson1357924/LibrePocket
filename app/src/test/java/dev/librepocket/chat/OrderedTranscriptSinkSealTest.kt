@@ -8,9 +8,12 @@ import java.util.Collections
 import java.util.concurrent.Executors
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -97,18 +100,35 @@ class OrderedTranscriptSinkSealTest {
         override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
       }
       val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      // Deterministic writer order: the second core launches only after the
+      // first has reserved its admission slot (synchronous, before the first
+      // suspend point), so the test never depends on launcher scheduling.
+      val firstReserved = CompletableDeferred<Unit>()
+      sink.onAdmissionReservedForTest = { firstReserved.complete(Unit) }
       runBlocking {
         withTimeout(10_000) {
-          val first = async { sink.onTurnStarted("run-1", "hi") }
-          val second = async { sink.onTurnCancelled("run-2", "half", hasReasoning = false) }
-          for (job in listOf(first, second)) {
-            try {
-              job.await()
-              fail("core behind a dead writer must fail, never hang or succeed")
-            } catch (_: CancellationException) {
-              // Explicit bounded failure (teardown seal or fail-fast).
-            } catch (_: Exception) {
-              // ClosedSendChannelException on the seal race also counts.
+          // supervisorScope: a child failing with non-cancellation
+          // (ClosedSendChannelException on the seal race) must fail its own
+          // await instead of cancelling the parent/sibling scope.
+          supervisorScope {
+            val first = async { sink.onTurnStarted("run-1", "hi") }
+            firstReserved.await()
+            val second = async { sink.onTurnCancelled("run-2", "half", hasReasoning = false) }
+            for (job in listOf(first, second)) {
+              try {
+                job.await()
+                fail("core behind a dead writer must fail, never hang or succeed")
+              } catch (e: CancellationException) {
+                // Explicit bounded failure (teardown seal or fail-fast).
+                // Guard against hang false-positives: a withTimeout hang raises
+                // TimeoutCancellationException, which must not pass as sealed.
+                assertFalse(
+                  "hung instead of failing boundedly behind a dead writer",
+                  e is TimeoutCancellationException,
+                )
+              } catch (_: ClosedSendChannelException) {
+                // Seal race: the send landed after the writer closed the channel.
+              }
             }
           }
           assertTrue(sink.interruptedRunIds().contains("run-1"))

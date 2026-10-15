@@ -1257,6 +1257,114 @@ class CheckTestBudgetsTest(unittest.TestCase):
             )
             self.assertEqual([], check_test_budgets.check_file(p))
 
+    def test_h2_named_param_times_fails(self) -> None:
+        # R6P2-1: `repeat(times = N)` is the same stdlib loop (sole
+        # parameter is `times`, case-sensitive) — it must not bypass H2.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NamedParamTest.kt",
+                'repeat(times = 2_000) { store.appendEvent(event(sid, "q")) }\n',
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h2_named_param_spacing_variants_fail(self) -> None:
+        # R6P2-1: no-whitespace / padded / masked-comment / cross-line
+        # `times =` shapes all read as the same 2000-row loop (masked
+        # comments blank to spaces; `\s*` spans newlines on joined text).
+        variants = (
+            'repeat(times=2000){ store.appendEvent(event(sid, "q")) }\n',
+            'repeat( times = 2_000 ) { store.appendEvent(event(sid, "q")) }\n',
+            "repeat(/*c*/ times /*c*/ = /*c*/ 2000)"
+            '{ store.appendEvent(event(sid, "q")) }\n',
+            "repeat(times =\n"
+            '  2000){ store.appendEvent(event(sid, "q")) }\n',
+        )
+        for i, content in enumerate(variants):
+            with self.subTest(i=i):
+                with tempfile.TemporaryDirectory() as d:
+                    p = _write(Path(d), f"NamedVariant{i}Test.kt", content)
+                    v = check_test_budgets.check_file(p)
+                    self.assertTrue(any("H2" in x for x in v), v)
+
+    def test_h1_named_param_times_fails(self) -> None:
+        # R6P2-1 H1: huge fixture plus `repeat(times = 100)` write loop.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NamedHugeTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "repeat(times = 100) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            v = check_test_budgets.check_file(p)
+            self.assertTrue(any("H1" in x for x in v), v)
+            self.assertFalse(any("H2" in x for x in v), v)
+
+    def test_h2_named_param_below_threshold_passes(self) -> None:
+        # R6P2-1 precision: `repeat(times = 1999)` stays under H2.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "Named1999Test.kt",
+                'repeat(times = 1999) { store.appendEvent(event(sid, "q")) }\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h1_named_param_below_threshold_passes(self) -> None:
+        # R6P2-1 precision: `repeat(times = 5)` stays under H1 even with a
+        # huge fixture on the write path.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NamedSmallHugeTest.kt",
+                'val payload = "x".repeat(100_000)\n'
+                "repeat(times = 5) {\n"
+                "    store.appendEvent(event(sid, payload))\n"
+                "}\n",
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_named_param_variable_count_passes(self) -> None:
+        # R6P2-1 negative: `repeat(times = n)` carries no literal count —
+        # the gate only judges literal digits, so it passes.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NamedVarTest.kt",
+                'repeat(times = n) { store.appendEvent(event(sid, "q")) }\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_named_param_myrepeat_passes(self) -> None:
+        # R6P2-1 retention: the immediate-`\w` lookbehind still excludes a
+        # `myrepeat` identifier carrying a named argument.
+        with tempfile.TemporaryDirectory() as d:
+            p = _write(
+                Path(d),
+                "NamedMyRepeatTest.kt",
+                'myrepeat(times = 2000){ store.appendEvent(event(sid, "q")) }\n',
+            )
+            self.assertEqual([], check_test_budgets.check_file(p))
+
+    def test_h2_named_param_member_access_passes(self) -> None:
+        # R6P2-1 loop-side exclusion retention: member access is never a
+        # loop, even with a named count — immediate `.repeat` via the
+        # lookbehind, spaced `. repeat` via the whitespace backscan.
+        # Synthetic shapes pinning the exclusion, not compilable Kotlin.
+        variants = (
+            '"x".repeat(times = 2000){ store.appendEvent(event(sid, "q")) }\n',
+            '"x" .repeat(times = 2000){ store.appendEvent(event(sid, "q")) }\n',
+            '"x". repeat(times = 2000){ store.appendEvent(event(sid, "q")) }\n',
+        )
+        for i, content in enumerate(variants):
+            with self.subTest(i=i):
+                with tempfile.TemporaryDirectory() as d:
+                    p = _write(Path(d), f"NamedMember{i}Test.kt", content)
+                    self.assertEqual([], check_test_budgets.check_file(p))
+
     def test_main_scans_all_test_source_sets(self) -> None:
         # Stage 4C pin: the repo-wide scan covers all four test source sets,
         # not just `app/src/test`.

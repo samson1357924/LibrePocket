@@ -66,8 +66,11 @@ from collections.abc import Iterator
 # `.repeat`/`myrepeat` shape; `repeat`/`(`/count whitespace (including
 # newlines and masked comments) is matched on the joined masked text via
 # `_iter_repeat_matches` (per-line `finditer` would miss multiline headers).
-# Underscored counts (`repeat(2_000)`) normalize to 2000.
-REPEAT_RE = re.compile(r"(?<![.\w])repeat\s*\(\s*(\d[\d_]*)")
+# Underscored counts (`repeat(2_000)`) normalize to 2000. The stdlib loop
+# takes a single `times` parameter, so an optional case-sensitive
+# `times =` prefix is accepted (`repeat(times = 2_000)`); the group is
+# non-capturing so group(1) stays the count.
+REPEAT_RE = re.compile(r"(?<![.\w])repeat\s*\(\s*(?:times\s*=\s*)?(\d[\d_]*)")
 
 
 def _repeat_count(raw: str) -> int:

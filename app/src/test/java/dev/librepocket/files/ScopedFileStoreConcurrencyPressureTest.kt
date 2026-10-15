@@ -49,8 +49,9 @@ import java.util.concurrent.atomic.AtomicReference
  *   symlink／escapes（本測試只翻轉 `flip`／`race-sub` 子路徑不動 root，
  *   root 定錨族 mismatch／identity 由 [ScopedFileStoreB2Test] T1／F1 確定性
  *   覆蓋）；事後清理＋可寫可讀證明安全重試／恢復（store 事後仍可用）。
- *   壓力有效性另以 flipOk／dirFlipOk／讀列刪進度計數證明非零覆蓋空轉
- *   （寫成功由無 errors 間接證明，失敗計入 denied 混合桶）。
+ *   壓力有效性另以 fileLinkOk／fileRealOk／dirLinkOk／dirRealOk 雙態計數與
+ *   讀列刪進度計數證明非零覆蓋空轉（讀成功零在高翻轉下合法，進度以 readAttempts 計；
+ *   寫成功由無 errors 間接證明，失敗計入 denied 混合桶）。
  *
  * 時序：起跑閘（[CountDownLatch]）＋背景線程池＋`await` 期限；全檔不用
  * 睡眠猜時序（僅 latch／await 期限）。
@@ -659,6 +660,53 @@ class ScopedFileStoreConcurrencyPressureTest {
             assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
         } finally {
             // NOFOLLOW 終兜：ws 可能殘留 race-sub 指外連結，絕不跟隨進 outside。
+            deleteNoFollowRecursively(ws)
+            deleteNoFollowRecursively(out)
+        }
+    }
+
+    /**
+     * 確定性重驗證據（人審 P2#2）：壓力測試的 `rejected` 只證明「有呼叫被拒」，
+     * 靜態毒鏈初驗亦同訊息，不等於初驗後重驗命中。本測試以 `preGateHook` 在
+     * 初驗通過之後、搬移前重驗之前把父段換成指外連結，`hookRan`＋事後 `sub`
+     * 為連結證明拒絕必來自重驗門（非入口先拒）；B2 T1/F1 另覆 root 置換。
+     */
+    @Test fun writeRevalidationGateRefusesMidOperationSwap() {
+        assumeNonWindows()
+        assertTrue(ScopedFileStore.TMP_NAME_PREFIX.isNotEmpty())
+        val ws = workspace()
+        val out = outside()
+        try {
+            File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
+            val store = ScopedFileStore(ws)
+            store.write("sub/seed.txt", "seed".toByteArray(Charsets.UTF_8))
+            var hookRan = false
+            try {
+                store.writeInternal(
+                    "sub/evil.txt",
+                    "x".toByteArray(Charsets.UTF_8),
+                    preGateHook = {
+                        hookRan = true
+                        deleteNoFollowRecursively(File(ws, "sub"))
+                        Files.createSymbolicLink(File(ws, "sub").toPath(), out.toPath())
+                    },
+                )
+                fail("expected IllegalArgumentException: mid-operation parent swap")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(
+                    "revalidation must hit chain family, got ${e.message}",
+                    isChainRejectionMessage(e.message),
+                )
+            }
+            assertTrue("hook must have run (rejection is post-initial)", hookRan)
+            assertTrue(
+                "sub must be swapped to symlink (rejection is post-initial)",
+                Files.isSymbolicLink(File(ws, "sub").toPath()),
+            )
+            assertFalse(File(out, "evil.txt").exists())
+            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
+        } finally {
+            removePossiblyFlipped(File(ws, "sub"))
             deleteNoFollowRecursively(ws)
             deleteNoFollowRecursively(out)
         }

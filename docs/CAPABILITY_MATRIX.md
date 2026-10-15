@@ -35,6 +35,7 @@
 | Setup key.write／probe 門 | staged 寫入＋metadata CAS、ASK one-shot 確認（含 STAGED／KEEP_EXISTING 身份列）、probe 的 provider.call 新鮮閘、KEEP_EXISTING metadata-only（存在性 hasKey 前提，零 put/get/delete）；JVM 單測存在 | 裝置端到端外洩證明；policy 後端本身的可用性保證；自訂端點在政策層的細粒度區分（共用同一 resource，見威脅模型） |
 | Chat key.read 門 | T0 新鮮評估＋綁定式 one-shot 確認、T1 capture 邊界重驗（ALLOW→ASK 翻轉拒絕、拒絕丟棄殘留槽位；T1→`vault()`→`getKey` 含 suspend／IO 的殘留窗口：`DENY` 翻轉後續無門捕捉，binding／generation 翻轉擋 attach 但擋不住已發生的 vault 讀，僅 close 抹除）；JVM 單測存在 | 重驗與 vault 讀之間的殘留窗口已消除；裝置端到端證明（已知殘留：含 suspend／IO，dispatcher hop＋Keystore/disk IO，未持有門控跨越；僅 JVM 單測） |
 | 語音 UI 手勢直連 | `ChatScreen` 直連系統引擎：使用者逐次手勢 + DataStore 持久化同名開關（`voice_input`/`voice_output`，設定頁可切、關閉隱藏入口）；朗讀首次內聯確認（只問一次）；引擎失敗經分離的 `sttError`／`ttsError` 可觀察（`NO_ENGINE` 無引擎 fail-closed；`LANG_UNAVAILABLE` 缺語料僅降級提醒非失敗；`LISTENER_FAILED` 掛載失敗僅警告）；引擎資料處理已揭露 | 直連等同政策授權；模型可經工具鏈執行語音（模型側 `executionReady=false` 維持未啟用） |
+| MCP 客戶端（D03，#11 Stage2） | declared＋implemented，not wired：`McpWire`（tools/list＋tools/call 單頁 POST 子集解析）、`McpServer`／`McpTransport`（Bearer 標頭、熔斷、取消、有界 body）、`McpScope`（投影＋確認，預設 WRITE）皆有 JVM 單測；`dev.librepocket.mcp` 外零 production 引用（未接 dispatcher／副作用）；`2025-11-25`／`2026-07-28` 修訂皆為 Proposed 未採納（單一最小子集起步，不送 initialize、不接 SSE、不跟隨分頁，見 `McpProtocolContractsTest`） | 投影 NATIVE 可作可用證據；子集綠燈可作修訂相容證據；模型可執行第三方工具 |
 
 `foss` 和 `github` 在某些 source/service 形狀上相似，不代表依賴、bridge 或能力相同。Flavor distribution/source-of-truth 見 [README](../README.md)、[Architecture](ARCHITECTURE.md) 與 [Threat Model](THREAT_MODEL.md)。
 

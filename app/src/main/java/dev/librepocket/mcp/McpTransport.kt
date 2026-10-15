@@ -20,6 +20,11 @@ import okio.Buffer
 /**
  * D03 Streamable HTTP 傳輸：POST `endpoint(baseUrl)`（使用者自訂完整 URL；bare-origin 自動補 `/mcp`，有 path 原樣保留）+ Bearer（舊 SSE 不做）。
  *
+ * 最小子集警示（#11 Stage2）：本層只發 `tools/list`／`tools/call` 單次 POST；
+ * 不送 `initialize` 交握、不接 SSE event-stream、不跟隨 `nextCursor` 分頁、
+ * 不協商 `protocolVersion`（`2025-11-25`／`2026-07-28` 皆為 Proposed 未採納）。
+ * SSE 文本餵給 [McpWire] 一律 `mcp: bad envelope`（見 `McpProtocolContractsTest`）。
+ *
  * 安全約定：
  * - [bearer] 只放 `Authorization` 標頭，永不拼進 body，不寫 log；
  * - 呼叫方（[McpServer]）負責從 KeyVault 取 key、用後即擦，本層不留存；

@@ -20,6 +20,12 @@ package dev.librepocket.mcp
  *
  * 已知非目標（follow-up，不在本層驗證）：`jsonrpc == "2.0"` 版本斷言、
  * response id 與 request id 對應（呼叫方以 HTTP 一問一答配對，不做 id 複用檢查）。
+ *
+ * 修訂立場（#11 Stage2 決策，單一最小子集起步）：`2025-11-25` 與 `2026-07-28`
+ * 皆為 Proposed（repo 內無規格文本、無外網可核對，不寫差異表）；本物件只保證
+ * `tools/list`＋`tools/call` 單頁 POST 子集，不送 `initialize`、不接 SSE stream、
+ * 不跟隨 `nextCursor` 分頁、不協商 `protocolVersion`。契約見
+ * `McpProtocolContractsTest`；修訂支援須先納規格文本再逐項補契約。
  */
 internal object McpWire {
 

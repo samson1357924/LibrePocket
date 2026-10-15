@@ -6,6 +6,10 @@ import kotlinx.coroutines.CancellationException
 /**
  * D03 單伺服器客戶端（多伺服器 = 每個配置一個 [McpServer] 實例）。
  *
+ * 最小子集警示（#11 Stage2）：只會 `tools/list`＋`tools/call`（見 [McpWire] 修訂立場）；
+ * 未接 production composition（`dev.librepocket.mcp` 外零引用，見 CAPABILITY_MATRIX
+ * MCP 行），啟用前須單獨驗 production dispatcher、取消與副作用邊界，不得批次開啟。
+ *
  * - 地址使用者配置（[McpServerConfig.baseUrl]），Key 走 [KeyVault] 加密存取；
  * - 方法：[listTools]（tools/list）+ [callTool]（tools/call）；
  * - 熔斷：連續失敗即開路（[McpCircuitBreaker]），開路期間短路為 CIRCUIT_OPEN；

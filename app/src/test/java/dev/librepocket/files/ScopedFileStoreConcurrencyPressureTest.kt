@@ -44,7 +44,8 @@ import java.util.concurrent.atomic.AtomicReference
  *   symlink／escapes（本測試只翻轉 `flip`／`race-sub` 子路徑不動 root，
  *   root 定錨族 mismatch／identity 由 [ScopedFileStoreB2Test] T1／F1 確定性
  *   覆蓋）；事後清理＋可寫可讀證明安全重試／恢復（store 事後仍可用）。
- *   壓力有效性另以 flipOk／dirFlipOk／讀寫列刪進度計數證明非零覆蓋空轉。
+ *   壓力有效性另以 flipOk／dirFlipOk／讀列刪進度計數證明非零覆蓋空轉
+ *   （寫成功由無 errors 間接證明，失敗計入 denied 混合桶）。
  *
  * 時序：起跑閘（[CountDownLatch]）＋背景線程池＋`await` 期限；全檔不用
  * 睡眠猜時序（僅 latch／await 期限）。
@@ -529,7 +530,7 @@ class ScopedFileStoreConcurrencyPressureTest {
             assertTrue(store.delete("after-pressure.txt"))
             store.write("after-pressure.txt", "ok".toByteArray(Charsets.UTF_8))
             assertEquals("ok", String(store.read("after-pressure.txt"), Charsets.UTF_8))
-            // 確定性錨點：事後毒鏈四操作仍拒（併發 rejected>0 為壓力證據，本段為確定性對照）。
+            // 確定性錨點：事後毒鏈讀寫刪仍拒（併發 rejected>0 為壓力證據，本段為確定性對照）。
             try {
                 Files.deleteIfExists(File(ws, "post-link").toPath())
             } catch (_: Exception) {

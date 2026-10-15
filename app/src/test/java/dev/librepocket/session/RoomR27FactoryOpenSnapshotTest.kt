@@ -358,8 +358,13 @@ class RoomR27FactoryOpenSnapshotTest {
         val newId = store.createSession("t", "m")
         val copied = snapshotSwitchHistory(store, sid, newId, "m0", "m1", historyWithheld = false, markIncomplete = true)
         // Batch fits the cap: both markers survive the same-batch auto-prune.
+        // P3 exact clamp pin (R29): 1999 prefix - 1 clamped oldest (u-h) - 2
+        // head-family re-trim (r-h marker + a-h orphan, same family h) = 1996
+        // carried + 2 markers = 1998 raw. A future trim that only deletes the
+        // user row (leaving a-h orphan) fails the 1996/whole-family asserts.
         val forkCount = store.countEvents(newId)
-        assertTrue("fork raw must fit keep-2000 (was $forkCount)", forkCount <= 2000)
+        assertEquals("clamped fork must hold 1996 carried + 2 markers", 1998, forkCount)
+        assertEquals("clamp must copy exactly 1996 carried rows", 1996, copied)
         val forked = store.loadEvents(newId, afterSeq = 0, limit = 3000)
         assertTrue(
             "switch audit marker must survive (pre-fix auto-prune deleted it)",
@@ -371,6 +376,12 @@ class RoomR27FactoryOpenSnapshotTest {
         )
         assertTrue("incomplete re-warning must scan true", hasIncompleteSnapshotMarker(store, newId))
         assertTrue("newest carried pair must survive", forked.any { it.text == "u-fill-997" })
+        assertTrue(
+            "clamped head family must be gone whole (user + marker + assistant, not just the user row)",
+            forked.none { it.runId == "h" },
+        )
+        val forkCarried = forked.filter { it.kind == "user" || it.kind == "assistant" }
+        assertEquals("clamped fork must start at the next user boundary", "u-fill-0", forkCarried.first().text)
         assertTrue("clamped prefix starts at a user boundary", findDanglingRunIds(forked).isEmpty())
         assertNoHeadOrphan(forked.filter { it.kind == "user" || it.kind == "assistant" }, "clamped fork")
         // An explicit keep-2000 sweep must not drop either marker.

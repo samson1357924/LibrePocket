@@ -15,11 +15,13 @@ import java.util.concurrent.atomic.AtomicLong
  * with the decision, the projection snapshot and the model-visible snapshot.
  *
  * Stage1 (P2 safe slice, #19 前置): guessing never executes. Missing
- * alarm time (defaults 7:00), missing phone number (empty string),
- * empty-field templates (`sms.compose` to / `calendar.create` start-end)
- * and negated intents all become DENIED + NEED_CLARIFICATION with a
- *補參 question (audit-distinct from USER_DISABLED). No new execution
- * path: FAST still requires projected AND `executionReady`.
+ * alarm time (never defaulted: [missingQuestionFor] intercepts first, so
+ * [alarmArgs]' 7:00 is only a dead template-direct fallback), missing phone
+ * number (empty string), empty-field templates (`sms.compose` to /
+ * `calendar.create` start-end) and negated intents all become DENIED +
+ * NEED_CLARIFICATION with a 補參 question (audit-distinct from
+ * USER_DISABLED). No new execution path: FAST still requires projected AND
+ * `executionReady`.
  *
  * Wiring gate (PR#1 re-review scope-down): a match whose tool is projected
  * but NOT `executionReady` is denied as USER_DISABLED (capability not
@@ -148,7 +150,7 @@ class FastRouter(
     private data class TemplateMatch(val toolName: String, val argumentsJson: String)
 
     private fun jsonText(text: String): String =
-        "{\"text\": \"${text.replace("\\", "\\\\").replace("\"", "\\\"")}\"}"
+        "{\"text\": \"${esc(text)}\"}"
 
     private fun matchTemplate(text: String): TemplateMatch? {
         if (text.isEmpty()) return null
@@ -166,94 +168,131 @@ class FastRouter(
     private fun containsAny(text: String, hints: List<Regex>): Boolean =
         hints.any { it.containsMatchIn(text) }
 
-    private fun r(pattern: String): Regex = Regex(pattern, RegexOption.IGNORE_CASE)
+    companion object {
+        private fun r(pattern: String): Regex = Regex(pattern, RegexOption.IGNORE_CASE)
+
+        // Template hints, precompiled once per process: these lists were
+        // per-instance vals (recompiling ~60 patterns per FastRouter()), but
+        // decide() is a hot path — hoisted with identical patterns.
+        private val SCREENSHOT_HINTS = listOf(r("截圖"), r("截图"), r("擷取"), r("screenshot"), r("螢幕.*存"), r("屏幕.*存"))
+        private val NOTIFICATION_HINTS = listOf(r("通知"), r("notification"), r("未讀"), r("未读"), r("訊息中心"))
+        private val ALARM_HINTS = listOf(r("鬧鐘"), r("闹钟"), r("alarm"), r("定時.*響"), r("定时.*响"), r("提醒.*點"), r("提醒.*点"))
+        private val PHONE_HINTS = listOf(r("打電話"), r("打电话"), r("撥打"), r("拨打"), r("撥號"), r("拨号"), r("打給"), r("打给"), r("致電"), r("致电"), r("\\bcall\\b"), r("tel:"))
+        private val SMS_HINTS = listOf(r("簡訊"), r("简讯"), r("短信"), r("短訊"), r("短讯"), r("\\bsms\\b"), r("傳訊息給"), r("发消息"))
+        private val MAIL_HINTS = listOf(r("郵件"), r("邮件"), r("e-?mail"), r("寫信"), r("写信"), r("寄信"), r("發郵件"), r("发邮件"))
+        private val CALENDAR_HINTS = listOf(r("日曆"), r("日历"), r("calendar"), r("行程"), r("會議"), r("会议"), r("約會"), r("约会"), r("安排.*(會|事)"))
+        private val MUSIC_HINTS = listOf(r("音樂"), r("音乐"), r("播放.*歌"), r("放.*歌"), r("切歌"), r("下一首"), r("上一首"), r("暫停.*音樂"), r("暂停.*音乐"), r("\\bmusic\\b"))
+        private val VOLUME_HINTS = listOf(r("音量"), r("靜音"), r("静音"), r("大聲"), r("大声"), r("小聲"), r("小声"), r("調.*音"), r("调.*音"), r("volume"), r("mute"))
+        private val NAVIGATE_HINTS = listOf(r("導航"), r("导航"), r("路線"), r("路线"), r("帶我去"), r("带我去"), r("怎麼去"), r("怎么去"), r("去.*(路|街|店|餐廳|餐厅|公司|家|站|場|场|店)"), r("\\bmap\\b"))
+        private val OPEN_APP_HINTS = listOf(r("打開"), r("打开"), r("開啟"), r("开启"), r("啟動"), r("启动"), r("開.*app"), r("开.*app"))
+        private val SLOW_HINTS = listOf(
+            r("自動點擊"), r("自动点击"), r("點擊螢幕"), r("点击屏幕"), r("幫我點"), r("帮我点"),
+            r("自動填表"), r("自动填表"), r("代操"), r("自動操作"), r("自动操作"),
+        )
+
+        /**
+         * Stage1 否定句門：裸「別/别」不用（避「特別/别人/特別/別人」誤判），只收
+         * 「別/别+動詞」（繁簡對稱）與明確否定詞；命中且同時命中工具模板即轉澄清，
+         * 絕不執行。
+         *
+         * 維護註記：封閉動詞表——新工具上線為執行 ready 前必須先擴充此表，
+         * 否則該工具參數齊備時的否定句會一路走到 FAST 執行（非 fail-safe；
+         * 今日僅因各工具多為非 ready 才看似安全）。
+         * 已知侷限：複合句（「取消舊鬧鐘再設一個新的」同時命中模板與取消/停止詞）
+         * 會被轉澄清，屬誤澄清（安全方向），由測試釘住。
+         */
+        private val NEGATION_HINTS = listOf(
+            r("不要"), r("不用"), r("不需要"), r("不必"), r("不需"), r("勿"),
+            r("取消"), r("停止"), r("禁止"), r("算了"),
+            r("別打"), r("別設"), r("別開"), r("別截"), r("別播"),
+            r("別調"), r("別導"), r("別發"), r("別傳"), r("別幫"), r("別給"),
+            r("别打"), r("别设"), r("别开"), r("别截"), r("别播"),
+            r("别调"), r("别导"), r("别发"), r("别传"), r("别帮"), r("别给"),
+            r("\\bdon'?t\\b"), r("\\bdo not\\b"), r("\\bstop\\b"), r("\\bcancel\\b"),
+        )
+
+        // Shared argument patterns (also hoisted: previously recompiled per
+        // call inside hasExplicitAlarmTime/hasPhoneNumber/phoneArgs and
+        // music/volume/alarm arg builders).
+        private val ALARM_TIME = Regex("(\\d{1,2})[:點点](\\d{1,2})?")
+        private val PHONE_CANDIDATE = Regex("[+\\d][\\d\\-\\.\\s]{5,16}")
+        private val MUSIC_NEXT = Regex("下一首|切歌|next", RegexOption.IGNORE_CASE)
+        private val MUSIC_PREV = Regex("上一首|previous", RegexOption.IGNORE_CASE)
+        private val MUSIC_PAUSE = Regex("暫停|暂停|pause", RegexOption.IGNORE_CASE)
+        private val VOLUME_MUTE = Regex("靜音|静音|mute", RegexOption.IGNORE_CASE)
+        private val VOLUME_LEVEL = Regex("(\\d{1,3})")
+    }
 
     private val RULES: List<Triple<String, List<Regex>, (String) -> String>> = listOf(
         Triple(
             "screenshot.capture",
-            listOf(r("截圖"), r("截图"), r("擷取"), r("screenshot"), r("螢幕.*存"), r("屏幕.*存")),
+            SCREENSHOT_HINTS,
             { t -> "{\"share\": false, \"text\": \"${esc(t)}\"}" },
         ),
         Triple(
             "notification.read",
-            listOf(r("通知"), r("notification"), r("未讀"), r("未读"), r("訊息中心")),
+            NOTIFICATION_HINTS,
             { t -> "{\"limit\": 10, \"text\": \"${esc(t)}\"}" },
         ),
         Triple(
             "alarm.create",
-            listOf(r("鬧鐘"), r("闹钟"), r("alarm"), r("定時.*響"), r("定时.*响"), r("提醒.*點"), r("提醒.*点")),
+            ALARM_HINTS,
             { t -> alarmArgs(t) },
         ),
         Triple(
             "phone.dial",
-            listOf(r("打電話"), r("打电话"), r("撥打"), r("拨打"), r("撥號"), r("拨号"), r("打給"), r("打给"), r("致電"), r("致电"), r("\\bcall\\b"), r("tel:")),
+            PHONE_HINTS,
             { t -> phoneArgs(t) },
         ),
         Triple(
             "sms.compose",
-            listOf(r("簡訊"), r("简讯"), r("短信"), r("短訊"), r("短讯"), r("\\bsms\\b"), r("傳訊息給"), r("发消息")),
+            SMS_HINTS,
             { t -> "{\"to\": \"\", \"body\": \"${esc(t)}\", \"raw\": \"${esc(t)}\"}" },
         ),
         Triple(
             "mail.compose",
-            listOf(r("郵件"), r("邮件"), r("e-?mail"), r("寫信"), r("写信"), r("寄信"), r("發郵件"), r("发邮件")),
+            MAIL_HINTS,
             { t -> "{\"to\": \"\", \"subject\": \"\", \"body\": \"${esc(t)}\"}" },
         ),
         Triple(
             "calendar.create",
-            listOf(r("日曆"), r("日历"), r("calendar"), r("行程"), r("會議"), r("会议"), r("約會"), r("约会"), r("安排.*(會|事)")),
+            CALENDAR_HINTS,
             { t -> "{\"title\": \"${esc(t)}\", \"start\": \"\", \"end\": \"\"}" },
         ),
         Triple(
             "music.control",
-            listOf(r("音樂"), r("音乐"), r("播放.*歌"), r("放.*歌"), r("切歌"), r("下一首"), r("上一首"), r("暫停.*音樂"), r("暂停.*音乐"), r("\\bmusic\\b")),
+            MUSIC_HINTS,
             { t -> "{\"action\": \"${musicAction(t)}\", \"text\": \"${esc(t)}\"}" },
         ),
         Triple(
             "volume.set",
-            listOf(r("音量"), r("靜音"), r("静音"), r("大聲"), r("大声"), r("小聲"), r("小声"), r("調.*音"), r("调.*音"), r("volume"), r("mute")),
+            VOLUME_HINTS,
             { t -> volumeArgs(t) },
         ),
         Triple(
             "navigate",
-            listOf(r("導航"), r("导航"), r("路線"), r("路线"), r("帶我去"), r("带我去"), r("怎麼去"), r("怎么去"), r("去.*(路|街|店|餐廳|餐厅|公司|家|站|場|场|店)"), r("\\bmap\\b")),
+            NAVIGATE_HINTS,
             { t -> "{\"destination\": \"${esc(t)}\", \"mode\": \"driving\"}" },
         ),
         Triple(
             "open_app",
-            listOf(r("打開"), r("打开"), r("開啟"), r("开启"), r("啟動"), r("启动"), r("開.*app"), r("开.*app")),
+            OPEN_APP_HINTS,
             { t -> "{\"appName\": \"${esc(t)}\", \"packageName\": \"\"}" },
         ),
-    )
-
-    private val SLOW_HINTS: List<Regex> = listOf(
-        r("自動點擊"), r("自动点击"), r("點擊螢幕"), r("点击屏幕"), r("幫我點"), r("帮我点"),
-        r("自動填表"), r("自动填表"), r("代操"), r("自動操作"), r("自动操作"),
-    )
-
-    /**
-     * Stage1 否定句門：裸「別/别」不用（避「特別/别人/特別/別人」誤判），只收
-     * 「別/别+動詞」（繁簡對稱）與明確否定詞；命中且同時命中工具模板即轉澄清，
-     * 絕不執行。
-     */
-    private val NEGATION_HINTS: List<Regex> = listOf(
-        r("不要"), r("不用"), r("不需要"), r("不必"), r("不需"), r("勿"),
-        r("取消"), r("停止"), r("禁止"), r("算了"),
-        r("別打"), r("別設"), r("別開"), r("別截"), r("別播"),
-        r("別調"), r("別導"), r("別發"), r("別傳"), r("別幫"), r("別給"),
-        r("别打"), r("别设"), r("别开"), r("别截"), r("别播"),
-        r("别调"), r("别导"), r("别发"), r("别传"), r("别帮"), r("别给"),
-        r("\\bdon'?t\\b"), r("\\bdo not\\b"), r("\\bstop\\b"), r("\\bcancel\\b"),
     )
 
     private fun isNegated(text: String): Boolean = containsAny(text, NEGATION_HINTS)
 
     private fun hasExplicitAlarmTime(text: String): Boolean =
-        Regex("(\\d{1,2})[:點点](\\d{1,2})?").containsMatchIn(text)
+        ALARM_TIME.containsMatchIn(text)
+
+    private fun findPhoneCandidate(text: String): String? =
+        PHONE_CANDIDATE.find(text)?.value
 
     private fun hasPhoneNumber(text: String): Boolean {
-        val raw = Regex("[+\\d][\\d\\-\\.\\s]{5,16}").find(text)?.value ?: return false
-        return raw.filter { it.isDigit() || it == '+' }.isNotBlank()
+        val raw = findPhoneCandidate(text) ?: return false
+        // Require at least one digit: a bare "+" with spaces is not a number.
+        return raw.any { it.isDigit() }
     }
 
     /**
@@ -279,30 +318,42 @@ class FastRouter(
         else -> null
     }
 
-    private fun esc(text: String): String =
-        text.replace("\\", "\\\\").replace("\"", "\\\"")
+    private fun esc(text: String): String = buildString {
+        for (c in text) {
+            when (c) {
+                '\\' -> { append('\\'); append('\\') }
+                '"' -> { append('\\'); append('"') }
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                '\b' -> append("\\b")
+                '\u000C' -> append("\\f")
+                else -> if (c.code < 0x20) append(String.format(java.util.Locale.ROOT, "\\u%04x", c.code)) else append(c)
+            }
+        }
+    }
 
     private fun phoneArgs(text: String): String {
-        val digits = Regex("[+\\d][\\d\\-\\.\\s]{5,16}").find(text)?.value?.trim() ?: ""
+        val digits = findPhoneCandidate(text)?.trim() ?: ""
         return "{\"number\": \"${esc(digits)}\", \"raw\": \"${esc(text)}\"}"
     }
 
     private fun musicAction(text: String): String = when {
-        Regex("下一首|切歌|next", RegexOption.IGNORE_CASE).containsMatchIn(text) -> "next"
-        Regex("上一首|previous", RegexOption.IGNORE_CASE).containsMatchIn(text) -> "previous"
-        Regex("暫停|暂停|pause", RegexOption.IGNORE_CASE).containsMatchIn(text) -> "pause"
+        MUSIC_NEXT.containsMatchIn(text) -> "next"
+        MUSIC_PREV.containsMatchIn(text) -> "previous"
+        MUSIC_PAUSE.containsMatchIn(text) -> "pause"
         else -> "play"
     }
 
     private fun volumeArgs(text: String): String {
-        val mute = Regex("靜音|静音|mute", RegexOption.IGNORE_CASE).containsMatchIn(text)
-        val level = Regex("(\\d{1,3})").find(text)?.groupValues?.get(1)?.toIntOrNull()
+        val mute = VOLUME_MUTE.containsMatchIn(text)
+        val level = VOLUME_LEVEL.find(text)?.groupValues?.get(1)?.toIntOrNull()
             ?.coerceIn(0, 100)
         return "{\"level\": ${level ?: 50}, \"mute\": $mute}"
     }
 
     private fun alarmArgs(text: String): String {
-        val m = Regex("(\\d{1,2})[:點点](\\d{1,2})?").find(text)
+        val m = ALARM_TIME.find(text)
         val hour = m?.groupValues?.get(1)?.toIntOrNull()?.coerceIn(0, 23) ?: 7
         val minute = m?.groupValues?.get(2)?.takeIf { it.isNotEmpty() }?.toIntOrNull()
             ?.coerceIn(0, 59) ?: 0

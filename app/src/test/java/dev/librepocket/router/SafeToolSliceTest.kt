@@ -300,7 +300,7 @@ class SafeToolSliceTest {
     }
 
     @Test fun throwingBackendWithSecretMessageDoesNotLeak() = runBlocking {
-        val secret = "sk-live-SECRET123 Bearer abc"
+        val secret = "super-secret-token-value-123"
         val throwing = object : LspTools.Backend {
             override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
                 throw IllegalStateException(secret)
@@ -311,7 +311,7 @@ class SafeToolSliceTest {
         assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
         // Fixed receipt: backend message never interpolates into the wire JSON.
         assertFalse(r.resultJson.contains(secret))
-        assertFalse(r.resultJson.contains("sk-live-SECRET123"))
+        assertFalse(r.resultJson.contains("super-secret-token-value-123"))
         assertFalse(r.resultJson.lowercase().contains("bearer"))
     }
 
@@ -365,6 +365,8 @@ class SafeToolSliceTest {
     }
 
     @Test fun denyJsonCarriesNoSecrets() = runBlocking {
+        // 形狀抽查（sk-/bearer 子串）：精確的洩漏保證見
+        // throwingBackendWithSecretMessageDoesNotLeak。
         val backend = CountingBackend()
         val denyPolicy = InMemoryPolicyStore(
             listOf(PolicyRule("tool.exec:lsp.symbols", Verdict.DENY, 10)),
@@ -377,12 +379,105 @@ class SafeToolSliceTest {
         val unreadyDenied =
             s.execute(listOf(call(name = "shell.exec", args = """{"argv":["ls"]}""", id = "unready-1"))).single()
         assertEquals(SafeToolSlice.DenyCodes.NOT_READY, unreadyDenied.denyCode)
+        val knownCodes = setOf(
+            SafeToolSlice.DenyCodes.UNKNOWN_TOOL,
+            SafeToolSlice.DenyCodes.NOT_READY,
+            SafeToolSlice.DenyCodes.SCOPE_DENIED,
+            SafeToolSlice.DenyCodes.SCHEMA_INVALID,
+            SafeToolSlice.DenyCodes.POLICY_DENIED,
+            SafeToolSlice.DenyCodes.NEED_CONFIRM,
+            SafeToolSlice.DenyCodes.EXEC_DENIED,
+            SafeToolSlice.DenyCodes.EXEC_ERROR,
+            SafeToolSlice.DenyCodes.BUDGET_EXCEEDED,
+        )
         val results = listOf(policyDenied, schemaDenied, unreadyDenied)
         assertTrue(results.all { it.denied })
         for (r in results) {
+            assertTrue(r.denyCode in knownCodes)
             assertFalse(r.resultJson.lowercase().contains("sk-"))
             assertFalse(r.resultJson.lowercase().contains("bearer"))
         }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun longQueryAndSymbolsTruncateToCap() = runBlocking {
+        val longBackend = object : LspTools.Backend {
+            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                listOf(LspTools.Symbol("N".repeat(2000), "K".repeat(2000), "P".repeat(2000), 7))
+            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val s = slice(backend = longBackend)
+        val longQuery = "Q".repeat(2000)
+        val r = s.execute(listOf(call(args = """{"query":"$longQuery"}"""))).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        val echoQuery = body["query"]!!.jsonPrimitive.content
+        assertTrue(echoQuery.startsWith("Q".repeat(SafeToolSlice.MAX_STRING_CHARS)))
+        assertTrue(echoQuery.contains("[truncated 2000→${SafeToolSlice.MAX_STRING_CHARS}]"))
+        val sym = body["symbols"]!!.jsonArray.single().jsonObject
+        for (field in listOf("name", "kind", "path")) {
+            val v = sym[field]!!.jsonPrimitive.content
+            assertTrue(field, v.contains("[truncated 2000→${SafeToolSlice.MAX_STRING_CHARS}]"))
+        }
+    }
+
+    @Test fun limitLowClampsToOneAndExecutes() = runBlocking {
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        var n = 0
+        for (args in listOf("""{"query":"x","limit":0}""", """{"query":"x","limit":-5}""")) {
+            val r = s.execute(listOf(call(args = args, id = "low-$n"))).single()
+            assertFalse(args, r.denied)
+            assertEquals(args, 1, backend.lastLimit)
+            n++
+        }
+        assertEquals(2, backend.invocations.get())
+    }
+
+    @Test fun limitDefaultsToFiftyWhenOmitted() = runBlocking {
+        val backend = CountingBackend()
+        val r = slice(backend = backend).execute(listOf(call())).single()
+        assertFalse(r.denied)
+        assertEquals(LspTools.DEFAULT_LIMIT, backend.lastLimit)
+    }
+
+    @Test fun limitFloatAndExplicitNullDeny() = runBlocking {
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        for ((i, args) in listOf(
+            """{"query":"x","limit":1.5}""",
+            """{"query":"x","limit":null}""",
+        ).withIndex()) {
+            val r = s.execute(listOf(call(args = args, id = "lim-$i"))).single()
+            assertTrue(args, r.denied)
+            assertEquals(args, SafeToolSlice.DenyCodes.SCHEMA_INVALID, r.denyCode)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun longCallIdCappedInOkReceipt() = runBlocking {
+        val backend = CountingBackend()
+        val longId = "I".repeat(2000)
+        val r = slice(backend = backend).execute(listOf(call(id = longId))).single()
+        assertFalse(r.denied)
+        // Internal pairing keeps the full id; the wire receipt is capped.
+        assertEquals(longId, r.callId)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals(SafeToolSlice.MAX_STRING_CHARS, body["callId"]!!.jsonPrimitive.content.length)
+        assertEquals("lsp.symbols", body["tool"]!!.jsonPrimitive.content)
+        assertEquals(1, backend.invocations.get())
+    }
+
+    @Test fun hookThrowMapsToTypedExecErrorWithoutLeak() = runBlocking {
+        val secret = "sk-hook-SECRET999"
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        s.beforeExecuteForTest = { throw IllegalStateException(secret) }
+        val r = s.execute(listOf(call())).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
+        assertEquals("call-1", r.callId)
+        assertFalse(r.resultJson.contains(secret))
         assertEquals(0, backend.invocations.get())
     }
 }

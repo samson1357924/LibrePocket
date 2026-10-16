@@ -37,8 +37,8 @@ import kotlin.coroutines.coroutineContext
  *    further effects — already-paired results are discarded by the throw,
  *    the backend is never touched afterwards);
  * 3. registry lookup + `executionReady` + single-tool READ-only gate
- *    (re-graded entries deny `SCOPE_DENIED`/`NEED_CONFIRM`; scope denials
- *    surface [DenyReason]);
+ *    (re-graded entries deny `SCOPE_DENIED` with a side-effect detail;
+ *    scope denials surface [DenyReason]);
  * 4. latest [ProjectionContext] scope re-check;
  * 5. arguments schema validation (JSON object, required non-blank `query`,
  *    optional `limit` int clamped 1..200, optional `pathPrefix` string
@@ -61,6 +61,13 @@ import kotlin.coroutines.coroutineContext
  * Pure JVM, no Android dependencies. The turn engine ([dev.librepocket.chat
  * .TurnController]) attaches this loop only when constructed with it
  * (default-off: production composition attaches none, staying records-only).
+ *
+ * Shareability: one instance is shared by every session a factory builds, so
+ * construction-captured state (`ctxSupplier`, `policy`, `backend`, `clock`)
+ * must be safe for concurrent turns — keep the slice stateless; per-turn
+ * state lives in the turn engine, not here. When a second tool wires, retire
+ * this slice (or generalize it): [offeredTools] stays pinned to [TOOL_NAME]
+ * and would silently hide the new tool otherwise.
  */
 class SafeToolSlice(
     private val ctxSupplier: () -> ProjectionContext = { ProjectionContext() },
@@ -78,13 +85,28 @@ class SafeToolSlice(
 
         /** Execution-basis policy action (known action; default ASK → slice needs ALLOW). */
         const val POLICY_ACTION = "tool.exec"
+
+        /**
+         * Per-string cap for result JSON: model-controlled `query` and
+         * backend-controlled symbol fields are truncated (per-string only,
+         * not a total bound), never passed through unbounded into the
+         * transcript/provider continuation. Ok echoes carry a
+         * `…[truncated N→cap]` marker so the model can tell echo from input;
+         * deny echoes are silently capped (codes are fixed constants).
+         */
+        const val MAX_STRING_CHARS = 500
+        /** Per-input cap for model-controlled `query` / `pathPrefix` (fail-closed). */
+        const val MAX_INPUT_CHARS = 4096
     }
 
     /**
      * Test seam run before EACH execution (after cancel check, before any
      * gate): lets cancel tests park the loop in the deny/execute window and
      * then cancel, proving zero backend invocations. Production leaves null.
+     * Volatile so a mid-turn install from the test thread is visible to the
+     * turn dispatcher thread.
      */
+    @Volatile
     var beforeExecuteForTest: (suspend () -> Unit)? = null
 
     /** Typed deny codes (audit-stable, user-visible in the paired denial). */
@@ -95,6 +117,11 @@ class SafeToolSlice(
         const val SCHEMA_INVALID = "SCHEMA_INVALID"
         const val POLICY_DENIED = "POLICY_DENIED"
         const val NEED_CONFIRM = "NEED_CONFIRM"
+        // Reserved for future WRITE/PRIVILEGED bridges: the current slice
+        // rejects non-READ entries with SCOPE_DENIED before the gate, so no
+        // slice path produces NEED_CONFIRM today. EXEC_DENIED is likewise
+        // reserved: blank queries (the only Unavailable source) are rejected
+        // by schema validation first.
         const val EXEC_DENIED = "EXEC_DENIED"
         const val EXEC_ERROR = "EXEC_ERROR"
         const val BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
@@ -131,6 +158,9 @@ class SafeToolSlice(
      * denials to preserve call-id pairing.
      */
     suspend fun execute(calls: List<ToolCall>): List<ToolResult> {
+        // Cancel first: a cancel racing the collect→execute handoff must not
+        // build denials or touch the backend (zero further effects).
+        coroutineContext.ensureActive()
         if (calls.size > maxCallsPerTurn) {
             return calls.map { deny(it, DenyCodes.BUDGET_EXCEEDED, "at most $maxCallsPerTurn tool round per turn") }
         }
@@ -143,8 +173,10 @@ class SafeToolSlice(
             beforeExecuteForTest?.invoke()
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
-            return deny(call, DenyCodes.EXEC_ERROR, "pre-execution gate failed: ${e.message}")
+        } catch (_: Exception) {
+            // Fixed receipt: hook messages never reach the wire (same rule
+            // as backend exceptions below).
+            return deny(call, DenyCodes.EXEC_ERROR, "pre-execution gate failed")
         }
         coroutineContext.ensureActive()
         val tool = ToolRegistry.find(call.name)
@@ -158,7 +190,7 @@ class SafeToolSlice(
         // confirm pipeline, not this slice). Static check first: fail fast
         // before schema parsing and the policy IO below.
         if (tool.sideEffect != SideEffect.READ) {
-            return deny(call, DenyCodes.SCOPE_DENIED, DenyCodes.NEED_CONFIRM)
+            return deny(call, DenyCodes.SCOPE_DENIED, "sideEffect=${tool.sideEffect} not allowed in slice")
         }
         val projection = tool.project(ctxSupplier())
         if (projection.level != CapabilityLevel.NATIVE) {
@@ -206,6 +238,7 @@ class SafeToolSlice(
 
     /** Registry-schema mirror: object + non-blank string `query`, optional int `limit`, optional string `pathPrefix`. */
     private fun parseArgs(argumentsJson: String): ValidArgs? {
+        if (argumentsJson.length > MAX_INPUT_CHARS * 4) return null
         val root = try {
             Json.parseToJsonElement(argumentsJson)
         } catch (_: Exception) {
@@ -213,7 +246,8 @@ class SafeToolSlice(
         }
         if (root !is JsonObject) return null
         val query = (root["query"] as? JsonPrimitive)?.takeIf { it.isString }?.content
-            ?.takeIf { it.isNotBlank() } ?: return null
+            ?.takeIf { it.isNotBlank() }
+            ?.takeIf { it.length <= MAX_INPUT_CHARS } ?: return null
         val limit = when (val raw = root["limit"]) {
             null -> LspTools.DEFAULT_LIMIT
             // Strict integer: a JSON string (even "5") is not an integer.
@@ -230,14 +264,15 @@ class SafeToolSlice(
                 if (!raw.isString) return null
                 val v = raw.content
                 // Scope traversal guard (raw-string layer): `..`, leading
-                // `/`, backslash, NUL. Encoded forms (`%2e%2e`, unicode
-                // normalization) pass this layer by design — the injected
-                // bridge must canonicalize/decode then re-validate and
+                // `/`, backslash, NUL, percent-escapes. Encoded forms
+                // (`%2e%2e`) are rejected here fail-closed; the injected
+                // bridge must still canonicalize/decode then re-validate and
                 // never treat this string as a trusted filesystem scope.
                 // `""` is allowed and normalizes downstream (StubBackend maps
                 // blank to the default scope); it is "unspecified", not a
                 // bypass (pinned by tests).
-                if (v.contains("..") || v.startsWith("/") || v.contains("\\") || v.contains("\u0000")) {
+                if (v.length > MAX_INPUT_CHARS) return null
+                if (v.contains("..") || v.startsWith("/") || v.contains("\\") || v.contains("\u0000") || v.contains("%")) {
                     return null
                 }
                 v
@@ -251,29 +286,42 @@ class SafeToolSlice(
         val json = buildJsonObject {
             put("denied", true)
             put("code", code)
-            put("tool", call.name)
-            put("callId", call.id)
-            put("detail", detail)
+            // Model-controlled echoes are capped like Ok results; codes are
+            // fixed constants.
+            put("tool", call.name.take(MAX_STRING_CHARS))
+            put("callId", call.id.take(MAX_STRING_CHARS))
+            put("detail", detail.take(MAX_STRING_CHARS))
             put("clockMillis", clock.millis())
         }.toString()
         return ToolResult(call.id, call.name, json, denied = true, denyCode = code)
     }
 
+    private fun cappedEcho(value: String, originalLength: Int): String =
+        if (originalLength > MAX_STRING_CHARS) {
+            value.take(MAX_STRING_CHARS) + "…[truncated $originalLength→$MAX_STRING_CHARS]"
+        } else {
+            value
+        }
+
     private fun ok(call: ToolCall, query: String, outcome: LspTools.SymbolsOutcome.Ok): ToolResult {
+        val redactedQuery = dev.librepocket.redact.Redactor.redact(query).text
         val json = buildJsonObject {
             put("denied", false)
-            put("tool", call.name)
-            put("callId", call.id)
-            put("query", query)
+            put("tool", call.name.take(MAX_STRING_CHARS))
+            put("callId", call.id.take(MAX_STRING_CHARS))
+            put("query", cappedEcho(redactedQuery, redactedQuery.length))
             put(
                 "symbols",
                 kotlinx.serialization.json.buildJsonArray {
-                    for (s in outcome.symbols) {
+                    for (s in outcome.symbols.take(LspTools.MAX_LIMIT)) {
                         add(
                             buildJsonObject {
-                                put("name", s.name)
-                                put("kind", s.kind)
-                                put("path", s.path)
+                                val rn = dev.librepocket.redact.Redactor.redact(s.name).text
+                                val rk = dev.librepocket.redact.Redactor.redact(s.kind).text
+                                val rp = dev.librepocket.redact.Redactor.redact(s.path).text
+                                put("name", cappedEcho(rn, rn.length))
+                                put("kind", cappedEcho(rk, rk.length))
+                                put("path", cappedEcho(rp, rp.length))
                                 put("line", s.line)
                             },
                         )
@@ -289,15 +337,17 @@ class SafeToolSlice(
     /**
      * Continuation messages appended after the tool-call assistant block:
      * one assistant `toolCalls` entry plus one `tool` message per result
-     * (executed or denied — call-id pairing is total). Wire shape mirrors
+     * (executed or denied — pairing is total within one executed round; a
+     * call re-emitted on a retried attempt is recorded without a result and
+     * never reaches here). Wire shape mirrors
      * the T1 mock round-trip histories so all three adapters serialize it.
      */
     fun continuationMessages(calls: List<ToolCall>, results: List<ToolResult>): List<ChatMessage> {
         require(calls.size == results.size) { "calls/results size mismatch" }
         val out = ArrayList<ChatMessage>(1 + results.size)
-        out.add(ChatMessage(role = "assistant", text = "", toolCalls = calls))
+        out.add(ChatMessage(role = "assistant", text = "", toolCalls = calls.map { it.copy(id = it.id.take(MAX_STRING_CHARS)) }))
         for (r in results) {
-            out.add(ChatMessage(role = "tool", text = r.resultJson, toolCallId = r.callId))
+            out.add(ChatMessage(role = "tool", text = r.resultJson, toolCallId = r.callId.take(MAX_STRING_CHARS)))
         }
         return out
     }

@@ -37,7 +37,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * 皆為候選未採納（repo 內無規格文本、無外網可核對，不寫差異表）；本物件只保證
  * `tools/list`＋`tools/call` 單頁 POST 子集，不送 `initialize`、不接 SSE stream、
  * 不跟隨 `nextCursor` 分頁、不協商 `protocolVersion`。契約見
- * `McpProtocolContractsTest`；修訂支援須先納規格文本再逐項補契約。
+ * `McpProtocolContractsTest`（由 #93 提供，本 PR 未自帶；合併順序 #93 先行）；
+ * 修訂支援須先納規格文本再逐項補契約。
  */
 internal object McpWire {
 

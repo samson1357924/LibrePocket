@@ -73,9 +73,6 @@ class ChatSessionImpl(
     toolSlice = toolSlice,
   )
 
-  @Suppress("unused")
-  private val sessionScope = CoroutineScope(SupervisorJob() + dispatcher)
-
   override val uiState: StateFlow<ChatUiState> = controller.uiState
 
   /** R5-5: live send-time per-request trim count (see [TurnController.requestTrimmedCount]). */
@@ -137,6 +134,5 @@ class ChatSessionImpl(
 
   override fun close() {
     controller.close()
-    sessionScope.cancel()
   }
 }

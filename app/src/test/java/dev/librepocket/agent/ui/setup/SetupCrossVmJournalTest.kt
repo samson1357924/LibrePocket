@@ -61,7 +61,11 @@ class SetupCrossVmJournalTest {
 
     @Before
     fun setUp() {
-        Dispatchers.setMain(UnconfinedTestDispatcher())
+        // TODO(#96-followup): root-cause the Main leak (neighboring class
+        // draining Main users) and remove this retry. CI flake hardening for
+        // "Dispatchers.Main is used concurrently with setting it" (observed
+        // in PR #96 CI): retry briefly, then fail loudly.
+        retryMainOp("setMain") { Dispatchers.setMain(UnconfinedTestDispatcher()) }
     }
 
     @After
@@ -70,8 +74,30 @@ class SetupCrossVmJournalTest {
         // collect store flows via viewModelScope(Main); cancelling after reset
         // would dispatch via a reset Main and fail teardown (not the test).
         scopes.forEach { it.cancel() }
-        Dispatchers.resetMain()
+        // resetMain races the same way as setMain (same NonConcurrent guard).
+        retryMainOp("resetMain") { Dispatchers.resetMain() }
         tmpDirs.forEach { it.deleteRecursively() }
+    }
+
+    private fun retryMainOp(name: String, op: () -> Unit) {
+        var attempts = 0
+        val end = System.nanoTime() + 5_000_000_000L
+        while (true) {
+            try {
+                op()
+                if (attempts > 0) println("SetupCrossVmJournalTest: $name succeeded after $attempts retries")
+                return
+            } catch (e: IllegalStateException) {
+                if (System.nanoTime() > end) throw e
+                attempts++
+                try {
+                    Thread.sleep(50)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw e
+                }
+            }
+        }
     }
 
     private val noProvider: (dev.librepocket.provider.ProviderConfig, dev.librepocket.provider.KeyProvider) -> LlmProvider =

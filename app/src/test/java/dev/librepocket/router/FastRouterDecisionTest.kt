@@ -5,6 +5,7 @@ import dev.librepocket.tool.Flavor
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -267,5 +268,49 @@ class FastRouterDecisionTest {
             assertEquals("$flavor", RouteKind.DENIED, negated.route)
             assertEquals("$flavor", DenyReason.NEED_CLARIFICATION, negated.reasonCode)
         }
+    }
+
+    @Test fun compoundCancelAndRecreateIsClarificationNotExecution() {
+        // 已知侷限（fail-safe 方向）：複合句同時命中模板與取消/停止詞時轉澄清，
+        // 屬誤澄清但絕不執行；行為釘住，待否定語義精化後再收斂。
+        val d = decide("取消舊的鬧鐘再設一個新的")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.toolCall)
+        assertTrue(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+        assertEquals("NEED_CLARIFICATION", d.header.reasonCode)
+    }
+
+    @Test fun cjkNumeralAlarmTimeNeedsClarification() {
+        // 中文數字時間（七點半）目前不被解析為明確時間：fail-safe 轉澄清，
+        // 不預設 7:00；行為釘住，待中文數字解析落地後再支援。
+        val d = decide("明早七點半設個鬧鐘")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.toolCall)
+        assertTrue(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+        assertEquals("NEED_CLARIFICATION", d.header.reasonCode)
+    }
+
+    @Test fun negationWithMissingGrantStaysNoPrivilege() {
+        // 遮罩順序：投影 UNAVAILABLE（無授權）優先於否定澄清；否定句在無授權
+        // 下仍回 NO_PRIVILEGE，絕不被誤讀為補參澄清。
+        val d = decide(
+            "不要加行程，明天開會",
+            play.copy(grantedPermissions = emptySet()),
+        )
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NO_PRIVILEGE, d.reasonCode)
+        assertNull(d.toolCall)
+        assertTrue(d.fallbackMessage!!.contains("NO_PRIVILEGE"))
+        assertFalse(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+    }
+
+    @Test fun plusWithoutDigitsIsNotAPhoneNumber() {
+        // "+" 後全空白無任何數字不是號碼：fail-safe 轉澄清，不送空字串。
+        val d = decide("打電話給 +      ")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.toolCall)
     }
 }

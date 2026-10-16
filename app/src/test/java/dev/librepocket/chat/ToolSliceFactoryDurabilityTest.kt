@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -36,6 +37,7 @@ import java.io.File
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * P2 safe slice (#19) factory durability: a REAL [ChatSessionFactory]-built
@@ -158,6 +160,65 @@ class ToolSliceFactoryDurabilityTest {
             } finally {
                 reopened.session.close()
             }
+        } finally {
+            created.session.close()
+        }
+    }
+
+    @Test fun defaultFactoryStaysRecordsOnlyAndPureChat() = runBlocking {
+        // Production default: no toolSlice attached — the request carries no
+        // tools, the model ToolDone is recorded only, and no continuation
+        // runs (single provider round-trip, no [tool-result:] marker).
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val opened = LibrePocketDb.openInMemory(context)
+        db = opened
+        val store: SessionStore = RoomSessionStore(opened) { 1_700_000_000_000L }
+        val provider = ScriptedProvider()
+        val policy = allowKeyReadPolicy()
+        val requests = AtomicInteger(0)
+        val factory = ChatSessionFactory(
+            policy = policy,
+            vaultSource = VaultSource {
+                val v = EncryptedPrefsVault(InMemoryPrefs())
+                v.putKey("preset:openai", "test-key-12345678".toCharArray())
+                v
+            },
+            buildProvider = { _, _ -> provider },
+            sessionStores = object : SessionStoreSource {
+                override suspend fun store() = store
+            },
+        )
+        provider.handler = { request ->
+            requests.incrementAndGet()
+            check(request.tools.isEmpty()) {
+                "default factory must attach no tools, was ${request.tools.map { it.name }}"
+            }
+            flow {
+                emit(
+                    StreamEvent.ToolDone(
+                        toolIndex = 0,
+                        id = "call-def-1",
+                        name = "lsp.symbols",
+                        argumentsJson = """{"query":"Foo"}""",
+                    ),
+                )
+                emit(StreamEvent.Done("tool_calls"))
+            }
+        }
+
+        val created = factory.create(endpoint(), "查符號", allowAsk = false, keyIsCurrent = { true })
+        try {
+            created.session.send("幫我查 Foo 這個符號")
+            assertTrue(created.session.flushDurable(8_000))
+
+            assertEquals(1, requests.get())
+            val sid = created.sessionId!!
+            val events = store.loadEvents(sid, 0, 2000)
+            val finals = events.filter { it.kind == "assistant" && it.isFinal }
+            assertEquals("exactly one final assistant row: $events", 1, finals.size)
+            val final = finals.single()
+            assertTrue("missing tool marker: $final", final.text.contains("[tool:lsp.symbols"))
+            assertFalse("must not execute without a loop: $final", final.text.contains("[tool-result:"))
         } finally {
             created.session.close()
         }

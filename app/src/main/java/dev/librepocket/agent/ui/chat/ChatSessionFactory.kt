@@ -2081,8 +2081,10 @@ class ChatViewModelFactory(app: Application) : ViewModelProvider.Factory {
     @Volatile
     private var vault: KeyVault? = null
     private val vaultSource = VaultSource {
-        vault ?: withContext(Dispatchers.IO) {
-            vault ?: EncryptedPrefsVault(app).also { vault = it }
+        vault ?: run {
+            val created = withContext(Dispatchers.IO) { EncryptedPrefsVault(app) }
+            synchronized(this@ChatViewModelFactory) { vault = vault ?: created }
+            vault!!
         }
     }
     private val sessionStores = SessionStoreSource {

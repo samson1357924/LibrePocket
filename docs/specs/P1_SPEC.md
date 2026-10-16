@@ -11,7 +11,7 @@
 >
 > **Target scope:** provider BYOK, minimum chat loop, session persistence, policy model, and local tests. Agent tool execution, GUI, terminal, MCP, memory, and cloud sync were originally scoped as later work. “No app-managed cloud sync” does not mean Android Auto Backup is disabled.
 
-### Current 行為補充（conversation-ledger；以程式為準，補充核對至 `0185935` S1–S7＋R27＋R28-1）
+### Current 行為補充（conversation-ledger；以程式為準，補充核對至 `0185935` S1–S7＋R27＋R28-1，另加 PR #94 P1/P2：`Failed.code` 傳遞、classifier `text_too_large`、sink distinct 256 順序、預算／用量邊界與 cancel+usage 測試硬化；以 `502f6bf` 程式為準，review-only 驗證，未跑 Gradle——ANDROID_HOME／local.properties 未配置）
 
 - **8 個 `CHAT_*` notice 碼**（見 `ChatScreen.chatNoticeText`／`ChatViewModel`）：`CHAT_SEND_DENIED`、`CHAT_APPROVAL_REQUIRED`、`CHAT_POLICY_UNAVAILABLE`、`CHAT_INPUT_TOO_LONG`、`CHAT_STORE_UNAVAILABLE` 皆為 NOT accepted（本次未送出，呼叫者保留文字；`INPUT_TOO_LONG` 為 100k 邊界 fail-fast）；`CHAT_STORE_PENDING` 為 UNKNOWN／PENDING_COMMIT（見下）；`CHAT_CANCELLED_RECOVERY`、`CHAT_QUEUE_RECOVERY_REQUIRED` 為排隊保留 recovery（取消／待送訊息已保留，須手動確認重送）。
 - **UNKNOWN／settle（勿重送）：** `TranscriptPendingException` 表示超時送後 fate 未定；ownership 保留，同 opId 重送被擋，直到 `TurnController.settlePendingAdmission` 以同一邏輯 id 認領（claim）或轉失敗可重試（convert）。呼叫者收到 PENDING 時必須 NOT 重送。
@@ -399,9 +399,9 @@ sealed interface StreamEvent {
 | 終態異常 | 缺 `[DONE]`/無合法 `finish_reason` → `Failed(retryable=true)` | `response.completed` 缺 `output`/空陣列 → 用流內已收增量恢復（記 `recovered=true`）；`response.failed/incomplete` → `Failed` | 缺 `message_stop` 或可見/工具塊未閉合 → `Failed(retryable=true)` |
 
 - 發送前上下文窗口（Current）：`HistoryWindowCap` 僅裁剪發送用請求副本（oldest-first，淘汰最舊、保留最新、整訊息；預設 `Unbounded` 即不裁剪），UI 與 transcript 保留完整歷史；裁剪數見 `TurnController.droppedHistoryCount`（永不靜默）。token 預算待裝置量測後再定（TODO #16，不硬編數字）。
-- UI 更新成本（Current）：可見增量先進 per-attempt buffer（O(delta) 累加）；區塊尚小時即時向 UI 提交（首繪快速、小 turn 行為不變），超出 4 KiB／32 append 節奏後才批次提交；終端與 cancel 必沖洗，快照讀 buffer，故串流可見且快照精確；`streamedTextDeltaCount` 計到達數、`uiTextUpdateCount` 計提交數、`uiTextCopiedChars` 計提交拷貝字元。
+- UI 更新成本（Current）：可見增量先進 per-attempt buffer（O(delta) 累加）；區塊尚小時即時向 UI 提交（首繪快速、小 turn 行為不變），超出 4 KiB／32 append 節奏後才批次提交；終端與 cancel 必沖洗，快照讀 buffer，故串流可見且快照精確；`streamedTextDeltaCount` 計到達數（超限觸發 delta 在計數前被拒，不計入）、`uiTextUpdateCount` 計提交數（無匹配 UI 列的 flush 跳過提交、不計數）、`uiTextCopiedChars` 計提交拷貝字元。
 - 可見文字預算（Current，#83）：每 attempt `TextDelta`＋`ReasoningDelta` 合計不得超過 100_000 字元（`MAX_TURN_TEXT_CHARS`，等於 durable-row 上限，tool marker 不計）；超限為 typed non-retryable `TEXT_TOO_LARGE`（code `AGG_TOO_LARGE`），不靜默截斷、不重試，失敗片段保留 partial。
-- 用量權威值（Current，#84）：每 attempt 單一權威 Usage（last-wins 合併，null 欄位保留舊值，`TurnController` 在終端前寫一次，`SessionTranscriptSink` 隨終端批次持久；Anthropic 雙 Usage 正常 turn 單行，100 事件 flood 仍單行，flood 上限各層 128）。
+- 用量權威值（Current，#84）：每 attempt 單一權威 Usage（last-wins 合併，null 欄位保留舊值，`TurnController` 在終端前寫一次（flush 亦清 attempt 計數），`SessionTranscriptSink` 隨終端批次持久；controller 的 attemptRunId 即 sink 的 runId；Anthropic 雙 Usage 正常 turn 單行，100 事件 flood 仍單行，flood 上限各層 128（第 129 起凍結）；sink 另有 distinct runId 256 上限（超限 best-effort 丟棄，先擋後記帳）＋ post-terminal trailing 每 runId 限追加一次；`lastUsage` 為 lifetime-last（無 Usage 的 turn 不清除）。
 
 ### 3.3 工具 ID 與多輪一致性（P1 記錄、不執行）
 
@@ -471,8 +471,8 @@ object ProviderErrorClassifier {
 | 類別 | 條件 | `retryable` |
 |------|------|-------------|
 | RETRYABLE | 連接中斷、讀超時、提前 EOF、HTTP 408/409/425/429/5xx（除 501）、`SSE_TRUNCATED` | `true` |
-| FATAL | 401/403（認證）、402/402變體（額度/計費）、400/422（協議格式）、證書錯誤（SSLHandshake）、`IMAGE_TOO_LARGE`、`SSE_LINE_TOO_LONG`、`SSE_FRAME_TOO_LARGE`、`TOOL_ARGS_TOO_LARGE`、URL/協議配置錯 | `false` |
-| 啟發式 | body 含 `insufficient_quota|billing|invalid_api_key|unauthorized|image_too_large|sse_line_too_long|sse_frame_too_large|tool_args_too_large`（大小寫無關） → FATAL；含 `rate_limit|overloaded|timeout|temporarily` → RETRYABLE | — |
+| FATAL | 401/403（認證）、402/402變體（額度/計費）、400/422（協議格式）、證書錯誤（SSLHandshake）、`IMAGE_TOO_LARGE`、`SSE_LINE_TOO_LONG`、`SSE_FRAME_TOO_LARGE`、`TOOL_ARGS_TOO_LARGE`、`TEXT_TOO_LARGE`、URL/協議配置錯 | `false` |
+| 啟發式 | body 含 `insufficient_quota|billing|invalid_api_key|unauthorized|image_too_large|sse_line_too_long|sse_frame_too_large|tool_args_too_large|text_too_large`（大小寫無關） → FATAL；含 `rate_limit|overloaded|timeout|temporarily` → RETRYABLE | — |
 - 型別化交叉引用（Current）：聚合／SSE 預算溢出另以型別化 `ProviderFailureCode.AGG_TOO_LARGE`（`ProviderFailure.code`／`StreamEvent.Failed.code`）傳遞，與上表 body 標記同義（`isResourceExhausted` 認 code 亦認 marker；實作見 `StreamEvent.kt`／`ProviderTransport.streamingFlow`／`TurnController.shouldDiscardPendingTools`）。未知 runtime 失敗另以 `ProviderFailureCode.UNKNOWN_RUNTIME` 傳遞（`streamingFlow` unknown fallback／直接拋 unknown／Error），`shouldDiscardPendingTools` 認 `AGG_TOO_LARGE` 或 `UNKNOWN_RUNTIME`；其他 `code == null` 致命事件（401／validation）維持 flush。
 
 ### 5.3 重試語義

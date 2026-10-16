@@ -4,7 +4,7 @@
 
 - **Scope:** GitHub Actions release workflow and the evidence required before an artifact can be called verified.
 - **Owner role:** Release maintainer; no individual is assigned here.
-- **Source of truth:** `.github/workflows/release.yml`, `scripts/build_release.sh`, `scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`, `app/build.gradle.kts`, signing configuration, and verification output tied to the final artifact bytes.
+- **Source of truth:** `.github/workflows/release.yml`, `scripts/build_release.sh`, `scripts/play_policy_check.sh`, `scripts/apk_policy_inspect.py`, `scripts/verify_release_apk.py`, `scripts/release_artifact_stage.py`, `scripts/check_release_pins.py`, `scripts/check_release_tag_version.py`, `scripts/fake_keystore_rehearsal.py`, `scripts/release_signer_pins.example.json`, `app/build.gradle.kts`, signing configuration, and verification output tied to the final artifact bytes.
 - **Update trigger:** Workflow, signing, package/flavor, versioning, distribution channel, or artifact-verification changes.
 
 ## Current state: public release disabled
@@ -34,6 +34,24 @@ The local builder's existing environment-first/Bitwarden keystore-password resol
 Current: a direct Gradle release build without `-PreleaseSigning=true` has no release signing configuration and produces an unsigned release artifact (not an approved distribution artifact); the only staged final-byte verified path is
 `scripts/build_release.sh --apk`, which explicitly enables per-flavor release signing, plus caller-supplied identity per selected flavor (all four values; identities for unselected flavors rejected), explicit `--apksigner`/`--aapt`/`--output-parent`,
 and the staged final-byte gate above, which rejects unsigned, debug-signed, debuggable, or identity-mismatched artifacts; the github flavor skips Play/Foss policy checks (signature/identity/checksum only); formal key custody/provenance and a signer-pin registry are not established.
+
+## Release acceptance evidence (Issue #12, local-only)
+
+The public workflow stays frozen (fail-closed `release.yml` above) regardless of the helpers below. They add no publishing, no credential lookup, and no production-key handling; they only let a maintainer fail fast on shape/consistency before supplying trusted pins as `--expected-*` identity to `scripts/build_release.sh`.
+
+- **Signer-pin registry (format gate, not custody).** `scripts/release_signer_pins.example.json` documents the registry shape (`{flavor: {package, cert_sha256}}`); production pins live outside the repo with the release maintainer and are never committed. `scripts/check_release_pins.py --pins <file> --require-flavors 'play foss github'` validates shape fail-closed (known flavors only, exactly `package`/`cert_sha256` per entry, dotted-package rule, 64-hex cert normalized to lowercase, 64 KiB cap). The checked-in example carries placeholder cert values and is rejected by the validator (negative control, pinned by `SignerPinRegistryTest`). This establishes a pin-file contract, not key custody/provenance — that remains open.
+- **Tag/version consistency.** `python3 scripts/check_release_tag_version.py --tag vX.Y.Z --app-build-gradle app/build.gradle.kts` requires the tag to equal `versionName` in exact `vX.Y.Z`/pure-`X.Y.Z` form (no suffix; the `versionNameSuffix = "-debug"` line cannot match) and `versionCode` in `1..2147483647` (pinned by `ReleaseTagVersionTest`). The tag is supplied by the trusted caller (CI `github.ref_name` or `git describe --exact-match`); the script never infers identity from an APK.
+- **Fake-keystore rehearsal.** `python3 scripts/fake_keystore_rehearsal.py` runs the REAL `verify_release_apk.verify_and_stage` gate against synthetic candidate bytes plus fake `apksigner`/`aapt` shims across a 10-case matrix: one pass case plus rejections for wrong cert, unsigned, debug-cert subject, wrong package, wrong versionCode, wrong versionName, debuggable, signed+unsigned coexistence (rejected by the exactly-one rule, never filtered by filename), and AAB-only (no fallback). The pass case pollutes `PLAY_KEYSTORE_PASSWORD`/`BW_SESSION` with garbage and then re-verifies a copy of the staged bytes in a fresh directory to the identical SHA-256, proving blank-runner verifiability (bytes + pins + tools only, no secrets). Pinned in CI by `FakeKeystoreRehearsalTest` with a blanked secret environment. Synthetic fixtures only: this proves the gate's fail-closed matrix, not that any real APK or SDK toolchain passed.
+
+Acceptance mapping (Current — see helpers above plus the existing harness):
+1. Missing secrets never publish: `build_release.sh` preflight (identity/tools/output checks) runs before password/Bitwarden/Gradle lookup; existing `ReleaseBuilderHarness` preflight tests assert Gradle/Bitwarden never run on failure.
+2. Signed+unsigned coexistence is rejected, never filtered: exactly-one-APK rule in `verify_release_apk.py` and per-flavor exactly-one in `release_artifact_stage.py`; covered by `test_multiple_apks_are_rejected_without_filename_preference` and the rehearsal `reject-multiple-apks` case.
+3. Wrong cert / unsigned / debug cert / wrong package-version all rejected: `verify_release_apk.py` apksigner/aapt comparisons; covered by `test_wrong_identity_unsigned_debug_and_debuggable_fail_closed` and the rehearsal reject cases.
+4. Fake-keystore rehearsal with pass/reject matrix: `scripts/fake_keystore_rehearsal.py` (10/10) as above.
+5. Blank-runner same-SHA verifiable: the verifier takes only candidate bytes, caller pins, and explicit tool paths (child env scrubbed to `PATH`/`JAVA_HOME`/`TMPDIR`/`LC_ALL`); the rehearsal re-verification step asserts identical SHA-256 with polluted secrets, and `FakeKeystoreRehearsalTest` runs the whole matrix with secret env stripped.
+6. Tag/version consistency: `scripts/check_release_tag_version.py` as above.
+
+Three-party policy consistency (Current, verified by inspection at this commit): `HardeningPolicy.kt` (`PLAY_PERMISSION_BLACKLIST`, `PLAY_CLASS_BLACKLIST`, `FOSS_STRING_BLACKLIST`, `PLAY_SUPERCLASS_BLACKLIST`, `PLAY_LINUX_ENTRY_BLACKLIST`), `scripts/apk_policy_inspect.py` (`PLAY_FORBIDDEN_PERMISSIONS`, `PLAY_DEFINED_CLASS_PREFIXES`, `FOSS_MANIFEST_NEEDLES`/`FOSS_TYPE_PREFIXES`, `PLAY_FORBIDDEN_SUPERCLASSES`, `proot`/`rootfs`/`linux/image` entry scan), and `scripts/play_policy_check.sh` (`BLACKLIST_PERMS`, `FOSS_BLACKLIST`, source-manifest/cleartext/backup-rule pre-checks delegating artifact authority to the Python scanner) agree on all Play/Foss forbidden sets. Any change to one must update the other two plus `HardeningPolicyTest`/`test_apk_policy_check.py`; the scanner limits remain deliberate restrictions (see scanner boundary above), not format maxima.
 
 ## Target release sequence
 

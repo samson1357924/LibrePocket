@@ -163,6 +163,32 @@ scripts/play_policy_check.sh app/build/outputs/apk/play/debug/app-play-debug.apk
 scripts/play_policy_check.sh --foss app/build/outputs/apk/foss/debug/app-foss-debug.apk
 ```
 
+Release-acceptance helpers (Issue #12, local-only, no secrets, no publishing;
+the public release workflow stays frozen — see [Release](RELEASE.md)):
+
+```sh
+# Signer-pin registry shape check (production pins live outside the repo;
+# the checked-in example is placeholder-only and must be rejected).
+python3 scripts/check_release_pins.py --pins scripts/release_signer_pins.example.json
+python3 scripts/check_release_pins.py --pins /path/to/release_signer_pins.json \
+  --require-flavors 'play foss github'
+
+# Tag <-> Gradle version consistency (tag supplied by the trusted caller).
+python3 scripts/check_release_tag_version.py \
+  --tag v0.1.0 --app-build-gradle app/build.gradle.kts
+
+# Fake-keystore rehearsal: real verifier gate, synthetic bytes + fake tools,
+# 10-case pass/reject matrix incl. blank-runner same-SHA re-verification.
+python3 scripts/fake_keystore_rehearsal.py
+```
+
+The new `SignerPinRegistryTest` / `ReleaseTagVersionTest` classes live in the
+already-wired `scripts/tests/test_build_release_identity.py` and
+`FakeKeystoreRehearsalTest` in `scripts/tests/test_release_artifact_verifier.py`,
+so the existing `policy-harness` job and the harness command above run them
+with no workflow change. The synthetic fixtures prove the gate's fail-closed
+matrix only; they are not real-APK/SDK evidence.
+
 The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. It remains a local staging/verification path only, not a publishing workflow or release-readiness claim.
 
 The synthetic Python fixtures and fake `aapt`/`dexdump`/`apksigner`/Gradle/policy commands test bounded parser, policy, identity, transaction, failure-cleanup, and process-cancellation behavior; they do not represent a real APK or prove Android SDK native-tool compatibility. A release/build maintainer should run the APK policy/native-parser gates against fresh debug APKs for all three flavors and record their paths, SHA-256 values, SDK build-tools version, command output, and tested commit. The separate signed-release verifier requires fresh controlled test fixtures/native-tool evidence and explicit trusted identity values; its synthetic harness alone does not establish that validation. Do not infer a pass from historical APK inventory. These are instructions, not a claim that they were run for this documentation change. Version sources are listed in [Build Environment](ENV.md).

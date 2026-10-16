@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VERIFIER = ROOT / "scripts" / "verify_release_apk.py"
+REHEARSAL = ROOT / "scripts" / "fake_keystore_rehearsal.py"
 EXPECTED_PACKAGE = "dev.librepocket.agent"
 EXPECTED_VERSION_CODE = "7"
 EXPECTED_VERSION_NAME = "1.2.3"
@@ -485,6 +486,46 @@ sys.exit({exit_code})
         result = self.run_verifier(expected_cert="")
 
         self.assert_rejected(result, "64 hexadecimal")
+
+
+class FakeKeystoreRehearsalTest(unittest.TestCase):
+    """The fake-keystore rehearsal matrix passes with no secrets present."""
+
+    def test_rehearsal_matrix_passes_on_a_blank_secret_environment(self) -> None:
+        env = {
+            name: value
+            for name, value in os.environ.items()
+            if "KEYSTORE" not in name and "BW_SESSION" not in name
+        }
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        result = subprocess.run(
+            [sys.executable, str(REHEARSAL)],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=120,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        for case in (
+            "pass-clean-signed",
+            "reject-wrong-cert",
+            "reject-unsigned",
+            "reject-debug-cert",
+            "reject-wrong-package",
+            "reject-wrong-version-code",
+            "reject-wrong-version-name",
+            "reject-debuggable",
+            "reject-multiple-apks",
+            "reject-aab-only",
+        ):
+            self.assertIn(case, result.stdout)
+        self.assertIn("10/10 cases behaved as expected", result.stdout)
+        self.assertIn("synthetic fixtures only", result.stdout)
 
 
 if __name__ == "__main__":

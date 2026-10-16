@@ -43,10 +43,13 @@ import java.util.concurrent.atomic.AtomicReference
  * - 無懸掛（起跑閘＋首次期限 miss 即 FAIL；reap 成功僅允許安全清理，不可當 PASS；
  *   teardown 另由存活門判定，見 [quiescePool]）；
  * - outside 秘密未被竄改（內容位元一致）且穩定路徑寫入未穿出
- *   （`out/file.txt` 不存在）；翻轉路徑的讀殘餘（`outsideReads`）與
- *   外部新增檔（`outsideExtra`）僅診斷記錄，不計為通過條件——系統性穿出由
+ *  （`out/stable/file.txt`、`out/stable`、`out/file.txt` 不存在；首兩者為真門，
+ *   `out/file.txt` 結構上恆真僅作健全哨兵）；翻轉路徑的讀殘餘（`outsideReads`）與
+ *   外部新增檔（`outsideExtra`）僅診斷記錄，不計為通過條件——靜態毒鏈由
  *   單線程確定性測試（`writeThroughParentSymlinkDenied`、
- *   `writeDoesNotMkdirThroughSymlink`）嚴格覆蓋；
+ *   `writeDoesNotMkdirThroughSymlink`）覆蓋，單點 mid-swap 寫門由
+ *   `writeRevalidationGateRefusesMidOperationSwap` 覆蓋；壓力僅證有界
+ *   （無未捕／無懸掛／可恢復），不證全交錯機密性；
  * - 拒絕或安全重試：併發 [rejected]（僅 IAE）為重驗門證據，首條須屬鏈族
  *   symlink／escapes（本測試只翻轉 `flip`／`race-sub` 子路徑不動 root，
  *   root 定錨族 mismatch／identity 由 [ScopedFileStoreB2Test] T1／F1 確定性
@@ -62,7 +65,8 @@ import java.util.concurrent.atomic.AtomicReference
  * - 未使用 `RobolectricTestRunner`／shadows；直寫宿主機 tmpfs（POSIX symlink、
  *   inode fileKey 語義，見 `assumeNonWindows`）。
  * - 宿主機語義≠裝置語義：裝置 ext4／f2fs、排程器、SELinux、程序隔離皆不同，
- *   本測試不宣稱任何裝置結論；裝置行為另由 `androidTest`／裝置驗證覆蓋。
+ *   本測試不宣稱任何裝置結論；裝置 ext4／f2fs 語義須由後續 `androidTest`／
+ *   裝置驗證補足（目前 `androidTest` 尚無 ScopedFileStore 覆蓋，屬 follow-up）。
  * - flipper 僅建模 symlink＋rename（hardlink／mount 同生產列 out-of-scope，
  *   見 [ScopedFileStore] 類註解）；`outsideExtra` 僅頂層診斷（`deep` 穿出落
  *   `out/deep` 下只見頂層名，內容遞迴未驗，刻意 flakiness 取捨）。
@@ -136,6 +140,8 @@ class ScopedFileStoreConcurrencyPressureTest {
      * NOFOLLOW 遞迴刪除：絕不跟隨目錄 symlink（`File.deleteRecursively()` 會跟隨，
      * 在 `race-sub -> out` 殘留時會越界刪 outside）。以 `walkFileTree` 預設
      * 不傳 `FOLLOW_LINKS` 語義：遇連結只刪連結本體並跳過子樹。best-effort。
+     * 僅在無併發修改者時呼叫；本檔以 `workersMayBeAlive` 門保證（併發翻轉中
+     * 目錄→連結置換與 walk 開流非原子，helper 單獨不承諾併發安全）。
      */
     private fun deleteNoFollowRecursively(root: File) {
         try {
@@ -299,6 +305,10 @@ class ScopedFileStoreConcurrencyPressureTest {
         assertFalse(
             "race-sub must be gone after cleanup",
             Files.exists(File(ws, "race-sub").toPath(), LinkOption.NOFOLLOW_LINKS),
+        )
+        assertFalse(
+            "flip must be gone after cleanup",
+            Files.exists(File(ws, "flip").toPath(), LinkOption.NOFOLLOW_LINKS),
         )
     }
 
@@ -617,6 +627,9 @@ class ScopedFileStoreConcurrencyPressureTest {
                             noteDenied(e)
                         } catch (_: FileNotFoundException) {
                             denied.incrementAndGet()
+                        } catch (e: FileBudgetException) {
+                            // delete 生產目前不拋 budget（見 deleteInternal），命中即真 bug。
+                            errors.compareAndSet(null, e)
                         } catch (_: IOException) {
                             denied.incrementAndGet()
                         } catch (t: Throwable) {
@@ -680,10 +693,15 @@ class ScopedFileStoreConcurrencyPressureTest {
             errors.get()?.let { throw AssertionError("stress failed", it) }
 
             // 有界斷言一：outside 秘密未被竄改；穩定路徑寫入未穿出。
+            // 穩定父段永不翻轉：`out/stable/*` 為真門，`out/file.txt` 恆真哨兵。
             assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
             assertFalse("stable writer must not escape", File(out, "file.txt").exists())
+            assertFalse("stable writer must not escape", File(out, "stable/file.txt").exists())
+            assertFalse("stable writer must not escape", File(out, "stable").exists())
             val outsideExtra = (out.listFiles()?.map { it.name }?.toSet() ?: emptySet()) -
                 setOf("secret.txt")
+            // 診斷輸出刻意保留（同 ScopedFileSymlinkTest println 前例；CI 不解析，
+            // 僅供 flaky 診斷），非正式斷言。
             println(
                 "[ConcurrencyPressure] denied=${denied.get()} rejected=${rejected.get()} " +
                     "inside=${observedInside.get()} readAttempts=${readAttempts.get()} " +
@@ -703,7 +721,10 @@ class ScopedFileStoreConcurrencyPressureTest {
             assertTrue(
                 "expected some rejections, got denied=${denied.get()} rejected=${rejected.get()} " +
                     "(inside=${observedInside.get()} outsideReads=${observedOutside.get()} " +
-                    "readAttempts=${readAttempts.get()})",
+                    "readAttempts=${readAttempts.get()} fileLinkOk=${fileLinkOk.get()} " +
+                    "fileRealOk=${fileRealOk.get()} dirLinkOk=${dirLinkOk.get()} " +
+                    "dirRealOk=${dirRealOk.get()} outsideExtra=$outsideExtra " +
+                    "firstRejection=${firstRejection.get()})",
                 rejected.get() > 0,
             )
             assertTrue(

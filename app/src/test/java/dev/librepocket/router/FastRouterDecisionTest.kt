@@ -50,11 +50,15 @@ class FastRouterDecisionTest {
         assertTrue(d.fallbackMessage!!.contains("phone.dial"))
     }
 
-    @Test fun smsIntentDeniedUntilWiredOnPlay() {
+    // Stage1: `sms.compose` 模板 to 恆空（待收件者抽取落地前一律補參），
+    // 不送空字串猜測執行；原因碼與接線門 USER_DISABLED 分開以供審計區分。
+    @Test fun smsWithoutNumberNeedsClarification() {
         val d = decide("傳簡訊給媽媽說我晚點到")
         assertEquals(RouteKind.DENIED, d.route)
-        assertEquals(DenyReason.USER_DISABLED, d.reasonCode)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.toolCall)
         assertTrue(d.fallbackMessage!!.contains("sms.compose"))
+        assertTrue(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
     }
 
     @Test fun alarmIntentDeniedUntilWired() {
@@ -146,5 +150,122 @@ class FastRouterDecisionTest {
     @Test fun fallbackTemplateShape() {
         val msg = FallbackMessages.format("X", DenyReason.FLAVOR_BLOCKED, "Y", "Z")
         assertEquals("做不到X（FLAVOR_BLOCKED）→ 可替代Y → 需要你做Z", msg)
+    }
+
+    // ---- Stage1: 猜測執行一律轉補參/澄清（#19 前置，不翻 executionReady） ----
+
+    @Test fun alarmWithoutTimeNeedsClarification() {
+        for (text in listOf("幫我設個鬧鐘", "設鬧鐘", "幫我設鬧鐘叫我起床")) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("alarm.create"))
+            assertTrue(text, d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+            assertEquals(text, "NEED_CLARIFICATION", d.header.reasonCode)
+        }
+    }
+
+    @Test fun phoneWithoutNumberNeedsClarification() {
+        for (text in listOf("打電話給媽媽", "幫我打電話", "撥打電話")) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("phone.dial"))
+            assertTrue(text, d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+        }
+    }
+
+    @Test fun calendarWithGrantButEmptyStartNeedsClarification() {
+        // 有 READ_CALENDAR 授權時投影通過，空 start/end 模板仍轉澄清（不猜時間）；
+        // 無授權時投影 NO_PRIVILEGE 優先（見 calendarWithoutGrantDeniedNoPrivilege）。
+        val d = decide("明天下午三點加個行程")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.toolCall)
+        assertTrue(d.fallbackMessage!!.contains("calendar.create"))
+        assertTrue(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+        assertEquals("NEED_CLARIFICATION", d.header.reasonCode)
+    }
+
+    @Test fun negatedIntentsNeedClarification() {
+        for (text in listOf(
+            "不要打電話給 0912345678",
+            "別設鬧鐘，明天早上7點叫我",
+            "不用幫我截圖",
+            "不要導航到台北車站",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+            assertEquals(text, "NEED_CLARIFICATION", d.header.reasonCode)
+        }
+    }
+
+    @Test fun negationDoesNotMisFireOnPartialMatch() {
+        // 「特別」含「別」但非否定：不得誤判為澄清，仍走接線門 USER_DISABLED。
+        val d = decide("特別想聽音樂，播放周杰倫的歌")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.USER_DISABLED, d.reasonCode)
+        assertTrue(d.fallbackMessage!!.contains("music.control"))
+    }
+
+    @Test fun negationDoesNotMisFireOnSimplifiedPartialMatch() {
+        // 簡體「别人」含「别」但非否定：不得誤判為澄清，仍走接線門 USER_DISABLED。
+        val d = decide("别人想聽音樂，播放周杰倫的歌")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.USER_DISABLED, d.reasonCode)
+        assertTrue(d.fallbackMessage!!.contains("music.control"))
+    }
+
+    @Test fun simplifiedNegationNeedsClarification() {
+        // 簡體否定（别+動詞）與繁體對稱，同樣轉澄清、絕不執行。
+        for (text in listOf(
+            "别打电话给 0912345678",
+            "别设闹钟，明天早上7点叫我",
+            "不用帮我截图",
+            "不要导航到台北车站",
+        )) {
+            val d = decide(text)
+            assertEquals(text, RouteKind.DENIED, d.route)
+            assertEquals(text, DenyReason.NEED_CLARIFICATION, d.reasonCode)
+            assertNull(text, d.toolCall)
+            assertTrue(text, d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+            assertEquals(text, "NEED_CLARIFICATION", d.header.reasonCode)
+        }
+    }
+
+    @Test fun clarificationReasonDistinctFromUserDisabled() {
+        // 審計可區分：缺參/否定（NEED_CLARIFICATION）≠ 未接線/開關關（USER_DISABLED）。
+        assertTrue(DenyReason.NEED_CLARIFICATION != DenyReason.USER_DISABLED)
+        val missing = decide("幫我設個鬧鐘")
+        val wired = decide("明天早上7點30分叫我起床，設個鬧鐘")
+        assertEquals(DenyReason.NEED_CLARIFICATION, missing.reasonCode)
+        assertEquals(DenyReason.USER_DISABLED, wired.reasonCode)
+        assertEquals("NEED_CLARIFICATION", missing.header.reasonCode)
+        assertEquals("USER_DISABLED", wired.header.reasonCode)
+        assertTrue(missing.header.projectedTools.contains("alarm.create"))
+    }
+
+    @Test fun missingArgsClarificationSharedAcrossFlavors() {
+        // 三 flavor 共用邏輯：缺參判定與否定判定不分 flavor（投影通過即澄清）。
+        for (flavor in listOf(Flavor.PLAY, Flavor.FOSS, Flavor.GITHUB)) {
+            val ctx = ProjectionContext(
+                flavor = flavor,
+                grantedPermissions = setOf("android.permission.READ_CALENDAR"),
+            )
+            val alarm = decide("幫我設個鬧鐘", ctx)
+            assertEquals("$flavor", RouteKind.DENIED, alarm.route)
+            assertEquals("$flavor", DenyReason.NEED_CLARIFICATION, alarm.reasonCode)
+            val phone = decide("打電話給媽媽", ctx)
+            assertEquals("$flavor", RouteKind.DENIED, phone.route)
+            assertEquals("$flavor", DenyReason.NEED_CLARIFICATION, phone.reasonCode)
+            val negated = decide("不要打電話給 0912345678", ctx)
+            assertEquals("$flavor", RouteKind.DENIED, negated.route)
+            assertEquals("$flavor", DenyReason.NEED_CLARIFICATION, negated.reasonCode)
+        }
     }
 }

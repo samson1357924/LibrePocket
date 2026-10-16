@@ -155,6 +155,13 @@ object ProotExec {
                     ShellDeny.BLACKLISTED,
                     "linux.exec privilege denied；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
                 )
+            // Stage1 新增碼：linux 門禁永不回 NEED_CLARIFICATION（僅 FastRouter
+            // 缺參用）；此分支不可達，fail-closed 拒絕以滿足窮舉。
+            DenyReason.NEED_CLARIFICATION ->
+                return ShellResult.Denied(
+                    ShellDeny.BLACKLISTED,
+                    "linux.exec needs clarification (NEED_CLARIFICATION)；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
+                )
             null -> Unit
         }
         if (LinuxEnv.containerVeto(filesDir, container) != null) {

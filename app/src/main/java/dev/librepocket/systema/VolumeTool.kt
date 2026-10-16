@@ -1,7 +1,9 @@
 package dev.librepocket.systema
 
 /**
- * 音量工具：AudioManager 公開 API（三風味皆完整，矩陣 §1 列 11）。
+ * 音量工具：AudioManager 公開 API。
+ *
+ * Status: Target（純側契約，未接線未 E2E）。
  *
  * 純側只做 [VolumeOp] 建模與範圍校驗；端側由 [AndroidIntentLauncher]
  * 經 `AudioManager.setStreamVolume / adjustStreamVolume` 落地。

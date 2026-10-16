@@ -4,7 +4,7 @@
   Decision (locked): NO SMS, NO MANAGE_EXTERNAL_STORAGE, NO VPN in any
   flavor. Foss adds ONLY the accessibility automation service (default off,
   two-step consent), symmetric with the src/github overlay.
-  See CAPABILITY_MATRIX §1-§2 + BACKLOG D15.
+  See capability matrix Current evidence + BACKLOG D15.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 

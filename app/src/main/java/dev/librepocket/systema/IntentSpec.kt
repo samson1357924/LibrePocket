@@ -155,7 +155,7 @@ data class ToolResult(
 )
 
 /**
- * 降級分支描述。話術必須遵守矩陣 §5 模板：
+ * 降級分支描述。話術必須遵守能力矩陣 Current evidence 模板：
  * `做不到 X（原因碼）→ 可替代 Y → 需要你做 Z`。
  */
 data class FallbackSpec(

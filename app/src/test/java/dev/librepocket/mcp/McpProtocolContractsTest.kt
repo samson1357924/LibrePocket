@@ -38,6 +38,17 @@ class McpProtocolContractsTest {
         override suspend fun hasKey(providerId: String): Boolean = true
     }
 
+    private class CountingVault : KeyVault {
+        var calls = 0
+        override suspend fun putKey(providerId: String, apiKey: CharArray) = Unit
+        override suspend fun getKey(providerId: String): CharArray? {
+            calls++
+            return "sekret-token-1".toCharArray()
+        }
+        override suspend fun deleteKey(providerId: String) = Unit
+        override suspend fun hasKey(providerId: String): Boolean = true
+    }
+
     // ---- a. 空包永不回 OK（{} 無 result 即拒） ----
 
     @Test fun emptyObjectIsNotOkForList() {
@@ -329,6 +340,147 @@ class McpProtocolContractsTest {
         )
         assertFalse(isError)
         assertNotNull(resultJson)
+    }
+
+    // ---- h3. Stage2 加固：安全端點／熔斷中性／非 JSON 早擋 ----
+
+    @Test fun secureEndpointUnits() {
+        // https 放行（含 bare-origin 自動補 /mcp）。
+        assertTrue(McpWire.requireSecureEndpoint("https://mcp.example.com").endsWith("/mcp"))
+        assertTrue(
+            McpWire.requireSecureEndpoint("https://mcp.example.com/api/mcp?x=1").contains("/api/mcp"),
+        )
+        // 回環 http 放行（測試／本機）。
+        assertNotNull(McpWire.requireSecureEndpoint("http://localhost:8080/mcp"))
+        assertNotNull(McpWire.requireSecureEndpoint("http://127.0.0.1:8080/"))
+        // 非回環 http 與畸形一律拒。
+        for (bad in listOf("http://mcp.example.com/mcp", "http://192.168.1.10/mcp", "::::", "ftp://h/mcp")) {
+            try {
+                McpWire.requireSecureEndpoint(bad)
+                fail("必須拒絕：$bad")
+            } catch (_: IllegalArgumentException) {
+                // 預期 fail-closed。
+            }
+        }
+        try {
+            McpWire.requireSecureEndpoint("   ")
+            fail("空白必須拒絕")
+        } catch (_: IllegalArgumentException) {
+            // 預期。
+        }
+    }
+
+    @Test fun insecureEndpointBlockedWithoutVaultOrBreaker() = runBlocking {
+        val counting = CountingVault()
+        val breaker = McpCircuitBreaker()
+        val server = McpServer(
+            config = McpServerConfig(id = "s1", baseUrl = "http://mcp.example.com/mcp"),
+            keyVault = counting,
+            transport = McpTransport(),
+            breaker = breaker,
+        )
+        // 目標為外網明文：若預驗失效而走到傳輸層，將嘗試真實連線（慢／TRANSPORT），
+        // 此處限 5s 內回 PROTOCOL 即證明發送前擋下。
+        val list = withTimeoutOrNull(5_000) { server.listTools() }
+        assertNotNull(list)
+        assertEquals(McpStatus.PROTOCOL, list!!.status)
+        val call = withTimeoutOrNull(5_000) { server.callTool("t", "{}") }
+        assertNotNull(call)
+        assertEquals(McpStatus.PROTOCOL, call!!.status)
+        assertEquals("配置錯誤不得碰 vault", 0, counting.calls)
+        assertEquals("配置錯誤不得計熔斷", 0, breaker.failureCount())
+    }
+
+    @Test fun toolErrorIsNeutralDoesNotResetBreaker() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // 2×TRANSPORT（500）＋1×TOOL_ERROR（isError）＋1×TRANSPORT 必開路；
+            // 若 TOOL_ERROR 重置計數則永不開路（舊 bug）。
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+                        "{\"content\":[{\"type\":\"text\",\"text\":\"x\"}],\"isError\":true}}",
+                ),
+            )
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(2, breaker.failureCount())
+            assertEquals(McpStatus.TOOL_ERROR, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals("TOOL_ERROR 必須中性（不重置）", 2, breaker.failureCount())
+            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertTrue(breaker.isOpen())
+            assertEquals(McpStatus.CIRCUIT_OPEN, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun errorPacketIsNeutralDoesNotResetBreaker() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            // error 包（McpToolFailure）同為中性：2×TRANSPORT＋1×error 包＋1×TRANSPORT 必開路。
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            web.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32602,\"message\":\"bad\"}}",
+                ),
+            )
+            web.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals(2, breaker.failureCount())
+            assertEquals(McpStatus.TOOL_ERROR, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertEquals("error 包必須中性（不重置）", 2, breaker.failureCount())
+            assertEquals(McpStatus.TRANSPORT, withTimeoutOrNull(5_000) { server.callTool("t", "{}") }!!.status)
+            assertTrue(breaker.isOpen())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun nonJsonContentTypeRejectedEarly() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            web.enqueue(
+                MockResponse().setResponseCode(200)
+                    .addHeader("Content-Type", "text/event-stream")
+                    .setBody("event: message\ndata: {\"jsonrpc\":\"2.0\"}\n\n"),
+            )
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val got = withTimeoutOrNull(5_000) { server.listTools() }
+            assertNotNull(got)
+            assertEquals(McpStatus.PROTOCOL, got!!.status)
+            assertEquals(1, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
     }
 
     // ---- i. 自訂 endpoint E2E（含 query 保留＋標頭） ----

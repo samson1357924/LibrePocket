@@ -59,8 +59,9 @@ import java.util.concurrent.atomic.AtomicReference
  *   讀列刪進度計數證明非零覆蓋空轉（讀成功零在高翻轉下合法，進度以 readAttempts 計；
  *   寫成功由無 errors 間接證明，失敗計入 denied 混合桶）。
  *
- * 時序：起跑閘（[CountDownLatch]）＋背景線程池＋`await` 期限；全檔不用
- * 睡眠猜時序（僅 latch／await 期限）。
+ * 時序：起跑閘（[CountDownLatch]）＋背景線程池＋`await` 期限；主壓力路徑不用
+ * 睡眠猜時序（僅 latch／await 期限；洩漏模擬 worker 內的 `sleep(50)` 為自旋
+ * 粒度，非同步 oracle）。
  *
  * Robolectric vs JVM 區分（本檔為純 JVM 單元測試）：
  * - 未使用 `RobolectricTestRunner`／shadows；直寫宿主機 tmpfs（POSIX symlink、
@@ -685,8 +686,9 @@ class ScopedFileStoreConcurrencyPressureTest {
                 }
                 pool.shutdownNow()
                 try {
-                    // 有界等待已提交者響應中斷；仍活則由 workersMayBeAlive 跳過清理，
-                    // daemon 線程不阻塞 JVM 退出。
+                    // 有界等待已提交者響應中斷（5s 固定值：提交失敗後兜底，
+                    // 與 POOL_REAP_TIMEOUT_SEC 的超時分支 10s 不同）；仍活則由
+                    // workersMayBeAlive 跳過清理，daemon 線程不阻塞 JVM 退出。
                     pool.awaitTermination(5, TimeUnit.SECONDS)
                 } catch (e: InterruptedException) {
                     Thread.currentThread().interrupt()

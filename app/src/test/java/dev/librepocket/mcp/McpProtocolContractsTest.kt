@@ -95,14 +95,18 @@ class McpProtocolContractsTest {
         try {
             McpWire.parseList("s1", json)
             fail("notification 形狀不得回工具列表")
-        } catch (_: IllegalArgumentException) {
-            // 預期：mcp: missing result。
+        } catch (e: McpWire.McpToolFailure) {
+            fail("不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("mcp: missing result", e.message)
         }
         try {
             McpWire.parseCall(json)
             fail("notification 形狀不得回 OK")
-        } catch (_: IllegalArgumentException) {
-            // 預期：mcp: missing result。
+        } catch (e: McpWire.McpToolFailure) {
+            fail("不得映射 TOOL_ERROR，實際=${e.message}")
+        } catch (e: IllegalArgumentException) {
+            assertEquals("mcp: missing result", e.message)
         }
     }
 
@@ -216,8 +220,118 @@ class McpProtocolContractsTest {
         }
     }
 
-    // ---- i. 自訂 endpoint E2E（含 query 保留＋標頭） ----
+    // ---- h2. Stage1 加固：轉義／請求體 fail-closed（鎖定修復） ----
 
+    @Test fun unicodeEscapeWithSignIsRejected() {
+        // \u+123 / \u-12a 非法（toIntOrNull(16) 會吞 +/-，此處必須拒）。
+        for (bad in listOf("\\u+123", "\\u-12a", "\\uZZZZ")) {
+            val json = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":" +
+                "[{\"name\":\"t\",\"inputSchema\":{\"type\":\"object\",\"v\":\"a${bad}b\"}}]}}"
+            try {
+                McpWire.parseList("s1", json)
+                fail("非法 \\u 跳脫必須拒絕：$bad")
+            } catch (_: McpWire.McpProtocol) {
+                // 預期：mcp: bad envelope。
+            } catch (e: IllegalArgumentException) {
+                fail("必須拋 McpProtocol，實際=${e.message}")
+            }
+        }
+    }
+
+    @Test fun escCoversBackspaceFormfeedAndC0() {
+        val name = "a\"b\\c\bd\ne\rg\th" + '\u000C' + '\u0001' + "-end"
+        val body = McpWire.callBody(name, "{}")
+        // 產出必須是合法 JSON（嚴格 parser 可走訪），且不得含裸控制字元。
+        McpWire.parseStrictDoc(body)
+        assertFalse("不得含裸 BS", body.contains("\b"))
+        assertFalse("不得含裸 FF", body.contains("\u000C"))
+        assertTrue(body.contains("\\b"))
+        assertTrue(body.contains("\\f"))
+        assertTrue(body.contains("\\u0001"))
+    }
+
+    @Test fun callBodyRejectsNonObjectArguments() {
+        for (bad in listOf("null", "[]", "{unquoted}", "not json")) {
+            try {
+                McpWire.callBody("t", bad)
+                fail("非 object arguments 必須拒絕：$bad")
+            } catch (_: IllegalArgumentException) {
+                // 預期 fail-closed（發送前擋下）。
+            }
+        }
+        try {
+            McpWire.callBody("   ", "{}")
+            fail("空白 toolName 必須拒絕")
+        } catch (_: IllegalArgumentException) {
+            // 預期。
+        }
+        // 空字串預設 {} 且合法。
+        McpWire.parseStrictDoc(McpWire.callBody("t", ""))
+    }
+
+    @Test fun clientArgErrorMapsToProtocolWithoutBreakerOrHttp() = runBlocking {
+        val web = MockWebServer()
+        web.start()
+        try {
+            val breaker = McpCircuitBreaker()
+            val server = McpServer(
+                config = McpServerConfig(id = "s1", baseUrl = web.url("/").toString()),
+                keyVault = FakeVault(),
+                transport = McpTransport(),
+                breaker = breaker,
+            )
+            val bad = withTimeoutOrNull(5_000) { server.callTool("t", "not json") }
+            assertNotNull(bad)
+            assertEquals(McpStatus.PROTOCOL, bad!!.status)
+            assertEquals("客戶端參數錯誤不得發送 HTTP", 0, web.requestCount)
+            assertEquals("客戶端參數錯誤不得計熔斷", 0, breaker.failureCount())
+            val blank = withTimeoutOrNull(5_000) { server.callTool("   ", "{}") }
+            assertNotNull(blank)
+            assertEquals(McpStatus.PROTOCOL, blank!!.status)
+            assertEquals(0, web.requestCount)
+            assertEquals(0, breaker.failureCount())
+        } finally {
+            web.shutdown()
+        }
+    }
+
+    @Test fun missingJsonrpcStillParsesLocksNonGoal() {
+        // jsonrpc 非目標（不斷言版本）：缺席仍照常解析，防後人誤加版本斷言。
+        val list = "{\"id\":1,\"result\":{\"tools\":[]}}"
+        assertTrue(McpWire.parseList("s1", list).isEmpty())
+        val call = "{\"id\":2,\"result\":{\"content\":[],\"isError\":false}}"
+        val (_, isError) = McpWire.parseCall(call)
+        assertFalse(isError)
+    }
+
+    @Test fun emptyResultObjectIsOkLocksCurrentSemantics() {
+        // 空 result {} 視為 OK（已知限制，見 McpWire.parseCall KDoc）。
+        val (resultJson, isError) = McpWire.parseCall("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}")
+        assertFalse(isError)
+        assertEquals("{}", resultJson)
+    }
+
+    @Test fun structuredContentDiscardedWhenContentPresent() {
+        // content 存在時 structuredContent 被丟棄（已知限制，見 KDoc）。
+        val json = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":" +
+            "{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]," +
+            "\"structuredContent\":{\"key\":\"rich\"},\"isError\":false}}"
+        val (resultJson, isError) = McpWire.parseCall(json)
+        assertFalse(isError)
+        assertNotNull(resultJson)
+        assertTrue(resultJson!!.contains("ok"))
+        assertFalse(resultJson.contains("rich"))
+    }
+
+    @Test fun isErrorNullIsFalse() {
+        val (resultJson, isError) = McpWire.parseCall(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[],\"isError\":null}}",
+        )
+        assertFalse(isError)
+        assertNotNull(resultJson)
+    }
+
+    // ---- i. 自訂 endpoint E2E（含 query 保留＋標頭） ----
     @Test fun customEndpointWithQueryPreservedEndToEnd() = runBlocking {
         val web = MockWebServer()
         web.start()

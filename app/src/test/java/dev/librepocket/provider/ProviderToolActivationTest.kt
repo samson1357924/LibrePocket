@@ -10,14 +10,25 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
  * Stage1 #5 remaining activation contracts (scaffold-only, no dispatcher).
  *
  * Production still sends no tools (`TurnController.buildRequest` stays
- * pure-chat, `ToolRegistry.visibleTools` is empty for all 41 tools); these
+ * pure-chat per TurnController.kt人工核實，本測試未直接覆蓋該 private 方法；
+ * `ToolRegistry.visibleTools` is empty for all tools); these
  * tests only validate explicit scaffold histories via `buildBody`.
+ *
+ * `strictObj` 僅為嚴格 JSON 解析（合法輸出可 parse），不代表 schema／pairing
+ * fail-closed 已釘住；fail-closed 負向見 `ProviderToolWireStrictTest`
+ *（toolSchema／assistant-image／thinking 閘）。
+ *
+ * Fake executor（[fakeExecute]）僅為確定性佔位，不代表真實 dispatcher 語義
+ *（error envelope／截斷／redaction／多輪迴圈）；且 history 用的 `fail_tool`
+ * 未在 `tools` 參數宣告（`validateToolPairing` 不檢查 name 是否已宣告，
+ * 未宣告工具名不被拒為已知缺口，wiring PR 須另立測試）。
  *
  * Covers:
  * - mock function_call -> fake executor -> function_call_output -> final
@@ -25,7 +36,7 @@ import org.junit.Test
  * - empty / single / multi / +hosted web_search strict JSON parse;
  * - nested / escaped / Unicode round-trip;
  * - multi-tool same round + failure result ID / role preservation;
- * - Chat / Anthropic no-regression (pure-chat + single-tool).
+ * - Chat / Responses / Anthropic no-regression (pure-chat + single-tool).
  */
 class ProviderToolActivationTest {
 
@@ -206,18 +217,24 @@ class ProviderToolActivationTest {
             ),
         )["tools"]!!.jsonArray
         assertEquals(1, respTools.size)
+        assertEquals("get_weather", respTools[0].jsonObject["name"]!!.jsonPrimitive.content)
         val chatTools = strictObj(
             ChatCompletionsProvider(chatConfig(), { null }).buildBody(
                 ChatRequest(model = "m", messages = messages, tools = singleTool()),
             ),
         )["tools"]!!.jsonArray
         assertEquals(1, chatTools.size)
+        assertEquals(
+            "get_weather",
+            chatTools[0].jsonObject["function"]!!.jsonObject["name"]!!.jsonPrimitive.content,
+        )
         val anthTools = strictObj(
             AnthropicProvider(anthropicConfig(), { null }).buildBody(
                 ChatRequest(model = "m", messages = messages, tools = singleTool()),
             ),
         )["tools"]!!.jsonArray
         assertEquals(1, anthTools.size)
+        assertEquals("get_weather", anthTools[0].jsonObject["name"]!!.jsonPrimitive.content)
     }
 
     @Test
@@ -228,20 +245,29 @@ class ProviderToolActivationTest {
             ResponsesProvider(responsesConfig(), { null }).buildBody(
                 ChatRequest(model = "m", messages = messages, tools = tools),
             ),
-        )["tools"]!!.jsonArray
+        )["tools"]!!.jsonArray.map { it.jsonObject }
         assertEquals(tools.size, respTools.size)
+        for (i in tools.indices) {
+            assertEquals(tools[i].name, respTools[i]["name"]!!.jsonPrimitive.content)
+        }
         val chatTools = strictObj(
             ChatCompletionsProvider(chatConfig(), { null }).buildBody(
                 ChatRequest(model = "m", messages = messages, tools = tools),
             ),
-        )["tools"]!!.jsonArray
+        )["tools"]!!.jsonArray.map { it.jsonObject }
         assertEquals(tools.size, chatTools.size)
+        for (i in tools.indices) {
+            assertEquals(tools[i].name, chatTools[i]["function"]!!.jsonObject["name"]!!.jsonPrimitive.content)
+        }
         val anthTools = strictObj(
             AnthropicProvider(anthropicConfig(), { null }).buildBody(
                 ChatRequest(model = "m", messages = messages, tools = tools),
             ),
-        )["tools"]!!.jsonArray
+        )["tools"]!!.jsonArray.map { it.jsonObject }
         assertEquals(tools.size, anthTools.size)
+        for (i in tools.indices) {
+            assertEquals(tools[i].name, anthTools[i]["name"]!!.jsonPrimitive.content)
+        }
     }
 
     @Test
@@ -307,38 +333,49 @@ class ProviderToolActivationTest {
             ChatMessage("assistant", "thinking 中文", toolCalls = listOf(tc)),
             ChatMessage("tool", advOutput, toolCallId = tc.id),
         )
-        val chatCall = strictObj(
+        val chatRoot = strictObj(
             ChatCompletionsProvider(chatConfig(), { null }).buildBody(
                 ChatRequest(model = "m", messages = history, tools = localTools()),
             ),
-        )["messages"]!!.jsonArray.map { it.jsonObject }
+        )
+        val chatCall = chatRoot["messages"]!!.jsonArray.map { it.jsonObject }
             .first { it["role"]!!.jsonPrimitive.content == "assistant" }["tool_calls"]!!.jsonArray[0].jsonObject
         assertEquals(expected, Json.parseToJsonElement(chatCall["function"]!!.jsonObject["arguments"]!!.jsonPrimitive.content))
-        val respCall = strictObj(
+        // Chat tool 輸出同樣承載 adversarial 字元（與 Responses 對稱）。
+        val chatToolMsg = chatRoot["messages"]!!.jsonArray.map { it.jsonObject }
+            .first { it["role"]!!.jsonPrimitive.content == "tool" }
+        assertEquals(advOutput, chatToolMsg["content"]!!.jsonPrimitive.content)
+        val respInput = strictObj(
             ResponsesProvider(responsesConfig(), { null }).buildBody(
                 ChatRequest(model = "m", messages = history, tools = localTools()),
             ),
         )["input"]!!.jsonArray.map { it.jsonObject }
+        val respCall = respInput
             .first { it["type"]!!.jsonPrimitive.content == "function_call" }
         assertEquals(expected, Json.parseToJsonElement(respCall["arguments"]!!.jsonPrimitive.content))
-        assertEquals(advOutput, strictObj(
-            ResponsesProvider(responsesConfig(), { null }).buildBody(
-                ChatRequest(model = "m", messages = history, tools = localTools()),
-            ),
-        )["input"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(advOutput, respInput
             .first { it["type"]!!.jsonPrimitive.content == "function_call_output" }["output"]!!.jsonPrimitive.content)
-        val anthUse = strictObj(
+        val anthRoot = strictObj(
             AnthropicProvider(anthropicConfig(), { null }).buildBody(
                 ChatRequest(model = "m", messages = history, tools = localTools()),
             ),
-        )["messages"]!!.jsonArray.map { it.jsonObject }
+        )
+        val anthUse = anthRoot["messages"]!!.jsonArray.map { it.jsonObject }
             .first { it["role"]!!.jsonPrimitive.content == "assistant" }["content"]!!.jsonArray
             .map { it.jsonObject }.first { it["type"]!!.jsonPrimitive.content == "tool_use" }
         assertEquals(expected, anthUse["input"]!!)
+        // Anthropic tool_result 同樣承載 adversarial 輸出（單一 tool 結果不合併仍可斷言；
+        // 首個 user 為原始提問，合併結果在最後一個 user）。
+        val anthResult = anthRoot["messages"]!!.jsonArray.map { it.jsonObject }
+            .last { it["role"]!!.jsonPrimitive.content == "user" }["content"]!!.jsonArray
+            .map { it.jsonObject }.first { it["type"]!!.jsonPrimitive.content == "tool_result" }
+        assertEquals(advOutput, anthResult["content"]!!.jsonPrimitive.content)
     }
 
     @Test
     fun adversarialNamesDescriptionsRoundTrip() {
+        // 僅測序列化轉義，非合法 API 工具名（真實 Responses/Anthropic 工具名有
+        // ^[a-zA-Z0-9_-]{1,64}$ 類字元集限制，此處 advName 含引號／反斜線／emoji 僅打轉義路徑）。
         val tools = localTools()
         val messages = listOf(ChatMessage("user", advText))
         val respTools = strictObj(
@@ -349,6 +386,7 @@ class ProviderToolActivationTest {
         for (i in tools.indices) {
             assertEquals(tools[i].name, respTools[i]["name"]!!.jsonPrimitive.content)
             assertEquals(tools[i].description, respTools[i]["description"]!!.jsonPrimitive.content)
+            assertEquals("object", respTools[i]["parameters"]!!.jsonObject["type"]!!.jsonPrimitive.content)
         }
         val chatTools = strictObj(
             ChatCompletionsProvider(chatConfig(), { null }).buildBody(
@@ -359,6 +397,7 @@ class ProviderToolActivationTest {
             val fn = chatTools[i]["function"]!!.jsonObject
             assertEquals(tools[i].name, fn["name"]!!.jsonPrimitive.content)
             assertEquals(tools[i].description, fn["description"]!!.jsonPrimitive.content)
+            assertEquals("object", fn["parameters"]!!.jsonObject["type"]!!.jsonPrimitive.content)
         }
         val anthTools = strictObj(
             AnthropicProvider(anthropicConfig(), { null }).buildBody(
@@ -368,6 +407,7 @@ class ProviderToolActivationTest {
         for (i in tools.indices) {
             assertEquals(tools[i].name, anthTools[i]["name"]!!.jsonPrimitive.content)
             assertEquals(tools[i].description, anthTools[i]["description"]!!.jsonPrimitive.content)
+            assertEquals("object", anthTools[i]["input_schema"]!!.jsonObject["type"]!!.jsonPrimitive.content)
         }
     }
 
@@ -467,13 +507,80 @@ class ProviderToolActivationTest {
         assertEquals(listOf(tc1.id, tc2.id), results.map { it["tool_use_id"]!!.jsonPrimitive.content })
         assertEquals(out1, results[0]["content"]!!.jsonPrimitive.content)
         assertEquals(failureOutput, results[1]["content"]!!.jsonPrimitive.content)
+        // 當前形狀無 is_error（見 ProviderJson.anthropicToolResultJson）：明確鎖定，
+        // 若 dispatcher 日後要求 is_error，此測須同步更新。
+        assertTrue(results.all { !it.containsKey("is_error") })
         assertEquals(
             finalAnswer,
             messages[3]["content"]!!.jsonArray[0].jsonObject["text"]!!.jsonPrimitive.content,
         )
     }
 
-    // ---- Chat / Anthropic no-regression ----
+    @Test
+    fun anthropicTailFlushWithoutFinalAssistant() {
+        // 尾 flush 路徑：tool 為最後一則、無 final assistant 時，尾部兩個 tool 輸出
+        // 合併為單一 user 訊息（flushPendingResults 尾呼叫）。
+        val tc1 = ToolCall(id = "toolu_tail_ok", name = "get_weather", argumentsJson = """{"city":"Taipei"}""")
+        val tc2 = ToolCall(id = "toolu_tail_fail", name = "fail_tool", argumentsJson = """{"city":"Taichung"}""")
+        val history = listOf(
+            ChatMessage("user", advText),
+            ChatMessage("assistant", "", toolCalls = listOf(tc1, tc2)),
+            ChatMessage("tool", fakeExecute(tc1), toolCallId = tc1.id),
+            ChatMessage("tool", fakeExecute(tc2), toolCallId = tc2.id),
+        )
+        val body = AnthropicProvider(anthropicConfig(), { null }).buildBody(
+            ChatRequest(model = "m", messages = history, tools = singleTool()),
+        )
+        val messages = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(
+            listOf("user", "assistant", "user"),
+            messages.map { it["role"]!!.jsonPrimitive.content },
+        )
+        val results = messages[2]["content"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(2, results.size)
+        assertEquals(listOf(tc1.id, tc2.id), results.map { it["tool_use_id"]!!.jsonPrimitive.content })
+    }
+
+    @Test
+    fun chatVsResponsesBlankIdBackfillDiffers() {
+        // 三 adapter 唯一 pairing 語義差：Chat 單 pending 時 tool 輸出空白 id 可 backfill，
+        // Responses/Anthropic 一律 MISSING 拒絕（見 ProviderJson.validateToolPairing）。
+        // 注意 toolCalls 本身空白 id 三家皆拒（TOOL_CALL_MISSING_ID），backfill 僅針對輸出側。
+        val history = listOf(
+            ChatMessage("user", "hi"),
+            ChatMessage("assistant", "", toolCalls = listOf(ToolCall(id = "call_backfill1", name = "get_weather", argumentsJson = "{}"))),
+            ChatMessage("tool", "out", toolCallId = ""),
+        )
+        val chatBody = ChatCompletionsProvider(chatConfig(), { null }).buildBody(
+            ChatRequest(model = "m", messages = history, tools = singleTool()),
+        )
+        val chatRoot = strictObj(chatBody)
+        val chatCalls = chatRoot["messages"]!!.jsonArray.map { it.jsonObject }
+            .first { it["role"]!!.jsonPrimitive.content == "assistant" }["tool_calls"]!!.jsonArray
+        assertEquals(1, chatCalls.size)
+        assertEquals("call_backfill1", chatCalls[0].jsonObject["id"]!!.jsonPrimitive.content)
+        val chatToolMsg = chatRoot["messages"]!!.jsonArray.map { it.jsonObject }
+            .first { it["role"]!!.jsonPrimitive.content == "tool" }
+        assertEquals("call_backfill1", chatToolMsg["tool_call_id"]!!.jsonPrimitive.content)
+        try {
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history, tools = singleTool()),
+            )
+            fail("responses 空白 id 必須拒絕")
+        } catch (e: ProviderFailure) {
+            assertTrue(e.message!!.contains("MISSING_ID"))
+        }
+        try {
+            AnthropicProvider(anthropicConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history, tools = singleTool()),
+            )
+            fail("anthropic 空白 id 必須拒絕")
+        } catch (e: ProviderFailure) {
+            assertTrue(e.message!!.contains("MISSING_ID"))
+        }
+    }
+
+    // ---- Chat / Responses / Anthropic no-regression ----
 
     @Test
     fun chatPureChatNoRegression() {
@@ -485,7 +592,10 @@ class ProviderToolActivationTest {
         val body = ChatCompletionsProvider(chatConfig(), { null }).buildBody(
             ChatRequest(model = "m", messages = history),
         )
-        val messages = strictObj(body)["messages"]!!.jsonArray.map { it.jsonObject }
+        val root = strictObj(body)
+        assertFalse(root.containsKey("tools"))
+        assertFalse(root.containsKey("web_search_options"))
+        val messages = root["messages"]!!.jsonArray.map { it.jsonObject }
         assertEquals(3, messages.size)
         assertEquals(
             listOf("user", "assistant", "user"),
@@ -493,6 +603,25 @@ class ProviderToolActivationTest {
         )
         assertTrue(messages.none { it.containsKey("tool_calls") })
         assertTrue(messages.none { it["role"]!!.jsonPrimitive.content == "tool" })
+    }
+
+    @Test
+    fun responsesPureChatNoRegression() {
+        val history = listOf(
+            ChatMessage("user", "hi 中文"),
+            ChatMessage("assistant", "hello 🎉"),
+            ChatMessage("user", "thanks"),
+        )
+        val root = strictObj(
+            ResponsesProvider(responsesConfig(), { null }).buildBody(
+                ChatRequest(model = "m", messages = history),
+            ),
+        )
+        assertFalse(root.containsKey("tools"))
+        val input = root["input"]!!.jsonArray.map { it.jsonObject }
+        assertEquals(3, input.size)
+        assertTrue(input.none { it["type"]!!.jsonPrimitive.content == "function_call" })
+        assertTrue(input.none { it["type"]!!.jsonPrimitive.content == "function_call_output" })
     }
 
     @Test
@@ -519,14 +648,14 @@ class ProviderToolActivationTest {
 
     @Test
     fun scaffoldStaysPureChatAndRegistryHidden() {
-        // Production invariant: TurnController.buildRequest sends
-        // ChatRequest(model, messages) with default tools == [] /
-        // serverTools == [] / thinking == null, and visibleTools is empty
-        // for all 41 tools until the wiring PR flips executionReady.
+        // Production invariant（部分人工核實）：ChatRequest 預設 tools／serverTools／thinking
+        // 皆空；`TurnController.buildRequest` 送 pure-chat 見 TurnController.kt 人工核實，
+        // 本測試未直接覆蓋該 private 方法，僅鎖預設值與 registry 一半。
         val empty = ChatRequest(model = "m", messages = listOf(ChatMessage("user", "hi")))
         assertTrue(empty.tools.isEmpty())
         assertTrue(empty.serverTools.isEmpty())
         assertEquals(null, empty.thinking)
+        assertEquals(41, ToolRegistry.ALL.size)
         val permissive = ProjectionContext(
             flavor = Flavor.GITHUB,
             automationEnabled = true,
@@ -557,7 +686,12 @@ class ProviderToolActivationTest {
                 "decompile" to true,
             ),
         )
+        // 真空防護：先證 context 真 permissive（投影非空），再證可見為空（雙閘）。
+        assertTrue(ToolRegistry.projectedTools(permissive).isNotEmpty())
         assertTrue(ToolRegistry.visibleTools(permissive).isEmpty())
         assertTrue(ToolRegistry.ALL.all { !it.executionReady })
+        // PLAY 對照：flavor-gated 工具在 PLAY 下同樣隱藏（wiring 前全空）。
+        val playPermissive = permissive.copy(flavor = Flavor.PLAY)
+        assertTrue(ToolRegistry.visibleTools(playPermissive).isEmpty())
     }
 }

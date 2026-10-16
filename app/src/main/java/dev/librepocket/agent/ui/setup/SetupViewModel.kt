@@ -25,6 +25,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
@@ -46,6 +47,12 @@ import kotlinx.coroutines.withContext
  * endpoint snapshot observed at mint time; consumed (nulled) on the first
  * confirm or abandon tap, so it can never be replayed or reused. Any
  * endpoint-identity edit discards it before use.
+ *
+ * Stage1 entity/policy split: [KeyWriteConsent.resource] is the preset-shared
+ * authorization scope, [KeyWriteConsent.providerId] the per-endpoint entity
+ * id — the two legitimately differ for custom endpoints (see
+ * [SetupValidation.policyResourceForPreset] /
+ * [SetupValidation.deriveEndpointId]).
  */
 private data class KeyWriteConsent(
     val action: String,
@@ -496,13 +503,25 @@ class SetupViewModel(
                         // providerId (staged commits point at a per-operation alias).
                         // Malformed refs and invalid URLs fail closed to NoEndpoint
                         // without vault I/O (proven unusable, not a read failure).
-                        if (!okUrl || !config.apiKeyRef.startsWith("provider_key/")) {
+                        // Stage1 compat: a legacy custom row (stored entity id
+                        // predates per-endpoint ids, e.g. `preset:custom`) joins
+                        // the same branch — its shared fixed vault slot may
+                        // hold another URL's key, so it must re-key in Setup
+                        // (fail-closed, never Ready), without vault I/O here.
+                        if (SetupValidation.isLegacyEndpoint(config) ||
+                            !okUrl || !config.apiKeyRef.startsWith("provider_key/")
+                        ) {
                             EndpointGate.NoEndpoint
                         } else {
-                            val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
-                            if (alias.isBlank()) {
+                            // Triple namespace parity with EndpointStore.readiness
+                            // and credential capture (one shared predicate): a
+                            // cross-namespace alias is proven unusable without
+                            // vault I/O — it must not even cost a hasKey probe
+                            // against the foreign slot, let alone gate Ready.
+                            if (!SetupValidation.aliasInNamespace(config.providerId, config.apiKeyRef)) {
                                 EndpointGate.NoEndpoint
                             } else {
+                                val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
                                 // Vault check failure propagates to the outer catch
                                 // → ReadFailure (unconfirmed, never NoEndpoint).
                                 // hasKey==false is proven keyless → NoEndpoint.
@@ -658,7 +677,7 @@ class SetupViewModel(
         } else if (v.trim().isNotEmpty() && keyBinding.bound == null) {
             val cur = _form.value
             try {
-                val newBound = SetupValidation.deriveProviderId(cur.presetId) to effectiveBaseUrlOf(cur).trim()
+                val newBound = SetupValidation.deriveEndpointId(cur.presetId, effectiveBaseUrlOf(cur)) to effectiveBaseUrlOf(cur).trim()
                 keyBinding = keyBinding.copy(bound = newBound)
             } catch (_: Exception) {
                 // Unknown preset：保持 null（entries 以 SETUP_UNKNOWN_PRESET fail-closed）。
@@ -685,6 +704,159 @@ class SetupViewModel(
 
     fun toggleShowKey() {
         _form.value = _form.value.copy(showKey = !_form.value.showKey)
+    }
+
+    /**
+     * Legacy migration probe outcome (metadata only, never a vault read).
+     *
+     * - [Available]: a quarantined pre-Stage1 custom row whose URL/model may
+     *   prefill the Setup form (its key is never reused).
+     * - [NothingToMigrate]: absent metadata or a non-legacy row — terminal,
+     *   a later retry cannot change this for the same store.
+     * - [RetryLater]: a pending teardown journal or any read failure —
+     *   transient, a later retry after reconcile/recovery may succeed.
+     * Cancellation always propagates (never folded into a terminal state).
+     */
+    sealed interface LegacyMigrationProbe {
+        data class Available(val config: EndpointConfig) : LegacyMigrationProbe
+        data object NothingToMigrate : LegacyMigrationProbe
+        data object RetryLater : LegacyMigrationProbe
+    }
+
+    suspend fun probeLegacyMigration(): LegacyMigrationProbe {
+        val journal = try {
+            store.observePendingDelete().first()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return LegacyMigrationProbe.RetryLater
+        }
+        if (journal !is PendingTeardownState.Absent) return LegacyMigrationProbe.RetryLater
+        val config = try {
+            store.snapshotStrict()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            return LegacyMigrationProbe.RetryLater
+        } ?: return LegacyMigrationProbe.NothingToMigrate
+        if (config.presetId != ProviderCatalog.CUSTOM_ID) return LegacyMigrationProbe.NothingToMigrate
+        if (!SetupValidation.isLegacyEndpoint(config)) return LegacyMigrationProbe.NothingToMigrate
+        return LegacyMigrationProbe.Available(config)
+    }
+
+    /**
+     * Read-only legacy migration source (metadata only, never a vault read).
+     *
+     * Returns the stored row only when it is a quarantined pre-Stage1 custom
+     * row (shared `preset:custom` entity id): its URL/model may prefill the
+     * Setup form so an upgrade does not lose the address, but its key is
+     * never reused. Null on absent metadata, non-legacy rows, a pending
+     * teardown journal, or any read failure (fail-closed: the form keeps its
+     * defaults instead of showing partial/stale data).
+     */
+    suspend fun legacyMigrationSource(): EndpointConfig? =
+        when (val probe = probeLegacyMigration()) {
+            is LegacyMigrationProbe.Available -> probe.config
+            else -> null
+        }
+
+    /**
+     * One-shot legacy migration prefill (Main-thread only).
+     *
+     * Fills preset/URL/model from [probeLegacyMigration] so a quarantined
+     * row (which never gates Ready) still recovers its address in Setup;
+     * the key field stays blank and [editBaseline] is deliberately left
+     * untouched (null), so keep-existing is impossible and a blank save
+     * still demands a re-paste while any save derives the new per-endpoint
+     * identity. Succeeds at most once per ViewModel and only over a pristine
+     * form — user input is never clobbered. A transient read failure or
+     * cancellation leaves the attempt unmarked (in-flight is released), so a
+     * later Setup entry retries instead of staying permanently disabled.
+     */
+    private var migrationPrefilled = false
+    private var migrationPrefillInFlight = false
+    /**
+     * Single shared definition of migration-retry eligibility, used by both
+     * the prefill gate below and the Setup screen's retry action: only the
+     * meaningful draft inputs matter (preset/URL/model/key), plus freedom
+     * from in-flight operations and open confirmations. Display-only state
+     * (error codes, show/hide-key, probe results, revision counters) never
+     * blocks a retry — a visible enabled button must always do something.
+     */
+    internal fun isMigrationEligibleForm(form: SetupUiState): Boolean =
+        form.presetId == ProviderCatalog.OPENAI_ID &&
+            form.baseUrl == ProviderCatalog.OPENAI_BASE_URL &&
+            form.model == ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID) &&
+            form.apiKey.isEmpty() &&
+            !form.saving && !form.testing && !form.modelsLoading &&
+            !form.confirmKeyWrite && !form.confirmRebind
+
+    /**
+     * True while a migration prefill attempt ended [LegacyMigrationProbe.RetryLater]
+     * and no later attempt has resolved it. Drives the Setup screen's explicit
+     * retry action; cleared on success, terminal absence, or a superseding
+     * state (the prefill itself still re-verifies pristine/revision, so a
+     * stale tap can never clobber user input).
+     */
+    private val _migrationRetryNeeded = MutableStateFlow(false)
+    val migrationRetryNeeded: StateFlow<Boolean> = _migrationRetryNeeded
+    /**
+     * Retry-action visibility: a pending retry exists and the current form
+     * still satisfies [isMigrationEligibleForm]. Single source of truth —
+     * the screen renders exactly this, so eligibility can never drift from
+     * the gate below.
+     */
+    val showMigrationRetry: StateFlow<Boolean> =
+        combine(_migrationRetryNeeded, _form) { retryNeeded, form ->
+            retryNeeded && !migrationPrefilled && isMigrationEligibleForm(form)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    suspend fun prefillLegacyMigrationIfNeeded() {
+        if (migrationPrefilled || migrationPrefillInFlight) return
+        if (!isMigrationEligibleForm(_form.value)) return
+        val entryRevision = formRevision.get()
+        migrationPrefillInFlight = true
+        try {
+            val legacy = when (val probe = probeLegacyMigration()) {
+                is LegacyMigrationProbe.Available -> {
+                    _migrationRetryNeeded.value = false
+                    probe.config
+                }
+                is LegacyMigrationProbe.NothingToMigrate -> {
+                    migrationPrefilled = true
+                    _migrationRetryNeeded.value = false
+                    return
+                }
+                is LegacyMigrationProbe.RetryLater -> {
+                    _migrationRetryNeeded.value = true
+                    return
+                }
+            }
+            // Re-verify after the suspend read: a keystroke landing in the read
+            // window must never be clobbered (field edits bump formRevision or
+            // break draft-field equality).
+            if (!isMigrationEligibleForm(_form.value) || formRevision.get() != entryRevision) return
+            formRevision.incrementAndGet()
+            invalidateKeyWriteConsent()
+            modelRefreshJob?.cancel()
+            modelRefreshJob = null
+            val revision = modelRefreshGeneration.incrementAndGet()
+            testConnectionJob?.cancel()
+            testConnectionJob = null
+            val testRevision = testConnectionGeneration.incrementAndGet()
+            keyBinding = KeyBindingHolder(null, null)
+            _form.value = SetupUiState(
+                presetId = ProviderCatalog.CUSTOM_ID,
+                baseUrl = legacy.baseUrl,
+                model = legacy.model,
+                modelRefreshRevision = revision,
+                testConnectionRevision = testRevision,
+                errorCode = "SETUP_MIGRATION_REKEY_REQUIRED",
+            )
+            migrationPrefilled = true
+        } finally {
+            migrationPrefillInFlight = false
+        }
     }
 
     /**
@@ -742,7 +914,7 @@ class SetupViewModel(
         try {
             if (form.apiKey.trim().isNotEmpty()) return SetupValidation.KeyMode.NEW
             val baseline = editBaseline ?: return SetupValidation.KeyMode.NEW
-            val providerId = SetupValidation.deriveProviderId(form.presetId)
+            val providerId = SetupValidation.deriveEndpointId(form.presetId, effectiveBaseUrlOf(form))
             if (providerId != baseline.providerId) return SetupValidation.KeyMode.NEW
             if (effectiveBaseUrlOf(form).trim() != baseline.baseUrl.trim()) return SetupValidation.KeyMode.NEW
             return SetupValidation.KeyMode.EDIT_KEEP_EXISTING
@@ -842,8 +1014,7 @@ class SetupViewModel(
         val newIdentity = providerId to effectiveBaseUrl.trim()
         val newLabel = ProviderCatalog.preset(cur.presetId)?.label ?: cur.presetId
         val oldLabel: String? = oldBound?.let { (pid, _) ->
-            val presetId = pid.removePrefix("preset:")
-            ProviderCatalog.preset(presetId)?.label ?: pid
+            SetupValidation.displayLabelForEndpointId(pid)
         }
         val pending = PendingRebind(
             oldBound = oldBound,
@@ -911,17 +1082,20 @@ class SetupViewModel(
             _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
-        // deriveProviderId is currently infallible (pure "preset:$presetId"
-        // concat, never throws — dead-code guard); the try is retained
-        // defensively so a future throwing mapping still fails closed here
-        // without crashing Main (mapped to SETUP_UNKNOWN_PRESET: policy was
-        // never consulted).
+        // Stage1 entity/policy split: the typed-key rebind check binds to the
+        // per-endpoint entity id ([SetupValidation.deriveEndpointId]), while
+        // probes evaluate `provider.call` against the preset-shared policy
+        // resource (granularity frozen for Stage2 #13). deriveEndpointId is
+        // pure but hash-backed, so the try is retained defensively: any
+        // failure fails closed here without crashing Main and without
+        // consulting policy (mapped to SETUP_UNKNOWN_PRESET).
         val providerId = try {
-            SetupValidation.deriveProviderId(cur.presetId)
+            SetupValidation.deriveEndpointId(cur.presetId, effectiveBaseUrl)
         } catch (_: Exception) {
             _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
+        val policyResource = SetupValidation.policyResourceForPreset(cur.presetId)
         // S4-C：typed key 綁定不符即 mint 顯式重綁對話框，零請求。先於 validate、
         // 先於任何 policy/vault/provider I/O（短 key 亦報
         // SETUP_KEY_IDENTITY_CHANGED）。成功只設框＋碼，testing 保持 false、
@@ -943,7 +1117,7 @@ class SetupViewModel(
         testConnectionJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 if (entryRevision != formRevision.get()) return@launch
-                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                if (freshVerdictOrDeny("provider.call", policyResource) != Verdict.ALLOW) {
                     if (entryRevision != formRevision.get() || generation != testConnectionGeneration.get()) return@launch
                     _form.update { current ->
                         if (entryRevision == formRevision.get() && generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
@@ -955,7 +1129,7 @@ class SetupViewModel(
                     return@launch
                 }
                 if (entryRevision != formRevision.get() || generation != testConnectionGeneration.get()) return@launch
-                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                if (freshVerdictOrDeny("provider.call", policyResource) != Verdict.ALLOW) {
                     if (entryRevision != formRevision.get() || generation != testConnectionGeneration.get()) return@launch
                     _form.update { current ->
                         if (entryRevision == formRevision.get() && generation == testConnectionGeneration.get() && current.testConnectionRevision == generation) {
@@ -1030,17 +1204,17 @@ class SetupViewModel(
         }
         // NEW always (same rule as testConnection): the listing needs the key
         // in memory; a blank edit field requires a re-paste, never a vault read.
-        // deriveProviderId is currently infallible (pure "preset:$presetId"
-        // concat, never throws — dead-code guard); the try is retained
-        // defensively so a future throwing mapping still fails closed here
-        // without crashing Main (mapped to SETUP_UNKNOWN_PRESET: policy was
-        // never consulted).
+        // Stage1 entity/policy split (see testConnection): the rebind check
+        // binds the typed key to the per-endpoint entity id, while the
+        // listing evaluates `provider.call` against the preset-shared policy
+        // resource (granularity frozen for Stage2 #13).
         val providerId = try {
-            SetupValidation.deriveProviderId(cur.presetId)
+            SetupValidation.deriveEndpointId(cur.presetId, effectiveBaseUrl)
         } catch (_: Exception) {
             _form.value = cur.copy(errorCode = "SETUP_UNKNOWN_PRESET")
             return
         }
+        val policyResource = SetupValidation.policyResourceForPreset(cur.presetId)
         // S4-C：同 testConnection（先於 validate、先於任何 policy/vault/provider I/O，
         // 短 key 亦報 SETUP_KEY_IDENTITY_CHANGED＋對話框，零 I/O）。
         if (keyIdentityChanged(cur, effectiveBaseUrl, providerId)) {
@@ -1065,7 +1239,7 @@ class SetupViewModel(
         modelRefreshJob = viewModelScope.launch(Dispatchers.IO) {
             try {
                 if (entryRevision != formRevision.get()) return@launch
-                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                if (freshVerdictOrDeny("provider.call", policyResource) != Verdict.ALLOW) {
                     if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
                     _form.update { current ->
                         if (entryRevision == formRevision.get() && generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
@@ -1077,7 +1251,7 @@ class SetupViewModel(
                     return@launch
                 }
                 if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
-                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                if (freshVerdictOrDeny("provider.call", policyResource) != Verdict.ALLOW) {
                     if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
                     _form.update { current ->
                         if (entryRevision == formRevision.get() && generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
@@ -1102,7 +1276,7 @@ class SetupViewModel(
                 // Post-live re-gate before any directory fetch: a policy flip
                 // landing during listModels must block with zero directory I/O.
                 if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
-                if (freshVerdictOrDeny("provider.call", providerId) != Verdict.ALLOW) {
+                if (freshVerdictOrDeny("provider.call", policyResource) != Verdict.ALLOW) {
                     if (entryRevision != formRevision.get() || generation != modelRefreshGeneration.get()) return@launch
                     _form.update { current ->
                         if (entryRevision == formRevision.get() && generation == modelRefreshGeneration.get() && current.modelRefreshRevision == generation) {
@@ -1200,7 +1374,7 @@ class SetupViewModel(
         // policy/vault I/O（短 key 亦報 SETUP_KEY_IDENTITY_CHANGED＋對話框）。
         try {
             val eff = effectiveBaseUrlOf(cur)
-            val pid = SetupValidation.deriveProviderId(cur.presetId)
+            val pid = SetupValidation.deriveEndpointId(cur.presetId, eff)
             if (keyIdentityChanged(cur, eff, pid)) {
                 mintRebindAndShow(cur, eff, pid)
                 return
@@ -1278,16 +1452,22 @@ class SetupViewModel(
         baselineModel: String?,
     ) {
         val providerId = try {
-            SetupValidation.deriveProviderId(form.presetId)
+            SetupValidation.deriveEndpointId(form.presetId, effectiveBaseUrl)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
+        // Stage1 entity/policy split: `providerId` above is the per-endpoint
+        // entity id (vault namespace, persisted metadata, binding,
+        // provenance); `policyResource` is the preset-shared authorization
+        // scope for every key.write verdict below (granularity frozen for
+        // Stage2 #13 — never the endpoint id).
+        val policyResource = SetupValidation.policyResourceForPreset(form.presetId)
         // 1. Fresh evaluation immediately before ANY side effect (TOCTOU guard).
         // evaluateFresh failure fails closed to DENY.
-        val v1 = freshVerdictOrDeny("key.write", providerId)
+        val v1 = freshVerdictOrDeny("key.write", policyResource)
         if (v1 == Verdict.DENY) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
@@ -1315,7 +1495,7 @@ class SetupViewModel(
             }
         } else if (v1 == Verdict.ASK) {
             // key.write defaults to ASK: one explicit confirmation per key.
-            if (!mintKeyWriteConsentGuarded(providerId, effectiveBaseUrl, entryRevision)) {
+            if (!mintKeyWriteConsentGuarded(policyResource, providerId, effectiveBaseUrl, entryRevision)) {
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
@@ -1406,6 +1586,7 @@ class SetupViewModel(
                 form,
                 effectiveBaseUrl,
                 providerId,
+                policyResource,
                 consent,
                 entryRevision,
                 expectedRevision,
@@ -1559,7 +1740,7 @@ class SetupViewModel(
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
-        val vPut = freshVerdictOrDeny("key.write", providerId)
+        val vPut = freshVerdictOrDeny("key.write", policyResource)
         if (vPut == Verdict.DENY) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
@@ -1582,7 +1763,7 @@ class SetupViewModel(
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
-            if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrlPut, entryRevision)) {
+            if (!mintKeyWriteConsentGuarded(policyResource, providerId, liveBaseUrlPut, entryRevision)) {
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
@@ -1646,7 +1827,7 @@ class SetupViewModel(
             // 6. Second fresh evaluation AFTER the staged write, BEFORE metadata.
             // A policy flip during putKey blocks the metadata write; the
             // just-written staged key is deleted (own alias, safe).
-            val v2 = freshVerdictOrDeny("key.write", providerId)
+            val v2 = freshVerdictOrDeny("key.write", policyResource)
             if (v2 == Verdict.DENY) {
                 deleteStagedBestEffort(stagedAlias)
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
@@ -1700,7 +1881,7 @@ class SetupViewModel(
                     _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                     return
                 }
-                if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrl3, entryRevision)) {
+                if (!mintKeyWriteConsentGuarded(policyResource, providerId, liveBaseUrl3, entryRevision)) {
                     deleteStagedBestEffort(stagedAlias)
                     _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                     return
@@ -1748,7 +1929,7 @@ class SetupViewModel(
             // (accepted). DENY blocks with staged cleanup and zero publish; ASK
             // without a carried consent demands confirmation (staged deleted,
             // no publish); ASK with the verified carried consent proceeds.
-            val vCommit = freshVerdictOrDeny("key.write", providerId)
+            val vCommit = freshVerdictOrDeny("key.write", policyResource)
             if (vCommit == Verdict.DENY) {
                 deleteStagedBestEffort(stagedAlias)
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
@@ -1770,7 +1951,7 @@ class SetupViewModel(
                     _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                     return
                 }
-                if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrlCommit, entryRevision)) {
+                if (!mintKeyWriteConsentGuarded(policyResource, providerId, liveBaseUrlCommit, entryRevision)) {
                     deleteStagedBestEffort(stagedAlias)
                     _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                     return
@@ -1979,8 +2160,10 @@ class SetupViewModel(
      * to SAVE_BLOCKED_BY_TEARDOWN vs POLICY_DENIED exactly like the staged
      * path):
      * - live snapshot still carries a well-formed ref whose providerId/baseUrl
-     *   match the entry form (a concurrent writer moving the endpoint, or an
-     *   emptied store after a raced logout, aborts here);
+     *   match the entry form (a concurrent writer moving the endpoint, an
+     *   emptied store after a raced logout, or a Stage1-legacy custom row
+     *   whose shared `preset:custom` id never equals the derived
+     *   per-endpoint id, aborts here — legacy must re-paste, never reuse);
      * - the live alias provably still holds a key (`hasKey`; false or host
      *   failure aborts — a missing key cannot be reused);
      * - fresh key.write verdict + generation fence + carried-consent
@@ -2003,6 +2186,7 @@ class SetupViewModel(
         form: SetupUiState,
         effectiveBaseUrl: String,
         providerId: String,
+        policyResource: String,
         consent: KeyWriteConsent?,
         entryRevision: Long,
         expectedRevision: Long?,
@@ -2039,7 +2223,7 @@ class SetupViewModel(
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
         }
-        val vCommit = freshVerdictOrDeny("key.write", providerId)
+        val vCommit = freshVerdictOrDeny("key.write", policyResource)
         if (vCommit == Verdict.DENY) {
             _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
             return
@@ -2058,7 +2242,7 @@ class SetupViewModel(
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
-            if (!mintKeyWriteConsentGuarded(providerId, liveBaseUrlCommit, entryRevision)) {
+            if (!mintKeyWriteConsentGuarded(policyResource, providerId, liveBaseUrlCommit, entryRevision)) {
                 _form.value = _form.value.copy(saving = false, errorCode = "POLICY_DENIED_KEY_WRITE")
                 return
             }
@@ -2417,7 +2601,7 @@ class SetupViewModel(
         val pid: String
         try {
             eff = effectiveBaseUrlOf(cur)
-            pid = SetupValidation.deriveProviderId(cur.presetId)
+            pid = SetupValidation.deriveEndpointId(cur.presetId, eff)
         } catch (_: Exception) {
             hideRebindConfirm(errorCode = "SETUP_UNKNOWN_PRESET")
             return
@@ -2478,7 +2662,12 @@ class SetupViewModel(
     }
 
     /** Mint guarded by the form fence with TOCTOU-safe lock handoff. Read failures deny. */
-    private suspend fun mintKeyWriteConsentGuarded(providerId: String, baseUrl: String, entryRevision: Long): Boolean {
+    private suspend fun mintKeyWriteConsentGuarded(
+        policyResource: String,
+        endpointId: String,
+        baseUrl: String,
+        entryRevision: Long,
+    ): Boolean {
         try {
             if (entryRevision != formRevision.get()) return false
             val rev: Long? = try {
@@ -2491,8 +2680,8 @@ class SetupViewModel(
             if (entryRevision != formRevision.get()) return false
             val consent = KeyWriteConsent(
                 action = "key.write",
-                resource = providerId,
-                providerId = providerId,
+                resource = policyResource,
+                providerId = endpointId,
                 baseUrl = baseUrl,
                 configRevision = rev,
                 formRevision = entryRevision,
@@ -2518,9 +2707,15 @@ class SetupViewModel(
     ): Boolean {
         try {
             if (consent.action != "key.write") return false
-            if (consent.resource != consent.providerId) return false
+            // Stage1 entity/policy split: the consent carries both the
+            // preset-shared authorization scope (`resource`) and the
+            // per-endpoint entity (`providerId`); the live form must match
+            // both, so a preset-shared resource can never authorize a
+            // different endpoint entity.
+            val livePolicyResource = SetupValidation.policyResourceForPreset(liveForm.presetId)
+            if (consent.resource != livePolicyResource) return false
             val liveProviderId = try {
-                SetupValidation.deriveProviderId(liveForm.presetId)
+                SetupValidation.deriveEndpointId(liveForm.presetId, liveBaseUrl)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
@@ -4001,9 +4196,10 @@ class SetupViewModel(
     }
 
     private fun providerConfigOf(form: SetupUiState, effectiveBaseUrl: String): ProviderConfig {
-        val providerId = SetupValidation.deriveProviderId(form.presetId)
-        // In-memory transport mapping only (never persisted): the fixed ref is
-        // a placeholder — the key itself travels via the KeyProvider closure.
+        // In-memory transport mapping only (never persisted): the endpoint id
+        // is the per-endpoint entity (Stage1), the fixed ref is a placeholder
+        // — the key itself travels via the KeyProvider closure.
+        val providerId = SetupValidation.deriveEndpointId(form.presetId, effectiveBaseUrl)
         return endpointConfigOf(form, effectiveBaseUrl, providerId, SetupValidation.deriveApiKeyRef(providerId))
             .toProviderConfig()
     }

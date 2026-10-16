@@ -13,6 +13,7 @@ import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.lifecycle.ViewModelStore
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
 import dev.librepocket.policy.InMemoryPolicyStore
@@ -105,13 +106,16 @@ class ChatKeyReadConfirmUiTest {
     )
 
     private fun endpointB() = EndpointConfig(
-        providerId = "preset:custom",
+        // Stage1: stable per-endpoint entity id derived from the custom baseUrl.
+        providerId = SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
         presetId = "custom",
         label = "自訂",
         baseUrl = "http://127.0.0.1:11434/v1",
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         model = "local",
-        apiKeyRef = "provider_key/preset:custom",
+        apiKeyRef = SetupValidation.deriveApiKeyRef(
+            SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+        ),
     )
 
     private fun newVm(fake: KeyReadUiFakeProvider): Pair<ChatViewModel, EndpointStore> {
@@ -408,7 +412,9 @@ class ChatKeyReadConfirmUiTest {
         }
         composeRule.waitUntil(timeoutMillis = 8000) {
             try {
-                composeRule.onNodeWithText("供應商：preset:custom").assertIsDisplayed()
+                composeRule.onNodeWithText(
+                    "供應商：" + SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+                ).assertIsDisplayed()
                 true
             } catch (_: AssertionError) {
                 false

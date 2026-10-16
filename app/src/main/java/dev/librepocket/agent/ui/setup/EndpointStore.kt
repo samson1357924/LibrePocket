@@ -149,8 +149,12 @@ enum class EndpointReadiness {
  * [SetupValidation.newStagedAlias]). Readers MUST resolve the alias
  * from [apiKeyRef] and MUST NOT re-derive it from [providerId]: after a staged
  * commit the live alias and the providerId-derived alias differ.
- * [providerId] follows `ProviderCatalog.fromPreset` convention
- * (`preset:<presetId>`). The local
+ * [providerId] is the stable per-endpoint entity id (Stage1):
+ * `preset:<presetId>` for built-in presets (fixed catalog URL, unchanged),
+ * `custom:<sha256-32hex>` derived per custom baseUrl (see
+ * [SetupValidation.deriveEndpointId]). Pre-Stage1 custom rows stored the
+ * shared `preset:custom` id (see [SetupValidation.isLegacyEndpoint]) and
+ * must be re-keyed, never silently reused. The local
  * [configRevision] is atomically advanced by [EndpointStore.save]/[clear] and
  * is for stale-session fencing, not endpoint identity or vault-write atomicity.
  */
@@ -596,9 +600,21 @@ class EndpointStore(
         } catch (_: IllegalArgumentException) {
             return EndpointReadiness.INVALID_BASE_URL
         }
-        if (!config.apiKeyRef.startsWith("provider_key/")) return EndpointReadiness.NO_KEY
+        // Stage1 compat: a legacy custom row (pre-per-endpoint id) is proven
+        // unusable without vault I/O — its shared fixed slot may hold
+        // another URL's key — so it fails closed as NO_KEY (never READY, never
+        // a vault read here). Re-key via Setup. Checked after URL validity so
+        // a malformed endpoint still reports INVALID_BASE_URL.
+        if (SetupValidation.isLegacyEndpoint(config)) return EndpointReadiness.NO_KEY
+        // Stage1 triple consistency (read side): a non-legacy row whose vault
+        // alias falls outside its own providerId namespace can never be READY
+        // (fail closed without vault I/O, same as legacy). Legacy rows already
+        // returned NO_KEY above. Same predicate as the Setup gate and
+        // credential capture — the three never disagree.
+        if (!SetupValidation.aliasInNamespace(config.providerId, config.apiKeyRef)) {
+            return EndpointReadiness.NO_KEY
+        }
         val alias = SetupValidation.aliasFromRef(config.apiKeyRef)
-        if (alias.isBlank()) return EndpointReadiness.NO_KEY
         val hasKey = try {
             vault.hasKey(alias)
         } catch (_: Exception) {
@@ -783,5 +799,23 @@ class EndpointStore(
         require(config.apiKeyRef.startsWith("provider_key/")) { "PROVIDER_KEY_REF_MALFORMED" }
         require('\n' !in config.apiKeyRef && '\r' !in config.apiKeyRef) { "PROVIDER_KEY_REF_MALFORMED" }
         validateBaseUrl(config.baseUrl)
+        // Stage1 triple consistency (non-legacy rows only): the stored
+        // providerId must equal the derived per-endpoint id for its own
+        // (presetId, baseUrl), and the vault alias must belong to that id's
+        // namespace (live alias or per-operation staged alias). Legacy rows
+        // (pre-per-endpoint id) are exempt here to preserve migration seeding
+        // via save(); production saveIfRevision paths never mint legacy
+        // (SetupViewModel derives the id), and readers fail closed on legacy.
+        if (!SetupValidation.isLegacyEndpoint(config)) {
+            require(config.providerId == SetupValidation.deriveEndpointId(config.presetId, config.baseUrl)) {
+                "ENDPOINT_ID_MISMATCH"
+            }
+            require(SetupValidation.aliasFromRef(config.apiKeyRef).isNotBlank()) {
+                "PROVIDER_KEY_REF_MALFORMED"
+            }
+            require(SetupValidation.aliasInNamespace(config.providerId, config.apiKeyRef)) {
+                "PROVIDER_KEY_REF_NAMESPACE_MISMATCH"
+            }
+        }
     }
 }

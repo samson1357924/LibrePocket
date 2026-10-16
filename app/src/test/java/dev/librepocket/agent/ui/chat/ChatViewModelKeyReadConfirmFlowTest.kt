@@ -3,6 +3,7 @@ package dev.librepocket.agent.ui.chat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.chat.ChatStatus
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -105,13 +106,16 @@ class ChatViewModelKeyReadConfirmFlowTest {
     )
 
     private fun endpointB() = EndpointConfig(
-        providerId = "preset:custom",
+        // Stage1: stable per-endpoint entity id derived from the custom baseUrl.
+        providerId = SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
         presetId = "custom",
         label = "自訂",
         baseUrl = "http://127.0.0.1:11434/v1",
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         model = "local",
-        apiKeyRef = "provider_key/preset:custom",
+        apiKeyRef = SetupValidation.deriveApiKeyRef(
+            SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+        ),
     )
 
     private class Harness(
@@ -134,7 +138,7 @@ class ChatViewModelKeyReadConfirmFlowTest {
         val backend = EncryptedPrefsVault(InMemoryPrefs())
         runBlocking {
             backend.putKey("preset:openai", "test-key-123".toCharArray())
-            backend.putKey("preset:custom", "test-key-456".toCharArray())
+            backend.putKey(SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"), "test-key-456".toCharArray())
         }
         val getKeyCalls = AtomicInteger(0)
         val countingVault = object : KeyVault {

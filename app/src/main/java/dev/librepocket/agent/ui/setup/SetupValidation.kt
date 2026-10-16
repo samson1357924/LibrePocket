@@ -3,13 +3,118 @@ package dev.librepocket.agent.ui.setup
 import dev.librepocket.preset.ProviderCatalog
 import dev.librepocket.provider.validateBaseUrl
 import java.util.UUID
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * Pure setup-input validation (unit-testable without Android).
  * Returns an error code, or null when the input is acceptable.
  */
 object SetupValidation {
+    /**
+     * Preset-scoped policy resource (`preset:<presetId>`).
+     *
+     * Stage1 (R2): transport identity ([deriveEndpointId]) and authorization
+     * scope are deliberately split — every `key.read` / `key.write` /
+     * `provider.call` evaluation addresses this preset-shared resource, so
+     * policy granularity is bit-identical to before (explicit per-preset
+     * rules keep applying to every endpoint under the preset). Per-endpoint
+     * authorization scoping is Stage2 (#13); do NOT pass an endpoint id here.
+     */
+    fun policyResourceForPreset(presetId: String): String = deriveProviderId(presetId)
+
     fun deriveProviderId(presetId: String): String = "preset:$presetId"
+
+    /**
+     * Stable per-endpoint entity id (Stage1, #2 residual).
+     *
+     * Built-in presets have a fixed catalog baseUrl, so the preset id already
+     * identifies the endpoint 1:1 and the id stays `preset:<presetId>`
+     * (unchanged). Custom endpoints carry a user-entered baseUrl, so sharing
+     * `preset:custom` conflates every custom URL into one providerId
+     * namespace (one vault-alias prefix, one provenance identity, one binding
+     * field): each distinct custom baseUrl now derives its own
+     * `custom:<sha256-32hex>` id instead.
+     *
+     * The derivation is a pure function of `(presetId, trimmed
+     * effectiveBaseUrl)`: trimming surrounding whitespace is the ONLY
+     * normalization performed (no lowercasing, no default-port elision, no
+     * trailing-slash stripping). The same endpoint re-derives the same id
+     * across restarts and rotations (stable), while any URL change —
+     * including a mere respelling — is a distinct entity and must re-key
+     * (fail-closed, consistent with the binding's full-string
+     * effectiveBaseUrl equality).
+     * The 128-bit hash keeps accidental collision at ~2^-128 per pair (a
+     * collision would silently SHARE a namespace — the fail-open direction —
+     * so truncation stays wide); output is lowercase hex, so it is safe for
+     * vault aliases, the teardown journal (`|`-free), and provenance headers
+     * (`/`-free). Derivation is not validation: callers validate URLs
+     * separately and fail closed there.
+     */
+    fun deriveEndpointId(presetId: String, effectiveBaseUrl: String): String {
+        if (presetId != ProviderCatalog.CUSTOM_ID) return deriveProviderId(presetId)
+        val digest = try {
+            // Fresh instance per call: MessageDigest is not thread-safe,
+            // do not refactor into a shared/cached instance.
+            java.security.MessageDigest.getInstance("SHA-256")
+        } catch (e: java.security.NoSuchAlgorithmException) {
+            throw IllegalStateException("ENDPOINT_ID_HASH_UNAVAILABLE", e)
+        }
+        val bytes = digest.digest(effectiveBaseUrl.trim().toByteArray(Charsets.UTF_8))
+        val hex = buildString(bytes.size * 2) {
+            for (b in bytes) {
+                val v = b.toInt() and 0xFF
+                append("0123456789abcdef"[v ushr 4])
+                append("0123456789abcdef"[v and 0x0F])
+            }
+        }
+        return "custom:${hex.take(32)}"
+    }
+
+    /**
+     * Legacy-shape detector for persisted custom endpoints (Stage1 compat).
+     *
+     * Pre-Stage1 custom rows were stored with the shared `preset:custom`
+     * entity id (and pre-staged rows additionally share the single fixed
+     * vault slot `provider_key/preset:custom`, whose content may belong to
+     * ANY custom URL ever saved — the metadata/URL binding is unprovable).
+     * Any stored custom row whose providerId does not equal the derived
+     * [deriveEndpointId] for its own stored baseUrl — the exact old shape
+     * included — is legacy: readers must NOT silently reuse it (chat/gate
+     * treat it as absent, KeepExisting falls back to NEW) so the old key is
+     * never sent to a new URL; the user re-pastes once and the next save
+     * mints the per-endpoint id. Never throws except CancellationException
+     * passthrough (to preserve structured concurrency); any other derivation
+     * failure is legacy = fail closed.
+     */
+    fun isLegacyEndpointId(providerId: String, presetId: String, baseUrl: String): Boolean =
+        try {
+            providerId != deriveEndpointId(presetId, baseUrl)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            true
+        }
+
+    /** Overload for persisted rows (see [isLegacyEndpointId]). */
+    fun isLegacyEndpoint(config: EndpointConfig): Boolean =
+        isLegacyEndpointId(config.providerId, config.presetId, config.baseUrl)
+
+    /**
+     * Display label for a bound endpoint id (rebind dialog, display-only,
+     * never a gate): `preset:<id>` resolves through the catalog, new-shape
+     * `custom:<hash>` resolves to the custom preset label, anything else
+     * echoes raw.
+     */
+    fun displayLabelForEndpointId(endpointId: String): String {
+        if (endpointId.startsWith("preset:")) {
+            val presetId = endpointId.removePrefix("preset:")
+            return ProviderCatalog.preset(presetId)?.label ?: endpointId
+        }
+        if (endpointId.startsWith("custom:")) {
+            return ProviderCatalog.preset(ProviderCatalog.CUSTOM_ID)?.label ?: endpointId
+        }
+        return endpointId
+    }
 
     fun deriveApiKeyRef(providerId: String): String = "provider_key/$providerId"
 
@@ -70,6 +175,21 @@ object SetupValidation {
      * as malformed and fail closed (never touch the vault).
      */
     fun aliasFromRef(apiKeyRef: String): String = apiKeyRef.removePrefix("provider_key/")
+
+    /**
+     * Vault-alias namespace check shared by the store ([EndpointStore]),
+     * the Setup gate ([SetupViewModel.gate]), and credential capture
+     * ([ChatSessionFactory.captureCredential]): the alias addressed by
+     * [apiKeyRef] must be the endpoint's own live alias or one of its
+     * per-operation staged aliases. Anything else (including a foreign
+     * endpoint's slot) fails closed before any vault I/O.
+     */
+    fun aliasInNamespace(providerId: String, apiKeyRef: String): Boolean {
+        if (!apiKeyRef.startsWith("provider_key/")) return false
+        val alias = aliasFromRef(apiKeyRef)
+        if (alias.isBlank()) return false
+        return alias == providerId || alias.startsWith("$providerId#staged-")
+    }
 
     fun validate(presetId: String, baseUrl: String, apiKey: String): String? =
         validate(presetId, baseUrl, apiKey, KeyMode.NEW)

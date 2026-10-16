@@ -3,6 +3,7 @@ package dev.librepocket.agent.ui.chat
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import dev.librepocket.agent.ui.setup.EndpointConfig
 import dev.librepocket.agent.ui.setup.EndpointStore
+import dev.librepocket.agent.ui.setup.SetupValidation
 import dev.librepocket.chat.ChatImageRef
 import dev.librepocket.chat.ChatSession
 import dev.librepocket.chat.ChatSessionImpl
@@ -103,13 +104,16 @@ class ChatSessionLifecycleTest {
     }
 
     private fun endpoint() = EndpointConfig(
-        providerId = "preset:custom",
+        // Stage1: stable per-endpoint entity id derived from the custom baseUrl.
+        providerId = SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:4141/v1"),
         presetId = "custom",
         label = "custom",
         baseUrl = "http://127.0.0.1:4141/v1",
         protocol = ProviderProtocol.CHAT_COMPLETIONS,
         model = "test-model",
-        apiKeyRef = "provider_key/lifecycle-test",
+        apiKeyRef = SetupValidation.deriveApiKeyRef(
+            SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:4141/v1"),
+        ),
     )
 
     private fun newViewModel(

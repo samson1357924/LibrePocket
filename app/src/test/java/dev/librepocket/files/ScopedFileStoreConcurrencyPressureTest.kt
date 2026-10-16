@@ -251,11 +251,17 @@ class ScopedFileStoreConcurrencyPressureTest {
                     deleteQuietly(it)
                 }
             }
-        // 清理後毒鏈必須已除，否則恢復證明空洞。
+        // 清理後毒鏈必須已除，否則恢復證明空洞；且 race-sub 本體（無論連結／實目錄）
+        // 必須不存在（僅查連結會漏普通目錄殘留，人審 P3#2）。
+        // 呼叫前 workers 須已確認全退出（見 poolQuiesced 門），否則不得呼叫。
         assertFalse(
             "race-sub staging must be cleaned",
             File(ws, "race-sub").let { Files.isSymbolicLink(it.toPath()) } ||
                 (ws.listFiles()?.any { it.name.startsWith(stageAnyPrefix()) } == true),
+        )
+        assertFalse(
+            "race-sub must be gone after cleanup",
+            Files.exists(File(ws, "race-sub").toPath(), LinkOption.NOFOLLOW_LINKS),
         )
     }
 
@@ -303,6 +309,9 @@ class ScopedFileStoreConcurrencyPressureTest {
         assertTrue(stageDirPrefix().startsWith(ScopedFileStore.TMP_NAME_PREFIX))
         val ws = workspace()
         val out = outside()
+        // workers 退出確認旗：僅 pool.awaitTermination 成功才置 true；outer finally
+        // 據此決定是否可遞迴清理共享路徑（人審 P2：超時未退出不得 teardown）。
+        var poolQuiesced = false
         try {
             File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
             val store = ScopedFileStore(ws)
@@ -589,19 +598,23 @@ class ScopedFileStoreConcurrencyPressureTest {
                 startGate.countDown()
                 pool.shutdown()
                 // 無懸掛：期限內必須收斂，否則超時失敗（非無限等待）。
-                // 失敗路徑先 shutdownNow 避免 non-daemon worker 洩漏並與清理段競爭。
-                // 清理段只在確認終止後執行（見下 await 成功分支），超時直接拋出不清理，
-                // 避免 worker 存活時 teardown 與翻轉競爭（人審 P2#1）。
+                // 超時先 shutdownNow＋有界再等；仍活則置 poolQuiesced=false 並拋，
+                // outer finally 據旗跳過共享路徑遞迴清理（人審 P2：assert 先拋導致
+                // 後續 isTerminated 檢查永不可達，且 finally 無條件清理與活 worker 競爭）。
                 val terminated = pool.awaitTermination(POOL_TIMEOUT_SEC, TimeUnit.SECONDS)
-                try {
-                    assertTrue("stress pool must terminate", terminated)
-                } finally {
-                    if (!terminated) pool.shutdownNow()
+                if (!terminated) {
+                    pool.shutdownNow()
+                    val reaped = pool.awaitTermination(10, TimeUnit.SECONDS)
+                    if (!reaped) {
+                        throw AssertionError(
+                            "stress pool must terminate (timeout); workers leaked, teardown skipped",
+                        )
+                    }
                 }
-                // 超時且 worker 仍存活時不得進清理／斷言（路徑競爭），直接失敗。
                 if (!pool.isTerminated) {
                     throw AssertionError("stress pool leaked workers; skip teardown to avoid races")
                 }
+                poolQuiesced = true
             } catch (t: Throwable) {
                 try {
                     startGate.countDown()
@@ -670,12 +683,17 @@ class ScopedFileStoreConcurrencyPressureTest {
 
             // 安全重試／恢復（helpers 見 cleanupAfterPressure／verifyRecoveryAndAnchor；
             // workers 閉包共享 10＋ 計數器，保留內聯以免參數透傳遮蔽門關係）。
+            // 到此 poolQuiesced 必為 true（超時已在上文拋出），清理無活 worker 競爭。
             cleanupAfterPressure(ws)
             verifyRecoveryAndAnchor(ws, out, store)
         } finally {
-            // NOFOLLOW 終兜：ws 可能殘留 race-sub 指外連結，絕不跟隨進 outside。
-            deleteNoFollowRecursively(ws)
-            deleteNoFollowRecursively(out)
+            // NOFOLLOW 終兜；但 workers 未確認退出（poolQuiesced=false，即超時洩漏）
+            // 時跳過共享路徑遞迴清理，避免與存活翻轉競爭（人審 P2），殘留供診斷。
+            if (poolQuiesced) {
+                // ws 可能殘留 race-sub 指外連結，NOFOLLOW 絕不跟隨進 outside。
+                deleteNoFollowRecursively(ws)
+                deleteNoFollowRecursively(out)
+            }
         }
     }
 
@@ -721,6 +739,29 @@ class ScopedFileStoreConcurrencyPressureTest {
             assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
         } finally {
             removePossiblyFlipped(File(ws, "sub"))
+            deleteNoFollowRecursively(ws)
+            deleteNoFollowRecursively(out)
+        }
+    }
+
+    /**
+     * NOFOLLOW 回歸（人審 P2#1 最小重現断言化）：靜態 `ws/race-sub -> out` 下，
+     * `deleteNoFollowRecursively(ws)` 只刪連結本體，`out/secret.txt` 必須存活；
+     * 舊 `File.deleteRecursively()` 會跟隨進 target 刪外部內容。
+     */
+    @Test fun nofollowCleanupNeverFollowsStaticDirSymlink() {
+        assumeNonWindows()
+        val ws = workspace()
+        val out = outside()
+        try {
+            File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
+            Files.createSymbolicLink(File(ws, "race-sub").toPath(), out.toPath())
+            deleteNoFollowRecursively(ws)
+            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
+            assertFalse(
+                Files.exists(File(ws, "race-sub").toPath(), LinkOption.NOFOLLOW_LINKS),
+            )
+        } finally {
             deleteNoFollowRecursively(ws)
             deleteNoFollowRecursively(out)
         }

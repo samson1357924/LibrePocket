@@ -61,6 +61,13 @@ import kotlin.coroutines.coroutineContext
  * Pure JVM, no Android dependencies. The turn engine ([dev.librepocket.chat
  * .TurnController]) attaches this loop only when constructed with it
  * (default-off: production composition attaches none, staying records-only).
+ *
+ * Shareability: one instance is shared by every session a factory builds, so
+ * construction-captured state (`ctxSupplier`, `policy`, `backend`, `clock`)
+ * must be safe for concurrent turns — keep the slice stateless; per-turn
+ * state lives in the turn engine, not here. When a second tool wires, retire
+ * this slice (or generalize it): [offeredTools] stays pinned to [TOOL_NAME]
+ * and would silently hide the new tool otherwise.
  */
 class SafeToolSlice(
     private val ctxSupplier: () -> ProjectionContext = { ProjectionContext() },
@@ -78,13 +85,26 @@ class SafeToolSlice(
 
         /** Execution-basis policy action (known action; default ASK → slice needs ALLOW). */
         const val POLICY_ACTION = "tool.exec"
+
+        /**
+         * Per-string cap for result JSON: model-controlled `query` and
+         * backend-controlled symbol fields are truncated (per-string only,
+         * not a total bound), never passed through unbounded into the
+         * transcript/provider continuation. Ok echoes carry a
+         * `…[truncated N→cap]` marker so the model can tell echo from input;
+         * deny echoes are silently capped (codes are fixed constants).
+         */
+        const val MAX_STRING_CHARS = 500
     }
 
     /**
      * Test seam run before EACH execution (after cancel check, before any
      * gate): lets cancel tests park the loop in the deny/execute window and
      * then cancel, proving zero backend invocations. Production leaves null.
+     * Volatile so a mid-turn install from the test thread is visible to the
+     * turn dispatcher thread.
      */
+    @Volatile
     var beforeExecuteForTest: (suspend () -> Unit)? = null
 
     /** Typed deny codes (audit-stable, user-visible in the paired denial). */
@@ -131,6 +151,9 @@ class SafeToolSlice(
      * denials to preserve call-id pairing.
      */
     suspend fun execute(calls: List<ToolCall>): List<ToolResult> {
+        // Cancel first: a cancel racing the collect→execute handoff must not
+        // build denials or touch the backend (zero further effects).
+        coroutineContext.ensureActive()
         if (calls.size > maxCallsPerTurn) {
             return calls.map { deny(it, DenyCodes.BUDGET_EXCEEDED, "at most $maxCallsPerTurn tool round per turn") }
         }
@@ -251,29 +274,38 @@ class SafeToolSlice(
         val json = buildJsonObject {
             put("denied", true)
             put("code", code)
-            put("tool", call.name)
-            put("callId", call.id)
-            put("detail", detail)
+            // Model-controlled echoes are capped like Ok results; codes are
+            // fixed constants.
+            put("tool", call.name.take(MAX_STRING_CHARS))
+            put("callId", call.id.take(MAX_STRING_CHARS))
+            put("detail", detail.take(MAX_STRING_CHARS))
             put("clockMillis", clock.millis())
         }.toString()
         return ToolResult(call.id, call.name, json, denied = true, denyCode = code)
     }
+
+    private fun cappedEcho(value: String, originalLength: Int): String =
+        if (originalLength > MAX_STRING_CHARS) {
+            value.take(MAX_STRING_CHARS) + "…[truncated $originalLength→$MAX_STRING_CHARS]"
+        } else {
+            value
+        }
 
     private fun ok(call: ToolCall, query: String, outcome: LspTools.SymbolsOutcome.Ok): ToolResult {
         val json = buildJsonObject {
             put("denied", false)
             put("tool", call.name)
             put("callId", call.id)
-            put("query", query)
+            put("query", cappedEcho(query, query.length))
             put(
                 "symbols",
                 kotlinx.serialization.json.buildJsonArray {
                     for (s in outcome.symbols) {
                         add(
                             buildJsonObject {
-                                put("name", s.name)
-                                put("kind", s.kind)
-                                put("path", s.path)
+                                put("name", cappedEcho(s.name, s.name.length))
+                                put("kind", cappedEcho(s.kind, s.kind.length))
+                                put("path", cappedEcho(s.path, s.path.length))
                                 put("line", s.line)
                             },
                         )
@@ -289,7 +321,9 @@ class SafeToolSlice(
     /**
      * Continuation messages appended after the tool-call assistant block:
      * one assistant `toolCalls` entry plus one `tool` message per result
-     * (executed or denied — call-id pairing is total). Wire shape mirrors
+     * (executed or denied — pairing is total within one executed round; a
+     * call re-emitted on a retried attempt is recorded without a result and
+     * never reaches here). Wire shape mirrors
      * the T1 mock round-trip histories so all three adapters serialize it.
      */
     fun continuationMessages(calls: List<ToolCall>, results: List<ToolResult>): List<ChatMessage> {

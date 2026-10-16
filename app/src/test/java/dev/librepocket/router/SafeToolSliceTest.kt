@@ -385,4 +385,25 @@ class SafeToolSliceTest {
         }
         assertEquals(0, backend.invocations.get())
     }
+
+    @Test fun longQueryAndSymbolsTruncateToCap() = runBlocking {
+        val longBackend = object : LspTools.Backend {
+            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                listOf(LspTools.Symbol("N".repeat(2000), "K".repeat(2000), "P".repeat(2000), 7))
+            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val s = slice(backend = longBackend)
+        val longQuery = "Q".repeat(2000)
+        val r = s.execute(listOf(call(args = """{"query":"$longQuery"}"""))).single()
+        assertFalse(r.denied)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        val echoQuery = body["query"]!!.jsonPrimitive.content
+        assertTrue(echoQuery.startsWith("Q".repeat(SafeToolSlice.MAX_STRING_CHARS)))
+        assertTrue(echoQuery.contains("[truncated 2000→${SafeToolSlice.MAX_STRING_CHARS}]"))
+        val sym = body["symbols"]!!.jsonArray.single().jsonObject
+        for (field in listOf("name", "kind", "path")) {
+            val v = sym[field]!!.jsonPrimitive.content
+            assertTrue(field, v.contains("[truncated 2000→${SafeToolSlice.MAX_STRING_CHARS}]"))
+        }
+    }
 }

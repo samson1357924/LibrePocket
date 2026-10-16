@@ -14,6 +14,7 @@ import dev.librepocket.tool.ProjectionContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.emptyFlow
@@ -415,6 +416,110 @@ class TurnControllerToolSliceTest {
         assertEquals(listOf("call-a", "call-b"), sink.tools.map { it.id })
         assertEquals(ChatStatus.IDLE, c.uiState.value.status)
         assertTrue(c.uiState.value.messages.last { it.role == "assistant" }.text.contains("first answer stands"))
+    }
+
+    @Test fun retryAfterContinuationFailureDoesNotReExecute() = runBlocking {
+        // Turn-level budget: the retry after a retryable continuation failure
+        // must not run the slice a second time, even if the model re-emits
+        // the tool call on the fresh attempt.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        var continuations = 0
+        provider.handler = { request ->
+            if (request.messages.any { it.role == "tool" }) {
+                continuations++
+                flow {
+                    if (continuations == 1) {
+                        emit(StreamEvent.Failed("flaky continuation", retryable = true))
+                    } else {
+                        emit(StreamEvent.TextDelta(0, 0, "second round must never run"))
+                        emit(StreamEvent.Done("stop"))
+                    }
+                }
+            } else {
+                flow {
+                    if (continuations == 0) {
+                        emit(
+                            StreamEvent.ToolDone(
+                                toolIndex = 0,
+                                id = "call-a",
+                                name = "lsp.symbols",
+                                argumentsJson = """{"query":"A"}""",
+                            ),
+                        )
+                        emit(StreamEvent.Done("tool_calls"))
+                    } else {
+                        // Retry attempt: the model re-emits the call, but the
+                        // slice must NOT run a second round this turn.
+                        emit(
+                            StreamEvent.ToolDone(
+                                toolIndex = 0,
+                                id = "call-a2",
+                                name = "lsp.symbols",
+                                argumentsJson = """{"query":"A"}""",
+                            ),
+                        )
+                        emit(StreamEvent.Done("tool_calls"))
+                    }
+                }
+            }
+        }
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(3, provider.seenRequests.size)
+        assertTrue(provider.seenRequests[1].messages.any { it.role == "tool" })
+        assertTrue(provider.seenRequests[2].messages.none { it.role == "tool" })
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals(listOf("call-a", "call-a2"), sink.tools.map { it.id })
+        assertEquals(1, sink.succeeded.size)
+    }
+
+    @Test fun cancelDuringContinuationKeepsSingleExecution() = runBlocking {
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        val contGate = CompletableDeferred<Unit>()
+        val contEntered = CompletableDeferred<Unit>()
+        provider.handler = { request ->
+            if (request.messages.any { it.role == "tool" }) {
+                flow {
+                    contEntered.complete(Unit)
+                    contGate.await()
+                    emit(StreamEvent.TextDelta(0, 0, "late"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            } else {
+                flow {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 0,
+                            id = "call-a",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"A"}""",
+                        ),
+                    )
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+            }
+        }
+        val job = async(Dispatchers.Default) { c.send("查 A") }
+        val entered = withTimeoutOrNull(8000) { contEntered.await(); true } ?: false
+        assertTrue("continuation never started", entered)
+        assertEquals(2, provider.seenRequests.size)
+        c.cancel()
+        contGate.complete(Unit)
+        job.join()
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+        assertEquals(1, sink.cancelled.size)
+        assertTrue(sink.succeeded.isEmpty())
     }
 
     @Test fun cancelBeforeExecutionHasZeroSideEffects() = runBlocking {

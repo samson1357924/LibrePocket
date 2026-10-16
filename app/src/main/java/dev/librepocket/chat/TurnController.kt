@@ -4393,6 +4393,11 @@ class TurnController(
     }
     var attempt = 0
     var attemptRunId = logicalTurnId
+    // P2 slice budget: at most one tool round per turn, including retries.
+    // A retryable continuation failure starts a fresh attempt whose request
+    // excludes partial markers — without this flag the model could re-emit
+    // the call and the slice would execute it a second time.
+    var sliceExecutedThisTurn = false
     while (true) {
       appendAssistantPlaceholder(attemptRunId)
       val request = buildRequest(images)
@@ -4583,10 +4588,16 @@ class TurnController(
         // CancellationException, which the catch below rethrows). A failed
         // continuation falls into the existing retry/terminal logic below.
         // Budget: exactly one tool round per turn — continuation ToolDones
-        // are recorded, never executed (see collectToolContinuation).
+        // are recorded, never executed (see collectToolContinuation), and a
+        // retried attempt never re-executes (sliceExecutedThisTurn). A call
+        // re-emitted on a retried attempt is recorded but left unpaired
+        // (no tool result), pinned by test.
         val loop = toolSlice
-        if (failed == null && done && loop != null && sliceCalls.isNotEmpty()) {
+        if (failed == null && done && loop != null && sliceCalls.isNotEmpty() && !sliceExecutedThisTurn) {
           coroutineContext.ensureActive()
+          // Mark before executing: even an unexpected non-cancel throw below
+          // must not grant a second round on retry (fail-closed direction).
+          sliceExecutedThisTurn = true
           val sliceResults = loop.execute(sliceCalls)
           for (r in sliceResults) {
             appendAssistantText(attemptRunId, "\n[tool-result:${r.name} ${r.resultJson}]")
@@ -4749,6 +4760,13 @@ class TurnController(
    * updated total out); index-keyed maps are fresh per response (provider
    * tool indexes restart per response, so cross-round sharing would forge
    * false duplicates).
+   *
+   * Round identity: continuation records share this attempt's [attemptRunId]
+   * with the first round (both are append-only rows, never upserts, so no
+   * overwrite). Rounds are distinguished by order only in the durable
+   * transcript (markers hold name+args; call ids reach in-memory sinks but
+   * are not persisted); a typed per-round transcript event is future work
+   * (not this slice).
    */
   private suspend fun collectToolContinuation(
     request: ChatRequest,

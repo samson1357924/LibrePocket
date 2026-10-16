@@ -47,7 +47,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import verify_release_apk as verifier
+import verify_release_apk as verifier  # noqa: E402  (needs sys.path guard above)
 
 if not hasattr(verifier, "build_parser"):
     raise ImportError("verify_release_apk.build_parser is required by the rehearsal")
@@ -287,4 +287,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # NOTE: unlike the argparse helpers (parse_args(None) reads sys.argv),
+    # this rehearsal takes no arguments, so argv is passed explicitly to
+    # fail closed on unexpected CLI flags instead of silently ignoring them.
     raise SystemExit(main(sys.argv[1:]))

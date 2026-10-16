@@ -10,9 +10,8 @@ package dev.librepocket.systema
  * 故改為密封型別，launcher 按型別 putExtra。
  *
  * 決策註記：float/double 需求出現時再加 DoubleVal + toIntent 分支
- * （不預先加型別；此處 when 為 statement position，新增子類不會編譯期
- * 報錯，故 toIntent 另以 `else -> throw` 保底，防靜默掉 extra；實測編譯器
- * 拒絕測試源集新增子類，故該分支僅未來主模組新增子類時可達，刻意不單測）。
+ * （不預先加型別；[AndroidIntentLauncher.toIntent] 以窮舉 `when` 表達式
+ * （賦值迫使編譯器檢查）保證新增子類未補分支即編譯錯，fail-closed 於編譯期）。
  */
 sealed interface IntentExtra {
   data class Str(val value: String) : IntentExtra
@@ -27,8 +26,13 @@ sealed interface IntentExtra {
  * 錯型別或缺 key 一律拋 [IllegalStateException]（帶 key + 期望型別），
  * 避免 `ClassCastException` 訊息無 key 難定位。
  *
+ * Status: Target（純側契約，未接線未 E2E；矩陣層 `executionReady=false` 概念）。
  * 生產採用（#14）：[AlarmTool.parseParams]、[CalendarTool.parseInsertParams]
  * 以本 helper 讀必填 extra（缺參/錯型明確拋錯，禁預設猜測執行，#19）。
+ * 未來 dispatcher 必須在呼叫 parse 側包 try-catch（ISE/IAE），收斂為
+ * `ToolResult(INTERNAL)`，不得讓異常穿透生產迴圈；[AlarmTool.execute] 與
+ * [CalendarTool.execute]/[executeUpdate]/[executeDelete] 已在 builder 側
+ * 做同形收斂（見各 execute 內 try-catch）。
  */
 inline fun <reified T : IntentExtra> Map<String, IntentExtra>.requireExtra(key: String): T {
   val v = this[key]
@@ -81,6 +85,13 @@ object IntentFlags {
   /** fail-closed：只保留允許位。 */
   fun sanitize(flags: Int): Int = flags and ALLOWED_MASK
 }
+
+/**
+ * Status: Target（純側契約，未接線未 E2E）。`SystemEnv` 目前無生產 producer
+ *（無 `PackageManager.resolveActivity → SystemEnv` 映射，見各工具 `check`
+ * KDoc）；測試以假 `SystemEnv` + 假 `IntentLauncher` 直調驗證映射語義，
+ * 不得當作端到端能力證據。
+ */
 
 data class IntentSpec(
   val action: String,

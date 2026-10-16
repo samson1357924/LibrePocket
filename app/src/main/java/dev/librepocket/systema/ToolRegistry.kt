@@ -3,10 +3,14 @@ package dev.librepocket.systema
 /**
  * 快通道工具契約：每個 A 組工具都實現 check / execute / fallback 三件套。
  *
- * builder 的 `require` IAE 目前由呼叫方直接外洩、不收斂為 [ToolResult]
- *（[execute]/[fallback] 內調 builder 無 try-catch；生產尚無 dispatcher 接線，
- * 目前不可達，僅測試直調）。Target：未來 dispatcher（或 caller-catch）須將
- * builder IAE 收斂為 `ToolResult`，不讓 IAE 穿透生產迴圈。
+ * builder 的 `require` IAE/ISE 由 [AlarmTool.execute] 與
+ * [CalendarTool.execute]/[executeUpdate]/[executeDelete] 內 try-catch 收斂為
+ * [ToolResult]（INTERNAL，spec=null），不穿透生產迴圈。
+ * 其餘工具（Volume/Navigation/Music）仍直接外洩，屬 Target 缺口，
+ * 未來 dispatcher 須統一在呼叫 parse/builder 側包 try-catch 收斂。
+ * parse 側（模型參數 → Params，未來 dispatcher 唯一入口）同樣拋 IAE/ISE，
+ * 未來 dispatcher 須在呼叫 parse 側包 try-catch 收斂為 `ToolResult`；
+ * 生產尚無 dispatcher 接線，目前 parse 僅測試直調。
  *
  * @param P 該工具的參數型別（純資料）。
  */
@@ -20,7 +24,7 @@ interface SystemTool<P> {
 data class ToolDescriptor(
   val name: String,
   val level: SideEffectLevel,
-  /** 單次執行的超時毫秒（ARCH §9.1：每個快通道工具宣告超時）。 */
+  /** 單次執行的超時毫秒（ARCH §9.1：每個快通道工具宣告超時；目前僅宣告未強制，見各工具 KDoc）。 */
   val timeoutMs: Long,
   val description: String = "",
 )

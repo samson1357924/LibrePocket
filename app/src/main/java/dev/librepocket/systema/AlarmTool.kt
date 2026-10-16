@@ -3,6 +3,10 @@ package dev.librepocket.systema
 /**
  * 鬧鐘工具：`ALARM_CLOCK`（SET_ALARM）Intent 委託系統鬧鐘 App。
  *
+ * Status: Target（純側契約，未接線未 E2E；矩陣層 `executionReady=false` 概念，
+ * 非 `ToolDescriptor` 欄位；目前尚無生產呼叫方，接線 PR 啟用；`SystemEnv` 無生產 producer，
+ * `timeoutMs` 僅宣告未強制，見 [ToolRegistry]）。
+ *
  * 權限決策（#14：採「修正註解＋降級語義」，不加 manifest 宣告）：
  * SET_ALARM 發送端無需任何 `<uses-permission>`——AOSP `AlarmClock` 只要求
  * 接收端 activity 持有 `com.android.alarm.permission.SET_ALARM`（時鐘 App
@@ -10,7 +14,8 @@ package dev.librepocket.systema
  * （`ACTION_SET_ALARM` 區塊無 `@RequiresPermission`；權限註記只出現在
  * DISMISS/TIMER 動作）。故不為發送端加宣告（加了也是死重且擴大 Play 權限面）。
  * 個別裝置時鐘若自行強制要求而觸發 `SecurityException`，[AndroidIntentLauncher]
- * 已收斂為 `INTERNAL`（fail-closed，不靜默退回猜測執行）。
+ * 已收斂為 `INTERNAL`（fail-closed，不靜默退回猜測執行；僅附 cause 類名，
+ * 不含 message/PII，亦無 audit——intent 層不審計，由未來 dispatcher 層統一審計）。
  * 降級「自有提醒」才需要精準鬧鐘申報
  * （`SCHEDULE_EXACT_ALARM`，API 31+；或 `USE_EXACT_ALARM`，
  * Play 需在 Data Safety + 商店描述中披露用途，見 [fallback] 的
@@ -20,8 +25,18 @@ package dev.librepocket.systema
  * `resolveActivity` 被過濾為 null → 誤判 NO_HANDLER。靜態 [check] 通過但發射
  * 時仍無處理者（實現被移除/停用/不可見），一律走自有提醒降級（見 [execute]），
  * 與靜態 DEGRADED 同語義。
+ *
+ * 確認門（ASK 不默許 ALLOW）：[Params.skipUi] 為 true 時僅是「請求免確認直設」，
+ * 仍由系統鬧鐘 App 決定是否尊重；未來 dispatcher 若把模型參數透傳給
+ * [parseParams]，必須在 `skipUi=true` 時要求 `confirmed + 不可變操作快照
+ * （hour/minute/message + requestId + generation）` 全等，否則回 `NeedConfirm`
+ *（接線 PR 需先補 requestId/generation/confirmed/NeedConfirm 型別，現僅 KDoc 約束）。
+ * 本層不代行確認，不靜默直設.
  */
 object AlarmTool : SystemTool<AlarmTool.Params> {
+
+  /** Binder 傳輸上限防禦：訊息過長在 builder/parse 即拒，不等到 TransactionTooLarge。 */
+  const val MAX_MESSAGE_LEN = 500
 
   data class Params(
     val hour: Int,
@@ -48,8 +63,11 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
   fun buildSetAlarmIntent(params: Params): IntentSpec {
     require(params.hour in 0..23) { "hour out of range: ${params.hour}" }
     require(params.minute in 0..59) { "minute out of range: ${params.minute}" }
+    require(params.message.length <= MAX_MESSAGE_LEN) { "message too long: ${params.message.length} > $MAX_MESSAGE_LEN" }
     // D2 型別化：HOUR/MINUTES 用 Int（AlarmClock.EXTRA_* 為 int），
     // SKIP_UI 用 Boolean；系統鬧鐘 App 才能正確讀回（getIntExtra/getBooleanExtra）。
+    // 空白正規化：build 丟棄全空白 message（isNotBlank），parse 缺席回 ""；
+    // 故 Params(7,30," ") round-trip 後為 ""，屬刻意正規化（見測試釘選）。
     val extras = mutableMapOf<String, IntentExtra>(
       IntentActions.EXTRA_ALARM_HOUR to IntentExtra.IntVal(params.hour),
       IntentActions.EXTRA_ALARM_MINUTES to IntentExtra.IntVal(params.minute),
@@ -79,6 +97,7 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
     val skipUi = extras.optionalExtra<IntentExtra.Bool>(IntentActions.EXTRA_ALARM_SKIP_UI)?.value ?: false
     require(hour in 0..23) { "hour out of range: $hour" }
     require(minute in 0..59) { "minute out of range: $minute" }
+    require(message.length <= MAX_MESSAGE_LEN) { "message too long: ${message.length} > $MAX_MESSAGE_LEN" }
     return Params(hour, minute, message, skipUi)
   }
 
@@ -93,7 +112,15 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
         "做不到呼叫系統鬧鐘（${check.reasonCode}）→ 可替代自有提醒 → 需要你授權精準鬧鐘",
       )
     }
-    val spec = buildSetAlarmIntent(params)
+    // fail-closed：builder IAE/ISE（範圍/長度）收斂為 INTERNAL，不穿透生產迴圈。
+    val spec = try {
+      buildSetAlarmIntent(params)
+    } catch (e: IllegalArgumentException) {
+      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到設定鬧鐘（${ReasonCodes.INTERNAL}）")
+    } catch (e: IllegalStateException) {
+      if (e is kotlin.coroutines.cancellation.CancellationException) throw e
+      return ToolResult(false, false, null, ReasonCodes.INTERNAL, "做不到設定鬧鐘（${ReasonCodes.INTERNAL}）")
+    }
     return when (val launched = launcher.launchCatching(spec)) {
       // 發現式缺席（靜態 check 通過但 resolve 為空：實現被移除/停用/不可見）：
       // 與靜態 DEGRADED 同語義（自有提醒降級），禁靜默吞掉或猜測執行。
@@ -106,6 +133,11 @@ object AlarmTool : SystemTool<AlarmTool.Params> {
     }
   }
 
+  /**
+   * 降級分支僅用於 NO_HANDLER（靜態無 App 或執行期發現式缺席）。
+   * USER_DISABLED 等不可執行路徑由 [execute] 早期回傳，不經此函式；
+   * 未來呼叫方不得以 USER_DISABLED 調用本函式取 NO_HANDLER 話術。
+   */
   override fun fallback(params: Params, env: SystemEnv): FallbackSpec {
     val label = if (params.message.isNotBlank()) "「${params.message}」" else "鬧鐘"
     return FallbackSpec(

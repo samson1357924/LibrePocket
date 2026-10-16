@@ -252,7 +252,8 @@ class IntentAdapterStage1Test {
 
   @Test fun flags_grantReadAndClearTask_droppedViaToIntent() {
     // GRANT_*（URI 授權擴大）與 CLEAR_TASK（清空任務棧）一律丟棄；
-    // 允許位保留，NEW_TASK 預設仍在。
+    // 允許位保留，NEW_TASK 預設仍在；EXCLUDE_FROM_RECENTS/NO_HISTORY
+    //（任務棧語義最危險兩位）同樣丟棄。
     val launcher = AndroidIntentLauncher(appContext())
     val intent = launcher.toIntent(
       IntentSpec(
@@ -260,6 +261,8 @@ class IntentAdapterStage1Test {
         flags = IntentFlags.GRANT_READ_URI_PERMISSION or
           IntentFlags.GRANT_WRITE_URI_PERMISSION or
           IntentFlags.ACTIVITY_CLEAR_TASK or
+          IntentFlags.ACTIVITY_EXCLUDE_FROM_RECENTS or
+          IntentFlags.ACTIVITY_NO_HISTORY or
           IntentFlags.ACTIVITY_CLEAR_TOP or
           IntentFlags.ACTIVITY_SINGLE_TOP,
       ),
@@ -267,6 +270,8 @@ class IntentAdapterStage1Test {
     assertEquals(0, intent.flags and IntentFlags.GRANT_READ_URI_PERMISSION)
     assertEquals(0, intent.flags and IntentFlags.GRANT_WRITE_URI_PERMISSION)
     assertEquals(0, intent.flags and Intent.FLAG_ACTIVITY_CLEAR_TASK)
+    assertEquals(0, intent.flags and Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
+    assertEquals(0, intent.flags and Intent.FLAG_ACTIVITY_NO_HISTORY)
     assertTrue(intent.flags and Intent.FLAG_ACTIVITY_CLEAR_TOP != 0)
     assertTrue(intent.flags and Intent.FLAG_ACTIVITY_SINGLE_TOP != 0)
     assertTrue(intent.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0)
@@ -276,7 +281,8 @@ class IntentAdapterStage1Test {
 
   @Test fun calendar_executeNoHandler_degradesToManual() {
     // 發現式缺席（靜態 check 通過但發射無處理者）與鬧鐘同語義：
-    // ok=false + usedFallback=true + NO_HANDLER + 手動話術（嘗試過的 spec 保留）。
+    // ok=false + usedFallback=true + NO_HANDLER + 手動話術（嘗試過的 spec 保留，
+    // INSERT 帶 content URI）。
     val r = CalendarTool.execute(
       CalendarTool.EventParams("例會", 1000, 2000),
       env,
@@ -288,6 +294,7 @@ class IntentAdapterStage1Test {
     assertTrue(r.message, "手動" in r.message)
     assertTrue(r.message, "（${ReasonCodes.NO_HANDLER}）" in r.message)
     assertEquals(IntentActions.INSERT, r.spec?.action)
+    assertEquals(CalendarTool.EVENTS_CONTENT_URI, r.spec?.dataUri)
   }
 
   @Test fun calendar_executeUpdateDelete_NoHandler_degradesToManual() {
@@ -361,5 +368,277 @@ class IntentAdapterStage1Test {
     } catch (e: IllegalArgumentException) {
       assertTrue(e.message ?: "", "endTime must be after beginTime" in (e.message ?: ""))
     }
+  }
+
+  // ---- f. Phase1 fail-closed：builder 非法經 execute 收斂為 INTERNAL，不穿透 ----
+
+  @Test fun alarm_execute_invalidParams_convergesToInternal() {
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val longMsg = "x".repeat(AlarmTool.MAX_MESSAGE_LEN + 1)
+    for (p in listOf(
+      AlarmTool.Params(25, 0),
+      AlarmTool.Params(7, 60),
+      AlarmTool.Params(7, 30, longMsg),
+    )) {
+      called = false
+      val r = AlarmTool.execute(p, env, launcher)
+      assertFalse(r.ok)
+      assertFalse(r.usedFallback)
+      assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+      assertNull(r.spec)
+      assertTrue(r.message.contains(ReasonCodes.INTERNAL))
+      assertFalse("build 失敗不得回顯超長原文", r.message.contains(longMsg))
+      assertFalse("builder 非法不得調用 launcher", called)
+    }
+  }
+
+  @Test fun calendar_execute_invalidParams_convergesToInternal() {
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val longTitle = "t".repeat(CalendarTool.MAX_TITLE_LEN + 1)
+    for (p in listOf(
+      CalendarTool.EventParams("", 1000, 2000),
+      CalendarTool.EventParams("例會", -1, 2000),
+      CalendarTool.EventParams("例會", 0, Long.MAX_VALUE),
+      CalendarTool.EventParams("例會", 2000, 2000),
+      CalendarTool.EventParams(longTitle, 1000, 2000),
+    )) {
+      called = false
+      val r = CalendarTool.execute(p, env, launcher)
+      assertFalse(r.ok)
+      assertFalse(r.usedFallback)
+      assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+      assertNull(r.spec)
+      assertTrue(r.message.contains(ReasonCodes.INTERNAL))
+      assertFalse("build 失敗不得調用 launcher", called)
+    }
+    // 超長標題不得回顯原文（PII/超大回顯防禦）。
+    val rLong = CalendarTool.execute(CalendarTool.EventParams(longTitle, 1000, 2000), env, launcher)
+    assertFalse(rLong.message.contains(longTitle))
+  }
+
+  @Test fun calendar_executeUpdateDelete_invalid_convergesToInternal() {
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val badUpdate = CalendarTool.executeUpdate(
+      CalendarTool.UpdateParams(eventId = "7", beginTimeMillis = 2000L, endTimeMillis = 2000L),
+      env, launcher,
+    )
+    assertFalse(badUpdate.ok)
+    assertFalse(badUpdate.usedFallback)
+    assertEquals(ReasonCodes.INTERNAL, badUpdate.reasonCode)
+    assertNull(badUpdate.spec)
+    assertTrue(badUpdate.message.contains(ReasonCodes.INTERNAL))
+    for (badId in listOf("", "1/2", "../0", "abc")) {
+      for ((label, r) in listOf(
+        "update" to CalendarTool.executeUpdate(CalendarTool.UpdateParams(eventId = badId), env, launcher),
+        "delete" to CalendarTool.executeDelete(CalendarTool.DeleteParams(badId), env, launcher),
+      )) {
+        assertFalse("$label badId=$badId", r.ok)
+        assertFalse("$label badId=$badId", r.usedFallback)
+        assertEquals("$label badId=$badId", ReasonCodes.INTERNAL, r.reasonCode)
+        assertNull("$label badId=$badId", r.spec)
+        assertTrue("$label badId=$badId", r.message.contains(ReasonCodes.INTERNAL))
+      }
+      assertFalse("非法 eventId 不得調用 launcher：$badId", called)
+    }
+    // 無 App pending 路徑非法 eventId 同樣收斂為 INTERNAL（程式已修，補釘選）。
+    val noApp = env.copy(hasCalendarApp = false)
+    for (badId in listOf("", "1/2", "abc")) {
+      val u = CalendarTool.executeUpdate(CalendarTool.UpdateParams(eventId = badId), noApp, launcher)
+      assertFalse(u.ok)
+      assertEquals(ReasonCodes.INTERNAL, u.reasonCode)
+      assertNull(u.spec)
+      val d = CalendarTool.executeDelete(CalendarTool.DeleteParams(badId), noApp, launcher)
+      assertFalse(d.ok)
+      assertEquals(ReasonCodes.INTERNAL, d.reasonCode)
+      assertNull(d.spec)
+    }
+  }
+
+  @Test fun alarm_parse_messageTooLong_rejected() {
+    try {
+      AlarmTool.parseParams(
+        mapOf(
+          IntentActions.EXTRA_ALARM_HOUR to IntentExtra.IntVal(7),
+          IntentActions.EXTRA_ALARM_MINUTES to IntentExtra.IntVal(30),
+          IntentActions.EXTRA_ALARM_MESSAGE to IntentExtra.Str("x".repeat(AlarmTool.MAX_MESSAGE_LEN + 1)),
+        ),
+      )
+      fail("expected IllegalArgumentException for too-long message")
+    } catch (e: IllegalArgumentException) {
+      assertTrue(e.message ?: "", "too long" in (e.message ?: ""))
+    }
+  }
+
+  @Test fun calendar_parseInsert_bounds_rejected() {
+    // 負值 / 超長 / 超時長一律拒；各案斷言各自守衛子串，不用萬能非空斷言。
+    val cases = listOf(
+      mapOf(
+        CalendarTool.EXTRA_EVENT_TITLE to IntentExtra.Str("例會"),
+        CalendarTool.EXTRA_BEGIN_TIME to IntentExtra.LongVal(-1L),
+        CalendarTool.EXTRA_END_TIME to IntentExtra.LongVal(2000L),
+      ) to "beginTime must be >= 0",
+      mapOf(
+        CalendarTool.EXTRA_EVENT_TITLE to IntentExtra.Str("t".repeat(CalendarTool.MAX_TITLE_LEN + 1)),
+        CalendarTool.EXTRA_BEGIN_TIME to IntentExtra.LongVal(1000L),
+        CalendarTool.EXTRA_END_TIME to IntentExtra.LongVal(2000L),
+      ) to "title too long",
+      mapOf(
+        CalendarTool.EXTRA_EVENT_TITLE to IntentExtra.Str("例會"),
+        CalendarTool.EXTRA_BEGIN_TIME to IntentExtra.LongVal(0L),
+        CalendarTool.EXTRA_END_TIME to IntentExtra.LongVal(Long.MAX_VALUE),
+      ) to "duration too long",
+    )
+    for ((extras, expected) in cases) {
+      try {
+        CalendarTool.parseInsertParams(extras)
+        fail("expected IllegalArgumentException for $extras")
+      } catch (e: IllegalArgumentException) {
+        assertTrue(e.message ?: "", expected in (e.message ?: ""))
+      }
+    }
+  }
+
+  @Test fun alarm_parse_optionalMistypeMatrix_throwsExplicit() {
+    // 選填鍵錯型矩陣：MESSAGE IntVal / SKIP_UI 已測，此處補 MESSAGE 錯型。
+    try {
+      AlarmTool.parseParams(
+        mapOf(
+          IntentActions.EXTRA_ALARM_HOUR to IntentExtra.IntVal(7),
+          IntentActions.EXTRA_ALARM_MINUTES to IntentExtra.IntVal(30),
+          IntentActions.EXTRA_ALARM_MESSAGE to IntentExtra.IntVal(1),
+        ),
+      )
+      fail("expected IllegalStateException for mistyped MESSAGE")
+    } catch (e: IllegalStateException) {
+      assertTrue(e.message ?: "", IntentActions.EXTRA_ALARM_MESSAGE in (e.message ?: ""))
+    }
+    try {
+      CalendarTool.parseInsertParams(
+        mapOf(
+          CalendarTool.EXTRA_EVENT_TITLE to IntentExtra.LongVal(1L),
+          CalendarTool.EXTRA_BEGIN_TIME to IntentExtra.LongVal(1000L),
+          CalendarTool.EXTRA_END_TIME to IntentExtra.LongVal(2000L),
+        ),
+      )
+      fail("expected IllegalStateException for mistyped title")
+    } catch (e: IllegalStateException) {
+      assertTrue(e.message ?: "", CalendarTool.EXTRA_EVENT_TITLE in (e.message ?: ""))
+    }
+  }
+
+  @Test fun alarm_blankMessage_normalizesToEmpty() {
+    // build 丟棄全空白（isNotBlank），parse 缺席回 ""：刻意正規化，釘選行為。
+    val params = AlarmTool.Params(7, 30, "   ")
+    val roundTripped = AlarmTool.parseParams(AlarmTool.buildSetAlarmIntent(params).extras)
+    assertEquals("", roundTripped.message)
+    // edit 側同理：空白 title 不攜帶（takeIf isNotBlank），長度守衛一致。
+    val editSpec = CalendarTool.buildEditIntent(CalendarTool.UpdateParams(eventId = "7", title = "   "))
+    assertFalse(editSpec.extras.containsKey(CalendarTool.EXTRA_EVENT_TITLE))
+  }
+
+  @Test fun launchCatching_cancellation_reraises() {
+    val cancelling = IntentLauncher { throw kotlin.coroutines.cancellation.CancellationException("cancel") }
+    try {
+      cancelling.launchCatching(IntentSpec(action = IntentActions.SET_ALARM))
+      fail("expected CancellationException to propagate")
+    } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+      // 預期：取消直接外洩，不收斂為 Internal。
+    }
+  }
+
+  @Test fun launchInternal_doesNotLeakCauseMessage() {
+    // INTERNAL 僅附 cause 類名，不含 message/PII（假 key 不得外洩）。
+    val secret = "sk-fake-secret-12345 /data/data/secret"
+    val r = IntentLauncher { throw SecurityException(secret) }
+      .launchCatching(IntentSpec(action = IntentActions.SET_ALARM))
+      .toToolResult(IntentSpec(action = IntentActions.SET_ALARM), "設定鬧鐘")
+    assertFalse(r.ok)
+    assertEquals(ReasonCodes.INTERNAL, r.reasonCode)
+    assertFalse(r.message.contains(secret))
+    assertFalse(r.message.contains("sk-fake-secret"))
+    assertTrue(r.message.contains("SecurityException"))
+  }
+
+  @Test fun calendar_deletePendingSpec_neverLaunched() {
+    // 無 App 時 DELETE 待寫 spec 禁經 launcher：launcher 若被調用即失敗。
+    var called = false
+    val noApp = env.copy(hasCalendarApp = false)
+    val r = CalendarTool.executeDelete(
+      CalendarTool.DeleteParams("9"), noApp,
+      IntentLauncher { called = true; LaunchResult.Success },
+    )
+    assertFalse(called)
+    assertFalse(r.ok)
+    assertTrue(r.usedFallback)
+    assertEquals(ReasonCodes.NEED_PERMISSION, r.reasonCode)
+    assertEquals(IntentActions.DELETE, r.spec?.action)
+    assertEquals("${CalendarTool.EVENTS_CONTENT_URI}/9", r.spec?.dataUri)
+  }
+
+  @Test fun calendar_executeUpdate_noApp_returnsPendingSpec() {
+    // 無 App 時更新走待寫路徑：ok=false + usedFallback=true + NEED_PERMISSION，
+    // spec 攜帶 EDIT + 目標 URI + 變更欄位，且不調用 launcher。
+    var called = false
+    val noApp = env.copy(hasCalendarApp = false)
+    val r = CalendarTool.executeUpdate(
+      CalendarTool.UpdateParams(eventId = "7", title = "例會"), noApp,
+      IntentLauncher { called = true; LaunchResult.Success },
+    )
+    assertFalse(called)
+    assertFalse(r.ok)
+    assertTrue(r.usedFallback)
+    assertEquals(ReasonCodes.NEED_PERMISSION, r.reasonCode)
+    assertEquals(IntentActions.EDIT, r.spec?.action)
+    assertEquals("${CalendarTool.EVENTS_CONTENT_URI}/7", r.spec?.dataUri)
+  }
+
+  @Test fun execute_staticDegradedUnavailable_returnsNullSpec() {
+    // 靜態 DEGRADED（鬧鐘無 App）/ UNAVAILABLE（日曆無 App/USER_DISABLED）
+    // 經 execute 收斂為 spec=null，不攜帶嘗試過的 spec。
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val noApp = env.copy(hasAlarmApp = false, hasCalendarApp = false)
+    val a = AlarmTool.execute(AlarmTool.Params(7, 30), noApp, launcher)
+    assertFalse(a.ok)
+    assertTrue(a.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, a.reasonCode)
+    assertNull(a.spec)
+    val c = CalendarTool.execute(CalendarTool.EventParams("例會", 1000, 2000), noApp, launcher)
+    assertFalse(c.ok)
+    assertFalse(c.usedFallback)
+    assertEquals(ReasonCodes.NO_HANDLER, c.reasonCode)
+    assertNull(c.spec)
+    assertFalse("靜態不可執行不得調用 launcher", called)
+  }
+
+  @Test fun execute_userDisabled_returnsDisabledNotNoHandler() {
+    // USER_DISABLED 由 execute 早期回傳，不得經 fallback 取 NO_HANDLER 話術；
+    // launcher 不得被調用，spec 為 null。
+    var called = false
+    val launcher = IntentLauncher { called = true; LaunchResult.Success }
+    val disabled = env.copy(userEnabled = false)
+    val a = AlarmTool.execute(AlarmTool.Params(7, 30), disabled, launcher)
+    assertFalse(a.ok)
+    assertFalse(a.usedFallback)
+    assertNull(a.spec)
+    assertEquals(ReasonCodes.USER_DISABLED, a.reasonCode)
+    assertTrue(a.message.contains(ReasonCodes.USER_DISABLED))
+    val c = CalendarTool.execute(CalendarTool.EventParams("例會", 1000, 2000), disabled, launcher)
+    assertFalse(c.ok)
+    assertFalse(c.usedFallback)
+    assertNull(c.spec)
+    assertEquals(ReasonCodes.USER_DISABLED, c.reasonCode)
+    val u = CalendarTool.executeUpdate(CalendarTool.UpdateParams(eventId = "7"), disabled, launcher)
+    assertFalse(u.ok)
+    assertEquals(ReasonCodes.USER_DISABLED, u.reasonCode)
+    assertNull(u.spec)
+    val d = CalendarTool.executeDelete(CalendarTool.DeleteParams("7"), disabled, launcher)
+    assertFalse(d.ok)
+    assertEquals(ReasonCodes.USER_DISABLED, d.reasonCode)
+    assertNull(d.spec)
+    assertFalse("USER_DISABLED 不得調用 launcher", called)
   }
 }

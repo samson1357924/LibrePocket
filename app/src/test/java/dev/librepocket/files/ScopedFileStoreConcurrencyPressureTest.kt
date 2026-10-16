@@ -17,6 +17,7 @@ import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -174,6 +175,8 @@ class ScopedFileStoreConcurrencyPressureTest {
      * 不傳 `FOLLOW_LINKS` 語義：遇連結只刪連結本體並跳過子樹。best-effort。
      * 僅在無併發修改者時呼叫；本檔以 `workersMayBeAlive` 門保證（併發翻轉中
      * 目錄→連結置換與 walk 開流非原子，helper 單獨不承諾併發安全）。
+     * 失敗靜默為刻意 best-effort（攻擊側共用語義）；核心殘留由
+     * `cleanupAfterPressure` 嚴格斷言，outer-finally 殘留供診斷（人審 P3#2）。
      */
     private fun deleteNoFollowRecursively(root: File) {
         try {
@@ -383,6 +386,9 @@ class ScopedFileStoreConcurrencyPressureTest {
         assumeNonWindows()
         // 生產常數耦合守衛：staging／清理／列目斷言皆由此派生，空洞即 fail-fast。
         assertTrue(ScopedFileStore.TMP_NAME_PREFIX.isNotEmpty())
+        // 值錨定：生產若更名 TMP_NAME_PREFIX，此處明確失敗而非靜默跟隨，
+        // 迫使同步檢視 list 過濾／清理語義（PocketGuard PR91 建議）。
+        assertEquals(".lp-", ScopedFileStore.TMP_NAME_PREFIX)
         assertTrue(stageFilePrefix().startsWith(ScopedFileStore.TMP_NAME_PREFIX))
         assertTrue(stageDirPrefix().startsWith(ScopedFileStore.TMP_NAME_PREFIX))
         val ws = workspace()
@@ -404,6 +410,15 @@ class ScopedFileStoreConcurrencyPressureTest {
             // 非嚴格同步（放行後仍由排程器決定交錯），僅防 flipper 早退空轉。
             val readyLatch = CountDownLatch(POOL_SIZE)
             val errors = AtomicReference<Throwable?>(null)
+            // 次錯診斷：首錯仍為失敗主因，次錯進 queue 掛 suppressed，不再靜默丟棄
+            //（PocketGuard PR91 建議；注意 awaitStarted 內的啟動閘超時仍用首錯語義）。
+            val errorCount = AtomicInteger(0)
+            val errorQueue = ConcurrentLinkedQueue<Throwable>()
+            fun recordError(t: Throwable) {
+                errors.compareAndSet(null, t)
+                errorCount.incrementAndGet()
+                if (errors.get() !== t) errorQueue.add(t)
+            }
             val denied = AtomicInteger(0)
             val rejected = AtomicInteger(0)
             val firstRejection = AtomicReference<String?>(null)
@@ -453,7 +468,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                         }
                     }
                 } catch (t: Throwable) {
-                    errors.compareAndSet(null, t)
+                    recordError(t)
                 }
             }
 
@@ -487,12 +502,12 @@ class ScopedFileStoreConcurrencyPressureTest {
                                 deleteQuietly(staged)
                             }
                         } catch (t: Throwable) {
-                            errors.compareAndSet(null, t)
+                            recordError(t)
                             return@Runnable
                         }
                     }
                 } catch (t: Throwable) {
-                    errors.compareAndSet(null, t)
+                    recordError(t)
                 }
             }
 
@@ -509,8 +524,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                             when {
                                 text == SECRET -> observedOutside.incrementAndGet()
                                 text.startsWith("inside-") -> observedInside.incrementAndGet()
-                                else -> errors.compareAndSet(
-                                    null,
+                                else -> recordError(
                                     AssertionError("unexpected flip content: $text"),
                                 )
                             }
@@ -520,15 +534,15 @@ class ScopedFileStoreConcurrencyPressureTest {
                             denied.incrementAndGet()
                         } catch (e: FileBudgetException) {
                             // 預算異常屬 IOException 子類但本測試資料量極小，命中即真 bug，不進有界桶。
-                            errors.compareAndSet(null, e)
+                            recordError(e)
                         } catch (_: IOException) {
                             denied.incrementAndGet()
                         } catch (t: Throwable) {
-                            errors.compareAndSet(null, t)
+                            recordError(t)
                         }
                     }
                 } catch (t: Throwable) {
-                    errors.compareAndSet(null, t)
+                    recordError(t)
                 }
             }
 
@@ -543,7 +557,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                         try {
                             store.write(STABLE_PATH, "v$i".toByteArray(Charsets.UTF_8))
                         } catch (t: Throwable) {
-                            errors.compareAndSet(null, t)
+                            recordError(t)
                         }
                         try {
                             if (i % 2 == 0) {
@@ -556,15 +570,15 @@ class ScopedFileStoreConcurrencyPressureTest {
                         } catch (_: FileNotFoundException) {
                             denied.incrementAndGet()
                         } catch (e: FileBudgetException) {
-                            errors.compareAndSet(null, e)
+                            recordError(e)
                         } catch (_: IOException) {
                             denied.incrementAndGet()
                         } catch (t: Throwable) {
-                            errors.compareAndSet(null, t)
+                            recordError(t)
                         }
                     }
                 } catch (t: Throwable) {
-                    errors.compareAndSet(null, t)
+                    recordError(t)
                 }
             }
 
@@ -578,32 +592,29 @@ class ScopedFileStoreConcurrencyPressureTest {
                         try {
                             val listed = store.list()
                             if (listed.any { it.startsWith("/") || it.split("/").any { seg -> seg == ".." } }) {
-                                errors.compareAndSet(
-                                    null,
+                                recordError(
                                     AssertionError("list malformed: $listed"),
                                 )
                             }
                             if (listed.any { FileScope.sanitizeRelative(it) == null }) {
-                                errors.compareAndSet(
-                                    null,
+                                recordError(
                                     AssertionError("list unsanitized: $listed"),
                                 )
                             }
                             // staging 過濾：檔暫存以前綴被守衛忽略（BudgetTest.listSkipsTmpFiles
                             // 靜態覆蓋，本處併發覆蓋）；目錄暫存為空故無條目。
                             if (listed.any { it.contains(ScopedFileStore.TMP_NAME_PREFIX) }) {
-                                errors.compareAndSet(
-                                    null,
+                                recordError(
                                     AssertionError("list leaks staging: $listed"),
                                 )
                             }
                             listOk.incrementAndGet()
                         } catch (t: Throwable) {
-                            errors.compareAndSet(null, t)
+                            recordError(t)
                         }
                     }
                 } catch (t: Throwable) {
-                    errors.compareAndSet(null, t)
+                    recordError(t)
                 }
             }
 
@@ -618,12 +629,12 @@ class ScopedFileStoreConcurrencyPressureTest {
                         try {
                             store.write(ephemeral, "e".toByteArray(Charsets.UTF_8))
                         } catch (t: Throwable) {
-                            errors.compareAndSet(null, t)
+                            recordError(t)
                         }
                         try {
                             if (store.delete(ephemeral)) deleteOk.incrementAndGet()
                         } catch (t: Throwable) {
-                            errors.compareAndSet(null, t)
+                            recordError(t)
                         }
                         try {
                             store.delete("$RACE_SUB_NAME/race-file.txt")
@@ -633,15 +644,15 @@ class ScopedFileStoreConcurrencyPressureTest {
                             denied.incrementAndGet()
                         } catch (e: FileBudgetException) {
                             // delete 生產目前不拋 budget（見 deleteInternal），命中即真 bug。
-                            errors.compareAndSet(null, e)
+                            recordError(e)
                         } catch (_: IOException) {
                             denied.incrementAndGet()
                         } catch (t: Throwable) {
-                            errors.compareAndSet(null, t)
+                            recordError(t)
                         }
                     }
                 } catch (t: Throwable) {
-                    errors.compareAndSet(null, t)
+                    recordError(t)
                 }
             }
 
@@ -690,12 +701,18 @@ class ScopedFileStoreConcurrencyPressureTest {
                     // 與 POOL_REAP_TIMEOUT_SEC 的超時分支 10s 不同）；仍活則由
                     // workersMayBeAlive 跳過清理，daemon 線程不阻塞 JVM 退出。
                     pool.awaitTermination(5, TimeUnit.SECONDS)
+                    // 等待後若已無存活 worker，清除旗標以允許 finally 清理，避免異常路徑
+                    // fixture 殘留（人審 P3#1）；仍活則保持旗標跳過清理。
+                    if (pool.isTerminated) workersMayBeAlive = false
                 } catch (e: InterruptedException) {
                     Thread.currentThread().interrupt()
                 }
                 throw t
             }
-            errors.get()?.let { throw AssertionError("stress failed", it) }
+            errors.get()?.let {
+                throw AssertionError("stress failed (errorCount=${errorCount.get()})", it)
+                    .also { a -> errorQueue.forEach(a::addSuppressed) }
+            }
 
             // 有界斷言一：outside 秘密未被竄改；穩定路徑寫入未穿出。
             // 穩定父段永不翻轉：`out/stable/*` 為真門，`out/file.txt` 恆真哨兵。
@@ -709,7 +726,8 @@ class ScopedFileStoreConcurrencyPressureTest {
             // 僅供 flaky 診斷），非正式斷言。
             println(
                 "[ConcurrencyPressure] denied=${denied.get()} rejected=${rejected.get()} " +
-                    "inside=${observedInside.get()} readAttempts=${readAttempts.get()} " +
+                    "errors=${errorCount.get()} inside=${observedInside.get()} " +
+                    "readAttempts=${readAttempts.get()} " +
                     "outsideReads=${observedOutside.get()} listOk=${listOk.get()} " +
                     "deleteOk=${deleteOk.get()} fileLinkOk=${fileLinkOk.get()} " +
                     "fileRealOk=${fileRealOk.get()} dirLinkOk=${dirLinkOk.get()} " +

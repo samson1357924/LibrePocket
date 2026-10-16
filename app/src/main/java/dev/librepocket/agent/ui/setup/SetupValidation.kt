@@ -36,10 +36,13 @@ object SetupValidation {
      * `custom:<sha256-32hex>` id instead.
      *
      * The derivation is a pure function of `(presetId, trimmed
-     * effectiveBaseUrl)`: the same endpoint re-derives the same id across
-     * restarts and rotations (stable), while any URL change — including a
-     * mere respelling — is a distinct entity and must re-key (fail-closed,
-     * consistent with the binding's full-string effectiveBaseUrl equality).
+     * effectiveBaseUrl)`: trimming surrounding whitespace is the ONLY
+     * normalization performed (no lowercasing, no default-port elision, no
+     * trailing-slash stripping). The same endpoint re-derives the same id
+     * across restarts and rotations (stable), while any URL change —
+     * including a mere respelling — is a distinct entity and must re-key
+     * (fail-closed, consistent with the binding's full-string
+     * effectiveBaseUrl equality).
      * The 128-bit hash keeps accidental collision at ~2^-128 per pair (a
      * collision would silently SHARE a namespace — the fail-open direction —
      * so truncation stays wide); output is lowercase hex, so it is safe for

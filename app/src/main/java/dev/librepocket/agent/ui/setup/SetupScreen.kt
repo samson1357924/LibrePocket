@@ -44,7 +44,9 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -118,6 +120,18 @@ fun SetupScreen(
     LaunchedEffect(isFirstRun) {
         if (isFirstRun) viewModel.prefillLegacyMigrationIfNeeded()
     }
+    // Retryable migration status: a transient read failure leaves the probe
+    // RetryLater on a still-mounted first-run screen, where LaunchedEffect
+    // will not refire. Surface an explicit retry action instead (the prefill
+    // still re-verifies pristine/revision, so a stale tap cannot clobber).
+    val migrationRetryNeeded by viewModel.migrationRetryNeeded.collectAsStateWithLifecycle()
+    // Same pristine definition as the ViewModel gate: only offer retry while
+    // the form is still untouched.
+    val migrationFormPristine = state.presetId == ProviderCatalog.OPENAI_ID &&
+        state.baseUrl == ProviderCatalog.OPENAI_BASE_URL &&
+        state.model == ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID) &&
+        state.apiKey.isEmpty()
+    val screenScope = rememberCoroutineScope()
 
     LaunchedEffect(state.saved) {
         if (state.saved) {
@@ -155,6 +169,15 @@ fun SetupScreen(
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        if (isFirstRun && migrationRetryNeeded && migrationFormPristine) {
+            OutlinedButton(
+                onClick = { screenScope.launch { viewModel.prefillLegacyMigrationIfNeeded() } },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("重新載入舊版設定")
+            }
+        }
 
         // Stage F2 (#18)：gate 讀取未確認時在 SETUP 內提供非破壞性重試入口。
         // gate-first 發射序／transient 失敗後使用者可能靜止在此頁（舊守衛不導、

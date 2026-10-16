@@ -1,5 +1,7 @@
 package dev.librepocket.agent.ui.setup
 
+import dev.librepocket.preset.ProviderCatalog
+
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -53,13 +55,14 @@ class SetupValidationTest {
         // same id, forever) so persisted rows re-derive identically after an
         // upgrade. Any algorithm change must migrate stored rows explicitly —
         // it must never silently fork every custom endpoint into legacy.
+        assertEquals(ProviderCatalog.CUSTOM_ID, "custom")
         assertEquals(
             "custom:9b514b1a65f6ebfaa4da53a116ea0038",
-            SetupValidation.deriveEndpointId("custom", "http://127.0.0.1:11434/v1"),
+            SetupValidation.deriveEndpointId(ProviderCatalog.CUSTOM_ID, "http://127.0.0.1:11434/v1"),
         )
         assertEquals(
             "custom:a0507cea99932bea43520239cdcd6e82",
-            SetupValidation.deriveEndpointId("custom", "https://custom-a.example.com/v1"),
+            SetupValidation.deriveEndpointId(ProviderCatalog.CUSTOM_ID, "https://custom-a.example.com/v1"),
         )
     }
 

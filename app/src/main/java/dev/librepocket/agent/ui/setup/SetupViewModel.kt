@@ -774,6 +774,15 @@ class SetupViewModel(
      */
     private var migrationPrefilled = false
     private var migrationPrefillInFlight = false
+    /**
+     * True while a migration prefill attempt ended [LegacyMigrationProbe.RetryLater]
+     * and no later attempt has resolved it. Drives the Setup screen's explicit
+     * retry action; cleared on success, terminal absence, or a superseding
+     * state (the prefill itself still re-verifies pristine/revision, so a
+     * stale tap can never clobber user input).
+     */
+    private val _migrationRetryNeeded = MutableStateFlow(false)
+    val migrationRetryNeeded: StateFlow<Boolean> = _migrationRetryNeeded
 
     suspend fun prefillLegacyMigrationIfNeeded() {
         if (migrationPrefilled || migrationPrefillInFlight) return
@@ -783,12 +792,19 @@ class SetupViewModel(
         migrationPrefillInFlight = true
         try {
             val legacy = when (val probe = probeLegacyMigration()) {
-                is LegacyMigrationProbe.Available -> probe.config
+                is LegacyMigrationProbe.Available -> {
+                    _migrationRetryNeeded.value = false
+                    probe.config
+                }
                 is LegacyMigrationProbe.NothingToMigrate -> {
                     migrationPrefilled = true
+                    _migrationRetryNeeded.value = false
                     return
                 }
-                is LegacyMigrationProbe.RetryLater -> return
+                is LegacyMigrationProbe.RetryLater -> {
+                    _migrationRetryNeeded.value = true
+                    return
+                }
             }
             // Re-verify after the suspend read: a keystroke landing in the read
             // window must never be clobbered (field edits bump formRevision or

@@ -675,6 +675,82 @@ class SetupEndpointIdMigrationTest {
         assertEquals(url, vm.form.value.baseUrl)
         assertEquals("SETUP_MIGRATION_REKEY_REQUIRED", vm.form.value.errorCode)
     }
+
+    /**
+     * Retry-needed signal: false initially, true after a RetryLater attempt,
+     * false again once an attempt resolves (or proves nothing to migrate).
+     */
+    @Test
+    fun legacyMigrationRetrySignalTracksProbeOutcome() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val dir = Files.createTempDirectory("setup-migration-signal").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val raw = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "migration-signal.preferences_pb") },
+        )
+        EndpointStore(raw).save(legacyCustom(url))
+        // One failing read: the first prefill's journal probe consumes it.
+        val store = EndpointStore(FailFirstReadsDataStore(raw, failReads = 1))
+        val vault = CountingVault()
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+
+        assertFalse(vm.migrationRetryNeeded.value)
+        vm.prefillLegacyMigrationIfNeeded()
+        assertTrue(vm.migrationRetryNeeded.value)
+        assertEquals(ProviderCatalog.OPENAI_ID, vm.form.value.presetId)
+        vm.prefillLegacyMigrationIfNeeded()
+        assertFalse(vm.migrationRetryNeeded.value)
+        assertEquals(url, vm.form.value.baseUrl)
+    }
+
+    /**
+     * Overlap defense: a second prefill call landing while the first is still
+     * suspended in its metadata read is dropped by the in-flight guard; the
+     * first call still completes exactly once.
+     */
+    @Test
+    fun legacyMigrationOverlappingPrefillIsDroppedOnce() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val dir = Files.createTempDirectory("setup-migration-overlap").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val raw = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "migration-overlap.preferences_pb") },
+        )
+        EndpointStore(raw).save(legacyCustom(url))
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val store = EndpointStore(GateFirstReadDataStore(raw, entered, release))
+        val vault = CountingVault()
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+
+        val first = launch { vm.prefillLegacyMigrationIfNeeded() }
+        withTimeout(10_000) { entered.await() }
+        // Overlapping second call must not start a second read generation.
+        vm.prefillLegacyMigrationIfNeeded()
+        release.complete(Unit)
+        first.join()
+        assertEquals(url, vm.form.value.baseUrl)
+        assertEquals("SETUP_MIGRATION_REKEY_REQUIRED", vm.form.value.errorCode)
+        assertFalse(vm.migrationRetryNeeded.value)
+    }
 }
 
 /** DataStore wrapper failing the first [failReads] reads, then delegating. */

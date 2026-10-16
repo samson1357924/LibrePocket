@@ -4,9 +4,11 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.unit.dp
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.edit
 import dev.librepocket.agent.ui.chat.VaultSource
 import dev.librepocket.keystore.EncryptedPrefsVault
 import dev.librepocket.keystore.InMemoryPrefs
@@ -127,6 +129,64 @@ class SetupLegacyMigrationScreenTest {
     }
 
     @Test
+    fun transientFailureExposesRetryAndSameScreenRecovers() {
+        val url = "http://127.0.0.1:11434/v1"
+        val dir = Files.createTempDirectory("setup-legacy-migration-retry").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val raw = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "legacy-migration-retry.preferences_pb") },
+        )
+        runBlocking {
+            EndpointStore(raw).save(legacyCustom(url))
+            // A teardown journal blocks the probe as RetryLater without
+            // failing any read (the gate still settles NoEndpoint on the
+            // legacy row, unaffected).
+            raw.edit { prefs ->
+                prefs[ENDPOINT_PENDING_DELETE_V1] = "junk-journal"
+            }
+        }
+        val store = EndpointStore(raw)
+        val vault: KeyVault = EncryptedPrefsVault(InMemoryPrefs())
+        runBlocking {
+            vault.putKey("preset:custom", "stage1-legacy-key-12345678".toCharArray())
+        }
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = MutablePolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        composeRule.setContent {
+            SetupScreen(
+                padding = PaddingValues(0.dp),
+                isFirstRun = true,
+                onSaved = { error("must not save without a key") },
+                viewModel = vm,
+            )
+        }
+        composeRule.waitForIdle()
+        // Retry action is exposed while the form is still pristine.
+        composeRule.onNodeWithText("重新載入舊版設定").performScrollTo().assertIsDisplayed()
+        // Teardown reconciles (journal clears); the same screen's retry then
+        // recovers the address while the key stays blank.
+        runBlocking {
+            raw.edit { prefs ->
+                prefs.remove(ENDPOINT_PENDING_DELETE_V1)
+            }
+        }
+        composeRule.onNodeWithText("重新載入舊版設定").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText(url).performScrollTo().assertIsDisplayed()
+        val form = vm.form.value
+        assertEquals(url, form.baseUrl)
+        assertEquals("custom", form.presetId)
+        assertTrue(form.apiKey.isEmpty())
+    }
+
+    @Test
     fun nonFirstRunSetupDoesNotPrefillLegacy() {
         val url = "http://127.0.0.1:11434/v1"
         val (vm, _) = newVm(url)
@@ -145,3 +205,4 @@ class SetupLegacyMigrationScreenTest {
         assertEquals(ProviderCatalog.OPENAI_ID, form.presetId)
     }
 }
+

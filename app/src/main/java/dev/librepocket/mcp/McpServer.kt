@@ -7,14 +7,23 @@ import kotlinx.coroutines.CancellationException
  * D03 單伺服器客戶端（多伺服器 = 每個配置一個 [McpServer] 實例）。
  *
  * 最小子集警示（#11 Stage2）：只會 `tools/list`＋`tools/call`（見 [McpWire] 修訂立場）；
- * 未接 production composition（`dev.librepocket.mcp` 外零引用，見 CAPABILITY_MATRIX
+ * 未接 production composition（`dev.librepocket.mcp` 外零 production import，
+ * 僅 KDoc／description 前向提及，未接 dispatcher／副作用，見 CAPABILITY_MATRIX
  * MCP 行），啟用前須單獨驗 production dispatcher、取消與副作用邊界，不得批次開啟。
  *
  * - 地址使用者配置（[McpServerConfig.baseUrl]），Key 走 [KeyVault] 加密存取；
  * - 方法：[listTools]（tools/list）+ [callTool]（tools/call）；
  * - 熔斷：連續失敗即開路（[McpCircuitBreaker]），開路期間短路為 CIRCUIT_OPEN；
+ *   工具業務錯（`isError=true`／error 包）為中性，不重置亦不累計；
  * - 超時：單次 15–30s（[McpTimeouts.clamp]），超時映射 TIMEOUT，不重試；
- * - 隱私：Bearer 只放標頭；key 用後即擦；稽核只記 id/status/latency。
+ * - 傳輸安全：僅放行 `https`，以及回環 `http`（測試／本機；見 [McpWire.requireSecureEndpoint]），
+ *   其餘明文一律 PROTOCOL、不碰 vault、不發送、不計熔斷；
+ * - 隱私：Bearer 只放標頭；`CharArray` 用後即擦（`String`／OkHttp 拷貝為已知殘留，
+ *   見 THREAT_MODEL，已最小化生命週期）；稽核只記 id/status/latency；
+ * - 授權：本層不做 [McpScope.check]，接線 dispatcher 必須先經投影＋確認
+ *  （WRITE 未確認不得調 [callTool]，見 [McpScope]）；
+ * - 綁定：`keyId` 與 `baseUrl` 無自動綁定，換 URL 不得靜默沿用舊 key，
+ *   接線前須補重綁確認（對照 Setup S4-C，見 THREAT_MODEL Target）。
  */
 class McpServer(
     private val config: McpServerConfig,
@@ -34,10 +43,19 @@ class McpServer(
         if (!breaker.canCall()) {
             return McpListResult(config.id, emptyList(), McpStatus.CIRCUIT_OPEN, clockMs() - start)
         }
+        if (config.baseUrl.isBlank()) {
+            // 空地址：配置錯誤，不碰 vault、不計熔斷（沿用 UNAUTHORIZED 語義，相容既有測試）。
+            return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
+        }
+        try {
+            McpWire.requireSecureEndpoint(config.baseUrl)
+        } catch (_: IllegalArgumentException) {
+            // 明文非回環／畸形地址：fail-closed，不碰 vault、不發送、不計熔斷。
+            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+        }
         val key = keyVault.getKey(config.keyId)
-        if (key == null || config.baseUrl.isBlank()) {
-            key?.fill('\u0000')
-            // 無 key/無地址不計熔斷（配置問題，非傳輸失敗），直接回 UNAUTHORIZED/DISABLED 語義。
+        if (key == null) {
+            // 無 key 不計熔斷（配置問題，非傳輸失敗）。
             return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
         }
         val bearer: String
@@ -81,6 +99,10 @@ class McpServer(
             // 成功 body 超量（位元組/字元上限）：顯式 PROTOCOL + 計熔斷，不當 OK。
             breaker.onFailure()
             return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
+        } catch (_: McpWire.McpProtocol) {
+            // 傳輸層非 JSON 早擋（如 event-stream）：PROTOCOL + 計熔斷（同超量路徑）。
+            breaker.onFailure()
+            return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
         } catch (_: Exception) {
             breaker.onFailure()
             return McpListResult(config.id, emptyList(), McpStatus.TRANSPORT, clockMs() - start)
@@ -114,9 +136,17 @@ class McpServer(
             // 不碰 vault、不計熔斷（與傳輸失敗區分）。
             return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
         }
+        if (config.baseUrl.isBlank()) {
+            return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
+        }
+        try {
+            McpWire.requireSecureEndpoint(config.baseUrl)
+        } catch (_: IllegalArgumentException) {
+            // 明文非回環／畸形地址：fail-closed，不碰 vault、不發送、不計熔斷。
+            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+        }
         val key = keyVault.getKey(config.keyId)
-        if (key == null || config.baseUrl.isBlank()) {
-            key?.fill('\u0000')
+        if (key == null) {
             return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
         }
         val bearer: String
@@ -145,13 +175,17 @@ class McpServer(
             }
             return try {
                 val (resultJson, isError) = McpWire.parseCall(text)
-                // 傳輸成功：不斷熔斷計數（工具業務錯 isError 不計熔斷，只透狀態）。
-                breaker.onSuccess()
+                if (isError) {
+                    // 工具業務錯：中性，不重置亦不累計熔斷（防交錯壓住不斷路）。
+                    breaker.onNeutral()
+                } else {
+                    breaker.onSuccess()
+                }
                 val status = if (isError) McpStatus.TOOL_ERROR else McpStatus.OK
                 McpCallResult(config.id, toolName, status, clockMs() - start, resultJson, isError)
             } catch (e: McpWire.McpToolFailure) {
-                // 伺服器回 error 包：工具級錯誤，不計熔斷（會話不中斷）。
-                breaker.onSuccess()
+                // 伺服器回 error 包：工具級錯誤，中性（會話不中斷，不碰熔斷計數）。
+                breaker.onNeutral()
                 McpCallResult(config.id, toolName, McpStatus.TOOL_ERROR, clockMs() - start, null, true)
             } catch (_: IllegalArgumentException) {
                 breaker.onFailure()
@@ -165,6 +199,10 @@ class McpServer(
             // 成功 body 超量（位元組/字元上限）：顯式 PROTOCOL + 計熔斷，不當 OK。
             breaker.onFailure()
             return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
+        } catch (_: McpWire.McpProtocol) {
+            // 傳輸層非 JSON 早擋（如 event-stream）：PROTOCOL + 計熔斷（同超量路徑）。
+            breaker.onFailure()
+            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
         } catch (_: Exception) {
             breaker.onFailure()
             return McpCallResult(config.id, toolName, McpStatus.TRANSPORT, clockMs() - start)
@@ -172,7 +210,12 @@ class McpServer(
     }
 }
 
-/** 多伺服器聚合：薄封裝，逐服獨立熔斷（同進程多 [McpServer] 實例）。 */
+/**
+ * 多伺服器聚合：薄封裝，逐服獨立熔斷（同進程多 [McpServer] 實例）。
+ *
+ * `timeoutMs` 為逐服上限（非總量）：N 服最壞 N×timeout，呼叫方需另包總超時；
+ * 順序執行，取消時丟棄已得結果（見 Stage2 review W5）。
+ */
 class McpRegistry(
     private val servers: Map<String, McpServer>,
 ) {

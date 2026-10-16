@@ -1,5 +1,7 @@
 package dev.librepocket.mcp
 
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+
 /**
  * D03 JSON-RPC 2.0 編解碼（Streamable HTTP 最小子集，原創）。
  *
@@ -326,6 +328,33 @@ internal object McpWire {
             mainTrimmed.indexOf('/')
         }
         return pathStart < 0
+    }
+
+    /**
+     * 安全端點預驗（fail-closed，供 [McpServer] 在碰 vault／發送前呼叫）。
+     *
+     * - 空白即拋 `mcp: blank endpoint`；
+     * - 經 [endpoint] 正規化後必須能解析為 http(s) URL，否則拋 `mcp: bad endpoint`；
+     * - 僅放行 `https`，以及回環 `http`（`localhost`／`127.0.0.1`／`[::1]`，
+     *   供 MockWebServer／本機開發；其餘 `http` 一律拋 `mcp: insecure endpoint`）。
+     * 回傳正規化後 endpoint（可直接發送）。
+     */
+    fun requireSecureEndpoint(baseUrl: String): String {
+        if (baseUrl.isBlank()) throw IllegalArgumentException("mcp: blank endpoint")
+        val url = endpoint(baseUrl)
+        val parsed = try {
+            url.toHttpUrlOrNull()
+        } catch (_: Exception) {
+            null
+        } ?: throw IllegalArgumentException("mcp: bad endpoint")
+        if (parsed.scheme == "https") return url
+        if (parsed.scheme == "http" && isLoopbackHost(parsed.host)) return url
+        throw IllegalArgumentException("mcp: insecure endpoint")
+    }
+
+    internal fun isLoopbackHost(host: String): Boolean {
+        val h = host.trim().trim('[', ']').lowercase()
+        return h == "localhost" || h == "127.0.0.1" || h == "::1"
     }
 
     fun listBody(id: Long = 1L): String =

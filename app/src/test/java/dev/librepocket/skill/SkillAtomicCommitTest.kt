@@ -25,31 +25,42 @@ import java.util.zip.ZipOutputStream
  * - backup 步失敗：舊版原地、staging 已清、訊息含 `backup old version`；
  * - 回滾亦失敗：訊息含 `backup kept at`、`.bak` 保留舊版；
  * - 新鮮安裝 rename 失敗：無 target、staging 已清；
- * - 併發安裝同一 skill 序列化（per-skill 鎖 + hook 內最大並發斷言）；
+ * - staging 寫入階段失敗（[SkillInstaller.writeHook] 注入）：新鮮安裝無
+ *   target、覆蓋保留舊版位元組（backup 階段尚未開始）、staging 已清；
+ * - 併發安裝同一 skill 序列化（per-skill 鎖 + hook 內最大並發斷言；
+ *   新鮮安裝同 id 恰一勝出、其餘 ALREADY_EXISTS）；
  * - 重啟清理：過期 staging／孤兒 bak 收斂、嚴格檔名形狀、崩潰三窗口調 cleanup 即恢復、
  *   同 id 多份 orphan backup 歧義全保留；
+ * - 降版揭露不擋：覆蓋成功帶回 replacedVersion（舊版無 version/新鮮安裝為 null）、
+ *   [SkillInstaller.installedVersion] 缺席/損毀回 null；
+ * - 殘餘觀察：[SkillInstaller.listResiduals] 只列不刪（含歧義保留候選），
+ *   計數與清理一致；
  *
  * 測試 hook 採委託式：只擋指定 rename，其餘走真實 `from.renameTo(to)`，
  * 禁止「hook 回 true 卻沒搬」的空轉假成功。
  */
 class SkillAtomicCommitTest {
 
-    @After fun resetRenameHook() {
+    @After fun resetHooks() {
         SkillInstaller.renameHook = null
+        SkillInstaller.writeHook = null
     }
 
     private fun skillMd(
         name: String = "atomic-skill",
         body: String = "正文 v1",
-    ): String = """
-        ---
-        name: $name
-        description: 原子提交測試片段
-        allowed-tools: [calendar.create, alarm.create]
-        permissions: [needs calendar read]
-        ---
-        $body
-    """.trimIndent()
+        version: String? = null,
+    ): String {
+        // 顯式組行（不用 trimIndent 模板：條件行的縮排會破壞共同縮排計算）。
+        val front = buildList {
+            add("name: $name")
+            add("description: 原子提交測試片段")
+            add("allowed-tools: [calendar.create, alarm.create]")
+            add("permissions: [needs calendar read]")
+            if (version != null) add("version: $version")
+        }.joinToString("\n")
+        return "---\n$front\n---\n$body"
+    }
 
     private fun zipOf(vararg entries: Pair<String, ByteArray>): ByteArray {
         val bos = ByteArrayOutputStream()
@@ -390,6 +401,7 @@ class SkillAtomicCommitTest {
                 val c = inside.incrementAndGet()
                 maxInside.accumulateAndGet(c) { a, b -> maxOf(a, b) }
                 try {
+                    // 刻意放大競態窗口（有界 5ms，Future.get(60s)兜底；PR body「無 sleep」指無 wall-clock 等待生產邏輯，此處為測試同步手段）。
                     Thread.sleep(5)
                     from.renameTo(to)
                 } finally {
@@ -402,7 +414,7 @@ class SkillAtomicCommitTest {
             val futures = (0 until n).map { i ->
                 executor.submit(
                     Callable<SkillInstaller.Result> {
-                        start.await()
+                        assertTrue("latch hang", start.await(60, TimeUnit.SECONDS))
                         val zip = zipOf(
                             "concurrent-skill/SKILL.md" to
                                 skillMd(name = "concurrent-skill", body = "併發正文-$i").toByteArray(Charsets.UTF_8),
@@ -614,6 +626,363 @@ class SkillAtomicCommitTest {
             } finally {
                 root.deleteRecursively()
             }
+        }
+    }
+
+    @Test fun stagingWriteFailure_freshInstall_noTarget_noLeftovers() {
+        val root = tempRoot()
+        try {
+            // staging 寫入階段失敗（第二檔拋錯，模擬磁碟滿）：v1/v2 皆無，
+            // 失敗即無半成品、staging 已清、無 .bak。
+            SkillInstaller.writeHook = { _, rel, _ ->
+                if (rel == "refs/guide.md") throw java.io.IOException("disk full")
+            }
+            val zip = zipOf(
+                "atomic-skill/SKILL.md" to skillMd(body = "正文 v1").toByteArray(Charsets.UTF_8),
+                "atomic-skill/refs/guide.md" to "附檔".toByteArray(Charsets.UTF_8),
+            )
+            val r = SkillInstaller.installZip(zip, root)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(SkillInstaller.Failure.IO_ERROR, (r as SkillInstaller.Result.Failure).reason)
+            assertFalse(File(root, "atomic-skill").exists())
+            assertTrue(
+                "staging or bak left: ${root.listFiles()!!.toList()}",
+                root.listFiles()!!.none { it.name.contains(".tmp-") || it.name.contains(".bak-") },
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun stagingWriteFailure_replace_oldVersionIntact() {
+        val root = tempRoot()
+        try {
+            installV1(root)
+            val before = File(root, "atomic-skill/SKILL.md").readBytes()
+
+            // 首檔即拋錯：backup 階段尚未開始，target 從未被搬移。
+            SkillInstaller.writeHook = { _, _, _ -> throw java.io.IOException("disk full") }
+            val v2 = zipOf(
+                "atomic-skill/SKILL.md" to skillMd(body = "正文 v2").toByteArray(Charsets.UTF_8),
+            )
+            val r = SkillInstaller.installZip(v2, root, replace = true)
+            assertTrue("expected failure, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(SkillInstaller.Failure.IO_ERROR, (r as SkillInstaller.Result.Failure).reason)
+
+            // v1 位元組完整、staging 已清、無 .bak（backup 從未建）。
+            assertTrue(File(root, "atomic-skill/SKILL.md").readBytes().contentEquals(before))
+            assertTrue(
+                "staging or bak left: ${root.listFiles()!!.toList()}",
+                root.listFiles()!!.none { it.name.contains(".tmp-") || it.name.contains(".bak-") },
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun concurrentFreshInstallSameId_oneWinsRestExist() {
+        val root = tempRoot()
+        val executor = Executors.newFixedThreadPool(8)
+        try {
+            // 新鮮安裝同 id 併發：ALREADY_EXISTS 檢查在 per-skill 鎖內，恰一勝出。
+            val n = 8
+            val start = CountDownLatch(1)
+            val futures = (0 until n).map { i ->
+                executor.submit(
+                    Callable<SkillInstaller.Result> {
+                        assertTrue("latch hang", start.await(60, TimeUnit.SECONDS))
+                        val zip = zipOf(
+                            "fresh-skill/SKILL.md" to
+                                skillMd(name = "fresh-skill", body = "新鮮正文-$i").toByteArray(Charsets.UTF_8),
+                        )
+                        SkillInstaller.installZip(zip, root)
+                    },
+                )
+            }
+            start.countDown()
+            val results = futures.map { it.get(60, TimeUnit.SECONDS) }
+            val ok = results.count { it is SkillInstaller.Result.Success }
+            val exists = results.count {
+                (it as? SkillInstaller.Result.Failure)?.reason == SkillInstaller.Failure.ALREADY_EXISTS
+            }
+            assertEquals("exactly one winner, got $results", 1, ok)
+            assertEquals("rest must see ALREADY_EXISTS, got $results", n - 1, exists)
+
+            // 終態為某一個完整版本（可解析）、無殘留。
+            val finalText = File(root, "fresh-skill/SKILL.md").readText(Charsets.UTF_8)
+            SkillParser.parse(finalText)
+            val hits = (0 until n).count { "新鮮正文-$it" in finalText }
+            assertEquals("final content is not one complete version: $finalText", 1, hits)
+            assertTrue(
+                "installer leftovers: ${root.listFiles()!!.toList()}",
+                root.listFiles()!!.none { it.name.startsWith(".fresh-skill") },
+            )
+        } finally {
+            executor.shutdownNow()
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun replace_disclosesDowngrade_notBlocked() {
+        val root = tempRoot()
+        try {
+            val v2zip = zipOf(
+                "downgrade-skill/SKILL.md" to
+                    skillMd(name = "downgrade-skill", body = "高版正文", version = "2.0")
+                        .toByteArray(Charsets.UTF_8),
+            )
+            assertTrue(SkillInstaller.installZip(v2zip, root) is SkillInstaller.Result.Success)
+
+            // 降版（2.0 → 1.0）不阻擋，但成功須揭露舊版號供呼叫方並陳。
+            val v1zip = zipOf(
+                "downgrade-skill/SKILL.md" to
+                    skillMd(name = "downgrade-skill", body = "低版正文", version = "1.0")
+                        .toByteArray(Charsets.UTF_8),
+            )
+            val r = SkillInstaller.installZip(v1zip, root, replace = true)
+            assertTrue("expected success, got $r", r is SkillInstaller.Result.Success)
+            val s = r as SkillInstaller.Result.Success
+            assertEquals("2.0", s.replacedVersion)
+            assertEquals("1.0", s.skill.manifest.version)
+            assertTrue(File(root, "downgrade-skill/SKILL.md").readText(Charsets.UTF_8).contains("低版正文"))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun replace_replacedVersion_nullWhenOldHasNoVersion() {
+        val root = tempRoot()
+        try {
+            // 舊版無 version：揭露為 null（非空字串猜測）。
+            installV1(root, name = "noversion-skill", body = "無版正文")
+            val v2 = zipOf(
+                "noversion-skill/SKILL.md" to
+                    skillMd(name = "noversion-skill", body = "有版正文", version = "1.0")
+                        .toByteArray(Charsets.UTF_8),
+            )
+            val r = SkillInstaller.installZip(v2, root, replace = true)
+            assertTrue("expected success, got $r", r is SkillInstaller.Result.Success)
+            assertEquals(null, (r as SkillInstaller.Result.Success).replacedVersion)
+
+            // 新鮮安裝同為 null。
+            val fresh = zipOf(
+                "brandnew-skill/SKILL.md" to
+                    skillMd(name = "brandnew-skill", body = "新鮮正文", version = "9.9")
+                        .toByteArray(Charsets.UTF_8),
+            )
+            val rf = SkillInstaller.installZip(fresh, root)
+            assertTrue("expected success, got $rf", rf is SkillInstaller.Result.Success)
+            assertEquals(null, (rf as SkillInstaller.Result.Success).replacedVersion)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun installedVersion_readsNullOnMissingOrCorrupt() {
+        val root = tempRoot()
+        try {
+            installV1(root, name = "versioned-skill", body = "有版正文")
+            // installV1 經 skillMd 預設無 version：先覆蓋一個有版舊版再讀。
+            val v = zipOf(
+                "versioned-skill/SKILL.md" to
+                    skillMd(name = "versioned-skill", body = "有版正文", version = "3.1")
+                        .toByteArray(Charsets.UTF_8),
+            )
+            assertTrue(SkillInstaller.installZip(v, root, replace = true) is SkillInstaller.Result.Success)
+            assertEquals("3.1", SkillInstaller.installedVersion(File(root, "versioned-skill")))
+
+            // 缺席與損毀皆回 null，不拋錯。
+            assertEquals(null, SkillInstaller.installedVersion(File(root, "no-such-skill")))
+            File(root, "broken-skill").apply {
+                mkdirs()
+                File(this, "SKILL.md").writeText("junk without frontmatter")
+            }
+            assertEquals(null, SkillInstaller.installedVersion(File(root, "broken-skill")))
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun listResiduals_observesWithoutMutating() {
+        val root = tempRoot()
+        try {
+            installV1(root)
+            val tid = Thread.currentThread().id
+            val now = System.currentTimeMillis()
+            val stale = File(root, ".atomic-skill.tmp-${now * 1000L}-$tid").apply {
+                mkdirs()
+                setLastModified(now - 120_000L)
+            }
+            val fresh = File(root, ".atomic-skill.tmp-${System.nanoTime()}-$tid").apply { mkdirs() }
+            // target 仍在時的孤兒 bak（清理會刪除並計數）。
+            val staleBak = File(root, ".atomic-skill.bak-${System.nanoTime()}-$tid").apply {
+                mkdirs()
+                setLastModified(now - 120_000L)
+            }
+
+            // 只列不過期內部條目：新鮮者排除、真實 skill 目錄排除。
+            val listed = SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L)
+            assertEquals(listed.map { it.name }.sorted(), listed.map { it.name })
+            assertEquals(2, listed.size)
+            assertTrue(listed.any { it.name == stale.name })
+            assertTrue(listed.any { it.name == staleBak.name })
+
+            // 觀察不改變任何檔案；清理回傳同數並消費。
+            assertTrue(stale.exists())
+            assertTrue(staleBak.exists())
+            assertTrue(fresh.exists())
+            assertTrue(File(root, "atomic-skill/SKILL.md").isFile)
+            assertEquals(2, SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L))
+            assertFalse(stale.exists())
+            assertFalse(staleBak.exists())
+            assertTrue(fresh.exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun listResiduals_includesAmbiguousKeptCandidates() {
+        val root = tempRoot()
+        try {
+            // 同 id 兩份 expired .bak + target 缺席：清理全保留（0），
+            // 觀察仍列出兩份供人工核對（見 SkillInstaller KDoc）。
+            val tid = Thread.currentThread().id
+            val bakV1 = File(root, ".dup-skill.bak-111-$tid").apply {
+                mkdirs()
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            val bakV2 = File(root, ".dup-skill.bak-999-$tid").apply {
+                mkdirs()
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            val listed = SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L)
+            assertEquals(2, listed.size)
+            assertEquals(0, SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L))
+            assertTrue(bakV1.exists())
+            assertTrue(bakV2.exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun writeHook_runtimeException_convergesToIoError() {
+        // writeHook 拋 SecurityException/RuntimeException 同樣收斂為 IO_ERROR（現僅測 IOException）。
+        val root = tempRoot()
+        try {
+            for (ex in listOf(
+                SecurityException("deny"),
+                RuntimeException("boom"),
+                java.io.IOException("disk full"),
+            )) {
+                SkillInstaller.writeHook = { _, _, _ -> throw ex }
+                val zip = zipOf("hook-skill/SKILL.md" to skillMd(name = "hook-skill").toByteArray(Charsets.UTF_8))
+                val r = SkillInstaller.installZip(zip, root)
+                assertTrue("expected IO_ERROR for $ex, got $r", r is SkillInstaller.Result.Failure)
+                assertEquals(SkillInstaller.Failure.IO_ERROR, (r as SkillInstaller.Result.Failure).reason)
+                assertFalse(File(root, "hook-skill").exists())
+                assertTrue(
+                    "staging must be cleaned for $ex: ${root.listFiles()!!.toList()}",
+                    root.listFiles()!!.none { it.name.startsWith(".hook-skill.tmp-") || it.name.startsWith(".hook-skill.bak-") },
+                )
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun destRoot_notDirectory_doesNotLeakAbsolutePath() {
+        // destRoot 為檔案時拒裝，且訊息僅含檔名不含絕對路徑（脫敏）。
+        val parent = tempRoot()
+        try {
+            val fileAsRoot = File(parent, "notadir").apply { writeText("x") }
+            val zip = zipOf("leak-skill/SKILL.md" to skillMd(name = "leak-skill").toByteArray(Charsets.UTF_8))
+            val r = SkillInstaller.installZip(zip, fileAsRoot)
+            assertTrue(r is SkillInstaller.Result.Failure)
+            val msg = (r as SkillInstaller.Result.Failure).message
+            assertFalse("must not leak absolute path: $msg", msg.contains(fileAsRoot.absolutePath))
+            assertTrue(msg.contains("notadir"))
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun destRoot_symlink_rejected() {
+        // best-effort 僅擋直接 symlink destRoot（父層/TOCTOU 需呼叫方保證同 destRoot 勿併發）。
+        val parent = tempRoot()
+        try {
+            val real = File(parent, "real").apply { mkdirs() }
+            val link = File(parent, "linkroot")
+            try {
+                java.nio.file.Files.createSymbolicLink(link.toPath(), real.toPath())
+            } catch (e: UnsupportedOperationException) {
+                org.junit.Assume.assumeNoException("platform without symlink", e)
+            } catch (e: java.io.IOException) {
+                org.junit.Assume.assumeNoException("cannot create symlink", e)
+            }
+            val zip = zipOf("link-skill/SKILL.md" to skillMd(name = "link-skill").toByteArray(Charsets.UTF_8))
+            val r = SkillInstaller.installZip(zip, link)
+            assertTrue("symlink destRoot must be rejected, got $r", r is SkillInstaller.Result.Failure)
+            assertEquals(SkillInstaller.Failure.IO_ERROR, (r as SkillInstaller.Result.Failure).reason)
+            assertFalse("symlink 拒裝不得回顯絕對路徑：${r.message}", r.message.contains(link.absolutePath))
+            assertFalse(File(real, "link-skill").exists())
+        } finally {
+            parent.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_futureMtime_treatedAsFresh() {
+        // 未來 mtime（時鐘偏斜）：now-lastModified<0<maxAge，視為 fresh 不刪除（釘選行為）。
+        val root = tempRoot()
+        try {
+            val tid = Thread.currentThread().id
+            val future = File(root, ".atomic-skill.tmp-${System.nanoTime()}-$tid").apply {
+                mkdirs()
+                assertTrue("setLastModified must succeed", setLastModified(System.currentTimeMillis() + 600_000L))
+            }
+            assertEquals(0, SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L))
+            assertTrue(future.exists())
+            assertEquals(0, SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L).size)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun cleanup_fileTypeBak_deletedNotRestored() {
+        // 檔案型 .bak（非目錄）：只刪不恢復，不計歧義。
+        val root = tempRoot()
+        try {
+            val tid = Thread.currentThread().id
+            val fileBak = File(root, ".orphan2-skill.bak-${System.nanoTime()}-$tid").apply {
+                writeText("not a dir")
+                setLastModified(System.currentTimeMillis() - 120_000L)
+            }
+            assertEquals(1, SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L))
+            assertFalse(fileBak.exists())
+            assertFalse(File(root, "orphan2-skill").exists())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test fun dottedId_installAndResidualRoundTrip() {
+        // 點式 id（a.b-c）：貪婪 STAGING_RE/BACKUP_RE 正確往返，不誤判；安裝成功後
+        // 手工殘留同形亦能被 list/cleanup 識別（list 列出、cleanup 按齡期收斂）。
+        val root = tempRoot()
+        try {
+            val zip = zipOf("a.b-c/SKILL.md" to skillMd(name = "a.b-c", body = "點式").toByteArray(Charsets.UTF_8))
+            val r = SkillInstaller.installZip(zip, root, replace = false)
+            assertTrue("expected success, got $r", r is SkillInstaller.Result.Success)
+            assertTrue(File(root, "a.b-c/SKILL.md").isFile)
+            val tid = Thread.currentThread().id
+            val stale = File(root, ".a.b-c.tmp-${System.nanoTime()}-$tid").apply {
+                mkdirs()
+                assertTrue(setLastModified(System.currentTimeMillis() - 120_000L))
+            }
+            assertEquals(1, SkillInstaller.listResiduals(root, maxAgeMillis = 60_000L).size)
+            assertEquals(1, SkillInstaller.cleanupStaleStaging(root, maxAgeMillis = 60_000L))
+            assertFalse(stale.exists())
+        } finally {
+            root.deleteRecursively()
         }
     }
 }

@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Common manifest for all flavors. Only store-safe permissions live here.
-  High-risk permissions (SMS, all-files access) and privileged services
-  (Accessibility, VPN) are declared exclusively in the src/github + src/foss overlays,
-  so the play flavor can never inherit them.
+  High-risk uses-permissions (SMS, all-files access, VPN) are absent in all
+  three flavors; a11y service is declared only in src/foss + src/github
+  overlays (play overlay keeps 6x tools:node="remove" as drift guard for
+  permissions, service hardening relies on DEX superclass + xmltree gates).
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -26,6 +27,30 @@
         </intent>
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <!-- #14 Intent adapter（鬧鐘/日曆）：targetSdk 36 下 API 30+ package
+             visibility 會把未宣告的隱式 Intent 過濾掉，使 resolveActivity 回 null
+             而被誤判為 NO_HANDLER；故補最小可見性（只有本塊三項，不擴大到
+             導航/開 App/音樂——見各工具 KDoc 的缺口註記）。
+             - SET_ALARM：執行期 Intent 無 data，action-only 即可匹配時鐘 App。
+             - INSERT/EDIT：執行期帶 content URI 但無顯式 type；以
+               CalendarContract.Events.CONTENT_TYPE（dir/event）/
+               CONTENT_ITEM_TYPE（item/event）匹配日曆 App 過濾器；queries 的
+               path 屬性一律視為 *，故不寫 data URI。
+             刻意不加任何 uses-permission：SET_ALARM 發送端無需宣告（見
+             AlarmTool KDoc 決策）；DELETE 動作不經 launcher 發射（僅待寫描述）。
+             直啟（setPackage）不採用：OEM 時鐘/日曆包名各異，硬編碼等於猜測
+             包名（#19 猜測執行禁令），且剝奪使用者選擇器。 -->
+        <intent>
+            <action android:name="android.intent.action.SET_ALARM" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.INSERT" />
+            <data android:mimeType="vnd.android.cursor.dir/event" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.EDIT" />
+            <data android:mimeType="vnd.android.cursor.item/event" />
         </intent>
     </queries>
 

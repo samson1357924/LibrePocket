@@ -25,15 +25,25 @@ import java.util.zip.ZipInputStream
  *   原子性由 rename 語義保證）；
  *   replace 時舊版先搬到 `.bak`，成功後刪 bak，失敗回滾 bak；rename 失敗
  *   直接失敗並保留 from→to 根因，不退回拷貝；
- * - 同 skill 安裝互斥（per-skill 鎖），防併發交錯；Current 為錯誤回傳路徑原子
- *   （失敗回滾舊版）；kill -9 等崩潰窗口殘留需呼叫方調 [cleanupStaleStaging]
- *   收斂（Target：接入 production 啟動路徑；目前 LibrePocketApp 尚為空殼、
- *   尚無啟動接線點且無 destRoot 目錄約定，故不硬造接線，恢復能力由測試鎖定）；
- *   未呼叫則孤兒留存，
- *   成功路徑的 `.bak` 殘留由下次清理收斂）；
+ * - 同 skill 安裝互斥（per-skill 鎖），防併發交錯（新鮮安裝與覆蓋同 id 皆序列化）；
+ *   Current 為錯誤回傳路徑原子（失敗回滾舊版，staging 寫入階段故障經 [writeHook]
+ *   注入（test-only，全域非隔離）同樣回滾：新鮮安裝無 target、覆蓋保留舊版）；kill -9 等崩潰窗口殘留由
+ *   [cleanupStaleStaging] 收斂（窗口由測試鎖定：新鮮 staging、覆蓋中雙殘留、
+ *   commit 後孤兒 bak、雙重失敗 bak；同 id 多份 bak 歧義時全保留待人工）。
+ * - 啟動接線決策（#15：明確不接）：[cleanupStaleStaging] 尚未接入
+ *   LibrePocketApp 啟動路徑——LibrePocketApp 仍為空殼、尚無 destRoot 目錄約定
+ *   與登記表持久化，不硬造接線。殘餘記錄：孤兒僅限 destRoot 下嚴格形狀
+ *   `.$id.tmp-…` / `.$id.bak-…`（真實 skill 目錄永不以 `.` 開頭，不會誤傷），
+ *   可經 [listResiduals] 觀察、經下次 [cleanupStaleStaging] 收斂（回傳計數即
+ *   收斂記錄）；接線時呼叫方須記錄回傳計數。未呼叫則孤兒留存，成功路徑的
+ *   `.bak` 殘留同由下次清理收斂；
  * - 同名 Skill 預設保持不變（需 `replace=true` 才覆蓋）。
- * - 已知限制（Target）：`expectedHashes=null` 跳過雜湊比對、無版本比較，
- *   `replace=true` 可靜默降版（舊版覆蓋不擋低版本）。
+ * - 降版政策（#15：揭露不擋）：`version` 為選填自由字串、無可靠全序，
+ *   阻擋「降版」等於猜測比較，故永不因版本阻擋安裝；`replace=true` 已是
+ *   顯式覆蓋意圖，[Result.Success.replacedVersion] 攜帶被覆蓋舊版 version
+ *  （新鮮安裝或舊版無 version 時為 null），呼叫方（安裝確認 UI）須向使用者
+ *   並陳新舊版本。[installedVersion] 供讀取已安裝版。
+ * - 已知限制（Target）：`expectedHashes=null` 跳過雜湊比對。
  */
 object SkillInstaller {
     const val MAX_ENTRIES = 64
@@ -64,32 +74,52 @@ object SkillInstaller {
     }
 
     sealed interface Result {
-        data class Success(val skill: SkillDef) : Result
+        /**
+         * @param replacedVersion 被覆蓋舊版的 `version`（降版揭露用，見類 KDoc）：
+         *   新鮮安裝或舊版無 version 時為 null；讀取舊版 SKILL.md 失敗時亦為 null
+         *  （best-effort，不影響安裝結果）。
+         */
+        data class Success(val skill: SkillDef, val replacedVersion: String? = null) : Result
         data class Failure(val reason: SkillInstaller.Failure, val message: String) : Result
     }
 
     /** 過期 staging 的預設保留期限（啟動清理用）。 */
     const val STALE_STAGING_MAX_AGE_MILLIS = 24L * 60 * 60 * 1000L
 
-    /** 同 skill 互斥鎖（per-skill 序列化併發安裝；實務 skill 數量有界，條目永不驅逐，洩漏可接受）。 */
+    /** 同 skill 互斥鎖（per-skill 序列化併發安裝；distinct id 數量無界，條目永不驅逐，
+     *  呼叫方須限流；leak 可接受但已文件化，見 [lockFor]）。 */
     private val skillLocks = ConcurrentHashMap<String, ReentrantLock>()
 
     /**
      * 取 per-skill 鎖。呼叫方必須只傳 [SkillParser] NAME_RE 合法 id：
      * [installFiles] 在 [SkillParser.parse] 校驗＋NAME_MISMATCH 比對之後才取鎖
      *（`root == manifest.name`，已受 NAME_RE 約束），[cleanupStaleStaging]
-     * 僅對 [SkillParser.isValidName] 通過者取鎖；故 key 空間有界（長度/字符集受限），
+     * 僅對 [SkillParser.isValidName] 通過者取鎖；單 id 長度/字符集受限，
+     * 但 distinct id 數量無界（NAME_RE 未界定個數），呼叫方須限流，
      * 條目永不驅逐。
      */
     internal fun lockFor(skillId: String): ReentrantLock =
         skillLocks.computeIfAbsent(skillId) { ReentrantLock() }
 
-    /** 測試接縫：為 null 時走真實 [File.renameTo]；測試可注入失敗以驗證回滾。 */
+    /**
+     * 測試接縫（僅測試用，全域可變，非執行緒隔離：同一 JVM 內一執行緒設 hook
+     * 影響所有併發安裝；生產不得設定，測試須在 `@After` 重置為 null）。
+     * 為 null 時走真實 [File.renameTo]；測試可注入失敗以驗證回滾。
+     */
     @Volatile
     internal var renameHook: ((from: File, to: File) -> Boolean)? = null
 
     private fun rename(from: File, to: File): Boolean =
         renameHook?.invoke(from, to) ?: from.renameTo(to)
+
+    /**
+     * 測試接縫（僅測試用，全域可變，非執行緒隔離，同 [renameHook]）：
+     * staging 寫入階段故障注入。為 null 時直接寫盤；非 null 時每寫一檔
+     * 前先調用，拋錯即模擬該階段失敗（磁碟滿/IO 錯），安裝以 IO_ERROR 失敗並回滾
+     * （新鮮安裝無 target、覆蓋保留舊版，staging 已清）。
+     */
+    @Volatile
+    internal var writeHook: ((staging: File, rel: String, bytes: ByteArray) -> Unit)? = null
 
     /** 自家 staging／backup 檔名形狀（嚴格錨定；見 [cleanupStaleStaging]）。 */
     private val STAGING_RE = Regex("^\\.(.+)\\.tmp-\\d+-\\d+$")
@@ -205,6 +235,47 @@ object SkillInstaller {
             // best-effort：刪不掉就留下，不影響呼叫方。
             false
         }
+    }
+
+    /**
+     * 讀取已安裝版的 `version`（降版揭露用，見類 KDoc）。
+     *
+     * best-effort：SKILL.md 缺席或解析失敗時回 null，不拋錯、不影響安裝結果。
+     */
+    fun installedVersion(skillDir: File): String? {
+        return try {
+            val md = File(skillDir, SKILL_MD)
+            if (!md.isFile) return null
+            SkillParser.parse(md.readText(Charsets.UTF_8)).manifest.version
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * 殘餘觀察（不刪除、不恢復）：列出 [destRoot] 下已過期的安裝器內部條目
+     * （與 [cleanupStaleStaging] 同形狀同齡期規則），供啟動路徑接線前記錄殘餘。
+     *
+     * 與清理的差異：僅列形狀符合且過期者（含同 id 多份 bak 歧義候選——清理時
+     * 全保留，此處一併列出供人工核對）；實際收斂仍以 [cleanupStaleStaging]
+     * 回傳計數為準。回傳按檔名排序，保證穩定。
+     */
+    fun listResiduals(destRoot: File, maxAgeMillis: Long = STALE_STAGING_MAX_AGE_MILLIS): List<File> {
+        if (!destRoot.isDirectory) return emptyList()
+        val entries = try {
+            destRoot.listFiles()
+        } catch (_: Exception) {
+            null
+        } ?: return emptyList()
+        val now = System.currentTimeMillis()
+        return entries.filter { f ->
+            val n = f.name
+            val stagingId = STAGING_RE.matchEntire(n)?.groupValues?.get(1)
+            val bakId = if (stagingId != null) null else BACKUP_RE.matchEntire(n)?.groupValues?.get(1)
+            if (stagingId == null && bakId == null) return@filter false
+            if (now - f.lastModified() < maxAgeMillis) return@filter false
+            true
+        }.sortedBy { it.name }
     }
 
     /**
@@ -333,16 +404,32 @@ object SkillInstaller {
             enabled = true,
         )
         // 原子提交：staging 先寫入並 best-effort fsync，再同目錄 rename 切換；
+        // 跨進程同 id 併發需外部序列化（staging/bak 後綴 nanoTime-tid 在跨進程可撞，撞即誤刪他方 staging）；
         // replace 時舊版先搬到 .bak，成功後刪 bak，失敗回滾 bak。rename 失敗
-        // 直接失敗並保留 from→to 根因，不退回拷貝。
+        // replace 時舊版先搬到 .bak，成功後刪 bak，失敗回滾 bak。rename 失敗
+        // 直接失敗並保留 from→to 根因，不退回拷貝。覆蓋成功另經 [installedVersion]
+        // 帶回 replacedVersion（降版揭露，best-effort）。
         val lock = lockFor(root)
         lock.lock()
+        // 覆蓋成功時帶回的舊版 version（新鮮安裝保持 null；失敗路徑直接回傳，不用此值）。
+        var replacedVersion: String? = null
         try {
             if (destRoot.exists() && !destRoot.isDirectory) {
                 return Result.Failure(
                     Failure.IO_ERROR,
-                    "cannot create destRoot: not a directory: ${destRoot.path}",
+                    // 脫敏：僅含檔名，不含絕對路徑。
+                    "cannot create destRoot: not a directory: ${destRoot.name}",
                 )
+            }
+            try {
+                // best-effort 僅擋直接 symlink destRoot；父層 symlink/ check-then-use TOCTOU
+                // 需呼叫方保證同 destRoot 勿併發（見 cleanupStaleStaging 契約），此處不承諾完整防禦。
+                if (java.nio.file.Files.isSymbolicLink(destRoot.toPath())) {
+                    return Result.Failure(Failure.IO_ERROR, "destRoot must not be symlink: ${destRoot.name}")
+                }
+            } catch (_: Exception) {
+                // best-effort：判斷失敗即視為不可信，拒裝。
+                return Result.Failure(Failure.IO_ERROR, "cannot trust destRoot: ${destRoot.name}")
             }
             if (!destRoot.exists()) {
                 val made = try {
@@ -351,7 +438,7 @@ object SkillInstaller {
                     false
                 }
                 if (!made && !destRoot.isDirectory) {
-                    throw java.io.IOException("cannot create destRoot ${destRoot.path}")
+                    throw java.io.IOException("cannot create destRoot ${destRoot.name}")
                 }
             }
             val target = File(destRoot, root)
@@ -382,6 +469,8 @@ object SkillInstaller {
                             throw java.io.IOException("cannot create parent ${staging.name}/$rel")
                         }
                     }
+                    // staging 寫入階段故障注入點（null 時直寫；拋錯即該階段失敗）。
+                    writeHook?.invoke(staging, rel, bytes)
                     out.writeBytes(bytes)
                     fsyncBestEffort(out)
                 }
@@ -396,6 +485,8 @@ object SkillInstaller {
                     }
                     fsyncBestEffort(destRoot)
                 } else {
+                    // 降版揭露：先快照舊版 version（best-effort，失敗即 null），成功時帶回。
+                    replacedVersion = installedVersion(target)
                     val backup = File(destRoot, ".$root.bak-${System.nanoTime()}-$tid")
                     if (backup.exists()) backup.deleteRecursively()
                     if (!rename(target, backup)) {
@@ -452,10 +543,10 @@ object SkillInstaller {
             return Result.Failure(Failure.IO_ERROR, "commit failed: ${e.message}")
         } finally {
             lock.unlock()
-            // skill 數量有界，lock 條目永不驅逐：unlock 後再 hasQueuedThreads+remove
-            // 有 TOCTOU 互斥弱化窗口，leak 可接受。
+            // distinct id 數量無界，lock 條目永不驅逐：unlock 後再 hasQueuedThreads+remove
+            // 有 TOCTOU 互斥弱化窗口，leak 可接受但呼叫方須限流。
         }
-        return Result.Success(skill)
+        return Result.Success(skill, replacedVersion)
     }
 
     private class ConstrainedException(val failure: Failure, message: String) : Exception(message)

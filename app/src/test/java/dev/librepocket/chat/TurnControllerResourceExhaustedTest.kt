@@ -244,6 +244,27 @@ class TurnControllerResourceExhaustedTest {
     }
   }
 
+  @Test fun textTooLargeCollectorThrowSuppressesPendingFlush() {
+    // Collector-thrown TEXT_TOO_LARGE (requireTurnTextBudget) takes the
+    // `catch ProviderFailure` path: pending ToolDeltas must not flush.
+    val provider = ResExhaustFakeProvider {
+      flow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        repeat(101) { emit(StreamEvent.TextDelta(0, 0, "y".repeat(1_000))) }
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertSuppressed(c, provider, sink, TEXT_TOO_LARGE)
+    } finally {
+      c.close()
+    }
+  }
+
   @Test fun textTooLargeMarkersAreFatalAndInferAggTooLarge() {
     // Classifier: a text_too_large body snippet is fatal (never retried),
     // consistent with inferAggFailureCodeName and isResourceExhausted.

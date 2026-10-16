@@ -169,11 +169,14 @@ class SessionTranscriptSinkUsageTest {
         // 300 distinct pre-terminal runIds: only the first 256 buffer
         // (insertion order); the rest drop best-effort without throwing.
         repeat(300) { i -> sink.onUsage("r$i", i, i) }
+        // A buffered run must still merge while full (the cap only gates new
+        // runIds, never updates to an already-buffered one).
+        sink.onUsage("r0", 100, 100)
         sink.onTurnSucceeded("r0", "kept", hasReasoning = false)
         sink.onTurnSucceeded("r299", "dropped", hasReasoning = false)
 
         val rows = usageRows(store)
-        assertEquals("usage input=0 output=0", rows.first { it.runId == "r0" }.text)
+        assertEquals("usage input=100 output=100", rows.first { it.runId == "r0" }.text)
         assertTrue("r299 usage must have been dropped", rows.none { it.runId == "r299" })
     }
 

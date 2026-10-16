@@ -20,9 +20,19 @@ import okio.Buffer
 /**
  * D03 Streamable HTTP 傳輸：POST `endpoint(baseUrl)`（使用者自訂完整 URL；bare-origin 自動補 `/mcp`，有 path 原樣保留）+ Bearer（舊 SSE 不做）。
  *
+ * 最小子集警示（#11 Stage2 本 PR 選型，非 Accepted ADR）：本層只發 `tools/list`／`tools/call` 單次 POST；
+ * 不送 `initialize` 交握、不接 SSE event-stream、不跟隨 `nextCursor` 分頁、
+ * 不協商 `protocolVersion`（`2025-11-25`／`2026-07-28` 為 #11 提及的候選修訂號，
+ * repo 內無文本，皆為候選未採納）。
+ * SSE 文本餵給 [McpWire] 一律 `mcp: bad envelope`（見 `McpProtocolContractsTest`）。
+ *
  * 安全約定：
  * - [bearer] 只放 `Authorization` 標頭，永不拼進 body，不寫 log；
  * - 呼叫方（[McpServer]）負責從 KeyVault 取 key、用後即擦，本層不留存；
+ * - 僅放行 `https` 與回環 `http`（見 [McpWire.requireSecureEndpoint]，
+ *   直調亦擋；其餘明文拋 `McpProtocol`）；
+ * - 2xx 配非 JSON Content-Type（如 `text/event-stream`）早擋為 `McpProtocol`
+ *   （不讀滿 body；缺席則交 parser 判定）；
  * - 回傳 null = 本步超時（呼叫方映射為 [McpStatus.TIMEOUT]，不重試）。
  */
 class McpTransport(
@@ -74,6 +84,12 @@ class McpTransport(
         bodyJson: String,
         timeoutMs: Long,
     ): Pair<Int, String?>? {
+        // 縱深：直調 transport 亦 fail-closed（McpServer 已預驗，此處僅防直調）。
+        try {
+            McpWire.requireSecureEndpoint(baseUrl)
+        } catch (e: IllegalArgumentException) {
+            throw McpWire.McpProtocol(e.message ?: "mcp: bad endpoint")
+        }
         // bare-origin 相容：無 path 時 endpoint() 自動補 /mcp（舊配置相容，建議記 warning 提醒手動補完整 path）。
         val url = McpWire.endpoint(baseUrl)
         // 可觀測性：自動補 /mcp 時記 warning（runCatching 使 JVM 單測無 mocked Log 仍綠）。
@@ -124,6 +140,17 @@ class McpTransport(
                             }
                             code to null
                         } else {
+                            // 子集聲明僅收 JSON：2xx 配非 JSON Content-Type（如 event-stream）
+                            // 即早擋（cancel + 拋 McpProtocol），不讀滿 256KiB 才判；
+                            // Content-Type 缺席則放行交 parser 判定（相容 MockWebServer 預設）。
+                            val ct = resp.body?.contentType()
+                            if (ct != null && !ct.toString().contains("json", ignoreCase = true)) {
+                                try {
+                                    call.cancel()
+                                } catch (_: Exception) {
+                                }
+                                throw McpWire.McpProtocol("mcp: bad content-type")
+                            }
                             val text = readBoundedBody(resp.body) {
                                 try {
                                     call.cancel()

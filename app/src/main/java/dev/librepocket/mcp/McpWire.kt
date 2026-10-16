@@ -1,15 +1,17 @@
 package dev.librepocket.mcp
 
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+
 /**
  * D03 JSON-RPC 2.0 編解碼（Streamable HTTP 最小子集，原創）。
  *
- * 線路形狀（本包自定最小 Sup 集合，不依賴 org.json 以保持純 JVM 可測）：
- * - tools/list 请求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/list","params":{}}`
+ * 線路形狀（本包自定最小 subset 集合，不依賴 org.json 以保持純 JVM 可測）：
+ * - tools/list 請求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/list","params":{}}`
  * - tools/list 回應：`{"jsonrpc":"2.0","id":<n>,"result":{"tools":[
  *     {"name":"..","description":"..","inputSchema":{...}}, ... ]}}`
- * - tools/call 请求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/call",
+ * - tools/call 請求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/call",
  *     "params":{"name":"..","arguments":{... raw json ...}}}`
- *   `argumentsJson` 由呼叫方保證為合法 JSON object 文本（上層已過 Schema 校驗）。
+ *   `argumentsJson` 呼叫方可預檢，本函仍自驗證 fail-closed（非 object 即拋，不發送）。
  * - tools/call 回應：`{"jsonrpc":"2.0","id":<n>,"result":{
  *     "content":[...],"isError":false}}`；或 `{"error":{"code":..,"message":".."}}`。
  *
@@ -20,6 +22,13 @@ package dev.librepocket.mcp
  *
  * 已知非目標（follow-up，不在本層驗證）：`jsonrpc == "2.0"` 版本斷言、
  * response id 與 request id 對應（呼叫方以 HTTP 一問一答配對，不做 id 複用檢查）。
+ *
+ * 修訂立場（#11 Stage2 本 PR 選型，非 Accepted ADR；單一傳輸子集起步）：
+ * `2025-11-25` 與 `2026-07-28`（#11 提及的候選修訂號，repo 內無文本）
+ * 皆為候選未採納（repo 內無規格文本、無外網可核對，不寫差異表）；本物件只保證
+ * `tools/list`＋`tools/call` 單頁 POST 子集，不送 `initialize`、不接 SSE stream、
+ * 不跟隨 `nextCursor` 分頁、不協商 `protocolVersion`。契約見
+ * `McpProtocolContractsTest`；修訂支援須先納規格文本再逐項補契約。
  */
 internal object McpWire {
 
@@ -32,8 +41,8 @@ internal object McpWire {
      */
     private fun isJsonWs(c: Char): Boolean = c == ' ' || c == '\t' || c == '\n' || c == '\r'
 
-    /** JSON 字面量（true/false/null/number）校驗：非法字面量一律視為無效。 */
-    private val NUMBER_RE = Regex("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")
+    /** JSON 字面量（true/false/null/number）校驗：非法字面量一律視為無效（全字串匹配，錨點顯式鎖定）。 */
+    private val NUMBER_RE = Regex("^-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?$")
 
     /** 遞迴深度上限：超過拋 `mcp: too deep`（防 StackOverflow；MCP payload 不可能 64 層）。 */
     private const val MAX_DEPTH = 64
@@ -132,7 +141,13 @@ internal object McpWire {
                         'u' -> {
                             if (p + 4 > json.length) throw McpProtocol("mcp: bad envelope")
                             val hex = json.substring(p, p + 4)
-                            sb.append(hex.toIntOrNull(16)?.toChar() ?: throw McpProtocol("mcp: bad envelope"))
+                            if (hex.length != 4 || !hex.all {
+                                    it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F'
+                                }
+                            ) {
+                                throw McpProtocol("mcp: bad envelope")
+                            }
+                            sb.append(hex.toInt(16).toChar())
                             p += 4
                         }
                         else -> throw McpProtocol("mcp: bad envelope")
@@ -316,11 +331,55 @@ internal object McpWire {
         return pathStart < 0
     }
 
+    /**
+     * 安全端點預驗（fail-closed，供 [McpServer] 在碰 vault／發送前呼叫）。
+     *
+     * - 空白即拋 `mcp: blank endpoint`；
+     * - 經 [endpoint] 正規化後必須能解析為 http(s) URL，否則拋 `mcp: bad endpoint`；
+     * - 僅放行 `https`，以及回環 `http`（`localhost`／`127.0.0.1`／`[::1]`，
+     *   供 MockWebServer／本機開發；其餘 `http` 一律拋 `mcp: insecure endpoint`）。
+     * 回傳正規化後 endpoint（可直接發送）。
+     */
+    fun requireSecureEndpoint(baseUrl: String): String {
+        if (baseUrl.isBlank()) throw IllegalArgumentException("mcp: blank endpoint")
+        val url = endpoint(baseUrl)
+        val parsed = try {
+            url.toHttpUrlOrNull()
+        } catch (_: Exception) {
+            null
+        } ?: throw IllegalArgumentException("mcp: bad endpoint")
+        if (parsed.scheme == "https") return url
+        if (parsed.scheme == "http" && isLoopbackHost(parsed.host)) return url
+        throw IllegalArgumentException("mcp: insecure endpoint")
+    }
+
+    internal fun isLoopbackHost(host: String): Boolean {
+        val h = host.trim().trim('[', ']').lowercase()
+        return h == "localhost" || h == "127.0.0.1" || h == "::1"
+    }
+
     fun listBody(id: Long = 1L): String =
         """{"jsonrpc":"2.0","id":$id,"method":"tools/list","params":{}}"""
 
+    /**
+     * 組裝 tools/call 請求體（fail-closed）。
+     *
+     * - `toolName` 空白即拋（不送 `"name":""` 無效請求）；
+     * - `argumentsJson` 必須是合法 JSON object 文本（空字串視為 `{}`），
+     *   非 object（`null`／陣列／畸形）即拋，不發送；
+     * - `toolName` 經 [esc] 轉義（含 `\b`／`\f`／C0 控制字元 `\\u00XX`）。
+     */
     fun callBody(toolName: String, argumentsJson: String, id: Long = 2L): String {
+        require(toolName.isNotBlank()) { "mcp: blank tool name" }
         val args = argumentsJson.trim().ifEmpty { "{}" }
+        // fail-closed：arguments 必須是合法 JSON object 文本（上層不再另行保證，
+        // 此處直接驗證；非法即拋，呼叫方在發送前擋下，不送畸形 JSON-RPC）。
+        val parsed = try {
+            parseStrictDoc(args)
+        } catch (e: McpProtocol) {
+            throw IllegalArgumentException("mcp: bad arguments: ${e.message}")
+        }
+        if (parsed !is JObj) throw IllegalArgumentException("mcp: bad arguments")
         return """{"jsonrpc":"2.0","id":$id,"method":"tools/call"""" +
             ""","params":{"name":"${esc(toolName)}","arguments":$args}}"""
     }
@@ -378,6 +437,11 @@ internal object McpWire {
      * `isError`/`content` 只認頂層 `result` 物件的直接成員（DOM depth-1），
      * 巢狀同名鍵不得誤判；缺 `result` 即拋 IllegalArgumentException（fail-closed）。
      * 回傳的 resultJson 用 DOM 節點 `raw`（content 優先，否則整包 result）。
+     *
+     * 已知限制（鎖定現狀，不視為相容承諾）：
+     * - 空 `result`（`{}`，既無 `content` 又無 `structuredContent`）視為 OK
+     *  （`resultJson="{}"`，`isError=false`）；
+     * - `content` 存在時 `structuredContent` 被丟棄（僅保留 `content.raw`）。
      */
     fun parseCall(json: String): Pair<String?, Boolean> {
         if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
@@ -427,10 +491,16 @@ internal object McpWire {
             when (c) {
                 '"' -> sb.append("\\\"")
                 '\\' -> sb.append("\\\\")
+                '\b' -> sb.append("\\b")
+                '\u000C' -> sb.append("\\f")
                 '\n' -> sb.append("\\n")
                 '\r' -> sb.append("\\r")
                 '\t' -> sb.append("\\t")
-                else -> sb.append(c)
+                else -> if (c.code < 0x20) {
+                    sb.append("\\u%04x".format(c.code))
+                } else {
+                    sb.append(c)
+                }
             }
         }
         return sb.toString()

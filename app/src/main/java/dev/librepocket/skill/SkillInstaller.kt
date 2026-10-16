@@ -27,7 +27,7 @@ import java.util.zip.ZipInputStream
  *   直接失敗並保留 from→to 根因，不退回拷貝；
  * - 同 skill 安裝互斥（per-skill 鎖），防併發交錯（新鮮安裝與覆蓋同 id 皆序列化）；
  *   Current 為錯誤回傳路徑原子（失敗回滾舊版，staging 寫入階段故障經 [writeHook]
- *   注入同樣回滾：新鮮安裝無 target、覆蓋保留舊版）；kill -9 等崩潰窗口殘留由
+ *   注入（test-only，全域非隔離）同樣回滾：新鮮安裝無 target、覆蓋保留舊版）；kill -9 等崩潰窗口殘留由
  *   [cleanupStaleStaging] 收斂（窗口由測試鎖定：新鮮 staging、覆蓋中雙殘留、
  *   commit 後孤兒 bak、雙重失敗 bak；同 id 多份 bak 歧義時全保留待人工）。
  * - 啟動接線決策（#15：明確不接）：[cleanupStaleStaging] 尚未接入
@@ -86,20 +86,26 @@ object SkillInstaller {
     /** 過期 staging 的預設保留期限（啟動清理用）。 */
     const val STALE_STAGING_MAX_AGE_MILLIS = 24L * 60 * 60 * 1000L
 
-    /** 同 skill 互斥鎖（per-skill 序列化併發安裝；實務 skill 數量有界，條目永不驅逐，洩漏可接受）。 */
+    /** 同 skill 互斥鎖（per-skill 序列化併發安裝；distinct id 數量無界，條目永不驅逐，
+     *  呼叫方須限流；leak 可接受但已文件化，見 [lockFor]）。 */
     private val skillLocks = ConcurrentHashMap<String, ReentrantLock>()
 
     /**
      * 取 per-skill 鎖。呼叫方必須只傳 [SkillParser] NAME_RE 合法 id：
      * [installFiles] 在 [SkillParser.parse] 校驗＋NAME_MISMATCH 比對之後才取鎖
      *（`root == manifest.name`，已受 NAME_RE 約束），[cleanupStaleStaging]
-     * 僅對 [SkillParser.isValidName] 通過者取鎖；故 key 空間有界（長度/字符集受限），
+     * 僅對 [SkillParser.isValidName] 通過者取鎖；單 id 長度/字符集受限，
+     * 但 distinct id 數量無界（NAME_RE 未界定個數），呼叫方須限流，
      * 條目永不驅逐。
      */
     internal fun lockFor(skillId: String): ReentrantLock =
         skillLocks.computeIfAbsent(skillId) { ReentrantLock() }
 
-    /** 測試接縫：為 null 時走真實 [File.renameTo]；測試可注入失敗以驗證回滾。 */
+    /**
+     * 測試接縫（僅測試用，全域可變，非執行緒隔離：同一 JVM 內一執行緒設 hook
+     * 影響所有併發安裝；生產不得設定，測試須在 `@After` 重置為 null）。
+     * 為 null 時走真實 [File.renameTo]；測試可注入失敗以驗證回滾。
+     */
     @Volatile
     internal var renameHook: ((from: File, to: File) -> Boolean)? = null
 
@@ -107,7 +113,8 @@ object SkillInstaller {
         renameHook?.invoke(from, to) ?: from.renameTo(to)
 
     /**
-     * 測試接縫：staging 寫入階段故障注入。為 null 時直接寫盤；非 null 時每寫一檔
+     * 測試接縫（僅測試用，全域可變，非執行緒隔離，同 [renameHook]）：
+     * staging 寫入階段故障注入。為 null 時直接寫盤；非 null 時每寫一檔
      * 前先調用，拋錯即模擬該階段失敗（磁碟滿/IO 錯），安裝以 IO_ERROR 失敗並回滾
      * （新鮮安裝無 target、覆蓋保留舊版，staging 已清）。
      */
@@ -397,6 +404,8 @@ object SkillInstaller {
             enabled = true,
         )
         // 原子提交：staging 先寫入並 best-effort fsync，再同目錄 rename 切換；
+        // 跨進程同 id 併發需外部序列化（staging/bak 後綴 nanoTime-tid 在跨進程可撞，撞即誤刪他方 staging）；
+        // replace 時舊版先搬到 .bak，成功後刪 bak，失敗回滾 bak。rename 失敗
         // replace 時舊版先搬到 .bak，成功後刪 bak，失敗回滾 bak。rename 失敗
         // 直接失敗並保留 from→to 根因，不退回拷貝。覆蓋成功另經 [installedVersion]
         // 帶回 replacedVersion（降版揭露，best-effort）。
@@ -408,8 +417,19 @@ object SkillInstaller {
             if (destRoot.exists() && !destRoot.isDirectory) {
                 return Result.Failure(
                     Failure.IO_ERROR,
-                    "cannot create destRoot: not a directory: ${destRoot.path}",
+                    // 脫敏：僅含檔名，不含絕對路徑。
+                    "cannot create destRoot: not a directory: ${destRoot.name}",
                 )
+            }
+            try {
+                // best-effort 僅擋直接 symlink destRoot；父層 symlink/ check-then-use TOCTOU
+                // 需呼叫方保證同 destRoot 勿併發（見 cleanupStaleStaging 契約），此處不承諾完整防禦。
+                if (java.nio.file.Files.isSymbolicLink(destRoot.toPath())) {
+                    return Result.Failure(Failure.IO_ERROR, "destRoot must not be symlink: ${destRoot.name}")
+                }
+            } catch (_: Exception) {
+                // best-effort：判斷失敗即視為不可信，拒裝。
+                return Result.Failure(Failure.IO_ERROR, "cannot trust destRoot: ${destRoot.name}")
             }
             if (!destRoot.exists()) {
                 val made = try {
@@ -418,7 +438,7 @@ object SkillInstaller {
                     false
                 }
                 if (!made && !destRoot.isDirectory) {
-                    throw java.io.IOException("cannot create destRoot ${destRoot.path}")
+                    throw java.io.IOException("cannot create destRoot ${destRoot.name}")
                 }
             }
             val target = File(destRoot, root)
@@ -523,8 +543,8 @@ object SkillInstaller {
             return Result.Failure(Failure.IO_ERROR, "commit failed: ${e.message}")
         } finally {
             lock.unlock()
-            // skill 數量有界，lock 條目永不驅逐：unlock 後再 hasQueuedThreads+remove
-            // 有 TOCTOU 互斥弱化窗口，leak 可接受。
+            // distinct id 數量無界，lock 條目永不驅逐：unlock 後再 hasQueuedThreads+remove
+            // 有 TOCTOU 互斥弱化窗口，leak 可接受但呼叫方須限流。
         }
         return Result.Success(skill, replacedVersion)
     }

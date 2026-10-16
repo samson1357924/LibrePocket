@@ -25,6 +25,6 @@ google-services.json
 # Built artifacts (covered by /build/ too, belt and suspenders for strays).
 *.apk
 *.aab
-# Local verification/device logs must never be committed (explicit paths only).
+# Local verification/device logs must never be committed (explicit filename patterns only, not blanket *.log).
 device_*.log
 verify_*.log

@@ -24,7 +24,7 @@ interface SystemTool<P> {
 data class ToolDescriptor(
   val name: String,
   val level: SideEffectLevel,
-  /** 單次執行的超時毫秒（ARCH §9.1：每個快通道工具宣告超時；目前僅宣告未強制，見各工具 KDoc）。 */
+  /** 單次執行的超時毫秒（每個快通道工具宣告超時；目前僅宣告未強制，見各工具 KDoc）。 */
   val timeoutMs: Long,
   val description: String = "",
 )

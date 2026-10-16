@@ -41,6 +41,81 @@ class TagVersionError(Exception):
     """A fail-closed tag/version mismatch."""
 
 
+def _strip_kotlin_comments(text: str) -> str:
+    """Replace Kotlin comments with spaces (newlines preserved).
+
+    Strips ``//`` line comments and nestable ``/* ... */`` block comments
+    so commented-out literals can never satisfy the exactly-one gate.
+    Double-quoted and triple-quoted strings as well as character literals
+    are preserved, so ``//`` or ``/*`` inside a version string is never
+    treated as a comment. Unterminated block comments blank through EOF;
+    unterminated strings/literals are preserved as-is (still fail-closed
+    via the exactly-one gate).
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith('"""', i):
+            end = text.find('"""', i + 3)
+            i = n if end == -1 else end + 3
+        elif text[i] == "'":
+            # Kotlin character literal ('a', '\'', '\\', '\uXXXX'): skip it
+            # so a '"' inside never opens a phantom string.
+            i += 1
+            while i < n and text[i] != "\n":
+                if text[i] == "\\":
+                    nxt = text[i + 1 : i + 2]
+                    if nxt == "" or nxt == "\n":
+                        break  # unterminated escape at EOL
+                    if nxt == "u":
+                        if "\n" in text[i : i + 6] or len(text) < i + 6:
+                            break  # unterminated \u escape
+                        i += 6  # \uXXXX
+                    else:
+                        i += 2
+                elif text[i] == "'":
+                    i += 1
+                    break
+                else:
+                    i += 1
+        elif text[i] == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                elif text[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+        elif text.startswith("/*", i):
+            depth = 0
+            while i < n:
+                if text.startswith("/*", i):
+                    depth += 1
+                    out[i] = " "
+                    out[i + 1] = " "
+                    i += 2
+                elif text.startswith("*/", i):
+                    depth -= 1
+                    out[i] = " "
+                    out[i + 1] = " "
+                    i += 2
+                    if depth == 0:
+                        break
+                else:
+                    if text[i] != "\n":
+                        out[i] = " "
+                    i += 1
+        elif text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+        else:
+            i += 1
+    return "".join(out)
+
+
 def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
     if not isinstance(gradle_path, (str, os.PathLike)):
         raise TagVersionError("Gradle file path must be a string")
@@ -62,10 +137,11 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
     # NOTE: `versionNameSuffix` (debug "-debug") must not match; the pattern
     # requires `versionName` followed directly by `=`, so the longer
     # `versionNameSuffix = ...` line cannot match.
-    # Trailing `//` comments are allowed and stripped before matching so a
-    # legitimate edit with an end-of-line comment is not misreported.
-    codes = re.findall(r"(?m)^\s*versionCode\s*=\s*([0-9]+)\s*(?://.*)?$", text)
-    names = re.findall(r'(?m)^\s*versionName\s*=\s*"([^"]+)"\s*(?://.*)?$', text)
+    # Kotlin comments are stripped first so commented-out literals can never
+    # satisfy the gate; trailing `//` comments are tolerated.
+    stripped = _strip_kotlin_comments(text)
+    codes = re.findall(r"(?m)^\s*versionCode\s*=\s*([0-9]+)\s*$", stripped)
+    names = re.findall(r'(?m)^\s*versionName\s*=\s*"([^"]+)"\s*$', stripped)
     if len(codes) != 1:
         raise TagVersionError(
             f"Gradle file must contain exactly one versionCode assignment (found {len(codes)})"

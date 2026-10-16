@@ -1001,6 +1001,91 @@ class ReleaseTagVersionTest(unittest.TestCase):
         with self.assertRaisesRegex(tag_version.TagVersionError, "exceeds"):
             tag_version.parse_gradle_version(str(big))
 
+    def test_block_commented_literals_cannot_satisfy_the_gate(self) -> None:
+        commented = self.tmp / "commented.gradle.kts"
+        commented.write_text(
+            "/*\n"
+            'versionCode = 1\nversionName = "0.1.0"\n'
+            "*/\n"
+            "android {\n"
+            "  defaultConfig {\n"
+            '    versionCode = System.getenv("VERSION_CODE")?.toInt() ?: 9\n'
+            '    versionName = System.getenv("VERSION_NAME") ?: "9.9.9"\n'
+            "  }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.parse_gradle_version(str(commented))
+
+    def test_kdoc_nested_and_inline_block_comments(self) -> None:
+        kdoc = self.tmp / "kdoc.gradle.kts"
+        kdoc.write_text(
+            "/**\n"
+            ' * versionCode = 1\n * versionName = "0.1.0"\n'
+            " */\n"
+            'versionCode = 7\nversionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(kdoc)), (7, "1.2.3"))
+        nested = self.tmp / "nested.gradle.kts"
+        nested.write_text(
+            "/* outer /* inner */ still comment\n"
+            'versionCode = 1\nversionName = "0.1.0"\n'
+            "*/\n"
+            'versionCode = 7\nversionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(nested)), (7, "1.2.3"))
+        inline = self.tmp / "inline.gradle.kts"
+        inline.write_text(
+            "versionCode = 7 /* trailing block */\n"
+            'versionName = "1.2.3" /* trailing block */\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(inline)), (7, "1.2.3"))
+
+    def test_line_comment_markers_inside_strings_are_preserved(self) -> None:
+        full_line = self.tmp / "full-line.gradle.kts"
+        full_line.write_text(
+            "// versionCode = 999\n"
+            '// versionName = "9.9.9"\n'
+            'versionCode = 7\nversionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(full_line)), (7, "1.2.3"))
+        in_string = self.tmp / "in-string.gradle.kts"
+        in_string.write_text(
+            'versionCode = 7\nversionName = "1.2.3 // x"\n', encoding="utf-8"
+        )
+        code, name = tag_version.parse_gradle_version(str(in_string))
+        self.assertEqual((code, name), (7, "1.2.3 // x"))
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.check_tag_version("v1.2.3", code, name)
+
+    def test_char_literal_cannot_shadow_comments(self) -> None:
+        # A '"' inside a char literal must not open a phantom string that
+        # protects a commented-out value: the commented 999 must not win.
+        tricky = self.tmp / "char-literal.gradle.kts"
+        tricky.write_text(
+            "val c = '\"'\n"
+            "versionCode = 1 // keep\n"
+            "/*\n"
+            "versionCode = 999\n"
+            "*/\n"
+            'versionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(tricky)), (1, "1.2.3"))
+        escaped = self.tmp / "char-escape.gradle.kts"
+        escaped.write_text(
+            "val q = '\\u0027'\n"
+            "versionCode = 7 // comment\n"
+            'versionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(escaped)), (7, "1.2.3"))
+
     def test_cli_accepts_matching_tag_and_rejects_mismatch(self) -> None:
         path = self._write_gradle(version_code="7", version_name_line='versionName = "1.2.3"')
         good = subprocess.run(

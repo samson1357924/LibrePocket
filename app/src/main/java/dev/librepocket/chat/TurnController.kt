@@ -21,6 +21,7 @@ import dev.librepocket.provider.requireTotalToolAggBudget
 import dev.librepocket.provider.requireTurnTextBudget
 import dev.librepocket.redact.Redactor
 import java.io.IOException
+import dev.librepocket.router.SafeToolSlice
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -247,14 +248,23 @@ internal enum class DurableAdmission {
  * and isolated assistant/tool aggregation, with at most four provider attempts
  * per logical turn.
  *
- * SCAFFOLD (PR#1 re-review, P1 scope): this PR records ToolDone only and never
- * executes tools — no ToolDispatcher/FastRouter/PrivilegeGate/ElevatedDispatch
- * product wiring yet. Projection NATIVE means switch/flavor semantics only;
- * model visibility additionally requires `ToolDef.executionReady` (see
+ * SCAFFOLD (PR#1 re-review, P1 scope): without a tool loop this controller
+ * records ToolDone only and never executes tools — no
+ * ToolDispatcher/FastRouter/PrivilegeGate/ElevatedDispatch product wiring
+ * yet. Projection NATIVE means switch/flavor semantics only; model visibility
+ * additionally requires `ToolDef.executionReady` (see
  * [ToolRegistry.visibleTools], the ONLY list that may be sent to the model),
- * which is false for all 41 tools in this PR.
- * The true product tool loop (dispatcher + grant/confirm + Android executors +
- * E2E) lands in the wiring PR, which flips tools to ready one by one.
+ * which is true for exactly one tool (the P2 slice `lsp.symbols`) and false
+ * for the other 40. The remaining product tool loop (grant/confirm + Android
+ * executors + E2E per tool) still lands tool-by-tool in wiring PRs.
+ *
+ * P2 safe slice (#19, default-off): when constructed with a [SafeToolSlice],
+ * the single wired tool (`lsp.symbols`, the only `executionReady=true` entry)
+ * runs a same-turn closed loop — request tools → model ToolDone → schema
+ * validation → latest scope/policy re-check → executor → typed result →
+ * provider continuation → final UI/transcript. All other tools stay
+ * records-only; without a loop (null, the production composition) nothing
+ * executes and the request stays pure-chat.
  *
  * Execution-basis policy: every turn (including steered follow-ups) is gated
  * by [PolicyStore.evaluateFresh]. [PolicyStore.evaluate] is UI pre-display
@@ -429,6 +439,14 @@ class TurnController(
    * legacy-path tests as well; production 60 is shared by both paths.
    */
   private val cancelReceiptMaxRounds: Int = CANCEL_RECEIPT_MAX_ROUNDS,
+  /**
+   * P2 safe slice (#19, default-off): the single-tool closed loop. Null
+   * (production composition and all pre-slice tests) keeps records-only
+   * behavior: ToolDone markers persist, nothing executes, requests carry no
+   * tools. Non-null runs the `lsp.symbols` same-turn continuation (request
+   * tools → execute → typed result → one continuation request → final).
+   */
+  private val toolSlice: SafeToolSlice? = null,
 ) {
   companion object {
     const val POLICY_ACTION = "chat.send"
@@ -4708,6 +4726,10 @@ class TurnController(
       // decrement it); retries start a fresh attempt with fresh counters.
       var totalToolAggChars = 0
       val distinctToolIndexes = mutableSetOf<Int>()
+      // P2 slice: completed model calls for the single wired tool, executed
+      // after a successful collect (same turn). Calls for any other tool stay
+      // records-only (marker + transcript, never executed).
+      val sliceCalls = mutableListOf<dev.librepocket.provider.ToolCall>()
       suspend fun flushPendingTools() {
         // Atomicity: preflight every pending index (including the synthetic
         // id/name defaults, which delta billing never sees) before any
@@ -4886,6 +4908,18 @@ class TurnController(
               writeNotice {
                 orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
               }
+              // P2 slice: only the single wired tool proceeds to execution
+              // (after a successful collect, same turn); everything else stays
+              // records-only even when a loop is attached.
+              if (toolSlice != null && event.name == SafeToolSlice.TOOL_NAME) {
+                sliceCalls.add(
+                  dev.librepocket.provider.ToolCall(
+                    id = event.id,
+                    name = event.name,
+                    argumentsJson = event.argumentsJson,
+                  ),
+                )
+              }
             }
             is StreamEvent.Usage -> {
               // Authoritative per-attempt usage (#84): merge last-wins (null
@@ -4940,6 +4974,27 @@ class TurnController(
         }
         if (!done && failed == null) {
           failed = StreamEvent.Failed("truncated stream", retryable = true)
+        }
+        // P2 slice (default-off): same-turn tool continuation for the single
+        // wired tool. Cancel between collect and execution aborts here with
+        // zero further effects (ensureActive + the loop's own checks throw
+        // CancellationException, which the catch below rethrows). A failed
+        // continuation falls into the existing retry/terminal logic below.
+        // Budget: exactly one tool round per turn — continuation ToolDones
+        // are recorded, never executed (see collectToolContinuation).
+        val loop = toolSlice
+        if (failed == null && done && loop != null && sliceCalls.isNotEmpty()) {
+          coroutineContext.ensureActive()
+          val sliceResults = loop.execute(sliceCalls)
+          for (r in sliceResults) {
+            appendAssistantText(attemptRunId, "\n[tool-result:${r.name} ${r.resultJson}]")
+          }
+          val contRequest = buildToolContinuation(images, sliceCalls, sliceResults, loop)
+          val contOutcome = collectToolContinuation(contRequest, attemptRunId, totalToolAggChars)
+          totalToolAggChars = contOutcome.totalToolAggChars
+          if (contOutcome.failed != null) {
+            failed = contOutcome.failed
+          }
         }
       } catch (e: CancellationException) {
         throw e
@@ -5199,6 +5254,169 @@ class TurnController(
     }
   }
 
+  /** Outcome of the P2 slice continuation collect: terminal failure (if any) plus the updated per-attempt tool total. */
+  private data class ContinuationOutcome(val failed: StreamEvent.Failed?, val totalToolAggChars: Int)
+
+  /**
+   * P2 slice continuation request: the current history/user context plus the
+   * structured tool round (assistant `toolCalls` + paired `tool` results, both
+   * executed and denied — pairing is total). The in-progress assistant block
+   * is partial, so [buildRequest] excludes its marker text; the wire carries
+   * the structured round instead. Tools stay attached (same offer): a second
+   * model tool call is recorded but never executed (one tool round per turn).
+   */
+  private fun buildToolContinuation(
+    images: List<ChatImageRef>,
+    calls: List<dev.librepocket.provider.ToolCall>,
+    results: List<SafeToolSlice.ToolResult>,
+    loop: SafeToolSlice,
+  ): ChatRequest {
+    val base = buildRequest(images)
+    return base.copy(messages = base.messages + loop.continuationMessages(calls, results))
+  }
+
+  /**
+   * P2 slice continuation collect: mirrors the attempt collect above
+   * (text/reasoning/usage/notice handling identical) with record-only tool
+   * semantics — ToolDone/pending ToolDeltas get markers + transcript records
+   * but are never executed, enforcing the one-tool-round-per-turn budget.
+   * Aggregation budgets share the attempt total ([attemptTotalChars] in,
+   * updated total out); index-keyed maps are fresh per response (provider
+   * tool indexes restart per response, so cross-round sharing would forge
+   * false duplicates).
+   */
+  private suspend fun collectToolContinuation(
+    request: ChatRequest,
+    attemptRunId: String,
+    attemptTotalChars: Int,
+  ): ContinuationOutcome {
+    var totalToolAggChars = attemptTotalChars
+    val distinctToolIndexes = mutableSetOf<Int>()
+    val toolArgText = mutableMapOf<Int, StringBuilder>()
+    val toolIdText = mutableMapOf<Int, StringBuilder>()
+    val toolNameText = mutableMapOf<Int, StringBuilder>()
+    val toolDoneSeen = mutableSetOf<Int>()
+    suspend fun flushPendingTools() {
+      for ((index, args) in toolArgText) {
+        if (index !in toolDoneSeen) {
+          val id = toolIdText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
+          val name = toolNameText[index]?.toString().orEmpty().ifEmpty { "pending" }
+          val argsStr = args.toString()
+          requireToolAggBudget(0, id.length + name.length + argsStr.length)
+          appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
+          writeNotice { orderedTranscript.onToolDone(attemptRunId, index, id, name, argsStr) }
+        }
+      }
+    }
+    var failed: StreamEvent.Failed? = null
+    var done = false
+    try {
+      provider.stream(request).collect { event ->
+        coroutineContext.ensureActive()
+        if (done || failed != null) return@collect
+        when (event) {
+          is StreamEvent.TextDelta -> {
+            streamedTextDeltaCount++
+            appendAssistantText(attemptRunId, event.delta)
+          }
+          is StreamEvent.ReasoningDelta -> {
+            streamedTextDeltaCount++
+            appendReasoningDelta(attemptRunId, event.delta)
+          }
+          is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
+          is StreamEvent.ToolDelta -> {
+            val bufferedArgs = toolArgText[event.toolIndex]?.length ?: 0
+            val bufferedId = toolIdText[event.toolIndex]?.length ?: 0
+            val bufferedName = toolNameText[event.toolIndex]?.length ?: 0
+            val idIncoming =
+              if (event.idChunk != null && event.idChunk.isNotEmpty() && bufferedId == 0) {
+                event.idChunk.length
+              } else {
+                0
+              }
+            val nameIncoming =
+              if (event.nameChunk != null && event.nameChunk.isNotEmpty() && bufferedName == 0) {
+                event.nameChunk.length
+              } else {
+                0
+              }
+            val toolIncoming = event.argsChunk.length + idIncoming + nameIncoming
+            if (!distinctToolIndexes.contains(event.toolIndex)) {
+              requireToolCountBudget(distinctToolIndexes.size + 1)
+              distinctToolIndexes.add(event.toolIndex)
+            }
+            requireToolAggBudget(bufferedArgs + bufferedId + bufferedName, toolIncoming)
+            requireTotalToolAggBudget(totalToolAggChars, toolIncoming)
+            toolArgText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
+            if (idIncoming > 0) {
+              toolIdText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.idChunk!!)
+            }
+            if (nameIncoming > 0) {
+              toolNameText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.nameChunk!!)
+            }
+            totalToolAggChars += toolIncoming
+          }
+          is StreamEvent.ToolDone -> {
+            // Record-only (slice budget): never executed, even for the wired
+            // tool — the turn's single tool round already ran.
+            if (event.toolIndex in toolDoneSeen) return@collect
+            val toolDoneCandidate =
+              event.id.length + event.name.length + event.argumentsJson.length
+            requireToolAggBudget(0, toolDoneCandidate)
+            if (event.toolIndex !in distinctToolIndexes) {
+              requireToolCountBudget(distinctToolIndexes.size + 1)
+            }
+            val toolDoneBuffered =
+              (toolArgText[event.toolIndex]?.length ?: 0) +
+                (toolIdText[event.toolIndex]?.length ?: 0) +
+                (toolNameText[event.toolIndex]?.length ?: 0)
+            val toolDoneGrowth = (toolDoneCandidate - toolDoneBuffered).coerceAtLeast(0)
+            requireTotalToolAggBudget(totalToolAggChars, toolDoneGrowth)
+            distinctToolIndexes.add(event.toolIndex)
+            totalToolAggChars += toolDoneGrowth
+            toolDoneSeen.add(event.toolIndex)
+            appendAssistantText(attemptRunId, "\n[tool:${event.name} ${event.argumentsJson}]")
+            writeNotice {
+              orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
+            }
+          }
+          is StreamEvent.Usage -> {
+            lastUsage = event
+            writeNotice { orderedTranscript.onUsage(attemptRunId, event.inputTokens, event.outputTokens) }
+          }
+          is StreamEvent.Done -> {
+            finalizeAssistant(attemptRunId)
+            done = true
+          }
+          is StreamEvent.Failed -> failed = event
+          is StreamEvent.Retrying -> {
+            writeNotice { orderedTranscript.onTurnRetried(attemptRunId, event.attempt, event.maxAttempts, event.delayMs) }
+          }
+        }
+      }
+      if (!isResourceExhausted(failed)) {
+        flushPendingTools()
+      }
+      if (!done && failed == null) {
+        failed = StreamEvent.Failed("truncated stream", retryable = true)
+      }
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: ProviderFailure) {
+      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = e.retryable)
+      if (e.code != ProviderFailureCode.AGG_TOO_LARGE) {
+        flushPendingTools()
+      }
+    } catch (e: Exception) {
+      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
+      flushPendingTools()
+    } catch (e: Throwable) {
+      if (e is VirtualMachineError || e is ThreadDeath) throw e
+      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
+    }
+    return ContinuationOutcome(failed, totalToolAggChars)
+  }
+
   /**
    * Maps the resumed history plus the current (settled) UI history plus this
    * turn's images to one [ChatRequest]: the capped history prefix first, then
@@ -5252,11 +5470,13 @@ class TurnController(
     _lastRequestTrimmedCount.set(dropCount)
     _requestTrimmedCount.value = dropCount
     val finalMessages = if (dropCount > 0) base.drop(dropCount) else base
-    return ChatRequest(model = model, messages = finalMessages)
-    // NOTE (PR#1 scope-down): tools deliberately NOT attached here.
-    // ChatRequest.tools may only carry ToolRegistry.visibleTools() output
-    // (projection + executionReady); all 41 tools are executionReady=false
-    // in this scaffold PR, so the request stays pure-chat by construction.
+    // P2 slice: tools attach ONLY the loop's offer (visibleTools ∩ slice,
+    // empty when the loop is absent — the production composition — or when
+    // the slice projects unavailable). ChatRequest.tools may only carry
+    // ToolRegistry.visibleTools() output (projection + executionReady); 40
+    // tools stay executionReady=false, so a non-slice request is pure-chat
+    // by construction.
+    return ChatRequest(model = model, messages = finalMessages, tools = toolSlice?.offeredTools().orEmpty())
   }
 
   /**

@@ -14,6 +14,13 @@ import java.util.concurrent.atomic.AtomicLong
  * no-match with manual guidance. Every outcome carries a [TranscriptHeader]
  * with the decision, the projection snapshot and the model-visible snapshot.
  *
+ * Stage1 (P2 safe slice, #19 前置): guessing never executes. Missing
+ * alarm time (defaults 7:00), missing phone number (empty string),
+ * empty-field templates (`sms.compose` to / `calendar.create` start-end)
+ * and negated intents all become DENIED + NEED_CLARIFICATION with a
+ *補參 question (audit-distinct from USER_DISABLED). No new execution
+ * path: FAST still requires projected AND `executionReady`.
+ *
  * Wiring gate (PR#1 re-review scope-down): a match whose tool is projected
  * but NOT `executionReady` is denied as USER_DISABLED (capability not
  * enabled for this round; the wiring PR flips tools to ready one by one).
@@ -75,6 +82,39 @@ class FastRouter(
                 toolCall = null,
                 reasonCode = reason,
                 fallbackMessage = FallbackMessages.forTool(tool.name, reason, tool.annotations.fallbackHint),
+                header = header(RouteKind.DENIED, tool.name, reason),
+            )
+        }
+        // Stage1 guess-rejection (no new execution path): negated or
+        // under-specified intents become NEED_CLARIFICATION (audit-distinct
+        // from USER_DISABLED wiring/switch-off) with a 補參 question.
+        // Projection UNAVAILABLE stays first so FLAVOR/NO_PRIVILEGE mask
+        // clarification; wiring USER_DISABLED stays after so missing args
+        // are never masked as "not wired".
+        val trimmed = intentText.trim()
+        if (isNegated(trimmed)) {
+            val reason = dev.librepocket.tool.DenyReason.NEED_CLARIFICATION
+            val question = "看起來你說不要執行「${trimmed.take(24)}」，請確認是否要執行？若要執行請補充細節"
+            return RouteDecision(
+                route = RouteKind.DENIED,
+                toolCall = null,
+                reasonCode = reason,
+                fallbackMessage = FallbackMessages.forClarification(
+                    tool.name, question, tool.annotations.fallbackHint,
+                ),
+                header = header(RouteKind.DENIED, tool.name, reason),
+            )
+        }
+        val missingQuestion = missingQuestionFor(tool.name, trimmed)
+        if (missingQuestion != null) {
+            val reason = dev.librepocket.tool.DenyReason.NEED_CLARIFICATION
+            return RouteDecision(
+                route = RouteKind.DENIED,
+                toolCall = null,
+                reasonCode = reason,
+                fallbackMessage = FallbackMessages.forClarification(
+                    tool.name, missingQuestion, tool.annotations.fallbackHint,
+                ),
                 header = header(RouteKind.DENIED, tool.name, reason),
             )
         }
@@ -190,6 +230,54 @@ class FastRouter(
         r("自動點擊"), r("自动点击"), r("點擊螢幕"), r("点击屏幕"), r("幫我點"), r("帮我点"),
         r("自動填表"), r("自动填表"), r("代操"), r("自動操作"), r("自动操作"),
     )
+
+    /**
+     * Stage1 否定句門：裸「別/别」不用（避「特別/别人/特別/別人」誤判），只收
+     * 「別/别+動詞」（繁簡對稱）與明確否定詞；命中且同時命中工具模板即轉澄清，
+     * 絕不執行。
+     */
+    private val NEGATION_HINTS: List<Regex> = listOf(
+        r("不要"), r("不用"), r("不需要"), r("不必"), r("不需"), r("勿"),
+        r("取消"), r("停止"), r("禁止"), r("算了"),
+        r("別打"), r("別設"), r("別開"), r("別截"), r("別播"),
+        r("別調"), r("別導"), r("別發"), r("別傳"), r("別幫"), r("別給"),
+        r("别打"), r("别设"), r("别开"), r("别截"), r("别播"),
+        r("别调"), r("别导"), r("别发"), r("别传"), r("别帮"), r("别给"),
+        r("\\bdon'?t\\b"), r("\\bdo not\\b"), r("\\bstop\\b"), r("\\bcancel\\b"),
+    )
+
+    private fun isNegated(text: String): Boolean = containsAny(text, NEGATION_HINTS)
+
+    private fun hasExplicitAlarmTime(text: String): Boolean =
+        Regex("(\\d{1,2})[:點点](\\d{1,2})?").containsMatchIn(text)
+
+    private fun hasPhoneNumber(text: String): Boolean {
+        val raw = Regex("[+\\d][\\d\\-\\.\\s]{5,16}").find(text)?.value ?: return false
+        return raw.filter { it.isDigit() || it == '+' }.isNotBlank()
+    }
+
+    /**
+     * Stage1 缺參門（本輪封閉集，措辭收斂：只斷言此四項，不推及其他工具）：
+     * 缺 alarm 時間（不預設 7:00）、缺 phone 號碼（不送空字串）、
+     * `sms.compose`（to 恆空，待收件者抽取落地前一律補參）、`calendar.create`
+     *（start/end 恆空，待日期解析落地前一律補參）。回傳問句即需澄清，null
+     * 即參數齊備（進接線門）。
+     *
+     * 範圍註記：`mail.compose`（to/subject 模板恆空）與 `open_app`
+     *（packageName 模板恆空）同屬空欄位形狀，但本輪不在缺參門內（後續收件者／
+     * 包名抽取落地後再收斂）；此二者仍被接線門以 USER_DISABLED 拒絕，絕不執行。
+     */
+    private fun missingQuestionFor(toolName: String, text: String): String? = when (toolName) {
+        "alarm.create" ->
+            if (!hasExplicitAlarmTime(text)) "請問要設幾點的鬧鐘？例如「明天早上7點30分叫我」" else null
+        "phone.dial" ->
+            if (!hasPhoneNumber(text)) "請問要打給哪個號碼？例如「打電話給 0912345678」" else null
+        "sms.compose" ->
+            "請問簡訊要傳給誰？請補上收件號碼，例如「傳簡訊給 0912345678 說…」"
+        "calendar.create" ->
+            "請問行程的時間是？請補上日期時間，例如「明天下午三點加個行程」需含時間"
+        else -> null
+    }
 
     private fun esc(text: String): String =
         text.replace("\\", "\\\\").replace("\"", "\\\"")

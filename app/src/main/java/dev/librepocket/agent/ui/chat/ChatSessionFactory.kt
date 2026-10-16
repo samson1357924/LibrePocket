@@ -583,6 +583,14 @@ class ChatSessionFactory(
     private val clock: Clock = Clock.systemDefaultZone(),
     private val userTimezone: String? = null,
     private val systemZone: () -> ZoneId = ZoneId::systemDefault,
+    /**
+     * P2 safe slice (#19, default-off): attached to every session built by
+     * this factory and threaded into [ChatSessionImpl]. Null (production
+     * default) keeps records-only behavior; the slice test factory attaches a
+     * loop with fake clock/backend so a REAL factory-built session completes
+     * the fake-tool round-trip.
+     */
+    private val toolSlice: dev.librepocket.router.SafeToolSlice? = null,
 ) : ChatSessionProvider {
     // S1: no defaults on overrides (Kotlin forbids defaults on overriding
     // functions): the fail-closed default allowAsk=false lives on the
@@ -1183,6 +1191,7 @@ class ChatSessionFactory(
             systemZone = systemZone,
             initialHistory = history,
             historyCap = historyCap,
+            toolSlice = toolSlice,
         )
         return CredentialBoundChatSession(session, credential)
     }

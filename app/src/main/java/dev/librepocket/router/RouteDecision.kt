@@ -78,4 +78,13 @@ object FallbackMessages {
             userStep = "手動操作或補充細節",
         )
     }
+
+    /**
+     * Stage1 補參/澄清話術（P2 safe slice）：猜測執行一律轉澄清，不猜時間、
+     * 不猜號碼、不送空欄位模板。仍引用 [DenyReason.NEED_CLARIFICATION]
+     * 原文以供審計與話術斷言，並攜帶工具名以便轉錄追蹤。
+     */
+    fun forClarification(toolName: String, question: String, fallbackHint: String): String =
+        "需要補充${toolName}的資訊（${DenyReason.NEED_CLARIFICATION.name}）" +
+            "→ ${question} → 需要你做：補充後重試（可替代：${fallbackHint}）"
 }

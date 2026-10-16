@@ -30,6 +30,11 @@ import kotlinx.coroutines.flow.StateFlow
  * caller (see `ChatSessionFactory.open`) restores the stored user/assistant
  * prefix (excluding partial rows) so the first request after resume already
  * carries prior context.
+ *
+ * P2 safe slice (#19, default-off): [toolSlice] attaches the single-tool
+ * closed loop to the controller. Null (production default) keeps records-only
+ * behavior; tests attach a loop with fake clock/backend to prove the
+ * round-trip through this real session class.
  */
 class ChatSessionImpl(
   provider: LlmProvider,
@@ -47,6 +52,7 @@ class ChatSessionImpl(
   systemZone: () -> java.time.ZoneId = java.time.ZoneId::systemDefault,
   initialHistory: List<ChatMessage> = emptyList(),
   historyCap: HistoryWindowCap = HistoryWindowCap.Unbounded,
+  toolSlice: dev.librepocket.router.SafeToolSlice? = null,
 ) : ChatSession {
   private val controller = TurnController(
     provider = provider,
@@ -64,6 +70,7 @@ class ChatSessionImpl(
     systemZone = systemZone,
     initialHistory = initialHistory,
     historyCap = historyCap,
+    toolSlice = toolSlice,
   )
 
   @Suppress("unused")

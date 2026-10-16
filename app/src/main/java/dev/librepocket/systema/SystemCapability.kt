@@ -14,7 +14,13 @@ enum class Availability { NATIVE, DEGRADED, UNAVAILABLE }
 /** 副作用分級：READ 可重試；WRITE 需確認/冪等；PRIVILEGED 走系統接管。 */
 enum class SideEffectLevel { READ, WRITE, PRIVILEGED }
 
-/** 原因碼封閉集合（能力矩陣 Current evidence + 路由補充），禁止模型自由發揮。 */
+/** 原因碼封閉集合（能力矩陣 Current evidence／矩陣 §5 + 路由補充），禁止模型自由發揮。
+ *
+ * 命名空間註記：[NEED_CLARIFICATION] 與
+ * `dev.librepocket.tool.DenyReason.NEED_CLARIFICATION`（FastRouter 缺參／否定
+ * 澄清的 typed enum）審計字串相同但分屬不同命名空間（此處為 String 常量），
+ * 程式內絕不跨命名空間比較或混用。
+ */
 object ReasonCodes {
   const val FLAVOR_BLOCKED = "FLAVOR_BLOCKED"
   const val NO_PRIVILEGE = "NO_PRIVILEGE"

@@ -39,6 +39,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -897,6 +898,108 @@ class ProviderTransportTest {
             assertEquals("one provider collection is one request, regardless of legacy config fields", 1, server.requestCount)
         } finally {
             server.shutdown()
+        }
+    }
+
+    @Test
+    fun streamingFlowUnknownRuntimeFailureFailsClosed() = runBlocking {
+        val events = withTimeout(3_000) {
+            streamingFlow {
+                emit(StreamEvent.TextDelta(0, 0, "hi"))
+                throw RuntimeException("boom-unknown")
+            }.toList()
+        }
+        assertEquals(2, events.size)
+        assertTrue(events[0] is StreamEvent.TextDelta)
+        val failure = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse("unknown runtime failure must not retry", failure.retryable)
+        assertEquals(
+            "unknown runtime must carry provenance so the controller can discard pending tools",
+            ProviderFailureCode.UNKNOWN_RUNTIME.name,
+            failure.code,
+        )
+    }
+
+    @Test
+    fun streamingFlowNonFatalErrorFailsClosedWithProvenance() = runBlocking {
+        // S4对照 pin (Current): non-VM Error stays fail-closed with provenance.
+        val events = withTimeout(3_000) {
+            streamingFlow { throw AssertionError("boom-assert") }.toList()
+        }
+        val failure = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse(failure.retryable)
+        assertEquals(ProviderFailureCode.UNKNOWN_RUNTIME.name, failure.code)
+    }
+
+    @Test
+    fun streamingFlowUnknownWithOverflowMarkerReportsAggCode() = runBlocking {
+        // Code-inference parity with the direct-throw catches: a legacy
+        // overflow marker still reports AGG_TOO_LARGE (discard either way).
+        val events = withTimeout(3_000) {
+            streamingFlow { throw RuntimeException("x TOOL_ARGS_TOO_LARGE y") }.toList()
+        }
+        val failure = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse(failure.retryable)
+        assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, failure.code)
+    }
+
+    @Test
+    fun streamingFlowValidationFailureStaysFatal() = runBlocking {
+        val events = withTimeout(3_000) {
+            streamingFlow { throw IllegalArgumentException("bad-arg") }.toList()
+        }
+        val failure = events.filterIsInstance<StreamEvent.Failed>().single()
+        assertFalse("validation failure must not retry", failure.retryable)
+    }
+
+    @Test
+    fun streamingFlowRethrowsCancellation() = runBlocking {
+        try {
+            withTimeout(3_000) {
+                streamingFlow { throw CancellationException("cancel-test") }.toList()
+            }
+            fail("CancellationException must propagate, not become a Failed event")
+        } catch (e: CancellationException) {
+            // Expected: cancellation stays cancellation, never a retryable failure.
+            // Guard against hang false-positives: a withTimeout hang raises
+            // TimeoutCancellationException, which must not pass as cancel-test.
+            assertFalse(
+                "hung instead of propagating cancel-test",
+                e is TimeoutCancellationException,
+            )
+            assertEquals("cancel-test", e.message)
+        }
+    }
+
+    @Test
+    fun streamingFlowRethrowsVmFatal() = runBlocking {
+        try {
+            withTimeout(3_000) {
+                streamingFlow { throw OutOfMemoryError("synthetic-fatal") }.toList()
+            }
+            fail("OutOfMemoryError must propagate, not become a Failed event")
+        } catch (e: OutOfMemoryError) {
+            assertEquals("synthetic-fatal", e.message)
+        }
+        try {
+            withTimeout(3_000) {
+                streamingFlow { throw StackOverflowError("synthetic-fatal") }.toList()
+            }
+            fail("StackOverflowError must propagate, not become a Failed event")
+        } catch (e: StackOverflowError) {
+            assertEquals("synthetic-fatal", e.message)
+        }
+    }
+
+    @Test
+    fun streamingFlowRethrowsThreadDeath() = runBlocking {
+        try {
+            withTimeout(3_000) {
+                streamingFlow { throw ThreadDeath() }.toList()
+            }
+            fail("ThreadDeath must propagate, not become a Failed event")
+        } catch (_: ThreadDeath) {
+            // Expected: thread-death stays thread-death, never a failure terminal.
         }
     }
 

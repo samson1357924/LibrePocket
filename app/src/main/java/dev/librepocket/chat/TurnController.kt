@@ -11,10 +11,14 @@ import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.SseFrameParser
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
+import dev.librepocket.provider.FailureKind
+import dev.librepocket.provider.ProviderErrorClassifier
+import dev.librepocket.provider.inferAggFailureCodeName
 import dev.librepocket.provider.requireToolAggBudget
 import dev.librepocket.provider.requireToolCountBudget
 import dev.librepocket.provider.requireTotalToolAggBudget
 import dev.librepocket.redact.Redactor
+import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -4393,22 +4397,67 @@ class TurnController(
       var totalToolAggChars = 0
       val distinctToolIndexes = mutableSetOf<Int>()
       suspend fun flushPendingTools() {
-        for ((index, args) in toolArgText) {
-          if (index !in toolDoneSeen) {
+        // Atomicity: preflight every pending index (including the synthetic
+        // id/name defaults, which delta billing never sees) before any
+        // marker/transcript side effect, so a later index overflowing cannot
+        // leave an earlier index committed. Already-completed ToolDone
+        // records are skipped in both passes (written inline at collection).
+        // (Plain holder class: no copy/componentN needed.)
+        class PendingTool(val index: Int, val id: String, val name: String, val args: String)
+        val pending = toolArgText.mapNotNull { (index, args) ->
+          if (index in toolDoneSeen) null
+          else {
             val id = toolIdText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
             val name = toolNameText[index]?.toString().orEmpty().ifEmpty { "pending" }
-            val argsStr = args.toString()
-            // Terminal guard (Finding #4): whole pending ToolDone must fit
-            // the per-call budget before any marker/transcript side effect.
-            // Throws typed AGG_TOO_LARGE; the try-path catch turns it into
-            // the typed terminal without poison-adjacent records.
-            // Stage E invariant: NO total/count billing here — the delta path
-            // already billed both at collection time; re-adding would
-            // double-count.
-            // currentChars=0: pending was never per-call-billed; delta path already counted total/count, Stage E here is per-call only.
-            requireToolAggBudget(0, id.length + name.length + argsStr.length)
-            appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
-            writeNotice { orderedTranscript.onToolDone(attemptRunId, index, id, name, argsStr) }
+            PendingTool(index, id, name, args.toString())
+          }
+        }
+        for (p in pending) {
+          // Terminal guard (Finding #4): whole pending ToolDone must fit
+          // the per-call budget before any marker/transcript side effect.
+          // Throws typed AGG_TOO_LARGE; the try-path catch turns it into
+          // the typed terminal without poison-adjacent records.
+          // Stage E invariant: NO full re-billing here — the delta path
+          // already billed received bytes; only the unbilled synthetic-default
+          // growth (see the round-total guard below) is billed, so nothing is
+          // double-counted.
+          // currentChars=0: pending was never per-call-billed; delta path already counted total/count, Stage E here is per-call only.
+          requireToolAggBudget(0, p.id.length + p.name.length + p.args.length)
+        }
+        // Round-total guard: synthetic pending id/name defaults were never
+        // delta-billed, so bill their growth (projected minus already-billed,
+        // floor 0) against the per-attempt total before any side effect.
+        // No new indexes are admitted here, so the distinct-index cap needs
+        // no re-check. Throws typed AGG_TOO_LARGE like the per-call guard.
+        var totalGrowth = 0
+        for (p in pending) {
+          val billed =
+            p.args.length +
+              (toolIdText[p.index]?.length ?: 0) +
+              (toolNameText[p.index]?.length ?: 0)
+          totalGrowth += (p.id.length + p.name.length + p.args.length - billed).coerceAtLeast(0)
+        }
+        requireTotalToolAggBudget(totalToolAggChars, totalGrowth)
+        for (p in pending) {
+          appendAssistantText(attemptRunId, "\n[tool:${p.name} ${p.args}]")
+          writeNotice { orderedTranscript.onToolDone(attemptRunId, p.index, p.id, p.name, p.args) }
+        }
+      }
+      // Flush pending tools unless the terminal says discard. The preflight
+      // above throws before any side effect; this stays as a last-resort net
+      // converting a budget overflow to the typed terminal instead of
+      // escaping the attempt scope and skipping terminal bookkeeping. Only
+      // ProviderFailure is converted; cancellation still propagates.
+      suspend fun flushCatchingBudgetOverflow() {
+        if (!shouldDiscardPendingTools(failed)) {
+          try {
+            flushPendingTools()
+          } catch (e: ProviderFailure) {
+            failed = StreamEvent.Failed(
+              e.message ?: "provider error",
+              retryable = false,
+              code = e.code?.name ?: inferAggFailureCodeName(e.message),
+            )
           }
         }
       }
@@ -4520,7 +4569,10 @@ class TurnController(
               writeNotice { orderedTranscript.onUsage(attemptRunId, event.inputTokens, event.outputTokens) }
             }
             is StreamEvent.Done -> {
-              finalizeAssistant(attemptRunId)
+              // Finalization waits until post-collection flush succeeds and
+              // no failure terminal exists (see the success block below): a
+              // flush budget failure after Done must keep isPartial=true so
+              // the failed fragment is never replayed as settled history.
               done = true
             }
             is StreamEvent.Failed -> failed = event
@@ -4536,8 +4588,15 @@ class TurnController(
         // code or overflow markers) must not flush poison-adjacent pending
         // ToolDeltas; already-completed ToolDone records stay (emitted inline
         // at collection time). Truncated fallback (failed == null) still
-        // flushes: isResourceExhausted(null) is false.
-        if (!isResourceExhausted(failed)) {
+        // flushes: shouldDiscardPendingTools(null) is false.
+        // P1 residual: an unknown-runtime Failed (typed UNKNOWN_RUNTIME code
+        // from streamingFlow) must also not flush, while other fatal events
+        // (401/validation with code == null) keep the historical flush.
+        // If this flush throws ProviderFailure (budget overflow), the catch
+        // below records it as the typed terminal and the helper there
+        // short-circuits (the new failure already discards), so no second
+        // flush can occur.
+        if (!shouldDiscardPendingTools(failed)) {
           flushPendingTools()
         }
         if (!done && failed == null) {
@@ -4546,32 +4605,94 @@ class TurnController(
       } catch (e: CancellationException) {
         throw e
       } catch (e: ProviderFailure) {
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = e.retryable)
-        if (e.code != ProviderFailureCode.AGG_TOO_LARGE) {
-          flushPendingTools()
-        }
+        coroutineContext.ensureActive()
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = e.retryable,
+          code = e.code?.name ?: inferAggFailureCodeName(e.message),
+        )
+        // Single source of truth with the Failed-event path above: discard
+        // covers typed AGG_TOO_LARGE (incl. message-inferred legacy shape).
+        // UNKNOWN_RUNTIME arrives via the Failed-event path and the
+        // unknown-Exception/Throwable catches below (built-in adapters never
+        // throw it as a ProviderFailure; a custom one carrying it still
+        // discards via the same predicate); other ProviderFailures
+        // (e.g. 401) flush.
+        flushCatchingBudgetOverflow()
         // AGG_TOO_LARGE is this collector's own guard: fail closed without
         // recording poison-adjacent pending tools (the typed terminal error
         // is the observable record). Visible text is already current because
         // text updates stay per-delta (see uiTextUpdateCount).
+      } catch (e: IllegalArgumentException) {
+        // Validation fail-closed (mirrors streamingFlow's IAE branch):
+        // malformed request/arguments never retry. Flush stays, guarded by
+        // the same discard predicate as the Failed-event path (an overflow
+        // marker in the message still discards, reported as AGG_TOO_LARGE
+        // like every other projection).
+        coroutineContext.ensureActive()
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = false,
+          code = inferAggFailureCodeName(e.message),
+        )
+        flushCatchingBudgetOverflow()
+      } catch (e: IOException) {
+        // Direct transport failure (synchronously thrown by stream() or by
+        // the returned Flow before any terminal event): classify like
+        // streamingFlow's IOException branch so transient failures retry
+        // regardless of throw site. An aggregation-overflow marker dominates
+        // the classifier (poisoned streams never retry). The pending flush
+        // stays, guarded by the same discard predicate as the Failed-event
+        // path (code == null without overflow markers flushes on both paths).
+        coroutineContext.ensureActive()
+        val kind = ProviderErrorClassifier.classify(null, e, null)
+        val aggCode = inferAggFailureCodeName(e.message)
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = kind == FailureKind.RETRYABLE && aggCode == null,
+          code = aggCode,
+        )
+        flushCatchingBudgetOverflow()
       } catch (e: Exception) {
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
-        flushPendingTools()
+        // Unknown runtime failure fails closed: never retry, never persist
+        // possibly-poisoned pending tool fragments (mirrors the Error branch
+        // below). TurnController is the sole retry owner; only explicit
+        // retryable Failed terminals retry. Carries UNKNOWN_RUNTIME so a
+        // forwarded terminal stays distinguishable from flushable fatals
+        // (an overflow marker in the message still reports AGG_TOO_LARGE,
+        // like the ProviderFailure projection above).
+        coroutineContext.ensureActive()
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = false,
+          code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
+        )
       } catch (e: Throwable) {
         // S3-F1 Error symmetry (Current, option (a)): fatal Error from the
         // provider stream (e.g. AssertionError/LinkageError from a buggy
         // adapter) is a non-retryable terminal like AGG_TOO_LARGE — never
-        // flush poison-adjacent pending ToolDeltas (unlike Exception, which
-        // flushes), never retry. The outer hostedTurn Throwable catch below
+        // flush poison-adjacent pending ToolDeltas (like the unknown-Exception
+        // branch above, which also fails closed), never retry. The outer
+        // hostedTurn Throwable catch below
         // (or the retry-exhausted terminal path here) still projects
         // sanitizeError → UI ERROR. CancellationException never lands here
         // (rethrown first above), so CE semantics are unchanged. VM-fatal
         // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
         if (e is VirtualMachineError || e is ThreadDeath) throw e
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
+        coroutineContext.ensureActive()
+        failed = StreamEvent.Failed(
+          e.message ?: "provider error",
+          retryable = false,
+          code = inferAggFailureCodeName(e.message) ?: ProviderFailureCode.UNKNOWN_RUNTIME.name,
+        )
       }
       val failure = failed
       if (failure == null) {
+        // Done arrived and post-collection flush succeeded: the fragment is
+        // genuinely settled. Finalize here (not at Done receipt) so a flush
+        // budget failure keeps isPartial=true per the failed-fragment
+        // contract below.
+        finalizeAssistant(attemptRunId)
         // Snapshot text: assistantTextOf reads uiState at execution time.
         val successText = assistantTextOf(attemptRunId)
         val successReasoning = assistantReasoningOf(attemptRunId)
@@ -4596,7 +4717,10 @@ class TurnController(
       // persists the failed partial structurally: the ledger row keeps the
       // partial text with isPartial=1 plus the sanitized reason (parent-aware
       // onTurnFailed), while UI memory keeps the same fragment flagged.
-      if (!failure.retryable || attempt >= retryConfig.maxRetries) {
+      // Defensive invariant: a resource-exhausted terminal never retries,
+      // even if a legacy/custom path marks it retryable (poisoned streams
+      // must not burn the retry budget).
+      if (!failure.retryable || isResourceExhausted(failure) || attempt >= retryConfig.maxRetries) {
         val clean = sanitizeError(failure.message)
         synchronized(lock) {
           activityRevision++
@@ -4932,4 +5056,22 @@ internal fun isResourceExhausted(failed: StreamEvent.Failed?): Boolean {
   return failed.message.contains(TOOL_ARGS_TOO_LARGE, ignoreCase = true) ||
     failed.message.contains(SseFrameParser.FRAME_TOO_LARGE_MESSAGE, ignoreCase = true) ||
     failed.message.contains("SSE_LINE_TOO_LONG", ignoreCase = true)
+}
+
+/**
+ * P1 residual: should a collected [StreamEvent.Failed] terminal discard
+ * poison-adjacent pending (never-`ToolDone`) tool fragments instead of
+ * flushing them?
+ *
+ * True when [isResourceExhausted] holds, or when `failed.code` is the typed
+ * `UNKNOWN_RUNTIME` name (`streamingFlow` unknown fallback and the
+ * direct-throw unknown/Error catches). Other fatal events with
+ * `code == null` (401/validation) keep the historical flush; already-emitted
+ * `ToolDone` records are unaffected (written inline at collection time).
+ * Null (truncated fallback, not yet failed) never discards.
+ */
+internal fun shouldDiscardPendingTools(failed: StreamEvent.Failed?): Boolean {
+  if (failed == null) return false
+  if (isResourceExhausted(failed)) return true
+  return failed.code?.equals(ProviderFailureCode.UNKNOWN_RUNTIME.name, ignoreCase = true) == true
 }

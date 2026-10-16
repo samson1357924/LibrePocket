@@ -15,6 +15,7 @@ import dev.librepocket.provider.ProviderHttpConfig
 import dev.librepocket.provider.ProviderProtocol
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.provider.streamingFlow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -950,6 +951,448 @@ class TurnControllerTest {
     assertEquals(ChatStatus.ERROR, c.uiState.value.status)
     assertNotNull(c.uiState.value.error)
     assertTrue(c.uiState.value.error!!.length <= 500)
+  }
+
+  @Test fun unknownRuntimeExceptionFromProviderDoesNotRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      throw RuntimeException("boom-unknown")
+    }
+    val c = controller(provider, delays = delays)
+    runBlocking { c.send("hi") }
+    assertEquals(1, calls.get())
+    assertEquals(1, provider.streamCalls.get())
+    assertTrue("unknown failure schedules no backoff", delays.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertNotNull(c.uiState.value.error)
+  }
+
+  @Test fun validationExceptionFromProviderDoesNotRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      throw IllegalArgumentException("bad request shape")
+    }
+    val c = controller(provider, delays = delays)
+    runBlocking { c.send("hi") }
+    assertEquals(1, calls.get())
+    assertEquals(1, provider.streamCalls.get())
+    assertTrue("validation failure schedules no backoff", delays.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertNotNull(c.uiState.value.error)
+  }
+
+  // S3 parity pin (Current): a direct transport failure thrown synchronously
+  // by stream() or by the returned Flow before any terminal event is
+  // classified like streamingFlow's IOException branch, so a transient (e.g.
+  // SocketTimeout) retries regardless of throw site — with the same pending
+  // flush as the Failed-event path (one flushed tool per attempt).
+  @Test fun directTransportFailureRetriesLikeStreamingFlow() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw java.net.SocketTimeoutException("timed out")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(
+      provider,
+      delays = delays,
+      retry = TurnRetryConfig(maxRetries = 1, retryDelaysMs = listOf(0L)),
+      transcript = sink,
+    )
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(2, calls.get())
+    assertEquals(2, provider.streamCalls.get())
+    assertEquals(listOf(0L), delays)
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertEquals("each attempt flushes its pending tool like the Failed-event path", 2, sink.tools.size)
+  }
+
+  // Direct-path symmetry pin (Current): the IAE/IOException direct catches
+  // use the same discard predicate as the Failed-event path, so a legacy
+  // overflow marker in the message still discards instead of flushing.
+  @Test fun directValidationWithOverflowMarkerDoesNotFlush() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw IllegalArgumentException("boom TOOL_ARGS_TOO_LARGE boom")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, delays = delays, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertTrue(delays.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(sink.tools.isEmpty())
+    assertFalse(assistantsOf(c).single().text.contains("[tool:"))
+  }
+
+  // Boundary pin (Current): a pending buffer parked exactly at the per-call
+  // budget passes delta billing, but the flush adds unbilled synthetic
+  // pending id/name defaults and trips the same budget. The flush failure
+  // must convert to the typed terminal (no escape, no poison record).
+  @Test fun boundaryPendingFlushFailureConvertsToTypedTerminal() {
+    // MAX_TOOL_CALL_AGG_BYTES = 1MiB, x3 char->byte estimate: billable max
+    // is 349525 chars; the synthetic "call_pending_0"+"pending" defaults
+    // add 21 chars at flush time to overflow it.
+    val boundary = "x".repeat(349_525)
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ToolDelta(0, null, null, boundary))
+        throw IllegalArgumentException("bad-arg")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(
+      "flush budget overflow must surface the typed terminal, got: ${c.uiState.value.error}",
+      c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"),
+    )
+    assertTrue("poison-adjacent pending must not be recorded", sink.tools.isEmpty())
+    assertEquals("terminal failure must be recorded, not escape", 1, sink.failed.size)
+  }
+
+  // Round-total pin (Current): synthetic pending id/name defaults were
+  // never delta-billed, so their growth counts against the per-attempt
+  // total. Both halves bill legally ((174762+174763)*3=1048575<=1048576);
+  // the flush adds 2*21 synthetic chars (349567*3 overflows).
+  @Test fun multiPendingSyntheticGrowthCountsAgainstRoundTotal() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ToolDelta(0, null, null, "a".repeat(174_762)))
+        emit(StreamEvent.ToolDelta(1, null, null, "b".repeat(174_763)))
+        emit(StreamEvent.Failed("http 401 unauthorized", retryable = false))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(
+      "round-total overflow must surface the typed terminal, got: ${c.uiState.value.error}",
+      c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"),
+    )
+    assertTrue("no pending tool may be partially committed", sink.tools.isEmpty())
+    assertEquals(1, sink.failed.size)
+  }
+
+  // Atomicity pin (Current): the flush preflights every pending index
+  // before any side effect, so a later index overflowing cannot leave an
+  // earlier index committed. Both deltas are billing-legal
+  // ((3+349522)*3=1048575<=1048576); the flush adds 21 synthetic chars to
+  // index 1 (349543*3=1048629 overflows).
+  @Test fun multiPendingFlushOverflowCommitsNothing() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ToolDelta(0, "i", "f", "a"))
+        emit(StreamEvent.ToolDelta(1, null, null, "x".repeat(349_522)))
+        emit(StreamEvent.Failed("http 401 unauthorized", retryable = false))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(
+      "flush overflow must surface the typed terminal, got: ${c.uiState.value.error}",
+      c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"),
+    )
+    assertTrue("no pending tool may be partially committed", sink.tools.isEmpty())
+    assertFalse(assistantsOf(c).single().text.contains("[tool:"))
+    assertEquals(1, sink.failed.size)
+  }
+
+  // Done-then-flush-failure pin (Current): finalization waits until the
+  // post-collection flush succeeds, so a flush budget failure after Done
+  // keeps isPartial=true and the failed fragment never replays as settled
+  // history. Boundary: delta bills 349520*3=1048560 (legal), the flush adds
+  // 21 synthetic chars (349541*3 overflows).
+  @Test fun doneThenFlushOverflowKeepsPartialAndExcludesHistory() {
+    val calls = AtomicInteger(0)
+    val provider = FakeLlmProvider { _ ->
+      if (calls.incrementAndGet() == 1) {
+        flow {
+          emit(StreamEvent.TextDelta(0, 0, "visible"))
+          emit(StreamEvent.ToolDelta(0, null, null, "y".repeat(349_520)))
+          emit(StreamEvent.Done("stop"))
+        }
+      } else {
+        flow { emit(StreamEvent.Done("stop")) }
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(
+      "flush overflow must surface the typed terminal, got: ${c.uiState.value.error}",
+      c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"),
+    )
+    assertTrue("no pending tool may be partially committed", sink.tools.isEmpty())
+    val failedBlock = assistantsOf(c).single()
+    assertTrue("failed fragment must stay partial", failedBlock.isPartial)
+    runBlocking {
+      c.send("next")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertTrue(
+      "failed partial must not replay as settled history, got: ${provider.seenRequests[1].messages}",
+      provider.seenRequests[1].messages.none { it.role == "assistant" },
+    )
+  }
+
+  // AGG-dominance pin (Current): an aggregation-overflow marker forces
+  // non-retryable even through the IOException classifier, on the direct
+  // path, the streamingFlow path, and a legacy retryable=true Failed event
+  // (defensive retry invariant). Poisoned streams never burn retry budget.
+  @Test fun directIOExceptionWithOverflowMarkerDoesNotRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      flow { throw java.io.IOException("boom TOOL_ARGS_TOO_LARGE boom") }
+    }
+    val sink = RecordingSink()
+    val c = controller(
+      provider,
+      delays = delays,
+      retry = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+      transcript = sink,
+    )
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertTrue(delays.isEmpty())
+    assertTrue(sink.retried.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertTrue(c.uiState.value.error!!.contains("TOOL_ARGS_TOO_LARGE"))
+  }
+
+  @Test fun streamingFlowIOExceptionWithOverflowMarkerDoesNotRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      streamingFlow { throw java.io.IOException("boom SSE_FRAME_TOO_LARGE boom") }
+    }
+    val sink = RecordingSink()
+    val c = controller(
+      provider,
+      delays = delays,
+      retry = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+      transcript = sink,
+    )
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertTrue(delays.isEmpty())
+    assertTrue(sink.retried.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+  }
+
+  @Test fun retryableFlaggedAggFailureStillTerminates() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      flow { emit(StreamEvent.Failed("x TOOL_ARGS_TOO_LARGE y", retryable = true)) }
+    }
+    val sink = RecordingSink()
+    val c = controller(
+      provider,
+      delays = delays,
+      retry = TurnRetryConfig(maxRetries = 3, retryDelaysMs = listOf(0L, 0L, 0L)),
+      transcript = sink,
+    )
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertTrue(delays.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+  }
+
+  // IAE/unknown flush asymmetry pin (Current): IAE keeps the historical
+  // flush (validation = request shape, same observable pending-tool behavior
+  // as the pre-split generic branch), except legacy overflow-marker messages
+  // which discard like the Failed-event path (see directValidation...);
+  // while unknown runtime fails closed with no flush — possibly-poisoned
+  // pending fragments are dropped like AGG_TOO_LARGE/Error, and the typed
+  // terminal error is the record.
+  @Test fun unknownRuntimeWithPendingToolDeltaDoesNotFlush() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw RuntimeException("boom-unknown")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertNotNull(c.uiState.value.error)
+    assertFalse(
+      "unknown failure must not leave a pending-tool marker",
+      assistantsOf(c).single().text.contains("[tool:"),
+    )
+    assertTrue(
+      "unknown failure must not persist possibly-poisoned pending tools",
+      sink.tools.isEmpty(),
+    )
+  }
+
+  // P1 residual cross-layer pin (Current): production adapters wrap the
+  // stream in streamingFlow, so an unknown RuntimeException arrives as a
+  // Failed(UNKNOWN_RUNTIME) event — not as a direct throw. The controller
+  // must discard poison-adjacent pending ToolDeltas on that path too, while
+  // keeping visible text and without retrying.
+  @Test fun unknownRuntimeViaStreamingFlowDoesNotFlushNorRetry() {
+    val calls = AtomicInteger(0)
+    val delays = mutableListOf<Long>()
+    val provider = FakeLlmProvider {
+      calls.incrementAndGet()
+      streamingFlow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw RuntimeException("boom-unknown")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, delays = delays, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(1, calls.get())
+    assertEquals(1, provider.streamCalls.get())
+    assertTrue("unknown failure schedules no backoff", delays.isEmpty())
+    assertTrue("unknown failure must not emit a retry notice", sink.retried.isEmpty())
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertNotNull(c.uiState.value.error)
+    assertEquals(
+      "visible text stays, pending-tool marker is dropped",
+      "partial",
+      assistantsOf(c).single().text,
+    )
+    assertTrue(
+      "unknown failure via Failed event must not persist possibly-poisoned pending tools",
+      sink.tools.isEmpty(),
+    )
+    assertEquals("terminal failure must be recorded", 1, sink.failed.size)
+  }
+
+  // S4对照 pin (Current): IAE keeps the historical flush (validation path),
+  // asymmetric with unknown which discards.
+  @Test fun validationWithPendingToolDeltaDoesFlush() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        throw IllegalArgumentException("bad-arg")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertEquals(1, sink.tools.size)
+    assertTrue(
+      "validation flush must leave a pending-tool marker",
+      assistantsOf(c).single().text.contains("[tool:"),
+    )
+  }
+
+  // S4对照 pin (Current): completed ToolDone stays, only pending is
+  // discarded on unknown failure.
+  @Test fun unknownFailureKeepsCompletedToolDoneDropsPending() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.ToolDone(0, "call_1", "lookup", "{\"q\":\"hi\"}"))
+        emit(StreamEvent.ToolDelta(1, "call_y", "lookup", "{\"q\":\"bye\"}"))
+        throw RuntimeException("boom-unknown")
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertEquals(1, sink.tools.size)
+    assertEquals(0, sink.tools.single().toolIndex)
+    assertEquals("call_1", sink.tools.single().id)
+    val body = assistantsOf(c).single().text
+    assertTrue("completed ToolDone marker stays", body.contains("[tool:lookup"))
+    assertFalse("pending ToolDelta marker must be dropped", body.contains("bye"))
+  }
+
+  // S4对照 pin (Current): fatal Failed with code == null (e.g. 401) keeps
+  // the historical flush — over-discarding would break benign fatals.
+  @Test fun fatalFailedEventWithNullCodeStillFlushes() {
+    val provider = FakeLlmProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "partial"))
+        emit(StreamEvent.ToolDelta(0, "call_x", "lookup", "{\"q\":\"hi\"}"))
+        emit(StreamEvent.Failed("http 401 unauthorized", retryable = false))
+      }
+    }
+    val sink = RecordingSink()
+    val c = controller(provider, transcript = sink)
+    runBlocking {
+      c.send("hi")
+      withTimeout(5_000) { c.flushTranscript() }
+    }
+    assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+    assertEquals(1, sink.tools.size)
+    assertTrue(
+      assistantsOf(c).single().text.contains("[tool:"),
+    )
   }
 
   @Test fun policyDenyBlocksSend() {

@@ -98,13 +98,14 @@ class AndroidIntentLauncher(private val context: Context) : IntentLauncher {
     }
     spec.targetPackage?.let { intent.setPackage(it) }
     spec.extras.forEach { (k, v) ->
-      when (v) {
+      // 窮舉表達式（賦值迫使編譯器檢查）：新增 IntentExtra 子類未補分支即編譯錯，
+      // 不依賴執行期 `else -> throw`；保留 fail-closed 語義於編譯期。
+      @Suppress("UNUSED_VARIABLE")
+      val unused = when (v) {
         is IntentExtra.Str -> intent.putExtra(k, v.value)
         is IntentExtra.LongVal -> intent.putExtra(k, v.value)
         is IntentExtra.IntVal -> intent.putExtra(k, v.value)
         is IntentExtra.Bool -> intent.putExtra(k, v.value)
-        // statement-position when 不窮舉檢查：未知子類 fail-closed，不靜默掉 extra。
-        else -> throw IllegalStateException("unknown IntentExtra: ${v.javaClass.simpleName}")
       }
     }
     // 預設恆加 NEW_TASK（維持 D1 行為）；spec.flags 僅套用 allowlist。

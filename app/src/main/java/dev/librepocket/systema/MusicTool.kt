@@ -1,7 +1,9 @@
 package dev.librepocket.systema
 
 /**
- * 音樂工具：媒體 Intent + MediaSession 前台（三風味皆完整，矩陣 §1 列 10）。
+ * 音樂工具：媒體 Intent + MediaSession 前台。
+ *
+ * Status: Target（純側契約，未接線未 E2E）。
  *
  * - 點播：VIEW Intent 帶曲目/搜尋 URI，交給系統播放器。
  * - 控制（暫停/下一首等）：MEDIA_BUTTON 語義的 [ControlSpec]，
@@ -10,6 +12,10 @@ package dev.librepocket.systema
  * - 前台要求：實際播放必須跑在前台服務（`FOREGROUND_SERVICE_MEDIA_PLAYBACK`
  *   + 常駐通知），否則後台會被系統回收；本層僅建模，端側強制。
  * - 模糊目標（如「放點輕音樂」）不猜包名：先澄清或走預設播放器。
+ *
+ * Target 缺口（本 PR 不改 manifest）：API 30+ 包可見性下，VIEW https /
+ * MEDIA_BUTTON 未在主 manifest `<queries>` 宣告，真機 resolve 恐 NoHandler；
+ * 需裝置驗證後再補宣告（見主 manifest #14 註解「不擴大到音樂」）。
  */
 object MusicTool : SystemTool<MusicTool.Params> {
 

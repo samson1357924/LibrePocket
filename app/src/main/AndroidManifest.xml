@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Common manifest for all flavors. Only store-safe permissions live here.
-  High-risk permissions (SMS, all-files access) and privileged services
-  (Accessibility, VPN) are declared exclusively in the src/github + src/foss overlays,
-  so the play flavor can never inherit them.
+  High-risk uses-permissions (SMS, all-files access, VPN) are absent in all
+  three flavors; a11y service is declared only in src/foss + src/github
+  overlays (play overlay keeps 6x tools:node="remove" as drift guard for
+  permissions, service hardening relies on DEX superclass + xmltree gates).
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 

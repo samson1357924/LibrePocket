@@ -80,7 +80,12 @@ NETWORK_CONFIG="$ROOT/app/src/main/res/xml/network_security_config.xml"
 grep -q 'cleartextTrafficPermitted="false"' "$NETWORK_CONFIG" || fail "$NETWORK_CONFIG does not deny cleartext"
 for f in "$ROOT/app/src/main/res/xml/backup_rules.xml" "$ROOT/app/src/main/res/xml/data_extraction_rules.xml"; do
     [ -f "$f" ] || fail "missing $f"
-    grep -q 'librepocket_keys' "$f" || fail "$f does not exclude key prefs"
+    # BackupPolicy.KEY_FILES_EXCLUDED 5 項逐項斷言（僅查 librepocket_keys 會漏 vault/wal/shm/keysets）。
+    grep -q 'domain="sharedpref" path="librepocket_keys.xml"' "$f" || fail "$f does not exclude key prefs"
+    grep -q 'domain="database" path="librepocket_vault"' "$f" || fail "$f does not exclude vault"
+    grep -q 'librepocket_vault-wal' "$f" || fail "$f does not exclude vault-wal"
+    grep -q 'librepocket_vault-shm' "$f" || fail "$f does not exclude vault-shm"
+    grep -q 'librepocket_keysets' "$f" || fail "$f does not exclude keysets"
 done
 
 find_tool_pair() {

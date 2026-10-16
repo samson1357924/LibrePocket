@@ -23,6 +23,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -704,12 +705,87 @@ class SetupEndpointIdMigrationTest {
         vms.add(vm)
 
         assertFalse(vm.migrationRetryNeeded.value)
+        val visible = async { withTimeout(10_000) { vm.showMigrationRetry.first { it } } }
         vm.prefillLegacyMigrationIfNeeded()
         assertTrue(vm.migrationRetryNeeded.value)
+        visible.await()
         assertEquals(ProviderCatalog.OPENAI_ID, vm.form.value.presetId)
         vm.prefillLegacyMigrationIfNeeded()
         assertFalse(vm.migrationRetryNeeded.value)
         assertEquals(url, vm.form.value.baseUrl)
+    }
+
+    /**
+     * Shared eligibility: display-only state never blocks a retry. A blank
+     * save's validation error and a show/hide-key toggle leave the draft
+     * fields untouched, so the visible retry action still restores.
+     */
+    @Test
+    fun legacyMigrationRetrySurvivesBlankSaveValidationError() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val dir = Files.createTempDirectory("setup-migration-eligible").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val raw = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "migration-eligible.preferences_pb") },
+        )
+        EndpointStore(raw).save(legacyCustom(url))
+        val store = EndpointStore(FailFirstReadsDataStore(raw, failReads = 1))
+        val vault = CountingVault()
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+
+        // First attempt ends RetryLater (one failing journal read).
+        vm.prefillLegacyMigrationIfNeeded()
+        assertTrue(vm.migrationRetryNeeded.value)
+
+        // (1) Blank save records a validation error on untouched inputs.
+        vm.save()
+        awaitSaveIdle(vm)
+        assertEquals("SETUP_KEY_TOO_SHORT", vm.form.value.errorCode)
+        assertFalse(vm.form.value.saved)
+        vm.prefillLegacyMigrationIfNeeded()
+        assertEquals(url, vm.form.value.baseUrl)
+        assertEquals("SETUP_MIGRATION_REKEY_REQUIRED", vm.form.value.errorCode)
+    }
+
+    @Test
+    fun legacyMigrationRetrySurvivesShowKeyToggle() = runBlocking {
+        val url = "http://127.0.0.1:11434/v1"
+        val dir = Files.createTempDirectory("setup-migration-showkey").toFile()
+        tmpDirs.add(dir)
+        val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scopes.add(scope)
+        val raw = PreferenceDataStoreFactory.create(
+            scope = scope,
+            produceFile = { java.io.File(dir, "migration-showkey.preferences_pb") },
+        )
+        EndpointStore(raw).save(legacyCustom(url))
+        val store = EndpointStore(FailFirstReadsDataStore(raw, failReads = 1))
+        val vault = CountingVault()
+        val vm = SetupViewModel(
+            store = store,
+            vaultSource = VaultSource { vault },
+            policy = VerdictPolicy(Verdict.ALLOW),
+            buildProvider = noProvider,
+        )
+        vms.add(vm)
+
+        vm.prefillLegacyMigrationIfNeeded()
+        assertTrue(vm.migrationRetryNeeded.value)
+        // (2) Toggling key visibility touches no draft input.
+        vm.toggleShowKey()
+        assertTrue(vm.form.value.showKey)
+        vm.prefillLegacyMigrationIfNeeded()
+        assertEquals(url, vm.form.value.baseUrl)
+        assertTrue(vm.form.value.apiKey.isEmpty())
     }
 
     /**

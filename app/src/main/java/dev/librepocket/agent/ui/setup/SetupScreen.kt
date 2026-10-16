@@ -124,13 +124,9 @@ fun SetupScreen(
     // RetryLater on a still-mounted first-run screen, where LaunchedEffect
     // will not refire. Surface an explicit retry action instead (the prefill
     // still re-verifies pristine/revision, so a stale tap cannot clobber).
-    val migrationRetryNeeded by viewModel.migrationRetryNeeded.collectAsStateWithLifecycle()
-    // Same pristine definition as the ViewModel gate: only offer retry while
-    // the form is still untouched.
-    val migrationFormPristine = state.presetId == ProviderCatalog.OPENAI_ID &&
-        state.baseUrl == ProviderCatalog.OPENAI_BASE_URL &&
-        state.model == ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID) &&
-        state.apiKey.isEmpty()
+    // Single shared eligibility: renders exactly showMigrationRetry, so the
+    // visible button and the ViewModel gate can never drift apart.
+    val showMigrationRetry by viewModel.showMigrationRetry.collectAsStateWithLifecycle()
     val screenScope = rememberCoroutineScope()
 
     LaunchedEffect(state.saved) {
@@ -170,7 +166,7 @@ fun SetupScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
-        if (isFirstRun && migrationRetryNeeded && migrationFormPristine) {
+        if (isFirstRun && showMigrationRetry) {
             OutlinedButton(
                 onClick = { screenScope.launch { viewModel.prefillLegacyMigrationIfNeeded() } },
                 modifier = Modifier.fillMaxWidth(),

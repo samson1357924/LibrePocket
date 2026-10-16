@@ -25,6 +25,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
@@ -775,6 +776,22 @@ class SetupViewModel(
     private var migrationPrefilled = false
     private var migrationPrefillInFlight = false
     /**
+     * Single shared definition of migration-retry eligibility, used by both
+     * the prefill gate below and the Setup screen's retry action: only the
+     * meaningful draft inputs matter (preset/URL/model/key), plus freedom
+     * from in-flight operations and open confirmations. Display-only state
+     * (error codes, show/hide-key, probe results, revision counters) never
+     * blocks a retry — a visible enabled button must always do something.
+     */
+    internal fun isMigrationEligibleForm(form: SetupUiState): Boolean =
+        form.presetId == ProviderCatalog.OPENAI_ID &&
+            form.baseUrl == ProviderCatalog.OPENAI_BASE_URL &&
+            form.model == ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID) &&
+            form.apiKey.isEmpty() &&
+            !form.saving && !form.testing && !form.modelsLoading &&
+            !form.confirmKeyWrite && !form.confirmRebind
+
+    /**
      * True while a migration prefill attempt ended [LegacyMigrationProbe.RetryLater]
      * and no later attempt has resolved it. Drives the Setup screen's explicit
      * retry action; cleared on success, terminal absence, or a superseding
@@ -783,11 +800,20 @@ class SetupViewModel(
      */
     private val _migrationRetryNeeded = MutableStateFlow(false)
     val migrationRetryNeeded: StateFlow<Boolean> = _migrationRetryNeeded
+    /**
+     * Retry-action visibility: a pending retry exists and the current form
+     * still satisfies [isMigrationEligibleForm]. Single source of truth —
+     * the screen renders exactly this, so eligibility can never drift from
+     * the gate below.
+     */
+    val showMigrationRetry: StateFlow<Boolean> =
+        combine(_migrationRetryNeeded, _form) { retryNeeded, form ->
+            retryNeeded && !migrationPrefilled && isMigrationEligibleForm(form)
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     suspend fun prefillLegacyMigrationIfNeeded() {
         if (migrationPrefilled || migrationPrefillInFlight) return
-        val pristine = SetupUiState(model = ProviderCatalog.defaultModelFor(ProviderCatalog.OPENAI_ID))
-        if (_form.value != pristine) return
+        if (!isMigrationEligibleForm(_form.value)) return
         val entryRevision = formRevision.get()
         migrationPrefillInFlight = true
         try {
@@ -808,8 +834,8 @@ class SetupViewModel(
             }
             // Re-verify after the suspend read: a keystroke landing in the read
             // window must never be clobbered (field edits bump formRevision or
-            // break pristine equality).
-            if (_form.value != pristine || formRevision.get() != entryRevision) return
+            // break draft-field equality).
+            if (!isMigrationEligibleForm(_form.value) || formRevision.get() != entryRevision) return
             formRevision.incrementAndGet()
             invalidateKeyWriteConsent()
             modelRefreshJob?.cancel()

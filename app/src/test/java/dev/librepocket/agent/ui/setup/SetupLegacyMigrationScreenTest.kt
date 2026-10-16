@@ -23,7 +23,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
@@ -178,6 +180,12 @@ class SetupLegacyMigrationScreenTest {
             }
         }
         composeRule.onNodeWithText("重新載入舊版設定").performClick()
+        // Wait for the ViewModel state transition first: the retry tap only
+        // schedules a suspend prefill (two metadata reads), so asserting
+        // semantics nodes immediately would race recomposition.
+        runBlocking {
+            withTimeout(10_000) { vm.form.first { it.baseUrl == url } }
+        }
         composeRule.waitForIdle()
         composeRule.onNodeWithText(url).performScrollTo().assertIsDisplayed()
         val form = vm.form.value

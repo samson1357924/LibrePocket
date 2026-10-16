@@ -268,4 +268,26 @@ class FastRouterDecisionTest {
             assertEquals("$flavor", DenyReason.NEED_CLARIFICATION, negated.reasonCode)
         }
     }
+
+    @Test fun compoundCancelAndRecreateIsClarificationNotExecution() {
+        // 已知侷限（fail-safe 方向）：複合句同時命中模板與取消/停止詞時轉澄清，
+        // 屬誤澄清但絕不執行；行為釘住，待否定語義精化後再收斂。
+        val d = decide("取消舊的鬧鐘再設一個新的")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.toolCall)
+        assertTrue(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+        assertEquals("NEED_CLARIFICATION", d.header.reasonCode)
+    }
+
+    @Test fun cjkNumeralAlarmTimeNeedsClarification() {
+        // 中文數字時間（七點半）目前不被解析為明確時間：fail-safe 轉澄清，
+        // 不預設 7:00；行為釘住，待中文數字解析落地後再支援。
+        val d = decide("明早七點半設個鬧鐘")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.toolCall)
+        assertTrue(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
+        assertEquals("NEED_CLARIFICATION", d.header.reasonCode)
+    }
 }

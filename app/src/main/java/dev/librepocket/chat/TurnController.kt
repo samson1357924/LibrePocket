@@ -98,9 +98,13 @@ class ApprovalRequiredException : Exception("chat.send approval required")
  * the total reaches the cap. Oldest-first truncation at whole-message
  * boundaries. Tool-pair integrity
  * is structural — tool calls ride inline in their assistant block
- * (`[tool:name args]` marker text, never separate provider `tool` messages)
- * — so whole-message truncation can never detach a tool result from its
- * call. Any truncation is observable via [TurnController.droppedHistoryCount],
+ * (`[tool:name args]` marker text, never separate provider `tool` messages
+ * in the persisted replay) — so whole-message truncation can never detach a
+ * tool result from its call. The wire-only continuation round (structured
+ * assistant `toolCalls` + `tool` messages, single-turn, never truncated —
+ * see [buildToolContinuation]) is exempt from this argument by construction;
+ * if it is ever truncated, keep each pair atomic. Any truncation is
+ * observable via [TurnController.droppedHistoryCount],
  * never silent.
  *
  * The default is [Unbounded] (window everything, truncate nothing): no
@@ -241,15 +245,16 @@ internal enum class DurableAdmission {
  * and isolated assistant/tool aggregation, with at most four provider attempts
  * per logical turn.
  *
- * SCAFFOLD (PR#1 re-review, P1 scope): without a tool loop this controller
- * records ToolDone only and never executes tools — no
- * ToolDispatcher/FastRouter/PrivilegeGate/ElevatedDispatch product wiring
- * yet. Projection NATIVE means switch/flavor semantics only; model visibility
+ * Records-only default (production: toolSlice=null): without a loop this
+ * controller records ToolDone only and never executes tools. Projection
+ * NATIVE means switch/flavor semantics only; model visibility
  * additionally requires `ToolDef.executionReady` (see
  * [ToolRegistry.visibleTools], the ONLY list that may be sent to the model),
- * which is true for exactly one tool (the P2 slice `lsp.symbols`) and false
- * for the other 40. The remaining product tool loop (grant/confirm + Android
+ * which is true for exactly one tool (the P2 slice `lsp.symbols`; reference
+ * it via [SafeToolSlice.TOOL_NAME], not a hardcoded count) and false
+ * for the others. The remaining product tool loop (grant/confirm + Android
  * executors + E2E per tool) still lands tool-by-tool in wiring PRs.
+ * P2 slice opt-in (see below) attaches the single-tool closed loop.
  *
  * P2 safe slice (#19, default-off): when constructed with a [SafeToolSlice],
  * the single wired tool (`lsp.symbols`, the only `executionReady=true` entry)
@@ -4403,185 +4408,21 @@ class TurnController(
       val request = buildRequest(images)
       var failed: StreamEvent.Failed? = null
       var done = false
-      // Tool aggregation for this attempt: deltas without a terminal ToolDone
-      // are flushed as pending records so they are never silently dropped.
-      val toolArgText = mutableMapOf<Int, StringBuilder>()
-      val toolIdText = mutableMapOf<Int, StringBuilder>()
-      val toolNameText = mutableMapOf<Int, StringBuilder>()
-      val toolDoneSeen = mutableSetOf<Int>()
-      // Per-attempt whole-round tool total + distinct-index set (Finding #1):
-      // many small ToolDeltas across many indexes must still trip the shared
-      // budget. Monotonic within the attempt (ToolDone arrivals never
-      // decrement it); retries start a fresh attempt with fresh counters.
-      var totalToolAggChars = 0
-      val distinctToolIndexes = mutableSetOf<Int>()
       // P2 slice: completed model calls for the single wired tool, executed
       // after a successful collect (same turn). Calls for any other tool stay
       // records-only (marker + transcript, never executed).
       val sliceCalls = mutableListOf<dev.librepocket.provider.ToolCall>()
-      suspend fun flushPendingTools() {
-        for ((index, args) in toolArgText) {
-          if (index !in toolDoneSeen) {
-            val id = toolIdText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
-            val name = toolNameText[index]?.toString().orEmpty().ifEmpty { "pending" }
-            val argsStr = args.toString()
-            // Terminal guard (Finding #4): whole pending ToolDone must fit
-            // the per-call budget before any marker/transcript side effect.
-            // Throws typed AGG_TOO_LARGE; the try-path catch turns it into
-            // the typed terminal without poison-adjacent records.
-            // Stage E invariant: NO total/count billing here — the delta path
-            // already billed both at collection time; re-adding would
-            // double-count.
-            // currentChars=0: pending was never per-call-billed; delta path already counted total/count, Stage E here is per-call only.
-            requireToolAggBudget(0, id.length + name.length + argsStr.length)
-            appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
-            writeNotice { orderedTranscript.onToolDone(attemptRunId, index, id, name, argsStr) }
-          }
-        }
-      }
+      // Shared aggregation state, fresh per attempt (see ToolAggState).
+      val toolState = ToolAggState()
       try {
-        provider.stream(request).collect { event ->
-          coroutineContext.ensureActive()
-          // A provider terminal is authoritative; ignore buggy/legacy events
-          // that an implementation emits after Done or Failed.
-          if (done || failed != null) return@collect
-          when (event) {
-            is StreamEvent.TextDelta -> {
-              streamedTextDeltaCount++
-              appendAssistantText(attemptRunId, event.delta)
-            }
-            // Reasoning stays in the same assistant block: P1 keeps one visible
-            // stream and never loses thinking content. The block is additionally
-            // flagged reasoning-sourced so tool-dependent / thinking-mode
-            // follow-up rebuilds fail closed (ordinary no-tools ones continue).
-            // Single _uiState.update (text + flag) to avoid two full maps per delta.
-            is StreamEvent.ReasoningDelta -> {
-              streamedTextDeltaCount++
-              appendReasoningDelta(attemptRunId, event.delta)
-            }
-            // Opaque reasoning marker: no visible text, only the source flag
-            // (covers reasoning origins with no replayable payload).
-            is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
-            is StreamEvent.ToolDelta -> {
-              // Fail-closed per-call aggregation budget: a hostile stream of
-              // tiny fragments (args or id/name chunks) must not grow memory
-              // without bound. Throws typed non-retryable TOOL_ARGS_TOO_LARGE
-              // (never silent truncation); the catch below skips the pending
-              // flush so poison-adjacent fragments are never recorded.
-              // The same budget additionally guards the per-attempt total
-              // across all indexes, plus a distinct-index cap — all one
-              // failure semantics.
-              // Finding #5 first-chunk-wins: id/name winners are the first
-              // non-empty chunk only (same rule as ChatCompletionsMapper);
-              // repeats contribute 0 and are never appended. Args stay
-              // full-volume.
-              val bufferedArgs = toolArgText[event.toolIndex]?.length ?: 0
-              val bufferedId = toolIdText[event.toolIndex]?.length ?: 0
-              val bufferedName = toolNameText[event.toolIndex]?.length ?: 0
-              val idIncoming =
-                if (event.idChunk != null && event.idChunk.isNotEmpty() && bufferedId == 0) {
-                  event.idChunk.length
-                } else {
-                  0
-                }
-              val nameIncoming =
-                if (event.nameChunk != null && event.nameChunk.isNotEmpty() && bufferedName == 0) {
-                  event.nameChunk.length
-                } else {
-                  0
-                }
-              val toolIncoming = event.argsChunk.length + idIncoming + nameIncoming
-              if (!distinctToolIndexes.contains(event.toolIndex)) {
-                requireToolCountBudget(distinctToolIndexes.size + 1)
-                distinctToolIndexes.add(event.toolIndex)
-              }
-              requireToolAggBudget(
-                bufferedArgs + bufferedId + bufferedName,
-                toolIncoming,
-              )
-              requireTotalToolAggBudget(totalToolAggChars, toolIncoming)
-              toolArgText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
-              if (idIncoming > 0) {
-                toolIdText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.idChunk!!)
-              }
-              if (nameIncoming > 0) {
-                toolNameText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.nameChunk!!)
-              }
-              totalToolAggChars += toolIncoming
-            }
-            is StreamEvent.ToolDone -> {
-              // Terminal-only guard (Stage E): a direct ToolDone that never
-              // went through delta budgeting must still fit ALL budgets
-              // before any marker/transcript side effect. Per-call first,
-              // then distinct-index cap (BEFORE-insert), then round-total
-              // growth (candidate minus already-buffered delta bytes, floor
-              // 0 — delta-then-done never double-bills). Throws typed
-              // AGG_TOO_LARGE; the catch below turns it into the typed
-              // terminal with no marker and no transcript record for the
-              // tripping index (already-emitted ToolDones stay).
-              // Duplicate ToolDone for an already-completed index is ignored
-              // outright: no second billing, no second record.
-              if (event.toolIndex in toolDoneSeen) return@collect
-              val toolDoneCandidate =
-                event.id.length + event.name.length + event.argumentsJson.length
-              requireToolAggBudget(0, toolDoneCandidate)
-              if (event.toolIndex !in distinctToolIndexes) {
-                requireToolCountBudget(distinctToolIndexes.size + 1)
-              }
-              val toolDoneBuffered =
-                (toolArgText[event.toolIndex]?.length ?: 0) +
-                  (toolIdText[event.toolIndex]?.length ?: 0) +
-                  (toolNameText[event.toolIndex]?.length ?: 0)
-              val toolDoneGrowth = (toolDoneCandidate - toolDoneBuffered).coerceAtLeast(0)
-              requireTotalToolAggBudget(totalToolAggChars, toolDoneGrowth)
-              distinctToolIndexes.add(event.toolIndex)
-              totalToolAggChars += toolDoneGrowth
-              toolDoneSeen.add(event.toolIndex)
-              appendAssistantText(attemptRunId, "\n[tool:${event.name} ${event.argumentsJson}]")
-              writeNotice {
-                orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
-              }
-              // P2 slice: only the single wired tool proceeds to execution
-              // (after a successful collect, same turn); everything else stays
-              // records-only even when a loop is attached.
-              if (toolSlice != null && event.name == SafeToolSlice.TOOL_NAME) {
-                sliceCalls.add(
-                  dev.librepocket.provider.ToolCall(
-                    id = event.id,
-                    name = event.name,
-                    argumentsJson = event.argumentsJson,
-                  ),
-                )
-              }
-            }
-            is StreamEvent.Usage -> {
-              lastUsage = event
-              writeNotice { orderedTranscript.onUsage(attemptRunId, event.inputTokens, event.outputTokens) }
-            }
-            is StreamEvent.Done -> {
-              finalizeAssistant(attemptRunId)
-              done = true
-            }
-            is StreamEvent.Failed -> failed = event
-            is StreamEvent.Retrying -> {
-              // Compatibility with legacy/custom providers. Built-in adapters
-              // do not retry; this controller owns retries from Failed events.
-              // A per-attempt provider notice keeps the attempt id.
-              writeNotice { orderedTranscript.onTurnRetried(attemptRunId, event.attempt, event.maxAttempts, event.delayMs) }
-            }
-          }
-        }
-        // Finding #3: a provider resource-exhausted Failed (typed AGG_TOO_LARGE
-        // code or overflow markers) must not flush poison-adjacent pending
-        // ToolDeltas; already-completed ToolDone records stay (emitted inline
-        // at collection time). Truncated fallback (failed == null) still
-        // flushes: isResourceExhausted(null) is false.
-        if (!isResourceExhausted(failed)) {
-          flushPendingTools()
-        }
-        if (!done && failed == null) {
-          failed = StreamEvent.Failed("truncated stream", retryable = true)
-        }
+        val streamOutcome = collectStream(
+          request,
+          attemptRunId,
+          toolState,
+          onWiredToolDone = { call -> sliceCalls.add(call) },
+        )
+        failed = streamOutcome.failed
+        done = streamOutcome.done
         // P2 slice (default-off): same-turn tool continuation for the single
         // wired tool. Cancel between collect and execution aborts here with
         // zero further effects (ensureActive + the loop's own checks throw
@@ -4600,39 +4441,30 @@ class TurnController(
           sliceExecutedThisTurn = true
           val sliceResults = loop.execute(sliceCalls)
           for (r in sliceResults) {
-            appendAssistantText(attemptRunId, "\n[tool-result:${r.name} ${r.resultJson}]")
+            // Length-prefixed marker: resultJson embeds `]` (symbols array)
+            // and model-controlled text, so a bare `]` terminator would be
+            // ambiguous. Format: [tool-result:<name>:<len>:<json>], where
+            // <len> is String.length (UTF-16 units, matching substring
+            // slicing) and <name> never contains `:` (dotted tool names).
+            appendAssistantText(attemptRunId, "\n[tool-result:${r.name}:${r.resultJson.length}:${r.resultJson}]")
           }
           val contRequest = buildToolContinuation(images, sliceCalls, sliceResults, loop)
-          val contOutcome = collectToolContinuation(contRequest, attemptRunId, totalToolAggChars)
-          totalToolAggChars = contOutcome.totalToolAggChars
+          val contOutcome = collectToolContinuation(contRequest, attemptRunId, toolState.totalChars)
+          toolState.totalChars = contOutcome.totalToolAggChars
           if (contOutcome.failed != null) {
             failed = contOutcome.failed
           }
         }
+        // Catch parity with the pre-extraction loop: the slice block only
+        // throws CancellationException in practice (typed denials cover the
+        // rest), but a non-cancel throw here still becomes a terminal (not a
+        // leaked crash) exactly like the old inline catches.
       } catch (e: CancellationException) {
         throw e
-      } catch (e: ProviderFailure) {
-        failed = StreamEvent.Failed(e.message ?: "provider error", retryable = e.retryable)
-        if (e.code != ProviderFailureCode.AGG_TOO_LARGE) {
-          flushPendingTools()
-        }
-        // AGG_TOO_LARGE is this collector's own guard: fail closed without
-        // recording poison-adjacent pending tools (the typed terminal error
-        // is the observable record). Visible text is already current because
-        // text updates stay per-delta (see uiTextUpdateCount).
       } catch (e: Exception) {
         failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
-        flushPendingTools()
+        flushPendingTools(toolState, attemptRunId)
       } catch (e: Throwable) {
-        // S3-F1 Error symmetry (Current, option (a)): fatal Error from the
-        // provider stream (e.g. AssertionError/LinkageError from a buggy
-        // adapter) is a non-retryable terminal like AGG_TOO_LARGE — never
-        // flush poison-adjacent pending ToolDeltas (unlike Exception, which
-        // flushes), never retry. The outer hostedTurn Throwable catch below
-        // (or the retry-exhausted terminal path here) still projects
-        // sanitizeError → UI ERROR. CancellationException never lands here
-        // (rethrown first above), so CE semantics are unchanged. VM-fatal
-        // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
         if (e is VirtualMachineError || e is ThreadDeath) throw e
         failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
       }
@@ -4730,16 +4562,255 @@ class TurnController(
     }
   }
 
+  /**
+   * Shared per-response tool-aggregation state for stream collects.
+   * Per-attempt whole-round tool total + distinct-index set (Finding #1):
+   * many small ToolDeltas across many indexes must still trip the shared
+   * budget. Monotonic within the attempt (ToolDone arrivals never
+   * decrement it); retries start a fresh attempt with fresh counters.
+   */
+  private class ToolAggState(
+    var totalChars: Int = 0,
+    val distinctIndexes: MutableSet<Int> = mutableSetOf(),
+    val argText: MutableMap<Int, StringBuilder> = mutableMapOf(),
+    val idText: MutableMap<Int, StringBuilder> = mutableMapOf(),
+    val nameText: MutableMap<Int, StringBuilder> = mutableMapOf(),
+    val doneSeen: MutableSet<Int> = mutableSetOf(),
+  )
+
+  /** Outcome of one shared stream collect: terminal failure (if any) plus Done. */
+  private data class StreamOutcome(val failed: StreamEvent.Failed?, val done: Boolean)
+
+  private suspend fun flushPendingTools(state: ToolAggState, attemptRunId: String) {
+    for ((index, args) in state.argText) {
+      if (index !in state.doneSeen) {
+        val id = state.idText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
+        val name = state.nameText[index]?.toString().orEmpty().ifEmpty { "pending" }
+        val argsStr = args.toString()
+        // Terminal guard (Finding #4): whole pending ToolDone must fit
+        // the per-call budget before any marker/transcript side effect.
+        // Throws typed AGG_TOO_LARGE; the collect catch turns it into
+        // the typed terminal without poison-adjacent records.
+        // Stage E invariant: NO total/count billing here — the delta path
+        // already billed both at collection time; re-adding would
+        // double-count.
+        // currentChars=0: pending was never per-call-billed; delta path already counted total/count, Stage E here is per-call only.
+        requireToolAggBudget(0, id.length + name.length + argsStr.length)
+        appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
+        writeNotice { orderedTranscript.onToolDone(attemptRunId, index, id, name, argsStr) }
+      }
+    }
+  }
+
+  private fun noteToolDelta(state: ToolAggState, event: StreamEvent.ToolDelta) {
+    // Fail-closed per-call aggregation budget: a hostile stream of
+    // tiny fragments (args or id/name chunks) must not grow memory
+    // without bound. Throws typed non-retryable TOOL_ARGS_TOO_LARGE
+    // (never silent truncation); the collect catch skips the pending
+    // flush so poison-adjacent fragments are never recorded.
+    // The same budget additionally guards the per-attempt total
+    // across all indexes, plus a distinct-index cap — all one
+    // failure semantics.
+    // Finding #5 first-chunk-wins: id/name winners are the first
+    // non-empty chunk only (same rule as ChatCompletionsMapper);
+    // repeats contribute 0 and are never appended. Args stay
+    // full-volume.
+    val bufferedArgs = state.argText[event.toolIndex]?.length ?: 0
+    val bufferedId = state.idText[event.toolIndex]?.length ?: 0
+    val bufferedName = state.nameText[event.toolIndex]?.length ?: 0
+    val idIncoming =
+      if (event.idChunk != null && event.idChunk.isNotEmpty() && bufferedId == 0) {
+        event.idChunk.length
+      } else {
+        0
+      }
+    val nameIncoming =
+      if (event.nameChunk != null && event.nameChunk.isNotEmpty() && bufferedName == 0) {
+        event.nameChunk.length
+      } else {
+        0
+      }
+    val toolIncoming = event.argsChunk.length + idIncoming + nameIncoming
+    if (!state.distinctIndexes.contains(event.toolIndex)) {
+      requireToolCountBudget(state.distinctIndexes.size + 1)
+      state.distinctIndexes.add(event.toolIndex)
+    }
+    requireToolAggBudget(
+      bufferedArgs + bufferedId + bufferedName,
+      toolIncoming,
+    )
+    requireTotalToolAggBudget(state.totalChars, toolIncoming)
+    state.argText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
+    if (idIncoming > 0) {
+      state.idText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.idChunk!!)
+    }
+    if (nameIncoming > 0) {
+      state.nameText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.nameChunk!!)
+    }
+    state.totalChars += toolIncoming
+  }
+
+  private suspend fun noteToolDone(
+    state: ToolAggState,
+    event: StreamEvent.ToolDone,
+    attemptRunId: String,
+    onWiredToolDone: ((dev.librepocket.provider.ToolCall) -> Unit)?,
+  ) {
+    // Terminal-only guard (Stage E): a direct ToolDone that never
+    // went through delta budgeting must still fit ALL budgets
+    // before any marker/transcript side effect. Per-call first,
+    // then distinct-index cap (BEFORE-insert), then round-total
+    // growth (candidate minus already-buffered delta bytes, floor
+    // 0 — delta-then-done never double-bills). Throws typed
+    // AGG_TOO_LARGE; the collect catch turns it into the typed
+    // terminal with no marker and no transcript record for the
+    // tripping index (already-emitted ToolDones stay).
+    // Duplicate ToolDone for an already-completed index is ignored
+    // outright: no second billing, no second record.
+    if (event.toolIndex in state.doneSeen) return
+    val toolDoneCandidate =
+      event.id.length + event.name.length + event.argumentsJson.length
+    requireToolAggBudget(0, toolDoneCandidate)
+    if (event.toolIndex !in state.distinctIndexes) {
+      requireToolCountBudget(state.distinctIndexes.size + 1)
+    }
+    val toolDoneBuffered =
+      (state.argText[event.toolIndex]?.length ?: 0) +
+        (state.idText[event.toolIndex]?.length ?: 0) +
+        (state.nameText[event.toolIndex]?.length ?: 0)
+    val toolDoneGrowth = (toolDoneCandidate - toolDoneBuffered).coerceAtLeast(0)
+    requireTotalToolAggBudget(state.totalChars, toolDoneGrowth)
+    state.distinctIndexes.add(event.toolIndex)
+    state.totalChars += toolDoneGrowth
+    state.doneSeen.add(event.toolIndex)
+    appendAssistantText(attemptRunId, "\n[tool:${event.name} ${event.argumentsJson}]")
+    writeNotice {
+      orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
+    }
+    // P2 slice: only the single wired tool proceeds to execution
+    // (after a successful collect, same turn); everything else stays
+    // records-only even when a loop is attached. A null callback means
+    // record-only (tool continuation second round).
+    if (onWiredToolDone != null && toolSlice != null && event.name == SafeToolSlice.TOOL_NAME) {
+      onWiredToolDone(
+        dev.librepocket.provider.ToolCall(
+          id = event.id,
+          name = event.name,
+          argumentsJson = event.argumentsJson,
+        ),
+      )
+    }
+  }
+
+  /**
+   * Shared stream-event collect for the attempt loop and the P2 tool
+   * continuation: text/reasoning/usage/notice handling identical, plus the
+   * same Failed/Retrying/Done/truncated-terminal semantics as the old inline
+   * loop. ToolDone optionally forwarded to [onWiredToolDone] (attempt loop)
+   * or recorded only (continuation, null callback — one tool round per turn).
+   */
+  private suspend fun collectStream(
+    request: ChatRequest,
+    attemptRunId: String,
+    state: ToolAggState,
+    onWiredToolDone: ((dev.librepocket.provider.ToolCall) -> Unit)?,
+  ): StreamOutcome {
+    var done = false
+    var failed: StreamEvent.Failed? = null
+    try {
+      provider.stream(request).collect { event ->
+        coroutineContext.ensureActive()
+        // A provider terminal is authoritative; ignore buggy/legacy events
+        // that an implementation emits after Done or Failed.
+        if (done || failed != null) return@collect
+        when (event) {
+          is StreamEvent.TextDelta -> {
+            streamedTextDeltaCount++
+            appendAssistantText(attemptRunId, event.delta)
+          }
+          // Reasoning stays in the same assistant block: P1 keeps one visible
+          // stream and never loses thinking content. The block is additionally
+          // flagged reasoning-sourced so tool-dependent / thinking-mode
+          // follow-up rebuilds fail closed (ordinary no-tools ones continue).
+          // Single _uiState.update (text + flag) to avoid two full maps per delta.
+          is StreamEvent.ReasoningDelta -> {
+            streamedTextDeltaCount++
+            appendReasoningDelta(attemptRunId, event.delta)
+          }
+          // Opaque reasoning marker: no visible text, only the source flag
+          // (covers reasoning origins with no replayable payload).
+          is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
+          is StreamEvent.ToolDelta -> noteToolDelta(state, event)
+          is StreamEvent.ToolDone -> noteToolDone(state, event, attemptRunId, onWiredToolDone)
+          is StreamEvent.Usage -> {
+            lastUsage = event
+            writeNotice { orderedTranscript.onUsage(attemptRunId, event.inputTokens, event.outputTokens) }
+          }
+          is StreamEvent.Done -> {
+            finalizeAssistant(attemptRunId)
+            done = true
+          }
+          is StreamEvent.Failed -> failed = event
+          is StreamEvent.Retrying -> {
+            // Compatibility with legacy/custom providers. Built-in adapters
+            // do not retry; this controller owns retries from Failed events.
+            // A per-attempt provider notice keeps the attempt id.
+            writeNotice { orderedTranscript.onTurnRetried(attemptRunId, event.attempt, event.maxAttempts, event.delayMs) }
+          }
+        }
+      }
+      // Finding #3: a provider resource-exhausted Failed (typed AGG_TOO_LARGE
+      // code or overflow markers) must not flush poison-adjacent pending
+      // ToolDeltas; already-completed ToolDone records stay (emitted inline
+      // at collection time). Truncated fallback (failed == null) still
+      // flushes: isResourceExhausted(null) is false.
+      if (!isResourceExhausted(failed)) {
+        flushPendingTools(state, attemptRunId)
+      }
+      if (!done && failed == null) {
+        failed = StreamEvent.Failed("truncated stream", retryable = true)
+      }
+    } catch (e: CancellationException) {
+      throw e
+    } catch (e: ProviderFailure) {
+      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = e.retryable)
+      if (e.code != ProviderFailureCode.AGG_TOO_LARGE) {
+        flushPendingTools(state, attemptRunId)
+      }
+      // AGG_TOO_LARGE is this collector's own guard: fail closed without
+      // recording poison-adjacent pending tools (the typed terminal error
+      // is the observable record). Visible text is already current because
+      // text updates stay per-delta (see uiTextUpdateCount).
+    } catch (e: Exception) {
+      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
+      flushPendingTools(state, attemptRunId)
+    } catch (e: Throwable) {
+      // S3-F1 Error symmetry (Current, option (a)): fatal Error from the
+      // provider stream (e.g. AssertionError/LinkageError from a buggy
+      // adapter) is a non-retryable terminal like AGG_TOO_LARGE — never
+      // flush poison-adjacent pending ToolDeltas (unlike Exception, which
+      // flushes), never retry. The outer hostedTurn Throwable catch below
+      // (or the retry-exhausted terminal path here) still projects
+      // sanitizeError → UI ERROR. CancellationException never lands here
+      // (rethrown first above), so CE semantics are unchanged. VM-fatal
+      // always propagates (contrast OrderedTranscriptSink fail+throw+seal).
+      if (e is VirtualMachineError || e is ThreadDeath) throw e
+      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
+    }
+    return StreamOutcome(failed, done)
+  }
+
   /** Outcome of the P2 slice continuation collect: terminal failure (if any) plus the updated per-attempt tool total. */
   private data class ContinuationOutcome(val failed: StreamEvent.Failed?, val totalToolAggChars: Int)
 
   /**
    * P2 slice continuation request: the current history/user context plus the
-   * structured tool round (assistant `toolCalls` + paired `tool` results, both
-   * executed and denied — pairing is total). The in-progress assistant block
-   * is partial, so [buildRequest] excludes its marker text; the wire carries
-   * the structured round instead. Tools stay attached (same offer): a second
-   * model tool call is recorded but never executed (one tool round per turn).
+   * structured tool round (assistant `toolCalls` + paired `tool` results —
+   * pairing is total within one executed round). Markers stay inline in the
+   * assistant text AND the structured round rides alongside (double carry;
+   * only the inline markers survive into the next attempt). Tools stay
+   * attached (same offer): a second model tool call is recorded but never
+   * executed (one tool round per turn).
    */
   private fun buildToolContinuation(
     images: List<ChatImageRef>,
@@ -4752,14 +4823,13 @@ class TurnController(
   }
 
   /**
-   * P2 slice continuation collect: mirrors the attempt collect above
-   * (text/reasoning/usage/notice handling identical) with record-only tool
-   * semantics — ToolDone/pending ToolDeltas get markers + transcript records
-   * but are never executed, enforcing the one-tool-round-per-turn budget.
-   * Aggregation budgets share the attempt total ([attemptTotalChars] in,
-   * updated total out); index-keyed maps are fresh per response (provider
-   * tool indexes restart per response, so cross-round sharing would forge
-   * false duplicates).
+   * P2 slice continuation collect: delegates to [collectStream] with
+   * record-only tool semantics (`onWiredToolDone = null`) — ToolDone/pending
+   * ToolDeltas get markers + transcript records but are never executed,
+   * enforcing the one-tool-round-per-turn budget. Aggregation budgets share
+   * the attempt total ([attemptTotalChars] in, updated total out);
+   * index-keyed maps are fresh per response (provider tool indexes restart
+   * per response, so cross-round sharing would forge false duplicates).
    *
    * Round identity: continuation records share this attempt's [attemptRunId]
    * with the first round (both are append-only rows, never upserts, so no
@@ -4773,131 +4843,9 @@ class TurnController(
     attemptRunId: String,
     attemptTotalChars: Int,
   ): ContinuationOutcome {
-    var totalToolAggChars = attemptTotalChars
-    val distinctToolIndexes = mutableSetOf<Int>()
-    val toolArgText = mutableMapOf<Int, StringBuilder>()
-    val toolIdText = mutableMapOf<Int, StringBuilder>()
-    val toolNameText = mutableMapOf<Int, StringBuilder>()
-    val toolDoneSeen = mutableSetOf<Int>()
-    suspend fun flushPendingTools() {
-      for ((index, args) in toolArgText) {
-        if (index !in toolDoneSeen) {
-          val id = toolIdText[index]?.toString().orEmpty().ifEmpty { "call_pending_$index" }
-          val name = toolNameText[index]?.toString().orEmpty().ifEmpty { "pending" }
-          val argsStr = args.toString()
-          requireToolAggBudget(0, id.length + name.length + argsStr.length)
-          appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
-          writeNotice { orderedTranscript.onToolDone(attemptRunId, index, id, name, argsStr) }
-        }
-      }
-    }
-    var failed: StreamEvent.Failed? = null
-    var done = false
-    try {
-      provider.stream(request).collect { event ->
-        coroutineContext.ensureActive()
-        if (done || failed != null) return@collect
-        when (event) {
-          is StreamEvent.TextDelta -> {
-            streamedTextDeltaCount++
-            appendAssistantText(attemptRunId, event.delta)
-          }
-          is StreamEvent.ReasoningDelta -> {
-            streamedTextDeltaCount++
-            appendReasoningDelta(attemptRunId, event.delta)
-          }
-          is StreamEvent.ReasoningPresent -> markAssistantReasoning(attemptRunId)
-          is StreamEvent.ToolDelta -> {
-            val bufferedArgs = toolArgText[event.toolIndex]?.length ?: 0
-            val bufferedId = toolIdText[event.toolIndex]?.length ?: 0
-            val bufferedName = toolNameText[event.toolIndex]?.length ?: 0
-            val idIncoming =
-              if (event.idChunk != null && event.idChunk.isNotEmpty() && bufferedId == 0) {
-                event.idChunk.length
-              } else {
-                0
-              }
-            val nameIncoming =
-              if (event.nameChunk != null && event.nameChunk.isNotEmpty() && bufferedName == 0) {
-                event.nameChunk.length
-              } else {
-                0
-              }
-            val toolIncoming = event.argsChunk.length + idIncoming + nameIncoming
-            if (!distinctToolIndexes.contains(event.toolIndex)) {
-              requireToolCountBudget(distinctToolIndexes.size + 1)
-              distinctToolIndexes.add(event.toolIndex)
-            }
-            requireToolAggBudget(bufferedArgs + bufferedId + bufferedName, toolIncoming)
-            requireTotalToolAggBudget(totalToolAggChars, toolIncoming)
-            toolArgText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.argsChunk)
-            if (idIncoming > 0) {
-              toolIdText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.idChunk!!)
-            }
-            if (nameIncoming > 0) {
-              toolNameText.getOrPut(event.toolIndex) { StringBuilder() }.append(event.nameChunk!!)
-            }
-            totalToolAggChars += toolIncoming
-          }
-          is StreamEvent.ToolDone -> {
-            // Record-only (slice budget): never executed, even for the wired
-            // tool — the turn's single tool round already ran.
-            if (event.toolIndex in toolDoneSeen) return@collect
-            val toolDoneCandidate =
-              event.id.length + event.name.length + event.argumentsJson.length
-            requireToolAggBudget(0, toolDoneCandidate)
-            if (event.toolIndex !in distinctToolIndexes) {
-              requireToolCountBudget(distinctToolIndexes.size + 1)
-            }
-            val toolDoneBuffered =
-              (toolArgText[event.toolIndex]?.length ?: 0) +
-                (toolIdText[event.toolIndex]?.length ?: 0) +
-                (toolNameText[event.toolIndex]?.length ?: 0)
-            val toolDoneGrowth = (toolDoneCandidate - toolDoneBuffered).coerceAtLeast(0)
-            requireTotalToolAggBudget(totalToolAggChars, toolDoneGrowth)
-            distinctToolIndexes.add(event.toolIndex)
-            totalToolAggChars += toolDoneGrowth
-            toolDoneSeen.add(event.toolIndex)
-            appendAssistantText(attemptRunId, "\n[tool:${event.name} ${event.argumentsJson}]")
-            writeNotice {
-              orderedTranscript.onToolDone(attemptRunId, event.toolIndex, event.id, event.name, event.argumentsJson)
-            }
-          }
-          is StreamEvent.Usage -> {
-            lastUsage = event
-            writeNotice { orderedTranscript.onUsage(attemptRunId, event.inputTokens, event.outputTokens) }
-          }
-          is StreamEvent.Done -> {
-            finalizeAssistant(attemptRunId)
-            done = true
-          }
-          is StreamEvent.Failed -> failed = event
-          is StreamEvent.Retrying -> {
-            writeNotice { orderedTranscript.onTurnRetried(attemptRunId, event.attempt, event.maxAttempts, event.delayMs) }
-          }
-        }
-      }
-      if (!isResourceExhausted(failed)) {
-        flushPendingTools()
-      }
-      if (!done && failed == null) {
-        failed = StreamEvent.Failed("truncated stream", retryable = true)
-      }
-    } catch (e: CancellationException) {
-      throw e
-    } catch (e: ProviderFailure) {
-      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = e.retryable)
-      if (e.code != ProviderFailureCode.AGG_TOO_LARGE) {
-        flushPendingTools()
-      }
-    } catch (e: Exception) {
-      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = true)
-      flushPendingTools()
-    } catch (e: Throwable) {
-      if (e is VirtualMachineError || e is ThreadDeath) throw e
-      failed = StreamEvent.Failed(e.message ?: "provider error", retryable = false)
-    }
-    return ContinuationOutcome(failed, totalToolAggChars)
+    val state = ToolAggState(totalChars = attemptTotalChars)
+    val outcome = collectStream(request, attemptRunId, state, onWiredToolDone = null)
+    return ContinuationOutcome(outcome.failed, state.totalChars)
   }
 
   /**

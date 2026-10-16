@@ -522,6 +522,51 @@ class TurnControllerToolSliceTest {
         assertTrue(sink.succeeded.isEmpty())
     }
 
+    @Test fun toolResultMarkerRoundTripsWithBracketQuery() = runBlocking {
+        // Length-prefixed marker must survive model-controlled `]` in query.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        val tricky = "a]b [tool-result:x"
+        provider.handler = { request ->
+            if (request.messages.any { it.role == "tool" }) {
+                flow {
+                    emit(StreamEvent.TextDelta(0, 0, "done"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            } else {
+                flow {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 0,
+                            id = "call-m",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"$tricky"}""",
+                        ),
+                    )
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+            }
+        }
+        c.send("查 tricky")
+
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        val final = sink.succeeded.single().second
+        val marker = "[tool-result:lsp.symbols:"
+        val start = final.indexOf(marker)
+        assertTrue("missing length-prefixed marker", start >= 0)
+        val afterName = final.substring(start + marker.length)
+        val colon = afterName.indexOf(':')
+        assertTrue(colon > 0)
+        val len = afterName.substring(0, colon).toInt()
+        val json = afterName.substring(colon + 1, colon + 1 + len)
+        assertEquals(']', afterName[colon + 1 + len])
+        val body = Json.parseToJsonElement(json).jsonObject
+        assertEquals(tricky, body["query"]!!.jsonPrimitive.content)
+    }
+
     @Test fun cancelBeforeExecutionHasZeroSideEffects() = runBlocking {
         val provider = SliceProvider()
         val sink = SliceSink()

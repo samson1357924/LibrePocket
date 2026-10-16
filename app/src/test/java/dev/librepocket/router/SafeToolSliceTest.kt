@@ -377,9 +377,21 @@ class SafeToolSliceTest {
         val unreadyDenied =
             s.execute(listOf(call(name = "shell.exec", args = """{"argv":["ls"]}""", id = "unready-1"))).single()
         assertEquals(SafeToolSlice.DenyCodes.NOT_READY, unreadyDenied.denyCode)
+        val knownCodes = setOf(
+            SafeToolSlice.DenyCodes.UNKNOWN_TOOL,
+            SafeToolSlice.DenyCodes.NOT_READY,
+            SafeToolSlice.DenyCodes.SCOPE_DENIED,
+            SafeToolSlice.DenyCodes.SCHEMA_INVALID,
+            SafeToolSlice.DenyCodes.POLICY_DENIED,
+            SafeToolSlice.DenyCodes.NEED_CONFIRM,
+            SafeToolSlice.DenyCodes.EXEC_DENIED,
+            SafeToolSlice.DenyCodes.EXEC_ERROR,
+            SafeToolSlice.DenyCodes.BUDGET_EXCEEDED,
+        )
         val results = listOf(policyDenied, schemaDenied, unreadyDenied)
         assertTrue(results.all { it.denied })
         for (r in results) {
+            assertTrue(r.denyCode in knownCodes)
             assertFalse(r.resultJson.lowercase().contains("sk-"))
             assertFalse(r.resultJson.lowercase().contains("bearer"))
         }

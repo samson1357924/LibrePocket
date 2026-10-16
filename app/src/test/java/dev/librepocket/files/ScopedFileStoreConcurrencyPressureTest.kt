@@ -18,6 +18,7 @@ import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -39,7 +40,8 @@ import java.util.concurrent.atomic.AtomicReference
  *   [FileNotFoundException]／併發窗口 [IOException] 計入 [denied] 混合桶，其中僅
  *   [IllegalArgumentException] 計入 [rejected] 門證據桶；穩定路徑／ephemeral 獨佔
  *   路徑任何異常皆進 [errors]；[FileBudgetException] 屬真 bug 進 [errors]）；
- * - 無懸掛（起跑閘＋[awaitTermination] 期限，失敗先 shutdownNow 再超時斷言）；
+ * - 無懸掛（起跑閘＋首次期限 miss 即 FAIL；reap 成功僅允許安全清理，不可當 PASS；
+ *   teardown 另由存活門判定，見 [quiescePool]）；
  * - outside 秘密未被竄改（內容位元一致）且穩定路徑寫入未穿出
  *   （`out/file.txt` 不存在）；翻轉路徑的讀殘餘（`outsideReads`）與
  *   外部新增檔（`outsideExtra`）僅診斷記錄，不計為通過條件——系統性穿出由
@@ -77,6 +79,7 @@ class ScopedFileStoreConcurrencyPressureTest {
         const val DELETER_ROUNDS = 80
         const val GATE_TIMEOUT_SEC = 30L
         const val POOL_TIMEOUT_SEC = 60L
+        const val POOL_REAP_TIMEOUT_SEC = 10L
         const val POOL_SIZE = 7
         // staging 前綴錨定生產常數：若 TMP_NAME_PREFIX 變更，此處同步跟隨，
         // 避免清理塊靜默變 no-op（PocketGuard PR91 WARN）。
@@ -92,6 +95,40 @@ class ScopedFileStoreConcurrencyPressureTest {
         try {
             Files.deleteIfExists(f.toPath())
         } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * pool 靜默語義（人審 P2：deadline 與可否 teardown 分離，可注入極短 timeout 測試）。
+     * - `timedOut`：首次期限內未終止（即使＋reap 後收斂，仍須記 FAIL，不可當 PASS）。
+     * - `quiesced`：已確認無存活 worker，可安全遞迴清理共享路徑。
+     * 僅在已 `shutdown()` 的 pool 上呼叫（本檔呼叫前已 shutdown；重入冪等）。
+     * 中斷語義：若等待被中斷，補 `shutdownNow` 並恢復中斷位，回傳
+     * `timedOut=true, quiesced=false`（保守視為不可 teardown）。
+     */
+    internal data class QuiesceOutcome(val timedOut: Boolean, val quiesced: Boolean)
+
+    internal fun quiescePool(
+        pool: ExecutorService,
+        firstTimeoutSec: Long,
+        reapTimeoutSec: Long,
+    ): QuiesceOutcome {
+        try {
+            pool.shutdown()
+            val terminated = pool.awaitTermination(firstTimeoutSec, TimeUnit.SECONDS)
+            if (!terminated) {
+                pool.shutdownNow()
+                val reaped = pool.awaitTermination(reapTimeoutSec, TimeUnit.SECONDS)
+                return QuiesceOutcome(timedOut = true, quiesced = reaped && pool.isTerminated)
+            }
+            return QuiesceOutcome(timedOut = false, quiesced = pool.isTerminated)
+        } catch (e: InterruptedException) {
+            try {
+                pool.shutdownNow()
+            } catch (_: Exception) {
+            }
+            Thread.currentThread().interrupt()
+            return QuiesceOutcome(timedOut = true, quiesced = false)
         }
     }
 
@@ -253,7 +290,7 @@ class ScopedFileStoreConcurrencyPressureTest {
             }
         // 清理後毒鏈必須已除，否則恢復證明空洞；且 race-sub 本體（無論連結／實目錄）
         // 必須不存在（僅查連結會漏普通目錄殘留，人審 P3#2）。
-        // 呼叫前 workers 須已確認全退出（見 poolQuiesced 門），否則不得呼叫。
+        // 呼叫前 workers 須已確認全退出（見 workersMayBeAlive 門），否則不得呼叫。
         assertFalse(
             "race-sub staging must be cleaned",
             File(ws, "race-sub").let { Files.isSymbolicLink(it.toPath()) } ||
@@ -309,9 +346,13 @@ class ScopedFileStoreConcurrencyPressureTest {
         assertTrue(stageDirPrefix().startsWith(ScopedFileStore.TMP_NAME_PREFIX))
         val ws = workspace()
         val out = outside()
-        // workers 退出確認旗：僅 pool.awaitTermination 成功才置 true；outer finally
-        // 據此決定是否可遞迴清理共享路徑（人審 P2：超時未退出不得 teardown）。
-        var poolQuiesced = false
+        // workers 存活不確定旗：提交前為 false（setup 失敗仍可清理，人審 P3#2）；
+        // 提交後置 true，僅確認全退出才回 false。outer finally 據此決定是否可
+        // 遞迴清理共享路徑（人審 P2：超時未退出不得 teardown）。
+        var workersMayBeAlive = false
+        // 首次 60s 期限標記：即使 shutdownNow＋reap 後收斂，仍須記 FAIL（人審 P2）。
+        // （可否 teardown 以 workersMayBeAlive 判定，見下。）
+        var poolTimedOut = false
         try {
             File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
             val store = ScopedFileStore(ws)
@@ -353,6 +394,8 @@ class ScopedFileStoreConcurrencyPressureTest {
                         return@Runnable
                     }
                     repeat(FILE_FLIP_ROUNDS) { i ->
+                        // 響應 shutdownNow 中斷，使 reap 有界收斂（A P1-3）。
+                        if (Thread.currentThread().isInterrupted) return@Runnable
                         val flip = File(ws, "flip")
                         // 線程唯一性以 name 取得（pool 線程名唯一，無 deprecated API）。
                         val tid = Thread.currentThread().name
@@ -391,6 +434,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                         return@Runnable
                     }
                     repeat(DIR_FLIP_ROUNDS) { i ->
+                        if (Thread.currentThread().isInterrupted) return@Runnable
                         val sub = File(ws, "race-sub")
                         // 線程唯一性見 fileFlipper 註解（name，無 deprecated API）。
                         val tid = Thread.currentThread().name
@@ -432,6 +476,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                         return@Runnable
                     }
                     repeat(READER_ROUNDS) {
+                        if (Thread.currentThread().isInterrupted) return@Runnable
                         readAttempts.incrementAndGet()
                         try {
                             val text = String(store.read("flip"), Charsets.UTF_8)
@@ -471,6 +516,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                         return@Runnable
                     }
                     repeat(WRITER_ROUNDS) { i ->
+                        if (Thread.currentThread().isInterrupted) return@Runnable
                         // 穩定路徑永不翻轉：任何 IAE 皆為誤拒（false-positive），記 errors 不進 denied。
                         try {
                             store.write("stable/file.txt", "v$i".toByteArray(Charsets.UTF_8))
@@ -510,6 +556,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                         return@Runnable
                     }
                     repeat(LISTER_ROUNDS) {
+                        if (Thread.currentThread().isInterrupted) return@Runnable
                         try {
                             val listed = store.list()
                             if (listed.any { it.startsWith("/") || it.split("/").any { seg -> seg == ".." } }) {
@@ -551,6 +598,7 @@ class ScopedFileStoreConcurrencyPressureTest {
                         return@Runnable
                     }
                     repeat(DELETER_ROUNDS) { i ->
+                        if (Thread.currentThread().isInterrupted) return@Runnable
                         val ephemeral = "ephemeral-$i.txt"
                         // ephemeral 為 deleter 獨佔檔名（flipper 不碰）：IAE 屬誤拒記 errors。
                         try {
@@ -580,7 +628,13 @@ class ScopedFileStoreConcurrencyPressureTest {
                 }
             }
 
-            val pool = Executors.newFixedThreadPool(POOL_SIZE)
+            // daemon 線程：leaked 路徑下存活 worker 不阻塞 JVM 退出（A P1-3）。
+            val pool = Executors.newFixedThreadPool(POOL_SIZE) { r ->
+                Thread(r).apply { isDaemon = true }
+            }
+            // 建池後即視為可能存活：任一 submit 拋出時已提交者仍在跑，須跳過清理；
+            // 建池前 setup 失敗仍為 false 照常清理（人審 P3#2）。
+            workersMayBeAlive = true
             try {
                 pool.submit(fileFlipper)
                 pool.submit(dirFlipper)
@@ -595,30 +649,32 @@ class ScopedFileStoreConcurrencyPressureTest {
                 }
                 startGate.countDown()
                 pool.shutdown()
-                // 無懸掛：期限內必須收斂，否則超時失敗（非無限等待）。
-                // 超時先 shutdownNow＋有界再等；仍活則置 poolQuiesced=false 並拋，
-                // outer finally 據旗跳過共享路徑遞迴清理（人審 P2：assert 先拋導致
-                // 後續 isTerminated 檢查永不可達，且 finally 無條件清理與活 worker 競爭）。
-                val terminated = pool.awaitTermination(POOL_TIMEOUT_SEC, TimeUnit.SECONDS)
-                if (!terminated) {
-                    pool.shutdownNow()
-                    val reaped = pool.awaitTermination(10, TimeUnit.SECONDS)
-                    if (!reaped) {
-                        throw AssertionError(
-                            "stress pool must terminate (timeout); workers leaked, teardown skipped",
-                        )
-                    }
-                }
-                if (!pool.isTerminated) {
+                // deadline 與可否 teardown 分離：首次 60s 未達即記 timeout（後續 reap
+                // 成功僅允許安全清理，不可當 PASS）；未確認退出不得進清理／斷言。
+                val outcome = quiescePool(pool, POOL_TIMEOUT_SEC, POOL_REAP_TIMEOUT_SEC)
+                poolTimedOut = outcome.timedOut
+                if (!outcome.quiesced) {
                     throw AssertionError("stress pool leaked workers; skip teardown to avoid races")
                 }
-                poolQuiesced = true
+                workersMayBeAlive = false
+                assertFalse(
+                    "stress pool must terminate within ${POOL_TIMEOUT_SEC}s " +
+                        "(reaped after timeout is still a deadline miss)",
+                    poolTimedOut,
+                )
             } catch (t: Throwable) {
                 try {
                     startGate.countDown()
                 } catch (_: Exception) {
                 }
                 pool.shutdownNow()
+                try {
+                    // 有界等待已提交者響應中斷；仍活則由 workersMayBeAlive 跳過清理，
+                    // daemon 線程不阻塞 JVM 退出。
+                    pool.awaitTermination(5, TimeUnit.SECONDS)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
                 throw t
             }
             errors.get()?.let { throw AssertionError("stress failed", it) }
@@ -682,13 +738,14 @@ class ScopedFileStoreConcurrencyPressureTest {
 
             // 安全重試／恢復（helpers 見 cleanupAfterPressure／verifyRecoveryAndAnchor；
             // workers 閉包共享 10＋ 計數器，保留內聯以免參數透傳遮蔽門關係）。
-            // 到此 poolQuiesced 必為 true（超時已在上文拋出），清理無活 worker 競爭。
+            // 到此 workersMayBeAlive 必為 false（未退出已在上文拋出），清理無活 worker 競爭。
             cleanupAfterPressure(ws)
             verifyRecoveryAndAnchor(ws, out, store)
         } finally {
-            // NOFOLLOW 終兜；但 workers 未確認退出（poolQuiesced=false，即超時洩漏）
-            // 時跳過共享路徑遞迴清理，避免與存活翻轉競爭（人審 P2），殘留供診斷。
-            if (poolQuiesced) {
+            // NOFOLLOW 終兜；但 workers 可能存活（workersMayBeAlive，即超時洩漏或
+            // 提交後異常）時跳過共享路徑遞迴清理，避免與存活翻轉競爭（人審 P2），
+            // 殘留供診斷。提交前 setup 失敗時旗為 false，照常清理（人審 P3#2）。
+            if (!workersMayBeAlive) {
                 // ws 可能殘留 race-sub 指外連結，NOFOLLOW 絕不跟隨進 outside。
                 deleteNoFollowRecursively(ws)
                 deleteNoFollowRecursively(out)

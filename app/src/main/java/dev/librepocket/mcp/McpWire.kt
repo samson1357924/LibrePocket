@@ -5,11 +5,11 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 /**
  * D03 JSON-RPC 2.0 編解碼（Streamable HTTP 最小子集，原創）。
  *
- * 線路形狀（本包自定最小 Sup 集合，不依賴 org.json 以保持純 JVM 可測）：
- * - tools/list 请求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/list","params":{}}`
+ * 線路形狀（本包自定最小 subset 集合，不依賴 org.json 以保持純 JVM 可測）：
+ * - tools/list 請求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/list","params":{}}`
  * - tools/list 回應：`{"jsonrpc":"2.0","id":<n>,"result":{"tools":[
  *     {"name":"..","description":"..","inputSchema":{...}}, ... ]}}`
- * - tools/call 请求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/call",
+ * - tools/call 請求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/call",
  *     "params":{"name":"..","arguments":{... raw json ...}}}`
  *   `argumentsJson` 呼叫方可預檢，本函仍自驗證 fail-closed（非 object 即拋，不發送）。
  * - tools/call 回應：`{"jsonrpc":"2.0","id":<n>,"result":{
@@ -23,8 +23,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * 已知非目標（follow-up，不在本層驗證）：`jsonrpc == "2.0"` 版本斷言、
  * response id 與 request id 對應（呼叫方以 HTTP 一問一答配對，不做 id 複用檢查）。
  *
- * 修訂立場（#11 Stage2 決策，單一最小子集起步）：`2025-11-25` 與 `2026-07-28`
- * 皆為 Proposed（repo 內無規格文本、無外網可核對，不寫差異表）；本物件只保證
+ * 修訂立場（#11 Stage2 本 PR 選型，非 Accepted ADR；單一傳輸子集起步）：
+ * `2025-11-25` 與 `2026-07-28`（#11 提及的候選修訂號，repo 內無文本）
+ * 皆為候選未採納（repo 內無規格文本、無外網可核對，不寫差異表）；本物件只保證
  * `tools/list`＋`tools/call` 單頁 POST 子集，不送 `initialize`、不接 SSE stream、
  * 不跟隨 `nextCursor` 分頁、不協商 `protocolVersion`。契約見
  * `McpProtocolContractsTest`；修訂支援須先納規格文本再逐項補契約。

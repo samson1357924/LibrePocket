@@ -6,7 +6,9 @@ import kotlinx.coroutines.CancellationException
 /**
  * D03 單伺服器客戶端（多伺服器 = 每個配置一個 [McpServer] 實例）。
  *
- * 最小子集警示（#11 Stage2）：只會 `tools/list`＋`tools/call`（見 [McpWire] 修訂立場）；
+ * 最小子集警示（#11 Stage2 本 PR 選型，非 Accepted ADR）：只會 `tools/list`＋`tools/call`
+ * 單頁 POST 子集，不送 `initialize` 交握、不接 SSE event-stream、不跟隨 `nextCursor` 分頁、
+ * 不協商 `protocolVersion`（見 [McpWire] 修訂立場）；
  * 未接 production composition（`dev.librepocket.mcp` 外零 production import，
  * 僅 KDoc／description 前向提及，未接 dispatcher／副作用，見 CAPABILITY_MATRIX
  * MCP 行），啟用前須單獨驗 production dispatcher、取消與副作用邊界，不得批次開啟。

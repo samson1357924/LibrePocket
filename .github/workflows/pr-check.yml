@@ -59,6 +59,10 @@ jobs:
               - 'scripts/build_release.sh'
               - 'scripts/verify_release_apk.py'
               - 'scripts/release_artifact_stage.py'
+              - 'scripts/check_release_pins.py'
+              - 'scripts/check_release_tag_version.py'
+              - 'scripts/fake_keystore_rehearsal.py'
+              - 'scripts/release_signer_pins.example.json'
               - 'scripts/tests/test_release_artifact_verifier.py'
               - 'scripts/tests/test_build_release_identity.py'
               # The PR workflow itself: wiring changes must run the harness

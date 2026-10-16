@@ -657,8 +657,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_parser() -> argparse.ArgumentParser:
+    """Public entry point for test/rehearsal consumers (stable alias)."""
+    return _build_parser()
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
     try:
         result = verify_and_stage(args)
     except VerificationError as exc:

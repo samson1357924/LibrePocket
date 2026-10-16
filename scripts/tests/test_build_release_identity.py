@@ -12,11 +12,18 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from scripts import check_release_pins as signer_pins
+from scripts import check_release_tag_version as tag_version
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILDER = ROOT / "scripts" / "build_release.sh"
 VERIFIER = ROOT / "scripts" / "verify_release_apk.py"
 STAGER = ROOT / "scripts" / "release_artifact_stage.py"
+PINS_CHECKER = ROOT / "scripts" / "check_release_pins.py"
+PINS_EXAMPLE = ROOT / "scripts" / "release_signer_pins.example.json"
+TAG_CHECKER = ROOT / "scripts" / "check_release_tag_version.py"
+APP_BUILD_GRADLE = ROOT / "app" / "build.gradle.kts"
+
 FLAVORS = ("play", "foss", "github")
 EXPECTED = {
     flavor: {
@@ -543,6 +550,606 @@ class ReleaseBuilderHarness(unittest.TestCase):
         first_root = json.loads(first.stdout.strip().splitlines()[-1])["outputDirectory"]
         second_root = json.loads(second.stdout.strip().splitlines()[-1])["outputDirectory"]
         self.assertNotEqual(first_root, second_root)
+
+
+class SignerPinRegistryTest(unittest.TestCase):
+    """Pin-file shape controls for the Issue #12 signer-pin registry gap."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="librepocket-signer-pins-")
+        self.addCleanup(self.temporary.cleanup)
+        self.tmp = Path(self.temporary.name)
+
+    def _write(self, name: str, payload: object) -> Path:
+        path = self.tmp / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_valid_single_flavor_pin_normalizes_cert_to_lowercase(self) -> None:
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "AB12" * 16}},
+        )
+
+        pins = signer_pins.load_pins(str(path))
+
+        self.assertEqual(
+            pins,
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}},
+        )
+
+    def test_checked_in_example_is_rejected_as_non_production(self) -> None:
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(str(PINS_EXAMPLE))
+
+        result = subprocess.run(
+            [sys.executable, str(PINS_CHECKER), "--pins", str(PINS_EXAMPLE)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_unknown_flavor_is_rejected(self) -> None:
+        path = self._write(
+            "pins.json",
+            {"beta": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}},
+        )
+
+        with self.assertRaisesRegex(signer_pins.PinError, "unknown flavor"):
+            signer_pins.load_pins(str(path))
+
+    def test_missing_or_extra_fields_are_rejected(self) -> None:
+        missing = self._write(
+            "missing.json",
+            {"play": {"package": "dev.librepocket.agent"}},
+        )
+        with self.assertRaisesRegex(signer_pins.PinError, "exactly package/cert_sha256"):
+            signer_pins.load_pins(str(missing))
+
+        extra = self._write(
+            "extra.json",
+            {
+                "play": {
+                    "package": "dev.librepocket.agent",
+                    "cert_sha256": "ab12" * 16,
+                    "owner": "someone",
+                }
+            },
+        )
+        with self.assertRaisesRegex(signer_pins.PinError, "exactly package/cert_sha256"):
+            signer_pins.load_pins(str(extra))
+
+    def test_invalid_package_and_cert_values_are_rejected(self) -> None:
+        bad_cases = [
+            ({"package": "not a package", "cert_sha256": "ab12" * 16}, "package"),
+            ({"package": "single", "cert_sha256": "ab12" * 16}, "package"),
+            ({"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 15 + "ab1"}, "cert"),
+            ({"package": "dev.librepocket.agent", "cert_sha256": "zz" * 32}, "cert"),
+            ({"package": "dev.librepocket.agent", "cert_sha256": ""}, "cert"),
+            (
+                {"package": "dev.librepocket.agent", "cert_sha256": "PUT_REAL_64_HEX_PIN_HERE_FOR_PLAY"},
+                "cert",
+            ),
+        ]
+        for entry, _field in bad_cases:
+            with self.subTest(entry=entry):
+                path = self._write("pins.json", {"play": entry})
+                with self.assertRaises(signer_pins.PinError):
+                    signer_pins.load_pins(str(path))
+
+    def test_empty_and_non_object_registries_are_rejected(self) -> None:
+        for payload in ({}, [], "pins"):
+            path = self._write("pins.json", payload)
+            with self.subTest(payload=payload):
+                with self.assertRaises(signer_pins.PinError):
+                    signer_pins.load_pins(str(path))
+
+    def test_require_flavors_enforces_the_exact_expected_set(self) -> None:
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}},
+        )
+        with self.assertRaisesRegex(signer_pins.PinError, "do not match required"):
+            signer_pins.load_pins(str(path), require_flavors=("play", "foss", "github"))
+        pins = signer_pins.load_pins(str(path), require_flavors=("play",))
+        self.assertEqual(set(pins), {"play"})
+
+    def test_require_flavors_rejects_duplicates_unknown_and_empty_via_api(self) -> None:
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}},
+        )
+        for bad in ((), ("play", "play"), ("play", "Play"), ("beta",)):
+            with self.subTest(require=bad):
+                with self.assertRaises(signer_pins.PinError):
+                    signer_pins.load_pins(str(path), require_flavors=bad)
+
+    def test_require_flavors_rejects_non_sequence_container(self) -> None:
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}},
+        )
+        for bad in (123, "play", {"play"}):
+            with self.subTest(require=bad):
+                with self.assertRaises(signer_pins.PinError):
+                    signer_pins.load_pins(str(path), require_flavors=bad)  # type: ignore[arg-type]
+
+    def test_duplicate_json_keys_are_rejected(self) -> None:
+        dup = self.tmp / "dup.json"
+        dup.write_text(
+            '{"play": {"package": "dev.librepocket.agent", "cert_sha256": "'
+            + "ab12" * 16
+            + '"}, "play": {"package": "dev.librepocket.agent", "cert_sha256": "'
+            + "cd34" * 16
+            + '"}}',
+            encoding="utf-8",
+        )
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(str(dup))
+
+    def test_empty_and_oversize_pins_are_rejected(self) -> None:
+        empty = self.tmp / "empty.json"
+        empty.write_text("", encoding="utf-8")
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(str(empty))
+        big = self.tmp / "big.json"
+        big.write_bytes(b'{"play": {"package": "dev.librepocket.agent", "cert_sha256": "')
+        with open(big, "ab") as handle:
+            handle.write(b"ab12" * 16384)
+            handle.write(b'"}}')
+        with self.assertRaisesRegex(signer_pins.PinError, "exceeds"):
+            signer_pins.load_pins(str(big))
+
+    def test_non_string_path_is_rejected_fail_closed(self) -> None:
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(None)  # type: ignore[arg-type]
+
+    def test_package_length_boundary_and_cert_variants(self) -> None:
+        long_ok = "a." + "b" * 251 + ".c"  # 255 chars, valid dotted shape
+        self.assertEqual(len(long_ok), 255)
+        path = self._write(
+            "pins.json",
+            {"play": {"package": long_ok, "cert_sha256": "ab12" * 16}},
+        )
+        pins = signer_pins.load_pins(str(path))
+        self.assertEqual(pins["play"]["package"], long_ok)
+        long_bad = long_ok + "d"  # 256 chars
+        path = self._write(
+            "pins256.json",
+            {"play": {"package": long_bad, "cert_sha256": "ab12" * 16}},
+        )
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(str(path))
+        for bad_cert in ("ab12" * 16 + "ab1", "0x" + "ab12" * 15 + "ab", "ab12" * 15 + "ab\n"):
+            with self.subTest(cert=bad_cert[:20]):
+                path = self._write(
+                    "pins.json",
+                    {"play": {"package": "dev.librepocket.agent", "cert_sha256": bad_cert}},
+                )
+                with self.assertRaises(signer_pins.PinError):
+                    signer_pins.load_pins(str(path))
+
+    def test_non_dict_entry_and_mixed_case_cert(self) -> None:
+        path = self._write("pins.json", {"play": "not-a-dict"})
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(str(path))
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "Ab12" * 16}},
+        )
+        pins = signer_pins.load_pins(str(path))
+        self.assertEqual(pins["play"]["cert_sha256"], "ab12" * 16)
+
+    def test_missing_file_and_invalid_json_are_rejected(self) -> None:
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(str(self.tmp / "does-not-exist.json"))
+        broken = self.tmp / "broken.json"
+        broken.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(str(broken))
+
+
+class ReleaseTagVersionTest(unittest.TestCase):
+    """Tag <-> Gradle version consistency controls (Issue #12 acceptance)."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="librepocket-tag-version-")
+        self.addCleanup(self.temporary.cleanup)
+        self.tmp = Path(self.temporary.name)
+
+    def _write_gradle(self, *, version_code: str, version_name_line: str) -> Path:
+        path = self.tmp / "build.gradle.kts"
+        path.write_text(
+            "android {\n"
+            "    defaultConfig {\n"
+            f"        versionCode = {version_code}\n"
+            f"        {version_name_line}\n"
+            "    }\n"
+            "    buildTypes {\n"
+            '        debug { versionNameSuffix = "-debug" }\n'
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_checked_in_gradle_parses_and_round_trips_with_its_own_tag(self) -> None:
+        code, name = tag_version.parse_gradle_version(str(APP_BUILD_GRADLE))
+
+        result = tag_version.check_tag_version(f"v{name}", code, name)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["versionCode"], code)
+
+    def test_matching_tag_passes_on_a_fixture(self) -> None:
+        path = self._write_gradle(version_code="7", version_name_line='versionName = "1.2.3"')
+        code, name = tag_version.parse_gradle_version(str(path))
+
+        self.assertEqual((code, name), (7, "1.2.3"))
+        self.assertEqual(
+            tag_version.check_tag_version("v1.2.3", code, name)["status"], "ok"
+        )
+
+    def test_debug_suffix_line_does_not_create_a_second_version_name(self) -> None:
+        path = self._write_gradle(version_code="7", version_name_line='versionName = "1.2.3"')
+
+        code, name = tag_version.parse_gradle_version(str(path))
+
+        self.assertEqual(name, "1.2.3")
+        self.assertEqual(code, 7)
+
+    def test_mismatched_tag_is_rejected(self) -> None:
+        with self.assertRaisesRegex(tag_version.TagVersionError, "does not equal"):
+            tag_version.check_tag_version("v9.9.9", 7, "1.2.3")
+
+    def test_non_semver_tags_and_versions_are_rejected(self) -> None:
+        for bad_tag in ("1.2.3", "v1.2", "v1.2.3-rc1", "v1.2.3 ", "", "v01"):
+            with self.subTest(tag=bad_tag):
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.check_tag_version(bad_tag, 7, "1.2.3")
+        for bad_name in ("1.2", "1.2.3-rc1", "", "v1.2.3"):
+            with self.subTest(version=bad_name):
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.check_tag_version("v1.2.3", 7, bad_name)
+
+    def test_unicode_digits_and_leading_zeros_are_rejected(self) -> None:
+        for bad_tag in ("v\u0661.\u0662.\u0663", "v01.02.03", "v1.02.3", "v1.2.03"):
+            with self.subTest(tag=bad_tag):
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.check_tag_version(bad_tag, 7, "1.2.3")
+        for bad_name in ("\u0661.\u0662.\u0663", "01.02.03"):
+            with self.subTest(version=bad_name):
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.check_tag_version("v1.2.3", 7, bad_name)
+
+    def test_non_string_and_bool_inputs_are_rejected_fail_closed(self) -> None:
+        for bad_tag, bad_code, bad_name in (
+            (None, 7, "1.2.3"),
+            (123, 7, "1.2.3"),
+            ("v1.2.3", True, "1.2.3"),
+            ("v1.2.3", "7", "1.2.3"),
+            ("v1.2.3", 7, None),
+            ("v1.2.3", 7, 123),
+        ):
+            with self.subTest(tag=bad_tag, code=bad_code, name=bad_name):
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.check_tag_version(bad_tag, bad_code, bad_name)  # type: ignore[arg-type]
+
+    def test_version_code_boundaries_pass(self) -> None:
+        for good_code in (1, 2_147_483_647):
+            with self.subTest(code=good_code):
+                result = tag_version.check_tag_version("v1.2.3", good_code, "1.2.3")
+                self.assertEqual(result["status"], "ok")
+
+    def test_overlong_tag_and_version_are_rejected(self) -> None:
+        long_name = "1." + "2" * 300
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.check_tag_version(f"v{long_name}", 7, long_name)
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.check_tag_version("v" + "1" * 300, 7, "1.2.3")
+
+    def test_trailing_comment_is_accepted_and_leading_zero_code_rejected(self) -> None:
+        path = self.tmp / "comment.gradle.kts"
+        path.write_text(
+            'versionCode = 7 // release code\nversionName = "1.2.3" // comment\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(path)), (7, "1.2.3"))
+        leading = self.tmp / "leading.gradle.kts"
+        leading.write_text(
+            'versionCode = 007\nversionName = "1.2.3"\n', encoding="utf-8"
+        )
+        with self.assertRaisesRegex(tag_version.TagVersionError, "leading zero"):
+            tag_version.parse_gradle_version(str(leading))
+
+    def test_public_build_parser_alias_exists(self) -> None:
+        from scripts import verify_release_apk as verifier
+
+        self.assertTrue(hasattr(verifier, "build_parser"))
+        parser = verifier.build_parser()
+        namespace = parser.parse_args(
+            [
+                "--candidate-dir", "cand",
+                "--stage-dir", "stage",
+                "--expected-package", "dev.librepocket.agent",
+                "--expected-version-code", "7",
+                "--expected-version-name", "1.2.3",
+                "--expected-cert-sha256", "ab12" * 16,
+                "--apksigner", "apksigner",
+                "--aapt", "aapt",
+            ]
+        )
+        self.assertEqual(namespace.expected_package, "dev.librepocket.agent")
+
+    def test_rehearsal_rejects_unexpected_argv_without_env_mutation(self) -> None:
+        from scripts import fake_keystore_rehearsal as rehearsal
+
+        marker_play = os.environ.get("PLAY_KEYSTORE_PASSWORD", "<absent>")
+        marker_bw = os.environ.get("BW_SESSION", "<absent>")
+        self.assertEqual(rehearsal.main(["--unexpected"]), 1)
+        self.assertEqual(os.environ.get("PLAY_KEYSTORE_PASSWORD", "<absent>"), marker_play)
+        self.assertEqual(os.environ.get("BW_SESSION", "<absent>"), marker_bw)
+
+    def test_rehearsal_restores_env_on_harness_error(self) -> None:
+        import unittest.mock as mock
+
+        from scripts import fake_keystore_rehearsal as rehearsal
+
+        orig_play = os.environ.get("PLAY_KEYSTORE_PASSWORD")
+        orig_bw = os.environ.get("BW_SESSION")
+        self.addCleanup(
+            lambda: (
+                os.environ.__setitem__("PLAY_KEYSTORE_PASSWORD", orig_play)
+                if orig_play is not None
+                else os.environ.pop("PLAY_KEYSTORE_PASSWORD", None),
+                os.environ.__setitem__("BW_SESSION", orig_bw)
+                if orig_bw is not None
+                else os.environ.pop("BW_SESSION", None),
+            )
+        )
+        os.environ["PLAY_KEYSTORE_PASSWORD"] = "before-play"
+        os.environ["BW_SESSION"] = "before-bw"
+        with mock.patch.object(
+            rehearsal, "_run_case", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaises(RuntimeError):
+                rehearsal.main([])
+        self.assertEqual(os.environ.get("PLAY_KEYSTORE_PASSWORD"), "before-play")
+        self.assertEqual(os.environ.get("BW_SESSION"), "before-bw")
+
+    def test_fake_shims_reject_malformed_payload_with_distinct_codes(self) -> None:
+        import textwrap
+
+        from scripts import fake_keystore_rehearsal as rehearsal
+
+        bad_cert = self.tmp / "bad-cert.json"
+        bad_cert.write_text('{"signed": true}', encoding="utf-8")
+        shim = self.tmp / "apksigner"
+        shim.write_text(
+            rehearsal.FAKE_APKSIGNER.replace("{python}", sys.executable),
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        result = subprocess.run(
+            [sys.executable, str(shim), "verify", "--verbose", "--print-certs", "-Werr",
+             str(bad_cert)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 93, result.stdout)
+        bad_pkg = self.tmp / "bad-pkg.json"
+        bad_pkg.write_text('{"package": 123}', encoding="utf-8")
+        aapt = self.tmp / "aapt"
+        aapt.write_text(
+            rehearsal.FAKE_AAPT.replace("{python}", sys.executable), encoding="utf-8"
+        )
+        aapt.chmod(0o755)
+        result = subprocess.run(
+            [sys.executable, str(aapt), "dump", "badging", str(bad_pkg)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 83, result.stdout)
+
+    def test_version_code_range_is_rejected(self) -> None:
+        for bad_code in (0, -1, 2_147_483_648):
+            with self.subTest(code=bad_code):
+                with self.assertRaises(tag_version.TagVersionError):
+                    tag_version.check_tag_version("v1.2.3", bad_code, "1.2.3")
+
+    def test_missing_file_and_duplicate_assignments_are_rejected(self) -> None:
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.parse_gradle_version(str(self.tmp / "does-not-exist.gradle.kts"))
+        duplicated = self.tmp / "duplicated.gradle.kts"
+        duplicated.write_text(
+            'versionCode = 7\nversionCode = 8\nversionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionCode"):
+            tag_version.parse_gradle_version(str(duplicated))
+
+    def test_duplicate_version_name_missing_fields_and_single_quote(self) -> None:
+        dup_name = self.tmp / "dup-name.gradle.kts"
+        dup_name.write_text(
+            'versionCode = 7\nversionName = "1.2.3"\nversionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionName"):
+            tag_version.parse_gradle_version(str(dup_name))
+        missing_code = self.tmp / "missing-code.gradle.kts"
+        missing_code.write_text('versionName = "1.2.3"\n', encoding="utf-8")
+        with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionCode"):
+            tag_version.parse_gradle_version(str(missing_code))
+        missing_name = self.tmp / "missing-name.gradle.kts"
+        missing_name.write_text("versionCode = 7\n", encoding="utf-8")
+        with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionName"):
+            tag_version.parse_gradle_version(str(missing_name))
+        single = self.tmp / "single.gradle.kts"
+        single.write_text(
+            "versionCode = 7\nversionName = '1.2.3'\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(tag_version.TagVersionError, "double-quoted"):
+            tag_version.parse_gradle_version(str(single))
+
+    def test_oversize_gradle_is_rejected(self) -> None:
+        big = self.tmp / "big.gradle.kts"
+        big.write_bytes(b'versionCode = 7\nversionName = "1.2.3"\n' + b"x" * (512 * 1024))
+        with self.assertRaisesRegex(tag_version.TagVersionError, "exceeds"):
+            tag_version.parse_gradle_version(str(big))
+
+    def test_block_commented_literals_cannot_satisfy_the_gate(self) -> None:
+        commented = self.tmp / "commented.gradle.kts"
+        commented.write_text(
+            "/*\n"
+            'versionCode = 1\nversionName = "0.1.0"\n'
+            "*/\n"
+            "android {\n"
+            "  defaultConfig {\n"
+            '    versionCode = System.getenv("VERSION_CODE")?.toInt() ?: 9\n'
+            '    versionName = System.getenv("VERSION_NAME") ?: "9.9.9"\n'
+            "  }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.parse_gradle_version(str(commented))
+
+    def test_kdoc_nested_and_inline_block_comments(self) -> None:
+        kdoc = self.tmp / "kdoc.gradle.kts"
+        kdoc.write_text(
+            "/**\n"
+            ' * versionCode = 1\n * versionName = "0.1.0"\n'
+            " */\n"
+            'versionCode = 7\nversionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(kdoc)), (7, "1.2.3"))
+        nested = self.tmp / "nested.gradle.kts"
+        nested.write_text(
+            "/* outer /* inner */ still comment\n"
+            'versionCode = 1\nversionName = "0.1.0"\n'
+            "*/\n"
+            'versionCode = 7\nversionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(nested)), (7, "1.2.3"))
+        inline = self.tmp / "inline.gradle.kts"
+        inline.write_text(
+            "versionCode = 7 /* trailing block */\n"
+            'versionName = "1.2.3" /* trailing block */\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(inline)), (7, "1.2.3"))
+
+    def test_line_comment_markers_inside_strings_are_preserved(self) -> None:
+        full_line = self.tmp / "full-line.gradle.kts"
+        full_line.write_text(
+            "// versionCode = 999\n"
+            '// versionName = "9.9.9"\n'
+            'versionCode = 7\nversionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(full_line)), (7, "1.2.3"))
+        in_string = self.tmp / "in-string.gradle.kts"
+        in_string.write_text(
+            'versionCode = 7\nversionName = "1.2.3 // x"\n', encoding="utf-8"
+        )
+        code, name = tag_version.parse_gradle_version(str(in_string))
+        self.assertEqual((code, name), (7, "1.2.3 // x"))
+        with self.assertRaises(tag_version.TagVersionError):
+            tag_version.check_tag_version("v1.2.3", code, name)
+
+    def test_char_literal_cannot_shadow_comments(self) -> None:
+        # A '"' inside a char literal must not open a phantom string that
+        # protects a commented-out value: the commented 999 must not win.
+        tricky = self.tmp / "char-literal.gradle.kts"
+        tricky.write_text(
+            "val c = '\"'\n"
+            "versionCode = 1 // keep\n"
+            "/*\n"
+            "versionCode = 999\n"
+            "*/\n"
+            'versionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(tricky)), (1, "1.2.3"))
+        escaped = self.tmp / "char-escape.gradle.kts"
+        escaped.write_text(
+            "val q = '\\u0027'\n"
+            "versionCode = 7 // comment\n"
+            'versionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(tag_version.parse_gradle_version(str(escaped)), (7, "1.2.3"))
+
+    def test_cli_accepts_matching_tag_and_rejects_mismatch(self) -> None:
+        path = self._write_gradle(version_code="7", version_name_line='versionName = "1.2.3"')
+        good = subprocess.run(
+            [sys.executable, str(TAG_CHECKER), "--tag", "v1.2.3",
+             "--app-build-gradle", str(path)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(good.returncode, 0, good.stdout)
+        bad = subprocess.run(
+            [sys.executable, str(TAG_CHECKER), "--tag", "v9.9.9",
+             "--app-build-gradle", str(path)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=30,
+        )
+        self.assertNotEqual(bad.returncode, 0, bad.stdout)
+
+    def test_cli_rejects_bad_tag_missing_file_and_bad_require_flavors(self) -> None:
+        path = self._write_gradle(version_code="7", version_name_line='versionName = "1.2.3"')
+        bad_tag = subprocess.run(
+            [sys.executable, str(TAG_CHECKER), "--tag", "v01.02.03",
+             "--app-build-gradle", str(path)],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertNotEqual(bad_tag.returncode, 0, bad_tag.stdout)
+        missing = subprocess.run(
+            [sys.executable, str(TAG_CHECKER), "--tag", "v1.2.3",
+             "--app-build-gradle", str(self.tmp / "nope.gradle.kts")],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertNotEqual(missing.returncode, 0, missing.stdout)
+        pins = self.tmp / "pins.json"
+        pins.write_text(
+            json.dumps(
+                {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}}
+            ),
+            encoding="utf-8",
+        )
+        bad_flavors = subprocess.run(
+            [sys.executable, str(PINS_CHECKER), "--pins", str(pins),
+             "--require-flavors", "play play"],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertNotEqual(bad_flavors.returncode, 0, bad_flavors.stdout)
+        good_pins = subprocess.run(
+            [sys.executable, str(PINS_CHECKER), "--pins", str(pins),
+             "--require-flavors", "play"],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertEqual(good_pins.returncode, 0, good_pins.stdout)
+        result_json = json.loads(good_pins.stdout)
+        self.assertEqual(result_json.get("status"), "ok")
 
 
 if __name__ == "__main__":

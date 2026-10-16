@@ -244,7 +244,7 @@ def _invoke_verifier(
         aapt,
     ]
     try:
-        verifier_args_namespace = apk_verifier._build_parser().parse_args(verifier_args)
+        verifier_args_namespace = apk_verifier.build_parser().parse_args(verifier_args)
         value = apk_verifier.verify_and_stage(verifier_args_namespace)
     except apk_verifier.VerificationError as exc:
         _fail(f"{stage_dir.name} final APK verification failed: {exc}")

@@ -401,7 +401,7 @@ sealed interface StreamEvent {
 - 發送前上下文窗口（Current）：`HistoryWindowCap` 僅裁剪發送用請求副本（oldest-first，淘汰最舊、保留最新、整訊息；預設 `Unbounded` 即不裁剪），UI 與 transcript 保留完整歷史；裁剪數見 `TurnController.droppedHistoryCount`（永不靜默）。token 預算待裝置量測後再定（TODO #16，不硬編數字）。
 - UI 更新成本（Current）：可見增量先進 per-attempt buffer（O(delta) 累加）；區塊尚小時即時向 UI 提交（首繪快速、小 turn 行為不變），超出 4 KiB／32 append 節奏後才批次提交；終端與 cancel 必沖洗，快照讀 buffer，故串流可見且快照精確；`streamedTextDeltaCount` 計到達數（超限觸發 delta 在計數前被拒，不計入）、`uiTextUpdateCount` 計提交數（無匹配 UI 列的 flush 跳過提交、不計數）、`uiTextCopiedChars` 計提交拷貝字元。
 - 可見文字預算（Current，#83）：每 attempt `TextDelta`＋`ReasoningDelta` 合計不得超過 100_000 字元（`MAX_TURN_TEXT_CHARS`，等於 durable-row 上限，tool marker 不計）；超限為 typed non-retryable `TEXT_TOO_LARGE`（code `AGG_TOO_LARGE`），不靜默截斷、不重試，失敗片段保留 partial。
-- 用量權威值（Current，#84）：每 attempt 單一權威 Usage（last-wins 合併，null 欄位保留舊值，`TurnController` 在終端前寫一次（flush 亦清 attempt 計數），`SessionTranscriptSink` 隨終端批次持久；controller 的 attemptRunId 即 sink 的 runId；Anthropic 雙 Usage 正常 turn 單行，100 事件 flood 仍單行，flood 上限各層 128（第 129 起凍結）；sink 另有 distinct runId 256 上限（超限 best-effort 丟棄，先擋後記帳）＋ post-terminal trailing 每 runId 限追加一次；`lastUsage` 為 lifetime-last（無 Usage 的 turn 不清除）。
+- 用量權威值（Current，#84＋P1 fail-closed 跟進）：每 attempt 單一權威 Usage（last-wins 合併，null 欄位保留舊值，`TurnController` 在終端前寫一次（flush 亦清 attempt 計數），`SessionTranscriptSink` 在終端 core ack 後 best-effort 補寫（不在 terminal batch 內，失敗吞掉不影響終端；core 失敗時緩衝保留，同 runId 重試仍保有該列）；controller 的 attemptRunId 即 sink 的 runId；Anthropic 雙 Usage 正常 turn 單行，100 事件 flood 仍單行，flood 上限各層 128（第 129 起凍結）；sink 另有 distinct runId 256 上限（超限 best-effort 丟棄，先擋後記帳）＋ post-terminal trailing 每 runId 限追加一次（終端已沖洗者直接丟棄，全 runId 唯一一列）；`lastUsage` 為 lifetime-last（無 Usage 的 turn 不清除）。
 
 ### 3.3 工具 ID 與多輪一致性（P1 記錄、不執行）
 

@@ -143,9 +143,10 @@ class TurnControllerLedgerTest {
     // whole ledger prefix is durable here with no extra waiting.
     runBlocking { c.send("hi") }
     try {
-      // #84: the attempt's single authoritative usage rides the terminal
-      // batch, so it lands with the assistant row — still in admission order
-      // behind the tool notice via the single session writer.
+      // #84 follow-up: the attempt's single authoritative usage flushes
+      // best-effort right after the terminal ack, so it lands with the
+      // assistant row — still in admission order behind the tool notice
+      // via the single session writer.
       assertEquals(listOf("user", "tool", "assistant", "system"), kindsOf(store))
       assertEquals("hi", store.events[0].text)
       assertTrue(store.events[1].text.contains("lookup"))

@@ -2,6 +2,7 @@ package dev.librepocket.session
 
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -139,5 +140,55 @@ class SessionTranscriptSinkUsageTest {
         val rows = usageRows(store)
         assertEquals(1, rows.size)
         assertEquals("usage input=3 output=4", rows.single().text)
+    }
+
+    @Test
+    fun usageCapExactBoundary128And129Freeze() = runBlocking {
+        // 128 events merge fully (last wins = event 127); the 129th is
+        // ignored: both freeze at (127, 254), pinning `seen <= 128`.
+        for (count in listOf(128, 129)) {
+            val store = FakeSessionStore()
+            val sid = store.createSession("hi", "m")
+            val sink = SessionTranscriptSink(store, sid) { 42L }
+
+            repeat(count) { i -> sink.onUsage("r1", i, i * 2) }
+            sink.onTurnSucceeded("r1", "hi there", hasReasoning = false)
+
+            val rows = usageRows(store)
+            assertEquals("$count events still one row", 1, rows.size)
+            assertEquals("usage input=127 output=254", rows.single().text)
+        }
+    }
+
+    @Test
+    fun distinctRunsCappedAt256DropsBestEffort() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        // 300 distinct pre-terminal runIds: only the first 256 buffer
+        // (insertion order); the rest drop best-effort without throwing.
+        repeat(300) { i -> sink.onUsage("r$i", i, i) }
+        sink.onTurnSucceeded("r0", "kept", hasReasoning = false)
+        sink.onTurnSucceeded("r299", "dropped", hasReasoning = false)
+
+        val rows = usageRows(store)
+        assertEquals("usage input=0 output=0", rows.first { it.runId == "r0" }.text)
+        assertTrue("r299 usage must have been dropped", rows.none { it.runId == "r299" })
+    }
+
+    @Test
+    fun trailingAfterFailedAppendsOnceThenDrops() = runBlocking {
+        val store = FakeSessionStore()
+        val sid = store.createSession("hi", "m")
+        val sink = SessionTranscriptSink(store, sid) { 42L }
+
+        sink.onTurnFailed("r1", "half", "boom", null, 0, true, false)
+        sink.onUsage("r1", 10, 20)
+        sink.onUsage("r1", 11, 21)
+
+        val rows = usageRows(store)
+        assertEquals(1, rows.size)
+        assertEquals("usage input=10 output=20", rows.single().text)
     }
 }

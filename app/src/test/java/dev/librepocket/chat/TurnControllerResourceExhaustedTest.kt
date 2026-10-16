@@ -6,13 +6,17 @@ import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatMessage
 import dev.librepocket.provider.ChatRequest
+import dev.librepocket.provider.FailureKind
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.ProviderErrorClassifier
 import dev.librepocket.provider.ProviderFailure
 import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.SseFrameParser
 import dev.librepocket.provider.StreamEvent
+import dev.librepocket.provider.TEXT_TOO_LARGE
 import dev.librepocket.provider.TOOL_ARGS_TOO_LARGE
+import dev.librepocket.provider.inferAggFailureCodeName
 import dev.librepocket.provider.streamingFlow
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicInteger
@@ -196,6 +200,61 @@ class TurnControllerResourceExhaustedTest {
     } finally {
       c.close()
     }
+  }
+
+  @Test fun textTooLargeViaCodedStreamingFlowSuppressesPendingFlush() {
+    val provider = ResExhaustFakeProvider()
+    provider.handler = {
+      streamingFlow {
+        emit(StreamEvent.ToolDelta(0, "id-0", "f", "{\"a\":1}"))
+        emit(StreamEvent.ToolDelta(0, null, null, "x"))
+        throw ProviderFailure(false, TEXT_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+      }
+    }
+    // Probe the transport layer directly: the typed throw must surface as a
+    // coded non-retryable Failed (code propagation, not just message text).
+    val probe = runBlocking {
+      provider.handler(ChatRequest(model = "m", messages = listOf(ChatMessage("user", "hi")))).toList()
+    }
+    val probeFailed = probe.filterIsInstance<StreamEvent.Failed>().single()
+    assertTrue(probeFailed.message.contains(TEXT_TOO_LARGE))
+    assertEquals(ProviderFailureCode.AGG_TOO_LARGE.name, probeFailed.code)
+    assertFalse("TEXT_TOO_LARGE must be non-retryable", probeFailed.retryable)
+
+    val sink = ResExhaustRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertSuppressed(c, provider, sink, TEXT_TOO_LARGE)
+      // The collector-thrown shape (code present after the Phase 1 fix) and
+      // the legacy message-only shape must both read as exhausted.
+      assertTrue(isResourceExhausted(StreamEvent.Failed(TEXT_TOO_LARGE, retryable = false)))
+      assertTrue(
+        isResourceExhausted(
+          StreamEvent.Failed(
+            TEXT_TOO_LARGE,
+            retryable = false,
+            code = ProviderFailureCode.AGG_TOO_LARGE.name,
+          ),
+        ),
+      )
+      assertFalse(isResourceExhausted(StreamEvent.Failed("boom", retryable = true)))
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun textTooLargeMarkersAreFatalAndInferAggTooLarge() {
+    // Classifier: a text_too_large body snippet is fatal (never retried),
+    // consistent with inferAggFailureCodeName and isResourceExhausted.
+    assertEquals(
+      FailureKind.FATAL,
+      ProviderErrorClassifier.classify(null, null, "response text_too_large: budget exceeded"),
+    )
+    assertEquals(
+      ProviderFailureCode.AGG_TOO_LARGE.name,
+      inferAggFailureCodeName("TEXT_TOO_LARGE: per-attempt budget exceeded"),
+    )
   }
 
   @Test fun sseFrameTooLargeMessageOnlyStillSuppressesPendingFlush() {

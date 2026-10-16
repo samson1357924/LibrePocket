@@ -6,9 +6,13 @@ import dev.librepocket.policy.PolicyStore
 import dev.librepocket.policy.Verdict
 import dev.librepocket.provider.ChatRequest
 import dev.librepocket.provider.LlmProvider
+import dev.librepocket.provider.MAX_TURN_TEXT_CHARS
+import dev.librepocket.provider.ProviderFailure
+import dev.librepocket.provider.ProviderFailureCode
 import dev.librepocket.provider.ProviderProtocol as ProviderProto
 import dev.librepocket.provider.StreamEvent
 import dev.librepocket.provider.TEXT_TOO_LARGE
+import dev.librepocket.provider.requireTurnTextBudget
 import dev.librepocket.session.FakeSessionStore
 import dev.librepocket.session.SessionTranscriptSink
 import java.util.Collections
@@ -29,6 +33,7 @@ import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 private class UbtFakeProvider(
@@ -496,5 +501,170 @@ class TurnControllerUsageTextBudgetTest {
       outer.cancel()
       c.close()
     }
+  }
+
+  @Test fun turnTextBudgetGuardBoundary() {
+    // The fail-closed guard itself: exactly at cap passes, one char over
+    // throws typed non-retryable AGG_TOO_LARGE.
+    assertEquals(100_000, MAX_TURN_TEXT_CHARS)
+    requireTurnTextBudget(99_999, 1)
+    requireTurnTextBudget(MAX_TURN_TEXT_CHARS, 0)
+    try {
+      requireTurnTextBudget(MAX_TURN_TEXT_CHARS, 1)
+      fail("expected ProviderFailure")
+    } catch (e: ProviderFailure) {
+      assertFalse("TEXT_TOO_LARGE must be non-retryable", e.retryable)
+      assertEquals(TEXT_TOO_LARGE, e.message)
+      assertEquals(ProviderFailureCode.AGG_TOO_LARGE, e.code)
+    }
+  }
+
+  @Test fun textBudgetExactBoundaryPasses() {
+    // Exactly 100x1000 == MAX_TURN_TEXT_CHARS must pass (no off-by-one trip).
+    val provider = UbtFakeProvider {
+      flow {
+        repeat(100) { emit(StreamEvent.TextDelta(0, 0, "y".repeat(1_000))) }
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+      val assistants = c.uiState.value.messages.filter { it.role == "assistant" }
+      assertEquals(1, assistants.size)
+      assertEquals(MAX_TURN_TEXT_CHARS, assistants.single().text.length)
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun textBudgetOneOverTripsWithoutRetry() {
+    // 101x1000 trips on the 101st delta; the tripping delta is rejected so
+    // the accepted prefix stays exactly at cap, and the poisoned stream is
+    // never retried.
+    val provider = UbtFakeProvider {
+      flow {
+        repeat(101) { emit(StreamEvent.TextDelta(0, 0, "y".repeat(1_000))) }
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val sink = UbtRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertTrue(c.uiState.value.error.orEmpty().contains(TEXT_TOO_LARGE))
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+      assertEquals(
+        MAX_TURN_TEXT_CHARS,
+        c.uiState.value.messages.single { it.role == "assistant" }.text.length,
+      )
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun mixedTextReasoningSharesOneBudget() {
+    // Text + reasoning share one visible budget: 60k text + 41k reasoning trips.
+    val provider = UbtFakeProvider {
+      flow {
+        repeat(60) { emit(StreamEvent.TextDelta(0, 0, "a".repeat(1_000))) }
+        repeat(41) { emit(StreamEvent.ReasoningDelta(0, 0, "r".repeat(1_000))) }
+        emit(StreamEvent.Done("stop"))
+      }
+    }
+    val c = controller(provider)
+    try {
+      runBlocking { c.send("hi") }
+      assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+      assertTrue(c.uiState.value.error.orEmpty().contains(TEXT_TOO_LARGE))
+      assertEquals("poisoned stream must not be retried", 1, provider.streamCalls.get())
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun usageCapExactBoundary128And129Freeze() {
+    // 128 events merge fully (last wins = event 127); the 129th is ignored:
+    // both freeze at (127, 254), pinning `seen <= 128` against `< 128`.
+    for (count in listOf(128, 129)) {
+      val provider = UbtFakeProvider {
+        flow {
+          repeat(count) { i -> emit(StreamEvent.Usage(i, i * 2)) }
+          emit(StreamEvent.TextDelta(0, 0, "hi"))
+          emit(StreamEvent.Done("stop"))
+        }
+      }
+      val sink = UbtRecordingSink()
+      val c = controller(provider, sink)
+      try {
+        runBlocking { c.send("hello") }
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals("$count events still own one usage notice", 1, sink.usages.size)
+        assertEquals(127, sink.usages.single().inputTokens)
+        assertEquals(254, sink.usages.single().outputTokens)
+      } finally {
+        c.close()
+      }
+    }
+  }
+
+  @Test fun cancelFlushesSingleAuthoritativeUsage() {
+    // Mid-stream cancel must flush exactly one authoritative usage before the
+    // cancel terminal.
+    val provider = UbtFakeProvider {
+      flow {
+        emit(StreamEvent.Usage(5, 6))
+        repeat(50) { emit(StreamEvent.TextDelta(0, 0, "x".repeat(100))) }
+        awaitCancellation()
+      }
+    }
+    val sink = UbtRecordingSink()
+    val c = controller(provider, sink)
+    val outer = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    try {
+      val job = outer.async { c.send("hi") }
+      runBlocking { withTimeout(5_000) { while (c.streamedTextDeltaCount < 50) delay(1) } }
+      c.cancel()
+      runBlocking { withTimeout(5_000) { job.join() } }
+      assertEquals(ChatStatus.CANCELLED, c.uiState.value.status)
+      assertEquals("cancel must flush exactly one authoritative usage", 1, sink.usages.size)
+      assertEquals(5, sink.usages.single().inputTokens)
+      assertEquals(6, sink.usages.single().outputTokens)
+      assertEquals(1, sink.cancelled.size)
+    } finally {
+      outer.cancel()
+      c.close()
+    }
+  }
+
+  @Test fun usageAfterDoneIsIgnored() {
+    // Events after Done are never collected: a trailing Usage is dropped.
+    val provider = UbtFakeProvider {
+      flow {
+        emit(StreamEvent.TextDelta(0, 0, "hi"))
+        emit(StreamEvent.Done("stop"))
+        emit(StreamEvent.Usage(99, 99))
+      }
+    }
+    val sink = UbtRecordingSink()
+    val c = controller(provider, sink)
+    try {
+      runBlocking { c.send("hello") }
+      assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+      assertTrue("usage after Done must be ignored, got: ${sink.usages}", sink.usages.isEmpty())
+    } finally {
+      c.close()
+    }
+  }
+
+  @Test fun uiFlushCadenceConstantsAreDeliberate() {
+    // Hybrid flush cadence values are load-bearing for the O(flushes) bound;
+    // changing them must update this pin plus the KDoc math.
+    assertEquals(4_096, TurnController.UI_TEXT_FLUSH_CHARS)
+    assertEquals(32, TurnController.UI_TEXT_FLUSH_DELTAS)
+    assertEquals(128, TurnController.MAX_USAGE_EVENTS_PER_ATTEMPT)
+    assertEquals(100_000, MAX_TURN_TEXT_CHARS)
   }
 }

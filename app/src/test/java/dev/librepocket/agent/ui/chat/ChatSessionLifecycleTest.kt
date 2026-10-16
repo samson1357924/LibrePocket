@@ -912,8 +912,11 @@ class ChatSessionLifecycleTest {
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { live.closed.await() }
             withTimeout(5_000) { vm.sessionState.first { it.messages.isEmpty() } }
-            // Allow combine(history+live) to propagate; snapshot keeps 2 visible.
-            delay(300)
+            // #85: latch the post-invalidation combine emission instead of a
+            // fixed sleep (load-sensitive). Stale==final passes immediately
+            // (no later re-check to flake); a transient 4/0 waits for the
+            // final 2 here instead of asserting mid-transient.
+            withTimeout(5_000) { vm.messages.first { it.map { m -> m.text } == listOf("hello", "ok") } }
             assertEquals(2, vm.messages.value.size)
             assertEquals(listOf("hello", "ok"), vm.messages.value.map { it.text })
             assertEquals("session-1", vm.currentSessionId.value)
@@ -939,7 +942,9 @@ class ChatSessionLifecycleTest {
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { first.closed.await() }
             withTimeout(5_000) { vm.sessionState.first { it.messages.isEmpty() } }
-            delay(300)
+            // #85: same combine latch as F2 (see above); expects the first
+            // turn's snapshot ["one", "ok"] before the second send.
+            withTimeout(5_000) { vm.messages.first { it.map { m -> m.text } == listOf("one", "ok") } }
             assertEquals(2, vm.messages.value.size)
 
             chatMain.run { vm.sendDirect("two") }

@@ -143,13 +143,16 @@ class TurnControllerLedgerTest {
     // whole ledger prefix is durable here with no extra waiting.
     runBlocking { c.send("hi") }
     try {
-      assertEquals(listOf("user", "tool", "system", "assistant"), kindsOf(store))
+      // #84: the attempt's single authoritative usage rides the terminal
+      // batch, so it lands with the assistant row — still in admission order
+      // behind the tool notice via the single session writer.
+      assertEquals(listOf("user", "tool", "assistant", "system"), kindsOf(store))
       assertEquals("hi", store.events[0].text)
       assertTrue(store.events[1].text.contains("lookup"))
-      assertTrue(store.events[2].text.contains("usage"))
       // The ToolDone marker lives in the same assistant block by design.
-      assertTrue(store.events[3].text.contains("ok"))
-      assertTrue(store.events[3].text.contains("lookup"))
+      assertTrue(store.events[2].text.contains("ok"))
+      assertTrue(store.events[2].text.contains("lookup"))
+      assertTrue(store.events[3].text.contains("usage"))
       assertEquals(listOf(1L, 2L, 3L, 4L), store.events.map { it.seq })
     } finally {
       c.close()

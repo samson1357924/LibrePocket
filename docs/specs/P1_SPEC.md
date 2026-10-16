@@ -399,7 +399,9 @@ sealed interface StreamEvent {
 | 終態異常 | 缺 `[DONE]`/無合法 `finish_reason` → `Failed(retryable=true)` | `response.completed` 缺 `output`/空陣列 → 用流內已收增量恢復（記 `recovered=true`）；`response.failed/incomplete` → `Failed` | 缺 `message_stop` 或可見/工具塊未閉合 → `Failed(retryable=true)` |
 
 - 發送前上下文窗口（Current）：`HistoryWindowCap` 僅裁剪發送用請求副本（oldest-first，淘汰最舊、保留最新、整訊息；預設 `Unbounded` 即不裁剪），UI 與 transcript 保留完整歷史；裁剪數見 `TurnController.droppedHistoryCount`（永不靜默）。token 預算待裝置量測後再定（TODO #16，不硬編數字）。
-- UI 更新成本（Current）：可見增量仍逐 delta 寫入（串流可見性＋cancel 快照依賴）；`streamedTextDeltaCount`／`uiTextUpdateCount`／`uiTextCopiedChars` 為節流決策提供可觀察基線，節流閾值待裝置量測後再定（TODO #16）。
+- UI 更新成本（Current）：可見增量先進 per-attempt buffer（O(delta) 累加）；區塊尚小時即時向 UI 提交（首繪快速、小 turn 行為不變），超出 4 KiB／32 append 節奏後才批次提交；終端與 cancel 必沖洗，快照讀 buffer，故串流可見且快照精確；`streamedTextDeltaCount` 計到達數、`uiTextUpdateCount` 計提交數、`uiTextCopiedChars` 計提交拷貝字元。
+- 可見文字預算（Current，#83）：每 attempt `TextDelta`＋`ReasoningDelta` 合計不得超過 100_000 字元（`MAX_TURN_TEXT_CHARS`，等於 durable-row 上限，tool marker 不計）；超限為 typed non-retryable `TEXT_TOO_LARGE`（code `AGG_TOO_LARGE`），不靜默截斷、不重試，失敗片段保留 partial。
+- 用量權威值（Current，#84）：每 attempt 單一權威 Usage（last-wins 合併，null 欄位保留舊值，`TurnController` 在終端前寫一次，`SessionTranscriptSink` 隨終端批次持久；Anthropic 雙 Usage 正常 turn 單行，100 事件 flood 仍單行，flood 上限各層 128）。
 
 ### 3.3 工具 ID 與多輪一致性（P1 記錄、不執行）
 

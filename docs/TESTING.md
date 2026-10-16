@@ -169,11 +169,13 @@ the public release workflow stays frozen — see [Release](RELEASE.md)):
 ```sh
 # Signer-pin registry shape check (production pins live outside the repo;
 # the checked-in example is placeholder-only and must be rejected).
-python3 scripts/check_release_pins.py --pins scripts/release_signer_pins.example.json
+# NOTE: the first command is a negative control — expect exit 1.
+python3 scripts/check_release_pins.py --pins scripts/release_signer_pins.example.json # expect FAIL
 python3 scripts/check_release_pins.py --pins /path/to/release_signer_pins.json \
   --require-flavors 'play foss github'
 
-# Tag <-> Gradle version consistency (tag supplied by the trusted caller).
+# Tag <-> Gradle version consistency (tag supplied by the trusted caller;
+# tag must equal the current versionName — replace v0.1.0 when it bumps).
 python3 scripts/check_release_tag_version.py \
   --tag v0.1.0 --app-build-gradle app/build.gradle.kts
 
@@ -184,10 +186,10 @@ python3 scripts/fake_keystore_rehearsal.py
 
 The new `SignerPinRegistryTest` / `ReleaseTagVersionTest` classes live in the
 already-wired `scripts/tests/test_build_release_identity.py` and
-`FakeKeystoreRehearsalTest` in `scripts/tests/test_release_artifact_verifier.py`,
-so the existing `policy-harness` job and the harness command above run them
-with no workflow change. The synthetic fixtures prove the gate's fail-closed
-matrix only; they are not real-APK/SDK evidence.
+`FakeKeystoreRehearsalTest` in `scripts/tests/test_release_artifact_verifier.py`.
+The `policy-harness` paths-filter includes the three helpers plus the example
+JSON, so the harness runs them on helper-only diffs. The synthetic fixtures
+prove the gate's fail-closed matrix only; they are not real-APK/SDK evidence.
 
 The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. It remains a local staging/verification path only, not a publishing workflow or release-readiness claim.
 

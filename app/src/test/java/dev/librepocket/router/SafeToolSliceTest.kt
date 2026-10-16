@@ -365,6 +365,8 @@ class SafeToolSliceTest {
     }
 
     @Test fun denyJsonCarriesNoSecrets() = runBlocking {
+        // 形狀抽查（sk-/bearer 子串）：精確的洩漏保證見
+        // throwingBackendWithSecretMessageDoesNotLeak。
         val backend = CountingBackend()
         val denyPolicy = InMemoryPolicyStore(
             listOf(PolicyRule("tool.exec:lsp.symbols", Verdict.DENY, 10)),
@@ -450,6 +452,32 @@ class SafeToolSliceTest {
             assertTrue(args, r.denied)
             assertEquals(args, SafeToolSlice.DenyCodes.SCHEMA_INVALID, r.denyCode)
         }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun longCallIdCappedInOkReceipt() = runBlocking {
+        val backend = CountingBackend()
+        val longId = "I".repeat(2000)
+        val r = slice(backend = backend).execute(listOf(call(id = longId))).single()
+        assertFalse(r.denied)
+        // Internal pairing keeps the full id; the wire receipt is capped.
+        assertEquals(longId, r.callId)
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals(SafeToolSlice.MAX_STRING_CHARS, body["callId"]!!.jsonPrimitive.content.length)
+        assertEquals("lsp.symbols", body["tool"]!!.jsonPrimitive.content)
+        assertEquals(1, backend.invocations.get())
+    }
+
+    @Test fun hookThrowMapsToTypedExecErrorWithoutLeak() = runBlocking {
+        val secret = "sk-hook-SECRET999"
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        s.beforeExecuteForTest = { throw IllegalStateException(secret) }
+        val r = s.execute(listOf(call())).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
+        assertEquals("call-1", r.callId)
+        assertFalse(r.resultJson.contains(secret))
         assertEquals(0, backend.invocations.get())
     }
 }

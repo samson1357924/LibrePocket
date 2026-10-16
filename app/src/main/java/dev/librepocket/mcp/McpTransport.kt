@@ -23,7 +23,8 @@ import okio.Buffer
  * 最小子集警示（#11 Stage2）：本層只發 `tools/list`／`tools/call` 單次 POST；
  * 不送 `initialize` 交握、不接 SSE event-stream、不跟隨 `nextCursor` 分頁、
  * 不協商 `protocolVersion`（`2025-11-25`／`2026-07-28` 皆為 Proposed 未採納）。
- * SSE 文本餵給 [McpWire] 一律 `mcp: bad envelope`（見 `McpProtocolContractsTest`）。
+ * SSE 文本餵給 [McpWire] 一律 `mcp: bad envelope`（見 `McpProtocolContractsTest`，
+ * 由 #93 提供，本 PR 未自帶；合併順序 #93 先行）。
  *
  * 安全約定：
  * - [bearer] 只放 `Authorization` 標頭，永不拼進 body，不寫 log；

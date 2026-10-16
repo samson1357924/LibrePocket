@@ -305,4 +305,12 @@ class FastRouterDecisionTest {
         assertTrue(d.fallbackMessage!!.contains("NO_PRIVILEGE"))
         assertFalse(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
     }
+
+    @Test fun plusWithoutDigitsIsNotAPhoneNumber() {
+        // "+" 後全空白無任何數字不是號碼：fail-safe 轉澄清，不送空字串。
+        val d = decide("打電話給 +      ")
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NEED_CLARIFICATION, d.reasonCode)
+        assertNull(d.toolCall)
+    }
 }

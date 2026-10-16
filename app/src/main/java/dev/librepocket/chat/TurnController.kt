@@ -103,7 +103,9 @@ class ApprovalRequiredException : Exception("chat.send approval required")
  * tool result from its call. The wire-only continuation round (structured
  * assistant `toolCalls` + `tool` messages, single-turn, never truncated —
  * see [buildToolContinuation]) is exempt from this argument by construction;
- * if it is ever truncated, keep each pair atomic. Any truncation is
+ * it is appended after window trimming, so a request may exceed
+ * `MAX_REQUEST_CHARS` by at most one bounded round. If it is ever
+ * truncated, keep each pair atomic. Any truncation is
  * observable via [TurnController.droppedHistoryCount],
  * never silent.
  *
@@ -4598,6 +4600,9 @@ class TurnController(
         requireToolAggBudget(0, id.length + name.length + argsStr.length)
         appendAssistantText(attemptRunId, "\n[tool:$name $argsStr]")
         writeNotice { orderedTranscript.onToolDone(attemptRunId, index, id, name, argsStr) }
+        // Idempotent: a second flush over the same state (defensive outer
+        // catch after an already-flushed collect) records nothing twice.
+        state.doneSeen.add(index)
       }
     }
   }

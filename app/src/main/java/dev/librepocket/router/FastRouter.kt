@@ -291,7 +291,8 @@ class FastRouter(
 
     private fun hasPhoneNumber(text: String): Boolean {
         val raw = findPhoneCandidate(text) ?: return false
-        return raw.filter { it.isDigit() || it == '+' }.isNotBlank()
+        // Require at least one digit: a bare "+" with spaces is not a number.
+        return raw.any { it.isDigit() }
     }
 
     /**

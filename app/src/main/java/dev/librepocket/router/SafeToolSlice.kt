@@ -37,8 +37,8 @@ import kotlin.coroutines.coroutineContext
  *    further effects — already-paired results are discarded by the throw,
  *    the backend is never touched afterwards);
  * 3. registry lookup + `executionReady` + single-tool READ-only gate
- *    (re-graded entries deny `SCOPE_DENIED`/`NEED_CONFIRM`; scope denials
- *    surface [DenyReason]);
+ *    (re-graded entries deny `SCOPE_DENIED` with a side-effect detail;
+ *    scope denials surface [DenyReason]);
  * 4. latest [ProjectionContext] scope re-check;
  * 5. arguments schema validation (JSON object, required non-blank `query`,
  *    optional `limit` int clamped 1..200, optional `pathPrefix` string
@@ -115,6 +115,11 @@ class SafeToolSlice(
         const val SCHEMA_INVALID = "SCHEMA_INVALID"
         const val POLICY_DENIED = "POLICY_DENIED"
         const val NEED_CONFIRM = "NEED_CONFIRM"
+        // Reserved for future WRITE/PRIVILEGED bridges: the current slice
+        // rejects non-READ entries with SCOPE_DENIED before the gate, so no
+        // slice path produces NEED_CONFIRM today. EXEC_DENIED is likewise
+        // reserved: blank queries (the only Unavailable source) are rejected
+        // by schema validation first.
         const val EXEC_DENIED = "EXEC_DENIED"
         const val EXEC_ERROR = "EXEC_ERROR"
         const val BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
@@ -166,8 +171,10 @@ class SafeToolSlice(
             beforeExecuteForTest?.invoke()
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
-            return deny(call, DenyCodes.EXEC_ERROR, "pre-execution gate failed: ${e.message}")
+        } catch (_: Exception) {
+            // Fixed receipt: hook messages never reach the wire (same rule
+            // as backend exceptions below).
+            return deny(call, DenyCodes.EXEC_ERROR, "pre-execution gate failed")
         }
         coroutineContext.ensureActive()
         val tool = ToolRegistry.find(call.name)
@@ -181,7 +188,7 @@ class SafeToolSlice(
         // confirm pipeline, not this slice). Static check first: fail fast
         // before schema parsing and the policy IO below.
         if (tool.sideEffect != SideEffect.READ) {
-            return deny(call, DenyCodes.SCOPE_DENIED, DenyCodes.NEED_CONFIRM)
+            return deny(call, DenyCodes.SCOPE_DENIED, "sideEffect=${tool.sideEffect} not allowed in slice")
         }
         val projection = tool.project(ctxSupplier())
         if (projection.level != CapabilityLevel.NATIVE) {
@@ -294,8 +301,8 @@ class SafeToolSlice(
     private fun ok(call: ToolCall, query: String, outcome: LspTools.SymbolsOutcome.Ok): ToolResult {
         val json = buildJsonObject {
             put("denied", false)
-            put("tool", call.name)
-            put("callId", call.id)
+            put("tool", call.name.take(MAX_STRING_CHARS))
+            put("callId", call.id.take(MAX_STRING_CHARS))
             put("query", cappedEcho(query, query.length))
             put(
                 "symbols",

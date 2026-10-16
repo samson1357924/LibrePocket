@@ -21,6 +21,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
@@ -110,9 +111,9 @@ class ScopedFileStoreConcurrencyPressureTest {
      * 中斷語義：若等待被中斷，補 `shutdownNow` 並恢復中斷位，回傳
      * `timedOut=true, quiesced=false`（保守視為不可 teardown）。
      */
-    internal data class QuiesceOutcome(val timedOut: Boolean, val quiesced: Boolean)
+    private data class QuiesceOutcome(val timedOut: Boolean, val quiesced: Boolean)
 
-    internal fun quiescePool(
+    private fun quiescePool(
         pool: ExecutorService,
         firstTimeoutSec: Long,
         reapTimeoutSec: Long,
@@ -822,7 +823,7 @@ class ScopedFileStoreConcurrencyPressureTest {
     }
 
     /**
-     * NOFOLLOW 回歸（人審 P2#1 最小重現断言化）：靜態 `ws/race-sub -> out` 下，
+     * NOFOLLOW 回歸（人審 P2#1 最小重現斷言化）：靜態 `ws/race-sub -> out` 下，
      * `deleteNoFollowRecursively(ws)` 只刪連結本體，`out/secret.txt` 必須存活；
      * 舊 `File.deleteRecursively()` 會跟隨進 target 刪外部內容。
      */
@@ -841,6 +842,105 @@ class ScopedFileStoreConcurrencyPressureTest {
         } finally {
             deleteNoFollowRecursively(ws)
             deleteNoFollowRecursively(out)
+        }
+    }
+
+    /**
+     * NOFOLLOW 懸空連結回歸：dangling file／dir symlink 只刪本體，不跟隨、
+     * 不影響 outside 存活內容。
+     */
+    @Test fun nofollowCleanupDeletesDanglingLinksWithoutFollowing() {
+        assumeNonWindows()
+        val ws = workspace()
+        val out = outside()
+        try {
+            File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
+            Files.createSymbolicLink(
+                File(ws, "dangling-file").toPath(),
+                File(out, "missing-target.txt").toPath(),
+            )
+            Files.createSymbolicLink(
+                File(ws, "dangling-dir").toPath(),
+                File(out, "missing-dir").toPath(),
+            )
+            deleteNoFollowRecursively(ws)
+            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
+            assertFalse(
+                Files.exists(File(ws, "dangling-file").toPath(), LinkOption.NOFOLLOW_LINKS),
+            )
+            assertFalse(
+                Files.exists(File(ws, "dangling-dir").toPath(), LinkOption.NOFOLLOW_LINKS),
+            )
+        } finally {
+            deleteNoFollowRecursively(ws)
+            deleteNoFollowRecursively(out)
+        }
+    }
+
+    /** quiesce 正常路徑：快速任務在首次期限內收斂，不記 timeout 且可 teardown。 */
+    @Test fun quiescePoolFastTasksPassWithoutTimeout() {
+        // 純 Executor 語義與 OS 無關，Windows 下亦可跑，不 assume。
+        val pool = Executors.newFixedThreadPool(2) { r -> Thread(r).apply { isDaemon = true } }
+        repeat(4) { pool.submit { } }
+        val outcome = quiescePool(pool, 5, 2)
+        assertFalse("fast tasks must not time out", outcome.timedOut)
+        assertTrue("fast tasks must quiesce", outcome.quiesced)
+        pool.shutdownNow()
+    }
+
+    /**
+     * quiesce 超時語義：首次期限 miss 即使 reap 後收斂，仍須記 timeout
+     * （壓力主測試據此 FAIL，僅允許安全清理）。
+     */
+    @Test fun quiescePoolTimeoutThenReapedMarksTimedOut() {
+        // 純 Executor 語義與 OS 無關，Windows 下亦可跑，不 assume。
+        val pool = Executors.newFixedThreadPool(1) { r -> Thread(r).apply { isDaemon = true } }
+        val started = CountDownLatch(1)
+        val entered = CountDownLatch(1)
+        pool.submit {
+            started.countDown()
+            try {
+                // 可中斷阻塞：shutdownNow 中斷後退出，使 reap 成功。
+                entered.await(30, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        assertTrue(started.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS))
+        val outcome = quiescePool(pool, 0, 5)
+        assertTrue("first deadline miss must mark timedOut", outcome.timedOut)
+        assertTrue("interruptible worker must reap", outcome.quiesced)
+        pool.shutdownNow()
+    }
+
+    /**
+     * quiesce 洩漏語義：無視中斷的 worker 在 reap 後仍活，須回 quiesced=false
+     * （壓力主測試據此跳過共享路徑 teardown）。
+     */
+    @Test fun quiescePoolUninterruptibleWorkerMarksNotQuiesced() {
+        // 純 Executor 語義與 OS 無關，Windows 下亦可跑，不 assume。
+        val pool = Executors.newFixedThreadPool(1) { r -> Thread(r).apply { isDaemon = true } }
+        val started = CountDownLatch(1)
+        val release = AtomicBoolean(false)
+        pool.submit {
+            started.countDown()
+            while (!release.get()) {
+                try {
+                    Thread.sleep(50)
+                } catch (_: InterruptedException) {
+                    // 刻意無視中斷，模擬 shutdownNow 無效的洩漏 worker。
+                }
+            }
+        }
+        try {
+            assertTrue(started.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS))
+            val outcome = quiescePool(pool, 0, 1)
+            assertTrue("deadline miss must mark timedOut", outcome.timedOut)
+            assertFalse("uninterruptible worker must not quiesce", outcome.quiesced)
+        } finally {
+            release.set(true)
+            pool.shutdownNow()
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS))
         }
     }
 }

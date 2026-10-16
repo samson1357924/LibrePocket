@@ -20,14 +20,20 @@ regardless of this check's result.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import sys
 from pathlib import Path
 
 MAX_GRADLE_BYTES = 512 * 1024
-TAG_RE = re.compile(r"v(\d+\.\d+\.\d+)")
-VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
+_SEMVER_CORE = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+# NOTE: use [0-9] (ASCII-only) rather than \d: Python re matches Unicode
+# decimal digits with \d, which must not pass as a release version.
+TAG_RE = re.compile(r"v(" + _SEMVER_CORE + r")")
+VERSION_RE = re.compile(_SEMVER_CORE)
 MAX_VERSION_CODE = 2_147_483_647
+MAX_VERSION_NAME_LEN = 256
 
 
 class TagVersionError(Exception):
@@ -35,22 +41,30 @@ class TagVersionError(Exception):
 
 
 def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
+    if not isinstance(gradle_path, (str, os.PathLike)):
+        raise TagVersionError("Gradle file path must be a string")
     path = Path(gradle_path)
     try:
         size = path.stat().st_size
     except OSError as exc:
         raise TagVersionError(f"cannot stat Gradle file: {exc}") from exc
     if size <= 0 or size > MAX_GRADLE_BYTES:
-        raise TagVersionError("Gradle file size is empty or exceeds the parser limit")
+        if size <= 0:
+            raise TagVersionError("Gradle file is empty")
+        raise TagVersionError("Gradle file size exceeds the parser limit")
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise TagVersionError(f"cannot read Gradle file as UTF-8: {exc}") from exc
+    if len(text.encode("utf-8")) > MAX_GRADLE_BYTES:
+        raise TagVersionError("Gradle file size exceeds the parser limit")
     # NOTE: `versionNameSuffix` (debug "-debug") must not match; the pattern
     # requires `versionName` followed directly by `=`, so the longer
     # `versionNameSuffix = ...` line cannot match.
-    codes = re.findall(r"(?m)^\s*versionCode\s*=\s*([0-9]+)\s*$", text)
-    names = re.findall(r'(?m)^\s*versionName\s*=\s*"([^"]+)"\s*$', text)
+    # Trailing `//` comments are allowed and stripped before matching so a
+    # legitimate edit with an end-of-line comment is not misreported.
+    codes = re.findall(r"(?m)^\s*versionCode\s*=\s*([0-9]+)\s*(?://.*)?$", text)
+    names = re.findall(r'(?m)^\s*versionName\s*=\s*"([^"]+)"\s*(?://.*)?$', text)
     if len(codes) != 1:
         raise TagVersionError(
             f"Gradle file must contain exactly one versionCode assignment (found {len(codes)})"
@@ -59,14 +73,23 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
         raise TagVersionError(
             f"Gradle file must contain exactly one versionName assignment (found {len(names)})"
         )
+    raw_code = codes[0]
+    if len(raw_code) > 1 and raw_code.startswith("0"):
+        raise TagVersionError("Gradle versionCode must not contain leading zeros")
     try:
-        code = int(codes[0])
+        code = int(raw_code)
     except ValueError as exc:
         raise TagVersionError("Gradle versionCode is not a decimal integer") from exc
     return code, names[0]
 
 
 def check_tag_version(tag: str, version_code: int, version_name: str) -> dict[str, object]:
+    if not isinstance(tag, str) or not isinstance(version_name, str):
+        raise TagVersionError("tag and versionName must be strings")
+    if type(version_code) is not int:
+        raise TagVersionError("versionCode must be an integer")
+    if len(tag) > 256 or len(version_name) > MAX_VERSION_NAME_LEN:
+        raise TagVersionError("tag/versionName exceeds the length limit")
     match = TAG_RE.fullmatch(tag)
     if match is None:
         raise TagVersionError(f"tag {tag!r} must use exact vX.Y.Z form (no suffix)")
@@ -105,8 +128,6 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # never a traceback-or-pass fallback
         print(f"FAIL: tag/version check error: {exc}", file=sys.stderr)
         return 1
-    import json
-
     print(json.dumps(result, sort_keys=True))
     return 0
 

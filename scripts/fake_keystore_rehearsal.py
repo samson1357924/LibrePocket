@@ -41,12 +41,16 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import Literal
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import verify_release_apk as verifier
+
+if not hasattr(verifier, "build_parser"):
+    raise ImportError("verify_release_apk.build_parser is required by the rehearsal")
 
 FAKE_PACKAGE = "dev.librepocket.agent"
 FAKE_VERSION_CODE = "7"
@@ -68,11 +72,14 @@ if not data.get("signed"):
     print("synthetic unsigned or tampered APK", file=sys.stderr)
     sys.exit(1)
 subject = data.get("subject", "CN=LibrePocket Synthetic Rehearsal")
+cert = data.get("cert")
+if not isinstance(cert, str):
+    sys.exit(93)
 print("Verifies")
 print("Verified using v3 scheme (APK Signature Scheme v3): true")
 print("Number of signers: 1")
 print("Signer #1 certificate DN: " + subject)
-print("Signer #1 certificate SHA-256 digest: " + data["cert"])
+print("Signer #1 certificate SHA-256 digest: " + cert)
 print("Signer #1 certificate SHA-1 digest: " + "ab" * 20)
 print("Signer #1 certificate MD5 digest: " + "ab" * 16)
 """
@@ -88,8 +95,13 @@ try:
     data = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
 except Exception:
     sys.exit(82)
+package = data.get("package")
+version_code = data.get("version_code")
+version_name = data.get("version_name")
+if not isinstance(package, str) or not isinstance(version_code, str) or not isinstance(version_name, str):
+    sys.exit(83)
 print("package: name='{}' versionCode='{}' versionName='{}' platformBuildVersionName='17'".format(
-    data["package"], data["version_code"], data["version_name"]
+    package, version_code, version_name
 ))
 print("application: label='Synthetic' icon=''")
 if data.get("debuggable"):
@@ -118,7 +130,7 @@ def _run_case(
     *,
     name: str,
     files: dict[str, bytes],
-    expect: str,
+    expect: Literal["pass", "reject"],
     apksigner: str,
     aapt: str,
     tmp: Path,
@@ -128,7 +140,7 @@ def _run_case(
     for filename, content in files.items():
         (candidate_dir / filename).write_bytes(content)
     stage_dir = tmp / f"stage-{name}"
-    namespace = verifier._build_parser().parse_args(
+    namespace = verifier.build_parser().parse_args(
         [
             "--candidate-dir", str(candidate_dir),
             "--stage-dir", str(stage_dir),
@@ -167,7 +179,7 @@ def _run_case(
     recand.mkdir()
     (recand / "copy.apk").write_bytes(staged_bytes)
     restage = tmp / f"restage-{name}"
-    re_namespace = verifier._build_parser().parse_args(
+    re_namespace = verifier.build_parser().parse_args(
         [
             "--candidate-dir", str(recand),
             "--stage-dir", str(restage),
@@ -188,8 +200,11 @@ def _run_case(
     return True, f"REHEARSAL {name}: EXPECTED_PASS -> PASS (sha256={digest[:16]}..., re-verified same)"
 
 
-def main() -> int:
-    cases: list[tuple[str, dict[str, bytes], str]] = [
+def main(argv: list[str] | None = None) -> int:
+    if argv is not None and len(argv) > 0:
+        print(f"FAIL: rehearsal takes no arguments (got {argv!r})", file=sys.stderr)
+        return 1
+    cases: list[tuple[str, dict[str, bytes], Literal["pass", "reject"]]] = [
         ("pass-clean-signed", {"candidate.apk": _payload()}, "pass"),
         ("reject-wrong-cert", {"candidate.apk": _payload(cert="bb" * 32)}, "reject"),
         ("reject-unsigned", {"candidate.apk": _payload(signed=False)}, "reject"),
@@ -230,25 +245,39 @@ def main() -> int:
     ]
     # Prove no secret is needed: pollute credential env with garbage; the
     # verifier scrubs its tool environment and must still pass identically.
+    # Saved/restored so importing this module and calling main() never leaks
+    # into the caller's environment.
+    saved_play = os.environ.get("PLAY_KEYSTORE_PASSWORD")
+    saved_bw = os.environ.get("BW_SESSION")
     os.environ["PLAY_KEYSTORE_PASSWORD"] = "garbage-rehearsal-value"
     os.environ["BW_SESSION"] = "garbage-rehearsal-value"
-    passed = 0
-    with tempfile.TemporaryDirectory(prefix="librepocket-fake-keystore-rehearsal-") as raw:
-        tmp = Path(raw)
-        tools = tmp / "tools"
-        tools.mkdir()
-        apksigner = tools / "apksigner"
-        aapt = tools / "aapt"
-        _write_executable(apksigner, FAKE_APKSIGNER.replace("{python}", sys.executable))
-        _write_executable(aapt, FAKE_AAPT.replace("{python}", sys.executable))
-        for name, files, expect in cases:
-            ok, line = _run_case(
-                name=name, files=files, expect=expect,
-                apksigner=str(apksigner), aapt=str(aapt), tmp=tmp,
-            )
-            print(line, flush=True)
-            if ok:
-                passed += 1
+    try:
+        passed = 0
+        with tempfile.TemporaryDirectory(prefix="librepocket-fake-keystore-rehearsal-") as raw:
+            tmp = Path(raw)
+            tools = tmp / "tools"
+            tools.mkdir()
+            apksigner = tools / "apksigner"
+            aapt = tools / "aapt"
+            _write_executable(apksigner, FAKE_APKSIGNER.replace("{python}", sys.executable))
+            _write_executable(aapt, FAKE_AAPT.replace("{python}", sys.executable))
+            for name, files, expect in cases:
+                ok, line = _run_case(
+                    name=name, files=files, expect=expect,
+                    apksigner=str(apksigner), aapt=str(aapt), tmp=tmp,
+                )
+                print(line, flush=True)
+                if ok:
+                    passed += 1
+    finally:
+        if saved_play is None:
+            os.environ.pop("PLAY_KEYSTORE_PASSWORD", None)
+        else:
+            os.environ["PLAY_KEYSTORE_PASSWORD"] = saved_play
+        if saved_bw is None:
+            os.environ.pop("BW_SESSION", None)
+        else:
+            os.environ["BW_SESSION"] = saved_bw
     print(f"REHEARSAL SUMMARY: {passed}/{len(cases)} cases behaved as expected", flush=True)
     if passed != len(cases):
         print("FAIL: fake-keystore rehearsal matrix did not match expectations", file=sys.stderr)
@@ -258,4 +287,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

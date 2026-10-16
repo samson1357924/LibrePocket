@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -50,30 +51,58 @@ class PinError(Exception):
     """A fail-closed registry validation failure."""
 
 
+def _no_duplicate_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
 def load_pins(path_value: str, *, require_flavors: tuple[str, ...] | None = None) -> dict[str, dict[str, str]]:
+    if not isinstance(path_value, (str, os.PathLike)):
+        raise PinError("pins file path must be a string")
     path = Path(path_value)
     try:
         size = path.stat().st_size
     except OSError as exc:
         raise PinError(f"cannot stat pins file: {exc}") from exc
-    if size <= 0 or size > MAX_PINS_BYTES:
-        raise PinError(f"pins file size is empty or exceeds {MAX_PINS_BYTES} bytes")
+    if size <= 0:
+        raise PinError("pins file is empty")
+    if size > MAX_PINS_BYTES:
+        raise PinError(f"pins file size exceeds {MAX_PINS_BYTES} bytes")
     try:
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise PinError(f"cannot read pins file as UTF-8: {exc}") from exc
+    if len(raw.encode("utf-8")) > MAX_PINS_BYTES:
+        raise PinError(f"pins file size exceeds {MAX_PINS_BYTES} bytes")
     try:
-        data = json.loads(raw)
+        data = json.loads(raw, object_pairs_hook=_no_duplicate_object)
     except json.JSONDecodeError as exc:
+        raise PinError(f"pins file is not valid JSON: {exc}") from exc
+    except ValueError as exc:
         raise PinError(f"pins file is not valid JSON: {exc}") from exc
     if not isinstance(data, dict) or not data:
         raise PinError("pins file must be a non-empty JSON object keyed by flavor")
-    if any(not isinstance(key, str) for key in data):
+    # Defensive: json object keys are always str, but keep the check
+    # fail-closed in case the loader is ever reused with another mapping.
+    if any(not isinstance(key, str) for key in data):  # pragma: no cover
         raise PinError("pins file flavor keys must be strings")
     unknown = sorted(k for k in data if k not in KNOWN_FLAVORS)
     if unknown:
         raise PinError(f"pins file contains unknown flavor(s): {', '.join(unknown)}")
     if require_flavors is not None:
+        if not isinstance(require_flavors, (tuple, list)):
+            raise PinError("--require-flavors must list unique known flavors")
+        if (
+            not require_flavors
+            or any(not isinstance(f, str) for f in require_flavors)
+            or len(set(require_flavors)) != len(require_flavors)
+            or any(f not in KNOWN_FLAVORS for f in require_flavors)
+        ):
+            raise PinError("--require-flavors must list unique known flavors")
         if set(require_flavors) != set(data):
             raise PinError(
                 "pins file flavors "

@@ -259,7 +259,8 @@ class SessionTranscriptSinkUsageTest {
     @Test
     fun successReasoningCoreFaultMidBatchStaysDangling() = runBlocking {
         // Owner P1: the core batch keeps its pre-#84 fail-closed shape — a
-        // mid-batch fault leaves at most the orphan marker, never a final.
+        // mid-batch fault leaves at most the orphan marker, never a final
+        // assistant (the marker itself is isFinal but never a family terminal).
         val store = SequentialFaultStore(setOf(2))
         val sid = store.createSession("hi", "m")
         val sink = SessionTranscriptSink(store, sid) { 42L }

@@ -189,7 +189,8 @@ already-wired `scripts/tests/test_build_release_identity.py` and
 `FakeKeystoreRehearsalTest` in `scripts/tests/test_release_artifact_verifier.py`.
 The `policy-harness` paths-filter includes the three helpers plus the example
 JSON, so the harness runs them on helper-only diffs. The synthetic fixtures
-prove the gate's fail-closed matrix only; they are not real-APK/SDK evidence.
+prove the gate's fail-closed matrix only; they are not real-APK/SDK evidence,
+not a signing/build rehearsal, and not a basis for closing Issue #12.
 
 The local APK release integration is `scripts/build_release.sh`; it requires `--apk`, explicit per-flavor trusted identity values, explicit SDK parser paths, and an existing output parent before it reaches credential lookup or build. It remains a local staging/verification path only, not a publishing workflow or release-readiness claim.
 

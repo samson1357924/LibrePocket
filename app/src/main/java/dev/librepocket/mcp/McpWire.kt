@@ -9,7 +9,7 @@ package dev.librepocket.mcp
  *     {"name":"..","description":"..","inputSchema":{...}}, ... ]}}`
  * - tools/call 请求：`{"jsonrpc":"2.0","id":<n>,"method":"tools/call",
  *     "params":{"name":"..","arguments":{... raw json ...}}}`
- *   `argumentsJson` 由呼叫方保證為合法 JSON object 文本（上層已過 Schema 校驗）。
+ *   `argumentsJson` 呼叫方可預檢，本函仍自驗證 fail-closed（非 object 即拋，不發送）。
  * - tools/call 回應：`{"jsonrpc":"2.0","id":<n>,"result":{
  *     "content":[...],"isError":false}}`；或 `{"error":{"code":..,"message":".."}}`。
  *
@@ -38,8 +38,8 @@ internal object McpWire {
      */
     private fun isJsonWs(c: Char): Boolean = c == ' ' || c == '\t' || c == '\n' || c == '\r'
 
-    /** JSON 字面量（true/false/null/number）校驗：非法字面量一律視為無效。 */
-    private val NUMBER_RE = Regex("-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?")
+    /** JSON 字面量（true/false/null/number）校驗：非法字面量一律視為無效（全字串匹配，錨點顯式鎖定）。 */
+    private val NUMBER_RE = Regex("^-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?$")
 
     /** 遞迴深度上限：超過拋 `mcp: too deep`（防 StackOverflow；MCP payload 不可能 64 層）。 */
     private const val MAX_DEPTH = 64
@@ -138,7 +138,13 @@ internal object McpWire {
                         'u' -> {
                             if (p + 4 > json.length) throw McpProtocol("mcp: bad envelope")
                             val hex = json.substring(p, p + 4)
-                            sb.append(hex.toIntOrNull(16)?.toChar() ?: throw McpProtocol("mcp: bad envelope"))
+                            if (hex.length != 4 || !hex.all {
+                                    it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F'
+                                }
+                            ) {
+                                throw McpProtocol("mcp: bad envelope")
+                            }
+                            sb.append(hex.toInt(16).toChar())
                             p += 4
                         }
                         else -> throw McpProtocol("mcp: bad envelope")
@@ -325,8 +331,25 @@ internal object McpWire {
     fun listBody(id: Long = 1L): String =
         """{"jsonrpc":"2.0","id":$id,"method":"tools/list","params":{}}"""
 
+    /**
+     * 組裝 tools/call 請求體（fail-closed）。
+     *
+     * - `toolName` 空白即拋（不送 `"name":""` 無效請求）；
+     * - `argumentsJson` 必須是合法 JSON object 文本（空字串視為 `{}`），
+     *   非 object（`null`／陣列／畸形）即拋，不發送；
+     * - `toolName` 經 [esc] 轉義（含 `\b`／`\f`／C0 控制字元 `\\u00XX`）。
+     */
     fun callBody(toolName: String, argumentsJson: String, id: Long = 2L): String {
+        require(toolName.isNotBlank()) { "mcp: blank tool name" }
         val args = argumentsJson.trim().ifEmpty { "{}" }
+        // fail-closed：arguments 必須是合法 JSON object 文本（上層不再另行保證，
+        // 此處直接驗證；非法即拋，呼叫方在發送前擋下，不送畸形 JSON-RPC）。
+        val parsed = try {
+            parseStrictDoc(args)
+        } catch (e: McpProtocol) {
+            throw IllegalArgumentException("mcp: bad arguments: ${e.message}")
+        }
+        if (parsed !is JObj) throw IllegalArgumentException("mcp: bad arguments")
         return """{"jsonrpc":"2.0","id":$id,"method":"tools/call"""" +
             ""","params":{"name":"${esc(toolName)}","arguments":$args}}"""
     }
@@ -384,6 +407,11 @@ internal object McpWire {
      * `isError`/`content` 只認頂層 `result` 物件的直接成員（DOM depth-1），
      * 巢狀同名鍵不得誤判；缺 `result` 即拋 IllegalArgumentException（fail-closed）。
      * 回傳的 resultJson 用 DOM 節點 `raw`（content 優先，否則整包 result）。
+     *
+     * 已知限制（鎖定現狀，不視為相容承諾）：
+     * - 空 `result`（`{}`，既無 `content` 又無 `structuredContent`）視為 OK
+     *  （`resultJson="{}"`，`isError=false`）；
+     * - `content` 存在時 `structuredContent` 被丟棄（僅保留 `content.raw`）。
      */
     fun parseCall(json: String): Pair<String?, Boolean> {
         if (json.length > McpTransport.RESPONSE_MAX_CHARS) {
@@ -433,10 +461,16 @@ internal object McpWire {
             when (c) {
                 '"' -> sb.append("\\\"")
                 '\\' -> sb.append("\\\\")
+                '\b' -> sb.append("\\b")
+                '\u000C' -> sb.append("\\f")
                 '\n' -> sb.append("\\n")
                 '\r' -> sb.append("\\r")
                 '\t' -> sb.append("\\t")
-                else -> sb.append(c)
+                else -> if (c.code < 0x20) {
+                    sb.append("\\u%04x".format(c.code))
+                } else {
+                    sb.append(c)
+                }
             }
         }
         return sb.toString()

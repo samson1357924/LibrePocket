@@ -90,8 +90,9 @@ class McpServer(
     /**
      * tools/call。
      *
-     * @param argumentsJson 已過 Schema 校驗的參數 JSON object 文本；只駐記憶體，
-     *   不寫盤、不進稽核（稽核見 [McpCallResult.auditMap]）。
+     * @param argumentsJson 必須是合法 JSON object 文本（空字串視為 `{}`）；
+     *   非法（空白 tool 名／非 object／畸形）即回 PROTOCOL，不發送、不碰 vault、
+     *   不計熔斷。只駐記憶體，不寫盤、不進稽核（稽核見 [McpCallResult.auditMap]）。
      */
     suspend fun callTool(
         toolName: String,
@@ -104,6 +105,14 @@ class McpServer(
         }
         if (!breaker.canCall()) {
             return McpCallResult(config.id, toolName, McpStatus.CIRCUIT_OPEN, clockMs() - start)
+        }
+        val body: String
+        try {
+            body = McpWire.callBody(toolName, argumentsJson)
+        } catch (_: IllegalArgumentException) {
+            // 客戶端參數錯誤（空白名／非 object／畸形）：fail-closed，不發送、
+            // 不碰 vault、不計熔斷（與傳輸失敗區分）。
+            return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
         }
         val key = keyVault.getKey(config.keyId)
         if (key == null || config.baseUrl.isBlank()) {
@@ -120,7 +129,6 @@ class McpServer(
             }
         }
         try {
-            val body = McpWire.callBody(toolName, argumentsJson)
             val raw = transport.postJson(config.baseUrl, bearer, body, timeoutMs)
             if (raw == null) {
                 breaker.onFailure()

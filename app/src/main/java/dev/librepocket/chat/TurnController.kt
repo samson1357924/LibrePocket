@@ -46,6 +46,7 @@ import java.time.ZoneId
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
 
@@ -765,16 +766,23 @@ class TurnController(
    * Counts every accepted delta at arrival (the tripping over-budget delta is
    * rejected before counting). Together with [uiTextUpdateCount]/
    * [uiTextCopiedChars] this keeps the per-delta arrival rate observable while
-   * the UI commit cost below is batched (#83).
+   * the UI commit cost below is batched (#83). Atomic so the count stays
+   * correct even if the single-writer discipline is ever relaxed.
    */
-  @Volatile
-  var streamedTextDeltaCount: Int = 0
-    private set
+  private val _streamedTextDeltaCount = AtomicInteger(0)
+  var streamedTextDeltaCount: Int
+    get() = _streamedTextDeltaCount.get()
+    private set(value) {
+      _streamedTextDeltaCount.set(value)
+    }
 
-  /** UI text commits performed (one per flush: immediate while small, cadenced past it; tool markers included). */
-  @Volatile
-  var uiTextUpdateCount: Int = 0
-    private set
+  /** UI text commits performed (one per flush: immediate while small, cadenced past it; tool markers included). Atomic, see above. */
+  private val _uiTextUpdateCount = AtomicInteger(0)
+  var uiTextUpdateCount: Int
+    get() = _uiTextUpdateCount.get()
+    private set(value) {
+      _uiTextUpdateCount.set(value)
+    }
 
   /**
    * Chars copied by immutable UI text commits (materialized block length per
@@ -782,11 +790,14 @@ class TurnController(
    * O(delta) and are not counted here — that uncounted incremental path is
    * the #83 O(n^2) fix; only flush commits copy. Exact under the
    * controller's single-writer discipline (no concurrent writers on one
-   * attempt's buffer).
+   * attempt's buffer); atomic like the counters above.
    */
-  @Volatile
-  var uiTextCopiedChars: Long = 0
-    private set
+  private val _uiTextCopiedChars = AtomicLong(0)
+  var uiTextCopiedChars: Long
+    get() = _uiTextCopiedChars.get()
+    private set(value) {
+      _uiTextCopiedChars.set(value)
+    }
 
   /**
    * Per-attempt visible-text buffer (#83): the full assistant-block text
@@ -4607,7 +4618,7 @@ class TurnController(
               // is never retained and never counted.
               requireTurnTextBudget(visibleTextChars, event.delta.length)
               visibleTextChars += event.delta.length
-              streamedTextDeltaCount++
+              _streamedTextDeltaCount.incrementAndGet()
               appendAssistantText(attemptRunId, event.delta)
             }
             // Reasoning stays in the same assistant block: P1 keeps one visible
@@ -4618,7 +4629,7 @@ class TurnController(
             is StreamEvent.ReasoningDelta -> {
               requireTurnTextBudget(visibleTextChars, event.delta.length)
               visibleTextChars += event.delta.length
-              streamedTextDeltaCount++
+              _streamedTextDeltaCount.incrementAndGet()
               appendReasoningDelta(attemptRunId, event.delta)
             }
             // Opaque reasoning marker: no visible text, only the source flag
@@ -4714,7 +4725,7 @@ class TurnController(
               // failure). Attempt isolation: each retry merges into its own
               // attempt id. [lastUsage] holds the merged authoritative value.
               val seen = attemptUsageSeen
-                .getOrPut(attemptRunId) { AtomicInteger(0) }
+                .computeIfAbsent(attemptRunId) { AtomicInteger(0) }
                 .incrementAndGet()
               if (seen <= MAX_USAGE_EVENTS_PER_ATTEMPT) {
                 val merged = mergeUsage(attemptUsages[attemptRunId], event)
@@ -5099,7 +5110,7 @@ class TurnController(
    * both share the one visible-text budget enforced by the caller).
    */
   private fun bufferAppend(runId: String, delta: String, reasoning: Boolean) {
-    val buf = attemptTextBuffers.getOrPut(runId) { TextBuffer() }
+    val buf = attemptTextBuffers.computeIfAbsent(runId) { TextBuffer() }
     if (buf.text.isEmpty()) {
       // Late join without a placeholder (defensive; production always
       // placeholders first): seed from the committed UI copy so the buffer
@@ -5158,8 +5169,8 @@ class TurnController(
     }
     buf.unflushedChars = 0
     buf.unflushedDeltas = 0
-    uiTextUpdateCount++
-    uiTextCopiedChars += snapshot.length
+    _uiTextUpdateCount.incrementAndGet()
+    _uiTextCopiedChars.addAndGet(snapshot.length.toLong())
   }
 
   /** Drops one attempt's buffer after its terminal snapshot (UI already exact). */
@@ -5198,7 +5209,7 @@ class TurnController(
   private fun appendReasoningDelta(runId: String, delta: String) {
     if (delta.isEmpty()) {
       markAssistantReasoning(runId)
-      attemptTextBuffers.getOrPut(runId) { TextBuffer() }.hasReasoning = true
+      attemptTextBuffers.computeIfAbsent(runId) { TextBuffer() }.hasReasoning = true
       return
     }
     bufferAppend(runId, delta, reasoning = true)

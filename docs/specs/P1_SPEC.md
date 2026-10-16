@@ -11,7 +11,7 @@
 >
 > **Target scope:** provider BYOK, minimum chat loop, session persistence, policy model, and local tests. Agent tool execution, GUI, terminal, MCP, memory, and cloud sync were originally scoped as later work. “No app-managed cloud sync” does not mean Android Auto Backup is disabled.
 
-### Current 行為補充（conversation-ledger；以程式為準，補充核對至 `0185935` S1–S7＋R27＋R28-1，另加 PR #94 P1/P2：`Failed.code` 傳遞、classifier `text_too_large`、sink distinct 256 順序、預算／用量邊界與 cancel+usage 測試硬化；以 `502f6bf` 程式為準，review-only 驗證，未跑 Gradle——ANDROID_HOME／local.properties 未配置）
+### Current 行為補充（conversation-ledger；以程式為準，補充核對至 `0185935` S1–S7＋R27＋R28-1，另加 PR #94 P1/P2：`Failed.code` 傳遞、classifier `text_too_large`、sink distinct 256 順序、預算／用量邊界與 cancel+usage 測試硬化，另加 R2：rebase 至 `c169276`、usage post-ack best-effort（不在 terminal unit 內）、latch 改 emission-history＋穩態斷言、Atomic 計數器；程式以 `41e8f05`＋本批 R2-3 提交為準，review-only 驗證，未跑 Gradle——ANDROID_HOME／local.properties 未配置）
 
 - **8 個 `CHAT_*` notice 碼**（見 `ChatScreen.chatNoticeText`／`ChatViewModel`）：`CHAT_SEND_DENIED`、`CHAT_APPROVAL_REQUIRED`、`CHAT_POLICY_UNAVAILABLE`、`CHAT_INPUT_TOO_LONG`、`CHAT_STORE_UNAVAILABLE` 皆為 NOT accepted（本次未送出，呼叫者保留文字；`INPUT_TOO_LONG` 為 100k 邊界 fail-fast）；`CHAT_STORE_PENDING` 為 UNKNOWN／PENDING_COMMIT（見下）；`CHAT_CANCELLED_RECOVERY`、`CHAT_QUEUE_RECOVERY_REQUIRED` 為排隊保留 recovery（取消／待送訊息已保留，須手動確認重送）。
 - **UNKNOWN／settle（勿重送）：** `TranscriptPendingException` 表示超時送後 fate 未定；ownership 保留，同 opId 重送被擋，直到 `TurnController.settlePendingAdmission` 以同一邏輯 id 認領（claim）或轉失敗可重試（convert）。呼叫者收到 PENDING 時必須 NOT 重送。

@@ -1,6 +1,6 @@
 # 威脅模型：目前資料流與安全邊界
 
-> **狀態：Current snapshot**，依 `0185935`（S1–S7＋R27＋R28-1）＋ PR #94 P1/P2（code 傳遞、classifier `text_too_large`、預算／用量邊界測試硬化；以 `502f6bf` 程式為準；2026-10-16 核對，review-only，未跑 Gradle——ANDROID_HOME／local.properties 未配置）。這不是正式安全認證，也不代表所有列出的防護均已驗證。B1/B2 有界切片（PR #80）僅經 JVM 單測驗證，裝置 smoke 與快照更新待後續。
+> **狀態：Current snapshot**，依 `0185935`（S1–S7＋R27＋R28-1）＋ PR #94 P1/P2（code 傳遞、classifier `text_too_large`、預算／用量邊界測試硬化）＋ R2（rebase 至 `c169276`；usage 移出 terminal unit、core ack 後 best-effort 補寫；latch 改 emission-history＋穩態斷言；Atomic 計數器）；程式以 `41e8f05`＋本批 R2-3 提交為準；2026-10-16 核對，review-only，未跑 Gradle——ANDROID_HOME／local.properties 未配置）。這不是正式安全認證，也不代表所有列出的防護均已驗證。B1/B2 有界切片（PR #80）僅經 JVM 單測驗證，裝置 smoke 與快照更新待後續。
 >
 > - **範圍：** Android app 的聊天、provider、Room transcript、Android backup 與已宣告工具邊界。
 > - **Owner role：** app/runtime 維護者；目前未指派個人或安全團隊。

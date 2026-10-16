@@ -128,10 +128,10 @@ class SessionTranscriptSink(
     /** Pre-terminal authoritative usage per runId (#84, last-wins merged). */
     private data class PendingUsage(val inputTokens: Int?, val outputTokens: Int?)
 
-    /** Buffered usages not yet flushed with their attempt terminal. Single-writer (Ordered), insertion-ordered. */
+    /** Buffered usages not yet flushed with their attempt terminal. Single-writer (Ordered), insertion-ordered. Guarded by the ordered single-writer discipline of the hosting session writer — never touch from a second writer. */
     private val pendingUsage = LinkedHashMap<String, PendingUsage>()
 
-    /** Per-run pre-terminal onUsage arrival counts for the flood cap. */
+    /** Per-run pre-terminal onUsage arrival counts for the flood cap. Same single-writer guard as [pendingUsage]. */
     private val usageSeen = HashMap<String, Int>()
 
     /**
@@ -139,11 +139,13 @@ class SessionTranscriptSink(
      * (trailing accounting, e.g. legacy call order) is appended immediately
      * once per runId instead of buffering forever; pre-terminal floods still
      * merge to one row via [pendingUsage]. Bounded by the session's terminal
-     * count (same discipline as the controller's terminal sets).
+     * count (same discipline as the controller's terminal sets); deliberately
+     * uncapped (an eviction would break the once-per-runId dedup — a bounded
+     * residue of small ids, not payload). Same single-writer guard.
      */
     private val terminalizedRuns = HashSet<String>()
 
-    /** RunIds that already consumed their single trailing post-terminal usage write (rate-limit). */
+    /** RunIds that already consumed their single trailing post-terminal usage write (rate-limit). Same bound and single-writer guard as [terminalizedRuns]. */
     private val trailingUsageWritten = HashSet<String>()
 
     /** Durable core write: store failures propagate so the writer fails the ack. */

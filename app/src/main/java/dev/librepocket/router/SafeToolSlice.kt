@@ -9,6 +9,7 @@ import dev.librepocket.tool.CapabilityLevel
 import dev.librepocket.tool.DenyReason
 import dev.librepocket.tool.LspTools
 import dev.librepocket.tool.ProjectionContext
+import dev.librepocket.tool.SideEffect
 import dev.librepocket.tool.ToolRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ensureActive
@@ -33,22 +34,29 @@ import kotlin.coroutines.coroutineContext
  * Stage order per model tool call (fresh every call — "latest" policy/scope):
  * 1. per-turn budget ([maxCallsPerTurn]; excess is [DenyCodes.BUDGET_EXCEEDED]);
  * 2. cancel check ([ensureActive]: cancel before execution aborts with zero
- *    further effects — already-denied calls keep their typed denials, the
- *    backend is never touched afterwards);
- * 3. registry lookup + `executionReady` + latest [ProjectionContext] scope
- *    ([DenyReason] surfaced in the typed denial);
- * 4. arguments schema validation (JSON object, required non-blank `query`,
- *    optional `limit` int clamped 1..200, optional `pathPrefix` string);
- * 5. fresh `tool.exec` [PolicyStore.evaluateFresh] (ALLOW only; ASK/DENY/
+ *    further effects — already-paired results are discarded by the throw,
+ *    the backend is never touched afterwards);
+ * 3. registry lookup + `executionReady` + single-tool READ-only gate
+ *    (re-graded entries deny `SCOPE_DENIED`/`NEED_CONFIRM`; scope denials
+ *    surface [DenyReason]);
+ * 4. latest [ProjectionContext] scope re-check;
+ * 5. arguments schema validation (JSON object, required non-blank `query`,
+ *    optional `limit` int clamped 1..200, optional `pathPrefix` string
+ *    without traversal: no `..`, no leading `/`, no backslash);
+ * 6. fresh `tool.exec` [PolicyStore.evaluateFresh] (ALLOW only; ASK/DENY/
  *    failure all deny);
- * 6. [PrivilegeGate] (READ passes without confirmation; anything else denies);
- * 7. executor ([LspTools.symbols] on the injected backend — pure computation,
- *    no IO, no external side effects by construction).
+ * 7. [PrivilegeGate] (READ passes without confirmation; anything else denies);
+ * 8. executor ([LspTools.symbols] on the injected backend — default
+ *    [LspTools.StubBackend] is pure computation, no IO; injected backends
+ *    must honor the same cancel contract and never return secrets, see
+ *    [LspTools.Backend]).
  *
  * Denials are TYPED RESULTS (not throws, except [CancellationException]):
  * every model call gets a paired `tool` message (call-id pairing preserved
  * per the T1 provider contracts), so DENY/cancel/schema-error paths are
  * observable with backend invocation count zero (pinned by tests).
+ * Backend exceptions (non-cancel) are mapped to typed `EXEC_ERROR`
+ * denials, never leaked as turn failures.
  *
  * Pure JVM, no Android dependencies. The turn engine ([dev.librepocket.chat
  * .TurnController]) attaches this loop only when constructed with it
@@ -61,6 +69,9 @@ class SafeToolSlice(
     private val clock: Clock = Clock.systemDefaultZone(),
     val maxCallsPerTurn: Int = 1,
 ) {
+    init {
+        require(maxCallsPerTurn in 1..8) { "maxCallsPerTurn must be 1..8, was $maxCallsPerTurn" }
+    }
     companion object {
         /** The single wired tool (the only `executionReady=true` entry). */
         const val TOOL_NAME: String = "lsp.symbols"
@@ -114,9 +125,10 @@ class SafeToolSlice(
 
     /**
      * Execute one attempt's model tool calls in order. Never throws except
-     * [CancellationException] (cancel aborts remaining calls; already-paired
-     * results are returned by the caller discarding them — zero further
-     * backend effects).
+     * [CancellationException] (cancel aborts remaining calls; partial
+     * results are discarded by the throw — zero further backend effects).
+     * Backend exceptions (non-cancel) are mapped to typed `EXEC_ERROR`
+     * denials to preserve call-id pairing.
      */
     suspend fun execute(calls: List<ToolCall>): List<ToolResult> {
         if (calls.size > maxCallsPerTurn) {
@@ -140,6 +152,14 @@ class SafeToolSlice(
         if (call.name != TOOL_NAME || !tool.executionReady) {
             return deny(call, DenyCodes.NOT_READY, "${call.name} is not wired this round")
         }
+        // Defense-in-depth: the slice is READ-only by construction. Even if
+        // the registry entry for TOOL_NAME were ever re-graded, never execute
+        // WRITE/PRIVILEGED here (a second tool must go through its own
+        // confirm pipeline, not this slice). Static check first: fail fast
+        // before schema parsing and the policy IO below.
+        if (tool.sideEffect != SideEffect.READ) {
+            return deny(call, DenyCodes.SCOPE_DENIED, DenyCodes.NEED_CONFIRM)
+        }
         val projection = tool.project(ctxSupplier())
         if (projection.level != CapabilityLevel.NATIVE) {
             val reason = projection.reason ?: DenyReason.USER_DISABLED
@@ -149,8 +169,8 @@ class SafeToolSlice(
             ?: return deny(call, DenyCodes.SCHEMA_INVALID, "arguments must be a JSON object with a non-blank string query")
         val verdict = try {
             policy.evaluateFresh(POLICY_ACTION, tool.name).verdict
-        } catch (_: CancellationException) {
-            throw CancellationException("tool policy recheck cancelled")
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             null
         }
@@ -165,7 +185,17 @@ class SafeToolSlice(
                 return deny(call, DenyCodes.SCOPE_DENIED, gate.reason.name)
         }
         coroutineContext.ensureActive()
-        return when (val outcome = LspTools.symbols(args.query, args.pathPrefix, args.limit, backend)) {
+        val outcome = try {
+            LspTools.symbols(args.query, args.pathPrefix, args.limit, backend)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Fixed receipt: never interpolate backend messages (an MCP
+            // bridge message could carry paths/secrets, and this JSON rides
+            // the provider continuation). Debug detail stays out of the wire.
+            return deny(call, DenyCodes.EXEC_ERROR, "backend failed")
+        }
+        return when (outcome) {
             is LspTools.SymbolsOutcome.Ok -> ok(call, args.query, outcome)
             is LspTools.SymbolsOutcome.Unavailable ->
                 deny(call, DenyCodes.EXEC_DENIED, outcome.detail)
@@ -196,7 +226,22 @@ class SafeToolSlice(
         }
         val pathPrefix = when (val raw = root["pathPrefix"]) {
             null -> null
-            is JsonPrimitive -> if (raw.isString) raw.content else return null
+            is JsonPrimitive -> {
+                if (!raw.isString) return null
+                val v = raw.content
+                // Scope traversal guard (raw-string layer): `..`, leading
+                // `/`, backslash, NUL. Encoded forms (`%2e%2e`, unicode
+                // normalization) pass this layer by design — the injected
+                // bridge must canonicalize/decode then re-validate and
+                // never treat this string as a trusted filesystem scope.
+                // `""` is allowed and normalizes downstream (StubBackend maps
+                // blank to the default scope); it is "unspecified", not a
+                // bypass (pinned by tests).
+                if (v.contains("..") || v.startsWith("/") || v.contains("\\") || v.contains("\u0000")) {
+                    return null
+                }
+                v
+            }
             else -> return null
         }
         return ValidArgs(query, pathPrefix, limit)

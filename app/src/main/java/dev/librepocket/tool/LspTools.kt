@@ -30,6 +30,11 @@ object LspTools {
     /**
      * 後端縫：[StubBackend] 為預設本地樁；MCP 橋接實作此介面即可替換
      * （僅替換資料來源，不改變開關/投影語義）。
+     *
+     * 實作契約：必須是純計算或有界查詢；不得執行副作用、不得回傳秘密
+     * （結果會經 continuation 發給 provider），呼叫方取消時應盡快響應。
+     * [dev.librepocket.router.SafeToolSlice] 會把非取消例外映射為 typed
+     * denial，絕不洩漏為 turn 失敗。
      */
     interface Backend {
         fun symbols(query: String, pathPrefix: String?, limit: Int): List<Symbol>

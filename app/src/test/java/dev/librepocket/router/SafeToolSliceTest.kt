@@ -230,16 +230,22 @@ class SafeToolSliceTest {
     @Test fun budgetExceededDeniesWholeRoundWithZeroSideEffects() = runBlocking {
         val backend = CountingBackend()
         val s = slice(backend = backend)
-        val results = s.execute(
-            listOf(
-                call(id = "call-1", args = """{"query":"A"}"""),
-                call(id = "call-2", args = """{"query":"B"}"""),
-            ),
+        val calls = listOf(
+            call(id = "call-1", args = """{"query":"A"}"""),
+            call(id = "call-2", args = """{"query":"B"}"""),
         )
+        val results = s.execute(calls)
         assertEquals(2, results.size)
         assertTrue(results.all { it.denied })
         assertTrue(results.all { it.denyCode == SafeToolSlice.DenyCodes.BUDGET_EXCEEDED })
         assertEquals(listOf("call-1", "call-2"), results.map { it.callId })
+        // Pairing holds for budget denials too: continuation carries both.
+        val msgs = s.continuationMessages(calls, results)
+        assertEquals(3, msgs.size)
+        assertEquals("call-1", msgs[1].toolCallId)
+        assertEquals("call-2", msgs[2].toolCallId)
+        assertTrue(msgs[1].text.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED))
+        assertTrue(msgs[2].text.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED))
         assertEquals(0, backend.invocations.get())
     }
 
@@ -247,17 +253,11 @@ class SafeToolSliceTest {
         val backend = CountingBackend()
         val s = slice(backend = backend)
         val calls = listOf(call(id = "call-1"), call(id = "call-2", args = "{bad"))
-        // Budget is 1: run them as two single-call rounds to get one ok + one denied.
+        // One ok + one schema-denied single-call round (budget is 1).
         val ok = s.execute(listOf(calls[0])).single()
-        val over = SafeToolSlice(
-            ctxSupplier = { ProjectionContext(userSwitches = mapOf("lsp" to true)) },
-            policy = allowPolicy(),
-            backend = backend,
-            clock = fixedClock,
-            maxCallsPerTurn = 0,
-        ).execute(listOf(calls[1])).single()
-        assertTrue(over.denied)
-        val msgs = s.continuationMessages(calls, listOf(ok, over))
+        val denied = s.execute(listOf(calls[1])).single()
+        assertTrue(denied.denied)
+        val msgs = s.continuationMessages(calls, listOf(ok, denied))
         assertEquals(3, msgs.size)
         assertEquals("assistant", msgs[0].role)
         assertEquals(calls, msgs[0].toolCalls)
@@ -266,7 +266,123 @@ class SafeToolSliceTest {
         assertEquals(ok.resultJson, msgs[1].text)
         assertEquals("tool", msgs[2].role)
         assertEquals("call-2", msgs[2].toolCallId)
-        assertTrue(msgs[2].text.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED))
+        assertTrue(msgs[2].text.contains(SafeToolSlice.DenyCodes.SCHEMA_INVALID))
         assertEquals(1, backend.invocations.get())
+    }
+
+    @Test fun wiredToolIsReadOnlyPin() {
+        // Tripwire for the slice READ-only gate: if the registry re-grades
+        // lsp.symbols, this fails. The SCOPE_DENIED/NEED_CONFIRM behavior
+        // branch itself is not directly executable (static registry), the
+        // defense-in-depth check in SafeToolSlice.executeOne covers it.
+        val tool = ToolRegistry.find(SafeToolSlice.TOOL_NAME)
+        assertTrue(tool != null)
+        assertEquals(dev.librepocket.tool.SideEffect.READ, tool!!.sideEffect)
+        assertTrue(tool.executionReady)
+    }
+
+    @Test fun throwingBackendMapsToTypedExecError() = runBlocking {
+        val throwing = object : LspTools.Backend {
+            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                throw IllegalStateException("boom")
+            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val s = slice(backend = throwing)
+        val r = s.execute(listOf(call())) .single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
+        assertEquals("call-1", r.callId)
+        // Typed denial body carries the pairing (code + callId), not the throw.
+        val body = Json.parseToJsonElement(r.resultJson).jsonObject
+        assertEquals("true", body["denied"]!!.jsonPrimitive.content)
+        assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, body["code"]!!.jsonPrimitive.content)
+        assertEquals("call-1", body["callId"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun throwingBackendWithSecretMessageDoesNotLeak() = runBlocking {
+        val secret = "sk-live-SECRET123 Bearer abc"
+        val throwing = object : LspTools.Backend {
+            override fun symbols(query: String, pathPrefix: String?, limit: Int): List<LspTools.Symbol> =
+                throw IllegalStateException(secret)
+            override fun diagnostics(path: String): List<LspTools.Diagnostic> = emptyList()
+        }
+        val r = slice(backend = throwing).execute(listOf(call())).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.EXEC_ERROR, r.denyCode)
+        // Fixed receipt: backend message never interpolates into the wire JSON.
+        assertFalse(r.resultJson.contains(secret))
+        assertFalse(r.resultJson.contains("sk-live-SECRET123"))
+        assertFalse(r.resultJson.lowercase().contains("bearer"))
+    }
+
+    @Test fun pathPrefixTraversalDeniesWithZeroSideEffects() = runBlocking {
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        val bad = listOf(
+            """{"query":"Foo","pathPrefix":"../etc"}""",
+            """{"query":"Foo","pathPrefix":"a/../b"}""",
+            """{"query":"Foo","pathPrefix":"/etc/passwd"}""",
+            """{"query":"Foo","pathPrefix":"a\\b"}""",
+            "{\"query\":\"Foo\",\"pathPrefix\":\"a\\u0000b\"}",
+        )
+        for ((i, args) in bad.withIndex()) {
+            val r = s.execute(listOf(call(args = args, id = "trav-$i"))).single()
+            assertTrue(args, r.denied)
+            assertEquals(args, SafeToolSlice.DenyCodes.SCHEMA_INVALID, r.denyCode)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun pathPrefixBenignValuesPass() = runBlocking {
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        // Omitted, null-equivalent empty, and a relative sub-scope all pass.
+        val okMissing = s.execute(listOf(call(args = """{"query":"Foo"}"""))).single()
+        assertFalse(okMissing.denied)
+        val okEmpty = s.execute(listOf(call(args = """{"query":"Foo","pathPrefix":""}""", id = "empty"))).single()
+        assertFalse(okEmpty.denied)
+        val okSub = s.execute(listOf(call(args = """{"query":"Foo","pathPrefix":"a/b"}""", id = "sub"))).single()
+        assertFalse(okSub.denied)
+        assertEquals(3, backend.invocations.get())
+    }
+
+    @Test fun policyFlipAfterOfferDenies() = runBlocking {
+        val backend = CountingBackend()
+        val policy = allowPolicy()
+        val switches = mutableMapOf("lsp" to true)
+        val s = SafeToolSlice(
+            ctxSupplier = { ProjectionContext(userSwitches = switches) },
+            policy = policy,
+            backend = backend,
+            clock = fixedClock,
+        )
+        assertEquals(listOf("lsp.symbols"), s.offeredTools().map { it.name })
+        policy.setRule(PolicyRule("tool.exec:lsp.symbols", Verdict.DENY, 10))
+        val r = s.execute(listOf(call())).single()
+        assertTrue(r.denied)
+        assertEquals(SafeToolSlice.DenyCodes.POLICY_DENIED, r.denyCode)
+        assertEquals(0, backend.invocations.get())
+    }
+
+    @Test fun denyJsonCarriesNoSecrets() = runBlocking {
+        val backend = CountingBackend()
+        val denyPolicy = InMemoryPolicyStore(
+            listOf(PolicyRule("tool.exec:lsp.symbols", Verdict.DENY, 10)),
+        )
+        val s = slice(policy = denyPolicy, backend = backend)
+        val policyDenied = s.execute(listOf(call(id = "policy-1"))).single()
+        assertEquals(SafeToolSlice.DenyCodes.POLICY_DENIED, policyDenied.denyCode)
+        val schemaDenied = s.execute(listOf(call(args = "{bad", id = "bad-1"))).single()
+        assertEquals(SafeToolSlice.DenyCodes.SCHEMA_INVALID, schemaDenied.denyCode)
+        val unreadyDenied =
+            s.execute(listOf(call(name = "shell.exec", args = """{"argv":["ls"]}""", id = "unready-1"))).single()
+        assertEquals(SafeToolSlice.DenyCodes.NOT_READY, unreadyDenied.denyCode)
+        val results = listOf(policyDenied, schemaDenied, unreadyDenied)
+        assertTrue(results.all { it.denied })
+        for (r in results) {
+            assertFalse(r.resultJson.lowercase().contains("sk-"))
+            assertFalse(r.resultJson.lowercase().contains("bearer"))
+        }
+        assertEquals(0, backend.invocations.get())
     }
 }

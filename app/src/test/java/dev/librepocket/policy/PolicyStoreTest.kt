@@ -68,6 +68,14 @@ class PolicyStoreTest {
     assertEquals(Verdict.ASK, d.verdict)
   }
 
+  @Test fun toolExecDefaultAskHoldsOnFreshRecheck() = runBlocking {
+    // The slice uses evaluateFresh(SafeToolSlice.POLICY_ACTION,
+    // SafeToolSlice.TOOL_NAME) — literals kept in sync with those constants.
+    // Pin the same ASK default on the execution-basis path.
+    val s = InMemoryPolicyStore()
+    assertEquals(Verdict.ASK, s.evaluateFresh("tool.exec", "lsp.symbols").verdict)
+  }
+
   @Test fun toolExecExplicitAllowAuthorizes() = runBlocking {
     val s = store(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 10))
     assertEquals(Verdict.ALLOW, s.evaluateFresh("tool.exec", "lsp.symbols").verdict)

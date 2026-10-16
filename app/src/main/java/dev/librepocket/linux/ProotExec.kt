@@ -155,12 +155,14 @@ object ProotExec {
                     ShellDeny.BLACKLISTED,
                     "linux.exec privilege denied；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
                 )
-            // Stage1 新增碼：linux 門禁永不回 NEED_CLARIFICATION（僅 FastRouter
-            // 缺參用）；此分支不可達，fail-closed 拒絕以滿足窮舉。
+            // Exhaustiveness branch: the linux gate never produces
+            // NEED_CLARIFICATION today (only FastRouter uses it for missing
+            // args); if a future helper ever returns it, fail closed to
+            // BLACKLISTED here — never surface it as a clarification.
             DenyReason.NEED_CLARIFICATION ->
                 return ShellResult.Denied(
                     ShellDeny.BLACKLISTED,
-                    "linux.exec needs clarification (NEED_CLARIFICATION)；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
+                    "linux.exec veto: unexpected clarify state, fail-closed；$FALLBACK_HINT；${LinuxTools.PERF_NOTICE}",
                 )
             null -> Unit
         }

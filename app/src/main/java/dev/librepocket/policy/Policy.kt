@@ -51,6 +51,11 @@ interface PolicyStore {
  * `tool.exec` rule: under [DefaultPolicyRuleset] it matches only `*:*` ASK,
  * and the slice requires ALLOW — ASK/DENY/failure all deny with zero side
  * effects (fail-closed preserved; no silent widening).
+ *
+ * Upgrade note: before this action existed, any persisted `tool.exec:*`
+ * rule was inert (unknown actions deny). After upgrade it becomes
+ * effective. Operators upgrading with pre-existing `tool.exec` rules must
+ * re-review them; no automatic migration drops user rules.
  */
 internal val KNOWN_ACTIONS = setOf(
   "chat.send",

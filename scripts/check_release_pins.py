@@ -77,6 +77,9 @@ def load_pins(path_value: str, *, require_flavors: tuple[str, ...] | None = None
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise PinError(f"cannot read pins file as UTF-8: {exc}") from exc
+    # Re-check the decoded length: the stat size is advisory (the file may
+    # grow or be replaced between stat and read, e.g. symlink/fd reuse), so
+    # the in-memory snapshot is the binding measurement.
     if len(raw.encode("utf-8")) > MAX_PINS_BYTES:
         raise PinError(f"pins file size exceeds {MAX_PINS_BYTES} bytes")
     try:

@@ -12,6 +12,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from scripts import check_release_pins as signer_pins
+from scripts import check_release_tag_version as tag_version
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILDER = ROOT / "scripts" / "build_release.sh"
@@ -22,8 +24,6 @@ PINS_EXAMPLE = ROOT / "scripts" / "release_signer_pins.example.json"
 TAG_CHECKER = ROOT / "scripts" / "check_release_tag_version.py"
 APP_BUILD_GRADLE = ROOT / "app" / "build.gradle.kts"
 
-from scripts import check_release_pins as signer_pins
-from scripts import check_release_tag_version as tag_version
 FLAVORS = ("play", "foss", "github")
 EXPECTED = {
     flavor: {

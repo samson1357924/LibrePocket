@@ -124,14 +124,17 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
         size = path.stat().st_size
     except OSError as exc:
         raise TagVersionError(f"cannot stat Gradle file: {exc}") from exc
-    if size <= 0 or size > MAX_GRADLE_BYTES:
-        if size <= 0:
-            raise TagVersionError("Gradle file is empty")
+    if size <= 0:
+        raise TagVersionError("Gradle file is empty")
+    if size > MAX_GRADLE_BYTES:
         raise TagVersionError("Gradle file size exceeds the parser limit")
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise TagVersionError(f"cannot read Gradle file as UTF-8: {exc}") from exc
+    # Re-check the decoded length: the stat size is advisory (the file may
+    # grow or be replaced between stat and read), so the in-memory snapshot
+    # is the binding measurement.
     if len(text.encode("utf-8")) > MAX_GRADLE_BYTES:
         raise TagVersionError("Gradle file size exceeds the parser limit")
     # NOTE: `versionNameSuffix` (debug "-debug") must not match; the pattern

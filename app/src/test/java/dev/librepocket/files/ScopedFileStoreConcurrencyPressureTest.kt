@@ -187,7 +187,7 @@ class ScopedFileStoreConcurrencyPressureTest {
     /** symlink 需 POSIX 語義；Windows 下跳過（宿主機語義限制，非裝置結論）。 */
     private fun assumeNonWindows() {
         val osName: String = System.getProperty("os.name") ?: ""
-        assumeTrue(!osName.startsWith("Windows"))
+        assumeTrue(!osName.startsWith("Windows", ignoreCase = true))
     }
 
     /**
@@ -354,9 +354,8 @@ class ScopedFileStoreConcurrencyPressureTest {
                     }
                     repeat(FILE_FLIP_ROUNDS) { i ->
                         val flip = File(ws, "flip")
-                        // JDK17 相容：threadId() 需 19+，測試僅需唯一性用 deprecated id 即可。
-                        @Suppress("DEPRECATION")
-                        val tid = Thread.currentThread().id
+                        // 線程唯一性以 name 取得（pool 線程名唯一，無 deprecated API）。
+                        val tid = Thread.currentThread().name
                         val staged = File(ws, stageFilePrefix() + "${tid}-$i")
                         try {
                             deleteQuietly(staged)
@@ -393,9 +392,8 @@ class ScopedFileStoreConcurrencyPressureTest {
                     }
                     repeat(DIR_FLIP_ROUNDS) { i ->
                         val sub = File(ws, "race-sub")
-                        // JDK17 相容：見 fileFlipper 註解。
-                        @Suppress("DEPRECATION")
-                        val tid = Thread.currentThread().id
+                        // 線程唯一性見 fileFlipper 註解（name，無 deprecated API）。
+                        val tid = Thread.currentThread().name
                         val staged = File(ws, stageDirPrefix() + "${tid}-$i")
                         try {
                             deleteQuietly(staged)
@@ -642,8 +640,9 @@ class ScopedFileStoreConcurrencyPressureTest {
 
             // 有界斷言二：拒絕門有觸發。denied 為混合桶（IAE＋FNFE／IO 窗口），
             // 真正門證據為 rejected（僅 IAE）＋首條鏈族訊息；注意此僅證明「有呼叫被拒」，
-            // 不等於「初驗後重驗命中」（靜態毒鏈初驗亦同訊息），重驗命中由下文
-            // `writeRevalidationGateRefusesMidOperationSwap` 以 preGateHook 確定性證明；
+            // 不等於「初驗後重驗命中」（靜態毒鏈初驗亦同訊息；極端單 vCPU 排程飢餓下
+            // 碰撞密度可降，門檻僅 >0），重驗命中以 `writeRevalidationGateRefusesMidOperationSwap`
+            // 為主要確定性門檢查（preGateHook 確定性證明）；
             // root 定錨族 mismatch／identity 由 B2Test T1／F1 確定性覆蓋。
             assertTrue(
                 "expected some rejections, got denied=${denied.get()} rejected=${rejected.get()} " +

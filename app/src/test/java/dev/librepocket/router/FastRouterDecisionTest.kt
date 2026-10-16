@@ -5,6 +5,7 @@ import dev.librepocket.tool.Flavor
 import dev.librepocket.tool.ProjectionContext
 import dev.librepocket.tool.ToolRegistry
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -289,5 +290,19 @@ class FastRouterDecisionTest {
         assertNull(d.toolCall)
         assertTrue(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
         assertEquals("NEED_CLARIFICATION", d.header.reasonCode)
+    }
+
+    @Test fun negationWithMissingGrantStaysNoPrivilege() {
+        // 遮罩順序：投影 UNAVAILABLE（無授權）優先於否定澄清；否定句在無授權
+        // 下仍回 NO_PRIVILEGE，絕不被誤讀為補參澄清。
+        val d = decide(
+            "不要加行程，明天開會",
+            play.copy(grantedPermissions = emptySet()),
+        )
+        assertEquals(RouteKind.DENIED, d.route)
+        assertEquals(DenyReason.NO_PRIVILEGE, d.reasonCode)
+        assertNull(d.toolCall)
+        assertTrue(d.fallbackMessage!!.contains("NO_PRIVILEGE"))
+        assertFalse(d.fallbackMessage!!.contains("NEED_CLARIFICATION"))
     }
 }

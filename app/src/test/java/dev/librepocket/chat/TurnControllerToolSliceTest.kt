@@ -567,6 +567,94 @@ class TurnControllerToolSliceTest {
         assertEquals(tricky, body["query"]!!.jsonPrimitive.content)
     }
 
+    @Test fun firstRoundMultiCallBudgetDeniesWithPairing() = runBlocking {
+        // Slice-unit budget exceeded is covered in SafeToolSliceTest; this
+        // pins the controller cross-layer combination: one round, two typed
+        // denials, paired continuation, zero backend touches.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.handler = { request ->
+            if (request.messages.any { it.role == "tool" }) {
+                flow {
+                    emit(StreamEvent.TextDelta(0, 0, "standing by"))
+                    emit(StreamEvent.Done("stop"))
+                }
+            } else {
+                flow {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 0,
+                            id = "call-1",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"A"}""",
+                        ),
+                    )
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 1,
+                            id = "call-2",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"B"}""",
+                        ),
+                    )
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+            }
+        }
+        c.send("查 A 和 B")
+
+        assertEquals(0, backend.invocations.get())
+        assertEquals(2, provider.seenRequests.size)
+        assertEquals(listOf("call-1", "call-2"), sink.tools.map { it.id })
+        val toolMessages = provider.seenRequests[1].messages.filter { it.role == "tool" }
+        assertEquals(listOf("call-1", "call-2"), toolMessages.map { it.toolCallId })
+        val toolTexts = toolMessages.map { it.text }
+        assertEquals(2, toolTexts.size)
+        assertTrue(toolTexts.all { it.contains(SafeToolSlice.DenyCodes.BUDGET_EXCEEDED) })
+        assertEquals(ChatStatus.IDLE, c.uiState.value.status)
+        assertEquals(1, sink.succeeded.size)
+        assertTrue(sink.succeeded.single().second.contains("standing by"))
+    }
+
+    @Test fun continuationFailureEndsTurnWithoutReplaying() = runBlocking {
+        // The executed result is kept (backend ran once); a non-retryable
+        // continuation failure ends the turn instead of replaying execution.
+        val provider = SliceProvider()
+        val sink = SliceSink()
+        val backend = CountingBackend()
+        val pol = slicePolicy()
+        val c = controller(provider, pol, sink, loop(pol, backend))
+        provider.handler = { request ->
+            if (request.messages.any { it.role == "tool" }) {
+                flow {
+                    emit(StreamEvent.Failed("continuation exploded", retryable = false))
+                }
+            } else {
+                flow {
+                    emit(
+                        StreamEvent.ToolDone(
+                            toolIndex = 0,
+                            id = "call-a",
+                            name = "lsp.symbols",
+                            argumentsJson = """{"query":"A"}""",
+                        ),
+                    )
+                    emit(StreamEvent.Done("tool_calls"))
+                }
+            }
+        }
+        c.send("查 A")
+
+        assertEquals(1, backend.invocations.get())
+        assertEquals(2, provider.seenRequests.size)
+        assertEquals(listOf("call-a"), sink.tools.map { it.id })
+        assertEquals(ChatStatus.ERROR, c.uiState.value.status)
+        assertTrue(sink.succeeded.isEmpty())
+    }
+
     @Test fun cancelBeforeExecutionHasZeroSideEffects() = runBlocking {
         val provider = SliceProvider()
         val sink = SliceSink()

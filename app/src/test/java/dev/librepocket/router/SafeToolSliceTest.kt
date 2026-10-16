@@ -418,4 +418,38 @@ class SafeToolSliceTest {
             assertTrue(field, v.contains("[truncated 2000→${SafeToolSlice.MAX_STRING_CHARS}]"))
         }
     }
+
+    @Test fun limitLowClampsToOneAndExecutes() = runBlocking {
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        var n = 0
+        for (args in listOf("""{"query":"x","limit":0}""", """{"query":"x","limit":-5}""")) {
+            val r = s.execute(listOf(call(args = args, id = "low-$n"))).single()
+            assertFalse(args, r.denied)
+            assertEquals(args, 1, backend.lastLimit)
+            n++
+        }
+        assertEquals(2, backend.invocations.get())
+    }
+
+    @Test fun limitDefaultsToFiftyWhenOmitted() = runBlocking {
+        val backend = CountingBackend()
+        val r = slice(backend = backend).execute(listOf(call())).single()
+        assertFalse(r.denied)
+        assertEquals(LspTools.DEFAULT_LIMIT, backend.lastLimit)
+    }
+
+    @Test fun limitFloatAndExplicitNullDeny() = runBlocking {
+        val backend = CountingBackend()
+        val s = slice(backend = backend)
+        for ((i, args) in listOf(
+            """{"query":"x","limit":1.5}""",
+            """{"query":"x","limit":null}""",
+        ).withIndex()) {
+            val r = s.execute(listOf(call(args = args, id = "lim-$i"))).single()
+            assertTrue(args, r.denied)
+            assertEquals(args, SafeToolSlice.DenyCodes.SCHEMA_INVALID, r.denyCode)
+        }
+        assertEquals(0, backend.invocations.get())
+    }
 }

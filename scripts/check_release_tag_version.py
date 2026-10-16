@@ -14,7 +14,8 @@ The tag is supplied by the trusted caller (CI passes ``github.ref_name``
 or the output of ``git describe --exact-match``); this script never
 infers identity from an APK and never touches keystores. The public
 release workflow (``.github/workflows/release.yml``) stays frozen
-regardless of this check's result.
+regardless of this check's result. The Gradle path is caller-supplied
+trusted input (local checkout file), not an adversarial path.
 """
 
 from __future__ import annotations
@@ -71,7 +72,8 @@ def parse_gradle_version(gradle_path: str) -> tuple[int, str]:
         )
     if len(names) != 1:
         raise TagVersionError(
-            f"Gradle file must contain exactly one versionName assignment (found {len(names)})"
+            "Gradle file must contain exactly one versionName assignment "
+            f"(double-quoted, found {len(names)})"
         )
     raw_code = codes[0]
     if len(raw_code) > 1 and raw_code.startswith("0"):

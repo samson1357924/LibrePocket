@@ -708,6 +708,42 @@ class SignerPinRegistryTest(unittest.TestCase):
         with self.assertRaises(signer_pins.PinError):
             signer_pins.load_pins(None)  # type: ignore[arg-type]
 
+    def test_package_length_boundary_and_cert_variants(self) -> None:
+        long_ok = "a." + "b" * 251 + ".c"  # 255 chars, valid dotted shape
+        self.assertEqual(len(long_ok), 255)
+        path = self._write(
+            "pins.json",
+            {"play": {"package": long_ok, "cert_sha256": "ab12" * 16}},
+        )
+        pins = signer_pins.load_pins(str(path))
+        self.assertEqual(pins["play"]["package"], long_ok)
+        long_bad = long_ok + "d"  # 256 chars
+        path = self._write(
+            "pins256.json",
+            {"play": {"package": long_bad, "cert_sha256": "ab12" * 16}},
+        )
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(str(path))
+        for bad_cert in ("ab12" * 16 + "ab1", "0x" + "ab12" * 15 + "ab", "ab12" * 15 + "ab\n"):
+            with self.subTest(cert=bad_cert[:20]):
+                path = self._write(
+                    "pins.json",
+                    {"play": {"package": "dev.librepocket.agent", "cert_sha256": bad_cert}},
+                )
+                with self.assertRaises(signer_pins.PinError):
+                    signer_pins.load_pins(str(path))
+
+    def test_non_dict_entry_and_mixed_case_cert(self) -> None:
+        path = self._write("pins.json", {"play": "not-a-dict"})
+        with self.assertRaises(signer_pins.PinError):
+            signer_pins.load_pins(str(path))
+        path = self._write(
+            "pins.json",
+            {"play": {"package": "dev.librepocket.agent", "cert_sha256": "Ab12" * 16}},
+        )
+        pins = signer_pins.load_pins(str(path))
+        self.assertEqual(pins["play"]["cert_sha256"], "ab12" * 16)
+
     def test_missing_file_and_invalid_json_are_rejected(self) -> None:
         with self.assertRaises(signer_pins.PinError):
             signer_pins.load_pins(str(self.tmp / "does-not-exist.json"))
@@ -936,6 +972,35 @@ class ReleaseTagVersionTest(unittest.TestCase):
         with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionCode"):
             tag_version.parse_gradle_version(str(duplicated))
 
+    def test_duplicate_version_name_missing_fields_and_single_quote(self) -> None:
+        dup_name = self.tmp / "dup-name.gradle.kts"
+        dup_name.write_text(
+            'versionCode = 7\nversionName = "1.2.3"\nversionName = "1.2.3"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionName"):
+            tag_version.parse_gradle_version(str(dup_name))
+        missing_code = self.tmp / "missing-code.gradle.kts"
+        missing_code.write_text('versionName = "1.2.3"\n', encoding="utf-8")
+        with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionCode"):
+            tag_version.parse_gradle_version(str(missing_code))
+        missing_name = self.tmp / "missing-name.gradle.kts"
+        missing_name.write_text("versionCode = 7\n", encoding="utf-8")
+        with self.assertRaisesRegex(tag_version.TagVersionError, "exactly one versionName"):
+            tag_version.parse_gradle_version(str(missing_name))
+        single = self.tmp / "single.gradle.kts"
+        single.write_text(
+            "versionCode = 7\nversionName = '1.2.3'\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(tag_version.TagVersionError, "double-quoted"):
+            tag_version.parse_gradle_version(str(single))
+
+    def test_oversize_gradle_is_rejected(self) -> None:
+        big = self.tmp / "big.gradle.kts"
+        big.write_bytes(b'versionCode = 7\nversionName = "1.2.3"\n' + b"x" * (512 * 1024))
+        with self.assertRaisesRegex(tag_version.TagVersionError, "exceeds"):
+            tag_version.parse_gradle_version(str(big))
+
     def test_cli_accepts_matching_tag_and_rejects_mismatch(self) -> None:
         path = self._write_gradle(version_code="7", version_name_line='versionName = "1.2.3"')
         good = subprocess.run(
@@ -960,6 +1025,46 @@ class ReleaseTagVersionTest(unittest.TestCase):
             timeout=30,
         )
         self.assertNotEqual(bad.returncode, 0, bad.stdout)
+
+    def test_cli_rejects_bad_tag_missing_file_and_bad_require_flavors(self) -> None:
+        path = self._write_gradle(version_code="7", version_name_line='versionName = "1.2.3"')
+        bad_tag = subprocess.run(
+            [sys.executable, str(TAG_CHECKER), "--tag", "v01.02.03",
+             "--app-build-gradle", str(path)],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertNotEqual(bad_tag.returncode, 0, bad_tag.stdout)
+        missing = subprocess.run(
+            [sys.executable, str(TAG_CHECKER), "--tag", "v1.2.3",
+             "--app-build-gradle", str(self.tmp / "nope.gradle.kts")],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertNotEqual(missing.returncode, 0, missing.stdout)
+        pins = self.tmp / "pins.json"
+        pins.write_text(
+            json.dumps(
+                {"play": {"package": "dev.librepocket.agent", "cert_sha256": "ab12" * 16}}
+            ),
+            encoding="utf-8",
+        )
+        bad_flavors = subprocess.run(
+            [sys.executable, str(PINS_CHECKER), "--pins", str(pins),
+             "--require-flavors", "play play"],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertNotEqual(bad_flavors.returncode, 0, bad_flavors.stdout)
+        good_pins = subprocess.run(
+            [sys.executable, str(PINS_CHECKER), "--pins", str(pins),
+             "--require-flavors", "play"],
+            cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=30,
+        )
+        self.assertEqual(good_pins.returncode, 0, good_pins.stdout)
+        result_json = json.loads(good_pins.stdout)
+        self.assertEqual(result_json.get("status"), "ok")
 
 
 if __name__ == "__main__":

@@ -29,7 +29,8 @@ Rules (all fail-closed):
 This validator never reads keystores, passwords, or Bitwarden state and
 never approves a signing policy; it only checks pin-file shape so a
 caller can fail fast before supplying pins as ``--expected-*`` identity
-to ``scripts/build_release.sh``.
+to ``scripts/build_release.sh``. The pins path is caller-supplied trusted
+input (local maintainer file), not an adversarial path.
 """
 
 from __future__ import annotations

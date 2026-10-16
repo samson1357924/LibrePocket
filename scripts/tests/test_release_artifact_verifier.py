@@ -495,7 +495,10 @@ class FakeKeystoreRehearsalTest(unittest.TestCase):
         env = {
             name: value
             for name, value in os.environ.items()
-            if "KEYSTORE" not in name and "BW_SESSION" not in name
+            if "KEYSTORE" not in name.upper()
+            and not name.upper().startswith("BW_")
+            and "SECRET" not in name.upper()
+            and "TOKEN" not in name.upper()
         }
         env["PYTHONDONTWRITEBYTECODE"] = "1"
 
@@ -526,6 +529,31 @@ class FakeKeystoreRehearsalTest(unittest.TestCase):
             self.assertIn(case, result.stdout)
         self.assertIn("10/10 cases behaved as expected", result.stdout)
         self.assertIn("synthetic fixtures only", result.stdout)
+        self.assertIn("EXPECTED_PASS -> PASS", result.stdout)
+        self.assertIn("EXPECTED_REJECT -> REJECT", result.stdout)
+        self.assertIn("re-verified same", result.stdout)
+
+    def test_child_environment_scrubs_secrets(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PLAY_KEYSTORE_PASSWORD": "secret",
+                "BW_SESSION": "secret",
+                "BW_ITEM_PLAY": "secret",
+                "LD_PRELOAD": "evil",
+                "PYTHONPATH": "evil",
+                "PATH": "/usr/bin",
+            },
+            clear=False,
+        ):
+            child = verifier._child_environment()
+        self.assertNotIn("PLAY_KEYSTORE_PASSWORD", child)
+        self.assertNotIn("BW_SESSION", child)
+        self.assertNotIn("BW_ITEM_PLAY", child)
+        self.assertNotIn("LD_PRELOAD", child)
+        self.assertNotIn("PYTHONPATH", child)
+        for allowed in ("PATH", "LC_ALL"):
+            self.assertIn(allowed, child)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@ package dev.librepocket.mcp
 import dev.librepocket.tool.SideEffect
 
 /**
- * D03 MCP 客戶端最小版模型（BACKLOG D03，ARCHITECTURE §10.1）。
+ * D03 MCP 客戶端最小版模型（BACKLOG D03；架構位置見 ARCHITECTURE.md Target
+ *「capability state must distinguish…」）。
  *
  * 原創小模型，只走 Streamable HTTP（POST `endpoint(baseUrl)`，使用者自訂完整 URL）+ Bearer；
  * 舊 SSE transport 不做。
@@ -61,7 +62,7 @@ data class McpTool(
     val sideEffect: SideEffect = SideEffect.WRITE,
 )
 
-/** 傳輸/邏輯狀態：OK 以外一律視為工具級錯誤，不中斷會話（ARCH §10.1）。 */
+/** 傳輸/邏輯狀態：OK 以外一律視為工具級錯誤，不中斷會話（見 BACKLOG.md D03）。 */
 enum class McpStatus {
     OK,
     UNAUTHORIZED,

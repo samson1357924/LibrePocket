@@ -9,7 +9,8 @@ import dev.librepocket.tool.ToolAnnotations
 import dev.librepocket.tool.ToolDef
 
 /**
- * D03 第三方工具範圍門（投影 + 確認），與內建快工具同鏈路（ARCH §5/§6/§10.1）。
+ * D03 第三方工具範圍門（投影 + 確認），與內建快工具同鏈路
+ *（見 ARCHITECTURE.md Target「capability state must distinguish…」與 BACKLOG.md D03）。
  *
  * 規則（原創，BACKLOG D03「再投影，預設 WRITE」）：
  * 1. 預設副作用 [SideEffect.WRITE]：除非伺服器另行聲明，第三方工具一律按
@@ -18,11 +19,14 @@ import dev.librepocket.tool.ToolDef
  * 2. 投影（[project] 純函數）：伺服器主開關關閉，或該工具逐項關閉
  *    （[McpServerConfig.enabledTools] / [ProjectionContext.userSwitches]
  *    的 `mcp.<serverId>.<tool>` 覆寫），一律 UNAVAILABLE + USER_DISABLED；
- *    開啟即 NATIVE（MCP 只需網路權限，無風味封鎖）。
+ *    開啟即 NATIVE（MCP 只需網路權限，無風味封鎖；開關預設開是為了讓
+ *    確認閘（[check]）接管 WRITE 授權，而非預設放行執行——執行仍須確認）。
  * 3. 確認（[check]）：投影不可用一律 [McpGate.Denied]；READ 無需確認即可
  *    [McpGate.Allowed]；WRITE / PRIVILEGED 未確認一律 [McpGate.NeedConfirm]。
  *
  * 開關 key 形狀：`mcp.<serverId>.<toolName>`（例如 `mcp.files.search`）。
+ * 命名保留：橋接別名（`LspTools` 約定 `mcp.<serverId>.lsp…`）不得與遠端
+ * `tools/list` 回傳名機械式區分，碰撞時逃逸規則待定（現未接線，僅預留）。
  */
 object McpScope {
 
@@ -38,6 +42,8 @@ object McpScope {
             description = "Third-party MCP tool $toolName on server $serverId (default WRITE).",
             jsonSchema = """{"type": "object"}""",
             sideEffect = sideEffect,
+            // 顯式雙閘：即使將來接線，模型仍不可見（須 wiring PR 逐項翻轉）。
+            executionReady = false,
             annotations = ToolAnnotations(
                 requiresSwitch = switchKey(serverId, toolName),
                 switchDefault = true,

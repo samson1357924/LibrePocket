@@ -14,12 +14,13 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 /**
- * #11 MCP protocol contracts：單一最小子集起步（per-revision suite）。
+ * #11 MCP protocol contracts：單一傳輸子集起步（per-revision suite）。
  *
- * 修訂決策（Stage2，書面記錄）：
- * - 候選 `2025-11-25` 與 `2026-07-28` 皆為 **Proposed**（未採納）：本 repo 內無任一
- *   修訂的規格文本，工作區無外網可核對，任何「差異表」都將是虛構，故此處不寫差異表。
- * - 選擇：單一起步 —— 僅 `tools/list`＋`tools/call` 經 Streamable HTTP POST、
+ * 修訂選型（Stage2 本 PR 選型，非 Accepted ADR，書面記錄）：
+ * - 候選 `2025-11-25` 與 `2026-07-28`（#11 提及的候選修訂號，repo 內無文本）
+ *   皆為候選未採納：本 repo 內無任一修訂的規格文本，工作區無外網可核對，
+ *   任何「差異表」都將是虛構，故此處不寫差異表。
+ * - 選擇：單一傳輸子集起步 —— 僅 `tools/list`＋`tools/call` 經 Streamable HTTP POST、
  *   Bearer 標頭、單頁（不跟隨分頁）、HTTP 一問一答配對（不做 response id 斷言）。
  *   不送 `initialize`、不接 SSE stream、不協商 `protocolVersion`。
  *   排除依據不是「規格說不用」，而是 fail-closed：子集外的形狀一律走 PROTOCOL
@@ -27,7 +28,7 @@ import org.junit.Test
  * - 將來若要支援任一修訂，須先把該修訂文本納入 `docs/specs/` 並逐項補契約，
  *   不得把本子集的綠燈當成修訂相容證據。
  *
- * 全程 MockWebServer／純 wire 解析，不連外網；MCP 生產零引用維持（不接線）。
+ * 全程 MockWebServer／純 wire 解析，不連外網；MCP 生產零 import 維持（不接線）。
  */
 class McpProtocolContractsTest {
 

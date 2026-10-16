@@ -767,10 +767,12 @@ class TurnController(
    * [uiTextCopiedChars] this keeps the per-delta arrival rate observable while
    * the UI commit cost below is batched (#83).
    */
+  @Volatile
   var streamedTextDeltaCount: Int = 0
     private set
 
   /** UI text commits performed (one per flush: immediate while small, cadenced past it; tool markers included). */
+  @Volatile
   var uiTextUpdateCount: Int = 0
     private set
 
@@ -782,6 +784,7 @@ class TurnController(
    * controller's single-writer discipline (no concurrent writers on one
    * attempt's buffer).
    */
+  @Volatile
   var uiTextCopiedChars: Long = 0
     private set
 
@@ -1198,7 +1201,7 @@ class TurnController(
           runCatching {
             android.util.Log.w(
               "TurnController",
-              "cancel receipt system compensation failed: ${storeFailure.message}",
+              "cancel receipt system compensation failed: ${sanitizeError(storeFailure.message ?: "")}",
             )
           }
           false
@@ -1232,7 +1235,7 @@ class TurnController(
           runCatching {
             android.util.Log.w(
               "TurnController",
-              "cancel receipt compensation failed: ${storeFailure.message}",
+              "cancel receipt compensation failed: ${sanitizeError(storeFailure.message ?: "")}",
             )
           }
           false
@@ -1267,7 +1270,7 @@ class TurnController(
           runCatching {
             android.util.Log.w(
               "TurnController",
-              "cancel receipt compensation failed: ${storeFailure.message}",
+              "cancel receipt compensation failed: ${sanitizeError(storeFailure.message ?: "")}",
             )
           }
           false
@@ -1308,7 +1311,7 @@ class TurnController(
           runCatching {
             android.util.Log.w(
               "TurnController",
-              "cancel receipt batch compensation failed: ${storeFailure.message}",
+              "cancel receipt batch compensation failed: ${sanitizeError(storeFailure.message ?: "")}",
             )
           }
           false
@@ -1418,7 +1421,7 @@ class TurnController(
               runCatching {
                 android.util.Log.w(
                   "TurnController",
-                  "cancel receipt waiter failed: ${compensationFailure.message}",
+                  "cancel receipt waiter failed: ${sanitizeError(compensationFailure.message ?: "")}",
                 )
               }
               receipt.state.compareAndSet(CancelReceiptState.CLAIMED, CancelReceiptState.SEALED)
@@ -1565,7 +1568,7 @@ class TurnController(
             runCatching {
               android.util.Log.w(
                 "TurnController",
-                "cancel receipt waiter failed: ${compensationFailure.message}",
+                "cancel receipt waiter failed: ${sanitizeError(compensationFailure.message ?: "")}",
               )
             }
             receipt.state.compareAndSet(CancelReceiptState.CLAIMED, CancelReceiptState.SEALED)
@@ -1578,7 +1581,7 @@ class TurnController(
         runCatching {
           android.util.Log.w(
             "TurnController",
-            "cancel receipt waiter failed: ${waiterFailure.message}",
+            "cancel receipt waiter failed: ${sanitizeError(waiterFailure.message ?: "")}",
           )
         }
         receipt.state.compareAndSet(CancelReceiptState.PENDING, CancelReceiptState.SEALED)
@@ -4116,6 +4119,10 @@ class TurnController(
       // STREAMING, and never report success. Falls through to the normal
       // completion path below (same as a provider failure): empty queue keeps
       // ERROR, queued work may still promote.
+      // The terminal path above never ran its discardTextBuffer, so drop any
+      // retained attempt buffer here (ids are never reused; clear-all is safe
+      // under single-flight and idempotent with the normal path).
+      attemptTextBuffers.clear()
       synchronized(lock) {
         activityRevision++
         _uiState.update {
@@ -4137,6 +4144,9 @@ class TurnController(
       // VM-fatal (VirtualMachineError/ThreadDeath) never lands here either —
       // it always propagates (never swallowed like the sink's rethrow).
       if (e is VirtualMachineError || e is ThreadDeath) throw e
+      // Same leak guard as the Exception path above: the terminal discard
+      // never ran, so drop any retained attempt buffer.
+      attemptTextBuffers.clear()
       synchronized(lock) {
         activityRevision++
         _uiState.update {
@@ -4755,13 +4765,6 @@ class TurnController(
           retryable = e.retryable,
           code = e.code?.name ?: inferAggFailureCodeName(e.message),
         )
-        // Single source of truth with the Failed-event path above: discard
-        // covers typed AGG_TOO_LARGE (incl. message-inferred legacy shape).
-        // UNKNOWN_RUNTIME arrives via the Failed-event path and the
-        // unknown-Exception/Throwable catches below (built-in adapters never
-        // throw it as a ProviderFailure; a custom one carrying it still
-        // discards via the same predicate); other ProviderFailures
-        // (e.g. 401) flush.
         flushCatchingBudgetOverflow()
         // AGG_TOO_LARGE is this collector's own guard: fail closed without
         // recording poison-adjacent pending tools (the typed terminal error
@@ -5133,6 +5136,11 @@ class TurnController(
   private fun flushAssistantText(runId: String) {
     val buf = attemptTextBuffers[runId] ?: return
     if (buf.unflushedChars == 0 && buf.unflushedDeltas == 0) return
+    // No matching UI row (defensive; production always placeholders first):
+    // skip the full-history copy plus the no-op emission instead of counting
+    // a phantom commit. The buffer is kept so the terminal snapshot stays
+    // exact via assistantTextOf.
+    if (_uiState.value.messages.none { it.id == runId && it.role == "assistant" }) return
     val snapshot = buf.text.toString()
     val reasoning = buf.hasReasoning
     // The update{} lambda may re-run on contention, so counter side effects

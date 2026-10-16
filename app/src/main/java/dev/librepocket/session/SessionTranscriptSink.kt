@@ -724,11 +724,11 @@ class SessionTranscriptSink(
             appendNotice(runId, "system", "usage input=$inputTokens output=$outputTokens", isFinal = true)
             return
         }
+        if (pendingUsage[runId] == null && pendingUsage.size >= MAX_PENDING_USAGE_RUNS) return
         val seen = (usageSeen[runId] ?: 0) + 1
         if (seen > MAX_USAGE_EVENTS_PER_RUN) return
         usageSeen[runId] = seen
         val prev = pendingUsage[runId]
-        if (prev == null && pendingUsage.size >= MAX_PENDING_USAGE_RUNS) return
         pendingUsage[runId] = PendingUsage(
             inputTokens = inputTokens ?: prev?.inputTokens,
             outputTokens = outputTokens ?: prev?.outputTokens,

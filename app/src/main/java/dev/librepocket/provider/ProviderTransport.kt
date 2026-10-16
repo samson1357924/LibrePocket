@@ -397,7 +397,7 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * `code` propagation (Stage D): a [ProviderFailure] becomes
  * [StreamEvent.Failed] with `code = e.code?.name ?: inferAggFailureCodeName(e.message)`,
  * so aggregation/SSE budget overflows (`AGG_TOO_LARGE` with distinct
- * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
+ * `TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
  * messages) stay typed end-to-end for TurnController's pending-flush guard.
  * Other branches keep `code = null` (legacy/classified failures), except the
  * unknown-runtime fallback which carries `UNKNOWN_RUNTIME` so the controller

@@ -62,7 +62,7 @@ sealed interface StreamEvent {
      * `ProviderFailure` or the unknown-runtime fallback via the streaming
      * transport; null for legacy/classified failures. The transport fills it
      * in `streamingFlow` (`code?.name` or inferred from the
-     * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
+     * `TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
      * markers; unknown runtime fallback uses `UNKNOWN_RUNTIME`; `pumpSse`
      * throws typed `ProviderFailure` for SSE budget overflows which
      * `streamingFlow` projects to `code`). TurnController uses `code` plus

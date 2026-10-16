@@ -1,0 +1,259 @@
+package dev.librepocket.router
+
+import dev.librepocket.policy.PolicyStore
+import dev.librepocket.policy.Verdict
+import dev.librepocket.provider.ChatMessage
+import dev.librepocket.provider.ToolCall
+import dev.librepocket.provider.ToolSchema
+import dev.librepocket.tool.CapabilityLevel
+import dev.librepocket.tool.DenyReason
+import dev.librepocket.tool.LspTools
+import dev.librepocket.tool.ProjectionContext
+import dev.librepocket.tool.ToolRegistry
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.put
+import java.time.Clock
+import kotlin.coroutines.coroutineContext
+
+/**
+ * P2 safe vertical slice (#19): the single wired tool's closed loop.
+ *
+ * Owns exactly one tool ([TOOL_NAME] = `lsp.symbols`, READ-only, deterministic
+ * [LspTools.StubBackend] echo): request-tools offer → schema validation →
+ * latest scope/policy re-check → executor → typed result → continuation
+ * messages. All other 40 tools stay `executionReady=false` and are never
+ * executed here (unknown names are typed denials, never dispatched).
+ *
+ * Stage order per model tool call (fresh every call — "latest" policy/scope):
+ * 1. per-turn budget ([maxCallsPerTurn]; excess is [DenyCodes.BUDGET_EXCEEDED]);
+ * 2. cancel check ([ensureActive]: cancel before execution aborts with zero
+ *    further effects — already-denied calls keep their typed denials, the
+ *    backend is never touched afterwards);
+ * 3. registry lookup + `executionReady` + latest [ProjectionContext] scope
+ *    ([DenyReason] surfaced in the typed denial);
+ * 4. arguments schema validation (JSON object, required non-blank `query`,
+ *    optional `limit` int clamped 1..200, optional `pathPrefix` string);
+ * 5. fresh `tool.exec` [PolicyStore.evaluateFresh] (ALLOW only; ASK/DENY/
+ *    failure all deny);
+ * 6. [PrivilegeGate] (READ passes without confirmation; anything else denies);
+ * 7. executor ([LspTools.symbols] on the injected backend — pure computation,
+ *    no IO, no external side effects by construction).
+ *
+ * Denials are TYPED RESULTS (not throws, except [CancellationException]):
+ * every model call gets a paired `tool` message (call-id pairing preserved
+ * per the T1 provider contracts), so DENY/cancel/schema-error paths are
+ * observable with backend invocation count zero (pinned by tests).
+ *
+ * Pure JVM, no Android dependencies. The turn engine ([dev.librepocket.chat
+ * .TurnController]) attaches this loop only when constructed with it
+ * (default-off: production composition attaches none, staying records-only).
+ */
+class SafeToolSlice(
+    private val ctxSupplier: () -> ProjectionContext = { ProjectionContext() },
+    private val policy: PolicyStore,
+    private val backend: LspTools.Backend = LspTools.StubBackend,
+    private val clock: Clock = Clock.systemDefaultZone(),
+    val maxCallsPerTurn: Int = 1,
+) {
+    companion object {
+        /** The single wired tool (the only `executionReady=true` entry). */
+        const val TOOL_NAME: String = "lsp.symbols"
+
+        /** Execution-basis policy action (known action; default ASK → slice needs ALLOW). */
+        const val POLICY_ACTION = "tool.exec"
+    }
+
+    /**
+     * Test seam run before EACH execution (after cancel check, before any
+     * gate): lets cancel tests park the loop in the deny/execute window and
+     * then cancel, proving zero backend invocations. Production leaves null.
+     */
+    var beforeExecuteForTest: (suspend () -> Unit)? = null
+
+    /** Typed deny codes (audit-stable, user-visible in the paired denial). */
+    object DenyCodes {
+        const val UNKNOWN_TOOL = "UNKNOWN_TOOL"
+        const val NOT_READY = "NOT_READY"
+        const val SCOPE_DENIED = "SCOPE_DENIED"
+        const val SCHEMA_INVALID = "SCHEMA_INVALID"
+        const val POLICY_DENIED = "POLICY_DENIED"
+        const val NEED_CONFIRM = "NEED_CONFIRM"
+        const val EXEC_DENIED = "EXEC_DENIED"
+        const val EXEC_ERROR = "EXEC_ERROR"
+        const val BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
+    }
+
+    /**
+     * One paired outcome: executed value ([denied] = false) or typed denial
+     * ([denied] = true, [denyCode] set). [resultJson] always rides the `tool`
+     * message so call-id pairing survives denials too.
+     */
+    data class ToolResult(
+        val callId: String,
+        val name: String,
+        val resultJson: String,
+        val denied: Boolean = false,
+        val denyCode: String? = null,
+    )
+
+    /**
+     * Schemas the model may call this round: `visibleTools ∩ {slice}`.
+     * Empty (switch off / flavor-blocked / not-ready) means pure chat —
+     * the request carries no tools and [execute] refuses everything.
+     */
+    fun offeredTools(): List<ToolSchema> =
+        ToolRegistry.visibleTools(ctxSupplier())
+            .filter { it.name == TOOL_NAME }
+            .map { ToolSchema(it.name, it.description, it.jsonSchema) }
+
+    /**
+     * Execute one attempt's model tool calls in order. Never throws except
+     * [CancellationException] (cancel aborts remaining calls; already-paired
+     * results are returned by the caller discarding them — zero further
+     * backend effects).
+     */
+    suspend fun execute(calls: List<ToolCall>): List<ToolResult> {
+        if (calls.size > maxCallsPerTurn) {
+            return calls.map { deny(it, DenyCodes.BUDGET_EXCEEDED, "at most $maxCallsPerTurn tool round per turn") }
+        }
+        return calls.map { executeOne(it) }
+    }
+
+    private suspend fun executeOne(call: ToolCall): ToolResult {
+        coroutineContext.ensureActive()
+        try {
+            beforeExecuteForTest?.invoke()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return deny(call, DenyCodes.EXEC_ERROR, "pre-execution gate failed: ${e.message}")
+        }
+        coroutineContext.ensureActive()
+        val tool = ToolRegistry.find(call.name)
+            ?: return deny(call, DenyCodes.UNKNOWN_TOOL, "unknown tool ${call.name}")
+        if (call.name != TOOL_NAME || !tool.executionReady) {
+            return deny(call, DenyCodes.NOT_READY, "${call.name} is not wired this round")
+        }
+        val projection = tool.project(ctxSupplier())
+        if (projection.level != CapabilityLevel.NATIVE) {
+            val reason = projection.reason ?: DenyReason.USER_DISABLED
+            return deny(call, DenyCodes.SCOPE_DENIED, reason.name)
+        }
+        val args = parseArgs(call.argumentsJson)
+            ?: return deny(call, DenyCodes.SCHEMA_INVALID, "arguments must be a JSON object with a non-blank string query")
+        val verdict = try {
+            policy.evaluateFresh(POLICY_ACTION, tool.name).verdict
+        } catch (_: CancellationException) {
+            throw CancellationException("tool policy recheck cancelled")
+        } catch (_: Exception) {
+            null
+        }
+        if (verdict != Verdict.ALLOW) {
+            return deny(call, DenyCodes.POLICY_DENIED, verdict?.name ?: "ERROR")
+        }
+        when (val gate = PrivilegeGate.check(tool, confirmed = false, projection)) {
+            is GateResult.Allowed -> Unit
+            is GateResult.NeedConfirm ->
+                return deny(call, DenyCodes.NEED_CONFIRM, gate.toolName)
+            is GateResult.Denied ->
+                return deny(call, DenyCodes.SCOPE_DENIED, gate.reason.name)
+        }
+        coroutineContext.ensureActive()
+        return when (val outcome = LspTools.symbols(args.query, args.pathPrefix, args.limit, backend)) {
+            is LspTools.SymbolsOutcome.Ok -> ok(call, args.query, outcome)
+            is LspTools.SymbolsOutcome.Unavailable ->
+                deny(call, DenyCodes.EXEC_DENIED, outcome.detail)
+        }
+    }
+
+    private data class ValidArgs(val query: String, val pathPrefix: String?, val limit: Int)
+
+    /** Registry-schema mirror: object + non-blank string `query`, optional int `limit`, optional string `pathPrefix`. */
+    private fun parseArgs(argumentsJson: String): ValidArgs? {
+        val root = try {
+            Json.parseToJsonElement(argumentsJson)
+        } catch (_: Exception) {
+            return null
+        }
+        if (root !is JsonObject) return null
+        val query = (root["query"] as? JsonPrimitive)?.takeIf { it.isString }?.content
+            ?.takeIf { it.isNotBlank() } ?: return null
+        val limit = when (val raw = root["limit"]) {
+            null -> LspTools.DEFAULT_LIMIT
+            // Strict integer: a JSON string (even "5") is not an integer.
+            is JsonPrimitive -> if (raw.isString) {
+                return null
+            } else {
+                raw.intOrNull?.coerceIn(1, LspTools.MAX_LIMIT) ?: return null
+            }
+            else -> return null
+        }
+        val pathPrefix = when (val raw = root["pathPrefix"]) {
+            null -> null
+            is JsonPrimitive -> if (raw.isString) raw.content else return null
+            else -> return null
+        }
+        return ValidArgs(query, pathPrefix, limit)
+    }
+
+    private fun deny(call: ToolCall, code: String, detail: String): ToolResult {
+        val json = buildJsonObject {
+            put("denied", true)
+            put("code", code)
+            put("tool", call.name)
+            put("callId", call.id)
+            put("detail", detail)
+            put("clockMillis", clock.millis())
+        }.toString()
+        return ToolResult(call.id, call.name, json, denied = true, denyCode = code)
+    }
+
+    private fun ok(call: ToolCall, query: String, outcome: LspTools.SymbolsOutcome.Ok): ToolResult {
+        val json = buildJsonObject {
+            put("denied", false)
+            put("tool", call.name)
+            put("callId", call.id)
+            put("query", query)
+            put(
+                "symbols",
+                kotlinx.serialization.json.buildJsonArray {
+                    for (s in outcome.symbols) {
+                        add(
+                            buildJsonObject {
+                                put("name", s.name)
+                                put("kind", s.kind)
+                                put("path", s.path)
+                                put("line", s.line)
+                            },
+                        )
+                    }
+                },
+            )
+            put("fromStub", outcome.fromStub)
+            put("clockMillis", clock.millis())
+        }.toString()
+        return ToolResult(call.id, call.name, json, denied = false)
+    }
+
+    /**
+     * Continuation messages appended after the tool-call assistant block:
+     * one assistant `toolCalls` entry plus one `tool` message per result
+     * (executed or denied — call-id pairing is total). Wire shape mirrors
+     * the T1 mock round-trip histories so all three adapters serialize it.
+     */
+    fun continuationMessages(calls: List<ToolCall>, results: List<ToolResult>): List<ChatMessage> {
+        require(calls.size == results.size) { "calls/results size mismatch" }
+        val out = ArrayList<ChatMessage>(1 + results.size)
+        out.add(ChatMessage(role = "assistant", text = "", toolCalls = calls))
+        for (r in results) {
+            out.add(ChatMessage(role = "tool", text = r.resultJson, toolCallId = r.callId))
+        }
+        return out
+    }
+}

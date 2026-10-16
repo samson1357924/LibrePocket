@@ -426,6 +426,12 @@ object ToolRegistry {
                 switchDefault = LspTools.SWITCH_DEFAULT,
                 fallbackHint = LspTools.FALLBACK_HINT,
             ),
+            // P2 safe slice (#19): the single wired tool. Dispatcher +
+            // grant/confirm + executor + E2E land here first (see SafeToolSlice:
+            // READ-only StubBackend echo, one tool round per turn, fresh
+            // `tool.exec` ALLOW + latest projection re-check, zero side
+            // effects on deny/cancel/schema-error). All other 40 stay false.
+            executionReady = true,
         ),
         ToolDef(
             name = LspTools.DIAGNOSTICS_NAME,

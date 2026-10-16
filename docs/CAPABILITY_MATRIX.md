@@ -25,7 +25,7 @@
 | Ledger durability (`flushDurable`) | `TurnController.flushDurable` 八檢查合取（排空＋無 PENDING/CLAIMED receipt＋無未補償 SEALED＋admission／promotion／host／sticky 證明＋failure epoch 三讀 fail-last），永不 true-and-dangling；close 以 cancel-receipt barrier＋remaining-budget 線性化交接；同源 hydrate 保證僅限 R4-1 後新建/fork 的 ledger（pre-R4-1 混雜 id 須手動隔離，見威脅模型） | `true` 代表跨重啟耐久；fake session 的 `true` 可作耐久證據；SEALED 等同 settled |
 | Prune family-aware（R27） | Room raw cut＋family fixup 同一 tx（kill→rollback→pre-prune）；fixup 無條件、無界收斂、shape-aware suspect；新 prune 跨重啟無頭孤兒進 model context／快照 | crash-mid-fixup 仍是已知限制；interior／pre-R26 既有孤兒會被 fixup 刪除；測試 fake 的 suspect 可作耐久證據 |
 | Cancel receipt / admission proofs | `hasUnsettledCancelReceipts`（PENDING/CLAIMED）、`hasSealedUncompensatedReceipts`（SEALED truth）、`hasUnsettledAdmission`（direct／promotion／UNKNOWN ghost／orphan；R22 由 direct-only 擴大）皆為 production 實作並合取進 `flushDurable`，且由 ViewModel 證據檢查直接讀取（無未接線 follow-up）；同源 hydrate 保證僅限 R4-1 後新建/fork 的 ledger（pre-R4-1 混雜 id 須手動隔離，見威脅模型） | 僅有 KDoc／介面預設即代表已接線；介面預設 `false` 可作耐久證據 |
-| Built-in tools | registry 有 41 個 definitions；目前 `executionReady=false` 全部未啟用；model-visible built-in tool 集合為空 | 模型可以執行 schema 中描述的動作 |
+| Built-in tools | registry 有 41 個 definitions；恰 1 個 `executionReady=true`（P2 slice `lsp.symbols`：READ-only StubBackend 回顯、每 turn 至多一工具輪、fresh `tool.exec` ALLOW＋最新投影重驗、拒絕／取消／schema 錯零副作用，見 `SafeToolSlice`）；其餘 40 維持 `false`；開關全開下 model-visible built-in tool 集合為 `["lsp.symbols"]`（`lsp` 開關預設關，預設上下文仍為空） | 模型可以執行 schema 中描述的動作（除 slice 外皆否）；投影可作執行證據 |
 | `play` | base application ID；Play overlay 移除高風險權限/service | 商店已上架或政策已被商店批准 |
 | `foss` | `.foss` application ID；Foss manifest/source set 有 accessibility service 與 OSS vision dependencies | 與 `github` 有相同能力或已由 F-Droid 發布 |
 | `github` | `.github` application ID；含 accessibility service 及 GitHub-only ML Kit/Azure Speech/Shizuku dependencies | 「完整版」意指所有設計能力均已接線 |
@@ -35,6 +35,7 @@
 | Setup key.write／probe 門 | staged 寫入＋metadata CAS、ASK one-shot 確認（含 STAGED／KEEP_EXISTING 身份列）、probe 的 provider.call 新鮮閘、KEEP_EXISTING metadata-only（存在性 hasKey 前提，零 put/get/delete）；JVM 單測存在 | 裝置端到端外洩證明；policy 後端本身的可用性保證；自訂端點在政策層的細粒度區分（共用同一 resource，見威脅模型） |
 | Chat key.read 門 | T0 新鮮評估＋綁定式 one-shot 確認、T1 capture 邊界重驗（ALLOW→ASK 翻轉拒絕、拒絕丟棄殘留槽位；T1→`vault()`→`getKey` 含 suspend／IO 的殘留窗口：`DENY` 翻轉後續無門捕捉，binding／generation 翻轉擋 attach 但擋不住已發生的 vault 讀，僅 close 抹除）；JVM 單測存在 | 重驗與 vault 讀之間的殘留窗口已消除；裝置端到端證明（已知殘留：含 suspend／IO，dispatcher hop＋Keystore/disk IO，未持有門控跨越；僅 JVM 單測） |
 | 語音 UI 手勢直連 | `ChatScreen` 直連系統引擎：使用者逐次手勢 + DataStore 持久化同名開關（`voice_input`/`voice_output`，設定頁可切、關閉隱藏入口）；朗讀首次內聯確認（只問一次）；引擎失敗經分離的 `sttError`／`ttsError` 可觀察（`NO_ENGINE` 無引擎 fail-closed；`LANG_UNAVAILABLE` 缺語料僅降級提醒非失敗；`LISTENER_FAILED` 掛載失敗僅警告）；引擎資料處理已揭露 | 直連等同政策授權；模型可經工具鏈執行語音（模型側 `executionReady=false` 維持未啟用） |
+| MCP 客戶端（D03，#11 Stage2） | declared＋implemented，not wired：`McpWire`（tools/list＋tools/call 單頁 POST 子集解析）、`McpServer`／`McpTransport`（Bearer 標頭、熔斷、取消、有界 body）、`McpScope`（投影＋確認，預設 WRITE）皆有 JVM 單測；`dev.librepocket.mcp` 外零 production 引用（未接 dispatcher／副作用）；`2025-11-25`／`2026-07-28` 修訂皆為 Proposed 未採納（單一最小子集起步，不送 initialize、不接 SSE、不跟隨分頁，見 `McpProtocolContractsTest`） | 投影 NATIVE 可作可用證據；子集綠燈可作修訂相容證據；模型可執行第三方工具 |
 
 `foss` 和 `github` 在某些 source/service 形狀上相似，不代表依賴、bridge 或能力相同。Flavor distribution/source-of-truth 見 [README](../README.md)、[Architecture](ARCHITECTURE.md) 與 [Threat Model](THREAT_MODEL.md)。
 

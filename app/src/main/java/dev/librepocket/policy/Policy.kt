@@ -43,13 +43,22 @@ interface PolicyStore {
   suspend fun evaluateFresh(action: String, resource: String): PolicyDecision
 }
 
-/** P1 closed action set. Unknown query actions fail closed to DENY. */
+/** P1 closed action set. Unknown query actions fail closed to DENY.
+ *
+ * Stage2 (P2 safe slice, #19): `tool.exec` is the execution basis for the
+ * single wired tool (`lsp.symbols`; see `SafeToolSlice`). It is known so an
+ * explicit rule can authorize it, but the default ruleset carries no
+ * `tool.exec` rule: under [DefaultPolicyRuleset] it matches only `*:*` ASK,
+ * and the slice requires ALLOW — ASK/DENY/failure all deny with zero side
+ * effects (fail-closed preserved; no silent widening).
+ */
 internal val KNOWN_ACTIONS = setOf(
   "chat.send",
   "provider.call",
   "session.export",
   "key.read",
   "key.write",
+  "tool.exec",
 )
 
 /** Split + validate `action:resource`. Blank/empty halves are illegal. */

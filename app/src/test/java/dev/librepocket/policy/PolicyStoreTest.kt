@@ -49,12 +49,30 @@ class PolicyStoreTest {
 
   @Test fun unknownActionIsDenyFailClosed() {
     val s = InMemoryPolicyStore()
-    val d = s.evaluate("tool.exec", "anything")
+    // `tool.exec` is now a KNOWN slice action (see SafeToolSlice); probe with
+    // a still-unknown action so the closed-set pin keeps its meaning.
+    val d = s.evaluate("tool.delete", "anything")
     assertEquals(Verdict.DENY, d.verdict)
     assertNull(d.matchedRule)
     // Even an explicit rule for an unknown action never authorizes it.
-    val s2 = store(PolicyRule("tool.exec:*", Verdict.ALLOW, 99))
-    assertEquals(Verdict.DENY, s2.evaluate("tool.exec", "x").verdict)
+    val s2 = store(PolicyRule("tool.delete:*", Verdict.ALLOW, 99))
+    assertEquals(Verdict.DENY, s2.evaluate("tool.delete", "x").verdict)
+  }
+
+  @Test fun toolExecIsKnownButDefaultsToAsk() {
+    // Stage2 slice basis: known (explicit rules apply), but the default
+    // ruleset has no `tool.exec` rule — only `*:*` ASK matches, so the slice
+    // (which requires ALLOW) denies fail-closed until explicitly allowed.
+    val s = InMemoryPolicyStore()
+    val d = s.evaluate("tool.exec", "lsp.symbols")
+    assertEquals(Verdict.ASK, d.verdict)
+  }
+
+  @Test fun toolExecExplicitAllowAuthorizes() = runBlocking {
+    val s = store(PolicyRule("tool.exec:lsp.symbols", Verdict.ALLOW, 10))
+    assertEquals(Verdict.ALLOW, s.evaluateFresh("tool.exec", "lsp.symbols").verdict)
+    // Other tools stay denied without their own rule.
+    assertEquals(Verdict.DENY, s.evaluateFresh("tool.exec", "shell.exec").verdict)
   }
 
   @Test fun noMatchIsDeny() {

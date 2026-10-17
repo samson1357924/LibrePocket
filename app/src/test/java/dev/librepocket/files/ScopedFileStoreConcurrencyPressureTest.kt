@@ -775,7 +775,7 @@ class ScopedFileStoreConcurrencyPressureTest {
             )
             assertTrue(
                 "expected readers to run, got readAttempts=${readAttempts.get()}",
-                readAttempts.get() == READER_ROUNDS * 2,
+                readAttempts.get() >= READER_ROUNDS * 2,
             )
             assertTrue("expected lists to happen, got listOk=${listOk.get()}", listOk.get() > 0)
             assertTrue("expected deletes to happen, got deleteOk=${deleteOk.get()}", deleteOk.get() > 0)

@@ -902,22 +902,34 @@ class ChatSessionLifecycleTest {
         store.save(endpoint())
         val sessions = ControlledSessions()
         val vm = newViewModel(store, sessions)
+        // Owner P2/TEST: a value-only latch cannot tell a stale pre-switch
+        // emission from the new generation (both are ["hello","ok"] — and no
+        // auto-reattach re-emits without another send). Record every messages
+        // emission across the switch instead: the fixed behavior never blanks
+        // (snapshotLiveToHistory keeps _history intact), while the old
+        // blanking behavior emits a steady [] here and fails below.
+        val seen = CopyOnWriteArrayList<List<String>>()
+        val emissions = CoroutineScope(Dispatchers.Default + SupervisorJob())
         try {
             chatMain.run { vm.sendDirect("hello") }
             val live = sessions.awaitCreated(1)
             live.sendFinished.await()
             withTimeout(5_000) { vm.messages.first { it.size == 2 } }
             assertEquals("session-1", vm.currentSessionId.value)
+            emissions.launch { vm.messages.collect { seen.add(it.map { m -> m.text }) } }
 
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { live.closed.await() }
             withTimeout(5_000) { vm.sessionState.first { it.messages.isEmpty() } }
-            // Allow combine(history+live) to propagate; snapshot keeps 2 visible.
-            delay(300)
-            assertEquals(2, vm.messages.value.size)
+            // Steady-state read (no race — a blank would persist, as nothing
+            // reattaches without another send).
             assertEquals(listOf("hello", "ok"), vm.messages.value.map { it.text })
+            assertEquals(2, vm.messages.value.size)
             assertEquals("session-1", vm.currentSessionId.value)
+            // Negative: no blank emission across the whole switch window.
+            assertTrue("no blank emission across endpoint switch, got: $seen", seen.none { it.isEmpty() })
         } finally {
+            emissions.cancel()
             chatMain.run { vm.newChat() }
         }
     }
@@ -930,17 +942,26 @@ class ChatSessionLifecycleTest {
         store.save(endpoint())
         val sessions = ControlledSessions()
         val vm = newViewModel(store, sessions)
+        // Same generation barrier as F2 (see above): the ["one","ok"] latch
+        // below must observe the parked post-invalidation display, never a
+        // stale pre-switch emission.
+        val seen = CopyOnWriteArrayList<List<String>>()
+        val emissions = CoroutineScope(Dispatchers.Default + SupervisorJob())
         try {
             chatMain.run { vm.sendDirect("one") }
             val first = sessions.awaitCreated(1)
             first.sendFinished.await()
             withTimeout(5_000) { vm.messages.first { it.size == 2 } }
+            emissions.launch { vm.messages.collect { seen.add(it.map { m -> m.text }) } }
 
             store.save(endpoint().copy(model = "other-model"))
             withTimeout(5_000) { first.closed.await() }
             withTimeout(5_000) { vm.sessionState.first { it.messages.isEmpty() } }
-            delay(300)
+            // Same steady-state barrier as F2 (see above): no auto-reattach
+            // without another send, so intact display must persist here.
+            assertEquals(listOf("one", "ok"), vm.messages.value.map { it.text })
             assertEquals(2, vm.messages.value.size)
+            assertTrue("no blank emission across endpoint switch, got: $seen", seen.none { it.isEmpty() })
 
             chatMain.run { vm.sendDirect("two") }
             val second = sessions.awaitCreated(2)
@@ -950,6 +971,7 @@ class ChatSessionLifecycleTest {
             assertEquals("", vm.input.value)
             assertNull(vm.notice.value)
         } finally {
+            emissions.cancel()
             chatMain.run { vm.newChat() }
         }
     }

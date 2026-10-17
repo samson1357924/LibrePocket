@@ -62,7 +62,7 @@ sealed interface StreamEvent {
      * `ProviderFailure` or the unknown-runtime fallback via the streaming
      * transport; null for legacy/classified failures. The transport fills it
      * in `streamingFlow` (`code?.name` or inferred from the
-     * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
+     * `TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
      * markers; unknown runtime fallback uses `UNKNOWN_RUNTIME`; `pumpSse`
      * throws typed `ProviderFailure` for SSE budget overflows which
      * `streamingFlow` projects to `code`). TurnController uses `code` plus
@@ -233,5 +233,42 @@ internal const val MAX_TOOL_ID_CHARS = 4096
 internal fun requireToolIdBudget(idLength: Int) {
     if (idLength > MAX_TOOL_ID_CHARS) {
         throw ProviderFailure(false, TOOL_ARGS_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
+    }
+}
+
+/**
+ * Per-attempt visible-text budget (chars of `TextDelta` + `ReasoningDelta`
+ * accepted into one attempt's assistant block, #83).
+ *
+ * The value reuses the durable-row cap ([dev.librepocket.session.RoomSessionStore.MAX_TEXT_CHARS]):
+ * a text-only attempt that passes this budget fits the store without silent
+ * truncation, so exceeding it fails closed here instead. Tool-marker text
+ * (`"\n[tool:...]"`) is excluded — it has its own per-call / round-total /
+ * distinct-index budgets above; a marker-heavy attempt may still hit the
+ * store truncate path (pre-existing residual, disclosed in
+ * `TurnController`, not silently introduced here).
+ *
+ * Same failure semantics as every other aggregation overflow (message +
+ * [ProviderFailureCode.AGG_TOO_LARGE], retryable=false): never silent
+ * truncation, never a retry of the poisoned stream. Checked BEFORE the delta
+ * is buffered or displayed, so the tripping delta is never retained.
+ * Per-attempt isolated (retries start fresh, like the tool budgets).
+ */
+internal const val MAX_TURN_TEXT_CHARS = 100_000
+
+/** Typed visible-text overflow failure, distinct from `TOOL_ARGS_TOO_LARGE` but the same code. */
+internal const val TEXT_TOO_LARGE = "TEXT_TOO_LARGE"
+
+/**
+ * Fail-closed visible-text guard: [currentChars] is the already-accepted
+ * `TextDelta` + `ReasoningDelta` length for one attempt, [incomingChars] the
+ * delta about to be appended. Plain chars (the store cap counts chars, not
+ * the tool path's x3 CJK byte estimate).
+ *
+ * @throws ProviderFailure non-retryable, [ProviderFailureCode.AGG_TOO_LARGE].
+ */
+internal fun requireTurnTextBudget(currentChars: Int, incomingChars: Int) {
+    if (currentChars.toLong() + incomingChars.toLong() > MAX_TURN_TEXT_CHARS) {
+        throw ProviderFailure(false, TEXT_TOO_LARGE, code = ProviderFailureCode.AGG_TOO_LARGE)
     }
 }

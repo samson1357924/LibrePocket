@@ -317,8 +317,8 @@ class TurnControllerAggBudgetTest {
       val assistants = c.uiState.value.messages.filter { it.role == "assistant" }
       assertEquals("abcdef", assistants.single().text)
       assertEquals(3, c.streamedTextDeltaCount)
-      // Downgraded batching: every delta still performs exactly one update
-      // (streaming visibility + cancel snapshots depend on it).
+      // #83 hybrid cadence: 3 small deltas stay under the flush cadence, so
+      // each still commits immediately (streaming visibility preserved).
       assertEquals(3, c.uiTextUpdateCount)
       // Copies: (0+2) + (2+3) + (5+1).
       assertEquals(13L, c.uiTextCopiedChars)
@@ -341,6 +341,7 @@ class TurnControllerAggBudgetTest {
       val assistants = c.uiState.value.messages.filter { it.role == "assistant" }
       assertEquals("a\n[tool:n {}]", assistants.single().text)
       assertEquals(1, c.streamedTextDeltaCount)
+      // #83 hybrid cadence: small text delta + tool marker commit immediately.
       assertEquals(2, c.uiTextUpdateCount)
     } finally {
       c.close()

@@ -40,9 +40,10 @@ internal enum class ProviderFailureCode {
     /**
      * A streaming aggregate exceeded its memory budget (per-tool-call
      * ToolDelta fragments, the per-attempt whole-round tool total, the
-     * distinct-tool count, or one SSE event's total `data:` payload).
+     * distinct-tool count, one SSE event's total `data:` payload, or the
+     * per-attempt visible-text budget `TEXT_TOO_LARGE`).
      * Always pairs with a distinct non-retryable message
-     * (`TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`),
+     * (`TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`),
      * never silent truncation, and never a retry of the poisoned stream.
      */
     AGG_TOO_LARGE,
@@ -67,6 +68,7 @@ internal class ProviderFailure(
 internal fun inferAggFailureCodeName(message: String?): String? {
     val lower = message?.lowercase().orEmpty()
     return if (lower.contains("tool_args_too_large") ||
+        lower.contains("text_too_large") ||
         lower.contains("sse_frame_too_large") ||
         lower.contains("sse_line_too_long")
     ) {
@@ -395,7 +397,7 @@ internal fun postJson(url: String, headers: LinkedHashMap<String, String>, bodyJ
  * `code` propagation (Stage D): a [ProviderFailure] becomes
  * [StreamEvent.Failed] with `code = e.code?.name ?: inferAggFailureCodeName(e.message)`,
  * so aggregation/SSE budget overflows (`AGG_TOO_LARGE` with distinct
- * `TOOL_ARGS_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
+ * `TOOL_ARGS_TOO_LARGE` / `TEXT_TOO_LARGE` / `SSE_FRAME_TOO_LARGE` / `SSE_LINE_TOO_LONG`
  * messages) stay typed end-to-end for TurnController's pending-flush guard.
  * Other branches keep `code = null` (legacy/classified failures), except the
  * unknown-runtime fallback which carries `UNKNOWN_RUNTIME` so the controller

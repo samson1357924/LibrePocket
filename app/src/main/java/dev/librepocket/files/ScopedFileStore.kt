@@ -377,6 +377,8 @@ class ScopedFileStore(val root: File) {
      * - [preGateHook]：搬移前重驗之前調用（測試用來在初驗與終門之間 swap root）。
      * - [moveFn]：搬移執行（預設 `Files.move`；測試可注入首調拋
      *   [AtomicMoveNotSupportedException] 驗 fallback 重跑 gates）。
+     * 注意：此接縫簽名為重驗門證據測試所依賴（見 files/ 下併發壓力測試），
+     * 重構時保留參數與調用時機，僅註解變更。
      */
     internal fun writeInternal(
         relativePath: String,

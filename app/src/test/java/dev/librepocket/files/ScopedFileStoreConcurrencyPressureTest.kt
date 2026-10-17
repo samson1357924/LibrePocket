@@ -1,0 +1,964 @@
+package dev.librepocket.files
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Assume.assumeTrue
+import org.junit.Test
+import java.io.File
+import java.io.FileNotFoundException
+import java.io.IOException
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileVisitResult
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * #10 併發壓力補充（測試為主，不動生產）。
+ * Current：併發替換有界行為釘住；Target：TOCTOU 消除需平台原語，屬 follow-up。
+ *
+ * 覆蓋既有 [ScopedFileSymlinkTest.concurrentSwapStressBounded] 未覆蓋的組合：
+ * 以 `rename`（[Files.move] 原子搬移＋退回）與 symlink 建立交替替換
+ * `ws/flip`（檔）與 `ws/race-sub`（目錄），穿插 read／write／list／delete。
+ * 合成 fixture：宿主機臨時 workspace＋outside 目錄＋假資料（`OUTSIDE-SECRET`／
+ * `inside-*`／`v*`／`race-v*`），無真實個資、不碰生產端點。
+ *
+ * 有界斷言（僅證明行為有界，不宣稱消除競態；Java 無 O_NOFOLLOW／openat，
+ * 見 [ScopedFileStore] 類註解 TOCTOU 段限制）：
+ * - 無未捕異常逃逸（[errors] 為空；翻轉路徑預期內的 [IllegalArgumentException]／
+ *   [FileNotFoundException]／併發窗口 [IOException] 計入 [denied] 混合桶，其中僅
+ *   [IllegalArgumentException] 計入 [rejected] 門證據桶；穩定路徑／ephemeral 獨佔
+ *   路徑任何異常皆進 [errors]；[FileBudgetException] 屬真 bug 進 [errors]）；
+ * - 無懸掛（起跑閘＋首次期限 miss 即 FAIL；reap 成功僅允許安全清理，不可當 PASS；
+ *   teardown 另由存活門判定，見 [quiescePool]）；
+ * - outside 秘密未被竄改（內容位元一致）且穩定路徑寫入未穿出
+ *  （`out/stable/file.txt`、`out/stable`、`out/file.txt` 不存在；首兩者為真門，
+ *   `out/file.txt` 結構上恆真僅作健全哨兵）；翻轉路徑的讀殘餘（`outsideReads`）與
+ *   外部新增檔（`outsideExtra`）僅診斷記錄，不計為通過條件——靜態毒鏈由
+ *   單線程確定性測試（`writeThroughParentSymlinkDenied`、
+ *   `writeDoesNotMkdirThroughSymlink`）覆蓋，單點 mid-swap 寫門由
+ *   `writeRevalidationGateRefusesMidOperationSwap` 覆蓋；壓力僅證有界
+ *   （無未捕／無懸掛／可恢復），不證全交錯機密性；
+ * - 拒絕或安全重試：併發 [rejected]（僅 IAE）為重驗門證據，首條須屬鏈族
+ *   symlink／escapes（本測試只翻轉 `flip`／`race-sub` 子路徑不動 root，
+ *   root 定錨族 mismatch／identity 由 [ScopedFileStoreB2Test] T1／F1 確定性
+ *   覆蓋）；事後清理＋可寫可讀證明安全重試／恢復（store 事後仍可用）。
+ *   壓力有效性另以 fileLinkOk／fileRealOk／dirLinkOk／dirRealOk 雙態計數與
+ *   讀列刪進度計數證明非零覆蓋空轉（讀成功零在高翻轉下合法，進度以 readAttempts 計；
+ *   寫成功由無 errors 間接證明，失敗計入 denied 混合桶）。
+ *
+ * 時序：起跑閘（[CountDownLatch]）＋背景線程池＋`await` 期限；主壓力路徑不用
+ * 睡眠猜時序（僅 latch／await 期限；洩漏模擬 worker 內的 `sleep(50)` 為自旋
+ * 粒度，非同步 oracle）。
+ *
+ * Robolectric vs JVM 區分（本檔為純 JVM 單元測試）：
+ * - 未使用 `RobolectricTestRunner`／shadows；直寫宿主機 tmpfs（POSIX symlink、
+ *   inode fileKey 語義，見 `assumeNonWindows`）。
+ * - 宿主機語義≠裝置語義：裝置 ext4／f2fs、排程器、SELinux、程序隔離皆不同，
+ *   本測試不宣稱任何裝置結論；裝置 ext4／f2fs 語義須由後續 `androidTest`／
+ *   裝置驗證補足（目前 `androidTest` 尚無 ScopedFileStore 覆蓋，屬 follow-up）。
+ * - flipper 僅建模 symlink＋rename（hardlink／mount 同生產列 out-of-scope，
+ *   見 [ScopedFileStore] 類註解）；`outsideExtra` 僅頂層診斷（`deep` 穿出落
+ *   `out/deep` 下只見頂層名，內容遞迴未驗，刻意 flakiness 取捨）。
+ */
+class ScopedFileStoreConcurrencyPressureTest {
+
+    private companion object {
+        const val SECRET = "OUTSIDE-SECRET-pressure"
+        const val FILE_FLIP_ROUNDS = 150
+        const val DIR_FLIP_ROUNDS = 100
+        const val READER_ROUNDS = 150
+        const val WRITER_ROUNDS = 80
+        const val LISTER_ROUNDS = 80
+        const val DELETER_ROUNDS = 80
+        const val GATE_TIMEOUT_SEC = 30L
+        const val POOL_TIMEOUT_SEC = 60L
+        const val POOL_REAP_TIMEOUT_SEC = 10L
+        const val POOL_SIZE = 7
+        // 翻轉／穩定路徑名：收斂散落字串，改名時編譯期聯動（D P2-2）。
+        const val FLIP_NAME = "flip"
+        const val RACE_SUB_NAME = "race-sub"
+        const val STABLE_PATH = "stable/file.txt"
+        const val AFTER_PATH = "after-pressure.txt"
+        const val POST_LINK_NAME = "post-link"
+        // staging 前綴錨定生產常數：若 TMP_NAME_PREFIX 變更，此處同步跟隨，
+        // 避免清理塊靜默變 no-op（PocketGuard PR91 WARN）。
+        const val STAGE_ANY_INFIX = "stage-"
+        const val STAGE_FILE_INFIX = STAGE_ANY_INFIX + "f-"
+        const val STAGE_DIR_INFIX = STAGE_ANY_INFIX + "d-"
+        fun stageFilePrefix(): String = ScopedFileStore.TMP_NAME_PREFIX + STAGE_FILE_INFIX
+        fun stageDirPrefix(): String = ScopedFileStore.TMP_NAME_PREFIX + STAGE_DIR_INFIX
+        fun stageAnyPrefix(): String = ScopedFileStore.TMP_NAME_PREFIX + STAGE_ANY_INFIX
+    }
+
+    /** best-effort 靜默清理（壓力攻擊側／收尾段共用，失敗即忽略）。 */
+    private fun deleteQuietly(f: File) {
+        try {
+            Files.deleteIfExists(f.toPath())
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * worker 起跑：6 處定義（reader 複用，計 7 提交）開頭重複 5 行收斂
+     * （countDown＋有界 await＋超時記錯）。回傳 false 時呼叫方須 `return@Runnable`
+     * （D P2-1，不碰門計數器語義）。
+     */
+    private fun awaitStarted(
+        readyLatch: CountDownLatch,
+        startGate: CountDownLatch,
+        errors: AtomicReference<Throwable?>,
+    ): Boolean {
+        readyLatch.countDown()
+        if (!startGate.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+            errors.compareAndSet(null, AssertionError("startGate timeout"))
+            return false
+        }
+        return true
+    }
+
+    /** symlink 建立收斂（同目錄 B2/Symlink link() 體例，D P3）。 */
+    private fun link(link: File, target: File) {
+        Files.createSymbolicLink(link.toPath(), target.toPath())
+    }
+
+    /**
+     * pool 靜默語義（人審 P2：deadline 與可否 teardown 分離，可注入極短 timeout 測試）。
+     * - `timedOut`：首次期限內未終止（即使＋reap 後收斂，仍須記 FAIL，不可當 PASS）。
+     * - `quiesced`：已確認無存活 worker，可安全遞迴清理共享路徑。
+     * 僅在已 `shutdown()` 的 pool 上呼叫（本檔呼叫前已 shutdown；重入冪等）。
+     * 中斷語義：若等待被中斷，補 `shutdownNow` 並恢復中斷位，回傳
+     * `timedOut=true, quiesced=false`（保守視為不可 teardown）。
+     */
+    private data class QuiesceOutcome(val timedOut: Boolean, val quiesced: Boolean)
+
+    private fun quiescePool(
+        pool: ExecutorService,
+        firstTimeoutSec: Long,
+        reapTimeoutSec: Long,
+    ): QuiesceOutcome {
+        try {
+            pool.shutdown()
+            val terminated = pool.awaitTermination(firstTimeoutSec, TimeUnit.SECONDS)
+            if (!terminated) {
+                pool.shutdownNow()
+                val reaped = pool.awaitTermination(reapTimeoutSec, TimeUnit.SECONDS)
+                return QuiesceOutcome(timedOut = true, quiesced = reaped && pool.isTerminated)
+            }
+            return QuiesceOutcome(timedOut = false, quiesced = pool.isTerminated)
+        } catch (e: InterruptedException) {
+            try {
+                pool.shutdownNow()
+            } catch (_: Exception) {
+            }
+            Thread.currentThread().interrupt()
+            return QuiesceOutcome(timedOut = true, quiesced = false)
+        }
+    }
+
+    /**
+     * NOFOLLOW 遞迴刪除：絕不跟隨目錄 symlink（`File.deleteRecursively()` 會跟隨，
+     * 在 `race-sub -> out` 殘留時會越界刪 outside）。以 `walkFileTree` 預設
+     * 不傳 `FOLLOW_LINKS` 語義：遇連結只刪連結本體並跳過子樹。best-effort。
+     * 僅在無併發修改者時呼叫；本檔以 `workersMayBeAlive` 門保證（併發翻轉中
+     * 目錄→連結置換與 walk 開流非原子，helper 單獨不承諾併發安全）。
+     * 失敗靜默為刻意 best-effort（攻擊側共用語義）；核心殘留由
+     * `cleanupAfterPressure` 嚴格斷言，outer-finally 殘留供診斷（人審 P3#2）。
+     */
+    private fun deleteNoFollowRecursively(root: File) {
+        try {
+            val start = root.toPath()
+            if (Files.isSymbolicLink(start)) {
+                Files.deleteIfExists(start)
+                return
+            }
+            if (!Files.exists(start, LinkOption.NOFOLLOW_LINKS)) return
+            Files.walkFileTree(
+                start,
+                object : SimpleFileVisitor<Path>() {
+                    override fun preVisitDirectory(
+                        dir: Path,
+                        attrs: BasicFileAttributes,
+                    ): FileVisitResult {
+                        // walk 預設不跟隨連結；此處若 provider 仍回目錄屬性，以 link 檢查兜底。
+                        if (Files.isSymbolicLink(dir)) {
+                            try {
+                                Files.deleteIfExists(dir)
+                            } catch (_: Exception) {
+                            }
+                            return FileVisitResult.SKIP_SUBTREE
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun visitFile(
+                        file: Path,
+                        attrs: BasicFileAttributes,
+                    ): FileVisitResult {
+                        try {
+                            Files.deleteIfExists(file)
+                        } catch (_: Exception) {
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun postVisitDirectory(
+                        dir: Path,
+                        exc: IOException?,
+                    ): FileVisitResult {
+                        try {
+                            Files.deleteIfExists(dir)
+                        } catch (_: Exception) {
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+                },
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 移除可能被翻轉為 symlink 的路徑：先刪連結本體，殘留為實目錄才 NOFOLLOW 遞迴。 */
+    private fun removePossiblyFlipped(sub: File) {
+        try {
+            if (Files.isSymbolicLink(sub.toPath())) {
+                Files.deleteIfExists(sub.toPath())
+                return
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            if (sub.isDirectory) {
+                deleteNoFollowRecursively(sub)
+                return
+            }
+        } catch (_: Exception) {
+        }
+        deleteQuietly(sub)
+    }
+
+    /**
+     * 宿主機暫存：沿用 `files/` 全目錄既有模式（`createTempDirectory＋deleteOnExit＋
+     * try-finally NOFOLLOW deleteNoFollowRecursively`）。`deleteOnExit` 非遞迴，
+     * 僅作 kill 殘留第二道網；主清理為 `finally`（bot TemporaryFolder 建議不採納：
+     * `files/` 全目錄皆手動模式，`@Rule` 混用反增分歧，且仍需 NOFOLLOW 語義自理）。
+     */
+    private fun workspace(): File =
+        Files.createTempDirectory("ws-pressure").toFile().apply { deleteOnExit() }
+
+    private fun outside(): File =
+        Files.createTempDirectory("outside-pressure").toFile().apply { deleteOnExit() }
+
+    /** symlink 需 POSIX 語義；Windows 下跳過（宿主機語義限制，非裝置結論）。 */
+    private fun assumeNonWindows() {
+        val osName: String = System.getProperty("os.name") ?: ""
+        assumeTrue(!osName.startsWith("Windows", ignoreCase = true))
+    }
+
+    /**
+     * 原子替換：暫存→目標。先試 `ATOMIC_MOVE＋REPLACE_EXISTING`，不支援原子
+     * 搬移才退回普通覆蓋；其餘異常視為併發窗口（best-effort，呼叫方忽略），
+     * 並清理暫存殘留。回傳是否成功，供壓力有效性計數（不計為通過條件）。
+     */
+    private fun renameReplace(staged: File, target: File): Boolean {
+        try {
+            try {
+                Files.move(
+                    staged.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(
+                    staged.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: UnsupportedOperationException) {
+                // 部分 provider 拋裸 UOE 而非子類，語義同不支援原子搬移。
+                Files.move(
+                    staged.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+            return true
+        } catch (_: Exception) {
+            deleteQuietly(staged)
+            return false
+        }
+    }
+
+    private fun isRejectionMessage(msg: String?): Boolean {
+        val m = msg ?: return false
+        return m.contains("symlink") || m.contains("escapes") ||
+            m.contains("mismatch") || m.contains("identity")
+    }
+
+    /** 壓力下實際可達的鏈族（翻轉 flip/race-sub）；定錨族由 B2 T1/F1 確定性覆蓋。 */
+    private fun isChainRejectionMessage(msg: String?): Boolean {
+        val m = msg ?: return false
+        return m.contains("symlink") || m.contains("escapes")
+    }
+    // 關係：isChain 為 isRejection 的子集（後者另含 mismatch/identity 定錨族）；
+    // 壓力門用嚴（鏈族），恢復錨點用寬（本測試只翻轉子路徑，兩者在此等價）。
+
+    /** 壓力後清理＋恢復驗證抽取（bot 單體建議善意收斂；workers 閉包共享計數器保留內聯）。 */
+    private fun cleanupAfterPressure(ws: File) {
+        // 先 NOFOLLOW 移除翻轉殘留（絕不跟隨 symlink 進 outside，人審 P2#1）。
+        removePossiblyFlipped(File(ws, RACE_SUB_NAME))
+        deleteQuietly(File(ws, FLIP_NAME))
+        (ws.listFiles()?.toList() ?: emptyList())
+            .filter { it.name.startsWith(stageAnyPrefix()) }
+            .forEach {
+                if (it.isDirectory && !Files.isSymbolicLink(it.toPath())) {
+                    deleteNoFollowRecursively(it)
+                } else {
+                    deleteQuietly(it)
+                }
+            }
+        // 清理後毒鏈必須已除，否則恢復證明空洞；且 race-sub 本體（無論連結／實目錄）
+        // 必須不存在（僅查連結會漏普通目錄殘留，人審 P3#2）。
+        // 呼叫前 workers 須已確認全退出（見 workersMayBeAlive 門），否則不得呼叫。
+        assertFalse(
+            "race-sub staging must be cleaned",
+            File(ws, RACE_SUB_NAME).let { Files.isSymbolicLink(it.toPath()) } ||
+                (ws.listFiles()?.any { it.name.startsWith(stageAnyPrefix()) } == true),
+        )
+        assertFalse(
+            "race-sub must be gone after cleanup",
+            Files.exists(File(ws, RACE_SUB_NAME).toPath(), LinkOption.NOFOLLOW_LINKS),
+        )
+        assertFalse(
+            "flip must be gone after cleanup",
+            Files.exists(File(ws, FLIP_NAME).toPath(), LinkOption.NOFOLLOW_LINKS),
+        )
+    }
+
+    /** 恢復證明＋事後毒鏈錨點（讀寫刪三拒；exists 由單線程既有測試覆蓋）。 */
+    private fun verifyRecoveryAndAnchor(ws: File, out: File, store: ScopedFileStore) {
+        store.write(AFTER_PATH, "ok".toByteArray(Charsets.UTF_8))
+        assertEquals("ok", String(store.read(AFTER_PATH), Charsets.UTF_8))
+        // 恢復後列目 sane＋刪除往返。
+        assertTrue(store.list().none { it.contains(ScopedFileStore.TMP_NAME_PREFIX) })
+        assertTrue(store.delete(AFTER_PATH))
+        store.write(AFTER_PATH, "ok".toByteArray(Charsets.UTF_8))
+        assertEquals("ok", String(store.read(AFTER_PATH), Charsets.UTF_8))
+        // 確定性錨點：事後毒鏈讀寫刪仍拒（併發 rejected>0 為壓力證據，本段為確定性對照）。
+        deleteQuietly(File(ws, POST_LINK_NAME))
+        link(File(ws, POST_LINK_NAME), File(out, "secret.txt"))
+        try {
+            store.read(POST_LINK_NAME)
+            fail("expected IllegalArgumentException: $POST_LINK_NAME read")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(isRejectionMessage(e.message))
+        }
+        try {
+            store.write(POST_LINK_NAME, "x".toByteArray(Charsets.UTF_8))
+            fail("expected IllegalArgumentException: $POST_LINK_NAME write")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(isRejectionMessage(e.message))
+        }
+        try {
+            store.delete(POST_LINK_NAME)
+            fail("expected IllegalArgumentException: $POST_LINK_NAME delete")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(isRejectionMessage(e.message))
+        }
+        assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
+    }
+
+    @Test fun renameSymlinkPressureBounded() {
+        assumeNonWindows()
+        // 生產常數耦合守衛：staging／清理／列目斷言皆由此派生，空洞即 fail-fast。
+        assertTrue(ScopedFileStore.TMP_NAME_PREFIX.isNotEmpty())
+        // 值錨定：生產若更名 TMP_NAME_PREFIX，此處明確失敗而非靜默跟隨，
+        // 迫使同步檢視 list 過濾／清理語義（PocketGuard PR91 建議）。
+        assertEquals(".lp-", ScopedFileStore.TMP_NAME_PREFIX)
+        assertTrue(stageFilePrefix().startsWith(ScopedFileStore.TMP_NAME_PREFIX))
+        assertTrue(stageDirPrefix().startsWith(ScopedFileStore.TMP_NAME_PREFIX))
+        val ws = workspace()
+        val out = outside()
+        // workers 存活不確定旗：提交前為 false（setup 失敗仍可清理，人審 P3#2）；
+        // 提交後置 true，僅確認全退出才回 false。outer finally 據此決定是否可
+        // 遞迴清理共享路徑（人審 P2：超時未退出不得 teardown）。
+        var workersMayBeAlive = false
+        // 首次 POOL_TIMEOUT_SEC 期限標記：即使 shutdownNow＋reap 後收斂，仍須記 FAIL（人審 P2）。
+        // （可否 teardown 以 workersMayBeAlive 判定，見下。）
+        var poolTimedOut = false
+        try {
+            File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
+            val store = ScopedFileStore(ws)
+            store.write(STABLE_PATH, "seed".toByteArray(Charsets.UTF_8))
+
+            val startGate = CountDownLatch(1)
+            // ready 屏障：確保 POOL_SIZE workers 皆已啟動再同時放行，縮小零交錯窗口。
+            // 非嚴格同步（放行後仍由排程器決定交錯），僅防 flipper 早退空轉。
+            val readyLatch = CountDownLatch(POOL_SIZE)
+            val errors = AtomicReference<Throwable?>(null)
+            // 次錯診斷：首錯仍為失敗主因，次錯進 queue 掛 suppressed，不再靜默丟棄
+            //（PocketGuard PR91 建議；注意 awaitStarted 內的啟動閘超時仍用首錯語義）。
+            val errorCount = AtomicInteger(0)
+            val errorQueue = ConcurrentLinkedQueue<Throwable>()
+            fun recordError(t: Throwable) {
+                errors.compareAndSet(null, t)
+                errorCount.incrementAndGet()
+                if (errors.get() !== t) errorQueue.add(t)
+            }
+            val denied = AtomicInteger(0)
+            val rejected = AtomicInteger(0)
+            val firstRejection = AtomicReference<String?>(null)
+            val observedOutside = AtomicInteger(0)
+            val observedInside = AtomicInteger(0)
+            val readAttempts = AtomicInteger(0)
+            val listOk = AtomicInteger(0)
+            val deleteOk = AtomicInteger(0)
+            // 雙態計數：symlink 與實檔／實目錄各至少成功一次，證明翻轉非單態空轉。
+            val fileLinkOk = AtomicInteger(0)
+            val fileRealOk = AtomicInteger(0)
+            val dirLinkOk = AtomicInteger(0)
+            val dirRealOk = AtomicInteger(0)
+
+            fun noteDenied(e: IllegalArgumentException) {
+                denied.incrementAndGet()
+                rejected.incrementAndGet()
+                firstRejection.compareAndSet(null, e.message ?: ("IAE:" + e.javaClass.simpleName))
+            }
+
+            // 攻擊者一：rename 式檔案翻轉（真檔 ↔ 指外 symlink），暫存前綴
+            // 以 ScopedFileStore.TMP_NAME_PREFIX 錨定（檔暫存被列目守衛忽略；
+            // 目錄暫存為空故無條目，見 ScopedFileStore list 過濾段）。
+            val fileFlipper = Runnable {
+                try {
+                    if (!awaitStarted(readyLatch, startGate, errors)) return@Runnable
+                    repeat(FILE_FLIP_ROUNDS) { i ->
+                        // 響應 shutdownNow 中斷，使 reap 有界收斂（A P1-3）。
+                        if (Thread.currentThread().isInterrupted) return@Runnable
+                        val flip = File(ws, FLIP_NAME)
+                        // 線程唯一性以 name 取得（pool 線程名唯一，無 deprecated API）。
+                        val tid = Thread.currentThread().name
+                        val staged = File(ws, stageFilePrefix() + "${tid}-$i")
+                        try {
+                            deleteQuietly(staged)
+                            val isLink = (i % 2 == 0)
+                            if (isLink) {
+                                link(staged, File(out, "secret.txt"))
+                            } else {
+                                staged.writeText("inside-$i", Charsets.UTF_8)
+                            }
+                            if (renameReplace(staged, flip)) {
+                                if (isLink) fileLinkOk.incrementAndGet() else fileRealOk.incrementAndGet()
+                            }
+                        } catch (_: Exception) {
+                            deleteQuietly(staged)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    recordError(t)
+                }
+            }
+
+            // 攻擊者二：rename 式目錄翻轉（真目錄 ↔ 指外 symlink）。
+            // 非空目錄無法 rename 覆蓋，故先移走現態（best-effort），再把
+            // staged rename 進來；失敗即下一輪重試（壓力來源，不保證每次翻轉成功）。
+            val dirFlipper = Runnable {
+                try {
+                    if (!awaitStarted(readyLatch, startGate, errors)) return@Runnable
+                    repeat(DIR_FLIP_ROUNDS) { i ->
+                        if (Thread.currentThread().isInterrupted) return@Runnable
+                        val sub = File(ws, RACE_SUB_NAME)
+                        // 線程唯一性見 fileFlipper 註解（name，無 deprecated API）。
+                        val tid = Thread.currentThread().name
+                        val staged = File(ws, stageDirPrefix() + "${tid}-$i")
+                        try {
+                            deleteQuietly(staged)
+                            // NOFOLLOW 移除現態：絕不跟隨 symlink 進 outside（見人審 P2#1）。
+                            removePossiblyFlipped(sub)
+                            try {
+                                val isLink = (i % 2 == 0)
+                                if (isLink) {
+                                    link(staged, out)
+                                } else {
+                                    staged.mkdirs()
+                                }
+                                if (renameReplace(staged, sub)) {
+                                    if (isLink) dirLinkOk.incrementAndGet() else dirRealOk.incrementAndGet()
+                                }
+                            } catch (_: Exception) {
+                                deleteQuietly(staged)
+                            }
+                        } catch (t: Throwable) {
+                            recordError(t)
+                            return@Runnable
+                        }
+                    }
+                } catch (t: Throwable) {
+                    recordError(t)
+                }
+            }
+
+            // 讀者：合法內容僅 `inside-*`；SECRET 屬已知 TOCTOU 殘餘只記錄；
+            // IAE／找不到／併發 IO 窗口計入有界桶。
+            val reader = Runnable {
+                try {
+                    if (!awaitStarted(readyLatch, startGate, errors)) return@Runnable
+                    repeat(READER_ROUNDS) {
+                        if (Thread.currentThread().isInterrupted) return@Runnable
+                        readAttempts.incrementAndGet()
+                        try {
+                            val text = String(store.read(FLIP_NAME), Charsets.UTF_8)
+                            when {
+                                text == SECRET -> observedOutside.incrementAndGet()
+                                text.startsWith("inside-") -> observedInside.incrementAndGet()
+                                else -> recordError(
+                                    AssertionError("unexpected flip content: $text"),
+                                )
+                            }
+                        } catch (e: IllegalArgumentException) {
+                            noteDenied(e)
+                        } catch (_: FileNotFoundException) {
+                            denied.incrementAndGet()
+                        } catch (e: FileBudgetException) {
+                            // 預算異常屬 IOException 子類但本測試資料量極小，命中即真 bug，不進有界桶。
+                            recordError(e)
+                        } catch (_: IOException) {
+                            denied.incrementAndGet()
+                        } catch (t: Throwable) {
+                            recordError(t)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    recordError(t)
+                }
+            }
+
+            // 寫者：穩定路徑（永不翻轉）＋翻轉路徑（淺／深交替，覆蓋逐段建父目錄）。
+            // 穩定路徑穿出即真缺陷（下文嚴格斷言）；翻轉路徑殘餘僅診斷。
+            val writer = Runnable {
+                try {
+                    if (!awaitStarted(readyLatch, startGate, errors)) return@Runnable
+                    repeat(WRITER_ROUNDS) { i ->
+                        if (Thread.currentThread().isInterrupted) return@Runnable
+                        // 穩定路徑永不翻轉：任何 IAE 皆為誤拒（false-positive），記 errors 不進 denied。
+                        try {
+                            store.write(STABLE_PATH, "v$i".toByteArray(Charsets.UTF_8))
+                        } catch (t: Throwable) {
+                            recordError(t)
+                        }
+                        try {
+                            if (i % 2 == 0) {
+                                store.write("$RACE_SUB_NAME/race-file.txt", "race-v$i".toByteArray(Charsets.UTF_8))
+                            } else {
+                                store.write("$RACE_SUB_NAME/deep/file-$i.txt", "race-v$i".toByteArray(Charsets.UTF_8))
+                            }
+                        } catch (e: IllegalArgumentException) {
+                            noteDenied(e)
+                        } catch (_: FileNotFoundException) {
+                            denied.incrementAndGet()
+                        } catch (e: FileBudgetException) {
+                            recordError(e)
+                        } catch (_: IOException) {
+                            denied.incrementAndGet()
+                        } catch (t: Throwable) {
+                            recordError(t)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    recordError(t)
+                }
+            }
+
+            // 列目者：結構性質與競態無關，嚴格斷言（相對路徑、無穿越段、無暫存洩露）。
+            // `..` 以路徑段比對（合法名 `report..bak` 允許，見 FileScope.isSafeName）。
+            val lister = Runnable {
+                try {
+                    if (!awaitStarted(readyLatch, startGate, errors)) return@Runnable
+                    repeat(LISTER_ROUNDS) {
+                        if (Thread.currentThread().isInterrupted) return@Runnable
+                        try {
+                            val listed = store.list()
+                            if (listed.any { it.startsWith("/") || it.split("/").any { seg -> seg == ".." } }) {
+                                recordError(
+                                    AssertionError("list malformed: $listed"),
+                                )
+                            }
+                            if (listed.any { FileScope.sanitizeRelative(it) == null }) {
+                                recordError(
+                                    AssertionError("list unsanitized: $listed"),
+                                )
+                            }
+                            // staging 過濾：檔暫存以前綴被守衛忽略（BudgetTest.listSkipsTmpFiles
+                            // 靜態覆蓋，本處併發覆蓋）；目錄暫存為空故無條目。
+                            if (listed.any { it.contains(ScopedFileStore.TMP_NAME_PREFIX) }) {
+                                recordError(
+                                    AssertionError("list leaks staging: $listed"),
+                                )
+                            }
+                            listOk.incrementAndGet()
+                        } catch (t: Throwable) {
+                            recordError(t)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    recordError(t)
+                }
+            }
+
+            // 刪除者：自有 ephemeral 檔寫後刪＋翻轉路徑刪除嘗試；IAE／併發窗口有界化。
+            val deleter = Runnable {
+                try {
+                    if (!awaitStarted(readyLatch, startGate, errors)) return@Runnable
+                    repeat(DELETER_ROUNDS) { i ->
+                        if (Thread.currentThread().isInterrupted) return@Runnable
+                        val ephemeral = "ephemeral-$i.txt"
+                        // ephemeral 為 deleter 獨佔檔名（flipper 不碰）：IAE 屬誤拒記 errors。
+                        try {
+                            store.write(ephemeral, "e".toByteArray(Charsets.UTF_8))
+                        } catch (t: Throwable) {
+                            recordError(t)
+                        }
+                        try {
+                            if (store.delete(ephemeral)) deleteOk.incrementAndGet()
+                        } catch (t: Throwable) {
+                            recordError(t)
+                        }
+                        try {
+                            store.delete("$RACE_SUB_NAME/race-file.txt")
+                        } catch (e: IllegalArgumentException) {
+                            noteDenied(e)
+                        } catch (_: FileNotFoundException) {
+                            denied.incrementAndGet()
+                        } catch (e: FileBudgetException) {
+                            // delete 生產目前不拋 budget（見 deleteInternal），命中即真 bug。
+                            recordError(e)
+                        } catch (_: IOException) {
+                            denied.incrementAndGet()
+                        } catch (t: Throwable) {
+                            recordError(t)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    recordError(t)
+                }
+            }
+
+            // daemon 線程：leaked 路徑下存活 worker 不阻塞 JVM 退出（A P1-3）。
+            val pool = Executors.newFixedThreadPool(POOL_SIZE) { r ->
+                Thread(r).apply { isDaemon = true }
+            }
+            // 建池後即視為可能存活：任一 submit 拋出時已提交者仍在跑，須跳過清理；
+            // 建池前 setup 失敗仍為 false 照常清理（人審 P3#2）。
+            workersMayBeAlive = true
+            try {
+                pool.submit(fileFlipper)
+                pool.submit(dirFlipper)
+                pool.submit(reader)
+                pool.submit(reader)
+                pool.submit(writer)
+                pool.submit(lister)
+                pool.submit(deleter)
+                // ready 屏障：POOL_SIZE workers 就緒後才放行；超時記錯並強制收尾。
+                if (!readyLatch.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+                    errors.compareAndSet(null, AssertionError("workers not ready"))
+                }
+                startGate.countDown()
+                pool.shutdown()
+                // deadline 與可否 teardown 分離：首次 POOL_TIMEOUT_SEC 未達即記 timeout（後續 reap
+                // 成功僅允許安全清理，不可當 PASS）；未確認退出不得進清理／斷言。
+                val outcome = quiescePool(pool, POOL_TIMEOUT_SEC, POOL_REAP_TIMEOUT_SEC)
+                poolTimedOut = outcome.timedOut
+                if (!outcome.quiesced) {
+                    throw AssertionError("stress pool leaked workers; skip teardown to avoid races")
+                }
+                workersMayBeAlive = false
+                assertFalse(
+                    "stress pool must terminate within ${POOL_TIMEOUT_SEC}s " +
+                        "(reaped after timeout is still a deadline miss)",
+                    poolTimedOut,
+                )
+            } catch (t: Throwable) {
+                try {
+                    startGate.countDown()
+                } catch (_: Exception) {
+                }
+                pool.shutdownNow()
+                try {
+                    // 有界等待已提交者響應中斷（5s 固定值：提交失敗後兜底，
+                    // 與 POOL_REAP_TIMEOUT_SEC 的超時分支 10s 不同）；仍活則由
+                    // workersMayBeAlive 跳過清理，daemon 線程不阻塞 JVM 退出。
+                    pool.awaitTermination(5, TimeUnit.SECONDS)
+                    // 等待後若已無存活 worker，清除旗標以允許 finally 清理，避免異常路徑
+                    // fixture 殘留（人審 P3#1）；仍活則保持旗標跳過清理。
+                    if (pool.isTerminated) workersMayBeAlive = false
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                throw t
+            }
+            errors.get()?.let {
+                throw AssertionError("stress failed (errorCount=${errorCount.get()})", it)
+                    .also { a -> errorQueue.forEach(a::addSuppressed) }
+            }
+
+            // 有界斷言一：outside 秘密未被竄改；穩定路徑寫入未穿出。
+            // 穩定父段永不翻轉：`out/stable/*` 為真門，`out/file.txt` 恆真哨兵。
+            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
+            assertFalse("stable writer must not escape", File(out, "file.txt").exists())
+            assertFalse("stable writer must not escape", File(out, STABLE_PATH).exists())
+            assertFalse("stable writer must not escape", File(out, "stable").exists())
+            val outsideExtra = (out.listFiles()?.map { it.name }?.toSet() ?: emptySet()) -
+                setOf("secret.txt")
+            // 診斷輸出刻意保留（同 ScopedFileSymlinkTest println 前例；CI 不解析，
+            // 僅供 flaky 診斷），非正式斷言。
+            println(
+                "[ConcurrencyPressure] denied=${denied.get()} rejected=${rejected.get()} " +
+                    "errors=${errorCount.get()} inside=${observedInside.get()} " +
+                    "readAttempts=${readAttempts.get()} " +
+                    "outsideReads=${observedOutside.get()} listOk=${listOk.get()} " +
+                    "deleteOk=${deleteOk.get()} fileLinkOk=${fileLinkOk.get()} " +
+                    "fileRealOk=${fileRealOk.get()} dirLinkOk=${dirLinkOk.get()} " +
+                    "dirRealOk=${dirRealOk.get()} firstRejection=${firstRejection.get()} " +
+                    "outsideExtra=$outsideExtra",
+            )
+
+            // 有界斷言二：拒絕門有觸發。denied 為混合桶（IAE＋FNFE／IO 窗口），
+            // 真正門證據為 rejected（僅 IAE）＋首條鏈族訊息；注意此僅證明「有呼叫被拒」，
+            // 不等於「初驗後重驗命中」（靜態毒鏈初驗亦同訊息；極端單 vCPU 排程飢餓下
+            // 碰撞密度可降，門檻僅 >0），重驗命中以 `writeRevalidationGateRefusesMidOperationSwap`
+            // 為主要確定性門檢查（preGateHook 確定性證明）；
+            // root 定錨族 mismatch／identity 由 B2Test T1／F1 確定性覆蓋。
+            assertTrue(
+                "expected some rejections, got denied=${denied.get()} rejected=${rejected.get()} " +
+                    "(inside=${observedInside.get()} outsideReads=${observedOutside.get()} " +
+                    "readAttempts=${readAttempts.get()} fileLinkOk=${fileLinkOk.get()} " +
+                    "fileRealOk=${fileRealOk.get()} dirLinkOk=${dirLinkOk.get()} " +
+                    "dirRealOk=${dirRealOk.get()} outsideExtra=$outsideExtra " +
+                    "firstRejection=${firstRejection.get()})",
+                rejected.get() > 0,
+            )
+            assertTrue(
+                "first rejection must be a chain reverify family, got ${firstRejection.get()}",
+                isChainRejectionMessage(firstRejection.get()),
+            )
+            // 壓力有效性與進度證明：雙態翻轉確實發生、各操作確實執行（非零覆蓋空轉）。
+            // 讀進度以 attempts（READER_ROUNDS*2 次嘗試必達）證明執行；成功讀零（inside＋outside＝0）
+            // 在高翻轉下為合法全拒，Foss 曾以此 flaky（人審 P1#3），不得計為失敗。
+            assertTrue(
+                "expected file link flips, got fileLinkOk=${fileLinkOk.get()}",
+                fileLinkOk.get() > 0,
+            )
+            assertTrue(
+                "expected file real flips, got fileRealOk=${fileRealOk.get()}",
+                fileRealOk.get() > 0,
+            )
+            assertTrue(
+                "expected dir link flips, got dirLinkOk=${dirLinkOk.get()}",
+                dirLinkOk.get() > 0,
+            )
+            assertTrue(
+                "expected dir real flips, got dirRealOk=${dirRealOk.get()}",
+                dirRealOk.get() > 0,
+            )
+            assertTrue(
+                "expected readers to run, got readAttempts=${readAttempts.get()}",
+                readAttempts.get() >= READER_ROUNDS * 2,
+            )
+            assertTrue("expected lists to happen, got listOk=${listOk.get()}", listOk.get() > 0)
+            assertTrue("expected deletes to happen, got deleteOk=${deleteOk.get()}", deleteOk.get() > 0)
+
+            // 安全重試／恢復（helpers 見 cleanupAfterPressure／verifyRecoveryAndAnchor；
+            // workers 閉包共享計數器保留內聯以免參數透傳遮蔽門關係；
+            // 路徑字串收斂到 FLIP/RACE_SUB/STABLE 等常數即止，不再拆計數器結構——
+            // PocketGuard 700LOC 拆分建議的刻意 wontfix 邊界）。
+            // 到此 workersMayBeAlive 必為 false（未退出已在上文拋出），清理無活 worker 競爭。
+            cleanupAfterPressure(ws)
+            verifyRecoveryAndAnchor(ws, out, store)
+        } finally {
+            // NOFOLLOW 終兜；但 workers 可能存活（workersMayBeAlive，即超時洩漏或
+            // 提交後異常）時跳過共享路徑遞迴清理，避免與存活翻轉競爭（人審 P2），
+            // 殘留供診斷。提交前 setup 失敗時旗為 false，照常清理（人審 P3#2）。
+            if (!workersMayBeAlive) {
+                // ws 可能殘留 race-sub 指外連結，NOFOLLOW 絕不跟隨進 outside。
+                deleteNoFollowRecursively(ws)
+                deleteNoFollowRecursively(out)
+            }
+        }
+    }
+
+    /**
+     * 確定性重驗證據（人審 P2#2）：壓力測試的 `rejected` 只證明「有呼叫被拒」，
+     * 靜態毒鏈初驗亦同訊息，不等於初驗後重驗命中。本測試以 `preGateHook` 在
+     * 初驗通過之後、搬移前重驗之前把父段換成指外連結，`hookRan`＋事後 `sub`
+     * 為連結證明拒絕必來自重驗門（非入口先拒）；B2 T1/F1 另覆 root 置換。
+     */
+    @Test fun writeRevalidationGateRefusesMidOperationSwap() {
+        assumeNonWindows()
+        assertTrue(ScopedFileStore.TMP_NAME_PREFIX.isNotEmpty())
+        val ws = workspace()
+        val out = outside()
+        try {
+            File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
+            val store = ScopedFileStore(ws)
+            store.write("sub/seed.txt", "seed".toByteArray(Charsets.UTF_8))
+            var hookRan = false
+            try {
+                store.writeInternal(
+                    "sub/evil.txt",
+                    "x".toByteArray(Charsets.UTF_8),
+                    preGateHook = {
+                        hookRan = true
+                        deleteNoFollowRecursively(File(ws, "sub"))
+                        link(File(ws, "sub"), out)
+                    },
+                )
+                fail("expected IllegalArgumentException: mid-operation parent swap")
+            } catch (e: IllegalArgumentException) {
+                assertTrue(
+                    "revalidation must hit chain family, got ${e.message}",
+                    isChainRejectionMessage(e.message),
+                )
+            }
+            assertTrue("hook must have run (rejection is post-initial)", hookRan)
+            assertTrue(
+                "sub must be swapped to symlink (rejection is post-initial)",
+                Files.isSymbolicLink(File(ws, "sub").toPath()),
+            )
+            assertFalse(File(out, "evil.txt").exists())
+            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
+        } finally {
+            removePossiblyFlipped(File(ws, "sub"))
+            deleteNoFollowRecursively(ws)
+            deleteNoFollowRecursively(out)
+        }
+    }
+
+    /**
+     * NOFOLLOW 回歸（人審 P2#1 最小重現斷言化）：靜態 `ws/race-sub -> out` 下，
+     * `deleteNoFollowRecursively(ws)` 只刪連結本體，`out/secret.txt` 必須存活；
+     * 舊 `File.deleteRecursively()` 會跟隨進 target 刪外部內容。
+     */
+    @Test fun nofollowCleanupNeverFollowsStaticDirSymlink() {
+        assumeNonWindows()
+        val ws = workspace()
+        val out = outside()
+        try {
+            File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
+            link(File(ws, RACE_SUB_NAME), out)
+            deleteNoFollowRecursively(ws)
+            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
+            assertFalse(
+                Files.exists(File(ws, RACE_SUB_NAME).toPath(), LinkOption.NOFOLLOW_LINKS),
+            )
+        } finally {
+            deleteNoFollowRecursively(ws)
+            deleteNoFollowRecursively(out)
+        }
+    }
+
+    /**
+     * NOFOLLOW 懸空連結回歸：dangling file／dir symlink 只刪本體，不跟隨、
+     * 不影響 outside 存活內容。
+     */
+    @Test fun nofollowCleanupDeletesDanglingLinksWithoutFollowing() {
+        assumeNonWindows()
+        val ws = workspace()
+        val out = outside()
+        try {
+            File(out, "secret.txt").writeText(SECRET, Charsets.UTF_8)
+            link(File(ws, "dangling-file"), File(out, "missing-target.txt"))
+            link(File(ws, "dangling-dir"), File(out, "missing-dir"))
+            deleteNoFollowRecursively(ws)
+            assertEquals(SECRET, File(out, "secret.txt").readText(Charsets.UTF_8))
+            assertFalse(
+                Files.exists(File(ws, "dangling-file").toPath(), LinkOption.NOFOLLOW_LINKS),
+            )
+            assertFalse(
+                Files.exists(File(ws, "dangling-dir").toPath(), LinkOption.NOFOLLOW_LINKS),
+            )
+        } finally {
+            deleteNoFollowRecursively(ws)
+            deleteNoFollowRecursively(out)
+        }
+    }
+
+    /** quiesce 正常路徑：快速任務在首次期限內收斂，不記 timeout 且可 teardown。 */
+    @Test fun quiescePoolFastTasksPassWithoutTimeout() {
+        // 純 Executor 語義與 OS 無關，Windows 下亦可跑，不 assume。
+        val pool = Executors.newFixedThreadPool(2) { r -> Thread(r).apply { isDaemon = true } }
+        repeat(4) { pool.submit { } }
+        val outcome = quiescePool(pool, 5, 2)
+        assertFalse("fast tasks must not time out", outcome.timedOut)
+        assertTrue("fast tasks must quiesce", outcome.quiesced)
+        pool.shutdownNow()
+    }
+
+    /**
+     * quiesce 超時語義：首次期限 miss 即使 reap 後收斂，仍須記 timeout
+     * （壓力主測試據此 FAIL，僅允許安全清理）。
+     */
+    @Test fun quiescePoolTimeoutThenReapedMarksTimedOut() {
+        // 純 Executor 語義與 OS 無關，Windows 下亦可跑，不 assume。
+        val pool = Executors.newFixedThreadPool(1) { r -> Thread(r).apply { isDaemon = true } }
+        val started = CountDownLatch(1)
+        val entered = CountDownLatch(1)
+        pool.submit {
+            started.countDown()
+            try {
+                // 可中斷阻塞：shutdownNow 中斷後退出，使 reap 成功。
+                entered.await(30, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        assertTrue(started.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS))
+        val outcome = quiescePool(pool, 0, 5)
+        assertTrue("first deadline miss must mark timedOut", outcome.timedOut)
+        assertTrue("interruptible worker must reap", outcome.quiesced)
+        pool.shutdownNow()
+    }
+
+    /**
+     * quiesce 洩漏語義：無視中斷的 worker 在 reap 後仍活，須回 quiesced=false
+     * （壓力主測試據此跳過共享路徑 teardown）。
+     */
+    @Test fun quiescePoolUninterruptibleWorkerMarksNotQuiesced() {
+        // 純 Executor 語義與 OS 無關，Windows 下亦可跑，不 assume。
+        val pool = Executors.newFixedThreadPool(1) { r -> Thread(r).apply { isDaemon = true } }
+        val started = CountDownLatch(1)
+        val release = AtomicBoolean(false)
+        pool.submit {
+            started.countDown()
+            while (!release.get()) {
+                try {
+                    Thread.sleep(50)
+                } catch (_: InterruptedException) {
+                    // 刻意無視中斷，模擬 shutdownNow 無效的洩漏 worker。
+                }
+            }
+        }
+        try {
+            assertTrue(started.await(GATE_TIMEOUT_SEC, TimeUnit.SECONDS))
+            val outcome = quiescePool(pool, 0, 1)
+            assertTrue("deadline miss must mark timedOut", outcome.timedOut)
+            assertFalse("uninterruptible worker must not quiesce", outcome.quiesced)
+        } finally {
+            release.set(true)
+            pool.shutdownNow()
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS))
+        }
+    }
+}

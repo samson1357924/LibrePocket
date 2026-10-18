@@ -100,9 +100,10 @@ object SkillInstaller {
      *
      * 上限只約束遞迴刪除工作（避免單次啟動在主執行緒做無界遞迴 I/O 拖慢
      * cold start／引發 ANR）；崩潰還原（same-dir rename，O(1)）不受此上限約束，
-     * 維持「process restart 即恢復」的窗口語意。symlink 條目的 unlink（O(1)）
-     * 亦計入本預算（保守方向：link 多時會讓同批真實目錄延後到下次收斂，
-     * 正確性不受影響）。
+     * 維持「process restart 即恢復」的窗口語意。symlink 條目的 unlink（O(1)、
+     * `handleCleanupEntry` 第一步即處置，不經 `deletionAllowed` 檢查——
+     * 不因 cap 保留）亦占用本計數（保守方向：link 多時會讓同批真實目錄
+     * 延後到下次收斂，正確性不受影響）。
      */
     const val MAX_CLEANUP_ENTRIES_PER_RUN = 64
 

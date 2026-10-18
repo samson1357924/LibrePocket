@@ -3,11 +3,20 @@ package dev.librepocket.chat
 import java.io.IOException
 import java.util.concurrent.Executors
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -396,6 +405,155 @@ class OrderedTranscriptSinkErrorTest {
         }
       }
     } finally {
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * Writer-teardown race on the flush barrier (CI flake root, play/github
+   * 2026-10-18): a barrier buffered behind a writer that dies afterwards is
+   * completed exceptionally by the seal orphan-drain with the teardown CE
+   * ("transcript writer dead"). [OrderedTranscriptSink.flush] must map that
+   * seal race to NOT drained — `false` with the durable-failure poison set —
+   * instead of rethrowing the foreign teardown CE through [flushDurable]
+   * (which a controller-level caller treats as a fail-closed Boolean), which
+   * previously failed `ErrorTerminalTest.delegateThrowsErrorOnStarted_productsDurabilityError`
+   * non-deterministically.
+   *
+   * Deterministic interleave (test hook, no timing inference): `afterBarrierSendForTest`
+   * parks flush at the exact barrier-is-buffered + chain-clear proof point
+   * (post send, post gate release, pre barrier-await); the teardown is only
+   * then armed, so its internal flush barrier await (200ms budget) and
+   * channel close provably start AFTER the barrier is buffered; releasing
+   * the hook finishes flush's await. The parked writer is then killed by the
+   * teardown scope cancel into the writer finally seal + orphan drain,
+   * failing THIS barrier with the teardown CE.
+   *
+   * All goroutines run off the runBlocking event loop (feeder/flush on
+   * Dispatchers.Default, writer on the single-thread sink executor) and every
+   * test-side wait is a suspend await — no thread-blocking latch can starve
+   * the runBlocking loop.
+   */
+  @Test fun flushBarrierWriterTeardownRace_mapsToFalseNotThrowsCe() {
+    val exec = Executors.newSingleThreadExecutor()
+    var scope: CoroutineScope? = null
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+      val writerParked = CompletableDeferred<Unit>()
+      val barrierBuffered = CompletableDeferred<Unit>()
+      val releaseBarrier = CompletableDeferred<Unit>()
+      val delegate = object : TranscriptSink {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          writerParked.complete(Unit)
+          awaitCancellation() // parked inside the writer; resumed only by teardown cancel
+        }
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+        override suspend fun onTurnFailed(runId: String, error: String) = Unit
+        override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+        override suspend fun onSteerQueued(text: String) = Unit
+        override suspend fun onToolDone(
+          runId: String,
+          toolIndex: Int,
+          id: String,
+          name: String,
+          argumentsJson: String,
+        ) = Unit
+        override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      sink.afterBarrierSendForTest = {
+        barrierBuffered.complete(Unit)
+        releaseBarrier.await() // hold flush at the barrier-is-buffered proof point
+      }
+      runBlocking {
+        withTimeout(20_000) {
+          scope.launch { runCatching { sink.onTurnStarted("run-park", "hi") } }
+          writerParked.await() // writer consumed the entry; parked in the delegate
+          val drained = scope.async { sink.flush(10_000) }
+          barrierBuffered.await() // barrier send returned, chain clear, writer still parked
+          // Seal armed only after the barrier is provably buffered. The
+          // teardown's own flush then runs, times out on its barrier (200ms),
+          // closes the channel, times out joining the parked writer, and
+          // finally cancels the scope → seal + orphan drain → THIS barrier
+          // fails with the teardown CE.
+          val teardown = sink.shutdown(drainTimeoutMs = 200)
+          releaseBarrier.complete(Unit)
+          val outcome = runCatching { drained.await() }
+          assertFalse(
+            "teardown-raced barrier must report NOT drained, got ${outcome.getOrNull()}",
+            outcome.getOrNull() == true,
+          )
+          assertTrue(
+            "flush must swallow the writer-teardown CE, not rethrow it, got ${outcome.exceptionOrNull()}",
+            outcome.exceptionOrNull() == null,
+          )
+          assertTrue(sink.isSealed())
+          assertTrue("seal must poison the parked core write", sink.hasDurableFailures())
+          assertTrue(sink.interruptedRunIds().contains("run-park"))
+          assertFalse("flushDurable on a dead writer must stay fail-closed", sink.flushDurable())
+          teardown?.join()
+        }
+      }
+    } finally {
+      scope?.cancel()
+      exec.shutdown()
+    }
+  }
+
+  /**
+   * Control for the seal-race mapping above: caller cancellation while the
+   * flush barrier is parked behind a LIVE writer must still propagate as a
+   * [CancellationException] (never swallowed into a `false`), and the writer
+   * must stay unsealed.
+   */
+  @Test fun flushCallerCancellation_stillPropagates_whenWriterAlive() {
+    val exec = Executors.newSingleThreadExecutor()
+    var scope: CoroutineScope? = null
+    try {
+      val dispatcher = exec.asCoroutineDispatcher()
+      scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+      val writerParked = CompletableDeferred<Unit>()
+      val delegate = object : TranscriptSink {
+        override suspend fun onTurnStarted(runId: String, text: String) {
+          writerParked.complete(Unit)
+          awaitCancellation() // parked forever; never resumed in this control
+        }
+        override suspend fun onTurnSucceeded(runId: String, text: String, hasReasoning: Boolean) = Unit
+        override suspend fun onTurnFailed(runId: String, error: String) = Unit
+        override suspend fun onTurnRetried(runId: String, attempt: Int, maxAttempts: Int, delayMs: Long) = Unit
+        override suspend fun onTurnCancelled(runId: String, partialText: String, hasReasoning: Boolean) = Unit
+        override suspend fun onSteerQueued(text: String) = Unit
+        override suspend fun onToolDone(
+          runId: String,
+          toolIndex: Int,
+          id: String,
+          name: String,
+          argumentsJson: String,
+        ) = Unit
+        override suspend fun onUsage(runId: String, inputTokens: Int?, outputTokens: Int?) = Unit
+      }
+      val sink = OrderedTranscriptSink(delegate, dispatcher, capacity = 8)
+      runBlocking {
+        withTimeout(20_000) {
+          scope.launch { runCatching { sink.onTurnStarted("run-park-2", "hi") } }
+          writerParked.await()
+          val flushed = scope.async { sink.flush(30_000) } // long timeout: the cancel below, never timeout
+          withTimeoutOrNull(5_000) { while (!sink.isSealed()) delay(10) }
+            ?.let { fail("writer must stay alive in this control") }
+          assertFalse("writer must be unsealed for the control", sink.isSealed())
+          flushed.cancel()
+          val outcome = runCatching { withTimeout(5_000) { flushed.await() } }
+          assertTrue(
+            "caller cancellation must propagate as CE, got ${outcome.exceptionOrNull()}",
+            outcome.exceptionOrNull() is CancellationException,
+          )
+          sink.shutdown(drainTimeoutMs = 200)?.join()
+        }
+      }
+    } finally {
+      scope?.cancel()
       exec.shutdown()
     }
   }

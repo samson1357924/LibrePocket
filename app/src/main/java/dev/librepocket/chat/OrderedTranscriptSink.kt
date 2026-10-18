@@ -283,6 +283,22 @@ class OrderedTranscriptSink(
   internal var afterCommitBeforeAckForTest: ((String) -> Unit)? = null
 
   /**
+   * Sink-seal-race test seam (flush barrier only, null in production).
+   *
+   * Serial flush barrier after firing: runs strictly after the barrier entry
+   * is buffered in [channel] (send returned) and its admission gate was
+   * released, but before the barrier await — the deterministic proof point
+   * that "the barrier is buffered behind whatever is currently in flight and
+   * the admission chain is clear". A test observing this hook signal knows
+   * any later writer death will fail THIS barrier via the [sealWriter]
+   * orphan drain (the exact shape the seal-race mapping in [flush] handles);
+   * the hook may suspend to park the flush there while the test arms the
+   * teardown. Must not run under [admissionLock] (checked like the other
+   * hooks); a hook throw propagates like any post-send caller fault.
+   */
+  internal var afterBarrierSendForTest: (suspend () -> Unit)? = null
+
+  /**
    * Reserves one admission slot (ticket + chain link) in a single tiny
    * synchronized section.
    *
@@ -1166,8 +1182,21 @@ class OrderedTranscriptSink(
    * behind the barrier. A timeout abandoning the reserved slot completes it
    * normally so successors are never stuck.
    * PG-W2: barrier reservation follows the [reserveAdmission] lock-order contract.
+   *
+   * Writer-teardown seal race: if the writer dies while a buffered barrier
+   * is still queued behind it, [sealWriter]'s orphan drain fails that
+   * barrier with the teardown CE. [flush] maps that race to `false` (not
+   * drained) instead of rethrowing the foreign teardown exception — the
+   * durable-failure truth then flows through [hasDurableFailures]/[flushDurable]
+   * as usual. A caller cancellation, and any CE from a still-unsealed
+   * writer, keep propagating (see the catch in the body).
    */
   suspend fun flush(timeoutMs: Long = DEFAULT_FLUSH_TIMEOUT_MS): Boolean {
+    // Writer-teardown seal-race signal: set when the buffered barrier was
+    // completed exceptionally by [sealWriter]'s orphan drain (see the catch
+    // below). Timeout shapes keep `null` (withTimeoutOrNull); an armed seal
+    // race forces `false` even though the body otherwise returned.
+    var barrierSealed = false
     try {
       return withTimeoutOrNull(timeoutMs) {
         awaitAdmissionTail()
@@ -1203,7 +1232,34 @@ class OrderedTranscriptSink(
           // may proceed while this caller waits. Idempotent with the finally
           // below, which covers timeout/cancel abandonment paths.
           releaseAdmission(reservation.gate)
-          barrier.await()
+          // Seal-race test seam: exactly here the barrier is buffered and the
+          // admission chain is clear — the deterministic proof point that the
+          // writer teardown (whenever the test then arms it) will fail THIS
+          // barrier via the [sealWriter] orphan drain (null in production).
+          checkNotHoldingAdmissionLock("afterBarrierSendForTest:flush")
+          afterBarrierSendForTest?.invoke()
+          try {
+            barrier.await()
+          } catch (e: CancellationException) {
+            // Writer-teardown race on a buffered barrier (CI flake root):
+            // while this barrier sits in the channel behind a still-running
+            // entry, the writer can die (fatal delegate Error, shutdown
+            // scope cancel) and [sealWriter]'s orphan drain then completes
+            // this VERY barrier exceptionally with its teardown CE
+            // ("transcript writer dead"). That failure is not caller
+            // cancellation, and rethrowing it would surface a foreign
+            // teardown exception through [flushDurable] (which promises a
+            // fail-closed Boolean). Mapping, in catch order:
+            // - caller coroutine cancelled, or writer not yet sealed (some
+            //   unrelated cancellation): rethrow — cancellation semantics
+            //   unchanged;
+            // - sealed writer: treat as NOT drained (barrierSealed). The
+            //   seal already marked every unacked core under [poisonLock],
+            //   so [hasDurableFailures] is true and [flushDurable] returns
+            //   the fail-closed false instead of throwing.
+            if (coroutineContext[Job]?.isCancelled == true || !isSealed()) throw e
+            barrierSealed = true
+          }
         } finally {
           // D15-1: a timeout/cancel abandoning the reserved slot before the
           // send defers to the forwarder (never an immediate complete past a
@@ -1212,7 +1268,7 @@ class OrderedTranscriptSink(
           if (sendInvoked) releaseAdmission(reservation.gate)
           else releaseAbandoned(reservation)
         }
-      } != null
+      } != null && !barrierSealed
     } catch (e: CancellationException) {
       throw e
     }

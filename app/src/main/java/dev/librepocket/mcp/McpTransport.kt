@@ -9,13 +9,19 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Authenticator
+import okhttp3.CookieJar
+import okhttp3.Interceptor
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody
+import okhttp3.Response
 import okhttp3.ResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
+import okio.BufferedSink
 
 /**
  * D03 Streamable HTTP 傳輸：POST `endpoint(baseUrl)`（使用者自訂完整 URL；bare-origin 自動補 `/mcp`，有 path 原樣保留）+ Bearer（舊 SSE 不做）。
@@ -31,23 +37,64 @@ import okio.Buffer
  * - 呼叫方（[McpServer]）負責從 KeyVault 取 key、用後即擦，本層不留存；
  * - 僅放行 `https` 與回環 `http`（見 [McpWire.requireSecureEndpoint]，
  *   直調亦擋；其餘明文拋 `McpProtocol`）；
+ * - 不自動跟隨 redirect：3xx 為終端回應（[McpServer] 映射 PROTOCOL + 計熔斷），
+ *   `tools/call` body／Bearer 只會送到預驗過的初始端點；
+ *   注入的 client 經 [transportClient] 強制套用 redirect／連線失敗重試／503 重送／
+ *   authenticator／cookie／cache 政策，且 POST body 為 one-shot（OkHttp 層的
+ *   replay 分支一律拒送）；注入 client 自帶的 application interceptor 屬受信任的
+ *   呼叫方元件，不在本層防禦邊界內（對齊 provider 同款界線）；
  * - 2xx 配非 JSON Content-Type（如 `text/event-stream`）早擋為 `McpProtocol`
  *   （不讀滿 body；缺席則交 parser 判定）；
  * - 回傳 null = 本步超時（呼叫方映射為 [McpStatus.TIMEOUT]，不重試）。
  */
 class McpTransport(
-    private val http: OkHttpClient = defaultHttp(),
+    client: OkHttpClient = defaultHttp(),
 ) {
-    companion object {
-        private val JSON = "application/json; charset=utf-8".toMediaType()
+    /** 注入 client 一律正規化（見 [transportClient]）：不重定向、不預算外重送。 */
+    private val http: OkHttpClient = transportClient(client)
 
+    companion object {
         /** 連接 5s / 寫 10s / 讀 30s；單步總超時另由 [McpTimeouts] 鉗制 15–30s。 */
-        fun defaultHttp(): OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .writeTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(false)
-            .build()
+        fun defaultHttp(): OkHttpClient = transportClient(
+            OkHttpClient.Builder()
+                .connectTimeout(5, TimeUnit.SECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .build(),
+        )
+
+        /**
+         * MCP 單次預算：不自動跟隨 redirect（含 SSL 降級）、不重試連線失敗，
+         * 剝除 OkHttp 5.5.0 在 `RetryAndFollowUpInterceptor` 內部、**不看**
+         * `retryOnConnectionFailure` 的 `503 + Retry-After: 0` 預算外重送，
+         * 並清空 `authenticator`／`proxyAuthenticator`／`cookieJar`／`cache`
+         * （這四者會各自觸發 OkHttp 重送或把舊回應送回來；
+         * `421` 同源連線層重送由 one-shot body 擋下，cached-503 由 `cache(null)` 消除，
+         * `503 + Retry-After: 0` 由 [RetryAfterStrip] 擋下，`authenticator` 分支由 NONE 擋下）。
+         *
+         * 理由：[McpWire.requireSecureEndpoint] 只驗初始 URL。一旦跟隨 307/308，
+         * `tools/call` body（含 arguments）會被原樣重放到未驗證 origin；301/302/303
+         * 則改寫為 GET 內網 SSRF，且回程 200 會被當成正常結果（熔斷還會 onSuccess）。
+         * 本層政策對**注入的 client 同樣強制**（對齊 `providerTransportClient`）；
+         * 注入 client 的 application interceptor／eventListener／dispatcher／pool
+         * 保留（受信任的呼叫方元件，用於觀測與測試）。
+         *
+         * @return 套用本層政策後的 client（idempotent：已有本攔截器則不重複掛）。
+         */
+        internal fun transportClient(client: OkHttpClient): OkHttpClient {
+            val builder = client.newBuilder()
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .retryOnConnectionFailure(false)
+                .authenticator(Authenticator.NONE)
+                .proxyAuthenticator(Authenticator.NONE)
+                .cookieJar(CookieJar.NO_COOKIES)
+                .cache(null)
+            if (client.networkInterceptors.none { it is RetryAfterStrip }) {
+                builder.addNetworkInterceptor(RetryAfterStrip())
+            }
+            return builder.build()
+        }
 
         /**
          * 成功 body 位元組安全上限：覆蓋既有 `take(64_000)` 字元語義的所有語言
@@ -74,7 +121,8 @@ class McpTransport(
      *   （相容舊 `take(64_000)`）；超量拋 [McpResponseTooLarge]，
      *   呼叫方映射 PROTOCOL + 計熔斷，絕不回截斷半 JSON 充 OK；
      *   非 2xx 不讀 body（呼叫方只看 code）：先 cancel 再回 `code to null`，
-     *   保留 401/403→UNAUTHORIZED、其餘→TRANSPORT 語義，且 close() 不排空大 body；
+     *   保留 401/403→UNAUTHORIZED、3xx→PROTOCOL、其餘→TRANSPORT 語義，
+     *   且 close() 不排空大 body；
      * - 其餘 `IOException` 透傳（呼叫方映射 TRANSPORT）。
      */
     @OptIn(InternalCoroutinesApi::class)
@@ -103,7 +151,7 @@ class McpTransport(
         }
         val request = Request.Builder()
             .url(url)
-            .post(bodyJson.toRequestBody(JSON))
+            .post(OneShotJsonBody(bodyJson))
             .header("Authorization", "Bearer $bearer")
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
@@ -129,7 +177,8 @@ class McpTransport(
                     call.execute().use { resp ->
                         val code = resp.code
                         if (code !in 200..299) {
-                            // 非 2xx：McpServer 只看 code（401/403→UNAUTHORIZED，其餘→TRANSPORT），
+                            // 非 2xx：McpServer 只看 code
+                            // （401/403→UNAUTHORIZED、3xx→PROTOCOL、其餘→TRANSPORT），
                             // 不消費 body 文本；跳過成功-body 有界讀，否則超大 error body 會拋
                             // McpResponseTooLarge 而抹掉 HTTP 狀態語義（誤判 PROTOCOL）。
                             // 先 cancel 再回（use{} 離開即 close）：close() 不得排空未讀位元組，
@@ -143,7 +192,7 @@ class McpTransport(
                             // 子集聲明僅收 JSON：2xx 配非 JSON Content-Type（如 event-stream）
                             // 即早擋（cancel + 拋 McpProtocol），不讀滿 256KiB 才判；
                             // Content-Type 缺席則放行交 parser 判定（相容 MockWebServer 預設）。
-                            val ct = resp.body?.contentType()
+                            val ct = resp.body.contentType()
                             if (ct != null && !ct.toString().contains("json", ignoreCase = true)) {
                                 try {
                                     call.cancel()
@@ -167,6 +216,45 @@ class McpTransport(
                     cancellation?.dispose()
                 }
             }
+        }
+    }
+}
+
+/**
+ * 本層唯一的 JSON media type（top-level：[OneShotJsonBody] 共用）。
+ */
+private val JSON_MEDIA_TYPE: MediaType = "application/json; charset=utf-8".toMediaType()
+
+/**
+ * one-shot POST body：OkHttp 5.5.0 的 `408`、`421` 與 `recover()` 分支檢查到
+ * `isOneShot` 即原樣回傳該回應、不再重送（同 provider `OneShotJsonBody`）。
+ * `503 + Retry-After: 0` 與 `authenticator` 兩個分支**不看** `isOneShot`，
+ * 分別由 [RetryAfterStrip] 與 `Authenticator.NONE` 擋下（三道閘各守一路）。
+ * `tools/call` 非 idempotent（MCP 工具預設 WRITE），這是把「非 idempotent 只送一次」
+ * 釘在 OkHttp 層的最後一道閘。每次 `postJson` 皆新建 body，單次消費不影響正常單發路徑。
+ */
+internal class OneShotJsonBody(private val json: String) : RequestBody() {
+    override fun contentType(): MediaType = JSON_MEDIA_TYPE
+    override fun contentLength(): Long = json.toByteArray(Charsets.UTF_8).size.toLong()
+    override fun isOneShot(): Boolean = true
+    override fun writeTo(sink: BufferedSink) {
+        sink.writeUtf8(json)
+    }
+}
+
+/**
+ * 剝除 `503 + Retry-After: 0` 觸發：OkHttp 5.5.0 會在攔截器內部直接重送
+ * 原本的 method＋body，不檢查 `retryOnConnectionFailure(false)`。
+ * `tools/call` 非 idempotent（MCP 工具預設 WRITE），重送即重複副作用，
+ * 故一律移除該 header 讓 503 原樣回到呼叫方（同 provider 層做法）。
+ */
+internal class RetryAfterStrip : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val response = chain.proceed(chain.request())
+        return if (response.code == 503) {
+            response.newBuilder().removeHeader("Retry-After").build()
+        } else {
+            response
         }
     }
 }

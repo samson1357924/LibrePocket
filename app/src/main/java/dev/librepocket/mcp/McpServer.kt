@@ -20,6 +20,10 @@ import kotlinx.coroutines.CancellationException
  * - 超時：單次 15–30s（[McpTimeouts.clamp]），超時映射 TIMEOUT，不重試；
  * - 傳輸安全：僅放行 `https`，以及回環 `http`（測試／本機；見 [McpWire.requireSecureEndpoint]），
  *   其餘明文一律 PROTOCOL、不碰 vault、不發送、不計熔斷；
+ *   傳輸層不自動跟隨 redirect（3xx 終端 → PROTOCOL + 計熔斷，
+ *   參數不會重放到未驗證 origin；注入 client 的 redirect／連線重試／503 重送／
+ *   authenticator／cookie／cache 政策同樣強制、POST body 為 one-shot，
+ *   application interceptor 屬受信任呼叫方元件，見 [McpTransport] KDoc）；
  * - 隱私：Bearer 只放標頭；`CharArray` 用後即擦（`String`／OkHttp 拷貝為已知殘留，
  *   見 THREAT_MODEL，已最小化生命週期）；稽核只記 id/status/latency；
  * - 授權：本層不做 [McpScope.check]，接線 dispatcher 必須先經投影＋確認
@@ -80,6 +84,13 @@ class McpServer(
             if (code == 401 || code == 403) {
                 breaker.onFailure()
                 return McpListResult(config.id, emptyList(), McpStatus.UNAUTHORIZED, clockMs() - start)
+            }
+            if (code in 300..399) {
+                // 傳輸層不跟隨 redirect（見 McpTransport.transportClient）：3xx 是終端回應。
+                // 伺服器/代理配置與本子集不合 → PROTOCOL + 計熔斷；body 不讀、
+                // 參數不重放（第二次端點從未收到請求，見 McpTransportSecurityTest）。
+                breaker.onFailure()
+                return McpListResult(config.id, emptyList(), McpStatus.PROTOCOL, clockMs() - start)
             }
             if (code !in 200..299 || text.isNullOrBlank()) {
                 breaker.onFailure()
@@ -170,6 +181,11 @@ class McpServer(
             if (code == 401 || code == 403) {
                 breaker.onFailure()
                 return McpCallResult(config.id, toolName, McpStatus.UNAUTHORIZED, clockMs() - start)
+            }
+            if (code in 300..399) {
+                // 同 listTools：不跟隨 redirect，3xx 終端 → PROTOCOL + 計熔斷。
+                breaker.onFailure()
+                return McpCallResult(config.id, toolName, McpStatus.PROTOCOL, clockMs() - start)
             }
             if (code !in 200..299 || text.isNullOrBlank()) {
                 breaker.onFailure()
